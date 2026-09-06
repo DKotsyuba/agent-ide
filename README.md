@@ -10,3 +10,5 @@ Status: technical specification and implementation planning. There is no impleme
 The proposed implementation uses Rust and Tokio.
 
 Persistent LSP caches follow the worktree, including sequential coder-to-reviewer handoff. MCP or hook failure must leave ordinary agent work usable, with honest degraded results.
+
+Closing a worktree retires its cache and analysis leases; finishing a coder session does not. Shared backends remain available to other open worktrees.
