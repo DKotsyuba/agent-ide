@@ -1,12 +1,14 @@
 //! Raw Git evidence and NUL-safe status parsing owned by Workspace.
 
 use std::{
+    collections::BTreeMap,
     ffi::OsString,
     os::unix::ffi::OsStringExt,
     path::{Path, PathBuf},
 };
 
 use super::authority::{AuthorityStamp, WorktreeRef};
+use crate::execution::{CommandKind, ControlledCommand, WorkspaceAuthority as ExecutionAuthority};
 
 /// Names one v0.1 Git comparison that Workspace supplies to Changes for bounded composition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -141,6 +143,94 @@ pub struct GitScope {
     authority_epoch: u64,
     /// Exact logical comparison mode requested by the current actor.
     mode: DiffMode,
+}
+
+/// Selects one fixed read-only Git collection command without accepting model-provided argv or paths.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GitReadQuery {
+    /// Collects NUL-delimited porcelain-v2 status, including separately reported untracked paths.
+    Status,
+    /// Collects the raw `HEAD` comparison bytes for the current worktree.
+    HeadDiff,
+    /// Collects the raw staged/index comparison bytes.
+    StagedDiff,
+    /// Collects the raw unstaged/worktree comparison bytes.
+    UnstagedDiff,
+}
+
+/// Couples a current Workspace scope to one immutable read-only Git argv/env construction.
+#[derive(Clone, Debug)]
+pub struct GitReadIntent {
+    /// Scope whose worktree incarnation and epoch Execution must preserve.
+    scope: GitScope,
+    /// Absolute configured Git executable, never supplied by a model argument.
+    program: PathBuf,
+    /// Fixed read-only query selected by Workspace code.
+    query: GitReadQuery,
+}
+
+impl GitReadIntent {
+    /// Creates one fixed read-only Git intent for a current authority without accepting paths or flags.
+    pub fn new(
+        authority: &AuthorityStamp,
+        program: PathBuf,
+        query: GitReadQuery,
+    ) -> Result<Self, GitError> {
+        if !is_normal_absolute(&program) {
+            return Err(GitError::InvalidGitProgram);
+        }
+        let mode = match query {
+            GitReadQuery::Status | GitReadQuery::HeadDiff => DiffMode::Head,
+            GitReadQuery::StagedDiff => DiffMode::Staged,
+            GitReadQuery::UnstagedDiff => DiffMode::Unstaged,
+        };
+        Ok(Self {
+            scope: GitScope::from_authority(authority, mode),
+            program,
+            query,
+        })
+    }
+
+    /// Returns the worktree incarnation, epoch, and logical mode bound to this collection request.
+    pub fn scope(&self) -> &GitScope {
+        &self.scope
+    }
+
+    /// Returns the fixed read-only query selected by Workspace.
+    pub const fn query(&self) -> GitReadQuery {
+        self.query
+    }
+
+    /// Builds the Execution-owned controlled command with no caller-provided argv or environment.
+    ///
+    /// The argv disables repository-configured fsmonitor, pager/color formatting, external diff,
+    /// and textconv where a diff can invoke them. `GIT_OPTIONAL_LOCKS=0` prevents status reads from
+    /// opportunistically refreshing the index. Execution still validates process policy and spawn.
+    pub fn controlled_command(&self) -> Result<ControlledCommand, GitError> {
+        ControlledCommand::from_validated_peer(
+            CommandKind::Git,
+            self.program.clone(),
+            read_args(self.query),
+            self.scope.worktree.worktree_path().to_path_buf(),
+            BTreeMap::from([
+                (OsString::from("GIT_OPTIONAL_LOCKS"), OsString::from("0")),
+                (OsString::from("GIT_PAGER"), OsString::from("cat")),
+                (OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0")),
+            ]),
+        )
+        .map_err(|_| GitError::InvalidGitProgram)
+    }
+
+    /// Converts current Workspace identity to Execution's full worktree/incarnation/root/epoch token.
+    pub fn execution_authority(&self) -> Result<ExecutionAuthority, GitError> {
+        ExecutionAuthority::from_workspace(
+            self.scope.worktree.id(),
+            self.scope.worktree.incarnation().to_string(),
+            self.scope.worktree.worktree_path().to_path_buf(),
+            self.scope.authority_epoch,
+        )
+        .map_err(|_| GitError::InvalidGitProgram)
+    }
 }
 
 impl GitScope {
@@ -339,6 +429,8 @@ pub enum GitError {
     InvalidBaselineReference,
     /// An operation reference is empty or exceeds the bounded local identifier limit.
     InvalidOperationReference,
+    /// The configured Git executable is not a lexically normal absolute Unix path.
+    InvalidGitProgram,
     /// A terminal-LF discovery value omitted its terminal delimiter or had no path bytes.
     InvalidTerminalPath,
     /// A NUL-delimited porcelain record was incomplete or had an unsupported fixed header shape.
@@ -444,4 +536,70 @@ fn nth_space(record: &[u8], nth: usize) -> Option<usize> {
 /// Converts raw Unix path bytes into an `OsString` without lossy UTF-8 decoding.
 fn raw_path(path: &[u8]) -> PathBuf {
     PathBuf::from(OsString::from_vec(path.to_vec()))
+}
+
+/// Builds one fixed Git argv that cannot enable repository helpers or accept arbitrary pathspecs.
+fn read_args(query: GitReadQuery) -> Vec<OsString> {
+    let mut args = vec![
+        OsString::from("-c"),
+        OsString::from("core.fsmonitor=false"),
+        OsString::from("-c"),
+        OsString::from("color.ui=false"),
+        OsString::from("--no-pager"),
+    ];
+    match query {
+        GitReadQuery::Status => args.extend([
+            OsString::from("status"),
+            OsString::from("--porcelain=v2"),
+            OsString::from("-z"),
+            OsString::from("--untracked-files=all"),
+        ]),
+        GitReadQuery::HeadDiff => args.extend(diff_args([OsString::from("HEAD")])),
+        GitReadQuery::StagedDiff => {
+            args.extend(diff_args([OsString::from("--cached")]));
+        }
+        GitReadQuery::UnstagedDiff => args.extend(diff_args([])),
+    }
+    args
+}
+
+/// Returns common raw-diff flags that prevent external diff and textconv helper execution.
+fn diff_args<const N: usize>(mode: [OsString; N]) -> Vec<OsString> {
+    let mut args = vec![
+        OsString::from("diff"),
+        OsString::from("--no-ext-diff"),
+        OsString::from("--no-textconv"),
+        OsString::from("--raw"),
+        OsString::from("-z"),
+    ];
+    args.extend(mode);
+    args
+}
+
+/// Checks an absolute Unix executable path without normalizing or resolving its raw bytes.
+fn is_normal_absolute(path: &Path) -> bool {
+    path.is_absolute()
+        && path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GitReadQuery, read_args};
+    use std::ffi::OsString;
+
+    /// Keeps read-only collection options fixed rather than allowing repository helpers or caller argv.
+    #[test]
+    fn fixed_read_only_args_disable_fsmonitor_and_diff_helpers() {
+        let status = read_args(GitReadQuery::Status);
+        assert!(status.contains(&OsString::from("core.fsmonitor=false")));
+        assert!(status.contains(&OsString::from("--porcelain=v2")));
+        let diff = read_args(GitReadQuery::UnstagedDiff);
+        assert!(diff.contains(&OsString::from("--no-ext-diff")));
+        assert!(diff.contains(&OsString::from("--no-textconv")));
+    }
 }
