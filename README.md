@@ -4,6 +4,10 @@ An explicitly activated coding companion for Codex and Claude Code, designed for
 
 Status: technical specification and implementation planning. There is no implementation or installable release yet.
 
+- [Current delivery roadmap](docs/roadmap.md)
+
+Earlier design documents (subject to the current roadmap and interface renegotiation):
+
 - [Product requirements](docs/product.md)
 - [Architecture](docs/architecture.md)
 
