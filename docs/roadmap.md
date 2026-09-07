@@ -35,7 +35,7 @@ Only types, tables and settings actually consumed by this path are implemented. 
 
 ### Acceptance
 
-Full v0.1 requires real Codex CLI and Claude CLI scenarios on both Linux and macOS, including native coding subagents. A single passing host/platform cell is an alpha milestone. Record exact versions and explicit `not_tested`, `mocked`, or `real_pass` evidence; a passing mock never grants support status.
+The target platforms are Linux and macOS. Current v0.1 acceptance runs real Codex CLI and Claude CLI scenarios on the available Mac, including native coding subagents. Linux validation is deferred and must remain explicitly unverified; it does not block this delivery. A single passing host cell is still only an intermediate milestone. Record exact versions and explicit `not_tested`, `mocked`, or `real_pass` evidence; a passing mock never grants support status.
 
 Checks cover isolation between divergent worktrees, stale source/provider results, inactive hooks, stop and handoff, daemon/provider crashes, cancellation, bounded queues/output, and preservation of native tool/turn behavior. Productivity evaluation includes correctness, full model-visible context, cold/warm/handoff time, and the complete process tree's resource use. Fewer tool calls alone do not establish improvement.
 
