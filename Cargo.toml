@@ -11,7 +11,7 @@ path = "src/lib.rs"
 async-lsp = { version = "0.2.4", default-features = false, features = ["omni-trait", "tokio"] }
 blake3 = "1"
 rmcp = { version = "3.2.0", features = ["server", "macros", "transport-io"] }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["backup", "bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"

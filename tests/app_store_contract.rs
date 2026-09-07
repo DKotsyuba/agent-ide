@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use agent_ide::app::config::StoreConfig;
-use agent_ide::app::store::{OperationId, Store, StoreError, StoreOutcome};
+use agent_ide::app::store::{
+    DomainMigration, DomainName, MigrationAdmission, MigrationDigest, MigrationKey, OperationId,
+    Store, StoreError, StoreOutcome, TrustedUpSql,
+};
 use rusqlite::Connection;
 
 static TEST_ID: AtomicUsize = AtomicUsize::new(0);
@@ -52,6 +55,17 @@ fn remove_database(path: &Path) {
     for suffix in ["", "-wal", "-shm"] {
         let path = PathBuf::from(format!("{}{}", path.display(), suffix));
         let _ = fs::remove_file(path);
+    }
+}
+
+/// Builds one trusted immutable migration request with a digest that Application must verify.
+fn migration(domain: &str, key: &str, sql: &str) -> DomainMigration {
+    let up_sql = TrustedUpSql::new(sql).unwrap();
+    DomainMigration {
+        domain: DomainName::new(domain).unwrap(),
+        key: MigrationKey::new(key).unwrap(),
+        expected_digest: MigrationDigest::from_sql(&up_sql),
+        up_sql,
     }
 }
 
@@ -161,5 +175,101 @@ async fn receipt_capacity_never_evicts_operation_ids() {
         .unwrap_err();
     assert_eq!(error, StoreError::ReceiptCapacityExhausted);
     drop(store);
+    remove_database(&path);
+}
+
+/// Proves receipt-table-only initialization is fresh, then preserves migration identity and digest.
+#[tokio::test]
+async fn fresh_migration_is_idempotent_and_rejects_changed_sql() {
+    let path = database_path();
+    let store = Store::open(&path, test_config(8)).unwrap();
+    let first = migration(
+        "workspace",
+        "initial",
+        "CREATE TABLE work_items (id INTEGER PRIMARY KEY);",
+    );
+    let applied = store.admit_migration(first.clone()).await.unwrap();
+    let (version, digest) = match applied {
+        MigrationAdmission::Applied {
+            version,
+            digest,
+            backup,
+        } => {
+            assert_eq!(backup, None);
+            (version, digest)
+        }
+        other => panic!("expected fresh applied migration, got {other:?}"),
+    };
+    assert_eq!(version.get(), 1);
+    assert_eq!(
+        store.admit_migration(first).await.unwrap(),
+        MigrationAdmission::AlreadyApplied { version, digest }
+    );
+    let changed = migration(
+        "workspace",
+        "initial",
+        "CREATE TABLE work_items (id INTEGER PRIMARY KEY, name TEXT);",
+    );
+    assert_eq!(
+        store.admit_migration(changed).await.unwrap(),
+        MigrationAdmission::Incompatible {
+            version,
+            existing_digest: digest,
+        }
+    );
+    drop(store);
+    remove_database(&path);
+}
+
+/// Requires an owned fsynced backup before a nonfresh upgrade and allocates the next domain version.
+#[tokio::test]
+async fn nonfresh_migration_requires_backup_and_versions_monotonically() {
+    let path = database_path();
+    let backup_root = path.with_extension("backups");
+    let initial = migration(
+        "workspace",
+        "initial",
+        "CREATE TABLE work_items (id INTEGER PRIMARY KEY);",
+    );
+    let store = Store::open(&path, test_config(8)).unwrap();
+    assert!(matches!(
+        store.admit_migration(initial).await.unwrap(),
+        MigrationAdmission::Applied { backup: None, .. }
+    ));
+    drop(store);
+    let store = Store::open(&path, test_config(8)).unwrap();
+    assert_eq!(
+        store
+            .admit_migration(migration(
+                "workspace",
+                "add_name",
+                "ALTER TABLE work_items ADD COLUMN name TEXT;"
+            ))
+            .await
+            .unwrap(),
+        MigrationAdmission::BackupUnavailable
+    );
+    drop(store);
+    let store = Store::open_with_backup_root(&path, &backup_root, test_config(8)).unwrap();
+    let applied = store
+        .admit_migration(migration(
+            "workspace",
+            "add_name",
+            "ALTER TABLE work_items ADD COLUMN name TEXT;",
+        ))
+        .await
+        .unwrap();
+    match applied {
+        MigrationAdmission::Applied {
+            version, backup, ..
+        } => {
+            assert_eq!(version.get(), 2);
+            let backup = backup.expect("nonfresh upgrade must retain a backup reference");
+            assert!(backup_root.join(backup.relative_path).is_file());
+        }
+        other => panic!("expected backed-up migration, got {other:?}"),
+    }
+    drop(store);
+    let _ = fs::remove_dir_all(&backup_root);
     remove_database(&path);
 }
