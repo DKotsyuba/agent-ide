@@ -1,4 +1,4 @@
-//! Minimal crate seed for validating the Rust development environment.
+//! Local infrastructure for the Agent IDE daemon.
 
-/// Nonfunctional marker used to verify symbol inspection before coder assignment.
-pub const TOOLING_READY: bool = true;
+/// Owns the process-local daemon and private Unix IPC boundary.
+pub mod app;
