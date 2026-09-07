@@ -1,5 +1,7 @@
 # Exact changes and current verification
 
+Historical contract for the earlier design. The current v0.1 boundary is [bounded Git diff composition](changes-v0.1.md); the material below is retained as historical reference.
+
 Revision: r3. Provider: Changes. Consumer: Assistance. Inputs: Workspace authority/snapshots/permits, Intelligence proposals/diagnostics, Execution job evidence, Application config/SQLite. Vocabulary: [common](common.md).
 
 ## Operations and results
