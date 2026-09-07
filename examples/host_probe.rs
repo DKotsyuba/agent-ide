@@ -10,14 +10,23 @@ use serde_json::{Map, Value, json};
 const MAX_INPUT: usize = 64 * 1024;
 const MAX_DEPTH: usize = 8;
 const MAX_FIELDS: usize = 256;
-const MAX_RECORD: usize = 4 * 1024;
-const MAX_LOG: u64 = 256 * 1024;
+const MAX_RECORD: usize = 32 * 1024;
+const MAX_LOG: u64 = 1024 * 1024;
+const MAX_SANDBOX_STATE: usize = 64 * 1024;
 const SKIPPED_SUBTREES: &[&str] = &["tool_input", "arguments", "content", "environment"];
 const STARTUP_ENV: &[&str] = &["CODEX_THREAD_ID", "CODEX_TURN_ID", "CODEX_SESSION_ID"];
+const SANDBOX_STATE_META: &str = "codex/sandbox-state-meta";
+const SANDBOX_STATE_FIELDS: &[&str] = &[
+    "permissionProfile",
+    "codexLinuxSandboxExe",
+    "sandboxCwd",
+    "useLegacyLandlock",
+];
 
-/// Runs the test-only recorder as `host_probe <mcp|hook> LOG KEY`.
+/// Runs the test-only recorder as `host_probe <mcp|hook> LOG KEY [SANDBOX_STATE_OUTPUT]`.
 ///
-/// A bad input, key, or log path is non-fatal so the diagnostic does not change host flow.
+/// The fourth path is accepted only in MCP mode. A bad input, key, or output path is non-fatal
+/// so the diagnostic does not change host flow.
 fn main() -> io::Result<()> {
     let mut args = env::args().skip(1);
     let mode = args.next();
@@ -25,29 +34,35 @@ fn main() -> io::Result<()> {
     let key = args.next().map(PathBuf::from);
     match mode.as_deref() {
         Some("hook") => hook(log, key),
-        Some("mcp") => mcp(log, key),
+        Some("mcp") => mcp(log, key, args.next().map(PathBuf::from)),
         _ => {
-            eprintln!("usage: host_probe <mcp|hook> LOG KEY");
+            eprintln!("usage: host_probe <mcp|hook> LOG KEY [SANDBOX_STATE_OUTPUT]");
             Ok(())
         }
     }
 }
 
-/// Holds the bounded observation destination and its separate 32-byte BLAKE3 key.
+/// Holds the bounded observation destination, BLAKE3 key, and private sandbox-state output.
 ///
 /// The recorder is inert unless both paths are supplied and the key file is exact length.
 #[derive(Clone)]
 struct Recorder {
     log: Option<PathBuf>,
     key: Option<[u8; 32]>,
+    sandbox_state_output: Option<PathBuf>,
 }
 
 impl Recorder {
     /// Builds a recorder and fingerprints only allowlisted public startup identifiers.
-    fn new(log: Option<PathBuf>, key_path: Option<PathBuf>) -> Self {
+    fn new(
+        log: Option<PathBuf>,
+        key_path: Option<PathBuf>,
+        sandbox_state_output: Option<PathBuf>,
+    ) -> Self {
         let recorder = Self {
             log,
             key: key_path.as_deref().and_then(read_key),
+            sandbox_state_output,
         };
         let mut values = Map::new();
         for name in STARTUP_ENV {
@@ -72,6 +87,13 @@ impl Recorder {
     fn marker(&self, status: &str) {
         self.record(&json!({ "status": status }));
     }
+
+    /// Creates the operator-selected private sandbox fixture from the exact request metadata.
+    fn record_sandbox_state(&self, request_meta: &Value) {
+        if let Some(path) = self.sandbox_state_output.as_deref() {
+            save_sandbox_state(path, request_meta);
+        }
+    }
 }
 
 /// Reads exactly one 32-byte BLAKE3 key; short, long, or unreadable keys are rejected.
@@ -81,7 +103,7 @@ fn read_key(path: &Path) -> Option<[u8; 32]> {
 
 /// Reads one bounded hook payload and always returns success without model-facing stdout.
 fn hook(log: Option<PathBuf>, key: Option<PathBuf>) -> io::Result<()> {
-    let recorder = Recorder::new(log, key);
+    let recorder = Recorder::new(log, key, None);
     let mut input = Vec::new();
     let complete = io::stdin()
         .take((MAX_INPUT + 1) as u64)
@@ -183,12 +205,18 @@ fn fingerprint(input: &[u8], key: &[u8; 32]) -> String {
 /// Appends one bounded record without taking the log beyond `MAX_LOG`.
 ///
 /// A nonblocking advisory lock protects the cooperative metadata-size-check-and-append span.
+/// Oversized projections end with an explicit ASCII truncation marker.
 fn write_record(path: &Path, record: &str) -> io::Result<()> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     if file.try_lock().is_err() {
         return Ok(());
     }
-    let line = format!("{}\n", &record[..record.len().min(MAX_RECORD - 1)]);
+    let line = if record.len() < MAX_RECORD {
+        format!("{record}\n")
+    } else {
+        let suffix = ";truncated\n";
+        format!("{}{}", &record[..MAX_RECORD - suffix.len()], suffix)
+    };
     let enough_room = file
         .metadata()
         .map(|metadata| metadata.len().saturating_add(line.len() as u64) <= MAX_LOG)
@@ -200,11 +228,56 @@ fn write_record(path: &Path, record: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Selects exactly the four Codex sandbox-state fields from the opt-in request metadata.
+///
+/// Other `_meta` fields, including arguments and host-private extensions, are discarded.
+fn sandbox_state(request_meta: &Value) -> Option<Value> {
+    let input = request_meta.get(SANDBOX_STATE_META)?.as_object()?;
+    let mut output = Map::new();
+    for field in SANDBOX_STATE_FIELDS {
+        if let Some(value) = input.get(*field) {
+            output.insert((*field).to_owned(), value.clone());
+        }
+    }
+    (!output.is_empty()).then_some(Value::Object(output))
+}
+
+/// Creates one private, bounded sandbox-state fixture without replacing an existing file.
+///
+/// The file contains only the selected `codex/sandbox-state-meta` object. Serialization,
+/// size, creation, permission, and write failures are intentionally inert for the MCP host.
+fn save_sandbox_state(path: &Path, request_meta: &Value) {
+    let Some(state) = sandbox_state(request_meta) else {
+        return;
+    };
+    let Ok(bytes) = serde_json::to_vec(&state) else {
+        return;
+    };
+    if bytes.len() > MAX_SANDBOX_STATE {
+        return;
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let Ok(mut file) = options.open(path) else {
+        return;
+    };
+    let _ = file.write_all(&bytes);
+}
+
 /// Serves the only test diagnostic tool over stdio until ordinary protocol EOF.
 ///
-/// `call_tool` records the rmcp request id, `_meta`, and available initialize information.
+/// The requested experimental capability makes Codex attach sandbox state to request `_meta`.
 #[tokio::main]
-async fn mcp(log: Option<PathBuf>, key: Option<PathBuf>) -> io::Result<()> {
+async fn mcp(
+    log: Option<PathBuf>,
+    key: Option<PathBuf>,
+    sandbox_state_output: Option<PathBuf>,
+) -> io::Result<()> {
     use rmcp::{ServiceExt, handler::server::tool::ToolRouter, model::*, service::RequestContext};
 
     /// Owns the generated one-tool router and the shared diagnostic recorder.
@@ -229,8 +302,15 @@ async fn mcp(log: Option<PathBuf>, key: Option<PathBuf>) -> io::Result<()> {
     impl rmcp::ServerHandler for Probe {
         /// Describes only the diagnostic tool capability exposed by this test server.
         fn get_info(&self) -> ServerInfo {
-            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-                .with_instructions("test-only host metadata probe")
+            let mut experimental = ExperimentalCapabilities::new();
+            experimental.insert(SANDBOX_STATE_META.to_owned(), Default::default());
+            ServerInfo::new(
+                ServerCapabilities::builder()
+                    .enable_tools()
+                    .enable_experimental_with(experimental)
+                    .build(),
+            )
+            .with_instructions("test-only host metadata probe")
         }
 
         /// Records the safe request context before ordinary generated router dispatch.
@@ -240,9 +320,11 @@ async fn mcp(log: Option<PathBuf>, key: Option<PathBuf>) -> io::Result<()> {
             context: RequestContext<rmcp::RoleServer>,
         ) -> impl Future<Output = Result<CallToolResponse, rmcp::ErrorData>> + Send + '_ {
             async move {
+                let request_meta = serde_json::to_value(&context.meta).unwrap_or(Value::Null);
+                self.recorder.record_sandbox_state(&request_meta);
                 self.recorder.record(&json!({
                     "request_id": &context.id,
-                    "request_meta": &context.meta,
+                    "request_meta": request_meta,
                     "client_info": context.client_info(),
                     "client_capabilities": context.client_capabilities(),
                 }));
@@ -257,7 +339,7 @@ async fn mcp(log: Option<PathBuf>, key: Option<PathBuf>) -> io::Result<()> {
 
     Probe {
         router: Probe::tool_router(),
-        recorder: Recorder::new(log, key),
+        recorder: Recorder::new(log, key, sandbox_state_output),
     }
     .serve(rmcp::transport::io::stdio())
     .await
@@ -336,12 +418,49 @@ mod tests {
         let log = dir.join("log");
         let key = dir.join("key");
         fs::write(&key, [9_u8; 32]).unwrap();
-        let recorder = Recorder::new(Some(log.clone()), Some(key));
+        let recorder = Recorder::new(Some(log.clone()), Some(key), None);
         record_hook_input(&recorder, Some(b"{private-marker"));
         record_hook_input(&recorder, Some(&vec![b'x'; MAX_INPUT + 1]));
         let output = fs::read_to_string(log).unwrap();
         assert!(!output.contains("private-marker"));
         assert!(!output.contains(&"x".repeat(32)));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Saves only opt-in sandbox profile fields in a new owner-private fixture.
+    #[test]
+    fn sandbox_fixture_is_private_and_excludes_other_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir();
+        let output = dir.join("sandbox-state.json");
+        let private_marker = "private-marker";
+        save_sandbox_state(
+            &output,
+            &json!({
+                SANDBOX_STATE_META: {
+                    "permissionProfile": "managed",
+                    "codexLinuxSandboxExe": true,
+                    "sandboxCwd": "/tmp/fixture",
+                    "useLegacyLandlock": false,
+                    "unrecognized": private_marker,
+                },
+                "arguments": { "secret": private_marker },
+            }),
+        );
+        let saved: Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
+        assert_eq!(saved.get("permissionProfile"), Some(&json!("managed")));
+        assert!(saved.get("unrecognized").is_none());
+        assert!(
+            !fs::read_to_string(&output)
+                .unwrap()
+                .contains(private_marker)
+        );
+        assert_eq!(
+            fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        save_sandbox_state(&output, &json!({ SANDBOX_STATE_META: {} }));
         fs::remove_dir_all(dir).unwrap();
     }
 }

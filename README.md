@@ -2,7 +2,7 @@
 
 An explicitly activated coding companion for Codex and Claude Code, designed for Linux and macOS. One coding agent owns one Git worktree. A local broker coordinates isolated analysis views, compatible shared language-server backends and bounded feedback.
 
-Status: technical specification and implementation planning. There is no implementation or installable release yet.
+Status: the private daemon/IPC/config/SQLite substrate is implemented; the v0.1 coding companion is not yet an installable product.
 
 - [Current delivery roadmap](docs/roadmap.md)
 

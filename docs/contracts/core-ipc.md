@@ -20,6 +20,16 @@ The health request is `{"version":1,"request_id":"opaque-client-id","method":"he
 
 A successful reply is `{"version":1,"request_id":"opaque-client-id","status":"ok","daemon_generation":"fresh-instance-id"}`. The request ID is echoed exactly after validation. Generate a new collision-resistant daemon generation at every daemon start; generation is not authentication. Invalid transport input may be closed without a reply. Doctor must report unavailable/failed rather than interpreting a closed or stale endpoint as healthy.
 
+## Wire version 2: finite Assistance ingress
+
+Version 1 health remains unchanged. Version 2 has the same one-request/one-reply Unix connection lifecycle, peer-UID boundary, daemon generation, and total connection deadline. Its frame limit is 128 KiB; every opaque identifier (`request_id`, `correlation_id`, and `opaque_attachment`) is required, UTF-8, nonempty, and at most 128 bytes. `sanitized_observation_json`, `params_json`, and `opaque_result_json` are valid JSON values independently capped at 64 KiB. A value at its field limit may still be rejected when its containing frame exceeds 128 KiB.
+
+Only two version-2 methods exist. `assistance.hook_submit` is `{version:2,request_id,correlation_id,opaque_attachment,sanitized_observation_json}`. Its observation is supplied already sanitized by Assistance and is an opaque JSON object to Application; it carries no tool input, tool output, or source content. The bounded reply keeps `request_id` and `correlation_id` and contains only an opaque Assistance reply or the bounded transport state `unavailable` or `overflow`.
+
+`assistance.method_dispatch` is `{version:2,request_id,correlation_id,opaque_attachment,method,params_json}`. `method` is the closed enum `start | context | diff | inspect | stop`; unknown method tags, fields, versions, malformed JSON, or over-limit values are rejected before forwarding. Its reply is `{version:2,request_id,opaque_result_json}` or the bounded transport state `unavailable` or `overflow`. Application correlates and bounds transport only. Assistance alone interprets attachment, identity, params, results, rendering, and tool failures.
+
+`submit_hook_if_running` is connect-only: it never prepares a runtime directory, starts or retries a daemon, or retries inline. Every connect, timeout, framing, or dispatch failure is `unavailable` to its caller, which must exit the host hook permissively. There is no subscription, queue fan-out, retained event stream, or other generic bus.
+
 ## Verification
 
 Use actual Unix sockets and separate daemon processes. Cover correct reply/correlation, private directory/socket permissions and current peer UID, invalid/oversized/truncated frames, unknown fields/methods, bounded partial-input wait, lock contention, stale-socket recovery, restart generation change and doctor on an absent runtime directory. Test wrong-UID rejection as far as the local test privileges permit and state that limit. These checks establish Application mechanics only; they do not establish host binding, sandbox propagation or a working IDE.
