@@ -1,6 +1,6 @@
 # Application v0.1 contract
 
-Revision: v0.1-r1. Provider: Application. Direct consumers: Assistance (private daemon IPC), Workspace (durable transaction mechanics), and Execution (effective bounded runtime/store settings when it consumes them). Vocabulary: [common](common.md).
+Revision: v0.1-r2. Provider: Application. Direct consumers: Assistance (private daemon IPC), Workspace (durable transaction and migration mechanics), and Execution (effective bounded runtime/store settings when it consumes them). Vocabulary: [common](common.md).
 
 ## Scope and ownership
 
@@ -10,11 +10,15 @@ It does not authenticate actors, grant Workspace authority, read Git or source, 
 
 ## Private IPC and executable modes
 
-[`core-ipc.md`](core-ipc.md) is the complete wire contract. It owns the v1 health frame, request and response shape, frame limit, endpoint ownership, peer-UID check, stale-socket recovery, and the exact `daemon`/`doctor` CLI modes. This contract does not restate that wire format.
+[`core-ipc.md`](core-ipc.md) is the complete wire contract. It owns the unchanged v1 health frame and the finite v2 Assistance ingress, including frame and field limits, endpoint ownership, peer-UID check, stale-socket recovery, and the exact `daemon`/`doctor` CLI modes. This contract does not restate that wire format.
 
 `RuntimeDir::prepare_for_daemon` creates or validates one final private real directory. `run_daemon` holds its nonblocking lock, binds one private Unix socket, generates a fresh daemon generation, and serves only health. It does not start Workspace, Execution, Intelligence, or Assistance activity. `doctor` receives a plain path, never creates a directory or starts a daemon, and returns `Healthy { daemon_generation }` or `Unavailable`.
 
 UID equality is only a local-user transport boundary; it is not actor proof or authority. Assistance must validate any host attachment before it asks a domain to activate. A stale lock pathname, PID, socket closure, or successful local connection alone never establishes host binding.
+
+The accepted r2 addition exposes exactly `assistance.hook_submit` and `assistance.method_dispatch`; the latter has the closed v0.1 tool enum `start | context | diff | inspect | stop`. Application dispatches one correlated request to Assistance and returns one correlated opaque reply. It has no generic event bus, pub/sub, retained hook queue, host identity, authority, rendering, or method semantics. `submit_hook_if_running` is connect-only and returns bounded `Unavailable` on every transport fault; it never starts/retries a daemon and its caller must fail open.
+
+The r2 Rust surface is `HookTransportLimits { max_frame_bytes, max_observation_bytes, deadline }`, `HookSubmit { request_id, correlation_id, opaque_attachment, sanitized_observation_json }`, `AssistanceMethod::HookSubmit`, `AssistanceDispatch`, `AssistanceDispatchReply`, `AssistanceDispatcher::dispatch`, `submit_hook_if_running(runtime_dir, request, limits)`, and `run_daemon_with_assistance(runtime_dir, dispatcher, config)`. `AssistanceMethod` has no extensible string variant. `OpaqueAttachmentRef`, request/correlation IDs, and opaque JSON results are bounded transport values; they are not authority assertions or Application-owned semantic types.
 
 ## Immutable configuration
 
@@ -43,10 +47,18 @@ Application's transaction covers only SQLite. It does not make Git, filesystem, 
 
 Assistance may depend on the health transport only after its own accepted host-binding proof; those tests do not prove D01. Workspace may use `Store` only with its own stable operation IDs and reconcile `OutcomeUnknown` rather than replaying effects. Execution may consume the current explicit limits and store mechanics for its own durable receipts, but no Application API admits or launches its processes. The tests prove local IPC/config/SQLite mechanics only and do not prove D03 sandbox propagation, provider isolation, host fail-open behavior, or a complete IDE.
 
+## Domain migration admission
+
+The accepted r2 migration API is `Store::open_with_backup_root(database_path, backup_root, config)` and `Store::admit_migration(DomainMigration) -> MigrationAdmission`. `DomainMigration` contains a validated `DomainName`, stable `MigrationKey`, trusted up SQL, and expected immutable digest. Application computes the digest, serializes admission on its one owner thread, and allocates the next monotonically increasing version within that domain.
+
+`MigrationAdmission` is exactly `Applied { version, digest, backup }`, `AlreadyApplied { version, digest }`, `Incompatible { version, existing_digest }`, `OutcomeUnknown { key }`, or `BackupUnavailable`. `backup` is `Option<BackupRef>`: it is `None` only for a fresh initialization and otherwise names the fsynced owned SQLite backup. No successful or failed migration result is inferred from a missing receipt.
+
+The immutable `(domain,key)` mapping rejects changed digest as `Incompatible`; a matching completed digest returns `AlreadyApplied` without executing SQL. `Applied` returns allocated version, digest, and an optional durable backup reference. Commit ambiguity returns `OutcomeUnknown` and never permits blind replay. Trusted up SQL and its applied migration ledger row (domain, key, allocated version, digest, and backup reference) commit together in one SQLite transaction. Application never assigns a version or reserves a future migration outside an accepted admission.
+
+Before upgrading a nonfresh database, Application makes and fsyncs a SQLite backup inside its owned `backup_root`, then persists the `BackupRef` with the migration result. A Store without a safe writable backup root, or any backup failure, returns `BackupUnavailable` without executing migration SQL. Fresh means no non-Application schema object and no migration-ledger entry for the requested domain. `application_operation_receipts` and Application's own migration ledger do not make a database nonfresh. Unknown legacy schema is nonfresh, never assumed fresh. Workspace supplies trusted migration content; Application does not decide Workspace closure, cache policy, or domain semantics.
+
 ## Explicit unresolved v0.1 boundaries
 
 No cache-directory or cache-retirement API exists yet. Its contract needs Workspace's canonical worktree-incarnation and verified closure/reset signal plus Intelligence's provider-compatibility and semantic-validity decision. Application must not infer closure from a missing or moved path, or claim provider-cache reuse.
 
-No versioned migration allocator, schema-compatibility gate, backup/restore flow, or upgrade rollback contract exists yet. A domain's first required migration must negotiate that interface with Application; no future tables or migration filenames are reserved now.
-
-The current doctor checks only the private health endpoint. Packaging, install/remove behavior, richer capability/schema reporting, actual host integration, and product assembly remain separate unimplemented work.
+The accepted r2 ingress and migration contracts are normative before their implementation commits. The current code still serves only v1 health and has no migration ledger or backup root. The current doctor checks only the private health endpoint. Packaging, install/remove behavior, richer capability/schema reporting, actual host integration, and product assembly remain separate unimplemented work.
