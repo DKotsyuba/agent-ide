@@ -1,0 +1,122 @@
+# Intelligence v0.1 contract
+
+Revision: v0.1-r0 (proposed; direct consumer acceptance pending). Provider:
+Intelligence. Direct providers: Workspace supplies current authority, worktree
+identity and source observations; Execution supplies admitted owned protocol
+children; Application supplies effective provider settings and owned cache
+directories. Direct consumers: Assistance renders returned observations and
+Workspace receives a stop drain receipt. Shared vocabulary:
+[common](common.md).
+
+This proposal consumes Workspace v0.1-r4, frozen at SHA-256
+`7ad84f5c834f2e3295709f9c7a5b65f086060d58a78159e47875b2483590d180`,
+and Execution r5, frozen at SHA-256
+`bb14ea5e4d9668ddaf412b34700988694b05a18ff1d4602c32129c57a9514a87`.
+
+## Ownership and exclusions
+
+Intelligence owns provider compatibility, logical views, protocol generations,
+semantic reads, diagnostic observations, and native-cache validity decisions.
+It does not create a child process, interpret host proof, mint a Workspace
+authority or Execution profile permit, read protocol stdout outside an owned
+protocol lease, apply source bytes, run checks, or compose a diff. Execution
+owns the physical process, admission and reaping; Workspace owns worktree
+identity, authority and source observations.
+
+v0.1 has no DAP, check, edit, rename, arbitrary JSON-RPC, task-context, or
+`Scope` surface. Server-originated content is an observation, never an
+instruction or authority.
+
+## Read-only surface
+
+`attach_view` accepts a current Workspace authority bound to one `WorktreeRef`
+including incarnation and epoch, current source/configuration/toolchain
+observations with coverage, one declared provider profile, and a stable request
+ID. It returns one opaque owner-bound `ViewLease` plus backend generation,
+readiness and reuse disposition, or `queued`, `unavailable`, `stale`, or
+`incompatible`. A queue ticket reserves no process resource. A cold owned start
+is requested only through Execution's admission/profile path, with the
+freshly-correlated Assistance binding and observed sandbox state required by
+that path.
+
+`context` accepts a `ViewLease`, an exact current source observation reference,
+and a bounded semantic query. It returns only bounded semantic facts with the
+provider document version, negotiated position encoding, source observation
+reference and sequence, backend generation, coverage, and freshness. A changed
+relevant source sequence, worktree incarnation, epoch, configuration, toolchain
+or generation makes older evidence `stale`; missing or partial coverage is
+`unknown` or `incomplete`, never a clean result.
+
+`diagnostics` accepts the same lease and exact source observation reference. A
+pulled result has the same freshness envelope as `context`. A pushed diagnostic
+without a provider-specific validated barrier is `provisional`; no diagnostic
+message is `unknown`, never clean. Each view owns document synchronization,
+document versions and request/result mapping; a reply is routed by backend
+generation, view and request ID, never arrival order or current cwd.
+
+`release_view` releases only one logical lease. On Workspace's finite direct
+`AuthorityRevoked { worktree_ref, old_epoch, reason }` call, Intelligence
+rejects new attachment, query and diagnostic work for that exact view, cancels
+its mappings, releases the view and returns a drain receipt. It requests
+Execution reaping only for an owned backend with no surviving view and no
+supported quiescent retention. It never kills a borrowed endpoint or a shared
+peer backend.
+
+## Protocol safety and callbacks
+
+The implementation uses `async-lsp` and its re-exported compatible LSP types;
+it does not add a second JSON-RPC multiplexer. The wire boundary owns explicit
+header, body, outstanding-request and retained-output ceilings. It handles
+fragmented and coalesced frames, rejects malformed framing/encoding/IDs,
+disposes a cancelled request before accepting a late response, and invalidates
+the affected generation on protocol failure or EOF. Pipe completion is handed
+to Execution for owned-child reap evidence.
+
+Server `workspace/applyEdit` is rejected without writing bytes and no
+callback-write capability is advertised. Configuration responses are scoped to
+the requested URI; scope-less settings must be globally compatible or fail.
+Noninteractive prompts have no affirmative default. Unknown server commands
+remain inert observations.
+
+The existing real `async-lsp`/`gopls` probe proves only one owned stdio
+initialize/open/hover/definition/shutdown/reap exchange. It is not proof of the
+limits, cancellation, callback or EOF rules above.
+
+## Profiles, isolation and caches
+
+Every profile declares binary and protocol identity, provider revision,
+configuration, toolchain, trust boundary, transport, lifecycle and sharing
+mode. The compatibility key contains those inputs. An exclusive profile also
+contains the canonical `WorktreeRef` including incarnation. A shared profile
+uses that worktree identity as an isolated view key and never shares mutable
+document buffers across views.
+
+`rust-analyzer` is exclusive in v0.1. A shared `gopls` profile is unavailable
+until its real divergent-worktree acceptance succeeds; a provider that cannot
+detach one stopped view while keeping a peer correct remains exclusive.
+
+Reusable native-cache identity excludes actor, session, binding, context and
+authority IDs. It includes compatible provider/profile/configuration/toolchain
+and trust inputs, plus the provider-supported worktree state. Release, stop and
+handoff do not delete a valid owned cache. Only Workspace's verified deletion
+or reset fact can retire its namespace; moving, unmounting or a temporary
+missing path cannot. Unsupported, corrupt or incompatible state is cold or
+unavailable with a reason, never an empty valid analysis.
+
+## Acceptance queue
+
+1. Build the bounded `async-lsp` wire adapter and prove frame limits,
+   malformed/fragmented/coalesced framing, cancellation with late response
+   disposal, read-only callbacks, EOF generation invalidation and owned-pipe
+   cleanup handoff.
+2. Prove a real shared `gopls` profile with two divergent worktrees containing
+   duplicate module/symbol names and different configuration; stop one view and
+   confirm the peer remains semantically usable and isolated.
+3. Prove the exclusive real `rust-analyzer` profile: no cross-worktree reuse;
+   a second demand is separately admitted, queued or refused.
+4. Prove source-sequence freshness, provisional diagnostics, same-worktree
+   coder-to-reviewer warm handoff, and cache retirement only after a verified
+   Workspace closure/reset fact.
+
+Consumer acceptance freezes this revision and SHA-256 before code relies on it.
+Subsequent contract changes require bilateral revision acceptance.
