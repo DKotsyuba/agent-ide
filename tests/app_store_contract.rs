@@ -205,6 +205,28 @@ async fn fresh_migration_is_idempotent_and_rejects_changed_sql() {
         store.admit_migration(first).await.unwrap(),
         MigrationAdmission::AlreadyApplied { version, digest }
     );
+    assert_eq!(
+        store
+            .migration_admission(
+                DomainName::new("workspace").unwrap(),
+                MigrationKey::new("initial").unwrap(),
+            )
+            .await
+            .unwrap(),
+        MigrationAdmission::AlreadyApplied { version, digest }
+    );
+    assert_eq!(
+        store
+            .migration_admission(
+                DomainName::new("workspace").unwrap(),
+                MigrationKey::new("missing").unwrap(),
+            )
+            .await
+            .unwrap(),
+        MigrationAdmission::OutcomeUnknown {
+            key: MigrationKey::new("missing").unwrap()
+        }
+    );
     let changed = migration(
         "workspace",
         "initial",

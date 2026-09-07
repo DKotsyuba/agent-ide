@@ -383,6 +383,33 @@ impl Store {
         }
     }
 
+    /// Reconciles one migration key without executing trusted SQL or allocating another version.
+    ///
+    /// Workspace calls this only after `MigrationAdmission::OutcomeUnknown`. A present immutable
+    /// ledger row returns `AlreadyApplied`; a missing or unreadable row remains unknown and never
+    /// grants permission to replay the migration.
+    pub async fn migration_admission(
+        &self,
+        domain: DomainName,
+        key: MigrationKey,
+    ) -> Result<MigrationAdmission, StoreError> {
+        let unknown_key = key.clone();
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        match self.sender.try_send(StoreMessage::MigrationLookup {
+            domain,
+            key,
+            reply: reply_sender,
+        }) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => return Err(StoreError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => return Err(StoreError::Unavailable),
+        }
+        match tokio::time::timeout(self.config.request_deadline, reply_receiver).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) | Err(_) => Ok(MigrationAdmission::OutcomeUnknown { key: unknown_key }),
+        }
+    }
+
     /// Executes typed domain SQL inside an Application-owned transaction with a durable operation receipt.
     ///
     /// `sql` receives the live [`Transaction`] and must not manually begin, commit, or roll back a
@@ -584,6 +611,15 @@ enum StoreMessage {
         /// Returns only the bounded migration admission result.
         reply: oneshot::Sender<Result<MigrationAdmission, StoreError>>,
     },
+    /// Reads one immutable migration ledger row without executing or admitting any migration SQL.
+    MigrationLookup {
+        /// Domain namespace that scopes the opaque migration key.
+        domain: DomainName,
+        /// Stable key to reconcile after an unknown admission result.
+        key: MigrationKey,
+        /// Returns only a known applied row or an explicit unknown state.
+        reply: oneshot::Sender<Result<MigrationAdmission, StoreError>>,
+    },
 }
 
 /// Opens SQLite once, applies Application mechanics policy, and serially owns all messages.
@@ -618,6 +654,9 @@ fn owner_thread(
                     backup_root.as_deref(),
                     migration,
                 ));
+            }
+            StoreMessage::MigrationLookup { domain, key, reply } => {
+                let _ = reply.send(read_migration_admission(&connection, domain, key));
             }
         }
     }
@@ -666,7 +705,9 @@ fn admit_one_migration(
     if digest != migration.expected_digest {
         return Err(StoreError::MigrationDigestMismatch);
     }
-    if let Some((version, existing_digest)) = migration_by_key(connection, &migration)? {
+    if let Some((version, existing_digest)) =
+        migration_by_key(connection, &migration.domain, &migration.key)?
+    {
         return Ok(if existing_digest == digest {
             MigrationAdmission::AlreadyApplied { version, digest }
         } else {
@@ -742,13 +783,14 @@ fn admit_one_migration(
 /// Reads an immutable migration-key mapping, treating corrupt stored digest data as unsafe.
 fn migration_by_key(
     connection: &Connection,
-    migration: &DomainMigration,
+    domain: &DomainName,
+    key: &MigrationKey,
 ) -> Result<Option<(NonZeroU64, MigrationDigest)>, StoreError> {
     let row = connection
         .query_row(
             "SELECT version, digest FROM application_domain_migrations
              WHERE domain = ?1 AND migration_key = ?2",
-            params![migration.domain.as_str(), migration.key.as_str()],
+            params![domain.as_str(), key.as_str()],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
         .optional()
@@ -764,6 +806,18 @@ fn migration_by_key(
         Ok((version, MigrationDigest(digest)))
     })
     .transpose()
+}
+
+/// Reads one completed migration row without interpreting a missing or corrupt row as safe to replay.
+fn read_migration_admission(
+    connection: &Connection,
+    domain: DomainName,
+    key: MigrationKey,
+) -> Result<MigrationAdmission, StoreError> {
+    match migration_by_key(connection, &domain, &key)? {
+        Some((version, digest)) => Ok(MigrationAdmission::AlreadyApplied { version, digest }),
+        None => Ok(MigrationAdmission::OutcomeUnknown { key }),
+    }
 }
 
 /// Returns an existing equal-digest version so a renamed migration cannot execute twice.
