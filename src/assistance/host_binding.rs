@@ -1,10 +1,11 @@
 //! Codex-specific transport validation for an MCP invocation and its native hook lifecycle.
 //!
-//! A parsed candidate is not an authority claim. Only a matching trusted `PreToolUse` and
-//! `PostToolUse` pair yields a [`ValidatedInvocation`]; consumers still decide whether the
-//! host transport and any execution profile prove the authority they require.
+//! A parsed candidate is not an authority claim. A matching trusted `PreToolUse` yields a
+//! [`ValidatedInvocation`] before MCP result delivery; later `PostToolUse` is settlement
+//! evidence. Consumers still decide whether the host transport and execution profile prove
+//! the authority they require.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use serde_json::{Map, Value};
 
@@ -86,8 +87,10 @@ pub enum BindingUnavailable {
     UnsupportedHookPhase,
     /// A hook could not be linked exactly to one registered MCP candidate.
     Mismatch,
-    /// A post-hook arrived before its exact pre-hook.
+    /// MCP validation arrived before its exact pre-hook, or a post-hook had no invocation.
     MissingPre,
+    /// A post-hook arrived after pre-observation but before MCP validation completed.
+    MissingInvocation,
     /// The candidate was observed twice or after it was already validated.
     Replay,
     /// Bounded pending or completed lifecycle storage is full.
@@ -98,19 +101,22 @@ pub enum BindingUnavailable {
 
 /// Reports the lifecycle strength available to a Workspace or Execution consumer.
 ///
-/// `Candidate` is only a parsed host claim. `Validated` proves an exact native hook pair for
-/// the candidate, but does not itself attest host transport authority or sandbox enforcement.
+/// `PreObserved` is not an authority claim. `Validated` proves the exact native pre-hook was
+/// observed before MCP acceptance; `Settled` records its later matching post-hook evidence.
+/// Neither result itself attests host transport authority or sandbox enforcement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BindingStatus {
-    /// Trusted MCP metadata was parsed but native lifecycle validation is still pending.
-    Candidate(CandidateInvocation),
-    /// A matching trusted pre/post lifecycle pair completed for one candidate.
+    /// A native pre-hook was retained while awaiting matching trusted MCP metadata.
+    PreObserved,
+    /// Trusted MCP metadata matched a pre-hook before the handler returned its result.
     Validated(ValidatedInvocation),
+    /// The matching native post-hook arrived after a validated MCP invocation.
+    Settled(ValidatedInvocation),
     /// Required host data was absent, malformed, mismatched, replayed, or unavailable.
     Unavailable(BindingUnavailable),
 }
 
-/// Captures the exact actor and call pair whose native hook lifecycle completed.
+/// Captures the exact actor and call pair whose pre-hook matched trusted MCP metadata.
 ///
 /// This value is bounded and contains no model arguments, source, prompt, or hook payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -120,49 +126,60 @@ pub struct ValidatedInvocation {
 }
 
 impl ValidatedInvocation {
-    /// Returns the exact actor shared by MCP metadata and both native hook events.
+    /// Returns the exact actor shared by MCP metadata and its pre-hook event.
     pub fn actor_id(&self) -> &str {
         &self.actor_id
     }
 
-    /// Returns the exact call id shared by MCP metadata and both native hook events.
+    /// Returns the exact call id shared by MCP metadata and its pre-hook event.
     pub fn call_id(&self) -> &str {
         &self.call_id
     }
 }
 
-/// Tracks a bounded one-shot candidate lifecycle and rejects replay after stop or validation.
+/// Tracks a bounded one-shot pre/MCP/post lifecycle and rejects replay after stop or settlement.
 ///
 /// One guard belongs to one host connection/turn scope. When its completed-call capacity is
 /// exhausted, it reports unavailable instead of evicting replay evidence; make a fresh guard
 /// only after the surrounding trusted host lifecycle has changed.
 #[derive(Debug, Default)]
 pub struct HostBindingGuard {
-    pending: BTreeMap<CandidateInvocation, bool>,
+    pre_observed: BTreeSet<CandidateInvocation>,
+    active: BTreeSet<CandidateInvocation>,
     completed: BTreeSet<CandidateInvocation>,
     stopped: bool,
 }
 
 impl HostBindingGuard {
-    /// Registers a parsed candidate as a one-shot lifecycle awaiting its native pre/post hooks.
+    /// Validates a parsed MCP candidate only when its exact native pre-hook is already observed.
+    ///
+    /// This ordering avoids a causal cycle: the pre-hook occurs before the MCP handler, while
+    /// the later post-hook is settlement evidence and cannot gate the handler result.
     pub fn register(&mut self, candidate: CandidateInvocation) -> BindingStatus {
         if self.stopped {
             return BindingStatus::Unavailable(BindingUnavailable::Stopped);
         }
-        if self.pending.contains_key(&candidate) || self.completed.contains(&candidate) {
+        if self.active.contains(&candidate) || self.completed.contains(&candidate) {
             return BindingStatus::Unavailable(BindingUnavailable::Replay);
         }
-        if self.pending.len() >= MAX_PENDING || self.completed.len() >= MAX_COMPLETED {
+        if !self.pre_observed.contains(&candidate) {
+            return BindingStatus::Unavailable(BindingUnavailable::MissingPre);
+        }
+        if self.active.len() >= MAX_PENDING || self.completed.len() >= MAX_COMPLETED {
             return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
         }
-        self.pending.insert(candidate.clone(), false);
-        BindingStatus::Candidate(candidate)
+        self.pre_observed.remove(&candidate);
+        self.active.insert(candidate.clone());
+        BindingStatus::Validated(ValidatedInvocation {
+            actor_id: candidate.actor_id,
+            call_id: candidate.call_id,
+        })
     }
 
-    /// Matches a bounded native hook event against one registered candidate lifecycle.
+    /// Buffers a native pre-hook or records post-hook settlement for one validated invocation.
     ///
-    /// A pre-hook leaves the candidate pending. Only its matching post-hook returns `Validated`.
-    /// Unknown, duplicate, mismatched, and stopped events remain unavailable and grant nothing.
+    /// A pre-hook never validates an invocation on its own. A post-hook never gates MCP result
+    /// acceptance: it only returns `Settled` after the earlier pre/MCP validation sequence.
     pub fn observe_hook(&mut self, event: HookEvent) -> BindingStatus {
         if self.stopped {
             return BindingStatus::Unavailable(BindingUnavailable::Stopped);
@@ -171,26 +188,38 @@ impl HostBindingGuard {
             actor_id: event.actor_id,
             call_id: event.call_id,
         };
-        let Some(pre_seen) = self.pending.get_mut(&candidate) else {
-            return BindingStatus::Unavailable(if self.completed.contains(&candidate) {
-                BindingUnavailable::Replay
-            } else {
-                BindingUnavailable::Mismatch
-            });
-        };
         match event.phase {
-            HookPhase::Pre if *pre_seen => BindingStatus::Unavailable(BindingUnavailable::Replay),
-            HookPhase::Pre => {
-                *pre_seen = true;
-                BindingStatus::Candidate(candidate)
+            HookPhase::Pre
+                if self.pre_observed.contains(&candidate)
+                    || self.active.contains(&candidate)
+                    || self.completed.contains(&candidate) =>
+            {
+                BindingStatus::Unavailable(BindingUnavailable::Replay)
             }
-            HookPhase::Post if !*pre_seen => {
-                BindingStatus::Unavailable(BindingUnavailable::MissingPre)
+            HookPhase::Pre => {
+                if self.pre_observed.len() + self.active.len() >= MAX_PENDING
+                    || self.completed.len() >= MAX_COMPLETED
+                {
+                    return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
+                }
+                self.pre_observed.insert(candidate);
+                BindingStatus::PreObserved
             }
             HookPhase::Post => {
-                self.pending.remove(&candidate);
+                if self.completed.contains(&candidate) {
+                    return BindingStatus::Unavailable(BindingUnavailable::Replay);
+                }
+                if self.pre_observed.contains(&candidate) {
+                    return BindingStatus::Unavailable(BindingUnavailable::MissingInvocation);
+                }
+                if !self.active.remove(&candidate) {
+                    return BindingStatus::Unavailable(BindingUnavailable::Mismatch);
+                }
+                if self.completed.len() >= MAX_COMPLETED {
+                    return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
+                }
                 self.completed.insert(candidate.clone());
-                BindingStatus::Validated(ValidatedInvocation {
+                BindingStatus::Settled(ValidatedInvocation {
                     actor_id: candidate.actor_id,
                     call_id: candidate.call_id,
                 })
@@ -198,9 +227,10 @@ impl HostBindingGuard {
         }
     }
 
-    /// Stops this lifecycle, discarding incomplete candidates and rejecting all later input.
+    /// Stops this lifecycle, discarding unvalidated/active calls and rejecting all later input.
     pub fn stop(&mut self) {
-        self.pending.clear();
+        self.pre_observed.clear();
+        self.active.clear();
         self.stopped = true;
     }
 }
