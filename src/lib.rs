@@ -8,3 +8,6 @@ pub mod assistance;
 
 /// Admits and owns bounded local processes under supported host profiles.
 pub mod execution;
+
+/// Owns worktree identity, authority lifecycles, raw Git evidence, and source observations.
+pub mod workspace;
