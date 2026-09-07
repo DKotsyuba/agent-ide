@@ -22,7 +22,7 @@ use tokio::{
 };
 
 /// Classifies the host permission profile whose complete state accompanies a request.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ProfileClass {
     /// A managed profile is replayed by `codex sandbox --sandbox-state-json`.
     Managed,
@@ -43,21 +43,33 @@ pub enum SandboxStateError {
     UnsupportedProfile,
 }
 
-/// Binds a host state class to real execution evidence before any physical effect.
+/// Names the tested host mechanism/profile class that Execution supports across worktrees.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PhysicalEffectAuthorization {
-    /// Application recorded a D03-passing managed profile for this exact opaque state digest.
-    ManagedD03 {
-        /// Stable Application profile record, never a model-selected value.
-        profile_id: String,
-        /// BLAKE3 digest of the complete state used in the accepted profile run.
-        state_digest: blake3::Hash,
-    },
-    /// Application recorded an explicitly validated host case without an outer sandbox.
-    DisabledHost {
-        /// Stable Application host-case record for the exceptional disabled profile.
-        profile_id: String,
-    },
+pub struct ExecutionProfileTemplate {
+    /// Stable Execution-owned profile name, never an invocation input.
+    id: String,
+    /// Execution-owned revision of the tested mechanism and profile shape.
+    version: u32,
+    /// Host profile class covered by this template.
+    class: ProfileClass,
+    /// Normalized opaque-state shape proven by this template without pinning one worktree path.
+    shape_digest: blake3::Hash,
+}
+
+/// Holds Execution-owned templates whose real evidence permits physical effects.
+#[derive(Clone, Debug)]
+pub struct ExecutionProfileCatalog {
+    /// Exactly one current tested template per host profile class.
+    templates: BTreeMap<ProfileClass, ExecutionProfileTemplate>,
+}
+
+/// Correlates one invocation's full opaque state with its supporting profile template.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionProfilePermit {
+    /// Tested template that authorizes this class of execution, not a fixture directory.
+    template: ExecutionProfileTemplate,
+    /// Full-state digest retained only for operation evidence and later lookup correlation.
+    state_digest: blake3::Hash,
 }
 
 /// Holds an entire host-provided sandbox state without expanding its roots or rewriting policy.
@@ -95,7 +107,13 @@ impl HostSandboxState {
             .map(PathBuf::from)
             .ok_or(SandboxStateError::Malformed)?;
         let class = match profile_type {
-            "managed" => ProfileClass::Managed,
+            "managed"
+                if permission_profile.contains_key("file_system")
+                    && permission_profile.contains_key("network") =>
+            {
+                ProfileClass::Managed
+            }
+            "managed" => return Err(SandboxStateError::UnsupportedProfile),
             "disabled" => ProfileClass::Disabled,
             "external" => return Err(SandboxStateError::ExternalUnsupported),
             _ => return Err(SandboxStateError::UnsupportedProfile),
@@ -117,40 +135,61 @@ impl HostSandboxState {
     fn json_argument(&self) -> String {
         self.raw.to_string()
     }
+
+    /// Returns a shape digest that preserves JSON structure and array cardinality, not scalar values.
+    fn shape_digest(&self) -> blake3::Hash {
+        blake3::hash(normalize_shape(&self.raw).to_string().as_bytes())
+    }
 }
 
-impl PhysicalEffectAuthorization {
-    /// Creates an Application-issued authorization after its matching real profile evidence exists.
-    ///
-    /// The crate-visible constructor does not run D03; Application must call it only after its
-    /// durable profile record is accepted. MCP input handling cannot construct this token.
-    pub(crate) fn from_application_record(
-        class: ProfileClass,
-        profile_id: impl Into<String>,
+impl ExecutionProfileTemplate {
+    /// Defines a nonempty, tested Execution profile template and its owned revision.
+    pub(crate) fn from_execution_evidence(
+        id: impl Into<String>,
+        version: u32,
         state: &HostSandboxState,
     ) -> Result<Self, RequestError> {
-        let profile_id = profile_id.into();
-        if profile_id.is_empty() || class != state.class {
+        let id = id.into();
+        if id.is_empty() || version == 0 {
             return Err(RequestError::ExecutionProfileDenied);
         }
-        Ok(match class {
-            ProfileClass::Managed => Self::ManagedD03 {
-                profile_id,
-                state_digest: blake3::hash(state.json_argument().as_bytes()),
-            },
-            ProfileClass::Disabled => Self::DisabledHost { profile_id },
+        Ok(Self {
+            id,
+            version,
+            class: state.class,
+            shape_digest: state.shape_digest(),
         })
     }
+}
 
-    /// Returns whether this authorization covers the profile class and exact managed state.
-    fn covers(&self, state: &HostSandboxState) -> bool {
-        match self {
-            Self::ManagedD03 { state_digest, .. } => {
-                state.class == ProfileClass::Managed
-                    && *state_digest == blake3::hash(state.json_argument().as_bytes())
+impl ExecutionProfileCatalog {
+    /// Builds the catalog from Execution-accepted D03 or disabled-host evidence, not Application policy.
+    pub(crate) fn from_execution_evidence(
+        templates: Vec<ExecutionProfileTemplate>,
+    ) -> Result<Self, RequestError> {
+        let mut entries = BTreeMap::new();
+        for template in templates {
+            if entries.insert(template.class, template).is_some() {
+                return Err(RequestError::ExecutionProfileDenied);
             }
-            Self::DisabledHost { .. } => state.class == ProfileClass::Disabled,
         }
+        Ok(Self { templates: entries })
+    }
+
+    /// Mints an Execution-owned permit when the invocation's supported class has real evidence.
+    fn permit(&self, state: &HostSandboxState) -> Result<ExecutionProfilePermit, RequestError> {
+        let template = self
+            .templates
+            .get(&state.class)
+            .cloned()
+            .ok_or(RequestError::ExecutionProfileDenied)?;
+        if template.shape_digest != state.shape_digest() {
+            return Err(RequestError::ExecutionProfileDenied);
+        }
+        Ok(ExecutionProfilePermit {
+            template,
+            state_digest: blake3::hash(state.json_argument().as_bytes()),
+        })
     }
 }
 
@@ -161,8 +200,6 @@ pub struct ValidatedHostInvocation {
     binding: String,
     /// Complete host sandbox state associated with that specific binding.
     sandbox: HostSandboxState,
-    /// Application-issued proof that physical effects are permitted for this host state.
-    physical_effects: PhysicalEffectAuthorization,
 }
 
 impl ValidatedHostInvocation {
@@ -173,20 +210,12 @@ impl ValidatedHostInvocation {
     pub fn from_verified_binding(
         binding: impl Into<String>,
         sandbox: HostSandboxState,
-        physical_effects: PhysicalEffectAuthorization,
     ) -> Result<Self, RequestError> {
         let binding = binding.into();
         if binding.is_empty() {
             return Err(RequestError::MissingBinding);
         }
-        if !physical_effects.covers(&sandbox) {
-            return Err(RequestError::ExecutionProfileDenied);
-        }
-        Ok(Self {
-            binding,
-            sandbox,
-            physical_effects,
-        })
+        Ok(Self { binding, sandbox })
     }
 
     /// Returns the stable, opaque binding identifier for operation evidence.
@@ -197,11 +226,6 @@ impl ValidatedHostInvocation {
     /// Returns the validated sandbox state associated with this invocation.
     pub fn sandbox(&self) -> &HostSandboxState {
         &self.sandbox
-    }
-
-    /// Returns the Application-issued physical-effect proof bound to this invocation.
-    pub fn physical_effects(&self) -> &PhysicalEffectAuthorization {
-        &self.physical_effects
     }
 }
 
@@ -341,17 +365,19 @@ pub enum RequestError {
     EnvironmentTooLarge,
     /// A disabled host sandbox was not explicitly accepted by local policy.
     DisabledHostDenied,
-    /// Application did not bind this invocation to matching D03 or disabled-host evidence.
+    /// Execution has no accepted template for this host profile class or shape.
     ExecutionProfileDenied,
 }
 
 /// Couples the only inputs permitted to reach an owned operating-system spawn.
 #[derive(Clone, Debug)]
 pub struct ValidatedExecutionRequest {
-    /// Host binding and matching physical-effect authorization.
+    /// Host binding whose class must match an Execution-owned profile template.
     invocation: ValidatedHostInvocation,
     /// Workspace ownership token constraining this child to one current worktree epoch.
     authority: WorkspaceAuthority,
+    /// Execution-minted profile permit carrying a per-invocation correlation digest.
+    permit: ExecutionProfilePermit,
     /// Fully controlled executable invocation ready for admission and later owned spawn.
     command: ControlledCommand,
 }
@@ -363,6 +389,7 @@ impl ValidatedExecutionRequest {
         authority: WorkspaceAuthority,
         command: ControlledCommand,
         policy: &LocalExecutionPolicy,
+        catalog: &ExecutionProfileCatalog,
     ) -> Result<Self, RequestError> {
         if !policy.allowed_programs.contains(&command.program) {
             return Err(RequestError::ProgramDenied);
@@ -379,17 +406,16 @@ impl ValidatedExecutionRequest {
         if command.env.len() > policy.max_environment_entries {
             return Err(RequestError::EnvironmentTooLarge);
         }
-        if !invocation.physical_effects.covers(&invocation.sandbox) {
-            return Err(RequestError::ExecutionProfileDenied);
-        }
         if invocation.sandbox.class == ProfileClass::Disabled
             && !policy.allow_explicit_disabled_host
         {
             return Err(RequestError::DisabledHostDenied);
         }
+        let permit = catalog.permit(&invocation.sandbox)?;
         Ok(Self {
             invocation,
             authority,
+            permit,
             command,
         })
     }
@@ -1055,5 +1081,22 @@ fn os_bytes(value: &OsString) -> usize {
     #[cfg(not(unix))]
     {
         value.to_string_lossy().len()
+    }
+}
+
+/// Replaces opaque scalar values while preserving JSON keys, types, and array cardinality for profile matching.
+fn normalize_shape(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| (key.clone(), normalize_shape(value)))
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.iter().map(normalize_shape).collect()),
+        Value::String(_) => Value::String("<string>".into()),
+        Value::Number(_) => Value::String("<number>".into()),
+        Value::Bool(_) => Value::String("<bool>".into()),
+        Value::Null => Value::Null,
     }
 }

@@ -15,9 +15,9 @@ use std::{
 
 use execution::{
     Admission, AdmissionClass, AdmissionController, AdmissionLimits, BorrowedEndpoint, CommandKind,
-    ControlledCommand, EndpointOwnership, HostSandboxState, LocalExecutionPolicy, OwnerId,
-    PhysicalEffectAuthorization, ProfileClass, SandboxStateError, ValidatedExecutionRequest,
-    ValidatedHostInvocation, WorkspaceAuthority,
+    ControlledCommand, EndpointOwnership, ExecutionProfileCatalog, ExecutionProfileTemplate,
+    HostSandboxState, LocalExecutionPolicy, OwnerId, ProfileClass, SandboxStateError,
+    ValidatedExecutionRequest, ValidatedHostInvocation, WorkspaceAuthority,
 };
 use serde_json::json;
 use tokio::io::AsyncReadExt;
@@ -48,14 +48,12 @@ fn disabled_state(root: &Path) -> HostSandboxState {
 /// Builds a request whose argv/profile data is fixed by this test rather than model text.
 fn request(root: &Path, script: &str) -> ValidatedExecutionRequest {
     let sandbox = disabled_state(root);
-    let effects = PhysicalEffectAuthorization::from_application_record(
-        ProfileClass::Disabled,
-        "disabled-contract-case",
-        &sandbox,
-    )
+    let profiles = ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence("disabled-contract-case", 1, &sandbox)
+            .unwrap(),
+    ])
     .unwrap();
-    let invocation =
-        ValidatedHostInvocation::from_verified_binding("bound-test", sandbox, effects).unwrap();
+    let invocation = ValidatedHostInvocation::from_verified_binding("bound-test", sandbox).unwrap();
     let authority = WorkspaceAuthority::from_workspace(root.to_path_buf(), 7).unwrap();
     let command = ControlledCommand::from_validated_peer(
         CommandKind::Job,
@@ -68,7 +66,7 @@ fn request(root: &Path, script: &str) -> ValidatedExecutionRequest {
     let policy =
         LocalExecutionPolicy::new(BTreeSet::from([PathBuf::from("/bin/sh")]), 4096, 4, true)
             .unwrap();
-    ValidatedExecutionRequest::validate(invocation, authority, command, &policy).unwrap()
+    ValidatedExecutionRequest::validate(invocation, authority, command, &policy, &profiles).unwrap()
 }
 
 /// Checks that opaque profile classification never treats missing or external state as executable.
@@ -86,7 +84,7 @@ fn opaque_state_rejects_missing_and_external_profiles() {
         Err(SandboxStateError::ExternalUnsupported)
     );
     let managed = HostSandboxState::parse(Some(json!({
-        "permissionProfile": {"type": "managed", "file_system": {"type": "read"}},
+        "permissionProfile": {"type": "managed", "file_system": {"type": "read"}, "network": false},
         "codexLinuxSandboxExe": null,
         "sandboxCwd": "/private/tmp",
         "useLegacyLandlock": false
