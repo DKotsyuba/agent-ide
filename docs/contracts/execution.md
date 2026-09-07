@@ -1,6 +1,6 @@
 # Governed execution and process evidence
 
-Revision: r4 (proposed). Provider: Execution. Direct providers: Assistance supplies validated host identity and observed host state; Workspace supplies controlled Git intent and worktree authority; Application supplies config/store mechanics only. Direct consumers: Workspace consumes raw Git execution results; Intelligence consumes owned protocol/process leases after profile admission; Application persists Execution-owned records. Changes composes Workspace raw Git results and does not directly spawn. Vocabulary: [common](common.md).
+Revision: r5 (proposed; post-authority rules from r4 unchanged). Provider: Execution. Direct providers: Assistance supplies validated host identity and observed host state; Workspace supplies controlled Git intent and worktree authority; Application supplies config/store mechanics only. Direct consumers: Workspace consumes raw Git execution results; Intelligence consumes owned protocol/process leases after profile admission; Application persists Execution-owned records. Changes composes Workspace raw Git results and does not directly spawn. Vocabulary: [common](common.md).
 
 ## Host-state and spawn gate
 
@@ -20,7 +20,13 @@ Owned and borrowed handles have different capabilities. Borrowed endpoints may b
 
 ## Bootstrap boundary
 
-Current physical execution requires `WorkspaceAuthority`, but Workspace needs bounded Git discovery before it can issue final worktree authority. This is an unresolved activation bootstrap, not permission for generic unauthorised execution. The proposed narrow follow-up is a Workspace-owned discovery intent limited to configured read-only Git argv, one canonical candidate cwd, a fixed output budget, and no provider/check/write class. It must return raw discovery evidence only and cannot mint authority or a profile permit. Until Workspace and Execution accept that separate contract, discovery stays outside this spawn API.
+Current physical execution requires `WorkspaceAuthority`, but Workspace needs bounded Git discovery before it can issue final worktree authority. Discovery is a separate, Workspace-owned read-only effect and is not generic unauthorised execution.
+
+Its required inputs are an active Assistance `BindingRef` correlated to the observed host state, that complete opaque state, the applicable Execution D03 gate, and local `git_discovery` policy. Missing/unsupported state or a closed D03 gate returns `unavailable`; lack of final Workspace authority never creates an unconfined child. Discovery needs no Intelligence LSP/provider compatibility permit and cannot mint Workspace authority, an Execution profile permit, or any other capability.
+
+Execution preserves `state.sandboxCwd` exactly as the child working directory. It may invoke only a configured Git executable with one argv pattern: `git -C <exact raw candidate_cwd> <fixed query>`. `<candidate_cwd>` is the sole path operand and is carried without normalization, rewriting, or substitution; it must not replace `sandboxCwd`. The fixed queries are separate invocations of `rev-parse --show-toplevel` and `rev-parse --git-common-dir`, followed only by `worktree list --porcelain -z`. Each `rev-parse` result remains raw and separate for Workspace to parse as one terminal LF; path-valued results are never concatenated or newline-split. `worktree list` remains NUL-delimited. No caller-selected flags, environment, shell, additional path operands, provider/check/write class, or generic command is permitted.
+
+Discovery returns bounded raw stdout/stderr, exit, and operation evidence only. Until Workspace confirms this r5 edge and Assistance exposes the correlated state/active binding input, the current post-authority API remains the only Execution spawn path.
 
 ## Admission and fairness
 
