@@ -82,6 +82,8 @@ impl StoreOutcome {
 /// Explains a safe refusal, indeterminate outcome, or SQLite mechanics failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreError {
+    /// The supplied direct store configuration contains a zero capacity or deadline.
+    InvalidConfig,
     /// The caller supplied an empty or oversized operation identifier.
     InvalidOperationId,
     /// The bounded owner-thread submission channel is full before this operation was accepted.
@@ -112,6 +114,7 @@ impl Display for StoreError {
     /// Formats a compact mechanics failure without inventing domain effect status.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidConfig => formatter.write_str("invalid store configuration"),
             Self::InvalidOperationId => formatter.write_str("invalid operation identifier"),
             Self::QueueFull => formatter.write_str("store queue is full"),
             Self::Unavailable => formatter.write_str("store owner is unavailable"),
@@ -156,6 +159,7 @@ impl Store {
     /// interrupted `Queued`/`Started` receipts to `OutcomeUnknown`. It creates no domain table and
     /// does not infer whether interrupted external work happened.
     pub fn open(database_path: &Path, config: StoreConfig) -> Result<Self, StoreError> {
+        validate_store_config(config)?;
         let (sender, receiver) = mpsc::sync_channel(config.queue_capacity);
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let database_path = database_path.to_path_buf();
@@ -219,6 +223,19 @@ impl Store {
             Ok(Ok(result)) => result,
             Ok(Err(_)) | Err(_) => Err(StoreError::OutcomeUnknown { operation }),
         }
+    }
+}
+
+/// Rejects direct store startup settings that would make a bounded owner-thread contract impossible.
+fn validate_store_config(config: StoreConfig) -> Result<(), StoreError> {
+    if config.queue_capacity == 0
+        || config.receipt_capacity == 0
+        || config.busy_timeout.is_zero()
+        || config.request_deadline.is_zero()
+    {
+        Err(StoreError::InvalidConfig)
+    } else {
+        Ok(())
     }
 }
 

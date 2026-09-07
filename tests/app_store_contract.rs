@@ -30,6 +30,23 @@ fn test_config(receipt_capacity: usize) -> StoreConfig {
     }
 }
 
+/// Rejects direct Store construction with a zero limit instead of relying on callers to use config merging.
+#[test]
+fn direct_store_open_validates_bounded_limits() {
+    let path = database_path();
+    let error = Store::open(
+        &path,
+        StoreConfig {
+            queue_capacity: 0,
+            ..test_config(1)
+        },
+    )
+    .err()
+    .unwrap();
+    assert_eq!(error, StoreError::InvalidConfig);
+    assert!(!path.exists());
+}
+
 /// Removes the database and WAL sidecars created solely by this test.
 fn remove_database(path: &Path) {
     for suffix in ["", "-wal", "-shm"] {
