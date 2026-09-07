@@ -21,6 +21,10 @@ use tokio::{
     time::timeout,
 };
 
+use crate::assistance::host_binding::{
+    ActiveBindingUse, ObservedSandboxState, SandboxStateProvenance,
+};
+
 /// Classifies the host permission profile whose complete state accompanies a request.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ProfileClass {
@@ -54,8 +58,8 @@ pub struct ExecutionProfileTemplate {
     version: u32,
     /// Host profile class covered by this template.
     class: ProfileClass,
-    /// Normalized opaque-state shape proven by this template without pinning one worktree path.
-    shape_digest: blake3::Hash,
+    /// Effective permission/trust value proven by this template, excluding only sandbox cwd identity.
+    profile_digest: blake3::Hash,
 }
 
 /// Holds Execution-owned templates whose real evidence permits physical effects.
@@ -172,15 +176,15 @@ impl HostSandboxState {
         &self.raw_json
     }
 
-    /// Returns a shape digest that preserves JSON structure and array cardinality, not scalar values.
-    fn shape_digest(&self) -> blake3::Hash {
-        blake3::hash(normalize_shape(&self.raw).to_string().as_bytes())
+    /// Returns a profile digest that retains effective permission values but excludes cwd identity.
+    fn profile_digest(&self) -> blake3::Hash {
+        blake3::hash(profile_template_value(&self.raw).to_string().as_bytes())
     }
 }
 
 impl ExecutionProfileTemplate {
     /// Defines a nonempty, tested Execution profile template and its owned revision.
-    pub(crate) fn from_execution_evidence(
+    pub fn from_execution_evidence(
         id: impl Into<String>,
         version: u32,
         state: &HostSandboxState,
@@ -193,14 +197,14 @@ impl ExecutionProfileTemplate {
             id,
             version,
             class: state.class,
-            shape_digest: state.shape_digest(),
+            profile_digest: state.profile_digest(),
         })
     }
 }
 
 impl ExecutionProfileCatalog {
     /// Builds the catalog from Execution-accepted D03 or disabled-host evidence, not Application policy.
-    pub(crate) fn from_execution_evidence(
+    pub fn from_execution_evidence(
         templates: Vec<ExecutionProfileTemplate>,
     ) -> Result<Self, RequestError> {
         let mut entries = BTreeMap::new();
@@ -219,7 +223,7 @@ impl ExecutionProfileCatalog {
             .get(&state.class)
             .cloned()
             .ok_or(RequestError::ExecutionProfileDenied)?;
-        if template.shape_digest != state.shape_digest() {
+        if template.profile_digest != state.profile_digest() {
             return Err(RequestError::ExecutionProfileDenied);
         }
         Ok(ExecutionProfilePermit {
@@ -236,6 +240,8 @@ pub struct ValidatedHostInvocation {
     binding: String,
     /// Complete host sandbox state associated with that specific binding.
     sandbox: HostSandboxState,
+    /// Assistance binding that requires a fresh consume before a delayed owned spawn.
+    active_binding: Option<crate::assistance::host_binding::BindingRef>,
 }
 
 impl ValidatedHostInvocation {
@@ -251,7 +257,34 @@ impl ValidatedHostInvocation {
         if binding.is_empty() {
             return Err(RequestError::MissingBinding);
         }
-        Ok(Self { binding, sandbox })
+        Ok(Self {
+            binding,
+            sandbox,
+            active_binding: None,
+        })
+    }
+
+    /// Admits one consumed active use and its matching observed state into Execution.
+    ///
+    /// The use is consumed at this boundary: it proves a fresh liveness check before this local
+    /// step begins, but cannot become durable authority. Execution retains every semantic JSON
+    /// field from the opaque observation for its own bounded profile parser.
+    pub fn from_active_observation(
+        active_use: ActiveBindingUse,
+        observed: ObservedSandboxState,
+    ) -> Result<Self, RequestError> {
+        if active_use.binding_ref() != observed.binding_ref()
+            || observed.provenance() != SandboxStateProvenance::AdvertisedAndReturned
+        {
+            return Err(RequestError::BindingMismatch);
+        }
+        let sandbox = HostSandboxState::parse(Some(observed.state().as_json().clone()))
+            .map_err(RequestError::ObservedStateUnavailable)?;
+        Ok(Self {
+            binding: observed.call_id().to_owned(),
+            sandbox,
+            active_binding: Some(observed.binding_ref().clone()),
+        })
     }
 
     /// Returns the stable, opaque binding identifier for operation evidence.
@@ -263,11 +296,27 @@ impl ValidatedHostInvocation {
     pub fn sandbox(&self) -> &HostSandboxState {
         &self.sandbox
     }
+
+    /// Consumes a freshly checked binding use for an immediate owned child spawn.
+    ///
+    /// Synthetic/test invocations have no Assistance binding and need no use. An invocation from
+    /// observed host state requires a use for the same immutable generation, preventing queue
+    /// delay from authorizing a post-stop effect.
+    fn consume_active_use(&self, active_use: ActiveBindingUse) -> Result<(), RequestError> {
+        match &self.active_binding {
+            Some(binding) if active_use.binding_ref() == binding => Ok(()),
+            _ => Err(RequestError::MissingActiveBindingUse),
+        }
+    }
 }
 
 /// Identifies the canonical worktree and epoch validated by Workspace.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceAuthority {
+    /// Opaque Workspace worktree identity; root path alone cannot distinguish reincarnations.
+    worktree_id: String,
+    /// Workspace incarnation that changes when identity evidence requires reconciliation.
+    incarnation: String,
     /// Canonical root whose ownership and lifecycle Workspace has already validated.
     root: PathBuf,
     /// Monotonic Workspace authority epoch that rejects stale effects at peer boundaries.
@@ -276,16 +325,38 @@ pub struct WorkspaceAuthority {
 
 impl WorkspaceAuthority {
     /// Creates the narrow authority token after Workspace has checked ownership and lifecycle.
-    pub fn from_workspace(root: PathBuf, epoch: u64) -> Result<Self, RequestError> {
-        if !is_normal_absolute(&root) {
+    pub fn from_workspace(
+        worktree_id: impl Into<String>,
+        incarnation: impl Into<String>,
+        root: PathBuf,
+        epoch: u64,
+    ) -> Result<Self, RequestError> {
+        let worktree_id = worktree_id.into();
+        let incarnation = incarnation.into();
+        if worktree_id.is_empty() || incarnation.is_empty() || !is_normal_absolute(&root) {
             return Err(RequestError::InvalidWorktree);
         }
-        Ok(Self { root, epoch })
+        Ok(Self {
+            worktree_id,
+            incarnation,
+            root,
+            epoch,
+        })
     }
 
     /// Returns the canonical worktree root supplied by Workspace.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Returns the opaque worktree identity supplied by Workspace.
+    pub fn worktree_id(&self) -> &str {
+        &self.worktree_id
+    }
+
+    /// Returns the Workspace incarnation required to distinguish recreated worktrees.
+    pub fn incarnation(&self) -> &str {
+        &self.incarnation
     }
 
     /// Returns the authority epoch that peers use to reject stale effects.
@@ -341,6 +412,220 @@ impl ControlledCommand {
             args,
             cwd,
             env,
+        })
+    }
+}
+
+/// Identifies one Workspace discovery operation without granting worktree authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscoveryOperationRef(String);
+
+impl DiscoveryOperationRef {
+    /// Creates a nonempty stable operation reference supplied by Workspace for result correlation.
+    pub fn new(value: impl Into<String>) -> Result<Self, RequestError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(RequestError::InvalidDiscoveryOperation);
+        }
+        Ok(Self(value))
+    }
+}
+
+/// Selects one fixed read-only Git discovery command; callers cannot extend its argv.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GitDiscoveryQuery {
+    /// Returns the worktree root as one terminal-LF raw path result.
+    ShowTopLevel,
+    /// Returns the common Git directory as one terminal-LF raw path result.
+    GitCommonDir,
+    /// Returns every worktree record as NUL-delimited porcelain bytes.
+    WorktreeListPorcelainZ,
+}
+
+/// Holds the fresh observed binding/state and raw candidate path for pre-authority Git discovery.
+#[derive(Clone, Debug)]
+pub struct DiscoverWorktreeRequest {
+    /// Invocation that consumed current Assistance liveness and retained the matching generation.
+    invocation: ValidatedHostInvocation,
+    /// Raw Unix candidate path used only as the literal value after Git's `-C` argument.
+    candidate_cwd: OsString,
+    /// Workspace operation reference copied to every raw result without interpreting it.
+    operation: DiscoveryOperationRef,
+}
+
+impl DiscoverWorktreeRequest {
+    /// Accepts a fresh Assistance use, its correlated observed state, raw candidate path, and operation ref.
+    ///
+    /// This constructor has no WorkspaceAuthority output and never normalizes `candidate_cwd`.
+    /// A later queued execution must present another fresh use to `run` before a child can launch.
+    pub fn from_active_observation(
+        active_use: ActiveBindingUse,
+        observed: ObservedSandboxState,
+        candidate_cwd: OsString,
+        operation: DiscoveryOperationRef,
+    ) -> Result<Self, RequestError> {
+        if os_bytes(&candidate_cwd) == 0 {
+            return Err(RequestError::InvalidDiscoveryCandidate);
+        }
+        Ok(Self {
+            invocation: ValidatedHostInvocation::from_active_observation(active_use, observed)?,
+            candidate_cwd,
+            operation,
+        })
+    }
+
+    /// Validates exactly one fixed Git query under Execution's tested profile catalog and local policy.
+    pub fn validate_query(
+        self,
+        query: GitDiscoveryQuery,
+        policy: &GitDiscoveryPolicy,
+        catalog: &ExecutionProfileCatalog,
+    ) -> Result<ValidatedGitDiscovery, RequestError> {
+        if !is_normal_absolute(&policy.git_program) || policy.output_cap == 0 {
+            return Err(RequestError::InvalidDiscoveryPolicy);
+        }
+        if self.invocation.sandbox.class == ProfileClass::Disabled
+            && !policy.allow_explicit_disabled_host
+        {
+            return Err(RequestError::DisabledHostDenied);
+        }
+        let mut args = vec![OsString::from("-C"), self.candidate_cwd.clone()];
+        match query {
+            GitDiscoveryQuery::ShowTopLevel => {
+                args.extend([
+                    OsString::from("rev-parse"),
+                    OsString::from("--show-toplevel"),
+                ]);
+            }
+            GitDiscoveryQuery::GitCommonDir => {
+                args.extend([
+                    OsString::from("rev-parse"),
+                    OsString::from("--git-common-dir"),
+                ]);
+            }
+            GitDiscoveryQuery::WorktreeListPorcelainZ => {
+                args.extend([
+                    OsString::from("worktree"),
+                    OsString::from("list"),
+                    OsString::from("--porcelain"),
+                    OsString::from("-z"),
+                ]);
+            }
+        }
+        let command = ControlledCommand::from_validated_peer(
+            CommandKind::Git,
+            policy.git_program.clone(),
+            args,
+            self.invocation.sandbox.cwd().to_path_buf(),
+            BTreeMap::new(),
+        )?;
+        let permit = catalog.permit(&self.invocation.sandbox)?;
+        Ok(ValidatedGitDiscovery {
+            invocation: self.invocation,
+            command,
+            operation: self.operation,
+            query,
+            permit,
+            output_cap: policy.output_cap,
+        })
+    }
+}
+
+/// Defines the only local policy values available to fixed pre-authority Git discovery.
+#[derive(Clone, Debug)]
+pub struct GitDiscoveryPolicy {
+    /// Absolute configured Git executable; no request can replace it.
+    git_program: PathBuf,
+    /// Bounded retained bytes for each stdout/stderr stream while both pipes continue draining.
+    output_cap: usize,
+    /// Whether a separately accepted explicit disabled host profile may perform this read-only operation.
+    allow_explicit_disabled_host: bool,
+}
+
+impl GitDiscoveryPolicy {
+    /// Creates a fixed discovery policy after rejecting an invalid executable or zero output budget.
+    pub fn new(
+        git_program: PathBuf,
+        output_cap: usize,
+        allow_explicit_disabled_host: bool,
+    ) -> Result<Self, RequestError> {
+        if !is_normal_absolute(&git_program) || output_cap == 0 {
+            return Err(RequestError::InvalidDiscoveryPolicy);
+        }
+        Ok(Self {
+            git_program,
+            output_cap,
+            allow_explicit_disabled_host,
+        })
+    }
+}
+
+/// Carries a catalog-admitted fixed Git discovery until a fresh active use permits its owned spawn.
+#[derive(Clone, Debug)]
+pub struct ValidatedGitDiscovery {
+    /// Assistance-correlated invocation retained for the final liveness recheck.
+    invocation: ValidatedHostInvocation,
+    /// Fixed Git command with raw candidate only after `-C`.
+    command: ControlledCommand,
+    /// Opaque Workspace operation correlation reference.
+    operation: DiscoveryOperationRef,
+    /// Fixed query kind whose output remains raw.
+    query: GitDiscoveryQuery,
+    /// Execution profile evidence associated with this operation.
+    permit: ExecutionProfilePermit,
+    /// Fixed per-stream retained-output cap from local discovery policy.
+    output_cap: usize,
+}
+
+/// Returns one raw fixed-query Git result without parsing or minting worktree authority.
+#[derive(Clone, Debug)]
+pub struct RawGitDiscovery {
+    /// Original Workspace operation reference.
+    pub operation: DiscoveryOperationRef,
+    /// Fixed query whose raw output is returned.
+    pub query: GitDiscoveryQuery,
+    /// Raw stdout bytes; terminal LF and NUL encoding remain Workspace's responsibility.
+    pub stdout: CapturedOutput,
+    /// Raw stderr bytes without text decoding.
+    pub stderr: CapturedOutput,
+    /// Direct child exit status observed after reap.
+    pub exit_status: ExitStatus,
+    /// Elapsed wall time from child spawn to direct-child reap and drain collection.
+    pub elapsed: Duration,
+    /// Admission lease released by the caller only after it records or otherwise handles this evidence.
+    pub lease: AdmissionLease,
+}
+
+impl ValidatedGitDiscovery {
+    /// Rechecks active binding immediately before spawning the fixed Git child and returns raw evidence.
+    pub async fn run(
+        self,
+        lease: AdmissionLease,
+        active_use: ActiveBindingUse,
+        codex_executable: &Path,
+    ) -> Result<RawGitDiscovery, ProcessError> {
+        self.invocation
+            .consume_active_use(active_use)
+            .map_err(ProcessError::Request)?;
+        let started = std::time::Instant::now();
+        let result = OwnedChild::spawn_parts(
+            &self.command,
+            &self.invocation.sandbox,
+            lease,
+            codex_executable,
+            self.output_cap,
+        )?
+        .reap(Duration::from_secs(10))
+        .await?;
+        let _ = &self.permit;
+        Ok(RawGitDiscovery {
+            operation: self.operation,
+            query: self.query,
+            stdout: result.stdout,
+            stderr: result.stderr,
+            exit_status: result.status,
+            elapsed: started.elapsed(),
+            lease: result.lease,
         })
     }
 }
@@ -403,6 +688,18 @@ pub enum RequestError {
     DisabledHostDenied,
     /// Execution has no accepted template for this host profile class or shape.
     ExecutionProfileDenied,
+    /// The consumed active binding does not match the observed sandbox-state generation.
+    BindingMismatch,
+    /// The observed host state cannot satisfy Execution's bounded parser.
+    ObservedStateUnavailable(SandboxStateError),
+    /// A delayed owned spawn did not present a newly consumed matching active binding use.
+    MissingActiveBindingUse,
+    /// Workspace supplied an empty discovery operation reference.
+    InvalidDiscoveryOperation,
+    /// Workspace supplied an empty raw candidate path for fixed Git `-C` execution.
+    InvalidDiscoveryCandidate,
+    /// Local fixed Git discovery policy has no absolute executable or output budget.
+    InvalidDiscoveryPolicy,
 }
 
 /// Couples the only inputs permitted to reach an owned operating-system spawn.
@@ -464,6 +761,24 @@ impl ValidatedExecutionRequest {
     /// Returns the peer-validated Workspace authority used for this request.
     pub fn authority(&self) -> &WorkspaceAuthority {
         &self.authority
+    }
+
+    /// Returns the Execution-minted profile permit retained as operation evidence after admission.
+    pub fn profile_permit(&self) -> &ExecutionProfilePermit {
+        &self.permit
+    }
+
+    /// Consumes a freshly checked active use immediately before an owned physical spawn.
+    ///
+    /// Requests constructed from an Assistance observation retain its binding generation so a
+    /// queue delay cannot convert pre-stop liveness into a later effect. Synthetic/test requests
+    /// have no active binding and reject no optional use.
+    fn consume_spawn_use(&self, active_use: Option<ActiveBindingUse>) -> Result<(), RequestError> {
+        match (&self.invocation.active_binding, active_use) {
+            (Some(_), Some(active_use)) => self.invocation.consume_active_use(active_use),
+            (Some(_), None) => Err(RequestError::MissingActiveBindingUse),
+            (None, _) => Ok(()),
+        }
     }
 }
 
@@ -791,6 +1106,8 @@ pub struct ReapedProcess {
 pub enum ProcessError {
     /// The OS refused to launch or manage the direct child.
     Io(io::Error),
+    /// A request failed its final active-binding admission check before any child launched.
+    Request(RequestError),
     /// A process protocol requested stdout, so captured-output APIs cannot be used.
     ProtocolStdoutReserved,
 }
@@ -824,13 +1141,34 @@ impl OwnedChild {
     pub fn spawn_captured(
         request: &ValidatedExecutionRequest,
         lease: AdmissionLease,
+        active_use: Option<ActiveBindingUse>,
         codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
-        let mut command = build_command(request, codex_executable)?;
-        command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        configure_process_group(&mut command);
-        let mut child = command.spawn()?;
+        request
+            .consume_spawn_use(active_use)
+            .map_err(ProcessError::Request)?;
+        Self::spawn_parts(
+            &request.command,
+            &request.invocation.sandbox,
+            lease,
+            codex_executable,
+            output_cap,
+        )
+    }
+
+    /// Launches a capture-mode child from already validated command and sandbox components.
+    fn spawn_parts(
+        command: &ControlledCommand,
+        sandbox: &HostSandboxState,
+        lease: AdmissionLease,
+        codex_executable: &Path,
+        output_cap: usize,
+    ) -> Result<Self, ProcessError> {
+        let mut process = build_command(command, sandbox, codex_executable)?;
+        process.stdout(Stdio::piped()).stderr(Stdio::piped());
+        configure_process_group(&mut process);
+        let mut child = process.spawn()?;
         let pid = child
             .id()
             .ok_or_else(|| io::Error::other("spawned child has no PID"))?;
@@ -930,10 +1268,18 @@ impl OwnedProtocolChild {
     pub fn spawn(
         request: &ValidatedExecutionRequest,
         lease: AdmissionLease,
+        active_use: Option<ActiveBindingUse>,
         codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
-        let mut command = build_command(request, codex_executable)?;
+        request
+            .consume_spawn_use(active_use)
+            .map_err(ProcessError::Request)?;
+        let mut command = build_command(
+            &request.command,
+            &request.invocation.sandbox,
+            codex_executable,
+        )?;
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1002,20 +1348,20 @@ impl BorrowedEndpoint {
 /// Managed Codex wrappers receive only the executable's own directory as `PATH` so an env-based
 /// Node launcher can start without inheriting arbitrary parent environment entries.
 fn build_command(
-    request: &ValidatedExecutionRequest,
+    command: &ControlledCommand,
+    sandbox: &HostSandboxState,
     codex_executable: &Path,
 ) -> Result<Command, ProcessError> {
-    let command = &request.command;
-    let mut process = match request.invocation.sandbox.class {
+    let mut process = match sandbox.class {
         ProfileClass::Managed => {
-            let mut sandbox = Command::new(codex_executable);
-            sandbox
+            let mut sandbox_command = Command::new(codex_executable);
+            sandbox_command
                 .arg("sandbox")
                 .arg("--sandbox-state-json")
-                .arg(request.invocation.sandbox.json_argument())
+                .arg(sandbox.json_argument())
                 .arg("--")
                 .arg(&command.program);
-            sandbox
+            sandbox_command
         }
         ProfileClass::Disabled => Command::new(&command.program),
     };
@@ -1024,7 +1370,7 @@ fn build_command(
         .current_dir(&command.cwd)
         .env_clear()
         .envs(&command.env);
-    if request.invocation.sandbox.class == ProfileClass::Managed {
+    if sandbox.class == ProfileClass::Managed {
         let parent = codex_executable
             .parent()
             .filter(|path| path.is_absolute())
@@ -1138,21 +1484,13 @@ fn os_bytes(value: &OsString) -> usize {
     }
 }
 
-/// Replaces opaque scalar values while preserving JSON keys, types, and array cardinality for profile matching.
-fn normalize_shape(value: &Value) -> Value {
-    match value {
-        Value::Object(object) => Value::Object(
-            object
-                .iter()
-                .map(|(key, value)| (key.clone(), normalize_shape(value)))
-                .collect(),
-        ),
-        Value::Array(values) => Value::Array(values.iter().map(normalize_shape).collect()),
-        Value::String(_) => Value::String("<string>".into()),
-        Value::Number(_) => Value::String("<number>".into()),
-        Value::Bool(_) => Value::String("<bool>".into()),
-        Value::Null => Value::Null,
+/// Keeps all semantic profile fields/values while excluding only sandbox cwd identity from a template digest.
+fn profile_template_value(value: &Value) -> Value {
+    let mut template = value.clone();
+    if let Some(object) = template.as_object_mut() {
+        object.insert("sandboxCwd".into(), Value::String("<workspace-cwd>".into()));
     }
+    template
 }
 
 /// Detects unsupported multi-root profile fields without resolving or expanding any root path.

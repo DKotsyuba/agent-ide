@@ -1,8 +1,6 @@
 //! Contract checks for the unassembled Execution module.
 
-#[allow(dead_code)]
-#[path = "../src/execution/mod.rs"]
-mod execution;
+use agent_ide::{assistance, execution};
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -13,9 +11,14 @@ use std::{
     time::Duration,
 };
 
+use assistance::host_binding::{
+    BindingStatus, ChannelSessionRef, HostBindingGuard, parse_candidate, parse_channel_session,
+    parse_hook_event, parse_observed_sandbox_state,
+};
 use execution::{
     Admission, AdmissionClass, AdmissionController, AdmissionLimits, BorrowedEndpoint, CommandKind,
-    ControlledCommand, EndpointOwnership, ExecutionProfileCatalog, ExecutionProfileTemplate,
+    ControlledCommand, DiscoverWorktreeRequest, DiscoveryOperationRef, EndpointOwnership,
+    ExecutionProfileCatalog, ExecutionProfileTemplate, GitDiscoveryPolicy, GitDiscoveryQuery,
     HostSandboxState, LocalExecutionPolicy, OwnerId, ProfileClass, SandboxStateError,
     ValidatedExecutionRequest, ValidatedHostInvocation, WorkspaceAuthority,
 };
@@ -54,7 +57,13 @@ fn request(root: &Path, script: &str) -> ValidatedExecutionRequest {
     ])
     .unwrap();
     let invocation = ValidatedHostInvocation::from_verified_binding("bound-test", sandbox).unwrap();
-    let authority = WorkspaceAuthority::from_workspace(root.to_path_buf(), 7).unwrap();
+    let authority = WorkspaceAuthority::from_workspace(
+        "test-worktree",
+        "test-incarnation",
+        root.to_path_buf(),
+        7,
+    )
+    .unwrap();
     let command = ControlledCommand::from_validated_peer(
         CommandKind::Job,
         PathBuf::from("/bin/sh"),
@@ -67,6 +76,39 @@ fn request(root: &Path, script: &str) -> ValidatedExecutionRequest {
         LocalExecutionPolicy::new(BTreeSet::from([PathBuf::from("/bin/sh")]), 4096, 4, true)
             .unwrap();
     ValidatedExecutionRequest::validate(invocation, authority, command, &policy, &profiles).unwrap()
+}
+
+/// Creates a trusted host candidate with the metadata fields Assistance validates.
+fn candidate(actor: &str, call: &str) -> assistance::host_binding::CandidateInvocation {
+    parse_candidate(
+        json!({
+            "threadId": actor,
+            "callId": call,
+            "x-codex-turn-metadata": {"turn": "bounded"}
+        })
+        .as_object()
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+/// Creates the matching native pre-hook event required to establish a binding generation.
+fn pre_hook(actor: &str, call: &str) -> assistance::host_binding::HookEvent {
+    parse_hook_event(
+        json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": actor,
+            "tool_use_id": call
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap()
+}
+
+/// Creates a bounded trusted channel identifier for the host-binding guard.
+fn channel() -> ChannelSessionRef {
+    parse_channel_session(b"execution-contract-channel").unwrap()
 }
 
 /// Checks that opaque profile classification never treats missing or external state as executable.
@@ -121,6 +163,181 @@ fn opaque_state_rejects_missing_and_external_profiles() {
     );
 }
 
+/// Proves an Execution admission accepts only Assistance-consumed liveness paired with its state.
+#[test]
+fn active_observation_becomes_a_validated_execution_invocation() {
+    let mut guard = HostBindingGuard::default();
+    let channel = channel();
+    assert!(matches!(
+        guard.observe_hook(pre_hook("actor", "call"), channel.clone()),
+        BindingStatus::PreObserved
+    ));
+    let BindingStatus::Validated(invocation) =
+        guard.establish_start(candidate("actor", "call"), channel)
+    else {
+        panic!("explicit start must establish the binding");
+    };
+    let active = guard.consume_active(invocation.binding_ref()).unwrap();
+    let observed = parse_observed_sandbox_state(
+        json!({
+            "codex/sandbox-state-meta": {
+                "permissionProfile": {"type": "managed", "file_system": {}, "network": "restricted"},
+                "codexLinuxSandboxExe": null,
+                "sandboxCwd": "file:///private/tmp",
+                "useLegacyLandlock": false,
+                "unknown_nested_field": {"preserved": true}
+            }
+        })
+        .as_object()
+        .unwrap(),
+        &invocation,
+        &active,
+        true,
+    )
+    .unwrap();
+    let execution =
+        execution::ValidatedHostInvocation::from_active_observation(active, observed).unwrap();
+    assert_eq!(execution.sandbox().class(), ProfileClass::Managed);
+    assert_eq!(execution.sandbox().cwd(), Path::new("/private/tmp"));
+}
+
+/// Proves a request originating from Assistance cannot launch after a queue delay without a fresh use.
+#[tokio::test]
+async fn observed_request_rejects_missing_fresh_use_at_spawn() {
+    let mut guard = HostBindingGuard::default();
+    let channel = channel();
+    assert!(matches!(
+        guard.observe_hook(pre_hook("actor", "call"), channel.clone()),
+        BindingStatus::PreObserved
+    ));
+    let BindingStatus::Validated(invocation) =
+        guard.establish_start(candidate("actor", "call"), channel)
+    else {
+        panic!("explicit start must validate");
+    };
+    let active = guard.consume_active(invocation.binding_ref()).unwrap();
+    let observed = parse_observed_sandbox_state(
+        json!({
+            "codex/sandbox-state-meta": {
+                "permissionProfile": {"type": "managed", "file_system": {}, "network": "restricted"},
+                "codexLinuxSandboxExe": null,
+                "sandboxCwd": "file:///private/tmp",
+                "useLegacyLandlock": false
+            }
+        })
+        .as_object()
+        .unwrap(),
+        &invocation,
+        &active,
+        true,
+    )
+    .unwrap();
+    let state = HostSandboxState::parse(Some(observed.state().as_json().clone())).unwrap();
+    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence("managed", 1, &state).unwrap(),
+    ])
+    .unwrap();
+    let execution =
+        execution::ValidatedHostInvocation::from_active_observation(active, observed).unwrap();
+    let authority = WorkspaceAuthority::from_workspace(
+        "worktree",
+        "incarnation",
+        PathBuf::from("/private/tmp"),
+        1,
+    )
+    .unwrap();
+    let command = ControlledCommand::from_validated_peer(
+        CommandKind::Provider,
+        PathBuf::from("/bin/true"),
+        Vec::new(),
+        PathBuf::from("/private/tmp"),
+        BTreeMap::new(),
+    )
+    .unwrap();
+    let policy =
+        LocalExecutionPolicy::new(BTreeSet::from([PathBuf::from("/bin/true")]), 1, 0, false)
+            .unwrap();
+    let request =
+        ValidatedExecutionRequest::validate(execution, authority, command, &policy, &catalog)
+            .unwrap();
+    let mut admission = AdmissionController::new(AdmissionLimits {
+        total_running: 1,
+        per_owner_running: 1,
+        per_owner_queued: 1,
+        total_queued: 1,
+        interactive_burst: 1,
+    })
+    .unwrap();
+    let lease = match admission.submit(OwnerId::new("owner").unwrap(), AdmissionClass::Interactive)
+    {
+        Admission::Granted(lease) => lease,
+        outcome => panic!("unexpected admission: {outcome:?}"),
+    };
+    assert!(matches!(
+        execution::OwnedChild::spawn_captured(
+            &request,
+            lease,
+            None,
+            Path::new("/usr/bin/codex"),
+            1
+        ),
+        Err(execution::ProcessError::Request(
+            execution::RequestError::MissingActiveBindingUse
+        ))
+    ));
+}
+
+/// Proves pre-authority discovery is accepted only from a consumed observed binding and fixed Git policy.
+#[test]
+fn discovery_request_is_catalog_gated_before_authority_exists() {
+    let mut guard = HostBindingGuard::default();
+    let channel = channel();
+    assert!(matches!(
+        guard.observe_hook(pre_hook("actor", "call"), channel.clone()),
+        BindingStatus::PreObserved
+    ));
+    let BindingStatus::Validated(invocation) =
+        guard.establish_start(candidate("actor", "call"), channel)
+    else {
+        panic!("explicit start must validate");
+    };
+    let active = guard.consume_active(invocation.binding_ref()).unwrap();
+    let observed = parse_observed_sandbox_state(
+        json!({
+            "codex/sandbox-state-meta": {
+                "permissionProfile": {"type": "managed", "file_system": {}, "network": "restricted"},
+                "codexLinuxSandboxExe": null,
+                "sandboxCwd": "file:///private/tmp",
+                "useLegacyLandlock": false
+            }
+        })
+        .as_object()
+        .unwrap(),
+        &invocation,
+        &active,
+        true,
+    )
+    .unwrap();
+    let state = HostSandboxState::parse(Some(observed.state().as_json().clone())).unwrap();
+    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence("managed", 1, &state).unwrap(),
+    ])
+    .unwrap();
+    let request = DiscoverWorktreeRequest::from_active_observation(
+        active,
+        observed,
+        OsString::from("/private/tmp/candidate\n"),
+        DiscoveryOperationRef::new("discover-1").unwrap(),
+    )
+    .unwrap();
+    let policy = GitDiscoveryPolicy::new(PathBuf::from("/usr/bin/git"), 1024, false).unwrap();
+    assert!(
+        request
+            .validate_query(GitDiscoveryQuery::ShowTopLevel, &policy, &catalog)
+            .is_ok()
+    );
+}
+
 /// Proves bounded class preference and owner rotation without granting queued work a hidden slot.
 #[test]
 fn admission_bounds_and_fairness_are_centralized() {
@@ -172,12 +389,17 @@ async fn captured_streams_are_bounded_but_drained() {
         Admission::Granted(lease) => lease,
         outcome => panic!("unexpected admission: {outcome:?}"),
     };
-    let result =
-        execution::OwnedChild::spawn_captured(&request, lease, Path::new("/usr/bin/codex"), 3)
-            .unwrap()
-            .reap(Duration::from_secs(1))
-            .await
-            .unwrap();
+    let result = execution::OwnedChild::spawn_captured(
+        &request,
+        lease,
+        None,
+        Path::new("/usr/bin/codex"),
+        3,
+    )
+    .unwrap()
+    .reap(Duration::from_secs(1))
+    .await
+    .unwrap();
     assert!(result.status.success());
     assert_eq!(result.stdout.bytes, b"abc");
     assert_eq!(result.stderr.bytes, b"123");
@@ -207,12 +429,17 @@ async fn cancellation_reports_reap_without_claiming_descendants() {
         Admission::Granted(lease) => lease,
         outcome => panic!("unexpected admission: {outcome:?}"),
     };
-    let result =
-        execution::OwnedChild::spawn_captured(&request, lease, Path::new("/usr/bin/codex"), 64)
-            .unwrap()
-            .cancel_and_reap(Duration::from_millis(100), Duration::from_secs(1))
-            .await
-            .unwrap();
+    let result = execution::OwnedChild::spawn_captured(
+        &request,
+        lease,
+        None,
+        Path::new("/usr/bin/codex"),
+        64,
+    )
+    .unwrap()
+    .cancel_and_reap(Duration::from_millis(100), Duration::from_secs(1))
+    .await
+    .unwrap();
     assert!(result.cancellation.unwrap().term_requested);
     assert_eq!(
         result.descendants,
@@ -240,9 +467,14 @@ async fn protocol_stdout_has_one_owner_and_borrowed_endpoints_cannot_be_killed()
         Admission::Granted(lease) => lease,
         outcome => panic!("unexpected admission: {outcome:?}"),
     };
-    let mut child =
-        execution::OwnedProtocolChild::spawn(&request, lease, Path::new("/usr/bin/codex"), 64)
-            .unwrap();
+    let mut child = execution::OwnedProtocolChild::spawn(
+        &request,
+        lease,
+        None,
+        Path::new("/usr/bin/codex"),
+        64,
+    )
+    .unwrap();
     let mut protocol = String::new();
     child.stdout.read_to_string(&mut protocol).await.unwrap();
     let (status, stderr, released) = child.reap(Duration::from_secs(1)).await.unwrap();

@@ -1,8 +1,12 @@
 //! Real managed-sandbox D03 check driven by a captured host state and disposable targets.
 
-#[allow(dead_code)]
-#[path = "../src/execution/mod.rs"]
-mod execution;
+use agent_ide::{
+    assistance::host_binding::{
+        BindingStatus, HostBindingGuard, parse_candidate, parse_channel_session, parse_hook_event,
+        parse_observed_sandbox_state,
+    },
+    execution,
+};
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -16,7 +20,8 @@ use std::{
 
 use execution::{
     Admission, AdmissionClass, AdmissionController, AdmissionLimits, CommandKind,
-    ControlledCommand, ExecutionProfileCatalog, ExecutionProfileTemplate, HostSandboxState,
+    ControlledCommand, DiscoverWorktreeRequest, DiscoveryOperationRef, ExecutionProfileCatalog,
+    ExecutionProfileTemplate, GitDiscoveryPolicy, GitDiscoveryQuery, HostSandboxState,
     LocalExecutionPolicy, OwnedChild, OwnerId, ValidatedExecutionRequest, ValidatedHostInvocation,
     WorkspaceAuthority,
 };
@@ -35,6 +40,34 @@ fn test_path(directory: &Path, label: &str) -> PathBuf {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ))
+}
+
+/// Creates a matching trusted candidate for the local real-discovery probe binding guard.
+fn candidate(actor: &str, call: &str) -> agent_ide::assistance::host_binding::CandidateInvocation {
+    parse_candidate(
+        serde_json::json!({
+            "threadId": actor,
+            "callId": call,
+            "x-codex-turn-metadata": {"turn": "d03"}
+        })
+        .as_object()
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+/// Creates the matching native pre-hook required for the local real-discovery probe binding guard.
+fn pre_hook(actor: &str, call: &str) -> agent_ide::assistance::host_binding::HookEvent {
+    parse_hook_event(
+        serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": actor,
+            "tool_use_id": call
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap()
 }
 
 /// Builds one request from the exact captured state, fixed executable, and one controlled path operand.
@@ -56,7 +89,13 @@ fn request_args(
 ) -> ValidatedExecutionRequest {
     let invocation =
         ValidatedHostInvocation::from_verified_binding("d03-fixture", state.clone()).unwrap();
-    let authority = WorkspaceAuthority::from_workspace(state.cwd().to_path_buf(), 1).unwrap();
+    let authority = WorkspaceAuthority::from_workspace(
+        "d03-worktree",
+        "d03-incarnation",
+        state.cwd().to_path_buf(),
+        1,
+    )
+    .unwrap();
     let command = ControlledCommand::from_validated_peer(
         CommandKind::Job,
         program.to_path_buf(),
@@ -88,7 +127,7 @@ async fn run_child(
         Admission::Granted(lease) => lease,
         outcome => panic!("unexpected D03 admission result: {outcome:?}"),
     };
-    let result = OwnedChild::spawn_captured(request, lease, codex, 8192)
+    let result = OwnedChild::spawn_captured(request, lease, None, codex, 8192)
         .unwrap()
         .reap(Duration::from_secs(10))
         .await
@@ -183,4 +222,124 @@ async fn captured_managed_profile_enforces_fixture_boundaries() {
         !network_result.status.success(),
         "network-restricted profile connected to the controlled listener"
     );
+}
+
+/// Proves Codex accepts the captured sandbox JSON after semantic Value serialization, not only original spelling.
+#[tokio::test]
+#[ignore = "requires AGENT_IDE_D03_STATE and AGENT_IDE_D03_CODEX"]
+async fn managed_profile_accepts_semantic_json_reserialization() {
+    let captured = fs::read_to_string(required("AGENT_IDE_D03_STATE")).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&captured).unwrap();
+    let semantic_variant = format!(
+        "{{\n  \"useLegacyLandlock\": {},\n  \"sandboxCwd\": {},\n  \"permissionProfile\": {},\n  \"codexLinuxSandboxExe\": {}\n}}\n",
+        serde_json::to_string_pretty(&value["useLegacyLandlock"]).unwrap(),
+        serde_json::to_string_pretty(&value["sandboxCwd"]).unwrap(),
+        serde_json::to_string_pretty(&value["permissionProfile"]).unwrap(),
+        serde_json::to_string_pretty(&value["codexLinuxSandboxExe"]).unwrap(),
+    );
+    let state = HostSandboxState::parse_json(&semantic_variant).unwrap();
+    assert_ne!(state.sandbox_state_json(), captured);
+    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence("captured-managed-d03", 1, &state)
+            .unwrap(),
+    ])
+    .unwrap();
+    let codex = PathBuf::from(required("AGENT_IDE_D03_CODEX"));
+    let touch = Path::new("/usr/bin/touch");
+    let allowed = test_path(state.cwd(), "reserialized");
+    let result = run_child(
+        &request(&state, &catalog, touch, allowed.clone()),
+        &codex,
+        "reserialized",
+    )
+    .await;
+    assert!(
+        result.status.success(),
+        "reserialized stderr: {:?}",
+        result.stderr.bytes
+    );
+    assert!(
+        allowed.is_file(),
+        "reserialized state did not permit fixture write"
+    );
+    fs::remove_file(allowed).unwrap();
+}
+
+/// Proves the fixed pre-authority Git query runs with a fresh consumed binding use under the captured profile.
+#[tokio::test]
+#[ignore = "requires AGENT_IDE_D03_STATE and AGENT_IDE_D03_CODEX"]
+async fn managed_profile_runs_fixed_git_discovery() {
+    let captured = fs::read_to_string(required("AGENT_IDE_D03_STATE")).unwrap();
+    let state = HostSandboxState::parse_json(&captured).unwrap();
+    let observed_value: serde_json::Value = serde_json::from_str(&captured).unwrap();
+    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence("captured-managed-d03", 1, &state)
+            .unwrap(),
+    ])
+    .unwrap();
+    let mut guard = HostBindingGuard::default();
+    let channel = parse_channel_session(b"d03-discovery-channel").unwrap();
+    assert!(matches!(
+        guard.observe_hook(pre_hook("actor", "call"), channel.clone()),
+        BindingStatus::PreObserved
+    ));
+    let BindingStatus::Validated(invocation) =
+        guard.establish_start(candidate("actor", "call"), channel)
+    else {
+        panic!("explicit start must establish the real discovery probe binding");
+    };
+    let active = guard.consume_active(invocation.binding_ref()).unwrap();
+    let observed = parse_observed_sandbox_state(
+        serde_json::json!({"codex/sandbox-state-meta": observed_value})
+            .as_object()
+            .unwrap(),
+        &invocation,
+        &active,
+        true,
+    )
+    .unwrap();
+    let discovery = DiscoverWorktreeRequest::from_active_observation(
+        active,
+        observed,
+        state.cwd().as_os_str().to_owned(),
+        DiscoveryOperationRef::new("d03-discovery").unwrap(),
+    )
+    .unwrap()
+    .validate_query(
+        GitDiscoveryQuery::ShowTopLevel,
+        &GitDiscoveryPolicy::new(PathBuf::from("/usr/bin/git"), 4096, false).unwrap(),
+        &catalog,
+    )
+    .unwrap();
+    let mut admission = AdmissionController::new(AdmissionLimits {
+        total_running: 1,
+        per_owner_running: 1,
+        per_owner_queued: 1,
+        total_queued: 1,
+        interactive_burst: 1,
+    })
+    .unwrap();
+    let lease = match admission.submit(
+        OwnerId::new("d03-discovery").unwrap(),
+        AdmissionClass::Interactive,
+    ) {
+        Admission::Granted(lease) => lease,
+        outcome => panic!("unexpected discovery admission: {outcome:?}"),
+    };
+    let result = discovery
+        .run(
+            lease,
+            guard.consume_active(invocation.binding_ref()).unwrap(),
+            Path::new(&required("AGENT_IDE_D03_CODEX")),
+        )
+        .await
+        .unwrap();
+    assert!(
+        result.exit_status.success(),
+        "git stderr: {:?}",
+        result.stderr.bytes
+    );
+    assert!(!result.stdout.bytes.is_empty());
+    assert!(result.stdout.complete && result.stderr.complete);
+    assert!(admission.release(result.lease).unwrap().is_empty());
 }
