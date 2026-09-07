@@ -1,20 +1,26 @@
 # Governed execution and process evidence
 
-Revision: r3. Provider: Execution. Consumers: Intelligence, Changes, Application; Assistance receives job facts through domain results. Workspace supplies authority; Application supplies validated config/store. Vocabulary: [common](common.md).
+Revision: r4 (proposed). Provider: Execution. Direct providers: Assistance supplies validated host identity and observed host state; Workspace supplies controlled Git intent and worktree authority; Application supplies config/store mechanics only. Direct consumers: Workspace consumes raw Git execution results; Intelligence consumes owned protocol/process leases after profile admission; Application persists Execution-owned records. Changes composes Workspace raw Git results and does not directly spawn. Vocabulary: [common](common.md).
 
 ## Host-state and spawn gate
 
-Execution accepts a physical-effect request only with a peer-validated host binding, Workspace authority epoch, controlled command, immutable local policy, and an Execution-minted profile permit. Assistance creates the host-binding token only after its real D01 proof; an absent or heuristic binding is `unavailable`, never a candidate for admission. Workspace constructs and validates raw Git argv. Intelligence chooses provider topology and a declared profile. Neither model text nor an MCP field supplies an executable, argv, cwd, environment, or profile to Execution directly.
+Execution accepts a physical-effect request only with a peer-validated host binding, Workspace authority epoch, controlled command, immutable local policy, and an Execution-minted profile permit. Assistance creates the host-binding token only after its real D01 proof; an absent or heuristic binding is `unavailable`, never a candidate for admission. Workspace constructs and validates raw Git argv. Intelligence chooses provider topology and a declared profile, then consumes an owned protocol lease. Neither model text nor an MCP field supplies an executable, argv, cwd, environment, or profile to Execution directly.
 
 The only accepted managed macOS/Linux replay input is the complete opaque JSON value from `_meta["codex/sandbox-state-meta"]`, and only when server initialization advertised the same experimental capability. Execution validates its supported managed shape and invokes `codex sandbox --sandbox-state-json <one JSON argv value> -- <controlled child argv>` without shell interpolation. It preserves `sandboxCwd` and special-path semantics as supplied; it does not expand project roots or add `--sandbox-state-readable-root`. `external`, proxy, multi-root, missing, malformed, or unknown states are unavailable. Execution owns the catalog of tested profile template/version pairs and mints a permit only for a supported class and normalized state shape; its per-invocation full-state digest is correlation evidence, not a fixture-root authorization boundary. Application may persist profile evidence but does not verify or issue permits. `disabled` is executable only after the host explicitly supplied that type, Execution accepted its host-case template, and local policy explicitly accepts the no-outer-sandbox case.
 
+The API and its substitute checks are contract-ready. They are not D03 acceptance: a managed provider, check, or write remains unavailable until Assistance supplies the captured state from a D01-validated invocation and Execution records a real macOS Seatbelt result for the applicable template. v0.1 does not expose check-profile execution; Changes does not gain a spawn path by composing a raw Git result.
+
 ## Requests and responses
 
-`ExecutionIntent` contains operation/request ID, the validated host-binding token, current Workspace authority/epoch or backend lease authorization, class (interactive/heavy/backend-start/view-warmup), typed resource demand, executable/argv/cwd/environment from a validated profile, output policy and deadline. No shell string is synthesized from model/server text. Intelligence owns compatibility and logical leases; Execution never infers LSP compatibility.
+The current API validates `ValidatedHostInvocation`, `WorkspaceAuthority`, `ControlledCommand`, local policy, and an Execution-profile catalog before admission. For v0.1, Workspace is the only producer of a Git command and receives its raw bounded stdout/stderr/exit evidence. Intelligence owns compatibility and logical leases; Execution never infers LSP compatibility or reads protocol stdout. `CommandKind::Job` is an internal controlled-child category, not a public arbitrary-command facility or a v0.1 check API.
 
-`submit` returns admitted handle, queued ticket or typed refusal. Reservations are acquired before owned process launch or admitted work begins. Tickets support inspect/cancel; request cancellation is distinct from termination. Completed execution returns exit code/signal, spawn/timeout/cancel reason, bounded stdout/stderr references plus truncation, actual timing and process/resource evidence. Changes interprets check coverage; Execution does not declare tests passed.
+Admission returns an admitted lease, bounded queue ticket, or typed refusal. Reservations are acquired before an owned process launch; queue tickets reserve nothing. Cancellation request, TERM/KILL delivery, direct-child reap, and descendant certainty are separate facts. Completed execution returns bounded stdout/stderr plus truncation, exit and timing evidence; it never declares Git-derived diff meaning, test coverage, or task completion.
 
 Owned and borrowed handles have different capabilities. Borrowed endpoints may be observed/detached, never killed or reconfigured. A physical process is counted once where verified process identity permits dedup; marginal views and warmups reserve their own cost. Unknown borrowed process identity/resource usage is reported and conservatively reserved or refused under a required enforcement policy, never counted as zero.
+
+## Bootstrap boundary
+
+Current physical execution requires `WorkspaceAuthority`, but Workspace needs bounded Git discovery before it can issue final worktree authority. This is an unresolved activation bootstrap, not permission for generic unauthorised execution. The proposed narrow follow-up is a Workspace-owned discovery intent limited to configured read-only Git argv, one canonical candidate cwd, a fixed output budget, and no provider/check/write class. It must return raw discovery evidence only and cannot mint authority or a profile permit. Until Workspace and Execution accept that separate contract, discovery stays outside this spawn API.
 
 ## Admission and fairness
 
@@ -30,11 +36,11 @@ TERM/grace/KILL and recovery have configurable budgets. Release physical reserva
 
 Linux hard_required uses available delegated cgroups/controllers or returns unavailable. macOS resource sampling is monitoring, not a hard RSS guarantee. Soft-budget overage stops further admission and applies configured owned-process policy; OS-enforced memory behavior cannot be invented by Tokio.
 
-## Durable evidence and tests
+## Evidence and acceptance boundary
 
-Launch intent and obtained identity are durably associated with operation ID; crash gaps become recovery-required. SQLite alone cannot transact process spawn. Running job history must permit distinguishing not_started, started, terminal, and effect_unknown. Old epoch callbacks cannot release a new reservation or update a replacement process.
+The current contract harness, `tests/execution_contract.rs`, proves profile rejection, bounded admission, captured output drain, cancellation versus direct-child reap, protocol-stdout exclusivity, and borrowed-endpoint refusal. It does not prove host binding, sandbox replay, durable process identity, or provider isolation.
 
-Shared scenarios cover invalid demand, full queue, fairness, one physical process/multiple views, stale scope, borrowed kill refusal, output flood, cancellation acknowledged before exit, daemon crash between intent/spawn/record, PID reuse and unavailable cgroup policy. Scripted clock/launcher/journal substitutes verify mapping and scheduling; real Linux/macOS subprocess tests prove signals, output, direct-child reap and descendant observations. Harness: `tests/execution_contract.rs`; actual OS scenarios: `tests/execution_processes.rs`, `tests/execution_resources.rs`.
+The D03 acceptance experiment must use an Assistance-captured state from a real D01-bound invocation, invoke the managed child through the exact Codex sandbox argv, and report allowed/denied operations that match the host contract. It must additionally observe bounded output, direct-child reap, and uncertainty about descendants. Until that experiment is recorded for the Execution template/version, managed provider/check/write effects remain unavailable. SQLite persistence, crash recovery, resource ceilings beyond the in-memory admission controller, retained backends, and real Linux/macOS provider scenarios are later integration work, not present v0.1 acceptance evidence.
 
 ## Retention and failure isolation
 
