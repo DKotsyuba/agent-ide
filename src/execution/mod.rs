@@ -41,6 +41,8 @@ pub enum SandboxStateError {
     ExternalUnsupported,
     /// The profile class is not one Execution knows how to preserve.
     UnsupportedProfile,
+    /// The supplied sandbox cwd is neither an absolute path nor a supported local file URI.
+    UnsupportedCwd,
 }
 
 /// Names the tested host mechanism/profile class that Execution supports across worktrees.
@@ -75,11 +77,15 @@ pub struct ExecutionProfilePermit {
 /// Holds an entire host-provided sandbox state without expanding its roots or rewriting policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostSandboxState {
-    /// Complete unmodified state value passed as one Codex CLI argument for managed execution.
+    /// Parsed state copy used only for validation and profile-shape comparison.
     raw: Value,
+    /// Original JSON text retained byte-for-byte for the managed Codex sandbox argument.
+    raw_json: String,
     /// Accepted high-level profile class derived from the state envelope.
     class: ProfileClass,
-    /// Host-selected sandbox cwd that the controlled command must preserve exactly.
+    /// Exact host-selected sandbox cwd retained unchanged inside `raw` for Codex replay.
+    sandbox_cwd: String,
+    /// Local filesystem cwd derived only for `Command::current_dir`, never written back to `raw`.
     cwd: PathBuf,
 }
 
@@ -91,6 +97,18 @@ impl HostSandboxState {
     /// from a path or expand special path syntax.
     pub fn parse(raw: Option<Value>) -> Result<Self, SandboxStateError> {
         let raw = raw.ok_or(SandboxStateError::Missing)?;
+        let raw_json = raw.to_string();
+        Self::parse_value(raw, raw_json)
+    }
+
+    /// Parses captured JSON while retaining its exact original bytes for sandbox replay.
+    pub fn parse_json(raw_json: &str) -> Result<Self, SandboxStateError> {
+        let raw = serde_json::from_str(raw_json).map_err(|_| SandboxStateError::Malformed)?;
+        Self::parse_value(raw, raw_json.to_owned())
+    }
+
+    /// Validates one parsed state while associating it with the exact JSON argument to replay.
+    fn parse_value(raw: Value, raw_json: String) -> Result<Self, SandboxStateError> {
         let object = raw.as_object().ok_or(SandboxStateError::Malformed)?;
         let permission_profile = object
             .get("permissionProfile")
@@ -100,12 +118,13 @@ impl HostSandboxState {
             .get("type")
             .and_then(Value::as_str)
             .ok_or(SandboxStateError::Malformed)?;
-        let cwd = object
+        let sandbox_cwd = object
             .get("sandboxCwd")
             .and_then(Value::as_str)
             .filter(|cwd| !cwd.is_empty())
-            .map(PathBuf::from)
+            .map(str::to_owned)
             .ok_or(SandboxStateError::Malformed)?;
+        let cwd = local_sandbox_cwd(&sandbox_cwd)?;
         let class = match profile_type {
             "managed"
                 if permission_profile.contains_key("file_system")
@@ -119,7 +138,13 @@ impl HostSandboxState {
             "external" => return Err(SandboxStateError::ExternalUnsupported),
             _ => return Err(SandboxStateError::UnsupportedProfile),
         };
-        Ok(Self { raw, class, cwd })
+        Ok(Self {
+            raw,
+            raw_json,
+            class,
+            sandbox_cwd,
+            cwd,
+        })
     }
 
     /// Returns the accepted profile class.
@@ -127,14 +152,24 @@ impl HostSandboxState {
         self.class
     }
 
-    /// Returns the host-selected working directory without resolving or broadening it.
+    /// Returns the local path used as the child cwd while leaving the raw sandbox URI unchanged.
     pub fn cwd(&self) -> &Path {
         &self.cwd
     }
 
+    /// Returns the exact host-provided cwd representation retained inside the replayed state.
+    pub fn sandbox_cwd(&self) -> &str {
+        &self.sandbox_cwd
+    }
+
     /// Serializes the complete original state for the Codex sandbox command.
-    fn json_argument(&self) -> String {
-        self.raw.to_string()
+    fn json_argument(&self) -> &str {
+        &self.raw_json
+    }
+
+    /// Returns the exact captured JSON argument retained for managed Codex sandbox replay.
+    pub fn sandbox_state_json(&self) -> &str {
+        &self.raw_json
     }
 
     /// Returns a shape digest that preserves JSON structure and array cardinality, not scalar values.
@@ -792,7 +827,7 @@ impl OwnedChild {
         codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
-        let mut command = build_command(request, codex_executable);
+        let mut command = build_command(request, codex_executable)?;
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         configure_process_group(&mut command);
         let mut child = command.spawn()?;
@@ -898,7 +933,7 @@ impl OwnedProtocolChild {
         codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
-        let mut command = build_command(request, codex_executable);
+        let mut command = build_command(request, codex_executable)?;
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -963,7 +998,13 @@ impl BorrowedEndpoint {
 }
 
 /// Constructs a direct or sandbox-wrapped command entirely from validated typed inputs.
-fn build_command(request: &ValidatedExecutionRequest, codex_executable: &Path) -> Command {
+///
+/// Managed Codex wrappers receive only the executable's own directory as `PATH` so an env-based
+/// Node launcher can start without inheriting arbitrary parent environment entries.
+fn build_command(
+    request: &ValidatedExecutionRequest,
+    codex_executable: &Path,
+) -> Result<Command, ProcessError> {
     let command = &request.command;
     let mut process = match request.invocation.sandbox.class {
         ProfileClass::Managed => {
@@ -983,7 +1024,19 @@ fn build_command(request: &ValidatedExecutionRequest, codex_executable: &Path) -
         .current_dir(&command.cwd)
         .env_clear()
         .envs(&command.env);
-    process
+    if request.invocation.sandbox.class == ProfileClass::Managed {
+        let parent = codex_executable
+            .parent()
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| {
+                ProcessError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "managed Codex executable must have an absolute parent directory",
+                ))
+            })?;
+        process.env("PATH", parent);
+    }
+    Ok(process)
 }
 
 /// Configures a distinct Unix process group so signals may target owned descendants conservatively.
@@ -1108,4 +1161,21 @@ fn has_multiple_roots(value: &serde_json::Map<String, Value>) -> bool {
         (key == "roots" || key.ends_with("_roots"))
             && value.as_array().is_some_and(|roots| roots.len() > 1)
     })
+}
+
+/// Derives a local process cwd from a host cwd without modifying the opaque sandbox state.
+fn local_sandbox_cwd(raw: &str) -> Result<PathBuf, SandboxStateError> {
+    let path = if let Some(path) = raw.strip_prefix("file://") {
+        if path.contains('%') || !path.starts_with('/') {
+            return Err(SandboxStateError::UnsupportedCwd);
+        }
+        PathBuf::from(path)
+    } else {
+        PathBuf::from(raw)
+    };
+    if is_normal_absolute(&path) {
+        Ok(path)
+    } else {
+        Err(SandboxStateError::UnsupportedCwd)
+    }
 }

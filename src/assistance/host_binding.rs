@@ -5,7 +5,10 @@
 //! evidence. Consumers still decide whether the host transport and execution profile prove
 //! the authority they require.
 
-use std::collections::BTreeSet;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use serde_json::{Map, Value};
 
@@ -13,7 +16,16 @@ const MAX_IDENTIFIER_BYTES: usize = 256;
 const MAX_HOOK_METADATA_BYTES: usize = 64 * 1024;
 const MAX_PENDING: usize = 128;
 const MAX_COMPLETED: usize = 1024;
+const MAX_BINDINGS: usize = 64;
+const MAX_SANDBOX_STATE_BYTES: usize = 64 * 1024;
 const TURN_METADATA: &str = "x-codex-turn-metadata";
+const SANDBOX_STATE_METADATA: &str = "codex/sandbox-state-meta";
+const SANDBOX_STATE_FIELDS: &[&str] = &[
+    "permissionProfile",
+    "codexLinuxSandboxExe",
+    "sandboxCwd",
+    "useLegacyLandlock",
+];
 
 /// Identifies one candidate invocation extracted only from trusted MCP request metadata.
 ///
@@ -34,6 +46,58 @@ impl CandidateInvocation {
     /// Returns the host tool-call identity claimed by trusted request metadata.
     pub fn call_id(&self) -> &str {
         &self.call_id
+    }
+}
+
+/// Identifies the trusted Application channel-session carrying a hook or MCP invocation.
+///
+/// Its value is opaque outside Assistance and is accepted only from the private transport
+/// attachment after Application has established its endpoint and connection generation.
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ChannelSessionRef(String);
+
+impl fmt::Debug for ChannelSessionRef {
+    /// Redacts the opaque private transport attachment from diagnostic output.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ChannelSessionRef(..)")
+    }
+}
+
+/// Parses one bounded opaque Application attachment into a channel-session reference.
+///
+/// The attachment must be valid UTF-8 and meet the common identifier bound. Its contents are
+/// never logged, rendered, or treated as actor identity by this parser.
+pub fn parse_channel_session(attachment: &[u8]) -> Result<ChannelSessionRef, BindingUnavailable> {
+    let value = std::str::from_utf8(attachment)
+        .map_err(|_| BindingUnavailable::InvalidAttachment)?
+        .to_owned();
+    checked_identifier(value, "opaque attachment")
+        .map(ChannelSessionRef)
+        .map_err(|_| BindingUnavailable::InvalidAttachment)
+}
+
+/// Identifies one revocable Assistance binding generation for an actor and channel-session.
+///
+/// Consumers may retain and pass this opaque value back to Assistance but cannot construct,
+/// inspect, or turn it into Workspace authority, an Execution permit, or host evidence.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct BindingRef {
+    actor_id: String,
+    channel: ChannelSessionRef,
+    generation: u64,
+}
+
+/// Represents one successful liveness consume for a particular [`BindingRef`] generation.
+///
+/// It is a transient, non-authorizing result. Consumers must acquire a fresh value at each
+/// scoped admission because a later stop can revoke the underlying binding generation.
+#[derive(Debug, Eq, PartialEq)]
+pub struct ActiveBindingUse(BindingRef);
+
+impl ActiveBindingUse {
+    /// Returns the opaque binding reference whose active state was consumed.
+    pub fn binding_ref(&self) -> &BindingRef {
+        &self.0
     }
 }
 
@@ -83,6 +147,8 @@ pub enum BindingUnavailable {
     MissingField(&'static str),
     /// A supported field had an empty, non-string, or over-limit value.
     InvalidField(&'static str),
+    /// The private Application attachment was not valid bounded opaque channel-session data.
+    InvalidAttachment,
     /// The hook phase was not the native `PreToolUse` or `PostToolUse` form.
     UnsupportedHookPhase,
     /// A hook could not be linked exactly to one registered MCP candidate.
@@ -91,12 +157,20 @@ pub enum BindingUnavailable {
     MissingPre,
     /// A post-hook arrived after pre-observation but before MCP validation completed.
     MissingInvocation,
+    /// An ordinary MCP invocation had no active matching actor/channel-session binding.
+    InactiveBinding,
+    /// A sandbox-state parser was called without the required advertised capability.
+    CapabilityNotAdvertised,
+    /// The host did not return the required bounded sandbox-state object.
+    MissingSandboxState,
+    /// The host returned a sandbox-state object missing a required outer field or over the cap.
+    InvalidSandboxState,
+    /// A consumed active binding did not belong to the supplied validated invocation.
+    BindingUseMismatch,
     /// The candidate was observed twice or after it was already validated.
     Replay,
     /// Bounded pending or completed lifecycle storage is full.
     CapacityExceeded,
-    /// The guard was stopped and must be replaced for a fresh host lifecycle.
-    Stopped,
 }
 
 /// Reports the lifecycle strength available to a Workspace or Execution consumer.
@@ -116,13 +190,14 @@ pub enum BindingStatus {
     Unavailable(BindingUnavailable),
 }
 
-/// Captures the exact actor and call pair whose pre-hook matched trusted MCP metadata.
+/// Captures the exact actor, call, and active binding whose pre-hook matched trusted MCP metadata.
 ///
 /// This value is bounded and contains no model arguments, source, prompt, or hook payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedInvocation {
     actor_id: String,
     call_id: String,
+    binding: BindingRef,
 }
 
 impl ValidatedInvocation {
@@ -135,103 +210,259 @@ impl ValidatedInvocation {
     pub fn call_id(&self) -> &str {
         &self.call_id
     }
+
+    /// Returns the immutable active binding generation that this invocation matched.
+    pub fn binding_ref(&self) -> &BindingRef {
+        &self.binding
+    }
 }
 
-/// Tracks a bounded one-shot pre/MCP/post lifecycle and rejects replay after stop or settlement.
+/// States why Assistance accepts a sandbox-state observation from trusted request metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SandboxStateProvenance {
+    /// The server advertised `codex/sandbox-state-meta` and the request returned that object.
+    AdvertisedAndReturned,
+}
+
+/// Holds the complete bounded host sandbox-state object without assigning field semantics.
 ///
-/// One guard belongs to one host connection/turn scope. When its completed-call capacity is
-/// exhausted, it reports unavailable instead of evicting replay evidence; make a fresh guard
-/// only after the surrounding trusted host lifecycle has changed.
+/// Execution may parse this JSON under its own versioned policy. Assistance does not interpret
+/// it as an operator profile, a permit, sandbox enforcement proof, or authority grant.
+#[derive(Clone, PartialEq)]
+pub struct OpaqueSandboxState(Value);
+
+impl fmt::Debug for OpaqueSandboxState {
+    /// Redacts the complete host state while preserving explicit access for Execution parsing.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OpaqueSandboxState(..)")
+    }
+}
+
+impl OpaqueSandboxState {
+    /// Returns the complete host-returned JSON object for Execution's bounded parser.
+    pub fn as_json(&self) -> &Value {
+        &self.0
+    }
+}
+
+/// Correlates a complete opaque sandbox-state observation to one validated host invocation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObservedSandboxState {
+    actor_id: String,
+    call_id: String,
+    binding: BindingRef,
+    provenance: SandboxStateProvenance,
+    state: OpaqueSandboxState,
+}
+
+impl ObservedSandboxState {
+    /// Returns the actor shared with the validated invocation that returned this state.
+    pub fn actor_id(&self) -> &str {
+        &self.actor_id
+    }
+
+    /// Returns the call id shared with the validated invocation that returned this state.
+    pub fn call_id(&self) -> &str {
+        &self.call_id
+    }
+
+    /// Returns the active binding reference required for every Execution admission consume.
+    pub fn binding_ref(&self) -> &BindingRef {
+        &self.binding
+    }
+
+    /// Returns why this otherwise opaque state object was accepted from the host.
+    pub fn provenance(&self) -> SandboxStateProvenance {
+        self.provenance
+    }
+
+    /// Returns the complete bounded opaque host state for Execution policy parsing.
+    pub fn state(&self) -> &OpaqueSandboxState {
+        &self.state
+    }
+}
+
+/// Tracks bounded pre/MCP/post calls plus revocable actor/channel binding generations.
+///
+/// One guard belongs to one host connection scope. It never silently reactivates a stopped
+/// binding: only `establish_start` creates a generation, while ordinary calls use
+/// `validate_active`. Completed call capacity is never evicted because it is replay evidence.
 #[derive(Debug, Default)]
 pub struct HostBindingGuard {
-    pre_observed: BTreeSet<CandidateInvocation>,
-    active: BTreeSet<CandidateInvocation>,
-    completed: BTreeSet<CandidateInvocation>,
-    stopped: bool,
+    pre_observed: BTreeSet<(CandidateInvocation, ChannelSessionRef)>,
+    settling: BTreeMap<(CandidateInvocation, ChannelSessionRef), BindingRef>,
+    completed: BTreeSet<(CandidateInvocation, ChannelSessionRef)>,
+    bindings: BTreeMap<(String, ChannelSessionRef), BindingRef>,
+    next_generation: u64,
 }
 
 impl HostBindingGuard {
-    /// Validates a parsed MCP candidate only when its exact native pre-hook is already observed.
+    /// Establishes an explicit start binding after its exact native pre-hook is already observed.
     ///
-    /// This ordering avoids a causal cycle: the pre-hook occurs before the MCP handler, while
-    /// the later post-hook is settlement evidence and cannot gate the handler result.
-    pub fn register(&mut self, candidate: CandidateInvocation) -> BindingStatus {
-        if self.stopped {
-            return BindingStatus::Unavailable(BindingUnavailable::Stopped);
-        }
-        if self.active.contains(&candidate) || self.completed.contains(&candidate) {
+    /// A current binding for the same actor/channel is reused for an idempotent explicit start.
+    /// After `stop_binding` or `stop`, a later explicit start creates a fresh generation.
+    pub fn establish_start(
+        &mut self,
+        candidate: CandidateInvocation,
+        channel: ChannelSessionRef,
+    ) -> BindingStatus {
+        let invocation = (candidate.clone(), channel.clone());
+        if self.settling.contains_key(&invocation) || self.completed.contains(&invocation) {
             return BindingStatus::Unavailable(BindingUnavailable::Replay);
         }
-        if !self.pre_observed.contains(&candidate) {
+        if !self.pre_observed.contains(&invocation) {
             return BindingStatus::Unavailable(BindingUnavailable::MissingPre);
         }
-        if self.active.len() >= MAX_PENDING || self.completed.len() >= MAX_COMPLETED {
+        if self.settling.len() >= MAX_PENDING || self.completed.len() >= MAX_COMPLETED {
             return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
         }
-        self.pre_observed.remove(&candidate);
-        self.active.insert(candidate.clone());
-        BindingStatus::Validated(ValidatedInvocation {
-            actor_id: candidate.actor_id,
-            call_id: candidate.call_id,
-        })
+        let binding_key = (candidate.actor_id.clone(), channel.clone());
+        let binding = if let Some(existing) = self.bindings.get(&binding_key) {
+            existing.clone()
+        } else {
+            if self.bindings.len() >= MAX_BINDINGS {
+                return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
+            }
+            let Some(generation) = self.next_generation.checked_add(1) else {
+                return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
+            };
+            self.next_generation = generation;
+            let binding = BindingRef {
+                actor_id: candidate.actor_id.clone(),
+                channel,
+                generation,
+            };
+            self.bindings.insert(binding_key, binding.clone());
+            binding
+        };
+        self.pre_observed.remove(&invocation);
+        self.settling.insert(invocation, binding.clone());
+        BindingStatus::Validated(validated(candidate, binding))
     }
 
-    /// Buffers a native pre-hook or records post-hook settlement for one validated invocation.
+    /// Validates an ordinary MCP candidate against its active matching actor/channel binding.
     ///
-    /// A pre-hook never validates an invocation on its own. A post-hook never gates MCP result
-    /// acceptance: it only returns `Settled` after the earlier pre/MCP validation sequence.
-    pub fn observe_hook(&mut self, event: HookEvent) -> BindingStatus {
-        if self.stopped {
-            return BindingStatus::Unavailable(BindingUnavailable::Stopped);
+    /// This path never creates or revives a binding. Its pre-observation is consumed even when
+    /// no active binding exists, so a later start cannot validate an old ordinary call.
+    pub fn validate_active(
+        &mut self,
+        candidate: CandidateInvocation,
+        channel: ChannelSessionRef,
+    ) -> BindingStatus {
+        let invocation = (candidate.clone(), channel.clone());
+        if self.settling.contains_key(&invocation) || self.completed.contains(&invocation) {
+            return BindingStatus::Unavailable(BindingUnavailable::Replay);
         }
+        if !self.pre_observed.remove(&invocation) {
+            return BindingStatus::Unavailable(BindingUnavailable::MissingPre);
+        }
+        let Some(binding) = self
+            .bindings
+            .get(&(candidate.actor_id.clone(), channel))
+            .cloned()
+        else {
+            return BindingStatus::Unavailable(BindingUnavailable::InactiveBinding);
+        };
+        if self.settling.len() >= MAX_PENDING || self.completed.len() >= MAX_COMPLETED {
+            return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
+        }
+        self.settling.insert(invocation, binding.clone());
+        BindingStatus::Validated(validated(candidate, binding))
+    }
+
+    /// Buffers a native pre-hook or records post-hook settlement for a channel-bound invocation.
+    ///
+    /// A pre-hook is not an authority claim. A post-hook never gates MCP result acceptance: it
+    /// only settles a call that was already validated by `establish_start` or `validate_active`.
+    pub fn observe_hook(&mut self, event: HookEvent, channel: ChannelSessionRef) -> BindingStatus {
         let candidate = CandidateInvocation {
             actor_id: event.actor_id,
             call_id: event.call_id,
         };
+        let invocation = (candidate.clone(), channel);
         match event.phase {
             HookPhase::Pre
-                if self.pre_observed.contains(&candidate)
-                    || self.active.contains(&candidate)
-                    || self.completed.contains(&candidate) =>
+                if self.pre_observed.contains(&invocation)
+                    || self.settling.contains_key(&invocation)
+                    || self.completed.contains(&invocation) =>
             {
                 BindingStatus::Unavailable(BindingUnavailable::Replay)
             }
             HookPhase::Pre => {
-                if self.pre_observed.len() + self.active.len() >= MAX_PENDING
+                if self.pre_observed.len() + self.settling.len() >= MAX_PENDING
                     || self.completed.len() >= MAX_COMPLETED
                 {
                     return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
                 }
-                self.pre_observed.insert(candidate);
+                self.pre_observed.insert(invocation);
                 BindingStatus::PreObserved
             }
             HookPhase::Post => {
-                if self.completed.contains(&candidate) {
+                if self.completed.contains(&invocation) {
                     return BindingStatus::Unavailable(BindingUnavailable::Replay);
                 }
-                if self.pre_observed.contains(&candidate) {
+                if self.pre_observed.contains(&invocation) {
                     return BindingStatus::Unavailable(BindingUnavailable::MissingInvocation);
                 }
-                if !self.active.remove(&candidate) {
+                let Some(binding) = self.settling.remove(&invocation) else {
                     return BindingStatus::Unavailable(BindingUnavailable::Mismatch);
-                }
+                };
                 if self.completed.len() >= MAX_COMPLETED {
+                    self.settling.insert(invocation, binding);
                     return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
                 }
-                self.completed.insert(candidate.clone());
-                BindingStatus::Settled(ValidatedInvocation {
-                    actor_id: candidate.actor_id,
-                    call_id: candidate.call_id,
-                })
+                self.completed.insert(invocation);
+                BindingStatus::Settled(validated(candidate, binding))
             }
         }
     }
 
-    /// Stops this lifecycle, discarding unvalidated/active calls and rejecting all later input.
+    /// Checks whether one immutable binding generation remains active at this exact boundary.
+    pub fn check_active(&self, binding: &BindingRef) -> Result<(), BindingUnavailable> {
+        let key = (binding.actor_id.clone(), binding.channel.clone());
+        (self.bindings.get(&key) == Some(binding))
+            .then_some(())
+            .ok_or(BindingUnavailable::InactiveBinding)
+    }
+
+    /// Consumes current liveness for one scoped Workspace or Execution admission.
+    ///
+    /// Calls are serialized with `stop_binding` and `stop`: a consume after their revocation
+    /// point fails. The returned value is not a durable permit and must not be reused.
+    pub fn consume_active(
+        &mut self,
+        binding: &BindingRef,
+    ) -> Result<ActiveBindingUse, BindingUnavailable> {
+        self.check_active(binding)?;
+        Ok(ActiveBindingUse(binding.clone()))
+    }
+
+    /// Revokes exactly one active binding generation without discarding later post settlement.
+    pub fn stop_binding(&mut self, binding: &BindingRef) -> Result<(), BindingUnavailable> {
+        let key = (binding.actor_id.clone(), binding.channel.clone());
+        if self.bindings.get(&key) != Some(binding) {
+            return Err(BindingUnavailable::InactiveBinding);
+        }
+        self.bindings.remove(&key);
+        Ok(())
+    }
+
+    /// Revokes every active binding and discards unmatched pre-hooks in this host scope.
+    ///
+    /// Later explicit starts remain permitted and receive fresh generations; later post-hooks
+    /// can still settle calls that were validated before this stop.
     pub fn stop(&mut self) {
         self.pre_observed.clear();
-        self.active.clear();
-        self.stopped = true;
+        self.bindings.clear();
+    }
+}
+
+/// Builds a public invocation record from a bounded candidate and immutable binding reference.
+fn validated(candidate: CandidateInvocation, binding: BindingRef) -> ValidatedInvocation {
+    ValidatedInvocation {
+        actor_id: candidate.actor_id,
+        call_id: candidate.call_id,
+        binding,
     }
 }
 
@@ -283,6 +514,51 @@ pub fn parse_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnavailable>
         phase,
         actor_id,
         call_id: required_identifier(&object, "tool_use_id")?,
+    })
+}
+
+/// Parses a complete bounded host sandbox-state observation for one consumed active invocation.
+///
+/// The caller must pass `advertised_capability` only when the same server session advertised
+/// `codex/sandbox-state-meta`. All four source-proven outer names are required, while nested
+/// values remain opaque for Execution's own versioned parser and never become a permit.
+pub fn parse_observed_sandbox_state(
+    meta: &Map<String, Value>,
+    invocation: &ValidatedInvocation,
+    active_use: &ActiveBindingUse,
+    advertised_capability: bool,
+) -> Result<ObservedSandboxState, BindingUnavailable> {
+    if !advertised_capability {
+        return Err(BindingUnavailable::CapabilityNotAdvertised);
+    }
+    if active_use.binding_ref() != invocation.binding_ref() {
+        return Err(BindingUnavailable::BindingUseMismatch);
+    }
+    let Some(state) = meta.get(SANDBOX_STATE_METADATA) else {
+        return Err(BindingUnavailable::MissingSandboxState);
+    };
+    let Some(object) = state.as_object() else {
+        return Err(BindingUnavailable::InvalidSandboxState);
+    };
+    if !SANDBOX_STATE_FIELDS
+        .iter()
+        .all(|field| object.contains_key(*field))
+    {
+        return Err(BindingUnavailable::InvalidSandboxState);
+    }
+    if serde_json::to_vec(state)
+        .map_err(|_| BindingUnavailable::InvalidSandboxState)?
+        .len()
+        > MAX_SANDBOX_STATE_BYTES
+    {
+        return Err(BindingUnavailable::InvalidSandboxState);
+    }
+    Ok(ObservedSandboxState {
+        actor_id: invocation.actor_id.clone(),
+        call_id: invocation.call_id.clone(),
+        binding: invocation.binding.clone(),
+        provenance: SandboxStateProvenance::AdvertisedAndReturned,
+        state: OpaqueSandboxState(state.clone()),
     })
 }
 

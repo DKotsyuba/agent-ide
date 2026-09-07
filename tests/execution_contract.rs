@@ -103,6 +103,22 @@ fn opaque_state_rejects_missing_and_external_profiles() {
     })))
     .unwrap();
     assert_eq!(managed.class(), ProfileClass::Managed);
+    let uri = HostSandboxState::parse(Some(json!({
+        "permissionProfile": {"type": "managed", "file_system": {"type": "read"}, "network": false},
+        "codexLinuxSandboxExe": null,
+        "sandboxCwd": "file:///private/tmp",
+        "useLegacyLandlock": false
+    })))
+    .unwrap();
+    assert_eq!(uri.sandbox_cwd(), "file:///private/tmp");
+    assert_eq!(uri.cwd(), Path::new("/private/tmp"));
+    let raw_json = "{\n  \"permissionProfile\": {\"type\": \"disabled\"},\n  \"sandboxCwd\": \"/private/tmp\"\n}";
+    assert_eq!(
+        HostSandboxState::parse_json(raw_json)
+            .unwrap()
+            .sandbox_state_json(),
+        raw_json
+    );
 }
 
 /// Proves bounded class preference and owner rotation without granting queued work a hidden slot.
