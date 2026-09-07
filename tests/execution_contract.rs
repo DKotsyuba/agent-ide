@@ -83,6 +83,18 @@ fn opaque_state_rejects_missing_and_external_profiles() {
         }))),
         Err(SandboxStateError::ExternalUnsupported)
     );
+    assert_eq!(
+        HostSandboxState::parse(Some(json!({
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {"type": "read"},
+                "network": false,
+                "workspace_roots": ["/one", "/two"]
+            },
+            "sandboxCwd": "/one"
+        }))),
+        Err(SandboxStateError::UnsupportedProfile)
+    );
     let managed = HostSandboxState::parse(Some(json!({
         "permissionProfile": {"type": "managed", "file_system": {"type": "read"}, "network": false},
         "codexLinuxSandboxExe": null,

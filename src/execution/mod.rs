@@ -109,7 +109,8 @@ impl HostSandboxState {
         let class = match profile_type {
             "managed"
                 if permission_profile.contains_key("file_system")
-                    && permission_profile.contains_key("network") =>
+                    && permission_profile.contains_key("network")
+                    && !has_multiple_roots(permission_profile) =>
             {
                 ProfileClass::Managed
             }
@@ -1099,4 +1100,12 @@ fn normalize_shape(value: &Value) -> Value {
         Value::Bool(_) => Value::String("<bool>".into()),
         Value::Null => Value::Null,
     }
+}
+
+/// Detects unsupported multi-root profile fields without resolving or expanding any root path.
+fn has_multiple_roots(value: &serde_json::Map<String, Value>) -> bool {
+    value.iter().any(|(key, value)| {
+        (key == "roots" || key.ends_with("_roots"))
+            && value.as_array().is_some_and(|roots| roots.len() > 1)
+    })
 }
