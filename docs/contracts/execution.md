@@ -1,10 +1,16 @@
 # Governed execution and process evidence
 
-Revision: r2. Provider: Execution. Consumers: Intelligence, Changes, Application; Assistance receives job facts through domain results. Workspace supplies authority; Application supplies validated config/store. Vocabulary: [common](common.md).
+Revision: r3. Provider: Execution. Consumers: Intelligence, Changes, Application; Assistance receives job facts through domain results. Workspace supplies authority; Application supplies validated config/store. Vocabulary: [common](common.md).
+
+## Host-state and spawn gate
+
+Execution accepts a physical-effect request only with a peer-validated host binding, Workspace authority epoch, controlled command, and an immutable local policy. Assistance creates the host-binding token only after its real D01 proof; an absent or heuristic binding is `unavailable`, never a candidate for admission. Workspace constructs and validates raw Git argv. Intelligence chooses provider topology and a declared profile. Neither model text nor an MCP field supplies an executable, argv, cwd, environment, or profile to Execution directly.
+
+The only accepted managed macOS/Linux replay input is the complete opaque JSON value from `_meta["codex/sandbox-state-meta"]`, and only when server initialization advertised the same experimental capability. Execution validates its envelope and invokes `codex sandbox --sandbox-state-json <one JSON argv value> -- <controlled child argv>` without shell interpolation. It preserves `sandboxCwd` and special-path semantics as supplied; it does not expand project roots or add `--sandbox-state-readable-root`. `external`, proxy, multi-root, missing, malformed, or unknown states are unavailable. Application may authorize a managed physical effect only with an accepted D03 profile record bound to the digest of that complete state. `disabled` is executable only after the host explicitly supplied that type, Application recorded that host case, and local policy explicitly accepts the no-outer-sandbox case.
 
 ## Requests and responses
 
-`ExecutionIntent` contains operation/request ID, current caller scope or backend lease authorization, class (interactive/heavy/backend-start/view-warmup), typed resource demand, executable/argv/cwd/environment from a validated profile, output policy and deadline. No shell string is synthesized from model/server text. Intelligence owns compatibility and logical leases; Execution never infers LSP compatibility.
+`ExecutionIntent` contains operation/request ID, the validated host-binding token, current Workspace authority/epoch or backend lease authorization, class (interactive/heavy/backend-start/view-warmup), typed resource demand, executable/argv/cwd/environment from a validated profile, output policy and deadline. No shell string is synthesized from model/server text. Intelligence owns compatibility and logical leases; Execution never infers LSP compatibility.
 
 `submit` returns admitted handle, queued ticket or typed refusal. Reservations are acquired before owned process launch or admitted work begins. Tickets support inspect/cancel; request cancellation is distinct from termination. Completed execution returns exit code/signal, spawn/timeout/cancel reason, bounded stdout/stderr references plus truncation, actual timing and process/resource evidence. Changes interprets check coverage; Execution does not declare tests passed.
 

@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "async-lsp",
  "blake3",
+ "libc",
  "rmcp",
  "serde",
  "serde_json",
