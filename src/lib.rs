@@ -11,3 +11,6 @@ pub mod execution;
 
 /// Owns worktree identity, authority lifecycles, raw Git evidence, and source observations.
 pub mod workspace;
+
+/// Provides bounded internal LSP wire safety primitives for later semantic views.
+pub mod intelligence;
