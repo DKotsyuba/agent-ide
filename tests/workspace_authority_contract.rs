@@ -47,7 +47,7 @@ fn worktree(name: &str, incarnation: u64) -> WorktreeRef {
     WorktreeRef::from_discovery(
         PathBuf::from(format!("/private/tmp/{name}")),
         PathBuf::from(format!("/private/tmp/{name}")),
-        PathBuf::from(format!("/private/tmp/{name}/.git")),
+        PathBuf::from(".git"),
         incarnation,
     )
     .expect("test paths are canonical")

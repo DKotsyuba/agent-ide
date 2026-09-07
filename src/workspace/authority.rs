@@ -22,16 +22,18 @@ pub struct WorktreeRef {
     worktree_path: PathBuf,
     /// Raw Unix path of the repository root observed by Git discovery.
     repository_root: PathBuf,
-    /// Raw Unix path of Git's shared common directory.
+    /// Raw Git common-directory value, which may be relative to the discovered worktree root.
     git_common_dir: PathBuf,
 }
 
 impl WorktreeRef {
     /// Builds an immutable worktree reference from separately discovered Git identity paths.
     ///
-    /// Each path must be lexically absolute without `.` or `..` components. The caller supplies
-    /// an incarnation after Workspace has classified lifecycle continuity; this constructor does
-    /// not inspect the filesystem, infer identity from HEAD, or normalize raw Unix path bytes.
+    /// Worktree and repository-root paths must be lexically absolute without `.` or `..`
+    /// components. Git may report a relative common directory such as `.git`, so that raw value
+    /// need only be nonempty and is retained unchanged beside the absolute worktree root. The
+    /// caller supplies an incarnation after Workspace has classified lifecycle continuity; this
+    /// constructor does not inspect the filesystem, infer identity from HEAD, or normalize bytes.
     pub fn from_discovery(
         worktree_path: PathBuf,
         repository_root: PathBuf,
@@ -41,7 +43,7 @@ impl WorktreeRef {
         if incarnation == 0
             || !is_normal_absolute(&worktree_path)
             || !is_normal_absolute(&repository_root)
-            || !is_normal_absolute(&git_common_dir)
+            || git_common_dir.as_os_str().is_empty()
         {
             return Err(AuthorityError::InvalidWorktreeIdentity);
         }
@@ -80,7 +82,7 @@ impl WorktreeRef {
         &self.repository_root
     }
 
-    /// Returns the exact raw Unix Git common directory supplied by Git discovery.
+    /// Returns the exact raw Git common-directory value supplied by Git discovery.
     pub fn git_common_dir(&self) -> &Path {
         &self.git_common_dir
     }
