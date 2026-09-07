@@ -1,10 +1,15 @@
 //! Private Unix daemon lifecycle and its health-only wire protocol.
 
+/// Immutable restart-only limits and their provenance for Application infrastructure.
+pub mod config;
+/// Dedicated SQLite owner-thread mechanics and durable operation receipts for domain SQL.
+pub mod store;
+
 use std::fmt::{self, Display};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,8 +24,6 @@ const LOCK_NAME: &str = "agent-ide.lock";
 const WIRE_VERSION: u8 = 1;
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 const MAX_REQUEST_ID_BYTES: usize = 128;
-const CONNECTION_DEADLINE: Duration = Duration::from_secs(2);
-const MAX_CONNECTIONS: usize = 16;
 
 /// Reports whether a daemon answered the side-effect-free health request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,8 +88,8 @@ impl RuntimeDir {
         match fs::symlink_metadata(root) {
             Ok(metadata) => validate_private_directory(root, &metadata)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir(root)?;
-                fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
+                let mut builder = fs::DirBuilder::new();
+                builder.mode(0o700).create(root)?;
                 validate_private_directory(root, &fs::symlink_metadata(root)?)?;
             }
             Err(error) => return Err(error.into()),
@@ -118,14 +121,15 @@ impl RuntimeDir {
 /// an exclusive nonblocking lock, creates one fresh daemon generation, and never starts Workspace,
 /// Execution, Intelligence, or Assistance work. It returns only for a setup or listener failure.
 pub async fn run_daemon(runtime_dir: RuntimeDir) -> Result<(), AppError> {
+    let ipc = config::EffectiveConfig::defaults().ipc();
     let _lock = DaemonLock::acquire(runtime_dir.lock_path())?;
     let socket_path = runtime_dir.socket_path();
-    retire_stale_socket(&socket_path).await?;
+    retire_stale_socket(&socket_path, ipc.connection_deadline).await?;
     let listener = UnixListener::bind(&socket_path)?;
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
     let _socket = OwnedSocket::new(socket_path)?;
     let generation = new_generation()?;
-    let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let permits = Arc::new(Semaphore::new(ipc.max_connections));
 
     loop {
         let (stream, _) = listener.accept().await?;
@@ -136,8 +140,11 @@ pub async fn run_daemon(runtime_dir: RuntimeDir) -> Result<(), AppError> {
         let generation = generation.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let _ = tokio::time::timeout(CONNECTION_DEADLINE, serve_connection(stream, generation))
-                .await;
+            let _ = tokio::time::timeout(
+                ipc.connection_deadline,
+                serve_connection(stream, generation),
+            )
+            .await;
         });
     }
 
@@ -150,15 +157,16 @@ pub async fn run_daemon(runtime_dir: RuntimeDir) -> Result<(), AppError> {
 
 /// Queries `runtime_dir` for a health reply without creating directories, locks, sockets, or a daemon.
 pub async fn doctor(runtime_dir: &Path) -> Result<DoctorStatus, AppError> {
+    let deadline = config::EffectiveConfig::defaults()
+        .ipc()
+        .connection_deadline;
     let socket_path = runtime_dir.join(SOCKET_NAME);
-    let stream =
-        match tokio::time::timeout(CONNECTION_DEADLINE, UnixStream::connect(socket_path)).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(_)) | Err(_) => return Ok(DoctorStatus::Unavailable),
-        };
+    let stream = match tokio::time::timeout(deadline, UnixStream::connect(socket_path)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(_)) | Err(_) => return Ok(DoctorStatus::Unavailable),
+    };
     let request = HealthRequest::new("doctor");
-    let response = match tokio::time::timeout(CONNECTION_DEADLINE, exchange(stream, &request)).await
-    {
+    let response = match tokio::time::timeout(deadline, exchange(stream, &request)).await {
         Ok(Ok(response)) => response,
         Ok(Err(_)) | Err(_) => return Ok(DoctorStatus::Unavailable),
     };
@@ -268,6 +276,7 @@ impl DaemonLock {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .mode(0o600)
             .open(path)?;
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -282,14 +291,14 @@ impl DaemonLock {
 }
 
 /// Removes an unreachable socket only after this daemon holds the exclusive lock.
-async fn retire_stale_socket(socket_path: &Path) -> Result<(), AppError> {
+async fn retire_stale_socket(socket_path: &Path, deadline: Duration) -> Result<(), AppError> {
     match fs::symlink_metadata(socket_path) {
         Ok(metadata) if metadata.file_type().is_socket() => {}
         Ok(_) => return Err(AppError::SocketStateUnknown),
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     }
-    match tokio::time::timeout(CONNECTION_DEADLINE, UnixStream::connect(socket_path)).await {
+    match tokio::time::timeout(deadline, UnixStream::connect(socket_path)).await {
         Ok(Err(error)) if error.raw_os_error() == Some(libc::ECONNREFUSED) => {
             fs::remove_file(socket_path)?;
             Ok(())

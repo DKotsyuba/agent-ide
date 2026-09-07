@@ -1,5 +1,11 @@
 # Local application infrastructure
 
+## Current implemented substrate
+
+The first implementation is intentionally narrow. It provides the private Unix health endpoint described in [the core IPC contract](core-ipc.md), immutable in-memory restart-only Application configuration, and a single-threaded bundled-SQLite store. The effective configuration presently covers only private IPC and store queue/busy/request/receipt limits; it records the origin of each final ceiling but does not parse a configuration file or provide live reload.
+
+The store creates only `application_operation_receipts`, an Application mechanics table. Each accepted opaque operation ID receives a durable receipt; a duplicate ID is refused without rerunning its SQL closure. Domain SQL receives an Application-owned transaction, and its typed result is returned only after the transaction and `committed` receipt commit atomically. A timeout or interrupted queued/started receipt is `outcome_unknown` until a domain owner reconciles it. Receipt capacity is a hard admission cap: the implementation never evicts an old operation ID. Domain schemas, migrations and transitions remain domain-owned.
+
 Revision: r2. Provider: Application. Consumers: Workspace, Execution, Intelligence, Changes, Assistance. Inputs are each domain's configuration/persistence/lifecycle requirements. Vocabulary: [common](common.md).
 
 ## Runtime and composition
