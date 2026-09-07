@@ -1,0 +1,9 @@
+# Assistance host binding
+
+`assistance::host_binding` accepts only metadata that a trusted MCP or hook ingress has already separated from model tool arguments. It parses Codex `_meta.threadId`, `_meta.callId`, and the required `x-codex-turn-metadata` object into a `CandidateInvocation`. A candidate is a transport observation, never a workspace authority grant.
+
+`HostBindingGuard` registers a candidate once, matches its `PreToolUse` and `PostToolUse` native hooks by exact actor and call ID, and returns `ValidatedInvocation` only after both match. Child events use `agent_id`; root events use `session_id`; `tool_use_id` must match `_meta.callId`. Missing, ambiguous, mismatched, repeated, oversized, or post-stop data is `Unavailable`. The guard retains bounded pending and completed identifiers and refuses new input when its fixed storage cap is exhausted rather than discarding replay evidence.
+
+The hook parser retains only phase, actor ID, and call ID. It never returns tool input, tool output, source, cwd, transcript paths, or other raw hook fields. Its failure is local and fail-open: it makes the Assistance claim unavailable but cannot block an ordinary native tool, host completion, or existing host permissions.
+
+This validation proves only that the supported host metadata and native hook lifecycle agreed for one invocation. It does not cryptographically attest the host transport, grant authority, or prove sandbox enforcement. Workspace must make its own admission decision from `ValidatedInvocation`; Execution separately decides whether an operator-provided sandbox profile is available and enforceable.
