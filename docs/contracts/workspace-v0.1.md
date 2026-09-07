@@ -1,6 +1,6 @@
 # Workspace v0.1 contract
 
-Revision: v0.1-r2 (proposed; direct consumer acceptance pending). Provider: Workspace. Direct consumers: Assistance, Execution, Application; Intelligence and Changes consume only the stated observations when their v0.1 slices arrive. Shared vocabulary: [common](common.md).
+Revision: v0.1-r3 (proposed; direct consumer acceptance pending). Provider: Workspace. Direct consumers: Assistance, Execution, Application; Intelligence and Changes consume only the stated observations when their v0.1 slices arrive. Shared vocabulary: [common](common.md).
 
 ## Ownership and boundary
 
@@ -16,13 +16,17 @@ Assistance supplies a fresh opaque `ActiveBindingUse` for a `BindingRef`, plus t
 
 Before authority exists, Workspace may ask Execution for the accepted read-only discovery edge. The request carries the active binding use, observed sandbox state, raw candidate Unix path, and a stable operation ID. Execution applies its D03/local `git_discovery` gate, preserves `sandboxCwd`, and runs only the fixed `git -C <candidate>` discovery queries. Discovery returns raw bounded evidence or `unavailable`; it cannot create an authority or profile permit.
 
-Workspace parses that evidence as raw bytes and derives identity from the discovered worktree path, repository root, and Git common directory. It then claims the worktree exclusively and grants authority. The durable claim uses an Application stable operation ID; `OutcomeUnknown` is reconciled by lookup and never blindly replayed.
+Workspace parses that evidence as raw bytes and derives identity from the discovered worktree path, repository root, and Git common directory. It then claims the worktree exclusively and grants authority. The durable claim uses an Application stable activation operation ID; retrying it resolves the same activation. `OutcomeUnknown` is reconciled by lookup and never blindly replayed.
 
 ## Offered values and behavior
 
 `WorktreeRef` contains an opaque worktree ID and incarnation plus the raw Unix worktree path, repository root, and Git common directory. A changed path, common directory, or identity evidence creates/requires reconciliation; HEAD alone never identifies a worktree.
 
-`WorkspaceAuthority` is opaque and bound to one `WorktreeRef`, active `BindingRef`, and authority epoch. It is granted only after the preceding sequence succeeds. Concurrent claims for one worktree admit one actor; an actor with another active worktree is refused. `stop` revokes only this authority and its leases. It never rolls back files, closes a worktree, or stops peers.
+`WorkspaceAuthority` is opaque and bound to one `WorktreeRef`, active `BindingRef`, and authority epoch. It is granted only after the preceding sequence succeeds. Concurrent claims for one worktree admit one actor; an actor with another active worktree is refused. A retried `stop` carries its expected authority: an old stop never revokes a newly activated generation.
+
+After Assistance validates `stop` while the binding is live, it calls `stop_binding(authority.binding_ref)` before or atomically with Workspace final revocation. Workspace finalization does not consume or reactivate that now-revoked binding. If the host-binding stop handoff is absent, Workspace records `revocation-incomplete` and refuses all later authority use. A later explicit `start` creates a fresh binding generation.
+
+Workspace sends one finite typed `AuthorityRevoked { worktree_ref, old_epoch, reason }` directly to Intelligence. `worktree_ref` includes its incarnation. Intelligence fences new view/query/diagnostic work, releases only that logical view, and returns a drain receipt; it asks Execution to reap only an owned unshared backend, never a surviving shared peer. This is a direct call/result, not an event bus. `stop` never rolls back files, closes a worktree, or stops peers.
 
 `SourceObservation` contains an opaque reference, `WorktreeRef`, monotonic source sequence, raw path, byte digest and length, source revision, and explicit coverage. A newer relevant sequence makes an older observation stale. A source revision is distinct from HEAD, index, session baseline, task BASE, and submitted COMMIT. Unknown or partial coverage is never reported as clean.
 
