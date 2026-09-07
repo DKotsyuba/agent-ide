@@ -1,6 +1,6 @@
 # Workspace v0.1 contract
 
-Revision: v0.1-r1 (proposed; direct consumer acceptance pending). Provider: Workspace. Direct consumers: Assistance, Execution, Application; Intelligence and Changes consume only the stated observations when their v0.1 slices arrive. Shared vocabulary: [common](common.md).
+Revision: v0.1-r2 (proposed; direct consumer acceptance pending). Provider: Workspace. Direct consumers: Assistance, Execution, Application; Intelligence and Changes consume only the stated observations when their v0.1 slices arrive. Shared vocabulary: [common](common.md).
 
 ## Ownership and boundary
 
@@ -32,7 +32,7 @@ Workspace parses that evidence as raw bytes and derives identity from the discov
 
 ## Persistence, lifecycle, and cache gate
 
-Workspace installs its first domain table through Application's accepted migration admission. It supplies stable domain/key and trusted SQL/digest, treats `AlreadyApplied`, `Incompatible`, `OutcomeUnknown`, and `BackupUnavailable` exactly as Application reports them, and never assigns migration versions or runs a second attempt after an unknown result.
+Workspace installs its first domain table through Application's accepted migration admission. It supplies stable domain/key and trusted SQL/digest, treats `AlreadyApplied`, `Incompatible`, `OutcomeUnknown`, and `BackupUnavailable` exactly as Application reports them, and never assigns migration versions or runs a second attempt after an unknown result. After `OutcomeUnknown`, it calls only `Store::migration_admission(domain, key)` to reconcile; that lookup never replays SQL.
 
 A temporary missing or moved path is not closure. Stop, reconnect, handoff, missing paths, and moves never request cache retirement. Workspace may publish a verified closure/reset fact to a later retention boundary, but does not retire any cache itself. Strict lifetime of opaque/native provider indexes at closure remains an owner decision; no weaker cache-retention claim is made here.
 
