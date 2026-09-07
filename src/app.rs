@@ -1,9 +1,11 @@
-//! Private Unix daemon lifecycle and its health-only wire protocol.
+//! Private Unix daemon lifecycle with health and finite Assistance wire transport.
 
 /// Immutable restart-only limits and their provenance for Application infrastructure.
 pub mod config;
 /// Dedicated SQLite owner-thread mechanics and durable operation receipts for domain SQL.
 pub mod store;
+/// Finite opaque Assistance hook and current-method transport values.
+pub mod transport;
 
 use std::fmt::{self, Display};
 use std::fs::{self, File, OpenOptions};
@@ -15,15 +17,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 
+use self::transport::{
+    AssistanceDispatch, AssistanceDispatchReply, AssistanceDispatcher, AssistanceMethod,
+    HookSubmit, HookSubmitTransportResult, HookTransportLimits, MethodDispatch,
+    MethodDispatchTransportResult, OpaqueJson,
+};
+
 const SOCKET_NAME: &str = "agent-ide.sock";
 const LOCK_NAME: &str = "agent-ide.lock";
 const WIRE_VERSION: u8 = 1;
-const MAX_FRAME_BYTES: usize = 64 * 1024;
 const MAX_REQUEST_ID_BYTES: usize = 128;
+const MAX_V1_FRAME_BYTES: usize = 64 * 1024;
+const MAX_V2_FRAME_BYTES: usize = 128 * 1024;
+const MAX_ASSISTANCE_JSON_BYTES: usize = 64 * 1024;
 
 /// Reports whether a daemon answered the side-effect-free health request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +133,36 @@ impl RuntimeDir {
 /// Execution, Intelligence, or Assistance work. It returns only for a setup or listener failure.
 pub async fn run_daemon(runtime_dir: RuntimeDir) -> Result<(), AppError> {
     let ipc = config::EffectiveConfig::defaults().ipc();
+    run_daemon_inner(runtime_dir, None, ipc, None).await
+}
+
+/// Starts a private daemon that additionally routes the two finite r2 Assistance transport methods.
+///
+/// `dispatcher` owns all attachment, host, rendering, and method semantics. Application only
+/// frames, limits, correlates, and times out `assistance.hook_submit` and the closed current-method
+/// dispatch set. Health remains available with its unchanged version-one contract.
+pub async fn run_daemon_with_assistance(
+    runtime_dir: RuntimeDir,
+    dispatcher: Arc<dyn AssistanceDispatcher>,
+    config: config::EffectiveConfig,
+) -> Result<(), AppError> {
+    let ipc = config.ipc();
+    let limits = HookTransportLimits::new(
+        MAX_V2_FRAME_BYTES,
+        MAX_ASSISTANCE_JSON_BYTES,
+        ipc.connection_deadline,
+    )
+    .expect("fixed r2 transport limits are valid");
+    run_daemon_inner(runtime_dir, Some(dispatcher), ipc, Some(limits)).await
+}
+
+/// Binds one daemon endpoint and forwards only the explicitly supplied finite Application transport.
+async fn run_daemon_inner(
+    runtime_dir: RuntimeDir,
+    dispatcher: Option<Arc<dyn AssistanceDispatcher>>,
+    ipc: config::IpcConfig,
+    transport_limits: Option<HookTransportLimits>,
+) -> Result<(), AppError> {
     let _lock = DaemonLock::acquire(runtime_dir.lock_path())?;
     let socket_path = runtime_dir.socket_path();
     retire_stale_socket(&socket_path, ipc.connection_deadline).await?;
@@ -138,11 +179,12 @@ pub async fn run_daemon(runtime_dir: RuntimeDir) -> Result<(), AppError> {
             continue;
         };
         let generation = generation.clone();
+        let dispatcher = dispatcher.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let _ = tokio::time::timeout(
                 ipc.connection_deadline,
-                serve_connection(stream, generation),
+                serve_connection(stream, generation, dispatcher, transport_limits),
             )
             .await;
         });
@@ -152,6 +194,92 @@ pub async fn run_daemon(runtime_dir: RuntimeDir) -> Result<(), AppError> {
     {
         drop((_socket, _lock));
         Ok(())
+    }
+}
+
+/// Connects to an already-running daemon for one hook submission without preparing or starting it.
+///
+/// Every connection, framing, deadline, or dispatcher fault becomes `Unavailable`. Callers must
+/// exit their host hook permissively and must not retry inline or use this result as actor proof.
+pub async fn submit_hook_if_running(
+    runtime_dir: &Path,
+    request: HookSubmit,
+    limits: HookTransportLimits,
+) -> HookSubmitTransportResult {
+    let socket_path = runtime_dir.join(SOCKET_NAME);
+    let mut stream =
+        match tokio::time::timeout(limits.deadline, UnixStream::connect(socket_path)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(_)) | Err(_) => return HookSubmitTransportResult::Unavailable,
+        };
+    let observation =
+        match serde_json::from_str::<Value>(request.sanitized_observation_json().as_str()) {
+            Ok(observation) => observation,
+            Err(_) => return HookSubmitTransportResult::Unavailable,
+        };
+    let wire = json!({
+        "version": 2,
+        "request_id": request.request_id(),
+        "correlation_id": request.correlation_id(),
+        "opaque_attachment": request.opaque_attachment(),
+        "method": "assistance.hook_submit",
+        "sanitized_observation_json": observation,
+    });
+    let result = async {
+        write_frame(&mut stream, &wire, limits.max_frame_bytes).await?;
+        let reply: Value = read_frame(&mut stream, limits.max_frame_bytes).await?;
+        parse_hook_submit_reply(&reply, &request, limits.max_observation_bytes)
+    };
+    match tokio::time::timeout(limits.deadline, result).await {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(_)) | Err(_) => HookSubmitTransportResult::Unavailable,
+    }
+}
+
+/// Connects to an already-running daemon for one closed current-method dispatch without starting it.
+///
+/// Transport faults return `Unavailable`; Application does not retry, render, or reinterpret the
+/// opaque result. Assistance decides whether that unavailable result must be shown to its caller.
+pub async fn dispatch_method_if_running(
+    runtime_dir: &Path,
+    request: MethodDispatch,
+    limits: HookTransportLimits,
+) -> MethodDispatchTransportResult {
+    let socket_path = runtime_dir.join(SOCKET_NAME);
+    let mut stream =
+        match tokio::time::timeout(limits.deadline, UnixStream::connect(socket_path)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(_)) | Err(_) => return MethodDispatchTransportResult::Unavailable,
+        };
+    let params = match serde_json::from_str::<Value>(request.params_json().as_str()) {
+        Ok(params) => params,
+        Err(_) => return MethodDispatchTransportResult::Unavailable,
+    };
+    let method = match request.method() {
+        AssistanceMethod::Start => "start",
+        AssistanceMethod::Context => "context",
+        AssistanceMethod::Diff => "diff",
+        AssistanceMethod::Inspect => "inspect",
+        AssistanceMethod::Stop => "stop",
+        AssistanceMethod::HookSubmit => return MethodDispatchTransportResult::Unavailable,
+    };
+    let wire = json!({
+        "version": 2,
+        "request_id": request.request_id(),
+        "correlation_id": request.correlation_id(),
+        "opaque_attachment": request.opaque_attachment(),
+        "method": "assistance.method_dispatch",
+        "dispatch_method": method,
+        "params_json": params,
+    });
+    let result = async {
+        write_frame(&mut stream, &wire, limits.max_frame_bytes).await?;
+        let reply: Value = read_frame(&mut stream, limits.max_frame_bytes).await?;
+        parse_method_dispatch_reply(&reply, &request)
+    };
+    match tokio::time::timeout(limits.deadline, result).await {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(_)) | Err(_) => MethodDispatchTransportResult::Unavailable,
     }
 }
 
@@ -181,12 +309,37 @@ pub async fn doctor(runtime_dir: &Path) -> Result<DoctorStatus, AppError> {
     })
 }
 
-/// Validates one accepted peer, one bounded health request, and its correlated response.
-async fn serve_connection(mut stream: UnixStream, generation: String) -> io::Result<()> {
+/// Validates one accepted peer and routes either unchanged health or one finite Assistance request.
+async fn serve_connection(
+    mut stream: UnixStream,
+    generation: String,
+    dispatcher: Option<Arc<dyn AssistanceDispatcher>>,
+    transport_limits: Option<HookTransportLimits>,
+) -> io::Result<()> {
     if peer_uid(stream.as_raw_fd())? != effective_uid() {
         return Ok(());
     }
-    let request: HealthRequest = read_frame(&mut stream).await?;
+    let request: Value = read_frame(&mut stream, MAX_V2_FRAME_BYTES).await?;
+    match request.get("version").and_then(Value::as_u64) {
+        Some(1) => serve_health(&mut stream, request, generation).await,
+        Some(2) => match (dispatcher, transport_limits) {
+            (Some(dispatcher), Some(limits)) => {
+                serve_assistance_request(&mut stream, request, dispatcher, limits).await
+            }
+            _ => Ok(()),
+        },
+        _ => Ok(()),
+    }
+}
+
+/// Validates the unchanged v1 health request and emits only its existing correlated health reply.
+async fn serve_health(
+    stream: &mut UnixStream,
+    request: Value,
+    generation: String,
+) -> io::Result<()> {
+    let request: HealthRequest = serde_json::from_value(request)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if request.version != WIRE_VERSION
         || request.request_id.is_empty()
         || request.request_id.len() > MAX_REQUEST_ID_BYTES
@@ -200,24 +353,227 @@ async fn serve_connection(mut stream: UnixStream, generation: String) -> io::Res
         status: "ok".to_owned(),
         daemon_generation: generation,
     };
-    write_frame(&mut stream, &response).await
+    write_frame(stream, &response, MAX_V1_FRAME_BYTES).await
 }
 
 /// Sends a health request over one connection and decodes its one response.
 async fn exchange(mut stream: UnixStream, request: &HealthRequest) -> io::Result<HealthResponse> {
-    write_frame(&mut stream, request).await?;
-    read_frame(&mut stream).await
+    write_frame(&mut stream, request, MAX_V1_FRAME_BYTES).await?;
+    read_frame(&mut stream, MAX_V1_FRAME_BYTES).await
+}
+
+/// Decodes and forwards exactly one finite v2 Assistance request without inspecting its semantics.
+async fn serve_assistance_request(
+    stream: &mut UnixStream,
+    request: Value,
+    dispatcher: Arc<dyn AssistanceDispatcher>,
+    limits: HookTransportLimits,
+) -> io::Result<()> {
+    let object = request
+        .as_object()
+        .ok_or_else(|| invalid_transport("v2 request is not an object"))?;
+    let method = required_string(object, "method")?;
+    match method {
+        "assistance.hook_submit" => {
+            require_exact_keys(
+                object,
+                &[
+                    "version",
+                    "request_id",
+                    "correlation_id",
+                    "opaque_attachment",
+                    "method",
+                    "sanitized_observation_json",
+                ],
+            )?;
+            let hook = HookSubmit::new(
+                required_string(object, "request_id")?,
+                required_string(object, "correlation_id")?,
+                required_string(object, "opaque_attachment")?,
+                OpaqueJson::from_value(
+                    required_value(object, "sanitized_observation_json")?,
+                    limits.max_observation_bytes,
+                )
+                .ok_or_else(|| invalid_transport("invalid hook observation"))?,
+            )
+            .ok_or_else(|| invalid_transport("invalid hook correlation"))?;
+            let reply = tokio::time::timeout(
+                limits.deadline,
+                dispatcher.dispatch(AssistanceDispatch::HookSubmit(hook.clone())),
+            )
+            .await;
+            let value = match reply {
+                Ok(Ok(AssistanceDispatchReply::HookSubmit(payload)))
+                    if payload.as_str().len() <= MAX_ASSISTANCE_JSON_BYTES =>
+                {
+                    json!({
+                        "version": 2,
+                        "request_id": hook.request_id(),
+                        "correlation_id": hook.correlation_id(),
+                        "opaque_reply_json": serde_json::from_str::<Value>(payload.as_str())
+                            .map_err(|error| invalid_transport(error.to_string()))?,
+                    })
+                }
+                Ok(Ok(_)) | Ok(Err(_)) | Err(_) => json!({
+                    "version": 2,
+                    "request_id": hook.request_id(),
+                    "correlation_id": hook.correlation_id(),
+                    "status": "unavailable",
+                }),
+            };
+            write_frame(stream, &value, limits.max_frame_bytes).await
+        }
+        "assistance.method_dispatch" => {
+            require_exact_keys(
+                object,
+                &[
+                    "version",
+                    "request_id",
+                    "correlation_id",
+                    "opaque_attachment",
+                    "method",
+                    "dispatch_method",
+                    "params_json",
+                ],
+            )?;
+            let dispatch_method =
+                AssistanceMethod::from_dispatch_tag(required_string(object, "dispatch_method")?)
+                    .ok_or_else(|| invalid_transport("unsupported assistance method"))?;
+            let dispatch = MethodDispatch::new(
+                required_string(object, "request_id")?,
+                required_string(object, "correlation_id")?,
+                required_string(object, "opaque_attachment")?,
+                dispatch_method,
+                OpaqueJson::from_value(
+                    required_value(object, "params_json")?,
+                    MAX_ASSISTANCE_JSON_BYTES,
+                )
+                .ok_or_else(|| invalid_transport("invalid method parameters"))?,
+            )
+            .ok_or_else(|| invalid_transport("invalid method correlation"))?;
+            let reply = tokio::time::timeout(
+                limits.deadline,
+                dispatcher.dispatch(AssistanceDispatch::MethodDispatch(dispatch.clone())),
+            )
+            .await;
+            let value = match reply {
+                Ok(Ok(AssistanceDispatchReply::MethodDispatch(payload)))
+                    if payload.as_str().len() <= MAX_ASSISTANCE_JSON_BYTES =>
+                {
+                    json!({
+                        "version": 2,
+                        "request_id": dispatch.request_id(),
+                        "opaque_result_json": serde_json::from_str::<Value>(payload.as_str())
+                            .map_err(|error| invalid_transport(error.to_string()))?,
+                    })
+                }
+                Ok(Ok(_)) | Ok(Err(_)) | Err(_) => json!({
+                    "version": 2,
+                    "request_id": dispatch.request_id(),
+                    "status": "unavailable",
+                }),
+            };
+            write_frame(stream, &value, limits.max_frame_bytes).await
+        }
+        _ => Err(invalid_transport("unsupported v2 transport method")),
+    }
+}
+
+/// Parses one hook reply and maps all bounded unavailable or overflow states to fail-open transport.
+fn parse_hook_submit_reply(
+    reply: &Value,
+    request: &HookSubmit,
+    max_json_bytes: usize,
+) -> io::Result<HookSubmitTransportResult> {
+    let object = reply
+        .as_object()
+        .ok_or_else(|| invalid_transport("hook reply is not an object"))?;
+    if object.get("version").and_then(Value::as_u64) != Some(2)
+        || object.get("request_id").and_then(Value::as_str) != Some(request.request_id())
+        || object.get("correlation_id").and_then(Value::as_str) != Some(request.correlation_id())
+    {
+        return Err(invalid_transport("hook reply correlation mismatch"));
+    }
+    let Some(payload) = object.get("opaque_reply_json") else {
+        return Ok(HookSubmitTransportResult::Unavailable);
+    };
+    let payload = OpaqueJson::from_value(payload, max_json_bytes)
+        .ok_or_else(|| invalid_transport("invalid hook reply payload"))?;
+    Ok(HookSubmitTransportResult::Dispatched {
+        correlation_id: request.correlation_id().to_owned(),
+        opaque_reply_json: payload,
+    })
+}
+
+/// Parses one closed method reply and maps transport unavailable or overflow states without semantics.
+fn parse_method_dispatch_reply(
+    reply: &Value,
+    request: &MethodDispatch,
+) -> io::Result<MethodDispatchTransportResult> {
+    let object = reply
+        .as_object()
+        .ok_or_else(|| invalid_transport("method reply is not an object"))?;
+    if object.get("version").and_then(Value::as_u64) != Some(2)
+        || object.get("request_id").and_then(Value::as_str) != Some(request.request_id())
+    {
+        return Err(invalid_transport("method reply correlation mismatch"));
+    }
+    let Some(payload) = object.get("opaque_result_json") else {
+        return Ok(MethodDispatchTransportResult::Unavailable);
+    };
+    let payload = OpaqueJson::from_value(payload, MAX_ASSISTANCE_JSON_BYTES)
+        .ok_or_else(|| invalid_transport("invalid method reply payload"))?;
+    Ok(MethodDispatchTransportResult::Dispatched {
+        opaque_result_json: payload,
+    })
+}
+
+/// Requires an exact string field from one finite v2 transport object.
+fn required_string<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    name: &str,
+) -> io::Result<&'a str> {
+    required_value(object, name)?
+        .as_str()
+        .ok_or_else(|| invalid_transport("required transport field is not a string"))
+}
+
+/// Requires one present field from one finite v2 transport object.
+fn required_value<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    name: &str,
+) -> io::Result<&'a Value> {
+    object
+        .get(name)
+        .ok_or_else(|| invalid_transport("required transport field is missing"))
+}
+
+/// Rejects unknown or omitted fields before Application forwards a v2 request to Assistance.
+fn require_exact_keys(
+    object: &serde_json::Map<String, Value>,
+    expected: &[&str],
+) -> io::Result<()> {
+    if object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key)) {
+        Ok(())
+    } else {
+        Err(invalid_transport("unknown or missing transport field"))
+    }
+}
+
+/// Creates one bounded invalid-data error for a rejected private transport frame.
+fn invalid_transport(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
 /// Reads one length-prefixed JSON value without allocating for an unchecked frame length.
-async fn read_frame<T>(stream: &mut UnixStream) -> io::Result<T>
+async fn read_frame<T>(stream: &mut UnixStream, max_frame_bytes: usize) -> io::Result<T>
 where
     T: for<'de> Deserialize<'de>,
 {
     let mut length = [0_u8; 4];
     stream.read_exact(&mut length).await?;
     let length = u32::from_be_bytes(length) as usize;
-    if length > MAX_FRAME_BYTES {
+    if length > max_frame_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "oversized IPC frame",
@@ -230,13 +586,17 @@ where
 }
 
 /// Serializes one JSON value as the fixed bounded length-prefixed IPC frame.
-async fn write_frame<T>(stream: &mut UnixStream, value: &T) -> io::Result<()>
+async fn write_frame<T>(
+    stream: &mut UnixStream,
+    value: &T,
+    max_frame_bytes: usize,
+) -> io::Result<()>
 where
     T: Serialize,
 {
     let bytes = serde_json::to_vec(value)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if bytes.len() > MAX_FRAME_BYTES {
+    if bytes.len() > max_frame_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "oversized IPC frame",

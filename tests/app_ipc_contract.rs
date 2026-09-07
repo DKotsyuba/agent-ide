@@ -1,18 +1,64 @@
 //! Contract checks for the Application layer's real private Unix IPC boundary.
 
 use std::fs;
+use std::future::Future;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use agent_ide::app::config::EffectiveConfig;
+use agent_ide::app::transport::{
+    AssistanceDispatch, AssistanceDispatchReply, AssistanceDispatchUnavailable,
+    AssistanceDispatcher, HookSubmit, HookSubmitTransportResult, HookTransportLimits,
+    MethodDispatch, MethodDispatchTransportResult, OpaqueJson,
+};
+use agent_ide::app::{
+    RuntimeDir, dispatch_method_if_running, run_daemon_with_assistance, submit_hook_if_running,
+};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{Child, Command};
 
 static TEST_ID: AtomicUsize = AtomicUsize::new(0);
+
+/// Returns the fixed finite limits used by all real v2 transport contract scenarios.
+fn transport_limits() -> HookTransportLimits {
+    HookTransportLimits::new(128 * 1024, 64 * 1024, Duration::from_secs(1)).unwrap()
+}
+
+/// Supplies opaque deterministic Assistance results without interpreting host identity or tool semantics.
+struct TestDispatcher;
+
+impl AssistanceDispatcher for TestDispatcher {
+    /// Returns a distinct opaque reply for each of the two closed Application dispatch shapes.
+    fn dispatch(
+        &self,
+        request: AssistanceDispatch,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<Output = Result<AssistanceDispatchReply, AssistanceDispatchUnavailable>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            match request {
+                AssistanceDispatch::HookSubmit(_) => Ok(AssistanceDispatchReply::HookSubmit(
+                    OpaqueJson::new("{\"hook\":true}", 64 * 1024).unwrap(),
+                )),
+                AssistanceDispatch::MethodDispatch(_) => {
+                    Ok(AssistanceDispatchReply::MethodDispatch(
+                        OpaqueJson::new("{\"method\":true}", 64 * 1024).unwrap(),
+                    ))
+                }
+            }
+        })
+    }
+}
 
 /// Creates a unique private directory below the platform temporary directory for one daemon process.
 fn runtime_dir() -> PathBuf {
@@ -44,6 +90,35 @@ async fn start_daemon(runtime_dir: &Path) -> Child {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("daemon did not bind its private socket");
+}
+
+/// Starts the in-process finite Assistance daemon and waits until its Unix endpoint accepts a peer.
+async fn start_assistance_daemon(runtime_dir: &Path) -> tokio::task::JoinHandle<()> {
+    let daemon_runtime = RuntimeDir::prepare_for_daemon(runtime_dir).unwrap();
+    let task = tokio::spawn(async move {
+        run_daemon_with_assistance(
+            daemon_runtime,
+            Arc::new(TestDispatcher),
+            EffectiveConfig::defaults(),
+        )
+        .await
+        .unwrap();
+    });
+    let socket = runtime_dir.join("agent-ide.sock");
+    for _ in 0..40 {
+        if UnixStream::connect(&socket).await.is_ok() {
+            return task;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("Assistance daemon did not bind its private socket");
+}
+
+/// Stops the test-only in-process daemon and removes its disposable private runtime directory.
+async fn stop_assistance_daemon(task: tokio::task::JoinHandle<()>, runtime_dir: PathBuf) {
+    task.abort();
+    let _ = task.await;
+    fs::remove_dir_all(runtime_dir).unwrap();
 }
 
 /// Stops a disposable daemon process and removes its whole test-owned runtime directory.
@@ -173,4 +248,83 @@ async fn doctor_does_not_autostart_or_create_runtime_directory() {
         "unavailable"
     );
     assert!(!runtime_dir.exists());
+}
+
+/// Proves hook ingress and the closed five-method dispatch stay finite, correlated, and unavailable when inactive.
+#[tokio::test]
+async fn assistance_transport_is_finite_and_hook_submission_never_autostarts() {
+    let missing = std::env::temp_dir().join(format!(
+        "agent-ide-hook-missing-{}-{}",
+        std::process::id(),
+        TEST_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let inactive = submit_hook_if_running(
+        &missing,
+        HookSubmit::new(
+            "request",
+            "correlation",
+            "attachment",
+            OpaqueJson::new("{\"phase\":\"post\"}", 64 * 1024).unwrap(),
+        )
+        .unwrap(),
+        transport_limits(),
+    )
+    .await;
+    assert_eq!(inactive, HookSubmitTransportResult::Unavailable);
+    assert!(!missing.exists());
+
+    let runtime_dir = runtime_dir();
+    let task = start_assistance_daemon(&runtime_dir).await;
+    let hook = submit_hook_if_running(
+        &runtime_dir,
+        HookSubmit::new(
+            "request",
+            "correlation",
+            "attachment",
+            OpaqueJson::new("{\"phase\":\"post\",\"actor_id\":\"a\"}", 64 * 1024).unwrap(),
+        )
+        .unwrap(),
+        transport_limits(),
+    )
+    .await;
+    assert!(matches!(hook, HookSubmitTransportResult::Dispatched { .. }));
+
+    let method = dispatch_method_if_running(
+        &runtime_dir,
+        MethodDispatch::new(
+            "method-request",
+            "method-correlation",
+            "attachment",
+            agent_ide::app::transport::AssistanceMethod::Context,
+            OpaqueJson::new("{\"path\":\"main.rs\"}", 64 * 1024).unwrap(),
+        )
+        .unwrap(),
+        transport_limits(),
+    )
+    .await;
+    assert!(matches!(
+        method,
+        MethodDispatchTransportResult::Dispatched { .. }
+    ));
+    let mut unknown = UnixStream::connect(runtime_dir.join("agent-ide.sock"))
+        .await
+        .unwrap();
+    let unknown_body = serde_json::to_vec(&json!({
+        "version": 2,
+        "request_id": "unknown-request",
+        "correlation_id": "unknown-correlation",
+        "opaque_attachment": "attachment",
+        "method": "assistance.method_dispatch",
+        "dispatch_method": "finish",
+        "params_json": {},
+    }))
+    .unwrap();
+    unknown
+        .write_all(&(unknown_body.len() as u32).to_be_bytes())
+        .await
+        .unwrap();
+    unknown.write_all(&unknown_body).await.unwrap();
+    let mut reply = [0_u8; 1];
+    assert_eq!(unknown.read(&mut reply).await.unwrap(), 0);
+    stop_assistance_daemon(task, runtime_dir).await;
 }
