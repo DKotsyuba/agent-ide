@@ -1,5 +1,7 @@
 # Host metadata probe
 
+Implementation status: incomplete. The current example compiles, but MCP metadata capture, strict log bounds, privacy projection and executable checks are not yet accepted.
+
 This test instrument is not the Agent IDE product API or a supported release. It establishes which non-secret metadata a real host supplies to MCP requests and hook events before the application relies on actor identity or execution authority.
 
 The `host_probe` example has two modes: `mcp` serves the single diagnostic tool `probe_observe` over local stdio using the official `rmcp` SDK; `hook` reads one bounded JSON input from stdin and exits successfully without model-facing output. The diagnostic tool accepts no identity/authority arguments and returns `binding_unproven`. It does not expose placeholder `ide.*` tools, create activation, touch repository source, start a daemon/provider, or schedule other processes.

@@ -6,3 +6,10 @@ publish = false
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+blake3 = "1"
+rmcp = { version = "3.2.0", features = ["server", "macros", "transport-io"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
