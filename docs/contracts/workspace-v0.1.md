@@ -1,12 +1,12 @@
 # Workspace v0.1 contract
 
-Revision: v0.1-r3 (proposed; direct consumer acceptance pending). Provider: Workspace. Direct consumers: Assistance, Execution, Application; Intelligence and Changes consume only the stated observations when their v0.1 slices arrive. Shared vocabulary: [common](common.md).
+Revision: v0.1-r4 (proposed; direct consumer acceptance pending). Provider: Workspace. Direct consumers: Assistance, Execution, Application, and Changes; Intelligence consumes only the stated observations when its v0.1 slice arrives. Shared vocabulary: [common](common.md).
 
 ## Ownership and boundary
 
 Workspace owns Git/worktree identity and incarnation, authority grants and revocation after host verification, source observations and session baselines, worktree ownership/lifecycle, and raw Git intent/parsing. Its Git adapter belongs under `workspace/git`.
 
-Workspace does not prove host identity, spawn a process, own SQLite mechanics or migrations, provide LSP semantics, enrich a diff, run checks, write source, keep an edit journal, interpret a WorkBundle, or compile task context. Assistance owns host proof and the five MCP schemas; Execution owns physical Git execution; Application owns transaction and migration mechanics; Intelligence owns semantic lookup; Changes owns later composition and enrichment.
+Workspace does not prove host identity, spawn a process, own SQLite mechanics or migrations, provide LSP semantics, semantically enrich a diff, run checks, write source, keep an edit journal, interpret a WorkBundle, or compile task context. Assistance owns host proof and the five MCP schemas; Execution owns physical Git execution; Application owns transaction and migration mechanics; Intelligence owns semantic lookup; Changes owns v0.1 bounded diff composition, with ChangeSet persistence and semantic enrichment beginning in v0.2.
 
 The only v0.1 logical tools are `start`, `context`, `diff`, `inspect`, and `stop`. No future tool is registered as a placeholder.
 
@@ -30,9 +30,11 @@ Workspace sends one finite typed `AuthorityRevoked { worktree_ref, old_epoch, re
 
 `SourceObservation` contains an opaque reference, `WorktreeRef`, monotonic source sequence, raw path, byte digest and length, source revision, and explicit coverage. A newer relevant sequence makes an older observation stale. A source revision is distinct from HEAD, index, session baseline, task BASE, and submitted COMMIT. Unknown or partial coverage is never reported as clean.
 
-`RawGitEvidence` contains an operation reference, `WorktreeRef`, fixed command kind, bounded raw stdout/stderr, exit status, truncation/timing, and observation coverage. Workspace parses NUL-delimited Git data and terminal-LF discovery paths without UTF-8 assumptions. It keeps Git HEAD/index/baseline facts separate from source bytes. Changes may later consume this evidence; it cannot create semantic meaning or bypass Workspace ownership in v0.1.
+For a `head`, `staged`, or `unstaged` request, Workspace validates authority, worktree incarnation and epoch, and supplies Changes exact left/right Git identities, bounded raw comparison evidence, NUL-safe paths/status/conflicts, separately listed untracked files, and baseline completeness/provenance only as context. A baseline never substitutes for any of those three comparison modes. Workspace parses NUL-delimited Git data and terminal-LF discovery paths without UTF-8 assumptions and keeps Git HEAD/index/baseline facts separate from source bytes. Changes composes the bounded logical diff result; Assistance renders it.
 
-`context`, `diff`, and `inspect` return the applicable bounded exact observation/evidence only when it is current and ownership-scoped; otherwise they return `unavailable`, `incomplete`, or `failed` with scope, freshness, coverage, provenance, and a bounded detail reference. `ready` means the requested evidence is available, never that a product, check, or criterion is verified.
+`RawGitEvidence` contains an operation reference, `WorktreeRef`, fixed command kind, raw bounded stdout/stderr, exit status, truncation/timing, and observation coverage. An owner-scoped bounded expansion takes its `OperationRef` and hunk cursor; invalidated evidence is `unavailable` or `stale`, and neither Workspace nor Changes reconstructs omitted patches.
+
+Workspace contributes current, ownership-scoped bounded observations/evidence and detail expansion to `context`, `diff`, and `inspect`; Changes produces the logical `diff` result and Assistance renders every public tool response. Invalid evidence returns `unavailable`, `incomplete`, or `failed` with scope, freshness, coverage, provenance, and a bounded detail reference. `ready` means requested evidence is available, never that a product, check, or criterion is verified.
 
 ## Persistence, lifecycle, and cache gate
 
