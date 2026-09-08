@@ -295,11 +295,10 @@ fn snapshot_intents_own_private_file_cleanup() {
     );
 }
 
-/// Failed, signalled, truncated and undrained processes cannot mint patch evidence; exit one can.
+/// Fixture output cannot mint actual-wait identity or release files, even with an apparent success exit.
 #[tokio::test]
 async fn incomplete_execution_never_becomes_snapshot_evidence() {
-    use agent_ide::workspace::git::snapshot::SnapshotRunner;
-    use std::{os::unix::process::ExitStatusExt, process::ExitStatus};
+    use agent_ide::{execution::CapturedProcessEvidence, workspace::git::snapshot::SnapshotRunner};
     let fixture = GitFixture::new();
     let scope = agent_ide::workspace::git::GitScope::from_authority(
         &authority_for(&fixture),
@@ -309,33 +308,21 @@ async fn incomplete_execution_never_becomes_snapshot_evidence() {
         SnapshotIntent::compare(scope, std::path::Path::new(GIT), b"old\n", b"new\n").unwrap();
     let dir = intent.snapshot_directory().unwrap().to_owned();
     let result = Runner::default().run(intent.clone()).await.unwrap();
-    assert_eq!(result.status.code(), Some(1));
-    assert!(intent.accept(result.clone()).is_ok());
-    let mut rejected = Vec::new();
-    let mut output = result.clone();
-    output.status = ExitStatus::from_raw(2 << 8);
-    rejected.push(output);
-    let mut output = result.clone();
-    output.status = ExitStatus::from_raw(9);
-    rejected.push(output);
-    let mut output = result.clone();
-    output.stdout.complete = false;
-    rejected.push(output);
-    let mut output = result.clone();
-    output.stderr.complete = false;
-    rejected.push(output);
-    let mut output = result.clone();
-    output.stdout.truncated = true;
-    rejected.push(output);
-    let mut output = result.clone();
-    output.stderr.truncated = true;
-    rejected.push(output);
-    let mut output = result;
-    output.stdout.bytes = vec![0; MAX_SNAPSHOT_BLOB_BYTES + 1];
-    rejected.push(output);
-    for output in rejected {
-        assert_eq!(intent.accept(output), Err(GitError::IncompleteIdentity));
-    }
+    assert_eq!(result.status().code(), Some(1));
+    let fixture_only = CapturedProcessEvidence::new(
+        result.status(),
+        result.cancellation(),
+        result.stdout().clone(),
+        result.stderr().clone(),
+        result.descendants(),
+    )
+    .unwrap();
+    assert!(fixture_only.reap_identity().is_none());
+    assert_eq!(
+        intent.accept(fixture_only),
+        Err(GitError::IncompleteIdentity)
+    );
+    assert!(intent.accept(result).is_ok());
     drop(intent);
     assert!(!dir.exists());
 }
@@ -506,24 +493,31 @@ async fn source_digest_revision_and_sequence_are_correlated() {
 /// A Git binary lacking mandatory no-lazy-fetch is explicit unsupported, never a weaker fallback.
 #[tokio::test]
 async fn unsupported_git_and_missing_promisor_blob_fail_without_helpers() {
-    use agent_ide::{execution::CapturedOutput, workspace::git::snapshot::SnapshotRunner};
-    use std::{os::unix::process::ExitStatusExt, process::ExitStatus};
     let fixture = GitFixture::new();
     let scope = agent_ide::workspace::git::GitScope::from_authority(
         &authority_for(&fixture),
         DiffMode::Head,
     );
-    let intent =
-        SnapshotIntent::compare(scope, std::path::Path::new(GIT), b"old\n", b"new\n").unwrap();
-    let mut output = Runner::default().run(intent.clone()).await.unwrap();
-    output.status = ExitStatus::from_raw(129 << 8);
-    output.stderr = CapturedOutput {
-        bytes: b"unknown option: --no-lazy-fetch\n".to_vec(),
-        truncated: false,
-        complete: true,
-        drained_bytes: 30,
-    };
-    assert_eq!(intent.accept(output), Err(GitError::UnsupportedSnapshotGit));
+    let wrapper = support::git_wrapper(
+        &fixture,
+        "unsupported-git",
+        "printf '%s\\n' 'unknown option: --no-lazy-fetch' >&2\nexit 129",
+    );
+    let intent = SnapshotIntent::compare(scope, &wrapper, b"old\n", b"new\n").unwrap();
+    let (child, mut admissions) =
+        support::launch_intent(&intent, &wrapper, MAX_SNAPSHOT_BLOB_BYTES).unwrap();
+    let completed = child
+        .reap(
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+    admissions.release_reaped(completed.settlement).unwrap();
+    assert_eq!(
+        intent.accept(completed.evidence),
+        Err(GitError::UnsupportedSnapshotGit)
+    );
     fixture.install_malicious_helpers();
     fixture.git(["config", "remote.origin.promisor", "true"]);
     fixture.git(["config", "protocol.ext.allow", "always"]);
@@ -571,6 +565,21 @@ async fn source_modes_use_git_owner_execute_semantics() {
         .await
         .unwrap();
     assert!(snapshot.paths().is_empty());
+    assert!(
+        fixture
+            .git([
+                "-c",
+                "core.fsmonitor=false",
+                "status",
+                "--porcelain=v2",
+                "-z",
+                "--untracked-files=no"
+            ])
+            .stdout
+            .is_empty(),
+        "Apple Git also treats group-only execute as 100644"
+    );
+
     fs::set_permissions(
         fixture.root.join("unstaged.txt"),
         fs::Permissions::from_mode(0o744),
@@ -761,5 +770,142 @@ async fn untracked_symlink_and_special_entries_are_explicitly_unsupported() {
             agent_ide::workspace::observation::SourceReadLimits::new(4096, 1024).unwrap()
         ),
         Err(agent_ide::workspace::observation::ObservationError::NotRegularFile)
+    );
+}
+
+/// Dropping a borrowed wait preserves ownership; a reaper handoff retains scratch until actual wait.
+#[tokio::test]
+async fn cancellation_handoff_keeps_private_files_until_matching_reap() {
+    use std::time::Duration;
+    let fixture = GitFixture::new();
+    let wrapper = support::git_wrapper(&fixture, "slow-git", "exec /bin/sleep 5");
+    let scope = agent_ide::workspace::git::GitScope::from_authority(
+        &authority_for(&fixture),
+        DiffMode::Head,
+    );
+    let intent = SnapshotIntent::compare(scope, &wrapper, b"old\n", b"new\n").unwrap();
+    let directory = intent.snapshot_directory().unwrap().to_owned();
+    let (mut child, mut admissions) = support::launch_intent(&intent, &wrapper, 4096).unwrap();
+    assert!(
+        child.take_process_identity().is_none(),
+        "launch token was transferred exactly once"
+    );
+    assert!(
+        intent.command().is_err(),
+        "private argv cannot be exported twice"
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(10),
+            child.wait(Duration::from_secs(2))
+        )
+        .await
+        .is_err()
+    );
+    assert!(directory.exists());
+    let (release, transferred) = tokio::sync::oneshot::channel();
+    let reaper = tokio::spawn(async move {
+        transferred.await.unwrap();
+        child
+            .cancel_bounded(Duration::from_millis(10), Duration::from_secs(2))
+            .await
+            .unwrap();
+        let completed = child
+            .reap(Duration::from_secs(2), Duration::from_secs(2))
+            .await
+            .unwrap();
+        intent.acknowledge_reap(&completed.evidence).unwrap();
+        admissions.release_reaped(completed.settlement).unwrap();
+        drop(intent);
+    });
+    assert!(
+        directory.exists(),
+        "handoff owns the guard before cancellation completes"
+    );
+    release.send(()).unwrap();
+    reaper.await.unwrap();
+    assert!(!directory.exists());
+}
+
+/// Actual wait evidence for another launch cannot release this still-running child's private files.
+#[tokio::test]
+async fn foreign_reap_identity_cannot_release_scratch() {
+    use agent_ide::workspace::git::snapshot::SnapshotRunner;
+    use std::time::Duration;
+    let fixture = GitFixture::new();
+    let wrapper = support::git_wrapper(&fixture, "other-slow-git", "exec /bin/sleep 5");
+    let scope = agent_ide::workspace::git::GitScope::from_authority(
+        &authority_for(&fixture),
+        DiffMode::Head,
+    );
+    let intent = SnapshotIntent::compare(scope.clone(), &wrapper, b"a\n", b"b\n").unwrap();
+    let directory = intent.snapshot_directory().unwrap().to_owned();
+    let (mut child, mut admissions) = support::launch_intent(&intent, &wrapper, 4096).unwrap();
+    let other = SnapshotIntent::compare(scope, std::path::Path::new(GIT), b"a\n", b"b\n").unwrap();
+    let foreign = Runner::default().run(other).await.unwrap();
+    assert_eq!(
+        intent.acknowledge_reap(&foreign),
+        Err(GitError::IncompleteIdentity)
+    );
+    assert!(directory.exists());
+    child
+        .cancel_bounded(Duration::from_millis(10), Duration::from_secs(2))
+        .await
+        .unwrap();
+    let completed = child
+        .reap(Duration::from_secs(2), Duration::from_secs(2))
+        .await
+        .unwrap();
+    intent.acknowledge_reap(&completed.evidence).unwrap();
+    admissions.release_reaped(completed.settlement).unwrap();
+    drop(intent);
+    assert!(!directory.exists());
+}
+
+/// Issued argv without actual-child evidence remains quarantined on drop instead of guessing no effect.
+#[test]
+fn uncertain_issued_snapshot_drop_quarantines_files() {
+    let fixture = GitFixture::new();
+    let scope = agent_ide::workspace::git::GitScope::from_authority(
+        &authority_for(&fixture),
+        DiffMode::Head,
+    );
+    let intent = SnapshotIntent::compare(scope, std::path::Path::new(GIT), b"a", b"b").unwrap();
+    let directory = intent.snapshot_directory().unwrap().to_owned();
+    let _unused_command = intent.command().unwrap();
+    drop(intent);
+    assert!(directory.exists());
+    // This fixture never spawns a child; remove its deliberately unstarted quarantine explicitly.
+    fs::remove_dir_all(directory).unwrap();
+}
+
+/// Real truncated cat-file output is rejected despite successful exit and actual wait identity.
+#[tokio::test]
+async fn real_truncated_blob_evidence_is_not_complete() {
+    use std::time::Duration;
+    let fixture = GitFixture::new();
+    fixture.write(b".git/large-blob", &vec![b'x'; 8192]);
+    let output = fixture.git(["hash-object", "-w", "--no-filters", "--", ".git/large-blob"]);
+    let oid =
+        agent_ide::workspace::git::GitObjectId::parse(output.stdout.strip_suffix(b"\n").unwrap())
+            .unwrap()
+            .unwrap();
+    let scope = agent_ide::workspace::git::GitScope::from_authority(
+        &authority_for(&fixture),
+        DiffMode::Head,
+    );
+    let intent = SnapshotIntent::blob(scope, std::path::Path::new(GIT), &oid).unwrap();
+    let (child, mut admissions) =
+        support::launch_intent(&intent, std::path::Path::new(GIT), 128).unwrap();
+    let completed = child
+        .reap(Duration::from_secs(2), Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert!(completed.evidence.stdout().truncated);
+    assert_eq!(completed.evidence.status().code(), Some(0));
+    admissions.release_reaped(completed.settlement).unwrap();
+    assert_eq!(
+        intent.accept(completed.evidence),
+        Err(GitError::IncompleteIdentity)
     );
 }

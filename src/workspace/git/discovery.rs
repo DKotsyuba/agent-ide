@@ -5,7 +5,7 @@ use super::{
     raw_path,
 };
 use crate::{
-    execution::{DiscoveryOperationRef, GitDiscoveryQuery, RawGitDiscovery},
+    execution::{DiscoveryOperationRef, GitDiscoveryEvidence, GitDiscoveryQuery},
     workspace::{
         authority::WorktreeRef,
         durable::real_directory,
@@ -54,50 +54,53 @@ impl DiscoveredWorktree {
 pub fn validate_discovery(
     candidate_cwd: &Path,
     operation: &DiscoveryOperationRef,
-    outputs: &[RawGitDiscovery],
+    outputs: &[GitDiscoveryEvidence],
 ) -> Result<DiscoveredWorktree, GitError> {
     if outputs.len() != 3 {
         return Err(GitError::InvalidDiscovery);
     }
     let mut values: [Option<&[u8]>; 3] = [None, None, None];
     for output in outputs {
-        if output.query == GitDiscoveryQuery::GitCommonDir
-            && output.exit_status.code() != Some(0)
+        if output.query() == GitDiscoveryQuery::GitCommonDir
+            && output.exit_status().code() != Some(0)
             && output
-                .stderr
+                .stderr()
                 .bytes
                 .windows(b"path-format".len())
                 .any(|part| part == b"path-format")
             && output
-                .stderr
+                .stderr()
                 .bytes
                 .windows(b"unknown option".len())
                 .any(|part| part == b"unknown option")
         {
             return Err(GitError::UnsupportedDiscoveryGit);
         }
-        if &output.operation != operation
-            || output.exit_status.code() != Some(0)
-            || output.stdout.truncated
-            || output.stderr.truncated
-            || !output.stdout.complete
-            || !output.stderr.complete
-            || output.stdout.bytes.len() > MAX_GIT_STDOUT_BYTES
-            || output.stderr.bytes.len() > MAX_GIT_STDERR_BYTES
+        if output.operation() != operation
+            || output.exit_status().code() != Some(0)
+            || output.stdout().truncated
+            || output.stderr().truncated
+            || !output.stdout().complete
+            || !output.stderr().complete
+            || output.stdout().bytes.len() > MAX_GIT_STDOUT_BYTES
+            || output.stderr().bytes.len() > MAX_GIT_STDERR_BYTES
         {
             return Err(GitError::InvalidDiscovery);
         }
-        if output.query == GitDiscoveryQuery::GitCommonDir
-            && output.stdout.bytes.starts_with(b"--path-format=absolute\n")
+        if output.query() == GitDiscoveryQuery::GitCommonDir
+            && output
+                .stdout()
+                .bytes
+                .starts_with(b"--path-format=absolute\n")
         {
             return Err(GitError::UnsupportedDiscoveryGit);
         }
-        let slot = match output.query {
+        let slot = match output.query() {
             GitDiscoveryQuery::ShowTopLevel => 0,
             GitDiscoveryQuery::GitCommonDir => 1,
             GitDiscoveryQuery::WorktreeListPorcelainZ => 2,
         };
-        if values[slot].replace(&output.stdout.bytes).is_some() {
+        if values[slot].replace(&output.stdout().bytes).is_some() {
             return Err(GitError::InvalidDiscovery);
         }
     }

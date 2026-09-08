@@ -4,10 +4,13 @@ mod support;
 
 use agent_ide::{
     execution::{
-        Admission, AdmissionClass, AdmissionController, AdmissionLimits, CapturedOutput,
-        DiscoveryOperationRef, GitDiscoveryQuery, OwnerId, RawGitDiscovery,
+        CapturedOutput, DescendantEvidence, DiscoveryOperationRef, GitDiscoveryEvidence,
+        GitDiscoveryQuery,
     },
-    workspace::git::{GitError, discovery::validate_discovery},
+    workspace::git::{
+        GitError,
+        discovery::{DiscoveredWorktree, validate_discovery as validate_captured_discovery},
+    },
 };
 use std::{
     ffi::OsString,
@@ -22,17 +25,53 @@ use std::{
 };
 use support::{GIT, GitFixture};
 
+/// Mutable test data for malformed-input scenarios; conversion still passes Execution's checked constructor.
+#[derive(Clone)]
+struct DiscoveryFixture {
+    /// Exact test operation reference.
+    operation: DiscoveryOperationRef,
+    /// Fixed query tag.
+    query: GitDiscoveryQuery,
+    /// Raw captured test stdout.
+    stdout: CapturedOutput,
+    /// Raw captured test stderr.
+    stderr: CapturedOutput,
+    /// Synthetic or actually observed child status; no settlement capability is present.
+    exit_status: ExitStatus,
+    /// Test capture interval.
+    elapsed: Duration,
+}
+
+/// Converts fixture data through the immutable evidence boundary before exercising Workspace validation.
+fn validate_discovery(
+    candidate: &Path,
+    operation: &DiscoveryOperationRef,
+    fixtures: &[DiscoveryFixture],
+) -> Result<DiscoveredWorktree, GitError> {
+    let evidence = fixtures
+        .iter()
+        .map(|fixture| {
+            let mut stdout = fixture.stdout.clone();
+            stdout.drained_bytes = stdout.drained_bytes.max(stdout.bytes.len() as u64);
+            GitDiscoveryEvidence::new(
+                fixture.operation.clone(),
+                fixture.query,
+                stdout,
+                fixture.stderr.clone(),
+                fixture.exit_status,
+                fixture.elapsed,
+                None,
+                DescendantEvidence::Unverified,
+            )
+            .map_err(|_| GitError::InvalidDiscovery)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_captured_discovery(candidate, operation, &evidence)
+}
+
 /// Wraps truthful bounded real output with the typed query/operation correlation consumed by Workspace.
-fn discovered(root: &Path) -> (DiscoveryOperationRef, Vec<RawGitDiscovery>) {
+fn discovered(root: &Path) -> (DiscoveryOperationRef, Vec<DiscoveryFixture>) {
     let operation = DiscoveryOperationRef::new("discovery").unwrap();
-    let mut admissions = AdmissionController::new(AdmissionLimits {
-        total_running: 3,
-        per_owner_running: 3,
-        per_owner_queued: 1,
-        total_queued: 1,
-        interactive_burst: 1,
-    })
-    .unwrap();
     let mut outputs = Vec::new();
     for (query, args) in [
         (
@@ -56,20 +95,13 @@ fn discovered(root: &Path) -> (DiscoveryOperationRef, Vec<RawGitDiscovery>) {
             .output()
             .unwrap();
         assert!(output.status.success());
-        let Admission::Granted(lease) = admissions.submit(
-            OwnerId::new("discovery").unwrap(),
-            AdmissionClass::Interactive,
-        ) else {
-            panic!("fixture admitted")
-        };
-        outputs.push(RawGitDiscovery {
+        outputs.push(DiscoveryFixture {
             operation: operation.clone(),
             query,
             stdout: captured(output.stdout),
             stderr: captured(output.stderr),
             exit_status: output.status,
             elapsed: Duration::ZERO,
-            lease,
         });
     }
     (operation, outputs)

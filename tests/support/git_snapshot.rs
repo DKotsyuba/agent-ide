@@ -234,9 +234,9 @@ pub fn authority_for(fixture: &GitFixture) -> agent_ide::workspace::authority::A
 
 use agent_ide::{
     execution::{
-        Admission, AdmissionClass, AdmissionController, AdmissionLimits, ExecutionProfileCatalog,
-        ExecutionProfileTemplate, HostSandboxState, LocalExecutionPolicy, OwnedChild, OwnerId,
-        ReapedProcess, ValidatedExecutionRequest, ValidatedHostInvocation,
+        Admission, AdmissionClass, AdmissionController, AdmissionLimits, CapturedProcessEvidence,
+        ExecutionProfileCatalog, ExecutionProfileTemplate, HostSandboxState, LocalExecutionPolicy,
+        OwnedChild, OwnerId, ValidatedExecutionRequest, ValidatedHostInvocation,
     },
     workspace::{
         authority::AuthorityStamp,
@@ -288,7 +288,7 @@ impl SnapshotRunner for Runner {
     }
 
     /// Admits and reaps the exact peer command; scratch remains owned through process completion.
-    async fn run(&mut self, intent: SnapshotIntent) -> Result<ReapedProcess, GitError> {
+    async fn run(&mut self, intent: SnapshotIntent) -> Result<CapturedProcessEvidence, GitError> {
         use std::os::unix::fs::PermissionsExt;
         if let Some(dir) = intent.snapshot_directory() {
             assert_eq!(
@@ -305,62 +305,22 @@ impl SnapshotRunner for Runner {
         } else if format!("{:?}", intent.command()).contains("cat-file") {
             self.blobs += 1;
         }
-        let root = intent.scope().worktree().worktree_path();
-        let state = HostSandboxState::parse(Some(
-            json!({"permissionProfile":{"type":"disabled"}, "codexLinuxSandboxExe":null,
-            "sandboxCwd":root, "useLegacyLandlock":false}),
-        ))
-        .unwrap();
-        let profiles = ExecutionProfileCatalog::from_execution_evidence(vec![
-            ExecutionProfileTemplate::from_execution_evidence("snapshot-test", 1, &state).unwrap(),
-        ])
-        .unwrap();
-        let invocation =
-            ValidatedHostInvocation::from_verified_binding("snapshot-test", state).unwrap();
-        let policy =
-            LocalExecutionPolicy::new(BTreeSet::from([PathBuf::from(GIT)]), 8192, 16, true)
-                .unwrap();
-        let request = ValidatedExecutionRequest::validate(
-            invocation,
-            intent.execution_authority()?,
-            intent.command(),
-            &policy,
-            &profiles,
-        )
-        .unwrap();
-        let mut admissions = AdmissionController::new(AdmissionLimits {
-            total_running: 1,
-            per_owner_running: 1,
-            total_queued: 1,
-            per_owner_queued: 1,
-            interactive_burst: 1,
-        })
-        .unwrap();
-        let Admission::Granted(lease) = admissions.submit(
-            OwnerId::new("snapshot").unwrap(),
-            AdmissionClass::Interactive,
-        ) else {
-            panic!("bounded runner is admitted")
-        };
-        let result = OwnedChild::spawn_captured(
-            &request,
-            lease,
-            None,
-            Path::new("/usr/bin/false"),
-            MAX_SNAPSHOT_BLOB_BYTES,
-        )
-        .map_err(|_| GitError::IncompleteIdentity)?
-        .reap(Duration::from_secs(5))
-        .await
-        .map_err(|_| GitError::IncompleteIdentity)?;
-        admissions.release(result.lease).unwrap();
+        let (child, mut admissions) =
+            launch_intent(&intent, Path::new(GIT), MAX_SNAPSHOT_BLOB_BYTES)?;
+        let completed = child
+            .reap(Duration::from_secs(5), Duration::from_secs(5))
+            .await
+            .map_err(|_| GitError::IncompleteIdentity)?;
+        intent.acknowledge_reap(&completed.evidence)?;
+        admissions.release_reaped(completed.settlement).unwrap();
+        let result = completed.evidence;
         self.operations += 1;
         if intent.is_comparison() {
             self.comparisons += 1;
             if let Some(hook) = &mut self.after_compare {
                 hook();
             }
-            self.different += usize::from(result.status.code() == Some(1));
+            self.different += usize::from(result.status().code() == Some(1));
             if let Some(path) = &self.mutate_path {
                 fs::write(
                     path,
@@ -405,4 +365,79 @@ pub async fn capture_with_authority(
         runner,
     )
     .await
+}
+
+/// Starts one exact private/metadata intent through real Execution and binds its transferred launch token.
+/// The returned controller remains owned by the caller until it consumes the child's settlement proof.
+pub fn launch_intent(
+    intent: &SnapshotIntent,
+    allowed_program: &Path,
+    output_cap: usize,
+) -> Result<(OwnedChild, AdmissionController), GitError> {
+    let root = intent.scope().worktree().worktree_path();
+    let state = HostSandboxState::parse(Some(
+        json!({"permissionProfile":{"type":"disabled"}, "codexLinuxSandboxExe":null,
+        "sandboxCwd":root, "useLegacyLandlock":false}),
+    ))
+    .unwrap();
+    let profiles = ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence("snapshot-test", 1, &state).unwrap(),
+    ])
+    .unwrap();
+    let invocation =
+        ValidatedHostInvocation::from_verified_binding("snapshot-test", state).unwrap();
+    let policy = LocalExecutionPolicy::new(
+        BTreeSet::from([allowed_program.to_path_buf()]),
+        8192,
+        16,
+        true,
+    )
+    .unwrap();
+    let request = ValidatedExecutionRequest::validate(
+        invocation,
+        intent.execution_authority()?,
+        intent.command()?,
+        &policy,
+        &profiles,
+    )
+    .unwrap();
+    let mut admissions = AdmissionController::new(AdmissionLimits {
+        total_running: 1,
+        per_owner_running: 1,
+        total_queued: 1,
+        per_owner_queued: 1,
+        interactive_burst: 1,
+    })
+    .unwrap();
+    let Admission::Granted(lease) = admissions.submit(
+        OwnerId::new("snapshot").unwrap(),
+        AdmissionClass::Interactive,
+    ) else {
+        panic!("bounded runner is admitted")
+    };
+    let mut child = OwnedChild::spawn_captured(
+        &request,
+        lease,
+        None,
+        Path::new("/usr/bin/false"),
+        output_cap,
+    )
+    .map_err(|_| GitError::IncompleteIdentity)?;
+    if intent.snapshot_directory().is_some() {
+        intent.bind_process(
+            child
+                .take_process_identity()
+                .ok_or(GitError::IncompleteIdentity)?,
+        )?;
+    }
+    Ok((child, admissions))
+}
+
+/// Writes a trusted test-only executable wrapper under this disposable fixture's Git admin directory.
+pub fn git_wrapper(fixture: &GitFixture, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = fixture.root.join(".git").join(name);
+    fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    path
 }

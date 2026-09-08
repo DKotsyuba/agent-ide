@@ -5,7 +5,10 @@ use super::{
     GitReadQuery, GitScope, GitStatus, PathStatus, evidence_identity, safe_git_environment,
 };
 use crate::{
-    execution::{CommandKind, ControlledCommand, ReapedProcess, WorkspaceAuthority},
+    execution::{
+        CapturedProcessEvidence, CommandKind, ControlledCommand, ProcessIdentity,
+        WorkspaceAuthority,
+    },
     workspace::observation::{
         ObservationError, SourceBytes, SourceCoverage, SourceObservation, SourceRead,
         SourceReadLimits, read_authorized_source,
@@ -21,7 +24,7 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -44,6 +47,24 @@ static NEXT_SNAPSHOT: AtomicU64 = AtomicU64::new(1);
 struct SnapshotDirectory {
     /// ASCII absolute directory created exclusively with mode 0700 outside the worktree.
     path: PathBuf,
+    /// Shared one-command lifecycle; unknown/cancelled owners quarantine instead of deleting files.
+    lifecycle: Mutex<ScratchLifecycle>,
+}
+
+/// Private command ownership and exact-child correlation; no process or settlement proof is cloned.
+#[derive(Debug)]
+enum ScratchLifecycle {
+    /// No controlled command has escaped; dropping this directory is safe.
+    Unused,
+    /// Command exported once, so a process may have started even if no binding was returned.
+    Issued,
+    /// Exact transferred launch token; only matching actual-wait evidence permits deletion.
+    Bound {
+        identity: ProcessIdentity,
+        reaped: bool,
+    },
+    /// An invalid second binding made physical ownership uncertain; retain files for recovery.
+    Quarantined,
 }
 
 impl SnapshotDirectory {
@@ -62,7 +83,12 @@ impl SnapshotDirectory {
                 NEXT_SNAPSHOT.fetch_add(1, Ordering::Relaxed)
             ));
             match DirBuilder::new().mode(0o700).create(&path) {
-                Ok(()) => return Ok(Arc::new(Self { path })),
+                Ok(()) => {
+                    return Ok(Arc::new(Self {
+                        path,
+                        lifecycle: Mutex::new(ScratchLifecycle::Unused),
+                    }));
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(_) => return Err(GitError::SnapshotIo),
             }
@@ -86,9 +112,16 @@ impl SnapshotDirectory {
 }
 
 impl Drop for SnapshotDirectory {
-    /// Removes only this owned scratch tree on normal completion, failure, or dropped capture.
+    /// Removes unused or actually reaped scratch only; uncertain drops quarantine the private tree.
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        if self.lifecycle.get_mut().is_ok_and(|state| {
+            matches!(
+                state,
+                ScratchLifecycle::Unused | ScratchLifecycle::Bound { reaped: true, .. }
+            )
+        }) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }
 
@@ -106,10 +139,67 @@ pub struct SnapshotIntent {
 }
 
 impl SnapshotIntent {
-    /// Returns the immutable controlled command; caller must retain this intent until child reap.
-    pub fn command(&self) -> ControlledCommand {
-        self.command.clone()
+    /// Exports a private command once and marks its files potentially in use before returning argv.
+    /// Repeated private exports fail; dropping an issued command without matching reap quarantines it.
+    pub fn command(&self) -> Result<ControlledCommand, GitError> {
+        if let Some(directory) = &self.directory {
+            let mut state = directory
+                .lifecycle
+                .lock()
+                .map_err(|_| GitError::IncompleteIdentity)?;
+            if !matches!(*state, ScratchLifecycle::Unused) {
+                return Err(GitError::IncompleteIdentity);
+            }
+            *state = ScratchLifecycle::Issued;
+        }
+        Ok(self.command.clone())
     }
+
+    /// Consumes the exact child's one-time launch identity after a successful private-command spawn.
+    /// Duplicate/unexpected binding quarantines files rather than accepting a potentially foreign reap.
+    pub fn bind_process(&self, identity: ProcessIdentity) -> Result<(), GitError> {
+        let directory = self
+            .directory
+            .as_ref()
+            .ok_or(GitError::IncompleteIdentity)?;
+        let mut state = directory
+            .lifecycle
+            .lock()
+            .map_err(|_| GitError::IncompleteIdentity)?;
+        if !matches!(*state, ScratchLifecycle::Issued) {
+            *state = ScratchLifecycle::Quarantined;
+            return Err(GitError::IncompleteIdentity);
+        }
+        *state = ScratchLifecycle::Bound {
+            identity,
+            reaped: false,
+        };
+        Ok(())
+    }
+
+    /// Allows cleanup only from actual Execution wait evidence for the exact bound child.
+    /// This consumes no admission/settlement capability and is idempotent for matching evidence.
+    /// A cancellation reaper must retain this same intent and call this method before dropping it.
+    pub fn acknowledge_reap(&self, evidence: &CapturedProcessEvidence) -> Result<(), GitError> {
+        let reaped_identity = evidence
+            .reap_identity()
+            .ok_or(GitError::IncompleteIdentity)?;
+        if let Some(directory) = &self.directory {
+            let mut state = directory
+                .lifecycle
+                .lock()
+                .map_err(|_| GitError::IncompleteIdentity)?;
+            let ScratchLifecycle::Bound { identity, reaped } = &mut *state else {
+                return Err(GitError::IncompleteIdentity);
+            };
+            if !reaped_identity.matches(identity) {
+                return Err(GitError::IncompleteIdentity);
+            }
+            *reaped = true;
+        }
+        Ok(())
+    }
+
     /// Returns the exact original scope for admission, currentness checks, and output correlation.
     pub fn scope(&self) -> &GitScope {
         &self.scope
@@ -256,46 +346,48 @@ impl SnapshotIntent {
         })
     }
     /// Accepts only reaped, fully drained bounded output with the command's exact success exit set.
-    pub fn accept(&self, result: ReapedProcess) -> Result<Vec<u8>, GitError> {
-        if result.status.code() != Some(0)
+    pub fn accept(&self, result: CapturedProcessEvidence) -> Result<Vec<u8>, GitError> {
+        self.acknowledge_reap(&result)?;
+        if result.status().code() != Some(0)
             && result
-                .stderr
+                .stderr()
                 .bytes
                 .windows(b"no-lazy-fetch".len())
                 .any(|bytes| bytes == b"no-lazy-fetch")
             && result
-                .stderr
+                .stderr()
                 .bytes
                 .windows(b"unknown option".len())
                 .any(|bytes| bytes == b"unknown option")
         {
             return Err(GitError::UnsupportedSnapshotGit);
         }
-        if result.cancellation.is_some()
-            || result.stdout.truncated
-            || result.stderr.truncated
-            || !result.stdout.complete
-            || !result.stderr.complete
-            || result.stdout.bytes.len() > MAX_SNAPSHOT_BLOB_BYTES
-            || result.stderr.bytes.len() > super::MAX_GIT_STDERR_BYTES
-            || !matches!(result.status.code(), Some(0))
-                && !(self.differences_allowed && result.status.code() == Some(1))
+        if result.cancellation().is_some()
+            || result.stdout().truncated
+            || result.stderr().truncated
+            || !result.stdout().complete
+            || !result.stderr().complete
+            || result.stdout().bytes.len() > MAX_SNAPSHOT_BLOB_BYTES
+            || result.stderr().bytes.len() > super::MAX_GIT_STDERR_BYTES
+            || !matches!(result.status().code(), Some(0))
+                && !(self.differences_allowed && result.status().code() == Some(1))
         {
             return Err(GitError::IncompleteIdentity);
         }
-        Ok(result.stdout.bytes)
+        Ok(result.stdout().bytes.clone())
     }
 }
 
 /// Integration boundary: Execution owns admission, live-use checks, timeouts, cancellation and reap.
-/// A runner must keep the owned intent alive until every child using its scratch files is reaped.
+/// Export a private command once, bind its transferred launch identity, and acknowledge actual wait.
+/// Cancellation handoff retains child plus intent; unknown drops quarantine rather than deleting files.
 /// No implementation may run repository diff commands or transform SourceRead content with Git.
 pub trait SnapshotRunner: Send {
-    /// Runs this immutable operation with bounded streams and a Send future returning direct-child reap evidence.
+    /// Runs this immutable operation with bounded streams and a Send future returning immutable actual-wait evidence after the Execution owner settles its one-time capability.
     fn run(
         &mut self,
         intent: SnapshotIntent,
-    ) -> impl std::future::Future<Output = Result<ReapedProcess, GitError>> + Send;
+    ) -> impl std::future::Future<Output = Result<CapturedProcessEvidence, GitError>> + Send;
     /// Supplies an optional durable source observation already registered for this exact path.
     /// When supplied, scope, digest, length and complete coverage must match the fresh SourceRead.
     fn observation(
@@ -504,11 +596,11 @@ async fn metadata<R: SnapshotRunner>(
         let intent = SnapshotIntent::metadata(authority, program, query)?;
         let output = runner.run(intent.clone()).await?;
         if query == GitReadQuery::HeadIdentity
-            && output.status.code() == Some(1)
-            && output.stdout.complete
-            && output.stderr.complete
-            && !output.stdout.truncated
-            && !output.stderr.truncated
+            && output.status().code() == Some(1)
+            && output.stdout().complete
+            && output.stderr().complete
+            && !output.stdout().truncated
+            && !output.stderr().truncated
         {
             return Err(GitError::UnbornHead);
         }
