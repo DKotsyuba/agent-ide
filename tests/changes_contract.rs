@@ -246,7 +246,10 @@ fn compose_preserves_comparison_identities_and_provenance_owner_ref() {
     );
     assert_eq!(result.identities().left(), b"left-id");
     assert_eq!(result.identities().right(), b"right-id");
-    assert_eq!(result.provenance().operation_reference(), "operation-1");
+    assert_eq!(
+        result.provenance().operation_reference(),
+        Some("operation-1")
+    );
 }
 
 #[test]

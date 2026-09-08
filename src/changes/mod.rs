@@ -1,7 +1,5 @@
 //! Bounded diff composition for Workspace raw Git evidence in Changes v0.1.
 
-use std::ffi::OsString;
-use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 
 use crate::workspace::git::{
@@ -42,6 +40,8 @@ pub enum DiffCoverage {
 pub enum DiffFreshness {
     /// Request metadata and evidence metadata matched exactly.
     Current,
+    /// Evidence belongs to the same worktree incarnation but an older authority epoch.
+    Stale,
     /// Evidence metadata could not be confirmed as current for this request.
     Unknown,
 }
@@ -205,7 +205,7 @@ impl DiffStatusCounts {
 /// Describes owner-scoped freshness, coverage, and provenance metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiffProvenance {
-    operation_reference: String,
+    operation_reference: Option<String>,
     baseline_reference: Option<String>,
     baseline_coverage: Option<BaselineCoverage>,
 }
@@ -213,20 +213,20 @@ pub struct DiffProvenance {
 impl DiffProvenance {
     /// Builds provenance for one compose result.
     pub fn new(
-        operation_reference: impl Into<String>,
+        operation_reference: Option<String>,
         baseline_reference: Option<String>,
         baseline_coverage: Option<BaselineCoverage>,
     ) -> Self {
         Self {
-            operation_reference: operation_reference.into(),
+            operation_reference,
             baseline_reference,
             baseline_coverage,
         }
     }
 
     /// Returns the owner-scoped operation reference returned by Workspace.
-    pub fn operation_reference(&self) -> &str {
-        &self.operation_reference
+    pub fn operation_reference(&self) -> Option<&str> {
+        self.operation_reference.as_deref()
     }
 
     /// Returns baseline provenance when Workspace context was present for this request.
@@ -357,40 +357,45 @@ pub fn compose_diff(
     evidence: RawGitEvidence,
     budget: DiffSelectionBudget,
 ) -> DiffResult {
+    let same_worktree = evidence.scope().worktree() == expected_scope.worktree();
+    let stale = same_worktree
+        && evidence.scope().authority_epoch() != expected_scope.authority_epoch()
+        && evidence.scope().mode() == expected_scope.mode()
+        && comparison.mode() == expected_scope.mode();
     if evidence.scope() != expected_scope || comparison.mode() != expected_scope.mode() {
         return DiffResult {
             state: DiffResultState::Unavailable,
-            freshness: DiffFreshness::Unknown,
+            freshness: if stale {
+                DiffFreshness::Stale
+            } else {
+                DiffFreshness::Unknown
+            },
             coverage: DiffCoverage::Unknown,
             scope_mode: expected_scope.mode(),
             authority_epoch: expected_scope.authority_epoch(),
             worktree_id: expected_scope.worktree().id().to_owned(),
-            identities: DiffComparisonIdentities::new(
-                comparison.left().as_bytes(),
-                comparison.right().as_bytes(),
-            ),
-            status_counts: DiffStatusCounts::from_status(&status),
+            identities: DiffComparisonIdentities::new(&[], &[]),
+            status_counts: DiffStatusCounts {
+                tracked: 0,
+                conflicted: 0,
+                untracked: 0,
+                ignored: 0,
+            },
             selected_hunks: Vec::new(),
-            truncated_output: evidence.is_truncated(),
+            truncated_output: false,
             overflow_hunks: 0,
             overflow_bytes: 0,
-            untracked: status.untracked().to_vec(),
-            conflicts: status.conflicts().to_vec(),
-            ignored: status.ignored().to_vec(),
+            untracked: Vec::new(),
+            conflicts: Vec::new(),
+            ignored: Vec::new(),
             detail_cursor: None,
-            provenance: DiffProvenance::new(
-                evidence.operation_reference(),
-                Some(comparison.baseline().reference().to_owned()),
-                Some(comparison.baseline().coverage()),
-            ),
+            provenance: DiffProvenance::new(None, None, None),
         };
     }
 
     let mut state = DiffResultState::Ready;
     let mut coverage = DiffCoverage::Complete;
     let mut detail_cursor = None;
-    let mut malformed = false;
-    let mut has_binary = false;
 
     if evidence.exit_code() != Some(0) {
         state = DiffResultState::Failed;
@@ -401,17 +406,17 @@ pub fn compose_diff(
     }
 
     let truncated_output = evidence.is_truncated();
-    if truncated_output {
+    if truncated_output && state != DiffResultState::Failed {
         state = DiffResultState::Incomplete;
         coverage = DiffCoverage::Partial;
     }
 
     let parsed = parse_diff_hunks(evidence.stdout());
-    malformed = parsed.malformed;
-    has_binary = parsed.has_binary;
+    let malformed = parsed.malformed;
+    let has_binary = parsed.has_binary;
     let raw_hunks = parsed.hunks;
 
-    if malformed {
+    if malformed && state != DiffResultState::Failed {
         state = DiffResultState::Incomplete;
         coverage = DiffCoverage::Unknown;
     }
@@ -427,8 +432,14 @@ pub fn compose_diff(
         };
     }
 
-    let (selected_hunks, overflow_hunks, overflow_bytes, cursor_offset) =
-        select_hunks(raw_hunks, budget);
+    let (selected_hunks, overflow_hunks, overflow_bytes, cursor_offset) = select_hunks(
+        raw_hunks,
+        if truncated_output {
+            DiffSelectionBudget::default()
+        } else {
+            budget
+        },
+    );
     if overflow_hunks > 0 {
         state = match state {
             DiffResultState::Ready => DiffResultState::Incomplete,
@@ -463,7 +474,7 @@ pub fn compose_diff(
         ignored: status.ignored().to_vec(),
         detail_cursor,
         provenance: DiffProvenance::new(
-            evidence.operation_reference(),
+            Some(evidence.operation_reference().to_owned()),
             Some(comparison.baseline().reference().to_owned()),
             Some(comparison.baseline().coverage()),
         ),
@@ -506,14 +517,17 @@ fn select_hunks(
 
 /// Parsed, owner-scoped raw diff hunk before budget selection.
 struct RawHunk {
+    /// Zero-based position in the raw hunk stream.
     original_index: usize,
+    /// Path supplied only when an exact Workspace status mapping exists.
     path: Option<PathBuf>,
+    /// Complete raw patch bytes.
     patch: Vec<u8>,
+    /// Whether this entry is a binary summary.
     binary: bool,
 }
 
 /// Splits stdout into exact hunks, preserving complete patch units.
-#[derive(Clone, Debug, Eq, PartialEq)]
 struct ParsedDiff {
     /// All full hunks successfully parsed from stdout.
     hunks: Vec<RawHunk>,
@@ -534,7 +548,6 @@ fn parse_diff_hunks(stdout: &[u8]) -> ParsedDiff {
     }
 
     let mut hunks = Vec::new();
-    let mut current_file: Option<PathBuf> = None;
     let mut index = 0usize;
     let mut cursor = 0usize;
     let mut malformed = false;
@@ -545,12 +558,6 @@ fn parse_diff_hunks(stdout: &[u8]) -> ParsedDiff {
         let line = &stdout[cursor..end];
 
         if line.starts_with(b"diff --git ") {
-            if let Some(path) = parse_file_path(line) {
-                current_file = Some(path);
-                cursor = end;
-                continue;
-            }
-            malformed = true;
             cursor = end;
             continue;
         }
@@ -558,7 +565,7 @@ fn parse_diff_hunks(stdout: &[u8]) -> ParsedDiff {
         if line.starts_with(b"Binary files ") || line.starts_with(b"Binary file ") {
             hunks.push(RawHunk {
                 original_index: index,
-                path: current_file.clone(),
+                path: None,
                 patch: line.to_vec(),
                 binary: true,
             });
@@ -582,6 +589,15 @@ fn parse_diff_hunks(stdout: &[u8]) -> ParsedDiff {
                     break;
                 }
                 let candidate = &stdout[previous_end..next];
+                if !candidate.starts_with(b"+")
+                    && !candidate.starts_with(b"-")
+                    && !candidate.starts_with(b" ")
+                    && !candidate.starts_with(b"\\")
+                    && !candidate.starts_with(b"@@")
+                    && !candidate.starts_with(b"diff --git ")
+                {
+                    malformed = true;
+                }
                 if (candidate.starts_with(b"@@") || candidate.starts_with(b"diff --git "))
                     && previous_end != end
                 {
@@ -592,7 +608,7 @@ fn parse_diff_hunks(stdout: &[u8]) -> ParsedDiff {
             if previous_end > start {
                 hunks.push(RawHunk {
                     original_index: index,
-                    path: current_file.clone(),
+                    path: None,
                     patch: stdout[start..previous_end].to_vec(),
                     binary: false,
                 });
@@ -633,29 +649,6 @@ fn next_line_end(bytes: &[u8], start: usize) -> usize {
         end + 1
     } else {
         bytes.len()
-    }
-}
-
-/// Parses one `diff --git` header path token into a best-effort raw path.
-fn parse_file_path(line: &[u8]) -> Option<PathBuf> {
-    const PREFIX: &[u8] = b"diff --git ";
-    if !line.starts_with(PREFIX) {
-        return None;
-    }
-    let mut fields = line[PREFIX.len()..].split_ascii_whitespace();
-    let _left = fields.next()?;
-    let right = fields.next()?;
-    let unquoted = strip_wrapping_quotes(right);
-    let without_side = unquoted.strip_prefix(b"b/").unwrap_or(unquoted);
-    Some(PathBuf::from(OsString::from_vec(without_side.to_vec())))
-}
-
-/// Removes wrapping quote bytes from diff headers that use quoted path notation.
-fn strip_wrapping_quotes(value: &[u8]) -> &[u8] {
-    if value.len() >= 2 && value.first() == Some(&b'"') && value.last() == Some(&b'"') {
-        &value[1..value.len() - 1]
-    } else {
-        value
     }
 }
 
