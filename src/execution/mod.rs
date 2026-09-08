@@ -377,16 +377,24 @@ impl ExecutionProfileCatalog {
         Ok(Self { templates: entries })
     }
 
-    /// Rebuilds a usable catalog only from complete verified records and their matching states.
+    /// Rebuilds a usable catalog only from records matching trusted expected D03 evidence.
     ///
-    /// The caller supplies the state captured by the current D01-bound invocation for each record;
-    /// a stale, corrupt, missing, duplicate-class, or value-mismatched record is unavailable.
+    /// `expected` comes from Execution-owned trusted configuration/evidence, never the durable
+    /// store or a model request. The caller supplies each current D01-bound state; extra, missing,
+    /// stale, corrupt, duplicate-class, or value-mismatched records are unavailable.
     pub fn from_persisted_records(
         records: Vec<(PersistedProfileRecord, HostSandboxState)>,
+        expected: &[PersistedProfileRecord],
     ) -> Result<Self, RequestError> {
+        if records.len() != expected.len() {
+            return Err(RequestError::ExecutionProfileDenied);
+        }
         let mut templates = Vec::with_capacity(records.len());
         for (record, state) in records {
-            if record.class != state.class() || !record.matches_state(&state) {
+            if !expected.contains(&record)
+                || record.class != state.class()
+                || !record.matches_state(&state)
+            {
                 return Err(RequestError::ExecutionProfileDenied);
             }
             templates.push(ExecutionProfileTemplate {
@@ -1036,6 +1044,26 @@ pub enum Admission {
     Refused(AdmissionError),
 }
 
+/// Couples a central queue ticket to the exact lease that promoted it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdmissionPromotion {
+    /// Ticket removed from the controller queue by this promotion.
+    ticket: QueueTicket,
+    /// Newly reserved central lease which must be consumed or released exactly once.
+    lease: AdmissionLease,
+}
+
+impl AdmissionPromotion {
+    /// Returns the queued identity this promotion settles.
+    pub const fn ticket(self) -> QueueTicket {
+        self.ticket
+    }
+    /// Returns the central reservation created for this exact ticket.
+    pub const fn lease(self) -> AdmissionLease {
+        self.lease
+    }
+}
+
 /// Schedules finite requests with per-owner round-robin selection and bounded class preference.
 #[derive(Debug)]
 pub struct AdmissionController {
@@ -1124,6 +1152,18 @@ impl AdmissionController {
         &mut self,
         lease: AdmissionLease,
     ) -> Result<Vec<AdmissionLease>, AdmissionError> {
+        Ok(self
+            .release_with_promotions(lease)?
+            .into_iter()
+            .map(|promotion| promotion.lease)
+            .collect())
+    }
+
+    /// Releases a lease and preserves ticket-to-lease identity for dependent bounded registries.
+    pub fn release_with_promotions(
+        &mut self,
+        lease: AdmissionLease,
+    ) -> Result<Vec<AdmissionPromotion>, AdmissionError> {
         let owner = self
             .leases
             .remove(&lease.0)
@@ -1145,7 +1185,11 @@ impl AdmissionController {
                 .queue
                 .remove(position)
                 .expect("position comes from queue");
-            grants.push(self.grant(queued.owner, queued.class));
+            let ticket = QueueTicket(queued.id);
+            grants.push(AdmissionPromotion {
+                ticket,
+                lease: self.grant(queued.owner, queued.class),
+            });
         }
         Ok(grants)
     }
@@ -1247,6 +1291,8 @@ pub enum ProviderBackendKind {
 /// Reports why a provider view cannot be attached to a backend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderLeaseError {
+    /// A view limit is zero or cannot bound the requested registry.
+    InvalidLimits,
     /// The requested backend identity is empty or attempts to alter established ownership.
     InvalidBackend,
     /// An exclusive backend already has a logical view.
@@ -1257,6 +1303,10 @@ pub enum ProviderLeaseError {
     InvalidAuthority,
     /// The central controller rejected release of the registry's owned admission lease.
     Admission(AdmissionError),
+    /// A promotion was not pending, was already consumed, or mismatched its current authority.
+    InvalidPromotion,
+    /// A bounded view ceiling would be exceeded.
+    ViewCapacity,
 }
 
 /// Reports one bounded request for a logical provider view.
@@ -1270,6 +1320,15 @@ pub enum ProviderLeaseAdmission {
     Refused(AdmissionError),
     /// The requested backend cannot safely accept this view.
     Rejected(ProviderLeaseError),
+}
+
+/// Defines finite logical-view ceilings; physical heavy-process ceilings remain central admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderLeaseLimits {
+    /// Maximum logical views across all backends.
+    pub total_views: usize,
+    /// Maximum logical views sharing one backend identity.
+    pub per_backend_views: usize,
 }
 
 /// States whether the final release of a logical view can reap a physical backend.
@@ -1302,18 +1361,22 @@ pub struct AuthorityDrainReceipt {
 /// heavy process and each attached view counts once as a forwarder; borrowed endpoints count as
 /// views only and are never candidates for a kill.  The registry does not infer Intelligence
 /// compatibility: its caller supplies a stable backend identity after that decision.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ProviderLeaseRegistry {
+    /// Immutable logical-view ceilings enforced before any attachment or pending record.
+    limits: ProviderLeaseLimits,
     /// Next nonzero logical view identity.
     next_view: u64,
     /// Active views keyed by their opaque logical lease.
     views: BTreeMap<u64, ProviderView>,
     /// Physical backend state keyed by caller-supplied compatible identity.
     backends: BTreeMap<String, ProviderBackend>,
+    /// Bounded request metadata retained only until its matching controller promotion settles.
+    pending: BTreeMap<u64, PendingProviderLease>,
 }
 
 /// Stores the scope that a direct Workspace revocation may fence.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ProviderView {
     /// Backend to which this view is attached.
     backend: String,
@@ -1336,7 +1399,32 @@ struct ProviderBackend {
     views: usize,
 }
 
+/// Stores no resource reservation, only the identity needed to consume one exact promotion.
+#[derive(Clone, Debug)]
+struct PendingProviderLease {
+    /// Backend identity requested before central admission queued it.
+    backend: String,
+    /// Ownership/share rule that must still be compatible at promotion time.
+    kind: ProviderBackendKind,
+    /// Authority scope which must still be current when the view attaches.
+    authority: ProviderView,
+}
+
 impl ProviderLeaseRegistry {
+    /// Creates an empty registry with finite logical-view ceilings.
+    pub fn new(limits: ProviderLeaseLimits) -> Result<Self, ProviderLeaseError> {
+        if limits.total_views == 0 || limits.per_backend_views == 0 {
+            return Err(ProviderLeaseError::InvalidLimits);
+        }
+        Ok(Self {
+            limits,
+            next_view: 1,
+            views: BTreeMap::new(),
+            backends: BTreeMap::new(),
+            pending: BTreeMap::new(),
+        })
+    }
+
     /// Requests a view under a current Workspace authority and centralized admission policy.
     ///
     /// Each attached view is one forwarder for accounting; only a newly created owned backend
@@ -1365,14 +1453,30 @@ impl ProviderLeaseRegistry {
             if existing.kind == ProviderBackendKind::OwnedExclusive {
                 return ProviderLeaseAdmission::Rejected(ProviderLeaseError::ExclusiveInUse);
             }
+            if !self.can_attach(&backend) {
+                return ProviderLeaseAdmission::Rejected(ProviderLeaseError::ViewCapacity);
+            }
             return ProviderLeaseAdmission::Granted(self.attach(backend, authority));
+        }
+        if !self.can_attach(&backend) {
+            return ProviderLeaseAdmission::Rejected(ProviderLeaseError::ViewCapacity);
         }
         let reserved = match kind {
             ProviderBackendKind::Borrowed => None,
             ProviderBackendKind::OwnedShared | ProviderBackendKind::OwnedExclusive => {
                 match admission.submit(owner, class) {
                     Admission::Granted(lease) => Some(lease),
-                    Admission::Queued(ticket) => return ProviderLeaseAdmission::Queued(ticket),
+                    Admission::Queued(ticket) => {
+                        self.pending.insert(
+                            ticket.0,
+                            PendingProviderLease {
+                                backend,
+                                kind,
+                                authority: ProviderView::from_authority("", authority),
+                            },
+                        );
+                        return ProviderLeaseAdmission::Queued(ticket);
+                    }
                     Admission::Refused(error) => return ProviderLeaseAdmission::Refused(error),
                 }
             }
@@ -1386,6 +1490,46 @@ impl ProviderLeaseRegistry {
             },
         );
         ProviderLeaseAdmission::Granted(self.attach(backend, authority))
+    }
+
+    /// Cancels a pending provider request and its central ticket without releasing any resource.
+    pub fn cancel_pending(
+        &mut self,
+        admission: &mut AdmissionController,
+        ticket: QueueTicket,
+    ) -> bool {
+        self.pending.remove(&ticket.0).is_some() && admission.cancel_ticket(ticket)
+    }
+
+    /// Consumes one exact central promotion once, revalidating its stored scope and backend limits.
+    pub fn promote(
+        &mut self,
+        admission: &mut AdmissionController,
+        promotion: AdmissionPromotion,
+        authority: &WorkspaceAuthority,
+    ) -> Result<ProviderViewLease, ProviderLeaseError> {
+        let pending = self
+            .pending
+            .remove(&promotion.ticket.0)
+            .ok_or(ProviderLeaseError::InvalidPromotion)?;
+        if pending.authority != ProviderView::from_authority("", authority)
+            || !self.can_attach(&pending.backend)
+            || self.backends.contains_key(&pending.backend)
+        {
+            admission
+                .release(promotion.lease)
+                .map_err(ProviderLeaseError::Admission)?;
+            return Err(ProviderLeaseError::InvalidPromotion);
+        }
+        self.backends.insert(
+            pending.backend.clone(),
+            ProviderBackend {
+                kind: pending.kind,
+                admission: Some(promotion.lease),
+                views: 0,
+            },
+        );
+        Ok(self.attach(pending.backend, authority))
     }
 
     /// Releases exactly one logical view and returns the physical ownership consequence.
@@ -1479,7 +1623,7 @@ impl ProviderLeaseRegistry {
 
     /// Attaches one view after the caller has safely established/reused the backend.
     fn attach(&mut self, backend: String, authority: &WorkspaceAuthority) -> ProviderViewLease {
-        let id = self.next_view.max(1);
+        let id = self.next_view;
         self.next_view = id
             .checked_add(1)
             .expect("provider view identifier exhausted");
@@ -1487,19 +1631,33 @@ impl ProviderLeaseRegistry {
             .get_mut(&backend)
             .expect("backend exists")
             .views += 1;
-        self.views.insert(
-            id,
-            ProviderView {
-                backend,
-                worktree_id: authority.worktree_id().to_owned(),
-                incarnation: authority
-                    .incarnation()
-                    .parse()
-                    .expect("request validated Workspace incarnation"),
-                epoch: authority.epoch(),
-            },
-        );
+        self.views
+            .insert(id, ProviderView::from_authority(backend, authority));
         ProviderViewLease(id)
+    }
+
+    /// Checks both finite forwarder ceilings before mutating backend/view state.
+    fn can_attach(&self, backend: &str) -> bool {
+        self.views.len() < self.limits.total_views
+            && self
+                .backends
+                .get(backend)
+                .is_none_or(|entry| entry.views < self.limits.per_backend_views)
+    }
+}
+
+impl ProviderView {
+    /// Copies the current Execution authority into a revocation-comparable logical-view scope.
+    fn from_authority(backend: impl Into<String>, authority: &WorkspaceAuthority) -> Self {
+        Self {
+            backend: backend.into(),
+            worktree_id: authority.worktree_id().to_owned(),
+            incarnation: authority
+                .incarnation()
+                .parse()
+                .expect("request validated Workspace incarnation"),
+            epoch: authority.epoch(),
+        }
     }
 }
 

@@ -23,8 +23,9 @@ use execution::{
     ControlledCommand, D03ProfileEvidence, DiscoverWorktreeRequest, DiscoveryOperationRef,
     EndpointOwnership, ExecutionProfileCatalog, ExecutionProfileTemplate, GitDiscoveryPolicy,
     GitDiscoveryQuery, HostSandboxState, LocalExecutionPolicy, OwnerId, PersistedProfileRecord,
-    ProfileClass, ProviderBackendKind, ProviderLeaseAdmission, ProviderLeaseRegistry,
-    SandboxStateError, ValidatedExecutionRequest, ValidatedHostInvocation, WorkspaceAuthority,
+    ProfileClass, ProviderBackendKind, ProviderLeaseAdmission, ProviderLeaseLimits,
+    ProviderLeaseRegistry, SandboxStateError, ValidatedExecutionRequest, ValidatedHostInvocation,
+    WorkspaceAuthority,
 };
 use serde_json::json;
 use tokio::io::AsyncReadExt;
@@ -50,6 +51,14 @@ fn disabled_state(root: &Path) -> HostSandboxState {
         "useLegacyLandlock": false
     })))
     .unwrap()
+}
+
+/// Supplies finite view ceilings for provider-lease contract scenarios.
+fn lease_limits(total_views: usize, per_backend_views: usize) -> ProviderLeaseLimits {
+    ProviderLeaseLimits {
+        total_views,
+        per_backend_views,
+    }
 }
 
 /// Builds a request whose argv/profile data is fixed by this test rather than model text.
@@ -394,7 +403,13 @@ fn persisted_catalog_requires_complete_matching_d03_evidence() {
     )
     .unwrap();
     let loaded = PersistedProfileRecord::from_json(&record.to_json()).unwrap();
-    assert!(ExecutionProfileCatalog::from_persisted_records(vec![(loaded, state.clone())]).is_ok());
+    assert!(
+        ExecutionProfileCatalog::from_persisted_records(
+            vec![(loaded, state.clone())],
+            std::slice::from_ref(&record),
+        )
+        .is_ok()
+    );
     assert!(PersistedProfileRecord::from_json("{\"profile_id\":\"only\"}").is_err());
     let changed = HostSandboxState::parse(Some(json!({
         "permissionProfile": {"type": "disabled"},
@@ -404,7 +419,31 @@ fn persisted_catalog_requires_complete_matching_d03_evidence() {
         "changed_semantic_value": true
     })))
     .unwrap();
-    assert!(ExecutionProfileCatalog::from_persisted_records(vec![(record, changed)]).is_err());
+    assert!(
+        ExecutionProfileCatalog::from_persisted_records(
+            vec![(record.clone(), changed)],
+            std::slice::from_ref(&record)
+        )
+        .is_err()
+    );
+    let fabricated = PersistedProfileRecord::from_execution_evidence(
+        "fabricated",
+        1,
+        D03ProfileEvidence {
+            provider_binary: "fake".into(),
+            toolchain: "fake".into(),
+            configuration: "fake".into(),
+            trust: "fake".into(),
+            transport: "fake".into(),
+            d03_evidence: "fake".into(),
+        },
+        &state,
+    )
+    .unwrap();
+    assert!(
+        ExecutionProfileCatalog::from_persisted_records(vec![(fabricated, state)], &[record])
+            .is_err()
+    );
 }
 
 /// Proves compatible views share one heavy reservation while exclusive and queued requests do not.
@@ -421,7 +460,7 @@ fn provider_leases_share_only_compatible_owned_backends() {
         interactive_burst: 1,
     })
     .unwrap();
-    let mut registry = ProviderLeaseRegistry::default();
+    let mut registry = ProviderLeaseRegistry::new(lease_limits(2, 2)).unwrap();
     let first = match registry.request(
         &mut admission,
         OwnerId::new("owner").unwrap(),
@@ -479,6 +518,109 @@ fn provider_leases_share_only_compatible_owned_backends() {
     assert_eq!(registry.counts(), (1, 1));
 }
 
+/// Proves forwarder ceilings reject before mutation while the earlier shared view remains usable.
+#[test]
+fn provider_view_limits_bound_shared_forwarders() {
+    let authority =
+        WorkspaceAuthority::from_workspace("worktree", "1", PathBuf::from("/private/tmp"), 7)
+            .unwrap();
+    let mut admission = AdmissionController::new(AdmissionLimits {
+        total_running: 2,
+        per_owner_running: 2,
+        per_owner_queued: 2,
+        total_queued: 2,
+        interactive_burst: 1,
+    })
+    .unwrap();
+    let mut registry = ProviderLeaseRegistry::new(lease_limits(1, 1)).unwrap();
+    assert!(matches!(
+        registry.request(
+            &mut admission,
+            OwnerId::new("owner").unwrap(),
+            AdmissionClass::Interactive,
+            "shared",
+            ProviderBackendKind::OwnedShared,
+            &authority
+        ),
+        ProviderLeaseAdmission::Granted(_)
+    ));
+    assert!(matches!(
+        registry.request(
+            &mut admission,
+            OwnerId::new("peer").unwrap(),
+            AdmissionClass::Interactive,
+            "shared",
+            ProviderBackendKind::OwnedShared,
+            &authority
+        ),
+        ProviderLeaseAdmission::Rejected(execution::ProviderLeaseError::ViewCapacity)
+    ));
+    assert!(matches!(
+        registry.request(
+            &mut admission,
+            OwnerId::new("borrowed").unwrap(),
+            AdmissionClass::Interactive,
+            "other",
+            ProviderBackendKind::Borrowed,
+            &authority
+        ),
+        ProviderLeaseAdmission::Rejected(execution::ProviderLeaseError::ViewCapacity)
+    ));
+    assert_eq!(registry.counts(), (1, 1));
+}
+
+/// Proves a queued provider request has no registry reservation until its exact promotion is consumed.
+#[test]
+fn queued_provider_ticket_promotes_once_with_its_matching_lease() {
+    let authority =
+        WorkspaceAuthority::from_workspace("worktree", "1", PathBuf::from("/private/tmp"), 7)
+            .unwrap();
+    let mut admission = AdmissionController::new(AdmissionLimits {
+        total_running: 1,
+        per_owner_running: 1,
+        per_owner_queued: 2,
+        total_queued: 2,
+        interactive_burst: 1,
+    })
+    .unwrap();
+    let held = match admission.submit(OwnerId::new("holder").unwrap(), AdmissionClass::Interactive)
+    {
+        Admission::Granted(lease) => lease,
+        result => panic!("unexpected holder: {result:?}"),
+    };
+    let mut registry = ProviderLeaseRegistry::new(lease_limits(2, 1)).unwrap();
+    let ticket = match registry.request(
+        &mut admission,
+        OwnerId::new("queued").unwrap(),
+        AdmissionClass::Background,
+        "queued-backend",
+        ProviderBackendKind::OwnedShared,
+        &authority,
+    ) {
+        ProviderLeaseAdmission::Queued(ticket) => ticket,
+        result => panic!("unexpected queue: {result:?}"),
+    };
+    assert_eq!(registry.counts(), (0, 0));
+    let promotion = admission
+        .release_with_promotions(held)
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(promotion.ticket(), ticket);
+    let view = registry
+        .promote(&mut admission, promotion, &authority)
+        .unwrap();
+    assert_eq!(registry.counts(), (1, 1));
+    assert!(matches!(
+        registry.promote(&mut admission, promotion, &authority),
+        Err(execution::ProviderLeaseError::InvalidPromotion)
+    ));
+    assert!(matches!(
+        registry.release(&mut admission, view),
+        Ok((execution::BackendRelease::ReapOwned { .. }, _))
+    ));
+}
+
 /// Proves one Workspace revocation drains only its views and leaves a shared peer backend alive.
 #[test]
 fn authority_revocation_returns_logical_drain_not_reap_claim() {
@@ -520,7 +662,7 @@ fn authority_revocation_returns_logical_drain_not_reap_claim() {
         interactive_burst: 1,
     })
     .unwrap();
-    let mut leases = ProviderLeaseRegistry::default();
+    let mut leases = ProviderLeaseRegistry::new(lease_limits(2, 2)).unwrap();
     let first = match leases.request(
         &mut admission,
         OwnerId::new("owner").unwrap(),
