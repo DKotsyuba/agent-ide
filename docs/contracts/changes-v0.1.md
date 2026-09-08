@@ -12,6 +12,8 @@ Workspace owns authority, Git commands and raw parsing, comparison identities, b
 
 For the requested current authority, Workspace supplies its opaque worktree reference and incarnation, authority epoch, selected mode, and the exact left/right Git identities applicable to that mode. Each comparison has its own raw bounded stdout/stderr, fixed command kind, exit status, truncation/timing, coverage, and operation reference.
 
+Workspace derives those identities only from complete fixed `HEAD`, index, and selected patch evidence. Its status command remains NUL-delimited porcelain v2; diff commands request complete patches, disable external diff and textconv helpers, and terminate path parsing with `--`. An unborn `HEAD` is explicit rather than an empty identity.
+
 Raw NUL-safe path/status/conflict data and a separate bounded untracked list identify the affected entries. Baseline completeness and provenance are context only: a session snapshot is never substituted for HEAD, index, or working-state comparison. An absent HEAD or unsupported comparison is explicit rather than a fabricated empty comparison.
 
 Workspace supplies currentness and ownership checks before composition and detail expansion. A revoked, stale, unsupported, failed, or incomplete input remains visibly so in the result; Changes never reconstructs a missing patch or declares partial evidence clean.
