@@ -8,7 +8,7 @@ use agent_ide::assistance::host_binding::{
 };
 use agent_ide::changes::{DiffResultState, DiffSelectionBudget, compose_diff};
 use agent_ide::workspace::authority::{
-    ActivationRequest, AuthorityError, AuthorityRegistry, WorktreeRef,
+    ActivationRequest, AuthorityError, AuthorityRegistry, StopBindingHandoff, WorktreeRef,
 };
 use agent_ide::workspace::git::{
     BaselineContext, BaselineCoverage, DiffMode, GitComparison, GitIdentity, GitScope,
@@ -339,4 +339,71 @@ fn path_with_spaces_keeps_raw_hunk_and_no_guessed_path() {
         b"@@ -1 +1 @@\n-old\n+new\n"
     );
     assert!(result.selected_hunks()[0].path().is_none());
+}
+
+#[test]
+fn old_epoch_for_same_worktree_is_stale_and_returns_no_data() {
+    let mut registry = AuthorityRegistry::default();
+    let mut guard = HostBindingGuard::default();
+    let worktree = WorktreeRef::from_discovery(
+        PathBuf::from("/private/tmp/stale-contract"),
+        PathBuf::from("/private/tmp/stale-contract"),
+        PathBuf::from("/private/tmp/stale-contract/.git"),
+        1,
+    )
+    .unwrap();
+    let channel = parse_channel_session(b"stale-one").unwrap();
+    assert!(matches!(
+        guard.observe_hook(pre_hook("actor", "call-1"), channel.clone()),
+        BindingStatus::PreObserved
+    ));
+    let BindingStatus::Validated(invocation) =
+        guard.establish_start(candidate("actor", "call-1"), channel)
+    else {
+        panic!()
+    };
+    let active = guard.consume_active(invocation.binding_ref()).unwrap();
+    let request =
+        ActivationRequest::new("stale-op-1", invocation, active, worktree.clone()).unwrap();
+    let old = registry.activate(request).unwrap();
+    let old_scope = GitScope::from_authority(&old, DiffMode::Head);
+    guard.stop_binding(old.binding()).unwrap();
+    registry
+        .revoke(&old, StopBindingHandoff::Confirmed)
+        .unwrap();
+
+    let channel = parse_channel_session(b"stale-two").unwrap();
+    assert!(matches!(
+        guard.observe_hook(pre_hook("actor", "call-2"), channel.clone()),
+        BindingStatus::PreObserved
+    ));
+    let BindingStatus::Validated(invocation) =
+        guard.establish_start(candidate("actor", "call-2"), channel)
+    else {
+        panic!()
+    };
+    let active = guard.consume_active(invocation.binding_ref()).unwrap();
+    let request = ActivationRequest::new("stale-op-2", invocation, active, worktree).unwrap();
+    let current = registry.activate(request).unwrap();
+    let expected = GitScope::from_authority(&current, DiffMode::Head);
+    let result = compose_diff(
+        &expected,
+        &comparison(DiffMode::Head),
+        status_fixture(),
+        make_evidence(&old_scope, b"foreign", Some(0), false),
+        DiffSelectionBudget::default(),
+    );
+    assert_eq!(result.state(), DiffResultState::Unavailable);
+    assert_eq!(result.freshness(), agent_ide::changes::DiffFreshness::Stale);
+    assert!(
+        result.selected_hunks().is_empty()
+            && result.untracked().is_empty()
+            && result.conflicts().is_empty()
+            && result.ignored().is_empty()
+    );
+    assert_eq!(result.identities().left(), b"");
+    assert_eq!(result.counts().tracked(), 0);
+    assert!(result.detail_cursor().is_none());
+    assert_eq!(result.provenance().operation_reference(), None);
+    assert_eq!(result.provenance().baseline_reference(), None);
 }
