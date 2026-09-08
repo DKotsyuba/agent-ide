@@ -249,13 +249,20 @@ fn optional_string(
 }
 
 /// Holds opaque trusted host correlations that never come from model tool arguments.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct TrustedTransport {
     request_id: String,
     correlation_id: String,
     opaque_attachment: String,
     /// Selected MCP host metadata, absent for generic transport-only callers.
     host_meta: Option<Value>,
+}
+
+impl std::fmt::Debug for TrustedTransport {
+    /// Hides every private correlation, launcher attachment and populated host metadata field.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TrustedTransport(..)")
+    }
 }
 
 impl TrustedTransport {
@@ -735,5 +742,19 @@ impl StdioFacade {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         self.call(AssistanceTool::Stop, parameters, context).await
+    }
+}
+
+/// Ensures diagnostics hide both launch attachments and populated host metadata in either format.
+#[test]
+fn debug_redacts_trusted_transport_and_host_metadata() {
+    let secret = "private-debug-sentinel";
+    let mut host = TrustedTransport::from_host_ingress(secret, secret, secret).unwrap();
+    host.host_meta = Some(json!({"threadId":secret,"callId":secret,"private_json":secret}));
+    for rendered in [format!("{host:?}"), format!("{host:#?}")] {
+        assert!(
+            !rendered.contains(secret) && !rendered.contains("private_json"),
+            "private host Debug leaked"
+        );
     }
 }

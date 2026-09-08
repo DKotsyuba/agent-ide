@@ -35,8 +35,15 @@ impl HookTransportLimits {
 }
 
 /// Carries a bounded validated JSON value that Application must not interpret semantically.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OpaqueJson(String);
+
+impl std::fmt::Debug for OpaqueJson {
+    /// Writes only the type name, never private correlations, attachments or JSON content.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OpaqueJson(..)")
+    }
+}
 
 impl OpaqueJson {
     /// Validates JSON serialization and a byte cap without inspecting the value's domain meaning.
@@ -89,12 +96,19 @@ impl AssistanceMethod {
 }
 
 /// Holds one sanitized hook observation with opaque caller and attachment correlations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct HookSubmit {
     request_id: String,
     correlation_id: String,
     opaque_attachment: String,
     sanitized_observation_json: OpaqueJson,
+}
+
+impl std::fmt::Debug for HookSubmit {
+    /// Writes only the type name, never private correlations, attachments or JSON content.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("HookSubmit(..)")
+    }
 }
 
 impl HookSubmit {
@@ -145,13 +159,20 @@ impl HookSubmit {
 }
 
 /// Holds one finite dispatch request for exactly one current v0.1 Assistance method.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MethodDispatch {
     request_id: String,
     correlation_id: String,
     opaque_attachment: String,
     method: AssistanceMethod,
     params_json: OpaqueJson,
+}
+
+impl std::fmt::Debug for MethodDispatch {
+    /// Writes only the type name, never private correlations, attachments or JSON content.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("MethodDispatch(..)")
+    }
 }
 
 impl MethodDispatch {
@@ -243,7 +264,7 @@ pub trait AssistanceDispatcher: Send + Sync {
 }
 
 /// Reports a hook connect-only submission without requiring the caller to repair or retry transport.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum HookSubmitTransportResult {
     /// Assistance returned one opaque reply correlated to the submitted hook observation.
     Dispatched {
@@ -254,6 +275,16 @@ pub enum HookSubmitTransportResult {
     },
     /// Daemon, framing, deadline, or Assistance dispatch was unavailable; the hook must fail open.
     Unavailable,
+}
+
+impl std::fmt::Debug for HookSubmitTransportResult {
+    /// Preserves only the outcome tag, hiding the echoed opaque correlation and reply content.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Dispatched { .. } => "HookSubmitTransportResult::Dispatched(..)",
+            Self::Unavailable => "HookSubmitTransportResult::Unavailable",
+        })
+    }
 }
 
 /// Reports one finite current-method transport call without defining its tool result semantics.
@@ -271,4 +302,50 @@ pub enum MethodDispatchTransportResult {
 /// Checks the common bounded opaque identifier invariant without making an identity claim.
 fn valid_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= MAX_OPAQUE_ID_BYTES
+}
+
+/// Ensures direct and nested public transport diagnostics cannot expose opaque host data.
+#[test]
+fn debug_redacts_private_transport_fields_and_nested_wrappers() {
+    let secret = "private-debug-sentinel";
+    let raw = format!(r#"{{"private":"{secret}"}}"#);
+    let payload = OpaqueJson::new(&raw, 1024).unwrap();
+    let hook = HookSubmit::new(secret, secret, secret, payload.clone()).unwrap();
+    let method = MethodDispatch::new(
+        secret,
+        secret,
+        secret,
+        AssistanceMethod::Start,
+        payload.clone(),
+    )
+    .unwrap();
+    let hook_dispatch = AssistanceDispatch::HookSubmit(hook.clone());
+    let method_dispatch = AssistanceDispatch::MethodDispatch(method.clone());
+    let hook_reply = AssistanceDispatchReply::HookSubmit(payload.clone());
+    let method_reply = AssistanceDispatchReply::MethodDispatch(payload.clone());
+    let hook_result = HookSubmitTransportResult::Dispatched {
+        correlation_id: secret.into(),
+        opaque_reply_json: payload.clone(),
+    };
+    let method_result = MethodDispatchTransportResult::Dispatched {
+        opaque_result_json: payload.clone(),
+    };
+    for value in [
+        &payload as &dyn std::fmt::Debug,
+        &hook,
+        &method,
+        &hook_dispatch,
+        &method_dispatch,
+        &hook_reply,
+        &method_reply,
+        &hook_result,
+        &method_result,
+    ] {
+        for rendered in [format!("{value:?}"), format!("{value:#?}")] {
+            assert!(
+                !rendered.contains(secret) && !rendered.contains(&raw),
+                "private transport Debug leaked"
+            );
+        }
+    }
 }

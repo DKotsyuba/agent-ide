@@ -17,6 +17,12 @@ use tokio::{
 /// Distinguishes temporary endpoints across concurrently running scenarios in this process.
 static NEXT_RUNTIME: AtomicUsize = AtomicUsize::new(0);
 
+/// Allows 200 ms for subprocess startup/scheduling beyond the 250 ms hook contract.
+///
+/// Child Tokio clocks cannot be paused by this test runtime. This wall-clock ceiling stays
+/// below both a doubled (500 ms) and sixfold (1500 ms) timeout without changing product code.
+const HOOK_EXIT_CEILING: Duration = Duration::from_millis(450);
+
 /// Returns a unique missing runtime path; the tested command decides whether to create it.
 fn runtime() -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -500,11 +506,14 @@ async fn binary_codex_hook_fail_open_inactive_invalid_and_stdin_deadline() {
         let mut child = hook_process(&runtime, attachment);
         let input = child.stdin.take().unwrap();
         let before = std::time::Instant::now();
-        let output = tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
+        let output = tokio::time::timeout(HOOK_EXIT_CEILING, child.wait_with_output())
             .await
             .unwrap()
             .unwrap();
-        assert!(before.elapsed() < Duration::from_millis(1500));
+        assert!(
+            before.elapsed() < HOOK_EXIT_CEILING,
+            "hook exceeded 250 ms deadline plus 200 ms scheduler allowance"
+        );
         assert!(output.status.success() && output.stdout.is_empty() && output.stderr.is_empty());
         drop(input);
     }
@@ -546,12 +555,15 @@ async fn binary_codex_hook_hung_daemon_deadline_sends_only_selected_fields() {
             std::io::ErrorKind::UnexpectedEof
         );
     };
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(HOOK_EXIT_CEILING, async {
         tokio::join!(hook, capture);
     })
     .await
     .unwrap();
-    assert!(before.elapsed() < Duration::from_millis(1500));
+    assert!(
+        before.elapsed() < HOOK_EXIT_CEILING,
+        "hook exceeded 250 ms deadline plus 200 ms scheduler allowance"
+    );
     drop(listener);
     std::fs::remove_dir_all(runtime).unwrap();
 }

@@ -63,7 +63,9 @@ Hook parsing rejects duplicate known JSON keys and retains only phase, actor and
 ID. Root events require `session_id`; child events require `agent_id`; supplying both is
 ambiguous. `tool_use_id` identifies the exact call. Tool input/output, cwd, transcript
 paths and all other raw fields are discarded before IPC. The raw hook payload is never
-logged or retained in daemon state.
+logged or retained in daemon state. `Debug` formatting of the trusted transport, opaque
+JSON, hook/method requests and nested dispatch/reply wrappers redacts private fields,
+including echoed hook correlations; it cannot be used to print attachment or payload data.
 
 The MCP ingress obtains `threadId`, `callId` and the presence of the supported
 `x-codex-turn-metadata` object from rmcp `RequestContext.meta`, separately from model
@@ -128,3 +130,9 @@ active hints and suppression after stop, without claiming those fixtures changed
 These are controlled host-shaped process tests using the established Codex field contract;
 they do not substitute for a fresh live Codex host acceptance scenario. Live Claude
 root/subagent behavior and feedback delivery are unverified.
+
+The executable deadline regressions enforce a 450 ms wall-clock ceiling: the 250 ms
+product deadline plus 200 ms for child startup and scheduling. Child-process Tokio clocks
+are independent of the test runtime, so paused test time cannot control these paths.
+The allowance remains below doubled (500 ms) and sixfold (1500 ms) timeout regressions;
+both open-stdin and hung-daemon scenarios keep their real subprocess/Unix IPC boundary.
