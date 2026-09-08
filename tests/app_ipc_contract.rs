@@ -84,7 +84,7 @@ async fn start_daemon(runtime_dir: &Path) -> Child {
         .spawn()
         .unwrap();
     let socket = runtime_dir.join("agent-ide.sock");
-    for _ in 0..40 {
+    for _ in 0..200 {
         if UnixStream::connect(&socket).await.is_ok() {
             return child;
         }
@@ -106,7 +106,7 @@ async fn start_assistance_daemon(runtime_dir: &Path) -> tokio::task::JoinHandle<
         .unwrap();
     });
     let socket = runtime_dir.join("agent-ide.sock");
-    for _ in 0..40 {
+    for _ in 0..200 {
         if UnixStream::connect(&socket).await.is_ok() {
             return task;
         }
