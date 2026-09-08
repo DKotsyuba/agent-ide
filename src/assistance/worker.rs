@@ -20,6 +20,11 @@ use crate::{
         store::WorkspaceStore,
     },
 };
+#[path = "providers.rs"]
+mod providers;
+#[path = "snapshots.rs"]
+mod snapshots;
+
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -59,6 +64,8 @@ struct Detail {
     binding: BindingRef,
     /// Current pending, error or owner-generated result.
     reply: PeerReply,
+    /// Exact method/query selection, excluding only the opaque detail handle itself.
+    selection: (AssistanceTool, [u8; 32]),
     /// Current Workspace stamp, required before any source/activation result can be delivered.
     authority: Option<AuthorityStamp>,
     /// Exact registered source facts rechecked before context delivery.
@@ -102,6 +109,12 @@ struct Inspection {
     binding: BindingRef,
     /// Opaque result handle supplied by the model; it does not confer ownership.
     reference: String,
+    /// Current host-correlated sandbox metadata, never a cached prior permission observation.
+    observed: ObservedSandboxState,
+    /// Exact trusted attachment target used for current read-scope validation.
+    target: LaunchTarget,
+    /// Optional owner/path constraint for method-specific detail retrieval.
+    expected: Option<(AssistanceTool, [u8; 32])>,
     /// Finite IPC caller waiting for the current authorized result.
     reply: oneshot::Sender<PeerReply>,
 }
@@ -164,6 +177,8 @@ pub struct WorkerHandle {
     receiver: Mutex<Option<mpsc::Receiver<Inspection>>>,
     /// Sole owned worker task; no duplicate boot is allowed.
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Cooperative stop flag for the bounded startup fingerprint reader.
+    startup_cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 impl std::fmt::Debug for WorkerHandle {
     /// Omits all host, target, profile and result contents.
@@ -174,6 +189,8 @@ impl std::fmt::Debug for WorkerHandle {
 impl Drop for WorkerHandle {
     /// Cancels owned work without inventing child-reap or admission-release evidence.
     fn drop(&mut self) {
+        self.startup_cancel
+            .store(true, std::sync::atomic::Ordering::Release);
         if let Ok(task) = self.task.get_mut()
             && let Some(task) = task.take()
         {
@@ -200,6 +217,7 @@ impl WorkerHandle {
             inspect,
             receiver: Mutex::new(Some(receiver)),
             task: Mutex::new(None),
+            startup_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
     /// Opens exactly one durable Workspace owner and observation schema for this daemon boot.
@@ -213,7 +231,20 @@ impl WorkerHandle {
         let shared = self.shared.clone();
         let runtime = runtime.to_path_buf();
         let (ready, wait) = oneshot::channel();
+        let cancel = self.startup_cancel.clone();
         let task = tokio::spawn(async move {
+            let verification = shared.clone();
+            if !matches!(
+                tokio::task::spawn_blocking(move || verification
+                    .launcher
+                    .verify_executables(&cancel))
+                .await,
+                Ok(Ok(()))
+            ) {
+                let _ = ready.send(Err(FailureCode::ExecutionProfile));
+                return;
+            }
+
             let store = match Store::open_with_backup_root(
                 &runtime.join("state.sqlite"),
                 &runtime.join("backups"),
@@ -248,6 +279,20 @@ impl WorkerHandle {
                 grants: BTreeMap::new(),
                 registered: BTreeMap::new(),
                 source_sequence: 0,
+                uncertain: std::collections::BTreeSet::new(),
+                uncertain_snapshots: Vec::new(),
+                runtime,
+                providers: providers::Providers::new(),
+                admission: crate::execution::AdmissionController::new(
+                    crate::execution::AdmissionLimits {
+                        total_running: 16,
+                        per_owner_running: 2,
+                        per_owner_queued: 1,
+                        total_queued: 64,
+                        interactive_burst: 8,
+                    },
+                )
+                .expect("fixed process limits"),
             }
             .run(receiver)
             .await;
@@ -255,8 +300,8 @@ impl WorkerHandle {
         *self.task.lock().map_err(|_| FailureCode::Internal)? = Some(task);
         wait.await.map_err(|_| FailureCode::Internal)?
     }
-    /// Enqueues one bounded operation and returns immediately; duplicate starts share their result key.
-    pub fn submit(
+    /// Enqueues or resolves the exact query, returning pending without waiting for provider warmup.
+    pub async fn submit(
         &self,
         invocation: ValidatedInvocation,
         observed: Option<ObservedSandboxState>,
@@ -264,21 +309,42 @@ impl WorkerHandle {
         parameters: Value,
         attachment: &str,
     ) -> PeerReply {
-        match self.enqueue(invocation, observed, tool, parameters, attachment, None) {
-            Ok(reference) => PeerReply::Pending {
-                detail_ref: reference,
-            },
+        let binding = invocation.binding_ref().clone();
+        let Some(current) = observed.clone() else {
+            return PeerReply::Error {
+                code: FailureCode::SandboxState,
+            };
+        };
+        let expected = Some((tool, selection(&parameters)));
+        let reference =
+            if let Some(reference) = parameters.get("detail_ref").and_then(Value::as_str) {
+                Ok(reference.to_owned())
+            } else {
+                self.enqueue(invocation, observed, tool, parameters, attachment, None)
+            };
+        match reference {
+            Ok(reference) => {
+                self.inspect(binding, reference, current, attachment, expected)
+                    .await
+            }
             Err(code) => PeerReply::Error { code },
         }
     }
-    /// Revokes queued/running work immediately and awaits only the finite stop outcome.
-    /// Host binding revocation must already have happened; this method never restores it.
+
+    /// Signals revocation immediately and waits only for the bounded exact stop result.
+    /// The caller has already revoked the binding; this method never restores its authority.
     pub async fn stop(&self, invocation: ValidatedInvocation, attachment: &str) -> PeerReply {
         let binding = invocation.binding_ref().clone();
-        if let Ok(mut ledger) = self.shared.ledger.lock()
-            && let Some(sender) = ledger.cancellation.remove(&binding)
-        {
-            let _ = sender.send(true);
+        if let Ok(mut ledger) = self.shared.ledger.lock() {
+            if let Some(sender) = ledger.cancellation.remove(&binding) {
+                let _ = sender.send(true);
+            }
+            ledger
+                .queue
+                .retain(|job| job.invocation.binding_ref() != &binding);
+            ledger.details.retain(|_, detail| detail.binding != binding);
+            ledger.starts.retain(|(owner, _), _| owner != &binding);
+            ledger.native_epoch.remove(&binding);
         }
         self.shared.notify.notify_one();
         let (send, wait) = oneshot::channel();
@@ -299,14 +365,30 @@ impl WorkerHandle {
             },
         }
     }
-    /// Routes a same-binding inspection to the sole worker for fresh durable authorization.
-    pub async fn inspect(&self, binding: BindingRef, reference: String) -> PeerReply {
+
+    /// Asks the sole worker for a same-binding, current-profile, durably authorized result.
+    pub async fn inspect(
+        &self,
+        binding: BindingRef,
+        reference: String,
+        observed: ObservedSandboxState,
+        attachment: &str,
+        expected: Option<(AssistanceTool, [u8; 32])>,
+    ) -> PeerReply {
+        let Some(target) = self.shared.launcher.target(attachment).cloned() else {
+            return PeerReply::Error {
+                code: FailureCode::LauncherConfiguration,
+            };
+        };
         let (reply, wait) = oneshot::channel();
         if self
             .inspect
             .try_send(Inspection {
                 binding,
                 reference,
+                observed,
+                target,
+                expected,
                 reply,
             })
             .is_err()
@@ -319,7 +401,8 @@ impl WorkerHandle {
             code: FailureCode::Internal,
         })
     }
-    /// Wakes bounded registered-path reconciliation after an active native hook lifecycle.
+
+    /// Invalidates cached results on native hints; reads wait for a current MCP sandbox observation.
     pub fn native_hint(&self, binding: BindingRef) {
         if let Ok(mut ledger) = self.shared.ledger.lock() {
             let epoch = ledger.native_epoch.entry(binding).or_default();
@@ -328,7 +411,7 @@ impl WorkerHandle {
         self.shared.notify.notify_one();
     }
 
-    /// Validates bounds/ownership and publishes one queue entry atomically without any I/O.
+    /// Atomically bounds and publishes one operation, without file, database or child-process I/O.
     fn enqueue(
         &self,
         invocation: ValidatedInvocation,
@@ -375,12 +458,13 @@ impl WorkerHandle {
         {
             return Ok(reference.clone());
         }
-        if tool != AssistanceTool::Stop && ledger.queue.len() >= self.shared.launcher.limits.queued
-        {
+        let queue_cap =
+            self.shared.launcher.limits.queued + if tool == AssistanceTool::Stop { 64 } else { 0 };
+        if ledger.queue.len() >= queue_cap {
             return Err(FailureCode::Capacity);
         }
-        if ledger.details.len() >= self.shared.launcher.limits.details
-            && tool != AssistanceTool::Stop
+        if tool != AssistanceTool::Stop
+            && ledger.details.len() >= self.shared.launcher.limits.details
         {
             return Err(FailureCode::Capacity);
         }
@@ -407,6 +491,7 @@ impl WorkerHandle {
                     reply: PeerReply::Pending {
                         detail_ref: reference.clone(),
                     },
+                    selection: (tool, selection(&parameters)),
                     authority: None,
                     source: None,
                     native_epoch: 0,
@@ -454,12 +539,21 @@ struct Worker<'a> {
     registered: BTreeMap<BindingRef, std::collections::BTreeSet<std::path::PathBuf>>,
     /// Boot-unique source observation operation sequence.
     source_sequence: u64,
+    /// Finite physical-effect admission, shared by discovery, snapshots and language providers.
+    admission: crate::execution::AdmissionController,
+    /// Bindings with uncertain physical/durable completion cannot report successful cleanup.
+    uncertain: std::collections::BTreeSet<BindingRef>,
+    /// Retains private scratch files when a child has no positive reap evidence.
+    uncertain_snapshots: Vec<crate::workspace::git::snapshot::SnapshotIntent>,
+    /// Private runtime namespace for current-boot provider sockets.
+    runtime: std::path::PathBuf,
+    /// Exact provider/backend/view ownership and generations.
+    providers: providers::Providers,
 }
 impl Worker<'_> {
     /// Processes one slow operation at a time while servicing short same-worker inspections.
     async fn run(mut self, mut inspections: mpsc::Receiver<Inspection>) {
         loop {
-            self.reconcile_hints().await;
             let shared = self.shared.clone();
             let wake = shared.notify.notified();
             let job = shared
@@ -468,14 +562,14 @@ impl Worker<'_> {
                 .ok()
                 .and_then(|mut ledger| ledger.queue.pop_front());
             if let Some(job) = job {
-                let workspace = self.workspace;
+                let workspace = self.workspace.clone();
                 let service = self.perform(job);
                 tokio::pin!(service);
                 loop {
-                    tokio::select! {_= &mut service=>break,Some(request)=inspections.recv()=>serve_inspection(workspace,&shared,request).await}
+                    tokio::select! {_= &mut service=>break,Some(request)=inspections.recv()=>serve_inspection(&workspace,&shared,request).await}
                 }
             } else {
-                tokio::select! {_=wake=>{},Some(request)=inspections.recv()=>serve_inspection(self.workspace,&shared,request).await}
+                tokio::select! {_=wake=>{},Some(request)=inspections.recv()=>serve_inspection(&self.workspace,&shared,request).await}
             }
         }
     }
@@ -496,11 +590,16 @@ impl Worker<'_> {
         } else if tokio::time::Instant::now() >= job.deadline {
             Err(FailureCode::Deadline)
         } else {
-            match job.tool {
-                AssistanceTool::Start => self.activate(&job).await,
-                AssistanceTool::Context => self.context(&job).await,
-                AssistanceTool::Diff => Err(FailureCode::SourceUnavailable),
-                _ => Err(FailureCode::Internal),
+            self.reconcile_hints(&job).await;
+            if tokio::time::Instant::now() >= job.deadline {
+                Err(FailureCode::Deadline)
+            } else {
+                match job.tool {
+                    AssistanceTool::Start => self.activate(&mut job).await,
+                    AssistanceTool::Context => self.context(&mut job).await,
+                    AssistanceTool::Diff => self.diff(&mut job).await,
+                    _ => Err(FailureCode::Internal),
+                }
             }
         };
         let (reply, authority, source) = match result {
@@ -518,19 +617,203 @@ impl Worker<'_> {
             let _ = sender.send(reply);
         }
     }
-    /// Stops at the missing validated Git-discovery peer; no caller path can mint durable authority.
+    /// Runs only the fixed catalog-admitted discovery commands, settling each child before parsing.
     async fn activate(
         &mut self,
-        job: &Job,
+        job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
-        let _ = (
-            &self.observations,
-            &job.parameters,
-            &job.target,
-            &job.observed,
+        use crate::execution::{
+            DiscoverWorktreeRequest, DiscoveryOperationRef, GitDiscoveryPolicy, GitDiscoveryQuery,
+        };
+        let binding = job.invocation.binding_ref().clone();
+        let observed = job.observed.clone().ok_or(FailureCode::SandboxState)?;
+        let operation = DiscoveryOperationRef::new(format!("discover-{}", job.reference))
+            .map_err(|_| FailureCode::Internal)?;
+        let policy = GitDiscoveryPolicy::new(
+            job.target.git.path.clone(),
+            self.shared.launcher.limits.output_bytes,
+            job.target.allow_disabled_host,
+        )
+        .map_err(|_| FailureCode::ExecutionProfile)?;
+        let mut evidence = Vec::with_capacity(3);
+        for query in [
+            GitDiscoveryQuery::ShowTopLevel,
+            GitDiscoveryQuery::GitCommonDir,
+            GitDiscoveryQuery::WorktreeListPorcelainZ,
+        ] {
+            let request = DiscoverWorktreeRequest::from_active_observation(
+                self.shared.active(&binding)?,
+                observed.clone(),
+                job.target.candidate.clone().into_os_string(),
+                operation.clone(),
+            )
+            .map_err(|_| FailureCode::SandboxState)?;
+            let request = request
+                .validate_query(query, &policy, &job.target.catalog)
+                .map_err(|_| FailureCode::ExecutionProfile)?;
+            if *job.cancel.borrow() {
+                return Err(FailureCode::Cancelled);
+            }
+            if tokio::time::Instant::now() >= job.deadline {
+                return Err(FailureCode::Deadline);
+            }
+            let active = self.shared.active(&binding)?;
+            let lease = self.admit(&binding)?;
+            let mut child = match request.spawn(lease, active, &job.target.codex.path) {
+                Ok(child) => child,
+                Err(error) => return Err(self.spawn_failure(error, &binding)),
+            };
+            let remaining = job
+                .deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(Duration::from_secs(60));
+            let interrupted = tokio::select! {result=child.wait(remaining)=>result.is_err(),_=job.cancel.changed()=>true};
+            let result = if interrupted {
+                child
+                    .cancel_and_reap(Duration::from_millis(100), Duration::from_millis(500))
+                    .await
+            } else {
+                child
+                    .reap(Duration::from_millis(500), Duration::from_millis(100))
+                    .await
+            };
+            let completed = match result {
+                Ok(completed) => completed,
+                Err(_) => {
+                    self.uncertain.insert(binding.clone());
+                    return Err(FailureCode::Deadline);
+                }
+            };
+            self.admission
+                .release_reaped(completed.settlement)
+                .map_err(|_| FailureCode::Internal)?;
+            if interrupted {
+                return Err(if *job.cancel.borrow() {
+                    FailureCode::Cancelled
+                } else {
+                    FailureCode::Deadline
+                });
+            }
+            self.shared.active(&binding)?;
+            evidence.push(completed.evidence);
+        }
+        let discovered = crate::workspace::git::discovery::validate_discovery(
+            &job.target.candidate,
+            &operation,
+            &evidence,
+        )
+        .map_err(|error| match error {
+            crate::workspace::git::GitError::UnsupportedDiscoveryGit => {
+                FailureCode::ExecutionProfile
+            }
+            _ => FailureCode::WorkspaceActivation,
+        })?;
+        self.shared.active(&binding)?;
+        let tree = self
+            .workspace
+            .resolve_worktree(
+                discovered.root().to_path_buf(),
+                discovered.repository_root().to_path_buf(),
+                discovered.common_dir().to_path_buf(),
+            )
+            .await
+            .map_err(|_| FailureCode::WorkspaceActivation)?;
+        let mut identity = blake3::Hasher::new();
+        identity.update(&binding.fingerprint());
+        identity.update(
+            job.parameters["activation_id"]
+                .as_str()
+                .ok_or(FailureCode::Internal)?
+                .as_bytes(),
         );
-        Err(FailureCode::WorkspaceActivation)
+        let operation = identity.finalize().to_hex().to_string();
+        let request = crate::workspace::authority::ActivationRequest::new(
+            operation,
+            job.invocation.clone(),
+            self.shared.active(&binding)?,
+            tree,
+        )
+        .map_err(|_| FailureCode::WorkspaceActivation)?;
+        // Do not cancel an in-flight durable commit: preserve its recoverable receipt before fencing output.
+        let receipt = match self.workspace.activate(request).await {
+            Ok(receipt) => receipt,
+            Err(crate::workspace::durable::DurableError::OperationConflict) => {
+                return Err(FailureCode::Conflict);
+            }
+            Err(
+                crate::workspace::durable::DurableError::Application(_)
+                | crate::workspace::durable::DurableError::CorruptState,
+            ) => {
+                self.uncertain.insert(binding.clone());
+                return Err(FailureCode::WorkspaceActivation);
+            }
+            Err(_) => return Err(FailureCode::WorkspaceActivation),
+        };
+        self.grants.insert(binding.clone(), receipt);
+        let authority = match self.authority(&binding).await {
+            Ok(authority) => authority,
+            Err(error) => {
+                if let Ok(mut guard) = self.shared.bindings.lock() {
+                    let _ = guard.stop_binding(&binding);
+                }
+                let _ = self.revoke(&binding, &job.reference).await;
+                return Err(error);
+            }
+        };
+        self.shared.active(&binding)?;
+        Ok((
+            PeerReply::Complete {
+                kind: ResultKind::Activation,
+                text: format!(
+                    "Workspace activated; authority_epoch: {}. Provider readiness is not implied.",
+                    authority.epoch()
+                ),
+                detail_ref: Some(job.reference.clone()),
+                truncated: false,
+            },
+            Some(authority),
+            None,
+        ))
     }
+
+    /// Allocates one physical slot without waiting behind a retained idle backend; queued tickets are cancelled.
+    fn admit(
+        &mut self,
+        binding: &BindingRef,
+    ) -> Result<crate::execution::AdmissionLease, FailureCode> {
+        use crate::execution::{Admission, AdmissionClass, OwnerId};
+        let owner = OwnerId::new(
+            blake3::Hash::from_bytes(binding.fingerprint())
+                .to_hex()
+                .to_string(),
+        )
+        .map_err(|_| FailureCode::Internal)?;
+        match self.admission.submit(owner, AdmissionClass::Interactive) {
+            Admission::Granted(lease) => Ok(lease),
+            Admission::Queued(ticket) => {
+                self.admission.cancel_ticket(ticket);
+                Err(FailureCode::Capacity)
+            }
+            Admission::Refused(_) => Err(FailureCode::Capacity),
+        }
+    }
+
+    /// Settles only a definite pre-child failure; every uncertain process error retains its reservation.
+    fn spawn_failure(
+        &mut self,
+        error: crate::execution::ProcessError,
+        binding: &BindingRef,
+    ) -> FailureCode {
+        if let crate::execution::ProcessError::NeverStarted { settlement, .. } = error {
+            if self.admission.settle_never_started(settlement).is_err() {
+                self.uncertain.insert(binding.clone());
+            }
+        } else {
+            self.uncertain.insert(binding.clone());
+        }
+        FailureCode::ExecutionProfile
+    }
+
     /// Returns only a current boot-fenced stamp after a fresh binding consume.
     async fn authority(&self, binding: &BindingRef) -> Result<AuthorityStamp, FailureCode> {
         let receipt = self
@@ -549,6 +832,8 @@ impl Worker<'_> {
         &mut self,
         binding: &BindingRef,
         path: std::path::PathBuf,
+        observed_scope: &ObservedSandboxState,
+        target: &LaunchTarget,
     ) -> Result<(SourceObservation, Vec<u8>), FailureCode> {
         use crate::workspace::{
             observation::{
@@ -558,7 +843,7 @@ impl Worker<'_> {
             store::{ObservationAdmission, ObservationDraft},
         };
         let authority = self.authority(binding).await?;
-        self.shared.active(binding)?;
+        validate_read_scope(&self.shared, binding, observed_scope, target, &authority)?;
         let read = read_authorized_source(
             authority.worktree(),
             &path,
@@ -633,39 +918,56 @@ impl Worker<'_> {
         Ok((observed, bytes))
     }
 
-    /// Reconciles only registered paths after native hints, without inferring command effects.
-    async fn reconcile_hints(&mut self) {
-        let bindings = self.registered.keys().cloned().collect::<Vec<_>>();
-        for binding in bindings {
-            let hinted = self
-                .shared
-                .bindings
-                .lock()
-                .ok()
-                .and_then(|mut guard| guard.take_native_change_hint(&binding).ok())
-                .unwrap_or(false);
-            if hinted {
-                let paths = self.registered.get(&binding).cloned().unwrap_or_default();
-                for path in paths {
-                    if self.observe(&binding, path).await.is_err() {
-                        break;
-                    }
+    /// Reconciles native-hinted registered paths only when a new MCP call supplies current sandbox state.
+    /// Hooks themselves never provide new read authority or authorize a scope from tool payload text.
+    async fn reconcile_hints(&mut self, job: &Job) {
+        let binding = job.invocation.binding_ref();
+        let Some(scope) = &job.observed else {
+            return;
+        };
+        let hinted = self
+            .shared
+            .bindings
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take_native_change_hint(binding).ok())
+            .unwrap_or(false);
+        if hinted {
+            let paths = self.registered.get(binding).cloned().unwrap_or_default();
+            for path in paths {
+                if *job.cancel.borrow() || tokio::time::Instant::now() >= job.deadline {
+                    break;
+                }
+                if self
+                    .observe(binding, path, scope, &job.target)
+                    .await
+                    .is_err()
+                {
+                    break;
                 }
             }
         }
     }
 
-    /// Produces exact-file lexical context until accepted provider service supplies semantic facts.
+    /// Returns current owner context with explicit semantic or lexical provenance and bounded source text.
     async fn context(
         &mut self,
-        job: &Job,
+        job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
-        use crate::intelligence::context::{ContextQuery, lexical_context};
-        let binding = job.invocation.binding_ref();
+        use crate::intelligence::context::{ContextMode, ContextQuery, lexical_context};
+        let binding = job.invocation.binding_ref().clone();
         let path = job.parameters["path"]
             .as_str()
-            .ok_or(FailureCode::SourceUnavailable)?;
-        let (observed, bytes) = self.observe(binding, path.into()).await?;
+            .ok_or(FailureCode::SourceUnavailable)?
+            .to_owned();
+        let (observed, bytes) = self
+            .observe(
+                &binding,
+                path.clone().into(),
+                job.observed.as_ref().ok_or(FailureCode::SandboxState)?,
+                &job.target,
+            )
+            .await?;
         let query = job
             .parameters
             .get("byte_offset")
@@ -673,14 +975,17 @@ impl Worker<'_> {
             .map_or(ContextQuery::File, |byte_offset| ContextQuery::Symbol {
                 byte_offset: byte_offset as usize,
             });
-        let context = lexical_context(
-            &observed,
-            &bytes,
-            query,
-            "accepted semantic provider is not connected",
-        )
-        .map_err(|_| FailureCode::SourceUnavailable)?;
-        let authority = self.authority(binding).await?;
+        let semantic = if observed.bytes().is_none() {
+            Ok(None)
+        } else {
+            self.semantic_context(job, &observed, &bytes, query).await
+        };
+        let context=match semantic {
+            Ok(Some(context))=>context,
+            Ok(None)=>lexical_context(&observed,&bytes,query,"no accepted provider is configured for this source, or the registered path is missing").map_err(|_|FailureCode::SourceUnavailable)?,
+            Err(FailureCode::ProviderUnavailable)=>lexical_context(&observed,&bytes,query,"accepted semantic provider is unavailable").map_err(|_|FailureCode::SourceUnavailable)?,
+            Err(code)=>return Err(code),
+        };
         if !source_matches(&observed) {
             return Err(FailureCode::SourceUnavailable);
         }
@@ -690,17 +995,32 @@ impl Worker<'_> {
             .lock()
             .map_err(|_| FailureCode::Internal)?
             .native_epoch
-            .get(binding)
+            .get(&binding)
             .copied()
             .unwrap_or(0);
         if epoch != job.native_epoch {
             return Err(FailureCode::SourceUnavailable);
         }
-        self.shared.active(binding)?;
+        if tokio::time::Instant::now() >= job.deadline {
+            return Err(FailureCode::Deadline);
+        }
+        let authority = self.authority(&binding).await?;
+        self.shared.active(&binding)?;
+        let mode = match &context.mode {
+            ContextMode::Semantic => "semantic".to_owned(),
+            ContextMode::Lexical { reason } => format!("lexical ({reason})"),
+        };
         let text = format!(
-            "mode: lexical\npath: {path}\nsource_sequence: {}\nauthority_epoch: {}\ncoverage: complete registered path\nreason: accepted semantic provider is not connected\n\n{}",
+            "mode: {mode}\npath: {path}\nsource_state: {:?}\nsource_sequence: {}\nauthority_epoch: {}\ncoverage: complete registered path\nposition_encoding: {:?}\nprovider_generation: {:?}\ndocument_version: {:?}\ndefinitions: {}\nreferences: {}\nlexical_matches: {}\n\n{}",
+            observed.state(),
             observed.sequence(),
             authority.epoch(),
+            context.position_encoding,
+            context.generation,
+            context.document_version,
+            serde_json::to_string(&context.definitions).map_err(|_| FailureCode::Internal)?,
+            serde_json::to_string(&context.references).map_err(|_| FailureCode::Internal)?,
+            serde_json::to_string(&context.lexical_matches).map_err(|_| FailureCode::Internal)?,
             context.text
         );
         Ok((
@@ -719,27 +1039,34 @@ impl Worker<'_> {
     async fn revoke(
         &mut self,
         binding: &BindingRef,
-        reference: &str,
+        _reference: &str,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        self.close_provider(binding).await?;
         self.registered.remove(binding);
-        if let Ok(mut ledger) = self.shared.ledger.lock() {
-            ledger.native_epoch.remove(binding);
-        }
-        if let Some(receipt) = self.grants.remove(binding) {
+        if let Some(receipt) = self.grants.get(binding).cloned() {
             self.workspace
                 .revoke(
-                    OperationId::new(format!("stop-{reference}"))
-                        .map_err(|_| FailureCode::Internal)?,
+                    OperationId::new(format!(
+                        "stop-{}",
+                        blake3::Hash::from_bytes(binding.fingerprint()).to_hex()
+                    ))
+                    .map_err(|_| FailureCode::Internal)?,
                     &receipt,
                     StopBindingHandoff::Confirmed,
                 )
                 .await
                 .map_err(|_| FailureCode::WorkspaceAuthority)?;
+            self.grants.remove(binding);
+        }
+        if self.uncertain.contains(binding) {
+            return Err(FailureCode::Internal);
         }
         Ok((
             PeerReply::Complete {
                 kind: ResultKind::Stop,
-                text: "Host binding revoked; no owned provider work remains".into(),
+                text:
+                    "Assistance stopped for this binding; compatible shared peers remain eligible"
+                        .into(),
                 detail_ref: None,
                 truncated: false,
             },
@@ -750,7 +1077,7 @@ impl Worker<'_> {
 }
 
 /// Delivers only a same-binding result after fresh durable authorization, with a final liveness check.
-async fn serve_inspection(workspace: DurableWorkspace<'_>, shared: &Shared, request: Inspection) {
+async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, request: Inspection) {
     let result = async {
         let active = shared.active(&request.binding)?;
         let (reply, authority, source, native_epoch) = {
@@ -760,6 +1087,13 @@ async fn serve_inspection(workspace: DurableWorkspace<'_>, shared: &Shared, requ
                 .get(&request.reference)
                 .filter(|detail| detail.binding == request.binding)
                 .ok_or(FailureCode::InvalidDetail)?;
+            if request
+                .expected
+                .as_ref()
+                .is_some_and(|expected| expected != &detail.selection)
+            {
+                return Err(FailureCode::InvalidDetail);
+            }
             (
                 detail.reply.clone(),
                 detail.authority.clone(),
@@ -767,11 +1101,18 @@ async fn serve_inspection(workspace: DurableWorkspace<'_>, shared: &Shared, requ
                 detail.native_epoch,
             )
         };
-        if let Some(authority) = authority {
+        if let Some(authority) = &authority {
             workspace
-                .authorize(&authority, &active)
+                .authorize(authority, &active)
                 .await
                 .map_err(|_| FailureCode::WorkspaceAuthority)?;
+            validate_read_scope(
+                shared,
+                &request.binding,
+                &request.observed,
+                &request.target,
+                authority,
+            )?;
         }
         if let Some(source) = source
             && !source_matches(&source)
@@ -796,6 +1137,13 @@ async fn serve_inspection(workspace: DurableWorkspace<'_>, shared: &Shared, requ
         {
             return Err(FailureCode::SourceUnavailable);
         }
+        let active = shared.active(&request.binding)?;
+        if let Some(authority) = &authority {
+            workspace
+                .authorize(authority, &active)
+                .await
+                .map_err(|_| FailureCode::WorkspaceAuthority)?;
+        }
         shared.active(&request.binding)?;
         Ok::<_, FailureCode>(reply)
     }
@@ -819,4 +1167,39 @@ fn source_matches(source: &SourceObservation) -> bool {
         Err(ObservationError::Missing) => source.state() == ObservedState::Missing,
         Err(_) => false,
     }
+}
+
+/// Intersects a current durable stamp and fresh invocation metadata before any native/cached source read.
+fn validate_read_scope(
+    shared: &Shared,
+    binding: &BindingRef,
+    observed: &ObservedSandboxState,
+    target: &LaunchTarget,
+    authority: &AuthorityStamp,
+) -> Result<(), FailureCode> {
+    let scoped = crate::execution::WorkspaceAuthority::from_workspace(
+        authority.worktree().id(),
+        authority.worktree().incarnation().to_string(),
+        authority.worktree().worktree_path().to_path_buf(),
+        authority.epoch(),
+    )
+    .map_err(|_| FailureCode::WorkspaceAuthority)?;
+    crate::execution::validate_workspace_read(
+        shared.active(binding)?,
+        observed.clone(),
+        &scoped,
+        &target.catalog,
+        target.allow_disabled_host,
+    )
+    .map(|_| ())
+    .map_err(|_| FailureCode::ExecutionProfile)
+}
+
+/// Binds detail reuse to the exact closed query (including diff mode and context byte offset).
+fn selection(parameters: &Value) -> [u8; 32] {
+    let mut selected = parameters.clone();
+    if let Some(object) = selected.as_object_mut() {
+        object.remove("detail_ref");
+    }
+    *blake3::hash(selected.to_string().as_bytes()).as_bytes()
 }

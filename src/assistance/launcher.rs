@@ -24,6 +24,8 @@ pub enum LauncherError {
     Rejected,
     /// A configured executable no longer has its accepted content fingerprint.
     ExecutableChanged,
+    /// Daemon shutdown cancelled bounded startup verification.
+    Cancelled,
 }
 
 /// An operator-accepted executable path and immutable measured identity.
@@ -34,7 +36,7 @@ pub struct AcceptedExecutable {
     pub path: PathBuf,
     /// Nonempty accepted binary/version identity matched to Execution profile evidence.
     pub identity: String,
-    /// BLAKE3 digest of the accepted executable bytes; rechecked before each physical spawn.
+    /// BLAKE3 digest checked before worker readiness; executable bytes must remain immutable until restart.
     pub blake3: String,
 }
 impl AcceptedExecutable {
@@ -49,8 +51,23 @@ impl AcceptedExecutable {
         }
         Ok(())
     }
-    /// Rechecks bounded executable contents immediately before use; it never starts a process.
+    /// Checks bounded current executable contents without starting a process.
     pub fn verify(&self) -> Result<(), LauncherError> {
+        self.verify_cancellable(&std::sync::atomic::AtomicBool::new(false))
+    }
+    /// Verifies one regular bounded executable, checking daemon cancellation between read chunks.
+    pub(crate) fn verify_cancellable(
+        &self,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), LauncherError> {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(LauncherError::Cancelled);
+        }
+        let metadata =
+            std::fs::metadata(&self.path).map_err(|_| LauncherError::ExecutableChanged)?;
+        if !metadata.is_file() || metadata.len() > MAX_EXECUTABLE_BYTES {
+            return Err(LauncherError::ExecutableChanged);
+        }
         let mut file = File::open(&self.path)
             .map_err(|_| LauncherError::ExecutableChanged)?
             .take(MAX_EXECUTABLE_BYTES + 1);
@@ -58,6 +75,9 @@ impl AcceptedExecutable {
         let mut buffer = [0; 32 * 1024];
         let mut total = 0;
         loop {
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(LauncherError::Cancelled);
+            }
             let count = file
                 .read(&mut buffer)
                 .map_err(|_| LauncherError::ExecutableChanged)?;
@@ -313,6 +333,30 @@ impl LauncherConfig {
             limits: raw.limits,
         })
     }
+    /// Verifies each immutable configured executable once before the worker becomes visible.
+    /// Duplicate paths share verification; conflicting fingerprints and cancellation fail closed.
+    pub(crate) fn verify_executables(
+        &self,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), LauncherError> {
+        let mut programs: BTreeMap<&Path, &AcceptedExecutable> = BTreeMap::new();
+        for target in self.targets.values() {
+            for program in std::iter::once(&target.git)
+                .chain(std::iter::once(&target.codex))
+                .chain(target.providers.iter().map(|provider| &provider.executable))
+            {
+                if let Some(existing) = programs.insert(program.path.as_path(), program)
+                    && !existing.blake3.eq_ignore_ascii_case(&program.blake3)
+                {
+                    return Err(LauncherError::Rejected);
+                }
+            }
+        }
+        for program in programs.values() {
+            program.verify_cancellable(cancel)?;
+        }
+        Ok(())
+    }
     /// Returns only the target keyed by an exact separately supplied launcher attachment.
     pub fn target(&self, attachment: &str) -> Option<&LaunchTarget> {
         self.targets.get(attachment)
@@ -391,4 +435,19 @@ fn accepted_executable_requires_exact_current_bytes() {
     std::fs::write(&path, b"changed bytes").unwrap();
     assert_eq!(executable.verify(), Err(LauncherError::ExecutableChanged));
     std::fs::remove_file(path).unwrap();
+}
+
+/// Cancelled startup verification performs no read even when the configured path does not exist.
+#[test]
+fn startup_fingerprint_verification_is_cooperatively_cancellable() {
+    let program = AcceptedExecutable {
+        path: "/private/tmp/nonexistent-cancelled-executable".into(),
+        identity: "cancelled".into(),
+        blake3: "0".repeat(64),
+    };
+    let cancel = std::sync::atomic::AtomicBool::new(true);
+    assert_eq!(
+        program.verify_cancellable(&cancel),
+        Err(LauncherError::Cancelled)
+    );
 }

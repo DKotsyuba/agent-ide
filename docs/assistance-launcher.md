@@ -48,7 +48,9 @@ execution evidence; they are deliberately invalid configuration values. Configur
 loading does not fabricate D03 evidence. Complete profile records are parsed by Execution
 and must match the accompanying accepted state before rebuilding its catalog. A current
 invocation still needs its own exact host-correlated state and fresh binding liveness.
-Executable content fingerprints are rechecked before physical execution.
+Each distinct configured executable fingerprint is checked once in a cancellable blocking
+startup task before the worker becomes ready. Selected executable bytes must remain
+immutable for that daemon boot; changes require restart and fresh verification.
 
 Each optional provider has `executable` in the same shape as `git`, a closed `settings`
 value, `toolchain`, `trust`, and `cache_namespace`. `gopls_defaults` requires an absolute

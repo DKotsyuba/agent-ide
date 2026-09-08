@@ -726,26 +726,7 @@ impl StdioFacade {
             Err(_) => FacadeOutcome::InvalidParameters,
         };
         let message = match outcome {
-            FacadeOutcome::Reply(reply) => {
-                let summary = match &reply {
-                    PeerReply::Pending { .. } => {
-                        "Assistance work is pending; use ide.inspect with the returned detail_ref"
-                    }
-                    PeerReply::Error { .. } => {
-                        "Assistance could not complete this operation; inspect the typed error and continue with native tools"
-                    }
-                    _ => "Assistance returned the current owner result in structured content",
-                };
-                let mut rendered = CallToolResult::success(vec![ContentBlock::text(summary)]);
-                rendered.is_error = Some(matches!(reply, PeerReply::Error { .. }));
-                rendered.structured_content = serde_json::to_value(&reply).ok();
-                if serde_json::to_vec(&rendered).is_ok_and(|bytes| bytes.len() <= MAX_REPLY_BYTES) {
-                    return rendered;
-                }
-                return CallToolResult::error(vec![ContentBlock::text(
-                    "Assistance result exceeds the bounded envelope; continue with native tools",
-                )]);
-            }
+            FacadeOutcome::Reply(reply) => return render_reply(reply),
             FacadeOutcome::InvalidParameters => {
                 "invalid bounded parameters; inspect the tool schema"
             }
@@ -769,6 +750,55 @@ impl StdioFacade {
         };
         CallToolResult::error(vec![ContentBlock::text(message)])
     }
+}
+
+/// Budgets both MCP's structured result and its escaped text fallback, reserving protocol framing.
+fn render_reply(mut reply: PeerReply) -> CallToolResult {
+    loop {
+        let summary = match &reply {
+            PeerReply::Pending { .. } => {
+                "Assistance work is pending; use ide.inspect with the returned detail_ref"
+            }
+            PeerReply::Error { .. } => {
+                "Assistance could not complete this operation; inspect the typed error and continue with native tools"
+            }
+            _ => "Assistance returned the current owner result",
+        };
+        let Ok(value) = serde_json::to_value(&reply) else {
+            break;
+        };
+        let mut rendered = if matches!(reply, PeerReply::Error { .. }) {
+            CallToolResult::structured_error(value)
+        } else {
+            CallToolResult::structured(value)
+        };
+        rendered.content.insert(0, ContentBlock::text(summary));
+        if serde_json::to_vec(&rendered).is_ok_and(|bytes| bytes.len() <= MAX_REPLY_BYTES - 1024) {
+            return rendered;
+        }
+        if !reply.shrink_text() {
+            break;
+        }
+    }
+    CallToolResult::error(vec![ContentBlock::text(
+        "Assistance result exceeds the bounded envelope; continue with native tools",
+    )])
+}
+
+/// Ensures duplicated and escaped MCP text cannot defeat the actual serialized response budget.
+#[test]
+fn rendered_reply_bounds_the_complete_mcp_result() {
+    let rendered = render_reply(PeerReply::Complete {
+        kind: ResultKind::Context,
+        text: "\0🦀\"\\".repeat(16000),
+        detail_ref: Some("same-binding-detail".into()),
+        truncated: false,
+    });
+    assert!(serde_json::to_vec(&rendered).unwrap().len() <= MAX_REPLY_BYTES - 1024);
+    let result = rendered.structured_content.unwrap();
+    assert_eq!(result["truncated"], true);
+    assert_eq!(result["detail_ref"], "same-binding-detail");
+    assert!(result["text"].as_str().unwrap().contains('🦀'));
 }
 
 #[tool_router]

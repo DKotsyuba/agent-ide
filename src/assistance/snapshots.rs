@@ -1,0 +1,298 @@
+//! Execution adapter for Workspace's filter-free snapshot collector; no Git syntax is interpreted here.
+
+use super::*;
+use crate::{
+    execution::{
+        CapturedProcessEvidence, ControlledCommand, LocalExecutionPolicy, OwnedChild,
+        ValidatedExecutionRequest, ValidatedHostInvocation, WorkspaceAuthority,
+    },
+    workspace::{
+        authority::AuthorityStamp,
+        git::{
+            BaselineContext, BaselineCoverage, DiffMode, GitError, GitScope,
+            snapshot::{SnapshotIntent, SnapshotRunner, collect_snapshot},
+        },
+    },
+};
+use std::collections::BTreeSet;
+
+/// Borrows the sole worker's admission controller while retaining exact job/authority scope.
+struct ProductSnapshotRunner<'w, 'store> {
+    /// Sole owner of physical admission and durable authorization.
+    worker: &'w mut Worker<'store>,
+    /// Original current host invocation plus absolute deadline and stop signal.
+    job: &'w mut Job,
+    /// Exact durable stamp being captured, reauthorized before every physical command.
+    authority: AuthorityStamp,
+    /// Safe typed failure retained separately from Workspace's parsing errors.
+    failure: Option<FailureCode>,
+}
+impl SnapshotRunner for ProductSnapshotRunner<'_, '_> {
+    /// Executes only the peer-owned intent, settles direct-child proof, then returns immutable data.
+    async fn run(&mut self, intent: SnapshotIntent) -> Result<CapturedProcessEvidence, GitError> {
+        match self.run_owned(intent).await {
+            Ok(evidence) => Ok(evidence),
+            Err(code) => {
+                self.failure = Some(code);
+                Err(GitError::IncompleteIdentity)
+            }
+        }
+    }
+}
+impl ProductSnapshotRunner<'_, '_> {
+    /// Keeps private snapshot files alive through wait/cancellation/reap; uncertain reaps retain the intent.
+    async fn run_owned(
+        &mut self,
+        intent: SnapshotIntent,
+    ) -> Result<CapturedProcessEvidence, FailureCode> {
+        let binding = self.job.invocation.binding_ref().clone();
+        if intent.scope().worktree() != self.authority.worktree()
+            || intent.scope().authority_epoch() != self.authority.epoch()
+        {
+            return Err(FailureCode::WorkspaceAuthority);
+        }
+        let request = self
+            .worker
+            .execution_request(
+                self.job,
+                &self.authority,
+                intent
+                    .command()
+                    .map_err(|_| FailureCode::SourceUnavailable)?,
+                &self.job.target.git,
+            )
+            .await?;
+        let active = self.worker.shared.active(&binding)?;
+        let lease = self.worker.admit(&binding)?;
+        let mut child = match OwnedChild::spawn_captured(
+            &request,
+            lease,
+            Some(active),
+            &self.job.target.codex.path,
+            self.worker.shared.launcher.limits.output_bytes,
+        ) {
+            Ok(child) => child,
+            Err(error) => return Err(self.worker.spawn_failure(error, &binding)),
+        };
+        if intent.snapshot_directory().is_some() {
+            let Some(identity) = child.take_process_identity() else {
+                self.worker.uncertain.insert(binding);
+                self.worker.uncertain_snapshots.push(intent);
+                return Err(FailureCode::Internal);
+            };
+            if intent.bind_process(identity).is_err() {
+                self.worker.uncertain.insert(binding);
+                self.worker.uncertain_snapshots.push(intent);
+                return Err(FailureCode::Internal);
+            }
+        }
+        let remaining = self
+            .job
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .min(Duration::from_secs(60));
+        let interrupted = tokio::select! {result=child.wait(remaining)=>result.is_err(),_=self.job.cancel.changed()=>true};
+        let reaped = if interrupted {
+            child
+                .cancel_and_reap(Duration::from_millis(100), Duration::from_millis(500))
+                .await
+        } else {
+            child
+                .reap(Duration::from_millis(500), Duration::from_millis(100))
+                .await
+        };
+        let completed = match reaped {
+            Ok(completed) => completed,
+            Err(_) => {
+                self.worker.uncertain.insert(binding);
+                self.worker.uncertain_snapshots.push(intent);
+                return Err(FailureCode::Deadline);
+            }
+        };
+        self.worker
+            .admission
+            .release_reaped(completed.settlement)
+            .map_err(|_| FailureCode::Internal)?;
+        intent
+            .acknowledge_reap(&completed.evidence)
+            .map_err(|_| FailureCode::Internal)?;
+        self.worker.shared.active(&binding)?;
+        if interrupted {
+            return Err(if *self.job.cancel.borrow() {
+                FailureCode::Cancelled
+            } else {
+                FailureCode::Deadline
+            });
+        }
+        Ok(completed.evidence)
+    }
+}
+
+impl Worker<'_> {
+    /// Combines startup-verified executable selection with current durable authority and sandbox state before spawn.
+    pub(super) async fn execution_request(
+        &self,
+        job: &Job,
+        authority: &AuthorityStamp,
+        command: ControlledCommand,
+        program: &crate::assistance::launcher::AcceptedExecutable,
+    ) -> Result<ValidatedExecutionRequest, FailureCode> {
+        let binding = job.invocation.binding_ref();
+        let active = self.shared.active(binding)?;
+        self.workspace
+            .authorize(authority, &active)
+            .await
+            .map_err(|_| FailureCode::WorkspaceAuthority)?;
+        if tokio::time::Instant::now() >= job.deadline || *job.cancel.borrow() {
+            return Err(FailureCode::Cancelled);
+        }
+        let invocation = ValidatedHostInvocation::from_active_observation(
+            self.shared.active(binding)?,
+            job.observed.clone().ok_or(FailureCode::SandboxState)?,
+        )
+        .map_err(|_| FailureCode::SandboxState)?;
+        let authority = WorkspaceAuthority::from_workspace(
+            authority.worktree().id(),
+            authority.worktree().incarnation().to_string(),
+            authority.worktree().worktree_path().to_path_buf(),
+            authority.epoch(),
+        )
+        .map_err(|_| FailureCode::WorkspaceAuthority)?;
+        let policy = LocalExecutionPolicy::new(
+            BTreeSet::from([program.path.clone()]),
+            64 * 1024,
+            16,
+            job.target.allow_disabled_host,
+        )
+        .map_err(|_| FailureCode::ExecutionProfile)?;
+        ValidatedExecutionRequest::validate(
+            invocation,
+            authority,
+            command,
+            &policy,
+            &job.target.catalog,
+        )
+        .map_err(|_| FailureCode::ExecutionProfile)
+    }
+
+    /// Captures one mode through safe raw Git peers and renders only Changes-owned snapshot evidence.
+    pub(super) async fn diff(
+        &mut self,
+        job: &mut Job,
+    ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        let binding = job.invocation.binding_ref().clone();
+        let authority = self.authority(&binding).await?;
+        validate_read_scope(
+            &self.shared,
+            &binding,
+            job.observed.as_ref().ok_or(FailureCode::SandboxState)?,
+            &job.target,
+            &authority,
+        )?;
+        let mode = match job.parameters["mode"].as_str() {
+            Some("head") => DiffMode::Head,
+            Some("staged") => DiffMode::Staged,
+            Some("unstaged") => DiffMode::Unstaged,
+            _ => return Err(FailureCode::Internal),
+        };
+        self.source_sequence = self
+            .source_sequence
+            .checked_add(1)
+            .ok_or(FailureCode::Capacity)?;
+        let generation = self.source_sequence;
+        let program = job.target.git.path.clone();
+        let reference = job.reference.clone();
+        let baseline =
+            BaselineContext::new(format!("baseline-{reference}"), BaselineCoverage::Unknown)
+                .map_err(|_| FailureCode::Internal)?;
+        let mut runner = ProductSnapshotRunner {
+            worker: self,
+            job,
+            authority: authority.clone(),
+            failure: None,
+        };
+        let capture = collect_snapshot(
+            &authority,
+            &program,
+            mode,
+            generation,
+            &reference,
+            baseline,
+            &mut runner,
+        )
+        .await;
+        let evidence = match capture {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return Err(runner.failure.unwrap_or(match error {
+                    GitError::UnsupportedSnapshotGit => FailureCode::UnsupportedGit,
+                    _ => FailureCode::SourceUnavailable,
+                }));
+            }
+        };
+        let comparison = evidence.comparison().clone();
+        let result = crate::changes::compose_diff(
+            &GitScope::from_authority(&authority, mode),
+            &comparison,
+            evidence,
+            crate::changes::DiffSelectionBudget::bounded(32, 48 * 1024),
+        );
+        if matches!(
+            result.state(),
+            crate::changes::DiffResultState::Unavailable | crate::changes::DiffResultState::Failed
+        ) {
+            return Err(FailureCode::SourceUnavailable);
+        }
+        let authority = self.authority(&binding).await?;
+        let epoch = self
+            .shared
+            .ledger
+            .lock()
+            .map_err(|_| FailureCode::Internal)?
+            .native_epoch
+            .get(&binding)
+            .copied()
+            .unwrap_or(0);
+        if epoch != job.native_epoch || tokio::time::Instant::now() >= job.deadline {
+            return Err(FailureCode::SourceUnavailable);
+        }
+        self.shared.active(&binding)?;
+        let mut text = format!(
+            "mode: {:?}\nstate: {:?}\ncoverage: {:?}\nfreshness: captured snapshot; not an atomic filesystem transaction\nauthority_epoch: {}\nsession_baseline: not captured\ntracked: {}; untracked: {}; conflicted: {}\n",
+            mode,
+            result.state(),
+            result.coverage(),
+            authority.epoch(),
+            result.counts().tracked(),
+            result.counts().untracked(),
+            result.counts().conflicted()
+        );
+        for path in result.tracked() {
+            text.push_str(&format!("tracked_path: {:?}\n", path.path()));
+        }
+        for path in result.untracked() {
+            text.push_str(&format!("untracked_path: {:?}\n", path.path()));
+        }
+        for path in result.conflicts() {
+            text.push_str(&format!("conflicted_path: {:?}\n", path.path()));
+        }
+        for hunk in result.selected_hunks() {
+            match std::str::from_utf8(hunk.patch()) {
+                Ok(patch) => text.push_str(patch),
+                Err(_) => text.push_str(&format!("raw_patch_hex: {:02x?}\n", hunk.patch())),
+            }
+        }
+        let truncated =
+            result.truncated_output() || result.overflow_hunks() > 0 || result.overflow_bytes() > 0;
+        Ok((
+            PeerReply::Complete {
+                kind: ResultKind::Diff,
+                text,
+                detail_ref: Some(reference),
+                truncated,
+            },
+            Some(authority),
+            None,
+        ))
+    }
+}

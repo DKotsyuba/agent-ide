@@ -186,16 +186,23 @@ impl ProductDispatcher {
                             .inspect(
                                 invocation.binding_ref().clone(),
                                 call.parameters()["detail_ref"].as_str()?.to_owned(),
+                                observed?,
+                                method.opaque_attachment(),
+                                None,
                             )
                             .await
                     }
-                    _ => worker.submit(
-                        invocation,
-                        observed,
-                        tool,
-                        call.parameters().clone(),
-                        method.opaque_attachment(),
-                    ),
+                    _ => {
+                        worker
+                            .submit(
+                                invocation,
+                                observed,
+                                tool,
+                                call.parameters().clone(),
+                                method.opaque_attachment(),
+                            )
+                            .await
+                    }
                 })
             }
         }

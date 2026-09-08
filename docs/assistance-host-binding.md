@@ -84,7 +84,8 @@ native Pre/Post lifecycle without an MCP invocation coalesces a registered-path 
 hint only for an already active binding. This applies equally to successful and failed
 commands: actor/call/phase are sufficient triggers; command text, paths and tool results
 are never trusted as effects. `take_native_change_hint` consumes that bounded hint after
-a fresh liveness check. Actual Workspace reconciliation is not yet connected here.
+a fresh liveness check. The worker invalidates old detail immediately, then reconciles only
+registered paths when the next MCP invocation supplies a current sandbox observation.
 Duplicate pre-hooks, premature post-hooks and MCP-before-pre ordering reject that
 invocation for subsequent MCP validation in the remaining daemon lifetime; late hooks cannot repair it. Explicit stop revokes the
 exact binding and rejects its pending pre-hooks before any Workspace handoff could occur.
@@ -109,18 +110,17 @@ Closed daemon outcomes are:
 | `{"state":"native_hook_observed"}` | Active native lifecycle requested a registered-path recheck; no source effect is claimed. |
 | `{"state":"host_stopped"}` | The exact host binding was revoked; no Workspace authority was created. |
 
-The MCP facade renders only the corresponding closed method outcomes. Stop reports host
-binding revocation, while other methods still direct the model to native tools. Unknown
+The MCP facade renders only the corresponding closed method outcomes. Without trusted
+configuration, stop reports host binding revocation and other methods direct the model to native tools. Unknown
 states or extra fields cannot become successful peer results. Hook transport submission
 is not proof of binding or model-context delivery.
 
 This adapter relies on the trusted launcher and the existing private local daemon endpoint;
 it does not cryptographically authenticate local processes or attest sandbox enforcement.
-The next gate is Workspace activation/revocation with controlled Execution admission and
-Git discovery. Invocation-correlated sandbox observation now reaches the dispatcher; physical
-execution still requires trusted configured profile evidence and a fresh spawn use. Intelligence context, Changes diff/detail and delivery visibility
-remain separate missing gates. No successful `start → context`, `start → diff`,
-`model_seen`, Claude support or end-user IDE readiness is claimed.
+Physical execution requires trusted configured profile evidence and a fresh spawn use.
+Configured product fixtures exercise `start → context`, `start → diff` and `stop` through
+the shipping CLI/MCP boundary. These fixtures do not establish `model_seen`, live Claude
+support or end-user IDE readiness.
 
 Verify with `cargo test --offline --test product_mcp_contract --test assistance_binding_contract
 --test assistance_facade_contract --test app_ipc_contract` (one command). The real binary
@@ -149,8 +149,9 @@ Daemon launch may supply `AGENT_IDE_LAUNCHER_CONFIG` naming the bounded restart-
 [trusted configuration](assistance-launcher.md). The closed result protocol additionally
 supports `pending` with a same-binding `detail_ref`, fixed error codes, and owner-produced
 `complete` results. The serialized envelope is capped at 64 KiB including escaping;
-UTF-8-safe owner-text truncation is explicit. MCP exposes it as structured content with
-a fixed short summary rather than duplicating the entire payload in text.
+UTF-8-safe owner-text truncation is explicit. MCP exposes structured content, the standard
+text fallback and a fixed short summary. Their combined serialized size has its own bound,
+including reserve for JSON-RPC framing.
 
 Cold executable startup is bounded separately by an inactive fixture invocation before
 measuring the hung-daemon case. The observed test-harness cold start can exceed 800 ms
@@ -168,5 +169,25 @@ references are boot-unique without using PID, timing or cwd as identity.
 Long operations are retained in a bounded queue and return pending details. The same
 worker services short inspections during pending work; results require same-binding
 ownership, fresh durable authority and source/native-revision rechecks. Native lifecycle
-hints trigger only registered-path reconciliation. Controlled discovery/provider wiring
-is still required before the worker can activate a worktree or return source results.
+hints trigger only registered-path reconciliation under the next current invocation.
+Activation consumes three controlled Git discovery results and commits durable authority
+before successful results are visible. Exact activation retries reuse committed facts.
+
+Source context reads one registered relative path under current sandbox and durable authority.
+Optional accepted Go/Rust profiles supply semantic results over those exact bytes; absent or
+unavailable providers return explicit lexical context. Compatible Go worktrees share one
+accounted listener with separate protocol forwarders; Rust uses an exclusive session.
+Requests have at most a 60-second protocol deadline within the configured operation budget;
+warmup remains pending while short inspections and stop remain available.
+
+Git comparisons compose typed HEAD/index/worktree snapshots. Discovery and capture use
+controlled filter-free commands and direct-child reap evidence. Results retain their
+non-atomic snapshot coverage and explicit unknown/not-captured baseline facts.
+
+`ide.stop` revokes only the exact binding, cancels pending work and reaps its owned provider
+processes before success. A shared listener survives another active Go view. Stop is not a
+worktree closure or cache-retirement fact. Restart discards bindings and detail references;
+new activation uses a boot-specific channel identity and the durable native-identity fence.
+Stop also reclaims that binding's queued jobs and retained start/detail references, without
+evicting a live peer's results. Active retained details fail with `capacity` at their configured
+limit; the worker never silently evicts live retry evidence to admit another operation.

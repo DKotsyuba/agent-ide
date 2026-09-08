@@ -28,6 +28,8 @@ pub enum FailureCode {
     SandboxState,
     /// Accepted executable/profile evidence does not authorize this operation.
     ExecutionProfile,
+    /// Configured Git lacks the required filter-free discovery/snapshot flags.
+    UnsupportedGit,
     /// Workspace activation is unavailable or refused.
     WorkspaceActivation,
     /// Current durable authority was revoked, replaced or fenced by a new boot.
@@ -121,22 +123,30 @@ impl PeerReply {
             if serialized.len() <= MAX_REPLY_BYTES - MCP_RESERVE {
                 return OpaqueJson::new(serialized, MAX_REPLY_BYTES);
             }
-            let Self::Complete {
-                text, truncated, ..
-            } = &mut self
-            else {
-                return None;
-            };
-            if text.is_empty() {
+            if !self.shrink_text() {
                 return None;
             }
-            let mut limit = text.len() / 2;
-            while !text.is_char_boundary(limit) {
-                limit -= 1;
-            }
-            text.truncate(limit);
-            *truncated = true;
         }
+    }
+    /// Reduces only owner text while preserving UTF-8 and explicitly marking omitted content.
+    /// Returns false for non-text results or already empty text; callers then fail closed.
+    pub(crate) fn shrink_text(&mut self) -> bool {
+        let Self::Complete {
+            text, truncated, ..
+        } = self
+        else {
+            return false;
+        };
+        if text.is_empty() {
+            return false;
+        }
+        let mut limit = text.len() / 2;
+        while !text.is_char_boundary(limit) {
+            limit -= 1;
+        }
+        text.truncate(limit);
+        *truncated = true;
+        true
     }
     /// Decodes a closed envelope only when serialized bytes and reference syntax are bounded.
     pub(crate) fn decode(value: &str) -> Option<Self> {
