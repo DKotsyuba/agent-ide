@@ -7,6 +7,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Bounded Git discovery validation before durable worktree identity is resolved.
+pub mod discovery;
+/// Filter-free object and source snapshot collection.
+pub mod snapshot;
+
 use super::authority::{AuthorityStamp, WorktreeRef};
 use crate::execution::{CommandKind, ControlledCommand, WorkspaceAuthority as ExecutionAuthority};
 
@@ -209,17 +214,21 @@ pub struct GitScope {
 /// Selects one fixed read-only Git collection command without accepting model-provided argv or paths.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GitReadQuery {
-    /// Collects NUL-delimited porcelain-v2 status, including separately reported untracked paths.
+    /// Legacy non-executable porcelain evidence tag; live snapshots derive raw status from safe plumbing.
     Status,
+    /// Enumerates committed HEAD paths, full OIDs and modes without reading worktree content.
+    HeadTree,
+    /// Lists raw untracked paths with Git ignore handling but without content/filter reads.
+    UntrackedPaths,
     /// Quietly verifies the current `HEAD`; its fixed missing-ref exit reports an unborn head.
     HeadIdentity,
     /// Collects the complete NUL-delimited index state without writing a tree object.
     IndexState,
-    /// Collects the raw `HEAD` comparison bytes for the current worktree.
+    /// Legacy non-executable HEAD patch tag; live HEAD mode uses the raw snapshot collector.
     HeadDiff,
-    /// Collects the raw staged/index comparison bytes.
+    /// Legacy non-executable staged patch tag; live staged mode uses the raw snapshot collector.
     StagedDiff,
-    /// Collects the raw unstaged/worktree comparison bytes.
+    /// Legacy non-executable unstaged patch tag; live unstaged mode uses the raw snapshot collector.
     UnstagedDiff,
 }
 
@@ -227,18 +236,13 @@ impl GitReadQuery {
     /// Returns the fixed comparison mode assigned to this collection command.
     pub const fn mode(self) -> DiffMode {
         match self {
-            Self::Status | Self::HeadIdentity | Self::HeadDiff => DiffMode::Head,
+            Self::Status
+            | Self::HeadTree
+            | Self::UntrackedPaths
+            | Self::HeadIdentity
+            | Self::HeadDiff => DiffMode::Head,
             Self::IndexState | Self::StagedDiff => DiffMode::Staged,
             Self::UnstagedDiff => DiffMode::Unstaged,
-        }
-    }
-
-    /// Returns the only patch query that can supply a requested comparison mode.
-    pub const fn diff_for(mode: DiffMode) -> Self {
-        match mode {
-            DiffMode::Head => Self::HeadDiff,
-            DiffMode::Staged => Self::StagedDiff,
-            DiffMode::Unstaged => Self::UnstagedDiff,
         }
     }
 }
@@ -255,7 +259,7 @@ pub struct GitReadIntent {
 }
 
 impl GitReadIntent {
-    /// Creates one fixed read-only Git intent for a current authority without accepting paths or flags.
+    /// Creates a fixed metadata intent; unsafe legacy status/diff tags return SnapshotRequired.
     pub fn new(
         authority: &AuthorityStamp,
         program: PathBuf,
@@ -263,6 +267,15 @@ impl GitReadIntent {
     ) -> Result<Self, GitError> {
         if !is_normal_absolute(&program) {
             return Err(GitError::InvalidGitProgram);
+        }
+        if matches!(
+            query,
+            GitReadQuery::Status
+                | GitReadQuery::HeadDiff
+                | GitReadQuery::StagedDiff
+                | GitReadQuery::UnstagedDiff
+        ) {
+            return Err(GitError::SnapshotRequired);
         }
         let mode = query.mode();
         Ok(Self {
@@ -284,22 +297,15 @@ impl GitReadIntent {
 
     /// Builds the Execution-owned controlled command with no caller-provided argv or environment.
     ///
-    /// The argv disables repository-configured fsmonitor, pager/color formatting, external diff,
-    /// and textconv where a diff can invoke them. `GIT_OPTIONAL_LOCKS=0` prevents status reads from
-    /// opportunistically refreshing the index. These flags do not disable clean/process filters;
-    /// content queries still require a future raw-snapshot collector for helper isolation.
-    /// Execution validates process policy and spawn.
+    /// Safe tree/index/untracked metadata commands disable fsmonitor and inherited configuration. Content comparisons
+    /// must use the raw snapshot collector; repository diff intents are rejected at construction.
     pub fn controlled_command(&self) -> Result<ControlledCommand, GitError> {
         ControlledCommand::from_validated_peer(
             CommandKind::Git,
             self.program.clone(),
             read_args(self.query),
             self.scope.worktree.worktree_path().to_path_buf(),
-            BTreeMap::from([
-                (OsString::from("GIT_OPTIONAL_LOCKS"), OsString::from("0")),
-                (OsString::from("GIT_PAGER"), OsString::from("cat")),
-                (OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0")),
-            ]),
+            safe_git_environment(),
         )
         .map_err(|_| GitError::InvalidGitProgram)
     }
@@ -467,6 +473,10 @@ pub struct PathStatus {
     original_path: Option<PathBuf>,
     /// Two-byte XY status for tracked records; untracked and ignored records have no XY value.
     status: Option<[u8; 2]>,
+    /// HEAD/index/worktree modes for non-conflicted tracked entries.
+    modes: Option<[u32; 3]>,
+    /// Full validated HEAD/index object names; zero names represent absent sides.
+    objects: Option<[Option<GitObjectId>; 2]>,
 }
 
 impl PathStatus {
@@ -489,9 +499,18 @@ impl PathStatus {
     pub const fn status(&self) -> Option<[u8; 2]> {
         self.status
     }
+    /// Returns raw HEAD/index/worktree modes, including zero for absence.
+    pub const fn modes(&self) -> Option<[u32; 3]> {
+        self.modes
+    }
+
+    /// Returns full validated HEAD/index blob names for ordinary and rename records.
+    pub fn objects(&self) -> Option<&[Option<GitObjectId>; 2]> {
+        self.objects.as_ref()
+    }
 }
 
-/// Splits porcelain status into tracked entries, conflicts, and separately listed untracked paths.
+/// Splits raw status into tracked entries, conflicts, and separately listed untracked paths.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GitStatus {
     /// Collection scope, absent for untrusted standalone byte parsing.
@@ -551,6 +570,20 @@ impl GitStatus {
 pub enum GitError {
     /// A raw Git identity is empty, contains NUL, or exceeds the bounded evidence limit.
     InvalidIdentity,
+    /// Repository status/content commands must use the filter-free snapshot collector.
+    SnapshotRequired,
+    /// Discovery outputs or administrative backpointers do not identify one coherent candidate.
+    InvalidDiscovery,
+    /// Git lacks the fixed absolute-path discovery capability; no relative fallback is permitted.
+    UnsupportedDiscoveryGit,
+    /// Git lacks the mandatory no-lazy-fetch capability; raw collection requires Git >= 2.45.
+    UnsupportedSnapshotGit,
+    /// A bounded snapshot could not be read or its owned scratch space could not be created.
+    SnapshotIo,
+    /// Source/Git identities changed during both bounded capture attempts.
+    UnstableSnapshot,
+    /// A symlink, submodule, or unsupported object mode cannot produce regular-file hunks.
+    UnsupportedSnapshot,
     /// A baseline lookup reference is empty or exceeds the bounded local identifier limit.
     InvalidBaselineReference,
     /// A caller attempted to claim Complete without a verified stored capture window.
@@ -571,49 +604,6 @@ pub enum GitError {
     UnbornHead,
 }
 
-/// Builds an exact comparison from fixed, complete read-only Git evidence.
-pub fn comparison_from_evidence(
-    mode: DiffMode,
-    head: &RawGitEvidence,
-    index: &RawGitEvidence,
-    working: &RawGitEvidence,
-    baseline: BaselineContext,
-) -> Result<GitComparison, GitError> {
-    if !baseline.matches_scope(head.scope())
-        || head.query() != GitReadQuery::HeadIdentity
-        || index.query() != GitReadQuery::IndexState
-        || working.query() != GitReadQuery::diff_for(mode)
-        || !same_scope(head, index)
-        || !same_scope(head, working)
-        || head.is_truncated()
-        || index.is_truncated()
-        || working.is_truncated()
-    {
-        return Err(GitError::IncompleteIdentity);
-    }
-    if head.exit_code() != Some(0) {
-        return Err(if head.exit_code() == Some(1) {
-            GitError::UnbornHead
-        } else {
-            GitError::IncompleteIdentity
-        });
-    }
-    if index.exit_code() != Some(0) || working.exit_code() != Some(0) || head.stdout().is_empty() {
-        return Err(GitError::IncompleteIdentity);
-    }
-    let head_identity = evidence_identity(b"workspace-git-head-v1", head.stdout());
-    let index_identity = evidence_identity(b"workspace-git-index-v1", index.stdout());
-    let working_identity = evidence_identity(b"workspace-git-working-v1", working.stdout());
-    let (left, right) = match mode {
-        DiffMode::Head => (head_identity, working_identity),
-        DiffMode::Staged => (head_identity, index_identity),
-        DiffMode::Unstaged => (index_identity, working_identity),
-    };
-    let mut scope = head.scope().clone();
-    scope.mode = mode;
-    Ok(GitComparison::new(scope, left, right, baseline))
-}
-
 /// Returns a domain-separated bounded identity for exact complete controlled-Git bytes.
 fn evidence_identity(domain: &[u8], bytes: &[u8]) -> GitIdentity {
     let mut hasher = blake3::Hasher::new();
@@ -621,12 +611,6 @@ fn evidence_identity(domain: &[u8], bytes: &[u8]) -> GitIdentity {
     hasher.update(&(bytes.len() as u64).to_le_bytes());
     hasher.update(bytes);
     GitIdentity(hasher.finalize().as_bytes().to_vec())
-}
-
-/// Requires all evidence to refer to the same live worktree incarnation and authority generation.
-fn same_scope(left: &RawGitEvidence, right: &RawGitEvidence) -> bool {
-    left.scope.worktree == right.scope.worktree
-        && left.scope.authority_epoch == right.scope.authority_epoch
 }
 
 /// Parses one terminal-LF Git discovery result without splitting newline bytes inside the path.
@@ -658,7 +642,7 @@ pub fn parse_porcelain_v2_z(value: &[u8]) -> Result<GitStatus, GitError> {
             b'2' => {
                 let mut entry = parse_tracked(record, StatusKind::RenamedOrCopied, 9, None)?;
                 let original = records.next().ok_or(GitError::InvalidPorcelain)?;
-                if original.is_empty() {
+                if !super::observation::valid_relative_path(&raw_path(original)) {
                     return Err(GitError::InvalidPorcelain);
                 }
                 entry.original_path = Some(raw_path(original));
@@ -685,7 +669,7 @@ fn parse_simple(record: &[u8], kind: StatusKind) -> Result<PathStatus, GitError>
         return Err(GitError::InvalidPorcelain);
     }
     let path = &record[2..];
-    if path.is_empty() {
+    if !super::observation::valid_relative_path(&raw_path(path)) {
         return Err(GitError::InvalidPorcelain);
     }
     Ok(PathStatus {
@@ -693,6 +677,8 @@ fn parse_simple(record: &[u8], kind: StatusKind) -> Result<PathStatus, GitError>
         path: raw_path(path),
         original_path: None,
         status: None,
+        modes: None,
+        objects: None,
     })
 }
 
@@ -712,11 +698,46 @@ fn parse_tracked(
     if path.is_empty() {
         return Err(GitError::InvalidPorcelain);
     }
+    if !super::observation::valid_relative_path(&raw_path(path)) {
+        return Err(GitError::InvalidPorcelain);
+    }
+    let fields: Vec<&[u8]> = record[..path_start - 1]
+        .split(|byte| *byte == b' ')
+        .collect();
+    let mut modes = None;
+    let mut objects = None;
+    if kind != StatusKind::Unmerged {
+        let parsed_modes = [
+            parse_mode(fields[3])?,
+            parse_mode(fields[4])?,
+            parse_mode(fields[5])?,
+        ];
+        let parsed_objects = [
+            GitObjectId::parse(fields[6])?,
+            GitObjectId::parse(fields[7])?,
+        ];
+        if (parsed_modes[0] == 0) != parsed_objects[0].is_none()
+            || (parsed_modes[1] == 0) != parsed_objects[1].is_none()
+        {
+            return Err(GitError::InvalidPorcelain);
+        }
+        modes = Some(parsed_modes);
+        objects = Some(parsed_objects);
+    } else {
+        for field in &fields[3..7] {
+            parse_mode(field)?;
+        }
+        for field in &fields[7..10] {
+            GitObjectId::parse(field)?;
+        }
+    }
     Ok(PathStatus {
         kind,
         path: raw_path(path),
         original_path,
         status: Some([status_start[0], status_start[1]]),
+        modes,
+        objects,
     })
 }
 
@@ -742,14 +763,14 @@ fn read_args(query: GitReadQuery) -> Vec<OsString> {
         OsString::from("-c"),
         OsString::from("color.ui=false"),
         OsString::from("--no-pager"),
+        OsString::from("--no-lazy-fetch"),
     ];
     match query {
-        GitReadQuery::Status => args.extend([
-            OsString::from("status"),
-            OsString::from("--porcelain=v2"),
-            OsString::from("-z"),
-            OsString::from("--untracked-files=all"),
-        ]),
+        GitReadQuery::HeadTree => {
+            args.extend(["ls-tree", "-r", "-z", "--full-tree", "HEAD", "--"].map(OsString::from))
+        }
+        GitReadQuery::UntrackedPaths => args
+            .extend(["ls-files", "--others", "--exclude-standard", "-z", "--"].map(OsString::from)),
         GitReadQuery::HeadIdentity => args.extend([
             OsString::from("rev-parse"),
             OsString::from("--verify"),
@@ -763,28 +784,67 @@ fn read_args(query: GitReadQuery) -> Vec<OsString> {
             OsString::from("-z"),
             OsString::from("--"),
         ]),
-        GitReadQuery::HeadDiff => args.extend(diff_args([OsString::from("HEAD")])),
-        GitReadQuery::StagedDiff => {
-            args.extend(diff_args([OsString::from("--cached")]));
+        GitReadQuery::Status
+        | GitReadQuery::HeadDiff
+        | GitReadQuery::StagedDiff
+        | GitReadQuery::UnstagedDiff => {
+            unreachable!("content requires snapshot")
         }
-        GitReadQuery::UnstagedDiff => args.extend(diff_args([])),
     }
     args
 }
 
-/// Returns common raw-diff flags that prevent external diff and textconv helper execution.
-fn diff_args<const N: usize>(mode: [OsString; N]) -> Vec<OsString> {
-    let mut args = vec![
-        OsString::from("diff"),
-        OsString::from("--no-ext-diff"),
-        OsString::from("--no-textconv"),
-        OsString::from("--full-index"),
-        OsString::from("--patch"),
-        OsString::from("--no-color"),
-    ];
-    args.extend(mode);
-    args.push(OsString::from("--"));
-    args
+/// Full immutable Git object name accepted only as 40 or 64 ASCII hexadecimal bytes.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct GitObjectId(String);
+
+impl GitObjectId {
+    /// Validates an exact object name; an all-zero name means an absent tree/index entry.
+    pub fn parse(value: &[u8]) -> Result<Option<Self>, GitError> {
+        if !matches!(value.len(), 40 | 64) || !value.iter().all(u8::is_ascii_hexdigit) {
+            return Err(GitError::InvalidIdentity);
+        }
+        if value.iter().all(|byte| *byte == b'0') {
+            return Ok(None);
+        }
+        Ok(Some(Self(
+            String::from_utf8(value.to_ascii_lowercase()).map_err(|_| GitError::InvalidIdentity)?,
+        )))
+    }
+
+    /// Returns the validated full object name, safe as a fixed cat-file object argument.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Rejects malformed octal porcelain modes instead of guessing absent or regular-file sides.
+fn parse_mode(value: &[u8]) -> Result<u32, GitError> {
+    if value.len() != 6 || !value.iter().all(|byte| (b'0'..=b'7').contains(byte)) {
+        return Err(GitError::InvalidPorcelain);
+    }
+    u32::from_str_radix(
+        std::str::from_utf8(value).map_err(|_| GitError::InvalidPorcelain)?,
+        8,
+    )
+    .map_err(|_| GitError::InvalidPorcelain)
+}
+
+/// Clears inherited global/system Git policy and forbids object replacement and lazy network fetch.
+fn safe_git_environment() -> BTreeMap<OsString, OsString> {
+    [
+        ("GIT_OPTIONAL_LOCKS", "0"),
+        ("GIT_PAGER", "cat"),
+        ("GIT_TERMINAL_PROMPT", "0"),
+        ("GIT_ATTR_NOSYSTEM", "1"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_NO_LAZY_FETCH", "1"),
+        ("GIT_NO_REPLACE_OBJECTS", "1"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.into(), value.into()))
+    .collect()
 }
 
 /// Checks an absolute Unix executable path without normalizing or resolving its raw bytes.
@@ -806,16 +866,9 @@ mod tests {
     /// Keeps read-only collection options fixed rather than allowing repository helpers or caller argv.
     #[test]
     fn fixed_read_only_args_disable_fsmonitor_and_diff_helpers() {
-        let status = read_args(GitReadQuery::Status);
+        let status = read_args(GitReadQuery::HeadTree);
         assert!(status.contains(&OsString::from("core.fsmonitor=false")));
-        assert!(status.contains(&OsString::from("--porcelain=v2")));
-        let diff = read_args(GitReadQuery::UnstagedDiff);
-        assert!(diff.contains(&OsString::from("--no-ext-diff")));
-        assert!(diff.contains(&OsString::from("--no-textconv")));
-        assert!(diff.contains(&OsString::from("--patch")));
-        assert!(diff.contains(&OsString::from("--full-index")));
-        assert_eq!(diff.last(), Some(&OsString::from("--")));
-        assert!(!diff.contains(&OsString::from("--raw")));
+        assert!(status.contains(&OsString::from("ls-tree")));
         let head = read_args(GitReadQuery::HeadIdentity);
         assert!(head.contains(&OsString::from("--verify")));
         assert!(head.contains(&OsString::from("--quiet")));

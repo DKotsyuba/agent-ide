@@ -627,7 +627,7 @@ impl DiscoveryOperationRef {
 pub enum GitDiscoveryQuery {
     /// Returns the worktree root as one terminal-LF raw path result.
     ShowTopLevel,
-    /// Returns the common Git directory as one terminal-LF raw path result.
+    /// Returns the absolute common Git directory as one terminal-LF raw path result (Git >= 2.31).
     GitCommonDir,
     /// Returns every worktree record as NUL-delimited porcelain bytes.
     WorktreeListPorcelainZ,
@@ -691,6 +691,7 @@ impl DiscoverWorktreeRequest {
             GitDiscoveryQuery::GitCommonDir => {
                 args.extend([
                     OsString::from("rev-parse"),
+                    OsString::from("--path-format=absolute"),
                     OsString::from("--git-common-dir"),
                 ]);
             }

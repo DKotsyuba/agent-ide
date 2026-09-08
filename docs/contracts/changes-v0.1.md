@@ -1,6 +1,6 @@
 # Bounded Git diff composition
 
-Revision: v0.1-r3. Provider: Changes. Direct consumer: Assistance. Input provider: Workspace. Shared vocabulary: [common](common.md); current raw evidence boundary: [Workspace v0.1](workspace-v0.1.md).
+Revision: v0.1-r4. Provider: Changes. Direct consumer: Assistance. Input provider: Workspace. Shared vocabulary: [common](common.md); current raw evidence boundary: [Workspace v0.1](workspace-v0.1.md).
 
 ## Responsibility
 
@@ -10,11 +10,9 @@ Workspace owns authority, Git commands and raw parsing, comparison identities, b
 
 ## Required evidence
 
-For the requested current authority, Workspace supplies its opaque worktree reference and incarnation, authority epoch, selected mode, and the exact left/right Git identities applicable to that mode. Each comparison has its own raw bounded stdout/stderr, fixed command kind, exit status, truncation/timing, coverage, and operation reference.
+For the requested current authority, Workspace supplies one typed `GitSnapshot`: full worktree/incarnation/epoch/mode scope, one nonzero capture generation, exact comparison, separately classified raw status and per-path patch evidence. Each `PathSnapshot` carries the exact path directly; it never relies on Git's temporary headers. Capture, no-filter Git commands, finite limits, process-result validation and retry rules are owned by the [Workspace contract](workspace-v0.1.md).
 
-Workspace derives those identities only from complete fixed `HEAD`, index, and selected patch evidence. Its status command remains NUL-delimited porcelain v2; diff commands request complete patches, disable external diff and textconv helpers, and terminate path parsing with `--`. An unborn `HEAD` is explicit rather than an empty identity.
-
-Composition requires matching comparison scope, raw patch scope/query, and status worktree/epoch. Unscoped status or a mixed component yields `unavailable` without identities, hunks, paths, or expansion references. Capture ceilings and the remaining repository-filter limitation are defined by the Workspace contract.
+Composition requires the expected scope, snapshot comparison, every path scope/generation, status scope, and baseline scope to match. A mismatch yields unavailable without identities, hunks, paths or expansion references. Failed, truncated, undrained, unsupported or unstable captures cannot mint a complete `GitSnapshot` and therefore never reach successful composition. Workspace must translate their explicit errors into the public incomplete/failed/stale response.
 
 Raw NUL-safe path/status/conflict data and a separate bounded untracked list identify the affected entries. Baseline completeness, capture-window status, and provenance are context only: a session snapshot is never substituted for HEAD, index, or working-state comparison. An absent HEAD or unsupported comparison is explicit rather than a fabricated empty comparison.
 
@@ -26,7 +24,7 @@ The result uses the existing bounded envelope: `ready`, `unavailable`, `incomple
 
 Hunk selection respects both byte and hunk-count budgets. Omitted data is counted or marked as unknown when the source itself is truncated. Changes does not silently cut a hunk into a different patch. Binary changes and raw Unix paths remain explicit; safe display escaping must not replace the underlying raw identity.
 
-Every selected hunk has an exact raw path. Whole default Git header bytes are matched against scoped status path pairs, including C quoting for control and non-UTF-8 bytes; paths are never split on whitespace. Unknown prefixes, unsupported rename attribution, duplicate/ambiguous headers, and unmapped hunks make the result `incomplete`; unmapped hunks are omitted. Budgeted mapped hunks retain their paths across selection and expansion cursors.
+Every selected hunk has a non-optional exact raw path bound directly to its per-path Workspace evidence. Temporary `diff`, `---` and `+++` headers are discarded; no reverse mapping or path decoding is performed. Binary changes retain the binary flag and exact path with an empty text payload, so temporary names cannot leak into summaries. Tracked metadata remains available for mode-only, empty-file, addition/deletion and other changes without textual hunks. Raw rename paths are represented as delete/add because the collector does not infer rename identity. Conflicts and untracked paths remain separate and never receive fabricated hunks. Budgeted hunks retain their direct paths across selection and expansion cursors.
 
 Further detail is requested through Workspace by operation reference and bounded hunk cursor. A reference grants no new authority, and invalidation is rechecked before expansion. Changes stores no persistent ChangeSet and creates no second reference store.
 
@@ -36,6 +34,6 @@ Further detail is requested through Workspace by operation reference and bounded
 - Budget overflow preserves selected exact hunks, a bounded summary, and honest omissions; untracked and conflicted entries remain visible.
 - Space, newline, leading-dash, and non-UTF-8 paths retain their identities; an unsupported encoding is reported explicitly.
 - Stale, revoked, truncated, binary, empty, and failed Git evidence cannot become a clean complete result.
-- A real macOS Git fixture proves staged/unstaged separation and the supported raw-path cases through the Workspace boundary.
+- A real Apple Git fixture through Execution proves all three modes, raw-path attribution, helpers not executing, bounded retries, result acceptance and scratch cleanup. Non-UTF-8 filesystem support is reported separately from raw-byte parser coverage.
 
 ChangeSet persistence, semantic enrichment, history, checks, verification, edits, and Scope integration belong to later versions. The v0.1 composer has no effects and no direct Execution dependency.

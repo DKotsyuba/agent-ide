@@ -514,42 +514,7 @@ async fn baseline_complete_cannot_be_forged_and_partial_capture_is_durable() {
         agent_ide::workspace::git::GitIdentity::new(b"right".to_vec()).unwrap(),
         baseline.clone(),
     );
-    let status = agent_ide::workspace::git::GitStatus::from_evidence(
-        &RawGitEvidence::new(
-            "status",
-            scope.clone(),
-            GitReadQuery::Status,
-            vec![],
-            vec![],
-            Some(0),
-            false,
-            false,
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    let diff = RawGitEvidence::new(
-        "diff",
-        scope.clone(),
-        GitReadQuery::HeadDiff,
-        vec![],
-        vec![],
-        Some(0),
-        false,
-        false,
-    )
-    .unwrap();
-    let result = agent_ide::changes::compose_diff(
-        &scope,
-        &comparison,
-        status,
-        diff,
-        agent_ide::changes::DiffSelectionBudget::default(),
-    );
-    assert_eq!(
-        result.provenance().baseline_window(),
-        Some(BaselineWindow::Unverified)
-    );
+    assert_eq!(comparison.baseline().window(), BaselineWindow::Unverified);
     assert_eq!(
         owner
             .capture_baseline(

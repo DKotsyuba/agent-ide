@@ -1,592 +1,602 @@
-//! Real local-Git coverage for the Workspace-to-Changes diff boundary.
-
-use std::{
-    ffi::OsString,
-    fs,
-    os::unix::ffi::{OsStrExt, OsStringExt},
-    path::{Path, PathBuf},
-    process::{Command, Output},
-    sync::atomic::{AtomicUsize, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
-};
+//! Real Apple Git and Execution regression checks for the raw snapshot pipeline.
+#[path = "support/git_snapshot.rs"]
+mod support;
 
 use agent_ide::{
-    assistance::host_binding::{
-        BindingStatus, CandidateInvocation, HostBindingGuard, parse_candidate,
-        parse_channel_session, parse_hook_event,
-    },
     changes::{DiffResultState, DiffSelectionBudget, compose_diff},
-    workspace::{
-        authority::{ActivationRequest, AuthorityRegistry, WorktreeRef},
-        git::{
-            BaselineContext, BaselineCoverage, DiffMode, GitError, GitReadIntent, GitReadQuery,
-            GitStatus, RawGitEvidence, comparison_from_evidence,
-        },
+    workspace::git::{
+        DiffMode, GitError,
+        snapshot::{MAX_SNAPSHOT_BLOB_BYTES, SnapshotIntent},
     },
 };
-use serde_json::json;
+use std::{ffi::OsString, fs, os::unix::ffi::OsStrExt, path::PathBuf};
+use support::{GIT, GitFixture, Runner, authority_for, collect};
 
-static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
-const GIT: &str = "/usr/bin/git";
-
-/// Owns one recoverable local Git worktree and removes only that directory on drop.
-struct GitFixture {
-    /// Exact worktree root created for this test instance.
-    root: PathBuf,
-    /// Marker written only if a configured malicious Git helper executes.
-    sentinel: PathBuf,
-    /// Whether this Darwin filesystem accepted the attempted non-UTF-8 fixture filename.
-    non_utf8_supported: bool,
-}
-
-impl GitFixture {
-    /// Creates a committed repository with separately staged, unstaged, and raw-path changes.
-    fn new() -> Self {
-        let root = unique_temp_path("changes-git");
-        fs::create_dir_all(&root).expect("fixture root is creatable");
-        let mut fixture = Self {
-            sentinel: root.join("sentinel-ran"),
-            root,
-            non_utf8_supported: false,
-        };
-        fixture.git(["init", "--quiet"]);
-        fixture.git([
-            "config",
-            "--local",
-            "user.email",
-            "changes-git@example.invalid",
-        ]);
-        fixture.git(["config", "--local", "user.name", "Changes Git Fixture"]);
-
-        fixture.write(b"staged.txt", b"base\n");
-        fixture.write(b"unstaged.txt", b"base\n");
-        fixture.write(b"special space\n-leading.txt", b"base\n");
+/// Proves clean/smudge/process, textconv, external-diff and fsmonitor helpers never run in any mode.
+#[tokio::test]
+async fn content_queries_must_not_execute_repository_clean_filters() {
+    let fixture = GitFixture::new();
+    fixture.install_malicious_helpers();
+    fixture.write(b".gitattributes", b"*.txt diff=evil\nstaged.txt filter=clean\nunstaged.txt filter=process\n\"special space\\n-leading.txt\" filter=smudge\n");
+    for key in [
+        "filter.clean.clean",
+        "filter.smudge.smudge",
+        "filter.process.process",
+    ] {
         fixture.git_os([
-            OsString::from("add"),
-            OsString::from("--"),
-            OsString::from("."),
-        ]);
-        fixture.git(["commit", "--quiet", "-m", "fixture baseline"]);
-
-        fixture.write(b"staged.txt", b"index change\n");
-        fixture.git_os([
-            OsString::from("add"),
-            OsString::from("--"),
-            OsString::from("staged.txt"),
-        ]);
-        fixture.write(b"unstaged.txt", b"working change\n");
-        fixture.write(b"special space\n-leading.txt", b"special index change\n");
-        fixture.git_os([
-            OsString::from("add"),
-            OsString::from("--"),
-            OsString::from_vec(b"special space\n-leading.txt".to_vec()),
-        ]);
-        fixture.write(b"untracked space\n-leading.txt", b"untracked\n");
-        fixture.non_utf8_supported = fs::write(
-            fixture
-                .root
-                .join(OsString::from_vec(b"untracked-non-utf8-\xff.txt".to_vec())),
-            b"untracked non-utf8\n",
-        )
-        .is_ok();
-        fixture.install_malicious_helpers();
-        fixture
-    }
-
-    /// Creates an otherwise empty repository for the explicit unborn-HEAD platform check.
-    fn unborn() -> Self {
-        let root = unique_temp_path("changes-git-unborn");
-        fs::create_dir_all(&root).expect("fixture root is creatable");
-        let fixture = Self {
-            sentinel: root.join("sentinel-ran"),
-            root,
-            non_utf8_supported: false,
-        };
-        fixture.git(["init", "--quiet"]);
-        fixture
-    }
-
-    /// Writes one raw Unix relative path without interpreting it as UTF-8.
-    fn write(&self, relative: &[u8], bytes: &[u8]) {
-        fs::write(self.root.join(OsString::from_vec(relative.to_vec())), bytes)
-            .expect("fixture path is writable");
-    }
-
-    /// Runs a local-only setup command against this fixture with no inherited user configuration.
-    fn git<const N: usize>(&self, args: [&str; N]) -> Output {
-        self.git_os(args.map(OsString::from))
-    }
-
-    /// Runs one setup command whose arguments may contain raw Unix bytes.
-    fn git_os<const N: usize>(&self, args: [OsString; N]) -> Output {
-        let output = base_git(&self.root)
-            .args(args)
-            .output()
-            .expect("Git starts");
-        assert!(output.status.success(), "Git setup failed: {output:?}");
-        output
-    }
-
-    /// Installs local-only fsmonitor, external-diff, and textconv sentinels that must never run.
-    fn install_malicious_helpers(&self) {
-        let helper = self.root.join(".git/sentinel.sh");
-        fs::write(
-            &helper,
-            format!("#!/bin/sh\ntouch {}\n", self.sentinel.display()),
-        )
-        .expect("sentinel helper is writable");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&helper, fs::Permissions::from_mode(0o700))
-                .expect("sentinel helper is executable");
-        }
-        self.write(b".gitattributes", b"*.txt diff=evil\n");
-        self.git_os([
             OsString::from("config"),
             OsString::from("--local"),
-            OsString::from("core.fsmonitor"),
-            helper.as_os_str().to_os_string(),
-        ]);
-        self.git_os([
-            OsString::from("config"),
-            OsString::from("--local"),
-            OsString::from("diff.external"),
-            helper.as_os_str().to_os_string(),
-        ]);
-        self.git_os([
-            OsString::from("config"),
-            OsString::from("--local"),
-            OsString::from("diff.evil.textconv"),
-            helper.as_os_str().to_os_string(),
+            key.into(),
+            fixture.root.join(".git/sentinel.sh").into_os_string(),
         ]);
     }
-}
-
-impl Drop for GitFixture {
-    /// Removes only the uniquely created fixture directory after its test completes.
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
-
-/// Returns a unique `/private/tmp` location without relying on test order or a global fixture path.
-fn unique_temp_path(prefix: &str) -> PathBuf {
-    let tick = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is after epoch")
-        .as_nanos();
-    PathBuf::from(format!(
-        "/private/tmp/{prefix}-{}-{tick}-{}",
-        std::process::id(),
-        NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
-    ))
-}
-
-/// Starts Git with the same cleared environment and literal worktree selection as the fixture needs.
-fn base_git(root: &Path) -> Command {
-    let mut command = Command::new(GIT);
-    command
-        .env_clear()
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_PAGER", "cat")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .arg("-C")
-        .arg(root);
-    command
-}
-
-/// Executes the exact fixed Workspace query selected by the supplied intent.
-fn run_fixed_query(fixture: &GitFixture, intent: &GitReadIntent) -> Output {
-    let controlled = format!(
-        "{:?}",
-        intent.controlled_command().expect("fixed command builds")
-    );
-    for required in ["core.fsmonitor=false", "--no-pager"] {
+    for mode in [DiffMode::Head, DiffMode::Staged, DiffMode::Unstaged] {
+        let mut runner = Runner::default();
+        let snapshot = collect(&fixture, mode, &mut runner).await.unwrap();
         assert!(
-            controlled.contains(required),
-            "intent omits {required}: {controlled}"
+            runner.different > 0,
+            "Apple Git no-index returns successful differences as exit 1"
         );
-    }
-    if matches!(
-        intent.query(),
-        GitReadQuery::HeadDiff | GitReadQuery::StagedDiff | GitReadQuery::UnstagedDiff
-    ) {
-        for required in [
-            "--no-ext-diff",
-            "--no-textconv",
-            "--full-index",
-            "--patch",
-            "--no-color",
-        ] {
+        assert!(runner.directories.iter().all(|dir| !dir.exists()));
+        assert!(
+            !fixture.sentinel.exists(),
+            "a repository helper executed in {mode:?}"
+        );
+        let comparison = snapshot.comparison().clone();
+        let scope = snapshot.scope().clone();
+        let result = compose_diff(
+            &scope,
+            &comparison,
+            snapshot,
+            DiffSelectionBudget::default(),
+        );
+        assert_eq!(result.state(), DiffResultState::Ready);
+        assert!(
+            result
+                .selected_hunks()
+                .iter()
+                .all(|hunk| !hunk.patch().starts_with(b"diff --git"))
+        );
+        assert!(
+            result
+                .untracked()
+                .iter()
+                .any(|path| path.path().as_os_str().as_bytes() == b"untracked space\n-leading.txt")
+        );
+        let paths: Vec<_> = result.tracked().iter().map(|entry| entry.path()).collect();
+        match mode {
+            DiffMode::Head => assert_eq!(paths.len(), 3),
+            DiffMode::Staged => {
+                assert_eq!(paths.len(), 2);
+                assert!(!paths.contains(&std::path::Path::new("unstaged.txt")));
+            }
+            DiffMode::Unstaged => assert_eq!(paths, vec![std::path::Path::new("unstaged.txt")]),
+        }
+        if fixture.non_utf8_supported {
             assert!(
-                controlled.contains(required),
-                "diff intent omits {required}: {controlled}"
+                result.untracked().iter().any(
+                    |path| path.path().as_os_str().as_bytes() == b"untracked-non-utf8-\xff.txt"
+                )
+            );
+        } else {
+            eprintln!(
+                "platform unsupported: Darwin filesystem rejected non-UTF-8 filenames; byte parser contract is separately checked"
             );
         }
     }
-    let mut command = base_git(&fixture.root);
-    command.args([
-        "-c",
-        "core.fsmonitor=false",
-        "-c",
-        "color.ui=false",
-        "--no-pager",
-    ]);
-    match intent.query() {
-        GitReadQuery::Status => {
-            command.args(["status", "--porcelain=v2", "-z", "--untracked-files=all"]);
-        }
-        GitReadQuery::HeadIdentity => {
-            command.args(["rev-parse", "--verify", "--quiet", "HEAD", "--"]);
-        }
-        GitReadQuery::IndexState => {
-            command.args(["ls-files", "--stage", "-z", "--"]);
-        }
-        GitReadQuery::HeadDiff => {
-            command.args([
-                "diff",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--full-index",
-                "--patch",
-                "--no-color",
-                "HEAD",
-                "--",
-            ]);
-        }
-        GitReadQuery::StagedDiff => {
-            command.args([
-                "diff",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--full-index",
-                "--patch",
-                "--no-color",
-                "--cached",
-                "--",
-            ]);
-        }
-        GitReadQuery::UnstagedDiff => {
-            command.args([
-                "diff",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--full-index",
-                "--patch",
-                "--no-color",
-                "--",
-            ]);
-        }
-    }
-    let output = command.output().expect("fixed Git query starts");
-    assert!(
-        output.status.success() || intent.query() == GitReadQuery::HeadIdentity,
-        "fixed Git query failed unexpectedly: {output:?}"
+    let output = std::process::Command::new(GIT)
+        .arg("--version")
+        .output()
+        .unwrap();
+    eprintln!(
+        "real platform evidence: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
-    assert!(
-        !fixture.sentinel.exists(),
-        "configured Git helper ran despite fixed read-only arguments"
-    );
-    output
 }
 
-/// Establishes one live Workspace authority whose worktree paths are the fixture's exact raw paths.
-fn authority_for(fixture: &GitFixture) -> agent_ide::workspace::authority::AuthorityStamp {
-    let mut guard = HostBindingGuard::default();
-    let channel = parse_channel_session(b"changes-real-git").expect("channel is valid");
-    let hook = parse_hook_event(
-        json!({"hook_event_name": "PreToolUse", "session_id": "real-git", "tool_use_id": "collect"})
-            .to_string()
-            .as_bytes(),
-    )
-    .expect("hook is valid");
-    assert!(matches!(
-        guard.observe_hook(hook, channel.clone()),
-        BindingStatus::PreObserved
-    ));
-    let candidate: CandidateInvocation = parse_candidate(
-        json!({"threadId": "real-git", "callId": "collect", "x-codex-turn-metadata": {"turn": "real"}})
-            .as_object()
-            .expect("candidate object"),
-    )
-    .expect("candidate is valid");
-    let BindingStatus::Validated(invocation) = guard.establish_start(candidate, channel) else {
-        panic!("binding must validate");
+/// Confirms raw additions/deletions, rename source, binary, mode-only and conflicts remain attributable.
+#[tokio::test]
+async fn raw_modes_paths_and_separate_conflicts_survive() {
+    use std::{
+        io::Write,
+        os::unix::fs::PermissionsExt,
+        process::{Command, Stdio},
     };
-    let active = guard
-        .consume_active(invocation.binding_ref())
-        .expect("binding is active");
-    let worktree = WorktreeRef::from_discovery(
-        fixture.root.clone(),
-        fixture.root.clone(),
-        PathBuf::from(".git"),
-        1,
-    )
-    .expect("fixture worktree is valid");
-    let request = ActivationRequest::new("changes-real-git", invocation, active, worktree)
-        .expect("activation request is valid");
-    AuthorityRegistry::default()
-        .activate(request)
-        .expect("authority activates")
-}
-
-/// Converts a completed fixed query into Workspace raw evidence without assigning its contents a new meaning.
-fn evidence(operation: &str, intent: &GitReadIntent, output: Output) -> RawGitEvidence {
-    RawGitEvidence::new(
-        operation,
-        intent.scope().clone(),
-        intent.query(),
-        output.stdout,
-        output.stderr,
-        output.status.code(),
-        false,
-        false,
-    )
-    .expect("fixed output has bounded metadata")
-}
-
-/// Uses a complete baseline only as context, never as a comparison side.
-fn baseline() -> BaselineContext {
-    BaselineContext::new("real-git-session-baseline", BaselineCoverage::Partial)
-        .expect("baseline context is bounded")
-}
-
-/// Confirms the real macOS Git boundary preserves comparison modes, raw paths, bounded hunks, and helper safety.
-#[test]
-fn real_git_workspace_evidence_composes_distinct_bounded_changes() {
     let fixture = GitFixture::new();
-    let authority = authority_for(&fixture);
-    let program = PathBuf::from(GIT);
-    let status_intent =
-        GitReadIntent::new(&authority, program.clone(), GitReadQuery::Status).unwrap();
-    let head_id_intent =
-        GitReadIntent::new(&authority, program.clone(), GitReadQuery::HeadIdentity).unwrap();
-    let index_intent =
-        GitReadIntent::new(&authority, program.clone(), GitReadQuery::IndexState).unwrap();
-    let head_intent =
-        GitReadIntent::new(&authority, program.clone(), GitReadQuery::HeadDiff).unwrap();
-    let staged_intent =
-        GitReadIntent::new(&authority, program.clone(), GitReadQuery::StagedDiff).unwrap();
-    let unstaged_intent =
-        GitReadIntent::new(&authority, program, GitReadQuery::UnstagedDiff).unwrap();
-
-    let status = GitStatus::from_evidence(&evidence(
-        "status",
-        &status_intent,
-        run_fixed_query(&fixture, &status_intent),
-    ))
-    .expect("real porcelain-v2 -z parses");
-    let raw_special = b"special space\n-leading.txt";
+    for (path, bytes) in [
+        ("delete.txt", b"delete me\n".as_slice()),
+        ("rename-old.txt", b"rename me\n"),
+        ("binary.txt", b"binary\0old"),
+        ("mode.txt", b"same bytes\n"),
+        ("conflict.txt", b"conflict\n"),
+    ] {
+        fixture.write(path.as_bytes(), bytes);
+    }
+    fixture.git(["add", "."]);
+    fixture.git(["commit", "--quiet", "-m", "edge baseline"]);
+    fixture.write(b"add.txt", b"added\n");
+    fixture.git(["add", "add.txt"]);
+    fixture.git(["rm", "--quiet", "delete.txt"]);
+    fixture.git(["mv", "rename-old.txt", "rename-new.txt"]);
+    fixture.write(b"binary.txt", b"binary\0new");
+    fs::set_permissions(
+        fixture.root.join("mode.txt"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let object = fixture.git(["rev-parse", "HEAD:conflict.txt"]);
+    let oid = std::str::from_utf8(&object.stdout).unwrap().trim();
+    let mut child = Command::new(GIT)
+        .env_clear()
+        .arg("-C")
+        .arg(&fixture.root)
+        .args(["update-index", "--index-info"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let conflict = format!(
+        "0 {}\tconflict.txt\n100644 {oid} 1\tconflict.txt\n100644 {oid} 2\tconflict.txt\n100644 {oid} 3\tconflict.txt\n",
+        "0".repeat(40)
+    );
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(conflict.as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+    fixture.write(b"untracked.txt", b"untracked\n");
+    fixture.install_malicious_helpers();
+    let mut runner = Runner::default();
+    let snapshot = collect(&fixture, DiffMode::Head, &mut runner)
+        .await
+        .unwrap();
+    let renamed = snapshot
+        .paths()
+        .iter()
+        .find(|path| path.status().path() == std::path::Path::new("rename-new.txt"))
+        .unwrap();
+    assert_eq!(renamed.status().original_path(), None);
     assert!(
-        status
-            .tracked()
+        !renamed.patch().is_empty(),
+        "raw collection represents rename as delete/add without guessing"
+    );
+    assert!(
+        snapshot
+            .paths()
             .iter()
-            .any(|entry| entry.path().as_os_str().as_bytes() == raw_special)
+            .any(|path| path.status().path() == std::path::Path::new("rename-old.txt"))
     );
-    assert!(
-        status.untracked().iter().any(|entry| {
-            entry.path().as_os_str().as_bytes() == b"untracked space\n-leading.txt"
-        })
-    );
-    if fixture.non_utf8_supported {
-        assert!(status.untracked().iter().any(|entry| {
-            entry.path().as_os_str().as_bytes() == b"untracked-non-utf8-\xff.txt"
-        }));
-    } else {
-        eprintln!("platform unsupported: Darwin filesystem rejected a non-UTF-8 raw filename");
-    }
-
-    let head_identity = evidence(
-        "head-id",
-        &head_id_intent,
-        run_fixed_query(&fixture, &head_id_intent),
-    );
-    let index = evidence(
-        "index",
-        &index_intent,
-        run_fixed_query(&fixture, &index_intent),
-    );
-    let head_diff = evidence(
-        "head-diff",
-        &head_intent,
-        run_fixed_query(&fixture, &head_intent),
-    );
-    let staged_diff = evidence(
-        "staged-diff",
-        &staged_intent,
-        run_fixed_query(&fixture, &staged_intent),
-    );
-    let unstaged_diff = evidence(
-        "unstaged-diff",
-        &unstaged_intent,
-        run_fixed_query(&fixture, &unstaged_intent),
-    );
-
-    let head = compose_diff(
-        head_intent.scope(),
-        &comparison_from_evidence(
-            DiffMode::Head,
-            &head_identity,
-            &index,
-            &head_diff,
-            baseline(),
-        )
-        .unwrap(),
-        status.clone(),
-        head_diff,
+    assert!(snapshot.paths().iter().all(|path| path.source().is_some()));
+    let deleted = snapshot
+        .paths()
+        .iter()
+        .find(|path| path.status().path() == std::path::Path::new("delete.txt"))
+        .unwrap();
+    assert!(deleted.source().unwrap().bytes().is_none());
+    let scope = snapshot.scope().clone();
+    let comparison = snapshot.comparison().clone();
+    let result = compose_diff(
+        &scope,
+        &comparison,
+        snapshot,
         DiffSelectionBudget::default(),
     );
-    let staged = compose_diff(
-        staged_intent.scope(),
-        &comparison_from_evidence(
-            DiffMode::Staged,
-            &head_identity,
-            &index,
-            &staged_diff,
-            baseline(),
-        )
-        .unwrap(),
-        status.clone(),
-        staged_diff,
-        DiffSelectionBudget::default(),
-    );
-    let unstaged = compose_diff(
-        unstaged_intent.scope(),
-        &comparison_from_evidence(
-            DiffMode::Unstaged,
-            &head_identity,
-            &index,
-            &unstaged_diff,
-            baseline(),
-        )
-        .unwrap(),
-        status.clone(),
-        unstaged_diff,
-        DiffSelectionBudget::default(),
-    );
-
-    for result in [&head, &staged, &unstaged] {
-        assert_eq!(result.state(), DiffResultState::Ready);
-        assert!(!result.selected_hunks().is_empty());
-        assert!(
-            result
-                .selected_hunks()
-                .iter()
-                .all(|hunk| hunk.path().is_some())
-        );
-        assert!(
-            result
-                .selected_hunks()
-                .iter()
-                .all(|hunk| hunk.patch().starts_with(b"@@"))
-        );
-        assert_eq!(
-            result.provenance().baseline_reference(),
-            Some("real-git-session-baseline")
-        );
-    }
-    assert_eq!(head.identities().left(), staged.identities().left());
-    assert_eq!(staged.identities().right(), unstaged.identities().left());
-    assert_ne!(head.identities().left(), head.identities().right());
-    assert_ne!(staged.identities().left(), staged.identities().right());
-    assert_ne!(unstaged.identities().left(), unstaged.identities().right());
-    assert_ne!(head.identities().right(), unstaged.identities().right());
-
-    let bounded_evidence = evidence(
-        "head-overflow",
-        &head_intent,
-        run_fixed_query(&fixture, &head_intent),
-    );
-    let bounded = compose_diff(
-        head_intent.scope(),
-        &comparison_from_evidence(
-            DiffMode::Head,
-            &head_identity,
-            &index,
-            &bounded_evidence,
-            baseline(),
-        )
-        .unwrap(),
-        status,
-        bounded_evidence,
-        DiffSelectionBudget::bounded(0, 0),
-    );
-    assert_eq!(bounded.state(), DiffResultState::Incomplete);
-    assert!(bounded.selected_hunks().is_empty());
-    assert!(bounded.overflow_hunks() > 0);
     assert_eq!(
-        bounded
-            .detail_cursor()
-            .expect("overflow has a cursor")
-            .next_hunk(),
-        0
+        result.state(),
+        DiffResultState::Incomplete,
+        "binary is explicit partial textual coverage"
     );
+    assert_eq!(result.conflicts().len(), 1);
     assert!(
-        !fixture.sentinel.exists(),
-        "Changes must not execute Git helpers"
+        result
+            .selected_hunks()
+            .iter()
+            .all(|hunk| hunk.path() != &PathBuf::from("conflict.txt"))
     );
+    let binary = result
+        .selected_hunks()
+        .iter()
+        .find(|hunk| hunk.is_binary())
+        .unwrap();
+    assert_eq!(binary.path(), &PathBuf::from("binary.txt"));
+    assert!(binary.patch().is_empty());
+    let mode = result
+        .tracked()
+        .iter()
+        .find(|entry| entry.path() == std::path::Path::new("mode.txt"))
+        .unwrap();
+    assert_eq!(mode.modes(), Some([0o100644, 0o100644, 0o100755]));
+    assert!(runner.directories.iter().all(|dir| !dir.exists()));
+    assert!(!fixture.sentinel.exists());
 }
 
-/// Verifies Apple Git's fixed quiet HEAD query reports an unborn repository explicitly.
-#[test]
-fn real_git_unborn_head_is_explicit_not_an_empty_identity() {
-    let fixture = GitFixture::unborn();
-    let authority = authority_for(&fixture);
-    let program = PathBuf::from(GIT);
-    let head_intent =
-        GitReadIntent::new(&authority, program.clone(), GitReadQuery::HeadIdentity).unwrap();
-    let index_intent =
-        GitReadIntent::new(&authority, program.clone(), GitReadQuery::IndexState).unwrap();
-    let working_intent =
-        GitReadIntent::new(&authority, program, GitReadQuery::UnstagedDiff).unwrap();
-    let head = evidence(
-        "unborn-head",
-        &head_intent,
-        run_fixed_query(&fixture, &head_intent),
+/// Retries one changing capture, rejects a second change, and removes every scratch directory.
+#[tokio::test]
+async fn instability_has_one_retry_and_cleanup() {
+    let fixture = GitFixture::new();
+    let mut once = Runner {
+        mutate_path: Some(fixture.root.join("unstaged.txt")),
+        mutate_once: true,
+        ..Runner::default()
+    };
+    assert!(
+        collect(&fixture, DiffMode::Unstaged, &mut once)
+            .await
+            .is_ok()
+    );
+    assert_eq!(once.directories.len(), 2);
+    assert!(once.directories.iter().all(|dir| !dir.exists()));
+    let mut always = Runner {
+        mutate_path: Some(fixture.root.join("unstaged.txt")),
+        ..Runner::default()
+    };
+    assert_eq!(
+        collect(&fixture, DiffMode::Unstaged, &mut always).await,
+        Err(GitError::UnstableSnapshot)
+    );
+    assert_eq!(always.directories.len(), 2);
+    assert!(always.directories.iter().all(|dir| !dir.exists()));
+}
+
+/// Rejects oversized source/blob evidence, excessive paths, and unborn HEAD without producing clean results.
+#[tokio::test]
+async fn snapshot_bounds_and_unborn_head_are_explicit() {
+    let fixture = GitFixture::new();
+    fixture.write(b"unstaged.txt", &vec![b'x'; MAX_SNAPSHOT_BLOB_BYTES + 1]);
+    assert_eq!(
+        collect(&fixture, DiffMode::Unstaged, &mut Runner::default()).await,
+        Err(GitError::EvidenceTooLarge)
+    );
+    fixture.write(b"unstaged.txt", b"working change\n");
+    for n in 0..257 {
+        fixture.write(format!("untracked-{n}").as_bytes(), b"");
+    }
+    assert_eq!(
+        collect(&fixture, DiffMode::Head, &mut Runner::default()).await,
+        Err(GitError::EvidenceTooLarge)
     );
     assert_eq!(
-        head.exit_code(),
-        Some(1),
-        "Apple Git quiet missing HEAD exit changed"
-    );
-    let index = evidence(
-        "unborn-index",
-        &index_intent,
-        run_fixed_query(&fixture, &index_intent),
-    );
-    let working = evidence(
-        "unborn-working",
-        &working_intent,
-        run_fixed_query(&fixture, &working_intent),
-    );
-    assert_eq!(
-        comparison_from_evidence(DiffMode::Unstaged, &head, &index, &working, baseline()),
+        collect(
+            &GitFixture::unborn(),
+            DiffMode::Head,
+            &mut Runner::default()
+        )
+        .await,
         Err(GitError::UnbornHead)
     );
 }
 
-/// Reproduces the outstanding clean-filter execution gap in content-reading Git commands.
+/// An abandoned or oversized comparison leaves no scratch files, including cloned pending intents.
 #[test]
-#[ignore = "known unsafe clean-filter path; requires raw snapshot collector before enabling"]
-fn content_queries_must_not_execute_repository_clean_filters() {
+fn snapshot_intents_own_private_file_cleanup() {
     let fixture = GitFixture::new();
-    fixture.write(b".gitattributes", b"*.txt filter=evil\n");
-    fixture.git_os([
-        OsString::from("config"),
-        OsString::from("--local"),
-        OsString::from("filter.evil.clean"),
-        fixture.root.join(".git/sentinel.sh").into_os_string(),
-    ]);
-    let intent = GitReadIntent::new(
+    let scope = agent_ide::workspace::git::GitScope::from_authority(
         &authority_for(&fixture),
-        PathBuf::from(GIT),
-        GitReadQuery::HeadDiff,
+        DiffMode::Head,
+    );
+    let intent =
+        SnapshotIntent::compare(scope.clone(), std::path::Path::new(GIT), b"left", b"right")
+            .unwrap();
+    let dir = intent.snapshot_directory().unwrap().to_path_buf();
+    let pending = intent.clone();
+    drop(intent);
+    assert!(dir.exists());
+    drop(pending);
+    assert!(!dir.exists());
+    assert!(
+        SnapshotIntent::compare(
+            scope,
+            std::path::Path::new(GIT),
+            &vec![0; MAX_SNAPSHOT_BLOB_BYTES + 1],
+            b""
+        )
+        .is_err()
+    );
+}
+
+/// Failed, signalled, truncated and undrained processes cannot mint patch evidence; exit one can.
+#[tokio::test]
+async fn incomplete_execution_never_becomes_snapshot_evidence() {
+    use agent_ide::workspace::git::snapshot::SnapshotRunner;
+    use std::{os::unix::process::ExitStatusExt, process::ExitStatus};
+    let fixture = GitFixture::new();
+    let scope = agent_ide::workspace::git::GitScope::from_authority(
+        &authority_for(&fixture),
+        DiffMode::Head,
+    );
+    let intent =
+        SnapshotIntent::compare(scope, std::path::Path::new(GIT), b"old\n", b"new\n").unwrap();
+    let dir = intent.snapshot_directory().unwrap().to_owned();
+    let result = Runner::default().run(intent.clone()).await.unwrap();
+    assert_eq!(result.status.code(), Some(1));
+    assert!(intent.accept(result.clone()).is_ok());
+    let mut rejected = Vec::new();
+    let mut output = result.clone();
+    output.status = ExitStatus::from_raw(2 << 8);
+    rejected.push(output);
+    let mut output = result.clone();
+    output.status = ExitStatus::from_raw(9);
+    rejected.push(output);
+    let mut output = result.clone();
+    output.stdout.complete = false;
+    rejected.push(output);
+    let mut output = result.clone();
+    output.stderr.complete = false;
+    rejected.push(output);
+    let mut output = result.clone();
+    output.stdout.truncated = true;
+    rejected.push(output);
+    let mut output = result.clone();
+    output.stderr.truncated = true;
+    rejected.push(output);
+    let mut output = result;
+    output.stdout.bytes = vec![0; MAX_SNAPSHOT_BLOB_BYTES + 1];
+    rejected.push(output);
+    for output in rejected {
+        assert_eq!(intent.accept(output), Err(GitError::IncompleteIdentity));
+    }
+    drop(intent);
+    assert!(!dir.exists());
+}
+
+/// Changed committed identities and untracked metadata invalidate the entire capture generation.
+#[tokio::test]
+async fn metadata_brackets_detect_head_and_untracked_changes() {
+    use std::process::Command;
+    let fixture = GitFixture::new();
+    let initial = fixture.git(["rev-parse", "HEAD"]);
+    let alternate = fixture.git(["commit-tree", "-m", "alternate metadata", "HEAD^{tree}"]);
+    let initial = String::from_utf8(initial.stdout).unwrap().trim().to_owned();
+    let alternate = String::from_utf8(alternate.stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let root = fixture.root.clone();
+    let mut alternate_next = true;
+    let mut runner = Runner {
+        after_compare: Some(Box::new(move || {
+            let oid = if alternate_next { &alternate } else { &initial };
+            alternate_next = !alternate_next;
+            assert!(
+                Command::new(GIT)
+                    .env_clear()
+                    .arg("-C")
+                    .arg(&root)
+                    .args(["update-ref", "HEAD", oid])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        })),
+        ..Runner::default()
+    };
+    assert!(matches!(
+        collect(&fixture, DiffMode::Unstaged, &mut runner).await,
+        Err(GitError::UnstableSnapshot)
+    ));
+    assert_eq!(runner.directories.len(), 2);
+    assert!(runner.directories.iter().all(|path| !path.exists()));
+    let path = fixture.root.join("metadata-created");
+    let mut next = true;
+    let mut runner = Runner {
+        after_compare: Some(Box::new(move || {
+            if next {
+                fs::write(&path, b"new").unwrap();
+            } else {
+                fs::remove_file(&path).unwrap();
+            }
+            next = !next;
+        })),
+        ..Runner::default()
+    };
+    assert!(matches!(
+        collect(&fixture, DiffMode::Unstaged, &mut runner).await,
+        Err(GitError::UnstableSnapshot)
+    ));
+    assert_eq!(runner.directories.len(), 2);
+}
+
+/// Aggregate source and patch ceilings reject complete-looking output after bounded work.
+#[tokio::test]
+async fn aggregate_source_and_patch_limits_are_enforced() {
+    let fixture = GitFixture::new();
+    for n in 0..9 {
+        fixture.write(format!("large-{n}").as_bytes(), b"base\n");
+    }
+    fixture.git(["add", "."]);
+    fixture.git(["commit", "--quiet", "-m", "aggregate baseline"]);
+    for n in 0..9 {
+        fixture.write(format!("large-{n}").as_bytes(), &vec![0; 950_000]);
+    }
+    let mut runner = Runner::default();
+    assert!(matches!(
+        collect(&fixture, DiffMode::Head, &mut runner).await,
+        Err(GitError::EvidenceTooLarge)
+    ));
+    assert!(runner.directories.iter().all(|dir| !dir.exists()));
+    let fixture = GitFixture::new();
+    for path in ["patch-a", "patch-b"] {
+        fixture.write(path.as_bytes(), b"");
+    }
+    fixture.git(["add", "."]);
+    fixture.git(["commit", "--quiet", "-m", "patch baseline"]);
+    for path in ["patch-a", "patch-b"] {
+        fixture.write(path.as_bytes(), &b"long added text line\n".repeat(29_000));
+    }
+    let mut runner = Runner::default();
+    assert!(matches!(
+        collect(&fixture, DiffMode::Head, &mut runner).await,
+        Err(GitError::EvidenceTooLarge)
+    ));
+    assert!(runner.directories.iter().all(|dir| !dir.exists()));
+}
+
+/// Optional persisted source correlation retains exact revision/sequence and rejects stale byte identity.
+#[tokio::test]
+async fn source_digest_revision_and_sequence_are_correlated() {
+    use agent_ide::{
+        app::{
+            config::StoreConfig,
+            store::{OperationId, Store},
+        },
+        workspace::{
+            observation::{ObservationRef, SourceBytes, SourceCoverage, SourceRevision},
+            store::{ObservationAdmission, ObservationDraft, WorkspaceStore},
+        },
+    };
+    let fixture = GitFixture::new();
+    let authority = authority_for(&fixture);
+    let store = Store::open(
+        &fixture.root.join(".git/source.sqlite"),
+        StoreConfig {
+            queue_capacity: 8,
+            busy_timeout: std::time::Duration::from_millis(100),
+            request_deadline: std::time::Duration::from_secs(1),
+            receipt_capacity: 16,
+        },
     )
     .unwrap();
-    run_fixed_query(&fixture, &intent);
+    let workspace = WorkspaceStore::new(&store);
+    workspace.install_schema().await.unwrap();
+    let ObservationAdmission::Recorded(observation) = workspace
+        .record(
+            ObservationDraft::present(
+                authority.worktree().clone(),
+                authority.epoch(),
+                OperationId::new("source").unwrap(),
+                ObservationRef::new("source").unwrap(),
+                "unstaged.txt".into(),
+                SourceBytes::from_bytes(b"working change\n"),
+                SourceRevision::new("source-revision").unwrap(),
+                SourceCoverage::Complete,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("source persisted")
+    };
+    let mut runner = Runner {
+        source_observation: Some(observation.clone()),
+        ..Runner::default()
+    };
+    let snapshot = support::capture_with_authority(&authority, DiffMode::Unstaged, &mut runner)
+        .await
+        .unwrap();
+    let source = snapshot.paths()[0].source().unwrap();
+    assert_eq!(source.observation(), Some(&observation));
+    assert_eq!(source.bytes(), observation.bytes());
+    assert_eq!(
+        source.observation().unwrap().source_revision().as_str(),
+        "source-revision"
+    );
+    assert_eq!(
+        source.observation().unwrap().sequence(),
+        observation.sequence()
+    );
+    fixture.write(b"unstaged.txt", b"newer bytes\n");
+    assert!(matches!(
+        support::capture_with_authority(&authority, DiffMode::Unstaged, &mut runner).await,
+        Err(GitError::UnstableSnapshot)
+    ));
+}
+
+/// A Git binary lacking mandatory no-lazy-fetch is explicit unsupported, never a weaker fallback.
+#[tokio::test]
+async fn unsupported_git_and_missing_promisor_blob_fail_without_helpers() {
+    use agent_ide::{execution::CapturedOutput, workspace::git::snapshot::SnapshotRunner};
+    use std::{os::unix::process::ExitStatusExt, process::ExitStatus};
+    let fixture = GitFixture::new();
+    let scope = agent_ide::workspace::git::GitScope::from_authority(
+        &authority_for(&fixture),
+        DiffMode::Head,
+    );
+    let intent =
+        SnapshotIntent::compare(scope, std::path::Path::new(GIT), b"old\n", b"new\n").unwrap();
+    let mut output = Runner::default().run(intent.clone()).await.unwrap();
+    output.status = ExitStatus::from_raw(129 << 8);
+    output.stderr = CapturedOutput {
+        bytes: b"unknown option: --no-lazy-fetch\n".to_vec(),
+        truncated: false,
+        complete: true,
+        drained_bytes: 30,
+    };
+    assert_eq!(intent.accept(output), Err(GitError::UnsupportedSnapshotGit));
+    fixture.install_malicious_helpers();
+    fixture.git(["config", "remote.origin.promisor", "true"]);
+    fixture.git(["config", "protocol.ext.allow", "always"]);
+    fixture.git_os([
+        "config".into(),
+        "remote.origin.url".into(),
+        format!("ext::{}", fixture.root.join(".git/sentinel.sh").display()).into(),
+    ]);
+    let object = fixture.git(["rev-parse", "HEAD:unstaged.txt"]);
+    let oid = std::str::from_utf8(&object.stdout).unwrap().trim();
+    fs::remove_file(
+        fixture
+            .root
+            .join(".git/objects")
+            .join(&oid[..2])
+            .join(&oid[2..]),
+    )
+    .unwrap();
+    let mut runner = Runner::default();
+    assert!(
+        collect(&fixture, DiffMode::Unstaged, &mut runner)
+            .await
+            .is_err()
+    );
     assert!(
         !fixture.sentinel.exists(),
-        "repository clean filter executed"
+        "missing promisor object launched a remote helper"
     );
+    assert!(runner.directories.iter().all(|dir| !dir.exists()));
+}
+
+/// Git's regular-file mode reflects the owner execute bit, not unrelated group/other permissions.
+#[tokio::test]
+async fn source_modes_use_git_owner_execute_semantics() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = GitFixture::new();
+    fixture.git(["add", "."]);
+    fixture.git(["commit", "--quiet", "-m", "mode baseline"]);
+    fs::set_permissions(
+        fixture.root.join("unstaged.txt"),
+        fs::Permissions::from_mode(0o654),
+    )
+    .unwrap();
+    let snapshot = collect(&fixture, DiffMode::Unstaged, &mut Runner::default())
+        .await
+        .unwrap();
+    assert!(snapshot.paths().is_empty());
+    fs::set_permissions(
+        fixture.root.join("unstaged.txt"),
+        fs::Permissions::from_mode(0o744),
+    )
+    .unwrap();
+    let snapshot = collect(&fixture, DiffMode::Unstaged, &mut Runner::default())
+        .await
+        .unwrap();
+    assert_eq!(snapshot.paths().len(), 1);
+    assert_eq!(
+        snapshot.paths()[0].status().modes(),
+        Some([0o100644, 0o100644, 0o100755])
+    );
+}
+
+/// The real Execution runner yields a Send collection future suitable for the product's tokio task.
+#[test]
+fn execution_snapshot_future_is_send() {
+    /// Proves the future's Send bound at compile time without polling or spawning a new operation.
+    fn assert_send<T: Send>(_future: T) {}
+    let fixture = GitFixture::new();
+    let authority = authority_for(&fixture);
+    let mut runner = Runner::default();
+    assert_send(support::capture_with_authority(
+        &authority,
+        DiffMode::Head,
+        &mut runner,
+    ));
 }

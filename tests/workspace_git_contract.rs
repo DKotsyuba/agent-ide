@@ -18,7 +18,7 @@ fn terminal_discovery_removes_only_the_final_lf() {
 #[test]
 fn porcelain_v2_preserves_raw_paths_and_separate_untracked() {
     assert!(parse_porcelain_v2_z(b"? unterminated").is_err());
-    let raw = b"1 M. N... 100644 100644 100644 a b - spaced name\0u UU N... 100644 100644 100644 100644 a b c conflict\0? -leading\npath\x002 R. N... 100644 100644 100644 a b R100 renamed\0old name\0";
+    let raw = b"1 M. N... 100644 100644 100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb - spaced name\0u UU N... 100644 100644 100644 100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccccccccccccc conflict\0? -leading\npath\x002 R. N... 100644 100644 100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb R100 renamed\0old name\0";
     let status = parse_porcelain_v2_z(raw).expect("fixed porcelain records parse");
     assert_eq!(status.tracked().len(), 2);
     assert_eq!(status.conflicts().len(), 1);
@@ -49,4 +49,32 @@ fn baseline_context_preserves_partial_coverage() {
     let baseline = BaselineContext::new("session-baseline", BaselineCoverage::Partial).unwrap();
     assert_eq!(baseline.reference(), "session-baseline");
     assert_eq!(baseline.coverage(), BaselineCoverage::Partial);
+}
+
+/// Porcelain inspection preserves non-UTF-8 bytes and validates every immutable object name and mode.
+#[test]
+fn raw_status_retains_full_objects_and_non_utf8_paths() {
+    let record = [
+        b"1 .M N... 100644 100644 100755 ".as_slice(),
+        &[b'a'; 64],
+        b" ",
+        &[b'b'; 64],
+        b" raw-\xff\n name\0",
+    ]
+    .concat();
+    let status = parse_porcelain_v2_z(&record).unwrap();
+    let path = &status.tracked()[0];
+    assert_eq!(path.path().as_os_str().as_bytes(), b"raw-\xff\n name");
+    assert_eq!(path.modes(), Some([0o100644, 0o100644, 0o100755]));
+    assert_eq!(
+        path.objects().unwrap()[0].as_ref().unwrap().as_str(),
+        "a".repeat(64)
+    );
+    let invalid = [
+        b"1 .M N... 100644 100644 100644 a ".as_slice(),
+        &[b'b'; 40],
+        b" raw\0",
+    ]
+    .concat();
+    assert!(parse_porcelain_v2_z(&invalid).is_err());
 }

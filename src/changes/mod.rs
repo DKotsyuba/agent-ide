@@ -1,10 +1,10 @@
 //! Bounded diff composition for Workspace raw Git evidence in Changes v0.1.
 
-use std::{collections::BTreeMap, os::unix::ffi::OsStrExt, path::PathBuf};
+use std::path::PathBuf;
 
 use crate::workspace::git::{
-    BaselineCoverage, BaselineWindow, DiffMode, GitComparison, GitReadQuery, GitScope, GitStatus,
-    PathStatus, RawGitEvidence,
+    BaselineCoverage, BaselineWindow, DiffMode, GitComparison, GitScope, GitStatus, PathStatus,
+    snapshot::GitSnapshot,
 };
 
 /// Maximum number of hunks selected by default for one bounded composition.
@@ -103,9 +103,13 @@ impl DiffComparisonIdentities {
 /// Bounded hunk payload selected from raw evidence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiffHunk {
+    /// Position in the complete per-path hunk stream for bounded expansion.
     index: usize,
-    path: Option<PathBuf>,
+    /// Exact raw Workspace path, independent of temporary Git headers.
+    path: PathBuf,
+    /// Complete hunk bytes, or empty for binary summaries.
     patch: Vec<u8>,
+    /// Whether this entry represents binary rather than textual content.
     is_binary: bool,
 }
 
@@ -115,12 +119,9 @@ impl DiffHunk {
         self.index
     }
 
-    /// Returns a path only when Workspace supplied an exact, unambiguous mapping.
-    ///
-    /// Header bytes must exactly match one scoped status path pair, including Git quoting.
-    /// Unsupported or ambiguous mappings are omitted and mark the result incomplete.
-    pub fn path(&self) -> Option<&PathBuf> {
-        self.path.as_ref()
+    /// Returns the exact raw Workspace evidence path; temporary Git headers never supply identity.
+    pub fn path(&self) -> &PathBuf {
+        &self.path
     }
 
     /// Returns the exact raw hunk bytes, including header and context lines.
@@ -259,22 +260,41 @@ impl DiffProvenance {
 /// Bounded diff composition result exposed to Assistance formatting/rendering layers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiffResult {
+    /// Overall availability and completeness outcome.
     state: DiffResultState,
+    /// Evidence currentness relative to requested scope.
     freshness: DiffFreshness,
+    /// Whether bounded selection covers all supported material.
     coverage: DiffCoverage,
+    /// Exact requested HEAD/index/worktree comparison mode.
     scope_mode: DiffMode,
+    /// Authority generation that fences expansion.
     authority_epoch: u64,
+    /// Opaque worktree identity, including its incarnation.
     worktree_id: String,
+    /// Exact comparison side fingerprints; absent for unavailable results.
     identities: DiffComparisonIdentities,
+    /// Counts of the original separately classified raw status.
     status_counts: DiffStatusCounts,
+    /// Unsliced directly attributed hunks retained within request budgets.
     selected_hunks: Vec<DiffHunk>,
+    /// Whether retained raw output was incomplete; minted snapshots require complete streams.
     truncated_output: bool,
+    /// Number of complete hunks omitted by request budgets.
     overflow_hunks: usize,
+    /// Sum of bytes in omitted complete hunks.
     overflow_bytes: usize,
+    /// Selected tracked paths, including additions/deletions and mode-only changes with no hunks.
+    tracked: Vec<PathStatus>,
+    /// Separately listed raw untracked paths, never treated as baseline content.
     untracked: Vec<PathStatus>,
+    /// Unmerged paths retained without guessed hunks.
     conflicts: Vec<PathStatus>,
+    /// Optional standalone ignored context; live snapshots do not scan ignored files.
     ignored: Vec<PathStatus>,
+    /// First omitted hunk in the owning operation, if selection overflowed.
     detail_cursor: Option<DiffDetailCursor>,
+    /// Bounded operation and baseline context for rendering and expansion.
     provenance: DiffProvenance,
 }
 
@@ -324,6 +344,11 @@ impl DiffResult {
         &self.selected_hunks
     }
 
+    /// Returns exact tracked paths selected for this mode, including changes without textual hunks.
+    pub fn tracked(&self) -> &[PathStatus] {
+        &self.tracked
+    }
+
     /// Returns explicit untracked paths preserved by Workspace parsing.
     pub fn untracked(&self) -> &[PathStatus] {
         &self.untracked
@@ -365,15 +390,14 @@ impl DiffResult {
     }
 }
 
-/// Composes bounded hunks only from matching comparison/patch scopes and scoped status.
-/// Mismatches return unavailable with no payload; unassociated paths are omitted as incomplete.
+/// Composes bounded hunks from a complete per-path Workspace snapshot; mismatched scope yields no payload.
 pub fn compose_diff(
     expected_scope: &GitScope,
     comparison: &GitComparison,
-    status: GitStatus,
-    evidence: RawGitEvidence,
+    evidence: GitSnapshot,
     budget: DiffSelectionBudget,
 ) -> DiffResult {
+    let status = evidence.status();
     let same_worktree = evidence.scope().worktree() == expected_scope.worktree();
     let stale = same_worktree
         && evidence.scope().authority_epoch() != expected_scope.authority_epoch()
@@ -385,7 +409,10 @@ pub fn compose_diff(
     });
     if evidence.scope() != expected_scope
         || comparison.scope() != expected_scope
-        || evidence.query() != GitReadQuery::diff_for(expected_scope.mode())
+        || evidence.comparison() != comparison
+        || evidence.paths().iter().any(|path| {
+            path.scope() != expected_scope || path.generation() != evidence.generation()
+        })
         || !status_matches
         || !comparison.baseline().matches_scope(expected_scope)
     {
@@ -411,6 +438,7 @@ pub fn compose_diff(
             truncated_output: false,
             overflow_hunks: 0,
             overflow_bytes: 0,
+            tracked: Vec::new(),
             untracked: Vec::new(),
             conflicts: Vec::new(),
             ignored: Vec::new(),
@@ -423,21 +451,8 @@ pub fn compose_diff(
     let mut coverage = DiffCoverage::Complete;
     let mut detail_cursor = None;
 
-    if evidence.exit_code() != Some(0) {
-        state = DiffResultState::Failed;
-        coverage = DiffCoverage::Unknown;
-    } else if evidence.exit_code().is_none() {
-        state = DiffResultState::Incomplete;
-        coverage = DiffCoverage::Partial;
-    }
-
-    let truncated_output = evidence.is_truncated();
-    if truncated_output && state != DiffResultState::Failed {
-        state = DiffResultState::Incomplete;
-        coverage = DiffCoverage::Partial;
-    }
-
-    let parsed = parse_diff_hunks(evidence.stdout(), &status);
+    let truncated_output = false;
+    let parsed = parse_snapshot_hunks(&evidence);
     let malformed = parsed.malformed;
     let has_binary = parsed.has_binary;
     let raw_hunks = parsed.hunks;
@@ -484,11 +499,16 @@ pub fn compose_diff(
             comparison.left().as_bytes(),
             comparison.right().as_bytes(),
         ),
-        status_counts: DiffStatusCounts::from_status(&status),
+        status_counts: DiffStatusCounts::from_status(status),
         selected_hunks,
         truncated_output,
         overflow_hunks,
         overflow_bytes,
+        tracked: evidence
+            .paths()
+            .iter()
+            .map(|path| path.status().clone())
+            .collect(),
         untracked: status.untracked().to_vec(),
         conflicts: status.conflicts().to_vec(),
         ignored: status.ignored().to_vec(),
@@ -540,8 +560,8 @@ fn select_hunks(
 struct RawHunk {
     /// Zero-based position in the raw hunk stream.
     original_index: usize,
-    /// Path supplied only when an exact Workspace status mapping exists.
-    path: Option<PathBuf>,
+    /// Exact raw path bound directly to the Workspace per-path evidence.
+    path: PathBuf,
     /// Complete raw patch bytes.
     patch: Vec<u8>,
     /// Whether this entry is a binary summary.
@@ -558,169 +578,65 @@ struct ParsedDiff {
     has_binary: bool,
 }
 
-/// Parses supported patch units against scoped raw path pairs; unmapped hunks are omitted as malformed.
-fn parse_diff_hunks(stdout: &[u8], status: &GitStatus) -> ParsedDiff {
-    if stdout.is_empty() {
-        return ParsedDiff {
-            hunks: Vec::new(),
-            malformed: false,
-            has_binary: false,
-        };
-    }
-
-    let mut hunks = Vec::new();
-    let mut index = 0usize;
-    let mut cursor = 0usize;
-    let mut malformed = false;
-    let mut has_binary = false;
-    let mut path = None;
-    let paths = exact_diff_paths(status);
-
-    while cursor < stdout.len() {
-        let end = next_line_end(stdout, cursor);
-        let line = &stdout[cursor..end];
-
-        if line.starts_with(b"diff --git ") {
-            path = paths.get(line).cloned().flatten();
-            malformed |= path.is_none();
-            cursor = end;
-            continue;
-        }
-
-        if line.starts_with(b"Binary files ") || line.starts_with(b"Binary file ") {
-            hunks.push(RawHunk {
-                original_index: index,
-                path: path.clone(),
-                patch: line.to_vec(),
-                binary: true,
-            });
-            has_binary = true;
-            index += 1;
-            cursor = end;
-            continue;
-        }
-
-        if line.starts_with(b"@@") {
-            let start = cursor;
-            let mut next = end;
-            let mut previous_end = end;
-            loop {
-                if next >= stdout.len() {
-                    previous_end = next;
-                    break;
-                }
-                next = next_line_end(stdout, next);
-                if next == previous_end {
-                    break;
-                }
-                let candidate = &stdout[previous_end..next];
-                if !candidate.starts_with(b"+")
-                    && !candidate.starts_with(b"-")
-                    && !candidate.starts_with(b" ")
-                    && !candidate.starts_with(b"\\")
-                    && !candidate.starts_with(b"@@")
-                    && !candidate.starts_with(b"diff --git ")
-                {
-                    malformed = true;
-                }
-                if candidate.starts_with(b"@@") || candidate.starts_with(b"diff --git ") {
-                    break;
-                }
-                previous_end = next;
-            }
-            if previous_end > start {
-                hunks.push(RawHunk {
-                    original_index: index,
+/// Parses each bounded patch with its explicit path; headers are transport details, never identities.
+fn parse_snapshot_hunks(snapshot: &GitSnapshot) -> ParsedDiff {
+    let mut parsed = ParsedDiff {
+        hunks: Vec::new(),
+        malformed: false,
+        has_binary: false,
+    };
+    for evidence in snapshot.paths() {
+        let stdout = evidence.patch();
+        let path = evidence.status().path().to_path_buf();
+        let mut cursor = 0;
+        while cursor < stdout.len() {
+            let end = next_line_end(stdout, cursor);
+            let line = &stdout[cursor..end];
+            if line.starts_with(b"Binary files ") || line.starts_with(b"Binary file ") {
+                parsed.hunks.push(RawHunk {
+                    original_index: parsed.hunks.len(),
                     path: path.clone(),
-                    patch: stdout[start..previous_end].to_vec(),
+                    patch: Vec::new(),
+                    binary: true,
+                });
+                parsed.has_binary = true;
+            } else if line.starts_with(b"@@ ") {
+                let start = cursor;
+                let mut next = end;
+                while next < stdout.len() {
+                    let next_end = next_line_end(stdout, next);
+                    let candidate = &stdout[next..next_end];
+                    if candidate.starts_with(b"@@ ") || candidate.starts_with(b"diff --git ") {
+                        break;
+                    }
+                    if !matches!(candidate.first(), Some(b'+' | b'-' | b' ' | b'\\')) {
+                        parsed.malformed = true;
+                    }
+                    next = next_end;
+                }
+                parsed.hunks.push(RawHunk {
+                    original_index: parsed.hunks.len(),
+                    path: path.clone(),
+                    patch: stdout[start..next].to_vec(),
                     binary: false,
                 });
-                index += 1;
+                cursor = next;
+                continue;
+            } else if !line.starts_with(b"diff --git ")
+                && !line.starts_with(b"index ")
+                && !line.starts_with(b"--- ")
+                && !line.starts_with(b"+++ ")
+                && !line.starts_with(b"old mode ")
+                && !line.starts_with(b"new mode ")
+                && !line.starts_with(b"new file mode ")
+                && !line.starts_with(b"deleted file mode ")
+            {
+                parsed.malformed = true;
             }
-            cursor = previous_end;
-            continue;
-        }
-
-        if line != b"\n"
-            && line != b""
-            && !line.starts_with(b"diff --git ")
-            && !line.starts_with(b"index ")
-            && !line.starts_with(b"--- ")
-            && !line.starts_with(b"+++ ")
-            && !line.starts_with(b"\\")
-        {
-            malformed = true;
-        }
-
-        cursor = end;
-    }
-
-    malformed |= hunks.iter().any(|hunk| hunk.path.is_none());
-    hunks.retain(|hunk| hunk.path.is_some());
-    ParsedDiff {
-        hunks,
-        malformed,
-        has_binary,
-    }
-}
-
-/// Indexes entire default Git headers by exact raw status path pairs without splitting on spaces.
-/// Duplicate headers map to None; unknown quoting/prefixes/rename attribution cannot select hunks.
-fn exact_diff_paths(status: &GitStatus) -> BTreeMap<Vec<u8>, Option<PathBuf>> {
-    let mut paths = BTreeMap::new();
-    for entry in status.tracked().iter().chain(status.conflicts()) {
-        let mut header = b"diff --git ".to_vec();
-        header.extend(quoted_git_path(
-            b"a/",
-            entry
-                .original_path()
-                .unwrap_or(entry.path())
-                .as_os_str()
-                .as_bytes(),
-        ));
-        header.push(b' ');
-        header.extend(quoted_git_path(b"b/", entry.path().as_os_str().as_bytes()));
-        header.push(b'\n');
-        paths
-            .entry(header)
-            .and_modify(|path| *path = None)
-            .or_insert_with(|| Some(entry.path().to_path_buf()));
-    }
-    paths
-}
-
-/// Encodes a raw Git path with default quotePath C quoting, retaining every non-UTF-8 byte.
-/// Unknown nondefault encodings are rejected by exact matching instead of guessed.
-fn quoted_git_path(prefix: &[u8], path: &[u8]) -> Vec<u8> {
-    if path
-        .iter()
-        .all(|byte| (b' '..=b'~').contains(byte) && !matches!(byte, b'"' | b'\\'))
-    {
-        return [prefix, path].concat();
-    }
-    let mut result = vec![b'"'];
-    result.extend_from_slice(prefix);
-    for &byte in path {
-        match byte {
-            b'"' | b'\\' => result.extend_from_slice(&[b'\\', byte]),
-            b'\n' => result.extend_from_slice(b"\\n"),
-            b'\r' => result.extend_from_slice(b"\\r"),
-            b'\t' => result.extend_from_slice(b"\\t"),
-            7 => result.extend_from_slice(b"\\a"),
-            8 => result.extend_from_slice(b"\\b"),
-            11 => result.extend_from_slice(b"\\v"),
-            12 => result.extend_from_slice(b"\\f"),
-            b' '..=b'~' => result.push(byte),
-            _ => result.extend_from_slice(&[
-                b'\\',
-                b'0' + (byte >> 6),
-                b'0' + ((byte >> 3) & 7),
-                b'0' + (byte & 7),
-            ]),
+            cursor = end;
         }
     }
-    result.push(b'"');
-    result
+    parsed
 }
 
 /// Returns the byte index after the next line terminator.

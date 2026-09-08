@@ -326,9 +326,16 @@ pub struct SourceRead {
     contents: Vec<u8>,
     /// Digest and length for `contents`.
     bytes: SourceBytes,
+    /// Regular Git mode from the opened file descriptor; byte identity remains independent.
+    git_mode: u32,
 }
 
 impl SourceRead {
+    /// Returns descriptor-derived Git mode (100644 or 100755), using the owner executable bit; byte identity is separate.
+    pub const fn git_mode(&self) -> u32 {
+        self.git_mode
+    }
+
     /// Returns the raw relative Unix pathname.
     pub fn path(&self) -> &Path {
         &self.path
@@ -434,6 +441,11 @@ pub fn read_authorized_source(
         path: path.to_path_buf(),
         contents,
         bytes,
+        git_mode: if std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o100 != 0 {
+            0o100755
+        } else {
+            0o100644
+        },
     })
 }
 

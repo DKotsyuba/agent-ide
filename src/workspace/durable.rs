@@ -478,7 +478,7 @@ impl NativeIdentity {
 
 /// Walks native directories through owned descriptors, refusing symlinks without a check/open race.
 /// Returns a canonical path only when it still names the opened final device/inode.
-fn real_directory(path: &Path) -> Result<(PathBuf, [u8; 16]), DurableError> {
+pub(super) fn real_directory(path: &Path) -> Result<(PathBuf, [u8; 16]), DurableError> {
     if !path.is_absolute() {
         return Err(DurableError::IdentityUnavailable);
     }
