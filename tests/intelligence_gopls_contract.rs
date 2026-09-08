@@ -3,21 +3,23 @@
 use std::{
     collections::BTreeSet,
     env, fs, io,
+    ops::ControlFlow,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
 use agent_ide::{
     execution::{
         Admission, AdmissionClass, AdmissionController, AdmissionLease, AdmissionLimits,
-        CommandKind, ControlledCommand, ExecutionProfileCatalog, ExecutionProfileTemplate,
-        HostSandboxState, LocalExecutionPolicy, OwnerId, ValidatedExecutionRequest,
+        ExecutionProfileCatalog, ExecutionProfileTemplate, HostSandboxState, LocalExecutionPolicy,
+        OwnedChild, OwnedProtocolChild, OwnerId, ValidatedExecutionRequest,
         ValidatedHostInvocation, WorkspaceAuthority,
     },
     intelligence::gopls::{GoplsProfile, SharedGopls, WorktreeRef},
 };
 use async_lsp::{
-    LanguageServer, MainLoop,
+    LanguageServer, MainLoop, ServerSocket,
     lsp_types::{
         ClientCapabilities, DidOpenTextDocumentParams, HoverContents, HoverParams,
         InitializeParams, InitializedParams, Position, TextDocumentIdentifier, TextDocumentItem,
@@ -25,7 +27,8 @@ use async_lsp::{
     },
     router::Router,
 };
-use serde_json::json;
+use serde_json::{Value, json};
+use tokio::sync::{Barrier, Notify, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 /// Bounds every real daemon, initialize, semantic request, and shutdown operation in this test.
@@ -71,12 +74,19 @@ impl Drop for Fixture {
     }
 }
 
-/// Constructs explicit disabled-host Execution evidence for one controlled test provider child.
+/// Creates one exact Workspace authority for a fixture worktree incarnation.
+fn authority(root: &Path, id: &str, incarnation: &str) -> WorkspaceAuthority {
+    WorkspaceAuthority::from_workspace(id.to_owned(), incarnation.to_owned(), root.to_path_buf(), 1)
+        .expect("fixture root is absolute")
+}
+
+/// Constructs disabled-host Execution evidence for an already profile-declared provider command.
 fn request(
-    root: &Path,
+    authority: WorkspaceAuthority,
+    command: agent_ide::execution::ControlledCommand,
     program: &Path,
-    args: Vec<std::ffi::OsString>,
 ) -> ValidatedExecutionRequest {
+    let root = authority.root().to_path_buf();
     let sandbox = HostSandboxState::parse(Some(json!({
         "permissionProfile": {"type": "disabled"},
         "codexLinuxSandboxExe": null,
@@ -88,22 +98,7 @@ fn request(
             .expect("test profile is valid"),
     ])
     .expect("one test profile is valid");
-    let authority = WorkspaceAuthority::from_workspace(
-        root.display().to_string(),
-        "contract-incarnation",
-        root.to_path_buf(),
-        1,
-    )
-    .expect("fixture root is absolute");
-    let command = ControlledCommand::from_validated_peer(
-        CommandKind::Provider,
-        program.to_path_buf(),
-        args,
-        root.to_path_buf(),
-        Default::default(),
-    )
-    .expect("gopls command is absolute");
-    let policy = LocalExecutionPolicy::new(BTreeSet::from([program.to_path_buf()]), 4096, 0, true)
+    let policy = LocalExecutionPolicy::new(BTreeSet::from([program.to_path_buf()]), 4096, 3, true)
         .expect("test policy is valid");
     ValidatedExecutionRequest::validate(
         ValidatedHostInvocation::from_verified_binding("gopls-contract", sandbox)
@@ -127,14 +122,64 @@ fn lease(admission: &mut AdmissionController, owner: &str) -> AdmissionLease {
     }
 }
 
-/// Runs initialize, open, hover, shutdown, and exit for one distinct forwarder without sharing its pipes.
-async fn hover(
-    child: &mut agent_ide::execution::OwnedProtocolChild,
-    root: &Path,
+/// Records one forwarder's semantic result, post-detach result, and reaped Execution lease.
+struct SessionResult {
+    /// Semantic hover while both independently initialized forwarders remain live.
+    initial_hover: String,
+    /// Semantic hover after the left forwarder has completed provider-supported detachment.
+    post_detach_hover: Option<String>,
+    /// Execution admission lease released only after this forwarder was reaped.
+    admission: AdmissionLease,
+    /// Whether gopls reported its documented terminal remote-disconnect exit after LSP exit.
+    terminal_remote_disconnect: bool,
+}
+
+/// Returns the bounded hover text for the fixture's duplicate `Shared` symbol.
+async fn semantic_hover(
+    server: &mut ServerSocket,
+    file_uri: &Url,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let (mainloop, mut server) = MainLoop::new_client(|_| Router::new(()));
+    let response = tokio::time::timeout(
+        DEADLINE,
+        server.hover(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: file_uri.clone(),
+                },
+                position: Position::new(2, 6),
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        }),
+    )
+    .await??
+    .ok_or_else(|| io::Error::other("gopls returned no hover"))?;
+    Ok(match response.contents {
+        HoverContents::Scalar(value) => format!("{value:?}"),
+        HoverContents::Array(value) => format!("{value:?}"),
+        HoverContents::Markup(value) => value.value,
+    })
+}
+
+/// Builds a client router that observes server notifications without ending a valid session.
+fn client_router() -> Router<()> {
+    let mut router = Router::new(());
+    router.unhandled_notification(|_, _| ControlFlow::Continue(()));
+    router
+}
+
+/// Drives one forwarder through initialize/open, synchronized semantic work, and provider shutdown.
+async fn run_session(
+    mut child: OwnedProtocolChild,
+    root: PathBuf,
+    opened: Arc<Barrier>,
+    begin_semantic: Arc<Barrier>,
+    detached: Arc<Notify>,
+    detach_after_initial_hover: bool,
+    reaped_sender: Option<oneshot::Sender<AdmissionLease>>,
+) -> Result<SessionResult, Box<dyn std::error::Error>> {
+    let (mainloop, mut server) = MainLoop::new_client(|_| client_router());
     let root_uri =
-        Url::from_file_path(root).map_err(|_| io::Error::other("invalid fixture root URI"))?;
+        Url::from_file_path(&root).map_err(|_| io::Error::other("invalid fixture root URI"))?;
     let file_uri = Url::from_file_path(root.join("main.go"))
         .map_err(|_| io::Error::other("invalid fixture file URI"))?;
     let exchange = async {
@@ -160,35 +205,137 @@ async fn hover(
                 text,
             },
         })?;
-        let response = tokio::time::timeout(
-            DEADLINE,
-            server.hover(HoverParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri: file_uri },
-                    position: Position::new(2, 6),
-                },
-                work_done_progress_params: WorkDoneProgressParams::default(),
-            }),
-        )
-        .await??
-        .ok_or_else(|| io::Error::other("gopls returned no hover"))?;
+        tokio::time::timeout(DEADLINE, opened.wait())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "peer did not initialize"))?;
+        tokio::time::timeout(DEADLINE, begin_semantic.wait())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "session check did not finish"))?;
+        let initial_hover = semantic_hover(&mut server, &file_uri).await?;
+        let post_detach_hover = if detach_after_initial_hover {
+            None
+        } else {
+            tokio::time::timeout(DEADLINE, detached.notified())
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "left forwarder did not detach")
+                })?;
+            Some(semantic_hover(&mut server, &file_uri).await?)
+        };
         tokio::time::timeout(DEADLINE, server.shutdown(())).await??;
         server.exit(())?;
-        Ok::<_, Box<dyn std::error::Error>>(response)
+        Ok::<_, Box<dyn std::error::Error>>((initial_hover, post_detach_hover))
     };
     let loop_run = mainloop.run_buffered(
         (&mut child.stdout).compat(),
         (&mut child.stdin).compat_write(),
     );
-    let (response, loop_result) = tokio::join!(exchange, loop_run);
-    let response = response?;
-    loop_result?;
-    let text = match response.contents {
-        HoverContents::Scalar(value) => format!("{value:?}"),
-        HoverContents::Array(value) => format!("{value:?}"),
-        HoverContents::Markup(value) => value.value,
-    };
-    Ok(text)
+    let (exchange, loop_result) = tokio::join!(exchange, loop_run);
+    let (status, stderr, admission) = tokio::time::timeout(DEADLINE, child.reap(DEADLINE))
+        .await?
+        .map_err(execution_error)?;
+    let (initial_hover, post_detach_hover) = exchange?;
+    let terminal_remote_disconnect = status.code() == Some(2)
+        && String::from_utf8_lossy(&stderr.bytes)
+            .contains("remote disconnected: failed reading header line: EOF");
+    if !status.success() && !terminal_remote_disconnect {
+        return Err(io::Error::other(format!(
+            "gopls forwarder failed: {status}; stderr: {}",
+            String::from_utf8_lossy(&stderr.bytes)
+        ))
+        .into());
+    }
+    match loop_result {
+        Ok(()) | Err(async_lsp::Error::Eof) => {}
+        Err(error) => return Err(error.into()),
+    }
+    if let Some(sender) = reaped_sender {
+        sender
+            .send(admission)
+            .map_err(|_| io::Error::other("left-session coordinator stopped"))?;
+    }
+    Ok(SessionResult {
+        initial_hover,
+        post_detach_hover,
+        admission,
+        terminal_remote_disconnect,
+    })
+}
+
+/// Runs the provider-supported daemon inspection command through an Execution-owned child.
+async fn remote_sessions(
+    profile: &GoplsProfile,
+    socket: &Path,
+    root: &Path,
+    program: &Path,
+    admission: &mut AdmissionController,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let authority = authority(root, "sessions", "sessions-incarnation");
+    let request = request(
+        authority.clone(),
+        profile.sessions_command(&authority, socket)?,
+        program,
+    );
+    let child = OwnedChild::spawn_captured(
+        &request,
+        lease(admission, "sessions"),
+        None,
+        Path::new("/unused"),
+        4096,
+    )
+    .map_err(execution_error)?;
+    let reaped = tokio::time::timeout(DEADLINE, child.reap(DEADLINE))
+        .await?
+        .map_err(execution_error)?;
+    admission.release(reaped.lease).map_err(execution_error)?;
+    if !reaped.status.success() {
+        return Err(io::Error::other(format!(
+            "gopls remote sessions failed: {}; stderr: {}",
+            reaped.status,
+            String::from_utf8_lossy(&reaped.stderr.bytes)
+        ))
+        .into());
+    }
+    String::from_utf8(reaped.stdout.bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error).into())
+}
+
+/// Converts typed Execution failures into bounded test-context I/O errors.
+fn execution_error(error: impl std::fmt::Debug) -> io::Error {
+    io::Error::other(format!(
+        "Execution rejected gopls test operation: {error:?}"
+    ))
+}
+
+/// Counts sessions that existed before the `remote sessions` inspection command connected.
+fn forwarded_session_count(evidence: &str) -> io::Result<usize> {
+    let value: Value = serde_json::from_str(evidence)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let clients = value
+        .get("clients")
+        .and_then(Value::as_array)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "gopls omitted clients"))?;
+    let current = value
+        .get("currentClientID")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "gopls omitted current client")
+        })?;
+    if clients
+        .iter()
+        .filter(|client| client.get("sessionID").and_then(Value::as_str) == Some(current))
+        .count()
+        != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "gopls current client is not exactly one reported session",
+        ));
+    }
+    clients
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "gopls reported no session"))
 }
 
 /// Proves one listener serves two isolated divergent views and release leaves the peer usable.
@@ -207,24 +354,16 @@ async fn shared_gopls_isolates_divergent_worktrees_and_detaches_one_view() {
     )
     .expect("profile is valid");
     let socket = fixture.root.join("gopls.sock");
+    let listener_authority = authority(&fixture.worktree("left"), "listener", "one");
     let listener_command = profile
-        .listener_command(
-            &WorkspaceAuthority::from_workspace("listener", "one", fixture.worktree("left"), 1)
-                .unwrap(),
-            &socket,
-        )
+        .listener_command(&listener_authority, &socket)
         .expect("listener command is declared");
-    let listener_request = request(
-        &fixture.worktree("left"),
-        &gopls,
-        vec![
-            "serve".into(),
-            format!("-listen=unix;{}", socket.display()).into(),
-        ],
-    );
-    assert!(format!("{listener_command:?}").contains("-listen=unix;"));
+    let listener_request = request(listener_authority, listener_command.clone(), &gopls);
+    let listener_debug = format!("{listener_command:?}");
+    assert!(listener_debug.contains("-listen=unix;"));
+    assert!(listener_debug.contains("-listen.timeout=0"));
     let mut admission = AdmissionController::new(AdmissionLimits {
-        total_running: 3,
+        total_running: 4,
         per_owner_running: 1,
         per_owner_queued: 1,
         total_queued: 1,
@@ -250,15 +389,19 @@ async fn shared_gopls_isolates_divergent_worktrees_and_detaches_one_view() {
     let right_root = fixture.worktree("right");
     let left = WorktreeRef::new("same-name".into(), "left-incarnation".into()).unwrap();
     let right = WorktreeRef::new("same-name".into(), "right-incarnation".into()).unwrap();
+    let left_authority = authority(&left_root, "same-name", "left-authority");
     let left_request = request(
-        &left_root,
+        left_authority.clone(),
+        profile.forwarder_command(&left_authority, &socket).unwrap(),
         &gopls,
-        vec![format!("-remote=unix;{}", socket.display()).into()],
     );
+    let right_authority = authority(&right_root, "same-name", "right-authority");
     let right_request = request(
-        &right_root,
+        right_authority.clone(),
+        profile
+            .forwarder_command(&right_authority, &socket)
+            .unwrap(),
         &gopls,
-        vec![format!("-remote=unix;{}", socket.display()).into()],
     );
     let left_view = shared
         .open_view(
@@ -284,32 +427,99 @@ async fn shared_gopls_isolates_divergent_worktrees_and_detaches_one_view() {
     assert_eq!(shared.begin_request(&left, 1).unwrap(), 1);
     assert_eq!(shared.begin_request(&right, 1).unwrap(), 1);
     let left_lease = left_view.lease();
-    let mut left_child = left_view.into_child();
-    let left_hover = hover(&mut left_child, &left_root).await.unwrap();
+    let right_lease = right_view.lease();
+    let opened = Arc::new(Barrier::new(3));
+    let begin_semantic = Arc::new(Barrier::new(3));
+    let detached = Arc::new(Notify::new());
+    let (left_reaped_sender, left_reaped_receiver) = oneshot::channel();
+    let sessions = async {
+        let left_session = run_session(
+            left_view.into_child(),
+            left_root.clone(),
+            Arc::clone(&opened),
+            Arc::clone(&begin_semantic),
+            Arc::clone(&detached),
+            true,
+            Some(left_reaped_sender),
+        );
+        let right_session = run_session(
+            right_view.into_child(),
+            right_root.clone(),
+            Arc::clone(&opened),
+            Arc::clone(&begin_semantic),
+            Arc::clone(&detached),
+            false,
+            None,
+        );
+        let coordinator = async {
+            tokio::time::timeout(DEADLINE, opened.wait())
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "forwarders did not initialize")
+                })?;
+            let evidence =
+                remote_sessions(&profile, &socket, &left_root, &gopls, &mut admission).await?;
+            assert_eq!(
+                forwarded_session_count(&evidence)?,
+                2,
+                "two initialized forwarders must remain before inspection: {evidence}"
+            );
+            tokio::time::timeout(DEADLINE, begin_semantic.wait())
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "forwarders did not start semantics",
+                    )
+                })?;
+            let left_admission = left_reaped_receiver
+                .await
+                .map_err(|_| io::Error::other("left forwarder did not reap"))?;
+            shared.release_view(&left, left_lease)?;
+            admission.release(left_admission).map_err(execution_error)?;
+            assert_eq!(shared.process_counts(), (1, 1, 2));
+            detached.notify_one();
+            Ok::<_, Box<dyn std::error::Error>>(evidence)
+        };
+        tokio::try_join!(left_session, right_session, coordinator)
+    };
+    let (left_session, right_session, session_evidence) =
+        tokio::time::timeout(Duration::from_secs(70), sessions)
+            .await
+            .expect("two sessions complete on deadline")
+            .expect("two sessions satisfy the shared profile");
+    assert!(
+        session_evidence.contains("session"),
+        "session evidence: {session_evidence}"
+    );
+    let left_hover = left_session.initial_hover;
     assert!(
         left_hover.contains("int"),
         "left semantic result: {left_hover}"
     );
-    let left_admission = left_child.reap(DEADLINE).await.unwrap().2;
-    shared.release_view(&left, left_lease).unwrap();
-    admission.release(left_admission).unwrap();
-    assert_eq!(shared.process_counts(), (1, 1, 2));
-    let right_lease = right_view.lease();
-    let mut right_child = right_view.into_child();
-    let right_hover = hover(&mut right_child, &right_root).await.unwrap();
+    assert!(left_session.post_detach_hover.is_none());
+    assert!(left_session.terminal_remote_disconnect);
+    let right_hover = right_session.initial_hover;
     assert!(
         right_hover.contains("string"),
         "right semantic result: {right_hover}"
     );
-    let right_admission = right_child.reap(DEADLINE).await.unwrap().2;
+    let right_after_detach = right_session
+        .post_detach_hover
+        .expect("right view remains initialized after left detaches");
+    assert!(
+        right_after_detach.contains("string"),
+        "right post-detach semantic result: {right_after_detach}"
+    );
+    assert!(right_session.terminal_remote_disconnect);
     shared.release_view(&right, right_lease).unwrap();
-    admission.release(right_admission).unwrap();
+    admission.release(right_session.admission).unwrap();
     let listener_admission = shared
         .stop(Duration::from_millis(100), DEADLINE)
         .await
         .unwrap();
     admission.release(listener_admission).unwrap();
     println!(
-        "one listener, two isolated sessions, divergent int/string results, released left view, right peer survived; forwarders=2"
+        "one listener, two initialized sessions, remote sessions=2, divergent int/string results, released left view, right post-detach string result, terminal remote disconnects=2; forwarders=2"
     );
 }

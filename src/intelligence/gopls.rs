@@ -40,6 +40,7 @@ impl GoplsProfile {
         cache_namespace: String,
     ) -> io::Result<Self> {
         if !binary.is_absolute()
+            || !Path::new(&go_toolchain).is_absolute()
             || [
                 &version,
                 &revision,
@@ -53,7 +54,7 @@ impl GoplsProfile {
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "gopls profile requires absolute binary and nonempty identity components",
+                "gopls profile requires absolute binary/toolchain and nonempty identity components",
             ));
         }
         Ok(Self {
@@ -84,7 +85,7 @@ impl GoplsProfile {
     /// Declares the fixed listener command for Execution validation and controlled spawning.
     ///
     /// `socket` must be absolute and owned by the caller. The command deliberately contains one
-    /// explicit Unix listener and never selects `-remote=auto`.
+    /// explicit Unix listener with no idle timeout and never selects `-remote=auto`.
     pub fn listener_command(
         &self,
         authority: &WorkspaceAuthority,
@@ -93,8 +94,8 @@ impl GoplsProfile {
         self.command(
             authority,
             vec![
-                OsString::from("serve"),
                 OsString::from(format!("-listen=unix;{}", socket.display())),
+                OsString::from("-listen.timeout=0"),
             ],
         )
     }
@@ -111,6 +112,22 @@ impl GoplsProfile {
         )
     }
 
+    /// Declares the fixed daemon session-inspection command used by real sharing acceptance.
+    pub fn sessions_command(
+        &self,
+        authority: &WorkspaceAuthority,
+        socket: &Path,
+    ) -> io::Result<ControlledCommand> {
+        self.command(
+            authority,
+            vec![
+                OsString::from(format!("-remote=unix;{}", socket.display())),
+                OsString::from("remote"),
+                OsString::from("sessions"),
+            ],
+        )
+    }
+
     /// Builds a profile-owned provider command with a cleared, finite Go environment.
     fn command(
         &self,
@@ -119,6 +136,13 @@ impl GoplsProfile {
     ) -> io::Result<ControlledCommand> {
         let mut environment = BTreeMap::new();
         environment.insert(OsString::from("GOTOOLCHAIN"), OsString::from("local"));
+        let go_parent = Path::new(&self.go_toolchain)
+            .parent()
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "go toolchain has no parent")
+            })?;
+        environment.insert(OsString::from("PATH"), go_parent.as_os_str().to_os_string());
         environment.insert(
             OsString::from("AGENT_IDE_GOPLS_PROFILE"),
             OsString::from(&self.revision),
