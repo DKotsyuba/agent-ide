@@ -69,6 +69,167 @@ pub struct ExecutionProfileCatalog {
     templates: BTreeMap<ProfileClass, ExecutionProfileTemplate>,
 }
 
+/// Is the durable, Execution-owned record that Application may store without interpreting it.
+///
+/// Every identity is an opaque, nonempty value supplied by the verified Execution evidence
+/// pipeline.  The record deliberately stores the semantic state digest alongside its separate
+/// provider/toolchain/config/trust/transport identities: matching a template name alone never
+/// makes a changed profile executable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedProfileRecord {
+    /// Stable profile-template identity selected by Execution code.
+    pub profile_id: String,
+    /// Monotonic Execution-owned template revision.
+    pub revision: u32,
+    /// Supported host class recorded with the evidence; unknown values are unavailable.
+    pub class: ProfileClass,
+    /// Exact provider binary identity observed by the D03 run.
+    pub provider_binary: String,
+    /// Exact toolchain identity observed by the D03 run.
+    pub toolchain: String,
+    /// Effective provider configuration identity observed by the D03 run.
+    pub configuration: String,
+    /// Effective trust decision identity observed by the D03 run.
+    pub trust: String,
+    /// Sandbox transport/mechanism identity observed by the D03 run.
+    pub transport: String,
+    /// Effective permission-value identity, never a path-erasing shape match.
+    pub permission_value: String,
+    /// Immutable D03 evidence identity for this tested record.
+    pub d03_evidence: String,
+    /// Semantic (not textual) complete-state identity for the accepted profile value.
+    pub semantic_state: String,
+}
+
+/// Carries the non-state identities captured by one verified D03 profile experiment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct D03ProfileEvidence {
+    /// Exact provider binary identity from the experiment.
+    pub provider_binary: String,
+    /// Exact toolchain identity from the experiment.
+    pub toolchain: String,
+    /// Effective provider configuration identity from the experiment.
+    pub configuration: String,
+    /// Effective local trust identity from the experiment.
+    pub trust: String,
+    /// Sandbox transport identity from the experiment.
+    pub transport: String,
+    /// Immutable D03 result identity from the experiment.
+    pub d03_evidence: String,
+}
+
+impl PersistedProfileRecord {
+    /// Creates a complete record from one verified D03 result and the exact observed host state.
+    ///
+    /// Each supplied identity must be nonempty and comes from the Execution verification path,
+    /// never from a model request or a persisted record being replayed.
+    pub fn from_execution_evidence(
+        profile_id: impl Into<String>,
+        revision: u32,
+        evidence: D03ProfileEvidence,
+        state: &HostSandboxState,
+    ) -> Result<Self, RequestError> {
+        let record = Self {
+            profile_id: profile_id.into(),
+            revision,
+            class: state.class(),
+            provider_binary: evidence.provider_binary,
+            toolchain: evidence.toolchain,
+            configuration: evidence.configuration,
+            trust: evidence.trust,
+            transport: evidence.transport,
+            permission_value: state.profile_digest().to_hex().to_string(),
+            d03_evidence: evidence.d03_evidence,
+            semantic_state: semantic_state_identity(state),
+        };
+        (record.revision != 0
+            && [
+                &record.profile_id,
+                &record.provider_binary,
+                &record.toolchain,
+                &record.configuration,
+                &record.trust,
+                &record.transport,
+                &record.permission_value,
+                &record.d03_evidence,
+                &record.semantic_state,
+            ]
+            .iter()
+            .all(|value| !value.is_empty()))
+        .then_some(record)
+        .ok_or(RequestError::ExecutionProfileDenied)
+    }
+
+    /// Validates an opaque durable record before Execution may use it to rebuild a catalog.
+    ///
+    /// Empty identities, zero revisions, malformed JSON, and records for a different semantic
+    /// state are unavailable.  Application only persists the returned JSON; permit minting stays
+    /// in `ExecutionProfileCatalog`.
+    pub fn from_json(json: &str) -> Result<Self, RequestError> {
+        let value: Value =
+            serde_json::from_str(json).map_err(|_| RequestError::ExecutionProfileDenied)?;
+        let object = value
+            .as_object()
+            .ok_or(RequestError::ExecutionProfileDenied)?;
+        let string = |name: &str| {
+            object
+                .get(name)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or(RequestError::ExecutionProfileDenied)
+        };
+        let revision = object
+            .get("revision")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value != 0)
+            .ok_or(RequestError::ExecutionProfileDenied)?;
+        let class = match object.get("class").and_then(Value::as_str) {
+            Some("managed") => ProfileClass::Managed,
+            Some("disabled") => ProfileClass::Disabled,
+            _ => return Err(RequestError::ExecutionProfileDenied),
+        };
+        Ok(Self {
+            profile_id: string("profile_id")?,
+            revision,
+            class,
+            provider_binary: string("provider_binary")?,
+            toolchain: string("toolchain")?,
+            configuration: string("configuration")?,
+            trust: string("trust")?,
+            transport: string("transport")?,
+            permission_value: string("permission_value")?,
+            d03_evidence: string("d03_evidence")?,
+            semantic_state: string("semantic_state")?,
+        })
+    }
+
+    /// Serializes this complete record in a stable field layout for Application's opaque store.
+    pub fn to_json(&self) -> String {
+        serde_json::json!({
+            "profile_id": self.profile_id,
+            "revision": self.revision,
+            "class": match self.class { ProfileClass::Managed => "managed", ProfileClass::Disabled => "disabled" },
+            "provider_binary": self.provider_binary,
+            "toolchain": self.toolchain,
+            "configuration": self.configuration,
+            "trust": self.trust,
+            "transport": self.transport,
+            "permission_value": self.permission_value,
+            "d03_evidence": self.d03_evidence,
+            "semantic_state": self.semantic_state,
+        })
+        .to_string()
+    }
+
+    /// Returns whether this durable record is exactly applicable to the supplied observed state.
+    pub fn matches_state(&self, state: &HostSandboxState) -> bool {
+        self.semantic_state == semantic_state_identity(state)
+            && self.permission_value == state.profile_digest().to_hex().to_string()
+    }
+}
+
 /// Correlates one invocation's full opaque state with its supporting profile template.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionProfilePermit {
@@ -214,6 +375,28 @@ impl ExecutionProfileCatalog {
             }
         }
         Ok(Self { templates: entries })
+    }
+
+    /// Rebuilds a usable catalog only from complete verified records and their matching states.
+    ///
+    /// The caller supplies the state captured by the current D01-bound invocation for each record;
+    /// a stale, corrupt, missing, duplicate-class, or value-mismatched record is unavailable.
+    pub fn from_persisted_records(
+        records: Vec<(PersistedProfileRecord, HostSandboxState)>,
+    ) -> Result<Self, RequestError> {
+        let mut templates = Vec::with_capacity(records.len());
+        for (record, state) in records {
+            if record.class != state.class() || !record.matches_state(&state) {
+                return Err(RequestError::ExecutionProfileDenied);
+            }
+            templates.push(ExecutionProfileTemplate {
+                id: record.profile_id,
+                version: record.revision,
+                class: record.class,
+                profile_digest: state.profile_digest(),
+            });
+        }
+        Self::from_execution_evidence(templates)
     }
 
     /// Mints an Execution-owned permit when the invocation's supported class has real evidence.
@@ -1046,6 +1229,280 @@ impl AdmissionController {
     }
 }
 
+/// Identifies one Execution-owned logical provider view.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ProviderViewLease(u64);
+
+/// Classifies the ownership and sharing rule of a provider backend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderBackendKind {
+    /// One owned backend can serve compatible logical views and holds one admission lease.
+    OwnedShared,
+    /// One owned backend serves exactly one logical view and holds one admission lease.
+    OwnedExclusive,
+    /// An observed peer endpoint has no Execution signal or reap capability.
+    Borrowed,
+}
+
+/// Reports why a provider view cannot be attached to a backend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderLeaseError {
+    /// The requested backend identity is empty or attempts to alter established ownership.
+    InvalidBackend,
+    /// An exclusive backend already has a logical view.
+    ExclusiveInUse,
+    /// A stale logical-view lease was released twice or belongs to another registry.
+    UnknownView,
+    /// The supplied authority lacks a nonzero Workspace incarnation and cannot be revocation-scoped.
+    InvalidAuthority,
+    /// The central controller rejected release of the registry's owned admission lease.
+    Admission(AdmissionError),
+}
+
+/// Reports one bounded request for a logical provider view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderLeaseAdmission {
+    /// A logical view was attached and any owned backend admission is already reserved.
+    Granted(ProviderViewLease),
+    /// Central admission queued the new owned backend; this ticket reserves no backend or view.
+    Queued(QueueTicket),
+    /// Central admission refused the new owned backend.
+    Refused(AdmissionError),
+    /// The requested backend cannot safely accept this view.
+    Rejected(ProviderLeaseError),
+}
+
+/// States whether the final release of a logical view can reap a physical backend.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BackendRelease {
+    /// A compatible shared peer still uses this owned backend, so it remains alive.
+    SharedPeerSurvives,
+    /// The last view released an owned backend; its owner may begin bounded reap separately.
+    ReapOwned { backend: String },
+    /// Borrowed endpoints remain visible but are never signalled or reaped by Execution.
+    BorrowedDetached,
+}
+
+/// Receipts returned after one finite Workspace authority revocation reaches Execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorityDrainReceipt {
+    /// Number of matching logical views removed before any physical reap decision.
+    pub drained_views: usize,
+    /// Per-backend decisions that preserve peers and borrowed ownership.
+    pub backend_releases: Vec<BackendRelease>,
+    /// Admission leases released because an owned backend lost its final view.
+    pub released_admissions: Vec<AdmissionLease>,
+    /// Physical signal delivery/reap is separate work and remains unclaimed here.
+    pub reap_uncertain: bool,
+}
+
+/// Tracks bounded logical provider views while keeping physical admission on the shared controller.
+///
+/// A queued request records no state in this registry.  An owned shared backend counts once as a
+/// heavy process and each attached view counts once as a forwarder; borrowed endpoints count as
+/// views only and are never candidates for a kill.  The registry does not infer Intelligence
+/// compatibility: its caller supplies a stable backend identity after that decision.
+#[derive(Debug, Default)]
+pub struct ProviderLeaseRegistry {
+    /// Next nonzero logical view identity.
+    next_view: u64,
+    /// Active views keyed by their opaque logical lease.
+    views: BTreeMap<u64, ProviderView>,
+    /// Physical backend state keyed by caller-supplied compatible identity.
+    backends: BTreeMap<String, ProviderBackend>,
+}
+
+/// Stores the scope that a direct Workspace revocation may fence.
+#[derive(Clone, Debug)]
+struct ProviderView {
+    /// Backend to which this view is attached.
+    backend: String,
+    /// Exact Workspace identity and incarnation copied from the authority at attachment time.
+    worktree_id: String,
+    /// Exact incarnation paired with `worktree_id`.
+    incarnation: u64,
+    /// Authority epoch that must be invalidated by a matching revocation.
+    epoch: u64,
+}
+
+/// Stores physical ownership, shared-view count, and the one central admission reservation.
+#[derive(Clone, Debug)]
+struct ProviderBackend {
+    /// Ownership and sharing rule frozen when the backend is first attached.
+    kind: ProviderBackendKind,
+    /// Admission reservation retained only for an owned physical backend.
+    admission: Option<AdmissionLease>,
+    /// Number of logical views currently routed to this backend.
+    views: usize,
+}
+
+impl ProviderLeaseRegistry {
+    /// Requests a view under a current Workspace authority and centralized admission policy.
+    ///
+    /// Each attached view is one forwarder for accounting; only a newly created owned backend
+    /// consumes an admission lease, so compatible shared peers do not double-count a heavy
+    /// process. Queue tickets reserve neither a view nor a backend.
+    pub fn request(
+        &mut self,
+        admission: &mut AdmissionController,
+        owner: OwnerId,
+        class: AdmissionClass,
+        backend: impl Into<String>,
+        kind: ProviderBackendKind,
+        authority: &WorkspaceAuthority,
+    ) -> ProviderLeaseAdmission {
+        let backend = backend.into();
+        if backend.is_empty() {
+            return ProviderLeaseAdmission::Rejected(ProviderLeaseError::InvalidBackend);
+        }
+        if authority.incarnation().parse::<u64>().unwrap_or_default() == 0 {
+            return ProviderLeaseAdmission::Rejected(ProviderLeaseError::InvalidAuthority);
+        }
+        if let Some(existing) = self.backends.get(&backend) {
+            if existing.kind != kind {
+                return ProviderLeaseAdmission::Rejected(ProviderLeaseError::InvalidBackend);
+            }
+            if existing.kind == ProviderBackendKind::OwnedExclusive {
+                return ProviderLeaseAdmission::Rejected(ProviderLeaseError::ExclusiveInUse);
+            }
+            return ProviderLeaseAdmission::Granted(self.attach(backend, authority));
+        }
+        let reserved = match kind {
+            ProviderBackendKind::Borrowed => None,
+            ProviderBackendKind::OwnedShared | ProviderBackendKind::OwnedExclusive => {
+                match admission.submit(owner, class) {
+                    Admission::Granted(lease) => Some(lease),
+                    Admission::Queued(ticket) => return ProviderLeaseAdmission::Queued(ticket),
+                    Admission::Refused(error) => return ProviderLeaseAdmission::Refused(error),
+                }
+            }
+        };
+        self.backends.insert(
+            backend.clone(),
+            ProviderBackend {
+                kind,
+                admission: reserved,
+                views: 0,
+            },
+        );
+        ProviderLeaseAdmission::Granted(self.attach(backend, authority))
+    }
+
+    /// Releases exactly one logical view and returns the physical ownership consequence.
+    pub fn release(
+        &mut self,
+        admission: &mut AdmissionController,
+        view: ProviderViewLease,
+    ) -> Result<(BackendRelease, Option<AdmissionLease>), ProviderLeaseError> {
+        let view = self
+            .views
+            .remove(&view.0)
+            .ok_or(ProviderLeaseError::UnknownView)?;
+        let backend = self
+            .backends
+            .get_mut(&view.backend)
+            .expect("view backend exists");
+        backend.views -= 1;
+        if backend.views != 0 {
+            return Ok((BackendRelease::SharedPeerSurvives, None));
+        }
+        let backend = self
+            .backends
+            .remove(&view.backend)
+            .expect("view backend exists");
+        match backend.kind {
+            ProviderBackendKind::Borrowed => Ok((BackendRelease::BorrowedDetached, None)),
+            ProviderBackendKind::OwnedShared | ProviderBackendKind::OwnedExclusive => {
+                let lease = backend.admission.expect("owned backend has admission");
+                admission
+                    .release(lease)
+                    .map_err(ProviderLeaseError::Admission)?;
+                Ok((
+                    BackendRelease::ReapOwned {
+                        backend: view.backend,
+                    },
+                    Some(lease),
+                ))
+            }
+        }
+    }
+
+    /// Fences views matching one finite Workspace revocation without touching surviving peers.
+    ///
+    /// The receipt distinguishes logical removal and admission release from actual signal delivery
+    /// and reaping, which remain uncertain until the owner reports direct-child evidence.
+    pub fn revoke_authority(
+        &mut self,
+        admission: &mut AdmissionController,
+        revoked: &crate::workspace::authority::AuthorityRevoked,
+    ) -> AuthorityDrainReceipt {
+        let matching: Vec<_> = self
+            .views
+            .iter()
+            .filter_map(|(id, view)| {
+                (view.worktree_id == revoked.worktree().id()
+                    && view.incarnation == revoked.worktree().incarnation()
+                    && view.epoch == revoked.old_epoch())
+                .then_some(ProviderViewLease(*id))
+            })
+            .collect();
+        let mut backend_releases = Vec::with_capacity(matching.len());
+        let mut released_admissions = Vec::new();
+        for view in &matching {
+            if let Ok((release, admission_lease)) = self.release(admission, *view) {
+                if let Some(admission_lease) = admission_lease {
+                    released_admissions.push(admission_lease);
+                }
+                backend_releases.push(release);
+            }
+        }
+        AuthorityDrainReceipt {
+            drained_views: matching.len(),
+            reap_uncertain: backend_releases
+                .iter()
+                .any(|release| matches!(release, BackendRelease::ReapOwned { .. })),
+            backend_releases,
+            released_admissions,
+        }
+    }
+
+    /// Returns separate heavy-process and logical-forwarder counts for bounded accounting evidence.
+    pub fn counts(&self) -> (usize, usize) {
+        (
+            self.backends
+                .values()
+                .filter(|backend| backend.kind != ProviderBackendKind::Borrowed)
+                .count(),
+            self.views.len(),
+        )
+    }
+
+    /// Attaches one view after the caller has safely established/reused the backend.
+    fn attach(&mut self, backend: String, authority: &WorkspaceAuthority) -> ProviderViewLease {
+        let id = self.next_view.max(1);
+        self.next_view = id
+            .checked_add(1)
+            .expect("provider view identifier exhausted");
+        self.backends
+            .get_mut(&backend)
+            .expect("backend exists")
+            .views += 1;
+        self.views.insert(
+            id,
+            ProviderView {
+                backend,
+                worktree_id: authority.worktree_id().to_owned(),
+                incarnation: authority
+                    .incarnation()
+                    .parse()
+                    .expect("request validated Workspace incarnation"),
+                epoch: authority.epoch(),
+            },
+        );
+        ProviderViewLease(id)
+    }
+}
+
 /// Holds bounded bytes from one drained stream and states whether the reader reached EOF.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapturedOutput {
@@ -1491,6 +1948,40 @@ fn profile_template_value(value: &Value) -> Value {
         object.insert("sandboxCwd".into(), Value::String("<workspace-cwd>".into()));
     }
     template
+}
+
+/// Hashes the complete semantic host state without relying on JSON whitespace or key order.
+fn semantic_state_identity(state: &HostSandboxState) -> String {
+    blake3::hash(canonical_json(&profile_template_value(&state.raw)).as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+/// Produces a key-order-independent JSON representation while retaining every value and array order.
+fn canonical_json(value: &Value) -> String {
+    match value {
+        Value::Object(object) => {
+            let mut fields: Vec<_> = object.iter().collect();
+            fields.sort_unstable_by_key(|(key, _)| *key);
+            let body = fields
+                .into_iter()
+                .map(|(key, value)| {
+                    format!("{}:{}", Value::String(key.clone()), canonical_json(value))
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{body}}}")
+        }
+        Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(canonical_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        _ => value.to_string(),
+    }
 }
 
 /// Detects unsupported multi-root profile fields without resolving or expanding any root path.

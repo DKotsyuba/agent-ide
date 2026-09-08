@@ -1,5 +1,8 @@
 //! Contract checks for the unassembled Execution module.
 
+use agent_ide::workspace::authority::{
+    ActivationRequest, AuthorityRegistry, StopBindingHandoff, WorktreeRef,
+};
 use agent_ide::{assistance, execution};
 
 use std::{
@@ -17,10 +20,11 @@ use assistance::host_binding::{
 };
 use execution::{
     Admission, AdmissionClass, AdmissionController, AdmissionLimits, BorrowedEndpoint, CommandKind,
-    ControlledCommand, DiscoverWorktreeRequest, DiscoveryOperationRef, EndpointOwnership,
-    ExecutionProfileCatalog, ExecutionProfileTemplate, GitDiscoveryPolicy, GitDiscoveryQuery,
-    HostSandboxState, LocalExecutionPolicy, OwnerId, ProfileClass, SandboxStateError,
-    ValidatedExecutionRequest, ValidatedHostInvocation, WorkspaceAuthority,
+    ControlledCommand, D03ProfileEvidence, DiscoverWorktreeRequest, DiscoveryOperationRef,
+    EndpointOwnership, ExecutionProfileCatalog, ExecutionProfileTemplate, GitDiscoveryPolicy,
+    GitDiscoveryQuery, HostSandboxState, LocalExecutionPolicy, OwnerId, PersistedProfileRecord,
+    ProfileClass, ProviderBackendKind, ProviderLeaseAdmission, ProviderLeaseRegistry,
+    SandboxStateError, ValidatedExecutionRequest, ValidatedHostInvocation, WorkspaceAuthority,
 };
 use serde_json::json;
 use tokio::io::AsyncReadExt;
@@ -369,6 +373,199 @@ fn admission_bounds_and_fairness_are_centralized() {
     assert!(admission.contains_ticket(a_ticket));
     assert!(!admission.contains_ticket(b_ticket));
     assert_eq!(admission.running_count(), 1);
+}
+
+/// Proves corrupt durable profile records cannot restore a permit and value changes refuse replay.
+#[test]
+fn persisted_catalog_requires_complete_matching_d03_evidence() {
+    let state = disabled_state(Path::new("/private/tmp"));
+    let record = PersistedProfileRecord::from_execution_evidence(
+        "disabled-d03",
+        1,
+        D03ProfileEvidence {
+            provider_binary: "codex-sha".into(),
+            toolchain: "toolchain-sha".into(),
+            configuration: "config-sha".into(),
+            trust: "trusted".into(),
+            transport: "direct".into(),
+            d03_evidence: "d03-run".into(),
+        },
+        &state,
+    )
+    .unwrap();
+    let loaded = PersistedProfileRecord::from_json(&record.to_json()).unwrap();
+    assert!(ExecutionProfileCatalog::from_persisted_records(vec![(loaded, state.clone())]).is_ok());
+    assert!(PersistedProfileRecord::from_json("{\"profile_id\":\"only\"}").is_err());
+    let changed = HostSandboxState::parse(Some(json!({
+        "permissionProfile": {"type": "disabled"},
+        "codexLinuxSandboxExe": null,
+        "sandboxCwd": "/private/tmp",
+        "useLegacyLandlock": false,
+        "changed_semantic_value": true
+    })))
+    .unwrap();
+    assert!(ExecutionProfileCatalog::from_persisted_records(vec![(record, changed)]).is_err());
+}
+
+/// Proves compatible views share one heavy reservation while exclusive and queued requests do not.
+#[test]
+fn provider_leases_share_only_compatible_owned_backends() {
+    let authority =
+        WorkspaceAuthority::from_workspace("worktree", "1", PathBuf::from("/private/tmp"), 7)
+            .unwrap();
+    let mut admission = AdmissionController::new(AdmissionLimits {
+        total_running: 1,
+        per_owner_running: 1,
+        per_owner_queued: 2,
+        total_queued: 2,
+        interactive_burst: 1,
+    })
+    .unwrap();
+    let mut registry = ProviderLeaseRegistry::default();
+    let first = match registry.request(
+        &mut admission,
+        OwnerId::new("owner").unwrap(),
+        AdmissionClass::Interactive,
+        "shared",
+        ProviderBackendKind::OwnedShared,
+        &authority,
+    ) {
+        ProviderLeaseAdmission::Granted(view) => view,
+        result => panic!("unexpected first view: {result:?}"),
+    };
+    let second = match registry.request(
+        &mut admission,
+        OwnerId::new("other").unwrap(),
+        AdmissionClass::Interactive,
+        "shared",
+        ProviderBackendKind::OwnedShared,
+        &authority,
+    ) {
+        ProviderLeaseAdmission::Granted(view) => view,
+        result => panic!("unexpected shared view: {result:?}"),
+    };
+    assert_eq!(registry.counts(), (1, 2));
+    assert!(matches!(
+        registry.release(&mut admission, first).unwrap().0,
+        execution::BackendRelease::SharedPeerSurvives
+    ));
+    assert!(matches!(
+        registry.release(&mut admission, second).unwrap().0,
+        execution::BackendRelease::ReapOwned { .. }
+    ));
+    assert_eq!(registry.counts(), (0, 0));
+    assert!(matches!(
+        registry.request(
+            &mut admission,
+            OwnerId::new("owner").unwrap(),
+            AdmissionClass::Interactive,
+            "exclusive",
+            ProviderBackendKind::OwnedExclusive,
+            &authority,
+        ),
+        ProviderLeaseAdmission::Granted(_)
+    ));
+    assert!(matches!(
+        registry.request(
+            &mut admission,
+            OwnerId::new("other").unwrap(),
+            AdmissionClass::Background,
+            "queued",
+            ProviderBackendKind::OwnedShared,
+            &authority,
+        ),
+        ProviderLeaseAdmission::Queued(_)
+    ));
+    assert_eq!(registry.counts(), (1, 1));
+}
+
+/// Proves one Workspace revocation drains only its views and leaves a shared peer backend alive.
+#[test]
+fn authority_revocation_returns_logical_drain_not_reap_claim() {
+    let mut guard = HostBindingGuard::default();
+    let channel = channel();
+    assert!(matches!(
+        guard.observe_hook(pre_hook("actor", "call"), channel.clone()),
+        BindingStatus::PreObserved
+    ));
+    let BindingStatus::Validated(invocation) =
+        guard.establish_start(candidate("actor", "call"), channel)
+    else {
+        panic!("expected validated binding");
+    };
+    let worktree = WorktreeRef::from_discovery(
+        PathBuf::from("/private/tmp"),
+        PathBuf::from("/private/tmp"),
+        PathBuf::from(".git"),
+        1,
+    )
+    .unwrap();
+    let active = guard.consume_active(invocation.binding_ref()).unwrap();
+    let mut workspace = AuthorityRegistry::default();
+    let stamp = workspace
+        .activate(ActivationRequest::new("activate", invocation, active, worktree).unwrap())
+        .unwrap();
+    let authority = WorkspaceAuthority::from_workspace(
+        stamp.worktree().id(),
+        stamp.worktree().incarnation().to_string(),
+        stamp.worktree().worktree_path().to_path_buf(),
+        stamp.epoch(),
+    )
+    .unwrap();
+    let mut admission = AdmissionController::new(AdmissionLimits {
+        total_running: 1,
+        per_owner_running: 1,
+        per_owner_queued: 2,
+        total_queued: 2,
+        interactive_burst: 1,
+    })
+    .unwrap();
+    let mut leases = ProviderLeaseRegistry::default();
+    let first = match leases.request(
+        &mut admission,
+        OwnerId::new("owner").unwrap(),
+        AdmissionClass::Interactive,
+        "backend",
+        ProviderBackendKind::OwnedShared,
+        &authority,
+    ) {
+        ProviderLeaseAdmission::Granted(view) => view,
+        result => panic!("unexpected first lease: {result:?}"),
+    };
+    let peer_authority = WorkspaceAuthority::from_workspace(
+        stamp.worktree().id(),
+        stamp.worktree().incarnation().to_string(),
+        stamp.worktree().worktree_path().to_path_buf(),
+        stamp.epoch() + 1,
+    )
+    .unwrap();
+    assert!(matches!(
+        leases.request(
+            &mut admission,
+            OwnerId::new("peer").unwrap(),
+            AdmissionClass::Interactive,
+            "backend",
+            ProviderBackendKind::OwnedShared,
+            &peer_authority,
+        ),
+        ProviderLeaseAdmission::Granted(_)
+    ));
+    guard.stop_binding(stamp.binding()).unwrap();
+    let revoked = workspace
+        .revoke(&stamp, StopBindingHandoff::Confirmed)
+        .unwrap();
+    let receipt = leases.revoke_authority(&mut admission, &revoked);
+    assert_eq!(receipt.drained_views, 1);
+    assert_eq!(
+        receipt.backend_releases,
+        vec![execution::BackendRelease::SharedPeerSurvives]
+    );
+    assert!(!receipt.reap_uncertain);
+    assert!(matches!(
+        leases.release(&mut admission, first),
+        Err(execution::ProviderLeaseError::UnknownView)
+    ));
+    assert_eq!(leases.counts(), (1, 1));
 }
 
 /// Verifies that bounded retained output still drains both streams to EOF.
