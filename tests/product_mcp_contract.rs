@@ -731,3 +731,61 @@ async fn binary_preserves_sandbox_metadata_and_renders_closed_pending() {
     drop(listener);
     std::fs::remove_dir_all(runtime).unwrap();
 }
+
+/// Opens one durable owner after the daemon lock; a rejected second daemon cannot advance its boot.
+#[tokio::test]
+async fn configured_daemon_opens_workspace_once_after_exclusive_lock() {
+    let runtime = runtime();
+    let config = runtime.with_extension("json");
+    std::fs::write(&config,json!({"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[]}).to_string()).unwrap();
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+        .args(["daemon", "--runtime-dir"])
+        .arg(&runtime)
+        .env("AGENT_IDE_LAUNCHER_CONFIG", &config)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if UnixStream::connect(runtime.join("agent-ide.sock"))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            assert!(daemon.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let database = rusqlite::Connection::open(runtime.join("state.sqlite")).unwrap();
+    let boot: i64 = database
+        .query_row("SELECT boot FROM workspace_authority_clock", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(boot, 1);
+    let rejected = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+        .args(["daemon", "--runtime-dir"])
+        .arg(&runtime)
+        .env("AGENT_IDE_LAUNCHER_CONFIG", &config)
+        .output()
+        .await
+        .unwrap();
+    assert!(!rejected.status.success());
+    let boot: i64 = database
+        .query_row("SELECT boot FROM workspace_authority_clock", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(boot, 1);
+    drop(database);
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+    std::fs::remove_dir_all(runtime).unwrap();
+    std::fs::remove_file(config).unwrap();
+}

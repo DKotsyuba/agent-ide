@@ -250,6 +250,15 @@ pub struct AssistanceDispatchUnavailable;
 
 /// Allows Assistance to receive exactly one bounded dispatch while retaining all host/tool semantics.
 pub trait AssistanceDispatcher: Send + Sync {
+    /// Initializes optional daemon-owned peers only after Application holds its exclusive lock.
+    /// Default dispatchers have no startup effects; failures prevent a partially initialized daemon.
+    fn initialize<'a>(
+        &'a self,
+        _runtime_dir: &'a std::path::Path,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AssistanceDispatchUnavailable>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Starts one finite Assistance operation and resolves its opaque result within the caller budget.
     fn dispatch(
         &self,

@@ -19,3 +19,6 @@ pub mod launcher;
 
 /// Defines closed byte-budgeted pending/detail/error and owner-result envelopes.
 pub mod reply;
+
+/// Runs one bounded daemon-owned job/detail worker with durable authority gates.
+pub mod worker;

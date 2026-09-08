@@ -156,3 +156,17 @@ Cold executable startup is bounded separately by an inactive fixture invocation 
 measuring the hung-daemon case. The observed test-harness cold start can exceed 800 ms
 before the first hook instruction; the subsequent real ingress still uses the unchanged
 450 ms test ceiling and 250 ms product deadline.
+
+Configured daemon startup now creates one bounded job/detail worker only after Application
+holds its exclusive runtime lock. That worker opens one DurableWorkspace owner and the
+registered-source schema for the boot. A rejected second daemon cannot advance the
+Workspace boot fence. Hook binding locks are released before every queue or Store await.
+Each daemon contributes a fresh opaque nonce to the effective hook/MCP channel; both
+paths still match the same exact attachment/actor/call. Detail and SQLite operation
+references are boot-unique without using PID, timing or cwd as identity.
+
+Long operations are retained in a bounded queue and return pending details. The same
+worker services short inspections during pending work; results require same-binding
+ownership, fresh durable authority and source/native-revision rechecks. Native lifecycle
+hints trigger only registered-path reconciliation. Controlled discovery/provider wiring
+is still required before the worker can activate a worktree or return source results.

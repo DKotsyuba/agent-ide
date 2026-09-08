@@ -218,6 +218,15 @@ async fn run_daemon_inner(
     transport_limits: Option<HookTransportLimits>,
 ) -> Result<(), AppError> {
     let _lock = DaemonLock::acquire(runtime_dir.lock_path())?;
+    if let Some(dispatcher) = &dispatcher {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            dispatcher.initialize(runtime_dir.path()),
+        )
+        .await
+        .map_err(|_| AppError::InvalidResponse)?
+        .map_err(|_| AppError::InvalidResponse)?;
+    }
     let socket_path = runtime_dir.socket_path();
     retire_stale_socket(&socket_path, ipc.connection_deadline).await?;
     let listener = UnixListener::bind(&socket_path)?;
