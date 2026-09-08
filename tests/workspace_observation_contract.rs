@@ -398,8 +398,135 @@ async fn workspace_source_observations_are_durable_bounded_and_honest() {
             )
             .await
             .unwrap(),
-        RenameReconciliation::Rename(
-            agent_ide::workspace::observation::SourceChange::Rename { .. }
-        )
+        RenameReconciliation::DeleteAndCreate { .. }
     ));
+}
+
+/// Ignores stale/cross-worktree hints, never certifies a Boolean rename, and distinguishes root loss.
+#[tokio::test]
+async fn reconciliation_uses_latest_internal_state_and_rejects_root_absence() {
+    use agent_ide::workspace::{observation::SourceChange, store::WorkspaceStoreError};
+    let root = temporary("reconcile-root");
+    let foreign_root = temporary("foreign-root");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&foreign_root).unwrap();
+    let tree = worktree(&root);
+    let foreign = worktree(&foreign_root);
+    let database = temporary("reconcile-db").with_extension("sqlite");
+    let store = Store::open(&database, config()).unwrap();
+    let workspace = WorkspaceStore::new(&store);
+    workspace.install_schema().await.unwrap();
+    fs::write(root.join("file"), b"one").unwrap();
+    let ReconciliationAdmission::Fact(Some(SourceChange::Open(first))) = workspace
+        .reconcile_registered_path(
+            None,
+            request(tree.clone(), "first", "first", "file".into(), "v1"),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("first open")
+    };
+    fs::write(root.join("file"), b"two").unwrap();
+    let ReconciliationAdmission::Fact(Some(SourceChange::Change {
+        current: second, ..
+    })) = workspace
+        .reconcile_registered_path(
+            None,
+            request(tree.clone(), "second", "second", "file".into(), "v2"),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("stored previous supplies change even without hint")
+    };
+    assert_eq!(
+        workspace
+            .reconcile_registered_path(
+                Some(&first),
+                request(tree.clone(), "third", "third", "file".into(), "v2")
+            )
+            .await
+            .unwrap(),
+        ReconciliationAdmission::Fact(None)
+    );
+    fs::write(foreign_root.join("file"), b"two").unwrap();
+    assert!(matches!(
+        workspace
+            .reconcile_registered_path(
+                Some(&second),
+                request(foreign.clone(), "foreign", "foreign", "file".into(), "v2")
+            )
+            .await
+            .unwrap(),
+        ReconciliationAdmission::Fact(Some(SourceChange::Open(_)))
+    ));
+    fs::remove_file(root.join("file")).unwrap();
+    let rename = workspace
+        .reconcile_rename(
+            Some(&first),
+            request(tree.clone(), "old", "old", "file".into(), "v3"),
+            Some(&first),
+            request(foreign, "new", "new", "file".into(), "v2"),
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(rename, RenameReconciliation::DeleteAndCreate { old: ReconciliationAdmission::Fact(Some(SourceChange::Close { previous, .. })), new: ReconciliationAdmission::Fact(None) } if previous.sequence() == 3)
+    );
+    fs::write(root.join("still-present"), b"present").unwrap();
+    workspace
+        .reconcile_registered_path(
+            None,
+            request(
+                tree.clone(),
+                "present",
+                "present",
+                "still-present".into(),
+                "v1",
+            ),
+        )
+        .await
+        .unwrap();
+    let moved = temporary("moved-root");
+    fs::rename(&root, &moved).unwrap();
+    assert_eq!(
+        workspace
+            .reconcile_registered_path(
+                None,
+                request(
+                    tree.clone(),
+                    "root-gone",
+                    "root-gone",
+                    "still-present".into(),
+                    "v2"
+                )
+            )
+            .await,
+        Err(WorkspaceStoreError::Observation(
+            ObservationError::RootUnavailable
+        ))
+    );
+    let latest = workspace
+        .load_latest(
+            operation("root-check"),
+            tree.clone(),
+            "still-present".into(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.source_revision().as_str(), "v1");
+    fs::rename(&moved, &root).unwrap();
+    assert_eq!(
+        read_authorized_source(
+            &tree,
+            Path::new("missing/child"),
+            SourceReadLimits::new(256, 64).unwrap()
+        ),
+        Err(ObservationError::Missing)
+    );
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(foreign_root).unwrap();
 }

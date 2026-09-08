@@ -1,6 +1,6 @@
 # Bounded Git diff composition
 
-Revision: v0.1-r1. Provider: Changes. Direct consumer: Assistance. Input provider: Workspace. Shared vocabulary: [common](common.md); current raw evidence boundary: [Workspace v0.1](workspace-v0.1.md).
+Revision: v0.1-r2. Provider: Changes. Direct consumer: Assistance. Input provider: Workspace. Shared vocabulary: [common](common.md); current raw evidence boundary: [Workspace v0.1](workspace-v0.1.md).
 
 ## Responsibility
 
@@ -14,6 +14,8 @@ For the requested current authority, Workspace supplies its opaque worktree refe
 
 Workspace derives those identities only from complete fixed `HEAD`, index, and selected patch evidence. Its status command remains NUL-delimited porcelain v2; diff commands request complete patches, disable external diff and textconv helpers, and terminate path parsing with `--`. An unborn `HEAD` is explicit rather than an empty identity.
 
+Composition requires matching comparison scope, raw patch scope/query, and status worktree/epoch. Unscoped status or a mixed component yields `unavailable` without identities, hunks, paths, or expansion references. Capture ceilings and the remaining repository-filter limitation are defined by the Workspace contract.
+
 Raw NUL-safe path/status/conflict data and a separate bounded untracked list identify the affected entries. Baseline completeness and provenance are context only: a session snapshot is never substituted for HEAD, index, or working-state comparison. An absent HEAD or unsupported comparison is explicit rather than a fabricated empty comparison.
 
 Workspace supplies currentness and ownership checks before composition and detail expansion. A revoked, stale, unsupported, failed, or incomplete input remains visibly so in the result; Changes never reconstructs a missing patch or declares partial evidence clean.
@@ -23,6 +25,8 @@ Workspace supplies currentness and ownership checks before composition and detai
 The result uses the existing bounded envelope: `ready`, `unavailable`, `incomplete`, or `failed`, with scope, freshness, coverage, and provenance. Its payload contains comparison identities, status counts, selected exact hunks, separate untracked/conflict information, overflow limits, and owner-scoped operation/detail references.
 
 Hunk selection respects both byte and hunk-count budgets. Omitted data is counted or marked as unknown when the source itself is truncated. Changes does not silently cut a hunk into a different patch. Binary changes and raw Unix paths remain explicit; safe display escaping must not replace the underlying raw identity.
+
+Every selected hunk has an exact raw path. Whole default Git header bytes are matched against scoped status path pairs, including C quoting for control and non-UTF-8 bytes; paths are never split on whitespace. Unknown prefixes, unsupported rename attribution, duplicate/ambiguous headers, and unmapped hunks make the result `incomplete`; unmapped hunks are omitted. Budgeted mapped hunks retain their paths across selection and expansion cursors.
 
 Further detail is requested through Workspace by operation reference and bounded hunk cursor. A reference grants no new authority, and invalidation is rechecked before expansion. Changes stores no persistent ChangeSet and creates no second reference store.
 

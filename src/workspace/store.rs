@@ -261,11 +261,11 @@ pub enum ReconciliationAdmission {
     OutcomeUnknown,
 }
 
-/// Reports whether two explicit registered-path observations form a caller-proven rename.
+/// Reports independent path reconciliation; v0.1 does not certify rename identity from caller hints.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum RenameReconciliation {
-    /// The caller proved old/new native identity continuity, so Workspace emits one explicit rename fact.
+    /// Reserved for future internally proven native identity continuity; v0.1 never emits this variant.
     Rename(SourceChange),
     /// Identity was not proven, so Workspace retains honest independent delete/create observations.
     DeleteAndCreate {
@@ -325,7 +325,19 @@ impl<'a> WorkspaceStore<'a> {
         &self,
         draft: ObservationDraft,
     ) -> Result<ObservationAdmission, WorkspaceStoreError> {
+        self.record_with_previous(draft)
+            .await
+            .map(|(admission, _)| admission)
+    }
+
+    /// Reads the exact latest same-path/epoch row and inserts its successor in one transaction.
+    /// Returns previous facts only for a newly committed observation, never for replay or ambiguity.
+    async fn record_with_previous(
+        &self,
+        draft: ObservationDraft,
+    ) -> Result<(ObservationAdmission, Option<SourceObservation>), WorkspaceStoreError> {
         let operation = draft.operation.clone();
+
         let worktree_id = draft.worktree.id().to_owned();
         let incarnation = sqlite(draft.worktree.incarnation())?;
         let epoch = sqlite(draft.authority_epoch)?;
@@ -339,23 +351,44 @@ impl<'a> WorkspaceStore<'a> {
         });
         let length = length.transpose()?;
         let result = self.application.execute(operation.clone(), move |transaction| {
+            let previous = transaction.query_row("SELECT authority_epoch, source_sequence, observation_reference, byte_digest, byte_length, source_revision, coverage, observed_state FROM workspace_source_observations WHERE worktree_id = ?1 AND incarnation = ?2 AND relative_path = ?3 ORDER BY source_sequence DESC LIMIT 1", params![worktree_id, incarnation, path], |row| Ok(Row { epoch: row.get(0)?, sequence: row.get(1)?, reference: row.get(2)?, digest: row.get(3)?, length: row.get(4)?, revision: row.get(5)?, coverage: row.get(6)?, state: row.get(7)? })).optional()?;
             let latest: i64 = transaction.query_row("SELECT COALESCE(MAX(source_sequence), 0) FROM workspace_source_observations WHERE worktree_id = ?1 AND incarnation = ?2", params![worktree_id, incarnation], |row| row.get(0))?;
             let sequence = latest.checked_add(1).ok_or(rusqlite::Error::InvalidQuery)?;
             transaction.execute("INSERT INTO workspace_source_observations (worktree_id, incarnation, authority_epoch, source_sequence, operation_id, observation_reference, relative_path, byte_digest, byte_length, source_revision, coverage, observed_state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)", params![worktree_id, incarnation, epoch, sequence, operation.as_str(), reference, path, digest, length, revision, coverage, state])?;
-            Ok(sequence)
+            Ok((sequence, previous))
         }).await;
         match result {
-            Ok(sequence) => Ok(ObservationAdmission::Recorded(draft.observed(
-                u64::try_from(sequence).map_err(|_| WorkspaceStoreError::SequenceExhausted)?,
-            )?)),
+            Ok((sequence, previous)) => {
+                let previous = previous
+                    .filter(|row| row.epoch == epoch)
+                    .map(|row| row.observed(draft.worktree.clone(), draft.path.clone()))
+                    .transpose()?;
+                Ok((
+                    ObservationAdmission::Recorded(
+                        draft.observed(
+                            u64::try_from(sequence)
+                                .map_err(|_| WorkspaceStoreError::SequenceExhausted)?,
+                        )?,
+                    ),
+                    previous,
+                ))
+            }
             Err(StoreError::DuplicateOperation {
                 existing: StoreOutcome::Committed,
-            }) => self.duplicate_admission(&draft).await,
-            Err(StoreError::DuplicateOperation { .. }) => Ok(ObservationAdmission::OutcomeUnknown),
+            }) => self
+                .duplicate_admission(&draft)
+                .await
+                .map(|admission| (admission, None)),
+            Err(StoreError::DuplicateOperation { .. }) => {
+                Ok((ObservationAdmission::OutcomeUnknown, None))
+            }
             Err(StoreError::OutcomeUnknown { operation }) => {
                 match self.application.outcome(operation).await? {
-                    StoreOutcome::Committed => self.duplicate_admission(&draft).await,
-                    _ => Ok(ObservationAdmission::OutcomeUnknown),
+                    StoreOutcome::Committed => self
+                        .duplicate_admission(&draft)
+                        .await
+                        .map(|admission| (admission, None)),
+                    _ => Ok((ObservationAdmission::OutcomeUnknown, None)),
                 }
             }
             Err(error) => Err(error.into()),
@@ -431,16 +464,18 @@ impl<'a> WorkspaceStore<'a> {
             ObservationFreshness::Stale
         })
     }
-    /// Reads and records only one registered path for periodic polling; it never scans or retires cache state.
+    /// Reads and records one registered path, deriving facts from its atomically loaded latest row.
+    /// The legacy `previous` hint is ignored; cross-path, stale, and cross-epoch hints confer no authority.
     // ponytail: polling covers only caller-registered paths; replace with an event-backed collector when missed edits require stronger delivery.
     pub async fn reconcile_registered_path(
         &self,
-        previous: Option<&SourceObservation>,
+        _previous: Option<&SourceObservation>,
         request: RegisteredPathRequest,
     ) -> Result<ReconciliationAdmission, WorkspaceStoreError> {
-        match self.record(request.collect()?).await? {
+        let (admission, previous) = self.record_with_previous(request.collect()?).await?;
+        match admission {
             ObservationAdmission::Recorded(current) => Ok(ReconciliationAdmission::Fact(
-                change_fact(previous, current),
+                change_fact(previous.as_ref(), current),
             )),
             ObservationAdmission::AlreadyRecorded => Ok(ReconciliationAdmission::AlreadyRecorded),
             ObservationAdmission::Conflict => Ok(ReconciliationAdmission::Conflict),
@@ -448,14 +483,15 @@ impl<'a> WorkspaceStore<'a> {
         }
     }
 
-    /// Reconciles explicit old/new paths as a rename only when the periodic caller already proved identity.
+    /// Reconciles old/new paths independently; a caller Boolean never proves native identity continuity.
+    /// `identity_proven` is a legacy hint and is ignored; v0.1 returns conservative delete/create facts.
     pub async fn reconcile_rename(
         &self,
         old_previous: Option<&SourceObservation>,
         old_request: RegisteredPathRequest,
         new_previous: Option<&SourceObservation>,
         new_request: RegisteredPathRequest,
-        identity_proven: bool,
+        _identity_proven: bool,
     ) -> Result<RenameReconciliation, WorkspaceStoreError> {
         let old = self
             .reconcile_registered_path(old_previous, old_request)
@@ -463,17 +499,6 @@ impl<'a> WorkspaceStore<'a> {
         let new = self
             .reconcile_registered_path(new_previous, new_request)
             .await?;
-        if identity_proven
-            && let (
-                ReconciliationAdmission::Fact(Some(SourceChange::Close { missing, .. })),
-                ReconciliationAdmission::Fact(Some(SourceChange::Open(new))),
-            ) = (&old, &new)
-        {
-            return Ok(RenameReconciliation::Rename(SourceChange::Rename {
-                old: missing.clone(),
-                new: new.clone(),
-            }));
-        }
         Ok(RenameReconciliation::DeleteAndCreate { old, new })
     }
 }

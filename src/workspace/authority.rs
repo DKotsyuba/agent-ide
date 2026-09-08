@@ -219,7 +219,7 @@ impl AuthorityRevoked {
 /// Reports a rejected activation, authority use, or expected-authority stop request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthorityError {
-    /// Git discovery did not provide three lexically normal absolute paths and a nonzero incarnation.
+    /// Git discovery omitted normal absolute worktree/repository paths, a nonempty common-directory value, or a nonzero incarnation.
     InvalidWorktreeIdentity,
     /// The activation operation ID is empty or exceeds the bounded local identifier limit.
     InvalidActivationId,

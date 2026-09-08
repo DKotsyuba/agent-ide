@@ -20,7 +20,7 @@ use agent_ide::{
         authority::{ActivationRequest, AuthorityRegistry, WorktreeRef},
         git::{
             BaselineContext, BaselineCoverage, DiffMode, GitError, GitReadIntent, GitReadQuery,
-            RawGitEvidence, comparison_from_evidence, parse_porcelain_v2_z,
+            GitStatus, RawGitEvidence, comparison_from_evidence,
         },
     },
 };
@@ -336,6 +336,7 @@ fn evidence(operation: &str, intent: &GitReadIntent, output: Output) -> RawGitEv
     RawGitEvidence::new(
         operation,
         intent.scope().clone(),
+        intent.query(),
         output.stdout,
         output.stderr,
         output.status.code(),
@@ -370,8 +371,12 @@ fn real_git_workspace_evidence_composes_distinct_bounded_changes() {
     let unstaged_intent =
         GitReadIntent::new(&authority, program, GitReadQuery::UnstagedDiff).unwrap();
 
-    let status = parse_porcelain_v2_z(&run_fixed_query(&fixture, &status_intent).stdout)
-        .expect("real porcelain-v2 -z parses");
+    let status = GitStatus::from_evidence(&evidence(
+        "status",
+        &status_intent,
+        run_fixed_query(&fixture, &status_intent),
+    ))
+    .expect("real porcelain-v2 -z parses");
     let raw_special = b"special space\n-leading.txt";
     assert!(
         status
@@ -468,7 +473,7 @@ fn real_git_workspace_evidence_composes_distinct_bounded_changes() {
             result
                 .selected_hunks()
                 .iter()
-                .all(|hunk| hunk.path().is_none())
+                .all(|hunk| hunk.path().is_some())
         );
         assert!(
             result
@@ -556,7 +561,32 @@ fn real_git_unborn_head_is_explicit_not_an_empty_identity() {
         run_fixed_query(&fixture, &working_intent),
     );
     assert_eq!(
-        comparison_from_evidence(DiffMode::Head, &head, &index, &working, baseline()),
+        comparison_from_evidence(DiffMode::Unstaged, &head, &index, &working, baseline()),
         Err(GitError::UnbornHead)
+    );
+}
+
+/// Reproduces the outstanding clean-filter execution gap in content-reading Git commands.
+#[test]
+#[ignore = "known unsafe clean-filter path; requires raw snapshot collector before enabling"]
+fn content_queries_must_not_execute_repository_clean_filters() {
+    let fixture = GitFixture::new();
+    fixture.write(b".gitattributes", b"*.txt filter=evil\n");
+    fixture.git_os([
+        OsString::from("config"),
+        OsString::from("--local"),
+        OsString::from("filter.evil.clean"),
+        fixture.root.join(".git/sentinel.sh").into_os_string(),
+    ]);
+    let intent = GitReadIntent::new(
+        &authority_for(&fixture),
+        PathBuf::from(GIT),
+        GitReadQuery::HeadDiff,
+    )
+    .unwrap();
+    run_fixed_query(&fixture, &intent);
+    assert!(
+        !fixture.sentinel.exists(),
+        "repository clean filter executed"
     );
 }

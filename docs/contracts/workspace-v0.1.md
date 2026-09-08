@@ -1,6 +1,6 @@
 # Workspace v0.1 contract
 
-Revision: v0.1-r4 (proposed; direct consumer acceptance pending). Provider: Workspace. Direct consumers: Assistance, Execution, Application, and Changes; Intelligence consumes only the stated observations when its v0.1 slice arrives. Shared vocabulary: [common](common.md).
+Revision: v0.1-r5 (proposed; direct consumer acceptance pending). Provider: Workspace. Direct consumers: Assistance, Execution, Application, and Changes; Intelligence consumes only the stated observations when its v0.1 slice arrives. Shared vocabulary: [common](common.md).
 
 ## Ownership and boundary
 
@@ -34,11 +34,17 @@ For a `head`, `staged`, or `unstaged` request, Workspace validates authority, wo
 
 `RawGitEvidence` contains an operation reference, `WorktreeRef`, fixed command kind, raw bounded stdout/stderr, exit status, truncation/timing, and observation coverage. An owner-scoped bounded expansion takes its `OperationRef` and hunk cursor; invalidated evidence is `unavailable` or `stale`, and neither Workspace nor Changes reconstructs omitted patches.
 
+`GitComparison` retains the full worktree/incarnation/epoch/mode scope. `RawGitEvidence` retains its fixed `GitReadQuery`; constructors reject query/mode mismatch, stdout above 1 MiB, or stderr above 64 KiB even when truncation flags are false. Comparison construction requires HEAD-identity, index-state, and the selected mode's patch query. `GitStatus::from_evidence` accepts only complete successful status-query evidence and preserves its worktree/epoch. Standalone porcelain parsing has no collection authority and cannot be composed as current status.
+
+Content-reading Git commands still have an unresolved process-isolation limitation: `--no-ext-diff`, `--no-textconv`, and disabled fsmonitor do not prevent repository clean/process filters. These commands must not be described as safe against arbitrary repository helper configuration. A raw snapshot collector that reads Git blobs without filters and compares private out-of-repository snapshots is required to close that gap; required comparison modes remain present meanwhile.
+
 Workspace contributes current, ownership-scoped bounded observations/evidence and detail expansion to `context`, `diff`, and `inspect`; Changes produces the logical `diff` result and Assistance renders every public tool response. Invalid evidence returns `unavailable`, `incomplete`, or `failed` with scope, freshness, coverage, provenance, and a bounded detail reference. `ready` means requested evidence is available, never that a product, check, or criterion is verified.
 
 ## Persistence, lifecycle, and cache gate
 
 Workspace installs its first domain table through Application's accepted migration admission. It supplies stable domain/key and trusted SQL/digest, treats `AlreadyApplied`, `Incompatible`, `OutcomeUnknown`, and `BackupUnavailable` exactly as Application reports them, and never assigns migration versions or runs a second attempt after an unknown result. After `OutcomeUnknown`, it calls only `Store::migration_admission(domain, key)` to reconcile; that lookup never replays SQL.
+
+Registered-path reconciliation loads the exact latest same-worktree/incarnation/path observation in the insertion transaction; only the matching current authority epoch can supply the prior state. Caller-supplied previous observations are ignored. A bare rename hint does not establish native identity continuity, so v0.1 returns independent delete/create facts. A missing worktree root returns `RootUnavailable` without recording a missing descendant or emitting Close; a missing descendant beneath an opened root retains explicit missing-path semantics.
 
 A temporary missing or moved path is not closure. Stop, reconnect, handoff, missing paths, and moves never request cache retirement. Workspace may publish a verified closure/reset fact to a later retention boundary, but does not retire any cache itself. Strict lifetime of opaque/native provider indexes at closure remains an owner decision; no weaker cache-retention claim is made here.
 

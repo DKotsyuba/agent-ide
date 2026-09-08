@@ -87,8 +87,8 @@ impl BaselineContext {
 /// Identifies the exact left and right Git sides for one requested comparison mode.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitComparison {
-    /// Requested logical mode; baseline is context and never replaces either side.
-    mode: DiffMode,
+    /// Exact worktree incarnation, authority epoch, and logical mode of both identities.
+    scope: GitScope,
     /// Exact controlled-Git identity on the left side.
     left: GitIdentity,
     /// Exact controlled-Git identity on the right side.
@@ -98,15 +98,15 @@ pub struct GitComparison {
 }
 
 impl GitComparison {
-    /// Binds exact Git identities to one mode while retaining baseline provenance only as context.
+    /// Binds exact Git identities to their worktree incarnation, authority epoch, and mode.
     pub fn new(
-        mode: DiffMode,
+        scope: GitScope,
         left: GitIdentity,
         right: GitIdentity,
         baseline: BaselineContext,
     ) -> Self {
         Self {
-            mode,
+            scope,
             left,
             right,
             baseline,
@@ -115,7 +115,12 @@ impl GitComparison {
 
     /// Returns the requested `head`, `staged`, or `unstaged` comparison mode.
     pub const fn mode(&self) -> DiffMode {
-        self.mode
+        self.scope.mode
+    }
+
+    /// Returns the worktree incarnation, epoch, and comparison mode of these identities.
+    pub fn scope(&self) -> &GitScope {
+        &self.scope
     }
 
     /// Returns the exact left-side Git identity.
@@ -162,6 +167,26 @@ pub enum GitReadQuery {
     UnstagedDiff,
 }
 
+impl GitReadQuery {
+    /// Returns the fixed comparison mode assigned to this collection command.
+    pub const fn mode(self) -> DiffMode {
+        match self {
+            Self::Status | Self::HeadIdentity | Self::HeadDiff => DiffMode::Head,
+            Self::IndexState | Self::StagedDiff => DiffMode::Staged,
+            Self::UnstagedDiff => DiffMode::Unstaged,
+        }
+    }
+
+    /// Returns the only patch query that can supply a requested comparison mode.
+    pub const fn diff_for(mode: DiffMode) -> Self {
+        match mode {
+            DiffMode::Head => Self::HeadDiff,
+            DiffMode::Staged => Self::StagedDiff,
+            DiffMode::Unstaged => Self::UnstagedDiff,
+        }
+    }
+}
+
 /// Couples a current Workspace scope to one immutable read-only Git argv/env construction.
 #[derive(Clone, Debug)]
 pub struct GitReadIntent {
@@ -183,13 +208,7 @@ impl GitReadIntent {
         if !is_normal_absolute(&program) {
             return Err(GitError::InvalidGitProgram);
         }
-        let mode = match query {
-            GitReadQuery::Status | GitReadQuery::HeadIdentity | GitReadQuery::HeadDiff => {
-                DiffMode::Head
-            }
-            GitReadQuery::IndexState | GitReadQuery::StagedDiff => DiffMode::Staged,
-            GitReadQuery::UnstagedDiff => DiffMode::Unstaged,
-        };
+        let mode = query.mode();
         Ok(Self {
             scope: GitScope::from_authority(authority, mode),
             program,
@@ -211,7 +230,9 @@ impl GitReadIntent {
     ///
     /// The argv disables repository-configured fsmonitor, pager/color formatting, external diff,
     /// and textconv where a diff can invoke them. `GIT_OPTIONAL_LOCKS=0` prevents status reads from
-    /// opportunistically refreshing the index. Execution still validates process policy and spawn.
+    /// opportunistically refreshing the index. These flags do not disable clean/process filters;
+    /// content queries still require a future raw-snapshot collector for helper isolation.
+    /// Execution validates process policy and spawn.
     pub fn controlled_command(&self) -> Result<ControlledCommand, GitError> {
         ControlledCommand::from_validated_peer(
             CommandKind::Git,
@@ -265,6 +286,11 @@ impl GitScope {
     }
 }
 
+/// Hard stdout capture ceiling accepted by the Workspace evidence boundary.
+pub const MAX_GIT_STDOUT_BYTES: usize = 1024 * 1024;
+/// Hard stderr capture ceiling accepted by the Workspace evidence boundary.
+pub const MAX_GIT_STDERR_BYTES: usize = 64 * 1024;
+
 /// Represents bounded raw execution output without assigning it diff or source semantics.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RawGitEvidence {
@@ -272,6 +298,8 @@ pub struct RawGitEvidence {
     operation_reference: String,
     /// Scope that fences the evidence to one worktree incarnation and authority epoch.
     scope: GitScope,
+    /// Fixed query whose output these bytes represent.
+    query: GitReadQuery,
     /// Raw stdout bytes captured under the configured execution limit.
     stdout: Vec<u8>,
     /// Raw stderr bytes captured under the configured execution limit.
@@ -285,10 +313,14 @@ pub struct RawGitEvidence {
 }
 
 impl RawGitEvidence {
-    /// Creates bounded raw evidence for a current scope without parsing or rendering its bytes.
+    /// Creates raw evidence retaining its fixed query and scope; their modes must agree.
+    /// Rejects stdout over 1 MiB or stderr over 64 KiB regardless of caller truncation flags.
+    /// Callers must retain truthful Execution truncation flags; this constructor cannot recover omitted bytes.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         operation_reference: impl Into<String>,
         scope: GitScope,
+        query: GitReadQuery,
         stdout: Vec<u8>,
         stderr: Vec<u8>,
         exit_code: Option<i32>,
@@ -299,9 +331,16 @@ impl RawGitEvidence {
         if operation_reference.is_empty() || operation_reference.len() > 128 {
             return Err(GitError::InvalidOperationReference);
         }
+        if stdout.len() > MAX_GIT_STDOUT_BYTES || stderr.len() > MAX_GIT_STDERR_BYTES {
+            return Err(GitError::EvidenceTooLarge);
+        }
+        if scope.mode() != query.mode() {
+            return Err(GitError::IncompleteIdentity);
+        }
         Ok(Self {
             operation_reference,
             scope,
+            query,
             stdout,
             stderr,
             exit_code,
@@ -318,6 +357,11 @@ impl RawGitEvidence {
     /// Returns the authority/worktree/mode scope that invalidates stale evidence.
     pub fn scope(&self) -> &GitScope {
         &self.scope
+    }
+
+    /// Returns the fixed collection query, retained across parsing and composition.
+    pub const fn query(&self) -> GitReadQuery {
+        self.query
     }
 
     /// Returns the raw bounded stdout captured by Execution.
@@ -394,6 +438,8 @@ impl PathStatus {
 /// Splits porcelain status into tracked entries, conflicts, and separately listed untracked paths.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GitStatus {
+    /// Collection scope, absent for untrusted standalone byte parsing.
+    scope: Option<GitScope>,
     /// Non-conflicted tracked records.
     tracked: Vec<PathStatus>,
     /// Unmerged records whose status must be visible as conflicts.
@@ -405,6 +451,24 @@ pub struct GitStatus {
 }
 
 impl GitStatus {
+    /// Parses only complete successful Status evidence and retains its worktree and epoch.
+    pub fn from_evidence(evidence: &RawGitEvidence) -> Result<Self, GitError> {
+        if evidence.query() != GitReadQuery::Status
+            || evidence.exit_code() != Some(0)
+            || evidence.is_truncated()
+        {
+            return Err(GitError::IncompleteIdentity);
+        }
+        let mut status = parse_porcelain_v2_z(evidence.stdout())?;
+        status.scope = Some(evidence.scope().clone());
+        Ok(status)
+    }
+
+    /// Returns collection provenance; standalone parsed bytes cannot authorize composition.
+    pub fn scope(&self) -> Option<&GitScope> {
+        self.scope.as_ref()
+    }
+
     /// Returns ordinary and rename/copy tracked records.
     pub fn tracked(&self) -> &[PathStatus] {
         &self.tracked
@@ -435,6 +499,8 @@ pub enum GitError {
     InvalidBaselineReference,
     /// An operation reference is empty or exceeds the bounded local identifier limit.
     InvalidOperationReference,
+    /// A captured stream exceeds Workspace's hard byte ceiling, regardless of truncation flags.
+    EvidenceTooLarge,
     /// The configured Git executable is not a lexically normal absolute Unix path.
     InvalidGitProgram,
     /// A terminal-LF discovery value omitted its terminal delimiter or had no path bytes.
@@ -455,7 +521,10 @@ pub fn comparison_from_evidence(
     working: &RawGitEvidence,
     baseline: BaselineContext,
 ) -> Result<GitComparison, GitError> {
-    if !same_scope(head, index)
+    if head.query() != GitReadQuery::HeadIdentity
+        || index.query() != GitReadQuery::IndexState
+        || working.query() != GitReadQuery::diff_for(mode)
+        || !same_scope(head, index)
         || !same_scope(head, working)
         || head.is_truncated()
         || index.is_truncated()
@@ -481,7 +550,9 @@ pub fn comparison_from_evidence(
         DiffMode::Staged => (head_identity, index_identity),
         DiffMode::Unstaged => (index_identity, working_identity),
     };
-    Ok(GitComparison::new(mode, left, right, baseline))
+    let mut scope = head.scope().clone();
+    scope.mode = mode;
+    Ok(GitComparison::new(scope, left, right, baseline))
 }
 
 /// Returns a domain-separated bounded identity for exact complete controlled-Git bytes.
@@ -510,8 +581,12 @@ pub fn parse_terminal_path(value: &[u8]) -> Result<PathBuf, GitError> {
     Ok(PathBuf::from(OsString::from_vec(path.to_vec())))
 }
 
-/// Parses `git status --porcelain=v2 -z` records while retaining every path as raw Unix bytes.
+/// Parses at most 1 MiB of terminal-NUL porcelain-v2 records, retaining raw Unix paths.
+/// Returns unscoped status for standalone inspection; composition requires `GitStatus::from_evidence`.
 pub fn parse_porcelain_v2_z(value: &[u8]) -> Result<GitStatus, GitError> {
+    if value.len() > MAX_GIT_STDOUT_BYTES || (!value.is_empty() && !value.ends_with(&[0])) {
+        return Err(GitError::InvalidPorcelain);
+    }
     let mut records = value.split(|byte| *byte == 0).peekable();
     let mut status = GitStatus::default();
     while let Some(record) = records.next() {

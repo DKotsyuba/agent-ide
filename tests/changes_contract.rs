@@ -11,8 +11,8 @@ use agent_ide::workspace::authority::{
     ActivationRequest, AuthorityError, AuthorityRegistry, StopBindingHandoff, WorktreeRef,
 };
 use agent_ide::workspace::git::{
-    BaselineContext, BaselineCoverage, DiffMode, GitComparison, GitIdentity, GitScope,
-    RawGitEvidence, StatusKind, parse_porcelain_v2_z,
+    BaselineContext, BaselineCoverage, DiffMode, GitComparison, GitIdentity, GitReadQuery,
+    GitScope, GitStatus, RawGitEvidence, StatusKind,
 };
 
 use std::path::PathBuf;
@@ -43,7 +43,13 @@ fn pre_hook(actor: &str, call: &str) -> agent_ide::assistance::host_binding::Hoo
     .expect("pre hook fixture is valid")
 }
 
+/// Builds a current scope at the default isolated contract root.
 fn scope_from_mode(mode: DiffMode) -> GitScope {
+    scope_for_root(mode, "/private/tmp/changes-contract")
+}
+
+/// Activates an isolated registry for one exact fixture root and comparison mode.
+fn scope_for_root(mode: DiffMode, root: &str) -> GitScope {
     let mut registry = AuthorityRegistry::default();
     let mut guard = HostBindingGuard::default();
     let channel: ChannelSessionRef = parse_channel_session(b"changes-contract").unwrap();
@@ -65,9 +71,9 @@ fn scope_from_mode(mode: DiffMode) -> GitScope {
         invocation,
         active_use,
         WorktreeRef::from_discovery(
-            PathBuf::from("/private/tmp/changes-contract"),
-            PathBuf::from("/private/tmp/changes-contract"),
-            PathBuf::from("/private/tmp/changes-contract/.git"),
+            PathBuf::from(root),
+            PathBuf::from(root),
+            PathBuf::from(root).join(".git"),
             1,
         )
         .unwrap(),
@@ -84,9 +90,10 @@ fn scope_from_mode(mode: DiffMode) -> GitScope {
     GitScope::from_authority(&stamp, mode)
 }
 
+/// Binds fixed test identities to the requested fixture mode and full scope.
 fn comparison(mode: DiffMode) -> GitComparison {
     GitComparison::new(
-        mode,
+        scope_from_mode(mode),
         GitIdentity::new(b"left-id".to_vec()).expect("left identity is valid"),
         GitIdentity::new(b"right-id".to_vec()).expect("right identity is valid"),
         BaselineContext::new("baseline", BaselineCoverage::Complete)
@@ -94,6 +101,7 @@ fn comparison(mode: DiffMode) -> GitComparison {
     )
 }
 
+/// Captures bounded patch evidence retaining its mode-specific query provenance.
 fn make_evidence(
     scope: &GitScope,
     stdout: &[u8],
@@ -103,6 +111,7 @@ fn make_evidence(
     RawGitEvidence::new(
         "operation-1",
         scope.clone(),
+        GitReadQuery::diff_for(scope.mode()),
         stdout.to_vec(),
         Vec::new(),
         exit_code,
@@ -112,10 +121,13 @@ fn make_evidence(
     .expect("evidence has bounded metadata")
 }
 
+/// Parses complete scoped status evidence for one tracked, conflicted, and untracked path.
 fn status_fixture() -> agent_ide::workspace::git::GitStatus {
-    parse_porcelain_v2_z(
-        b"1 M. N... 100644 100644 100644 a b tracked\0u UU N... 100644 100644 100644 100644 a b c conflict\0? -leading\npath\0",
-    )
+    GitStatus::from_evidence(&RawGitEvidence::new(
+        "status", scope_from_mode(DiffMode::Head), GitReadQuery::Status,
+        b"1 M. N... 100644 100644 100644 a b tracked\0u UU N... 100644 100644 100644 100644 a b c conflict\0? -leading\npath\0".to_vec(),
+        Vec::new(), Some(0), false, false,
+    ).unwrap())
     .expect("fixture status parses as bounded tracked/conflict/untracked")
 }
 
@@ -162,7 +174,7 @@ fn compose_rejects_scope_mismatch_as_unavailable() {
         &scope,
         &mismatched,
         status_fixture(),
-        make_evidence(&scope, b"diff --git a/a b/a\n", Some(0), false),
+        make_evidence(&scope, b"diff --git a/tracked b/tracked\n", Some(0), false),
         DiffSelectionBudget::default(),
     );
     assert_eq!(result.state(), DiffResultState::Unavailable);
@@ -193,7 +205,7 @@ fn compose_marks_truncated_stdout_as_incomplete() {
         status.clone(),
         make_evidence(
             &scope,
-            b"diff --git a/a b/a\n@@ -1 +1 @@\n-old\n+new\n",
+            b"diff --git a/tracked b/tracked\n@@ -1 +1 @@\n-old\n+new\n",
             Some(0),
             true,
         ),
@@ -214,7 +226,7 @@ fn compose_marks_malformed_output_as_incomplete() {
         status_fixture(),
         make_evidence(
             &scope,
-            b"diff --git a/a b/a\n@@ -1 +1 @@\n-old\n+new\nmalformed-tail\n",
+            b"diff --git a/tracked b/tracked\n@@ -1 +1 @@\n-old\n+new\nmalformed-tail\n",
             Some(0),
             false,
         ),
@@ -235,7 +247,7 @@ fn compose_marks_binary_evidence_incomplete_and_preserves_binary_flag() {
         status_fixture(),
         make_evidence(
             &scope,
-            b"diff --git a/image.bin b/image.bin\nBinary files a/image.bin and b/image.bin differ\n",
+            b"diff --git a/tracked b/tracked\nBinary files a/image.bin and b/image.bin differ\n",
             Some(0),
             false,
         ),
@@ -249,13 +261,23 @@ fn compose_marks_binary_evidence_incomplete_and_preserves_binary_flag() {
 #[test]
 fn compose_preserves_comparison_identities_and_provenance_owner_ref() {
     let scope = scope_from_mode(DiffMode::Head);
-    let comparison = comparison(DiffMode::Head);
+    let comparison = GitComparison::new(
+        scope.clone(),
+        GitIdentity::new(b"left-id".to_vec()).unwrap(),
+        GitIdentity::new(b"right-id".to_vec()).unwrap(),
+        BaselineContext::new("baseline", BaselineCoverage::Partial).unwrap(),
+    );
+
     let result = compose_diff(
         &scope,
         &comparison,
         status_fixture(),
         make_evidence(&scope, b"", Some(0), false),
         DiffSelectionBudget::default(),
+    );
+    assert_eq!(
+        result.provenance().baseline_coverage(),
+        Some(BaselineCoverage::Partial)
     );
     assert_eq!(result.identities().left(), b"left-id");
     assert_eq!(result.identities().right(), b"right-id");
@@ -270,7 +292,7 @@ fn compose_applies_byte_and_hunk_overflow_without_partial_hunk_selection() {
     let scope = scope_from_mode(DiffMode::Head);
     let comparison = comparison(DiffMode::Head);
     let status = status_fixture();
-    let diff = b"diff --git a/large b/large\n@@ -1,1 +1,1 @@\nline\nline\nline\nline\nline\n";
+    let diff = b"diff --git a/tracked b/tracked\n@@ -1,1 +1,1 @@\nline\nline\nline\nline\nline\n";
     let result = compose_diff(
         &scope,
         &comparison,
@@ -311,7 +333,7 @@ fn failed_exit_with_truncation_malformed_binary_keeps_failed_and_budget() {
         status_fixture(),
         make_evidence(
             &scope,
-            b"diff --git a/file b/file\n@@ -1 +1 @@\n-old\n+new\nBinary files a/x and b/x differ\nbad-tail\n",
+            b"diff --git a/tracked b/tracked\n@@ -1 +1 @@\n-old\n+new\nBinary files a/x and b/x differ\nbad-tail\n",
             Some(7),
             true,
         ),
@@ -323,7 +345,7 @@ fn failed_exit_with_truncation_malformed_binary_keeps_failed_and_budget() {
 }
 
 #[test]
-fn path_with_spaces_keeps_raw_hunk_and_no_guessed_path() {
+fn path_absent_from_status_is_incomplete_without_guessed_hunks() {
     let scope = scope_from_mode(DiffMode::Head);
     let patch = b"diff --git a/with space.txt b/with space.txt\n@@ -1 +1 @@\n-old\n+new\n";
     let result = compose_diff(
@@ -333,11 +355,8 @@ fn path_with_spaces_keeps_raw_hunk_and_no_guessed_path() {
         make_evidence(&scope, patch, Some(0), false),
         DiffSelectionBudget::default(),
     );
-    assert_eq!(
-        result.selected_hunks()[0].patch(),
-        b"@@ -1 +1 @@\n-old\n+new\n"
-    );
-    assert!(result.selected_hunks()[0].path().is_none());
+    assert_eq!(result.state(), DiffResultState::Incomplete);
+    assert!(result.selected_hunks().is_empty());
 }
 
 #[test]
@@ -385,6 +404,47 @@ fn old_epoch_for_same_worktree_is_stale_and_returns_no_data() {
     let request = ActivationRequest::new("stale-op-2", invocation, active, worktree).unwrap();
     let current = registry.activate(request).unwrap();
     let expected = GitScope::from_authority(&current, DiffMode::Head);
+    let baseline = BaselineContext::new("baseline", BaselineCoverage::Complete).unwrap();
+    let identities = |scope| {
+        GitComparison::new(
+            scope,
+            GitIdentity::new(b"left".to_vec()).unwrap(),
+            GitIdentity::new(b"right".to_vec()).unwrap(),
+            baseline.clone(),
+        )
+    };
+    let status = |scope| {
+        GitStatus::from_evidence(
+            &RawGitEvidence::new(
+                "status",
+                scope,
+                GitReadQuery::Status,
+                vec![],
+                vec![],
+                Some(0),
+                false,
+                false,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    for (comparison, status) in [
+        (identities(old_scope.clone()), status(expected.clone())),
+        (identities(expected.clone()), status(old_scope.clone())),
+    ] {
+        assert_eq!(
+            compose_diff(
+                &expected,
+                &comparison,
+                status,
+                make_evidence(&expected, b"", Some(0), false),
+                DiffSelectionBudget::default()
+            )
+            .state(),
+            DiffResultState::Unavailable
+        );
+    }
     let result = compose_diff(
         &expected,
         &comparison(DiffMode::Head),
@@ -405,4 +465,144 @@ fn old_epoch_for_same_worktree_is_stale_and_returns_no_data() {
     assert!(result.detail_cursor().is_none());
     assert_eq!(result.provenance().operation_reference(), None);
     assert_eq!(result.provenance().baseline_reference(), None);
+}
+
+/// Rejects scopes on every component and preserves fixed-query roles and hard stream ceilings.
+#[test]
+fn comparison_status_query_and_capture_boundaries_are_enforced() {
+    use agent_ide::workspace::git::{
+        GitError, MAX_GIT_STDERR_BYTES, MAX_GIT_STDOUT_BYTES, comparison_from_evidence,
+    };
+    let scope = scope_from_mode(DiffMode::Head);
+    let foreign = scope_for_root(DiffMode::Head, "/private/tmp/foreign-changes");
+    let identities = |scope: GitScope| {
+        GitComparison::new(
+            scope,
+            GitIdentity::new(b"left".to_vec()).unwrap(),
+            GitIdentity::new(b"right".to_vec()).unwrap(),
+            BaselineContext::new("baseline", BaselineCoverage::Complete).unwrap(),
+        )
+    };
+    let capture = |scope: GitScope, query, stdout: Vec<u8>, stderr: Vec<u8>| {
+        RawGitEvidence::new(
+            "capture",
+            scope,
+            query,
+            stdout,
+            stderr,
+            Some(0),
+            false,
+            false,
+        )
+    };
+    let foreign_status = GitStatus::from_evidence(
+        &capture(foreign.clone(), GitReadQuery::Status, vec![], vec![]).unwrap(),
+    )
+    .unwrap();
+    for (comparison, status) in [
+        (identities(foreign), status_fixture()),
+        (identities(scope.clone()), foreign_status),
+    ] {
+        let result = compose_diff(
+            &scope,
+            &comparison,
+            status,
+            make_evidence(&scope, b"", Some(0), false),
+            DiffSelectionBudget::default(),
+        );
+        assert_eq!(result.state(), DiffResultState::Unavailable);
+        assert!(result.selected_hunks().is_empty());
+        assert!(result.identities().left().is_empty());
+    }
+    let wrong_query = capture(
+        scope.clone(),
+        GitReadQuery::HeadIdentity,
+        b"not a patch".to_vec(),
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(
+        compose_diff(
+            &scope,
+            &identities(scope.clone()),
+            status_fixture(),
+            wrong_query.clone(),
+            DiffSelectionBudget::default()
+        )
+        .state(),
+        DiffResultState::Unavailable
+    );
+    let index = capture(
+        scope_from_mode(DiffMode::Staged),
+        GitReadQuery::IndexState,
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    let patch = make_evidence(&scope, b"", Some(0), false);
+    assert_eq!(
+        comparison_from_evidence(
+            DiffMode::Head,
+            &patch,
+            &index,
+            &wrong_query,
+            BaselineContext::new("baseline", BaselineCoverage::Complete).unwrap()
+        ),
+        Err(GitError::IncompleteIdentity)
+    );
+    assert_eq!(
+        capture(
+            scope.clone(),
+            GitReadQuery::HeadDiff,
+            vec![0; MAX_GIT_STDOUT_BYTES + 1],
+            vec![]
+        ),
+        Err(GitError::EvidenceTooLarge)
+    );
+    assert_eq!(
+        capture(
+            scope,
+            GitReadQuery::HeadDiff,
+            vec![],
+            vec![0; MAX_GIT_STDERR_BYTES + 1]
+        ),
+        Err(GitError::EvidenceTooLarge)
+    );
+}
+
+/// Attributes multiple hunks to exact space, newline, and non-UTF-8 status paths without guessing.
+#[test]
+fn multiple_files_keep_exact_raw_path_association() {
+    use std::os::unix::ffi::OsStrExt;
+    let scope = scope_from_mode(DiffMode::Head);
+    let status = GitStatus::from_evidence(&RawGitEvidence::new("status", scope.clone(), GitReadQuery::Status,
+        b"1 M. N... 100644 100644 100644 a b with space.txt\x001 M. N... 100644 100644 100644 a b line\nraw-\xff\0".to_vec(), vec![], Some(0), false, false).unwrap()).unwrap();
+    let patch = b"diff --git a/with space.txt b/with space.txt\n@@ -1 +1 @@\n-old\n+space\ndiff --git \"a/line\\nraw-\\377\" \"b/line\\nraw-\\377\"\n@@ -1 +1 @@\n-old\n+raw\n";
+    let result = compose_diff(
+        &scope,
+        &comparison(DiffMode::Head),
+        status,
+        make_evidence(&scope, patch, Some(0), false),
+        DiffSelectionBudget::default(),
+    );
+    assert_eq!(result.state(), DiffResultState::Ready);
+    assert_eq!(result.selected_hunks().len(), 2);
+    assert_eq!(
+        result.selected_hunks()[0]
+            .path()
+            .unwrap()
+            .as_os_str()
+            .as_bytes(),
+        b"with space.txt"
+    );
+    assert_eq!(
+        result.selected_hunks()[1]
+            .path()
+            .unwrap()
+            .as_os_str()
+            .as_bytes(),
+        b"line\nraw-\xff"
+    );
+    assert!(result.selected_hunks()[0].patch().ends_with(b"+space\n"));
+    assert!(result.selected_hunks()[1].patch().ends_with(b"+raw\n"));
 }

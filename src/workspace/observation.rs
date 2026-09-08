@@ -366,6 +366,8 @@ pub enum ObservationError {
     TooLarge,
     /// The registered source path was absent; this does not claim worktree closure.
     Missing,
+    /// The worktree root is unavailable; no descendant absence or Close fact is established.
+    RootUnavailable,
     /// A durable row could not be decoded into the Workspace observation contract.
     CorruptPersistence,
     /// A native filesystem operation failed without a more specific safe classification.
@@ -377,7 +379,7 @@ pub enum ObservationError {
 /// The caller supplies a `WorktreeRef` already authorized by Workspace and a raw relative Unix
 /// path. The reader rejects empty, absolute, dot, parent, NUL, and over-limit paths; uses
 /// `openat` with `O_NOFOLLOW` for every component; caps bytes before hashing; and never scans.
-/// Missing paths return `ObservationError::Missing` rather than any lifecycle conclusion.
+/// Missing descendants return `Missing`; a missing root returns `RootUnavailable` and cannot produce Close.
 pub fn read_authorized_source(
     worktree: &WorktreeRef,
     path: &Path,
@@ -388,10 +390,17 @@ pub fn read_authorized_source(
     }
     // SAFETY: each successful `open` result becomes a File, which owns and closes its descriptor.
     let mut directory = unsafe {
-        File::from_raw_fd(open_directory(
-            libc::AT_FDCWD,
-            worktree.worktree_path().as_os_str(),
-        )?)
+        File::from_raw_fd(
+            open_directory(libc::AT_FDCWD, worktree.worktree_path().as_os_str()).map_err(
+                |error| {
+                    if error == ObservationError::Missing {
+                        ObservationError::RootUnavailable
+                    } else {
+                        error
+                    }
+                },
+            )?,
+        )
     };
     let components: Vec<&OsStr> = path
         .components()
