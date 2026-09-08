@@ -1,14 +1,11 @@
-#[path = "../src/assistance/mod.rs"]
-mod assistance;
-
-use assistance::host_binding::{
+use agent_ide::assistance::host_binding::{
     BindingStatus, BindingUnavailable, ChannelSessionRef, HookPhase, HostBindingGuard,
     SandboxStateProvenance, parse_candidate, parse_channel_session, parse_hook_event,
     parse_observed_sandbox_state,
 };
 use serde_json::json;
 
-fn candidate(actor: &str, call: &str) -> assistance::host_binding::CandidateInvocation {
+fn candidate(actor: &str, call: &str) -> agent_ide::assistance::host_binding::CandidateInvocation {
     parse_candidate(
         json!({
             "threadId": actor,
@@ -27,7 +24,7 @@ fn hook(
     actor_field: &str,
     actor: &str,
     call: &str,
-) -> assistance::host_binding::HookEvent {
+) -> agent_ide::assistance::host_binding::HookEvent {
     parse_hook_event(
         json!({
             "hook_event_name": phase,
