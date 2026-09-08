@@ -1,6 +1,6 @@
 # Intelligence v0.1 contract
 
-Revision: v0.1-r1 (production session API; direct consumer acceptance pending). Provider:
+Revision: v0.1-r2 (production session API; direct consumer acceptance pending). Provider:
 Intelligence. Direct providers: Workspace supplies current authority, worktree
 identity and source observations; Execution supplies admitted owned protocol
 children; Application supplies effective provider settings and owned cache
@@ -87,20 +87,18 @@ conversion, callback refusal, request timeout/cancellation and EOF.
 ## Production context API
 
 `intelligence::session::with_session` borrows independently owned protocol stdout
-and stdin, one admitted `WorktreeRef` and authority epoch, a `ViewGeneration`, and
+and stdin, one admitted `WorktreeRef` and authority epoch, a `ViewGeneration`, closed `ProviderSettings`, and
 finite deadlines. It drives `async-lsp` while the caller's asynchronous operation
 owns one `Session`. It never starts a process or consumes the caller's reap lease.
-`Session::shutdown` performs the explicit shutdown/exit handshake before the operation
-returns. Every exit drops the protocol driver; the Execution owner must then close
+`Session::shutdown` fences further context immediately and performs the bounded shutdown/exit handshake.
+Transport errors remain failures even when the operation returns Ok; only EOF after completed shutdown
+is normal. A sender stays alive through graceful EOF to meet async-lsp's driver lifetime contract. Every exit drops the protocol driver; the Execution owner must then close
 and reap its child. Cancellation of the enclosing future is the revocation boundary.
 The caller must check its live authority and cancel on its exact revocation event.
 
 `Session::capabilities` returns the actual initialize report, optional server identity,
 and negotiated UTF-8/16/32 positions; an omitted encoding means UTF-16. It does not
-assert index readiness. This default-settings adapter is accepted against gopls;
-the separately accepted Rust profile still uses its existing exclusive client path
-and profile-specific initialization/settings/barrier. The generic pipe adapter is
-not acceptance of a replacement Rust profile configuration.
+assert diagnostic cleanliness. `ProviderSettings::GoplsDefaults` preserves the accepted null/default configuration and cannot identify a Rust server. `ProviderSettings::Rust(profile)` retains the exact immutable Rust identity, checks the initialize analyzer name/version, sends `cache-priming-disabled-v1` initialization/configuration, and waits for `experimental/serverStatus` with both `health=ok` and `quiescent=true`. Missing, malformed, unhealthy, or non-quiescent status cannot satisfy the bounded barrier. `provider_readiness` is provider-status evidence, separate from push-diagnostic readiness.
 
 `Session::context(observation, bytes, ContextQuery::File | Symbol { byte_offset })`
 checks the exact Workspace worktree, epoch, source sequence, size and digest. It
@@ -124,7 +122,7 @@ snapshots with their latest Workspace/provider observations before reuse.
 
 The driver validates a 4 KiB header and an 8 MiB JSON body before deserialization.
 Retained fragmented input is capped at body + header + one 8 KiB read chunk.
-The exclusive mutable session permits one outgoing request at a time. async-lsp
+The exclusive mutable session permits one outgoing request at a time. Before any client request or notification enters async-lsp's unbounded sender, a cumulative budget admits at most 256 messages and 8 MiB of serialized parameters plus conservative framing overhead. Exhaustion retires the generation; the allowance is never replenished within a session. Protocol callback responses remain immediate and driver-backpressured under the existing bounded input envelope. async-lsp
 owns IDs and response correlation. A timed-out or caller-cancelled request retires
 the entire driver generation, disposing its pending mappings and late replies;
 it does not claim protocol-level per-request cancellation or reuse that connection.
@@ -133,15 +131,17 @@ positive and at most five minutes. The default is 30 seconds and two minutes.
 
 Callbacks reject source edits, decline interactive choices, acknowledge progress,
 and reject unknown requests through async-lsp's default handler. Configuration
-replies contain only globally compatible null/default settings, with exact response
-cardinality and a 128-item request ceiling; dynamic configuration is not advertised.
+replies contain the selected profile's fixed globally compatible value, with exact response
+cardinality and a 128-item ceiling. Workspace configuration/folders and progress capabilities are
+advertised exactly; dynamic configuration is not advertised.
 Unknown notifications remain inert and unretained.
 
 `Session::diagnostics` returns a bounded push observation tied to this generation.
 Wrong URIs and stale document versions are discarded. Matching versioned pushes are
 provisional; unversioned pushes carry no source binding and remain provisional.
-Source changes, close and invalidation clear diagnostic evidence. No pull/barrier is
-implemented by this adapter, so readiness remains `Unknown`, including empty pushes.
+Source changes and close clear diagnostic evidence. Invalidation clears source identity, document
+version, truncation, items and readiness. No document diagnostic pull is implemented, so diagnostic
+readiness remains `Unknown`, including empty pushes; Rust startup quiescence does not make a document clean.
 The pure freshness/cache lifecycle remains available for future verified pull results.
 
 Assistance still needs to route the public `ide.context` facade to this API, retain
@@ -180,16 +180,16 @@ bound once to its registry view and authority. The registry counts one shared
 backend and two logical views; two live forwarders add two separately counted
 process slots, giving three centrally admitted processes. Repeated capability
 issuance, slot reuse, and identity/incarnation/root/authority-epoch substitution
-are rejected before spawning. Gopls view keys use Workspace's canonical
+are rejected before spawning. Listener, forwarder, and Rust spawns receive a newly consumed ActiveBindingUse; none caches liveness across delayed admission. Gopls view keys use Workspace's canonical
 `WorktreeRef` rather than independently supplied names.
 
 `observe_source` advances an exact logical view lease monotonically without
 resetting its request IDs. A reply's worktree, lease and source sequence must
 still match `result_is_current`; older sequences and released views are stale.
-Reap precedes logical view release and each forwarder's separate slot release.
-After the final forwarder detaches, the listener is reaped before final registry
-release returns its sole backend slot; its returned lease is evidence, not a
-second release instruction.
+Each forwarder slot settles only from its own direct-child proof. Last-view release moves the
+listener/backend to draining and returns its one-time reap capability without freeing admission.
+After owned listener reap, complete_reap consumes matching evidence and frees/promotes once.
+Definite no-spawn failures use the separate one-time unstarted settlement; borrowed peers remain untouched.
 
 The Rust profile revision is `1`. Its compatibility identity includes the
 absolute `rust-analyzer` binary and observed version, observed Cargo and rustc

@@ -615,7 +615,7 @@ impl DiscoveryOperationRef {
     /// Creates a nonempty stable operation reference supplied by Workspace for result correlation.
     pub fn new(value: impl Into<String>) -> Result<Self, RequestError> {
         let value = value.into();
-        if value.is_empty() {
+        if value.is_empty() || value.len() > 128 || value.contains(char::from(0)) {
             return Err(RequestError::InvalidDiscoveryOperation);
         }
         Ok(Self(value))
@@ -741,7 +741,10 @@ impl GitDiscoveryPolicy {
         output_cap: usize,
         allow_explicit_disabled_host: bool,
     ) -> Result<Self, RequestError> {
-        if !is_normal_absolute(&git_program) || output_cap == 0 {
+        if !is_normal_absolute(&git_program)
+            || output_cap == 0
+            || output_cap > MAX_GIT_DISCOVERY_BYTES
+        {
             return Err(RequestError::InvalidDiscoveryPolicy);
         }
         Ok(Self {
@@ -769,56 +772,222 @@ pub struct ValidatedGitDiscovery {
     output_cap: usize,
 }
 
-/// Returns one raw fixed-query Git result without parsing or minting worktree authority.
+/// Hard per-stream retained byte ceiling for fixed discovery evidence.
+pub const MAX_GIT_DISCOVERY_BYTES: usize = 1024 * 1024;
+
+/// Immutable bounded fixed-query evidence, intentionally containing no execution settlement capability.
 #[derive(Clone, Debug)]
-pub struct RawGitDiscovery {
-    /// Original Workspace operation reference.
-    pub operation: DiscoveryOperationRef,
-    /// Fixed query whose raw output is returned.
-    pub query: GitDiscoveryQuery,
-    /// Raw stdout bytes; terminal LF and NUL encoding remain Workspace's responsibility.
-    pub stdout: CapturedOutput,
-    /// Raw stderr bytes without text decoding.
-    pub stderr: CapturedOutput,
-    /// Direct child exit status observed after reap.
-    pub exit_status: ExitStatus,
-    /// Elapsed wall time from child spawn to direct-child reap and drain collection.
-    pub elapsed: Duration,
-    /// Admission lease released by the caller only after it records or otherwise handles this evidence.
-    pub lease: AdmissionLease,
+pub struct GitDiscoveryEvidence {
+    /// Exact Workspace operation correlation reference.
+    operation: DiscoveryOperationRef,
+    /// Fixed query whose bytes were captured.
+    query: GitDiscoveryQuery,
+    /// Bounded raw stdout and its complete/truncated/drained metadata.
+    stdout: CapturedOutput,
+    /// Bounded raw stderr and its complete/truncated/drained metadata.
+    stderr: CapturedOutput,
+    /// Direct-child status observed by the Execution owner.
+    exit_status: ExitStatus,
+    /// Monotonic elapsed capture interval.
+    elapsed: Duration,
+    /// Explicit cancellation requests, never inferred from a nonzero exit.
+    cancellation: Option<CancellationEvidence>,
+    /// Direct-child reap does not prove termination of every descendant.
+    descendants: DescendantEvidence,
+}
+impl GitDiscoveryEvidence {
+    /// Validates bounded fixture/capture data without minting authority or a process settlement proof.
+    /// Exit status must describe exit/signal; drained bytes cannot contradict retained/truncated bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        operation: DiscoveryOperationRef,
+        query: GitDiscoveryQuery,
+        stdout: CapturedOutput,
+        stderr: CapturedOutput,
+        exit_status: ExitStatus,
+        elapsed: Duration,
+        cancellation: Option<CancellationEvidence>,
+        descendants: DescendantEvidence,
+    ) -> Result<Self, RequestError> {
+        use std::os::unix::process::ExitStatusExt;
+        if (!exit_status.success()
+            && exit_status.code().is_none()
+            && exit_status.signal().is_none())
+            || [&stdout, &stderr].iter().any(|output| {
+                output.bytes.len() > MAX_GIT_DISCOVERY_BYTES
+                    || output.drained_bytes < output.bytes.len() as u64
+                    || (!output.truncated && output.drained_bytes != output.bytes.len() as u64)
+            })
+        {
+            return Err(RequestError::InvalidDiscoveryEvidence);
+        }
+        Ok(Self {
+            operation,
+            query,
+            stdout,
+            stderr,
+            exit_status,
+            elapsed,
+            cancellation,
+            descendants,
+        })
+    }
+    /// Returns the original immutable operation reference.
+    pub fn operation(&self) -> &DiscoveryOperationRef {
+        &self.operation
+    }
+    /// Returns the fixed discovery query.
+    pub const fn query(&self) -> GitDiscoveryQuery {
+        self.query
+    }
+    /// Returns bounded raw stdout without exposing mutable capture metadata.
+    pub fn stdout(&self) -> &CapturedOutput {
+        &self.stdout
+    }
+    /// Returns bounded raw stderr without exposing mutable capture metadata.
+    pub fn stderr(&self) -> &CapturedOutput {
+        &self.stderr
+    }
+    /// Returns observed direct-child status, not a worktree/authority claim.
+    pub const fn exit_status(&self) -> ExitStatus {
+        self.exit_status
+    }
+    /// Returns monotonic elapsed execution/capture time.
+    pub const fn elapsed(&self) -> Duration {
+        self.elapsed
+    }
+    /// Returns exact cancellation request evidence when cancellation was requested.
+    pub const fn cancellation(&self) -> Option<CancellationEvidence> {
+        self.cancellation
+    }
+    /// Returns the deliberately conservative descendant status.
+    pub const fn descendants(&self) -> DescendantEvidence {
+        self.descendants
+    }
+}
+
+/// Separates immutable discovery bytes from one-time physical settlement, allowing immediate slot release.
+#[derive(Debug)]
+pub struct CompletedGitDiscovery {
+    /// Bounded immutable value safe to retain for Workspace's correlated three-query validation.
+    pub evidence: GitDiscoveryEvidence,
+    /// Consume immediately through admission.release_reaped; never clone or pass into Workspace parsing.
+    pub settlement: DirectChildReap,
 }
 
 impl ValidatedGitDiscovery {
-    /// Rechecks active binding immediately before spawning the fixed Git child and returns raw evidence.
-    pub async fn run(
+    /// Returns an owned fixed-query handle after consuming fresh liveness at physical spawn.
+    /// The handle retains operation/query provenance and can be cancelled while a borrowed wait runs.
+    pub fn spawn(
         self,
         lease: AdmissionLease,
         active_use: ActiveBindingUse,
         codex_executable: &Path,
-    ) -> Result<RawGitDiscovery, ProcessError> {
-        self.invocation
-            .consume_active_use(active_use)
-            .map_err(ProcessError::Request)?;
+    ) -> Result<OwnedGitDiscovery, ProcessError> {
         let started = std::time::Instant::now();
-        let result = OwnedChild::spawn_parts(
-            &self.command,
-            &self.invocation.sandbox,
-            lease,
-            codex_executable,
-            self.output_cap,
-        )?
-        .reap(Duration::from_secs(10))
-        .await?;
-        let _ = &self.permit;
-        Ok(RawGitDiscovery {
+        let process = (|| {
+            self.invocation
+                .consume_active_use(active_use)
+                .map_err(ProcessError::Request)?;
+            OwnedChild::spawn_parts(
+                &self.command,
+                &self.invocation.sandbox,
+                lease,
+                codex_executable,
+                self.output_cap,
+            )
+        })()
+        .map_err(|cause| ProcessError::NeverStarted {
+            cause: Box::new(cause),
+            settlement: SpawnNeverStarted {
+                lease,
+                target: SpawnTarget::Ordinary,
+            },
+        })?;
+        Ok(OwnedGitDiscovery {
+            process,
             operation: self.operation,
             query: self.query,
-            stdout: result.stdout,
-            stderr: result.stderr,
-            exit_status: result.status,
-            elapsed: started.elapsed(),
-            lease: result.lease,
+            started,
+            _permit: self.permit,
         })
+    }
+}
+
+/// Owns one fixed Git discovery and its immutable evidence scope until verified physical settlement.
+pub struct OwnedGitDiscovery {
+    /// Execution-owned process and exclusive captured streams.
+    process: OwnedChild,
+    /// Original stable Workspace operation reference.
+    operation: DiscoveryOperationRef,
+    /// Exact fixed discovery query; cancellation never changes its interpretation.
+    query: GitDiscoveryQuery,
+    /// Monotonic start instant for elapsed evidence.
+    started: std::time::Instant,
+    /// Catalog evidence retained through physical execution.
+    _permit: ExecutionProfilePermit,
+}
+impl OwnedGitDiscovery {
+    /// Borrows the child for a bounded wait; cancelling this wait retains the owning handle.
+    /// No admission proof is released until reap/cancel_and_reap completes.
+    pub async fn wait(&mut self, deadline: Duration) -> Result<ExitStatus, ProcessError> {
+        self.process.wait(deadline).await
+    }
+
+    /// Reaps under separate exit/drain deadlines and returns exact fixed-query evidence.
+    pub async fn reap(
+        self,
+        deadline: Duration,
+        output_deadline: Duration,
+    ) -> Result<CompletedGitDiscovery, ProcessError> {
+        let Self {
+            process,
+            operation,
+            query,
+            started,
+            ..
+        } = self;
+        let result = process.reap(deadline, output_deadline).await?;
+        Ok(discovery_result(operation, query, started, result))
+    }
+
+    /// Requests bounded TERM/KILL and returns release evidence only after direct-child reap.
+    pub async fn cancel_and_reap(
+        self,
+        grace: Duration,
+        output_deadline: Duration,
+    ) -> Result<CompletedGitDiscovery, ProcessError> {
+        let Self {
+            process,
+            operation,
+            query,
+            started,
+            ..
+        } = self;
+        let result = process.cancel_and_reap(grace, output_deadline).await?;
+        Ok(discovery_result(operation, query, started, result))
+    }
+}
+
+/// Binds the physical settlement to its original query/operation without decoding any Git bytes.
+fn discovery_result(
+    operation: DiscoveryOperationRef,
+    query: GitDiscoveryQuery,
+    started: std::time::Instant,
+    result: CompletedProcess,
+) -> CompletedGitDiscovery {
+    CompletedGitDiscovery {
+        evidence: GitDiscoveryEvidence {
+            operation,
+            query,
+            stdout: result.evidence.stdout,
+            stderr: result.evidence.stderr,
+            exit_status: result.evidence.status,
+            elapsed: started.elapsed(),
+            cancellation: result.evidence.cancellation,
+            descendants: result.evidence.descendants,
+        },
+        settlement: result.settlement,
     }
 }
 
@@ -892,6 +1061,8 @@ pub enum RequestError {
     InvalidDiscoveryCandidate,
     /// Local fixed Git discovery policy has no absolute executable or output budget.
     InvalidDiscoveryPolicy,
+    /// Fixed-query fixture/capture metadata is oversized or contradicts its exit/drain evidence.
+    InvalidDiscoveryEvidence,
 }
 
 /// Couples the only inputs permitted to reach an owned operating-system spawn.
@@ -905,6 +1076,26 @@ pub struct ValidatedExecutionRequest {
     permit: ExecutionProfilePermit,
     /// Fully controlled executable invocation ready for admission and later owned spawn.
     command: ControlledCommand,
+}
+
+/// Rechecks current host state for a durable-authorized Workspace read or cached-result delivery.
+/// Consumes fresh binding liveness, requires exact sandbox cwd/root and the accepted current profile,
+/// and applies local disabled-host policy without fabricating a command, child, or new Workspace grant.
+pub fn validate_workspace_read(
+    active_use: ActiveBindingUse,
+    observed: ObservedSandboxState,
+    authority: &WorkspaceAuthority,
+    catalog: &ExecutionProfileCatalog,
+    allow_explicit_disabled_host: bool,
+) -> Result<ExecutionProfilePermit, RequestError> {
+    let invocation = ValidatedHostInvocation::from_active_observation(active_use, observed)?;
+    if invocation.sandbox.cwd() != authority.root() {
+        return Err(RequestError::SandboxCwdMismatch);
+    }
+    if invocation.sandbox.class() == ProfileClass::Disabled && !allow_explicit_disabled_host {
+        return Err(RequestError::DisabledHostDenied);
+    }
+    catalog.permit(&invocation.sandbox)
 }
 
 impl ValidatedExecutionRequest {
@@ -1024,17 +1215,19 @@ pub enum AdmissionError {
     OwnerQueueFull,
     /// A lease does not belong to this controller or was already released.
     UnknownLease,
+    /// A provider reservation requires the registry's one-time direct-child reap completion.
+    ProviderReapRequired,
 }
 
 /// Identifies a queued request that may be inspected or cancelled without terminating a process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct QueueTicket(u64);
+pub struct QueueTicket(u64, u64);
 
 /// Reserves one admitted execution slot until it is explicitly released after reaping.
 ///
 /// Abnormal owned-child drop retains this reservation because it supplies no reap evidence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AdmissionLease(u64);
+pub struct AdmissionLease(u64, u64);
 
 /// Returns the only three observable outcomes of asking the centralized admission controller.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1070,6 +1263,8 @@ impl AdmissionPromotion {
 /// Schedules finite requests with per-owner round-robin selection and bounded class preference.
 #[derive(Debug)]
 pub struct AdmissionController {
+    /// Process-local unique controller identity preventing equal numeric IDs from crossing owners.
+    identity: u64,
     /// Finite queue/running ceilings shared by every owner.
     limits: AdmissionLimits,
     /// Number of leases currently held by each owner.
@@ -1099,6 +1294,10 @@ struct QueuedRequest {
     class: AdmissionClass,
 }
 
+/// Allocates nonzero controller identities; process-local proofs are never deserialized across restarts.
+static NEXT_ADMISSION_CONTROLLER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
 impl AdmissionController {
     /// Creates an empty centralized scheduler after rejecting unusable ceiling combinations.
     pub fn new(limits: AdmissionLimits) -> Result<Self, AdmissionError> {
@@ -1110,7 +1309,15 @@ impl AdmissionController {
         {
             return Err(AdmissionError::InvalidLimits);
         }
+        let identity = NEXT_ADMISSION_CONTROLLER
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |value| value.checked_add(1),
+            )
+            .map_err(|_| AdmissionError::InvalidLimits)?;
         Ok(Self {
+            identity,
             limits,
             running: BTreeMap::new(),
             leases: BTreeMap::new(),
@@ -1141,11 +1348,14 @@ impl AdmissionController {
         }
         let id = self.next_id();
         self.queue.push_back(QueuedRequest { id, owner, class });
-        Admission::Queued(QueueTicket(id))
+        Admission::Queued(QueueTicket(id, self.identity))
     }
 
     /// Cancels a queued request and releases no running resource because tickets reserve nothing.
     pub fn cancel_ticket(&mut self, ticket: QueueTicket) -> bool {
+        if ticket.1 != self.identity {
+            return false;
+        }
         self.queue
             .iter()
             .position(|entry| entry.id == ticket.0)
@@ -1170,6 +1380,39 @@ impl AdmissionController {
         &mut self,
         lease: AdmissionLease,
     ) -> Result<Vec<AdmissionPromotion>, AdmissionError> {
+        if self.provider_slots.contains(&lease.0) {
+            return Err(AdmissionError::ProviderReapRequired);
+        }
+        self.release_settled(lease)
+    }
+
+    /// Releases an ordinary owned process using its non-forgeable direct-child reap proof.
+    pub fn release_reaped(
+        &mut self,
+        proof: DirectChildReap,
+    ) -> Result<Vec<AdmissionPromotion>, AdmissionError> {
+        self.release_with_promotions(proof.lease)
+    }
+
+    /// Consumes a definite no-child proof for an ordinary reservation; provider proofs require their registry.
+    pub fn settle_never_started(
+        &mut self,
+        settlement: SpawnNeverStarted,
+    ) -> Result<Vec<AdmissionPromotion>, AdmissionError> {
+        if !matches!(settlement.target, SpawnTarget::Ordinary) {
+            return Err(AdmissionError::ProviderReapRequired);
+        }
+        self.release_with_promotions(settlement.lease)
+    }
+
+    /// Performs the final accounting mutation after an ordinary release or registry-verified reap.
+    fn release_settled(
+        &mut self,
+        lease: AdmissionLease,
+    ) -> Result<Vec<AdmissionPromotion>, AdmissionError> {
+        if lease.1 != self.identity {
+            return Err(AdmissionError::UnknownLease);
+        }
         let owner = self
             .leases
             .remove(&lease.0)
@@ -1192,7 +1435,7 @@ impl AdmissionController {
                 .queue
                 .remove(position)
                 .expect("position comes from queue");
-            let ticket = QueueTicket(queued.id);
+            let ticket = QueueTicket(queued.id, self.identity);
             grants.push(AdmissionPromotion {
                 ticket,
                 lease: self.grant(queued.owner, queued.class),
@@ -1208,6 +1451,9 @@ impl AdmissionController {
 
     /// Returns whether a ticket remains queued without changing its priority or lifetime.
     pub fn contains_ticket(&self, ticket: QueueTicket) -> bool {
+        if ticket.1 != self.identity {
+            return false;
+        }
         self.queue.iter().any(|entry| entry.id == ticket.0)
     }
 
@@ -1232,7 +1478,7 @@ impl AdmissionController {
             AdmissionClass::Interactive => self.interactive_streak.saturating_add(1),
             AdmissionClass::Background => 0,
         };
-        AdmissionLease(id)
+        AdmissionLease(id, self.identity)
     }
 
     /// Picks an eligible queue entry while alternating owners and bounding interactive bursts.
@@ -1295,9 +1541,16 @@ pub struct ProviderSpawnLease {
     authority: WorkspaceAuthority,
     /// Compatible backend identity selected by the responsible provider module.
     backend: String,
+    /// True only for a separately reserved shared forwarder.
+    forwarder: bool,
 }
 
 impl ProviderSpawnLease {
+    /// Cancels this unconsumed launch capability before any spawn attempt, producing a one-time no-child proof.
+    pub fn cancel(self) -> SpawnNeverStarted {
+        SpawnNeverStarted::provider(&self)
+    }
+
     /// Returns the backend identity to which this one-time spawn is restricted.
     pub fn backend(&self) -> &str {
         &self.backend
@@ -1324,6 +1577,11 @@ pub struct ProviderForwarderSpawnLease {
 }
 
 impl ProviderForwarderSpawnLease {
+    /// Cancels this unconsumed forwarder launch without inventing a child or reap event.
+    pub fn cancel(self) -> SpawnNeverStarted {
+        self.spawn.cancel()
+    }
+
     /// Returns the exact logical view generation allowed to own this forwarder.
     pub const fn view(&self) -> ProviderViewLease {
         self.spawn.view
@@ -1367,6 +1625,10 @@ pub enum ProviderLeaseError {
     ViewCapacity,
     /// This view has no unconsumed owned-backend spawn capability.
     SpawnUnavailable,
+    /// This backend has no live views and retains its slot until verified physical reap.
+    BackendDraining,
+    /// Reap proof/capability belongs to another reservation or was already completed.
+    InvalidReap,
 }
 
 /// Reports one bounded request for a logical provider view.
@@ -1391,26 +1653,114 @@ pub struct ProviderLeaseLimits {
     pub per_backend_views: usize,
 }
 
-/// States whether the final release of a logical view can reap a physical backend.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// One concrete logical detach outcome; an owned last view carries its one-time draining capability.
+#[derive(Debug, Eq, PartialEq)]
 pub enum BackendRelease {
-    /// A compatible shared peer still uses this owned backend, so it remains alive.
+    /// A compatible shared peer still owns the live backend.
     SharedPeerSurvives,
-    /// The last view released an owned backend; its owner may begin bounded reap separately.
-    ReapOwned { backend: String },
-    /// Borrowed endpoints remain visible but are never signalled or reaped by Execution.
+    /// Physical admission remains reserved until this capability meets matching direct-child proof.
+    ReapOwned(BackendReapCapability),
+    /// A borrowed endpoint was detached without signal/reap rights.
     BorrowedDetached,
 }
 
+/// One-time, non-cloneable permission to settle one draining backend after direct-child reap.
+#[derive(Debug, Eq, PartialEq)]
+pub struct BackendReapCapability {
+    /// Exact compatible backend held in draining state.
+    backend: String,
+    /// Exact central reservation which cannot be freed by logical view release.
+    lease: AdmissionLease,
+}
+
+/// Non-cloneable proof that validation/build/spawn returned before any owned Child handle existed.
+#[derive(Debug)]
+pub struct SpawnNeverStarted {
+    /// Exact reservation whose spawn did not create an owned child.
+    lease: AdmissionLease,
+    /// Registry scope when this was a provider capability, otherwise an ordinary reservation.
+    target: SpawnTarget,
+}
+
+/// Closed reservation ownership carried only inside Execution-created no-spawn proofs.
+#[derive(Debug)]
+enum SpawnTarget {
+    /// Ordinary non-provider reservation.
+    Ordinary,
+    /// Heavy backend and the logical view that owned its one-time launch capability.
+    Backend {
+        backend: String,
+        view: ProviderViewLease,
+    },
+    /// Separately counted shared forwarder view.
+    Forwarder { view: ProviderViewLease },
+}
+
+impl SpawnNeverStarted {
+    /// Copies only reservation identity before an attempted spawn; issued only on a definite pre-child error.
+    fn provider(capability: &ProviderSpawnLease) -> Self {
+        Self {
+            lease: capability.lease,
+            target: if capability.forwarder {
+                SpawnTarget::Forwarder {
+                    view: capability.view,
+                }
+            } else {
+                SpawnTarget::Backend {
+                    backend: capability.backend.clone(),
+                    view: capability.view,
+                }
+            },
+        }
+    }
+}
+
+/// Opaque, non-cloneable launch correlation that may be transferred once to an armed resource guard.
+pub struct ProcessIdentity(ProcessIdentityData);
+/// Non-authorizing, cloneable identity evidence constructible only after Execution successfully waits.
+#[derive(Clone)]
+pub struct ReapedChildIdentity(ProcessIdentityData);
+/// Private collision-resistant launch generation and direct PID; neither is exposed as signal authority.
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct ProcessIdentityData {
+    /// OS-random generation allocated before attempting the spawn.
+    generation: [u8; 32],
+    /// Direct PID from the newly created Child handle.
+    pid: u32,
+}
+impl std::fmt::Debug for ProcessIdentity {
+    /// Redacts raw launch/PID data while retaining the opaque correlation type.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ProcessIdentity(..)")
+    }
+}
+impl std::fmt::Debug for ReapedChildIdentity {
+    /// Redacts raw launch/PID data; this value grants no release/signal capability.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ReapedChildIdentity(..)")
+    }
+}
+impl ReapedChildIdentity {
+    /// Checks whether actual direct-wait evidence matches the exact child which armed a resource guard.
+    pub fn matches(&self, launched: &ProcessIdentity) -> bool {
+        self.0 == launched.0
+    }
+}
+
+/// One-time proof minted only by Execution after a successful direct-child wait.
+#[derive(Debug)]
+pub struct DirectChildReap {
+    /// Exact reservation whose owned child was reaped.
+    lease: AdmissionLease,
+}
+
 /// Receipts returned after one finite Workspace authority revocation reaches Execution.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct AuthorityDrainReceipt {
     /// Number of matching logical views removed before any physical reap decision.
     pub drained_views: usize,
     /// Per-backend decisions that preserve peers and borrowed ownership.
     pub backend_releases: Vec<BackendRelease>,
-    /// Admission leases released because an owned backend lost its final view.
-    pub released_admissions: Vec<AdmissionLease>,
     /// Physical signal delivery/reap is separate work and remains unclaimed here.
     pub reap_uncertain: bool,
 }
@@ -1458,6 +1808,8 @@ struct ProviderBackend {
     admission: Option<AdmissionLease>,
     /// Number of logical views currently routed to this backend.
     views: usize,
+    /// Last-view removal fences new attachments until direct-child reap completes.
+    draining: bool,
 }
 
 /// Stores no resource reservation, only the identity needed to consume one exact promotion.
@@ -1510,6 +1862,9 @@ impl ProviderLeaseRegistry {
             return ProviderLeaseAdmission::Rejected(ProviderLeaseError::InvalidAuthority);
         }
         if let Some(existing) = self.backends.get(&backend) {
+            if existing.draining {
+                return ProviderLeaseAdmission::Rejected(ProviderLeaseError::BackendDraining);
+            }
             if existing.kind != kind {
                 return ProviderLeaseAdmission::Rejected(ProviderLeaseError::InvalidBackend);
             }
@@ -1550,6 +1905,7 @@ impl ProviderLeaseRegistry {
                 kind,
                 admission: reserved,
                 views: 0,
+                draining: false,
             },
         );
         let view = self.attach(backend, authority);
@@ -1576,6 +1932,9 @@ impl ProviderLeaseRegistry {
         promotion: AdmissionPromotion,
         authority: &WorkspaceAuthority,
     ) -> Result<ProviderViewLease, ProviderLeaseError> {
+        if promotion.lease.1 != admission.identity || promotion.ticket.1 != admission.identity {
+            return Err(ProviderLeaseError::InvalidPromotion);
+        }
         let pending = self
             .pending
             .remove(&promotion.ticket.0)
@@ -1595,6 +1954,7 @@ impl ProviderLeaseRegistry {
                 kind: pending.kind,
                 admission: Some(promotion.lease),
                 views: 0,
+                draining: false,
             },
         );
         let view = self.attach(pending.backend, authority);
@@ -1619,6 +1979,7 @@ impl ProviderLeaseRegistry {
                 lease,
                 authority: authority.authority.clone(),
                 backend: authority.backend.clone(),
+                forwarder: false,
             })
             .ok_or(ProviderLeaseError::SpawnUnavailable)
     }
@@ -1642,6 +2003,7 @@ impl ProviderLeaseRegistry {
             return Err(ProviderLeaseError::InvalidAuthority);
         }
         if self.backends[&scope.backend].kind != ProviderBackendKind::OwnedShared
+            || lease.1 != admission.identity
             || !admission.leases.contains_key(&lease.0)
             || admission.provider_slots.contains(&lease.0)
             || self.forwarders.contains_key(&view.0)
@@ -1656,69 +2018,146 @@ impl ProviderLeaseRegistry {
                 lease,
                 authority: scope.authority.clone(),
                 backend: scope.backend.clone(),
+                forwarder: true,
             },
         })
     }
 
-    /// Releases exactly one logical view and returns the physical ownership consequence.
+    /// Detaches one view; owned last views stay draining and never promote work before physical settlement.
     pub fn release(
         &mut self,
-        admission: &mut AdmissionController,
         view: ProviderViewLease,
-    ) -> Result<
-        (
-            BackendRelease,
-            Option<AdmissionLease>,
-            Vec<AdmissionPromotion>,
-        ),
-        ProviderLeaseError,
-    > {
+    ) -> Result<BackendRelease, ProviderLeaseError> {
         let view_id = view.0;
         let view = self
             .views
             .remove(&view_id)
             .ok_or(ProviderLeaseError::UnknownView)?;
         self.spawnable.remove(&view_id);
-        self.forwarders.remove(&view_id);
         let backend = self
             .backends
             .get_mut(&view.backend)
             .expect("view backend exists");
         backend.views -= 1;
         if backend.views != 0 {
-            return Ok((BackendRelease::SharedPeerSurvives, None, Vec::new()));
+            return Ok(BackendRelease::SharedPeerSurvives);
         }
-        let backend = self
+        if backend.kind == ProviderBackendKind::Borrowed {
+            self.backends.remove(&view.backend);
+            return Ok(BackendRelease::BorrowedDetached);
+        }
+        backend.draining = true;
+        Ok(BackendRelease::ReapOwned(BackendReapCapability {
+            backend: view.backend,
+            lease: backend.admission.expect("owned reservation"),
+        }))
+    }
+
+    /// Consumes matching one-time draining/reap proofs, frees the slot, and returns promotions once.
+    /// Wrong, stale, or already settled identities fail without freeing any reservation.
+    pub fn complete_reap(
+        &mut self,
+        admission: &mut AdmissionController,
+        capability: BackendReapCapability,
+        proof: DirectChildReap,
+    ) -> Result<Vec<AdmissionPromotion>, ProviderLeaseError> {
+        let valid = self
             .backends
-            .remove(&view.backend)
-            .expect("view backend exists");
-        match backend.kind {
-            ProviderBackendKind::Borrowed => {
-                Ok((BackendRelease::BorrowedDetached, None, Vec::new()))
-            }
-            ProviderBackendKind::OwnedShared | ProviderBackendKind::OwnedExclusive => {
-                let lease = backend.admission.expect("owned backend has admission");
-                let promotions = admission
-                    .release_with_promotions(lease)
-                    .map_err(ProviderLeaseError::Admission)?;
-                Ok((
-                    BackendRelease::ReapOwned {
-                        backend: view.backend,
-                    },
-                    Some(lease),
-                    promotions,
-                ))
-            }
+            .get(&capability.backend)
+            .is_some_and(|backend| {
+                backend.draining
+                    && backend.views == 0
+                    && backend.admission == Some(capability.lease)
+                    && proof.lease == capability.lease
+            });
+        if !valid || !admission.leases.contains_key(&proof.lease.0) {
+            return Err(ProviderLeaseError::InvalidReap);
         }
+        let promotions = admission
+            .release_settled(proof.lease)
+            .map_err(ProviderLeaseError::Admission)?;
+        self.backends.remove(&capability.backend);
+        Ok(promotions)
+    }
+
+    /// Consumes a definite no-child proof once; only its exact backend/forwarder reservation is cancelled.
+    /// Backend failure invalidates attached logical views because no listener ever existed; separately
+    /// running forwarders retain their own reservations until their respective settlement proofs arrive.
+    pub fn settle_never_started(
+        &mut self,
+        admission: &mut AdmissionController,
+        settlement: SpawnNeverStarted,
+    ) -> Result<Vec<AdmissionPromotion>, ProviderLeaseError> {
+        match settlement.target {
+            SpawnTarget::Backend { backend, view } => {
+                let valid = self
+                    .backends
+                    .get(&backend)
+                    .is_some_and(|entry| entry.admission == Some(settlement.lease))
+                    && self
+                        .views
+                        .get(&view.0)
+                        .is_none_or(|entry| entry.backend == backend);
+                if !valid {
+                    return Err(ProviderLeaseError::InvalidReap);
+                }
+                let promotions = admission
+                    .release_settled(settlement.lease)
+                    .map_err(ProviderLeaseError::Admission)?;
+                self.views.retain(|_, entry| entry.backend != backend);
+                self.backends.remove(&backend);
+                self.spawnable.remove(&view.0);
+                Ok(promotions)
+            }
+            SpawnTarget::Forwarder { view } => {
+                if self.forwarders.get(&view.0) != Some(&settlement.lease) {
+                    return Err(ProviderLeaseError::InvalidReap);
+                }
+                let promotions = admission
+                    .release_settled(settlement.lease)
+                    .map_err(ProviderLeaseError::Admission)?;
+                self.forwarders.remove(&view.0);
+                Ok(promotions)
+            }
+            SpawnTarget::Ordinary => Err(ProviderLeaseError::InvalidReap),
+        }
+    }
+
+    /// Cancels a backend whose one-time capability has never left the registry; spawned/issued capabilities fail.
+    pub fn cancel_unstarted(
+        &mut self,
+        admission: &mut AdmissionController,
+        view: ProviderViewLease,
+    ) -> Result<Vec<AdmissionPromotion>, ProviderLeaseError> {
+        let proof = self.take_spawn_lease(view)?.cancel();
+        self.settle_never_started(admission, proof)
+    }
+
+    /// Releases one distinct shared forwarder only after its direct child was reaped.
+    /// Logical view/backend release does not settle this independently counted process slot.
+    pub fn complete_forwarder_reap(
+        &mut self,
+        admission: &mut AdmissionController,
+        proof: DirectChildReap,
+    ) -> Result<Vec<AdmissionPromotion>, ProviderLeaseError> {
+        let view = self
+            .forwarders
+            .iter()
+            .find_map(|(view, lease)| (*lease == proof.lease).then_some(*view))
+            .ok_or(ProviderLeaseError::InvalidReap)?;
+        let promotions = admission
+            .release_settled(proof.lease)
+            .map_err(ProviderLeaseError::Admission)?;
+        self.forwarders.remove(&view);
+        Ok(promotions)
     }
 
     /// Fences views matching one finite Workspace revocation without touching surviving peers.
     ///
-    /// The receipt distinguishes logical removal and admission release from actual signal delivery
+    /// The receipt distinguishes logical removal and pending reap capability from actual signal delivery
     /// and reaping, which remain uncertain until the owner reports direct-child evidence.
     pub fn revoke_authority(
         &mut self,
-        admission: &mut AdmissionController,
         revoked: &crate::workspace::authority::AuthorityRevoked,
     ) -> AuthorityDrainReceipt {
         let matching: Vec<_> = self
@@ -1732,23 +2171,23 @@ impl ProviderLeaseRegistry {
                 .then_some(ProviderViewLease(*id))
             })
             .collect();
+        let forwarders_pending = matching
+            .iter()
+            .any(|view| self.forwarders.contains_key(&view.0));
         let mut backend_releases = Vec::with_capacity(matching.len());
-        let mut released_admissions = Vec::new();
+
         for view in &matching {
-            if let Ok((release, admission_lease, _)) = self.release(admission, *view) {
-                if let Some(admission_lease) = admission_lease {
-                    released_admissions.push(admission_lease);
-                }
+            if let Ok(release) = self.release(*view) {
                 backend_releases.push(release);
             }
         }
         AuthorityDrainReceipt {
             drained_views: matching.len(),
-            reap_uncertain: backend_releases
-                .iter()
-                .any(|release| matches!(release, BackendRelease::ReapOwned { .. })),
+            reap_uncertain: forwarders_pending
+                || backend_releases
+                    .iter()
+                    .any(|release| matches!(release, BackendRelease::ReapOwned(_))),
             backend_releases,
-            released_admissions,
         }
     }
 
@@ -1841,21 +2280,90 @@ pub enum DescendantEvidence {
     Unverified,
 }
 
-/// Records a direct-child exit plus bounded stream and cancellation evidence.
+/// Hard per-stream capture bound for completed ordinary/provider processes.
+pub const MAX_CAPTURED_PROCESS_BYTES: usize = 8 * 1024 * 1024;
+
+/// Immutable bounded process output with no lease or settlement capability.
 #[derive(Clone, Debug)]
-pub struct ReapedProcess {
-    /// Direct child exit status observed by `wait`, not a claim about every descendant.
-    pub status: ExitStatus,
-    /// TERM/KILL requests made before direct-child reap, if cancellation was requested.
-    pub cancellation: Option<CancellationEvidence>,
-    /// Bounded standard output drain result.
-    pub stdout: CapturedOutput,
-    /// Bounded standard error drain result.
-    pub stderr: CapturedOutput,
-    /// Descendant termination confidence that intentionally remains conservative.
-    pub descendants: DescendantEvidence,
-    /// The lease released only after this direct child was reaped.
-    pub lease: AdmissionLease,
+pub struct CapturedProcessEvidence {
+    /// Present only on actual Execution direct-wait evidence; fixture constructors cannot mint it.
+    reap_identity: Option<ReapedChildIdentity>,
+    /// Direct-child status observed by the Execution owner.
+    status: ExitStatus,
+    /// TERM/KILL attempts, absent for ordinary completion.
+    cancellation: Option<CancellationEvidence>,
+    /// Bounded captured stdout, never a protocol child's reserved stdout.
+    stdout: CapturedOutput,
+    /// Bounded captured stderr.
+    stderr: CapturedOutput,
+    /// Direct-child exit does not prove descendant termination.
+    descendants: DescendantEvidence,
+}
+impl CapturedProcessEvidence {
+    /// Validates bounded fixture evidence without minting settlement rights.
+    pub fn new(
+        status: ExitStatus,
+        cancellation: Option<CancellationEvidence>,
+        stdout: CapturedOutput,
+        stderr: CapturedOutput,
+        descendants: DescendantEvidence,
+    ) -> Result<Self, ProcessError> {
+        use std::os::unix::process::ExitStatusExt;
+        if (status.code().is_none() && status.signal().is_none())
+            || [&stdout, &stderr].iter().any(|output| {
+                output.bytes.len() > MAX_CAPTURED_PROCESS_BYTES
+                    || output.drained_bytes < output.bytes.len() as u64
+                    || (!output.truncated && output.drained_bytes != output.bytes.len() as u64)
+            })
+        {
+            return Err(ProcessError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid bounded process evidence",
+            )));
+        }
+        Ok(Self {
+            reap_identity: None,
+            status,
+            cancellation,
+            stdout,
+            stderr,
+            descendants,
+        })
+    }
+    /// Returns non-authorizing actual-wait identity for exact scratch/resource lifetime correlation.
+    pub fn reap_identity(&self) -> Option<&ReapedChildIdentity> {
+        self.reap_identity.as_ref()
+    }
+
+    /// Returns observed direct-child status, without release rights.
+    pub const fn status(&self) -> ExitStatus {
+        self.status
+    }
+    /// Returns exact cancellation request evidence.
+    pub const fn cancellation(&self) -> Option<CancellationEvidence> {
+        self.cancellation
+    }
+    /// Returns immutable bounded stdout/drain metadata.
+    pub fn stdout(&self) -> &CapturedOutput {
+        &self.stdout
+    }
+    /// Returns immutable bounded stderr/drain metadata.
+    pub fn stderr(&self) -> &CapturedOutput {
+        &self.stderr
+    }
+    /// Returns conservative descendant evidence.
+    pub const fn descendants(&self) -> DescendantEvidence {
+        self.descendants
+    }
+}
+
+/// Owns bounded immutable output separately from the one-time physical settlement capability.
+#[derive(Debug)]
+pub struct CompletedProcess {
+    /// Safe to retain or pass to Workspace after the reservation is settled.
+    pub evidence: CapturedProcessEvidence,
+    /// Consume through ordinary release_reaped or provider complete_reap exactly once.
+    pub settlement: DirectChildReap,
 }
 
 /// Reports failures in owned-child launch, signal delivery, wait, or output collection.
@@ -1867,6 +2375,13 @@ pub enum ProcessError {
     Request(RequestError),
     /// A process protocol requested stdout, so captured-output APIs cannot be used.
     ProtocolStdoutReserved,
+    /// The bounded direct-child exit/reap wait expired; no release evidence was produced.
+    ReapTimedOut,
+    /// The cause is definite pre-child failure; its one-time proof may settle only that reservation.
+    NeverStarted {
+        cause: Box<ProcessError>,
+        settlement: SpawnNeverStarted,
+    },
 }
 
 impl From<io::Error> for ProcessError {
@@ -1881,10 +2396,16 @@ impl From<io::Error> for ProcessError {
 /// This private guard owns only a child launched by Execution. It never releases admission or
 /// claims reap/descendant completion. Tokio retains best-effort direct-child reaping on drop.
 struct ChildOwnership {
+    /// Private identity retained until direct wait can mint non-authorizing evidence.
+    identity: ProcessIdentityData,
+    /// Single launch correlation transferable to a scratch/resource owner.
+    launch_identity: Option<ProcessIdentity>,
     /// Live direct-child handle; its ID becomes absent after wait has reaped it.
     child: Child,
     /// Cancellation handles for the child's exclusively owned output drain tasks.
     drainers: Vec<AbortHandle>,
+    /// Cancellation requests retained across borrowed waits and supervisor handoff.
+    cancellation: Option<CancellationEvidence>,
 }
 
 impl Drop for ChildOwnership {
@@ -1910,8 +2431,6 @@ impl Drop for ChildOwnership {
 pub struct OwnedChild {
     /// Cancellation-safe direct-child and output-task ownership retained through reap/drain awaits.
     process: ChildOwnership,
-    /// Direct-child PID used only for the current owned process-group signal attempt.
-    pid: u32,
     /// Sole stdout drainer retaining bounded diagnostic output.
     stdout: JoinHandle<io::Result<CapturedOutput>>,
     /// Sole stderr drainer retaining bounded diagnostic output.
@@ -1921,6 +2440,11 @@ pub struct OwnedChild {
 }
 
 impl OwnedChild {
+    /// Transfers this child's opaque launch identity once; subsequent calls return None.
+    pub fn take_process_identity(&mut self) -> Option<ProcessIdentity> {
+        self.process.launch_identity.take()
+    }
+
     /// Starts a capture-mode provider backend using its one-time, authority-bound registry grant.
     /// Authority mismatch returns an error before consuming active use or spawning a process.
     pub fn spawn_from_provider_lease(
@@ -1930,14 +2454,24 @@ impl OwnedChild {
         codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
-        capability.validate_request(request)?;
-        Self::spawn_captured(
-            request,
-            capability.lease,
-            active_use,
-            codex_executable,
-            output_cap,
-        )
+        let settlement = SpawnNeverStarted::provider(&capability);
+        let result = (|| {
+            capability.validate_request(request)?;
+            request
+                .consume_spawn_use(active_use)
+                .map_err(ProcessError::Request)?;
+            Self::spawn_parts(
+                &request.command,
+                &request.invocation.sandbox,
+                capability.lease,
+                codex_executable,
+                output_cap,
+            )
+        })();
+        result.map_err(|cause| ProcessError::NeverStarted {
+            cause: Box::new(cause),
+            settlement,
+        })
     }
 
     /// Starts a capture-mode child only after central admission reserved `lease`.
@@ -1971,74 +2505,78 @@ impl OwnedChild {
         codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
+        validate_output_cap(output_cap)?;
         let mut process = build_command(command, sandbox, codex_executable)?;
         process.stdout(Stdio::piped()).stderr(Stdio::piped());
         configure_process_group(&mut process);
+        let generation = launch_generation()?;
         let mut child = process.spawn()?;
-        let pid = child
-            .id()
-            .ok_or_else(|| io::Error::other("spawned child has no PID"))?;
+        let identity = ProcessIdentityData {
+            generation,
+            pid: child.id().expect("new child PID"),
+        };
+
         let stdout = child.stdout.take().expect("piped stdout exists");
         let stderr = child.stderr.take().expect("piped stderr exists");
         let stdout = tokio::spawn(drain(stdout, output_cap));
         let stderr = tokio::spawn(drain(stderr, output_cap));
         Ok(Self {
             process: ChildOwnership {
+                identity,
+                launch_identity: Some(ProcessIdentity(identity)),
                 child,
                 drainers: vec![stdout.abort_handle(), stderr.abort_handle()],
+                cancellation: None,
             },
-            pid,
             stdout,
             stderr,
             lease,
         })
     }
 
-    /// Requests TERM, waits `grace`, requests KILL if necessary, then reaps the direct child.
-    ///
-    /// Signal acknowledgement proves only delivery attempt. The returned result proves direct-child
-    /// reaping and explicitly leaves descendant termination unverified. Cancelling this future
-    /// invokes immediate drop cleanup and produces no admission-release evidence.
+    /// Borrows cancellation so timeout or future cancellation retains the owned handle for supervisor handoff.
+    /// Successful exit still requires consuming reap to produce settlement/output; borrowed endpoints
+    /// cannot enter this API. Both waits are bounded and previous signal evidence is preserved.
+    pub async fn cancel_bounded(
+        &mut self,
+        grace: Duration,
+        deadline: Duration,
+    ) -> Result<ExitStatus, ProcessError> {
+        cancel_owned(&mut self.process, grace, deadline).await
+    }
+
+    /// Requests bounded TERM/KILL, reaps the direct child, and completes bounded stream collection.
+    /// Timeout/drop yields no settlement proof; retain the handle with cancel_bounded when scratch or
+    /// other resources must survive transfer to a supervised reaper.
     pub async fn cancel_and_reap(
         mut self,
         grace: Duration,
         output_deadline: Duration,
-    ) -> Result<ReapedProcess, ProcessError> {
-        let term_requested = signal_group(self.pid, libc::SIGTERM).is_ok();
-        let status = match timeout(grace, self.process.child.wait()).await {
-            Ok(status) => status?,
-            Err(_) => {
-                let kill_requested = signal_group(self.pid, libc::SIGKILL).is_ok();
-                self.process.child.start_kill()?;
-                let status = self.process.child.wait().await?;
-                return self
-                    .finish(
-                        status,
-                        Some(CancellationEvidence {
-                            term_requested,
-                            kill_requested,
-                        }),
-                        output_deadline,
-                    )
-                    .await;
-            }
-        };
-        self.finish(
-            status,
-            Some(CancellationEvidence {
-                term_requested,
-                kill_requested: false,
-            }),
-            output_deadline,
-        )
-        .await
+    ) -> Result<CompletedProcess, ProcessError> {
+        let status = self.cancel_bounded(grace, output_deadline).await?;
+        let cancellation = self.process.cancellation;
+        self.finish(status, cancellation, output_deadline).await
     }
 
-    /// Waits for ordinary completion and bounded stream evidence; cancellation invokes drop cleanup.
-    pub async fn reap(self, output_deadline: Duration) -> Result<ReapedProcess, ProcessError> {
-        let mut this = self;
-        let status = this.process.child.wait().await?;
-        this.finish(status, None, output_deadline).await
+    /// Borrows the direct child for a bounded, cancellation-safe wait without consuming ownership.
+    /// A successful wait is retained by Tokio; consuming reap still owns output/proof completion.
+    pub async fn wait(&mut self, deadline: Duration) -> Result<ExitStatus, ProcessError> {
+        validate_reap_deadline(deadline)?;
+        timeout(deadline, self.process.child.wait())
+            .await
+            .map_err(|_| ProcessError::ReapTimedOut)?
+            .map_err(ProcessError::Io)
+    }
+
+    /// Reaps under separate bounded exit/drain deadlines; timeout yields no settlement proof.
+    pub async fn reap(
+        mut self,
+        exit_deadline: Duration,
+        output_deadline: Duration,
+    ) -> Result<CompletedProcess, ProcessError> {
+        let status = self.wait(exit_deadline).await?;
+        let cancellation = self.process.cancellation;
+        self.finish(status, cancellation, output_deadline).await
     }
 
     /// Completes drain tasks within a separate deadline after the child is already reaped.
@@ -2047,19 +2585,40 @@ impl OwnedChild {
         status: ExitStatus,
         cancellation: Option<CancellationEvidence>,
         output_deadline: Duration,
-    ) -> Result<ReapedProcess, ProcessError> {
+    ) -> Result<CompletedProcess, ProcessError> {
+        let reap_identity = ReapedChildIdentity(self.process.identity);
         let _ownership = self.process;
         let stdout = collect_drain(self.stdout, output_deadline).await;
         let stderr = collect_drain(self.stderr, output_deadline).await;
-        Ok(ReapedProcess {
-            status,
-            cancellation,
-            stdout,
-            stderr,
-            descendants: DescendantEvidence::Unverified,
-            lease: self.lease,
+        Ok(CompletedProcess {
+            evidence: CapturedProcessEvidence {
+                reap_identity: Some(reap_identity),
+                status,
+                cancellation,
+                stdout,
+                stderr,
+                descendants: DescendantEvidence::Unverified,
+            },
+            settlement: DirectChildReap { lease: self.lease },
         })
     }
+}
+
+/// Direct protocol-child reap evidence, including cancellation and conservative descendant status.
+#[derive(Debug)]
+pub struct ReapedProtocolProcess {
+    /// Exit status returned only after the direct child was waited successfully.
+    pub status: ExitStatus,
+    /// TERM/KILL delivery attempts, absent for an ordinary exit wait.
+    pub cancellation: Option<CancellationEvidence>,
+    /// Exclusive bounded stderr drain; protocol stdout is never captured by Execution.
+    pub stderr: CapturedOutput,
+    /// Direct-child reap never proves complete descendant termination.
+    pub descendants: DescendantEvidence,
+    /// The admission reservation eligible for release only because direct-child reap succeeded.
+    pub lease: AdmissionLease,
+    /// One-time direct-child settlement proof required by provider accounting.
+    pub proof: DirectChildReap,
 }
 
 /// Gives Intelligence sole ownership of a protocol child's stdin/stdout while Execution drains stderr.
@@ -2080,6 +2639,11 @@ pub struct OwnedProtocolChild {
 }
 
 impl OwnedProtocolChild {
+    /// Transfers this child's opaque launch identity once; subsequent calls return None.
+    pub fn take_process_identity(&mut self) -> Option<ProcessIdentity> {
+        self.process.launch_identity.take()
+    }
+
     /// Starts an owned protocol child by consuming its authority-bound one-time backend capability.
     /// Authority mismatch returns an error before consuming active use or spawning a process.
     pub fn spawn_from_provider_lease(
@@ -2089,14 +2653,21 @@ impl OwnedProtocolChild {
         codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
-        capability.validate_request(request)?;
-        Self::spawn(
-            request,
-            capability.lease,
-            active_use,
-            codex_executable,
-            output_cap,
-        )
+        let settlement = SpawnNeverStarted::provider(&capability);
+        let result = (|| {
+            capability.validate_request(request)?;
+            Self::spawn(
+                request,
+                capability.lease,
+                active_use,
+                codex_executable,
+                output_cap,
+            )
+        })();
+        result.map_err(|cause| ProcessError::NeverStarted {
+            cause: Box::new(cause),
+            settlement,
+        })
     }
 
     /// Starts one forwarder using its distinct process slot and exact registry-view authority.
@@ -2125,6 +2696,7 @@ impl OwnedProtocolChild {
         codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
+        validate_output_cap(output_cap)?;
         request
             .consume_spawn_use(active_use)
             .map_err(ProcessError::Request)?;
@@ -2138,7 +2710,12 @@ impl OwnedProtocolChild {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         configure_process_group(&mut command);
+        let generation = launch_generation()?;
         let mut child = command.spawn()?;
+        let identity = ProcessIdentityData {
+            generation,
+            pid: child.id().expect("new child PID"),
+        };
         let stdin = child.stdin.take().expect("piped stdin exists");
         let stdout = child.stdout.take().expect("piped stdout exists");
         let stderr = child.stderr.take().expect("piped stderr exists");
@@ -2147,25 +2724,127 @@ impl OwnedProtocolChild {
             stdin,
             stdout,
             process: ChildOwnership {
+                identity,
+                launch_identity: Some(ProcessIdentity(identity)),
                 child,
                 drainers: vec![stderr.abort_handle()],
+                cancellation: None,
             },
             stderr,
             lease,
         })
     }
 
-    /// Closes the exclusive pipes and reaps the direct child; cancellation invokes drop cleanup.
-    pub async fn reap(
-        self,
-        output_deadline: Duration,
-    ) -> Result<(ExitStatus, CapturedOutput, AdmissionLease), ProcessError> {
+    /// Returns ordinary direct-child reap evidence under a positive deadline of at most 60 seconds.
+    pub async fn reap(self, deadline: Duration) -> Result<ReapedProtocolProcess, ProcessError> {
+        validate_reap_deadline(deadline)?;
         let mut this = self;
         drop(this.stdin);
+        let status = timeout(deadline, this.process.child.wait())
+            .await
+            .map_err(|_| ProcessError::ReapTimedOut)??;
         drop(this.stdout);
-        let status = this.process.child.wait().await?;
-        let stderr = collect_drain(this.stderr, output_deadline).await;
-        Ok((status, stderr, this.lease))
+        let stderr = collect_drain(this.stderr, deadline).await;
+        Ok(ReapedProtocolProcess {
+            status,
+            cancellation: this.process.cancellation,
+            stderr,
+            descendants: DescendantEvidence::Unverified,
+            lease: this.lease,
+            proof: DirectChildReap { lease: this.lease },
+        })
+    }
+
+    /// Borrows bounded cancellation while keeping ownership available for a supervised reaper handoff.
+    pub async fn cancel_bounded(
+        &mut self,
+        grace: Duration,
+        deadline: Duration,
+    ) -> Result<ExitStatus, ProcessError> {
+        cancel_owned(&mut self.process, grace, deadline).await
+    }
+
+    /// Closes pipes and requests bounded TERM/KILL; only successful direct wait produces proof.
+    /// A timeout/drop retains uncertain admission; use cancel_bounded to keep ownership for handoff.
+    pub async fn cancel_and_reap(
+        mut self,
+        grace: Duration,
+        deadline: Duration,
+    ) -> Result<ReapedProtocolProcess, ProcessError> {
+        self.cancel_bounded(grace, deadline).await?;
+        self.reap(deadline).await
+    }
+}
+
+/// Requests signals only for this unreaped owned child and retains evidence on borrowed timeout/cancellation.
+async fn cancel_owned(
+    process: &mut ChildOwnership,
+    grace: Duration,
+    deadline: Duration,
+) -> Result<ExitStatus, ProcessError> {
+    validate_reap_deadline(deadline)?;
+    if grace > Duration::from_secs(60) {
+        return Err(ProcessError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "owned process grace exceeds limit",
+        )));
+    }
+    if let Some(status) = process.child.try_wait()? {
+        return Ok(status);
+    }
+    let pid = process
+        .child
+        .id()
+        .ok_or_else(|| io::Error::other("owned child has no live PID"))?;
+    let mut evidence = process.cancellation.unwrap_or(CancellationEvidence {
+        term_requested: false,
+        kill_requested: false,
+    });
+    evidence.term_requested |= signal_group(pid, libc::SIGTERM).is_ok();
+    process.cancellation = Some(evidence);
+    match timeout(grace, process.child.wait()).await {
+        Ok(status) => status.map_err(ProcessError::Io),
+        Err(_) => {
+            evidence.kill_requested |= signal_group(pid, libc::SIGKILL).is_ok();
+            process.cancellation = Some(evidence);
+            process.child.start_kill()?;
+            timeout(deadline, process.child.wait())
+                .await
+                .map_err(|_| ProcessError::ReapTimedOut)?
+                .map_err(ProcessError::Io)
+        }
+    }
+}
+
+/// Reads a private random launch generation before an OS child can exist.
+fn launch_generation() -> Result<[u8; 32], ProcessError> {
+    use std::io::Read;
+    let mut generation = [0; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut generation)?;
+    Ok(generation)
+}
+
+/// Refuses over-limit capture policy before an OS child can be created; zero retains no bytes.
+fn validate_output_cap(cap: usize) -> Result<(), ProcessError> {
+    if cap > MAX_CAPTURED_PROCESS_BYTES {
+        Err(ProcessError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process capture cap exceeds limit",
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+/// Rejects deadlines that could leave a protocol process wait effectively unbounded.
+fn validate_reap_deadline(deadline: Duration) -> Result<(), ProcessError> {
+    if deadline.is_zero() || deadline > Duration::from_secs(60) {
+        Err(ProcessError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid protocol reap deadline",
+        )))
+    } else {
+        Ok(())
     }
 }
 

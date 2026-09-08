@@ -8,8 +8,9 @@ use std::{
     time::Duration,
 };
 
+use crate::assistance::host_binding::ActiveBindingUse;
 use crate::execution::{
-    AdmissionLease, CommandKind, ControlledCommand, OwnedChild, OwnedProtocolChild, ProcessError,
+    CommandKind, CompletedProcess, ControlledCommand, OwnedChild, OwnedProtocolChild, ProcessError,
     ProviderForwarderSpawnLease, ProviderSpawnLease, ProviderViewLease, ValidatedExecutionRequest,
     WorkspaceAuthority,
 };
@@ -182,24 +183,29 @@ pub struct SharedGopls {
 impl SharedGopls {
     /// Consumes the registry's one-time backend grant to start this profile's sole owned listener.
     /// A different compatibility key or request authority is rejected before any process effect.
+    /// Host-bound requests require a newly consumed active use at this physical spawn; no use is cached.
     pub fn start(
         profile: &GoplsProfile,
         listener_request: &ValidatedExecutionRequest,
         listener_lease: ProviderSpawnLease,
+        active_use: Option<ActiveBindingUse>,
         codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
         if listener_lease.backend() != profile.compatibility_key() {
-            return Err(ProcessError::Io(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "listener profile does not match its admitted backend",
-            )));
+            return Err(ProcessError::NeverStarted {
+                cause: Box::new(ProcessError::Io(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "listener profile does not match its admitted backend",
+                ))),
+                settlement: listener_lease.cancel(),
+            });
         }
         Ok(Self {
             listener: OwnedChild::spawn_from_provider_lease(
                 listener_request,
                 listener_lease,
-                None,
+                active_use,
                 codex_executable,
                 output_cap,
             )?,
@@ -219,45 +225,50 @@ impl SharedGopls {
     /// Requires the exact canonical worktree identity, incarnation and root in the validated
     /// request, and the registry capability's authority epoch and compatible backend. Mismatch
     /// or duplicate worktree is rejected before spawning; the caller retains release accounting
-    /// for the consumed capability's reserved slot on failure.
+    /// for the consumed capability's reserved slot on failure. Host-bound requests require a fresh
+    /// active use consumed immediately before this delayed forwarder spawn.
+    #[allow(clippy::too_many_arguments)]
     pub fn open_view(
         &mut self,
         worktree: WorktreeRef,
         source_sequence: u64,
         forwarder_request: &ValidatedExecutionRequest,
         forwarder_lease: ProviderForwarderSpawnLease,
+        active_use: Option<ActiveBindingUse>,
         codex_executable: &Path,
         output_cap: usize,
-    ) -> Result<GoplsView, io::Error> {
+    ) -> Result<GoplsView, ProcessError> {
         let authority = forwarder_request.authority();
         if worktree.id() != authority.worktree_id()
             || worktree.incarnation().to_string() != authority.incarnation()
             || worktree.worktree_path() != authority.root()
             || forwarder_lease.backend() != self.compatibility_key
         {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "forwarder worktree or backend does not match its authority",
-            ));
+            return Err(ProcessError::NeverStarted {
+                cause: Box::new(ProcessError::Io(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "forwarder worktree or backend does not match its authority",
+                ))),
+                settlement: forwarder_lease.cancel(),
+            });
         }
         if self.views.contains_key(&worktree) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "worktree view is active",
-            ));
+            return Err(ProcessError::NeverStarted {
+                cause: Box::new(ProcessError::Io(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "worktree view is active",
+                ))),
+                settlement: forwarder_lease.cancel(),
+            });
         }
         let lease = forwarder_lease.view();
         let child = OwnedProtocolChild::spawn_from_forwarder_lease(
             forwarder_request,
             forwarder_lease,
-            None,
+            active_use,
             codex_executable,
             output_cap,
-        )
-        .map_err(|error| match error {
-            ProcessError::Io(error) => error,
-            other => io::Error::other(format!("Execution rejected gopls forwarder: {other:?}")),
-        })?;
+        )?;
         self.views.insert(
             worktree.clone(),
             ViewState {
@@ -362,21 +373,18 @@ impl SharedGopls {
     /// Cancels and reaps the owned heavy listener through Execution after all views are released.
     ///
     /// After reap, final registry-view release returns this listener admission to the controller.
-    /// The returned lease is evidence only and must not be independently released a second time.
+    /// Pass the returned proof and the registry draining capability to complete_reap exactly once.
     pub async fn stop(
         self,
         grace: Duration,
         output_deadline: Duration,
-    ) -> Result<AdmissionLease, ProcessError> {
+    ) -> Result<CompletedProcess, ProcessError> {
         if !self.views.is_empty() {
             return Err(ProcessError::Io(io::Error::other(
                 "cannot stop listener with active views",
             )));
         }
-        self.listener
-            .cancel_and_reap(grace, output_deadline)
-            .await
-            .map(|reaped| reaped.lease)
+        self.listener.cancel_and_reap(grace, output_deadline).await
     }
 }
 

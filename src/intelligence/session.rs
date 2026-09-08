@@ -3,6 +3,7 @@
 use super::{
     context::{self, ContextMode, ContextQuery, ContextResult, MAX_CONTEXT_ITEMS},
     freshness::{DiagnosticReadiness, Freshness, SourceBinding, ViewGeneration},
+    rust::RustProfile,
     wire::{WireLimits, WireSafety},
 };
 use crate::workspace::{authority::WorktreeRef, observation::SourceObservation};
@@ -22,12 +23,132 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::watch;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 /// Maximum accepted provider JSON message, validated before async-lsp deserialization.
 const MAX_BODY: usize = 8 * 1024 * 1024;
 /// Maximum provider header including its terminating CRLF pair.
 const MAX_HEADER: usize = 4096;
+
+/// Cumulative serialized client output accepted per session, including conservative envelope overhead.
+const MAX_SESSION_OUTBOUND_BYTES: usize = 8 * 1024 * 1024;
+/// Cumulative client messages accepted before retiring this session's unbounded async-lsp sender.
+const MAX_SESSION_OUTBOUND_MESSAGES: usize = 256;
+
+/// Closed provider configurations accepted by the production pipe client.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum ProviderSettings {
+    /// The accepted gopls null/default configuration; never represents a Rust profile.
+    GoplsDefaults,
+    /// Exact accepted Rust analyzer/toolchain/configuration identity retained through the session.
+    Rust(RustProfile),
+}
+impl ProviderSettings {
+    /// Returns the fixed initialize/configuration payload; no dynamic settings or model keys are accepted.
+    fn configuration(&self) -> serde_json::Value {
+        match self {
+            Self::GoplsDefaults => serde_json::Value::Null,
+            Self::Rust(_) => serde_json::json!({"cachePriming":{"enable":false}}),
+        }
+    }
+
+    /// Refuses a Rust identity under generic defaults and requires exact analyzer identity for Rust.
+    fn validate_server(&self, info: Option<&lsp::ServerInfo>) -> io::Result<()> {
+        let valid = match self {
+            Self::GoplsDefaults => info.is_none_or(|info| info.name == "gopls"),
+            Self::Rust(profile) => info.is_some_and(|info| {
+                info.name == "rust-analyzer"
+                    && info.version.as_deref() == Some(profile.initialize_version())
+            }),
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(context::invalid(
+                "provider identity does not match its accepted settings",
+            ))
+        }
+    }
+}
+
+/// Provider status is separate from document diagnostics: quiescence never proves a document clean.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderReadiness {
+    /// No exact accepted provider-specific status barrier is available.
+    Unknown,
+    /// This Rust transport reported both health=ok and quiescent=true.
+    RustHealthyQuiescent,
+}
+
+/// Exact rust-analyzer status notification accepted by the versioned profile.
+enum RustServerStatus {}
+impl lsp::notification::Notification for RustServerStatus {
+    /// Only the accepted health/quiescence fields participate in readiness.
+    type Params = RustStatus;
+    /// Exact versioned rust-analyzer notification name.
+    const METHOD: &'static str = "experimental/serverStatus";
+}
+
+/// Bounded status fields used for the Rust readiness barrier; optional provider messages are ignored.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct RustStatus {
+    /// Whether the analyzer reports successful workspace health.
+    health: RustHealth,
+    /// Whether current background workspace activity is quiescent.
+    quiescent: bool,
+}
+
+/// Closed health values defined by the accepted rust-analyzer status protocol.
+#[derive(serde::Deserialize, serde::Serialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum RustHealth {
+    /// Workspace health is reported as successful.
+    Ok,
+    /// Provider reports a warning; it cannot satisfy the ready barrier.
+    Warning,
+    /// Provider reports an error; it cannot satisfy the ready barrier.
+    Error,
+}
+
+/// Conservative cumulative admission before async-lsp's unbounded outbound channel.
+/// The allowance is deliberately never replenished; a new bounded session is needed after exhaustion.
+#[derive(Default)]
+struct OutboundBudget {
+    /// Total serialized parameter bytes plus conservative per-message envelope overhead.
+    bytes: usize,
+    /// Total enqueued client requests/notifications.
+    messages: usize,
+}
+impl OutboundBudget {
+    /// Checks the entire next payload before its value can enter the unbounded sender.
+    fn reserve(&mut self, method: &str, params: &impl serde::Serialize) -> io::Result<()> {
+        let bytes = serde_json::to_vec(params)
+            .map_err(io::Error::other)?
+            .len()
+            .saturating_add(method.len())
+            .saturating_add(256);
+        if self.messages >= MAX_SESSION_OUTBOUND_MESSAGES
+            || self.bytes.saturating_add(bytes) > MAX_SESSION_OUTBOUND_BYTES
+        {
+            return Err(io::Error::other("session outbound budget exhausted"));
+        }
+        self.messages += 1;
+        self.bytes += bytes;
+        Ok(())
+    }
+}
+
+/// Reserves client notification bytes before async-lsp may retain their serialized value.
+fn send_notification<N: lsp::notification::Notification>(
+    server: &ServerSocket,
+    budget: &mut OutboundBudget,
+    params: N::Params,
+) -> io::Result<()> {
+    budget.reserve(N::METHOD, &params)?;
+    server.notify::<N>(params).map_err(io::Error::other)
+}
 
 /// Finite deadlines for client requests and the complete borrowed-pipe session.
 #[derive(Clone, Copy, Debug)]
@@ -91,6 +212,14 @@ struct Document {
 struct State {
     /// Whether this transport generation can still accept new semantic work.
     active: bool,
+    /// Explicit terminal handshake fence; later context is rejected, not synchronized.
+    terminal: bool,
+    /// True only after shutdown response and queued exit; permits the provider's clean EOF.
+    shutdown_complete: bool,
+    /// Immutable callback configuration for this exact provider profile.
+    settings: ProviderSettings,
+    /// Current provider-specific status, independently observable by the initialize barrier.
+    readiness: watch::Sender<ProviderReadiness>,
     /// Current document; only one exact file is retained.
     document: Option<Document>,
     /// Last bounded push evidence, cleared on source changes and invalidation.
@@ -100,6 +229,11 @@ impl State {
     /// Retires this generation and removes diagnostic evidence that could otherwise appear usable.
     fn invalidate(&mut self) {
         self.active = false;
+        self.document = None;
+        self.diagnostics.source = None;
+        self.diagnostics.document_version = None;
+        self.diagnostics.truncated = false;
+        self.readiness.send_replace(ProviderReadiness::Unknown);
         self.diagnostics.freshness = Freshness::Unknown;
         self.diagnostics.readiness = DiagnosticReadiness::Unknown;
         self.diagnostics.diagnostics.clear();
@@ -120,6 +254,10 @@ pub struct Session {
     epoch: u64,
     /// Immutable backend/configuration/toolchain/view fences for this connection.
     generation: ViewGeneration,
+    /// Exact closed provider settings used for initialize, callbacks, and identity checks.
+    settings: ProviderSettings,
+    /// Hard cumulative admission before client messages reach async-lsp.
+    budget: OutboundBudget,
     /// Shared bounded diagnostic and liveness state.
     state: Arc<Mutex<State>>,
     /// Observed initialize response, present only after successful handshake.
@@ -144,6 +282,7 @@ pub async fn with_session<R, W, F, Fut, T>(
     worktree: WorktreeRef,
     epoch: u64,
     generation: ViewGeneration,
+    settings: ProviderSettings,
     options: SessionOptions,
     operation: F,
 ) -> io::Result<T>
@@ -165,6 +304,10 @@ where
     }
     let state = Arc::new(Mutex::new(State {
         active: true,
+        terminal: false,
+        shutdown_complete: false,
+        settings: settings.clone(),
+        readiness: watch::channel(ProviderReadiness::Unknown).0,
         document: None,
         diagnostics: DiagnosticSnapshot {
             source: None,
@@ -179,6 +322,8 @@ where
     let router_state = state.clone();
     let (mainloop, server) = MainLoop::new_client(|_| client_router(router_state));
     let stop = server.clone();
+    // async-lsp requires a sender to stay alive while graceful EOF is still being drained.
+    let _driver_keepalive = server.clone();
     let mut session = Session {
         server,
         worktree,
@@ -186,6 +331,8 @@ where
         generation,
         state: state.clone(),
         capabilities: None,
+        settings,
+        budget: OutboundBudget::default(),
         options,
         sequence: 0,
         version: 0,
@@ -201,20 +348,39 @@ where
         driver_state.lock().expect("session lock").invalidate();
         result
     };
+    let exchange_state = state.clone();
     let exchange = async move {
         let result = match session.initialize().await {
             Ok(()) => operation(session).await,
             Err(error) => Err(error),
         };
         // The operation owns Session; graceful shutdown is explicit, and all paths stop the driver.
-        let _ = stop.emit(Stop);
+        if !exchange_state
+            .lock()
+            .expect("session lock")
+            .shutdown_complete
+        {
+            let _ = stop.emit(Stop);
+        }
         result
     };
     let outcome =
         tokio::time::timeout(options.lifetime, async { tokio::join!(exchange, driver) }).await;
     state.lock().expect("session lock").invalidate();
     match outcome {
-        Ok((result, _driver)) => result,
+        Ok((result, driver)) => {
+            let value = result?;
+            match driver {
+                Ok(()) => Ok(value),
+                Err(async_lsp::Error::Eof)
+                    if state.lock().expect("session lock").shutdown_complete =>
+                {
+                    Ok(value)
+                }
+                Err(error) => Err(io::Error::other(error)),
+            }
+        }
+
         Err(_) => Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "LSP session lifetime expired",
@@ -233,7 +399,22 @@ impl Session {
                     uri: root,
                     name: "workspace".into(),
                 }]),
+                initialization_options: match &self.settings {
+                    ProviderSettings::GoplsDefaults => None,
+                    ProviderSettings::Rust(_) => Some(self.settings.configuration()),
+                },
                 capabilities: lsp::ClientCapabilities {
+                    workspace: Some(lsp::WorkspaceClientCapabilities {
+                        configuration: Some(true),
+                        workspace_folders: Some(true),
+                        ..Default::default()
+                    }),
+                    window: Some(lsp::WindowClientCapabilities {
+                        work_done_progress: Some(true),
+                        ..Default::default()
+                    }),
+                    experimental: matches!(&self.settings, ProviderSettings::Rust(_))
+                        .then(|| serde_json::json!({"serverStatusNotification":true})),
                     general: Some(lsp::GeneralClientCapabilities {
                         position_encodings: Some(vec![
                             lsp::PositionEncodingKind::UTF8,
@@ -247,6 +428,7 @@ impl Session {
                 ..Default::default()
             })
             .await?;
+        self.settings.validate_server(reply.server_info.as_ref())?;
         let encoding = reply
             .capabilities
             .position_encoding
@@ -258,9 +440,49 @@ impl Session {
             position_encoding: encoding,
             server_info: reply.server_info,
         });
-        self.server
-            .notify::<lsp::notification::Initialized>(lsp::InitializedParams {})
-            .map_err(io::Error::other)
+        send_notification::<lsp::notification::Initialized>(
+            &self.server,
+            &mut self.budget,
+            lsp::InitializedParams {},
+        )
+        .map_err(io::Error::other)?;
+        if matches!(&self.settings, ProviderSettings::Rust(_)) {
+            self.wait_for_readiness().await?;
+        }
+        Ok(())
+    }
+
+    /// Waits under the request deadline for exact Rust health/quiescence; transport loss cannot satisfy it.
+    async fn wait_for_readiness(&mut self) -> io::Result<()> {
+        let mut ready = self
+            .state
+            .lock()
+            .expect("session lock")
+            .readiness
+            .subscribe();
+        tokio::time::timeout(self.options.request_timeout, async {
+            loop {
+                if !self.state.lock().expect("session lock").active {
+                    return Err(io::Error::other("provider generation unavailable"));
+                }
+                if *ready.borrow_and_update() == ProviderReadiness::RustHealthyQuiescent {
+                    return Ok(());
+                }
+                ready.changed().await.map_err(io::Error::other)?;
+            }
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Rust readiness barrier timed out"))?
+    }
+
+    /// Returns the exact accepted profile settings retained by this connection.
+    pub fn settings(&self) -> &ProviderSettings {
+        &self.settings
+    }
+
+    /// Returns only the latest exact Rust status barrier; gopls and diagnostic cleanliness remain unknown.
+    pub fn provider_readiness(&self) -> ProviderReadiness {
+        *self.state.lock().expect("session lock").readiness.borrow()
     }
 
     /// Returns only capabilities observed during this connection's successful handshake.
@@ -282,6 +504,9 @@ impl Session {
         bytes: &[u8],
         query: ContextQuery,
     ) -> io::Result<ContextResult> {
+        if self.state.lock().expect("session lock").terminal {
+            return Err(io::Error::other("LSP session is shut down"));
+        }
         let mut result =
             context::lexical_context(observation, bytes, query, "semantic operations unavailable")?;
         if observation.worktree() != &self.worktree
@@ -303,6 +528,8 @@ impl Session {
         let version = match self.synchronize(observation, text) {
             Ok(version) => version,
             Err(error) => {
+                self.state.lock().expect("session lock").invalidate();
+                let _ = self.server.emit(Stop);
                 result.mode = ContextMode::Lexical {
                     reason: context::prefix(&error.to_string(), 256).into(),
                 };
@@ -428,13 +655,14 @@ impl Session {
         let mut state = self.state.lock().expect("session lock");
         if observation.bytes().is_none() {
             if let Some(document) = state.document.take() {
-                self.server
-                    .notify::<lsp::notification::DidCloseTextDocument>(
-                        lsp::DidCloseTextDocumentParams {
-                            text_document: lsp::TextDocumentIdentifier { uri: document.uri },
-                        },
-                    )
-                    .map_err(io::Error::other)?;
+                send_notification::<lsp::notification::DidCloseTextDocument>(
+                    &self.server,
+                    &mut self.budget,
+                    lsp::DidCloseTextDocumentParams {
+                        text_document: lsp::TextDocumentIdentifier { uri: document.uri },
+                    },
+                )
+                .map_err(io::Error::other)?;
             }
             self.sequence = observation.sequence();
             state.diagnostics.source = None;
@@ -457,36 +685,38 @@ impl Session {
         if let Some(document) = &state.document
             && document.uri != uri
         {
-            self.server
-                .notify::<lsp::notification::DidCloseTextDocument>(
-                    lsp::DidCloseTextDocumentParams {
-                        text_document: lsp::TextDocumentIdentifier {
-                            uri: document.uri.clone(),
-                        },
+            send_notification::<lsp::notification::DidCloseTextDocument>(
+                &self.server,
+                &mut self.budget,
+                lsp::DidCloseTextDocumentParams {
+                    text_document: lsp::TextDocumentIdentifier {
+                        uri: document.uri.clone(),
                     },
-                )
-                .map_err(io::Error::other)?;
+                },
+            )
+            .map_err(io::Error::other)?;
         }
         if state
             .document
             .as_ref()
             .is_some_and(|document| document.uri == uri)
         {
-            self.server
-                .notify::<lsp::notification::DidChangeTextDocument>(
-                    lsp::DidChangeTextDocumentParams {
-                        text_document: lsp::VersionedTextDocumentIdentifier {
-                            uri: uri.clone(),
-                            version,
-                        },
-                        content_changes: vec![lsp::TextDocumentContentChangeEvent {
-                            range: None,
-                            range_length: None,
-                            text: text.into(),
-                        }],
+            send_notification::<lsp::notification::DidChangeTextDocument>(
+                &self.server,
+                &mut self.budget,
+                lsp::DidChangeTextDocumentParams {
+                    text_document: lsp::VersionedTextDocumentIdentifier {
+                        uri: uri.clone(),
+                        version,
                     },
-                )
-                .map_err(io::Error::other)?;
+                    content_changes: vec![lsp::TextDocumentContentChangeEvent {
+                        range: None,
+                        range_length: None,
+                        text: text.into(),
+                    }],
+                },
+            )
+            .map_err(io::Error::other)?;
         } else {
             let language_id = match observation
                 .path()
@@ -497,16 +727,19 @@ impl Session {
                 Some("rs") => "rust",
                 _ => "plaintext",
             };
-            self.server
-                .notify::<lsp::notification::DidOpenTextDocument>(lsp::DidOpenTextDocumentParams {
+            send_notification::<lsp::notification::DidOpenTextDocument>(
+                &self.server,
+                &mut self.budget,
+                lsp::DidOpenTextDocumentParams {
                     text_document: lsp::TextDocumentItem {
                         uri: uri.clone(),
                         language_id: language_id.into(),
                         version,
                         text: text.into(),
                     },
-                })
-                .map_err(io::Error::other)?;
+                },
+            )
+            .map_err(io::Error::other)?;
         }
         self.sequence = observation.sequence();
         self.version = version;
@@ -532,6 +765,11 @@ impl Session {
         if !self.state.lock().expect("session lock").active {
             return Err(io::Error::other("provider generation unavailable"));
         }
+        if let Err(error) = self.budget.reserve(R::METHOD, &params) {
+            self.state.lock().expect("session lock").invalidate();
+            let _ = self.server.emit(Stop);
+            return Err(error);
+        }
         let mut guard = RequestGuard {
             state: self.state.clone(),
             server: self.server.clone(),
@@ -554,12 +792,34 @@ impl Session {
         }
     }
 
-    /// Completes the read-only LSP shutdown/exit handshake; caller still owns child reaping.
+    /// Fences new context immediately, then completes bounded shutdown/exit; caller still owns reap.
     pub async fn shutdown(&mut self) -> io::Result<()> {
-        self.request::<request::Shutdown>(()).await?;
-        self.server
-            .notify::<lsp::notification::Exit>(())
-            .map_err(io::Error::other)
+        {
+            let mut state = self.state.lock().expect("session lock");
+            if !state.active || state.terminal {
+                return Err(io::Error::other("LSP session is not active"));
+            }
+            state.terminal = true;
+            state.invalidate();
+        }
+        let mut guard = RequestGuard {
+            state: self.state.clone(),
+            server: self.server.clone(),
+            completed: false,
+        };
+        self.budget
+            .reserve(<request::Shutdown as request::Request>::METHOD, &())?;
+        tokio::time::timeout(
+            self.options.request_timeout,
+            self.server.request::<request::Shutdown>(()),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "LSP shutdown timed out"))?
+        .map_err(io::Error::other)?;
+        send_notification::<lsp::notification::Exit>(&self.server, &mut self.budget, ())?;
+        self.state.lock().expect("session lock").shutdown_complete = true;
+        guard.completed = true;
+        Ok(())
     }
 }
 
@@ -592,14 +852,17 @@ fn client_router(state: Arc<Mutex<State>>) -> Router<Arc<Mutex<State>>> {
             failed_change: None,
         })
     });
-    router.request::<request::WorkspaceConfiguration, _>(|_, params| async move {
-        if params.items.len() > MAX_CONTEXT_ITEMS {
-            return Err(async_lsp::ResponseError::new(
-                async_lsp::ErrorCode::INVALID_PARAMS,
-                "configuration item limit exceeded",
-            ));
+    router.request::<request::WorkspaceConfiguration, _>(|state, params| {
+        let settings = state.lock().expect("session lock").settings.configuration();
+        async move {
+            if params.items.len() > MAX_CONTEXT_ITEMS {
+                return Err(async_lsp::ResponseError::new(
+                    async_lsp::ErrorCode::INVALID_PARAMS,
+                    "configuration item limit exceeded",
+                ));
+            }
+            Ok(vec![settings; params.items.len()])
         }
-        Ok(vec![serde_json::Value::Null; params.items.len()])
     });
     router.request::<request::WorkDoneProgressCreate, _>(|_, _| async { Ok(()) });
     router.request::<request::ShowMessageRequest, _>(|_, _| async { Ok(None) });
@@ -628,6 +891,19 @@ fn client_router(state: Arc<Mutex<State>>) -> Router<Arc<Mutex<State>>> {
             .into_iter()
             .take(MAX_CONTEXT_ITEMS)
             .collect();
+        ControlFlow::Continue(())
+    });
+    router.notification::<RustServerStatus>(|state, status| {
+        let state = state.lock().expect("session lock");
+        if state.active && matches!(&state.settings, ProviderSettings::Rust(_)) {
+            state
+                .readiness
+                .send_replace(if status.health == RustHealth::Ok && status.quiescent {
+                    ProviderReadiness::RustHealthyQuiescent
+                } else {
+                    ProviderReadiness::Unknown
+                });
+        }
         ControlFlow::Continue(())
     });
     router.unhandled_notification(|_, _| ControlFlow::Continue(()));

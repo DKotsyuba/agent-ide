@@ -114,7 +114,7 @@ async fn run_child(
     request: &ValidatedExecutionRequest,
     codex: &Path,
     label: &str,
-) -> execution::ReapedProcess {
+) -> execution::CapturedProcessEvidence {
     let mut admission = AdmissionController::new(AdmissionLimits {
         total_running: 1,
         per_owner_running: 1,
@@ -129,12 +129,17 @@ async fn run_child(
     };
     let result = OwnedChild::spawn_captured(request, lease, None, codex, 8192)
         .unwrap()
-        .reap(Duration::from_secs(10))
+        .reap(Duration::from_secs(60), Duration::from_secs(10))
         .await
         .unwrap();
-    assert!(result.stdout.complete && result.stderr.complete);
-    assert!(admission.release(result.lease).unwrap().is_empty());
-    result
+    assert!(result.evidence.stdout().complete && result.evidence.stderr().complete);
+    assert!(
+        admission
+            .release_reaped(result.settlement)
+            .unwrap()
+            .is_empty()
+    );
+    result.evidence
 }
 
 /// Proves the captured profile permits its fixture, refuses an approved outside target and `.git`, and reaps children.
@@ -169,9 +174,9 @@ async fn captured_managed_profile_enforces_fixture_boundaries() {
     )
     .await;
     assert!(
-        allowed_result.status.success(),
+        allowed_result.status().success(),
         "allowed stderr: {:?}",
-        allowed_result.stderr.bytes
+        allowed_result.stderr().bytes
     );
     assert!(allowed.is_file(), "allowed fixture write did not occur");
     fs::remove_file(&allowed).unwrap();
@@ -188,9 +193,9 @@ async fn captured_managed_profile_enforces_fixture_boundaries() {
             fs::remove_file(&target).unwrap();
         }
         assert!(
-            !result.status.success() && !unexpectedly_written,
+            !result.status().success() && !unexpectedly_written,
             "{label} write escaped the captured profile; stderr: {:?}",
-            result.stderr.bytes
+            result.stderr().bytes
         );
     }
 
@@ -219,7 +224,7 @@ async fn captured_managed_profile_enforces_fixture_boundaries() {
     )
     .await;
     assert!(
-        !network_result.status.success(),
+        !network_result.status().success(),
         "network-restricted profile connected to the controlled listener"
     );
 }
@@ -254,9 +259,9 @@ async fn managed_profile_accepts_semantic_json_reserialization() {
     )
     .await;
     assert!(
-        result.status.success(),
+        result.status().success(),
         "reserialized stderr: {:?}",
-        result.stderr.bytes
+        result.stderr().bytes
     );
     assert!(
         allowed.is_file(),
@@ -327,19 +332,26 @@ async fn managed_profile_runs_fixed_git_discovery() {
         outcome => panic!("unexpected discovery admission: {outcome:?}"),
     };
     let result = discovery
-        .run(
+        .spawn(
             lease,
             guard.consume_active(invocation.binding_ref()).unwrap(),
             Path::new(&required("AGENT_IDE_D03_CODEX")),
         )
+        .unwrap()
+        .reap(Duration::from_secs(10), Duration::from_secs(10))
         .await
         .unwrap();
     assert!(
-        result.exit_status.success(),
+        result.evidence.exit_status().success(),
         "git stderr: {:?}",
-        result.stderr.bytes
+        result.evidence.stderr().bytes
     );
-    assert!(!result.stdout.bytes.is_empty());
-    assert!(result.stdout.complete && result.stderr.complete);
-    assert!(admission.release(result.lease).unwrap().is_empty());
+    assert!(!result.evidence.stdout().bytes.is_empty());
+    assert!(result.evidence.stdout().complete && result.evidence.stderr().complete);
+    assert!(
+        admission
+            .release_reaped(result.settlement)
+            .unwrap()
+            .is_empty()
+    );
 }

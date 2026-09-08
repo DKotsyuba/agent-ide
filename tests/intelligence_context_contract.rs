@@ -14,7 +14,7 @@ use agent_ide::{
     intelligence::{
         context::{ContextMode, ContextQuery},
         freshness::{DiagnosticReadiness, Freshness, ViewGeneration},
-        session::{SessionOptions, with_session},
+        session::{ProviderSettings, SessionOptions, with_session},
     },
     workspace::{
         authority::WorktreeRef,
@@ -207,6 +207,7 @@ async fn real_gopls_production_context_tracks_exact_observed_bytes() {
             toolchain: 1,
             view: 1,
         },
+        ProviderSettings::GoplsDefaults,
         SessionOptions {
             request_timeout: Duration::from_secs(30),
             lifetime: Duration::from_secs(90),
@@ -303,17 +304,17 @@ async fn real_gopls_production_context_tracks_exact_observed_bytes() {
         },
     )
     .await;
-    let (status, stderr, reaped) =
-        tokio::time::timeout(Duration::from_secs(30), child.reap(Duration::from_secs(2)))
-            .await
-            .unwrap()
-            .unwrap();
+    let reaped = tokio::time::timeout(Duration::from_secs(30), child.reap(Duration::from_secs(2)))
+        .await
+        .unwrap()
+        .unwrap();
     assert!(
-        status.success(),
-        "gopls failed: {status}; {}",
-        String::from_utf8_lossy(&stderr.bytes)
+        reaped.status.success(),
+        "gopls failed: {}; {}",
+        reaped.status,
+        String::from_utf8_lossy(&reaped.stderr.bytes)
     );
-    admission.release(reaped).unwrap();
+    admission.release_reaped(reaped.proof).unwrap();
     assert_eq!(admission.running_count(), 0);
     result.unwrap();
     assert_eq!(

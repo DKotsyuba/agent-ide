@@ -478,7 +478,7 @@ fn provider_leases_share_only_compatible_owned_backends() {
         ProviderLeaseAdmission::Granted(view) => view,
         result => panic!("unexpected shared view: {result:?}"),
     };
-    assert!(registry.take_spawn_lease(first).is_ok());
+    let no_child = registry.take_spawn_lease(first).unwrap().cancel();
     assert!(matches!(
         registry.take_spawn_lease(first),
         Err(execution::ProviderLeaseError::SpawnUnavailable)
@@ -489,13 +489,17 @@ fn provider_leases_share_only_compatible_owned_backends() {
     ));
     assert_eq!(registry.counts(), (1, 2));
     assert!(matches!(
-        registry.release(&mut admission, first).unwrap().0,
+        registry.release(first).unwrap(),
         execution::BackendRelease::SharedPeerSurvives
     ));
     assert!(matches!(
-        registry.release(&mut admission, second).unwrap().0,
-        execution::BackendRelease::ReapOwned { .. }
+        registry.release(second).unwrap(),
+        execution::BackendRelease::ReapOwned(_)
     ));
+    assert_eq!(registry.counts(), (1, 0));
+    registry
+        .settle_never_started(&mut admission, no_child)
+        .unwrap();
     assert_eq!(registry.counts(), (0, 0));
     let exclusive = match registry.request(
         &mut admission,
@@ -519,7 +523,9 @@ fn provider_leases_share_only_compatible_owned_backends() {
         ProviderLeaseAdmission::Queued(ticket) => ticket,
         result => panic!("unexpected queued view: {result:?}"),
     };
-    let (_, _, promotions) = registry.release(&mut admission, exclusive).unwrap();
+    let promotions = registry
+        .cancel_unstarted(&mut admission, exclusive)
+        .unwrap();
     let promotion = promotions.into_iter().next().unwrap();
     assert_eq!(promotion.ticket(), ticket);
     assert!(
@@ -633,8 +639,8 @@ fn queued_provider_ticket_promotes_once_with_its_matching_lease() {
         Err(execution::ProviderLeaseError::InvalidPromotion)
     ));
     assert!(matches!(
-        registry.release(&mut admission, view),
-        Ok((execution::BackendRelease::ReapOwned { .. }, _, _))
+        registry.release(view),
+        Ok(execution::BackendRelease::ReapOwned(_))
     ));
 }
 
@@ -713,7 +719,7 @@ fn authority_revocation_returns_logical_drain_not_reap_claim() {
     let revoked = workspace
         .revoke(&stamp, StopBindingHandoff::Confirmed)
         .unwrap();
-    let receipt = leases.revoke_authority(&mut admission, &revoked);
+    let receipt = leases.revoke_authority(&revoked);
     assert_eq!(receipt.drained_views, 1);
     assert_eq!(
         receipt.backend_releases,
@@ -721,7 +727,7 @@ fn authority_revocation_returns_logical_drain_not_reap_claim() {
     );
     assert!(!receipt.reap_uncertain);
     assert!(matches!(
-        leases.release(&mut admission, first),
+        leases.release(first),
         Err(execution::ProviderLeaseError::UnknownView)
     ));
     assert_eq!(leases.counts(), (1, 1));
@@ -753,17 +759,22 @@ async fn captured_streams_are_bounded_but_drained() {
         3,
     )
     .unwrap()
-    .reap(Duration::from_secs(1))
+    .reap(Duration::from_secs(1), Duration::from_secs(1))
     .await
     .unwrap();
-    assert!(result.status.success());
-    assert_eq!(result.stdout.bytes, b"abc");
-    assert_eq!(result.stderr.bytes, b"123");
-    assert_eq!(result.stdout.drained_bytes, 6);
-    assert_eq!(result.stderr.drained_bytes, 6);
-    assert!(result.stdout.truncated && result.stderr.truncated);
-    assert!(result.stdout.complete && result.stderr.complete);
-    assert!(admission.release(result.lease).unwrap().is_empty());
+    assert!(result.evidence.status().success());
+    assert_eq!(result.evidence.stdout().bytes, b"abc");
+    assert_eq!(result.evidence.stderr().bytes, b"123");
+    assert_eq!(result.evidence.stdout().drained_bytes, 6);
+    assert_eq!(result.evidence.stderr().drained_bytes, 6);
+    assert!(result.evidence.stdout().truncated && result.evidence.stderr().truncated);
+    assert!(result.evidence.stdout().complete && result.evidence.stderr().complete);
+    assert!(
+        admission
+            .release_reaped(result.settlement)
+            .unwrap()
+            .is_empty()
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -796,12 +807,17 @@ async fn cancellation_reports_reap_without_claiming_descendants() {
     .cancel_and_reap(Duration::from_millis(100), Duration::from_secs(1))
     .await
     .unwrap();
-    assert!(result.cancellation.unwrap().term_requested);
+    assert!(result.evidence.cancellation().unwrap().term_requested);
     assert_eq!(
-        result.descendants,
+        result.evidence.descendants(),
         execution::DescendantEvidence::Unverified
     );
-    assert!(admission.release(result.lease).unwrap().is_empty());
+    assert!(
+        admission
+            .release_reaped(result.settlement)
+            .unwrap()
+            .is_empty()
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -842,14 +858,20 @@ async fn protocol_stdout_has_one_owner_and_borrowed_endpoints_cannot_be_killed()
     .unwrap();
     let mut protocol = String::new();
     child.stdout.read_to_string(&mut protocol).await.unwrap();
-    let (status, stderr, _released) = child.reap(Duration::from_secs(1)).await.unwrap();
+    let reaped = child.reap(Duration::from_secs(1)).await.unwrap();
+    let status = reaped.status;
+    let stderr = &reaped.stderr;
     assert!(status.success());
     assert_eq!(protocol, "protocol");
     assert_eq!(stderr.bytes, b"diagnostic");
-    assert!(matches!(
-        registry.release(&mut admission, view),
-        Ok((execution::BackendRelease::ReapOwned { .. }, Some(_), _))
-    ));
+    let execution::BackendRelease::ReapOwned(capability) = registry.release(view).unwrap() else {
+        panic!("owned reap capability")
+    };
+
+    assert_eq!(admission.running_count(), 1);
+    registry
+        .complete_reap(&mut admission, capability, reaped.proof)
+        .unwrap();
     assert_eq!(
         BorrowedEndpoint::observe("peer:42").unwrap().cancel(),
         EndpointOwnership::Borrowed
@@ -943,7 +965,8 @@ async fn dropping_owned_children_and_reap_futures_kills_without_freeing_uncertai
             match mode {
                 0 => drop(child),
                 1 => {
-                    let mut future = Box::pin(child.reap(Duration::from_secs(1)));
+                    let mut future =
+                        Box::pin(child.reap(Duration::from_secs(1), Duration::from_secs(1)));
                     assert!(
                         future
                             .as_mut()

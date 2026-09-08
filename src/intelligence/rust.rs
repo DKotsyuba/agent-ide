@@ -11,12 +11,14 @@ use std::{
     time::Duration,
 };
 
+use crate::assistance::host_binding::ActiveBindingUse;
 use crate::{
     execution::{
-        AdmissionClass, AdmissionController, AdmissionError, AdmissionPromotion, BackendRelease,
-        CapturedOutput, CommandKind, ControlledCommand, OwnedProtocolChild, OwnerId, ProcessError,
-        ProviderLeaseAdmission, ProviderLeaseError, ProviderLeaseRegistry, ProviderViewLease,
-        QueueTicket, ValidatedExecutionRequest, WorkspaceAuthority,
+        AdmissionClass, AdmissionController, AdmissionError, AdmissionPromotion,
+        BackendReapCapability, BackendRelease, CommandKind, ControlledCommand, OwnedProtocolChild,
+        OwnerId, ProcessError, ProviderLeaseAdmission, ProviderLeaseError, ProviderLeaseRegistry,
+        ProviderViewLease, QueueTicket, ReapedProtocolProcess, ValidatedExecutionRequest,
+        WorkspaceAuthority,
     },
     workspace::authority::WorktreeRef,
 };
@@ -126,9 +128,23 @@ impl RustProfile {
         &self.binary
     }
 
+    /// Returns the exact initialize server version expected from the observed analyzer CLI identity.
+    pub fn initialize_version(&self) -> &str {
+        self.rust_analyzer_version
+            .strip_prefix("rust-analyzer ")
+            .unwrap_or(&self.rust_analyzer_version)
+    }
+
+    /// Returns the immutable accepted Rust configuration identity.
+    pub fn configuration(&self) -> &str {
+        &self.configuration
+    }
+
     /// Returns whether every fixed compatibility input is present and the executable path is absolute.
     fn valid(&self) -> bool {
         self.binary.is_absolute()
+            && self.configuration == "cache-priming-disabled-v1"
+            && self.transport == "stdio-v1"
             && [
                 &self.rust_analyzer_version,
                 &self.cargo_version,
@@ -140,7 +156,7 @@ impl RustProfile {
                 &self.cache_namespace,
             ]
             .iter()
-            .all(|value| !value.is_empty())
+            .all(|value| !value.is_empty() && value.len() <= 4096)
     }
 }
 
@@ -266,15 +282,6 @@ pub enum RustAvailability {
     Unavailable,
 }
 
-/// Returns the direct-child reap decision and exact queued promotions after one view release.
-#[derive(Debug)]
-pub struct RustRelease {
-    /// Execution's ownership consequence; only `ReapOwned` may be reaped by the caller.
-    pub backend: BackendRelease,
-    /// Exact central promotions that can be consumed once through `promote`.
-    pub promotions: Vec<AdmissionPromotion>,
-}
-
 /// Holds per-view sequence state; one instance owns no shared Rust document buffers or caches.
 #[derive(Debug, Default)]
 pub struct RustViews {
@@ -367,24 +374,25 @@ impl RustViews {
         )
     }
 
-    /// Releases one logical exclusive view and returns only Execution's own reap decision.
+    /// Detaches the exclusive Rust view and returns its one concrete draining capability.
     pub fn release(
         &mut self,
         registry: &mut ProviderLeaseRegistry,
-        admission: &mut AdmissionController,
         lease: ProviderViewLease,
-    ) -> Result<RustRelease, RustProfileError> {
+    ) -> Result<BackendReapCapability, RustProfileError> {
         self.views
             .get(&lease)
             .ok_or(RustProfileError::UnknownView)?;
-        let release = registry
-            .release(admission, lease)
-            .map_err(RustProfileError::Execution)?;
+        let BackendRelease::ReapOwned(capability) = registry
+            .release(lease)
+            .map_err(RustProfileError::Execution)?
+        else {
+            return Err(RustProfileError::Execution(
+                ProviderLeaseError::InvalidBackend,
+            ));
+        };
         self.views.remove(&lease);
-        Ok(RustRelease {
-            backend: release.0,
-            promotions: release.2,
-        })
+        Ok(capability)
     }
 
     /// Marks one view unavailable after its owned protocol pipes hit EOF or a protocol failure.
@@ -420,25 +428,33 @@ pub struct RustProtocolChild {
 }
 
 impl RustProtocolChild {
-    /// Spawns one Rust protocol child through the validated Execution request and its exact lease.
+    /// Spawns one Rust protocol child through its exact lease and a newly consumed host-binding use.
+    /// Host-bound requests reject missing/mismatched uses; this wrapper never retains liveness.
     pub fn spawn(
         request: &ValidatedExecutionRequest,
         worktree: &RustWorktree,
         registry: &mut ProviderLeaseRegistry,
         view: ProviderViewLease,
+        active_use: Option<ActiveBindingUse>,
         codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, RustProfileError> {
-        if request.authority() != worktree.authority() {
-            return Err(RustProfileError::RequestAuthorityMismatch);
-        }
         let capability = registry
             .take_spawn_lease(view)
             .map_err(RustProfileError::Execution)?;
+        if request.authority() != worktree.authority() {
+            return Err(RustProfileError::Process(ProcessError::NeverStarted {
+                cause: Box::new(ProcessError::Request(
+                    crate::execution::RequestError::WorktreeDenied,
+                )),
+                settlement: capability.cancel(),
+            }));
+        }
+
         OwnedProtocolChild::spawn_from_provider_lease(
             request,
             capability,
-            None,
+            active_use,
             codex_executable,
             output_cap,
         )
@@ -456,13 +472,45 @@ impl RustProtocolChild {
         &mut self.child.stdout
     }
 
-    /// Drops the owned pipes, reaps the direct child, and returns Execution's capped stderr evidence.
-    /// `output_deadline` bounds stderr draining after exit, not the child's exit wait.
-    pub async fn reap(self, output_deadline: Duration) -> Result<CapturedOutput, RustProfileError> {
+    /// Borrows the sole protocol reader/writer together for the production Session driver.
+    pub fn pipes(
+        &mut self,
+    ) -> (
+        &mut tokio::process::ChildStdout,
+        &mut tokio::process::ChildStdin,
+    ) {
+        (&mut self.child.stdout, &mut self.child.stdin)
+    }
+
+    /// Reaps the direct child and stderr under a bounded deadline without dropping accounting proof.
+    pub async fn reap(self, deadline: Duration) -> Result<ReapedProtocolProcess, RustProfileError> {
         self.child
-            .reap(output_deadline)
+            .reap(deadline)
             .await
-            .map(|(_, stderr, _)| stderr)
+            .map_err(RustProfileError::Process)
+    }
+
+    /// Retains this owned protocol handle across a bounded cancellation attempt for supervisor handoff.
+    pub async fn cancel_bounded(
+        &mut self,
+        grace: Duration,
+        deadline: Duration,
+    ) -> Result<std::process::ExitStatus, RustProfileError> {
+        self.child
+            .cancel_bounded(grace, deadline)
+            .await
+            .map_err(RustProfileError::Process)
+    }
+
+    /// Cancels only this Execution-owned Rust process and returns its one-time direct-child reap proof.
+    pub async fn cancel_and_reap(
+        self,
+        grace: Duration,
+        deadline: Duration,
+    ) -> Result<ReapedProtocolProcess, RustProfileError> {
+        self.child
+            .cancel_and_reap(grace, deadline)
+            .await
             .map_err(RustProfileError::Process)
     }
 }

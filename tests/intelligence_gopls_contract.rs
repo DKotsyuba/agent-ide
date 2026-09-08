@@ -1,5 +1,9 @@
 //! Real acceptance coverage for the bounded shared Unix `gopls` profile.
 
+#[path = "support/provider.rs"]
+#[allow(dead_code)]
+mod provider;
+
 use std::{
     collections::BTreeSet,
     env, fs, io,
@@ -12,10 +16,10 @@ use std::{
 use agent_ide::{
     execution::{
         Admission, AdmissionClass, AdmissionController, AdmissionLease, AdmissionLimits,
-        ExecutionProfileCatalog, ExecutionProfileTemplate, HostSandboxState, LocalExecutionPolicy,
-        OwnedChild, OwnedProtocolChild, OwnerId, ProviderBackendKind, ProviderLeaseAdmission,
-        ProviderLeaseError, ProviderLeaseLimits, ProviderLeaseRegistry, ProviderViewLease,
-        ValidatedExecutionRequest, ValidatedHostInvocation, WorkspaceAuthority,
+        DirectChildReap, ExecutionProfileCatalog, ExecutionProfileTemplate, HostSandboxState,
+        LocalExecutionPolicy, OwnedChild, OwnedProtocolChild, OwnerId, ProviderBackendKind,
+        ProviderLeaseAdmission, ProviderLeaseError, ProviderLeaseLimits, ProviderLeaseRegistry,
+        ProviderViewLease, ValidatedExecutionRequest, ValidatedHostInvocation, WorkspaceAuthority,
     },
     intelligence::gopls::{GoplsProfile, SharedGopls, WorktreeRef},
 };
@@ -43,7 +47,13 @@ struct Fixture {
 impl Fixture {
     /// Creates two divergent Go worktrees with duplicate package and symbol names.
     fn create() -> io::Result<Self> {
-        let root = env::temp_dir().join(format!("agent-ide-gopls-contract-{}", std::process::id()));
+        /// Distinguishes concurrently running real provider fixtures within one test process.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let root = env::temp_dir().join(format!(
+            "agent-ide-gopls-contract-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         fs::create_dir(&root)?;
         for (name, return_type, value) in [("left", "int", "7"), ("right", "string", "\"seven\"")] {
             let worktree = root.join(name);
@@ -163,7 +173,7 @@ struct SessionResult {
     /// Semantic hover after the left forwarder has completed provider-supported detachment.
     post_detach_hover: Option<String>,
     /// Execution admission lease released only after this forwarder was reaped.
-    admission: AdmissionLease,
+    proof: Option<DirectChildReap>,
     /// Whether gopls reported its documented terminal remote-disconnect exit after LSP exit.
     terminal_remote_disconnect: bool,
 }
@@ -209,7 +219,7 @@ async fn run_session(
     begin_semantic: Arc<Barrier>,
     detached: Arc<Notify>,
     detach_after_initial_hover: bool,
-    reaped_sender: Option<oneshot::Sender<AdmissionLease>>,
+    reaped_sender: Option<oneshot::Sender<DirectChildReap>>,
 ) -> Result<SessionResult, Box<dyn std::error::Error>> {
     let (mainloop, mut server) = MainLoop::new_client(|_| client_router());
     let root_uri =
@@ -265,9 +275,11 @@ async fn run_session(
         (&mut child.stdin).compat_write(),
     );
     let (exchange, loop_result) = tokio::join!(exchange, loop_run);
-    let (status, stderr, admission) = tokio::time::timeout(DEADLINE, child.reap(DEADLINE))
+    let reaped = tokio::time::timeout(DEADLINE, child.reap(DEADLINE))
         .await?
         .map_err(execution_error)?;
+    let status = reaped.status;
+    let stderr = &reaped.stderr;
     let (initial_hover, post_detach_hover) = exchange?;
     let terminal_remote_disconnect = status.code() == Some(2)
         && String::from_utf8_lossy(&stderr.bytes)
@@ -283,15 +295,18 @@ async fn run_session(
         Ok(()) | Err(async_lsp::Error::Eof) => {}
         Err(error) => return Err(error.into()),
     }
-    if let Some(sender) = reaped_sender {
+    let proof = if let Some(sender) = reaped_sender {
         sender
-            .send(admission)
+            .send(reaped.proof)
             .map_err(|_| io::Error::other("left-session coordinator stopped"))?;
-    }
+        None
+    } else {
+        Some(reaped.proof)
+    };
     Ok(SessionResult {
         initial_hover,
         post_detach_hover,
-        admission,
+        proof,
         terminal_remote_disconnect,
     })
 }
@@ -318,23 +333,35 @@ async fn remote_sessions(
         4096,
     )
     .map_err(execution_error)?;
-    let reaped = tokio::time::timeout(DEADLINE, child.reap(DEADLINE))
+    let reaped = tokio::time::timeout(DEADLINE, child.reap(DEADLINE, DEADLINE))
         .await?
         .map_err(execution_error)?;
-    admission.release(reaped.lease).map_err(execution_error)?;
-    if !reaped.status.success() {
+    admission
+        .release_reaped(reaped.settlement)
+        .map_err(execution_error)?;
+    if !reaped.evidence.status().success() {
         return Err(io::Error::other(format!(
             "gopls remote sessions failed: {}; stderr: {}",
-            reaped.status,
-            String::from_utf8_lossy(&reaped.stderr.bytes)
+            reaped.evidence.status(),
+            String::from_utf8_lossy(&reaped.evidence.stderr().bytes)
         ))
         .into());
     }
-    String::from_utf8(reaped.stdout.bytes)
+    String::from_utf8(reaped.evidence.stdout().bytes.clone())
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error).into())
 }
 
 /// Converts typed Execution failures into bounded test-context I/O errors.
+/// Extracts the owned last-view capability without duplicating its settlement rights.
+fn reap_capability(
+    release: agent_ide::execution::BackendRelease,
+) -> agent_ide::execution::BackendReapCapability {
+    let agent_ide::execution::BackendRelease::ReapOwned(capability) = release else {
+        panic!("owned reap capability")
+    };
+    capability
+}
+
 fn execution_error(error: impl std::fmt::Debug) -> io::Error {
     io::Error::other(format!(
         "Execution rejected gopls test operation: {error:?}"
@@ -420,19 +447,25 @@ async fn gopls_spawns_require_exact_registry_authority() {
             &profile,
             &wrong,
             registry.take_spawn_lease(view).unwrap(),
+            None,
             Path::new("/unused"),
             64,
         )
         .err()
         .expect("listener authority mismatch must fail");
+        let agent_ide::execution::ProcessError::NeverStarted { cause, settlement } = error else {
+            panic!("missing no-child proof")
+        };
         assert!(
-            matches!(error, agent_ide::execution::ProcessError::Io(error) if error.kind() == io::ErrorKind::PermissionDenied)
+            matches!(*cause,agent_ide::execution::ProcessError::Io(error) if error.kind()==io::ErrorKind::PermissionDenied)
         );
         assert!(matches!(
             registry.take_spawn_lease(view),
             Err(ProviderLeaseError::SpawnUnavailable)
         ));
-        registry.release(&mut admission, view).unwrap();
+        registry
+            .settle_never_started(&mut admission, settlement)
+            .unwrap();
         assert_eq!(admission.running_count(), 0);
     }
     let listener_view = provider_view(&mut registry, &mut admission, &profile, &current);
@@ -445,6 +478,7 @@ async fn gopls_spawns_require_exact_registry_authority() {
         &profile,
         &listener_request,
         registry.take_spawn_lease(listener_view).unwrap(),
+        None,
         Path::new("/unused"),
         64,
     )
@@ -495,29 +529,46 @@ async fn gopls_spawns_require_exact_registry_authority() {
             ),
             Err(ProviderLeaseError::SpawnUnavailable)
         ));
-        other_registry.release(&mut admission, other_view).unwrap();
+        other_registry
+            .cancel_unstarted(&mut admission, other_view)
+            .unwrap();
         let error = shared
             .open_view(
                 worktree.clone(),
                 1,
                 &wrong,
                 capability,
+                None,
                 Path::new("/unused"),
                 64,
             )
             .err()
             .expect("forwarder authority mismatch must fail");
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let agent_ide::execution::ProcessError::NeverStarted { cause, settlement } = error else {
+            panic!("missing forwarder no-child proof")
+        };
+        assert!(
+            matches!(*cause,agent_ide::execution::ProcessError::Io(error) if error.kind()==io::ErrorKind::PermissionDenied)
+        );
+        registry
+            .settle_never_started(&mut admission, settlement)
+            .unwrap();
         assert_eq!(shared.process_counts(), (1, 0, 0));
-        registry.release(&mut admission, view).unwrap();
-        admission.release(process).unwrap();
+        registry.release(view).unwrap();
+        assert!(admission.release(process).is_err());
     }
     let listener_process = shared
         .stop(Duration::from_millis(10), DEADLINE)
         .await
         .unwrap();
-    let released = registry.release(&mut admission, listener_view).unwrap();
-    assert_eq!(released.1, Some(listener_process));
+    let released = registry.release(listener_view).unwrap();
+    registry
+        .complete_reap(
+            &mut admission,
+            reap_capability(released),
+            listener_process.settlement,
+        )
+        .unwrap();
     assert_eq!(registry.counts(), (0, 0));
     assert_eq!(registry.forwarder_count(), 0);
     assert_eq!(admission.running_count(), 0);
@@ -546,7 +597,12 @@ async fn shared_gopls_isolates_divergent_worktrees_and_detaches_one_view() {
     let listener_command = profile
         .listener_command(&left_authority, &socket)
         .expect("listener command is declared");
-    let listener_request = request(left_authority.clone(), listener_command.clone(), &gopls);
+    let mut listener_bound = provider::BoundRequest::new(
+        "real-gopls-listener",
+        left_authority.clone(),
+        listener_command.clone(),
+        &gopls,
+    );
     let listener_debug = format!("{listener_command:?}");
     assert!(listener_debug.contains("-listen=unix;"));
     assert!(listener_debug.contains("-listen.timeout=0"));
@@ -565,10 +621,12 @@ async fn shared_gopls_isolates_divergent_worktrees_and_detaches_one_view() {
     .unwrap();
     let left_registry_view =
         provider_view(&mut registry, &mut admission, &profile, &left_authority);
+    let listener_active = listener_bound.fresh();
     let mut shared = SharedGopls::start(
         &profile,
-        &listener_request,
+        &listener_bound.request,
         registry.take_spawn_lease(left_registry_view).unwrap(),
+        Some(listener_active),
         Path::new("/unused"),
         4096,
     )
@@ -577,19 +635,31 @@ async fn shared_gopls_isolates_divergent_worktrees_and_detaches_one_view() {
         registry.take_spawn_lease(left_registry_view),
         Err(ProviderLeaseError::SpawnUnavailable)
     ));
-    tokio::time::timeout(DEADLINE, async {
+    let ready = tokio::time::timeout(DEADLINE, async {
         while !socket.exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .expect("listener creates owned Unix socket");
-    let left_request = request(
+    .await;
+    if ready.is_err() {
+        let terminal = shared
+            .stop(Duration::from_millis(100), Duration::from_secs(2))
+            .await
+            .unwrap();
+        let cap = reap_capability(registry.release(left_registry_view).unwrap());
+        registry
+            .complete_reap(&mut admission, cap, terminal.settlement)
+            .unwrap();
+        panic!("listener did not bind: {:?}", terminal.evidence);
+    }
+    let mut left_bound = provider::BoundRequest::new(
+        "real-gopls-left",
         left_authority.clone(),
         profile.forwarder_command(&left_authority, &socket).unwrap(),
         &gopls,
     );
-    let right_request = request(
+    let mut right_bound = provider::BoundRequest::new(
+        "real-gopls-right",
         right_authority.clone(),
         profile
             .forwarder_command(&right_authority, &socket)
@@ -607,7 +677,7 @@ async fn shared_gopls_isolates_divergent_worktrees_and_detaches_one_view() {
         .take_forwarder_spawn_lease(
             &mut admission,
             left_registry_view,
-            &left_request,
+            &left_bound.request,
             left_process,
         )
         .unwrap();
@@ -615,7 +685,7 @@ async fn shared_gopls_isolates_divergent_worktrees_and_detaches_one_view() {
         registry.take_forwarder_spawn_lease(
             &mut admission,
             left_registry_view,
-            &left_request,
+            &left_bound.request,
             left_process
         ),
         Err(ProviderLeaseError::SpawnUnavailable)
@@ -624,7 +694,7 @@ async fn shared_gopls_isolates_divergent_worktrees_and_detaches_one_view() {
         registry.take_forwarder_spawn_lease(
             &mut admission,
             right_registry_view,
-            &right_request,
+            &right_bound.request,
             left_process
         ),
         Err(ProviderLeaseError::SpawnUnavailable)
@@ -634,26 +704,30 @@ async fn shared_gopls_isolates_divergent_worktrees_and_detaches_one_view() {
         .take_forwarder_spawn_lease(
             &mut admission,
             right_registry_view,
-            &right_request,
+            &right_bound.request,
             right_process,
         )
         .unwrap();
+    let left_active = left_bound.fresh();
     let left_view = shared
         .open_view(
             left.clone(),
             1,
-            &left_request,
+            &left_bound.request,
             left_capability,
+            Some(left_active),
             Path::new("/unused"),
             4096,
         )
         .unwrap();
+    let right_active = right_bound.fresh();
     let right_view = shared
         .open_view(
             right.clone(),
             1,
-            &right_request,
+            &right_bound.request,
             right_capability,
+            Some(right_active),
             Path::new("/unused"),
             4096,
         )
@@ -723,12 +797,13 @@ async fn shared_gopls_isolates_divergent_worktrees_and_detaches_one_view() {
             shared.release_view(&left, left_lease)?;
             assert!(matches!(
                 registry
-                    .release(&mut admission, left_registry_view)
-                    .map_err(execution_error)?
-                    .0,
+                    .release(left_registry_view)
+                    .map_err(execution_error)?,
                 agent_ide::execution::BackendRelease::SharedPeerSurvives
             ));
-            admission.release(left_admission).map_err(execution_error)?;
+            registry
+                .complete_forwarder_reap(&mut admission, left_admission)
+                .map_err(execution_error)?;
             assert_eq!(shared.process_counts(), (1, 1, 2));
             assert_eq!(registry.counts(), (1, 1));
             assert_eq!(registry.forwarder_count(), 1);
@@ -769,19 +844,93 @@ async fn shared_gopls_isolates_divergent_worktrees_and_detaches_one_view() {
     );
     assert!(right_session.terminal_remote_disconnect);
     shared.release_view(&right, right_lease).unwrap();
-    admission.release(right_session.admission).unwrap();
+    registry
+        .complete_forwarder_reap(&mut admission, right_session.proof.unwrap())
+        .unwrap();
     let listener_admission = shared
         .stop(Duration::from_millis(100), DEADLINE)
         .await
         .unwrap();
-    let released = registry
-        .release(&mut admission, right_registry_view)
+    let released = registry.release(right_registry_view).unwrap();
+    registry
+        .complete_reap(
+            &mut admission,
+            reap_capability(released),
+            listener_admission.settlement,
+        )
         .unwrap();
-    assert_eq!(released.1, Some(listener_admission));
     assert_eq!(registry.counts(), (0, 0));
     assert_eq!(registry.forwarder_count(), 0);
     assert_eq!(admission.running_count(), 0);
     println!(
         "one listener, two initialized sessions, remote sessions=2, divergent int/string results, released left view, right post-detach string result, terminal remote disconnects=2; forwarders=2"
     );
+}
+
+/// Abnormal owner drop kills a real live gopls listener while keeping unproven admission uncertain.
+#[tokio::test]
+async fn dropping_live_gopls_owner_closes_its_owned_listener() {
+    let fixture = Fixture::create().unwrap();
+    let gopls = PathBuf::from(env::var("AGENT_IDE_GOPLS").unwrap());
+    let root = fixture.worktree("left");
+    let (_, authority) = worktree(&root, 1);
+    let socket = fixture.root.join("drop.sock");
+    let profile = GoplsProfile::new(
+        gopls.clone(),
+        "v0.23.0".into(),
+        "v0.1".into(),
+        "default".into(),
+        env::var("AGENT_IDE_GO").unwrap(),
+        "disabled-contract".into(),
+        fixture.root.join("cache").display().to_string(),
+    )
+    .unwrap();
+    let mut admission = AdmissionController::new(AdmissionLimits {
+        total_running: 1,
+        per_owner_running: 1,
+        per_owner_queued: 1,
+        total_queued: 1,
+        interactive_burst: 1,
+    })
+    .unwrap();
+    let mut registry = ProviderLeaseRegistry::new(ProviderLeaseLimits {
+        total_views: 1,
+        per_backend_views: 1,
+    })
+    .unwrap();
+    let view = provider_view(&mut registry, &mut admission, &profile, &authority);
+    let mut bound = provider::BoundRequest::new(
+        "gopls-drop",
+        authority.clone(),
+        profile.listener_command(&authority, &socket).unwrap(),
+        &gopls,
+    );
+    let active = bound.fresh();
+    let shared = SharedGopls::start(
+        &profile,
+        &bound.request,
+        registry.take_spawn_lease(view).unwrap(),
+        Some(active),
+        Path::new("/unused"),
+        4096,
+    )
+    .unwrap();
+    tokio::time::timeout(DEADLINE, async {
+        while tokio::net::UnixStream::connect(&socket).await.is_err() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(shared);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while tokio::net::UnixStream::connect(&socket).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("dropped owned gopls still listens");
+    let _pending = reap_capability(registry.release(view).unwrap());
+
+    assert_eq!(admission.running_count(), 1);
 }
