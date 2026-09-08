@@ -145,12 +145,11 @@ fn compose_ready_keeps_mode_exact_and_separates_untracked_and_conflicts() {
     assert_eq!(result.untracked().len(), 1);
     assert_eq!(result.conflicts().len(), 1);
     assert_eq!(result.selected_hunks().len(), 1);
-    assert_eq!(
+    assert!(
         result
             .ignored()
             .iter()
-            .all(|p| p.kind() == StatusKind::Ignored),
-        true
+            .all(|p| p.kind() == StatusKind::Ignored)
     );
     assert_mode_counts(&result, 1, 1);
 }
