@@ -150,6 +150,10 @@ pub struct GitScope {
 pub enum GitReadQuery {
     /// Collects NUL-delimited porcelain-v2 status, including separately reported untracked paths.
     Status,
+    /// Verifies the current `HEAD`; a nonzero exit explicitly reports an unborn head.
+    HeadIdentity,
+    /// Collects the complete NUL-delimited index state without writing a tree object.
+    IndexState,
     /// Collects the raw `HEAD` comparison bytes for the current worktree.
     HeadDiff,
     /// Collects the raw staged/index comparison bytes.
@@ -180,8 +184,10 @@ impl GitReadIntent {
             return Err(GitError::InvalidGitProgram);
         }
         let mode = match query {
-            GitReadQuery::Status | GitReadQuery::HeadDiff => DiffMode::Head,
-            GitReadQuery::StagedDiff => DiffMode::Staged,
+            GitReadQuery::Status | GitReadQuery::HeadIdentity | GitReadQuery::HeadDiff => {
+                DiffMode::Head
+            }
+            GitReadQuery::IndexState | GitReadQuery::StagedDiff => DiffMode::Staged,
             GitReadQuery::UnstagedDiff => DiffMode::Unstaged,
         };
         Ok(Self {
@@ -435,6 +441,62 @@ pub enum GitError {
     InvalidTerminalPath,
     /// A NUL-delimited porcelain record was incomplete or had an unsupported fixed header shape.
     InvalidPorcelain,
+    /// Required identity evidence was truncated, failed, missing, or scoped to another worktree.
+    IncompleteIdentity,
+    /// `HEAD` could not be verified because the repository has no first commit yet.
+    UnbornHead,
+}
+
+/// Builds an exact comparison from fixed, complete read-only Git evidence.
+pub fn comparison_from_evidence(
+    mode: DiffMode,
+    head: &RawGitEvidence,
+    index: &RawGitEvidence,
+    working: &RawGitEvidence,
+    baseline: BaselineContext,
+) -> Result<GitComparison, GitError> {
+    if !same_scope(head, index)
+        || !same_scope(head, working)
+        || head.is_truncated()
+        || index.is_truncated()
+        || working.is_truncated()
+    {
+        return Err(GitError::IncompleteIdentity);
+    }
+    if head.exit_code() != Some(0) {
+        return Err(if head.exit_code() == Some(1) {
+            GitError::UnbornHead
+        } else {
+            GitError::IncompleteIdentity
+        });
+    }
+    if index.exit_code() != Some(0) || working.exit_code() != Some(0) || head.stdout().is_empty() {
+        return Err(GitError::IncompleteIdentity);
+    }
+    let head_identity = evidence_identity(b"workspace-git-head-v1", head.stdout());
+    let index_identity = evidence_identity(b"workspace-git-index-v1", index.stdout());
+    let working_identity = evidence_identity(b"workspace-git-working-v1", working.stdout());
+    let (left, right) = match mode {
+        DiffMode::Head => (head_identity, working_identity),
+        DiffMode::Staged => (head_identity, index_identity),
+        DiffMode::Unstaged => (index_identity, working_identity),
+    };
+    Ok(GitComparison::new(mode, left, right, baseline))
+}
+
+/// Returns a domain-separated bounded identity for exact complete controlled-Git bytes.
+fn evidence_identity(domain: &[u8], bytes: &[u8]) -> GitIdentity {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(domain);
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+    GitIdentity(hasher.finalize().as_bytes().to_vec())
+}
+
+/// Requires all evidence to refer to the same live worktree incarnation and authority generation.
+fn same_scope(left: &RawGitEvidence, right: &RawGitEvidence) -> bool {
+    left.scope.worktree == right.scope.worktree
+        && left.scope.authority_epoch == right.scope.authority_epoch
 }
 
 /// Parses one terminal-LF Git discovery result without splitting newline bytes inside the path.
@@ -554,6 +616,18 @@ fn read_args(query: GitReadQuery) -> Vec<OsString> {
             OsString::from("-z"),
             OsString::from("--untracked-files=all"),
         ]),
+        GitReadQuery::HeadIdentity => args.extend([
+            OsString::from("rev-parse"),
+            OsString::from("--verify"),
+            OsString::from("HEAD"),
+            OsString::from("--"),
+        ]),
+        GitReadQuery::IndexState => args.extend([
+            OsString::from("ls-files"),
+            OsString::from("--stage"),
+            OsString::from("-z"),
+            OsString::from("--"),
+        ]),
         GitReadQuery::HeadDiff => args.extend(diff_args([OsString::from("HEAD")])),
         GitReadQuery::StagedDiff => {
             args.extend(diff_args([OsString::from("--cached")]));
@@ -569,10 +643,12 @@ fn diff_args<const N: usize>(mode: [OsString; N]) -> Vec<OsString> {
         OsString::from("diff"),
         OsString::from("--no-ext-diff"),
         OsString::from("--no-textconv"),
-        OsString::from("--raw"),
-        OsString::from("-z"),
+        OsString::from("--full-index"),
+        OsString::from("--patch"),
+        OsString::from("--no-color"),
     ];
     args.extend(mode);
+    args.push(OsString::from("--"));
     args
 }
 
@@ -601,5 +677,9 @@ mod tests {
         let diff = read_args(GitReadQuery::UnstagedDiff);
         assert!(diff.contains(&OsString::from("--no-ext-diff")));
         assert!(diff.contains(&OsString::from("--no-textconv")));
+        assert!(diff.contains(&OsString::from("--patch")));
+        assert!(diff.contains(&OsString::from("--full-index")));
+        assert_eq!(diff.last(), Some(&OsString::from("--")));
+        assert!(!diff.contains(&OsString::from("--raw")));
     }
 }
