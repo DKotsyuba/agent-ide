@@ -323,6 +323,15 @@ impl GitReadIntent {
 }
 
 impl GitScope {
+    /// Reconstructs immutable stored capture scope without creating an authority stamp.
+    pub(super) fn from_historical(worktree: WorktreeRef, authority_epoch: u64) -> Self {
+        Self {
+            worktree,
+            authority_epoch,
+            mode: DiffMode::Head,
+        }
+    }
+
     /// Copies only scope data from a current Workspace authority for peer-facing raw Git evidence.
     pub fn from_authority(authority: &AuthorityStamp, mode: DiffMode) -> Self {
         Self {

@@ -13,6 +13,7 @@ use crate::{
 };
 use rusqlite::{OptionalExtension, params, types::Value};
 use std::{
+    collections::BTreeMap,
     fs::{self, File},
     io::Read,
     os::{
@@ -20,6 +21,7 @@ use std::{
         unix::{ffi::OsStrExt, fs::MetadataExt},
     },
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 /// Immutable Workspace migration for canonical identity and durable admission receipts.
@@ -32,6 +34,18 @@ CREATE UNIQUE INDEX workspace_one_worktree_owner ON workspace_starts(incarnation
 CREATE UNIQUE INDEX workspace_one_actor_worktree ON workspace_starts(actor) WHERE active=1;
 CREATE TABLE workspace_stops (operation TEXT PRIMARY KEY, digest BLOB NOT NULL, outcome TEXT NOT NULL);
 CREATE TABLE workspace_baselines (operation TEXT PRIMARY KEY, digest BLOB NOT NULL, incarnation INTEGER NOT NULL REFERENCES workspace_worktrees(incarnation), epoch INTEGER NOT NULL, boot INTEGER NOT NULL, payload BLOB NOT NULL, coverage TEXT NOT NULL, capture_window TEXT NOT NULL);
+";
+
+/// Adds opaque lifecycle nonces and explicit closure without changing the admitted v1 migration.
+const IDENTITY_SQL: &str = "
+ALTER TABLE workspace_worktrees ADD COLUMN nonce BLOB;
+ALTER TABLE workspace_worktrees ADD COLUMN root_object BLOB;
+ALTER TABLE workspace_worktrees ADD COLUMN root_identity BLOB;
+ALTER TABLE workspace_worktrees ADD COLUMN closed INTEGER NOT NULL DEFAULT 0 CHECK(closed IN (0,1));
+CREATE TABLE workspace_closures (operation TEXT PRIMARY KEY, digest BLOB NOT NULL, incarnation INTEGER NOT NULL, outcome TEXT NOT NULL);
+UPDATE workspace_worktrees SET closed=1 WHERE nonce IS NULL;
+CREATE UNIQUE INDEX workspace_open_root ON workspace_worktrees(root) WHERE closed=0;
+CREATE UNIQUE INDEX workspace_open_object ON workspace_worktrees(root_object) WHERE closed=0;
 ";
 
 /// Explains an unavailable native identity, failed durable admission, or conflicting stable operation.
@@ -99,15 +113,39 @@ impl StartReceipt {
     }
 }
 
+/// Immutable explicit lifecycle-close outcome; it is neither a stop handoff nor new authority.
+#[derive(Debug, Eq, PartialEq)]
+pub struct VerifiedWorktreeClosure {
+    /// Exact stable operation that committed closure.
+    operation: OperationId,
+    /// Retired durable lifecycle generation.
+    incarnation: u64,
+}
+impl VerifiedWorktreeClosure {
+    /// Returns the historical close operation for reconciliation.
+    pub fn operation(&self) -> &OperationId {
+        &self.operation
+    }
+    /// Returns the closed incarnation without granting access to a reopened directory.
+    pub const fn incarnation(&self) -> u64 {
+        self.incarnation
+    }
+}
+
+/// Boot-owned native handles indexed by incarnation with the matching database nonce.
+type HeldIdentities = BTreeMap<u64, ([u8; 32], NativeIdentity)>;
+
 /// Sole product admission owner for one Application Store boot; clones share the same boot fence.
 /// Opening another owner deliberately fences prior claims. Product wiring must hold one owner,
 /// use canonical resolution before start, and call authority/authorize for every scoped admission.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct DurableWorkspace<'a> {
     /// Application-owned SQLite connection and bounded submission mechanics.
     store: &'a Store,
     /// Durable boot generation minted during this owner's initialization.
     boot: u64,
+    /// Keeps admitted native objects open across calls so live inode reuse cannot alias a grant.
+    identities: Arc<Mutex<HeldIdentities>>,
 }
 
 impl<'a> DurableWorkspace<'a> {
@@ -136,10 +174,28 @@ impl<'a> DurableWorkspace<'a> {
         ) {
             return Err(DurableError::Migration(admission));
         }
-        let mut nonce = [0; 32];
-        File::open("/dev/urandom")
-            .and_then(|mut file| file.read_exact(&mut nonce))
-            .map_err(|error| StoreError::Infrastructure(error.to_string()))?;
+        let sql = TrustedUpSql::new(IDENTITY_SQL)?;
+        let domain = DomainName::new("workspace")?;
+        let key = MigrationKey::new("creation_identity_v2")?;
+        let migration = DomainMigration {
+            domain: domain.clone(),
+            key: key.clone(),
+            expected_digest: MigrationDigest::from_sql(&sql),
+            up_sql: sql,
+        };
+        let admission = match store.admit_migration(migration).await? {
+            MigrationAdmission::OutcomeUnknown { .. } => {
+                store.migration_admission(domain, key).await?
+            }
+            value => value,
+        };
+        if !matches!(
+            admission,
+            MigrationAdmission::Applied { .. } | MigrationAdmission::AlreadyApplied { .. }
+        ) {
+            return Err(DurableError::Migration(admission));
+        }
+        let nonce = random_nonce()?;
         let operation = operation("boot", &nonce)?;
         let boot = store
             .execute(operation, |tx| {
@@ -164,12 +220,13 @@ impl<'a> DurableWorkspace<'a> {
         Ok(Self {
             store,
             boot: unsigned(boot)?,
+            identities: Arc::default(),
         })
     }
 
-    /// Resolves real directories without following symlinks and mints or reuses their stored incarnation.
-    /// Caller-supplied incarnation values are never accepted. Moves require explicit later reconciliation;
-    /// same-path recreation with changed native identity receives a new SQLite-allocated incarnation.
+    /// Resolves creation-aware native objects, retaining owned descriptors for this owner's lifetime.
+    /// Changed creation-aware objects replace inactive records; active grants must first be revoked.
+    /// Legacy rows without creation identity/nonces fail closed and cannot revive an old grant.
     pub async fn resolve_worktree(
         &self,
         root: PathBuf,
@@ -177,37 +234,118 @@ impl<'a> DurableWorkspace<'a> {
         common_dir: PathBuf,
     ) -> Result<WorktreeRef, DurableError> {
         let native = NativeIdentity::read(&root, &repository, &common_dir)?;
-        let physical = native.physical;
+        let root_object = native.physical;
+        let root_identity = native.root_identity;
         let key = native.key;
         let root = native.root.as_os_str().as_bytes().to_vec();
         let repository = native.repository.as_os_str().as_bytes().to_vec();
         let common = native.common.as_os_str().as_bytes().to_vec();
+        let nonce = random_nonce()?;
+        let physical = fingerprint(&[b"incarnation", &root_object, &nonce]);
         let boot = signed(self.boot)?;
-        let op = operation("identity", &key)?;
+        let op = operation("identity", &nonce)?;
+        let verify_paths = (
+            native.root.clone(),
+            native.repository.clone(),
+            native.common.clone(),
+        );
         let result = self.store.execute(op.clone(), move |tx| {
-            if current_boot(tx)? != boot { return Ok(None); }
-            tx.execute("INSERT OR IGNORE INTO workspace_worktrees(physical_key,native_key,root,repository,common_dir) VALUES (?1,?2,?3,?4,?5)", params![physical.as_slice(),key.as_slice(),root,repository,common])?;
-            tx.query_row("SELECT incarnation,native_key FROM workspace_worktrees WHERE physical_key=?1", [physical.as_slice()], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,Vec<u8>>(1)?))).optional()
+            if current_boot(tx)? != boot || NativeIdentity::read(&verify_paths.0, &verify_paths.1, &verify_paths.2).map(|current| current.key) != Ok(key) { return Ok(None); }
+            let existing = tx.query_row("SELECT incarnation,native_key,nonce,root FROM workspace_worktrees WHERE closed=0 AND (root=?1 OR root_object=?2)", params![root,root_object.as_slice()], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,Vec<u8>>(1)?,row.get::<_,Option<Vec<u8>>>(2)?,row.get::<_,Vec<u8>>(3)?))).optional()?;
+            if let Some((incarnation, previous_key, previous_nonce, previous_root)) = existing {
+                if previous_root != root { return Ok(None); }
+                if previous_key == key { return Ok(Some((incarnation, previous_key, previous_nonce))); }
+                let active: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_starts WHERE incarnation=?1 AND active=1)", [incarnation], |row| row.get(0))?;
+                if active { return Ok(None); }
+                tx.execute("UPDATE workspace_worktrees SET closed=1 WHERE incarnation=?1", [incarnation])?;
+            }
+
+            tx.execute("INSERT INTO workspace_worktrees(physical_key,native_key,root,repository,common_dir,nonce,root_object,root_identity) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)", params![physical.as_slice(),key.as_slice(),root,repository,common,nonce.as_slice(),root_object.as_slice(),root_identity.as_slice()])?;
+            Ok(Some((tx.last_insert_rowid(), key.to_vec(), Some(nonce.to_vec()))))
         }).await;
         let row = match result {
             Ok(row) => row,
             Err(error) => {
                 self.require_committed(&op, error).await?;
-                self.store.read_one("SELECT incarnation,native_key FROM workspace_worktrees WHERE physical_key=?1", vec![Value::Blob(physical.to_vec())], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,Vec<u8>>(1)?))).await?
+                self.store.read_one("SELECT incarnation,native_key,nonce FROM workspace_worktrees WHERE native_key=?1 AND closed=0", vec![Value::Blob(key.to_vec())], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,Vec<u8>>(1)?,row.get::<_,Option<Vec<u8>>>(2)?))).await?
             }
-        }.ok_or(AuthorityError::StaleAuthority)?;
+        }.ok_or(DurableError::IdentityUnavailable)?;
+        let nonce: [u8; 32] = row
+            .2
+            .ok_or(DurableError::IdentityUnavailable)?
+            .try_into()
+            .map_err(|_| DurableError::CorruptState)?;
         if row.1 != key {
             return Err(DurableError::IdentityUnavailable);
         }
+        let incarnation = unsigned(row.0)?;
         let mut tree = WorktreeRef::from_discovery(
-            native.root,
-            native.repository,
-            native.common,
-            unsigned(row.0)?,
+            native.root.clone(),
+            native.repository.clone(),
+            native.common.clone(),
+            incarnation,
         )?;
         tree.native_key = Some(key);
         tree.native_root_identity = Some(native.root_identity);
+        tree.set_durable_nonce(nonce);
+        self.identities
+            .lock()
+            .map_err(|_| DurableError::CorruptState)?
+            .insert(incarnation, (nonce, native));
         Ok(tree)
+    }
+
+    /// Commits explicit lifecycle closure only for an exact verified directory with no active grant.
+    /// This is separate from actor stop; no product stop ingress invokes it. A later resolution of
+    /// even the same native directory mints a fresh nonce/incarnation. Exact retries recover the receipt.
+    pub async fn close_worktree(
+        &self,
+        id: OperationId,
+        tree: &WorktreeRef,
+    ) -> Result<VerifiedWorktreeClosure, DurableError> {
+        let key = tree.native_key.ok_or(DurableError::IdentityUnavailable)?;
+        let nonce = tree
+            .durable_nonce
+            .ok_or(DurableError::IdentityUnavailable)?;
+        let digest = fingerprint(&[id.as_str().as_bytes(), tree.id().as_bytes(), &key, &nonce]);
+        let op = operation("close", id.as_str().as_bytes())?;
+        let incarnation = signed(tree.incarnation())?;
+        let boot = signed(self.boot)?;
+        let closure_tree = tree.clone();
+        let sql_id = id.as_str().to_owned();
+        let result = self.store.execute(op.clone(), move |tx| {
+            let outcome = if current_boot(tx)? != boot { "stale" }
+            else if NativeIdentity::read(closure_tree.worktree_path(),closure_tree.repository_root(),closure_tree.git_common_dir()).map(|native|native.key) != Ok(key) { "identity" }
+            else if tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_starts WHERE incarnation=?1 AND active=1)", [incarnation], |row|row.get::<_,bool>(0))? { "worktree_owned" }
+            else if tx.execute("UPDATE workspace_worktrees SET closed=1 WHERE incarnation=?1 AND native_key=?2 AND nonce=?3 AND closed=0",params![incarnation,key.as_slice(),nonce.as_slice()])? == 1 { "closed" }
+            else { "identity" };
+            tx.execute("INSERT INTO workspace_closures(operation,digest,incarnation,outcome) VALUES (?1,?2,?3,?4)",params![sql_id,digest.as_slice(),incarnation,outcome])?;
+            Ok((digest.to_vec(),outcome.to_owned()))
+        }).await;
+        let (stored_digest, outcome) = match result {
+            Ok(row) => row,
+            Err(error) => {
+                self.require_committed(&op, error).await?;
+                self.store
+                    .read_one(
+                        "SELECT digest,outcome FROM workspace_closures WHERE operation=?1",
+                        vec![Value::Text(id.as_str().to_owned())],
+                        |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .await?
+                    .ok_or(DurableError::CorruptState)?
+            }
+        };
+        if stored_digest != digest {
+            return Err(DurableError::OperationConflict);
+        }
+        if outcome != "closed" {
+            return Err(rejection(&outcome));
+        }
+        Ok(VerifiedWorktreeClosure {
+            operation: id,
+            incarnation: tree.incarnation(),
+        })
     }
 
     /// Commits one exact host-bound start or returns its original immutable receipt on an exact retry.
@@ -234,9 +372,13 @@ impl<'a> DurableWorkspace<'a> {
             .worktree
             .native_key
             .ok_or(DurableError::IdentityUnavailable)?;
+        let nonce = request
+            .worktree
+            .durable_nonce
+            .ok_or(DurableError::IdentityUnavailable)?;
         let result = self.store.execute(op.clone(), move |tx| {
             let outcome = if current_boot(tx)? != boot { "stale" }
-                else if !tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_worktrees WHERE incarnation=?1 AND native_key=?2)", params![incarnation,native_key.as_slice()], |row| row.get::<_,bool>(0))? { "identity" }
+                else if !tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_worktrees WHERE incarnation=?1 AND native_key=?2 AND nonce=?3 AND closed=0)", params![incarnation,native_key.as_slice(),nonce.as_slice()], |row| row.get::<_,bool>(0))? { "identity" }
                 else if tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_starts WHERE binding=?1 AND outcome='granted' AND (boot<>?2 OR active=0))", params![binding.as_slice(),boot], |row| row.get::<_,bool>(0))? { "binding" }
                 else if tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_starts WHERE incarnation=?1 AND active=1)", [incarnation], |row| row.get::<_,bool>(0))? { "worktree_owned" }
                 else if tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_starts WHERE actor=?1 AND active=1)", [&sql_actor], |row| row.get::<_,bool>(0))? { "actor_owned" }
@@ -407,7 +549,18 @@ impl<'a> DurableWorkspace<'a> {
             tree.repository_root(),
             tree.git_common_dir(),
         )?;
-        if tree.native_key == Some(native.key) {
+        let held = self
+            .identities
+            .lock()
+            .map_err(|_| DurableError::CorruptState)?;
+        if tree.durable_nonce.is_some()
+            && tree.native_key == Some(native.key)
+            && held
+                .get(&tree.incarnation())
+                .is_some_and(|(nonce, identity)| {
+                    Some(*nonce) == tree.durable_nonce && identity.key == native.key
+                })
+        {
             Ok(())
         } else {
             Err(DurableError::IdentityUnavailable)
@@ -438,13 +591,15 @@ impl<'a> DurableWorkspace<'a> {
 struct NativeIdentity {
     /// Canonical worktree root with every symlink component refused.
     root: PathBuf,
+    /// Owned root, repository, and common-directory handles prevent live inode reuse.
+    _directories: [File; 3],
     /// Creation-aware identity of the same opened root used for the durable native key.
     root_identity: [u8; 32],
     /// Canonical discovered repository root.
     repository: PathBuf,
     /// Canonical Git common directory.
     common: PathBuf,
-    /// Stable root device/inode key independent of caller-supplied incarnation or Git path guesses.
+    /// Device/inode index used only to reject live-root path aliases; never sufficient for lifecycle reuse.
     physical: [u8; 32],
     /// Fingerprint of root, repository, common-directory native identities and canonical paths.
     key: [u8; 32],
@@ -452,17 +607,18 @@ struct NativeIdentity {
 impl NativeIdentity {
     /// Reads exactly the three discovered directories; no repository scan or process is launched.
     fn read(root: &Path, repository: &Path, common: &Path) -> Result<Self, DurableError> {
-        let (root, root_id, root_identity) = real_directory_with_root_identity(root)?;
-        let (repository, repo_id) = real_directory(repository)?;
-        let (common, common_id) = real_directory(&if common.is_absolute() {
-            common.to_path_buf()
-        } else {
-            root.join(common)
-        })?;
+        let (root, root_id, root_identity, root_handle) = real_directory_with_root_identity(root)?;
+        let (repository, _, repo_id, repo_handle) = real_directory_with_root_identity(repository)?;
+        let (common, _, common_id, common_handle) =
+            real_directory_with_root_identity(&if common.is_absolute() {
+                common.to_path_buf()
+            } else {
+                root.join(common)
+            })?;
         let physical = fingerprint(&[b"physical-root", &root_id]);
         let key = fingerprint(&[
             b"native-worktree",
-            &physical,
+            &root_identity,
             &repo_id,
             &common_id,
             root.as_os_str().as_bytes(),
@@ -472,6 +628,7 @@ impl NativeIdentity {
         Ok(Self {
             root,
             root_identity,
+            _directories: [root_handle, repo_handle, common_handle],
             repository,
             common,
             physical,
@@ -483,14 +640,14 @@ impl NativeIdentity {
 /// Walks native directories through owned descriptors, refusing symlinks without a check/open race.
 /// Returns a canonical path only when it still names the opened final device/inode.
 pub(super) fn real_directory(path: &Path) -> Result<(PathBuf, [u8; 16]), DurableError> {
-    let (path, native, _) = real_directory_with_root_identity(path)?;
+    let (path, native, _, _) = real_directory_with_root_identity(path)?;
     Ok((path, native))
 }
 
 /// Resolves a directory while retaining creation-aware identity from that exact opened descriptor.
 fn real_directory_with_root_identity(
     path: &Path,
-) -> Result<(PathBuf, [u8; 16], [u8; 32]), DurableError> {
+) -> Result<(PathBuf, [u8; 16], [u8; 32], File), DurableError> {
     if !path.is_absolute() {
         return Err(DurableError::IdentityUnavailable);
     }
@@ -518,7 +675,16 @@ fn real_directory_with_root_identity(
     let mut native = [0; 16];
     native[..8].copy_from_slice(&metadata.dev().to_le_bytes());
     native[8..].copy_from_slice(&metadata.ino().to_le_bytes());
-    Ok((canonical, native, root_identity))
+    Ok((canonical, native, root_identity, directory))
+}
+
+/// Reads an opaque OS random incarnation/operation nonce; randomness never substitutes for native identity.
+fn random_nonce() -> Result<[u8; 32], DurableError> {
+    let mut nonce = [0; 32];
+    File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut nonce))
+        .map_err(|_| DurableError::IdentityUnavailable)?;
+    Ok(nonce)
 }
 
 /// Returns the durable singleton boot inside the same admission transaction.
@@ -578,6 +744,15 @@ pub const MAX_BASELINE_PATHS: usize = 128;
 /// Maximum framed Git/source payload stored for one baseline, including raw metadata.
 pub const MAX_BASELINE_BYTES: usize = 4 * 1024 * 1024;
 
+/// Native boundaries exposed only to the private deterministic capture harness.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CaptureCheckpoint {
+    /// The original grant is authorized but the source root has not yet been opened.
+    BeforeSourceRead,
+    /// All source bytes are read but no baseline transaction has been submitted.
+    BeforeCommit,
+}
+
 impl DurableWorkspace<'_> {
     /// Captures bounded Git evidence and explicitly registered native source bytes under current authority.
     /// The stored window is always Unverified/Partial: separate Git evidence and native reads are not
@@ -591,11 +766,26 @@ impl DurableWorkspace<'_> {
         git: Vec<super::git::RawGitEvidence>,
         paths: Vec<PathBuf>,
     ) -> Result<super::git::BaselineContext, DurableError> {
+        self.capture_baseline_inner(id, expected, active, git, paths, |_| {})
+            .await
+    }
+
+    /// Captures with deterministic boundary callbacks used by native root replacement regression tests.
+    #[allow(clippy::too_many_arguments)]
+    async fn capture_baseline_inner(
+        &self,
+        id: OperationId,
+        expected: &AuthorityStamp,
+        active: &ActiveBindingUse,
+        git: Vec<super::git::RawGitEvidence>,
+        paths: Vec<PathBuf>,
+        mut checkpoint: impl FnMut(CaptureCheckpoint),
+    ) -> Result<super::git::BaselineContext, DurableError> {
         use super::{
             git::{BaselineContext, DiffMode, GitScope},
             observation::{SourceReadLimits, read_authorized_source, valid_relative_path},
         };
-        self.authorize(expected, active).await?;
+
         if git.is_empty()
             || git.len() > 6
             || paths.len() > MAX_BASELINE_PATHS
@@ -632,7 +822,10 @@ impl DurableWorkspace<'_> {
         let digest = fingerprint(&[
             expected.worktree.id().as_bytes(),
             &expected.epoch.to_le_bytes(),
-            &self.boot.to_le_bytes(),
+            &expected
+                .owner_boot
+                .ok_or(DurableError::IdentityUnavailable)?
+                .to_le_bytes(),
             &payload,
         ]);
         let old = self.baseline_row(id.as_str()).await?;
@@ -647,6 +840,8 @@ impl DurableWorkspace<'_> {
             )
             .map_err(|_| DurableError::CorruptState);
         }
+        self.authorize(expected, active).await?;
+        checkpoint(CaptureCheckpoint::BeforeSourceRead);
         for path in paths {
             let available = MAX_BASELINE_BYTES
                 .saturating_sub(payload.len())
@@ -670,6 +865,10 @@ impl DurableWorkspace<'_> {
                         super::observation::ObservationError::TooLarge => b"too_large",
                         super::observation::ObservationError::SymlinkEscape => b"symlink",
                         super::observation::ObservationError::NotRegularFile => b"not_regular",
+                        super::observation::ObservationError::RootIdentityChanged
+                        | super::observation::ObservationError::RootUnavailable => {
+                            return Err(DurableError::IdentityUnavailable);
+                        }
                         _ => b"unavailable",
                     };
                     frame(&mut payload, tag)?;
@@ -682,7 +881,11 @@ impl DurableWorkspace<'_> {
         let activation = expected.activation_id.clone();
         let sql_id = id.as_str().to_owned();
         let op = operation("baseline", id.as_str().as_bytes())?;
+        checkpoint(CaptureCheckpoint::BeforeCommit);
+        self.authorize(expected, active).await?;
+        let capture_tree = expected.worktree.clone();
         let result = self.store.execute(op.clone(),move |tx| {
+            if NativeIdentity::read(capture_tree.worktree_path(), capture_tree.repository_root(), capture_tree.git_common_dir()).map(|native| Some(native.key)) != Ok(capture_tree.native_key) { return Ok(false); }
             let current: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_starts s JOIN workspace_authority_clock c ON c.singleton=1 WHERE s.operation=?1 AND s.incarnation=?2 AND s.epoch=?3 AND s.boot=?4 AND c.boot=?4 AND s.active=1)",params![activation,incarnation,epoch,boot],|row|row.get(0))?;
             if !current { return Ok(false); }
             tx.execute("INSERT INTO workspace_baselines(operation,digest,incarnation,epoch,boot,payload,coverage,capture_window) VALUES (?1,?2,?3,?4,?5,?6,'partial','unverified')",params![sql_id,digest.as_slice(),incarnation,epoch,boot,payload])?;
@@ -705,6 +908,53 @@ impl DurableWorkspace<'_> {
             scope,
             stored_capture_digest(&payload)?,
         )
+        .map_err(|_| DurableError::CorruptState)
+    }
+
+    /// Recovers an immutable committed capture by its exact stable operation, even after root loss/restart.
+    /// Scope comes entirely from stored evidence; callers cannot relabel it, and no authority is minted.
+    /// Missing operations return None without reading source or consuming a mechanics receipt.
+    pub async fn committed_baseline(
+        &self,
+        id: &OperationId,
+    ) -> Result<Option<super::git::BaselineContext>, DurableError> {
+        let row = self.store.read_one("SELECT b.incarnation,b.epoch,b.boot,w.nonce,w.native_key,w.root_identity,w.root,w.repository,w.common_dir,b.payload FROM workspace_baselines b JOIN workspace_worktrees w ON w.incarnation=b.incarnation WHERE b.operation=?1 AND b.coverage='partial' AND b.capture_window='unverified'", vec![Value::Text(id.as_str().to_owned())], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,Vec<u8>>(3)?,row.get::<_,Vec<u8>>(4)?,row.get::<_,Vec<u8>>(5)?,row.get::<_,Vec<u8>>(6)?,row.get::<_,Vec<u8>>(7)?,row.get::<_,Vec<u8>>(8)?,row.get::<_,Vec<u8>>(9)?))).await?;
+        let Some((
+            incarnation,
+            epoch,
+            boot,
+            nonce,
+            key,
+            root_identity,
+            root,
+            repository,
+            common,
+            payload,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        unsigned(boot)?;
+        let mut tree = WorktreeRef::from_discovery(
+            PathBuf::from(std::ffi::OsStr::from_bytes(&root)),
+            PathBuf::from(std::ffi::OsStr::from_bytes(&repository)),
+            PathBuf::from(std::ffi::OsStr::from_bytes(&common)),
+            unsigned(incarnation)?,
+        )
+        .map_err(|_| DurableError::CorruptState)?;
+        tree.native_key = Some(key.try_into().map_err(|_| DurableError::CorruptState)?);
+        tree.native_root_identity = Some(
+            root_identity
+                .try_into()
+                .map_err(|_| DurableError::CorruptState)?,
+        );
+        tree.set_durable_nonce(nonce.try_into().map_err(|_| DurableError::CorruptState)?);
+        super::git::BaselineContext::from_stored(
+            id.as_str().to_owned(),
+            super::git::GitScope::from_historical(tree, unsigned(epoch)?),
+            stored_capture_digest(&payload)?,
+        )
+        .map(Some)
         .map_err(|_| DurableError::CorruptState)
     }
 
@@ -731,3 +981,7 @@ fn stored_capture_digest(payload: &[u8]) -> Result<[u8; 32], DurableError> {
     }
     Ok(*blake3::hash(payload).as_bytes())
 }
+
+#[cfg(test)]
+#[path = "durable_tests.rs"]
+mod tests;

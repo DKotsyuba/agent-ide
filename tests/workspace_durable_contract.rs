@@ -456,6 +456,24 @@ async fn canonical_identity_and_sqlite_ownership_do_not_trust_caller_incarnation
         Err(DurableError::IdentityUnavailable)
     );
     fs::create_dir_all(fixture.root.join(".git")).unwrap();
+    assert_eq!(
+        owner
+            .resolve_worktree(
+                fixture.root.clone(),
+                fixture.root.clone(),
+                fixture.root.join(".git")
+            )
+            .await,
+        Err(DurableError::IdentityUnavailable)
+    );
+    owner
+        .revoke(
+            OperationId::new("retire-replaced-grant").unwrap(),
+            &receipt,
+            StopBindingHandoff::Confirmed,
+        )
+        .await
+        .unwrap();
     let recreated = fixture.resolve(&owner).await;
     assert!(recreated.incarnation() > tree.incarnation());
     assert_ne!(recreated.id(), tree.id());
@@ -650,7 +668,30 @@ fn abrupt_exit_writer() {
         let store = fixture.store();
         let owner = DurableWorkspace::open(&store).await.unwrap();
         let tree = fixture.resolve(&owner).await;
-        let _ = activate(&owner, &tree, "abrupt-start", "abrupt-actor").await;
+        let (mut guard, invocation, stamp, _) =
+            activate(&owner, &tree, "abrupt-start", "abrupt-actor").await;
+        let git = RawGitEvidence::new(
+            "abrupt-head",
+            GitScope::from_authority(&stamp, DiffMode::Head),
+            GitReadQuery::HeadIdentity,
+            b"oid\n".to_vec(),
+            vec![],
+            Some(0),
+            false,
+            false,
+        )
+        .unwrap();
+        owner
+            .capture_baseline(
+                OperationId::new("abrupt-baseline").unwrap(),
+                &stamp,
+                &guard.consume_active(invocation.binding_ref()).unwrap(),
+                vec![git],
+                vec![],
+            )
+            .await
+            .unwrap();
+
         std::process::exit(0);
     });
 }
@@ -665,8 +706,19 @@ async fn process_exit_keeps_receipts_without_reviving_stale_binding() {
         .output()
         .unwrap();
     assert!(child.status.success(), "abrupt fixture failed: {child:?}");
+    let moved = fixture.base.join("missing-after-crash");
+    fs::rename(&fixture.root, &moved).unwrap();
     let store = fixture.store();
     let owner = DurableWorkspace::open(&store).await.unwrap();
+    let baseline = owner
+        .committed_baseline(&OperationId::new("abrupt-baseline").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(baseline.window(), BaselineWindow::Unverified);
+    assert!(baseline.capture_digest().is_some());
+    fs::rename(&moved, &fixture.root).unwrap();
+
     let tree = fixture.resolve(&owner).await;
     let (mut old, invocation) = binding("abrupt-actor", "abrupt-reconnect-call", "abrupt-start");
     let receipt = owner
@@ -695,4 +747,175 @@ async fn process_exit_keeps_receipts_without_reviving_stale_binding() {
     );
     let (_, _, new, _) = activate(&owner, &tree, "after-abrupt", "abrupt-actor").await;
     assert!(new.epoch() > receipt.epoch());
+}
+
+/// Explicit closure requires an inactive exact lifecycle and permits reopening the same native directory.
+#[tokio::test]
+async fn explicit_closure_reopens_same_directory_with_a_fresh_incarnation() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let owner = DurableWorkspace::open(&store).await.unwrap();
+    let tree = fixture.resolve(&owner).await;
+    let (mut guard, invocation, stamp, start) =
+        activate(&owner, &tree, "close-start", "close-actor").await;
+    assert_eq!(
+        owner
+            .close_worktree(OperationId::new("close-active").unwrap(), &tree)
+            .await,
+        Err(DurableError::Authority(AuthorityError::WorktreeOwned))
+    );
+    owner
+        .revoke(
+            OperationId::new("stop-before-close").unwrap(),
+            &start,
+            StopBindingHandoff::Confirmed,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.resolve(&owner).await,
+        tree,
+        "actor stop does not close a worktree lifecycle"
+    );
+    let id = OperationId::new("explicit-close").unwrap();
+    let closed = owner.close_worktree(id.clone(), &tree).await.unwrap();
+    assert_eq!(closed.incarnation(), tree.incarnation());
+    assert_eq!(closed.operation(), &id);
+    assert_eq!(
+        owner.close_worktree(id.clone(), &tree).await.unwrap(),
+        closed
+    );
+    let reopened = fixture.resolve(&owner).await;
+    assert_ne!(tree.id(), reopened.id());
+    assert!(reopened.incarnation() > tree.incarnation());
+    assert_eq!(
+        owner.close_worktree(id, &reopened).await,
+        Err(DurableError::OperationConflict)
+    );
+    assert!(
+        owner
+            .authorize(
+                &stamp,
+                &guard.consume_active(invocation.binding_ref()).unwrap()
+            )
+            .await
+            .is_err()
+    );
+}
+
+/// Missing native paths mint nothing, while verified replacement of inactive root/common objects retires old identities.
+#[tokio::test]
+async fn inactive_recreation_and_common_directory_replacement_change_identity() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let owner = DurableWorkspace::open(&store).await.unwrap();
+    let tree = fixture.resolve(&owner).await;
+    fs::rename(&fixture.root, fixture.base.join("old-root")).unwrap();
+    assert_eq!(
+        owner
+            .resolve_worktree(
+                fixture.root.clone(),
+                fixture.root.clone(),
+                fixture.root.join(".git")
+            )
+            .await,
+        Err(DurableError::IdentityUnavailable)
+    );
+    fs::create_dir_all(fixture.root.join(".git")).unwrap();
+    let recreated = fixture.resolve(&owner).await;
+    assert_ne!(tree.id(), recreated.id());
+    fs::rename(fixture.root.join(".git"), fixture.root.join(".git-old")).unwrap();
+    fs::create_dir(fixture.root.join(".git")).unwrap();
+    let changed_common = fixture.resolve(&owner).await;
+    assert_ne!(recreated.id(), changed_common.id());
+}
+
+/// Stable operation lookup recovers committed bytes after restart even when no live native path or authority remains.
+#[tokio::test]
+async fn baseline_lookup_after_restart_never_recaptures_or_revives_authority() {
+    let fixture = Fixture::new();
+    let id = OperationId::new("restart-baseline").unwrap();
+    let (baseline, start, stamp, mut guard, invocation) = {
+        let store = fixture.store();
+        let owner = DurableWorkspace::open(&store).await.unwrap();
+        let tree = fixture.resolve(&owner).await;
+        let (mut guard, invocation, stamp, start) =
+            activate(&owner, &tree, "restart-capture", "actor").await;
+        fs::write(fixture.root.join("source"), b"original capture").unwrap();
+        let git = RawGitEvidence::new(
+            "restart-head",
+            GitScope::from_authority(&stamp, DiffMode::Head),
+            GitReadQuery::HeadIdentity,
+            b"oid\n".to_vec(),
+            vec![],
+            Some(0),
+            false,
+            false,
+        )
+        .unwrap();
+        let baseline = owner
+            .capture_baseline(
+                id.clone(),
+                &stamp,
+                &guard.consume_active(invocation.binding_ref()).unwrap(),
+                vec![git],
+                vec!["source".into()],
+            )
+            .await
+            .unwrap();
+        (baseline, start, stamp, guard, invocation)
+    };
+    let store = fixture.store();
+    let owner = DurableWorkspace::open(&store).await.unwrap();
+    let tree = fixture.resolve(&owner).await;
+    let recovered = owner
+        .activate(request("restart-capture", &mut guard, &invocation, &tree))
+        .await
+        .unwrap();
+    assert_eq!(recovered, start);
+    fs::rename(&fixture.root, fixture.base.join("temporarily-missing")).unwrap();
+    assert_eq!(owner.committed_baseline(&id).await.unwrap(), Some(baseline));
+    assert_eq!(
+        owner
+            .committed_baseline(&OperationId::new("missing-baseline").unwrap())
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        owner
+            .authorize(
+                &stamp,
+                &guard.consume_active(invocation.binding_ref()).unwrap()
+            )
+            .await,
+        Err(DurableError::Authority(AuthorityError::StaleAuthority))
+    );
+    fs::create_dir_all(fixture.root.join(".git")).unwrap();
+    let other_tree = fixture.resolve(&owner).await;
+    let (_, _, other_stamp, _) = activate(&owner, &other_tree, "replacement-start", "other").await;
+    let restored = owner.committed_baseline(&id).await.unwrap().unwrap();
+    assert!(!restored.matches_scope(&GitScope::from_authority(&other_stamp, DiffMode::Head)));
+}
+
+/// Identical paths and integer incarnations from another database cannot alias canonical authority.
+#[tokio::test]
+async fn independent_databases_have_distinct_nonces_and_reject_foreign_references() {
+    let fixture = Fixture::new();
+    let other = Fixture::new();
+    let store = fixture.store();
+    let other_store = other.store();
+    let owner = DurableWorkspace::open(&store).await.unwrap();
+    let other_owner = DurableWorkspace::open(&other_store).await.unwrap();
+    let tree = fixture.resolve(&owner).await;
+    let foreign = fixture.resolve(&other_owner).await;
+    assert_eq!(tree.incarnation(), foreign.incarnation());
+    assert_ne!(tree.id(), foreign.id());
+    let (mut guard, invocation) = binding("foreign", "foreign-call", "foreign-channel");
+    assert_eq!(
+        owner
+            .activate(request("foreign-start", &mut guard, &invocation, &foreign))
+            .await,
+        Err(DurableError::IdentityUnavailable)
+    );
 }

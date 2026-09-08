@@ -537,10 +537,22 @@ pub(super) fn native_directory_identity(directory: &File) -> Result<[u8; 32], Ob
         .map_err(|_| ObservationError::RootUnavailable)?
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| ObservationError::RootUnavailable)?;
+    directory_identity(metadata.dev(), metadata.ino(), created)
+}
+
+/// Encodes device/inode plus a nonzero creation timestamp; equal reusable inode numbers alone never match.
+pub(super) fn directory_identity(
+    dev: u64,
+    ino: u64,
+    created: std::time::Duration,
+) -> Result<[u8; 32], ObservationError> {
+    if created.is_zero() {
+        return Err(ObservationError::RootUnavailable);
+    }
     let mut hash = blake3::Hasher::new();
     hash.update(b"workspace-source-root-v1");
-    hash.update(&metadata.dev().to_le_bytes());
-    hash.update(&metadata.ino().to_le_bytes());
+    hash.update(&dev.to_le_bytes());
+    hash.update(&ino.to_le_bytes());
     hash.update(&created.as_secs().to_le_bytes());
     hash.update(&created.subsec_nanos().to_le_bytes());
     Ok(*hash.finalize().as_bytes())

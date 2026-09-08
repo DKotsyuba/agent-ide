@@ -26,6 +26,8 @@ pub struct WorktreeRef {
     git_common_dir: PathBuf,
     /// Native identity evidence minted only by the durable Workspace resolver.
     pub(super) native_key: Option<[u8; 32]>,
+    /// Opaque database-minted lifecycle nonce, absent from caller-built references.
+    pub(super) durable_nonce: Option<[u8; 32]>,
     /// Descriptor-derived root identity minted by durable resolution, including creation time.
     pub(super) native_root_identity: Option<[u8; 32]>,
 }
@@ -64,8 +66,19 @@ impl WorktreeRef {
             repository_root,
             git_common_dir,
             native_key: None,
+            durable_nonce: None,
             native_root_identity: None,
         })
+    }
+
+    /// Binds the public identity to this database's unpredictable lifecycle nonce.
+    pub(super) fn set_durable_nonce(&mut self, nonce: [u8; 32]) {
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"workspace-incarnation-v2");
+        hash.update(self.id.as_bytes());
+        hash.update(&nonce);
+        self.id = hash.finalize().to_hex().to_string();
+        self.durable_nonce = Some(nonce);
     }
 
     /// Returns this opaque identity, which is stable only for these exact paths and incarnation.
