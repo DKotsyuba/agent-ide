@@ -3,6 +3,7 @@
 use std::fs;
 use std::future::Future;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -269,6 +270,79 @@ async fn doctor_does_not_autostart_or_create_runtime_directory() {
     assert!(stdout.contains("control.workspace_scan=unsupported"));
     assert!(stdout.contains("control.lsp_open=unsupported"));
     assert!(!runtime_dir.exists());
+}
+
+/// Proves doctor never follows an unsafe runtime symlink to connect to an otherwise observable socket.
+#[tokio::test]
+async fn doctor_does_not_connect_through_an_unsafe_runtime_path() {
+    let target = runtime_dir();
+    let socket = target.join("agent-ide.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let unsafe_path = std::env::temp_dir().join(format!(
+        "agent-ide-unsafe-{}-{}",
+        std::process::id(),
+        TEST_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    symlink(&target, &unsafe_path).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+        .args(["doctor", "--runtime-dir"])
+        .arg(&unsafe_path)
+        .output()
+        .await
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("status=unavailable"));
+    assert!(stdout.contains("runtime=Unsafe"));
+    assert!(stdout.contains("endpoint=Unavailable"));
+    assert!(stdout.contains("lock=Unavailable"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), listener.accept())
+            .await
+            .is_err()
+    );
+    assert!(unsafe_path.is_symlink());
+    assert!(socket.exists());
+    fs::remove_file(unsafe_path).unwrap();
+    fs::remove_file(socket).unwrap();
+    fs::remove_dir(target).unwrap();
+}
+
+/// Proves doctor does not follow a socket symlink even when its containing runtime directory is safe.
+#[tokio::test]
+async fn doctor_does_not_connect_through_a_non_socket_endpoint() {
+    let runtime = runtime_dir();
+    let target = runtime_dir();
+    let target_socket = target.join("agent-ide.sock");
+    let listener = UnixListener::bind(&target_socket).unwrap();
+    let endpoint = runtime.join("agent-ide.sock");
+    symlink(&target_socket, &endpoint).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+        .args(["doctor", "--runtime-dir"])
+        .arg(&runtime)
+        .output()
+        .await
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("status=unavailable"));
+    assert!(stdout.contains("runtime=Private"));
+    assert!(stdout.contains("endpoint=Unexpected"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), listener.accept())
+            .await
+            .is_err()
+    );
+    assert!(endpoint.is_symlink());
+    assert!(target_socket.exists());
+    fs::remove_file(endpoint).unwrap();
+    fs::remove_file(target_socket).unwrap();
+    fs::remove_dir(runtime).unwrap();
+    fs::remove_dir(target).unwrap();
 }
 
 /// Proves hook ingress and the closed five-method dispatch stay finite, correlated, and unavailable when inactive.

@@ -339,10 +339,11 @@ pub async fn dispatch_method_if_running(
 
 /// Queries `runtime_dir` for a health reply without creating directories, locks, sockets, or a daemon.
 pub async fn doctor(runtime_dir: &Path) -> Result<DoctorStatus, AppError> {
-    let deadline = config::EffectiveConfig::defaults()
-        .ipc()
-        .connection_deadline;
-    let socket_path = runtime_dir.join(SOCKET_NAME);
+    Ok(doctor_report(runtime_dir).await?.status)
+}
+
+/// Exchanges one health request only after a private real runtime directory and socket were observed.
+async fn doctor_socket(socket_path: PathBuf, deadline: Duration) -> Result<DoctorStatus, AppError> {
     let stream = match tokio::time::timeout(deadline, UnixStream::connect(socket_path)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(_)) | Err(_) => return Ok(DoctorStatus::Unavailable),
@@ -367,7 +368,16 @@ pub async fn doctor(runtime_dir: &Path) -> Result<DoctorStatus, AppError> {
 pub async fn doctor_report(runtime_dir: &Path) -> Result<DoctorReport, AppError> {
     let config = config::EffectiveConfig::defaults();
     let (runtime, endpoint, lock) = inspect_runtime(runtime_dir);
-    let status = doctor(runtime_dir).await?;
+    let status = match (runtime, endpoint) {
+        (DoctorRuntimeState::Private, DoctorEndpointState::Socket) => {
+            doctor_socket(
+                runtime_dir.join(SOCKET_NAME),
+                config.ipc().connection_deadline,
+            )
+            .await?
+        }
+        _ => DoctorStatus::Unavailable,
+    };
     Ok(DoctorReport {
         status,
         runtime,
@@ -424,9 +434,20 @@ fn inspect_endpoint(path: &Path) -> DoctorEndpointState {
 
 /// Probes an existing lock without creating it and immediately releases any successful probe.
 fn inspect_lock(path: &Path) -> DoctorLockState {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return DoctorLockState::Missing,
+        Err(_) => return DoctorLockState::Unavailable,
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != effective_uid()
+        || metadata.mode() & 0o077 != 0
+    {
+        return DoctorLockState::Unavailable;
+    }
     let file = match OpenOptions::new().read(true).write(true).open(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return DoctorLockState::Missing,
         Err(_) => return DoctorLockState::Unavailable,
     };
     match unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } {
