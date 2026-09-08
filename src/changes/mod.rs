@@ -138,17 +138,40 @@ impl DiffHunk {
 /// Tracks cursor and scope data used for bounded detail inspection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiffDetailCursor {
+    /// Exact scope that owns this cursor; a reference never authorizes a different scope.
+    scope: GitScope,
+    /// Capture generation that must still identify the retained snapshot.
+    capture_generation: u64,
+    /// Bounded owner operation reference, interpreted only together with scope and generation.
     operation_reference: String,
+    /// Global index of the first omitted hunk within that exact snapshot.
     next_hunk: usize,
 }
 
 impl DiffDetailCursor {
-    /// Builds one owner-scoped hunk cursor for detail expansion.
-    pub fn new(operation_reference: impl Into<String>, next_hunk: usize) -> Self {
+    /// Mints a cursor only from the exact snapshot whose bounded selection omitted this hunk.
+    fn new(snapshot: &GitSnapshot, next_hunk: usize) -> Self {
         Self {
-            operation_reference: operation_reference.into(),
+            scope: snapshot.scope().clone(),
+            capture_generation: snapshot.generation(),
+            operation_reference: snapshot.operation_reference().to_owned(),
             next_hunk,
         }
+    }
+
+    /// Returns the full required worktree/incarnation/epoch/mode scope for detail expansion.
+    pub fn scope(&self) -> &GitScope {
+        &self.scope
+    }
+    /// Returns the exact required capture generation; operation-reference reuse cannot satisfy it.
+    pub const fn capture_generation(&self) -> u64 {
+        self.capture_generation
+    }
+    /// Checks the complete cursor identity against an already retained Workspace capture.
+    fn matches(&self, snapshot: &GitSnapshot) -> bool {
+        self.scope == *snapshot.scope()
+            && self.capture_generation == snapshot.generation()
+            && self.operation_reference == snapshot.operation_reference()
     }
 
     /// Returns the owning operation reference for owner-scoped detail requests.
@@ -212,6 +235,10 @@ impl DiffStatusCounts {
 pub struct DiffProvenance {
     /// Owner-scoped raw execution reference, absent for unavailable evidence.
     operation_reference: Option<String>,
+    /// Exact scope bound to the operation reference, absent when input validation failed.
+    scope: Option<GitScope>,
+    /// Exact capture generation bound to that same reference.
+    capture_generation: Option<u64>,
     /// Baseline context reference, never a Git comparison side.
     baseline_reference: Option<String>,
     /// Explicit baseline coverage, absent when scope checks fail.
@@ -221,19 +248,33 @@ pub struct DiffProvenance {
 }
 
 impl DiffProvenance {
-    /// Builds provenance for one compose result.
+    /// Builds rendering metadata; absent scope/generation means no validated capture.
+    /// These fields grant no authority: expansion separately validates its bound cursor.
     pub fn new(
         operation_reference: Option<String>,
+        scope: Option<GitScope>,
+        capture_generation: Option<u64>,
         baseline_reference: Option<String>,
         baseline_coverage: Option<BaselineCoverage>,
         baseline_window: Option<BaselineWindow>,
     ) -> Self {
         Self {
             operation_reference,
+            scope,
+            capture_generation,
             baseline_reference,
             baseline_coverage,
             baseline_window,
         }
+    }
+
+    /// Returns the exact scope needed to interpret this operation reference.
+    pub fn scope(&self) -> Option<&GitScope> {
+        self.scope.as_ref()
+    }
+    /// Returns the exact generation needed to interpret this operation reference.
+    pub const fn capture_generation(&self) -> Option<u64> {
+        self.capture_generation
     }
 
     /// Returns the owner-scoped operation reference returned by Workspace.
@@ -397,17 +438,38 @@ pub fn compose_diff(
     evidence: GitSnapshot,
     budget: DiffSelectionBudget,
 ) -> DiffResult {
+    compose_diff_at(expected_scope, comparison, evidence, None, budget)
+}
+
+/// Expands only the exact scope/generation/operation retained by a prior bounded result.
+/// A reused reference from a different capture returns Unavailable with no payload or references.
+pub fn expand_diff(
+    expected_scope: &GitScope,
+    comparison: &GitComparison,
+    evidence: GitSnapshot,
+    cursor: &DiffDetailCursor,
+    budget: DiffSelectionBudget,
+) -> DiffResult {
+    compose_diff_at(expected_scope, comparison, evidence, Some(cursor), budget)
+}
+
+/// Applies common scope/cursor validation before parsing or selecting any hunk payload.
+fn compose_diff_at(
+    expected_scope: &GitScope,
+    comparison: &GitComparison,
+    evidence: GitSnapshot,
+    cursor: Option<&DiffDetailCursor>,
+    budget: DiffSelectionBudget,
+) -> DiffResult {
     let status = evidence.status();
     let same_worktree = evidence.scope().worktree() == expected_scope.worktree();
     let stale = same_worktree
         && evidence.scope().authority_epoch() != expected_scope.authority_epoch()
         && evidence.scope().mode() == expected_scope.mode()
         && comparison.mode() == expected_scope.mode();
-    let status_matches = status.scope().is_some_and(|scope| {
-        scope.worktree() == expected_scope.worktree()
-            && scope.authority_epoch() == expected_scope.authority_epoch()
-    });
-    if evidence.scope() != expected_scope
+    let status_matches = status.scope() == Some(expected_scope);
+    if cursor.is_some_and(|cursor| !cursor.matches(&evidence))
+        || evidence.scope() != expected_scope
         || comparison.scope() != expected_scope
         || evidence.comparison() != comparison
         || evidence.paths().iter().any(|path| {
@@ -443,7 +505,7 @@ pub fn compose_diff(
             conflicts: Vec::new(),
             ignored: Vec::new(),
             detail_cursor: None,
-            provenance: DiffProvenance::new(None, None, None, None),
+            provenance: DiffProvenance::new(None, None, None, None, None, None),
         };
     }
 
@@ -455,7 +517,11 @@ pub fn compose_diff(
     let parsed = parse_snapshot_hunks(&evidence);
     let malformed = parsed.malformed;
     let has_binary = parsed.has_binary;
-    let raw_hunks = parsed.hunks;
+    let raw_hunks = parsed
+        .hunks
+        .into_iter()
+        .skip(cursor.map_or(0, DiffDetailCursor::next_hunk))
+        .collect();
 
     if malformed && state != DiffResultState::Failed {
         state = DiffResultState::Incomplete;
@@ -484,8 +550,7 @@ pub fn compose_diff(
             DiffCoverage::Complete => DiffCoverage::Partial,
             current => current,
         };
-        detail_cursor = cursor_offset
-            .map(|offset| DiffDetailCursor::new(evidence.operation_reference(), offset));
+        detail_cursor = cursor_offset.map(|offset| DiffDetailCursor::new(&evidence, offset));
     }
 
     DiffResult {
@@ -499,7 +564,10 @@ pub fn compose_diff(
             comparison.left().as_bytes(),
             comparison.right().as_bytes(),
         ),
-        status_counts: DiffStatusCounts::from_status(status),
+        status_counts: DiffStatusCounts {
+            tracked: evidence.paths().len(),
+            ..DiffStatusCounts::from_status(status)
+        },
         selected_hunks,
         truncated_output,
         overflow_hunks,
@@ -515,6 +583,8 @@ pub fn compose_diff(
         detail_cursor,
         provenance: DiffProvenance::new(
             Some(evidence.operation_reference().to_owned()),
+            Some(evidence.scope().clone()),
+            Some(evidence.generation()),
             Some(comparison.baseline().reference().to_owned()),
             Some(comparison.baseline().coverage()),
             Some(comparison.baseline().window()),

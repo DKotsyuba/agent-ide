@@ -165,6 +165,41 @@ impl SnapshotIntent {
             differences_allowed: false,
         })
     }
+    /// Returns whether this intent is a no-index comparison rather than metadata/blob verification.
+    pub const fn is_comparison(&self) -> bool {
+        self.differences_allowed
+    }
+
+    /// Hashes an exact private blob snapshot with the repository's SHA-1/SHA-256 format and no filters.
+    /// No object is written; callers must compare the returned full hash with the requested blob OID.
+    fn verify_blob(scope: GitScope, program: &Path, bytes: &[u8]) -> Result<Self, GitError> {
+        let directory = SnapshotDirectory::new(&scope)?;
+        directory.write("blob", bytes)?;
+        let command = ControlledCommand::from_validated_peer(
+            CommandKind::Git,
+            program.to_path_buf(),
+            vec![
+                "--no-pager".into(),
+                "--no-lazy-fetch".into(),
+                "-c".into(),
+                "core.fsmonitor=false".into(),
+                "hash-object".into(),
+                "--no-filters".into(),
+                "--".into(),
+                directory.path.join("blob").into_os_string(),
+            ],
+            scope.worktree().worktree_path().to_path_buf(),
+            safe_git_environment(),
+        )
+        .map_err(|_| GitError::InvalidGitProgram)?;
+        Ok(Self {
+            scope,
+            command,
+            directory: Some(directory),
+            differences_allowed: false,
+        })
+    }
+
     /// Copies two exact sides into private files and compares them outside repository configuration.
     /// Modes stay in path evidence, so private files always remain 0600 even for executable sources.
     pub fn compare(
@@ -305,6 +340,7 @@ impl SnapshotSource {
             Ok(read) => Some(read),
             Err(ObservationError::Missing) => None,
             Err(ObservationError::TooLarge) => return Err(GitError::EvidenceTooLarge),
+            Err(ObservationError::RootIdentityChanged) => return Err(GitError::UnstableSnapshot),
             Err(ObservationError::NotRegularFile | ObservationError::SymlinkEscape) => {
                 return Err(GitError::UnsupportedSnapshot);
             }
@@ -313,7 +349,7 @@ impl SnapshotSource {
         if let Some(obs) = &observation
             && (obs.worktree() != authority.worktree()
                 || obs.authority_epoch() != authority.epoch()
-                || obs.path() != path
+                || obs.path().as_os_str().as_bytes() != path.as_os_str().as_bytes()
                 || obs.coverage() != SourceCoverage::Complete
                 || obs.bytes() != read.as_ref().map(SourceRead::bytes))
         {
@@ -572,7 +608,7 @@ async fn capture_attempt<R: SnapshotRunner>(
         return Err(GitError::InvalidPorcelain);
     }
     let mut status = GitStatus {
-        scope: Some(GitScope::from_authority(authority, DiffMode::Head)),
+        scope: Some(scope.clone()),
         ..GitStatus::default()
     };
     for bytes in before[3]
@@ -590,6 +626,7 @@ async fn capture_attempt<R: SnapshotRunner>(
             status: None,
             modes: None,
             objects: None,
+            conflict_stages: Vec::new(),
         });
     }
     if union.len() + status.untracked.len() > MAX_SNAPSHOT_PATHS
@@ -607,6 +644,9 @@ async fn capture_attempt<R: SnapshotRunner>(
     {
         return Err(GitError::EvidenceTooLarge);
     }
+    for entry in status.untracked() {
+        inspect_untracked(authority, entry.path())?;
+    }
     let mut blobs = BTreeMap::new();
     let mut paths = Vec::new();
     let mut sources = BTreeMap::new();
@@ -621,9 +661,18 @@ async fn capture_attempt<R: SnapshotRunner>(
                 kind: super::StatusKind::Unmerged,
                 path,
                 original_path: None,
-                status: Some(*b"UU"),
+                status: None,
                 modes: None,
                 objects: None,
+                conflict_stages: stages
+                    .expect("unmerged stages exist")
+                    .iter()
+                    .map(|(stage, entry)| super::ConflictStage {
+                        stage: *stage,
+                        mode: entry.mode,
+                        object: entry.oid.clone(),
+                    })
+                    .collect(),
             });
             continue;
         }
@@ -681,8 +730,8 @@ async fn capture_attempt<R: SnapshotRunner>(
             status: Some([x, y]),
             modes: Some(modes),
             objects: Some(objects.clone()),
+            conflict_stages: Vec::new(),
         };
-        status.tracked.push(entry.clone());
         let selected = match scope.mode() {
             DiffMode::Head => true,
             DiffMode::Staged => x != b'.',
@@ -691,6 +740,7 @@ async fn capture_attempt<R: SnapshotRunner>(
         if !selected {
             continue;
         }
+        status.tracked.push(entry.clone());
         let left = if scope.mode() == DiffMode::Unstaged {
             index_bytes.clone()
         } else {
@@ -729,6 +779,9 @@ async fn capture_attempt<R: SnapshotRunner>(
         if after.read != source.read {
             return Err(GitError::UnstableSnapshot);
         }
+    }
+    for entry in status.untracked() {
+        inspect_untracked(authority, entry.path())?;
     }
     if metadata(authority, program, runner).await? != before {
         return Err(GitError::UnstableSnapshot);
@@ -779,6 +832,30 @@ async fn blob_bytes<R: SnapshotRunner>(
     if *total > MAX_SNAPSHOT_TOTAL_BYTES {
         return Err(GitError::EvidenceTooLarge);
     }
+    let verification = SnapshotIntent::verify_blob(scope.clone(), program, &bytes)?;
+    let hash = verification.accept(runner.run(verification.clone()).await?)?;
+    let verified = GitObjectId::parse(
+        hash.strip_suffix(b"\n")
+            .ok_or(GitError::ObjectHashMismatch)?,
+    )?
+    .ok_or(GitError::ObjectHashMismatch)?;
+    if &verified != oid {
+        return Err(GitError::ObjectHashMismatch);
+    }
     cache.insert(oid.clone(), bytes.clone());
     Ok(bytes)
+}
+
+/// Rejects untracked symlink/special entries without reading bytes; disappearing paths trigger retry.
+fn inspect_untracked(authority: &AuthorityStamp, path: &Path) -> Result<(), GitError> {
+    crate::workspace::observation::inspect_authorized_source_kind(authority.worktree(), path)
+        .map_err(|error| match error {
+            ObservationError::SymlinkEscape | ObservationError::NotRegularFile => {
+                GitError::UnsupportedSnapshot
+            }
+            ObservationError::Missing | ObservationError::RootIdentityChanged => {
+                GitError::UnstableSnapshot
+            }
+            _ => GitError::SnapshotIo,
+        })
 }

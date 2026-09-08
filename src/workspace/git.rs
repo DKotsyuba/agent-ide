@@ -462,21 +462,49 @@ pub enum StatusKind {
     Ignored,
 }
 
+/// Retains one actual unmerged index stage; omitted stage numbers are absent rather than inferred.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConflictStage {
+    /// Exact index stage, restricted to base/ours/theirs values 1/2/3.
+    pub(super) stage: u8,
+    /// Raw Git mode from this stage.
+    pub(super) mode: u32,
+    /// Full immutable object name reported for this stage.
+    pub(super) object: GitObjectId,
+}
+
+impl ConflictStage {
+    /// Returns the exact index stage (1 base, 2 ours, 3 theirs).
+    pub const fn stage(&self) -> u8 {
+        self.stage
+    }
+    /// Returns the stage's Git mode without inferring a worktree mode.
+    pub const fn mode(&self) -> u32 {
+        self.mode
+    }
+    /// Returns the complete immutable object identity for this stage.
+    pub fn object(&self) -> &GitObjectId {
+        &self.object
+    }
+}
+
 /// Preserves one status path, optional original path, and bounded raw status bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PathStatus {
     /// Porcelain record category that determines whether this entry is tracked, conflicted, or untracked.
     kind: StatusKind,
-    /// Raw Unix path from the first NUL-delimited porcelain record.
+    /// Exact raw Unix path from bounded Git metadata.
     path: PathBuf,
     /// Original raw Unix path supplied only by rename/copy records.
     original_path: Option<PathBuf>,
-    /// Two-byte XY status for tracked records; untracked and ignored records have no XY value.
+    /// Proven two-byte XY status; absent for untracked/ignored records and derived conflict XY.
     status: Option<[u8; 2]>,
     /// HEAD/index/worktree modes for non-conflicted tracked entries.
     modes: Option<[u32; 3]>,
     /// Full validated HEAD/index object names; zero names represent absent sides.
     objects: Option<[Option<GitObjectId>; 2]>,
+    /// Actual unmerged index stages; empty for non-conflicted entries.
+    conflict_stages: Vec<ConflictStage>,
 }
 
 impl PathStatus {
@@ -495,13 +523,18 @@ impl PathStatus {
         self.original_path.as_deref()
     }
 
-    /// Returns the tracked XY status bytes, when the record class carries them.
+    /// Returns proven XY status; derived conflicts remain None because no porcelain XY was collected.
     pub const fn status(&self) -> Option<[u8; 2]> {
         self.status
     }
     /// Returns raw HEAD/index/worktree modes, including zero for absence.
     pub const fn modes(&self) -> Option<[u32; 3]> {
         self.modes
+    }
+
+    /// Returns actual index stages without synthesizing a porcelain conflict XY code.
+    pub fn conflict_stages(&self) -> &[ConflictStage] {
+        &self.conflict_stages
     }
 
     /// Returns full validated HEAD/index blob names for ordinary and rename records.
@@ -570,6 +603,8 @@ impl GitStatus {
 pub enum GitError {
     /// A raw Git identity is empty, contains NUL, or exceeds the bounded evidence limit.
     InvalidIdentity,
+    /// Raw cat-file bytes did not hash back to their requested full immutable object identity.
+    ObjectHashMismatch,
     /// Repository status/content commands must use the filter-free snapshot collector.
     SnapshotRequired,
     /// Discovery outputs or administrative backpointers do not identify one coherent candidate.
@@ -679,6 +714,7 @@ fn parse_simple(record: &[u8], kind: StatusKind) -> Result<PathStatus, GitError>
         status: None,
         modes: None,
         objects: None,
+        conflict_stages: Vec::new(),
     })
 }
 
@@ -706,6 +742,7 @@ fn parse_tracked(
         .collect();
     let mut modes = None;
     let mut objects = None;
+    let mut conflict_stages = Vec::new();
     if kind != StatusKind::Unmerged {
         let parsed_modes = [
             parse_mode(fields[3])?,
@@ -724,11 +761,20 @@ fn parse_tracked(
         modes = Some(parsed_modes);
         objects = Some(parsed_objects);
     } else {
-        for field in &fields[3..7] {
-            parse_mode(field)?;
-        }
-        for field in &fields[7..10] {
-            GitObjectId::parse(field)?;
+        parse_mode(fields[6])?;
+        for stage in 1..=3 {
+            let mode = parse_mode(fields[stage + 2])?;
+            let object = GitObjectId::parse(fields[stage + 6])?;
+            if (mode == 0) != object.is_none() {
+                return Err(GitError::InvalidPorcelain);
+            }
+            if let Some(object) = object {
+                conflict_stages.push(ConflictStage {
+                    stage: stage as u8,
+                    mode,
+                    object,
+                });
+            }
         }
     }
     Ok(PathStatus {
@@ -738,6 +784,7 @@ fn parse_tracked(
         status: Some([status_start[0], status_start[1]]),
         modes,
         objects,
+        conflict_stages,
     })
 }
 

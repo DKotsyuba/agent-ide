@@ -198,3 +198,96 @@ async fn object_deduplication_and_mode_side_identity_are_exact() {
         assert!(path.source().unwrap().bytes().is_some());
     }
 }
+
+/// Status and tracked counts are restricted to the requested mode, including raw stage metadata.
+#[tokio::test]
+async fn selected_mode_status_scope_and_counts_are_exact() {
+    let fixture = GitFixture::new();
+    for (mode, count) in [
+        (DiffMode::Head, 3),
+        (DiffMode::Staged, 2),
+        (DiffMode::Unstaged, 1),
+    ] {
+        let snapshot = collect(&fixture, mode, &mut Runner::default())
+            .await
+            .unwrap();
+        assert_eq!(snapshot.status().scope(), Some(snapshot.scope()));
+        assert_eq!(snapshot.status().tracked().len(), count);
+        let scope = snapshot.scope().clone();
+        let comparison = snapshot.comparison().clone();
+        let result = compose_diff(
+            &scope,
+            &comparison,
+            snapshot,
+            DiffSelectionBudget::default(),
+        );
+        assert_eq!(result.counts().tracked(), count);
+        assert_eq!(result.tracked().len(), count);
+    }
+}
+
+/// A detail cursor is usable only with its exact scope/generation, even when operation names repeat.
+#[tokio::test]
+async fn cursor_expansion_rejects_reference_reuse_across_generations_and_modes() {
+    use agent_ide::{changes::expand_diff, workspace::git::snapshot::collect_snapshot};
+    let fixture = GitFixture::new();
+    let authority = authority_for(&fixture);
+    let snapshot = capture_with_authority(&authority, DiffMode::Head, &mut Runner::default())
+        .await
+        .unwrap();
+    let scope = snapshot.scope().clone();
+    let comparison = snapshot.comparison().clone();
+    let first = compose_diff(
+        &scope,
+        &comparison,
+        snapshot.clone(),
+        DiffSelectionBudget::bounded(1, 65536),
+    );
+    let cursor = first.detail_cursor().unwrap();
+    assert_eq!(cursor.scope(), &scope);
+    assert_eq!(cursor.capture_generation(), 1);
+    assert_eq!(first.provenance().scope(), Some(&scope));
+    assert_eq!(first.provenance().capture_generation(), Some(1));
+    let expanded = expand_diff(
+        &scope,
+        &comparison,
+        snapshot.clone(),
+        cursor,
+        DiffSelectionBudget::bounded(1, 65536),
+    );
+    assert_eq!(expanded.selected_hunks()[0].index(), 1);
+    let newer = collect_snapshot(
+        &authority,
+        std::path::Path::new(GIT),
+        DiffMode::Head,
+        2,
+        snapshot.operation_reference(),
+        comparison.baseline().clone(),
+        &mut Runner::default(),
+    )
+    .await
+    .unwrap();
+    let newer_comparison = newer.comparison().clone();
+    let rejected = expand_diff(
+        &scope,
+        &newer_comparison,
+        newer,
+        cursor,
+        DiffSelectionBudget::default(),
+    );
+    assert_eq!(rejected.state(), DiffResultState::Unavailable);
+    assert!(rejected.selected_hunks().is_empty());
+    assert!(rejected.provenance().operation_reference().is_none());
+    let wrong_mode = GitScope::from_authority(&authority, DiffMode::Staged);
+    assert_eq!(
+        expand_diff(
+            &wrong_mode,
+            &comparison,
+            snapshot,
+            cursor,
+            DiffSelectionBudget::default()
+        )
+        .state(),
+        DiffResultState::Unavailable
+    );
+}

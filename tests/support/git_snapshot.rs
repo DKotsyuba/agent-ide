@@ -266,6 +266,8 @@ pub struct Runner {
     pub blobs: usize,
     /// Number of successful differences exits; these must not be classified as command failures.
     pub different: usize,
+    /// Number of completed no-index comparisons, excluding private blob-hash verification.
+    pub comparisons: usize,
     /// Optional deterministic metadata mutation after a completed private comparison.
     pub after_compare: Option<Box<dyn FnMut() + Send>>,
     /// Optional durable source observation supplied to the exact-byte correlation boundary.
@@ -293,9 +295,9 @@ impl SnapshotRunner for Runner {
                 fs::metadata(dir).unwrap().permissions().mode() & 0o777,
                 0o700
             );
-            for side in ["left", "right"] {
+            for file in fs::read_dir(dir).unwrap() {
                 assert_eq!(
-                    fs::metadata(dir.join(side)).unwrap().permissions().mode() & 0o777,
+                    file.unwrap().metadata().unwrap().permissions().mode() & 0o777,
                     0o600
                 );
             }
@@ -353,7 +355,8 @@ impl SnapshotRunner for Runner {
         .map_err(|_| GitError::IncompleteIdentity)?;
         admissions.release(result.lease).unwrap();
         self.operations += 1;
-        if intent.snapshot_directory().is_some() {
+        if intent.is_comparison() {
+            self.comparisons += 1;
             if let Some(hook) = &mut self.after_compare {
                 hook();
             }

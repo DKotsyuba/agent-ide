@@ -6,9 +6,9 @@ use std::{
     io::{self, Read},
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::ffi::OsStrExt,
+        unix::{ffi::OsStrExt, fs::MetadataExt},
     },
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 
 use super::authority::WorktreeRef;
@@ -375,6 +375,8 @@ pub enum ObservationError {
     Missing,
     /// The worktree root is unavailable; no descendant absence or Close fact is established.
     RootUnavailable,
+    /// The opened root no longer matches the durable descriptor-derived directory identity.
+    RootIdentityChanged,
     /// A durable row could not be decoded into the Workspace observation contract.
     CorruptPersistence,
     /// A native filesystem operation failed without a more specific safe classification.
@@ -386,48 +388,15 @@ pub enum ObservationError {
 /// The caller supplies a `WorktreeRef` already authorized by Workspace and a raw relative Unix
 /// path. The reader rejects empty, absolute, dot, parent, NUL, and over-limit paths; uses
 /// `openat` with `O_NOFOLLOW` for every component; caps bytes before hashing; and never scans.
-/// Missing descendants return `Missing`; a missing root returns `RootUnavailable` and cannot produce Close.
+/// Durable roots are checked against opened descriptor identity before descendants. Missing roots return
+/// RootUnavailable and replacements RootIdentityChanged; neither can produce a missing-file fact.
+/// Legacy unverified fixture references have no durable identity claim but still use the same no-follow walk.
 pub fn read_authorized_source(
     worktree: &WorktreeRef,
     path: &Path,
     limits: SourceReadLimits,
 ) -> Result<SourceRead, ObservationError> {
-    if !valid_relative_path(path) || path.as_os_str().as_bytes().len() > limits.max_path_bytes {
-        return Err(ObservationError::InvalidPath);
-    }
-    // SAFETY: each successful `open` result becomes a File, which owns and closes its descriptor.
-    let mut directory = unsafe {
-        File::from_raw_fd(
-            open_directory(libc::AT_FDCWD, worktree.worktree_path().as_os_str()).map_err(
-                |error| {
-                    if error == ObservationError::Missing {
-                        ObservationError::RootUnavailable
-                    } else {
-                        error
-                    }
-                },
-            )?,
-        )
-    };
-    let components: Vec<&OsStr> = path
-        .components()
-        .map(|component| component.as_os_str())
-        .collect();
-    for component in &components[..components.len() - 1] {
-        // SAFETY: `next` is a new owned descriptor; assigning drops the prior directory afterwards.
-        let next = unsafe { File::from_raw_fd(open_directory(directory.as_raw_fd(), component)?) };
-        directory = next;
-    }
-    let file = open_file(
-        directory.as_raw_fd(),
-        components.last().expect("validated path has a component"),
-    )?;
-    // SAFETY: `file` is an owned successful open descriptor and File takes sole ownership.
-    let mut file = unsafe { File::from_raw_fd(file) };
-    let metadata = file.metadata().map_err(classify_io)?;
-    if !metadata.is_file() {
-        return Err(ObservationError::NotRegularFile);
-    }
+    let (mut file, metadata) = open_authorized_regular_file(worktree, path, limits.max_path_bytes)?;
     let mut contents = Vec::with_capacity(limits.max_bytes.min(8192));
     file.by_ref()
         .take((limits.max_bytes as u64).saturating_add(1))
@@ -466,7 +435,7 @@ fn open_file(parent: libc::c_int, component: &OsStr) -> Result<libc::c_int, Obse
     open_at(
         parent,
         component,
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
     )
 }
 
@@ -492,6 +461,7 @@ fn classify_errno() -> ObservationError {
     match io::Error::last_os_error().raw_os_error() {
         Some(libc::ELOOP) | Some(libc::ENOTDIR) => ObservationError::SymlinkEscape,
         Some(libc::ENOENT) => ObservationError::Missing,
+        Some(libc::ENXIO) => ObservationError::NotRegularFile,
         _ => ObservationError::Io,
     }
 }
@@ -511,8 +481,116 @@ pub(crate) fn valid_relative_path(path: &Path) -> bool {
     !bytes.is_empty()
         && bytes.len() <= MAX_SOURCE_PATH_BYTES
         && !bytes.contains(&0)
-        && !path.is_absolute()
-        && path
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
+        && bytes
+            .split(|byte| *byte == b'/')
+            .all(|part| !part.is_empty() && part != b"." && part != b"..")
+}
+
+/// Opens an absolute root by walking every raw component from `/` without following any symlink.
+/// Empty/dot/parent components and missing roots fail before any descendant source is inspected.
+pub(super) fn open_root_directory(path: &Path) -> Result<File, ObservationError> {
+    let raw = path.as_os_str().as_bytes();
+    if raw.first() != Some(&b'/') || raw.contains(&0) {
+        return Err(ObservationError::InvalidPath);
+    }
+    let tail = &raw[1..];
+    if !tail.is_empty()
+        && tail
+            .split(|byte| *byte == b'/')
+            .any(|part| part.is_empty() || part == b"." || part == b"..")
+    {
+        return Err(ObservationError::InvalidPath);
+    }
+    // SAFETY: each successful descriptor is immediately owned by File and closed on replacement/drop.
+    let mut directory =
+        unsafe { File::from_raw_fd(open_directory(libc::AT_FDCWD, OsStr::new("/"))?) };
+    for component in tail
+        .split(|byte| *byte == b'/')
+        .filter(|part| !part.is_empty())
+    {
+        let fd = open_directory(directory.as_raw_fd(), OsStr::from_bytes(component)).map_err(
+            |error| {
+                if error == ObservationError::Missing {
+                    ObservationError::RootUnavailable
+                } else {
+                    error
+                }
+            },
+        )?;
+        // SAFETY: fd is a newly opened directory descriptor and File owns its lifetime.
+        directory = unsafe { File::from_raw_fd(fd) };
+    }
+    Ok(directory)
+}
+
+/// Fingerprints the opened directory's device, inode and creation timestamp, never its pathname.
+/// A filesystem without creation-time evidence fails closed rather than trusting reusable inode numbers.
+pub(super) fn native_directory_identity(directory: &File) -> Result<[u8; 32], ObservationError> {
+    let metadata = directory
+        .metadata()
+        .map_err(|_| ObservationError::RootUnavailable)?;
+    if !metadata.is_dir() {
+        return Err(ObservationError::RootUnavailable);
+    }
+    let created = metadata
+        .created()
+        .map_err(|_| ObservationError::RootUnavailable)?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| ObservationError::RootUnavailable)?;
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"workspace-source-root-v1");
+    hash.update(&metadata.dev().to_le_bytes());
+    hash.update(&metadata.ino().to_le_bytes());
+    hash.update(&created.as_secs().to_le_bytes());
+    hash.update(&created.subsec_nanos().to_le_bytes());
+    Ok(*hash.finalize().as_bytes())
+}
+
+/// Classifies one registered raw path without reading content, blocking on a FIFO, or following symlinks.
+/// Uses the same root-identity and component checks as source reads; only a regular file succeeds.
+pub(super) fn inspect_authorized_source_kind(
+    worktree: &WorktreeRef,
+    path: &Path,
+) -> Result<(), ObservationError> {
+    open_authorized_regular_file(worktree, path, MAX_SOURCE_PATH_BYTES).map(|_| ())
+}
+
+/// Opens a bounded raw relative regular file only after verifying the entire root and parent chain.
+/// Returns its owned descriptor and metadata together; special files are rejected before content reads.
+fn open_authorized_regular_file(
+    worktree: &WorktreeRef,
+    path: &Path,
+    max_path_bytes: usize,
+) -> Result<(File, std::fs::Metadata), ObservationError> {
+    if !valid_relative_path(path) || path.as_os_str().as_bytes().len() > max_path_bytes {
+        return Err(ObservationError::InvalidPath);
+    }
+    let mut directory = open_root_directory(worktree.worktree_path())?;
+    if let Some(expected) = worktree.native_root_identity
+        && native_directory_identity(&directory)? != expected
+    {
+        return Err(ObservationError::RootIdentityChanged);
+    }
+    let components: Vec<&OsStr> = path
+        .as_os_str()
+        .as_bytes()
+        .split(|byte| *byte == b'/')
+        .map(OsStr::from_bytes)
+        .collect();
+    for component in &components[..components.len() - 1] {
+        // SAFETY: `next` is a new owned descriptor; assigning drops the prior directory afterwards.
+        let next = unsafe { File::from_raw_fd(open_directory(directory.as_raw_fd(), component)?) };
+        directory = next;
+    }
+    let file = open_file(
+        directory.as_raw_fd(),
+        components.last().expect("validated path has a component"),
+    )?;
+    // SAFETY: `file` is an owned successful open descriptor and File takes sole ownership.
+    let file = unsafe { File::from_raw_fd(file) };
+    let metadata = file.metadata().map_err(classify_io)?;
+    if !metadata.is_file() {
+        return Err(ObservationError::NotRegularFile);
+    }
+    Ok((file, metadata))
 }

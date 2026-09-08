@@ -206,6 +206,7 @@ impl<'a> DurableWorkspace<'a> {
             unsigned(row.0)?,
         )?;
         tree.native_key = Some(key);
+        tree.native_root_identity = Some(native.root_identity);
         Ok(tree)
     }
 
@@ -437,6 +438,8 @@ impl<'a> DurableWorkspace<'a> {
 struct NativeIdentity {
     /// Canonical worktree root with every symlink component refused.
     root: PathBuf,
+    /// Creation-aware identity of the same opened root used for the durable native key.
+    root_identity: [u8; 32],
     /// Canonical discovered repository root.
     repository: PathBuf,
     /// Canonical Git common directory.
@@ -449,7 +452,7 @@ struct NativeIdentity {
 impl NativeIdentity {
     /// Reads exactly the three discovered directories; no repository scan or process is launched.
     fn read(root: &Path, repository: &Path, common: &Path) -> Result<Self, DurableError> {
-        let (root, root_id) = real_directory(root)?;
+        let (root, root_id, root_identity) = real_directory_with_root_identity(root)?;
         let (repository, repo_id) = real_directory(repository)?;
         let (common, common_id) = real_directory(&if common.is_absolute() {
             common.to_path_buf()
@@ -468,6 +471,7 @@ impl NativeIdentity {
         ]);
         Ok(Self {
             root,
+            root_identity,
             repository,
             common,
             physical,
@@ -479,6 +483,14 @@ impl NativeIdentity {
 /// Walks native directories through owned descriptors, refusing symlinks without a check/open race.
 /// Returns a canonical path only when it still names the opened final device/inode.
 pub(super) fn real_directory(path: &Path) -> Result<(PathBuf, [u8; 16]), DurableError> {
+    let (path, native, _) = real_directory_with_root_identity(path)?;
+    Ok((path, native))
+}
+
+/// Resolves a directory while retaining creation-aware identity from that exact opened descriptor.
+fn real_directory_with_root_identity(
+    path: &Path,
+) -> Result<(PathBuf, [u8; 16], [u8; 32]), DurableError> {
     if !path.is_absolute() {
         return Err(DurableError::IdentityUnavailable);
     }
@@ -492,6 +504,8 @@ pub(super) fn real_directory(path: &Path) -> Result<(PathBuf, [u8; 16]), Durable
         // SAFETY: open_directory returned a new owned descriptor; File closes the previous one on assignment.
         directory = unsafe { File::from_raw_fd(next) };
     }
+    let root_identity = super::observation::native_directory_identity(&directory)
+        .map_err(|_| DurableError::IdentityUnavailable)?;
     let metadata = directory
         .metadata()
         .map_err(|_| DurableError::IdentityUnavailable)?;
@@ -504,7 +518,7 @@ pub(super) fn real_directory(path: &Path) -> Result<(PathBuf, [u8; 16]), Durable
     let mut native = [0; 16];
     native[..8].copy_from_slice(&metadata.dev().to_le_bytes());
     native[8..].copy_from_slice(&metadata.ino().to_le_bytes());
-    Ok((canonical, native))
+    Ok((canonical, native, root_identity))
 }
 
 /// Returns the durable singleton boot inside the same admission transaction.

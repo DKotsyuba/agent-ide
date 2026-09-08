@@ -26,6 +26,8 @@ pub struct WorktreeRef {
     git_common_dir: PathBuf,
     /// Native identity evidence minted only by the durable Workspace resolver.
     pub(super) native_key: Option<[u8; 32]>,
+    /// Descriptor-derived root identity minted by durable resolution, including creation time.
+    pub(super) native_root_identity: Option<[u8; 32]>,
 }
 
 impl WorktreeRef {
@@ -62,6 +64,7 @@ impl WorktreeRef {
             repository_root,
             git_common_dir,
             native_key: None,
+            native_root_identity: None,
         })
     }
 

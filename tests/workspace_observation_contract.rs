@@ -51,6 +51,7 @@ fn config() -> StoreConfig {
 
 /// Builds a canonical WorktreeRef rooted at the supplied test directory.
 fn worktree(root: &Path) -> WorktreeRef {
+    let root = fs::canonicalize(root).unwrap();
     WorktreeRef::from_discovery(
         root.to_path_buf(),
         root.to_path_buf(),
@@ -529,4 +530,155 @@ async fn reconciliation_uses_latest_internal_state_and_rejects_root_absence() {
     );
     fs::remove_dir_all(root).unwrap();
     fs::remove_dir_all(foreign_root).unwrap();
+}
+
+/// Source reads reject every raw empty/dot/parent path component before inspecting descendants.
+#[test]
+fn raw_source_paths_never_normalize_aliases() {
+    let root = temporary("raw-components");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(root.join("nested")).unwrap();
+    fs::write(root.join("nested/file"), b"data").unwrap();
+    let tree = worktree(&fs::canonicalize(&root).unwrap());
+    let limits = SourceReadLimits::new(256, 32).unwrap();
+    for path in [
+        "nested//file",
+        "nested/./file",
+        "nested/../nested/file",
+        "nested/file/",
+        "/nested/file",
+        "nested/",
+        "nested//",
+    ] {
+        assert_eq!(
+            read_authorized_source(&tree, Path::new(path), limits),
+            Err(ObservationError::InvalidPath),
+            "raw path {path:?}"
+        );
+        assert!(
+            RegisteredPathRequest::new(
+                tree.clone(),
+                1,
+                operation("invalid"),
+                reference("invalid"),
+                path.into(),
+                revision("invalid"),
+                SourceCoverage::Complete,
+                limits
+            )
+            .is_err()
+        );
+    }
+    assert_eq!(
+        read_authorized_source(&tree, Path::new("nested/file"), limits)
+            .unwrap()
+            .contents(),
+        b"data"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// O_NOFOLLOW protects every ancestor of a root, not merely the root's final component.
+#[test]
+fn source_root_parent_symlink_is_not_followed() {
+    let outer = temporary("root-parent-link");
+    fs::create_dir(&outer).unwrap();
+    fs::create_dir_all(outer.join("physical/root")).unwrap();
+    fs::write(outer.join("physical/root/secret"), b"must not escape").unwrap();
+    std::os::unix::fs::symlink("physical", outer.join("alias")).unwrap();
+    let canonical = fs::canonicalize(&outer).unwrap();
+    let tree = WorktreeRef::from_discovery(
+        canonical.join("alias/root"),
+        canonical.join("alias/root"),
+        ".git".into(),
+        1,
+    )
+    .unwrap();
+    assert_eq!(
+        read_authorized_source(
+            &tree,
+            Path::new("secret"),
+            SourceReadLimits::new(256, 64).unwrap()
+        ),
+        Err(ObservationError::SymlinkEscape)
+    );
+    fs::remove_dir_all(outer).unwrap();
+}
+
+/// A replaced durable root is rejected before reading bytes or treating absent descendants as missing.
+#[tokio::test]
+async fn durable_root_replacement_cannot_reuse_source_authority() {
+    use agent_ide::workspace::durable::DurableWorkspace;
+    let outer = temporary("durable-source-root");
+    fs::create_dir(&outer).unwrap();
+    let outer = fs::canonicalize(outer).unwrap();
+    let root = outer.join("root");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join("file"), b"original").unwrap();
+    let store = Store::open_with_backup_root(
+        &outer.join("state.sqlite"),
+        &outer.join("backups"),
+        config(),
+    )
+    .unwrap();
+    let durable = DurableWorkspace::open(&store).await.unwrap();
+    let tree = durable
+        .resolve_worktree(root.clone(), root.clone(), ".git".into())
+        .await
+        .unwrap();
+    let limits = SourceReadLimits::new(256, 64).unwrap();
+    assert_eq!(
+        read_authorized_source(&tree, Path::new("file"), limits)
+            .unwrap()
+            .contents(),
+        b"original"
+    );
+    let observations = WorkspaceStore::new(&store);
+    assert!(matches!(
+        observations.install_schema().await.unwrap(),
+        agent_ide::app::store::MigrationAdmission::Applied { .. }
+    ));
+    let ObservationAdmission::Recorded(recorded) = observations
+        .record(
+            ObservationDraft::present(
+                tree.clone(),
+                1,
+                operation("durable-proof"),
+                reference("durable-proof"),
+                "file".into(),
+                SourceBytes::from_bytes(b"original"),
+                revision("durable-proof"),
+                SourceCoverage::Complete,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("observation recorded")
+    };
+    let reloaded = observations
+        .load_latest(
+            operation("reload-durable-proof"),
+            tree.clone(),
+            "file".into(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reloaded, recorded,
+        "reload retains the supplied durable WorktreeRef proof; it does not reconstruct it from path strings"
+    );
+    fs::rename(&root, outer.join("retained-old-root")).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join("file"), b"replacement").unwrap();
+    for path in ["file", "absent"] {
+        assert_eq!(
+            read_authorized_source(&tree, Path::new(path), limits),
+            Err(ObservationError::RootIdentityChanged)
+        );
+    }
+    drop(store);
+    fs::remove_dir_all(outer).unwrap();
 }

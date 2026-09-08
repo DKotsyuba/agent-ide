@@ -225,7 +225,7 @@ async fn instability_has_one_retry_and_cleanup() {
             .await
             .is_ok()
     );
-    assert_eq!(once.directories.len(), 2);
+    assert_eq!(once.comparisons, 2);
     assert!(once.directories.iter().all(|dir| !dir.exists()));
     let mut always = Runner {
         mutate_path: Some(fixture.root.join("unstaged.txt")),
@@ -235,7 +235,7 @@ async fn instability_has_one_retry_and_cleanup() {
         collect(&fixture, DiffMode::Unstaged, &mut always).await,
         Err(GitError::UnstableSnapshot)
     );
-    assert_eq!(always.directories.len(), 2);
+    assert_eq!(always.comparisons, 2);
     assert!(always.directories.iter().all(|dir| !dir.exists()));
 }
 
@@ -375,7 +375,7 @@ async fn metadata_brackets_detect_head_and_untracked_changes() {
         collect(&fixture, DiffMode::Unstaged, &mut runner).await,
         Err(GitError::UnstableSnapshot)
     ));
-    assert_eq!(runner.directories.len(), 2);
+    assert_eq!(runner.comparisons, 2);
     assert!(runner.directories.iter().all(|path| !path.exists()));
     let path = fixture.root.join("metadata-created");
     let mut next = true;
@@ -394,7 +394,7 @@ async fn metadata_brackets_detect_head_and_untracked_changes() {
         collect(&fixture, DiffMode::Unstaged, &mut runner).await,
         Err(GitError::UnstableSnapshot)
     ));
-    assert_eq!(runner.directories.len(), 2);
+    assert_eq!(runner.comparisons, 2);
 }
 
 /// Aggregate source and patch ceilings reject complete-looking output after bounded work.
@@ -599,4 +599,167 @@ fn execution_snapshot_future_is_send() {
         DiffMode::Head,
         &mut runner,
     ));
+}
+
+/// Corrupted loose object content cannot be admitted merely because cat-file exits successfully.
+#[tokio::test]
+async fn blob_bytes_are_verified_against_the_requested_object_identity() {
+    let fixture = GitFixture::new();
+    let requested = fixture.git(["rev-parse", "HEAD:unstaged.txt"]);
+    let requested = std::str::from_utf8(&requested.stdout).unwrap().trim();
+    fixture.write(b".git/tampered-input", b"tampered\n");
+    let replacement = fixture.git([
+        "hash-object",
+        "-w",
+        "--no-filters",
+        "--",
+        ".git/tampered-input",
+    ]);
+    let replacement = std::str::from_utf8(&replacement.stdout).unwrap().trim();
+    let object_path = fixture
+        .root
+        .join(".git/objects")
+        .join(&requested[..2])
+        .join(&requested[2..]);
+    let replacement_path = fixture
+        .root
+        .join(".git/objects")
+        .join(&replacement[..2])
+        .join(&replacement[2..]);
+    let corrupted = fs::read(replacement_path).unwrap();
+    fs::remove_file(&object_path).unwrap();
+    fs::write(object_path, corrupted).unwrap();
+    assert_eq!(
+        fixture.git(["cat-file", "blob", requested]).stdout,
+        b"tampered\n",
+        "Apple Git cat-file does not check the requested blob hash"
+    );
+    fixture.install_malicious_helpers();
+    let mut runner = Runner::default();
+    assert_eq!(
+        collect(&fixture, DiffMode::Head, &mut runner).await,
+        Err(GitError::ObjectHashMismatch)
+    );
+    assert!(!fixture.sentinel.exists());
+    assert!(runner.directories.iter().all(|path| !path.exists()));
+}
+
+/// The fixed no-filter verifier uses the repository object format for a real SHA-256 repository.
+#[tokio::test]
+async fn sha256_blob_verification_uses_the_repository_format() {
+    let fixture = GitFixture::unborn();
+    fs::remove_dir_all(fixture.root.join(".git")).unwrap();
+    fixture.git(["init", "--quiet", "--object-format=sha256"]);
+    fixture.git(["config", "user.email", "snapshot@example.invalid"]);
+    fixture.git(["config", "user.name", "Snapshot Fixture"]);
+    fixture.write(b"tracked.txt", b"base\n");
+    fixture.git(["add", "tracked.txt"]);
+    fixture.git(["commit", "--quiet", "-m", "sha256 baseline"]);
+    fixture.write(b"tracked.txt", b"working\n");
+    fixture.install_malicious_helpers();
+    let snapshot = collect(&fixture, DiffMode::Head, &mut Runner::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.paths()[0].status().objects().unwrap()[0]
+            .as_ref()
+            .unwrap()
+            .as_str()
+            .len(),
+        64
+    );
+    assert!(!fixture.sentinel.exists());
+}
+
+/// Partial conflict stages remain exact and do not become a fabricated UU status.
+#[tokio::test]
+async fn conflicts_retain_actual_stage_modes_and_objects() {
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+    };
+    let fixture = GitFixture::new();
+    let base = fixture.git(["rev-parse", "HEAD:unstaged.txt"]);
+    let base = std::str::from_utf8(&base.stdout).unwrap().trim();
+    let theirs = fixture.git(["rev-parse", ":staged.txt"]);
+    let theirs = std::str::from_utf8(&theirs.stdout).unwrap().trim();
+    let mut child = Command::new(GIT)
+        .env_clear()
+        .arg("-C")
+        .arg(&fixture.root)
+        .args(["update-index", "--index-info"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(format!("0 {}\tunstaged.txt\n100644 {base} 1\tunstaged.txt\n100755 {theirs} 3\tunstaged.txt\n", "0".repeat(40)).as_bytes()).unwrap();
+    assert!(child.wait().unwrap().success());
+    let snapshot = collect(&fixture, DiffMode::Head, &mut Runner::default())
+        .await
+        .unwrap();
+    let conflict = &snapshot.status().conflicts()[0];
+    assert_eq!(conflict.status(), None);
+    let stages = conflict.conflict_stages();
+    assert_eq!(stages.len(), 2);
+    assert_eq!(
+        (
+            stages[0].stage(),
+            stages[0].mode(),
+            stages[0].object().as_str()
+        ),
+        (1, 0o100644, base)
+    );
+    assert_eq!(
+        (
+            stages[1].stage(),
+            stages[1].mode(),
+            stages[1].object().as_str()
+        ),
+        (3, 0o100755, theirs)
+    );
+    assert!(
+        snapshot
+            .paths()
+            .iter()
+            .all(|path| path.status().path().as_os_str().as_bytes() != b"unstaged.txt")
+    );
+}
+
+/// Git-listed links are rejected; Apple Git omits FIFOs, while direct source reads reject them without blocking.
+#[tokio::test]
+async fn untracked_symlink_and_special_entries_are_explicitly_unsupported() {
+    use std::{
+        ffi::CString,
+        os::unix::{ffi::OsStrExt, fs::symlink},
+    };
+    let fixture = GitFixture::new();
+    let entry = fixture.root.join("untracked-special");
+    symlink("staged.txt", &entry).unwrap();
+    assert_eq!(
+        collect(&fixture, DiffMode::Head, &mut Runner::default()).await,
+        Err(GitError::UnsupportedSnapshot)
+    );
+    fs::remove_file(&entry).unwrap();
+    let path = CString::new(entry.as_os_str().as_bytes()).unwrap();
+    // SAFETY: path is a live NUL-terminated test-owned pathname and mode is a bounded Unix permission value.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    let snapshot = collect(&fixture, DiffMode::Head, &mut Runner::default())
+        .await
+        .unwrap();
+    assert!(
+        snapshot
+            .status()
+            .untracked()
+            .iter()
+            .all(|entry| entry.path().as_os_str().as_bytes() != b"untracked-special"),
+        "Apple Git does not list untracked FIFOs; this is not a complete filesystem inventory"
+    );
+    let authority = authority_for(&fixture);
+    assert_eq!(
+        agent_ide::workspace::observation::read_authorized_source(
+            authority.worktree(),
+            std::path::Path::new("untracked-special"),
+            agent_ide::workspace::observation::SourceReadLimits::new(4096, 1024).unwrap()
+        ),
+        Err(agent_ide::workspace::observation::ObservationError::NotRegularFile)
+    );
 }
