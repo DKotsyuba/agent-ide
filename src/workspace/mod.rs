@@ -11,3 +11,6 @@ pub mod observation;
 
 /// Workspace schema admission and durable source-observation persistence.
 pub mod store;
+
+/// Canonical physical worktree identity, durable authority receipts, and bounded baseline captures.
+pub mod durable;

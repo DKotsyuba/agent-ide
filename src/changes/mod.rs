@@ -3,8 +3,8 @@
 use std::{collections::BTreeMap, os::unix::ffi::OsStrExt, path::PathBuf};
 
 use crate::workspace::git::{
-    BaselineCoverage, DiffMode, GitComparison, GitReadQuery, GitScope, GitStatus, PathStatus,
-    RawGitEvidence,
+    BaselineCoverage, BaselineWindow, DiffMode, GitComparison, GitReadQuery, GitScope, GitStatus,
+    PathStatus, RawGitEvidence,
 };
 
 /// Maximum number of hunks selected by default for one bounded composition.
@@ -209,9 +209,14 @@ impl DiffStatusCounts {
 /// Describes owner-scoped freshness, coverage, and provenance metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiffProvenance {
+    /// Owner-scoped raw execution reference, absent for unavailable evidence.
     operation_reference: Option<String>,
+    /// Baseline context reference, never a Git comparison side.
     baseline_reference: Option<String>,
+    /// Explicit baseline coverage, absent when scope checks fail.
     baseline_coverage: Option<BaselineCoverage>,
+    /// Whether baseline context was captured and its joint window verified.
+    baseline_window: Option<BaselineWindow>,
 }
 
 impl DiffProvenance {
@@ -220,11 +225,13 @@ impl DiffProvenance {
         operation_reference: Option<String>,
         baseline_reference: Option<String>,
         baseline_coverage: Option<BaselineCoverage>,
+        baseline_window: Option<BaselineWindow>,
     ) -> Self {
         Self {
             operation_reference,
             baseline_reference,
             baseline_coverage,
+            baseline_window,
         }
     }
 
@@ -236,6 +243,11 @@ impl DiffProvenance {
     /// Returns baseline provenance when Workspace context was present for this request.
     pub fn baseline_reference(&self) -> Option<&str> {
         self.baseline_reference.as_deref()
+    }
+
+    /// Returns the explicit baseline capture-window limitation when scoped context is available.
+    pub const fn baseline_window(&self) -> Option<BaselineWindow> {
+        self.baseline_window
     }
 
     /// Returns baseline completeness when Workspace context was present for this request.
@@ -375,6 +387,7 @@ pub fn compose_diff(
         || comparison.scope() != expected_scope
         || evidence.query() != GitReadQuery::diff_for(expected_scope.mode())
         || !status_matches
+        || !comparison.baseline().matches_scope(expected_scope)
     {
         return DiffResult {
             state: DiffResultState::Unavailable,
@@ -402,7 +415,7 @@ pub fn compose_diff(
             conflicts: Vec::new(),
             ignored: Vec::new(),
             detail_cursor: None,
-            provenance: DiffProvenance::new(None, None, None),
+            provenance: DiffProvenance::new(None, None, None, None),
         };
     }
 
@@ -484,6 +497,7 @@ pub fn compose_diff(
             Some(evidence.operation_reference().to_owned()),
             Some(comparison.baseline().reference().to_owned()),
             Some(comparison.baseline().coverage()),
+            Some(comparison.baseline().window()),
         ),
     }
 }

@@ -438,7 +438,10 @@ pub fn read_authorized_source(
 }
 
 /// Opens a directory component while refusing symlinks and preserving raw Unix bytes.
-fn open_directory(parent: libc::c_int, component: &OsStr) -> Result<libc::c_int, ObservationError> {
+pub(super) fn open_directory(
+    parent: libc::c_int,
+    component: &OsStr,
+) -> Result<libc::c_int, ObservationError> {
     open_at(
         parent,
         component,

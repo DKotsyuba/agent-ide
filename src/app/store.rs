@@ -442,6 +442,37 @@ impl Store {
         }
     }
 
+    /// Reads at most one row of trusted static SELECT SQL on the existing owner thread.
+    /// SQLite must classify the statement as read-only; no operation receipt is allocated.
+    /// Empty results return None; queue, decoding, and timeout failures never imply a domain effect.
+    pub async fn read_one<T, F>(
+        &self,
+        sql: &'static str,
+        parameters: Vec<rusqlite::types::Value>,
+        decode: F,
+    ) -> Result<Option<T>, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T> + Send + 'static,
+    {
+        let (reply, receive) = oneshot::channel();
+        let job = Box::new(TypedRead {
+            sql,
+            parameters,
+            decode,
+            reply,
+        });
+        match self.sender.try_send(StoreMessage::Read { job }) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => return Err(StoreError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => return Err(StoreError::Unavailable),
+        }
+        match tokio::time::timeout(self.config.request_deadline, receive).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) | Err(_) => Err(StoreError::Unavailable),
+        }
+    }
+
     /// Looks up the durable mechanics receipt without replaying domain SQL.
     ///
     /// Missing, interrupted, or corrupt receipts return `OutcomeUnknown`; that condition does not
@@ -588,8 +619,61 @@ where
     }
 }
 
+/// Erases a single-row SELECT while keeping its typed result on the existing owner thread.
+trait StoreRead: Send {
+    /// Executes read-only SQL and sends one bounded row or the classified failure.
+    fn run(self: Box<Self>, connection: &Connection);
+}
+
+/// Owns one static query, bound values, row decoder, and typed reply channel.
+struct TypedRead<T, F> {
+    /// Trusted SELECT statement, never model-supplied SQL.
+    sql: &'static str,
+    /// Owned SQLite bind values.
+    parameters: Vec<rusqlite::types::Value>,
+    /// Converts the first returned row to the caller's domain value.
+    decode: F,
+    /// Returns an optional decoded row without a durable mechanics receipt.
+    reply: oneshot::Sender<Result<Option<T>, StoreError>>,
+}
+
+impl<T, F> StoreRead for TypedRead<T, F>
+where
+    T: Send + 'static,
+    F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T> + Send + 'static,
+{
+    /// Refuses non-SELECT or SQLite-write statements before binding or stepping them.
+    fn run(self: Box<Self>, connection: &Connection) {
+        let Self {
+            sql,
+            parameters,
+            decode,
+            reply,
+        } = *self;
+        let result = (|| {
+            if !sql.trim_start().starts_with("SELECT ") {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            let mut statement = connection.prepare(sql)?;
+            if !statement.readonly() {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            statement
+                .query_row(rusqlite::params_from_iter(parameters), decode)
+                .optional()
+        })()
+        .map_err(infrastructure);
+        let _ = reply.send(result);
+    }
+}
+
 /// Carries one bounded owner-thread execution or read-only mechanics lookup.
 enum StoreMessage {
+    /// Reads a domain row without admitting a mutating operation or allocating a receipt.
+    Read {
+        /// Single-row static SELECT and typed response.
+        job: Box<dyn StoreRead>,
+    },
     /// Attempts exactly one operation receipt admission and transaction execution.
     Execute {
         /// Caller-supplied stable ID used to suppress duplicate execution.
@@ -642,6 +726,7 @@ fn owner_thread(
     };
     while let Ok(message) = receiver.recv() {
         match message {
+            StoreMessage::Read { job } => job.run(&connection),
             StoreMessage::Execute { operation, job } => {
                 execute_one(&mut connection, config, operation, job);
             }

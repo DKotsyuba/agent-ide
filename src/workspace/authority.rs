@@ -11,12 +11,12 @@ use crate::assistance::host_binding::{ActiveBindingUse, BindingRef, ValidatedInv
 
 const MAX_OPERATION_ID_BYTES: usize = 128;
 
-/// Identifies one canonical worktree incarnation without converting Unix paths to UTF-8.
+/// Carries a raw worktree incarnation; only durable-resolved values qualify for product authority.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct WorktreeRef {
     /// Opaque digest of raw identity paths and this lifecycle incarnation.
     id: String,
-    /// Monotonic lifecycle discriminator supplied after authoritative reconciliation.
+    /// Lifecycle discriminator minted by the durable resolver for product identities.
     incarnation: u64,
     /// Raw Unix path of the mutable worktree root.
     worktree_path: PathBuf,
@@ -24,6 +24,8 @@ pub struct WorktreeRef {
     repository_root: PathBuf,
     /// Raw Git common-directory value, which may be relative to the discovered worktree root.
     git_common_dir: PathBuf,
+    /// Native identity evidence minted only by the durable Workspace resolver.
+    pub(super) native_key: Option<[u8; 32]>,
 }
 
 impl WorktreeRef {
@@ -32,8 +34,8 @@ impl WorktreeRef {
     /// Worktree and repository-root paths must be lexically absolute without `.` or `..`
     /// components. Git may report a relative common directory such as `.git`, so that raw value
     /// need only be nonempty and is retained unchanged beside the absolute worktree root. The
-    /// caller supplies an incarnation after Workspace has classified lifecycle continuity; this
-    /// constructor does not inspect the filesystem, infer identity from HEAD, or normalize bytes.
+    /// caller-supplied incarnation creates an unverified fixture/reference only. Durable activation
+    /// rejects it; product identities are minted by `DurableWorkspace::resolve_worktree`.
     pub fn from_discovery(
         worktree_path: PathBuf,
         repository_root: PathBuf,
@@ -59,6 +61,7 @@ impl WorktreeRef {
             worktree_path,
             repository_root,
             git_common_dir,
+            native_key: None,
         })
     }
 
@@ -88,19 +91,22 @@ impl WorktreeRef {
     }
 }
 
-/// Represents Workspace's current authority for one actor, binding generation, and worktree.
+/// Carries one actor/binding/worktree authority claim.
+/// Registry-only claims are not product authority; every use requires DurableWorkspace validation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthorityStamp {
     /// Canonical worktree incarnation owned by this actor.
-    worktree: WorktreeRef,
+    pub(super) worktree: WorktreeRef,
     /// Assistance binding generation that must remain live for scoped use.
-    binding: BindingRef,
+    pub(super) binding: BindingRef,
     /// Host-validated actor identity retained only for exclusivity checks.
-    actor_id: String,
+    pub(super) actor_id: String,
     /// Monotonic authority generation for stale-peer fencing.
-    epoch: u64,
+    pub(super) epoch: u64,
     /// Stable activation operation ID for idempotent retry correlation.
-    activation_id: String,
+    pub(super) activation_id: String,
+    /// Durable owner boot generation; absent for the non-authoritative in-process helper.
+    pub(super) owner_boot: Option<u64>,
 }
 
 impl AuthorityStamp {
@@ -134,13 +140,13 @@ impl AuthorityStamp {
 #[derive(Debug)]
 pub struct ActivationRequest {
     /// Stable bounded activation operation ID supplied by Assistance's start request.
-    activation_id: String,
+    pub(super) activation_id: String,
     /// Exact host-validated invocation that established or reactivated this binding generation.
-    invocation: ValidatedInvocation,
+    pub(super) invocation: ValidatedInvocation,
     /// Fresh transient Assistance liveness evidence for the invocation binding.
-    active_use: ActiveBindingUse,
-    /// Canonical worktree identity parsed from controlled Git discovery evidence.
-    worktree: WorktreeRef,
+    pub(super) active_use: ActiveBindingUse,
+    /// Candidate reference; durable activation requires native identity minted by Workspace.
+    pub(super) worktree: WorktreeRef,
 }
 
 impl ActivationRequest {
@@ -192,11 +198,11 @@ pub enum RevocationReason {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthorityRevoked {
     /// Exact worktree incarnation whose logical peer view must be fenced.
-    worktree: WorktreeRef,
+    pub(super) worktree: WorktreeRef,
     /// Authority epoch invalidated by this finite direct event.
-    old_epoch: u64,
+    pub(super) old_epoch: u64,
     /// Whether the binding stop handoff was confirmed or had to fail closed.
-    reason: RevocationReason,
+    pub(super) reason: RevocationReason,
 }
 
 impl AuthorityRevoked {
@@ -241,7 +247,8 @@ pub enum AuthorityError {
     EpochExhausted,
 }
 
-/// Keeps the in-memory authority state that later persistence reconciles without changing semantics.
+/// Maintains bounded in-process fixture/cache state; it is not a product authority owner.
+/// Its stamps cannot satisfy `DurableWorkspace` admission; product callers require durable receipts.
 #[derive(Debug, Default)]
 pub struct AuthorityRegistry {
     /// Every submitted activation operation and whether its authority remains active.
@@ -267,8 +274,8 @@ impl AuthorityRegistry {
     /// Grants one new authority or returns the same still-active result for an identical activation retry.
     ///
     /// The registry enforces one mutable worktree per actor and one actor per worktree. It records
-    /// only in-memory state in this first task; the persistence task replays the same transitions
-    /// through Application's durable migration and operation APIs.
+    /// only non-authoritative in-memory state. Product callers must use `DurableWorkspace`
+    /// for canonical identity, durable start receipts, and every current authority admission.
     pub fn activate(
         &mut self,
         request: ActivationRequest,
@@ -304,6 +311,7 @@ impl AuthorityRegistry {
             actor_id: request.invocation.actor_id().to_owned(),
             epoch: self.next_epoch,
             activation_id: request.activation_id,
+            owner_boot: None,
         };
         self.active_actors
             .insert(stamp.actor_id.clone(), stamp.worktree.clone());

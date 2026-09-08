@@ -88,6 +88,24 @@ pub struct BindingRef {
     generation: u64,
 }
 
+impl BindingRef {
+    /// Returns a stable opaque persistence key without exposing actor/channel fields or minting proof.
+    /// The domain and length framing preserve distinct actor, channel, and generation identities.
+    pub(crate) fn fingerprint(&self) -> [u8; 32] {
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"assistance-binding-identity-v1");
+        for value in [
+            self.actor_id.as_bytes(),
+            self.channel.0.as_bytes(),
+            &self.generation.to_le_bytes(),
+        ] {
+            hash.update(&(value.len() as u64).to_le_bytes());
+            hash.update(value);
+        }
+        *hash.finalize().as_bytes()
+    }
+}
+
 /// Represents one successful liveness consume for a particular [`BindingRef`] generation.
 ///
 /// It is a transient, non-authorizing result. Consumers must acquire a fresh value at each

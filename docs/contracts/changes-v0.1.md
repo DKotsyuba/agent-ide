@@ -1,6 +1,6 @@
 # Bounded Git diff composition
 
-Revision: v0.1-r2. Provider: Changes. Direct consumer: Assistance. Input provider: Workspace. Shared vocabulary: [common](common.md); current raw evidence boundary: [Workspace v0.1](workspace-v0.1.md).
+Revision: v0.1-r3. Provider: Changes. Direct consumer: Assistance. Input provider: Workspace. Shared vocabulary: [common](common.md); current raw evidence boundary: [Workspace v0.1](workspace-v0.1.md).
 
 ## Responsibility
 
@@ -16,13 +16,13 @@ Workspace derives those identities only from complete fixed `HEAD`, index, and s
 
 Composition requires matching comparison scope, raw patch scope/query, and status worktree/epoch. Unscoped status or a mixed component yields `unavailable` without identities, hunks, paths, or expansion references. Capture ceilings and the remaining repository-filter limitation are defined by the Workspace contract.
 
-Raw NUL-safe path/status/conflict data and a separate bounded untracked list identify the affected entries. Baseline completeness and provenance are context only: a session snapshot is never substituted for HEAD, index, or working-state comparison. An absent HEAD or unsupported comparison is explicit rather than a fabricated empty comparison.
+Raw NUL-safe path/status/conflict data and a separate bounded untracked list identify the affected entries. Baseline completeness, capture-window status, and provenance are context only: a session snapshot is never substituted for HEAD, index, or working-state comparison. An absent HEAD or unsupported comparison is explicit rather than a fabricated empty comparison.
 
 Workspace supplies currentness and ownership checks before composition and detail expansion. A revoked, stale, unsupported, failed, or incomplete input remains visibly so in the result; Changes never reconstructs a missing patch or declares partial evidence clean.
 
 ## Offered result
 
-The result uses the existing bounded envelope: `ready`, `unavailable`, `incomplete`, or `failed`, with scope, freshness, coverage, and provenance. Its payload contains comparison identities, status counts, selected exact hunks, separate untracked/conflict information, overflow limits, and owner-scoped operation/detail references.
+The result uses the existing bounded envelope: `ready`, `unavailable`, `incomplete`, or `failed`, with scope, freshness, coverage, and provenance. Its payload contains comparison identities, status counts, selected exact hunks, separate untracked/conflict information, overflow limits, baseline coverage/window status, and owner-scoped operation/detail references. `NotCaptured` distinguishes descriptive context from stored `Unverified` captures; neither can claim a complete baseline.
 
 Hunk selection respects both byte and hunk-count budgets. Omitted data is counted or marked as unknown when the source itself is truncated. Changes does not silently cut a hunk into a different patch. Binary changes and raw Unix paths remain explicit; safe display escaping must not replace the underlying raw identity.
 

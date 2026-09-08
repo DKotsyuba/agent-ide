@@ -1,6 +1,6 @@
 # Application v0.1 contract
 
-Revision: v0.1-r2. Provider: Application. Direct consumers: Assistance (private daemon IPC), Workspace (durable transaction and migration mechanics), and Execution (effective bounded runtime/store settings when it consumes them). Vocabulary: [common](common.md).
+Revision: v0.1-r3. Provider: Application. Direct consumers: Assistance (private daemon IPC), Workspace (durable transaction and migration mechanics), and Execution (effective bounded runtime/store settings when it consumes them). Vocabulary: [common](common.md).
 
 ## Scope and ownership
 
@@ -44,6 +44,8 @@ There is no configuration-file parser, unknown-key handling, live reload, drain 
 `Store::execute(operation, sql)` admits one valid opaque `OperationId` and calls `sql` with an Application-owned `rusqlite::Transaction`. The closure may perform domain SQL and return a typed value, but may not manually settle the top-level transaction. Application writes `started` and `committed` in the same transaction; it returns the typed value only after that commit succeeds. A domain SQL error rolls back and returns `RolledBack`. SQLite busy returns `Busy` without running domain SQL.
 
 An accepted operation ID has a durable receipt. A duplicate ID returns `DuplicateOperation { existing }` and never calls the supplied closure. `Store::outcome(operation)` performs reconciliation without replaying SQL. Queued/started receipts found on store restart become `OutcomeUnknown`; missing or corrupt receipt data is also unknown. Caller timeout after acceptance likewise returns `OutcomeUnknown` and does not authorize a retry. Receipt capacity is a hard admission cap: no receipt is evicted, including terminal entries.
+
+`Store::read_one(static_select, parameters, decode)` reads at most one domain row on the same bounded owner queue without allocating an operation receipt. The statement must start with `SELECT` and SQLite must classify it as read-only before stepping. The caller owns the trusted query and row semantics. Missing rows return `None`; queue/decode/timeout failures remain explicit. This supports exact Workspace receipt reconciliation and currentness checks without a second connection or unbounded mechanics receipts.
 
 Application's transaction covers only SQLite. It does not make Git, filesystem, subprocess, host-delivery, or external effects atomic. Domain modules own their SQL tables, domain receipts, semantic transitions, and any decision based on this mechanics result.
 

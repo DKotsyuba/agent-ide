@@ -96,7 +96,7 @@ fn comparison(mode: DiffMode) -> GitComparison {
         scope_from_mode(mode),
         GitIdentity::new(b"left-id".to_vec()).expect("left identity is valid"),
         GitIdentity::new(b"right-id".to_vec()).expect("right identity is valid"),
-        BaselineContext::new("baseline", BaselineCoverage::Complete)
+        BaselineContext::new("baseline", BaselineCoverage::Partial)
             .expect("baseline context is bounded"),
     )
 }
@@ -404,7 +404,7 @@ fn old_epoch_for_same_worktree_is_stale_and_returns_no_data() {
     let request = ActivationRequest::new("stale-op-2", invocation, active, worktree).unwrap();
     let current = registry.activate(request).unwrap();
     let expected = GitScope::from_authority(&current, DiffMode::Head);
-    let baseline = BaselineContext::new("baseline", BaselineCoverage::Complete).unwrap();
+    let baseline = BaselineContext::new("baseline", BaselineCoverage::Partial).unwrap();
     let identities = |scope| {
         GitComparison::new(
             scope,
@@ -480,7 +480,7 @@ fn comparison_status_query_and_capture_boundaries_are_enforced() {
             scope,
             GitIdentity::new(b"left".to_vec()).unwrap(),
             GitIdentity::new(b"right".to_vec()).unwrap(),
-            BaselineContext::new("baseline", BaselineCoverage::Complete).unwrap(),
+            BaselineContext::new("baseline", BaselineCoverage::Partial).unwrap(),
         )
     };
     let capture = |scope: GitScope, query, stdout: Vec<u8>, stderr: Vec<u8>| {
@@ -546,7 +546,7 @@ fn comparison_status_query_and_capture_boundaries_are_enforced() {
             &patch,
             &index,
             &wrong_query,
-            BaselineContext::new("baseline", BaselineCoverage::Complete).unwrap()
+            BaselineContext::new("baseline", BaselineCoverage::Partial).unwrap()
         ),
         Err(GitError::IncompleteIdentity)
     );

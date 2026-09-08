@@ -348,7 +348,7 @@ fn evidence(operation: &str, intent: &GitReadIntent, output: Output) -> RawGitEv
 
 /// Uses a complete baseline only as context, never as a comparison side.
 fn baseline() -> BaselineContext {
-    BaselineContext::new("real-git-session-baseline", BaselineCoverage::Complete)
+    BaselineContext::new("real-git-session-baseline", BaselineCoverage::Partial)
         .expect("baseline context is bounded")
 }
 

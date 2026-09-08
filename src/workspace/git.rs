@@ -51,6 +51,15 @@ pub enum BaselineCoverage {
     Unknown,
 }
 
+/// States whether a baseline's Git/source capture window has actually been verified.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BaselineWindow {
+    /// Caller supplied descriptive context only; no stored capture exists.
+    NotCaptured,
+    /// A bounded capture is stored, but no joint atomic Git/source window has been established.
+    Unverified,
+}
+
 /// Carries session-baseline provenance only as context beside an exact Git comparison.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BaselineContext {
@@ -58,11 +67,21 @@ pub struct BaselineContext {
     reference: String,
     /// Explicit completeness state for that observation.
     coverage: BaselineCoverage,
+    /// Scope of a durable capture, absent for descriptive caller context.
+    scope: Option<GitScope>,
+    /// Explicit capture-window limitation; callers cannot claim a closed window.
+    window: BaselineWindow,
+    /// Fingerprint of the bounded stored payload, absent for descriptive context.
+    capture_digest: Option<[u8; 32]>,
 }
 
 impl BaselineContext {
-    /// Creates a bounded provenance value that never replaces `head`, `staged`, or `unstaged` sides.
+    /// Creates descriptive Partial/Unknown context without claiming a stored capture.
+    /// Complete coverage is rejected: only a future verified joint capture window may mint it.
     pub fn new(reference: impl Into<String>, coverage: BaselineCoverage) -> Result<Self, GitError> {
+        if coverage == BaselineCoverage::Complete {
+            return Err(GitError::UnverifiedBaseline);
+        }
         let reference = reference.into();
         if reference.is_empty() || reference.len() > 128 {
             return Err(GitError::InvalidBaselineReference);
@@ -70,7 +89,44 @@ impl BaselineContext {
         Ok(Self {
             reference,
             coverage,
+            scope: None,
+            window: BaselineWindow::NotCaptured,
+            capture_digest: None,
         })
+    }
+
+    /// Mints partial context only after Workspace has committed and verified a bounded stored payload.
+    pub(super) fn from_stored(
+        reference: String,
+        scope: GitScope,
+        digest: [u8; 32],
+    ) -> Result<Self, GitError> {
+        let mut context = Self::new(reference, BaselineCoverage::Partial)?;
+        context.scope = Some(scope);
+        context.window = BaselineWindow::Unverified;
+        context.capture_digest = Some(digest);
+        Ok(context)
+    }
+
+    /// Returns the explicit capture-window status, never an inferred complete snapshot.
+    pub const fn window(&self) -> BaselineWindow {
+        self.window
+    }
+
+    /// Returns the stored payload digest; None means no capture was minted by Workspace.
+    pub fn capture_digest(&self) -> Option<&[u8; 32]> {
+        self.capture_digest.as_ref()
+    }
+
+    /// Requires a stored baseline to match the worktree incarnation and authority epoch being compared.
+    /// Descriptive partial/unknown context has no authority and cannot claim Complete coverage.
+    pub fn matches_scope(&self, scope: &GitScope) -> bool {
+        self.scope
+            .as_ref()
+            .map_or(self.coverage != BaselineCoverage::Complete, |captured| {
+                captured.worktree() == scope.worktree()
+                    && captured.authority_epoch() == scope.authority_epoch()
+            })
     }
 
     /// Returns the bounded baseline lookup reference.
@@ -497,6 +553,8 @@ pub enum GitError {
     InvalidIdentity,
     /// A baseline lookup reference is empty or exceeds the bounded local identifier limit.
     InvalidBaselineReference,
+    /// A caller attempted to claim Complete without a verified stored capture window.
+    UnverifiedBaseline,
     /// An operation reference is empty or exceeds the bounded local identifier limit.
     InvalidOperationReference,
     /// A captured stream exceeds Workspace's hard byte ceiling, regardless of truncation flags.
@@ -521,7 +579,8 @@ pub fn comparison_from_evidence(
     working: &RawGitEvidence,
     baseline: BaselineContext,
 ) -> Result<GitComparison, GitError> {
-    if head.query() != GitReadQuery::HeadIdentity
+    if !baseline.matches_scope(head.scope())
+        || head.query() != GitReadQuery::HeadIdentity
         || index.query() != GitReadQuery::IndexState
         || working.query() != GitReadQuery::diff_for(mode)
         || !same_scope(head, index)
