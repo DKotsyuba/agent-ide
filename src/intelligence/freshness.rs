@@ -333,10 +333,19 @@ impl CacheIdentity {
 pub struct CacheLifecycle {
     /// Compatibility inputs that deliberately omit user/session/authority values.
     identity: CacheIdentity,
-    /// Retained private namespace until one verified retirement fact consumes it.
-    namespace: Option<CacheNamespace>,
+    /// Retained namespace state until one verified retirement fact completes successfully.
+    namespace: Option<RetainedNamespace>,
     /// Whether the outgoing view has stopped using this namespace.
     quiescent: bool,
+}
+
+/// Represents whether a retained namespace remains safe to hand off after a failed consuming retirement API.
+#[derive(Debug)]
+enum RetainedNamespace {
+    /// The namespace remains available for a compatible quiescent handoff.
+    Ready(CacheNamespace),
+    /// Retirement failed after consuming the handle, so lifecycle ownership remains but reuse is blocked.
+    Unavailable,
 }
 
 impl CacheLifecycle {
@@ -348,7 +357,7 @@ impl CacheLifecycle {
     ) -> Result<Self, crate::app::AppError> {
         Ok(Self {
             identity,
-            namespace: Some(root.retain(namespace)?),
+            namespace: Some(RetainedNamespace::Ready(root.retain(namespace)?)),
             quiescent: false,
         })
     }
@@ -360,7 +369,9 @@ impl CacheLifecycle {
 
     /// Reuses this namespace only for a compatible incoming identity after the old view quiesced.
     pub fn handoff(&mut self, incoming: &CacheIdentity) -> bool {
-        self.quiescent && self.namespace.is_some() && self.identity.compatible_with(incoming)
+        self.quiescent
+            && matches!(self.namespace.as_ref(), Some(RetainedNamespace::Ready(_)))
+            && self.identity.compatible_with(incoming)
     }
 
     /// Retires the namespace only after Workspace verified an exact closure or reset fact.
@@ -368,14 +379,26 @@ impl CacheLifecycle {
         &mut self,
         verified: VerifiedCacheRetirement,
     ) -> Result<(), crate::app::AppError> {
-        if let Some(namespace) = self.namespace.take() {
-            namespace.retire(verified)?;
+        let Some(namespace) = self.namespace.take() else {
+            return Ok(());
+        };
+        let RetainedNamespace::Ready(namespace) = namespace else {
+            self.namespace = Some(RetainedNamespace::Unavailable);
+            return Err(crate::app::AppError::UnsafeRuntimeDirectory);
+        };
+        match namespace.retire(verified) {
+            Ok(()) => {
+                self.quiescent = true;
+                Ok(())
+            }
+            Err(error) => {
+                self.namespace = Some(RetainedNamespace::Unavailable);
+                Err(error)
+            }
         }
-        self.quiescent = true;
-        Ok(())
     }
 
-    /// Returns whether this namespace remains retained after non-retirement lifecycle events.
+    /// Returns whether lifecycle ownership remains retained, including a namespace whose failed retirement blocks reuse.
     pub const fn retained(&self) -> bool {
         self.namespace.is_some()
     }
