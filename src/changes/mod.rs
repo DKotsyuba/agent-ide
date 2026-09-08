@@ -432,14 +432,8 @@ pub fn compose_diff(
         };
     }
 
-    let (selected_hunks, overflow_hunks, overflow_bytes, cursor_offset) = select_hunks(
-        raw_hunks,
-        if truncated_output {
-            DiffSelectionBudget::default()
-        } else {
-            budget
-        },
-    );
+    let (selected_hunks, overflow_hunks, overflow_bytes, cursor_offset) =
+        select_hunks(raw_hunks, budget);
     if overflow_hunks > 0 {
         state = match state {
             DiffResultState::Ready => DiffResultState::Incomplete,

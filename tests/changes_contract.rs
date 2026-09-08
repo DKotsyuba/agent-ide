@@ -167,6 +167,20 @@ fn compose_rejects_scope_mismatch_as_unavailable() {
         DiffSelectionBudget::default(),
     );
     assert_eq!(result.state(), DiffResultState::Unavailable);
+    assert_eq!(
+        result.freshness(),
+        agent_ide::changes::DiffFreshness::Unknown
+    );
+    assert_eq!(result.identities().left(), b"");
+    assert_eq!(result.identities().right(), b"");
+    assert_eq!(result.counts().tracked(), 0);
+    assert!(result.selected_hunks().is_empty());
+    assert!(result.untracked().is_empty());
+    assert!(result.conflicts().is_empty());
+    assert!(result.ignored().is_empty());
+    assert!(result.detail_cursor().is_none());
+    assert_eq!(result.provenance().operation_reference(), None);
+    assert_eq!(result.provenance().baseline_reference(), None);
 }
 
 #[test]
@@ -188,7 +202,7 @@ fn compose_marks_truncated_stdout_as_incomplete() {
     );
     assert_eq!(result.state(), DiffResultState::Incomplete);
     assert!(result.truncated_output());
-    assert_eq!(result.overflow_hunks(), 0);
+    assert_eq!(result.overflow_hunks(), 1);
 }
 
 #[test]
@@ -287,4 +301,42 @@ fn failed_exit_code_remains_failed_and_not_ready() {
         DiffSelectionBudget::default(),
     );
     assert_eq!(result.state(), DiffResultState::Failed);
+}
+
+#[test]
+fn failed_exit_with_truncation_malformed_binary_keeps_failed_and_budget() {
+    let scope = scope_from_mode(DiffMode::Head);
+    let result = compose_diff(
+        &scope,
+        &comparison(DiffMode::Head),
+        status_fixture(),
+        make_evidence(
+            &scope,
+            b"diff --git a/file b/file\n@@ -1 +1 @@\n-old\n+new\nBinary files a/x and b/x differ\nbad-tail\n",
+            Some(7),
+            true,
+        ),
+        DiffSelectionBudget::bounded(0, 0),
+    );
+    assert_eq!(result.state(), DiffResultState::Failed);
+    assert!(result.selected_hunks().is_empty());
+    assert_eq!(result.overflow_hunks(), 1);
+}
+
+#[test]
+fn path_with_spaces_keeps_raw_hunk_and_no_guessed_path() {
+    let scope = scope_from_mode(DiffMode::Head);
+    let patch = b"diff --git a/with space.txt b/with space.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    let result = compose_diff(
+        &scope,
+        &comparison(DiffMode::Head),
+        status_fixture(),
+        make_evidence(&scope, patch, Some(0), false),
+        DiffSelectionBudget::default(),
+    );
+    assert_eq!(
+        result.selected_hunks()[0].patch(),
+        b"@@ -1 +1 @@\n-old\n+new\n"
+    );
+    assert!(result.selected_hunks()[0].path().is_none());
 }
