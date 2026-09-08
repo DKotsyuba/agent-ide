@@ -150,7 +150,7 @@ pub struct GitScope {
 pub enum GitReadQuery {
     /// Collects NUL-delimited porcelain-v2 status, including separately reported untracked paths.
     Status,
-    /// Verifies the current `HEAD`; a nonzero exit explicitly reports an unborn head.
+    /// Quietly verifies the current `HEAD`; its fixed missing-ref exit reports an unborn head.
     HeadIdentity,
     /// Collects the complete NUL-delimited index state without writing a tree object.
     IndexState,
@@ -619,6 +619,7 @@ fn read_args(query: GitReadQuery) -> Vec<OsString> {
         GitReadQuery::HeadIdentity => args.extend([
             OsString::from("rev-parse"),
             OsString::from("--verify"),
+            OsString::from("--quiet"),
             OsString::from("HEAD"),
             OsString::from("--"),
         ]),
@@ -681,5 +682,9 @@ mod tests {
         assert!(diff.contains(&OsString::from("--full-index")));
         assert_eq!(diff.last(), Some(&OsString::from("--")));
         assert!(!diff.contains(&OsString::from("--raw")));
+        let head = read_args(GitReadQuery::HeadIdentity);
+        assert!(head.contains(&OsString::from("--verify")));
+        assert!(head.contains(&OsString::from("--quiet")));
+        assert_eq!(head.last(), Some(&OsString::from("--")));
     }
 }
