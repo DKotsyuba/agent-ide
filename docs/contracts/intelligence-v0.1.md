@@ -94,12 +94,13 @@ toolchain path and forwards only its parent as the process `PATH`.
 
 `rust-analyzer` is exclusive in v0.1. The shared `gopls` profile starts one
 controlled `gopls -listen=unix;<owned socket> -listen.timeout=0` listener per
-compatibility key. Each `WorktreeRef` incarnation receives an independently piped explicit
-`gopls -remote=unix;<owned socket>` forwarder, initialize root/workspace folder,
-document state, request IDs, source sequence and logical lease. `-remote=auto`
-is never used. The worktree is therefore an isolated view key, not a second
-heavy daemon. If divergent-worktree isolation or detach-with-peer-survival is
-not proved, the profile reports unsupported/exclusive rather than shared.
+compatibility key. Each `WorktreeRef` incarnation receives an independently
+piped explicit `gopls -remote=unix;<owned socket>` forwarder, initialize
+root/workspace folder, document state, request IDs, source sequence and logical
+lease. `-remote=auto` is never used. The worktree is therefore an isolated view
+key, not a second heavy daemon. If divergent-worktree isolation or
+detach-with-peer-survival is not proved, the profile reports
+unsupported/exclusive rather than shared.
 For `gopls v0.23.0`, an explicitly shutdown/exit forwarder may report its
 documented terminal `remote disconnected` exit after the daemon closes that
 session; it is accepted only with exact captured evidence and a still-live peer
