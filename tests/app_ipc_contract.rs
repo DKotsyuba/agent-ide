@@ -421,3 +421,77 @@ async fn assistance_transport_is_finite_and_hook_submission_never_autostarts() {
     assert_eq!(unknown.read(&mut reply).await.unwrap(), 0);
     stop_assistance_daemon(task, runtime_dir).await;
 }
+
+/// Proves delayed connect polling consumes the exchange budget using a real socket and virtual time.
+#[tokio::test(start_paused = true)]
+async fn hook_and_method_share_one_total_connect_and_exchange_deadline() {
+    // A runnable task prevents paused time from auto-advancing while the socket reactor catches up.
+    let clock_guard = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    for hook in [true, false] {
+        let runtime = runtime_dir();
+        let listener = UnixListener::bind(runtime.join("agent-ide.sock")).unwrap();
+        let limits =
+            HookTransportLimits::new(128 * 1024, 64 * 1024, Duration::from_millis(100)).unwrap();
+        let mut request = Box::pin(async {
+            if hook {
+                submit_hook_if_running(
+                    &runtime,
+                    HookSubmit::new(
+                        "request",
+                        "correlation",
+                        "attachment",
+                        OpaqueJson::new("{}", 64).unwrap(),
+                    )
+                    .unwrap(),
+                    limits,
+                )
+                .await
+                    == HookSubmitTransportResult::Unavailable
+            } else {
+                dispatch_method_if_running(
+                    &runtime,
+                    MethodDispatch::new(
+                        "request",
+                        "correlation",
+                        "attachment",
+                        agent_ide::app::transport::AssistanceMethod::Context,
+                        OpaqueJson::new("{}", 64).unwrap(),
+                    )
+                    .unwrap(),
+                    limits,
+                )
+                .await
+                    == MethodDispatchTransportResult::Unavailable
+            }
+        });
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(request.as_mut().poll(&mut context).is_pending());
+        tokio::time::advance(Duration::from_millis(60)).await;
+        let (mut socket, _) = listener.accept().await.unwrap();
+        // Drive the suspended connect and write to completion, then keep the peer silent.
+        tokio::select! {
+            _ = &mut request => panic!("transport completed before the fake peer read its request"),
+            frame = async {
+                let length = socket.read_u32().await.unwrap() as usize;
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).await.unwrap();
+                serde_json::from_slice::<Value>(&body).unwrap()
+            } => assert_eq!(frame["request_id"], "request"),
+        }
+        tokio::time::advance(Duration::from_millis(50)).await;
+        assert_eq!(
+            request.as_mut().poll(&mut context),
+            std::task::Poll::Ready(true),
+            "hook={hook}: exchange reset the original 100ms deadline"
+        );
+        drop(request);
+        drop(socket);
+        drop(listener);
+        fs::remove_dir_all(runtime).unwrap();
+    }
+    clock_guard.abort();
+}

@@ -862,3 +862,177 @@ async fn protocol_stdout_has_one_owner_and_borrowed_endpoints_cannot_be_killed()
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+/// Kills only the test-created process group if an assertion fails before ownership cleanup succeeds.
+struct ChildCleanup(libc::pid_t);
+
+impl Drop for ChildCleanup {
+    /// Best-effort cleanup of the still-owned fixture group; no borrowed or unrelated PID is accepted.
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(-self.0, libc::SIGKILL);
+        }
+    }
+}
+
+/// Waits for the fixture's PID handshake before cancellation, so the regression cannot pass by racing spawn.
+async fn child_cleanup(root: &Path) -> ChildCleanup {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(pid) = fs::read_to_string(root.join("child.pid"))
+                .ok()
+                .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+            {
+                return ChildCleanup(pid);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+/// Proves dropped captured/protocol handles and cancelled reap futures kill their real direct child.
+#[tokio::test]
+async fn dropping_owned_children_and_reap_futures_kills_without_freeing_uncertain_slots() {
+    let mut borrowed = tokio::process::Command::new("/bin/sleep")
+        .arg("30")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let endpoint = BorrowedEndpoint::observe(format!("peer:{}", borrowed.id().unwrap())).unwrap();
+    assert_eq!(endpoint.cancel(), EndpointOwnership::Borrowed);
+    drop(endpoint);
+    for mode in 0..5 {
+        let root = worktree();
+        let request = request(
+            &root,
+            "trap '' TERM; printf '%s' \"$$\" > child.pid; exec /bin/sleep 30",
+        );
+        let mut admission = AdmissionController::new(AdmissionLimits {
+            total_running: 1,
+            per_owner_running: 1,
+            per_owner_queued: 1,
+            total_queued: 1,
+            interactive_burst: 1,
+        })
+        .unwrap();
+        let Admission::Granted(lease) =
+            admission.submit(OwnerId::new("owner").unwrap(), AdmissionClass::Interactive)
+        else {
+            panic!("fixture admission must succeed")
+        };
+        let cleanup;
+        let mut group_member = None;
+        if mode < 3 {
+            let child = execution::OwnedChild::spawn_captured(
+                &request,
+                lease,
+                None,
+                Path::new("/usr/bin/codex"),
+                64,
+            )
+            .unwrap();
+            cleanup = child_cleanup(&root).await;
+            if mode == 0 {
+                // A test-owned direct child joins the group, so its exit can be reaped without
+                // assuming waitpid rights over arbitrary grandchildren or relying on init.
+                group_member = Some(
+                    tokio::process::Command::new("/bin/sleep")
+                        .arg("30")
+                        .process_group(cleanup.0)
+                        .kill_on_drop(true)
+                        .spawn()
+                        .unwrap(),
+                );
+            }
+            match mode {
+                0 => drop(child),
+                1 => {
+                    let mut future = Box::pin(child.reap(Duration::from_secs(1)));
+                    assert!(
+                        future
+                            .as_mut()
+                            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                            .is_pending()
+                    );
+                    drop(future);
+                }
+                _ => {
+                    let mut future = Box::pin(
+                        child.cancel_and_reap(Duration::from_secs(10), Duration::from_secs(1)),
+                    );
+                    assert!(
+                        future
+                            .as_mut()
+                            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                            .is_pending()
+                    );
+                    drop(future);
+                }
+            }
+        } else {
+            let child = execution::OwnedProtocolChild::spawn(
+                &request,
+                lease,
+                None,
+                Path::new("/usr/bin/codex"),
+                64,
+            )
+            .unwrap();
+            cleanup = child_cleanup(&root).await;
+            if mode == 3 {
+                drop(child);
+            } else {
+                let mut future = Box::pin(child.reap(Duration::from_secs(1)));
+                assert!(
+                    future
+                        .as_mut()
+                        .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                        .is_pending()
+                );
+                drop(future);
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let result = unsafe { libc::kill(cleanup.0, 0) };
+                if result == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("owned child survived dropped mode {mode}"));
+        if let Some(mut member) = group_member {
+            assert!(
+                !tokio::time::timeout(Duration::from_secs(3), member.wait())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .success(),
+                "owned group member survived drop"
+            );
+        }
+        assert!(
+            borrowed.try_wait().unwrap().is_none(),
+            "borrowed endpoint was killed"
+        );
+        assert_eq!(
+            admission.running_count(),
+            1,
+            "drop must not manufacture reap evidence"
+        );
+        assert!(matches!(
+            admission.submit(OwnerId::new("peer").unwrap(), AdmissionClass::Interactive),
+            Admission::Queued(_)
+        ));
+        std::mem::forget(cleanup); // The reaped PID must never be signalled again after possible reuse.
+        fs::remove_dir_all(root).unwrap();
+    }
+    borrowed.kill().await.unwrap();
+    borrowed.wait().await.unwrap();
+}

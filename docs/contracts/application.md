@@ -18,6 +18,12 @@ UID equality is only a local-user transport boundary; it is not actor proof or a
 
 The accepted r2 addition exposes exactly `assistance.hook_submit` and `assistance.method_dispatch`; the latter has the closed v0.1 tool enum `start | context | diff | inspect | stop`. Application dispatches one correlated request to Assistance and returns one correlated opaque reply. It has no generic event bus, pub/sub, retained hook queue, host identity, authority, rendering, or method semantics. `submit_hook_if_running` is connect-only and returns bounded `Unavailable` on every transport fault; it never starts/retries a daemon and its caller must fail open.
 
+Both connect-only clients compute one absolute deadline at call entry. Connecting and the
+subsequent frame exchange consume that same `HookTransportLimits.deadline` budget; a slow
+connection never grants a second full exchange interval. The fake-socket regression uses
+Tokio's test-only paused clock to spend 60ms before connect completes and 50ms in a silent
+exchange under a 100ms total budget, for both hook and method requests.
+
 The r2 Rust surface is `HookTransportLimits { max_frame_bytes, max_observation_bytes, deadline }`, `HookSubmit { request_id, correlation_id, opaque_attachment, sanitized_observation_json }`, `AssistanceMethod::HookSubmit`, `AssistanceDispatch`, `AssistanceDispatchReply`, `AssistanceDispatcher::dispatch`, `submit_hook_if_running(runtime_dir, request, limits)`, and `run_daemon_with_assistance(runtime_dir, dispatcher, config)`. `AssistanceMethod` has no extensible string variant. `OpaqueAttachmentRef`, request/correlation IDs, and opaque JSON results are bounded transport values; they are not authority assertions or Application-owned semantic types.
 
 ## Immutable configuration

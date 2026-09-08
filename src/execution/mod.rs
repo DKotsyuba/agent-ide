@@ -17,7 +17,7 @@ use serde_json::Value;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::{Child, ChildStdin, ChildStdout, Command},
-    task::JoinHandle,
+    task::{AbortHandle, JoinHandle},
     time::timeout,
 };
 
@@ -1030,6 +1030,8 @@ pub enum AdmissionError {
 pub struct QueueTicket(u64);
 
 /// Reserves one admitted execution slot until it is explicitly released after reaping.
+///
+/// Abnormal owned-child drop retains this reservation because it supplies no reap evidence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AdmissionLease(u64);
 
@@ -1194,7 +1196,7 @@ impl AdmissionController {
         Ok(grants)
     }
 
-    /// Returns the number of globally admitted slots for resource-accounting evidence.
+    /// Returns reserved slots, including uncertain dropped children; this is not a live-process count.
     pub fn running_count(&self) -> usize {
         self.total_running()
     }
@@ -1777,10 +1779,40 @@ impl From<io::Error> for ProcessError {
     }
 }
 
-/// Owns one launched direct child, its admission lease, and exclusive stdout/stderr drain tasks.
-pub struct OwnedChild {
-    /// Direct child that Execution launched and therefore may wait/reap.
+/// Keeps kill and drainer-abort responsibility alive across moves into a cancellable reap future.
+///
+/// This private guard owns only a child launched by Execution. It never releases admission or
+/// claims reap/descendant completion. Tokio retains best-effort direct-child reaping on drop.
+struct ChildOwnership {
+    /// Live direct-child handle; its ID becomes absent after wait has reaped it.
     child: Child,
+    /// Cancellation handles for the child's exclusively owned output drain tasks.
+    drainers: Vec<AbortHandle>,
+}
+
+impl Drop for ChildOwnership {
+    /// Requests immediate group/direct kill only while the child remains unreaped, then aborts drains.
+    ///
+    /// Signal failures leave cleanup uncertain. No async runtime is required to request the kills;
+    /// this path yields no release evidence and never signals a PID retained after successful reap.
+    fn drop(&mut self) {
+        if let Some(pid) = self.child.id() {
+            let _ = signal_group(pid, libc::SIGKILL);
+            let _ = self.child.start_kill();
+        }
+        for drainer in &self.drainers {
+            drainer.abort();
+        }
+    }
+}
+
+/// Owns one launched direct child, its admission lease, and exclusive stdout/stderr drain tasks.
+///
+/// Dropping the handle or a consuming reap future requests group/direct kill and aborts drains.
+/// The admission reservation remains uncertain until separately verified recovery or explicit reap.
+pub struct OwnedChild {
+    /// Cancellation-safe direct-child and output-task ownership retained through reap/drain awaits.
+    process: ChildOwnership,
     /// Direct-child PID used only for the current owned process-group signal attempt.
     pid: u32,
     /// Sole stdout drainer retaining bounded diagnostic output.
@@ -1832,11 +1864,16 @@ impl OwnedChild {
             .ok_or_else(|| io::Error::other("spawned child has no PID"))?;
         let stdout = child.stdout.take().expect("piped stdout exists");
         let stderr = child.stderr.take().expect("piped stderr exists");
+        let stdout = tokio::spawn(drain(stdout, output_cap));
+        let stderr = tokio::spawn(drain(stderr, output_cap));
         Ok(Self {
-            child,
+            process: ChildOwnership {
+                child,
+                drainers: vec![stdout.abort_handle(), stderr.abort_handle()],
+            },
             pid,
-            stdout: tokio::spawn(drain(stdout, output_cap)),
-            stderr: tokio::spawn(drain(stderr, output_cap)),
+            stdout,
+            stderr,
             lease,
         })
     }
@@ -1844,19 +1881,20 @@ impl OwnedChild {
     /// Requests TERM, waits `grace`, requests KILL if necessary, then reaps the direct child.
     ///
     /// Signal acknowledgement proves only delivery attempt. The returned result proves direct-child
-    /// reaping and explicitly leaves descendant termination unverified.
+    /// reaping and explicitly leaves descendant termination unverified. Cancelling this future
+    /// invokes immediate drop cleanup and produces no admission-release evidence.
     pub async fn cancel_and_reap(
         mut self,
         grace: Duration,
         output_deadline: Duration,
     ) -> Result<ReapedProcess, ProcessError> {
         let term_requested = signal_group(self.pid, libc::SIGTERM).is_ok();
-        let status = match timeout(grace, self.child.wait()).await {
+        let status = match timeout(grace, self.process.child.wait()).await {
             Ok(status) => status?,
             Err(_) => {
                 let kill_requested = signal_group(self.pid, libc::SIGKILL).is_ok();
-                self.child.start_kill()?;
-                let status = self.child.wait().await?;
+                self.process.child.start_kill()?;
+                let status = self.process.child.wait().await?;
                 return self
                     .finish(
                         status,
@@ -1880,10 +1918,10 @@ impl OwnedChild {
         .await
     }
 
-    /// Waits for ordinary completion and then gathers bounded stream evidence.
+    /// Waits for ordinary completion and bounded stream evidence; cancellation invokes drop cleanup.
     pub async fn reap(self, output_deadline: Duration) -> Result<ReapedProcess, ProcessError> {
         let mut this = self;
-        let status = this.child.wait().await?;
+        let status = this.process.child.wait().await?;
         this.finish(status, None, output_deadline).await
     }
 
@@ -1894,6 +1932,7 @@ impl OwnedChild {
         cancellation: Option<CancellationEvidence>,
         output_deadline: Duration,
     ) -> Result<ReapedProcess, ProcessError> {
+        let _ownership = self.process;
         let stdout = collect_drain(self.stdout, output_deadline).await;
         let stderr = collect_drain(self.stderr, output_deadline).await;
         Ok(ReapedProcess {
@@ -1908,13 +1947,16 @@ impl OwnedChild {
 }
 
 /// Gives Intelligence sole ownership of a protocol child's stdin/stdout while Execution drains stderr.
+///
+/// Dropping the handle or consuming reap future requests owned group/direct kill and aborts stderr;
+/// it produces no exit evidence and does not free the admission reservation.
 pub struct OwnedProtocolChild {
     /// The sole stdin writer for the selected protocol client.
     pub stdin: ChildStdin,
     /// The sole stdout reader for the selected protocol client; Execution never drains it.
     pub stdout: ChildStdout,
-    /// Direct owned protocol child that Execution reaps after pipe owner completion.
-    child: Child,
+    /// Cancellation-safe child ownership retained after the protocol pipes move or close.
+    process: ChildOwnership,
     /// Sole stderr drainer; stdout is deliberately unavailable to Execution.
     stderr: JoinHandle<io::Result<CapturedOutput>>,
     /// Admission slot retained until direct protocol-child reap.
@@ -1965,16 +2007,20 @@ impl OwnedProtocolChild {
         let stdin = child.stdin.take().expect("piped stdin exists");
         let stdout = child.stdout.take().expect("piped stdout exists");
         let stderr = child.stderr.take().expect("piped stderr exists");
+        let stderr = tokio::spawn(drain(stderr, output_cap));
         Ok(Self {
             stdin,
             stdout,
-            child,
-            stderr: tokio::spawn(drain(stderr, output_cap)),
+            process: ChildOwnership {
+                child,
+                drainers: vec![stderr.abort_handle()],
+            },
+            stderr,
             lease,
         })
     }
 
-    /// Reaps the direct protocol child after its owner has finished with the exclusive pipes.
+    /// Closes the exclusive pipes and reaps the direct child; cancellation invokes drop cleanup.
     pub async fn reap(
         self,
         output_deadline: Duration,
@@ -1982,7 +2028,7 @@ impl OwnedProtocolChild {
         let mut this = self;
         drop(this.stdin);
         drop(this.stdout);
-        let status = this.child.wait().await?;
+        let status = this.process.child.wait().await?;
         let stderr = collect_drain(this.stderr, output_deadline).await;
         Ok((status, stderr, this.lease))
     }
@@ -2061,8 +2107,9 @@ fn build_command(
     Ok(process)
 }
 
-/// Configures a distinct Unix process group so signals may target owned descendants conservatively.
+/// Configures an owned Unix group and direct-child kill-on-drop as a launch/setup failure fallback.
 fn configure_process_group(command: &mut Command) {
+    command.kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
     #[cfg(not(unix))]

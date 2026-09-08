@@ -255,17 +255,21 @@ async fn run_daemon_inner(
 ///
 /// Every connection, framing, deadline, or dispatcher fault becomes `Unavailable`. Callers must
 /// exit their host hook permissively and must not retry inline or use this result as actor proof.
+/// One absolute deadline covers connect, framing, exchange, and response parsing together.
 pub async fn submit_hook_if_running(
     runtime_dir: &Path,
     request: HookSubmit,
     limits: HookTransportLimits,
 ) -> HookSubmitTransportResult {
+    let Some(deadline) = tokio::time::Instant::now().checked_add(limits.deadline) else {
+        return HookSubmitTransportResult::Unavailable;
+    };
     let socket_path = runtime_dir.join(SOCKET_NAME);
-    let mut stream =
-        match tokio::time::timeout(limits.deadline, UnixStream::connect(socket_path)).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(_)) | Err(_) => return HookSubmitTransportResult::Unavailable,
-        };
+    let mut stream = match tokio::time::timeout_at(deadline, UnixStream::connect(socket_path)).await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(_)) | Err(_) => return HookSubmitTransportResult::Unavailable,
+    };
     let observation =
         match serde_json::from_str::<Value>(request.sanitized_observation_json().as_str()) {
             Ok(observation) => observation,
@@ -284,7 +288,7 @@ pub async fn submit_hook_if_running(
         let reply: Value = read_frame(&mut stream, limits.max_frame_bytes).await?;
         parse_hook_submit_reply(&reply, &request, limits.max_observation_bytes)
     };
-    match tokio::time::timeout(limits.deadline, result).await {
+    match tokio::time::timeout_at(deadline, result).await {
         Ok(Ok(reply)) => reply,
         Ok(Err(_)) | Err(_) => HookSubmitTransportResult::Unavailable,
     }
@@ -294,17 +298,21 @@ pub async fn submit_hook_if_running(
 ///
 /// Transport faults return `Unavailable`; Application does not retry, render, or reinterpret the
 /// opaque result. Assistance decides whether that unavailable result must be shown to its caller.
+/// Connect and exchange consume the same absolute deadline; a completed connect never resets it.
 pub async fn dispatch_method_if_running(
     runtime_dir: &Path,
     request: MethodDispatch,
     limits: HookTransportLimits,
 ) -> MethodDispatchTransportResult {
+    let Some(deadline) = tokio::time::Instant::now().checked_add(limits.deadline) else {
+        return MethodDispatchTransportResult::Unavailable;
+    };
     let socket_path = runtime_dir.join(SOCKET_NAME);
-    let mut stream =
-        match tokio::time::timeout(limits.deadline, UnixStream::connect(socket_path)).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(_)) | Err(_) => return MethodDispatchTransportResult::Unavailable,
-        };
+    let mut stream = match tokio::time::timeout_at(deadline, UnixStream::connect(socket_path)).await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(_)) | Err(_) => return MethodDispatchTransportResult::Unavailable,
+    };
     let params = match serde_json::from_str::<Value>(request.params_json().as_str()) {
         Ok(params) => params,
         Err(_) => return MethodDispatchTransportResult::Unavailable,
@@ -331,7 +339,7 @@ pub async fn dispatch_method_if_running(
         let reply: Value = read_frame(&mut stream, limits.max_frame_bytes).await?;
         parse_method_dispatch_reply(&reply, &request)
     };
-    match tokio::time::timeout(limits.deadline, result).await {
+    match tokio::time::timeout_at(deadline, result).await {
         Ok(Ok(reply)) => reply,
         Ok(Err(_)) | Err(_) => MethodDispatchTransportResult::Unavailable,
     }

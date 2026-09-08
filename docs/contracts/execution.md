@@ -50,6 +50,24 @@ Execution owns Unix process/resource adapters, strong process identity, pipe dra
 
 TERM/grace/KILL and recovery have configurable budgets. Release physical reservation only after exit evidence or an explicitly conservative recovery handoff. Identity/cleanup uncertainty is quarantined and exposed, not converted into success. Process groups do not contain intentionally escaped processes; unmanaged native shell remains outside this guarantee.
 
+Owned captured/protocol child handles now retain a private drop guard through consuming
+reap futures. If a handle or pending reap is dropped, the guard requests immediate KILL
+for its still-unreaped owned process group and direct child, aborts its owned output drain
+tasks, and leaves best-effort direct-child reaping to Tokio. Spawn setup also enables
+Tokio's direct-child `kill_on_drop` fallback. A successfully reaped child has no retained
+signal target, and borrowed endpoints never acquire this guard. Signal delivery failure,
+runtime shutdown, and escaped descendants remain uncertain; drop is not reap evidence.
+
+Admission leases are separate controller reservations, so abnormal drop cannot return a
+successful reap receipt or free capacity. `running_count` counts reservations, including
+these uncertain slots, rather than observed live OS processes. The current bounded recovery
+path is to stop further use of the affected owner/controller, obtain independently verified
+cleanup evidence, and recreate that controller with the owning daemon lifecycle. Automatic
+persistent reconciliation after daemon restart is not implemented. A restart or missing PID
+alone does not prove cleanup, authorize signalling an old numeric PID, or prove that a
+retained backend is live; unresolved cleanup must remain quarantined. Normal explicit reap
+continues to return the exact lease for the existing release path.
+
 Linux hard_required uses available delegated cgroups/controllers or returns unavailable. macOS resource sampling is monitoring, not a hard RSS guarantee. Soft-budget overage stops further admission and applies configured owned-process policy; OS-enforced memory behavior cannot be invented by Tokio.
 
 ## Evidence and acceptance boundary
