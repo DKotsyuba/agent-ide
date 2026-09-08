@@ -1,0 +1,652 @@
+//! Bounded MCP discovery, finite Application routing, and fail-open Assistance feedback.
+//!
+//! This module has no peer-domain implementation of its own. It validates the five logical tool
+//! inputs, carries trusted host transport context, and honestly reports an unavailable or
+//! incomplete result until Workspace, Intelligence, and Changes return their typed facts.
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{CallToolResult, ContentBlock};
+use rmcp::{tool, tool_router};
+use serde_json::{Map, Value, json};
+
+use crate::{
+    app::{
+        dispatch_method_if_running, submit_hook_if_running,
+        transport::{
+            AssistanceMethod, HookSubmit, HookSubmitTransportResult, HookTransportLimits,
+            MethodDispatch, MethodDispatchTransportResult, OpaqueJson,
+        },
+    },
+    assistance::host_binding::{HostBindingGuard, parse_hook_event},
+    workspace::authority::{
+        AuthorityError, AuthorityRegistry, AuthorityRevoked, AuthorityStamp, StopBindingHandoff,
+    },
+};
+
+const MAX_PARAMETER_BYTES: usize = 4 * 1024;
+const MAX_TEXT_BYTES: usize = 512;
+const MAX_DETAIL_REF_BYTES: usize = 128;
+const MAX_QUERY_BYTES: usize = 512;
+const MAX_ACTIVATION_ID_BYTES: usize = 128;
+const MAX_HOOK_BYTES: usize = 64 * 1024;
+
+/// Names the only logical MCP methods exposed by Assistance v0.1.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum AssistanceTool {
+    /// Creates or retries one bounded Workspace activation operation.
+    Start,
+    /// Requests bounded context from Intelligence when that peer is available.
+    Context,
+    /// Requests a bounded Changes diff when that peer is available.
+    Diff,
+    /// Expands one owner-scoped detail reference when its owner peer is available.
+    Inspect,
+    /// Stops the host binding and the expected Workspace authority generation.
+    Stop,
+}
+
+impl AssistanceTool {
+    /// Returns the stable MCP discovery name for this logical method.
+    pub const fn mcp_name(self) -> &'static str {
+        match self {
+            Self::Start => "ide.start",
+            Self::Context => "ide.context",
+            Self::Diff => "ide.diff",
+            Self::Inspect => "ide.inspect",
+            Self::Stop => "ide.stop",
+        }
+    }
+
+    /// Returns the corresponding closed Application transport tag.
+    const fn transport_method(self) -> AssistanceMethod {
+        match self {
+            Self::Start => AssistanceMethod::Start,
+            Self::Context => AssistanceMethod::Context,
+            Self::Diff => AssistanceMethod::Diff,
+            Self::Inspect => AssistanceMethod::Inspect,
+            Self::Stop => AssistanceMethod::Stop,
+        }
+    }
+}
+
+/// Describes one statically available MCP tool without consulting daemon health.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolSchema {
+    /// Logical method selected by the schema.
+    pub tool: AssistanceTool,
+    /// MCP-visible stable tool name.
+    pub name: &'static str,
+    /// JSON Schema object enforcing the bounded model-facing arguments.
+    pub input_schema: Value,
+}
+
+/// Returns exactly the five current Assistance schemas regardless of daemon availability.
+pub fn tool_schemas() -> [ToolSchema; 5] {
+    [
+        schema(
+            AssistanceTool::Start,
+            json!({
+                "type": "object", "additionalProperties": false,
+                "required": ["activation_id"],
+                "properties": {"activation_id": {"type": "string", "minLength": 1, "maxLength": MAX_ACTIVATION_ID_BYTES}}
+            }),
+        ),
+        schema(
+            AssistanceTool::Context,
+            json!({
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                    "query": {"type": "string", "maxLength": MAX_QUERY_BYTES},
+                    "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES}
+                }
+            }),
+        ),
+        schema(
+            AssistanceTool::Diff,
+            json!({
+                "type": "object", "additionalProperties": false,
+                "properties": {"detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES}}
+            }),
+        ),
+        schema(
+            AssistanceTool::Inspect,
+            json!({
+                "type": "object", "additionalProperties": false,
+                "required": ["detail_ref"],
+                "properties": {"detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES}}
+            }),
+        ),
+        schema(
+            AssistanceTool::Stop,
+            json!({
+                "type": "object", "additionalProperties": false,
+                "properties": {}
+            }),
+        ),
+    ]
+}
+
+/// Builds one schema record while keeping its MCP name coupled to its logical method.
+fn schema(tool: AssistanceTool, input_schema: Value) -> ToolSchema {
+    ToolSchema {
+        tool,
+        name: tool.mcp_name(),
+        input_schema,
+    }
+}
+
+/// Explains why a model-facing tool argument object was rejected before routing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParameterError {
+    /// The argument value was not an object under the hard byte limit.
+    InvalidObject,
+    /// The object named a field outside the selected method's closed schema.
+    UnknownField,
+    /// A required field was absent, empty, non-string, or over its method-specific limit.
+    InvalidField,
+}
+
+/// Holds one validated bounded method payload with no identity or authority fields.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ValidatedCall {
+    /// Selected logical method.
+    tool: AssistanceTool,
+    /// Exact normalized JSON object to send in the finite Application envelope.
+    parameters: Value,
+}
+
+impl ValidatedCall {
+    /// Returns the selected logical tool after its model arguments passed boundary validation.
+    pub const fn tool(&self) -> AssistanceTool {
+        self.tool
+    }
+
+    /// Returns the bounded normalized object without adding host identity or authority fields.
+    pub fn parameters(&self) -> &Value {
+        &self.parameters
+    }
+}
+
+/// Validates one closed logical tool payload and rejects identity or authority-shaped extra fields.
+pub fn validate_call(
+    tool: AssistanceTool,
+    parameters: Value,
+) -> Result<ValidatedCall, ParameterError> {
+    if serde_json::to_vec(&parameters)
+        .ok()
+        .is_none_or(|value| value.len() > MAX_PARAMETER_BYTES)
+    {
+        return Err(ParameterError::InvalidObject);
+    }
+    let object = parameters
+        .as_object()
+        .ok_or(ParameterError::InvalidObject)?;
+    let allowed = match tool {
+        AssistanceTool::Start => &["activation_id"][..],
+        AssistanceTool::Context => &["query", "detail_ref"][..],
+        AssistanceTool::Diff => &["detail_ref"][..],
+        AssistanceTool::Inspect => &["detail_ref"][..],
+        AssistanceTool::Stop => &[][..],
+    };
+    if object
+        .keys()
+        .any(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(ParameterError::UnknownField);
+    }
+    match tool {
+        AssistanceTool::Start => {
+            required_string(object, "activation_id", MAX_ACTIVATION_ID_BYTES)?;
+        }
+        AssistanceTool::Context => {
+            optional_string(object, "query", MAX_QUERY_BYTES)?;
+            optional_string(object, "detail_ref", MAX_DETAIL_REF_BYTES)?;
+        }
+        AssistanceTool::Diff => optional_string(object, "detail_ref", MAX_DETAIL_REF_BYTES)?,
+        AssistanceTool::Inspect => {
+            required_string(object, "detail_ref", MAX_DETAIL_REF_BYTES)?;
+        }
+        AssistanceTool::Stop => {}
+    }
+    Ok(ValidatedCall { tool, parameters })
+}
+
+/// Reads one required bounded nonempty string from a closed method object.
+fn required_string<'a>(
+    object: &'a Map<String, Value>,
+    field: &str,
+    max_bytes: usize,
+) -> Result<&'a str, ParameterError> {
+    let value = object
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or(ParameterError::InvalidField)?;
+    (!value.is_empty() && value.len() <= max_bytes)
+        .then_some(value)
+        .ok_or(ParameterError::InvalidField)
+}
+
+/// Reads one optional bounded nonempty string and rejects a present non-string or empty value.
+fn optional_string(
+    object: &Map<String, Value>,
+    field: &str,
+    max_bytes: usize,
+) -> Result<(), ParameterError> {
+    object
+        .get(field)
+        .map(|_| required_string(object, field, max_bytes).map(|_| ()))
+        .unwrap_or(Ok(()))
+}
+
+/// Holds opaque trusted host correlations that never come from model tool arguments.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrustedTransport {
+    request_id: String,
+    correlation_id: String,
+    opaque_attachment: String,
+}
+
+impl TrustedTransport {
+    /// Accepts bounded correlations only from trusted host-adapter ingress for one finite dispatch.
+    ///
+    /// This constructor does not establish identity or authority. Callers must not populate it
+    /// from model parameters; Application treats all three values as opaque transport data.
+    pub fn from_host_ingress(
+        request_id: impl Into<String>,
+        correlation_id: impl Into<String>,
+        opaque_attachment: impl Into<String>,
+    ) -> Option<Self> {
+        let request_id = request_id.into();
+        let correlation_id = correlation_id.into();
+        let opaque_attachment = opaque_attachment.into();
+        (!request_id.is_empty()
+            && request_id.len() <= MAX_DETAIL_REF_BYTES
+            && !correlation_id.is_empty()
+            && correlation_id.len() <= MAX_DETAIL_REF_BYTES
+            && !opaque_attachment.is_empty()
+            && opaque_attachment.len() <= MAX_DETAIL_REF_BYTES)
+            .then_some(Self {
+                request_id,
+                correlation_id,
+                opaque_attachment,
+            })
+    }
+}
+
+/// Reports the honest bounded outcome of facade routing without manufacturing peer readiness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FacadeOutcome {
+    /// Model arguments did not satisfy the selected tool schema; no IPC was attempted.
+    InvalidParameters,
+    /// The daemon, IPC, or typed peer result was unavailable; native host work remains unblocked.
+    Unavailable,
+    /// IPC accepted the envelope but no typed peer result was available for safe rendering.
+    Incomplete,
+}
+
+/// Owns one local facade endpoint and the finite limits for every connect-only dispatch.
+#[derive(Clone, Debug)]
+pub struct AssistanceFacade {
+    runtime_dir: PathBuf,
+    limits: HookTransportLimits,
+}
+
+impl AssistanceFacade {
+    /// Creates a facade that never prepares a runtime directory or starts a daemon.
+    pub fn new(runtime_dir: PathBuf) -> Self {
+        Self {
+            runtime_dir,
+            limits: HookTransportLimits::new(128 * 1024, MAX_HOOK_BYTES, Duration::from_secs(1))
+                .expect("fixed Assistance transport limits are valid"),
+        }
+    }
+
+    /// Validates and sends exactly one current method through Application's finite dispatch envelope.
+    ///
+    /// A transport acceptance is deliberately only `Incomplete`: no model-read, source-read, or
+    /// peer-ready claim can be rendered before a typed Workspace, Intelligence, or Changes result.
+    pub async fn dispatch(
+        &self,
+        host: &TrustedTransport,
+        tool: AssistanceTool,
+        parameters: Value,
+    ) -> FacadeOutcome {
+        let Ok(call) = validate_call(tool, parameters) else {
+            return FacadeOutcome::InvalidParameters;
+        };
+        let Some(parameters) = OpaqueJson::from_value(call.parameters(), MAX_PARAMETER_BYTES)
+        else {
+            return FacadeOutcome::InvalidParameters;
+        };
+        let Some(request) = MethodDispatch::new(
+            host.request_id.clone(),
+            host.correlation_id.clone(),
+            host.opaque_attachment.clone(),
+            call.tool().transport_method(),
+            parameters,
+        ) else {
+            return FacadeOutcome::Unavailable;
+        };
+        match dispatch_method_if_running(&self.runtime_dir, request, self.limits).await {
+            MethodDispatchTransportResult::Unavailable => FacadeOutcome::Unavailable,
+            MethodDispatchTransportResult::Dispatched { .. } => FacadeOutcome::Incomplete,
+        }
+    }
+}
+
+/// Reports the result of one fail-open native hook submission without blocking the host tool.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HookIngressOutcome {
+    /// The bounded observation reached an already-running daemon; this does not prove model delivery.
+    Submitted,
+    /// Parsing, connection, framing, dispatch, or reply was unavailable and the hook continued.
+    Unavailable,
+}
+
+/// Parses one native hook and performs one connect-only `assistance.hook_submit` attempt.
+///
+/// This function never starts a daemon, scans a workspace, waits for LSP, retries inline, or
+/// changes the native host tool's outcome. It serializes only the selected parsed hook fields.
+pub async fn submit_inactive_hook(
+    runtime_dir: &Path,
+    host: &TrustedTransport,
+    payload: &[u8],
+) -> HookIngressOutcome {
+    let Ok(event) = parse_hook_event(payload) else {
+        return HookIngressOutcome::Unavailable;
+    };
+    let observation = json!({
+        "phase": match event.phase() {
+            crate::assistance::host_binding::HookPhase::Pre => "pre",
+            crate::assistance::host_binding::HookPhase::Post => "post",
+        },
+        "actor_id": event.actor_id(),
+        "call_id": event.call_id(),
+    });
+    let Some(observation) = OpaqueJson::from_value(&observation, MAX_HOOK_BYTES) else {
+        return HookIngressOutcome::Unavailable;
+    };
+    let Some(request) = HookSubmit::new(
+        host.request_id.clone(),
+        host.correlation_id.clone(),
+        host.opaque_attachment.clone(),
+        observation,
+    ) else {
+        return HookIngressOutcome::Unavailable;
+    };
+    match submit_hook_if_running(
+        runtime_dir,
+        request,
+        HookTransportLimits::new(128 * 1024, MAX_HOOK_BYTES, Duration::from_secs(1))
+            .expect("fixed Assistance hook limits are valid"),
+    )
+    .await
+    {
+        HookSubmitTransportResult::Dispatched { .. } => HookIngressOutcome::Submitted,
+        HookSubmitTransportResult::Unavailable => HookIngressOutcome::Unavailable,
+    }
+}
+
+/// Stops the exact Assistance binding before asking Workspace to revoke that same authority stamp.
+///
+/// An old expected stamp cannot revoke a newer authority because Workspace compares the complete
+/// current stamp. If binding revocation is unavailable, Workspace still fences the expected active
+/// authority with `Missing` rather than pretending that Assistance completed the handoff.
+pub fn stop_binding_then_revoke(
+    bindings: &mut HostBindingGuard,
+    authorities: &mut AuthorityRegistry,
+    expected: &AuthorityStamp,
+) -> Result<AuthorityRevoked, AuthorityError> {
+    let handoff = match bindings.stop_binding(expected.binding()) {
+        Ok(()) => StopBindingHandoff::Confirmed,
+        Err(_) => StopBindingHandoff::Missing,
+    };
+    authorities.revoke(expected, handoff)
+}
+
+/// Carries one bounded feedback fact and its rendering envelope before an external channel sees it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeedbackDelta {
+    /// One new relevant fact, never a diagnostic dump.
+    fact: String,
+    /// Bounded evidence provenance for that fact.
+    provenance: String,
+    /// One practical next action or explicit absence of a safe action.
+    next_action: String,
+    /// Freshness or coverage qualifier that limits the fact's applicability.
+    freshness: String,
+    /// Optional owner-scoped detail reference; it is not expanded by this renderer.
+    detail_ref: Option<String>,
+}
+
+impl FeedbackDelta {
+    /// Validates the bounded factual envelope used for deduplication and later delivery.
+    pub fn new(
+        fact: impl Into<String>,
+        provenance: impl Into<String>,
+        next_action: impl Into<String>,
+        freshness: impl Into<String>,
+        detail_ref: Option<String>,
+    ) -> Option<Self> {
+        let fact = fact.into();
+        let provenance = provenance.into();
+        let next_action = next_action.into();
+        let freshness = freshness.into();
+        let fields = [&fact, &provenance, &next_action, &freshness];
+        (!fields
+            .iter()
+            .any(|value| value.is_empty() || value.len() > MAX_TEXT_BYTES)
+            && detail_ref
+                .as_deref()
+                .is_none_or(|value| !value.is_empty() && value.len() <= MAX_DETAIL_REF_BYTES))
+        .then_some(Self {
+            fact,
+            provenance,
+            next_action,
+            freshness,
+            detail_ref,
+        })
+    }
+
+    /// Renders the one-fact envelope without claiming that a model read or acted on it.
+    pub fn render(&self) -> String {
+        let mut rendered = format!(
+            "Fact: {}\nEvidence: {}\nNext: {}\nFreshness: {}",
+            self.fact, self.provenance, self.next_action, self.freshness
+        );
+        if let Some(detail_ref) = &self.detail_ref {
+            rendered.push_str("\nDetail: ");
+            rendered.push_str(detail_ref);
+        }
+        rendered
+    }
+}
+
+/// Tracks the explicit lifecycle of one feedback attempt without inferring model visibility.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FeedbackState {
+    /// The fact is eligible for a later authority/source recheck.
+    Pending,
+    /// A delivery attempt was submitted to the selected host channel.
+    Submitted,
+    /// The host accepted or lost the attempt without evidence of model-context delivery.
+    DeliveryUnknown,
+    /// Authority stopped, source changed, or a newer fact replaced this entry before delivery.
+    Superseded,
+}
+
+/// Identifies the observable result of recording one feedback delta.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FeedbackRecord {
+    /// A new pending fact was retained for its authority scope.
+    Pending,
+    /// An equivalent relevant fact was already retained and was not duplicated.
+    Deduplicated,
+    /// The authority was already stopped, so no post-stop feedback was retained.
+    Suppressed,
+}
+
+/// Keeps bounded per-authority feedback state and explicit deduplication outcomes.
+#[derive(Debug, Default)]
+pub struct FeedbackLedger {
+    entries: BTreeMap<(String, String), FeedbackState>,
+    stopped_authorities: BTreeSet<String>,
+}
+
+impl FeedbackLedger {
+    /// Records one new fact when its authority is live and no equivalent source revision exists.
+    pub fn record(
+        &mut self,
+        authority: impl Into<String>,
+        source_revision: impl Into<String>,
+        delta: &FeedbackDelta,
+    ) -> FeedbackRecord {
+        let authority = authority.into();
+        let source_revision = source_revision.into();
+        if authority.is_empty()
+            || source_revision.is_empty()
+            || self.stopped_authorities.contains(&authority)
+        {
+            return FeedbackRecord::Suppressed;
+        }
+        let key = (authority, format!("{source_revision}\u{0}{}", delta.fact));
+        if self.entries.contains_key(&key) {
+            return FeedbackRecord::Deduplicated;
+        }
+        self.entries.insert(key, FeedbackState::Pending);
+        FeedbackRecord::Pending
+    }
+
+    /// Rechecks authority and source currency before marking one pending fact submitted.
+    pub fn prepare_delivery(
+        &mut self,
+        authority: &str,
+        source_revision: &str,
+        fact: &str,
+        authority_current: bool,
+        source_current: bool,
+    ) -> Option<FeedbackState> {
+        let key = (
+            authority.to_owned(),
+            format!("{source_revision}\u{0}{fact}"),
+        );
+        let state = self.entries.get_mut(&key)?;
+        if !authority_current || !source_current || self.stopped_authorities.contains(authority) {
+            *state = FeedbackState::Superseded;
+            return Some(*state);
+        }
+        if *state == FeedbackState::Pending {
+            *state = FeedbackState::Submitted;
+        }
+        Some(*state)
+    }
+
+    /// Marks one submitted attempt as delivery-unknown without asserting the model read it.
+    pub fn mark_delivery_unknown(
+        &mut self,
+        authority: &str,
+        source_revision: &str,
+        fact: &str,
+    ) -> Option<FeedbackState> {
+        let key = (
+            authority.to_owned(),
+            format!("{source_revision}\u{0}{fact}"),
+        );
+        let state = self.entries.get_mut(&key)?;
+        if *state == FeedbackState::Submitted {
+            *state = FeedbackState::DeliveryUnknown;
+        }
+        Some(*state)
+    }
+
+    /// Suppresses all current and later feedback for an authority after its stop boundary.
+    pub fn stop_authority(&mut self, authority: impl Into<String>) {
+        let authority = authority.into();
+        self.stopped_authorities.insert(authority.clone());
+        for ((entry_authority, _), state) in &mut self.entries {
+            if entry_authority == &authority && *state == FeedbackState::Pending {
+                *state = FeedbackState::Superseded;
+            }
+        }
+    }
+}
+
+/// Hosts the static five-tool rmcp surface even when no trusted host attachment exists.
+#[derive(Clone, Debug)]
+pub struct StdioFacade {
+    facade: AssistanceFacade,
+}
+
+impl StdioFacade {
+    /// Creates a stdio facade whose calls remain unavailable until a real host adapter supplies context.
+    pub fn new(runtime_dir: PathBuf) -> Self {
+        Self {
+            facade: AssistanceFacade::new(runtime_dir),
+        }
+    }
+
+    /// Validates an rmcp tool object and returns a compact bounded unavailable or invalid outcome.
+    async fn call_without_host(&self, tool: AssistanceTool, parameters: Value) -> CallToolResult {
+        let outcome = match validate_call(tool, parameters) {
+            Ok(_) => FacadeOutcome::Unavailable,
+            Err(_) => FacadeOutcome::InvalidParameters,
+        };
+        let message = match outcome {
+            FacadeOutcome::InvalidParameters => {
+                "invalid bounded parameters; inspect the tool schema"
+            }
+            FacadeOutcome::Unavailable => {
+                "Assistance host attachment or daemon is unavailable; continue with native tools"
+            }
+            FacadeOutcome::Incomplete => {
+                "typed Assistance peer result is unavailable; continue with native tools"
+            }
+        };
+        let _ = &self.facade;
+        CallToolResult::error(vec![ContentBlock::text(message)])
+    }
+}
+
+#[tool_router(server_handler)]
+impl StdioFacade {
+    /// Starts one stable activation operation after validating only its model-facing operation ID.
+    #[tool(name = "ide.start", input_schema = json!({"type":"object","additionalProperties":false,"required":["activation_id"],"properties":{"activation_id":{"type":"string","minLength":1,"maxLength":MAX_ACTIVATION_ID_BYTES}}}).as_object().expect("tool schema is an object").clone())]
+    async fn start(&self, Parameters(parameters): Parameters<Value>) -> CallToolResult {
+        self.call_without_host(AssistanceTool::Start, parameters)
+            .await
+    }
+
+    /// Requests bounded context without accepting model-editable authority or identity fields.
+    #[tool(name = "ide.context", input_schema = json!({"type":"object","additionalProperties":false,"properties":{"query":{"type":"string","maxLength":MAX_QUERY_BYTES},"detail_ref":{"type":"string","minLength":1,"maxLength":MAX_DETAIL_REF_BYTES}}}).as_object().expect("tool schema is an object").clone())]
+    async fn context(&self, Parameters(parameters): Parameters<Value>) -> CallToolResult {
+        self.call_without_host(AssistanceTool::Context, parameters)
+            .await
+    }
+
+    /// Requests a bounded diff without adding Changes semantics when that peer is absent.
+    #[tool(name = "ide.diff", input_schema = json!({"type":"object","additionalProperties":false,"properties":{"detail_ref":{"type":"string","minLength":1,"maxLength":MAX_DETAIL_REF_BYTES}}}).as_object().expect("tool schema is an object").clone())]
+    async fn diff(&self, Parameters(parameters): Parameters<Value>) -> CallToolResult {
+        self.call_without_host(AssistanceTool::Diff, parameters)
+            .await
+    }
+
+    /// Expands one owner-scoped detail reference only when its typed owner peer later exists.
+    #[tool(name = "ide.inspect", input_schema = json!({"type":"object","additionalProperties":false,"required":["detail_ref"],"properties":{"detail_ref":{"type":"string","minLength":1,"maxLength":MAX_DETAIL_REF_BYTES}}}).as_object().expect("tool schema is an object").clone())]
+    async fn inspect(&self, Parameters(parameters): Parameters<Value>) -> CallToolResult {
+        self.call_without_host(AssistanceTool::Inspect, parameters)
+            .await
+    }
+
+    /// Stops only host-bound authority held outside model-provided tool arguments.
+    #[tool(name = "ide.stop", input_schema = json!({"type":"object","additionalProperties":false,"properties":{}}).as_object().expect("tool schema is an object").clone())]
+    async fn stop(&self, Parameters(parameters): Parameters<Value>) -> CallToolResult {
+        self.call_without_host(AssistanceTool::Stop, parameters)
+            .await
+    }
+}

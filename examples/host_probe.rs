@@ -314,26 +314,22 @@ async fn mcp(
         }
 
         /// Records the safe request context before ordinary generated router dispatch.
-        fn call_tool(
+        async fn call_tool(
             &self,
             request: CallToolRequestParams,
             context: RequestContext<rmcp::RoleServer>,
-        ) -> impl Future<Output = Result<CallToolResponse, rmcp::ErrorData>> + Send + '_ {
-            async move {
-                let request_meta = serde_json::to_value(&context.meta).unwrap_or(Value::Null);
-                self.recorder.record_sandbox_state(&request_meta);
-                self.recorder.record(&json!({
-                    "request_id": &context.id,
-                    "request_meta": request_meta,
-                    "client_info": context.client_info(),
-                    "client_capabilities": context.client_capabilities(),
-                }));
-                self.router
-                    .call(rmcp::handler::server::tool::ToolCallContext::new(
-                        self, request, context,
-                    ))
-                    .await
-            }
+        ) -> Result<CallToolResponse, rmcp::ErrorData> {
+            let request_meta = serde_json::to_value(&context.meta).unwrap_or(Value::Null);
+            self.recorder.record_sandbox_state(&request_meta);
+            self.recorder.record(&json!({
+                "request_id": &context.id,
+                "request_meta": request_meta,
+                "client_info": context.client_info(),
+                "client_capabilities": context.client_capabilities(),
+            }));
+            self.router
+                .call(rmcp::handler::server::tool::ToolCallContext::new(self, request, context))
+                .await
         }
     }
 
