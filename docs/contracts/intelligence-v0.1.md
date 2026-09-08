@@ -106,6 +106,16 @@ documented terminal `remote disconnected` exit after the daemon closes that
 session; it is accepted only with exact captured evidence and a still-live peer
 semantic check.
 
+The Rust profile revision is `1`. Its compatibility identity includes the
+absolute `rust-analyzer` binary and observed version, observed Cargo and rustc
+versions, configuration, trust, stdio transport, native-cache namespace, and
+the canonical `WorktreeRef` identity with incarnation. Each admitted Rust view
+owns its document sequence and request generation. A later sequence or a
+different generation makes a reply `stale`; EOF, stop, or revocation makes it
+`unavailable`. The profile creates only the configured `rust-analyzer` controlled
+provider command using its default stdio transport and passes owned pipes only through Execution's validated
+request and owned-child boundary.
+
 Reusable native-cache identity excludes actor, session, binding, context and
 authority IDs. It includes compatible provider/profile/configuration/toolchain
 and trust inputs, plus the provider-supported worktree state. Release, stop and
