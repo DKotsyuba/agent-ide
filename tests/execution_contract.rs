@@ -483,6 +483,15 @@ fn provider_leases_share_only_compatible_owned_backends() {
         ProviderLeaseAdmission::Granted(view) => view,
         result => panic!("unexpected shared view: {result:?}"),
     };
+    assert!(registry.take_spawn_lease(first).is_ok());
+    assert!(matches!(
+        registry.take_spawn_lease(first),
+        Err(execution::ProviderLeaseError::SpawnUnavailable)
+    ));
+    assert!(matches!(
+        registry.take_spawn_lease(second),
+        Err(execution::ProviderLeaseError::SpawnUnavailable)
+    ));
     assert_eq!(registry.counts(), (1, 2));
     assert!(matches!(
         registry.release(&mut admission, first).unwrap().0,
@@ -493,28 +502,36 @@ fn provider_leases_share_only_compatible_owned_backends() {
         execution::BackendRelease::ReapOwned { .. }
     ));
     assert_eq!(registry.counts(), (0, 0));
-    assert!(matches!(
-        registry.request(
-            &mut admission,
-            OwnerId::new("owner").unwrap(),
-            AdmissionClass::Interactive,
-            "exclusive",
-            ProviderBackendKind::OwnedExclusive,
-            &authority,
-        ),
-        ProviderLeaseAdmission::Granted(_)
-    ));
-    assert!(matches!(
-        registry.request(
-            &mut admission,
-            OwnerId::new("other").unwrap(),
-            AdmissionClass::Background,
-            "queued",
-            ProviderBackendKind::OwnedShared,
-            &authority,
-        ),
-        ProviderLeaseAdmission::Queued(_)
-    ));
+    let exclusive = match registry.request(
+        &mut admission,
+        OwnerId::new("owner").unwrap(),
+        AdmissionClass::Interactive,
+        "exclusive",
+        ProviderBackendKind::OwnedExclusive,
+        &authority,
+    ) {
+        ProviderLeaseAdmission::Granted(view) => view,
+        result => panic!("unexpected exclusive view: {result:?}"),
+    };
+    let ticket = match registry.request(
+        &mut admission,
+        OwnerId::new("other").unwrap(),
+        AdmissionClass::Background,
+        "queued",
+        ProviderBackendKind::OwnedShared,
+        &authority,
+    ) {
+        ProviderLeaseAdmission::Queued(ticket) => ticket,
+        result => panic!("unexpected queued view: {result:?}"),
+    };
+    let (_, _, promotions) = registry.release(&mut admission, exclusive).unwrap();
+    let promotion = promotions.into_iter().next().unwrap();
+    assert_eq!(promotion.ticket(), ticket);
+    assert!(
+        registry
+            .promote(&mut admission, promotion, &authority)
+            .is_ok()
+    );
     assert_eq!(registry.counts(), (1, 1));
 }
 
@@ -611,13 +628,18 @@ fn queued_provider_ticket_promotes_once_with_its_matching_lease() {
         .promote(&mut admission, promotion, &authority)
         .unwrap();
     assert_eq!(registry.counts(), (1, 1));
+    assert!(registry.take_spawn_lease(view).is_ok());
+    assert!(matches!(
+        registry.take_spawn_lease(view),
+        Err(execution::ProviderLeaseError::SpawnUnavailable)
+    ));
     assert!(matches!(
         registry.promote(&mut admission, promotion, &authority),
         Err(execution::ProviderLeaseError::InvalidPromotion)
     ));
     assert!(matches!(
         registry.release(&mut admission, view),
-        Ok((execution::BackendRelease::ReapOwned { .. }, _))
+        Ok((execution::BackendRelease::ReapOwned { .. }, _, _))
     ));
 }
 
@@ -801,14 +823,24 @@ async fn protocol_stdout_has_one_owner_and_borrowed_endpoints_cannot_be_killed()
         interactive_burst: 1,
     })
     .unwrap();
-    let lease = match admission.submit(OwnerId::new("owner").unwrap(), AdmissionClass::Interactive)
-    {
-        Admission::Granted(lease) => lease,
+    let authority =
+        WorkspaceAuthority::from_workspace("protocol-worktree", "1", root.clone(), 1).unwrap();
+    let mut registry = ProviderLeaseRegistry::new(lease_limits(1, 1)).unwrap();
+    let view = match registry.request(
+        &mut admission,
+        OwnerId::new("owner").unwrap(),
+        AdmissionClass::Interactive,
+        "protocol-backend",
+        ProviderBackendKind::OwnedExclusive,
+        &authority,
+    ) {
+        ProviderLeaseAdmission::Granted(view) => view,
         outcome => panic!("unexpected admission: {outcome:?}"),
     };
-    let mut child = execution::OwnedProtocolChild::spawn(
+    let capability = registry.take_spawn_lease(view).unwrap();
+    let mut child = execution::OwnedProtocolChild::spawn_from_provider_lease(
         &request,
-        lease,
+        capability,
         None,
         Path::new("/usr/bin/codex"),
         64,
@@ -816,11 +848,14 @@ async fn protocol_stdout_has_one_owner_and_borrowed_endpoints_cannot_be_killed()
     .unwrap();
     let mut protocol = String::new();
     child.stdout.read_to_string(&mut protocol).await.unwrap();
-    let (status, stderr, released) = child.reap(Duration::from_secs(1)).await.unwrap();
+    let (status, stderr, _released) = child.reap(Duration::from_secs(1)).await.unwrap();
     assert!(status.success());
     assert_eq!(protocol, "protocol");
     assert_eq!(stderr.bytes, b"diagnostic");
-    assert!(admission.release(released).unwrap().is_empty());
+    assert!(matches!(
+        registry.release(&mut admission, view),
+        Ok((execution::BackendRelease::ReapOwned { .. }, Some(_), _))
+    ));
     assert_eq!(
         BorrowedEndpoint::observe("peer:42").unwrap().cancel(),
         EndpointOwnership::Borrowed

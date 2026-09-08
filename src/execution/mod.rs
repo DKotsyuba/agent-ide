@@ -1277,6 +1277,15 @@ impl AdmissionController {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ProviderViewLease(u64);
 
+/// Is a one-time capability to start the owned backend attached to one newly admitted view.
+#[derive(Debug)]
+pub struct ProviderSpawnLease {
+    /// View that created this backend and owns this one-time start capability.
+    view: ProviderViewLease,
+    /// Central reservation consumed only by Execution's protocol-child setup.
+    lease: AdmissionLease,
+}
+
 /// Classifies the ownership and sharing rule of a provider backend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderBackendKind {
@@ -1307,6 +1316,8 @@ pub enum ProviderLeaseError {
     InvalidPromotion,
     /// A bounded view ceiling would be exceeded.
     ViewCapacity,
+    /// This view has no unconsumed owned-backend spawn capability.
+    SpawnUnavailable,
 }
 
 /// Reports one bounded request for a logical provider view.
@@ -1373,6 +1384,8 @@ pub struct ProviderLeaseRegistry {
     backends: BTreeMap<String, ProviderBackend>,
     /// Bounded request metadata retained only until its matching controller promotion settles.
     pending: BTreeMap<u64, PendingProviderLease>,
+    /// One-time spawn capabilities keyed by their newly created owned backend's first view.
+    spawnable: BTreeMap<u64, AdmissionLease>,
 }
 
 /// Stores the scope that a direct Workspace revocation may fence.
@@ -1422,6 +1435,7 @@ impl ProviderLeaseRegistry {
             views: BTreeMap::new(),
             backends: BTreeMap::new(),
             pending: BTreeMap::new(),
+            spawnable: BTreeMap::new(),
         })
     }
 
@@ -1489,7 +1503,11 @@ impl ProviderLeaseRegistry {
                 views: 0,
             },
         );
-        ProviderLeaseAdmission::Granted(self.attach(backend, authority))
+        let view = self.attach(backend, authority);
+        if let Some(lease) = reserved {
+            self.spawnable.insert(view.0, lease);
+        }
+        ProviderLeaseAdmission::Granted(view)
     }
 
     /// Cancels a pending provider request and its central ticket without releasing any resource.
@@ -1529,7 +1547,20 @@ impl ProviderLeaseRegistry {
                 views: 0,
             },
         );
-        Ok(self.attach(pending.backend, authority))
+        let view = self.attach(pending.backend, authority);
+        self.spawnable.insert(view.0, promotion.lease);
+        Ok(view)
+    }
+
+    /// Takes this view's one-time owned-backend spawn capability.
+    pub fn take_spawn_lease(
+        &mut self,
+        view: ProviderViewLease,
+    ) -> Result<ProviderSpawnLease, ProviderLeaseError> {
+        self.spawnable
+            .remove(&view.0)
+            .map(|lease| ProviderSpawnLease { view, lease })
+            .ok_or(ProviderLeaseError::SpawnUnavailable)
     }
 
     /// Releases exactly one logical view and returns the physical ownership consequence.
@@ -1537,35 +1568,47 @@ impl ProviderLeaseRegistry {
         &mut self,
         admission: &mut AdmissionController,
         view: ProviderViewLease,
-    ) -> Result<(BackendRelease, Option<AdmissionLease>), ProviderLeaseError> {
+    ) -> Result<
+        (
+            BackendRelease,
+            Option<AdmissionLease>,
+            Vec<AdmissionPromotion>,
+        ),
+        ProviderLeaseError,
+    > {
+        let view_id = view.0;
         let view = self
             .views
-            .remove(&view.0)
+            .remove(&view_id)
             .ok_or(ProviderLeaseError::UnknownView)?;
+        self.spawnable.remove(&view_id);
         let backend = self
             .backends
             .get_mut(&view.backend)
             .expect("view backend exists");
         backend.views -= 1;
         if backend.views != 0 {
-            return Ok((BackendRelease::SharedPeerSurvives, None));
+            return Ok((BackendRelease::SharedPeerSurvives, None, Vec::new()));
         }
         let backend = self
             .backends
             .remove(&view.backend)
             .expect("view backend exists");
         match backend.kind {
-            ProviderBackendKind::Borrowed => Ok((BackendRelease::BorrowedDetached, None)),
+            ProviderBackendKind::Borrowed => {
+                Ok((BackendRelease::BorrowedDetached, None, Vec::new()))
+            }
             ProviderBackendKind::OwnedShared | ProviderBackendKind::OwnedExclusive => {
                 let lease = backend.admission.expect("owned backend has admission");
-                admission
-                    .release(lease)
+                let promotions = admission
+                    .release_with_promotions(lease)
                     .map_err(ProviderLeaseError::Admission)?;
                 Ok((
                     BackendRelease::ReapOwned {
                         backend: view.backend,
                     },
                     Some(lease),
+                    promotions,
                 ))
             }
         }
@@ -1593,7 +1636,7 @@ impl ProviderLeaseRegistry {
         let mut backend_releases = Vec::with_capacity(matching.len());
         let mut released_admissions = Vec::new();
         for view in &matching {
-            if let Ok((release, admission_lease)) = self.release(admission, *view) {
+            if let Ok((release, admission_lease, _)) = self.release(admission, *view) {
                 if let Some(admission_lease) = admission_lease {
                     released_admissions.push(admission_lease);
                 }
@@ -1879,6 +1922,24 @@ pub struct OwnedProtocolChild {
 }
 
 impl OwnedProtocolChild {
+    /// Starts an owned protocol child by consuming the registry-issued one-time spawn capability.
+    pub fn spawn_from_provider_lease(
+        request: &ValidatedExecutionRequest,
+        capability: ProviderSpawnLease,
+        active_use: Option<ActiveBindingUse>,
+        codex_executable: &Path,
+        output_cap: usize,
+    ) -> Result<Self, ProcessError> {
+        let _ = capability.view;
+        Self::spawn(
+            request,
+            capability.lease,
+            active_use,
+            codex_executable,
+            output_cap,
+        )
+    }
+
     /// Starts a protocol child with stdout reserved exclusively for its logical protocol owner.
     pub fn spawn(
         request: &ValidatedExecutionRequest,
