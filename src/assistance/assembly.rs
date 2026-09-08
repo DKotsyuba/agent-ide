@@ -2,45 +2,19 @@
 
 use std::{future::Future, pin::Pin, sync::Mutex};
 
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::host_binding::{
     BindingStatus, HostBindingGuard, parse_candidate, parse_channel_session, parse_hook_event,
+    parse_observed_sandbox_state,
 };
 use crate::app::transport::{
     AssistanceDispatch, AssistanceDispatchReply, AssistanceDispatchUnavailable,
-    AssistanceDispatcher, AssistanceMethod, OpaqueJson,
+    AssistanceDispatcher, AssistanceMethod,
 };
 
-/// Names the first missing peer without implying workspace authority was granted.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MissingPeer {
-    /// Exact trusted hook and MCP invocation correlation is unavailable.
-    HostBinding,
-    /// Host correlation succeeded, but Workspace activation is not connected.
-    WorkspaceActivation,
-}
-
-/// Closed Assistance reply; unknown fields and states cannot become peer success.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum PeerReply {
-    /// The finite call stopped before the named peer boundary.
-    Unavailable {
-        /// First unavailable boundary; no source access or activation is claimed.
-        reason: MissingPeer,
-    },
-    /// Exactly one native pre-hook was retained for later MCP validation.
-    HookObserved {},
-    /// An exact post-hook settled an already validated MCP call.
-    HookSettled {},
-    /// A complete native lifecycle requested a registered-path recheck for an active binding.
-    NativeHookObserved {},
-    /// The exact active host binding was revoked; no Workspace grant existed.
-    HostStopped {},
-}
+pub use super::reply::{MissingPeer, PeerReply};
+use super::{launcher::LauncherConfig, reply::FailureCode};
 
 /// Owns bounded daemon-lifetime Codex binding state behind one serialized admission boundary.
 ///
@@ -50,9 +24,19 @@ pub(crate) enum PeerReply {
 pub struct ProductDispatcher {
     /// Serializes hook observations, validation and explicit stop; never held across I/O.
     bindings: Mutex<HostBindingGuard>,
+    /// Immutable attachment mappings accepted at daemon startup, absent in discovery-only mode.
+    launcher: Option<LauncherConfig>,
 }
 
 impl ProductDispatcher {
+    /// Installs one restart-only trusted map; no invocation can replace it or infer a target.
+    pub fn with_launcher(launcher: LauncherConfig) -> Self {
+        Self {
+            bindings: Mutex::new(HostBindingGuard::default()),
+            launcher: Some(launcher),
+        }
+    }
+
     /// Validates one finite request using only separately supplied host correlations.
     ///
     /// Malformed input and poisoned synchronization fail closed. Only explicit start creates a
@@ -117,7 +101,33 @@ impl ProductDispatcher {
                     bindings.stop_binding(invocation.binding_ref()).ok()?;
                     Some(PeerReply::HostStopped {})
                 } else {
-                    bindings.consume_active(invocation.binding_ref()).ok()?;
+                    let active = bindings.consume_active(invocation.binding_ref()).ok()?;
+                    let observed =
+                        match parse_observed_sandbox_state(meta, &invocation, &active, true) {
+                            Ok(observed) => observed,
+                            Err(_) => {
+                                return Some(PeerReply::Error {
+                                    code: FailureCode::SandboxState,
+                                });
+                            }
+                        };
+                    if crate::execution::HostSandboxState::parse(Some(
+                        observed.state().as_json().clone(),
+                    ))
+                    .is_err()
+                    {
+                        return Some(PeerReply::Error {
+                            code: FailureCode::SandboxState,
+                        });
+                    }
+                    if self.launcher.as_ref().is_some_and(|launcher| {
+                        launcher.target(method.opaque_attachment()).is_none()
+                    }) {
+                        return Some(PeerReply::Error {
+                            code: FailureCode::LauncherConfiguration,
+                        });
+                    }
+
                     Some(PeerReply::Unavailable {
                         reason: MissingPeer::WorkspaceActivation,
                     })
@@ -143,10 +153,7 @@ impl AssistanceDispatcher for ProductDispatcher {
             let result = self.handle(&request).unwrap_or(PeerReply::Unavailable {
                 reason: MissingPeer::HostBinding,
             });
-            let reply = serde_json::to_string(&result)
-                .ok()
-                .and_then(|reply| OpaqueJson::new(reply, 256))
-                .ok_or(AssistanceDispatchUnavailable)?;
+            let reply = result.encode().ok_or(AssistanceDispatchUnavailable)?;
             Ok(match request {
                 AssistanceDispatch::HookSubmit(_) => AssistanceDispatchReply::HookSubmit(reply),
                 AssistanceDispatch::MethodDispatch(_) => {

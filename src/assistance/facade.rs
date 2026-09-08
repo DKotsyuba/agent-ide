@@ -25,8 +25,8 @@ use crate::{
         },
     },
     assistance::{
-        assembly::{MissingPeer, PeerReply},
         host_binding::{HostBindingGuard, parse_candidate, parse_hook_event},
+        reply::{MAX_REPLY_BYTES, MissingPeer, PeerReply, ResultKind},
     },
     workspace::authority::{
         AuthorityError, AuthorityRegistry, AuthorityRevoked, AuthorityStamp, StopBindingHandoff,
@@ -36,7 +36,10 @@ use crate::{
 const MAX_PARAMETER_BYTES: usize = 4 * 1024;
 const MAX_TEXT_BYTES: usize = 512;
 const MAX_DETAIL_REF_BYTES: usize = 128;
-const MAX_QUERY_BYTES: usize = 512;
+/// Maximum UTF-8 relative source path accepted from a model request.
+const MAX_RELATIVE_PATH_BYTES: usize = 1024;
+/// Byte offsets cannot exceed Workspace's bounded source payload.
+const MAX_BYTE_OFFSET: u64 = crate::workspace::observation::MAX_SOURCE_BYTES as u64;
 const MAX_ACTIVATION_ID_BYTES: usize = 128;
 const MAX_HOOK_BYTES: usize = 64 * 1024;
 
@@ -105,8 +108,10 @@ pub fn tool_schemas() -> [ToolSchema; 5] {
             AssistanceTool::Context,
             json!({
                 "type": "object", "additionalProperties": false,
+                "required": ["path"],
                 "properties": {
-                    "query": {"type": "string", "maxLength": MAX_QUERY_BYTES},
+                    "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES},
+                    "byte_offset": {"type": "integer", "minimum": 0, "maximum": MAX_BYTE_OFFSET},
                     "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES}
                 }
             }),
@@ -115,7 +120,7 @@ pub fn tool_schemas() -> [ToolSchema; 5] {
             AssistanceTool::Diff,
             json!({
                 "type": "object", "additionalProperties": false,
-                "properties": {"detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES}}
+                "properties": {"mode": {"type":"string","enum":["head","staged","unstaged"],"default":"head"}, "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES}}
             }),
         ),
         schema(
@@ -180,7 +185,7 @@ impl ValidatedCall {
 /// Validates one closed logical tool payload and rejects identity or authority-shaped extra fields.
 pub fn validate_call(
     tool: AssistanceTool,
-    parameters: Value,
+    mut parameters: Value,
 ) -> Result<ValidatedCall, ParameterError> {
     if serde_json::to_vec(&parameters)
         .ok()
@@ -193,8 +198,8 @@ pub fn validate_call(
         .ok_or(ParameterError::InvalidObject)?;
     let allowed = match tool {
         AssistanceTool::Start => &["activation_id"][..],
-        AssistanceTool::Context => &["query", "detail_ref"][..],
-        AssistanceTool::Diff => &["detail_ref"][..],
+        AssistanceTool::Context => &["path", "byte_offset", "detail_ref"][..],
+        AssistanceTool::Diff => &["mode", "detail_ref"][..],
         AssistanceTool::Inspect => &["detail_ref"][..],
         AssistanceTool::Stop => &[][..],
     };
@@ -209,14 +214,41 @@ pub fn validate_call(
             required_string(object, "activation_id", MAX_ACTIVATION_ID_BYTES)?;
         }
         AssistanceTool::Context => {
-            optional_string(object, "query", MAX_QUERY_BYTES)?;
+            let path = required_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
+            if path.as_bytes().contains(&0)
+                || path.split('/').any(|part| matches!(part, "" | "." | ".."))
+            {
+                return Err(ParameterError::InvalidField);
+            }
+            if object
+                .get("byte_offset")
+                .is_some_and(|value| value.as_u64().is_none_or(|offset| offset > MAX_BYTE_OFFSET))
+            {
+                return Err(ParameterError::InvalidField);
+            }
+
             optional_string(object, "detail_ref", MAX_DETAIL_REF_BYTES)?;
         }
-        AssistanceTool::Diff => optional_string(object, "detail_ref", MAX_DETAIL_REF_BYTES)?,
+        AssistanceTool::Diff => {
+            optional_string(object, "detail_ref", MAX_DETAIL_REF_BYTES)?;
+            if object.get("mode").is_some_and(|value| {
+                !matches!(value.as_str(), Some("head" | "staged" | "unstaged"))
+            }) {
+                return Err(ParameterError::InvalidField);
+            }
+        }
+
         AssistanceTool::Inspect => {
             required_string(object, "detail_ref", MAX_DETAIL_REF_BYTES)?;
         }
         AssistanceTool::Stop => {}
+    }
+    if tool == AssistanceTool::Diff {
+        parameters
+            .as_object_mut()
+            .expect("validated object")
+            .entry("mode")
+            .or_insert(json!("head"));
     }
     Ok(ValidatedCall { tool, parameters })
 }
@@ -294,7 +326,7 @@ impl TrustedTransport {
 }
 
 /// Reports the honest bounded outcome of facade routing without manufacturing peer readiness.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FacadeOutcome {
     /// Model arguments did not satisfy the selected tool schema; no IPC was attempted.
     InvalidParameters,
@@ -306,6 +338,8 @@ pub enum FacadeOutcome {
     PeerUnavailable(MissingPeer),
     /// The exact host binding was revoked without claiming a Workspace operation.
     HostStopped,
+    /// Pending, typed failure or current owner result accepted from the daemon.
+    Reply(PeerReply),
 }
 
 /// Owns one local facade endpoint and the finite limits for every connect-only dispatch.
@@ -340,7 +374,7 @@ impl AssistanceFacade {
         };
         let Some(parameters) = OpaqueJson::from_value(
             &json!({"parameters":call.parameters(),"host_meta":host.host_meta}),
-            MAX_PARAMETER_BYTES + 1024,
+            MAX_HOOK_BYTES,
         ) else {
             return FacadeOutcome::InvalidParameters;
         };
@@ -356,10 +390,27 @@ impl AssistanceFacade {
         match dispatch_method_if_running(&self.runtime_dir, request, self.limits).await {
             MethodDispatchTransportResult::Unavailable => FacadeOutcome::Unavailable,
             MethodDispatchTransportResult::Dispatched { opaque_result_json } => {
-                match serde_json::from_str::<PeerReply>(opaque_result_json.as_str()) {
-                    Ok(PeerReply::Unavailable { reason }) => FacadeOutcome::PeerUnavailable(reason),
-                    Ok(PeerReply::HostStopped {}) if tool == AssistanceTool::Stop => {
+                match PeerReply::decode(opaque_result_json.as_str()) {
+                    Some(PeerReply::Unavailable { reason }) => {
+                        FacadeOutcome::PeerUnavailable(reason)
+                    }
+                    Some(PeerReply::HostStopped {}) if tool == AssistanceTool::Stop => {
                         FacadeOutcome::HostStopped
+                    }
+                    Some(reply @ (PeerReply::Pending { .. } | PeerReply::Error { .. })) => {
+                        FacadeOutcome::Reply(reply)
+                    }
+                    Some(reply @ PeerReply::Complete { kind, .. })
+                        if tool == AssistanceTool::Inspect
+                            || matches!(
+                                (tool, kind),
+                                (AssistanceTool::Start, ResultKind::Activation)
+                                    | (AssistanceTool::Context, ResultKind::Context)
+                                    | (AssistanceTool::Diff, ResultKind::Diff)
+                                    | (AssistanceTool::Stop, ResultKind::Stop)
+                            ) =>
+                    {
+                        FacadeOutcome::Reply(reply)
                     }
                     _ => FacadeOutcome::Incomplete,
                 }
@@ -612,6 +663,8 @@ pub struct StdioFacade {
     facade: AssistanceFacade,
     /// Host-launcher attachment, never populated from model tool arguments or request metadata.
     attachment: Option<String>,
+    /// Generated static tool router; independent of daemon availability.
+    router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
 
 impl StdioFacade {
@@ -620,6 +673,7 @@ impl StdioFacade {
         Self {
             facade: AssistanceFacade::new(runtime_dir),
             attachment: None,
+            router: Self::tool_router(),
         }
     }
 
@@ -632,6 +686,7 @@ impl StdioFacade {
         Some(Self {
             facade: AssistanceFacade::new(runtime_dir),
             attachment: Some(attachment),
+            router: Self::tool_router(),
         })
     }
 
@@ -654,7 +709,13 @@ impl StdioFacade {
                         candidate.call_id(),
                         attachment.clone(),
                     )?;
-                    host.host_meta = Some(json!({"threadId":candidate.actor_id(),"callId":candidate.call_id(),"x-codex-turn-metadata":{}}));
+                    let mut selected = json!({"threadId":candidate.actor_id(),"callId":candidate.call_id(),"x-codex-turn-metadata":{}});
+                    if let Some(state) = context.meta.get("codex/sandbox-state-meta") {
+                        selected["codex/sandbox-state-meta"] = state.clone();
+                    }
+                    if serde_json::to_vec(&selected).ok()?.len() > MAX_HOOK_BYTES { return None; }
+                    host.host_meta = Some(selected);
+
                     Some(host)
                 });
                 match host {
@@ -665,6 +726,26 @@ impl StdioFacade {
             Err(_) => FacadeOutcome::InvalidParameters,
         };
         let message = match outcome {
+            FacadeOutcome::Reply(reply) => {
+                let summary = match &reply {
+                    PeerReply::Pending { .. } => {
+                        "Assistance work is pending; use ide.inspect with the returned detail_ref"
+                    }
+                    PeerReply::Error { .. } => {
+                        "Assistance could not complete this operation; inspect the typed error and continue with native tools"
+                    }
+                    _ => "Assistance returned the current owner result in structured content",
+                };
+                let mut rendered = CallToolResult::success(vec![ContentBlock::text(summary)]);
+                rendered.is_error = Some(matches!(reply, PeerReply::Error { .. }));
+                rendered.structured_content = serde_json::to_value(&reply).ok();
+                if serde_json::to_vec(&rendered).is_ok_and(|bytes| bytes.len() <= MAX_REPLY_BYTES) {
+                    return rendered;
+                }
+                return CallToolResult::error(vec![ContentBlock::text(
+                    "Assistance result exceeds the bounded envelope; continue with native tools",
+                )]);
+            }
             FacadeOutcome::InvalidParameters => {
                 "invalid bounded parameters; inspect the tool schema"
             }
@@ -690,10 +771,10 @@ impl StdioFacade {
     }
 }
 
-#[tool_router(server_handler)]
+#[tool_router]
 impl StdioFacade {
     /// Routes a stable activation ID and separately supplied host context through the bounded call boundary.
-    #[tool(name = "ide.start", input_schema = json!({"type":"object","additionalProperties":false,"required":["activation_id"],"properties":{"activation_id":{"type":"string","minLength":1,"maxLength":MAX_ACTIVATION_ID_BYTES}}}).as_object().expect("tool schema is an object").clone())]
+    #[tool(name = "ide.start", input_schema = tool_schemas()[0].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn start(
         &self,
         Parameters(parameters): Parameters<Value>,
@@ -703,7 +784,7 @@ impl StdioFacade {
     }
 
     /// Routes bounded context parameters and host request context without accepting model-owned identity.
-    #[tool(name = "ide.context", input_schema = json!({"type":"object","additionalProperties":false,"properties":{"query":{"type":"string","maxLength":MAX_QUERY_BYTES},"detail_ref":{"type":"string","minLength":1,"maxLength":MAX_DETAIL_REF_BYTES}}}).as_object().expect("tool schema is an object").clone())]
+    #[tool(name = "ide.context", input_schema = tool_schemas()[1].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn context(
         &self,
         Parameters(parameters): Parameters<Value>,
@@ -714,7 +795,7 @@ impl StdioFacade {
     }
 
     /// Routes bounded diff parameters and host context; absent Changes results never imply a ready diff.
-    #[tool(name = "ide.diff", input_schema = json!({"type":"object","additionalProperties":false,"properties":{"detail_ref":{"type":"string","minLength":1,"maxLength":MAX_DETAIL_REF_BYTES}}}).as_object().expect("tool schema is an object").clone())]
+    #[tool(name = "ide.diff", input_schema = tool_schemas()[2].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn diff(
         &self,
         Parameters(parameters): Parameters<Value>,
@@ -724,7 +805,7 @@ impl StdioFacade {
     }
 
     /// Routes a bounded detail reference and host context; unavailable owner peers produce no expansion.
-    #[tool(name = "ide.inspect", input_schema = json!({"type":"object","additionalProperties":false,"required":["detail_ref"],"properties":{"detail_ref":{"type":"string","minLength":1,"maxLength":MAX_DETAIL_REF_BYTES}}}).as_object().expect("tool schema is an object").clone())]
+    #[tool(name = "ide.inspect", input_schema = tool_schemas()[3].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn inspect(
         &self,
         Parameters(parameters): Parameters<Value>,
@@ -735,7 +816,7 @@ impl StdioFacade {
     }
 
     /// Routes an empty stop object and host context without claiming revocation from an unavailable peer.
-    #[tool(name = "ide.stop", input_schema = json!({"type":"object","additionalProperties":false,"properties":{}}).as_object().expect("tool schema is an object").clone())]
+    #[tool(name = "ide.stop", input_schema = tool_schemas()[4].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn stop(
         &self,
         Parameters(parameters): Parameters<Value>,
@@ -756,5 +837,20 @@ fn debug_redacts_trusted_transport_and_host_metadata() {
             !rendered.contains(secret) && !rendered.contains("private_json"),
             "private host Debug leaked"
         );
+    }
+}
+
+#[rmcp::tool_handler(router = self.router)]
+impl rmcp::ServerHandler for StdioFacade {
+    /// Requests the measured Codex sandbox-state envelope without claiming its authority.
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        let mut experimental = rmcp::model::ExperimentalCapabilities::new();
+        experimental.insert("codex/sandbox-state-meta".into(), Default::default());
+        rmcp::model::ServerInfo::new(
+            rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .enable_experimental_with(experimental)
+                .build(),
+        )
     }
 }

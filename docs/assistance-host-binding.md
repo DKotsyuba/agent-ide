@@ -69,8 +69,10 @@ including echoed hook correlations; it cannot be used to print attachment or pay
 
 The MCP ingress obtains `threadId`, `callId` and the presence of the supported
 `x-codex-turn-metadata` object from rmcp `RequestContext.meta`, separately from model
-arguments. It forwards selected actor/call fields and an empty support marker, never the
-turn object contents. Assistance owns the opaque method parameter envelope
+arguments. It advertises `codex/sandbox-state-meta` and preserves that complete measured
+object alongside selected actor/call fields and an empty turn-support marker; arbitrary
+turn object contents are discarded. After exact binding, Assistance validates the
+correlated sandbox observation and Execution's supported profile shape. Assistance owns the opaque method parameter envelope
 `{"parameters":...,"host_meta":...}`; Application only frames it. The MCP request ID
 and exact call ID remain finite transport request/correlation values. All matching is by
 **attachment + actor + call**, never argument equality, timing, CWD, PID or parent identity.
@@ -115,8 +117,8 @@ is not proof of binding or model-context delivery.
 This adapter relies on the trusted launcher and the existing private local daemon endpoint;
 it does not cryptographically authenticate local processes or attest sandbox enforcement.
 The next gate is Workspace activation/revocation with controlled Execution admission and
-Git discovery. Full invocation-correlated sandbox observation is not assembled in the
-product dispatcher. Intelligence context, Changes diff/detail and delivery visibility
+Git discovery. Invocation-correlated sandbox observation now reaches the dispatcher; physical
+execution still requires trusted configured profile evidence and a fresh spawn use. Intelligence context, Changes diff/detail and delivery visibility
 remain separate missing gates. No successful `start → context`, `start → diff`,
 `model_seen`, Claude support or end-user IDE readiness is claimed.
 
@@ -136,3 +138,21 @@ product deadline plus 200 ms for child startup and scheduling. Child-process Tok
 are independent of the test runtime, so paused test time cannot control these paths.
 The allowance remains below doubled (500 ms) and sixfold (1500 ms) timeout regressions;
 both open-stdin and hung-daemon scenarios keep their real subprocess/Unix IPC boundary.
+
+`ide.context` now requires a relative `path` (at most 1024 UTF-8 bytes), with optional
+`byte_offset` (0..1048576) and `detail_ref`; absolute/traversal/NUL paths are rejected.
+`ide.diff` accepts only `head`, `staged`, or `unstaged` mode, defaulting to `head`. Both
+MCP discovery and runtime validation use the same schema definitions. Identity, profiles
+and candidate worktrees remain outside model arguments.
+
+Daemon launch may supply `AGENT_IDE_LAUNCHER_CONFIG` naming the bounded restart-only
+[trusted configuration](assistance-launcher.md). The closed result protocol additionally
+supports `pending` with a same-binding `detail_ref`, fixed error codes, and owner-produced
+`complete` results. The serialized envelope is capped at 64 KiB including escaping;
+UTF-8-safe owner-text truncation is explicit. MCP exposes it as structured content with
+a fixed short summary rather than duplicating the entire payload in text.
+
+Cold executable startup is bounded separately by an inactive fixture invocation before
+measuring the hung-daemon case. The observed test-harness cold start can exceed 800 ms
+before the first hook instruction; the subsequent real ingress still uses the unchanged
+450 ms test ceiling and 250 ms product deadline.

@@ -46,6 +46,7 @@ impl Mcp {
     /// Starts and initializes the shipping binary, optionally supplying a separate launcher attachment.
     async fn start(runtime: &Path, attachment: Option<&str>) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
+        command.env("TOKIO_WORKER_THREADS", "1");
         command
             .args(["mcp", "--runtime-dir"])
             .arg(runtime)
@@ -249,7 +250,7 @@ async fn binary_routes_five_methods_to_typed_missing_peer_and_survives_daemon_lo
     );
     for (index, (name, arguments)) in [
         ("ide.start", json!({"activation_id":"activate"})),
-        ("ide.context", json!({"query":"source"})),
+        ("ide.context", json!({"path":"src/main.rs"})),
         ("ide.diff", json!({})),
         ("ide.inspect", json!({"detail_ref":"detail"})),
         ("ide.stop", json!({})),
@@ -322,6 +323,8 @@ async fn daemon(runtime: &Path) -> Child {
 /// Starts the real hook process; callers own stdin closure and bounded completion checks.
 fn hook_process(runtime: &Path, attachment: Option<&str>) -> Child {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
+    // Bound fixture thread creation so the wall-clock deadline measures ingress, not CPU-sized pools.
+    command.env("TOKIO_WORKER_THREADS", "1");
     command
         .args(["codex-hook", "--runtime-dir"])
         .arg(runtime)
@@ -342,13 +345,13 @@ async fn hook(runtime: &Path, phase: &str, field: &str, actor: &str, call: &str)
         "tool_input":{"secret":"must-never-leave-hook"},"tool_response":"private-output",
         "cwd":"private-cwd","transcript_path":"private-transcript"});
     let mut child = hook_process(runtime, Some("private-host-channel"));
-    child
-        .stdin
-        .take()
-        .unwrap()
+    let mut input = child.stdin.take().unwrap();
+    input
         .write_all(payload.to_string().as_bytes())
         .await
         .unwrap();
+    input.shutdown().await.unwrap();
+    drop(input);
     let output = tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
         .await
         .unwrap()
@@ -361,12 +364,14 @@ async fn hook(runtime: &Path, phase: &str, field: &str, actor: &str, call: &str)
 fn host_call(actor: &str, call: &str, name: &str) -> Value {
     let arguments = if name == "ide.start" {
         json!({"activation_id":"same-activation"})
+    } else if name == "ide.context" {
+        json!({"path":"src/main.rs"})
     } else {
         json!({})
     };
     json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{
         "name":name,"arguments":arguments,"_meta":{"threadId":actor,"callId":call,
-        "x-codex-turn-metadata":{"private":"not-retained"}}}})
+        "x-codex-turn-metadata":{"private":"not-retained"},"codex/sandbox-state-meta":{"permissionProfile":{"type":"disabled"},"codexLinuxSandboxExe":null,"sandboxCwd":"/private/tmp","useLegacyLandlock":false}}}})
 }
 
 /// Checks a closed host boundary response and proves private launch/input fields were not rendered.
@@ -527,7 +532,18 @@ async fn binary_codex_hook_hung_daemon_deadline_sends_only_selected_fields() {
     let runtime = runtime();
     std::fs::create_dir(&runtime).unwrap();
     let listener = UnixListener::bind(runtime.join("agent-ide.sock")).unwrap();
+    // Cold executable startup can precede the hook timer by >800 ms under the test harness.
+    // Bound that separately; the measured invocation still fails a doubled 500 ms hook deadline.
+    let warm = tokio::time::timeout(
+        Duration::from_secs(2),
+        hook_process(&runtime, None).wait_with_output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(warm.status.success() && warm.stdout.is_empty() && warm.stderr.is_empty());
     let before = std::time::Instant::now();
+
     let hook = hook(&runtime, "PreToolUse", "agent_id", "child", "hung");
     let capture = async {
         let (mut stream, _) = listener.accept().await.unwrap();
@@ -671,5 +687,47 @@ async fn binary_active_native_hooks_accept_edits_deletes_renames_and_failed_comm
     mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
+    std::fs::remove_dir_all(runtime).unwrap();
+}
+
+/// Preserves measured nested sandbox fields through real MCP ingress and renders a bounded pending envelope.
+#[tokio::test]
+async fn binary_preserves_sandbox_metadata_and_renders_closed_pending() {
+    use tokio::{io::AsyncReadExt, net::UnixListener};
+    let runtime = runtime();
+    std::fs::create_dir(&runtime).unwrap();
+    let listener = UnixListener::bind(runtime.join("agent-ide.sock")).unwrap();
+    let mut mcp = Mcp::start(&runtime, Some("private-host-channel")).await;
+    let state = json!({"permissionProfile":{"type":"managed","file_system":{"opaque":[1,2]},"network":{"enabled":false}},"codexLinuxSandboxExe":"/trusted/wrapper","sandboxCwd":"file:///private/tmp/worktree","useLegacyLandlock":false,"preserved":{"nested":"private-state-marker"}});
+    let mut call = host_call("actor", "state-call", "ide.start");
+    call["params"]["_meta"]["codex/sandbox-state-meta"] = state.clone();
+    let peer = async {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let size = stream.read_u32().await.unwrap();
+        assert!(size < 128 * 1024);
+        let mut bytes = vec![0; size as usize];
+        stream.read_exact(&mut bytes).await.unwrap();
+        let frame: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            frame["params_json"]["host_meta"]["codex/sandbox-state-meta"],
+            state
+        );
+        assert_eq!(
+            frame["params_json"]["parameters"],
+            json!({"activation_id":"same-activation"})
+        );
+        let reply = json!({"version":2,"request_id":frame["request_id"],"opaque_result_json":{"state":"pending","detail_ref":"detail-1"}}).to_string();
+        stream.write_u32(reply.len() as u32).await.unwrap();
+        stream.write_all(reply.as_bytes()).await.unwrap();
+    };
+    let (reply, ()) = tokio::join!(mcp.exchange(call), peer);
+    assert_eq!(
+        reply["result"]["structuredContent"],
+        json!({"state":"pending","detail_ref":"detail-1"})
+    );
+    assert!(!reply.to_string().contains("private-state-marker"));
+    assert!(reply.to_string().len() < 64 * 1024);
+    mcp.close().await;
+    drop(listener);
     std::fs::remove_dir_all(runtime).unwrap();
 }

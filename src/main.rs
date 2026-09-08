@@ -9,7 +9,9 @@ use agent_ide::app::{
     AppError, DoctorReport, DoctorStatus, RuntimeDir, config::EffectiveConfig, doctor_report,
     run_daemon_with_assistance,
 };
-use agent_ide::assistance::{assembly::ProductDispatcher, facade::StdioFacade};
+use agent_ide::assistance::{
+    assembly::ProductDispatcher, facade::StdioFacade, launcher::LauncherConfig,
+};
 use rmcp::{serve_server, transport::io::stdio};
 
 /// Selects an explicit mode; MCP writes only protocol messages to stdout and never autostarts.
@@ -19,7 +21,14 @@ async fn main() -> ExitCode {
         Ok(Command::Daemon { runtime_dir }) => match RuntimeDir::prepare_for_daemon(runtime_dir) {
             Ok(runtime_dir) => match run_daemon_with_assistance(
                 runtime_dir,
-                Arc::new(ProductDispatcher::default()),
+                Arc::new(match std::env::var("AGENT_IDE_LAUNCHER_CONFIG") {
+                    Ok(path) => match LauncherConfig::read(std::path::Path::new(&path)) {
+                        Ok(config) => ProductDispatcher::with_launcher(config),
+                        Err(_) => return fail(AppError::InvalidResponse),
+                    },
+                    Err(std::env::VarError::NotPresent) => ProductDispatcher::default(),
+                    Err(_) => return fail(AppError::InvalidResponse),
+                }),
                 EffectiveConfig::defaults(),
             )
             .await

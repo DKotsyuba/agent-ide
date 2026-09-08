@@ -81,7 +81,11 @@ async fn unavailable_facade_and_hook_are_connect_only_and_fail_open() {
     let facade = AssistanceFacade::new(runtime.clone());
     assert_eq!(
         facade
-            .dispatch(&host(), AssistanceTool::Context, json!({"query":"status"}))
+            .dispatch(
+                &host(),
+                AssistanceTool::Context,
+                json!({"path":"src/main.rs"})
+            )
             .await,
         FacadeOutcome::Unavailable
     );
@@ -171,4 +175,50 @@ fn feedback_deduplicates_rechecks_and_suppresses_after_stop() {
         feedback.record("authority-1", "source-2", &delta),
         FeedbackRecord::Suppressed
     );
+}
+
+/// Keeps context source scope and diff modes bounded while rejecting authority-like model inputs.
+#[test]
+fn context_paths_offsets_and_diff_modes_are_closed() {
+    for path in [
+        "",
+        "/absolute",
+        "../escape",
+        "a/../escape",
+        "a//b",
+        ".",
+        "a/./b",
+        "nul\0path",
+    ] {
+        assert!(validate_call(AssistanceTool::Context, json!({"path":path})).is_err());
+    }
+    for offset in [json!(-1), json!(1.5), json!(1_048_577), json!(null)] {
+        assert!(
+            validate_call(
+                AssistanceTool::Context,
+                json!({"path":"src/main.rs","byte_offset":offset})
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        validate_call(
+            AssistanceTool::Context,
+            json!({"path":"src/🦀.rs","byte_offset":0})
+        )
+        .is_ok()
+    );
+    assert!(validate_call(AssistanceTool::Context, json!({"query":"old schema"})).is_err());
+    assert_eq!(
+        validate_call(AssistanceTool::Diff, json!({}))
+            .unwrap()
+            .parameters()["mode"],
+        "head"
+    );
+    for mode in ["head", "staged", "unstaged"] {
+        assert!(validate_call(AssistanceTool::Diff, json!({"mode":mode})).is_ok());
+    }
+    for mode in [json!("HEAD~1"), json!("arbitrary"), json!(null)] {
+        assert!(validate_call(AssistanceTool::Diff, json!({"mode":mode})).is_err());
+    }
 }
