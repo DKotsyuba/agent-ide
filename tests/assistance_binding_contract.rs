@@ -252,3 +252,70 @@ fn hook_parser_does_not_retain_raw_payload_fields() {
     assert!(parse_hook_event(br#"{"hook_event_name":"PreToolUse","session_id":"a","session_id":"b","tool_use_id":"c"}"#).is_err());
     assert!(parse_hook_event(br#"{"hook_event_name":"PreToolUse","session_id":"a","tool_use_id":"c","tool_use_id":"d"}"#).is_err());
 }
+
+/// Coalesces active native lifecycles without authorizing effects or repairing a premature MCP post.
+#[test]
+fn active_native_lifecycles_only_request_a_revocable_registered_path_recheck() {
+    let mut guard = HostBindingGuard::default();
+    let channel = channel("native-channel");
+    guard.observe_hook(
+        hook("PreToolUse", "session_id", "actor", "start"),
+        channel.clone(),
+    );
+    let BindingStatus::Validated(started) =
+        guard.establish_start(candidate("actor", "start"), channel.clone())
+    else {
+        panic!("start must validate");
+    };
+    for call in ["edit", "delete", "rename", "failed-command"] {
+        guard.observe_hook(
+            hook("PreToolUse", "session_id", "actor", call),
+            channel.clone(),
+        );
+        let post = parse_hook_event(json!({"hook_event_name":"PostToolUse","session_id":"actor","tool_use_id":call,
+            "tool_name":"exec_command","tool_input":{"cmd":"opaque command"},"tool_response":{"exit_code":7}}).to_string().as_bytes()).unwrap();
+        assert!(matches!(
+            guard.observe_hook(post, channel.clone()),
+            BindingStatus::NativeObserved(_)
+        ));
+        assert!(matches!(
+            guard.establish_start(candidate("actor", call), channel.clone()),
+            BindingStatus::Unavailable(_)
+        ));
+    }
+    assert!(
+        guard
+            .take_native_change_hint(started.binding_ref())
+            .unwrap()
+    );
+    assert!(
+        !guard
+            .take_native_change_hint(started.binding_ref())
+            .unwrap()
+    );
+    guard.observe_hook(
+        hook("PreToolUse", "session_id", "actor", "pending"),
+        channel.clone(),
+    );
+    guard.observe_hook(
+        hook("PostToolUse", "session_id", "actor", "pending"),
+        channel.clone(),
+    );
+    guard.stop_binding(started.binding_ref()).unwrap();
+    assert!(
+        guard
+            .take_native_change_hint(started.binding_ref())
+            .is_err()
+    );
+    guard.observe_hook(
+        hook("PreToolUse", "session_id", "actor", "inactive"),
+        channel.clone(),
+    );
+    assert!(matches!(
+        guard.observe_hook(
+            hook("PostToolUse", "session_id", "actor", "inactive"),
+            channel
+        ),
+        BindingStatus::Unavailable(_)
+    ));
+}

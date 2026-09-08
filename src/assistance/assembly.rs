@@ -36,6 +36,8 @@ pub(crate) enum PeerReply {
     HookObserved {},
     /// An exact post-hook settled an already validated MCP call.
     HookSettled {},
+    /// A complete native lifecycle requested a registered-path recheck for an active binding.
+    NativeHookObserved {},
     /// The exact active host binding was revoked; no Workspace grant existed.
     HostStopped {},
 }
@@ -78,6 +80,7 @@ impl ProductDispatcher {
                 match bindings.observe_hook(event, channel) {
                     BindingStatus::PreObserved => Some(PeerReply::HookObserved {}),
                     BindingStatus::Settled(_) => Some(PeerReply::HookSettled {}),
+                    BindingStatus::NativeObserved(_) => Some(PeerReply::NativeHookObserved {}),
                     _ => None,
                 }
             }

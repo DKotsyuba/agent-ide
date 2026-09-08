@@ -555,3 +555,109 @@ async fn binary_codex_hook_hung_daemon_deadline_sends_only_selected_fields() {
     drop(listener);
     std::fs::remove_dir_all(runtime).unwrap();
 }
+
+/// Reads the closed post-hook acknowledgement through real IPC without exposing it in the hook process.
+async fn post_ack(runtime: &Path, actor: &str, call: &str) -> Value {
+    use agent_ide::app::{
+        submit_hook_if_running,
+        transport::{HookSubmit, HookSubmitTransportResult, HookTransportLimits, OpaqueJson},
+    };
+    let request = HookSubmit::new(
+        call,
+        call,
+        "private-host-channel",
+        OpaqueJson::from_value(
+            &json!({"phase":"post","actor_id":actor,"call_id":call}),
+            1024,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let reply = submit_hook_if_running(
+        runtime,
+        request,
+        HookTransportLimits::new(128 * 1024, 64 * 1024, Duration::from_secs(1)).unwrap(),
+    )
+    .await;
+    let HookSubmitTransportResult::Dispatched {
+        opaque_reply_json, ..
+    } = reply
+    else {
+        panic!("daemon must reply");
+    };
+    serde_json::from_str(opaque_reply_json.as_str()).unwrap()
+}
+
+/// Active ordinary-tool hook lifecycles produce bounded recheck hints, including failed commands.
+#[tokio::test]
+async fn binary_active_native_hooks_accept_edits_deletes_renames_and_failed_commands() {
+    let runtime = runtime();
+    let mut daemon = daemon(&runtime).await;
+    let mut mcp = Mcp::start(&runtime, Some("private-host-channel")).await;
+    hook(&runtime, "PreToolUse", "session_id", "actor", "inactive").await;
+    assert_eq!(
+        post_ack(&runtime, "actor", "inactive").await["reason"],
+        "host_binding"
+    );
+    hook(&runtime, "PreToolUse", "session_id", "actor", "start").await;
+    boundary(
+        &mcp.exchange(host_call("actor", "start", "ide.start")).await,
+        "workspace_activation",
+    );
+    assert_eq!(
+        post_ack(&runtime, "actor", "start").await["state"],
+        "hook_settled"
+    );
+    for (call, command) in [
+        ("edit", "edit file"),
+        ("delete", "delete file"),
+        ("rename", "rename file"),
+        ("failed", "exit 7"),
+    ] {
+        let payload = json!({"hook_event_name":"PreToolUse","session_id":"actor","tool_use_id":call,
+            "tool_name":"exec_command","tool_input":{"cmd":command},"tool_response":{"exit_code":7}});
+        let mut native = hook_process(&runtime, Some("private-host-channel"));
+        native
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .await
+            .unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(2), native.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(output.status.success() && output.stdout.is_empty() && output.stderr.is_empty());
+        assert_eq!(
+            post_ack(&runtime, "actor", call).await,
+            json!({"state":"native_hook_observed"})
+        );
+        // A native hint must never turn a post-before-MCP call into validated activation.
+        boundary(
+            &mcp.exchange(host_call("actor", call, "ide.start")).await,
+            "host_binding",
+        );
+    }
+    hook(&runtime, "PreToolUse", "session_id", "actor", "stop").await;
+    boundary(
+        &mcp.exchange(host_call("actor", "stop", "ide.stop")).await,
+        "host binding stopped",
+    );
+    hook(
+        &runtime,
+        "PreToolUse",
+        "session_id",
+        "actor",
+        "after-stop-native",
+    )
+    .await;
+    assert_eq!(
+        post_ack(&runtime, "actor", "after-stop-native").await["reason"],
+        "host_binding"
+    );
+    mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+    std::fs::remove_dir_all(runtime).unwrap();
+}

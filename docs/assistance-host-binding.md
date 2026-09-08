@@ -7,7 +7,7 @@ implements this bounded binding/state boundary; Application separately owns its 
 
 `HostBindingGuard` first buffers the exact native `PreToolUse` event. The MCP handler then validates its candidate against that pre-observation and can return its result without waiting for `PostToolUse`. The sequence is `PreToolUse` → MCP validation/result → `PostToolUse`: post is later settlement evidence, not a condition for invocation validation. Child events use `agent_id`; root events use `session_id`; `tool_use_id` must match `_meta.callId`. Missing, ambiguous, mismatched, repeated, oversized, or post-stop data is `Unavailable`. The guard retains bounded pre-observed, active, and completed identifiers and refuses new input when its fixed storage cap is exhausted rather than discarding replay evidence.
 
-The provider surface is deliberately small: `parse_candidate`, `parse_channel_session`, and `parse_hook_event` create bounded ingress values; `HostBindingGuard::observe_hook`, `establish_start`, `validate_active`, `check_active`, `consume_active`, `stop_binding`, and `stop` manage lifecycle. `ValidatedInvocation` exposes only actor ID, call ID, and opaque `BindingRef`; `ActiveBindingUse` exposes only its same opaque ref. Workspace consumes only `ValidatedInvocation` plus a fresh `ActiveBindingUse`; `PreObserved` and `Settled` are lifecycle observations, while `Unavailable` grants nothing. Application owns crate-root exposure and consumer wiring.
+The provider surface is deliberately small: `parse_candidate`, `parse_channel_session`, and `parse_hook_event` create bounded ingress values; `HostBindingGuard::observe_hook`, `establish_start`, `validate_active`, `take_native_change_hint`, `check_active`, `consume_active`, `stop_binding`, and `stop` manage lifecycle. `ValidatedInvocation` exposes only actor ID, call ID, and opaque `BindingRef`; `ActiveBindingUse` exposes only its same opaque ref. Workspace consumes only `ValidatedInvocation` plus a fresh `ActiveBindingUse`; `PreObserved` and `Settled` are lifecycle observations; `NativeObserved` is only an active registered-path recheck hint, while `Unavailable` grants nothing. Application owns crate-root exposure and consumer wiring.
 
 The hook parser retains only phase, actor ID, and call ID. It never returns tool input, tool output, source, cwd, transcript paths, or other raw hook fields. Its failure is local and fail-open: it makes the Assistance claim unavailable but cannot block an ordinary native tool, host completion, or existing host permissions.
 
@@ -41,14 +41,15 @@ separately. Its `ProductDispatcher` retains one bounded `HostBindingGuard` for t
 lifetime, serialized across all finite Unix IPC connections.
 
 For Codex, configure **both** native `PreToolUse` and `PostToolUse` commands to invoke
-`agent-ide codex-hook --runtime-dir PATH`, restricted by the host's hook matcher to this
-MCP server's five `ide.*` tools. Supply the same `AGENT_IDE_HOST_ATTACHMENT` launch
+`agent-ide codex-hook --runtime-dir PATH` for supported native tools as well as this MCP
+server's five `ide.*` tools. Supply the same `AGENT_IDE_HOST_ATTACHMENT` launch
 environment value to those commands and the MCP process. It must be a fresh opaque
 handle for that host channel/session, nonempty UTF-8 and at most 128 bytes. Distinct host
 sessions must use distinct handles; root and native children in the same channel may
 share one. Do not put the handle in model arguments or tool output. Missing hook
-configuration or mismatched handles leaves calls unavailable. Hooks for unrelated native
-tools are not needed and would consume the finite pending/replay budget.
+configuration or mismatched handles leaves calls unavailable. Ordinary edits, deletes,
+renames and failed commands must remain observable after activation; their hook payloads
+are not a source-effect authority.
 
 The hook command reads at most 64 KiB plus one overflow byte and uses a separate **250 ms
 total deadline** for stdin, parsing, connect, dispatch and reply. An open stdin pipe cannot
@@ -74,15 +75,22 @@ and exact call ID remain finite transport request/correlation values. All matchi
 
 Only an exact pre-hook followed by `ide.start` creates an actor/channel binding. Later
 ordinary methods require their own matching pre-hook and that binding's current liveness.
-Post-hooks settle previously validated invocations after MCP result delivery. Duplicate
-pre-hooks, premature post-hooks and MCP-before-pre ordering reject that invocation for
-the remaining daemon lifetime; late hooks cannot repair it. Explicit stop revokes the
+Post-hooks settle previously validated invocations after MCP result delivery. A complete
+native Pre/Post lifecycle without an MCP invocation coalesces a registered-path recheck
+hint only for an already active binding. This applies equally to successful and failed
+commands: actor/call/phase are sufficient triggers; command text, paths and tool results
+are never trusted as effects. `take_native_change_hint` consumes that bounded hint after
+a fresh liveness check. Actual Workspace reconciliation is not yet connected here.
+Duplicate pre-hooks, premature post-hooks and MCP-before-pre ordering reject that
+invocation for subsequent MCP validation in the remaining daemon lifetime; late hooks cannot repair it. Explicit stop revokes the
 exact binding and rejects its pending pre-hooks before any Workspace handoff could occur.
 Post settlement for already validated calls can still complete. A fresh explicit start
 is required after stop; another actor's binding is unaffected.
 
 State is bounded to 128 pending/settling invocations, 64 active bindings, 1024 completed
-identities and 1024 rejected identities. Replay evidence is never evicted to make room.
+identities, 1024 rejected identities and at most one coalesced native hint per active
+binding. Native lifecycle identities consume the same finite replay budget. Replay
+evidence is never evicted to make room.
 Exhaustion makes further binding operations unavailable. Daemon restart discards all
 bindings and requires fresh exact pre/start input; it does not recover authority.
 
@@ -94,6 +102,7 @@ Closed daemon outcomes are:
 | `{"state":"unavailable","reason":"workspace_activation"}` | Host invocation and current binding are proven; Workspace activation is not connected. |
 | `{"state":"hook_observed"}` | One pre-hook was retained; no authority or delivery claim. |
 | `{"state":"hook_settled"}` | One exact post-hook settled a validated invocation. |
+| `{"state":"native_hook_observed"}` | Active native lifecycle requested a registered-path recheck; no source effect is claimed. |
 | `{"state":"host_stopped"}` | The exact host binding was revoked; no Workspace authority was created. |
 
 The MCP facade renders only the corresponding closed method outcomes. Stop reports host
@@ -114,6 +123,8 @@ Verify with `cargo test --offline --test product_mcp_contract --test assistance_
 MCP/Unix IPC tests cover parallel root/child actors with identical inputs and correlation
 IDs, cross-actor rejection, stop isolation, replay/order failures, daemon loss, inactive
 and malformed hooks, open stdin and hung-daemon deadlines, and discarded payload fields.
+Native edit/delete/rename and failed-command-shaped lifecycle fixtures verify coalesced
+active hints and suppression after stop, without claiming those fixtures changed source.
 These are controlled host-shaped process tests using the established Codex field contract;
 they do not substitute for a fresh live Codex host acceptance scenario. Live Claude
 root/subagent behavior and feedback delivery are unverified.

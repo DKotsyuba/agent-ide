@@ -178,7 +178,7 @@ pub enum BindingUnavailable {
 ///
 /// `PreObserved` is not an authority claim. `Validated` proves the exact native pre-hook was
 /// observed before MCP acceptance; `Settled` records its later matching post-hook evidence.
-/// Neither result itself attests host transport authority or sandbox enforcement.
+/// Native observations are recheck hints only; no result attests authority or sandbox enforcement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BindingStatus {
     /// A native pre-hook was retained while awaiting matching trusted MCP metadata.
@@ -187,6 +187,9 @@ pub enum BindingStatus {
     Validated(ValidatedInvocation),
     /// The matching native post-hook arrived after a validated MCP invocation.
     Settled(ValidatedInvocation),
+    /// A complete native hook lifecycle marks this active binding for registered-path recheck.
+    /// It proves neither an MCP invocation nor a source effect or successful native command.
+    NativeObserved(BindingRef),
     /// Required host data was absent, malformed, mismatched, replayed, or unavailable.
     Unavailable(BindingUnavailable),
 }
@@ -295,7 +298,9 @@ pub struct HostBindingGuard {
     completed: BTreeSet<(CandidateInvocation, ChannelSessionRef)>,
     bindings: BTreeMap<(String, ChannelSessionRef), BindingRef>,
     next_generation: u64,
-    /// Failed ordering/replay identities are never reusable within this daemon lifetime.
+    /// Coalesced native lifecycle hints, at most one per active binding and no raw tool data.
+    native_hints: BTreeSet<BindingRef>,
+    /// Failed or native-only identities cannot be reused for MCP validation in this daemon lifetime.
     rejected: BTreeSet<(CandidateInvocation, ChannelSessionRef)>,
 }
 
@@ -392,7 +397,10 @@ impl HostBindingGuard {
 
     /// Buffers a native pre-hook or records post-hook settlement for a channel-bound invocation.
     ///
-    /// Duplicate pre-hooks and out-of-order post-hooks invalidate that exact invocation.
+    /// Duplicate pre-hooks and post-before-MCP lifecycles prevent later MCP validation.
+    /// For an already active binding, a complete Pre/Post without MCP also coalesces one
+    /// native-change hint. Failed commands and edit/delete/rename lifecycles use the same hint;
+    /// tool payloads are never interpreted as proof of effects.
     /// A pre-hook is not an authority claim. A post-hook never gates MCP result acceptance: it
     /// only settles a call that was already validated by `establish_start` or `validate_active`.
     pub fn observe_hook(&mut self, event: HookEvent, channel: ChannelSessionRef) -> BindingStatus {
@@ -432,7 +440,15 @@ impl HostBindingGuard {
                     return BindingStatus::Unavailable(BindingUnavailable::Replay);
                 }
                 if self.pre_observed.remove(&invocation) {
+                    let binding = self
+                        .bindings
+                        .get(&(candidate.actor_id, invocation.1.clone()))
+                        .cloned();
                     self.rejected.insert(invocation);
+                    if let Some(binding) = binding {
+                        self.native_hints.insert(binding.clone());
+                        return BindingStatus::NativeObserved(binding);
+                    }
                     return BindingStatus::Unavailable(BindingUnavailable::MissingInvocation);
                 }
                 let Some(binding) = self.settling.remove(&invocation) else {
@@ -447,6 +463,19 @@ impl HostBindingGuard {
                 BindingStatus::Settled(validated(candidate, binding))
             }
         }
+    }
+
+    /// Consumes a coalesced native lifecycle hint for one currently active binding.
+    ///
+    /// `true` requests a fresh bounded registered-path reconciliation, never an assumed source
+    /// effect. `false` means no unconsumed hint. Stopped/stale generations return unavailable;
+    /// no path, command success, Workspace authority or Execution permit is inferred.
+    pub fn take_native_change_hint(
+        &mut self,
+        binding: &BindingRef,
+    ) -> Result<bool, BindingUnavailable> {
+        self.check_active(binding)?;
+        Ok(self.native_hints.remove(binding))
     }
 
     /// Checks whether one immutable binding generation remains active at this exact boundary.
@@ -476,6 +505,7 @@ impl HostBindingGuard {
             return Err(BindingUnavailable::InactiveBinding);
         }
         self.bindings.remove(&key);
+        self.native_hints.remove(binding);
         self.pre_observed.retain(|invocation| {
             if invocation.0.actor_id == binding.actor_id && invocation.1 == binding.channel {
                 if self.rejected.len() < MAX_COMPLETED {
@@ -496,6 +526,7 @@ impl HostBindingGuard {
     pub fn stop(&mut self) {
         self.pre_observed.clear();
         self.bindings.clear();
+        self.native_hints.clear();
     }
 }
 
