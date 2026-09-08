@@ -72,14 +72,11 @@ fn project(label: &str, result: &str) -> (PathBuf, String) {
         "[package]\nname = \"contract\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
     )
     .unwrap();
-    let body = if result == "u32" {
-        "1"
-    } else {
-        "String::new()"
-    };
     fs::write(
         root.join("src/lib.rs"),
-        format!("pub fn item() -> {result} {{ {body} }}\npub fn caller() {{ item(); }}\n"),
+        format!(
+            "pub fn item() {{\n    let answer: {result} = Default::default();\n    answer\n}}\n"
+        ),
     )
     .unwrap();
     let uri = format!("file://{}", root.join("src/lib.rs").display());
@@ -184,12 +181,15 @@ async fn response(child: &mut RustProtocolChild, id: u64) -> Value {
 }
 
 /// Initializes one server, opens the divergent source, and proves hover plus definition semantics.
-async fn semantic_probe(child: &mut RustProtocolChild, root: &Path, uri: &str) {
+async fn semantic_probe(child: &mut RustProtocolChild, root: &Path, uri: &str, expected: &str) {
     send(child, json!({
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {"processId": null, "rootUri": format!("file://{}", root.display()),
             "workspaceFolders": [{"uri": format!("file://{}", root.display()), "name": "contract"}],
-            "capabilities": {"textDocument": {"hover": {"contentFormat": ["markdown", "plaintext"]}}}}
+            "capabilities": {
+                "window": {"workDoneProgress": true},
+                "workspace": {"configuration": true, "workspaceFolders": true},
+                "textDocument": {"hover": {"contentFormat": ["markdown", "plaintext"]}}}}
     }))
     .await;
     assert!(response(child, 1).await.get("result").is_some());
@@ -207,48 +207,56 @@ async fn semantic_probe(child: &mut RustProtocolChild, root: &Path, uri: &str) {
         }),
     )
     .await;
-    send(
-        child,
-        json!({
-            "jsonrpc": "2.0", "method": "textDocument/didChange",
-            "params": {"textDocument": {"uri": uri, "version": 2},
-                "contentChanges": [{"text": fs::read_to_string(root.join("src/lib.rs")).unwrap()}]}
-        }),
-    )
-    .await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    send(
-        child,
-        json!({
-            "jsonrpc": "2.0", "id": 2, "method": "textDocument/hover",
-                "params": {"textDocument": {"uri": uri}, "position": {"line": 0, "character": 8}}
-        }),
-    )
-    .await;
-    let hover = response(child, 2).await;
+    let mut observations = Vec::new();
+    let mut hover = None;
+    for id in 2..=9 {
+        send(
+            child,
+            json!({
+                "jsonrpc": "2.0", "id": id, "method": "textDocument/hover",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 2, "character": 5}}
+            }),
+        )
+        .await;
+        let candidate = response(child, id).await;
+        let useful = candidate
+            .get("result")
+            .filter(|value| !value.is_null())
+            .is_some_and(|value| value.to_string().contains(expected));
+        observations.push(candidate);
+        if useful {
+            hover = observations.last().cloned();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
     assert!(
-        hover.get("result").is_some(),
-        "missing hover response: {hover}"
+        hover.is_some(),
+        "no useful hover after observable readiness responses: {observations:?}"
     );
     send(
         child,
         json!({
-            "jsonrpc": "2.0", "id": 3, "method": "textDocument/definition",
-                "params": {"textDocument": {"uri": uri}, "position": {"line": 1, "character": 18}}
+            "jsonrpc": "2.0", "id": 10, "method": "textDocument/definition",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 2, "character": 5}}
         }),
     )
     .await;
-    let definition = response(child, 3).await;
+    let definition = response(child, 10).await;
     assert!(
-        definition.get("result").is_some(),
-        "missing definition response: {definition}"
+        definition.to_string().contains(uri)
+            && definition
+                .pointer("/result/range/start/line")
+                .or_else(|| definition.pointer("/result/0/range/start/line"))
+                == Some(&json!(1)),
+        "unexpected definition: {definition}"
     );
     send(
         child,
-        json!({"jsonrpc": "2.0", "id": 4, "method": "shutdown", "params": null}),
+        json!({"jsonrpc": "2.0", "id": 11, "method": "shutdown", "params": null}),
     )
     .await;
-    assert!(response(child, 4).await.get("result").is_some());
+    assert!(response(child, 11).await.get("result").is_some());
     send(
         child,
         json!({"jsonrpc": "2.0", "method": "exit", "params": null}),
@@ -386,7 +394,7 @@ async fn real_rust_analyzer_is_exclusive_across_divergent_worktrees() {
         8192,
     )
     .unwrap();
-    semantic_probe(&mut first_child, &first_root, &first_uri).await;
+    semantic_probe(&mut first_child, &first_root, &first_uri, "u32").await;
     first_child.reap(Duration::from_secs(10)).await.unwrap();
     assert!(matches!(
         views.request(
@@ -427,7 +435,7 @@ async fn real_rust_analyzer_is_exclusive_across_divergent_worktrees() {
         8192,
     )
     .unwrap();
-    semantic_probe(&mut second_child, &second_root, &second_uri).await;
+    semantic_probe(&mut second_child, &second_root, &second_uri, "String").await;
     second_child.reap(Duration::from_secs(10)).await.unwrap();
     assert_ne!(
         profile.compatibility_key(&first_worktree),
