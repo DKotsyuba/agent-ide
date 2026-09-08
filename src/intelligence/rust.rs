@@ -6,6 +6,7 @@
 
 use std::{
     collections::BTreeMap,
+    ffi::OsString,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -13,7 +14,7 @@ use std::{
 use crate::{
     execution::{
         AdmissionClass, AdmissionController, AdmissionError, AdmissionPromotion, BackendRelease,
-        CommandKind, ControlledCommand, OwnedProtocolChild, OwnerId, ProcessError,
+        CapturedOutput, CommandKind, ControlledCommand, OwnedProtocolChild, OwnerId, ProcessError,
         ProviderLeaseAdmission, ProviderLeaseError, ProviderLeaseRegistry, ProviderViewLease,
         QueueTicket, ValidatedExecutionRequest, WorkspaceAuthority,
     },
@@ -34,6 +35,8 @@ pub struct RustProfileIdentity {
     pub cargo_version: String,
     /// Observed rustc version paired with this profile.
     pub rustc_version: String,
+    /// Explicit rustup toolchain selector used by the analyzer and its Cargo/rustc subprocesses.
+    pub rustup_toolchain: String,
     /// Effective provider configuration identity.
     pub configuration: String,
     /// Effective local trust identity.
@@ -51,6 +54,8 @@ pub struct RustProfile {
     rust_analyzer_version: String,
     cargo_version: String,
     rustc_version: String,
+    /// Toolchain selector included in command environment and compatibility identity.
+    rustup_toolchain: String,
     configuration: String,
     trust: String,
     transport: String,
@@ -65,6 +70,7 @@ impl RustProfile {
             rust_analyzer_version: identity.rust_analyzer_version,
             cargo_version: identity.cargo_version,
             rustc_version: identity.rustc_version,
+            rustup_toolchain: identity.rustup_toolchain,
             configuration: identity.configuration,
             trust: identity.trust,
             transport: identity.transport,
@@ -76,14 +82,18 @@ impl RustProfile {
             .ok_or(RustProfileError::InvalidProfile)
     }
 
-    /// Returns a controlled rust-analyzer stdio command constrained to this exact worktree root.
+    /// Returns the worktree-bound stdio command with only the selected rustup toolchain in its env.
+    /// The executable must provision tool discovery; no ambient process environment is inherited.
     pub fn command(&self, worktree: &RustWorktree) -> Result<ControlledCommand, RustProfileError> {
         ControlledCommand::from_validated_peer(
             CommandKind::Provider,
             self.binary.clone(),
             Vec::new(),
             worktree.worktree.worktree_path().to_path_buf(),
-            BTreeMap::new(),
+            BTreeMap::from([(
+                OsString::from("RUSTUP_TOOLCHAIN"),
+                OsString::from(&self.rustup_toolchain),
+            )]),
         )
         .map_err(|_| RustProfileError::InvalidProfile)
     }
@@ -97,6 +107,7 @@ impl RustProfile {
             &RUST_PROFILE_REVISION.to_string(),
             &self.cargo_version,
             &self.rustc_version,
+            &self.rustup_toolchain,
             &self.configuration,
             &self.trust,
             &self.transport,
@@ -122,6 +133,7 @@ impl RustProfile {
                 &self.rust_analyzer_version,
                 &self.cargo_version,
                 &self.rustc_version,
+                &self.rustup_toolchain,
                 &self.configuration,
                 &self.trust,
                 &self.transport,
@@ -444,12 +456,13 @@ impl RustProtocolChild {
         &mut self.child.stdout
     }
 
-    /// Reaps only this direct owned protocol child after its pipes are dropped.
-    pub async fn reap(self, output_deadline: Duration) -> Result<(), RustProfileError> {
+    /// Drops the owned pipes, reaps the direct child, and returns Execution's capped stderr evidence.
+    /// `output_deadline` bounds stderr draining after exit, not the child's exit wait.
+    pub async fn reap(self, output_deadline: Duration) -> Result<CapturedOutput, RustProfileError> {
         self.child
             .reap(output_deadline)
             .await
-            .map(|_| ())
+            .map(|(_, stderr, _)| stderr)
             .map_err(RustProfileError::Process)
     }
 }

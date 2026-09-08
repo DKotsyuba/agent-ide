@@ -108,13 +108,30 @@ semantic check.
 
 The Rust profile revision is `1`. Its compatibility identity includes the
 absolute `rust-analyzer` binary and observed version, observed Cargo and rustc
-versions, configuration, trust, stdio transport, native-cache namespace, and
-the canonical `WorktreeRef` identity with incarnation. Each admitted Rust view
+versions, the explicit rustup toolchain selector, configuration, trust, stdio
+transport, native-cache namespace, and the canonical `WorktreeRef` identity with
+incarnation. Each admitted Rust view
 owns its document sequence and request generation. A later sequence or a
 different generation makes a reply `stale`; EOF, stop, or revocation makes it
 `unavailable`. The profile creates only the configured `rust-analyzer` controlled
-provider command using its default stdio transport and passes owned pipes only through Execution's validated
-request and owned-child boundary.
+provider command using its default stdio transport and passes owned pipes only
+through Execution's validated request and owned-child boundary. The controlled
+environment contains only `RUSTUP_TOOLCHAIN`; the configured executable must
+provide tool discovery. The accepted local selector is
+`1.98.1-aarch64-apple-darwin`, including rust-analyzer
+`1.98.1 (48a229ce 2026-09-01)`. Changing the selector changes compatibility.
+The `cache-priming-disabled-v1` configuration sets
+`{"cachePriming":{"enable":false}}` in initialization options and configuration
+replies, avoiding eager dependency-cache warmup while retaining semantic analysis.
+
+Real acceptance waits for `experimental/serverStatus` with `quiescent=true`
+and `health=ok`, services server requests independently of client response IDs,
+and requires both a typed hover and a definition in each divergent worktree.
+Each semantic session has a 60-second deadline, checks the initialized analyzer
+build, and reaps its owned child before reporting failure. Reaping returns
+Execution's capped stderr evidence, including truncation and completion flags;
+its drain deadline begins after direct-child exit. A second worktree queues
+while the first child is owned and is promoted only after reap and release.
 
 Reusable native-cache identity excludes actor, session, binding, context and
 authority IDs. It includes compatible provider/profile/configuration/toolchain
