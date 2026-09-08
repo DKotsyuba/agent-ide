@@ -95,8 +95,10 @@ impl CacheNamespace {
     /// Retires this namespace only after a peer supplies a verified closure or reset fact.
     ///
     /// The fact is intentionally required at the call boundary: stop, handoff, a missing path,
-    /// provider incompatibility, and Application failures are not retirement evidence.
-    pub fn retire(self, _verified: VerifiedCacheRetirement) -> Result<(), AppError> {
+    /// provider incompatibility, and Application failures are not retirement evidence. The
+    /// namespace is borrowed so a caller retains its lifecycle handle and can retry after a
+    /// temporary filesystem validation or removal failure.
+    pub fn retire(&self, _verified: VerifiedCacheRetirement) -> Result<(), AppError> {
         let metadata = fs::symlink_metadata(&self.path)?;
         validate_private_directory(&self.path, &metadata)?;
         fs::remove_dir_all(&self.path)?;

@@ -17,7 +17,7 @@ fn cache_root() -> std::path::PathBuf {
     ))
 }
 
-/// Proves namespaces are private, bounded path components and retire only at an explicit fact boundary.
+/// Proves namespaces are private, bounded path components and retain a retryable handle after a failed verified retirement.
 #[test]
 fn cache_retirement_requires_an_explicit_verified_fact() {
     let root_path = cache_root();
@@ -34,5 +34,14 @@ fn cache_retirement_requires_an_explicit_verified_fact() {
     assert!(namespace.path().exists());
     namespace.retire(VerifiedCacheRetirement::Reset).unwrap();
     assert!(!root_path.join("worktree_42").exists());
+    let retry = root
+        .retain(CacheNamespaceId::new("retry").unwrap())
+        .unwrap();
+    fs::set_permissions(retry.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(retry.retire(VerifiedCacheRetirement::Closed).is_err());
+    assert!(retry.path().exists());
+    fs::set_permissions(retry.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    retry.retire(VerifiedCacheRetirement::Closed).unwrap();
+    assert!(!retry.path().exists());
     fs::remove_dir(root_path).unwrap();
 }

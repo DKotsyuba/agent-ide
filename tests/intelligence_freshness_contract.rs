@@ -275,6 +275,8 @@ async fn diagnostics_are_bounded_and_cache_reuse_requires_quiescent_compatibilit
     failed_cache.quiesce();
     assert!(!failed_cache.handoff(&identity));
     fs::set_permissions(&failed_path, fs::Permissions::from_mode(0o700)).unwrap();
+    failed_cache.retire(VerifiedCacheRetirement::Reset).unwrap();
+    assert!(!failed_cache.retained());
     fs::remove_dir_all(root).unwrap();
     fs::remove_file(database).unwrap();
     fs::remove_dir_all(cache_path).unwrap();

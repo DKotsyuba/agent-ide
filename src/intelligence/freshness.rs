@@ -333,19 +333,12 @@ impl CacheIdentity {
 pub struct CacheLifecycle {
     /// Compatibility inputs that deliberately omit user/session/authority values.
     identity: CacheIdentity,
-    /// Retained namespace state until one verified retirement fact completes successfully.
-    namespace: Option<RetainedNamespace>,
+    /// Retained private namespace until one verified retirement fact completes successfully.
+    namespace: Option<CacheNamespace>,
     /// Whether the outgoing view has stopped using this namespace.
     quiescent: bool,
-}
-
-/// Represents whether a retained namespace remains safe to hand off after a failed consuming retirement API.
-#[derive(Debug)]
-enum RetainedNamespace {
-    /// The namespace remains available for a compatible quiescent handoff.
-    Ready(CacheNamespace),
-    /// Retirement failed after consuming the handle, so lifecycle ownership remains but reuse is blocked.
-    Unavailable,
+    /// Whether a failed verified retirement blocked reuse until a later successful verified retry.
+    retirement_failed: bool,
 }
 
 impl CacheLifecycle {
@@ -357,8 +350,9 @@ impl CacheLifecycle {
     ) -> Result<Self, crate::app::AppError> {
         Ok(Self {
             identity,
-            namespace: Some(RetainedNamespace::Ready(root.retain(namespace)?)),
+            namespace: Some(root.retain(namespace)?),
             quiescent: false,
+            retirement_failed: false,
         })
     }
 
@@ -370,35 +364,36 @@ impl CacheLifecycle {
     /// Reuses this namespace only for a compatible incoming identity after the old view quiesced.
     pub fn handoff(&mut self, incoming: &CacheIdentity) -> bool {
         self.quiescent
-            && matches!(self.namespace.as_ref(), Some(RetainedNamespace::Ready(_)))
+            && self.namespace.is_some()
+            && !self.retirement_failed
             && self.identity.compatible_with(incoming)
     }
 
     /// Retires the namespace only after Workspace verified an exact closure or reset fact.
+    ///
+    /// A filesystem failure retains the namespace, blocks handoff, and returns the Application
+    /// error so the caller may retry the same verified fact after correcting local conditions.
     pub fn retire(
         &mut self,
         verified: VerifiedCacheRetirement,
     ) -> Result<(), crate::app::AppError> {
-        let Some(namespace) = self.namespace.take() else {
+        let Some(namespace) = self.namespace.as_ref() else {
             return Ok(());
-        };
-        let RetainedNamespace::Ready(namespace) = namespace else {
-            self.namespace = Some(RetainedNamespace::Unavailable);
-            return Err(crate::app::AppError::UnsafeRuntimeDirectory);
         };
         match namespace.retire(verified) {
             Ok(()) => {
+                self.namespace = None;
                 self.quiescent = true;
                 Ok(())
             }
             Err(error) => {
-                self.namespace = Some(RetainedNamespace::Unavailable);
+                self.retirement_failed = true;
                 Err(error)
             }
         }
     }
 
-    /// Returns whether lifecycle ownership remains retained, including a namespace whose failed retirement blocks reuse.
+    /// Returns whether lifecycle ownership remains retained after non-retirement lifecycle events or a failed verified retry.
     pub const fn retained(&self) -> bool {
         self.namespace.is_some()
     }
