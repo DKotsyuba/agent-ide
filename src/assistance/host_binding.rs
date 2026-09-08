@@ -10,6 +10,7 @@ use std::{
     fmt,
 };
 
+use serde::Deserialize;
 use serde_json::{Map, Value};
 
 const MAX_IDENTIFIER_BYTES: usize = 256;
@@ -294,11 +295,14 @@ pub struct HostBindingGuard {
     completed: BTreeSet<(CandidateInvocation, ChannelSessionRef)>,
     bindings: BTreeMap<(String, ChannelSessionRef), BindingRef>,
     next_generation: u64,
+    /// Failed ordering/replay identities are never reusable within this daemon lifetime.
+    rejected: BTreeSet<(CandidateInvocation, ChannelSessionRef)>,
 }
 
 impl HostBindingGuard {
     /// Establishes an explicit start binding after its exact native pre-hook is already observed.
     ///
+    /// Missing pre-observation rejects this invocation permanently within the daemon lifetime.
     /// A current binding for the same actor/channel is reused for an idempotent explicit start.
     /// After `stop_binding` or `stop`, a later explicit start creates a fresh generation.
     pub fn establish_start(
@@ -307,10 +311,17 @@ impl HostBindingGuard {
         channel: ChannelSessionRef,
     ) -> BindingStatus {
         let invocation = (candidate.clone(), channel.clone());
-        if self.settling.contains_key(&invocation) || self.completed.contains(&invocation) {
+        if self.rejected.len() >= MAX_COMPLETED {
+            return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
+        }
+        if self.rejected.contains(&invocation)
+            || self.settling.contains_key(&invocation)
+            || self.completed.contains(&invocation)
+        {
             return BindingStatus::Unavailable(BindingUnavailable::Replay);
         }
         if !self.pre_observed.contains(&invocation) {
+            self.rejected.insert(invocation);
             return BindingStatus::Unavailable(BindingUnavailable::MissingPre);
         }
         if self.settling.len() >= MAX_PENDING || self.completed.len() >= MAX_COMPLETED {
@@ -342,6 +353,7 @@ impl HostBindingGuard {
 
     /// Validates an ordinary MCP candidate against its active matching actor/channel binding.
     ///
+    /// Failed ordering is retained as bounded replay evidence and cannot be repaired by late hooks.
     /// This path never creates or revives a binding. Its pre-observation is consumed even when
     /// no active binding exists, so a later start cannot validate an old ordinary call.
     pub fn validate_active(
@@ -350,10 +362,17 @@ impl HostBindingGuard {
         channel: ChannelSessionRef,
     ) -> BindingStatus {
         let invocation = (candidate.clone(), channel.clone());
-        if self.settling.contains_key(&invocation) || self.completed.contains(&invocation) {
+        if self.rejected.len() >= MAX_COMPLETED {
+            return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
+        }
+        if self.rejected.contains(&invocation)
+            || self.settling.contains_key(&invocation)
+            || self.completed.contains(&invocation)
+        {
             return BindingStatus::Unavailable(BindingUnavailable::Replay);
         }
         if !self.pre_observed.remove(&invocation) {
+            self.rejected.insert(invocation);
             return BindingStatus::Unavailable(BindingUnavailable::MissingPre);
         }
         let Some(binding) = self
@@ -361,6 +380,7 @@ impl HostBindingGuard {
             .get(&(candidate.actor_id.clone(), channel))
             .cloned()
         else {
+            self.rejected.insert(invocation);
             return BindingStatus::Unavailable(BindingUnavailable::InactiveBinding);
         };
         if self.settling.len() >= MAX_PENDING || self.completed.len() >= MAX_COMPLETED {
@@ -372,6 +392,7 @@ impl HostBindingGuard {
 
     /// Buffers a native pre-hook or records post-hook settlement for a channel-bound invocation.
     ///
+    /// Duplicate pre-hooks and out-of-order post-hooks invalidate that exact invocation.
     /// A pre-hook is not an authority claim. A post-hook never gates MCP result acceptance: it
     /// only settles a call that was already validated by `establish_start` or `validate_active`.
     pub fn observe_hook(&mut self, event: HookEvent, channel: ChannelSessionRef) -> BindingStatus {
@@ -380,12 +401,21 @@ impl HostBindingGuard {
             call_id: event.call_id,
         };
         let invocation = (candidate.clone(), channel);
+        if self.rejected.len() >= MAX_COMPLETED {
+            return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
+        }
+        if self.rejected.contains(&invocation) {
+            return BindingStatus::Unavailable(BindingUnavailable::Mismatch);
+        }
         match event.phase {
             HookPhase::Pre
                 if self.pre_observed.contains(&invocation)
                     || self.settling.contains_key(&invocation)
                     || self.completed.contains(&invocation) =>
             {
+                self.pre_observed.remove(&invocation);
+                self.settling.remove(&invocation);
+                self.rejected.insert(invocation);
                 BindingStatus::Unavailable(BindingUnavailable::Replay)
             }
             HookPhase::Pre => {
@@ -401,10 +431,12 @@ impl HostBindingGuard {
                 if self.completed.contains(&invocation) {
                     return BindingStatus::Unavailable(BindingUnavailable::Replay);
                 }
-                if self.pre_observed.contains(&invocation) {
+                if self.pre_observed.remove(&invocation) {
+                    self.rejected.insert(invocation);
                     return BindingStatus::Unavailable(BindingUnavailable::MissingInvocation);
                 }
                 let Some(binding) = self.settling.remove(&invocation) else {
+                    self.rejected.insert(invocation);
                     return BindingStatus::Unavailable(BindingUnavailable::Mismatch);
                 };
                 if self.completed.len() >= MAX_COMPLETED {
@@ -437,13 +469,23 @@ impl HostBindingGuard {
         Ok(ActiveBindingUse(binding.clone()))
     }
 
-    /// Revokes exactly one active binding generation without discarding later post settlement.
+    /// Revokes one generation and rejects its pending pre-hooks; later post settlement remains valid.
     pub fn stop_binding(&mut self, binding: &BindingRef) -> Result<(), BindingUnavailable> {
         let key = (binding.actor_id.clone(), binding.channel.clone());
         if self.bindings.get(&key) != Some(binding) {
             return Err(BindingUnavailable::InactiveBinding);
         }
         self.bindings.remove(&key);
+        self.pre_observed.retain(|invocation| {
+            if invocation.0.actor_id == binding.actor_id && invocation.1 == binding.channel {
+                if self.rejected.len() < MAX_COMPLETED {
+                    self.rejected.insert(invocation.clone());
+                }
+                false
+            } else {
+                true
+            }
+        });
         Ok(())
     }
 
@@ -486,35 +528,42 @@ pub fn parse_candidate(
 /// Parses one bounded Codex hook payload while retaining only phase, actor, and call id.
 ///
 /// Child hooks must provide `agent_id`; root hooks must provide `session_id`. A payload with
-/// both or neither is unavailable because the actor origin is ambiguous. The parser never
-/// returns tool input/output, source, cwd, transcript paths, or unknown fields.
+/// both or neither, or duplicate known JSON keys, is unavailable because identity is ambiguous.
+/// The parser never returns tool input/output, source, cwd, transcript paths, or unknown fields.
 pub fn parse_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnavailable> {
     if payload.len() > MAX_HOOK_METADATA_BYTES {
         return Err(BindingUnavailable::InvalidMetadata);
     }
-    let Value::Object(object) =
-        serde_json::from_slice(payload).map_err(|_| BindingUnavailable::InvalidMetadata)?
-    else {
-        return Err(BindingUnavailable::InvalidMetadata);
-    };
-    let phase = match required_identifier(&object, "hook_event_name")?.as_str() {
+    let payload: CodexHookPayload =
+        serde_json::from_slice(payload).map_err(|_| BindingUnavailable::InvalidMetadata)?;
+    let phase = match payload.hook_event_name.as_str() {
         "PreToolUse" => HookPhase::Pre,
         "PostToolUse" => HookPhase::Post,
         _ => return Err(BindingUnavailable::UnsupportedHookPhase),
     };
-    let actor_id = match (
-        optional_identifier(&object, "agent_id")?,
-        optional_identifier(&object, "session_id")?,
-    ) {
-        (Some(actor), None) | (None, Some(actor)) => actor,
+    let actor_id = match (payload.agent_id, payload.session_id) {
+        (Some(actor), None) | (None, Some(actor)) => checked_identifier(actor, "hook actor")?,
         (Some(_), Some(_)) => return Err(BindingUnavailable::InvalidField("hook actor")),
         (None, None) => return Err(BindingUnavailable::MissingField("hook actor")),
     };
     Ok(HookEvent {
         phase,
         actor_id,
-        call_id: required_identifier(&object, "tool_use_id")?,
+        call_id: checked_identifier(payload.tool_use_id, "tool_use_id")?,
     })
+}
+
+/// Selects only Codex correlation fields and rejects duplicate known JSON keys while discarding extras.
+#[derive(Deserialize)]
+struct CodexHookPayload {
+    /// Native lifecycle name, restricted to PreToolUse or PostToolUse after decoding.
+    hook_event_name: String,
+    /// Root actor identity; absent/null for a child event, bounded after decoding.
+    session_id: Option<String>,
+    /// Child actor identity; absent/null for a root event, bounded after decoding.
+    agent_id: Option<String>,
+    /// Exact native tool-call identifier, nonempty and bounded after decoding.
+    tool_use_id: String,
 }
 
 /// Parses a complete bounded host sandbox-state observation for one consumed active invocation.
@@ -574,18 +623,6 @@ fn required_identifier(
         return Err(BindingUnavailable::InvalidField(field));
     };
     checked_identifier(value.to_owned(), field)
-}
-
-/// Reads an optional bounded string field without reporting its raw value.
-fn optional_identifier(
-    object: &Map<String, Value>,
-    field: &'static str,
-) -> Result<Option<String>, BindingUnavailable> {
-    match object.get(field) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(value)) => checked_identifier(value.clone(), field).map(Some),
-        Some(_) => Err(BindingUnavailable::InvalidField(field)),
-    }
 }
 
 /// Enforces the fixed identifier memory bound and rejects empty values.

@@ -241,6 +241,7 @@ fn observed_sandbox_state_requires_active_use_and_preserves_nested_object() {
     ));
 }
 
+/// Drops raw host payload fields and refuses ambiguous duplicate correlation keys.
 #[test]
 fn hook_parser_does_not_retain_raw_payload_fields() {
     let event = hook("PreToolUse", "session_id", "actor", "call");
@@ -248,4 +249,6 @@ fn hook_parser_does_not_retain_raw_payload_fields() {
     assert_eq!(event.actor_id(), "actor");
     assert_eq!(event.call_id(), "call");
     assert!(!format!("{event:?}").contains("never retained"));
+    assert!(parse_hook_event(br#"{"hook_event_name":"PreToolUse","session_id":"a","session_id":"b","tool_use_id":"c"}"#).is_err());
+    assert!(parse_hook_event(br#"{"hook_event_name":"PreToolUse","session_id":"a","tool_use_id":"c","tool_use_id":"d"}"#).is_err());
 }

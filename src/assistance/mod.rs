@@ -6,7 +6,10 @@
 /// Exposes the five bounded MCP tools, finite Application routing, and fail-open feedback state.
 pub mod facade;
 
-/// Connects the product daemon to the finite, explicitly unavailable host-peer boundary.
+/// Connects bounded daemon host correlation to closed peer-boundary outcomes.
 pub mod assembly;
 
 pub mod host_binding;
+
+/// Exposes the bounded fail-open native Codex hook command.
+pub mod codex_hook;

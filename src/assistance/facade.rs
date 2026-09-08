@@ -254,6 +254,8 @@ pub struct TrustedTransport {
     request_id: String,
     correlation_id: String,
     opaque_attachment: String,
+    /// Selected MCP host metadata, absent for generic transport-only callers.
+    host_meta: Option<Value>,
 }
 
 impl TrustedTransport {
@@ -279,6 +281,7 @@ impl TrustedTransport {
                 request_id,
                 correlation_id,
                 opaque_attachment,
+                host_meta: None,
             })
     }
 }
@@ -294,6 +297,8 @@ pub enum FacadeOutcome {
     Incomplete,
     /// Assistance explicitly identified the first unavailable peer boundary.
     PeerUnavailable(MissingPeer),
+    /// The exact host binding was revoked without claiming a Workspace operation.
+    HostStopped,
 }
 
 /// Owns one local facade endpoint and the finite limits for every connect-only dispatch.
@@ -326,8 +331,10 @@ impl AssistanceFacade {
         let Ok(call) = validate_call(tool, parameters) else {
             return FacadeOutcome::InvalidParameters;
         };
-        let Some(parameters) = OpaqueJson::from_value(call.parameters(), MAX_PARAMETER_BYTES)
-        else {
+        let Some(parameters) = OpaqueJson::from_value(
+            &json!({"parameters":call.parameters(),"host_meta":host.host_meta}),
+            MAX_PARAMETER_BYTES + 1024,
+        ) else {
             return FacadeOutcome::InvalidParameters;
         };
         let Some(request) = MethodDispatch::new(
@@ -344,7 +351,10 @@ impl AssistanceFacade {
             MethodDispatchTransportResult::Dispatched { opaque_result_json } => {
                 match serde_json::from_str::<PeerReply>(opaque_result_json.as_str()) {
                     Ok(PeerReply::Unavailable { reason }) => FacadeOutcome::PeerUnavailable(reason),
-                    Err(_) => FacadeOutcome::Incomplete,
+                    Ok(PeerReply::HostStopped {}) if tool == AssistanceTool::Stop => {
+                        FacadeOutcome::HostStopped
+                    }
+                    _ => FacadeOutcome::Incomplete,
                 }
             }
         }
@@ -620,7 +630,7 @@ impl StdioFacade {
 
     /// Validates model parameters before using separately supplied host metadata for finite IPC.
     ///
-    /// Missing or invalid ingress performs no IPC. Valid ingress sends only opaque correlations;
+    /// Missing or invalid ingress performs no IPC. Valid ingress sends selected actor/call metadata;
     /// the daemon must establish its own host binding before returning any successful peer result.
     async fn call(
         &self,
@@ -632,11 +642,13 @@ impl StdioFacade {
             Ok(_) => {
                 let host = self.attachment.as_ref().and_then(|attachment| {
                     let candidate = parse_candidate(&context.meta).ok()?;
-                    TrustedTransport::from_host_ingress(
+                    let mut host = TrustedTransport::from_host_ingress(
                         context.id.to_string(),
                         candidate.call_id(),
                         attachment.clone(),
-                    )
+                    )?;
+                    host.host_meta = Some(json!({"threadId":candidate.actor_id(),"callId":candidate.call_id(),"x-codex-turn-metadata":{}}));
+                    Some(host)
                 });
                 match host {
                     Some(host) => self.facade.dispatch(&host, tool, parameters).await,
@@ -654,6 +666,14 @@ impl StdioFacade {
             }
             FacadeOutcome::Incomplete => {
                 "typed Assistance peer result is unavailable; continue with native tools"
+            }
+            FacadeOutcome::HostStopped => {
+                return CallToolResult::success(vec![ContentBlock::text(
+                    "Assistance host binding stopped; no Workspace authority was created",
+                )]);
+            }
+            FacadeOutcome::PeerUnavailable(MissingPeer::WorkspaceActivation) => {
+                "Assistance unavailable: workspace_activation; continue with native tools"
             }
             FacadeOutcome::PeerUnavailable(MissingPeer::HostBinding) => {
                 "Assistance unavailable: host_binding; continue with native tools"

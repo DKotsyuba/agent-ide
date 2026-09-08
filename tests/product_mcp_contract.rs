@@ -284,3 +284,274 @@ async fn binary_routes_five_methods_to_typed_missing_peer_and_survives_daemon_lo
     mcp.close().await;
     std::fs::remove_dir_all(runtime).unwrap();
 }
+
+/// Starts a disposable daemon, waiting for its real Unix endpoint under a bounded test deadline.
+async fn daemon(runtime: &Path) -> Child {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+        .args(["daemon", "--runtime-dir"])
+        .arg(runtime)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if UnixStream::connect(runtime.join("agent-ide.sock"))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            assert!(child.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    child
+}
+
+/// Starts the real hook process; callers own stdin closure and bounded completion checks.
+fn hook_process(runtime: &Path, attachment: Option<&str>) -> Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
+    command
+        .args(["codex-hook", "--runtime-dir"])
+        .arg(runtime)
+        .env_remove("AGENT_IDE_HOST_ATTACHMENT")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(attachment) = attachment {
+        command.env("AGENT_IDE_HOST_ATTACHMENT", attachment);
+    }
+    command.spawn().unwrap()
+}
+
+/// Submits native-shaped hook JSON through the executable and requires silent fail-open completion.
+async fn hook(runtime: &Path, phase: &str, field: &str, actor: &str, call: &str) {
+    let payload = json!({"hook_event_name":phase,field:actor,"tool_use_id":call,
+        "tool_input":{"secret":"must-never-leave-hook"},"tool_response":"private-output",
+        "cwd":"private-cwd","transcript_path":"private-transcript"});
+    let mut child = hook_process(runtime, Some("private-host-channel"));
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.to_string().as_bytes())
+        .await
+        .unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty() && output.stderr.is_empty());
+}
+
+/// Builds identical model inputs and request/call IDs for actors whose identity differs only in host metadata.
+fn host_call(actor: &str, call: &str, name: &str) -> Value {
+    let arguments = if name == "ide.start" {
+        json!({"activation_id":"same-activation"})
+    } else {
+        json!({})
+    };
+    json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{
+        "name":name,"arguments":arguments,"_meta":{"threadId":actor,"callId":call,
+        "x-codex-turn-metadata":{"private":"not-retained"}}}})
+}
+
+/// Checks a closed host boundary response and proves private launch/input fields were not rendered.
+fn boundary(response: &Value, expected: &str) {
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains(expected), "{response}");
+    for private in [
+        "private-host-channel",
+        "must-never-leave-hook",
+        "private-output",
+        "private-cwd",
+        "private-transcript",
+        "not-retained",
+    ] {
+        assert!(!response.to_string().contains(private));
+    }
+}
+
+/// Proves parallel root/child calls with identical arguments and call IDs remain actor-scoped through stop.
+#[tokio::test]
+async fn binary_codex_hooks_bind_exact_parallel_actors_and_stop_before_workspace() {
+    let runtime = runtime();
+    let mut daemon = daemon(&runtime).await;
+    let (mut root, mut child) = tokio::join!(
+        Mcp::start(&runtime, Some("private-host-channel")),
+        Mcp::start(&runtime, Some("private-host-channel"))
+    );
+    // One actor's pre-hook must never validate the other's identical pending call.
+    hook(&runtime, "PreToolUse", "session_id", "root", "only-root").await;
+    let (root_reply, child_reply) = tokio::join!(
+        root.exchange(host_call("root", "only-root", "ide.start")),
+        child.exchange(host_call("child", "only-root", "ide.start"))
+    );
+    boundary(&root_reply, "workspace_activation");
+    boundary(&child_reply, "host_binding");
+    hook(&runtime, "PostToolUse", "session_id", "root", "only-root").await;
+    // Both actors supply their own exact lifecycle, with identical call/JSON-RPC correlations.
+    tokio::join!(
+        hook(&runtime, "PreToolUse", "session_id", "root", "parallel"),
+        hook(&runtime, "PreToolUse", "agent_id", "child", "parallel")
+    );
+    let (root_reply, child_reply) = tokio::join!(
+        root.exchange(host_call("root", "parallel", "ide.start")),
+        child.exchange(host_call("child", "parallel", "ide.start"))
+    );
+    boundary(&root_reply, "workspace_activation");
+    boundary(&child_reply, "workspace_activation");
+    tokio::join!(
+        hook(&runtime, "PostToolUse", "session_id", "root", "parallel"),
+        hook(&runtime, "PostToolUse", "agent_id", "child", "parallel")
+    );
+    boundary(
+        &root
+            .exchange(host_call("root", "parallel", "ide.start"))
+            .await,
+        "host_binding",
+    );
+    // Host stop is honest about its scope, and cannot revoke the other actor.
+    hook(&runtime, "PreToolUse", "session_id", "root", "stop").await;
+    let stopped = root.exchange(host_call("root", "stop", "ide.stop")).await;
+    assert_eq!(stopped["result"]["isError"], false);
+    boundary(&stopped, "host binding stopped");
+    hook(&runtime, "PostToolUse", "session_id", "root", "stop").await;
+    tokio::join!(
+        hook(&runtime, "PreToolUse", "session_id", "root", "after-stop"),
+        hook(&runtime, "PreToolUse", "agent_id", "child", "after-stop")
+    );
+    let (root_reply, child_reply) = tokio::join!(
+        root.exchange(host_call("root", "after-stop", "ide.context")),
+        child.exchange(host_call("child", "after-stop", "ide.context"))
+    );
+    boundary(&root_reply, "host_binding");
+    boundary(&child_reply, "workspace_activation");
+    hook(&runtime, "PreToolUse", "session_id", "root", "restart").await;
+    boundary(
+        &root
+            .exchange(host_call("root", "restart", "ide.start"))
+            .await,
+        "workspace_activation",
+    );
+    // Duplicate and premature post observations cannot be repaired by a subsequent MCP call.
+    for (call, second_phase) in [("duplicate", "PreToolUse"), ("early-post", "PostToolUse")] {
+        hook(&runtime, "PreToolUse", "session_id", "root", call).await;
+        hook(&runtime, second_phase, "session_id", "root", call).await;
+        boundary(
+            &root.exchange(host_call("root", call, "ide.start")).await,
+            "host_binding",
+        );
+    }
+    // MCP-before-pre is permanently rejected for that exact invocation.
+    boundary(
+        &root
+            .exchange(host_call("root", "late-pre", "ide.start"))
+            .await,
+        "host_binding",
+    );
+    hook(&runtime, "PreToolUse", "session_id", "root", "late-pre").await;
+    boundary(
+        &root
+            .exchange(host_call("root", "late-pre", "ide.start"))
+            .await,
+        "host_binding",
+    );
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+    hook(&runtime, "PreToolUse", "session_id", "root", "daemon-lost").await;
+    boundary(
+        &root
+            .exchange(host_call("root", "daemon-lost", "ide.start"))
+            .await,
+        "host attachment or daemon",
+    );
+    tokio::join!(root.close(), child.close());
+    std::fs::remove_dir_all(runtime).unwrap();
+}
+
+/// Checks absent daemon, inactive launch, malformed/oversized JSON, and an open stdin all exit silently.
+#[tokio::test]
+async fn binary_codex_hook_fail_open_inactive_invalid_and_stdin_deadline() {
+    let runtime = runtime();
+    hook(&runtime, "PreToolUse", "session_id", "root", "absent").await;
+    for payload in [
+        b"{".to_vec(),
+        vec![b'x'; 65537],
+        br#"{"hook_event_name":"PreToolUse","session_id":"a","agent_id":"b","tool_use_id":"c"}"#
+            .to_vec(),
+    ] {
+        let mut child = hook_process(&runtime, Some("private-host-channel"));
+        let _ = child.stdin.take().unwrap().write_all(&payload).await;
+        let output = tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(output.status.success() && output.stdout.is_empty() && output.stderr.is_empty());
+    }
+    for attachment in [None, Some("private-host-channel")] {
+        let mut child = hook_process(&runtime, attachment);
+        let input = child.stdin.take().unwrap();
+        let before = std::time::Instant::now();
+        let output = tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(before.elapsed() < Duration::from_millis(1500));
+        assert!(output.status.success() && output.stdout.is_empty() && output.stderr.is_empty());
+        drop(input);
+    }
+    assert!(!runtime.exists());
+}
+
+/// Captures the real hook IPC frame while withholding a reply, proving sanitization and total deadline.
+#[tokio::test]
+async fn binary_codex_hook_hung_daemon_deadline_sends_only_selected_fields() {
+    use tokio::{io::AsyncReadExt, net::UnixListener};
+    let runtime = runtime();
+    std::fs::create_dir(&runtime).unwrap();
+    let listener = UnixListener::bind(runtime.join("agent-ide.sock")).unwrap();
+    let before = std::time::Instant::now();
+    let hook = hook(&runtime, "PreToolUse", "agent_id", "child", "hung");
+    let capture = async {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let size = stream.read_u32().await.unwrap();
+        assert!(size < 4096);
+        let mut bytes = vec![0; size as usize];
+        stream.read_exact(&mut bytes).await.unwrap();
+        let frame: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            frame["sanitized_observation_json"],
+            json!({"phase":"pre","actor_id":"child","call_id":"hung"})
+        );
+        let wire = String::from_utf8(bytes).unwrap();
+        for private in [
+            "must-never-leave-hook",
+            "private-output",
+            "private-cwd",
+            "private-transcript",
+        ] {
+            assert!(!wire.contains(private));
+        }
+        // Hold the connection through client EOF; no reply can help it finish.
+        assert_eq!(
+            stream.read_u8().await.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    };
+    tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(hook, capture);
+    })
+    .await
+    .unwrap();
+    assert!(before.elapsed() < Duration::from_millis(1500));
+    drop(listener);
+    std::fs::remove_dir_all(runtime).unwrap();
+}

@@ -1,4 +1,4 @@
-//! Command-line entrypoint for the MCP facade, local Application daemon, and doctor.
+//! Command-line entrypoint for the MCP facade, Codex hook, local daemon, and doctor.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -19,7 +19,7 @@ async fn main() -> ExitCode {
         Ok(Command::Daemon { runtime_dir }) => match RuntimeDir::prepare_for_daemon(runtime_dir) {
             Ok(runtime_dir) => match run_daemon_with_assistance(
                 runtime_dir,
-                Arc::new(ProductDispatcher),
+                Arc::new(ProductDispatcher::default()),
                 EffectiveConfig::defaults(),
             )
             .await
@@ -29,6 +29,14 @@ async fn main() -> ExitCode {
             },
             Err(error) => fail(error),
         },
+        Ok(Command::CodexHook { runtime_dir }) => {
+            agent_ide::assistance::codex_hook::run(
+                &runtime_dir,
+                std::env::var("AGENT_IDE_HOST_ATTACHMENT").ok(),
+            )
+            .await;
+            ExitCode::SUCCESS
+        }
         Ok(Command::Mcp { runtime_dir }) => {
             let facade = match std::env::var("AGENT_IDE_HOST_ATTACHMENT") {
                 Ok(attachment) => {
@@ -112,6 +120,11 @@ enum Command {
     Daemon { runtime_dir: PathBuf },
     /// Serves the static five-tool MCP surface on stdio without creating local runtime state.
     Mcp { runtime_dir: PathBuf },
+    /// Submits one bounded native Codex hook and exits successfully on every ingress failure.
+    CodexHook {
+        /// Existing daemon endpoint directory; never created by the hook command.
+        runtime_dir: PathBuf,
+    },
     /// Queries an existing daemon without creating a directory or daemon process.
     Doctor { runtime_dir: PathBuf },
 }
@@ -130,6 +143,7 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
         Some("daemon") => Ok(Command::Daemon { runtime_dir }),
         Some("doctor") => Ok(Command::Doctor { runtime_dir }),
         Some("mcp") => Ok(Command::Mcp { runtime_dir }),
+        Some("codex-hook") => Ok(Command::CodexHook { runtime_dir }),
         _ => Err(AppError::InvalidResponse),
     }
 }

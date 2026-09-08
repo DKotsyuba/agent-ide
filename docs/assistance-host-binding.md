@@ -33,36 +33,87 @@ This validation proves only that the supported host metadata and native hook lif
 
 ## Product MCP boundary
 
-The shipping `agent-ide mcp --runtime-dir PATH` command serves exactly `ide.start`,
-`ide.context`, `ide.diff`, `ide.inspect`, and `ide.stop` over stdio. It writes only MCP
-protocol messages to stdout, never creates the runtime directory, and never autostarts
-or repairs the daemon. All calls validate the existing closed model-argument schemas.
+`agent-ide mcp --runtime-dir PATH` serves exactly `ide.start`, `ide.context`,
+`ide.diff`, `ide.inspect`, and `ide.stop` over stdio. It validates closed model-argument
+schemas, writes only MCP protocol messages to stdout, and never creates runtime state,
+starts a daemon, or repairs transport. Start `agent-ide daemon --runtime-dir PATH`
+separately. Its `ProductDispatcher` retains one bounded `HostBindingGuard` for the daemon
+lifetime, serialized across all finite Unix IPC connections.
 
-An embedding host may construct `StdioFacade::with_host_attachment`; the executable
-accepts the same bounded opaque value through `AGENT_IDE_HOST_ATTACHMENT` in its launch
-environment. The launcher must keep that value separate from model arguments. Empty,
-non-UTF-8, or over-128-byte executable attachments are rejected before serving. Each
-call also requires the existing supported Codex candidate metadata in request `_meta`.
-The MCP request ID and host call ID become finite request/correlation values. Neither
-metadata nor the launcher value authenticates a channel, creates a binding, or grants
-authority. They only make the connect-only Application transport path reachable.
+For Codex, configure **both** native `PreToolUse` and `PostToolUse` commands to invoke
+`agent-ide codex-hook --runtime-dir PATH`, restricted by the host's hook matcher to this
+MCP server's five `ide.*` tools. Supply the same `AGENT_IDE_HOST_ATTACHMENT` launch
+environment value to those commands and the MCP process. It must be a fresh opaque
+handle for that host channel/session, nonempty UTF-8 and at most 128 bytes. Distinct host
+sessions must use distinct handles; root and native children in the same channel may
+share one. Do not put the handle in model arguments or tool output. Missing hook
+configuration or mismatched handles leaves calls unavailable. Hooks for unrelated native
+tools are not needed and would consume the finite pending/replay budget.
 
-`agent-ide daemon --runtime-dir PATH` now wires `run_daemon_with_assistance` to
-`ProductDispatcher`. At the current missing host-adapter boundary it returns the closed
-Assistance result `{"state":"unavailable","reason":"host_binding"}` for each finite
-method or hook dispatch. The facade recognizes this typed failure and directs the model
-to native tools. Unknown reply shapes remain incomplete, never successful. An absent
-daemon or invalid/missing ingress remains unavailable locally. The opaque launcher handle
-is not rendered in MCP output. Hook dispatch acceptance remains only delivery to the
-dispatcher, not validation, binding, or feedback delivery to the model.
+The hook command reads at most 64 KiB plus one overflow byte and uses a separate **250 ms
+total deadline** for stdin, parsing, connect, dispatch and reply. An open stdin pipe cannot
+hold up process exit. Missing/invalid attachment, absent daemon, invalid or oversized
+JSON, malformed or ambiguous identity, transport loss and timeout all exit successfully
+without stdout or stderr. It performs one connect-only submission, with no retry,
+autostart, workspace scan or LSP work. Configure the command as written; malformed CLI
+syntax is a command configuration error, not a hook payload result.
 
-This assembly does not yet carry the full trusted invocation/sandbox observation into
-the daemon or match native Pre/Post hooks there. Remaining v0.1 gates are a real trusted
-host adapter, controlled Execution admission and Git discovery, Workspace activation and
-revocation orchestration, Intelligence context/provider assembly, Changes evidence and
-detail rendering, and real Codex/Claude root/subagent scenarios. In particular, no
-`start → diff` or `start → context` success is claimed by these executable roundtrips.
+Hook parsing rejects duplicate known JSON keys and retains only phase, actor and call
+ID. Root events require `session_id`; child events require `agent_id`; supplying both is
+ambiguous. `tool_use_id` identifies the exact call. Tool input/output, cwd, transcript
+paths and all other raw fields are discarded before IPC. The raw hook payload is never
+logged or retained in daemon state.
 
-The executable contract is checked with `cargo test --offline --test product_mcp_contract`;
-these are real local MCP/Unix-IPC process tests with synthetic host metadata, not evidence
-of host authentication or end-user IDE readiness.
+The MCP ingress obtains `threadId`, `callId` and the presence of the supported
+`x-codex-turn-metadata` object from rmcp `RequestContext.meta`, separately from model
+arguments. It forwards selected actor/call fields and an empty support marker, never the
+turn object contents. Assistance owns the opaque method parameter envelope
+`{"parameters":...,"host_meta":...}`; Application only frames it. The MCP request ID
+and exact call ID remain finite transport request/correlation values. All matching is by
+**attachment + actor + call**, never argument equality, timing, CWD, PID or parent identity.
+
+Only an exact pre-hook followed by `ide.start` creates an actor/channel binding. Later
+ordinary methods require their own matching pre-hook and that binding's current liveness.
+Post-hooks settle previously validated invocations after MCP result delivery. Duplicate
+pre-hooks, premature post-hooks and MCP-before-pre ordering reject that invocation for
+the remaining daemon lifetime; late hooks cannot repair it. Explicit stop revokes the
+exact binding and rejects its pending pre-hooks before any Workspace handoff could occur.
+Post settlement for already validated calls can still complete. A fresh explicit start
+is required after stop; another actor's binding is unaffected.
+
+State is bounded to 128 pending/settling invocations, 64 active bindings, 1024 completed
+identities and 1024 rejected identities. Replay evidence is never evicted to make room.
+Exhaustion makes further binding operations unavailable. Daemon restart discards all
+bindings and requires fresh exact pre/start input; it does not recover authority.
+
+Closed daemon outcomes are:
+
+| Outcome | Meaning |
+| --- | --- |
+| `{"state":"unavailable","reason":"host_binding"}` | No validated exact invocation. |
+| `{"state":"unavailable","reason":"workspace_activation"}` | Host invocation and current binding are proven; Workspace activation is not connected. |
+| `{"state":"hook_observed"}` | One pre-hook was retained; no authority or delivery claim. |
+| `{"state":"hook_settled"}` | One exact post-hook settled a validated invocation. |
+| `{"state":"host_stopped"}` | The exact host binding was revoked; no Workspace authority was created. |
+
+The MCP facade renders only the corresponding closed method outcomes. Stop reports host
+binding revocation, while other methods still direct the model to native tools. Unknown
+states or extra fields cannot become successful peer results. Hook transport submission
+is not proof of binding or model-context delivery.
+
+This adapter relies on the trusted launcher and the existing private local daemon endpoint;
+it does not cryptographically authenticate local processes or attest sandbox enforcement.
+The next gate is Workspace activation/revocation with controlled Execution admission and
+Git discovery. Full invocation-correlated sandbox observation is not assembled in the
+product dispatcher. Intelligence context, Changes diff/detail and delivery visibility
+remain separate missing gates. No successful `start → context`, `start → diff`,
+`model_seen`, Claude support or end-user IDE readiness is claimed.
+
+Verify with `cargo test --offline --test product_mcp_contract --test assistance_binding_contract
+--test assistance_facade_contract --test app_ipc_contract` (one command). The real binary
+MCP/Unix IPC tests cover parallel root/child actors with identical inputs and correlation
+IDs, cross-actor rejection, stop isolation, replay/order failures, daemon loss, inactive
+and malformed hooks, open stdin and hung-daemon deadlines, and discarded payload fields.
+These are controlled host-shaped process tests using the established Codex field contract;
+they do not substitute for a fresh live Codex host acceptance scenario. Live Claude
+root/subagent behavior and feedback delivery are unverified.

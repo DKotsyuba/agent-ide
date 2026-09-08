@@ -1,45 +1,131 @@
-//! Product dispatcher boundary before a trusted host-binding adapter is connected.
+//! Codex hook/MCP correlation at the finite product dispatch boundary.
 
-use std::{future::Future, pin::Pin};
+use std::{future::Future, pin::Pin, sync::Mutex};
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
+use super::host_binding::{
+    BindingStatus, HostBindingGuard, parse_candidate, parse_channel_session, parse_hook_event,
+};
 use crate::app::transport::{
     AssistanceDispatch, AssistanceDispatchReply, AssistanceDispatchUnavailable,
-    AssistanceDispatcher, OpaqueJson,
+    AssistanceDispatcher, AssistanceMethod, OpaqueJson,
 };
 
-/// Names the first missing peer boundary without implying any workspace authority was granted.
+/// Names the first missing peer without implying workspace authority was granted.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MissingPeer {
-    /// No adapter has matched trusted hook observations to this MCP invocation and channel.
+    /// Exact trusted hook and MCP invocation correlation is unavailable.
     HostBinding,
+    /// Host correlation succeeded, but Workspace activation is not connected.
+    WorkspaceActivation,
 }
 
-/// Closed Assistance reply accepted for rendering; unknown fields or states are rejected.
+/// Closed Assistance reply; unknown fields and states cannot become peer success.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum PeerReply {
-    /// The finite call reached Assistance but stopped before the named peer boundary.
+    /// The finite call stopped before the named peer boundary.
     Unavailable {
-        /// First missing boundary; this never means successful activation or source access.
+        /// First unavailable boundary; no source access or activation is claimed.
         reason: MissingPeer,
     },
+    /// Exactly one native pre-hook was retained for later MCP validation.
+    HookObserved {},
+    /// An exact post-hook settled an already validated MCP call.
+    HookSettled {},
+    /// The exact active host binding was revoked; no Workspace grant existed.
+    HostStopped {},
 }
 
-/// Serves finite production dispatches while host-binding ingress remains unassembled.
+/// Owns bounded daemon-lifetime Codex binding state behind one serialized admission boundary.
 ///
-/// Opaque attachments and hook JSON are observations, not identity proof. This stateless
-/// dispatcher grants no binding or authority, retains no payloads, and performs no peer I/O.
-#[derive(Debug)]
-pub struct ProductDispatcher;
+/// The private endpoint and launcher attachment scope observations; neither authenticates a
+/// hostile local user. State contains selected identifiers only, never source or hook payloads.
+#[derive(Debug, Default)]
+pub struct ProductDispatcher {
+    /// Serializes hook observations, validation and explicit stop; never held across I/O.
+    bindings: Mutex<HostBindingGuard>,
+}
+
+impl ProductDispatcher {
+    /// Validates one finite request using only separately supplied host correlations.
+    ///
+    /// Malformed input and poisoned synchronization fail closed. Only explicit start creates a
+    /// binding; stop revokes before any future Workspace handoff. No peer is invoked here.
+    fn handle(&self, request: &AssistanceDispatch) -> Option<PeerReply> {
+        let mut bindings = self.bindings.lock().ok()?;
+        match request {
+            AssistanceDispatch::HookSubmit(hook) => {
+                let observation: Value =
+                    serde_json::from_str(hook.sanitized_observation_json().as_str()).ok()?;
+                let object = observation.as_object()?;
+                if object.len() != 3 {
+                    return None;
+                }
+                let phase = match object.get("phase")?.as_str()? {
+                    "pre" => "PreToolUse",
+                    "post" => "PostToolUse",
+                    _ => return None,
+                };
+                let event = parse_hook_event(json!({"hook_event_name":phase,"session_id":object.get("actor_id")?,"tool_use_id":object.get("call_id")?}).to_string().as_bytes()).ok()?;
+                if event.call_id() != hook.correlation_id() {
+                    return None;
+                }
+                let channel = parse_channel_session(hook.opaque_attachment().as_bytes()).ok()?;
+                match bindings.observe_hook(event, channel) {
+                    BindingStatus::PreObserved => Some(PeerReply::HookObserved {}),
+                    BindingStatus::Settled(_) => Some(PeerReply::HookSettled {}),
+                    _ => None,
+                }
+            }
+            AssistanceDispatch::MethodDispatch(method) => {
+                let envelope: Value = serde_json::from_str(method.params_json().as_str()).ok()?;
+                let object = envelope.as_object()?;
+                if object.len() != 2 {
+                    return None;
+                }
+                let meta = object.get("host_meta")?.as_object()?;
+                let candidate = parse_candidate(meta).ok()?;
+                if candidate.call_id() != method.correlation_id() {
+                    return None;
+                }
+                let tool = match method.method() {
+                    AssistanceMethod::Start => super::facade::AssistanceTool::Start,
+                    AssistanceMethod::Context => super::facade::AssistanceTool::Context,
+                    AssistanceMethod::Diff => super::facade::AssistanceTool::Diff,
+                    AssistanceMethod::Inspect => super::facade::AssistanceTool::Inspect,
+                    AssistanceMethod::Stop => super::facade::AssistanceTool::Stop,
+                    AssistanceMethod::HookSubmit => return None,
+                };
+                super::facade::validate_call(tool, object.get("parameters")?.clone()).ok()?;
+                let channel = parse_channel_session(method.opaque_attachment().as_bytes()).ok()?;
+                let status = if method.method() == AssistanceMethod::Start {
+                    bindings.establish_start(candidate, channel)
+                } else {
+                    bindings.validate_active(candidate, channel)
+                };
+                let BindingStatus::Validated(invocation) = status else {
+                    return None;
+                };
+                if method.method() == AssistanceMethod::Stop {
+                    bindings.stop_binding(invocation.binding_ref()).ok()?;
+                    Some(PeerReply::HostStopped {})
+                } else {
+                    bindings.consume_active(invocation.binding_ref()).ok()?;
+                    Some(PeerReply::Unavailable {
+                        reason: MissingPeer::WorkspaceActivation,
+                    })
+                }
+            }
+        }
+    }
+}
 
 impl AssistanceDispatcher for ProductDispatcher {
-    /// Returns a bounded typed unavailable reply for either finite Application request shape.
-    ///
-    /// The request is consumed without interpreting its attachment as authority. Serialization
-    /// failure is transport unavailability; neither hooks nor methods claim peer success.
+    /// Returns only a closed host outcome, with all binding transitions completed before return.
     fn dispatch(
         &self,
         request: AssistanceDispatch,
@@ -51,12 +137,13 @@ impl AssistanceDispatcher for ProductDispatcher {
         >,
     > {
         Box::pin(async move {
-            let reply = serde_json::to_string(&PeerReply::Unavailable {
+            let result = self.handle(&request).unwrap_or(PeerReply::Unavailable {
                 reason: MissingPeer::HostBinding,
-            })
-            .ok()
-            .and_then(|reply| OpaqueJson::new(reply, 256))
-            .ok_or(AssistanceDispatchUnavailable)?;
+            });
+            let reply = serde_json::to_string(&result)
+                .ok()
+                .and_then(|reply| OpaqueJson::new(reply, 256))
+                .ok_or(AssistanceDispatchUnavailable)?;
             Ok(match request {
                 AssistanceDispatch::HookSubmit(_) => AssistanceDispatchReply::HookSubmit(reply),
                 AssistanceDispatch::MethodDispatch(_) => {
@@ -67,21 +154,14 @@ impl AssistanceDispatcher for ProductDispatcher {
     }
 }
 
-/// Ensures arbitrary daemon JSON cannot be interpreted as a typed peer result.
+/// Rejects unknown daemon result shapes instead of manufacturing peer readiness.
 #[test]
-fn peer_reply_accepts_only_the_closed_unavailable_shape() {
+fn peer_reply_accepts_only_the_closed_host_shapes() {
     for reply in [
         r#"{"state":"ready"}"#,
         r#"{"state":"unavailable","reason":"unknown"}"#,
-        r#"{"state":"unavailable","reason":"host_binding","source":"forged"}"#,
+        r#"{"state":"host_stopped","source":"forged"}"#,
     ] {
         assert!(serde_json::from_str::<PeerReply>(reply).is_err());
     }
-    assert_eq!(
-        serde_json::from_str::<PeerReply>(r#"{"state":"unavailable","reason":"host_binding"}"#)
-            .unwrap(),
-        PeerReply::Unavailable {
-            reason: MissingPeer::HostBinding
-        },
-    );
 }
