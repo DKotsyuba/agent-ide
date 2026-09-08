@@ -154,6 +154,25 @@ async fn workspace_source_observations_are_durable_bounded_and_honest() {
     );
     assert_eq!(
         workspace
+            .record(
+                ObservationDraft::present(
+                    tree.clone(),
+                    1,
+                    operation("first"),
+                    reference("first"),
+                    PathBuf::from("different.txt"),
+                    SourceBytes::from_bytes(b"different"),
+                    revision("source-r1"),
+                    SourceCoverage::Complete,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+        ObservationAdmission::Conflict
+    );
+    assert_eq!(
+        workspace
             .freshness(operation("fresh-first"), &first)
             .await
             .unwrap(),

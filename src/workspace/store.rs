@@ -155,6 +155,8 @@ pub enum ObservationAdmission {
     Recorded(SourceObservation),
     /// A stable operation already committed, so it was never replayed.
     AlreadyRecorded,
+    /// The stable operation identifies a different durable observation and cannot be replayed.
+    Conflict,
     /// Receipt lookup cannot safely establish the operation outcome.
     OutcomeUnknown,
 }
@@ -253,6 +255,8 @@ pub enum ReconciliationAdmission {
     Fact(Option<SourceChange>),
     /// The stable collection operation was already committed.
     AlreadyRecorded,
+    /// The stable collection operation identifies different durable source facts.
+    Conflict,
     /// The stable collection operation remains ambiguous.
     OutcomeUnknown,
 }
@@ -346,14 +350,46 @@ impl<'a> WorkspaceStore<'a> {
             )?)),
             Err(StoreError::DuplicateOperation {
                 existing: StoreOutcome::Committed,
-            }) => Ok(ObservationAdmission::AlreadyRecorded),
+            }) => self.duplicate_admission(&draft).await,
             Err(StoreError::DuplicateOperation { .. }) => Ok(ObservationAdmission::OutcomeUnknown),
             Err(StoreError::OutcomeUnknown { operation }) => {
                 match self.application.outcome(operation).await? {
-                    StoreOutcome::Committed => Ok(ObservationAdmission::AlreadyRecorded),
+                    StoreOutcome::Committed => self.duplicate_admission(&draft).await,
                     _ => Ok(ObservationAdmission::OutcomeUnknown),
                 }
             }
+            Err(error) => Err(error.into()),
+        }
+    }
+    /// Confirms that a committed stable operation names these exact immutable source facts.
+    async fn duplicate_admission(
+        &self,
+        draft: &ObservationDraft,
+    ) -> Result<ObservationAdmission, WorkspaceStoreError> {
+        let lookup = duplicate_lookup_operation(draft)?;
+        let operation = draft.operation.as_str().to_owned();
+        let worktree = draft.worktree.id().to_owned();
+        let incarnation = sqlite(draft.worktree.incarnation())?;
+        let epoch = sqlite(draft.authority_epoch)?;
+        let reference = draft.reference.as_str().to_owned();
+        let path = draft.path.as_os_str().as_bytes().to_vec();
+        let revision = draft.revision.as_str().to_owned();
+        let coverage = draft.coverage.as_str();
+        let state = draft.state.as_str();
+        let (digest, length) = draft.bytes.as_ref().map_or((None, None), |bytes| {
+            (Some(bytes.digest().to_vec()), Some(sqlite(bytes.length())))
+        });
+        let length = length.transpose()?;
+        match self.application.execute(lookup, move |tx| {
+            tx.query_row(
+                "SELECT 1 FROM workspace_source_observations WHERE operation_id = ?1 AND worktree_id = ?2 AND incarnation = ?3 AND authority_epoch = ?4 AND observation_reference = ?5 AND relative_path = ?6 AND byte_digest IS ?7 AND byte_length IS ?8 AND source_revision = ?9 AND coverage = ?10 AND observed_state = ?11",
+                params![operation, worktree, incarnation, epoch, reference, path, digest, length, revision, coverage, state],
+                |_| Ok(()),
+            )
+        }).await {
+            Ok(()) | Err(StoreError::DuplicateOperation { existing: StoreOutcome::Committed }) => Ok(ObservationAdmission::AlreadyRecorded),
+            Err(StoreError::RolledBack) => Ok(ObservationAdmission::Conflict),
+            Err(StoreError::DuplicateOperation { .. }) | Err(StoreError::OutcomeUnknown { .. }) => Ok(ObservationAdmission::OutcomeUnknown),
             Err(error) => Err(error.into()),
         }
     }
@@ -407,6 +443,7 @@ impl<'a> WorkspaceStore<'a> {
                 change_fact(previous, current),
             )),
             ObservationAdmission::AlreadyRecorded => Ok(ReconciliationAdmission::AlreadyRecorded),
+            ObservationAdmission::Conflict => Ok(ReconciliationAdmission::Conflict),
             ObservationAdmission::OutcomeUnknown => Ok(ReconciliationAdmission::OutcomeUnknown),
         }
     }
@@ -439,6 +476,36 @@ impl<'a> WorkspaceStore<'a> {
         }
         Ok(RenameReconciliation::DeleteAndCreate { old, new })
     }
+}
+
+/// Derives an internal, deterministic receipt key for one exact duplicate-observation comparison.
+fn duplicate_lookup_operation(
+    draft: &ObservationDraft,
+) -> Result<OperationId, WorkspaceStoreError> {
+    let mut hash = blake3::Hasher::new();
+    hash_part(&mut hash, draft.operation.as_str().as_bytes());
+    hash_part(&mut hash, draft.worktree.id().as_bytes());
+    hash_part(&mut hash, &draft.worktree.incarnation().to_le_bytes());
+    hash_part(&mut hash, &draft.authority_epoch.to_le_bytes());
+    hash_part(&mut hash, draft.reference.as_str().as_bytes());
+    hash_part(&mut hash, draft.path.as_os_str().as_bytes());
+    hash_part(&mut hash, draft.revision.as_str().as_bytes());
+    hash_part(&mut hash, draft.coverage.as_str().as_bytes());
+    hash_part(&mut hash, draft.state.as_str().as_bytes());
+    if let Some(bytes) = &draft.bytes {
+        hash_part(&mut hash, bytes.digest());
+        hash_part(&mut hash, &bytes.length().to_le_bytes());
+    }
+    Ok(OperationId::new(format!(
+        "workspace-observation-verify-{}",
+        hash.finalize().to_hex()
+    ))?)
+}
+
+/// Delimits one raw value in the duplicate-observation receipt identity.
+fn hash_part(hash: &mut blake3::Hasher, value: &[u8]) {
+    hash.update(&(value.len() as u64).to_le_bytes());
+    hash.update(value);
 }
 
 /// Carries the raw persisted fields until a caller supplies the authoritative worktree/path context.
