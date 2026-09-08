@@ -1,22 +1,53 @@
-//! Command-line entrypoint for the local Application daemon and doctor.
+//! Command-line entrypoint for the MCP facade, local Application daemon, and doctor.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
-use agent_ide::app::{AppError, DoctorReport, DoctorStatus, RuntimeDir, doctor_report, run_daemon};
+use agent_ide::app::{
+    AppError, DoctorReport, DoctorStatus, RuntimeDir, config::EffectiveConfig, doctor_report,
+    run_daemon_with_assistance,
+};
+use agent_ide::assistance::{assembly::ProductDispatcher, facade::StdioFacade};
+use rmcp::{serve_server, transport::io::stdio};
 
-/// Parses the two initial executable modes and prints only bounded operational status.
+/// Selects an explicit mode; MCP writes only protocol messages to stdout and never autostarts.
 #[tokio::main]
 async fn main() -> ExitCode {
     match command(std::env::args_os().skip(1)) {
         Ok(Command::Daemon { runtime_dir }) => match RuntimeDir::prepare_for_daemon(runtime_dir) {
-            Ok(runtime_dir) => match run_daemon(runtime_dir).await {
+            Ok(runtime_dir) => match run_daemon_with_assistance(
+                runtime_dir,
+                Arc::new(ProductDispatcher),
+                EffectiveConfig::defaults(),
+            )
+            .await
+            {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => fail(error),
             },
             Err(error) => fail(error),
         },
+        Ok(Command::Mcp { runtime_dir }) => {
+            let facade = match std::env::var("AGENT_IDE_HOST_ATTACHMENT") {
+                Ok(attachment) => {
+                    match StdioFacade::with_host_attachment(runtime_dir, attachment) {
+                        Some(facade) => facade,
+                        None => return fail(AppError::InvalidResponse),
+                    }
+                }
+                Err(std::env::VarError::NotPresent) => StdioFacade::new(runtime_dir),
+                Err(std::env::VarError::NotUnicode(_)) => return fail(AppError::InvalidResponse),
+            };
+            match serve_server(facade, stdio()).await {
+                Ok(service) => match service.waiting().await {
+                    Ok(_) => ExitCode::SUCCESS,
+                    Err(_) => fail(AppError::InvalidResponse),
+                },
+                Err(_) => fail(AppError::InvalidResponse),
+            }
+        }
         Ok(Command::Doctor { runtime_dir }) => match doctor_report(&runtime_dir).await {
             Ok(report) => {
                 let healthy = matches!(report.status, DoctorStatus::Healthy { .. });
@@ -62,7 +93,7 @@ fn print_doctor_report(report: &DoctorReport) {
     );
     println!("config.store.receipt_capacity={}", store.receipt_capacity);
     println!("protocol.health=v1");
-    println!("protocol.assistance_transport=v2-unavailable-without-peer-dispatcher");
+    println!("protocol.assistance_transport=v2");
     println!("control.daemon_autostart=unsupported");
     println!("control.workspace_scan=unsupported");
     println!("control.lsp_open=unsupported");
@@ -77,8 +108,10 @@ fn fail(error: AppError) -> ExitCode {
 
 /// Holds the explicit runtime directory required by each supported executable mode.
 enum Command {
-    /// Serves the health-only daemon until the process is interrupted or killed.
+    /// Serves health and finite Assistance dispatch until interrupted or killed.
     Daemon { runtime_dir: PathBuf },
+    /// Serves the static five-tool MCP surface on stdio without creating local runtime state.
+    Mcp { runtime_dir: PathBuf },
     /// Queries an existing daemon without creating a directory or daemon process.
     Doctor { runtime_dir: PathBuf },
 }
@@ -96,6 +129,7 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
     match mode.to_str() {
         Some("daemon") => Ok(Command::Daemon { runtime_dir }),
         Some("doctor") => Ok(Command::Doctor { runtime_dir }),
+        Some("mcp") => Ok(Command::Mcp { runtime_dir }),
         _ => Err(AppError::InvalidResponse),
     }
 }

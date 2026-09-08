@@ -12,7 +12,8 @@ use std::{
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
-use rmcp::{tool, tool_router};
+use rmcp::service::RequestContext;
+use rmcp::{RoleServer, tool, tool_router};
 use serde_json::{Map, Value, json};
 
 use crate::{
@@ -23,7 +24,10 @@ use crate::{
             MethodDispatch, MethodDispatchTransportResult, OpaqueJson,
         },
     },
-    assistance::host_binding::{HostBindingGuard, parse_hook_event},
+    assistance::{
+        assembly::{MissingPeer, PeerReply},
+        host_binding::{HostBindingGuard, parse_candidate, parse_hook_event},
+    },
     workspace::authority::{
         AuthorityError, AuthorityRegistry, AuthorityRevoked, AuthorityStamp, StopBindingHandoff,
     },
@@ -288,6 +292,8 @@ pub enum FacadeOutcome {
     Unavailable,
     /// IPC accepted the envelope but no typed peer result was available for safe rendering.
     Incomplete,
+    /// Assistance explicitly identified the first unavailable peer boundary.
+    PeerUnavailable(MissingPeer),
 }
 
 /// Owns one local facade endpoint and the finite limits for every connect-only dispatch.
@@ -309,8 +315,8 @@ impl AssistanceFacade {
 
     /// Validates and sends exactly one current method through Application's finite dispatch envelope.
     ///
-    /// A transport acceptance is deliberately only `Incomplete`: no model-read, source-read, or
-    /// peer-ready claim can be rendered before a typed Workspace, Intelligence, or Changes result.
+    /// Only a closed typed missing-peer reply is rendered; arbitrary transport acceptance remains
+    /// `Incomplete` and never becomes a model-read, source-read, or peer-ready claim.
     pub async fn dispatch(
         &self,
         host: &TrustedTransport,
@@ -335,7 +341,12 @@ impl AssistanceFacade {
         };
         match dispatch_method_if_running(&self.runtime_dir, request, self.limits).await {
             MethodDispatchTransportResult::Unavailable => FacadeOutcome::Unavailable,
-            MethodDispatchTransportResult::Dispatched { .. } => FacadeOutcome::Incomplete,
+            MethodDispatchTransportResult::Dispatched { opaque_result_json } => {
+                match serde_json::from_str::<PeerReply>(opaque_result_json.as_str()) {
+                    Ok(PeerReply::Unavailable { reason }) => FacadeOutcome::PeerUnavailable(reason),
+                    Err(_) => FacadeOutcome::Incomplete,
+                }
+            }
         }
     }
 }
@@ -578,9 +589,12 @@ impl FeedbackLedger {
 }
 
 /// Hosts the static five-tool rmcp surface even when no trusted host attachment exists.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct StdioFacade {
+    /// Connect-only Application endpoint and finite deadline.
     facade: AssistanceFacade,
+    /// Host-launcher attachment, never populated from model tool arguments or request metadata.
+    attachment: Option<String>,
 }
 
 impl StdioFacade {
@@ -588,13 +602,47 @@ impl StdioFacade {
     pub fn new(runtime_dir: PathBuf) -> Self {
         Self {
             facade: AssistanceFacade::new(runtime_dir),
+            attachment: None,
         }
     }
 
-    /// Validates an rmcp tool object and returns a compact bounded unavailable or invalid outcome.
-    async fn call_without_host(&self, tool: AssistanceTool, parameters: Value) -> CallToolResult {
-        let outcome = match validate_call(tool, parameters) {
-            Ok(_) => FacadeOutcome::Unavailable,
+    /// Configures a bounded opaque attachment supplied separately by a trusted host launcher.
+    ///
+    /// Empty or oversized attachments are rejected. Each invocation additionally needs supported
+    /// host request metadata; neither this attachment nor parsed metadata grants binding authority.
+    pub fn with_host_attachment(runtime_dir: PathBuf, attachment: String) -> Option<Self> {
+        TrustedTransport::from_host_ingress("validate", "validate", attachment.clone())?;
+        Some(Self {
+            facade: AssistanceFacade::new(runtime_dir),
+            attachment: Some(attachment),
+        })
+    }
+
+    /// Validates model parameters before using separately supplied host metadata for finite IPC.
+    ///
+    /// Missing or invalid ingress performs no IPC. Valid ingress sends only opaque correlations;
+    /// the daemon must establish its own host binding before returning any successful peer result.
+    async fn call(
+        &self,
+        tool: AssistanceTool,
+        parameters: Value,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        let outcome = match validate_call(tool, parameters.clone()) {
+            Ok(_) => {
+                let host = self.attachment.as_ref().and_then(|attachment| {
+                    let candidate = parse_candidate(&context.meta).ok()?;
+                    TrustedTransport::from_host_ingress(
+                        context.id.to_string(),
+                        candidate.call_id(),
+                        attachment.clone(),
+                    )
+                });
+                match host {
+                    Some(host) => self.facade.dispatch(&host, tool, parameters).await,
+                    None => FacadeOutcome::Unavailable,
+                }
+            }
             Err(_) => FacadeOutcome::InvalidParameters,
         };
         let message = match outcome {
@@ -607,46 +655,65 @@ impl StdioFacade {
             FacadeOutcome::Incomplete => {
                 "typed Assistance peer result is unavailable; continue with native tools"
             }
+            FacadeOutcome::PeerUnavailable(MissingPeer::HostBinding) => {
+                "Assistance unavailable: host_binding; continue with native tools"
+            }
         };
-        let _ = &self.facade;
         CallToolResult::error(vec![ContentBlock::text(message)])
     }
 }
 
 #[tool_router(server_handler)]
 impl StdioFacade {
-    /// Starts one stable activation operation after validating only its model-facing operation ID.
+    /// Routes a stable activation ID and separately supplied host context through the bounded call boundary.
     #[tool(name = "ide.start", input_schema = json!({"type":"object","additionalProperties":false,"required":["activation_id"],"properties":{"activation_id":{"type":"string","minLength":1,"maxLength":MAX_ACTIVATION_ID_BYTES}}}).as_object().expect("tool schema is an object").clone())]
-    async fn start(&self, Parameters(parameters): Parameters<Value>) -> CallToolResult {
-        self.call_without_host(AssistanceTool::Start, parameters)
-            .await
+    async fn start(
+        &self,
+        Parameters(parameters): Parameters<Value>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.call(AssistanceTool::Start, parameters, context).await
     }
 
-    /// Requests bounded context without accepting model-editable authority or identity fields.
+    /// Routes bounded context parameters and host request context without accepting model-owned identity.
     #[tool(name = "ide.context", input_schema = json!({"type":"object","additionalProperties":false,"properties":{"query":{"type":"string","maxLength":MAX_QUERY_BYTES},"detail_ref":{"type":"string","minLength":1,"maxLength":MAX_DETAIL_REF_BYTES}}}).as_object().expect("tool schema is an object").clone())]
-    async fn context(&self, Parameters(parameters): Parameters<Value>) -> CallToolResult {
-        self.call_without_host(AssistanceTool::Context, parameters)
+    async fn context(
+        &self,
+        Parameters(parameters): Parameters<Value>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.call(AssistanceTool::Context, parameters, context)
             .await
     }
 
-    /// Requests a bounded diff without adding Changes semantics when that peer is absent.
+    /// Routes bounded diff parameters and host context; absent Changes results never imply a ready diff.
     #[tool(name = "ide.diff", input_schema = json!({"type":"object","additionalProperties":false,"properties":{"detail_ref":{"type":"string","minLength":1,"maxLength":MAX_DETAIL_REF_BYTES}}}).as_object().expect("tool schema is an object").clone())]
-    async fn diff(&self, Parameters(parameters): Parameters<Value>) -> CallToolResult {
-        self.call_without_host(AssistanceTool::Diff, parameters)
-            .await
+    async fn diff(
+        &self,
+        Parameters(parameters): Parameters<Value>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.call(AssistanceTool::Diff, parameters, context).await
     }
 
-    /// Expands one owner-scoped detail reference only when its typed owner peer later exists.
+    /// Routes a bounded detail reference and host context; unavailable owner peers produce no expansion.
     #[tool(name = "ide.inspect", input_schema = json!({"type":"object","additionalProperties":false,"required":["detail_ref"],"properties":{"detail_ref":{"type":"string","minLength":1,"maxLength":MAX_DETAIL_REF_BYTES}}}).as_object().expect("tool schema is an object").clone())]
-    async fn inspect(&self, Parameters(parameters): Parameters<Value>) -> CallToolResult {
-        self.call_without_host(AssistanceTool::Inspect, parameters)
+    async fn inspect(
+        &self,
+        Parameters(parameters): Parameters<Value>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.call(AssistanceTool::Inspect, parameters, context)
             .await
     }
 
-    /// Stops only host-bound authority held outside model-provided tool arguments.
+    /// Routes an empty stop object and host context without claiming revocation from an unavailable peer.
     #[tool(name = "ide.stop", input_schema = json!({"type":"object","additionalProperties":false,"properties":{}}).as_object().expect("tool schema is an object").clone())]
-    async fn stop(&self, Parameters(parameters): Parameters<Value>) -> CallToolResult {
-        self.call_without_host(AssistanceTool::Stop, parameters)
-            .await
+    async fn stop(
+        &self,
+        Parameters(parameters): Parameters<Value>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.call(AssistanceTool::Stop, parameters, context).await
     }
 }

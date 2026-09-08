@@ -30,3 +30,39 @@ Assistance exposes `check_active(BindingRef)` and `consume_active(BindingRef) ->
 Execution r5 is accepted on these terms: every discovery and post-authority admission receives `ActiveBindingUse` from `consume_active(observed.binding)` for the same opaque `BindingRef` and generation, or invokes that exact consume operation itself. A bare `BindingRef` is insufficient because it can race stop. The admission also requires `ObservedSandboxState` and its own D03/local policy gate; it preserves `sandboxCwd` and limits itself to its fixed read-only Git queries. The observation is neither a physical permit, operator evidence, profile selection, nor sandbox-enforcement proof. Execution owns the separate operator-supplied profile catalog, verification evidence, and effect permits; it may compare the host observation with its own policy but cannot derive configuration, evidence, or enforcement from it.
 
 This validation proves only that the supported host metadata and native hook lifecycle agreed for one invocation. It does not cryptographically attest the host transport, grant authority, or prove sandbox enforcement.
+
+## Product MCP boundary
+
+The shipping `agent-ide mcp --runtime-dir PATH` command serves exactly `ide.start`,
+`ide.context`, `ide.diff`, `ide.inspect`, and `ide.stop` over stdio. It writes only MCP
+protocol messages to stdout, never creates the runtime directory, and never autostarts
+or repairs the daemon. All calls validate the existing closed model-argument schemas.
+
+An embedding host may construct `StdioFacade::with_host_attachment`; the executable
+accepts the same bounded opaque value through `AGENT_IDE_HOST_ATTACHMENT` in its launch
+environment. The launcher must keep that value separate from model arguments. Empty,
+non-UTF-8, or over-128-byte executable attachments are rejected before serving. Each
+call also requires the existing supported Codex candidate metadata in request `_meta`.
+The MCP request ID and host call ID become finite request/correlation values. Neither
+metadata nor the launcher value authenticates a channel, creates a binding, or grants
+authority. They only make the connect-only Application transport path reachable.
+
+`agent-ide daemon --runtime-dir PATH` now wires `run_daemon_with_assistance` to
+`ProductDispatcher`. At the current missing host-adapter boundary it returns the closed
+Assistance result `{"state":"unavailable","reason":"host_binding"}` for each finite
+method or hook dispatch. The facade recognizes this typed failure and directs the model
+to native tools. Unknown reply shapes remain incomplete, never successful. An absent
+daemon or invalid/missing ingress remains unavailable locally. The opaque launcher handle
+is not rendered in MCP output. Hook dispatch acceptance remains only delivery to the
+dispatcher, not validation, binding, or feedback delivery to the model.
+
+This assembly does not yet carry the full trusted invocation/sandbox observation into
+the daemon or match native Pre/Post hooks there. Remaining v0.1 gates are a real trusted
+host adapter, controlled Execution admission and Git discovery, Workspace activation and
+revocation orchestration, Intelligence context/provider assembly, Changes evidence and
+detail rendering, and real Codex/Claude root/subagent scenarios. In particular, no
+`start → diff` or `start → context` success is claimed by these executable roundtrips.
+
+The executable contract is checked with `cargo test --offline --test product_mcp_contract`;
+these are real local MCP/Unix-IPC process tests with synthetic host metadata, not evidence
+of host authentication or end-user IDE readiness.

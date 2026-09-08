@@ -185,9 +185,7 @@ async fn health_is_correlated_and_endpoint_is_private() {
     assert!(report.contains("runtime=Private"));
     assert!(report.contains("endpoint=Socket"));
     assert!(report.contains("lock=Held"));
-    assert!(
-        report.contains("protocol.assistance_transport=v2-unavailable-without-peer-dispatcher")
-    );
+    assert!(report.contains("protocol.assistance_transport=v2"));
     stop_daemon(child, runtime_dir).await;
 }
 
