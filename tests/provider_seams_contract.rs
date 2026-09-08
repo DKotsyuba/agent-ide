@@ -40,6 +40,19 @@ impl Fixture {
             WorkspaceAuthority::from_workspace(tree.id(), "1", self.0.clone(), 1).unwrap();
         (tree, authority)
     }
+    /// Creates a direct bounded job for non-provider capture/discovery correlation tests.
+    fn job(&self, label: &str, program: &Path, args: Vec<std::ffi::OsString>) -> BoundRequest {
+        let (_, authority) = self.scope();
+        let command = ControlledCommand::from_validated_peer(
+            CommandKind::Job,
+            program.to_path_buf(),
+            args,
+            self.0.clone(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        BoundRequest::new(label, authority, command, program)
+    }
     /// Creates one host-bound fixed provider command in the fixture cwd.
     fn command(&self, label: &str, program: &Path, args: Vec<std::ffi::OsString>) -> BoundRequest {
         let (_, authority) = self.scope();
@@ -259,8 +272,9 @@ async fn protocol_cancellation_fences_promotion_until_direct_child_reap() {
     assert!(result.cancellation.unwrap().kill_requested);
     assert_eq!(result.descendants, DescendantEvidence::Unverified);
     assert_eq!(
-        admission.release(result.lease),
-        Err(AdmissionError::ProviderReapRequired)
+        admission.running_count(),
+        1,
+        "reap alone never releases a provider slot"
     );
     let promotions = registry
         .complete_reap(&mut admission, reap, result.proof)
@@ -270,10 +284,7 @@ async fn protocol_cancellation_fences_promotion_until_direct_child_reap() {
         registry.release(view),
         Err(ProviderLeaseError::UnknownView)
     ));
-    assert_eq!(
-        admission.release(result.lease),
-        Err(AdmissionError::UnknownLease)
-    );
+
     let next = registry
         .promote(
             &mut admission,
@@ -515,7 +526,7 @@ async fn settled_snapshot(
 #[tokio::test]
 async fn captured_snapshot_evidence_retains_no_process_reservations() {
     let fixture = Fixture::new();
-    let mut bound = fixture.command(
+    let mut bound = fixture.job(
         "snapshot",
         Path::new("/bin/sh"),
         vec!["-c".into(), "printf snapshot".into()],
@@ -578,13 +589,6 @@ async fn definite_no_child_settlement_is_not_repeatable() {
     };
     let (_, first) = never_started(
         request
-            .clone()
-            .spawn(lease, bound.fresh(), Path::new("/unused"))
-            .err()
-            .unwrap(),
-    );
-    let (_, duplicate) = never_started(
-        request
             .spawn(lease, bound.fresh(), Path::new("/unused"))
             .err()
             .unwrap(),
@@ -592,10 +596,7 @@ async fn definite_no_child_settlement_is_not_repeatable() {
     assert_eq!(admission.running_count(), 1);
     admission.settle_never_started(first).unwrap();
     assert_eq!(admission.running_count(), 0);
-    assert_eq!(
-        admission.settle_never_started(duplicate),
-        Err(AdmissionError::UnknownLease)
-    );
+    // Both the discovery request and its admission are consumed; duplicate issuance is a compile error.
 }
 
 /// Equal local numeric IDs cannot mix reservations from two distinct central controllers.
@@ -617,7 +618,11 @@ fn opaque_reservations_include_their_controller_identity() {
     assert_eq!(left.release(b), Err(AdmissionError::UnknownLease));
     assert_eq!(left.running_count(), 1);
     left.release(a).unwrap();
-    right.release(b).unwrap();
+    assert_eq!(
+        right.running_count(),
+        1,
+        "a foreign failed release cannot free its rightful controller"
+    );
 }
 
 /// Native reads and cached delivery recheck changed host permissions even when the binding stays live.
@@ -673,7 +678,7 @@ fn current_read_admission_rejects_changed_profile_and_cwd_without_a_command() {
 #[tokio::test]
 async fn captured_wait_identity_is_bound_to_the_exact_child() {
     let fixture = Fixture::new();
-    let mut bound = fixture.command("identity", Path::new("/usr/bin/true"), vec![]);
+    let mut bound = fixture.job("identity", Path::new("/usr/bin/true"), vec![]);
     let (mut admission, _) = controllers(2);
     let mut identities = Vec::new();
     let mut completed = Vec::new();

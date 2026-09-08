@@ -10,6 +10,7 @@ use std::{
     io,
     path::{Component, Path, PathBuf},
     process::{ExitStatus, Stdio},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -756,7 +757,12 @@ impl GitDiscoveryPolicy {
 }
 
 /// Carries a catalog-admitted fixed Git discovery until a fresh active use permits its owned spawn.
-#[derive(Clone, Debug)]
+/// One validated attempt cannot be cloned to repeat-mint no-child settlement:
+/// ```compile_fail
+/// use agent_ide::execution::ValidatedGitDiscovery;
+/// fn duplicate(request:ValidatedGitDiscovery) { let copied=request.clone(); }
+/// ```
+#[derive(Debug)]
 pub struct ValidatedGitDiscovery {
     /// Assistance-correlated invocation retained for the final liveness recheck.
     invocation: ValidatedHostInvocation,
@@ -885,25 +891,17 @@ impl ValidatedGitDiscovery {
         codex_executable: &Path,
     ) -> Result<OwnedGitDiscovery, ProcessError> {
         let started = std::time::Instant::now();
-        let process = (|| {
-            self.invocation
-                .consume_active_use(active_use)
-                .map_err(ProcessError::Request)?;
-            OwnedChild::spawn_parts(
-                &self.command,
-                &self.invocation.sandbox,
-                lease,
-                codex_executable,
-                self.output_cap,
-            )
-        })()
-        .map_err(|cause| ProcessError::NeverStarted {
-            cause: Box::new(cause),
-            settlement: SpawnNeverStarted {
-                lease,
-                target: SpawnTarget::Ordinary,
-            },
-        })?;
+        let settlement = SpawnNeverStarted::ordinary(lease);
+        if let Err(error) = self.invocation.consume_active_use(active_use) {
+            return Err(settlement.error(ProcessError::Request(error)));
+        }
+        let process = OwnedChild::spawn_parts(
+            &self.command,
+            &self.invocation.sandbox,
+            settlement,
+            codex_executable,
+            self.output_cap,
+        )?;
         Ok(OwnedGitDiscovery {
             process,
             operation: self.operation,
@@ -1226,11 +1224,31 @@ pub struct QueueTicket(u64, u64);
 /// Reserves one admitted execution slot until it is explicitly released after reaping.
 ///
 /// Abnormal owned-child drop retains this reservation because it supplies no reap evidence.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// A forwarded admission cannot be copied into a second raw child:
+/// ```compile_fail
+/// use agent_ide::execution::*;
+/// use std::path::Path;
+/// fn duplicate(registry:&mut ProviderLeaseRegistry, admission:&mut AdmissionController,
+///     view:ProviderViewLease, request:&ValidatedExecutionRequest, lease:AdmissionLease) {
+///     let capability=registry.take_forwarder_spawn_lease(admission,view,request,lease).unwrap();
+///     let second=OwnedChild::spawn_captured(request,lease,None,Path::new("/unused"),64);
+/// }
+/// ```
+#[derive(Debug, Eq, PartialEq)]
 pub struct AdmissionLease(u64, u64);
 
-/// Returns the only three observable outcomes of asking the centralized admission controller.
+/// Non-authorizing controller/slot key retained by registries; cannot be converted into a lease.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdmissionKey(u64, u64);
+impl AdmissionLease {
+    /// Copies accounting identity without duplicating admission or spawn authority.
+    fn key(&self) -> AdmissionKey {
+        AdmissionKey(self.0, self.1)
+    }
+}
+
+/// Returns the only three observable outcomes of asking the centralized admission controller.
+#[derive(Debug, Eq, PartialEq)]
 pub enum Admission {
     /// A slot is reserved and the caller may proceed to an owned spawn.
     Granted(AdmissionLease),
@@ -1241,7 +1259,12 @@ pub enum Admission {
 }
 
 /// Couples a central queue ticket to the exact lease that promoted it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// The promotion and its newly granted lease each transfer exactly once:
+/// ```compile_fail
+/// use agent_ide::execution::AdmissionPromotion;
+/// fn duplicate(promotion:AdmissionPromotion) { let first=promotion.lease(); let second=promotion.lease(); }
+/// ```
+#[derive(Debug, Eq, PartialEq)]
 pub struct AdmissionPromotion {
     /// Ticket removed from the controller queue by this promotion.
     ticket: QueueTicket,
@@ -1251,7 +1274,7 @@ pub struct AdmissionPromotion {
 
 impl AdmissionPromotion {
     /// Returns the queued identity this promotion settles.
-    pub const fn ticket(self) -> QueueTicket {
+    pub const fn ticket(&self) -> QueueTicket {
         self.ticket
     }
     /// Returns the central reservation created for this exact ticket.
@@ -1391,6 +1414,9 @@ impl AdmissionController {
         &mut self,
         proof: DirectChildReap,
     ) -> Result<Vec<AdmissionPromotion>, AdmissionError> {
+        if proof.target != SpawnTarget::Ordinary {
+            return Err(AdmissionError::ProviderReapRequired);
+        }
         self.release_with_promotions(proof.lease)
     }
 
@@ -1541,6 +1567,8 @@ pub struct ProviderSpawnLease {
     authority: WorkspaceAuthority,
     /// Compatible backend identity selected by the responsible provider module.
     backend: String,
+    /// Shared write-once actual-child identity, also retained by the registry.
+    launched: Arc<Mutex<ProviderLaunchState>>,
     /// True only for a separately reserved shared forwarder.
     forwarder: bool,
 }
@@ -1548,7 +1576,7 @@ pub struct ProviderSpawnLease {
 impl ProviderSpawnLease {
     /// Cancels this unconsumed launch capability before any spawn attempt, producing a one-time no-child proof.
     pub fn cancel(self) -> SpawnNeverStarted {
-        SpawnNeverStarted::provider(&self)
+        SpawnNeverStarted::provider(self)
     }
 
     /// Returns the backend identity to which this one-time spawn is restricted.
@@ -1558,7 +1586,7 @@ impl ProviderSpawnLease {
 
     /// Rejects authority substitution before any process effect or active-binding consumption.
     fn validate_request(&self, request: &ValidatedExecutionRequest) -> Result<(), ProcessError> {
-        if self.authority != *request.authority() {
+        if request.kind() != CommandKind::Provider || self.authority != *request.authority() {
             return Err(ProcessError::Io(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "provider spawn authority does not match its admitted view",
@@ -1665,25 +1693,44 @@ pub enum BackendRelease {
 }
 
 /// One-time, non-cloneable permission to settle one draining backend after direct-child reap.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct BackendReapCapability {
     /// Exact compatible backend held in draining state.
     backend: String,
     /// Exact central reservation which cannot be freed by logical view release.
-    lease: AdmissionLease,
+    process: ProviderProcess,
 }
 
+impl PartialEq for BackendReapCapability {
+    /// Compares the exact registry reservation without duplicating its settlement right.
+    fn eq(&self, other: &Self) -> bool {
+        self.backend == other.backend
+            && self.process.key == other.process.key
+            && self.process.target == other.process.target
+            && Arc::ptr_eq(&self.process.launched, &other.process.launched)
+    }
+}
+impl Eq for BackendReapCapability {}
+
 /// Non-cloneable proof that validation/build/spawn returned before any owned Child handle existed.
+/// ```compile_fail
+/// use agent_ide::execution::{AdmissionController,SpawnNeverStarted};
+/// fn twice(admission:&mut AdmissionController,proof:SpawnNeverStarted) {
+///     admission.settle_never_started(proof); admission.settle_never_started(proof);
+/// }
+/// ```
 #[derive(Debug)]
 pub struct SpawnNeverStarted {
     /// Exact reservation whose spawn did not create an owned child.
     lease: AdmissionLease,
     /// Registry scope when this was a provider capability, otherwise an ordinary reservation.
     target: SpawnTarget,
+    /// Registry-owned launch correlation for provider reservations; absent for direct jobs.
+    launched: Option<Arc<Mutex<ProviderLaunchState>>>,
 }
 
-/// Closed reservation ownership carried only inside Execution-created no-spawn proofs.
-#[derive(Debug)]
+/// Closed reservation role carried unchanged through Execution-owned spawn and settlement.
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum SpawnTarget {
     /// Ordinary non-provider reservation.
     Ordinary,
@@ -1693,16 +1740,36 @@ enum SpawnTarget {
         view: ProviderViewLease,
     },
     /// Separately counted shared forwarder view.
-    Forwarder { view: ProviderViewLease },
+    Forwarder {
+        backend: String,
+        view: ProviderViewLease,
+    },
 }
 
 impl SpawnNeverStarted {
-    /// Copies only reservation identity before an attempted spawn; issued only on a definite pre-child error.
-    fn provider(capability: &ProviderSpawnLease) -> Self {
+    /// Wraps one untouched direct admission for an ordinary Git/job launch attempt.
+    fn ordinary(lease: AdmissionLease) -> Self {
+        Self {
+            lease,
+            target: SpawnTarget::Ordinary,
+            launched: None,
+        }
+    }
+    /// Returns this unique no-child settlement with its exact pre-spawn failure.
+    fn error(self, cause: ProcessError) -> ProcessError {
+        ProcessError::NeverStarted {
+            cause: Box::new(cause),
+            settlement: self,
+        }
+    }
+    /// Consumes the unique provider reservation into a definite pre-child settlement or launch attempt.
+    fn provider(capability: ProviderSpawnLease) -> Self {
         Self {
             lease: capability.lease,
+            launched: Some(capability.launched),
             target: if capability.forwarder {
                 SpawnTarget::Forwarder {
+                    backend: capability.backend.clone(),
                     view: capability.view,
                 }
             } else {
@@ -1712,6 +1779,60 @@ impl SpawnNeverStarted {
                 }
             },
         }
+    }
+}
+
+/// Serializes logical revocation against the exact physical spawn boundary.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ProviderLaunchState {
+    /// An issued capability may still create exactly one child.
+    #[default]
+    Pending,
+    /// The logical view was revoked before any child existed.
+    Revoked,
+    /// A single OS child owns the reservation until direct reap.
+    Launched(ProcessIdentityData),
+}
+
+/// Registry-owned non-authorizing correlation of reservation, provider target, and actual direct process.
+#[derive(Clone, Debug)]
+struct ProviderProcess {
+    /// Exact central controller and slot identity; never owns a spawn right.
+    key: AdmissionKey,
+    /// Exact backend/listener or forwarder-view role of this reservation.
+    target: SpawnTarget,
+    /// Set exactly once by the typed spawn path after OS child creation succeeds.
+    launched: Arc<Mutex<ProviderLaunchState>>,
+}
+impl ProviderProcess {
+    /// Creates a target-bound correlation before transferring the sole lease into a spawn capability.
+    fn new(lease: &AdmissionLease, target: SpawnTarget) -> Self {
+        Self {
+            key: lease.key(),
+            target,
+            launched: Arc::default(),
+        }
+    }
+    /// Invalidates an outstanding capability while preserving an already launched child's identity.
+    fn revoke_pending(&self) {
+        if let Ok(mut state) = self.launched.lock()
+            && matches!(*state, ProviderLaunchState::Pending)
+        {
+            *state = ProviderLaunchState::Revoked;
+        }
+    }
+    /// Accepts only actual direct-wait proof for this reservation, exact role, and launched process.
+    fn matches(&self, proof: &DirectChildReap) -> bool {
+        self.key == proof.lease.key() && self.target == proof.target && self.launched.lock().is_ok_and(|state| matches!(*state,ProviderLaunchState::Launched(identity) if identity==proof.identity))
+    }
+    /// Accepts no-child settlement only when this exact target never registered a launched process.
+    fn never_started(&self, proof: &SpawnNeverStarted) -> bool {
+        self.key == proof.lease.key()
+            && self.target == proof.target
+            && self
+                .launched
+                .lock()
+                .is_ok_and(|state| !matches!(*state, ProviderLaunchState::Launched(_)))
     }
 }
 
@@ -1727,6 +1848,12 @@ struct ProcessIdentityData {
     generation: [u8; 32],
     /// Direct PID from the newly created Child handle.
     pid: u32,
+}
+impl std::fmt::Debug for ProcessIdentityData {
+    /// Keeps private PID/generation data out of derived capability debug output.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ProcessIdentityData(..)")
+    }
 }
 impl std::fmt::Debug for ProcessIdentity {
     /// Redacts raw launch/PID data while retaining the opaque correlation type.
@@ -1752,6 +1879,10 @@ impl ReapedChildIdentity {
 pub struct DirectChildReap {
     /// Exact reservation whose owned child was reaped.
     lease: AdmissionLease,
+    /// Exact typed provider target or direct-job role attached before spawning.
+    target: SpawnTarget,
+    /// Actual direct child identity copied only after a successful wait.
+    identity: ProcessIdentityData,
 }
 
 /// Receipts returned after one finite Workspace authority revocation reaches Execution.
@@ -1787,7 +1918,21 @@ pub struct ProviderLeaseRegistry {
     /// One-time spawn capabilities keyed by their newly created owned backend's first view.
     spawnable: BTreeMap<u64, AdmissionLease>,
     /// Distinct process reservations bound once to currently attached shared forwarder views.
-    forwarders: BTreeMap<u64, AdmissionLease>,
+    forwarders: BTreeMap<u64, ProviderProcess>,
+}
+
+impl Drop for ProviderLeaseRegistry {
+    /// Fences every unissued or outstanding launch capability when its logical owner disappears.
+    fn drop(&mut self) {
+        for backend in self.backends.values() {
+            if let Some(process) = &backend.admission {
+                process.revoke_pending();
+            }
+        }
+        for forwarder in self.forwarders.values() {
+            forwarder.revoke_pending();
+        }
+    }
 }
 
 /// Stores the scope that a direct Workspace revocation may fence.
@@ -1805,7 +1950,7 @@ struct ProviderBackend {
     /// Ownership and sharing rule frozen when the backend is first attached.
     kind: ProviderBackendKind,
     /// Admission reservation retained only for an owned physical backend.
-    admission: Option<AdmissionLease>,
+    admission: Option<ProviderProcess>,
     /// Number of logical views currently routed to this backend.
     views: usize,
     /// Last-view removal fences new attachments until direct-child reap completes.
@@ -1899,11 +2044,20 @@ impl ProviderLeaseRegistry {
                 }
             }
         };
+        let process = reserved.as_ref().map(|lease| {
+            ProviderProcess::new(
+                lease,
+                SpawnTarget::Backend {
+                    backend: backend.clone(),
+                    view: ProviderViewLease(self.next_view),
+                },
+            )
+        });
         self.backends.insert(
             backend.clone(),
             ProviderBackend {
                 kind,
-                admission: reserved,
+                admission: process,
                 views: 0,
                 draining: false,
             },
@@ -1952,7 +2106,13 @@ impl ProviderLeaseRegistry {
             pending.backend.clone(),
             ProviderBackend {
                 kind: pending.kind,
-                admission: Some(promotion.lease),
+                admission: Some(ProviderProcess::new(
+                    &promotion.lease,
+                    SpawnTarget::Backend {
+                        backend: pending.backend.clone(),
+                        view: ProviderViewLease(self.next_view),
+                    },
+                )),
                 views: 0,
                 draining: false,
             },
@@ -1979,39 +2139,51 @@ impl ProviderLeaseRegistry {
                 lease,
                 authority: authority.authority.clone(),
                 backend: authority.backend.clone(),
+                launched: self.backends[&authority.backend]
+                    .admission
+                    .as_ref()
+                    .expect("owned backend")
+                    .launched
+                    .clone(),
                 forwarder: false,
             })
             .ok_or(ProviderLeaseError::SpawnUnavailable)
     }
 
-    /// Binds a separately admitted process slot once to a shared view's exact request authority.
-    /// Rejects unknown/stale views, authority changes, backend slots, released slots, and any
-    /// previously bound view or slot without consuming them. The caller retains the slot on error
-    /// and releases it only after forwarder reap on success; logical release never releases it.
+    /// Consumes one distinct direct reservation into a typed shared-forwarder launch capability.
+    /// On refusal returns the unchanged linear lease with the error, allowing safe retry or cancellation.
     pub fn take_forwarder_spawn_lease(
         &mut self,
         admission: &mut AdmissionController,
         view: ProviderViewLease,
         request: &ValidatedExecutionRequest,
         lease: AdmissionLease,
-    ) -> Result<ProviderForwarderSpawnLease, ProviderLeaseError> {
-        let scope = self
-            .views
-            .get(&view.0)
-            .ok_or(ProviderLeaseError::UnknownView)?;
+    ) -> Result<ProviderForwarderSpawnLease, (ProviderLeaseError, AdmissionLease)> {
+        let Some(scope) = self.views.get(&view.0) else {
+            return Err((ProviderLeaseError::UnknownView, lease));
+        };
         if scope.authority != *request.authority() {
-            return Err(ProviderLeaseError::InvalidAuthority);
+            return Err((ProviderLeaseError::InvalidAuthority, lease));
         }
-        if self.backends[&scope.backend].kind != ProviderBackendKind::OwnedShared
+        if request.kind() != CommandKind::Provider
+            || self.backends[&scope.backend].kind != ProviderBackendKind::OwnedShared
             || lease.1 != admission.identity
             || !admission.leases.contains_key(&lease.0)
             || admission.provider_slots.contains(&lease.0)
             || self.forwarders.contains_key(&view.0)
         {
-            return Err(ProviderLeaseError::SpawnUnavailable);
+            return Err((ProviderLeaseError::SpawnUnavailable, lease));
         }
+        let process = ProviderProcess::new(
+            &lease,
+            SpawnTarget::Forwarder {
+                backend: scope.backend.clone(),
+                view,
+            },
+        );
+        let launched = process.launched.clone();
         admission.provider_slots.insert(lease.0);
-        self.forwarders.insert(view.0, lease);
+        self.forwarders.insert(view.0, process);
         Ok(ProviderForwarderSpawnLease {
             spawn: ProviderSpawnLease {
                 view,
@@ -2019,6 +2191,7 @@ impl ProviderLeaseRegistry {
                 authority: scope.authority.clone(),
                 backend: scope.backend.clone(),
                 forwarder: true,
+                launched,
             },
         })
     }
@@ -2034,10 +2207,18 @@ impl ProviderLeaseRegistry {
             .remove(&view_id)
             .ok_or(ProviderLeaseError::UnknownView)?;
         self.spawnable.remove(&view_id);
+        if let Some(process) = self.forwarders.get(&view_id) {
+            process.revoke_pending();
+        }
         let backend = self
             .backends
             .get_mut(&view.backend)
             .expect("view backend exists");
+        if let Some(process) = &backend.admission
+            && matches!(&process.target,SpawnTarget::Backend{view,..} if view.0==view_id)
+        {
+            process.revoke_pending();
+        }
         backend.views -= 1;
         if backend.views != 0 {
             return Ok(BackendRelease::SharedPeerSurvives);
@@ -2049,7 +2230,7 @@ impl ProviderLeaseRegistry {
         backend.draining = true;
         Ok(BackendRelease::ReapOwned(BackendReapCapability {
             backend: view.backend,
-            lease: backend.admission.expect("owned reservation"),
+            process: backend.admission.clone().expect("owned reservation"),
         }))
     }
 
@@ -2067,8 +2248,12 @@ impl ProviderLeaseRegistry {
             .is_some_and(|backend| {
                 backend.draining
                     && backend.views == 0
-                    && backend.admission == Some(capability.lease)
-                    && proof.lease == capability.lease
+                    && backend.admission.as_ref().is_some_and(|process| {
+                        process.key == capability.process.key
+                            && process.target == capability.process.target
+                            && Arc::ptr_eq(&process.launched, &capability.process.launched)
+                    })
+                    && capability.process.matches(&proof)
             });
         if !valid || !admission.leases.contains_key(&proof.lease.0) {
             return Err(ProviderLeaseError::InvalidReap);
@@ -2088,29 +2273,34 @@ impl ProviderLeaseRegistry {
         admission: &mut AdmissionController,
         settlement: SpawnNeverStarted,
     ) -> Result<Vec<AdmissionPromotion>, ProviderLeaseError> {
-        match settlement.target {
+        match &settlement.target {
             SpawnTarget::Backend { backend, view } => {
-                let valid = self
-                    .backends
-                    .get(&backend)
-                    .is_some_and(|entry| entry.admission == Some(settlement.lease))
-                    && self
-                        .views
-                        .get(&view.0)
-                        .is_none_or(|entry| entry.backend == backend);
+                let valid = self.backends.get(backend).is_some_and(|entry| {
+                    entry
+                        .admission
+                        .as_ref()
+                        .is_some_and(|process| process.never_started(&settlement))
+                }) && self
+                    .views
+                    .get(&view.0)
+                    .is_none_or(|entry| &entry.backend == backend);
                 if !valid {
                     return Err(ProviderLeaseError::InvalidReap);
                 }
                 let promotions = admission
                     .release_settled(settlement.lease)
                     .map_err(ProviderLeaseError::Admission)?;
-                self.views.retain(|_, entry| entry.backend != backend);
-                self.backends.remove(&backend);
+                self.views.retain(|_, entry| &entry.backend != backend);
+                self.backends.remove(backend);
                 self.spawnable.remove(&view.0);
                 Ok(promotions)
             }
-            SpawnTarget::Forwarder { view } => {
-                if self.forwarders.get(&view.0) != Some(&settlement.lease) {
+            SpawnTarget::Forwarder { view, .. } => {
+                if !self
+                    .forwarders
+                    .get(&view.0)
+                    .is_some_and(|process| process.never_started(&settlement))
+                {
                     return Err(ProviderLeaseError::InvalidReap);
                 }
                 let promotions = admission
@@ -2140,11 +2330,17 @@ impl ProviderLeaseRegistry {
         admission: &mut AdmissionController,
         proof: DirectChildReap,
     ) -> Result<Vec<AdmissionPromotion>, ProviderLeaseError> {
-        let view = self
+        let SpawnTarget::Forwarder { view, .. } = &proof.target else {
+            return Err(ProviderLeaseError::InvalidReap);
+        };
+        let view = view.0;
+        if !self
             .forwarders
-            .iter()
-            .find_map(|(view, lease)| (*lease == proof.lease).then_some(*view))
-            .ok_or(ProviderLeaseError::InvalidReap)?;
+            .get(&view)
+            .is_some_and(|process| process.matches(&proof))
+        {
+            return Err(ProviderLeaseError::InvalidReap);
+        }
         let promotions = admission
             .release_settled(proof.lease)
             .map_err(ProviderLeaseError::Admission)?;
@@ -2437,6 +2633,8 @@ pub struct OwnedChild {
     stderr: JoinHandle<io::Result<CapturedOutput>>,
     /// Admission slot retained until direct-child reap produces evidence.
     lease: AdmissionLease,
+    /// Typed reservation target retained unchanged from launch through direct reap.
+    target: SpawnTarget,
 }
 
 impl OwnedChild {
@@ -2445,8 +2643,7 @@ impl OwnedChild {
         self.process.launch_identity.take()
     }
 
-    /// Starts a capture-mode provider backend using its one-time, authority-bound registry grant.
-    /// Authority mismatch returns an error before consuming active use or spawning a process.
+    /// Starts a capture provider only through its unique registry capability and fresh binding use.
     pub fn spawn_from_provider_lease(
         request: &ValidatedExecutionRequest,
         capability: ProviderSpawnLease,
@@ -2454,30 +2651,24 @@ impl OwnedChild {
         codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
-        let settlement = SpawnNeverStarted::provider(&capability);
-        let result = (|| {
-            capability.validate_request(request)?;
-            request
-                .consume_spawn_use(active_use)
-                .map_err(ProcessError::Request)?;
-            Self::spawn_parts(
-                &request.command,
-                &request.invocation.sandbox,
-                capability.lease,
-                codex_executable,
-                output_cap,
-            )
-        })();
-        result.map_err(|cause| ProcessError::NeverStarted {
-            cause: Box::new(cause),
+        if let Err(error) = capability.validate_request(request) {
+            return Err(capability.cancel().error(error));
+        }
+        let settlement = capability.cancel();
+        if let Err(error) = request.consume_spawn_use(active_use) {
+            return Err(settlement.error(ProcessError::Request(error)));
+        }
+        Self::spawn_parts(
+            &request.command,
+            &request.invocation.sandbox,
             settlement,
-        })
+            codex_executable,
+            output_cap,
+        )
     }
 
-    /// Starts a capture-mode child only after central admission reserved `lease`.
-    ///
-    /// Managed host state is passed intact as one `--sandbox-state-json` argv element; disabled
-    /// state launches directly only because `ValidatedExecutionRequest` required explicit policy.
+    /// Consumes a direct Git/job reservation; provider commands require a typed registry capability.
+    /// Every pre-child failure returns the unique NeverStarted proof for the consumed reservation.
     pub fn spawn_captured(
         request: &ValidatedExecutionRequest,
         lease: AdmissionLease,
@@ -2485,41 +2676,49 @@ impl OwnedChild {
         codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
-        request
-            .consume_spawn_use(active_use)
-            .map_err(ProcessError::Request)?;
+        let settlement = SpawnNeverStarted::ordinary(lease);
+        if request.kind() == CommandKind::Provider {
+            return Err(settlement.error(provider_capability_required()));
+        }
+        if let Err(error) = request.consume_spawn_use(active_use) {
+            return Err(settlement.error(ProcessError::Request(error)));
+        }
         Self::spawn_parts(
             &request.command,
             &request.invocation.sandbox,
-            lease,
+            settlement,
             codex_executable,
             output_cap,
         )
     }
 
-    /// Launches a capture-mode child from already validated command and sandbox components.
+    /// Launches from one linear reservation, returning it only on definite pre-child failure.
     fn spawn_parts(
         command: &ControlledCommand,
         sandbox: &HostSandboxState,
-        lease: AdmissionLease,
+        settlement: SpawnNeverStarted,
         codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
-        validate_output_cap(output_cap)?;
-        let mut process = build_command(command, sandbox, codex_executable)?;
-        process.stdout(Stdio::piped()).stderr(Stdio::piped());
-        configure_process_group(&mut process);
-        let generation = launch_generation()?;
-        let mut child = process.spawn()?;
-        let identity = ProcessIdentityData {
-            generation,
-            pid: child.id().expect("new child PID"),
+        let (mut child, identity) = match launch_child(
+            command,
+            sandbox,
+            &settlement,
+            codex_executable,
+            output_cap,
+            false,
+        ) {
+            Ok(child) => child,
+            Err(error) => return Err(settlement.error(error)),
         };
-
-        let stdout = child.stdout.take().expect("piped stdout exists");
-        let stderr = child.stderr.take().expect("piped stderr exists");
-        let stdout = tokio::spawn(drain(stdout, output_cap));
-        let stderr = tokio::spawn(drain(stderr, output_cap));
+        let stdout = tokio::spawn(drain(
+            child.stdout.take().expect("piped stdout"),
+            output_cap,
+        ));
+        let stderr = tokio::spawn(drain(
+            child.stderr.take().expect("piped stderr"),
+            output_cap,
+        ));
         Ok(Self {
             process: ChildOwnership {
                 identity,
@@ -2530,7 +2729,8 @@ impl OwnedChild {
             },
             stdout,
             stderr,
-            lease,
+            lease: settlement.lease,
+            target: settlement.target,
         })
     }
 
@@ -2592,14 +2792,18 @@ impl OwnedChild {
         let stderr = collect_drain(self.stderr, output_deadline).await;
         Ok(CompletedProcess {
             evidence: CapturedProcessEvidence {
-                reap_identity: Some(reap_identity),
+                reap_identity: Some(reap_identity.clone()),
                 status,
                 cancellation,
                 stdout,
                 stderr,
                 descendants: DescendantEvidence::Unverified,
             },
-            settlement: DirectChildReap { lease: self.lease },
+            settlement: DirectChildReap {
+                lease: self.lease,
+                target: self.target,
+                identity: reap_identity.0,
+            },
         })
     }
 }
@@ -2615,8 +2819,6 @@ pub struct ReapedProtocolProcess {
     pub stderr: CapturedOutput,
     /// Direct-child reap never proves complete descendant termination.
     pub descendants: DescendantEvidence,
-    /// The admission reservation eligible for release only because direct-child reap succeeded.
-    pub lease: AdmissionLease,
     /// One-time direct-child settlement proof required by provider accounting.
     pub proof: DirectChildReap,
 }
@@ -2636,6 +2838,8 @@ pub struct OwnedProtocolChild {
     stderr: JoinHandle<io::Result<CapturedOutput>>,
     /// Admission slot retained until direct protocol-child reap.
     lease: AdmissionLease,
+    /// Typed reservation target retained unchanged from launch through direct reap.
+    target: SpawnTarget,
 }
 
 impl OwnedProtocolChild {
@@ -2653,21 +2857,14 @@ impl OwnedProtocolChild {
         codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
-        let settlement = SpawnNeverStarted::provider(&capability);
-        let result = (|| {
-            capability.validate_request(request)?;
-            Self::spawn(
-                request,
-                capability.lease,
-                active_use,
-                codex_executable,
-                output_cap,
-            )
-        })();
-        result.map_err(|cause| ProcessError::NeverStarted {
-            cause: Box::new(cause),
-            settlement,
-        })
+        if let Err(error) = capability.validate_request(request) {
+            return Err(capability.cancel().error(error));
+        }
+        let settlement = capability.cancel();
+        if let Err(error) = request.consume_spawn_use(active_use) {
+            return Err(settlement.error(ProcessError::Request(error)));
+        }
+        Self::spawn_parts(request, settlement, codex_executable, output_cap)
     }
 
     /// Starts one forwarder using its distinct process slot and exact registry-view authority.
@@ -2688,7 +2885,7 @@ impl OwnedProtocolChild {
         )
     }
 
-    /// Starts a protocol child with stdout reserved exclusively for its logical protocol owner.
+    /// Consumes a direct Git/job reservation with exclusive protocol stdout; raw providers are refused.
     pub fn spawn(
         request: &ValidatedExecutionRequest,
         lease: AdmissionLease,
@@ -2696,30 +2893,40 @@ impl OwnedProtocolChild {
         codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
-        validate_output_cap(output_cap)?;
-        request
-            .consume_spawn_use(active_use)
-            .map_err(ProcessError::Request)?;
-        let mut command = build_command(
+        let settlement = SpawnNeverStarted::ordinary(lease);
+        if request.kind() == CommandKind::Provider {
+            return Err(settlement.error(provider_capability_required()));
+        }
+        if let Err(error) = request.consume_spawn_use(active_use) {
+            return Err(settlement.error(ProcessError::Request(error)));
+        }
+        Self::spawn_parts(request, settlement, codex_executable, output_cap)
+    }
+
+    /// Launches one typed or direct reservation while retaining its target and exact child identity.
+    fn spawn_parts(
+        request: &ValidatedExecutionRequest,
+        settlement: SpawnNeverStarted,
+        codex_executable: &Path,
+        output_cap: usize,
+    ) -> Result<Self, ProcessError> {
+        let (mut child, identity) = match launch_child(
             &request.command,
             &request.invocation.sandbox,
+            &settlement,
             codex_executable,
-        )?;
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        configure_process_group(&mut command);
-        let generation = launch_generation()?;
-        let mut child = command.spawn()?;
-        let identity = ProcessIdentityData {
-            generation,
-            pid: child.id().expect("new child PID"),
+            output_cap,
+            true,
+        ) {
+            Ok(child) => child,
+            Err(error) => return Err(settlement.error(error)),
         };
-        let stdin = child.stdin.take().expect("piped stdin exists");
-        let stdout = child.stdout.take().expect("piped stdout exists");
-        let stderr = child.stderr.take().expect("piped stderr exists");
-        let stderr = tokio::spawn(drain(stderr, output_cap));
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = tokio::spawn(drain(
+            child.stderr.take().expect("piped stderr"),
+            output_cap,
+        ));
         Ok(Self {
             stdin,
             stdout,
@@ -2731,7 +2938,8 @@ impl OwnedProtocolChild {
                 cancellation: None,
             },
             stderr,
-            lease,
+            lease: settlement.lease,
+            target: settlement.target,
         })
     }
 
@@ -2750,8 +2958,11 @@ impl OwnedProtocolChild {
             cancellation: this.process.cancellation,
             stderr,
             descendants: DescendantEvidence::Unverified,
-            lease: this.lease,
-            proof: DirectChildReap { lease: this.lease },
+            proof: DirectChildReap {
+                lease: this.lease,
+                target: this.target,
+                identity: this.process.identity,
+            },
         })
     }
 
@@ -2774,6 +2985,61 @@ impl OwnedProtocolChild {
         self.cancel_bounded(grace, deadline).await?;
         self.reap(deadline).await
     }
+}
+
+/// Refuses using direct-job admission to launch an Intelligence provider process.
+fn provider_capability_required() -> ProcessError {
+    ProcessError::Io(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "provider spawn requires a typed registry capability",
+    ))
+}
+
+/// Serializes provider revocation through physical spawn and records that exact direct child once.
+fn launch_child(
+    command: &ControlledCommand,
+    sandbox: &HostSandboxState,
+    settlement: &SpawnNeverStarted,
+    codex_executable: &Path,
+    output_cap: usize,
+    protocol: bool,
+) -> Result<(Child, ProcessIdentityData), ProcessError> {
+    let mut launch = settlement
+        .launched
+        .as_ref()
+        .map(|state| {
+            state
+                .lock()
+                .map_err(|_| io::Error::other("provider launch state unavailable"))
+        })
+        .transpose()?;
+    if launch
+        .as_ref()
+        .is_some_and(|state| !matches!(**state, ProviderLaunchState::Pending))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "provider launch capability was revoked or consumed",
+        )
+        .into());
+    }
+    validate_output_cap(output_cap)?;
+    let mut process = build_command(command, sandbox, codex_executable)?;
+    process.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if protocol {
+        process.stdin(Stdio::piped());
+    }
+    configure_process_group(&mut process);
+    let generation = launch_generation()?;
+    let child = process.spawn()?;
+    let identity = ProcessIdentityData {
+        generation,
+        pid: child.id().expect("new child PID"),
+    };
+    if let Some(state) = launch.as_mut() {
+        **state = ProviderLaunchState::Launched(identity);
+    }
+    Ok((child, identity))
 }
 
 /// Requests signals only for this unreaped owned child and retains evidence on borrowed timeout/cancellation.
@@ -3088,3 +3354,6 @@ fn local_sandbox_cwd(raw: &str) -> Result<PathBuf, SandboxStateError> {
         Err(SandboxStateError::UnsupportedCwd)
     }
 }
+
+#[cfg(test)]
+mod linear_tests;

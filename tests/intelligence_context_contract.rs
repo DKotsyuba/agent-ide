@@ -6,10 +6,11 @@ use agent_ide::{
         store::{OperationId, Store},
     },
     execution::{
-        Admission, AdmissionClass, AdmissionController, AdmissionLimits, CommandKind,
+        AdmissionClass, AdmissionController, AdmissionLimits, BackendRelease, CommandKind,
         ControlledCommand, ExecutionProfileCatalog, ExecutionProfileTemplate, HostSandboxState,
-        LocalExecutionPolicy, OwnedProtocolChild, OwnerId, ValidatedExecutionRequest,
-        ValidatedHostInvocation, WorkspaceAuthority,
+        LocalExecutionPolicy, OwnedProtocolChild, OwnerId, ProviderBackendKind,
+        ProviderLeaseAdmission, ProviderLeaseLimits, ProviderLeaseRegistry,
+        ValidatedExecutionRequest, ValidatedHostInvocation, WorkspaceAuthority,
     },
     intelligence::{
         context::{ContextMode, ContextQuery},
@@ -187,15 +188,29 @@ async fn real_gopls_production_context_tracks_exact_observed_bytes() {
         interactive_burst: 1,
     })
     .unwrap();
-    let lease = match admission.submit(
+    let mut registry = ProviderLeaseRegistry::new(ProviderLeaseLimits {
+        total_views: 1,
+        per_backend_views: 1,
+    })
+    .unwrap();
+    let ProviderLeaseAdmission::Granted(view) = registry.request(
+        &mut admission,
         OwnerId::new("context-test").unwrap(),
         AdmissionClass::Interactive,
-    ) {
-        Admission::Granted(lease) => lease,
-        other => panic!("provider admission failed: {other:?}"),
+        "context-gopls",
+        ProviderBackendKind::OwnedExclusive,
+        request.authority(),
+    ) else {
+        panic!("provider admission");
     };
-    let mut child =
-        OwnedProtocolChild::spawn(&request, lease, None, &PathBuf::from("/unused"), 4096).unwrap();
+    let mut child = OwnedProtocolChild::spawn_from_provider_lease(
+        &request,
+        registry.take_spawn_lease(view).unwrap(),
+        None,
+        &PathBuf::from("/unused"),
+        4096,
+    )
+    .unwrap();
     let result = with_session(
         &mut child.stdout,
         &mut child.stdin,
@@ -314,7 +329,12 @@ async fn real_gopls_production_context_tracks_exact_observed_bytes() {
         reaped.status,
         String::from_utf8_lossy(&reaped.stderr.bytes)
     );
-    admission.release_reaped(reaped.proof).unwrap();
+    let BackendRelease::ReapOwned(cap) = registry.release(view).unwrap() else {
+        panic!("owned backend");
+    };
+    registry
+        .complete_reap(&mut admission, cap, reaped.proof)
+        .unwrap();
     assert_eq!(admission.running_count(), 0);
     result.unwrap();
     assert_eq!(

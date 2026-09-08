@@ -63,6 +63,11 @@ fn lease_limits(total_views: usize, per_backend_views: usize) -> ProviderLeaseLi
 
 /// Builds a request whose argv/profile data is fixed by this test rather than model text.
 fn request(root: &Path, script: &str) -> ValidatedExecutionRequest {
+    request_kind(root, script, CommandKind::Job)
+}
+
+/// Builds the declared direct or provider command category for a fixed native test script.
+fn request_kind(root: &Path, script: &str, kind: CommandKind) -> ValidatedExecutionRequest {
     let sandbox = disabled_state(root);
     let profiles = ExecutionProfileCatalog::from_execution_evidence(vec![
         ExecutionProfileTemplate::from_execution_evidence("disabled-contract-case", 1, &sandbox)
@@ -73,7 +78,7 @@ fn request(root: &Path, script: &str) -> ValidatedExecutionRequest {
     let authority =
         WorkspaceAuthority::from_workspace("test-worktree", "1", root.to_path_buf(), 7).unwrap();
     let command = ControlledCommand::from_validated_peer(
-        CommandKind::Job,
+        kind,
         PathBuf::from("/bin/sh"),
         vec![OsString::from("-c"), OsString::from(script)],
         root.to_path_buf(),
@@ -255,7 +260,7 @@ async fn observed_request_rejects_missing_fresh_use_at_spawn() {
     )
     .unwrap();
     let command = ControlledCommand::from_validated_peer(
-        CommandKind::Provider,
+        CommandKind::Job,
         PathBuf::from("/bin/true"),
         Vec::new(),
         PathBuf::from("/private/tmp"),
@@ -289,9 +294,7 @@ async fn observed_request_rejects_missing_fresh_use_at_spawn() {
             Path::new("/usr/bin/codex"),
             1
         ),
-        Err(execution::ProcessError::Request(
-            execution::RequestError::MissingActiveBindingUse
-        ))
+        Err(execution::ProcessError::NeverStarted {cause,..}) if matches!(*cause,execution::ProcessError::Request(execution::RequestError::MissingActiveBindingUse))
     ));
 }
 
@@ -634,10 +637,7 @@ fn queued_provider_ticket_promotes_once_with_its_matching_lease() {
         registry.take_spawn_lease(view),
         Err(execution::ProviderLeaseError::SpawnUnavailable)
     ));
-    assert!(matches!(
-        registry.promote(&mut admission, promotion, &authority),
-        Err(execution::ProviderLeaseError::InvalidPromotion)
-    ));
+    // The consumed promotion cannot be reused; the compile-fail contract covers that ownership boundary.
     assert!(matches!(
         registry.release(view),
         Ok(execution::BackendRelease::ReapOwned(_))
@@ -825,7 +825,11 @@ async fn cancellation_reports_reap_without_claiming_descendants() {
 #[tokio::test]
 async fn protocol_stdout_has_one_owner_and_borrowed_endpoints_cannot_be_killed() {
     let root = worktree();
-    let request = request(&root, "printf protocol; printf diagnostic >&2");
+    let request = request_kind(
+        &root,
+        "printf protocol; printf diagnostic >&2",
+        CommandKind::Provider,
+    );
     let mut admission = AdmissionController::new(AdmissionLimits {
         total_running: 1,
         per_owner_running: 1,
