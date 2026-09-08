@@ -91,9 +91,14 @@ contains the canonical `WorktreeRef` including incarnation. A shared profile
 uses that worktree identity as an isolated view key and never shares mutable
 document buffers across views.
 
-`rust-analyzer` is exclusive in v0.1. A shared `gopls` profile is unavailable
-until its real divergent-worktree acceptance succeeds; a provider that cannot
-detach one stopped view while keeping a peer correct remains exclusive.
+`rust-analyzer` is exclusive in v0.1. The shared `gopls` profile starts one
+controlled `gopls serve -listen=unix;<owned socket>` listener per compatibility
+key. Each `WorktreeRef` incarnation receives an independently piped explicit
+`gopls -remote=unix;<owned socket>` forwarder, initialize root/workspace folder,
+document state, request IDs, source sequence and logical lease. `-remote=auto`
+is never used. The worktree is therefore an isolated view key, not a second
+heavy daemon. If divergent-worktree isolation or detach-with-peer-survival is
+not proved, the profile reports unsupported/exclusive rather than shared.
 
 Reusable native-cache identity excludes actor, session, binding, context and
 authority IDs. It includes compatible provider/profile/configuration/toolchain
@@ -111,7 +116,8 @@ unavailable with a reason, never an empty valid analysis.
    cleanup handoff.
 2. Prove a real shared `gopls` profile with two divergent worktrees containing
    duplicate module/symbol names and different configuration; stop one view and
-   confirm the peer remains semantically usable and isolated.
+   confirm the peer remains semantically usable and isolated. This acceptance
+   also reports one listener and its separately counted per-view forwarders.
 3. Prove the exclusive real `rust-analyzer` profile: no cross-worktree reuse;
    a second demand is separately admitted, queued or refused.
 4. Prove source-sequence freshness, provisional diagnostics, same-worktree

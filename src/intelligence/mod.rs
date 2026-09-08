@@ -4,3 +4,6 @@
 // The contract intentionally delays wiring this internal boundary into semantic views.
 #[allow(dead_code)]
 pub(crate) mod wire;
+
+/// Provides the bounded shared `gopls` listener and isolated logical-view profile.
+pub mod gopls;
