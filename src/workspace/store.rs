@@ -13,10 +13,7 @@ use crate::app::store::{
     Store as ApplicationStore, StoreError, StoreOutcome, TrustedUpSql,
 };
 use rusqlite::{OptionalExtension, params};
-use std::{
-    os::unix::ffi::OsStrExt,
-    path::{Path, PathBuf},
-};
+use std::{os::unix::ffi::OsStrExt, path::PathBuf};
 
 /// Stable Application migration namespace owned by Workspace.
 const DOMAIN: &str = "workspace";
@@ -58,6 +55,7 @@ pub struct ObservationDraft {
 
 impl ObservationDraft {
     /// Builds a present observation draft from bounded source bytes.
+    #[allow(clippy::too_many_arguments)]
     pub fn present(
         worktree: WorktreeRef,
         authority_epoch: u64,
@@ -103,6 +101,7 @@ impl ObservationDraft {
         )
     }
     /// Enforces the input invariants independent of durable sequence allocation.
+    #[allow(clippy::too_many_arguments)]
     fn build(
         worktree: WorktreeRef,
         authority_epoch: u64,
@@ -150,6 +149,7 @@ impl ObservationDraft {
 
 /// Reports durable insertion, idempotent prior insertion, or unresolved commit ambiguity.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ObservationAdmission {
     /// A new row committed atomically with its application receipt.
     Recorded(SourceObservation),
@@ -193,6 +193,7 @@ pub struct RegisteredPathRequest {
 
 impl RegisteredPathRequest {
     /// Validates one exact registered path request.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         worktree: WorktreeRef,
         authority_epoch: u64,
@@ -246,6 +247,7 @@ impl RegisteredPathRequest {
 
 /// Reports bounded reconciliation without a filesystem watcher or worktree-lifecycle claim.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ReconciliationAdmission {
     /// A committed observation produced an optional later didOpen/didChange/didClose fact.
     Fact(Option<SourceChange>),
@@ -257,6 +259,7 @@ pub enum ReconciliationAdmission {
 
 /// Reports whether two explicit registered-path observations form a caller-proven rename.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum RenameReconciliation {
     /// The caller proved old/new native identity continuity, so Workspace emits one explicit rename fact.
     Rename(SourceChange),
@@ -341,7 +344,10 @@ impl<'a> WorkspaceStore<'a> {
             Ok(sequence) => Ok(ObservationAdmission::Recorded(draft.observed(
                 u64::try_from(sequence).map_err(|_| WorkspaceStoreError::SequenceExhausted)?,
             )?)),
-            Err(StoreError::DuplicateOperation { .. }) => Ok(ObservationAdmission::AlreadyRecorded),
+            Err(StoreError::DuplicateOperation {
+                existing: StoreOutcome::Committed,
+            }) => Ok(ObservationAdmission::AlreadyRecorded),
+            Err(StoreError::DuplicateOperation { .. }) => Ok(ObservationAdmission::OutcomeUnknown),
             Err(StoreError::OutcomeUnknown { operation }) => {
                 match self.application.outcome(operation).await? {
                     StoreOutcome::Committed => Ok(ObservationAdmission::AlreadyRecorded),
@@ -461,7 +467,7 @@ impl Row {
         worktree: WorktreeRef,
         path: PathBuf,
     ) -> Result<SourceObservation, WorkspaceStoreError> {
-        let state = ObservedState::from_str(&self.state);
+        let state = ObservedState::from_str(&self.state)?;
         let bytes = match (self.digest, self.length) {
             (Some(digest), Some(length)) if matches!(state, ObservedState::Present) => {
                 Some(SourceBytes::from_persisted(digest, length)?)

@@ -261,13 +261,15 @@ async fn workspace_source_observations_are_durable_bounded_and_honest() {
         Err(ObservationError::TooLarge)
     );
     let raw = PathBuf::from(OsString::from_vec(b"non-utf8-\xFF".to_vec()));
-    fs::write(root.join(&raw), b"x").unwrap();
-    assert_eq!(
-        read_authorized_source(&tree, &raw, limits)
-            .unwrap()
-            .contents(),
-        b"x"
-    );
+    // APFS rejects this spelling, while common Unix filesystems preserve the raw byte.
+    if fs::write(root.join(&raw), b"x").is_ok() {
+        assert_eq!(
+            read_authorized_source(&tree, &raw, limits)
+                .unwrap()
+                .contents(),
+            b"x"
+        );
+    }
     let outside = temporary("outside");
     fs::write(&outside, b"x").unwrap();
     std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();

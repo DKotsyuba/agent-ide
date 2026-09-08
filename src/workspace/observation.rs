@@ -4,7 +4,10 @@ use std::{
     ffi::OsStr,
     fs::File,
     io::{self, Read},
-    os::{fd::FromRawFd, unix::ffi::OsStrExt},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::ffi::OsStrExt,
+    },
     path::{Component, Path, PathBuf},
 };
 
@@ -43,7 +46,7 @@ impl SourceCoverage {
     }
 
     /// Decodes a persisted Workspace coverage value without treating corruption as complete.
-    pub(crate) const fn from_str(value: &str) -> Self {
+    pub(crate) fn from_str(value: &str) -> Self {
         match value {
             "complete" => Self::Complete,
             "partial" => Self::Partial,
@@ -70,11 +73,12 @@ impl ObservedState {
         }
     }
 
-    /// Decodes a persisted Workspace state value without turning corrupt data into presence.
-    pub(crate) const fn from_str(value: &str) -> Self {
+    /// Decodes a persisted Workspace state value without treating corruption as a missing path.
+    pub(crate) fn from_str(value: &str) -> Result<Self, ObservationError> {
         match value {
-            "present" => Self::Present,
-            _ => Self::Missing,
+            "present" => Ok(Self::Present),
+            "missing" => Ok(Self::Missing),
+            _ => Err(ObservationError::CorruptPersistence),
         }
     }
 }
@@ -182,6 +186,7 @@ pub struct SourceObservation {
 
 impl SourceObservation {
     /// Builds an observation after persistence allocated `sequence` for a validated relative path.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         worktree: WorktreeRef,
         authority_epoch: u64,
@@ -381,24 +386,26 @@ pub fn read_authorized_source(
     if !valid_relative_path(path) || path.as_os_str().as_bytes().len() > limits.max_path_bytes {
         return Err(ObservationError::InvalidPath);
     }
-    let root = open_directory(libc::AT_FDCWD, worktree.worktree_path().as_os_str())?;
-    let mut directory = root;
+    // SAFETY: each successful `open` result becomes a File, which owns and closes its descriptor.
+    let mut directory = unsafe {
+        File::from_raw_fd(open_directory(
+            libc::AT_FDCWD,
+            worktree.worktree_path().as_os_str(),
+        )?)
+    };
     let components: Vec<&OsStr> = path
         .components()
         .map(|component| component.as_os_str())
         .collect();
     for component in &components[..components.len() - 1] {
-        let next = open_directory(directory, component)?;
-        // SAFETY: `directory` was returned by `open`/`openat` and is replaced exactly once here.
-        unsafe { libc::close(directory) };
+        // SAFETY: `next` is a new owned descriptor; assigning drops the prior directory afterwards.
+        let next = unsafe { File::from_raw_fd(open_directory(directory.as_raw_fd(), component)?) };
         directory = next;
     }
     let file = open_file(
-        directory,
+        directory.as_raw_fd(),
         components.last().expect("validated path has a component"),
     )?;
-    // SAFETY: `directory` was returned by `open`/`openat` and is no longer needed.
-    unsafe { libc::close(directory) };
     // SAFETY: `file` is an owned successful open descriptor and File takes sole ownership.
     let mut file = unsafe { File::from_raw_fd(file) };
     let metadata = file.metadata().map_err(classify_io)?;
