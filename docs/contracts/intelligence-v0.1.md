@@ -1,6 +1,6 @@
 # Intelligence v0.1 contract
 
-Revision: v0.1-r0 (proposed; direct consumer acceptance pending). Provider:
+Revision: v0.1-r1 (production session API; direct consumer acceptance pending). Provider:
 Intelligence. Direct providers: Workspace supplies current authority, worktree
 identity and source observations; Execution supplies admitted owned protocol
 children; Application supplies effective provider settings and owned cache
@@ -78,9 +78,76 @@ the requested URI; scope-less settings must be globally compatible or fail.
 Noninteractive prompts have no affirmative default. Unknown server commands
 remain inert observations.
 
-The existing real `async-lsp`/`gopls` probe proves only one owned stdio
-initialize/open/hover/definition/shutdown/reap exchange. It is not proof of the
-limits, cancellation, callback or EOF rules above.
+`intelligence_context_contract` runs the production session on an Execution-owned
+real gopls child. It proves capability negotiation, exact Workspace-byte open/change,
+definition/references, missing-path close/reopen, provisional pushed diagnostics,
+shutdown and reap. The focused session tests exercise malformed framing, UTF position
+conversion, callback refusal, request timeout/cancellation and EOF.
+
+## Production context API
+
+`intelligence::session::with_session` borrows independently owned protocol stdout
+and stdin, one admitted `WorktreeRef` and authority epoch, a `ViewGeneration`, and
+finite deadlines. It drives `async-lsp` while the caller's asynchronous operation
+owns one `Session`. It never starts a process or consumes the caller's reap lease.
+`Session::shutdown` performs the explicit shutdown/exit handshake before the operation
+returns. Every exit drops the protocol driver; the Execution owner must then close
+and reap its child. Cancellation of the enclosing future is the revocation boundary.
+The caller must check its live authority and cancel on its exact revocation event.
+
+`Session::capabilities` returns the actual initialize report, optional server identity,
+and negotiated UTF-8/16/32 positions; an omitted encoding means UTF-16. It does not
+assert index readiness. This default-settings adapter is accepted against gopls;
+the separately accepted Rust profile still uses its existing exclusive client path
+and profile-specific initialization/settings/barrier. The generic pipe adapter is
+not acceptance of a replacement Rust profile configuration.
+
+`Session::context(observation, bytes, ContextQuery::File | Symbol { byte_offset })`
+checks the exact Workspace worktree, epoch, source sequence, size and digest. It
+does not read disk. UTF-8 byte offsets are validated and converted to the negotiated
+encoding; raw Unix paths are converted directly to percent-encoded file URIs.
+Only one document is open at a time. A changed observation sends full `didChange`;
+a file switch sends close/open; an explicit missing-path observation accepts empty
+bytes and closes the current document. Versions remain monotonic across reopening.
+The source byte ceiling is Workspace's 1 MiB limit.
+
+For symbol queries, advertised definition/reference methods return typed locations.
+`None` means unsupported/unavailable; an empty vector means a completed empty reply.
+On unavailable synchronization, unsupported methods or failed requests, the result
+explicitly reports lexical provenance and no semantic locations. The standalone
+`intelligence::context::lexical_context` provides the same fallback even when a
+provider cannot initialize. It scans only the exact supplied observation and labels
+matches as lexical, never as project-wide references. Results retain at most 64 KiB
+of source text and 128 locations per collection, with explicit truncation. Source
+binding and generation/version facts accompany results; callers must compare these
+snapshots with their latest Workspace/provider observations before reuse.
+
+The driver validates a 4 KiB header and an 8 MiB JSON body before deserialization.
+Retained fragmented input is capped at body + header + one 8 KiB read chunk.
+The exclusive mutable session permits one outgoing request at a time. async-lsp
+owns IDs and response correlation. A timed-out or caller-cancelled request retires
+the entire driver generation, disposing its pending mappings and late replies;
+it does not claim protocol-level per-request cancellation or reuse that connection.
+Per-request timeouts are positive and at most 60 seconds; total session lifetime is
+positive and at most five minutes. The default is 30 seconds and two minutes.
+
+Callbacks reject source edits, decline interactive choices, acknowledge progress,
+and reject unknown requests through async-lsp's default handler. Configuration
+replies contain only globally compatible null/default settings, with exact response
+cardinality and a 128-item request ceiling; dynamic configuration is not advertised.
+Unknown notifications remain inert and unretained.
+
+`Session::diagnostics` returns a bounded push observation tied to this generation.
+Wrong URIs and stale document versions are discarded. Matching versioned pushes are
+provisional; unversioned pushes carry no source binding and remain provisional.
+Source changes, close and invalidation clear diagnostic evidence. No pull/barrier is
+implemented by this adapter, so readiness remains `Unknown`, including empty pushes.
+The pure freshness/cache lifecycle remains available for future verified pull results.
+
+Assistance still needs to route the public `ide.context` facade to this API, retain
+view lifecycle ownership, provide live authority/revocation cancellation, and compare
+returned source/generation snapshots before presentation. This module does not
+implement public tool dispatch, checks, source writes, Scope or a context compiler.
 
 ## Profiles, isolation and caches
 
@@ -178,10 +245,10 @@ unavailable with a reason, never an empty valid analysis.
 Consumer acceptance freezes this revision and SHA-256 before code relies on it.
 Subsequent contract changes require bilateral revision acceptance.
 
-## T066 freshness lifecycle
+## Freshness lifecycle
 
-`intelligence::freshness` is a controlled substitute for real provider integration pending the
-acceptance queue. It binds every provider document result to the Workspace observation's
+`intelligence::freshness` supplies reusable source bindings and lifecycle fencing alongside
+the production session. It binds provider document result facts to the Workspace observation's
 worktree incarnation, authority epoch, source sequence, reference, revision, byte digest and
 coverage, plus backend, configuration, toolchain and view generations. Any mismatch is stale;
 partial or unknown coverage is unknown; pushed diagnostics are provisional. An absent diagnostic
