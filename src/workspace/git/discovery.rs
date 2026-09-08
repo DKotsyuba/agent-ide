@@ -48,7 +48,7 @@ impl DiscoveredWorktree {
 /// Checks exactly three correlated bounded successful discovery outputs and one candidate identity.
 /// Common-dir must be absolute from the fixed --path-format=absolute query; raw Unix bytes
 /// survive LF/NUL parsing. Other listed worktrees are parsed uniquely but never opened or scanned.
-/// Truncation, incomplete drain, unknown/failed exits, malformed/duplicate/foreign candidate output,
+/// Cancellation, truncation, incomplete drain, unknown/failed exits, malformed/duplicate/foreign output,
 /// symlinks, unsupported bare candidates and inconsistent Git administrative backpointers fail closed.
 /// Callers pass the returned paths to DurableWorkspace::resolve_worktree for final native revalidation.
 pub fn validate_discovery(
@@ -77,6 +77,7 @@ pub fn validate_discovery(
             return Err(GitError::UnsupportedDiscoveryGit);
         }
         if output.operation() != operation
+            || output.cancellation().is_some()
             || output.exit_status().code() != Some(0)
             || output.stdout().truncated
             || output.stderr().truncated

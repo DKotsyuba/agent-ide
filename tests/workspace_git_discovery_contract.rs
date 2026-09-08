@@ -4,8 +4,8 @@ mod support;
 
 use agent_ide::{
     execution::{
-        CapturedOutput, DescendantEvidence, DiscoveryOperationRef, GitDiscoveryEvidence,
-        GitDiscoveryQuery,
+        CancellationEvidence, CapturedOutput, DescendantEvidence, DiscoveryOperationRef,
+        GitDiscoveryEvidence, GitDiscoveryQuery,
     },
     workspace::git::{
         GitError,
@@ -40,6 +40,8 @@ struct DiscoveryFixture {
     exit_status: ExitStatus,
     /// Test capture interval.
     elapsed: Duration,
+    /// Explicit cancellation evidence, even when stdout is complete and exit status is successful.
+    cancellation: Option<CancellationEvidence>,
 }
 
 /// Converts fixture data through the immutable evidence boundary before exercising Workspace validation.
@@ -60,7 +62,7 @@ fn validate_discovery(
                 fixture.stderr.clone(),
                 fixture.exit_status,
                 fixture.elapsed,
-                None,
+                fixture.cancellation,
                 DescendantEvidence::Unverified,
             )
             .map_err(|_| GitError::InvalidDiscovery)
@@ -102,6 +104,7 @@ fn discovered(root: &Path) -> (DiscoveryOperationRef, Vec<DiscoveryFixture>) {
             stderr: captured(output.stderr),
             exit_status: output.status,
             elapsed: Duration::ZERO,
+            cancellation: None,
         });
     }
     (operation, outputs)
@@ -240,4 +243,26 @@ fn raw_peer_paths_are_not_opened_or_lossily_decoded() {
     let duplicate = outputs[2].stdout.bytes.clone();
     outputs[2].stdout.bytes.extend(duplicate);
     assert!(validate_discovery(&fixture.root, &operation, &outputs).is_err());
+}
+
+/// Cancellation of any discovery command forbids a candidate, so durable resolution cannot follow.
+#[test]
+fn cancelled_success_discovery_never_produces_a_candidate() {
+    let fixture = GitFixture::new();
+    let (operation, outputs) = discovered(&fixture.root);
+    assert!(validate_discovery(&fixture.root, &operation, &outputs).is_ok());
+    for index in 0..outputs.len() {
+        let mut cancelled = outputs.clone();
+        cancelled[index].cancellation = Some(CancellationEvidence {
+            term_requested: true,
+            kill_requested: false,
+        });
+        assert_eq!(cancelled[index].exit_status.code(), Some(0));
+        assert!(cancelled[index].stdout.complete && cancelled[index].stderr.complete);
+        assert_eq!(
+            validate_discovery(&fixture.root, &operation, &cancelled),
+            Err(GitError::InvalidDiscovery),
+            "cancelled query {index} must not supply a durable-resolution candidate"
+        );
+    }
 }
