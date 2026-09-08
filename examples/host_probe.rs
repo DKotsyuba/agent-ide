@@ -328,7 +328,9 @@ async fn mcp(
                 "client_capabilities": context.client_capabilities(),
             }));
             self.router
-                .call(rmcp::handler::server::tool::ToolCallContext::new(self, request, context))
+                .call(rmcp::handler::server::tool::ToolCallContext::new(
+                    self, request, context,
+                ))
                 .await
         }
     }
