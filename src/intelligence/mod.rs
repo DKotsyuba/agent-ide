@@ -1,5 +1,8 @@
 //! Internal LSP safety boundaries used before semantic-view APIs are exposed.
 
+/// Generation fencing, diagnostic readiness, and native-cache lifecycle facts for semantic views.
+pub mod freshness;
+
 /// Holds the non-product framing and callback primitives used by the later view adapter.
 // The contract intentionally delays wiring this internal boundary into semantic views.
 #[allow(dead_code)]

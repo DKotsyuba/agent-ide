@@ -132,3 +132,19 @@ unavailable with a reason, never an empty valid analysis.
 
 Consumer acceptance freezes this revision and SHA-256 before code relies on it.
 Subsequent contract changes require bilateral revision acceptance.
+
+## T066 freshness lifecycle
+
+`intelligence::freshness` is a controlled substitute for real provider integration pending the
+acceptance queue. It binds every provider document result to the Workspace observation's
+worktree incarnation, authority epoch, source sequence, reference, revision, byte digest and
+coverage, plus backend, configuration, toolchain and view generations. Any mismatch is stale;
+partial or unknown coverage is unknown; pushed diagnostics are provisional. An absent diagnostic
+pull is unknown, never clean. Diagnostic references have an explicit bounded delta log.
+
+Reusable native-cache identity contains provider, profile, configuration, toolchain, trust and
+provider-supported worktree state. It excludes actor, session, binding and authority identifiers.
+It may pass from coder to reviewer only after quiescence and exact identity compatibility. Stop,
+handoff and a missing source retain the namespace. Only the existing verified Workspace closure
+or reset facts retire it. Authority revocation is represented by logical view quiescence and does
+not signal or kill a peer backend.
