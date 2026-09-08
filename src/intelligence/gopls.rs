@@ -130,7 +130,7 @@ impl GoplsProfile {
             authority.root().to_path_buf(),
             environment,
         )
-        .map_err(|error| io::Error::other(error.to_string()))
+        .map_err(|_| io::Error::other("Execution rejected gopls command"))
     }
 }
 
