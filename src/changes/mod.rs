@@ -114,7 +114,11 @@ impl DiffHunk {
         self.index
     }
 
-    /// Returns the raw file path associated with this hunk when Workspace provided one.
+    /// Returns a path only when Workspace supplied an exact, unambiguous mapping.
+    ///
+    /// The v0.1 parser never derives paths from whitespace-delimited diff headers;
+    /// ambiguous headers therefore return `None`, while exact raw paths remain in
+    /// Workspace status records.
     pub fn path(&self) -> Option<&PathBuf> {
         self.path.as_ref()
     }
