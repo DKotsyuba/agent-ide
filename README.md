@@ -4,6 +4,8 @@ An explicitly activated coding companion for Codex and Claude Code, designed for
 
 Status: the private daemon/IPC/config/SQLite substrate is implemented; the v0.1 coding companion is not yet an installable product.
 
+`agent-ide doctor --runtime-dir PATH` is observational: it reports effective default configuration and local endpoint/lock/protocol state without creating the path or starting services. Workspace scanning, LSP startup, daemon autostart, and cache retirement without a peer-verified closure/reset fact are unsupported.
+
 - [Current delivery roadmap](docs/roadmap.md)
 
 Earlier design documents (subject to the current roadmap and interface renegotiation):

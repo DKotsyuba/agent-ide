@@ -1,5 +1,7 @@
 //! Private Unix daemon lifecycle with health and finite Assistance wire transport.
 
+/// Private cache directory mechanics with peer-supplied retirement facts.
+pub mod cache;
 /// Immutable restart-only limits and their provenance for Application infrastructure.
 pub mod config;
 /// Dedicated SQLite owner-thread mechanics and durable operation receipts for domain SQL.
@@ -43,6 +45,58 @@ pub enum DoctorStatus {
     Healthy { daemon_generation: String },
     /// No daemon could be reached without creating files or treating a stale endpoint as healthy.
     Unavailable,
+}
+
+/// Classifies the runtime directory without changing its contents or following untrusted paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoctorRuntimeState {
+    /// The runtime directory is absent.
+    Missing,
+    /// The runtime directory exists but is not a private directory owned by this user.
+    Unsafe,
+    /// The runtime directory is a valid private directory.
+    Private,
+}
+
+/// Classifies the endpoint pathname without connecting to or changing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoctorEndpointState {
+    /// The endpoint pathname does not exist.
+    Missing,
+    /// The endpoint pathname is a Unix socket.
+    Socket,
+    /// The endpoint pathname exists but is not a Unix socket.
+    Unexpected,
+    /// Metadata could not be inspected.
+    Unavailable,
+}
+
+/// Classifies whether an existing daemon lock is currently retained without creating a lock file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoctorLockState {
+    /// The lock pathname does not exist.
+    Missing,
+    /// A nonblocking exclusive probe found another process retaining the lock.
+    Held,
+    /// A nonblocking exclusive probe succeeded and released the lock immediately.
+    Unheld,
+    /// The lock could not be safely inspected.
+    Unavailable,
+}
+
+/// Records doctor observations and fixed protocol support without starting optional services.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorReport {
+    /// Health result from an existing daemon only.
+    pub status: DoctorStatus,
+    /// Runtime directory classification made without creating it.
+    pub runtime: DoctorRuntimeState,
+    /// Endpoint pathname classification made before the health exchange.
+    pub endpoint: DoctorEndpointState,
+    /// Existing lock classification made without creating a lock file.
+    pub lock: DoctorLockState,
+    /// Effective immutable Application configuration used by this binary.
+    pub config: config::EffectiveConfig,
 }
 
 /// Describes a local infrastructure failure without exposing host proof or domain state.
@@ -307,6 +361,81 @@ pub async fn doctor(runtime_dir: &Path) -> Result<DoctorStatus, AppError> {
     Ok(DoctorStatus::Healthy {
         daemon_generation: response.daemon_generation,
     })
+}
+
+/// Observes local startup compatibility without autostarting a daemon or opening peer services.
+pub async fn doctor_report(runtime_dir: &Path) -> Result<DoctorReport, AppError> {
+    let config = config::EffectiveConfig::defaults();
+    let (runtime, endpoint, lock) = inspect_runtime(runtime_dir);
+    let status = doctor(runtime_dir).await?;
+    Ok(DoctorReport {
+        status,
+        runtime,
+        endpoint,
+        lock,
+        config,
+    })
+}
+
+/// Classifies only existing runtime paths; every missing or unsafe path remains non-mutating.
+fn inspect_runtime(
+    runtime_dir: &Path,
+) -> (DoctorRuntimeState, DoctorEndpointState, DoctorLockState) {
+    let metadata = match fs::symlink_metadata(runtime_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return (
+                DoctorRuntimeState::Missing,
+                DoctorEndpointState::Missing,
+                DoctorLockState::Missing,
+            );
+        }
+        Err(_) => {
+            return (
+                DoctorRuntimeState::Unsafe,
+                DoctorEndpointState::Unavailable,
+                DoctorLockState::Unavailable,
+            );
+        }
+    };
+    if validate_private_directory(runtime_dir, &metadata).is_err() {
+        return (
+            DoctorRuntimeState::Unsafe,
+            DoctorEndpointState::Unavailable,
+            DoctorLockState::Unavailable,
+        );
+    }
+    (
+        DoctorRuntimeState::Private,
+        inspect_endpoint(&runtime_dir.join(SOCKET_NAME)),
+        inspect_lock(&runtime_dir.join(LOCK_NAME)),
+    )
+}
+
+/// Classifies one endpoint pathname without opening a connection or altering filesystem state.
+fn inspect_endpoint(path: &Path) -> DoctorEndpointState {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => DoctorEndpointState::Socket,
+        Ok(_) => DoctorEndpointState::Unexpected,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => DoctorEndpointState::Missing,
+        Err(_) => DoctorEndpointState::Unavailable,
+    }
+}
+
+/// Probes an existing lock without creating it and immediately releases any successful probe.
+fn inspect_lock(path: &Path) -> DoctorLockState {
+    let file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return DoctorLockState::Missing,
+        Err(_) => return DoctorLockState::Unavailable,
+    };
+    match unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } {
+        0 => DoctorLockState::Unheld,
+        _ if io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock => {
+            DoctorLockState::Held
+        }
+        _ => DoctorLockState::Unavailable,
+    }
 }
 
 /// Validates one accepted peer and routes either unchanged health or one finite Assistance request.

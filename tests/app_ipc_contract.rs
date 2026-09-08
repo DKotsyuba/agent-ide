@@ -172,6 +172,21 @@ async fn health_is_correlated_and_endpoint_is_private() {
             & 0o077,
         0
     );
+    let doctor = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+        .args(["doctor", "--runtime-dir"])
+        .arg(&runtime_dir)
+        .output()
+        .await
+        .unwrap();
+    assert!(doctor.status.success());
+    let report = String::from_utf8(doctor.stdout).unwrap();
+    assert!(report.contains("status=healthy:"));
+    assert!(report.contains("runtime=Private"));
+    assert!(report.contains("endpoint=Socket"));
+    assert!(report.contains("lock=Held"));
+    assert!(
+        report.contains("protocol.assistance_transport=v2-unavailable-without-peer-dispatcher")
+    );
     stop_daemon(child, runtime_dir).await;
 }
 
@@ -243,10 +258,16 @@ async fn doctor_does_not_autostart_or_create_runtime_directory() {
         .await
         .unwrap();
     assert!(!output.status.success());
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap().trim(),
-        "unavailable"
-    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("status=unavailable"));
+    assert!(stdout.contains("runtime=Missing"));
+    assert!(stdout.contains("endpoint=Missing"));
+    assert!(stdout.contains("lock=Missing"));
+    assert!(stdout.contains("config.generation=1"));
+    assert!(stdout.contains("protocol.health=v1"));
+    assert!(stdout.contains("control.daemon_autostart=unsupported"));
+    assert!(stdout.contains("control.workspace_scan=unsupported"));
+    assert!(stdout.contains("control.lsp_open=unsupported"));
     assert!(!runtime_dir.exists());
 }
 
