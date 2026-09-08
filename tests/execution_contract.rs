@@ -70,13 +70,8 @@ fn request(root: &Path, script: &str) -> ValidatedExecutionRequest {
     ])
     .unwrap();
     let invocation = ValidatedHostInvocation::from_verified_binding("bound-test", sandbox).unwrap();
-    let authority = WorkspaceAuthority::from_workspace(
-        "test-worktree",
-        "test-incarnation",
-        root.to_path_buf(),
-        7,
-    )
-    .unwrap();
+    let authority =
+        WorkspaceAuthority::from_workspace("test-worktree", "1", root.to_path_buf(), 7).unwrap();
     let command = ControlledCommand::from_validated_peer(
         CommandKind::Job,
         PathBuf::from("/bin/sh"),
@@ -823,8 +818,7 @@ async fn protocol_stdout_has_one_owner_and_borrowed_endpoints_cannot_be_killed()
         interactive_burst: 1,
     })
     .unwrap();
-    let authority =
-        WorkspaceAuthority::from_workspace("protocol-worktree", "1", root.clone(), 1).unwrap();
+    let authority = request.authority().clone();
     let mut registry = ProviderLeaseRegistry::new(lease_limits(1, 1)).unwrap();
     let view = match registry.request(
         &mut admission,

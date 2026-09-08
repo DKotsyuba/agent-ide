@@ -106,6 +106,24 @@ documented terminal `remote disconnected` exit after the daemon closes that
 session; it is accepted only with exact captured evidence and a still-live peer
 semantic check.
 
+The listener consumes a registry-issued, one-time `ProviderSpawnLease` bound to
+the full admitted Workspace authority. Each forwarder consumes a distinct
+central process slot through a non-cloneable `ProviderForwarderSpawnLease`,
+bound once to its registry view and authority. The registry counts one shared
+backend and two logical views; two live forwarders add two separately counted
+process slots, giving three centrally admitted processes. Repeated capability
+issuance, slot reuse, and identity/incarnation/root/authority-epoch substitution
+are rejected before spawning. Gopls view keys use Workspace's canonical
+`WorktreeRef` rather than independently supplied names.
+
+`observe_source` advances an exact logical view lease monotonically without
+resetting its request IDs. A reply's worktree, lease and source sequence must
+still match `result_is_current`; older sequences and released views are stale.
+Reap precedes logical view release and each forwarder's separate slot release.
+After the final forwarder detaches, the listener is reaped before final registry
+release returns its sole backend slot; its returned lease is evidence, not a
+second release instruction.
+
 The Rust profile revision is `1`. Its compatibility identity includes the
 absolute `rust-analyzer` binary and observed version, observed Cargo and rustc
 versions, the explicit rustup toolchain selector, configuration, trust, stdio

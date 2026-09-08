@@ -10,8 +10,10 @@ use std::{
 
 use crate::execution::{
     AdmissionLease, CommandKind, ControlledCommand, OwnedChild, OwnedProtocolChild, ProcessError,
-    ValidatedExecutionRequest, WorkspaceAuthority,
+    ProviderForwarderSpawnLease, ProviderSpawnLease, ProviderViewLease, ValidatedExecutionRequest,
+    WorkspaceAuthority,
 };
+pub use crate::workspace::authority::WorktreeRef;
 
 /// Describes the immutable compatibility inputs for one shared `gopls` daemon.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -158,28 +160,6 @@ impl GoplsProfile {
     }
 }
 
-/// Identifies one Workspace worktree incarnation without making it a daemon compatibility input.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct WorktreeRef {
-    /// Opaque Workspace worktree identity.
-    pub id: String,
-    /// Workspace incarnation that distinguishes a recreated worktree.
-    pub incarnation: String,
-}
-
-impl WorktreeRef {
-    /// Creates a nonempty isolated view key for a current Workspace worktree incarnation.
-    pub fn new(id: String, incarnation: String) -> io::Result<Self> {
-        if id.is_empty() || incarnation.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "worktree id and incarnation are required",
-            ));
-        }
-        Ok(Self { id, incarnation })
-    }
-}
-
 /// Records the per-view state that must never be shared with a peer worktree.
 #[derive(Debug)]
 struct ViewState {
@@ -188,7 +168,7 @@ struct ViewState {
     /// Latest source sequence that may satisfy this view's freshness checks.
     source_sequence: u64,
     /// Opaque lease identity for release accounting.
-    lease: u64,
+    lease: ProviderViewLease,
 }
 
 /// Owns one compatible heavy listener and tracks its independent logical views.
@@ -196,21 +176,27 @@ pub struct SharedGopls {
     listener: OwnedChild,
     compatibility_key: String,
     views: BTreeMap<WorktreeRef, ViewState>,
-    next_lease: u64,
     forwarders_started: usize,
 }
 
 impl SharedGopls {
-    /// Starts exactly one Execution-owned Unix listener for this compatible profile.
+    /// Consumes the registry's one-time backend grant to start this profile's sole owned listener.
+    /// A different compatibility key or request authority is rejected before any process effect.
     pub fn start(
         profile: &GoplsProfile,
         listener_request: &ValidatedExecutionRequest,
-        listener_lease: AdmissionLease,
+        listener_lease: ProviderSpawnLease,
         codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
+        if listener_lease.backend() != profile.compatibility_key() {
+            return Err(ProcessError::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "listener profile does not match its admitted backend",
+            )));
+        }
         Ok(Self {
-            listener: OwnedChild::spawn_captured(
+            listener: OwnedChild::spawn_from_provider_lease(
                 listener_request,
                 listener_lease,
                 None,
@@ -219,7 +205,6 @@ impl SharedGopls {
             )?,
             compatibility_key: profile.compatibility_key(),
             views: BTreeMap::new(),
-            next_lease: 1,
             forwarders_started: 0,
         })
     }
@@ -231,35 +216,48 @@ impl SharedGopls {
 
     /// Opens one separately piped forwarder and records independent request, source and lease state.
     ///
-    /// A duplicate worktree incarnation or an exhausted lease counter is rejected before spawning.
+    /// Requires the exact canonical worktree identity, incarnation and root in the validated
+    /// request, and the registry capability's authority epoch and compatible backend. Mismatch
+    /// or duplicate worktree is rejected before spawning; the caller retains release accounting
+    /// for the consumed capability's reserved slot on failure.
     pub fn open_view(
         &mut self,
         worktree: WorktreeRef,
         source_sequence: u64,
         forwarder_request: &ValidatedExecutionRequest,
-        forwarder_lease: AdmissionLease,
+        forwarder_lease: ProviderForwarderSpawnLease,
         codex_executable: &Path,
         output_cap: usize,
     ) -> Result<GoplsView, io::Error> {
+        let authority = forwarder_request.authority();
+        if worktree.id() != authority.worktree_id()
+            || worktree.incarnation().to_string() != authority.incarnation()
+            || worktree.worktree_path() != authority.root()
+            || forwarder_lease.backend() != self.compatibility_key
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "forwarder worktree or backend does not match its authority",
+            ));
+        }
         if self.views.contains_key(&worktree) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "worktree view is active",
             ));
         }
-        let lease = self.next_lease;
-        self.next_lease = self
-            .next_lease
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("view lease identifiers exhausted"))?;
-        let child = OwnedProtocolChild::spawn(
+        let lease = forwarder_lease.view();
+        let child = OwnedProtocolChild::spawn_from_forwarder_lease(
             forwarder_request,
             forwarder_lease,
             None,
             codex_executable,
             output_cap,
         )
-        .map_err(|_| io::Error::other("Execution rejected gopls forwarder"))?;
+        .map_err(|error| match error {
+            ProcessError::Io(error) => error,
+            other => io::Error::other(format!("Execution rejected gopls forwarder: {other:?}")),
+        })?;
         self.views.insert(
             worktree.clone(),
             ViewState {
@@ -300,8 +298,48 @@ impl SharedGopls {
         Ok(request)
     }
 
+    /// Advances this exact view generation to a newer source observation without resetting IDs.
+    /// Equal sequences are idempotent; regressing sequences, stale leases and inactive views fail.
+    /// Replies tagged with the previous sequence subsequently fail `result_is_current`.
+    pub fn observe_source(
+        &mut self,
+        worktree: &WorktreeRef,
+        lease: ProviderViewLease,
+        source_sequence: u64,
+    ) -> io::Result<()> {
+        let state = self
+            .views
+            .get_mut(worktree)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "worktree view is inactive"))?;
+        if state.lease != lease || source_sequence < state.source_sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "view generation or source sequence is stale",
+            ));
+        }
+        state.source_sequence = source_sequence;
+        Ok(())
+    }
+
+    /// Accepts a reply only while its exact worktree, logical generation and source sequence are live.
+    /// Released or superseded views return false, including a reopened view at the same worktree.
+    pub fn result_is_current(
+        &self,
+        worktree: &WorktreeRef,
+        lease: ProviderViewLease,
+        source_sequence: u64,
+    ) -> bool {
+        self.views
+            .get(worktree)
+            .is_some_and(|state| state.lease == lease && state.source_sequence == source_sequence)
+    }
+
     /// Releases one view after its protocol child has been shut down and reaped by Execution.
-    pub fn release_view(&mut self, worktree: &WorktreeRef, lease: u64) -> io::Result<()> {
+    pub fn release_view(
+        &mut self,
+        worktree: &WorktreeRef,
+        lease: ProviderViewLease,
+    ) -> io::Result<()> {
         let state = self
             .views
             .get(worktree)
@@ -323,7 +361,8 @@ impl SharedGopls {
 
     /// Cancels and reaps the owned heavy listener through Execution after all views are released.
     ///
-    /// The returned admission lease is released by the same centralized controller that granted it.
+    /// After reap, final registry-view release returns this listener admission to the controller.
+    /// The returned lease is evidence only and must not be independently released a second time.
     pub async fn stop(
         self,
         grace: Duration,
@@ -344,7 +383,7 @@ impl SharedGopls {
 /// Owns one view's exclusive forwarder pipes until the caller completes LSP shutdown and reaping.
 pub struct GoplsView {
     worktree: WorktreeRef,
-    lease: u64,
+    lease: ProviderViewLease,
     /// The distinct Execution-owned protocol process and its sole stdin/stdout owners.
     pub child: OwnedProtocolChild,
 }
@@ -356,7 +395,7 @@ impl GoplsView {
     }
 
     /// Returns the opaque logical lease required to release this exact worktree incarnation.
-    pub const fn lease(&self) -> u64 {
+    pub const fn lease(&self) -> ProviderViewLease {
         self.lease
     }
 

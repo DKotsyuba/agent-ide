@@ -13,8 +13,9 @@ use agent_ide::{
     execution::{
         Admission, AdmissionClass, AdmissionController, AdmissionLease, AdmissionLimits,
         ExecutionProfileCatalog, ExecutionProfileTemplate, HostSandboxState, LocalExecutionPolicy,
-        OwnedChild, OwnedProtocolChild, OwnerId, ValidatedExecutionRequest,
-        ValidatedHostInvocation, WorkspaceAuthority,
+        OwnedChild, OwnedProtocolChild, OwnerId, ProviderBackendKind, ProviderLeaseAdmission,
+        ProviderLeaseError, ProviderLeaseLimits, ProviderLeaseRegistry, ProviderViewLease,
+        ValidatedExecutionRequest, ValidatedHostInvocation, WorkspaceAuthority,
     },
     intelligence::gopls::{GoplsProfile, SharedGopls, WorktreeRef},
 };
@@ -78,6 +79,39 @@ impl Drop for Fixture {
 fn authority(root: &Path, id: &str, incarnation: &str) -> WorkspaceAuthority {
     WorkspaceAuthority::from_workspace(id.to_owned(), incarnation.to_owned(), root.to_path_buf(), 1)
         .expect("fixture root is absolute")
+}
+
+/// Creates the canonical Workspace identity and matching authority for one fixture incarnation.
+fn worktree(root: &Path, incarnation: u64) -> (WorktreeRef, WorkspaceAuthority) {
+    let worktree = WorktreeRef::from_discovery(
+        root.to_path_buf(),
+        root.to_path_buf(),
+        PathBuf::from(".git"),
+        incarnation,
+    )
+    .unwrap();
+    let authority = authority(root, worktree.id(), &incarnation.to_string());
+    (worktree, authority)
+}
+
+/// Admits one compatible registry view, reserving a heavy slot only for the first attachment.
+fn provider_view(
+    registry: &mut ProviderLeaseRegistry,
+    admission: &mut AdmissionController,
+    profile: &GoplsProfile,
+    authority: &WorkspaceAuthority,
+) -> ProviderViewLease {
+    match registry.request(
+        admission,
+        OwnerId::new("listener").unwrap(),
+        AdmissionClass::Interactive,
+        profile.compatibility_key(),
+        ProviderBackendKind::OwnedShared,
+        authority,
+    ) {
+        ProviderLeaseAdmission::Granted(view) => view,
+        outcome => panic!("expected compatible provider view: {outcome:?}"),
+    }
 }
 
 /// Constructs disabled-host Execution evidence for an already profile-declared provider command.
@@ -338,6 +372,157 @@ fn forwarded_session_count(evidence: &str) -> io::Result<usize> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "gopls reported no session"))
 }
 
+/// Rejects identity, incarnation, root and epoch substitution before either owned spawn path.
+/// `/usr/bin/true` supplies harmless owned children only for the valid lifecycle endpoints.
+#[tokio::test]
+async fn gopls_spawns_require_exact_registry_authority() {
+    let root = env::temp_dir();
+    let (worktree, current) = worktree(&root, 1);
+    let profile = GoplsProfile::new(
+        PathBuf::from("/usr/bin/true"),
+        "test".into(),
+        "v0.1".into(),
+        "test".into(),
+        "/usr/bin/true".into(),
+        "test".into(),
+        "test".into(),
+    )
+    .unwrap();
+    let socket = root.join("unused-authority-contract.sock");
+    let mut admission = AdmissionController::new(AdmissionLimits {
+        total_running: 3,
+        per_owner_running: 1,
+        per_owner_queued: 1,
+        total_queued: 1,
+        interactive_burst: 1,
+    })
+    .unwrap();
+    let mut registry = ProviderLeaseRegistry::new(ProviderLeaseLimits {
+        total_views: 2,
+        per_backend_views: 2,
+    })
+    .unwrap();
+    let mismatches = [
+        WorkspaceAuthority::from_workspace("other-id", "1", root.clone(), 1).unwrap(),
+        WorkspaceAuthority::from_workspace(current.worktree_id(), "2", root.clone(), 1).unwrap(),
+        WorkspaceAuthority::from_workspace(current.worktree_id(), "1", root.join("other-root"), 1)
+            .unwrap(),
+        WorkspaceAuthority::from_workspace(current.worktree_id(), "1", root.clone(), 2).unwrap(),
+    ];
+    for mismatch in &mismatches {
+        let view = provider_view(&mut registry, &mut admission, &profile, &current);
+        let wrong = request(
+            mismatch.clone(),
+            profile.listener_command(mismatch, &socket).unwrap(),
+            Path::new("/usr/bin/true"),
+        );
+        let error = SharedGopls::start(
+            &profile,
+            &wrong,
+            registry.take_spawn_lease(view).unwrap(),
+            Path::new("/unused"),
+            64,
+        )
+        .err()
+        .expect("listener authority mismatch must fail");
+        assert!(
+            matches!(error, agent_ide::execution::ProcessError::Io(error) if error.kind() == io::ErrorKind::PermissionDenied)
+        );
+        assert!(matches!(
+            registry.take_spawn_lease(view),
+            Err(ProviderLeaseError::SpawnUnavailable)
+        ));
+        registry.release(&mut admission, view).unwrap();
+        assert_eq!(admission.running_count(), 0);
+    }
+    let listener_view = provider_view(&mut registry, &mut admission, &profile, &current);
+    let listener_request = request(
+        current.clone(),
+        profile.listener_command(&current, &socket).unwrap(),
+        Path::new("/usr/bin/true"),
+    );
+    let mut shared = SharedGopls::start(
+        &profile,
+        &listener_request,
+        registry.take_spawn_lease(listener_view).unwrap(),
+        Path::new("/unused"),
+        64,
+    )
+    .unwrap();
+    let forwarder_request = request(
+        current.clone(),
+        profile.forwarder_command(&current, &socket).unwrap(),
+        Path::new("/usr/bin/true"),
+    );
+    for mismatch in &mismatches {
+        let view = provider_view(&mut registry, &mut admission, &profile, &current);
+        let process = lease(&mut admission, "forwarder");
+        let wrong = request(
+            mismatch.clone(),
+            profile.forwarder_command(mismatch, &socket).unwrap(),
+            Path::new("/usr/bin/true"),
+        );
+        assert!(matches!(
+            registry.take_forwarder_spawn_lease(&mut admission, view, &wrong, process),
+            Err(ProviderLeaseError::InvalidAuthority)
+        ));
+        assert_eq!(registry.forwarder_count(), 0);
+        let capability = registry
+            .take_forwarder_spawn_lease(&mut admission, view, &forwarder_request, process)
+            .unwrap();
+        let mut other_registry = ProviderLeaseRegistry::new(ProviderLeaseLimits {
+            total_views: 1,
+            per_backend_views: 1,
+        })
+        .unwrap();
+        let other_view = match other_registry.request(
+            &mut admission,
+            OwnerId::new("other-registry").unwrap(),
+            AdmissionClass::Interactive,
+            profile.compatibility_key(),
+            ProviderBackendKind::OwnedShared,
+            &current,
+        ) {
+            ProviderLeaseAdmission::Granted(view) => view,
+            outcome => panic!("expected separate backend admission: {outcome:?}"),
+        };
+        assert!(matches!(
+            other_registry.take_forwarder_spawn_lease(
+                &mut admission,
+                other_view,
+                &forwarder_request,
+                process
+            ),
+            Err(ProviderLeaseError::SpawnUnavailable)
+        ));
+        other_registry.release(&mut admission, other_view).unwrap();
+        let error = shared
+            .open_view(
+                worktree.clone(),
+                1,
+                &wrong,
+                capability,
+                Path::new("/unused"),
+                64,
+            )
+            .err()
+            .expect("forwarder authority mismatch must fail");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(shared.process_counts(), (1, 0, 0));
+        registry.release(&mut admission, view).unwrap();
+        admission.release(process).unwrap();
+    }
+    let listener_process = shared
+        .stop(Duration::from_millis(10), DEADLINE)
+        .await
+        .unwrap();
+    let released = registry.release(&mut admission, listener_view).unwrap();
+    assert_eq!(released.1, Some(listener_process));
+    assert_eq!(registry.counts(), (0, 0));
+    assert_eq!(registry.forwarder_count(), 0);
+    assert_eq!(admission.running_count(), 0);
+}
+
 /// Proves one listener serves two isolated divergent views and release leaves the peer usable.
 #[tokio::test]
 async fn shared_gopls_isolates_divergent_worktrees_and_detaches_one_view() {
@@ -354,11 +539,14 @@ async fn shared_gopls_isolates_divergent_worktrees_and_detaches_one_view() {
     )
     .expect("profile is valid");
     let socket = fixture.root.join("gopls.sock");
-    let listener_authority = authority(&fixture.worktree("left"), "listener", "one");
+    let left_root = fixture.worktree("left");
+    let right_root = fixture.worktree("right");
+    let (left, left_authority) = worktree(&left_root, 1);
+    let (right, right_authority) = worktree(&right_root, 2);
     let listener_command = profile
-        .listener_command(&listener_authority, &socket)
+        .listener_command(&left_authority, &socket)
         .expect("listener command is declared");
-    let listener_request = request(listener_authority, listener_command.clone(), &gopls);
+    let listener_request = request(left_authority.clone(), listener_command.clone(), &gopls);
     let listener_debug = format!("{listener_command:?}");
     assert!(listener_debug.contains("-listen=unix;"));
     assert!(listener_debug.contains("-listen.timeout=0"));
@@ -370,14 +558,25 @@ async fn shared_gopls_isolates_divergent_worktrees_and_detaches_one_view() {
         interactive_burst: 1,
     })
     .unwrap();
+    let mut registry = ProviderLeaseRegistry::new(ProviderLeaseLimits {
+        total_views: 2,
+        per_backend_views: 2,
+    })
+    .unwrap();
+    let left_registry_view =
+        provider_view(&mut registry, &mut admission, &profile, &left_authority);
     let mut shared = SharedGopls::start(
         &profile,
         &listener_request,
-        lease(&mut admission, "listener"),
+        registry.take_spawn_lease(left_registry_view).unwrap(),
         Path::new("/unused"),
         4096,
     )
     .expect("Execution starts one listener");
+    assert!(matches!(
+        registry.take_spawn_lease(left_registry_view),
+        Err(ProviderLeaseError::SpawnUnavailable)
+    ));
     tokio::time::timeout(DEADLINE, async {
         while !socket.exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -385,17 +584,11 @@ async fn shared_gopls_isolates_divergent_worktrees_and_detaches_one_view() {
     })
     .await
     .expect("listener creates owned Unix socket");
-    let left_root = fixture.worktree("left");
-    let right_root = fixture.worktree("right");
-    let left = WorktreeRef::new("same-name".into(), "left-incarnation".into()).unwrap();
-    let right = WorktreeRef::new("same-name".into(), "right-incarnation".into()).unwrap();
-    let left_authority = authority(&left_root, "same-name", "left-authority");
     let left_request = request(
         left_authority.clone(),
         profile.forwarder_command(&left_authority, &socket).unwrap(),
         &gopls,
     );
-    let right_authority = authority(&right_root, "same-name", "right-authority");
     let right_request = request(
         right_authority.clone(),
         profile
@@ -403,12 +596,54 @@ async fn shared_gopls_isolates_divergent_worktrees_and_detaches_one_view() {
             .unwrap(),
         &gopls,
     );
+    let right_registry_view =
+        provider_view(&mut registry, &mut admission, &profile, &right_authority);
+    assert!(matches!(
+        registry.take_spawn_lease(right_registry_view),
+        Err(ProviderLeaseError::SpawnUnavailable)
+    ));
+    let left_process = lease(&mut admission, "left");
+    let left_capability = registry
+        .take_forwarder_spawn_lease(
+            &mut admission,
+            left_registry_view,
+            &left_request,
+            left_process,
+        )
+        .unwrap();
+    assert!(matches!(
+        registry.take_forwarder_spawn_lease(
+            &mut admission,
+            left_registry_view,
+            &left_request,
+            left_process
+        ),
+        Err(ProviderLeaseError::SpawnUnavailable)
+    ));
+    assert!(matches!(
+        registry.take_forwarder_spawn_lease(
+            &mut admission,
+            right_registry_view,
+            &right_request,
+            left_process
+        ),
+        Err(ProviderLeaseError::SpawnUnavailable)
+    ));
+    let right_process = lease(&mut admission, "right");
+    let right_capability = registry
+        .take_forwarder_spawn_lease(
+            &mut admission,
+            right_registry_view,
+            &right_request,
+            right_process,
+        )
+        .unwrap();
     let left_view = shared
         .open_view(
             left.clone(),
             1,
             &left_request,
-            lease(&mut admission, "left"),
+            left_capability,
             Path::new("/unused"),
             4096,
         )
@@ -418,16 +653,26 @@ async fn shared_gopls_isolates_divergent_worktrees_and_detaches_one_view() {
             right.clone(),
             1,
             &right_request,
-            lease(&mut admission, "right"),
+            right_capability,
             Path::new("/unused"),
             4096,
         )
         .unwrap();
     assert_eq!(shared.process_counts(), (1, 2, 2));
+    assert_eq!(registry.counts(), (1, 2));
+    assert_eq!(registry.forwarder_count(), 2);
+    assert_eq!(admission.running_count(), 3);
     assert_eq!(shared.begin_request(&left, 1).unwrap(), 1);
     assert_eq!(shared.begin_request(&right, 1).unwrap(), 1);
     let left_lease = left_view.lease();
     let right_lease = right_view.lease();
+    shared.observe_source(&left, left_lease, 2).unwrap();
+    assert!(!shared.result_is_current(&left, left_lease, 1));
+    assert!(shared.result_is_current(&left, left_lease, 2));
+    assert!(shared.begin_request(&left, 1).is_err());
+    assert_eq!(shared.begin_request(&left, 2).unwrap(), 2);
+    assert!(shared.observe_source(&left, left_lease, 1).is_err());
+    assert!(shared.result_is_current(&right, right_lease, 1));
     let opened = Arc::new(Barrier::new(3));
     let begin_semantic = Arc::new(Barrier::new(3));
     let detached = Arc::new(Notify::new());
@@ -476,8 +721,19 @@ async fn shared_gopls_isolates_divergent_worktrees_and_detaches_one_view() {
                 .await
                 .map_err(|_| io::Error::other("left forwarder did not reap"))?;
             shared.release_view(&left, left_lease)?;
+            assert!(matches!(
+                registry
+                    .release(&mut admission, left_registry_view)
+                    .map_err(execution_error)?
+                    .0,
+                agent_ide::execution::BackendRelease::SharedPeerSurvives
+            ));
             admission.release(left_admission).map_err(execution_error)?;
             assert_eq!(shared.process_counts(), (1, 1, 2));
+            assert_eq!(registry.counts(), (1, 1));
+            assert_eq!(registry.forwarder_count(), 1);
+            assert_eq!(admission.running_count(), 2);
+            assert!(!shared.result_is_current(&left, left_lease, 2));
             detached.notify_one();
             Ok::<_, Box<dyn std::error::Error>>(evidence)
         };
@@ -518,7 +774,13 @@ async fn shared_gopls_isolates_divergent_worktrees_and_detaches_one_view() {
         .stop(Duration::from_millis(100), DEADLINE)
         .await
         .unwrap();
-    admission.release(listener_admission).unwrap();
+    let released = registry
+        .release(&mut admission, right_registry_view)
+        .unwrap();
+    assert_eq!(released.1, Some(listener_admission));
+    assert_eq!(registry.counts(), (0, 0));
+    assert_eq!(registry.forwarder_count(), 0);
+    assert_eq!(admission.running_count(), 0);
     println!(
         "one listener, two initialized sessions, remote sessions=2, divergent int/string results, released left view, right post-detach string result, terminal remote disconnects=2; forwarders=2"
     );

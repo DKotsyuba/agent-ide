@@ -1075,6 +1075,8 @@ pub struct AdmissionController {
     running: BTreeMap<OwnerId, usize>,
     /// Active lease identity to owner mapping used to reject stale/double release.
     leases: BTreeMap<u64, OwnerId>,
+    /// Live slots already bound to provider spawn capabilities across this controller's registries.
+    provider_slots: BTreeSet<u64>,
     /// Requests awaiting a slot; entries intentionally consume no running resource.
     queue: VecDeque<QueuedRequest>,
     /// Next nonzero internal identity for tickets and leases.
@@ -1111,6 +1113,7 @@ impl AdmissionController {
             limits,
             running: BTreeMap::new(),
             leases: BTreeMap::new(),
+            provider_slots: BTreeSet::new(),
             queue: VecDeque::new(),
             next_id: 1,
             last_owner: None,
@@ -1170,6 +1173,7 @@ impl AdmissionController {
             .leases
             .remove(&lease.0)
             .ok_or(AdmissionError::UnknownLease)?;
+        self.provider_slots.remove(&lease.0);
         let running = self
             .running
             .get_mut(&owner)
@@ -1284,8 +1288,50 @@ pub struct ProviderViewLease(u64);
 pub struct ProviderSpawnLease {
     /// View that created this backend and owns this one-time start capability.
     view: ProviderViewLease,
-    /// Central reservation consumed only by Execution's protocol-child setup.
+    /// Central reservation consumed only by Execution's owned-child setup.
     lease: AdmissionLease,
+    /// Exact Workspace authority observed when this view was admitted, including root and epoch.
+    authority: WorkspaceAuthority,
+    /// Compatible backend identity selected by the responsible provider module.
+    backend: String,
+}
+
+impl ProviderSpawnLease {
+    /// Returns the backend identity to which this one-time spawn is restricted.
+    pub fn backend(&self) -> &str {
+        &self.backend
+    }
+
+    /// Rejects authority substitution before any process effect or active-binding consumption.
+    fn validate_request(&self, request: &ValidatedExecutionRequest) -> Result<(), ProcessError> {
+        if self.authority != *request.authority() {
+            return Err(ProcessError::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "provider spawn authority does not match its admitted view",
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Consumes one distinct admitted process slot to start one shared backend's logical forwarder.
+/// This non-cloneable capability is minted once per view and cannot start the heavy backend.
+#[derive(Debug)]
+pub struct ProviderForwarderSpawnLease {
+    /// Authority-bound process reservation; the listener's admission lease is never reused here.
+    spawn: ProviderSpawnLease,
+}
+
+impl ProviderForwarderSpawnLease {
+    /// Returns the exact logical view generation allowed to own this forwarder.
+    pub const fn view(&self) -> ProviderViewLease {
+        self.spawn.view
+    }
+
+    /// Returns the shared backend identity which the forwarder is permitted to join.
+    pub fn backend(&self) -> &str {
+        self.spawn.backend()
+    }
 }
 
 /// Classifies the ownership and sharing rule of a provider backend.
@@ -1370,10 +1416,11 @@ pub struct AuthorityDrainReceipt {
 
 /// Tracks bounded logical provider views while keeping physical admission on the shared controller.
 ///
-/// A queued request records no state in this registry.  An owned shared backend counts once as a
-/// heavy process and each attached view counts once as a forwarder; borrowed endpoints count as
-/// views only and are never candidates for a kill.  The registry does not infer Intelligence
-/// compatibility: its caller supplies a stable backend identity after that decision.
+/// A queued request holds no resource reservation. An owned shared backend counts once as a
+/// heavy backend; each attached view is counted separately. Owned shared forwarder processes
+/// require their own central slots, bound once to these views by `take_forwarder_spawn_lease`.
+/// Borrowed endpoints count as views only and are never candidates for a kill. The registry does
+/// not infer Intelligence compatibility: its caller supplies a stable backend identity after that decision.
 #[derive(Debug)]
 pub struct ProviderLeaseRegistry {
     /// Immutable logical-view ceilings enforced before any attachment or pending record.
@@ -1388,6 +1435,8 @@ pub struct ProviderLeaseRegistry {
     pending: BTreeMap<u64, PendingProviderLease>,
     /// One-time spawn capabilities keyed by their newly created owned backend's first view.
     spawnable: BTreeMap<u64, AdmissionLease>,
+    /// Distinct process reservations bound once to currently attached shared forwarder views.
+    forwarders: BTreeMap<u64, AdmissionLease>,
 }
 
 /// Stores the scope that a direct Workspace revocation may fence.
@@ -1395,12 +1444,8 @@ pub struct ProviderLeaseRegistry {
 struct ProviderView {
     /// Backend to which this view is attached.
     backend: String,
-    /// Exact Workspace identity and incarnation copied from the authority at attachment time.
-    worktree_id: String,
-    /// Exact incarnation paired with `worktree_id`.
-    incarnation: u64,
-    /// Authority epoch that must be invalidated by a matching revocation.
-    epoch: u64,
+    /// Complete authority copied at attachment time, including identity, incarnation, root and epoch.
+    authority: WorkspaceAuthority,
 }
 
 /// Stores physical ownership, shared-view count, and the one central admission reservation.
@@ -1438,6 +1483,7 @@ impl ProviderLeaseRegistry {
             backends: BTreeMap::new(),
             pending: BTreeMap::new(),
             spawnable: BTreeMap::new(),
+            forwarders: BTreeMap::new(),
         })
     }
 
@@ -1507,6 +1553,7 @@ impl ProviderLeaseRegistry {
         );
         let view = self.attach(backend, authority);
         if let Some(lease) = reserved {
+            admission.provider_slots.insert(lease.0);
             self.spawnable.insert(view.0, lease);
         }
         ProviderLeaseAdmission::Granted(view)
@@ -1550,19 +1597,66 @@ impl ProviderLeaseRegistry {
             },
         );
         let view = self.attach(pending.backend, authority);
+        admission.provider_slots.insert(promotion.lease.0);
         self.spawnable.insert(view.0, promotion.lease);
         Ok(view)
     }
 
-    /// Takes this view's one-time owned-backend spawn capability.
+    /// Takes this view's one-time backend spawn capability bound to its complete admitted authority.
     pub fn take_spawn_lease(
         &mut self,
         view: ProviderViewLease,
     ) -> Result<ProviderSpawnLease, ProviderLeaseError> {
+        let authority = self
+            .views
+            .get(&view.0)
+            .ok_or(ProviderLeaseError::UnknownView)?;
         self.spawnable
             .remove(&view.0)
-            .map(|lease| ProviderSpawnLease { view, lease })
+            .map(|lease| ProviderSpawnLease {
+                view,
+                lease,
+                authority: authority.authority.clone(),
+                backend: authority.backend.clone(),
+            })
             .ok_or(ProviderLeaseError::SpawnUnavailable)
+    }
+
+    /// Binds a separately admitted process slot once to a shared view's exact request authority.
+    /// Rejects unknown/stale views, authority changes, backend slots, released slots, and any
+    /// previously bound view or slot without consuming them. The caller retains the slot on error
+    /// and releases it only after forwarder reap on success; logical release never releases it.
+    pub fn take_forwarder_spawn_lease(
+        &mut self,
+        admission: &mut AdmissionController,
+        view: ProviderViewLease,
+        request: &ValidatedExecutionRequest,
+        lease: AdmissionLease,
+    ) -> Result<ProviderForwarderSpawnLease, ProviderLeaseError> {
+        let scope = self
+            .views
+            .get(&view.0)
+            .ok_or(ProviderLeaseError::UnknownView)?;
+        if scope.authority != *request.authority() {
+            return Err(ProviderLeaseError::InvalidAuthority);
+        }
+        if self.backends[&scope.backend].kind != ProviderBackendKind::OwnedShared
+            || !admission.leases.contains_key(&lease.0)
+            || admission.provider_slots.contains(&lease.0)
+            || self.forwarders.contains_key(&view.0)
+        {
+            return Err(ProviderLeaseError::SpawnUnavailable);
+        }
+        admission.provider_slots.insert(lease.0);
+        self.forwarders.insert(view.0, lease);
+        Ok(ProviderForwarderSpawnLease {
+            spawn: ProviderSpawnLease {
+                view,
+                lease,
+                authority: scope.authority.clone(),
+                backend: scope.backend.clone(),
+            },
+        })
     }
 
     /// Releases exactly one logical view and returns the physical ownership consequence.
@@ -1584,6 +1678,7 @@ impl ProviderLeaseRegistry {
             .remove(&view_id)
             .ok_or(ProviderLeaseError::UnknownView)?;
         self.spawnable.remove(&view_id);
+        self.forwarders.remove(&view_id);
         let backend = self
             .backends
             .get_mut(&view.backend)
@@ -1629,9 +1724,10 @@ impl ProviderLeaseRegistry {
             .views
             .iter()
             .filter_map(|(id, view)| {
-                (view.worktree_id == revoked.worktree().id()
-                    && view.incarnation == revoked.worktree().incarnation()
-                    && view.epoch == revoked.old_epoch())
+                (view.authority.worktree_id() == revoked.worktree().id()
+                    && view.authority.incarnation().parse::<u64>().ok()
+                        == Some(revoked.worktree().incarnation())
+                    && view.authority.epoch() == revoked.old_epoch())
                 .then_some(ProviderViewLease(*id))
             })
             .collect();
@@ -1655,7 +1751,7 @@ impl ProviderLeaseRegistry {
         }
     }
 
-    /// Returns separate heavy-process and logical-forwarder counts for bounded accounting evidence.
+    /// Returns owned-backend and logical-view counts; `forwarder_count` reports separate process slots.
     pub fn counts(&self) -> (usize, usize) {
         (
             self.backends
@@ -1664,6 +1760,11 @@ impl ProviderLeaseRegistry {
                 .count(),
             self.views.len(),
         )
+    }
+
+    /// Returns separately admitted forwarder slots still bound to active registry views.
+    pub fn forwarder_count(&self) -> usize {
+        self.forwarders.len()
     }
 
     /// Attaches one view after the caller has safely established/reused the backend.
@@ -1696,12 +1797,7 @@ impl ProviderView {
     fn from_authority(backend: impl Into<String>, authority: &WorkspaceAuthority) -> Self {
         Self {
             backend: backend.into(),
-            worktree_id: authority.worktree_id().to_owned(),
-            incarnation: authority
-                .incarnation()
-                .parse()
-                .expect("request validated Workspace incarnation"),
-            epoch: authority.epoch(),
+            authority: authority.clone(),
         }
     }
 }
@@ -1824,6 +1920,25 @@ pub struct OwnedChild {
 }
 
 impl OwnedChild {
+    /// Starts a capture-mode provider backend using its one-time, authority-bound registry grant.
+    /// Authority mismatch returns an error before consuming active use or spawning a process.
+    pub fn spawn_from_provider_lease(
+        request: &ValidatedExecutionRequest,
+        capability: ProviderSpawnLease,
+        active_use: Option<ActiveBindingUse>,
+        codex_executable: &Path,
+        output_cap: usize,
+    ) -> Result<Self, ProcessError> {
+        capability.validate_request(request)?;
+        Self::spawn_captured(
+            request,
+            capability.lease,
+            active_use,
+            codex_executable,
+            output_cap,
+        )
+    }
+
     /// Starts a capture-mode child only after central admission reserved `lease`.
     ///
     /// Managed host state is passed intact as one `--sandbox-state-json` argv element; disabled
@@ -1964,7 +2079,8 @@ pub struct OwnedProtocolChild {
 }
 
 impl OwnedProtocolChild {
-    /// Starts an owned protocol child by consuming the registry-issued one-time spawn capability.
+    /// Starts an owned protocol child by consuming its authority-bound one-time backend capability.
+    /// Authority mismatch returns an error before consuming active use or spawning a process.
     pub fn spawn_from_provider_lease(
         request: &ValidatedExecutionRequest,
         capability: ProviderSpawnLease,
@@ -1972,10 +2088,28 @@ impl OwnedProtocolChild {
         codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
-        let _ = capability.view;
+        capability.validate_request(request)?;
         Self::spawn(
             request,
             capability.lease,
+            active_use,
+            codex_executable,
+            output_cap,
+        )
+    }
+
+    /// Starts one forwarder using its distinct process slot and exact registry-view authority.
+    /// The consumed capability cannot be reused; reap returns this forwarder's slot, never its listener's.
+    pub fn spawn_from_forwarder_lease(
+        request: &ValidatedExecutionRequest,
+        capability: ProviderForwarderSpawnLease,
+        active_use: Option<ActiveBindingUse>,
+        codex_executable: &Path,
+        output_cap: usize,
+    ) -> Result<Self, ProcessError> {
+        Self::spawn_from_provider_lease(
+            request,
+            capability.spawn,
             active_use,
             codex_executable,
             output_cap,
