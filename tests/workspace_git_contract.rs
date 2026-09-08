@@ -18,7 +18,7 @@ fn terminal_discovery_removes_only_the_final_lf() {
 /// Keeps NUL-safe tracked, conflict, rename, and untracked paths in distinct result groups.
 #[test]
 fn porcelain_v2_preserves_raw_paths_and_separate_untracked() {
-    let raw = b"1 M. N... 100644 100644 100644 a b - spaced name\0u UU N... 100644 100644 100644 100644 a b c conflict\0? -leading\npath\02 R. N... 100644 100644 100644 a b c R100 renamed\0old name\0";
+    let raw = b"1 M. N... 100644 100644 100644 a b - spaced name\0u UU N... 100644 100644 100644 100644 a b c conflict\0? -leading\npath\x002 R. N... 100644 100644 100644 a b R100 renamed\0old name\0";
     let status = parse_porcelain_v2_z(raw).expect("fixed porcelain records parse");
     assert_eq!(status.tracked().len(), 2);
     assert_eq!(status.conflicts().len(), 1);
@@ -35,6 +35,11 @@ fn porcelain_v2_preserves_raw_paths_and_separate_untracked() {
             .as_os_str()
             .as_bytes(),
         b"old name"
+    );
+    assert_eq!(status.tracked()[1].kind(), StatusKind::RenamedOrCopied);
+    assert_eq!(
+        status.tracked()[1].path().as_os_str().as_bytes(),
+        b"renamed"
     );
 }
 
