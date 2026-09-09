@@ -88,7 +88,7 @@ conversion, callback refusal, request timeout/cancellation and EOF.
 
 `intelligence::session::with_session` borrows independently owned protocol stdout
 and stdin, one admitted `WorktreeRef` and authority epoch, a `ViewGeneration`, closed `ProviderSettings`, and
-finite deadlines. It drives `async-lsp` while the caller's asynchronous operation
+finite deadlines. One absolute session deadline covers initialize, every request, the caller exchange, shutdown, and driver drain; nested request budgets cannot extend it. Dropping the session future invalidates readiness and stops its driver so the owning caller can cancel and reap the child. It drives `async-lsp` while the caller's asynchronous operation
 owns one `Session`. It never starts a process or consumes the caller's reap lease.
 `Session::shutdown` fences further context immediately and performs the bounded shutdown/exit handshake.
 Transport errors remain failures even when the operation returns Ok; only EOF after completed shutdown
@@ -98,7 +98,7 @@ The caller must check its live authority and cancel on its exact revocation even
 
 `Session::capabilities` returns the actual initialize report, optional server identity,
 and negotiated UTF-8/16/32 positions; an omitted encoding means UTF-16. It does not
-assert diagnostic cleanliness. `ProviderSettings::GoplsDefaults` preserves the accepted null/default configuration and cannot identify a Rust server. `ProviderSettings::Rust(profile)` retains the exact immutable Rust identity, checks the initialize analyzer name/version, sends `cache-priming-disabled-v1` initialization/configuration, and waits for `experimental/serverStatus` with both `health=ok` and `quiescent=true`. Missing, malformed, unhealthy, or non-quiescent status cannot satisfy the bounded barrier. `provider_readiness` is provider-status evidence, separate from push-diagnostic readiness.
+assert diagnostic cleanliness. `ProviderSettings::GoplsDefaults` preserves the accepted null/default configuration and cannot identify a Rust server. `ProviderSettings::Rust(profile)` retains the exact immutable Rust identity, checks the initialize analyzer name/version, sends `cache-priming-disabled-v1` initialization/configuration, and waits for `experimental/serverStatus` with both `health=ok` and `quiescent=true`. Missing, malformed, unhealthy, or non-quiescent status cannot satisfy the bounded barrier. `provider_readiness` is an opaque provider-status observation minted only by the correlated session router; consumers can query it but cannot construct healthy evidence. It remains separate from push-diagnostic readiness.
 
 `Session::context(observation, bytes, ContextQuery::File | Symbol { byte_offset })`
 checks the exact Workspace worktree, epoch, source sequence, size and digest. It
@@ -155,7 +155,7 @@ dispatch, checks, source writes, Scope or a context compiler.
 Every profile declares binary and protocol identity, provider revision,
 configuration, toolchain, trust boundary, transport, lifecycle and sharing
 mode. The compatibility key contains those inputs. An exclusive profile also
-contains the canonical `WorktreeRef` including incarnation. A shared profile
+contains the measured executable-byte digest and the canonical `WorktreeRef` including incarnation. A shared profile
 uses that worktree identity as an isolated view key and never shares mutable
 document buffers across views. A `gopls` profile supplies the absolute Go
 toolchain path and forwards only its parent as the process `PATH`.

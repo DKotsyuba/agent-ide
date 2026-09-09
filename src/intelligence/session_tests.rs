@@ -94,7 +94,7 @@ fn diagnostic_state() -> Arc<Mutex<State>> {
         terminal: false,
         shutdown_complete: false,
         settings: ProviderSettings::GoplsDefaults,
-        readiness: watch::channel(ProviderReadiness::Unknown).0,
+        readiness: watch::channel(UNKNOWN_READINESS).0,
         document: Some(Document {
             uri: context::observation_uri(&observed).unwrap(),
             source: SourceBinding::from_observation(&observed),
@@ -486,9 +486,9 @@ async fn closed_settings_and_rust_status_barrier_match_the_actual_provider() {
                 assert_eq!(
                     session.provider_readiness(),
                     if rust {
-                        ProviderReadiness::RustHealthyQuiescent
+                        RUST_HEALTHY_QUIESCENT
                     } else {
-                        ProviderReadiness::Unknown
+                        UNKNOWN_READINESS
                     }
                 );
                 session.shutdown().await?;
@@ -502,7 +502,7 @@ async fn closed_settings_and_rust_status_barrier_match_the_actual_provider() {
                         .await
                         .is_err()
                 );
-                assert_eq!(session.provider_readiness(), ProviderReadiness::Unknown);
+                assert!(session.provider_readiness().is_unknown());
                 Ok(())
             },
         );

@@ -251,3 +251,33 @@ async fn dropped_registry_cannot_authorize_an_outstanding_capability() {
         "lost registry does not fabricate settlement"
     );
 }
+
+/// Managed launch supplies wrapper, provider, and configured tool search roots without ambient PATH.
+#[test]
+fn managed_provider_search_path_is_explicit_and_complete() {
+    let sandbox = HostSandboxState::parse(Some(serde_json::json!({
+        "permissionProfile": {"type": "managed", "file_system": {}, "network": "restricted"},
+        "sandboxCwd": "/private/tmp"
+    })))
+    .unwrap();
+    let command = ControlledCommand::from_validated_peer(
+        CommandKind::Provider,
+        PathBuf::from("/usr/bin/true"),
+        Vec::new(),
+        PathBuf::from("/private/tmp"),
+        BTreeMap::from([(OsString::from("PATH"), OsString::from("/toolchain/bin"))]),
+    )
+    .unwrap();
+    let process = build_command(&command, &sandbox, Path::new("/opt/codex/bin/codex")).unwrap();
+    let path = process
+        .as_std()
+        .get_envs()
+        .find_map(|(name, value)| (name == "PATH").then_some(value.unwrap()))
+        .unwrap();
+    assert_eq!(
+        std::env::split_paths(path).collect::<Vec<_>>(),
+        ["/opt/codex/bin", "/usr/bin", "/toolchain/bin"]
+            .map(PathBuf::from)
+            .to_vec()
+    );
+}

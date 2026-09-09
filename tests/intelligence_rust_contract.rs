@@ -525,7 +525,7 @@ async fn real_rust_production_session_uses_exact_profile_and_barrier() {
         intelligence::{
             context::{ContextMode, ContextQuery},
             freshness::{DiagnosticReadiness, ViewGeneration},
-            session::{ProviderReadiness, ProviderSettings, SessionOptions, with_session},
+            session::{ProviderSettings, SessionOptions, with_session},
         },
         workspace::{
             observation::{ObservationRef, SourceBytes, SourceCoverage, SourceRevision},
@@ -607,7 +607,7 @@ async fn real_rust_production_session_uses_exact_profile_and_barrier() {
     .unwrap();
     let (stdout, stdin) = child.pipes();
     let outcome=with_session(stdout,stdin,worktree.worktree().clone(),1,ViewGeneration {backend:view.generation(),configuration:1,toolchain:1,view:1},ProviderSettings::Rust(profile.clone()),SessionOptions{request_timeout:Duration::from_secs(40),lifetime:Duration::from_secs(70)},|mut session|async move{
-        assert_eq!(session.provider_readiness(),ProviderReadiness::RustHealthyQuiescent);
+        assert!(session.provider_readiness().is_rust_healthy_quiescent());
         assert_eq!(session.capabilities().server_info.as_ref().unwrap().version.as_deref(),Some(ANALYZER_VERSION));
         assert!(matches!(session.settings(),ProviderSettings::Rust(profile) if profile.configuration()=="cache-priming-disabled-v1"));
         let context=session.context(&observed,text.as_bytes(),ContextQuery::Symbol{byte_offset:text.rfind("answer").unwrap()}).await?;

@@ -20,6 +20,8 @@ pub use crate::workspace::authority::WorktreeRef;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GoplsProfile {
     binary: PathBuf,
+    /// Measured executable bytes included in every backend compatibility identity.
+    binary_digest: blake3::Hash,
     version: String,
     revision: String,
     configuration: String,
@@ -60,8 +62,13 @@ impl GoplsProfile {
                 "gopls profile requires absolute binary/toolchain and nonempty identity components",
             ));
         }
+        let binary_digest =
+            crate::execution::measured_executable_digest(&binary).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "gopls executable unavailable")
+            })?;
         Ok(Self {
             binary,
+            binary_digest,
             version,
             revision,
             configuration,
@@ -74,8 +81,9 @@ impl GoplsProfile {
     /// Returns the full sharing compatibility key, excluding only the isolated worktree view key.
     pub fn compatibility_key(&self) -> String {
         format!(
-            "{}|{}|{}|{}|{}|{}|unix|{}",
+            "{}|{}|{}|{}|{}|{}|{}|unix|{}",
             self.binary.display(),
+            self.binary_digest.to_hex(),
             self.version,
             self.revision,
             self.configuration,

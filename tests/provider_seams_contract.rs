@@ -737,3 +737,143 @@ async fn captured_wait_identity_is_bound_to_the_exact_child() {
     }
     assert_eq!(admission.running_count(), 0);
 }
+
+/// Replacing a validated provider executable cannot launch different bytes under the old request.
+#[tokio::test]
+async fn provider_spawn_rejects_executable_replacement_before_child_creation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let program = fixture.0.join("provider");
+    fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut bound = fixture.command("replace", &program, vec![]);
+    let (mut admission, mut registry) = controllers(1);
+    let authority = bound.request.authority().clone();
+    let view = backend(&mut registry, &mut admission, "replace", &authority);
+
+    fs::write(&program, "#!/bin/sh\nexit 7\n").unwrap();
+    let active = bound.fresh();
+    let error = OwnedProtocolChild::spawn_from_provider_lease(
+        &bound.request,
+        registry.take_spawn_lease(view).unwrap(),
+        Some(active),
+        Path::new("/unused"),
+        64,
+    )
+    .err()
+    .unwrap();
+    let (cause, settlement) = never_started(error);
+    assert!(matches!(
+        cause,
+        ProcessError::Request(RequestError::ExecutableUnavailable)
+    ));
+    registry
+        .settle_never_started(&mut admission, settlement)
+        .unwrap();
+    assert_eq!(admission.running_count(), 0);
+}
+
+/// Equal caller metadata cannot make different provider executables share one backend identity.
+#[test]
+fn provider_compatibility_uses_measured_executable_bytes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let left = fixture.0.join("left-provider");
+    let right = fixture.0.join("right-provider");
+    fs::write(&left, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::write(&right, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&left, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&right, fs::Permissions::from_mode(0o700)).unwrap();
+    let profile = |binary| {
+        GoplsProfile::new(
+            binary,
+            "self-attested-version".into(),
+            "v1".into(),
+            "default".into(),
+            "/usr/bin/true".into(),
+            "test".into(),
+            "test".into(),
+        )
+        .unwrap()
+    };
+    assert_ne!(
+        profile(left).compatibility_key(),
+        profile(right).compatibility_key()
+    );
+}
+
+/// Pending views count against configured ceilings and inspection distinguishes queue from reservation.
+#[test]
+fn pending_provider_capacity_is_bounded_and_truthfully_inspected() {
+    let fixture = Fixture::new();
+    let (_, authority) = fixture.scope();
+    let mut admission = AdmissionController::new(AdmissionLimits {
+        total_running: 1,
+        per_owner_running: 1,
+        per_owner_queued: 2,
+        total_queued: 2,
+        interactive_burst: 1,
+    })
+    .unwrap();
+    let Admission::Granted(blocker) = admission.submit(
+        OwnerId::new("blocker").unwrap(),
+        AdmissionClass::Interactive,
+    ) else {
+        panic!("blocker slot")
+    };
+    let mut registry = ProviderLeaseRegistry::new(ProviderLeaseLimits {
+        total_views: 1,
+        per_backend_views: 1,
+    })
+    .unwrap();
+    assert!(matches!(
+        registry.request(
+            &mut admission,
+            OwnerId::new("first").unwrap(),
+            AdmissionClass::Interactive,
+            "first",
+            ProviderBackendKind::OwnedExclusive,
+            &authority,
+        ),
+        ProviderLeaseAdmission::Queued(_)
+    ));
+    assert!(matches!(
+        registry.request(
+            &mut admission,
+            OwnerId::new("second").unwrap(),
+            AdmissionClass::Interactive,
+            "second",
+            ProviderBackendKind::OwnedExclusive,
+            &authority,
+        ),
+        ProviderLeaseAdmission::Rejected(ProviderLeaseError::ViewCapacity)
+    ));
+    let process = admission.inspect();
+    assert_eq!(
+        (process.reserved, process.queued, process.globally_available),
+        (1, 1, 0)
+    );
+    let providers = registry.inspect();
+    assert_eq!((providers.active_views, providers.pending_views), (0, 1));
+    let promotions = admission.release_with_promotions(blocker).unwrap();
+    assert_eq!(promotions.len(), 1);
+    let view = registry
+        .promote(
+            &mut admission,
+            promotions.into_iter().next().unwrap(),
+            &authority,
+        )
+        .unwrap();
+    let providers = registry.inspect();
+    assert_eq!(
+        (
+            providers.active_views,
+            providers.pending_views,
+            providers.spawnable_backends
+        ),
+        (1, 0, 1)
+    );
+    registry.cancel_unstarted(&mut admission, view).unwrap();
+}

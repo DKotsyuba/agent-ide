@@ -24,6 +24,7 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::watch;
+use tokio::time::Instant;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 /// Maximum accepted provider JSON message, validated before async-lsp deserialization.
@@ -73,14 +74,39 @@ impl ProviderSettings {
     }
 }
 
-/// Provider status is separate from document diagnostics: quiescence never proves a document clean.
+/// Provider status minted only from this session's correlated transport observations.
+///
+/// The private representation prevents callers from constructing readiness evidence. Quiescence
+/// remains separate from document diagnostics and never proves a document clean.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProviderReadiness {
+pub struct ProviderReadiness(ReadinessState);
+
+/// Internal readiness states accepted from the trusted protocol router.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadinessState {
     /// No exact accepted provider-specific status barrier is available.
     Unknown,
     /// This Rust transport reported both health=ok and quiescent=true.
     RustHealthyQuiescent,
 }
+
+impl ProviderReadiness {
+    /// Returns whether the trusted Rust status route observed healthy quiescence for this generation.
+    pub const fn is_rust_healthy_quiescent(self) -> bool {
+        matches!(self.0, ReadinessState::RustHealthyQuiescent)
+    }
+
+    /// Returns whether no accepted provider-specific readiness proof is currently retained.
+    pub const fn is_unknown(self) -> bool {
+        matches!(self.0, ReadinessState::Unknown)
+    }
+}
+
+/// Readiness value used before or after trusted correlated provider evidence.
+const UNKNOWN_READINESS: ProviderReadiness = ProviderReadiness(ReadinessState::Unknown);
+/// Readiness value minted only by the accepted Rust status notification callback.
+const RUST_HEALTHY_QUIESCENT: ProviderReadiness =
+    ProviderReadiness(ReadinessState::RustHealthyQuiescent);
 
 /// Exact rust-analyzer status notification accepted by the versioned profile.
 enum RustServerStatus {}
@@ -233,7 +259,7 @@ impl State {
         self.diagnostics.source = None;
         self.diagnostics.document_version = None;
         self.diagnostics.truncated = false;
-        self.readiness.send_replace(ProviderReadiness::Unknown);
+        self.readiness.send_replace(UNKNOWN_READINESS);
         self.diagnostics.freshness = Freshness::Unknown;
         self.diagnostics.readiness = DiagnosticReadiness::Unknown;
         self.diagnostics.diagnostics.clear();
@@ -264,6 +290,8 @@ pub struct Session {
     capabilities: Option<ProviderCapabilities>,
     /// Validated finite deadlines.
     options: SessionOptions,
+    /// Single absolute lifetime fence shared by handshake, operation, shutdown, and driver drain.
+    deadline: Instant,
     /// Last synchronized worktree source sequence; older observations are rejected.
     sequence: u64,
     /// Last allocated document version, retained after closing a missing document.
@@ -307,7 +335,7 @@ where
         terminal: false,
         shutdown_complete: false,
         settings: settings.clone(),
-        readiness: watch::channel(ProviderReadiness::Unknown).0,
+        readiness: watch::channel(UNKNOWN_READINESS).0,
         document: None,
         diagnostics: DiagnosticSnapshot {
             source: None,
@@ -319,9 +347,15 @@ where
             truncated: false,
         },
     }));
+    let deadline = Instant::now() + options.lifetime;
     let router_state = state.clone();
     let (mainloop, server) = MainLoop::new_client(|_| client_router(router_state));
     let stop = server.clone();
+    let mut cleanup = SessionCleanup {
+        state: state.clone(),
+        server: stop.clone(),
+        completed: false,
+    };
     // async-lsp requires a sender to stay alive while graceful EOF is still being drained.
     let _driver_keepalive = server.clone();
     let mut session = Session {
@@ -334,6 +368,7 @@ where
         settings,
         budget: OutboundBudget::default(),
         options,
+        deadline,
         sequence: 0,
         version: 0,
     };
@@ -364,10 +399,9 @@ where
         }
         result
     };
-    let outcome =
-        tokio::time::timeout(options.lifetime, async { tokio::join!(exchange, driver) }).await;
+    let outcome = tokio::time::timeout_at(deadline, async { tokio::join!(exchange, driver) }).await;
     state.lock().expect("session lock").invalidate();
-    match outcome {
+    let result = match outcome {
         Ok((result, driver)) => {
             let value = result?;
             match driver {
@@ -385,10 +419,17 @@ where
             io::ErrorKind::TimedOut,
             "LSP session lifetime expired",
         )),
-    }
+    };
+    cleanup.completed = true;
+    result
 }
 
 impl Session {
+    /// Returns the earlier of the per-exchange allowance and the session's one absolute deadline.
+    fn exchange_deadline(&self) -> Instant {
+        (Instant::now() + self.options.request_timeout).min(self.deadline)
+    }
+
     /// Negotiates supported encodings and records the actual provider capability report.
     async fn initialize(&mut self) -> io::Result<()> {
         let root = lsp::Url::from_file_path(self.worktree.worktree_path())
@@ -460,12 +501,12 @@ impl Session {
             .expect("session lock")
             .readiness
             .subscribe();
-        tokio::time::timeout(self.options.request_timeout, async {
+        tokio::time::timeout_at(self.exchange_deadline(), async {
             loop {
                 if !self.state.lock().expect("session lock").active {
                     return Err(io::Error::other("provider generation unavailable"));
                 }
-                if *ready.borrow_and_update() == ProviderReadiness::RustHealthyQuiescent {
+                if ready.borrow_and_update().is_rust_healthy_quiescent() {
                     return Ok(());
                 }
                 ready.changed().await.map_err(io::Error::other)?;
@@ -775,11 +816,9 @@ impl Session {
             server: self.server.clone(),
             completed: false,
         };
-        let result = tokio::time::timeout(
-            self.options.request_timeout,
-            self.server.request::<R>(params),
-        )
-        .await;
+        let result =
+            tokio::time::timeout_at(self.exchange_deadline(), self.server.request::<R>(params))
+                .await;
         match result {
             Ok(reply) => {
                 guard.completed = true;
@@ -809,8 +848,8 @@ impl Session {
         };
         self.budget
             .reserve(<request::Shutdown as request::Request>::METHOD, &())?;
-        tokio::time::timeout(
-            self.options.request_timeout,
+        tokio::time::timeout_at(
+            self.exchange_deadline(),
             self.server.request::<request::Shutdown>(()),
         )
         .await
@@ -831,6 +870,26 @@ struct RequestGuard {
     server: ServerSocket,
     /// True only after receiving a correlated response, including a provider error response.
     completed: bool,
+}
+
+/// Stops the protocol driver and invalidates evidence when the complete session future is dropped.
+struct SessionCleanup {
+    /// Generation state invalidated before the transport stop request.
+    state: Arc<Mutex<State>>,
+    /// Socket used only to stop this session's async-lsp driver.
+    server: ServerSocket,
+    /// True after `with_session` has joined both exchange and driver paths.
+    completed: bool,
+}
+
+impl Drop for SessionCleanup {
+    /// Guarantees caller cancellation cannot leave the driver or readiness evidence active.
+    fn drop(&mut self) {
+        if !self.completed {
+            self.state.lock().expect("session lock").invalidate();
+            let _ = self.server.emit(Stop);
+        }
+    }
 }
 impl Drop for RequestGuard {
     /// Retires all IDs and evidence when a request is cancelled or times out.
@@ -899,9 +958,9 @@ fn client_router(state: Arc<Mutex<State>>) -> Router<Arc<Mutex<State>>> {
             state
                 .readiness
                 .send_replace(if status.health == RustHealth::Ok && status.quiescent {
-                    ProviderReadiness::RustHealthyQuiescent
+                    RUST_HEALTHY_QUIESCENT
                 } else {
-                    ProviderReadiness::Unknown
+                    UNKNOWN_READINESS
                 });
         }
         ControlFlow::Continue(())

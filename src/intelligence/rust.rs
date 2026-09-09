@@ -53,6 +53,8 @@ pub struct RustProfileIdentity {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RustProfile {
     binary: PathBuf,
+    /// Measured analyzer bytes included in the exclusive backend compatibility identity.
+    binary_digest: blake3::Hash,
     rust_analyzer_version: String,
     cargo_version: String,
     rustc_version: String,
@@ -67,8 +69,11 @@ pub struct RustProfile {
 impl RustProfile {
     /// Creates the sole supported v0.1 Rust profile from complete nonempty observed identities.
     pub fn new(identity: RustProfileIdentity) -> Result<Self, RustProfileError> {
+        let binary_digest = crate::execution::measured_executable_digest(&identity.binary)
+            .map_err(|_| RustProfileError::InvalidProfile)?;
         let profile = Self {
             binary: identity.binary,
+            binary_digest,
             rust_analyzer_version: identity.rust_analyzer_version,
             cargo_version: identity.cargo_version,
             rustc_version: identity.rustc_version,
@@ -105,6 +110,7 @@ impl RustProfile {
         let mut identity = String::new();
         for value in [
             self.binary.to_string_lossy().as_ref(),
+            self.binary_digest.to_hex().as_str(),
             &self.rust_analyzer_version,
             &RUST_PROFILE_REVISION.to_string(),
             &self.cargo_version,

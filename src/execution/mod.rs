@@ -7,7 +7,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::OsString,
-    io,
+    io::{self, Read},
     path::{Component, Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::{Arc, Mutex},
@@ -569,7 +569,7 @@ pub enum CommandKind {
 }
 
 /// Carries a concrete executable invocation supplied by a responsible peer rather than a model.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ControlledCommand {
     /// Responsible peer's command category, used for evidence but not model policy inference.
     kind: CommandKind,
@@ -581,6 +581,35 @@ pub struct ControlledCommand {
     cwd: PathBuf,
     /// Exact environment entries after local cardinality validation; parent environment is cleared.
     env: BTreeMap<OsString, OsString>,
+    /// Executable identity observed at declaration, or absent so OS spawn can report a missing path.
+    program_identity: Option<ExecutableIdentity>,
+}
+
+impl PartialEq for ControlledCommand {
+    /// Compares command semantics and measured executable identity, never descriptor numbers.
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.program == other.program
+            && self.args == other.args
+            && self.cwd == other.cwd
+            && self.env == other.env
+            && self.program_identity == other.program_identity
+    }
+}
+
+impl Eq for ControlledCommand {}
+
+/// Immutable executable object and content identity used to reject path replacement before spawn.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExecutableIdentity {
+    /// Canonical path of the opened executable object.
+    canonical_path: PathBuf,
+    /// Unix device containing the opened executable object.
+    device: u64,
+    /// Unix inode of the opened executable object.
+    inode: u64,
+    /// Complete BLAKE3 digest of the regular executable bytes.
+    digest: blake3::Hash,
 }
 
 impl ControlledCommand {
@@ -598,12 +627,14 @@ impl ControlledCommand {
         if !is_normal_absolute(&program) || !is_normal_absolute(&cwd) {
             return Err(RequestError::InvalidCommandPath);
         }
+        let program_identity = executable_identity(&program).ok();
         Ok(Self {
             kind,
             program,
             args,
             cwd,
             env,
+            program_identity,
         })
     }
 }
@@ -1031,6 +1062,8 @@ pub enum RequestError {
     InvalidWorktree,
     /// A controlled command used a relative or lexically escaping program/cwd path.
     InvalidCommandPath,
+    /// The declared executable is not one stable regular executable object with readable bytes.
+    ExecutableUnavailable,
     /// The policy has no executable allowlist or no argv capacity.
     InvalidPolicy,
     /// The command program is outside the local allowlist.
@@ -1306,6 +1339,21 @@ pub struct AdmissionController {
     interactive_streak: usize,
 }
 
+/// Truthful bounded snapshot of centralized process admission and retained reservations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdmissionSnapshot {
+    /// Configured maximum simultaneous reservations.
+    pub total_running_limit: usize,
+    /// Configured maximum simultaneous reservations for one owner.
+    pub per_owner_running_limit: usize,
+    /// Reservations still held, including launched, draining, and cleanup-uncertain children.
+    pub reserved: usize,
+    /// Requests waiting without a reservation.
+    pub queued: usize,
+    /// Remaining global reservation capacity; owner-specific limits can still prevent admission.
+    pub globally_available: usize,
+}
+
 /// Stores the immutable details needed to promote one queued request fairly.
 #[derive(Clone, Debug)]
 struct QueuedRequest {
@@ -1473,6 +1521,20 @@ impl AdmissionController {
     /// Returns reserved slots, including uncertain dropped children; this is not a live-process count.
     pub fn running_count(&self) -> usize {
         self.total_running()
+    }
+
+    /// Returns configured capacity and current reservations without inferring process liveness.
+    pub fn inspect(&self) -> AdmissionSnapshot {
+        AdmissionSnapshot {
+            total_running_limit: self.limits.total_running,
+            per_owner_running_limit: self.limits.per_owner_running,
+            reserved: self.total_running(),
+            queued: self.queue.len(),
+            globally_available: self
+                .limits
+                .total_running
+                .saturating_sub(self.total_running()),
+        }
     }
 
     /// Returns whether a ticket remains queued without changing its priority or lifetime.
@@ -1679,6 +1741,27 @@ pub struct ProviderLeaseLimits {
     pub total_views: usize,
     /// Maximum logical views sharing one backend identity.
     pub per_backend_views: usize,
+}
+
+/// Bounded provider registry snapshot that keeps logical and physical lifecycle facts separate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderLeaseSnapshot {
+    /// Configured maximum logical views across all backends, including pending requests.
+    pub total_view_limit: usize,
+    /// Configured maximum logical views for one compatible backend, including pending requests.
+    pub per_backend_view_limit: usize,
+    /// Attached logical views.
+    pub active_views: usize,
+    /// Queued logical views that hold no process reservation.
+    pub pending_views: usize,
+    /// Owned backend reservations, including draining and not-yet-spawned entries.
+    pub owned_backends: usize,
+    /// Owned backends waiting for exact direct-child reap settlement.
+    pub draining_backends: usize,
+    /// Backend launch capabilities not yet taken by the trusted spawn path.
+    pub spawnable_backends: usize,
+    /// Separately reserved shared forwarder processes awaiting settlement.
+    pub forwarders: usize,
 }
 
 /// One concrete logical detach outcome; an owned last view carries its one-time draining capability.
@@ -2021,7 +2104,7 @@ impl ProviderLeaseRegistry {
             }
             return ProviderLeaseAdmission::Granted(self.attach(backend, authority));
         }
-        if !self.can_attach(&backend) {
+        if !self.can_request(&backend) {
             return ProviderLeaseAdmission::Rejected(ProviderLeaseError::ViewCapacity);
         }
         let reserved = match kind {
@@ -2403,6 +2486,28 @@ impl ProviderLeaseRegistry {
         self.forwarders.len()
     }
 
+    /// Reports exact bounded logical and reservation state without claiming readiness or liveness.
+    pub fn inspect(&self) -> ProviderLeaseSnapshot {
+        ProviderLeaseSnapshot {
+            total_view_limit: self.limits.total_views,
+            per_backend_view_limit: self.limits.per_backend_views,
+            active_views: self.views.len(),
+            pending_views: self.pending.len(),
+            owned_backends: self
+                .backends
+                .values()
+                .filter(|backend| backend.kind != ProviderBackendKind::Borrowed)
+                .count(),
+            draining_backends: self
+                .backends
+                .values()
+                .filter(|backend| backend.draining)
+                .count(),
+            spawnable_backends: self.spawnable.len(),
+            forwarders: self.forwarders.len(),
+        }
+    }
+
     /// Attaches one view after the caller has safely established/reused the backend.
     fn attach(&mut self, backend: String, authority: &WorkspaceAuthority) -> ProviderViewLease {
         let id = self.next_view;
@@ -2425,6 +2530,23 @@ impl ProviderLeaseRegistry {
                 .backends
                 .get(backend)
                 .is_none_or(|entry| entry.views < self.limits.per_backend_views)
+    }
+
+    /// Checks view ceilings while counting already queued requests that can later be promoted.
+    fn can_request(&self, backend: &str) -> bool {
+        self.views.len().saturating_add(self.pending.len()) < self.limits.total_views
+            && self
+                .views
+                .values()
+                .filter(|view| view.backend == backend)
+                .count()
+                .saturating_add(
+                    self.pending
+                        .values()
+                        .filter(|pending| pending.backend == backend)
+                        .count(),
+                )
+                < self.limits.per_backend_views
     }
 }
 
@@ -3024,6 +3146,11 @@ fn launch_child(
         .into());
     }
     validate_output_cap(output_cap)?;
+    if let Some(expected) = &command.program_identity
+        && executable_identity(&command.program).map_err(ProcessError::Request)? != *expected
+    {
+        return Err(ProcessError::Request(RequestError::ExecutableUnavailable));
+    }
     let mut process = build_command(command, sandbox, codex_executable)?;
     process.stdout(Stdio::piped()).stderr(Stdio::piped());
     if protocol {
@@ -3182,9 +3309,61 @@ fn build_command(
                     "managed Codex executable must have an absolute parent directory",
                 ))
             })?;
-        process.env("PATH", parent);
+        let mut search = vec![parent.to_path_buf()];
+        if let Some(program_parent) = command.program.parent().filter(|path| path.is_absolute()) {
+            search.push(program_parent.to_path_buf());
+        }
+        if let Some(configured) = command.env.get(&OsString::from("PATH")) {
+            search.extend(std::env::split_paths(configured));
+        }
+        process.env(
+            "PATH",
+            std::env::join_paths(search).map_err(|_| {
+                ProcessError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "managed executable search path is invalid",
+                ))
+            })?,
+        );
     }
     Ok(process)
+}
+
+/// Opens and hashes one regular executable, binding later launch to the same path object and bytes.
+fn executable_identity(path: &Path) -> Result<ExecutableIdentity, RequestError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let canonical_path =
+        std::fs::canonicalize(path).map_err(|_| RequestError::ExecutableUnavailable)?;
+    let mut file = std::fs::File::open(path).map_err(|_| RequestError::ExecutableUnavailable)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| RequestError::ExecutableUnavailable)?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        return Err(RequestError::ExecutableUnavailable);
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 32 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|_| RequestError::ExecutableUnavailable)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(ExecutableIdentity {
+        canonical_path,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        digest: hasher.finalize(),
+    })
+}
+
+/// Returns the measured executable digest used by trusted provider compatibility identities.
+pub(crate) fn measured_executable_digest(path: &Path) -> Result<blake3::Hash, RequestError> {
+    executable_identity(path).map(|identity| identity.digest)
 }
 
 /// Configures an owned Unix group and direct-child kill-on-drop as a launch/setup failure fallback.
