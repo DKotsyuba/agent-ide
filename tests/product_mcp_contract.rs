@@ -9,7 +9,7 @@ use std::{
 
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
     process::{Child, ChildStdin, ChildStdout, Command},
 };
@@ -528,7 +528,7 @@ async fn binary_codex_hook_fail_open_inactive_invalid_and_stdin_deadline() {
 /// Captures the real hook IPC frame while withholding a reply, proving sanitization and total deadline.
 #[tokio::test]
 async fn binary_codex_hook_hung_daemon_deadline_sends_only_selected_fields() {
-    use tokio::{io::AsyncReadExt, net::UnixListener};
+    use tokio::net::UnixListener;
     let runtime = runtime();
     std::fs::create_dir(&runtime).unwrap();
     let listener = UnixListener::bind(runtime.join("agent-ide.sock")).unwrap();
@@ -693,7 +693,7 @@ async fn binary_active_native_hooks_accept_edits_deletes_renames_and_failed_comm
 /// Preserves measured nested sandbox fields through real MCP ingress and renders a bounded pending envelope.
 #[tokio::test]
 async fn binary_preserves_sandbox_metadata_and_renders_closed_pending() {
-    use tokio::{io::AsyncReadExt, net::UnixListener};
+    use tokio::net::UnixListener;
     let runtime = runtime();
     std::fs::create_dir(&runtime).unwrap();
     let listener = UnixListener::bind(runtime.join("agent-ide.sock")).unwrap();
@@ -909,10 +909,17 @@ impl ProductFixture {
                 {
                     break;
                 }
-                assert!(
-                    daemon.try_wait().unwrap().is_none(),
-                    "configured daemon exited"
-                );
+                if let Some(status) = daemon.try_wait().unwrap() {
+                    let mut stderr = String::new();
+                    daemon
+                        .stderr
+                        .take()
+                        .unwrap()
+                        .read_to_string(&mut stderr)
+                        .await
+                        .unwrap();
+                    panic!("configured daemon exited with {status}: {stderr}");
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -1034,6 +1041,13 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
         .await;
     let started = actor.settle(&fixture, first).await;
     assert_eq!(started["kind"], "activation", "{started}");
+    assert!(
+        started["text"]
+            .as_str()
+            .unwrap()
+            .contains("baseline: partial (Unverified; durable capture true)"),
+        "{started}"
+    );
     let retried = actor
         .call(&fixture, "ide.start", json!({"activation_id":"start"}))
         .await;
@@ -1045,6 +1059,12 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
     let context = actor.settle(&fixture, context).await;
     assert_eq!(context["kind"], "context", "{context}");
     assert!(context["text"].as_str().unwrap().contains("mode: lexical"));
+    assert!(
+        context["text"]
+            .as_str()
+            .unwrap()
+            .contains("diagnostics_freshness: unknown")
+    );
     assert!(context["text"].as_str().unwrap().contains("pub fn value"));
     let old_context = context["detail_ref"].as_str().unwrap().to_owned();
     actor.state["useLegacyLandlock"] = json!(true);
@@ -1064,10 +1084,17 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
         match mode {
             "head" => {
                 assert!(text.contains("-base") && text.contains("+worktree"));
+                assert!(text.contains("session_baseline: Unverified"));
                 diff_ref = diff["detail_ref"].as_str().unwrap().to_owned();
             }
-            "staged" => assert!(text.contains("-base") && text.contains("+index")),
-            _ => assert!(text.contains("-index") && text.contains("+worktree")),
+            "staged" => {
+                assert!(text.contains("-base") && text.contains("+index"));
+                assert!(text.contains("session_baseline: NotCaptured"));
+            }
+            _ => {
+                assert!(text.contains("-index") && text.contains("+worktree"));
+                assert!(text.contains("session_baseline: NotCaptured"));
+            }
         }
     }
     let wrong_mode = actor
@@ -1295,6 +1322,12 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
         .await;
     let started = actor.settle(&fixture, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
+    let cache_namespaces = std::fs::read_dir(fixture.runtime.join("cache"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    assert_eq!(cache_namespaces.len(), 1);
     let pending = actor
         .call(
             &fixture,
@@ -1313,6 +1346,7 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
     let pid: libc::pid_t = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
+    assert!(cache_namespaces[0].is_dir());
     // SAFETY: zero only probes the fixture's previously recorded direct-child PID; it sends no signal.
     assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
     assert_eq!(
@@ -1328,10 +1362,23 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_GOPLS and AGENT_IDE_GO environment"]
 async fn configured_product_shares_go_across_two_exact_actors_without_crossing_views() {
+    use std::os::unix::fs::PermissionsExt;
     let gopls = std::env::var("AGENT_IDE_GOPLS").unwrap();
     let go = std::env::var("AGENT_IDE_GO").unwrap();
-    let providers = json!([{"executable":accepted_program(&gopls,"golang.org/x/tools/gopls v0.23.0"),"settings":"gopls_defaults","toolchain":go,"cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"shared-fixture-cache"}]);
-    let fixture = ProductFixture::new(providers);
+    let fixture = ProductFixture::new(json!([]));
+    let invocation_log = fixture.base.join("gopls-invocations");
+    let wrapper = fixture.base.join("gopls-provider");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nprintf '%s\\t%s\\t%s\\n' \"$$\" \"$PWD\" \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+            invocation_log.display(),
+            gopls.replace('\'', "'\\''")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    fixture.write_config(json!([{"executable":accepted_program(wrapper.to_str().unwrap(),"golang.org/x/tools/gopls v0.23.0"),"settings":"gopls_defaults","toolchain":go,"cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"shared-fixture-cache"}]));
     let child_root = fixture.base.join("child");
     std::fs::create_dir(&child_root).unwrap();
     let git = |args: &[&str]| {
@@ -1418,6 +1465,32 @@ async fn configured_product_shares_go_across_two_exact_actors_without_crossing_v
     assert!(a["text"].as_str().unwrap().contains("return 7"));
     assert!(b["text"].as_str().unwrap().contains("child-value"));
     assert!(!a["text"].as_str().unwrap().contains("child-value"));
+    let invocations = std::fs::read_to_string(&invocation_log).unwrap();
+    let listeners = invocations
+        .lines()
+        .filter(|line| line.contains("-listen=unix;"))
+        .collect::<Vec<_>>();
+    let forwarders = invocations
+        .lines()
+        .filter(|line| line.contains("-remote=unix;"))
+        .collect::<Vec<_>>();
+    assert_eq!(listeners.len(), 1, "{invocations}");
+    assert_eq!(forwarders.len(), 2, "{invocations}");
+    assert!(
+        forwarders
+            .iter()
+            .any(|line| line.contains(fixture.root.to_str().unwrap())),
+        "{invocations}"
+    );
+    assert!(
+        forwarders
+            .iter()
+            .any(|line| line.contains(child_root.to_str().unwrap())),
+        "{invocations}"
+    );
+    let listener_pid: libc::pid_t = listeners[0].split('\t').next().unwrap().parse().unwrap();
+    // SAFETY: signal zero only observes the wrapper-recorded listener PID and changes no process state.
+    assert_eq!(unsafe { libc::kill(listener_pid, 0) }, 0);
     let sockets = std::fs::read_dir(&fixture.runtime)
         .unwrap()
         .filter_map(Result::ok)

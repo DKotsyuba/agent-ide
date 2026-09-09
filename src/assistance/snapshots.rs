@@ -9,7 +9,8 @@ use crate::{
     workspace::{
         authority::AuthorityStamp,
         git::{
-            BaselineContext, BaselineCoverage, DiffMode, GitError, GitScope,
+            BaselineContext, BaselineCoverage, DiffMode, GitError, GitReadIntent, GitReadQuery,
+            GitScope, RawGitEvidence,
             snapshot::{SnapshotIntent, SnapshotRunner, collect_snapshot},
         },
     },
@@ -129,6 +130,110 @@ impl ProductSnapshotRunner<'_, '_> {
 }
 
 impl Worker<'_> {
+    /// Captures the activation baseline through fixed Git metadata commands and durable Workspace storage.
+    ///
+    /// The result remains partial because v0.1 cannot prove an atomic Git/source window. Any command,
+    /// reap, authority, or storage failure is returned so activation can report unknown coverage
+    /// without claiming that the already-committed authority grant failed.
+    pub(super) async fn capture_activation_baseline(
+        &mut self,
+        job: &mut Job,
+        authority: &AuthorityStamp,
+        activation_operation: &str,
+    ) -> Result<BaselineContext, FailureCode> {
+        let binding = job.invocation.binding_ref().clone();
+        let mut git = Vec::with_capacity(3);
+        for query in [
+            GitReadQuery::HeadTree,
+            GitReadQuery::UntrackedPaths,
+            GitReadQuery::HeadIdentity,
+        ] {
+            let intent = GitReadIntent::new(authority, job.target.git.path.clone(), query)
+                .map_err(|_| FailureCode::UnsupportedGit)?;
+            let request = self
+                .execution_request(
+                    job,
+                    authority,
+                    intent
+                        .controlled_command()
+                        .map_err(|_| FailureCode::UnsupportedGit)?,
+                    &job.target.git,
+                )
+                .await?;
+            let active = self.shared.active(&binding)?;
+            let lease = self.admit(&binding)?;
+            let mut child = match OwnedChild::spawn_captured(
+                &request,
+                lease,
+                Some(active),
+                &job.target.codex.path,
+                self.shared.launcher.limits.output_bytes,
+            ) {
+                Ok(child) => child,
+                Err(error) => return Err(self.spawn_failure(error, &binding)),
+            };
+            let remaining = job
+                .deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(Duration::from_secs(60));
+            let interrupted = tokio::select! {result=child.wait(remaining)=>result.is_err(),_=job.cancel.changed()=>true};
+            let completed = match if interrupted {
+                child
+                    .cancel_and_reap(Duration::from_millis(100), Duration::from_millis(500))
+                    .await
+            } else {
+                child
+                    .reap(Duration::from_millis(500), Duration::from_millis(100))
+                    .await
+            } {
+                Ok(completed) => completed,
+                Err(_) => {
+                    self.uncertain.insert(binding.clone());
+                    return Err(FailureCode::Deadline);
+                }
+            };
+            self.admission
+                .release_reaped(completed.settlement)
+                .map_err(|_| FailureCode::Internal)?;
+            if interrupted {
+                return Err(if *job.cancel.borrow() {
+                    FailureCode::Cancelled
+                } else {
+                    FailureCode::Deadline
+                });
+            }
+            let evidence = completed.evidence;
+            git.push(
+                RawGitEvidence::new(
+                    format!("baseline-{activation_operation}-{query:?}"),
+                    intent.scope().clone(),
+                    query,
+                    evidence.stdout().bytes.clone(),
+                    evidence.stderr().bytes.clone(),
+                    evidence.status().code(),
+                    evidence.stdout().truncated || !evidence.stdout().complete,
+                    evidence.stderr().truncated || !evidence.stderr().complete,
+                )
+                .map_err(|_| FailureCode::SourceUnavailable)?,
+            );
+        }
+        let paths = self
+            .registered
+            .get(&binding)
+            .map_or_else(Vec::new, |paths| paths.iter().cloned().collect());
+        self.workspace
+            .capture_baseline(
+                OperationId::new(format!("baseline-{activation_operation}"))
+                    .map_err(|_| FailureCode::Internal)?,
+                authority,
+                &self.shared.active(&binding)?,
+                git,
+                paths,
+            )
+            .await
+            .map_err(|_| FailureCode::SourceUnavailable)
+    }
+
     /// Combines startup-verified executable selection with current durable authority and sandbox state before spawn.
     pub(super) async fn execution_request(
         &self,
@@ -202,9 +307,19 @@ impl Worker<'_> {
         let generation = self.source_sequence;
         let program = job.target.git.path.clone();
         let reference = job.reference.clone();
-        let baseline =
-            BaselineContext::new(format!("baseline-{reference}"), BaselineCoverage::Unknown)
-                .map_err(|_| FailureCode::Internal)?;
+        let baseline = if mode == DiffMode::Head {
+            self.baselines.get(&binding).cloned()
+        } else {
+            None
+        }
+        .map_or_else(
+            || {
+                BaselineContext::new(format!("baseline-{reference}"), BaselineCoverage::Unknown)
+                    .map_err(|_| FailureCode::Internal)
+            },
+            Ok,
+        )?;
+        let baseline_window = baseline.window();
         let mut runner = ProductSnapshotRunner {
             worker: self,
             job,
@@ -258,11 +373,12 @@ impl Worker<'_> {
         }
         self.shared.active(&binding)?;
         let mut text = format!(
-            "mode: {:?}\nstate: {:?}\ncoverage: {:?}\nfreshness: captured snapshot; not an atomic filesystem transaction\nauthority_epoch: {}\nsession_baseline: not captured\ntracked: {}; untracked: {}; conflicted: {}\n",
+            "mode: {:?}\nstate: {:?}\ncoverage: {:?}\nfreshness: captured snapshot; not an atomic filesystem transaction\nauthority_epoch: {}\nsession_baseline: {:?}\ntracked: {}; untracked: {}; conflicted: {}\n",
             mode,
             result.state(),
             result.coverage(),
             authority.epoch(),
+            baseline_window,
             result.counts().tracked(),
             result.counts().untracked(),
             result.counts().conflicted()

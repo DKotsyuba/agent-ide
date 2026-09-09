@@ -3,21 +3,30 @@
 use super::*;
 use crate::assistance::launcher::{AcceptedProviderSettings, ProviderLaunch};
 use crate::{
+    app::cache::{CacheNamespaceId, CacheRoot},
     execution::{
         AdmissionClass, BackendRelease, OwnerId, ProcessError, ProviderBackendKind,
         ProviderLeaseAdmission, ProviderLeaseLimits, ProviderLeaseRegistry, ProviderViewLease,
     },
     intelligence::{
         context::{ContextQuery, ContextResult},
-        freshness::ViewGeneration,
+        freshness::{CacheIdentity, CacheLifecycle, ViewGeneration},
         gopls::{GoplsProfile, SharedGopls},
         rust::{
             RustProfile, RustProfileError, RustProfileIdentity, RustProtocolChild,
             RustViewAdmission, RustViews, RustWorktree,
         },
-        session::{ProviderSettings, SessionOptions, with_session},
+        session::{DiagnosticSnapshot, ProviderSettings, SessionOptions, with_session},
     },
 };
+
+/// Couples one semantic context result to diagnostics observed by that exact provider session.
+pub(super) struct ProviderContext {
+    /// Source and semantic locations returned for the synchronized document generation.
+    pub(super) context: ContextResult,
+    /// Latest bounded diagnostic push retained by the same session before shutdown.
+    pub(super) diagnostics: DiagnosticSnapshot,
+}
 
 /// Keeps a shared listener owned until the final logical view is released and reaped.
 struct GoBackend {
@@ -50,6 +59,10 @@ pub(super) struct Providers {
     rust: RustViews,
     /// Strictly increasing protocol/backend generation within this boot.
     generation: u64,
+    /// Worktree/provider cache owners retained independently from actor bindings.
+    caches: BTreeMap<String, CacheLifecycle>,
+    /// Cache keys currently used by each actor and quiesced when that actor stops.
+    binding_caches: BTreeMap<BindingRef, Vec<String>>,
 }
 impl Providers {
     /// Creates fixed finite provider bookkeeping without launching processes.
@@ -64,6 +77,8 @@ impl Providers {
             go_views: BTreeMap::new(),
             rust: RustViews::default(),
             generation: 0,
+            caches: BTreeMap::new(),
+            binding_caches: BTreeMap::new(),
         }
     }
     /// Mints one checked protocol generation without using timing/PID as actor identity.
@@ -77,6 +92,88 @@ impl Providers {
 }
 
 impl Worker<'_> {
+    /// Retains or reopens each configured provider cache under canonical worktree identity.
+    ///
+    /// A quiescent compatible lifecycle is handed to the incoming binding. Failure leaves the
+    /// durable activation valid but returns false so the activation reply cannot claim cache reuse.
+    pub(super) fn retain_worktree_caches(
+        &mut self,
+        binding: &BindingRef,
+        authority: &AuthorityStamp,
+        launches: &[ProviderLaunch],
+    ) -> bool {
+        let Ok(root) = CacheRoot::prepare(self.runtime.join("cache")) else {
+            return false;
+        };
+        let worktree_state = format!(
+            "{}:{}",
+            authority.worktree().id(),
+            authority.worktree().incarnation()
+        );
+        let mut keys = Vec::with_capacity(launches.len());
+        for launch in launches {
+            let settings = match launch.settings {
+                AcceptedProviderSettings::GoplsDefaults => "gopls-defaults-v1",
+                AcceptedProviderSettings::RustCachePrimingDisabledV1 => {
+                    "rust-cache-priming-disabled-v1"
+                }
+            };
+            let Some(identity) = CacheIdentity::new(
+                launch.executable.identity.clone(),
+                settings,
+                settings,
+                launch.toolchain.clone(),
+                launch.trust.clone(),
+                worktree_state.clone(),
+            ) else {
+                return false;
+            };
+            let key = blake3::hash(
+                format!(
+                    "{}\0{}\0{}\0{}\0{}\0{}",
+                    worktree_state,
+                    launch.cache_namespace,
+                    launch.executable.identity,
+                    settings,
+                    launch.toolchain,
+                    launch.trust
+                )
+                .as_bytes(),
+            )
+            .to_hex()
+            .to_string();
+            let Some(namespace) = CacheNamespaceId::new(key.clone()) else {
+                return false;
+            };
+            if let Some(cache) = self.providers.caches.get_mut(&key)
+                && !cache.handoff(&identity)
+            {
+                return false;
+            }
+            let Ok(cache) = CacheLifecycle::retain(&root, namespace, identity) else {
+                return false;
+            };
+            self.providers.caches.insert(key.clone(), cache);
+            keys.push(key);
+        }
+        self.providers.binding_caches.insert(binding.clone(), keys);
+        true
+    }
+
+    /// Quiesces the stopped actor's cache owners without deleting their worktree namespaces.
+    pub(super) fn quiesce_worktree_caches(&mut self, binding: &BindingRef) {
+        for key in self
+            .providers
+            .binding_caches
+            .remove(binding)
+            .unwrap_or_default()
+        {
+            if let Some(cache) = self.providers.caches.get_mut(&key) {
+                cache.quiesce();
+            }
+        }
+    }
+
     /// Selects only an operator-configured language profile; absent profiles stay explicitly lexical.
     pub(super) async fn semantic_context(
         &mut self,
@@ -84,7 +181,7 @@ impl Worker<'_> {
         source: &SourceObservation,
         bytes: &[u8],
         query: ContextQuery,
-    ) -> Result<Option<ContextResult>, FailureCode> {
+    ) -> Result<Option<ProviderContext>, FailureCode> {
         let required = match source.path().extension().and_then(|value| value.to_str()) {
             Some("go") => AcceptedProviderSettings::GoplsDefaults,
             Some("rs") => AcceptedProviderSettings::RustCachePrimingDisabledV1,
@@ -119,7 +216,7 @@ impl Worker<'_> {
         source: &SourceObservation,
         bytes: &[u8],
         query: ContextQuery,
-    ) -> Result<ContextResult, FailureCode> {
+    ) -> Result<ProviderContext, FailureCode> {
         let binding = job.invocation.binding_ref().clone();
         let authority = self.authority(&binding).await?;
         let profile = RustProfile::new(RustProfileIdentity {
@@ -244,7 +341,7 @@ impl Worker<'_> {
         source: &SourceObservation,
         bytes: &[u8],
         query: ContextQuery,
-    ) -> Result<ContextResult, FailureCode> {
+    ) -> Result<ProviderContext, FailureCode> {
         let generation = self.providers.next()?;
         let binding = job.invocation.binding_ref().clone();
         let authority = self.authority(&binding).await?;
@@ -552,7 +649,9 @@ fn remaining_options(job: &Job) -> SessionOptions {
     }
 }
 
-/// Runs the accepted settings handshake, one exact-source query, and graceful protocol shutdown.
+/// Runs the accepted settings handshake and one exact-source query, snapshots that Session's
+/// bounded diagnostics, then performs graceful protocol shutdown. Transport or protocol failures
+/// return `ProviderUnavailable`; the caller still owns and must reap the protocol child.
 #[allow(clippy::too_many_arguments)]
 async fn session_operation<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin>(
     input: R,
@@ -563,7 +662,7 @@ async fn session_operation<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncW
     generation: ViewGeneration,
     settings: ProviderSettings,
     options: SessionOptions,
-) -> Result<ContextResult, FailureCode> {
+) -> Result<ProviderContext, FailureCode> {
     let tree = source.worktree().clone();
     let epoch = source.authority_epoch();
     with_session(
@@ -575,9 +674,13 @@ async fn session_operation<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncW
         settings,
         options,
         |mut session| async move {
-            let result = session.context(&source, &bytes, query).await;
+            let context = session.context(&source, &bytes, query).await?;
+            let diagnostics = session.diagnostics();
             let _ = session.shutdown().await;
-            result
+            Ok(ProviderContext {
+                context,
+                diagnostics,
+            })
         },
     )
     .await

@@ -144,10 +144,11 @@ version, truncation, items and readiness. No document diagnostic pull is impleme
 readiness remains `Unknown`, including empty pushes; Rust startup quiescence does not make a document clean.
 The pure freshness/cache lifecycle remains available for future verified pull results.
 
-Assistance still needs to route the public `ide.context` facade to this API, retain
-view lifecycle ownership, provide live authority/revocation cancellation, and compare
-returned source/generation snapshots before presentation. This module does not
-implement public tool dispatch, checks, source writes, Scope or a context compiler.
+Assistance routes the public `ide.context` facade to this API with live
+authority/revocation cancellation. It presents diagnostics only when the Session snapshot's
+source binding, provider generation, and positive document version match the returned context,
+and labels the resulting feedback delta provisional. This module does not implement public tool
+dispatch, checks, source writes, Scope or a context compiler.
 
 ## Profiles, isolation and caches
 

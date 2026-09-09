@@ -14,7 +14,7 @@ Support standalone Codex and Claude Code on Linux and macOS. An optional agent-r
 
 ## Useful code operations
 
-Expose nine scenario tools: start, context, impact, edit, check, diff, status, finish, stop. Context returns bounded exact source, relevant contracts/relations and existing issues. Impact is an optional planning operation; edit performs required internal preflight itself. Edits support exact-base patches and semantic rename with ownership and revision checks. Check uses known profiles and actual completion evidence. Diff distinguishes pre-existing, staged, unstaged and untracked changes. Finish verifies the requested scope and current inputs; missing evidence is not success. Status is available for inspection but normal work must not require polling.
+The v0.1 product exposes exactly five scenario tools: `ide.start`, `ide.context`, `ide.diff`, `ide.inspect`, and `ide.stop`. Context returns bounded exact source plus generation-matched diagnostics and provisional feedback when available. Diff distinguishes pre-existing, staged, unstaged and untracked changes. Inspect resolves bounded asynchronous results. Missing evidence is not success, and unavailable assistance remains fail-open for ordinary native work.
 
 Unsupported language capabilities and incomplete semantic results must be explicit. Do not expose a raw catalog of LSP methods. Unicode coordinates and source bytes must be exact. The initial vertical slices should exercise Rust and Go; language coverage expands through verified provider profiles, not claims based on installed binaries alone.
 

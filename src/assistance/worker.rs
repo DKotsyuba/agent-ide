@@ -1,7 +1,7 @@
 //! One daemon-owned worker with bounded jobs/details, durable authorization and revocable work.
 
 use super::{
-    facade::AssistanceTool,
+    facade::{AssistanceTool, FeedbackDelta},
     host_binding::{
         ActiveBindingUse, BindingRef, HostBindingGuard, ObservedSandboxState, ValidatedInvocation,
     },
@@ -278,6 +278,7 @@ impl WorkerHandle {
                 observations,
                 grants: BTreeMap::new(),
                 registered: BTreeMap::new(),
+                baselines: BTreeMap::new(),
                 source_sequence: 0,
                 uncertain: std::collections::BTreeSet::new(),
                 uncertain_snapshots: Vec::new(),
@@ -537,6 +538,8 @@ struct Worker<'a> {
     grants: BTreeMap<BindingRef, StartReceipt>,
     /// Only explicitly requested paths are polled; no directory scanning is performed.
     registered: BTreeMap<BindingRef, std::collections::BTreeSet<std::path::PathBuf>>,
+    /// Durable partial activation baselines retained for same-binding diff provenance.
+    baselines: BTreeMap<BindingRef, crate::workspace::git::BaselineContext>,
     /// Boot-unique source observation operation sequence.
     source_sequence: u64,
     /// Finite physical-effect admission, shared by discovery, snapshots and language providers.
@@ -749,6 +752,7 @@ impl Worker<'_> {
             }
             Err(_) => return Err(FailureCode::WorkspaceActivation),
         };
+        let activation_operation = receipt.operation().to_owned();
         self.grants.insert(binding.clone(), receipt);
         let authority = match self.authority(&binding).await {
             Ok(authority) => authority,
@@ -760,13 +764,35 @@ impl Worker<'_> {
                 return Err(error);
             }
         };
+        let baseline = self
+            .capture_activation_baseline(job, &authority, &activation_operation)
+            .await;
+        let launches = job.target.providers.clone();
+        let cache_retained = self.retain_worktree_caches(&binding, &authority, &launches);
         self.shared.active(&binding)?;
+        let baseline = match baseline {
+            Ok(baseline) => {
+                let description = format!(
+                    "partial ({:?}; durable capture {})",
+                    baseline.window(),
+                    baseline.capture_digest().is_some()
+                );
+                self.baselines.insert(binding.clone(), baseline);
+                description
+            }
+            Err(_) => "unknown (durable capture unavailable)".to_owned(),
+        };
         Ok((
             PeerReply::Complete {
                 kind: ResultKind::Activation,
                 text: format!(
-                    "Workspace activated; authority_epoch: {}. Provider readiness is not implied.",
-                    authority.epoch()
+                    "Workspace activated; authority_epoch: {}; baseline: {baseline}; worktree_cache: {}. Provider readiness is not implied.",
+                    authority.epoch(),
+                    if cache_retained {
+                        "retained"
+                    } else {
+                        "unknown"
+                    },
                 ),
                 detail_ref: Some(job.reference.clone()),
                 truncated: false,
@@ -980,10 +1006,10 @@ impl Worker<'_> {
         } else {
             self.semantic_context(job, &observed, &bytes, query).await
         };
-        let context=match semantic {
-            Ok(Some(context))=>context,
-            Ok(None)=>lexical_context(&observed,&bytes,query,"no accepted provider is configured for this source, or the registered path is missing").map_err(|_|FailureCode::SourceUnavailable)?,
-            Err(FailureCode::ProviderUnavailable)=>lexical_context(&observed,&bytes,query,"accepted semantic provider is unavailable").map_err(|_|FailureCode::SourceUnavailable)?,
+        let (context, diagnostics)=match semantic {
+            Ok(Some(result))=>(result.context, Some(result.diagnostics)),
+            Ok(None)=>(lexical_context(&observed,&bytes,query,"no accepted provider is configured for this source, or the registered path is missing").map_err(|_|FailureCode::SourceUnavailable)?, None),
+            Err(FailureCode::ProviderUnavailable)=>(lexical_context(&observed,&bytes,query,"accepted semantic provider is unavailable").map_err(|_|FailureCode::SourceUnavailable)?, None),
             Err(code)=>return Err(code),
         };
         if !source_matches(&observed) {
@@ -1010,8 +1036,56 @@ impl Worker<'_> {
             ContextMode::Semantic => "semantic".to_owned(),
             ContextMode::Lexical { reason } => format!("lexical ({reason})"),
         };
+        let diagnostics = diagnostics.and_then(|diagnostics| {
+            (context.freshness == crate::intelligence::freshness::Freshness::Current
+                && diagnostics.freshness == crate::intelligence::freshness::Freshness::Provisional
+                && diagnostics.source.as_ref() == Some(&context.source)
+                && Some(diagnostics.generation) == context.generation
+                && diagnostics.document_version == context.document_version)
+                .then_some(diagnostics)
+        });
+        let diagnostic_text = diagnostics.as_ref().map_or_else(
+            || "diagnostics_freshness: unknown\ndiagnostic_count: unknown\nfeedback_delta: none".to_owned(),
+            |diagnostics| {
+                let messages = diagnostics
+                    .diagnostics
+                    .iter()
+                    .take(8)
+                    .map(|diagnostic| diagnostic.message.chars().take(256).collect::<String>())
+                    .collect::<Vec<_>>();
+                let feedback = if diagnostics.diagnostics.is_empty() {
+                    "none".to_owned()
+                } else {
+                    FeedbackDelta::new(
+                        format!(
+                            "Provider reported {} diagnostics for this exact source generation.",
+                            diagnostics.diagnostics.len()
+                        ),
+                        format!(
+                            "source_sequence={}; provider_generation={:?}; document_version={:?}",
+                            observed.sequence(),
+                            diagnostics.generation,
+                            diagnostics.document_version
+                        ),
+                        "Review the bounded diagnostic messages in this context result.",
+                        "provisional push; exact source and provider generation matched",
+                        Some(job.reference.clone()),
+                    )
+                    .expect("fixed feedback envelope is bounded")
+                    .render()
+                };
+                format!(
+                    "diagnostics_freshness: {:?}\ndiagnostic_readiness: {:?}\ndiagnostic_count: {}\ndiagnostics_truncated: {}\ndiagnostic_messages: {}\nfeedback_delta: {feedback}",
+                    diagnostics.freshness,
+                    diagnostics.readiness,
+                    diagnostics.diagnostics.len(),
+                    diagnostics.truncated || diagnostics.diagnostics.len() > messages.len(),
+                    serde_json::to_string(&messages).unwrap_or_else(|_| "[]".into()),
+                )
+            },
+        );
         let text = format!(
-            "mode: {mode}\npath: {path}\nsource_state: {:?}\nsource_sequence: {}\nauthority_epoch: {}\ncoverage: complete registered path\nposition_encoding: {:?}\nprovider_generation: {:?}\ndocument_version: {:?}\ndefinitions: {}\nreferences: {}\nlexical_matches: {}\n\n{}",
+            "mode: {mode}\npath: {path}\nsource_state: {:?}\nsource_sequence: {}\nauthority_epoch: {}\ncoverage: complete registered path\nposition_encoding: {:?}\nprovider_generation: {:?}\ndocument_version: {:?}\n{diagnostic_text}\ndefinitions: {}\nreferences: {}\nlexical_matches: {}\n\n{}",
             observed.state(),
             observed.sequence(),
             authority.epoch(),
@@ -1042,7 +1116,9 @@ impl Worker<'_> {
         _reference: &str,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
         self.close_provider(binding).await?;
+        self.quiesce_worktree_caches(binding);
         self.registered.remove(binding);
+        self.baselines.remove(binding);
         if let Some(receipt) = self.grants.get(binding).cloned() {
             self.workspace
                 .revoke(

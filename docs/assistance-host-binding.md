@@ -171,22 +171,33 @@ worker services short inspections during pending work; results require same-bind
 ownership, fresh durable authority and source/native-revision rechecks. Native lifecycle
 hints trigger only registered-path reconciliation under the next current invocation.
 Activation consumes three controlled Git discovery results and commits durable authority
-before successful results are visible. Exact activation retries reuse committed facts.
+before successful results are visible. It then attempts a durable baseline capture from three
+fixed, filter-free Git metadata reads. A stored v0.1 baseline is reported as partial with an
+unverified joint window; a capture failure leaves activation usable but reports baseline coverage
+as unknown. Exact activation retries reuse committed facts.
 
 Source context reads one registered relative path under current sandbox and durable authority.
 Optional accepted Go/Rust profiles supply semantic results over those exact bytes; absent or
 unavailable providers return explicit lexical context. Compatible Go worktrees share one
 accounted listener with separate protocol forwarders; Rust uses an exclusive session.
+Semantic replies include only bounded diagnostics from the same Session when source binding,
+provider generation, and positive document version all match the returned context. Push feedback
+is labelled provisional; stale or unversioned diagnostics produce no current feedback delta.
 Requests have at most a 60-second protocol deadline within the configured operation budget;
 warmup remains pending while short inspections and stop remain available.
 
 Git comparisons compose typed HEAD/index/worktree snapshots. Discovery and capture use
 controlled filter-free commands and direct-child reap evidence. Results retain their
-non-atomic snapshot coverage and explicit unknown/not-captured baseline facts.
+non-atomic snapshot coverage and explicit unknown/not-captured baseline facts. A current stored
+activation baseline accompanies same-scope HEAD comparisons; staged and unstaged comparisons keep
+their distinct scope and therefore report the baseline as not captured rather than crossing modes.
 
 `ide.stop` revokes only the exact binding, cancels pending work and reaps its owned provider
 processes before success. A shared listener survives another active Go view. Stop is not a
-worktree closure or cache-retirement fact. Restart discards bindings and detail references;
+worktree closure or cache-retirement fact: configured provider cache namespaces are quiesced and
+retained under canonical worktree/incarnation identity for a compatible successor. Only the
+existing verified Workspace closure or explicit reset fact may retire the retained namespace.
+Restart discards bindings and detail references;
 new activation uses a boot-specific channel identity and the durable native-identity fence.
 Stop also reclaims that binding's queued jobs and retained start/detail references, without
 evicting a live peer's results. Active retained details fail with `capacity` at their configured
