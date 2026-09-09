@@ -581,8 +581,8 @@ pub struct ControlledCommand {
     cwd: PathBuf,
     /// Exact environment entries after local cardinality validation; parent environment is cleared.
     env: BTreeMap<OsString, OsString>,
-    /// Executable identity observed at declaration, or absent so OS spawn can report a missing path.
-    program_identity: Option<ExecutableIdentity>,
+    /// Executable identity measured at declaration; construction fails closed without it.
+    program_identity: ExecutableIdentity,
 }
 
 impl PartialEq for ControlledCommand {
@@ -616,7 +616,10 @@ impl ControlledCommand {
     /// Builds a command from a peer-validated executable, argv, cwd, and environment.
     ///
     /// The caller must have validated command semantics for `kind`; Execution rejects relative
-    /// paths and later intersects this value with local policy and workspace authority.
+    /// paths and later intersects this value with local policy and workspace authority. The
+    /// executable must already be a stable regular file with readable bytes at declaration time;
+    /// an absent, unreadable, or non-regular path fails construction closed rather than deferring
+    /// identity to a later, unmeasured spawn attempt.
     pub fn from_validated_peer(
         kind: CommandKind,
         program: PathBuf,
@@ -627,7 +630,7 @@ impl ControlledCommand {
         if !is_normal_absolute(&program) || !is_normal_absolute(&cwd) {
             return Err(RequestError::InvalidCommandPath);
         }
-        let program_identity = executable_identity(&program).ok();
+        let program_identity = executable_identity(&program)?;
         Ok(Self {
             kind,
             program,
@@ -3146,8 +3149,8 @@ fn launch_child(
         .into());
     }
     validate_output_cap(output_cap)?;
-    if let Some(expected) = &command.program_identity
-        && executable_identity(&command.program).map_err(ProcessError::Request)? != *expected
+    if executable_identity(&command.program).map_err(ProcessError::Request)?
+        != command.program_identity
     {
         return Err(ProcessError::Request(RequestError::ExecutableUnavailable));
     }

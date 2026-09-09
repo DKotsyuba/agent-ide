@@ -124,8 +124,16 @@ fn never_started(error: ProcessError) -> (ProcessError, SpawnNeverStarted) {
 async fn provider_pre_spawn_failures_settle_once_without_reap_fiction() {
     let fixture = Fixture::new();
     for failure in ["missing", "stale", "authority", "os"] {
+        let os_program;
         let program = if failure == "os" {
-            Path::new("/no/such/provider-binary")
+            // Declared while present so construction still measures a real identity; removed
+            // below, right before spawn, so the OS-level failure is a genuine vanished executable
+            // rather than an identity Execution could reject at declaration time.
+            use std::os::unix::fs::PermissionsExt;
+            os_program = fixture.0.join("vanishing-provider");
+            fs::write(&os_program, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&os_program, fs::Permissions::from_mode(0o700)).unwrap();
+            os_program.as_path()
         } else {
             Path::new("/usr/bin/true")
         };
@@ -158,6 +166,9 @@ async fn provider_pre_spawn_failures_settle_once_without_reap_fiction() {
         } else {
             &bound.request
         };
+        if failure == "os" {
+            fs::remove_file(program).unwrap();
+        }
         let error = OwnedProtocolChild::spawn_from_provider_lease(
             request,
             registry.take_spawn_lease(view).unwrap(),
@@ -564,7 +575,14 @@ async fn captured_snapshot_evidence_retains_no_process_reservations() {
 #[tokio::test]
 async fn definite_no_child_settlement_is_not_repeatable() {
     let fixture = Fixture::new();
-    let program = Path::new("/no/such/git-fixture");
+    // Declared while present so construction still measures a real identity; removed below,
+    // right before spawn, so the no-spawn evidence comes from a genuinely vanished executable
+    // rather than an identity Execution could reject at declaration time.
+    use std::os::unix::fs::PermissionsExt;
+    let program_path = fixture.0.join("vanishing-git-fixture");
+    fs::write(&program_path, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&program_path, fs::Permissions::from_mode(0o700)).unwrap();
+    let program = program_path.as_path();
     let mut bound = fixture.command("no-discovery", program, vec![]);
     let request = DiscoverWorktreeRequest::from_active_observation(
         bound.fresh(),
@@ -587,6 +605,7 @@ async fn definite_no_child_settlement_is_not_repeatable() {
         Admission::Granted(lease) => lease,
         _ => panic!("slot"),
     };
+    fs::remove_file(program).unwrap();
     let (_, first) = never_started(
         request
             .spawn(lease, bound.fresh(), Path::new("/unused"))
@@ -772,6 +791,41 @@ async fn provider_spawn_rejects_executable_replacement_before_child_creation() {
         .settle_never_started(&mut admission, settlement)
         .unwrap();
     assert_eq!(admission.running_count(), 0);
+}
+
+/// An executable absent at declaration cannot gain identity by appearing before spawn is attempted.
+#[test]
+fn provider_command_construction_fails_closed_when_executable_is_missing_at_declaration() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let program = fixture.0.join("late-provider");
+
+    let missing = ControlledCommand::from_validated_peer(
+        CommandKind::Provider,
+        program.clone(),
+        vec![],
+        fixture.0.clone(),
+        BTreeMap::new(),
+    );
+    assert!(matches!(missing, Err(RequestError::ExecutableUnavailable)));
+
+    fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+
+    // The earlier, rejected declaration never observed the file: it stays unusable and there is
+    // no path from a failed construction to a later spawn. Only a fresh declaration made after
+    // the executable exists can measure and admit it.
+    assert!(
+        ControlledCommand::from_validated_peer(
+            CommandKind::Provider,
+            program,
+            vec![],
+            fixture.0.clone(),
+            BTreeMap::new(),
+        )
+        .is_ok()
+    );
 }
 
 /// Equal caller metadata cannot make different provider executables share one backend identity.
