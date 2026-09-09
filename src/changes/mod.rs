@@ -144,6 +144,8 @@ pub struct DiffDetailCursor {
     capture_generation: u64,
     /// Bounded owner operation reference, interpreted only together with scope and generation.
     operation_reference: String,
+    /// Exact comparison identities and baseline context retained from the originating request.
+    comparison: GitComparison,
     /// Global index of the first omitted hunk within that exact snapshot.
     next_hunk: usize,
 }
@@ -155,6 +157,7 @@ impl DiffDetailCursor {
             scope: snapshot.scope().clone(),
             capture_generation: snapshot.generation(),
             operation_reference: snapshot.operation_reference().to_owned(),
+            comparison: snapshot.comparison().clone(),
             next_hunk,
         }
     }
@@ -172,6 +175,7 @@ impl DiffDetailCursor {
         self.scope == *snapshot.scope()
             && self.capture_generation == snapshot.generation()
             && self.operation_reference == snapshot.operation_reference()
+            && self.comparison == *snapshot.comparison()
     }
 
     /// Returns the owning operation reference for owner-scoped detail requests.
@@ -555,7 +559,11 @@ fn compose_diff_at(
 
     DiffResult {
         state,
-        freshness: DiffFreshness::Current,
+        freshness: if status.conflicts().is_empty() {
+            DiffFreshness::Current
+        } else {
+            DiffFreshness::Unknown
+        },
         coverage,
         scope_mode: expected_scope.mode(),
         authority_epoch: expected_scope.authority_epoch(),
@@ -603,7 +611,8 @@ fn select_hunks(
     let mut omitted_bytes = 0usize;
     let mut cursor = None;
 
-    for hunk in hunks {
+    let mut hunks = hunks.into_iter();
+    while let Some(hunk) = hunks.next() {
         let next = selected.len();
         if next < budget.max_hunks && selected_bytes + hunk.patch.len() <= budget.max_bytes {
             selected_bytes += hunk.patch.len();
@@ -616,11 +625,11 @@ fn select_hunks(
             continue;
         }
 
-        omitted += 1;
-        omitted_bytes += hunk.patch.len();
-        if cursor.is_none() {
-            cursor = Some(hunk.original_index);
-        }
+        cursor = Some(hunk.original_index);
+        omitted = 1 + hunks.len();
+        omitted_bytes =
+            hunk.patch.len() + hunks.map(|remaining| remaining.patch.len()).sum::<usize>();
+        break;
     }
 
     (selected, omitted, omitted_bytes, cursor)

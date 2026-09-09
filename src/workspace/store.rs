@@ -172,6 +172,24 @@ pub enum ObservationFreshness {
     Incomplete,
 }
 
+/// Carries a complete observation only after Workspace matched it to the exact latest durable row.
+/// Callers can retain and return this token but cannot construct one from raw or stale hints.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentObservation(SourceObservation);
+
+impl CurrentObservation {
+    /// Returns the exact durable observation certified current when this token was minted.
+    /// Later persistence can supersede it, so each new collection request must obtain a fresh token.
+    pub fn observation(&self) -> &SourceObservation {
+        &self.0
+    }
+
+    /// Transfers the certified observation into the bounded snapshot collector.
+    pub(crate) fn into_observation(self) -> SourceObservation {
+        self.0
+    }
+}
+
 /// Supplies one explicit registered path for bounded polling reconciliation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RegisteredPathRequest {
@@ -344,8 +362,8 @@ impl<'a> WorkspaceStore<'a> {
         let reference = draft.reference.as_str().to_owned();
         let path = draft.path.as_os_str().as_bytes().to_vec();
         let revision = draft.revision.as_str().to_owned();
-        let coverage = draft.coverage.as_str();
-        let state = draft.state.as_str();
+        let coverage = draft.coverage.as_str().to_owned();
+        let state = draft.state.as_str().to_owned();
         let (digest, length) = draft.bytes.as_ref().map_or((None, None), |bytes| {
             (Some(bytes.digest().to_vec()), Some(sqlite(bytes.length())))
         });
@@ -394,12 +412,12 @@ impl<'a> WorkspaceStore<'a> {
             Err(error) => Err(error.into()),
         }
     }
-    /// Confirms that a committed stable operation names these exact immutable source facts.
+    /// Confirms without allocating another finite receipt that a committed stable operation names
+    /// these exact immutable source facts. Missing rows are conflicts; read ambiguity stays an error.
     async fn duplicate_admission(
         &self,
         draft: &ObservationDraft,
     ) -> Result<ObservationAdmission, WorkspaceStoreError> {
-        let lookup = duplicate_lookup_operation(draft)?;
         let operation = draft.operation.as_str().to_owned();
         let worktree = draft.worktree.id().to_owned();
         let incarnation = sqlite(draft.worktree.incarnation())?;
@@ -407,29 +425,32 @@ impl<'a> WorkspaceStore<'a> {
         let reference = draft.reference.as_str().to_owned();
         let path = draft.path.as_os_str().as_bytes().to_vec();
         let revision = draft.revision.as_str().to_owned();
-        let coverage = draft.coverage.as_str();
-        let state = draft.state.as_str();
+        let coverage = draft.coverage.as_str().to_owned();
+        let state = draft.state.as_str().to_owned();
         let (digest, length) = draft.bytes.as_ref().map_or((None, None), |bytes| {
             (Some(bytes.digest().to_vec()), Some(sqlite(bytes.length())))
         });
         let length = length.transpose()?;
-        match self.application.execute(lookup, move |tx| {
-            tx.query_row(
+        let matches = self.application.read_one(
                 "SELECT 1 FROM workspace_source_observations WHERE operation_id = ?1 AND worktree_id = ?2 AND incarnation = ?3 AND authority_epoch = ?4 AND observation_reference = ?5 AND relative_path = ?6 AND byte_digest IS ?7 AND byte_length IS ?8 AND source_revision = ?9 AND coverage = ?10 AND observed_state = ?11",
-                params![operation, worktree, incarnation, epoch, reference, path, digest, length, revision, coverage, state],
+                vec![
+                    operation.into(), worktree.into(), incarnation.into(), epoch.into(),
+                    reference.into(), path.into(), digest.into(), length.into(), revision.into(),
+                    coverage.into(), state.into(),
+                ],
                 |_| Ok(()),
-            )
-        }).await {
-            Ok(()) | Err(StoreError::DuplicateOperation { existing: StoreOutcome::Committed }) => Ok(ObservationAdmission::AlreadyRecorded),
-            Err(StoreError::RolledBack) => Ok(ObservationAdmission::Conflict),
-            Err(StoreError::DuplicateOperation { .. }) | Err(StoreError::OutcomeUnknown { .. }) => Ok(ObservationAdmission::OutcomeUnknown),
-            Err(error) => Err(error.into()),
-        }
+            ).await?;
+        Ok(if matches.is_some() {
+            ObservationAdmission::AlreadyRecorded
+        } else {
+            ObservationAdmission::Conflict
+        })
     }
-    /// Reopens the latest row for one exact path through a caller-owned, non-replayed lookup operation.
+    /// Reopens the latest row for one exact path without consuming a finite mechanics receipt.
+    /// The legacy lookup identifier is ignored because this operation is read-only and non-replayed.
     pub async fn load_latest(
         &self,
-        lookup: OperationId,
+        _lookup: OperationId,
         worktree: WorktreeRef,
         path: PathBuf,
     ) -> Result<Option<SourceObservation>, WorkspaceStoreError> {
@@ -439,13 +460,15 @@ impl<'a> WorkspaceStore<'a> {
         let id = worktree.id().to_owned();
         let incarnation = sqlite(worktree.incarnation())?;
         let raw_path = path.as_os_str().as_bytes().to_vec();
-        let row = self.application.execute(lookup, move |tx| tx.query_row("SELECT authority_epoch, source_sequence, observation_reference, byte_digest, byte_length, source_revision, coverage, observed_state FROM workspace_source_observations WHERE worktree_id = ?1 AND incarnation = ?2 AND relative_path = ?3 ORDER BY source_sequence DESC LIMIT 1", params![id, incarnation, raw_path], |row| Ok(Row { epoch: row.get(0)?, sequence: row.get(1)?, reference: row.get(2)?, digest: row.get(3)?, length: row.get(4)?, revision: row.get(5)?, coverage: row.get(6)?, state: row.get(7)? })).optional()).await?;
+        let row = self.application.read_one("SELECT authority_epoch, source_sequence, observation_reference, byte_digest, byte_length, source_revision, coverage, observed_state FROM workspace_source_observations WHERE worktree_id = ?1 AND incarnation = ?2 AND relative_path = ?3 ORDER BY source_sequence DESC LIMIT 1", vec![id.into(), incarnation.into(), raw_path.into()], |row| Ok(Row { epoch: row.get(0)?, sequence: row.get(1)?, reference: row.get(2)?, digest: row.get(3)?, length: row.get(4)?, revision: row.get(5)?, coverage: row.get(6)?, state: row.get(7)? })).await?;
         row.map(|row| row.observed(worktree, path)).transpose()
     }
-    /// Determines freshness for one path without ever treating partial or unknown coverage as current.
+    /// Determines freshness by exact equality with the latest persisted row for this raw path.
+    /// Partial/unknown coverage and same-sequence observations with different identity are not current;
+    /// the legacy lookup identifier is ignored because the comparison allocates no receipt.
     pub async fn freshness(
         &self,
-        lookup: OperationId,
+        _lookup: OperationId,
         observation: &SourceObservation,
     ) -> Result<ObservationFreshness, WorkspaceStoreError> {
         if !observation.coverage().is_complete() {
@@ -454,15 +477,27 @@ impl<'a> WorkspaceStore<'a> {
         let id = observation.worktree().id().to_owned();
         let incarnation = sqlite(observation.worktree().incarnation())?;
         let path = observation.path().as_os_str().as_bytes().to_vec();
-        let newest = self.application.execute(lookup, move |tx| tx.query_row("SELECT MAX(source_sequence) FROM workspace_source_observations WHERE worktree_id = ?1 AND incarnation = ?2 AND relative_path = ?3", params![id, incarnation, path], |row| row.get::<_, Option<i64>>(0))).await?;
-        let newest = newest
-            .and_then(|value| u64::try_from(value).ok())
-            .ok_or(ObservationError::CorruptPersistence)?;
-        Ok(if newest == observation.sequence() {
+        let newest = self.application.read_one("SELECT authority_epoch, source_sequence, observation_reference, byte_digest, byte_length, source_revision, coverage, observed_state FROM workspace_source_observations WHERE worktree_id = ?1 AND incarnation = ?2 AND relative_path = ?3 ORDER BY source_sequence DESC LIMIT 1", vec![id.into(), incarnation.into(), path.into()], |row| Ok(Row { epoch: row.get(0)?, sequence: row.get(1)?, reference: row.get(2)?, digest: row.get(3)?, length: row.get(4)?, revision: row.get(5)?, coverage: row.get(6)?, state: row.get(7)? })).await?
+            .ok_or(ObservationError::CorruptPersistence)?
+            .observed(observation.worktree().clone(), observation.path().to_path_buf())?;
+        Ok(if newest == *observation {
             ObservationFreshness::Current
         } else {
             ObservationFreshness::Stale
         })
+    }
+    /// Mints a non-authorizing snapshot hint only for an exact current durable observation.
+    /// Stale or incomplete observations return `None`; the read-only comparison consumes no receipt.
+    pub async fn confirm_current(
+        &self,
+        lookup: OperationId,
+        observation: SourceObservation,
+    ) -> Result<Option<CurrentObservation>, WorkspaceStoreError> {
+        Ok(matches!(
+            self.freshness(lookup, &observation).await?,
+            ObservationFreshness::Current
+        )
+        .then_some(CurrentObservation(observation)))
     }
     /// Reads and records one registered path, deriving facts from its atomically loaded latest row.
     /// The legacy `previous` hint is ignored; cross-path, stale, and cross-epoch hints confer no authority.
@@ -501,36 +536,6 @@ impl<'a> WorkspaceStore<'a> {
             .await?;
         Ok(RenameReconciliation::DeleteAndCreate { old, new })
     }
-}
-
-/// Derives an internal, deterministic receipt key for one exact duplicate-observation comparison.
-fn duplicate_lookup_operation(
-    draft: &ObservationDraft,
-) -> Result<OperationId, WorkspaceStoreError> {
-    let mut hash = blake3::Hasher::new();
-    hash_part(&mut hash, draft.operation.as_str().as_bytes());
-    hash_part(&mut hash, draft.worktree.id().as_bytes());
-    hash_part(&mut hash, &draft.worktree.incarnation().to_le_bytes());
-    hash_part(&mut hash, &draft.authority_epoch.to_le_bytes());
-    hash_part(&mut hash, draft.reference.as_str().as_bytes());
-    hash_part(&mut hash, draft.path.as_os_str().as_bytes());
-    hash_part(&mut hash, draft.revision.as_str().as_bytes());
-    hash_part(&mut hash, draft.coverage.as_str().as_bytes());
-    hash_part(&mut hash, draft.state.as_str().as_bytes());
-    if let Some(bytes) = &draft.bytes {
-        hash_part(&mut hash, bytes.digest());
-        hash_part(&mut hash, &bytes.length().to_le_bytes());
-    }
-    Ok(OperationId::new(format!(
-        "workspace-observation-verify-{}",
-        hash.finalize().to_hex()
-    ))?)
-}
-
-/// Delimits one raw value in the duplicate-observation receipt identity.
-fn hash_part(hash: &mut blake3::Hasher, value: &[u8]) {
-    hash.update(&(value.len() as u64).to_le_bytes());
-    hash.update(value);
 }
 
 /// Carries the raw persisted fields until a caller supplies the authoritative worktree/path context.

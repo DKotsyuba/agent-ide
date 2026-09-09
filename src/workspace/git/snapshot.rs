@@ -13,6 +13,7 @@ use crate::{
         ObservationError, SourceBytes, SourceCoverage, SourceObservation, SourceRead,
         SourceReadLimits, read_authorized_source,
     },
+    workspace::store::CurrentObservation,
 };
 use std::{
     collections::BTreeMap,
@@ -388,13 +389,22 @@ pub trait SnapshotRunner: Send {
         &mut self,
         intent: SnapshotIntent,
     ) -> impl std::future::Future<Output = Result<CapturedProcessEvidence, GitError>> + Send;
-    /// Supplies an optional durable source observation already registered for this exact path.
-    /// When supplied, scope, digest, length and complete coverage must match the fresh SourceRead.
+    /// Supplies a legacy unverified source hint, which the collector intentionally ignores.
+    /// Implementations should use [`Self::current_observation`] after Workspace reconciliation.
     fn observation(
         &mut self,
         _authority: &AuthorityStamp,
         _path: &Path,
     ) -> Option<SourceObservation> {
+        None
+    }
+    /// Supplies an optional Workspace-certified current observation for this exact path.
+    /// Raw/native hints and merely loaded observations cannot construct the required token.
+    fn current_observation(
+        &mut self,
+        _authority: &AuthorityStamp,
+        _path: &Path,
+    ) -> Option<CurrentObservation> {
         None
     }
 }
@@ -421,7 +431,7 @@ impl SnapshotSource {
     fn capture(
         authority: &AuthorityStamp,
         path: &Path,
-        observation: Option<SourceObservation>,
+        observation: Option<CurrentObservation>,
     ) -> Result<Self, GitError> {
         let read = match read_authorized_source(
             authority.worktree(),
@@ -438,11 +448,16 @@ impl SnapshotSource {
             }
             Err(_) => return Err(GitError::SnapshotIo),
         };
+        let observation = observation.map(CurrentObservation::into_observation);
         if let Some(obs) = &observation
             && (obs.worktree() != authority.worktree()
                 || obs.authority_epoch() != authority.epoch()
                 || obs.path().as_os_str().as_bytes() != path.as_os_str().as_bytes()
                 || obs.coverage() != SourceCoverage::Complete
+                || matches!(
+                    obs.state(),
+                    crate::workspace::observation::ObservedState::Present
+                ) != read.is_some()
                 || obs.bytes() != read.as_ref().map(SourceRead::bytes))
         {
             return Err(GitError::UnstableSnapshot);
@@ -769,8 +784,11 @@ async fn capture_attempt<R: SnapshotRunner>(
             continue;
         }
         let index = stages.and_then(|entries| entries.get(&0));
-        let source =
-            SnapshotSource::capture(authority, &path, runner.observation(authority, &path))?;
+        let source = SnapshotSource::capture(
+            authority,
+            &path,
+            runner.current_observation(authority, &path),
+        )?;
         total_bytes += source.contents().len();
         if total_bytes > MAX_SNAPSHOT_TOTAL_BYTES {
             return Err(GitError::EvidenceTooLarge);

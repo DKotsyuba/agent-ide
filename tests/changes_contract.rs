@@ -256,6 +256,49 @@ async fn cursor_expansion_rejects_reference_reuse_across_generations_and_modes()
         DiffSelectionBudget::bounded(1, 65536),
     );
     assert_eq!(expanded.selected_hunks()[0].index(), 1);
+    let final_page = expand_diff(
+        &scope,
+        &comparison,
+        snapshot.clone(),
+        expanded.detail_cursor().unwrap(),
+        DiffSelectionBudget::bounded(1, 65536),
+    );
+    assert_eq!(final_page.selected_hunks()[0].index(), 2);
+    assert!(final_page.detail_cursor().is_none());
+    let mut indexes = first
+        .selected_hunks()
+        .iter()
+        .chain(expanded.selected_hunks())
+        .chain(final_page.selected_hunks())
+        .map(|hunk| hunk.index())
+        .collect::<Vec<_>>();
+    indexes.sort_unstable();
+    assert_eq!(indexes, vec![0, 1, 2]);
+    fixture.write(b"unstaged.txt", b"replacement working change\n");
+    let changed = collect_snapshot(
+        &authority,
+        std::path::Path::new(GIT),
+        DiffMode::Head,
+        1,
+        snapshot.operation_reference(),
+        comparison.baseline().clone(),
+        &mut Runner::default(),
+    )
+    .await
+    .unwrap();
+    let changed_comparison = changed.comparison().clone();
+    assert_eq!(
+        expand_diff(
+            &scope,
+            &changed_comparison,
+            changed,
+            cursor,
+            DiffSelectionBudget::default()
+        )
+        .state(),
+        DiffResultState::Unavailable,
+        "same scope, generation, and operation cannot substitute another comparison"
+    );
     let newer = collect_snapshot(
         &authority,
         std::path::Path::new(GIT),

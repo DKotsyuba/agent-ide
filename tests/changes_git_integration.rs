@@ -3,14 +3,49 @@
 mod support;
 
 use agent_ide::{
-    changes::{DiffResultState, DiffSelectionBudget, compose_diff},
-    workspace::git::{
-        DiffMode, GitError,
-        snapshot::{MAX_SNAPSHOT_BLOB_BYTES, SnapshotIntent},
+    changes::{DiffFreshness, DiffResultState, DiffSelectionBudget, compose_diff},
+    workspace::{
+        git::{
+            BaselineContext, BaselineCoverage, DiffMode, GitError,
+            snapshot::{MAX_SNAPSHOT_BLOB_BYTES, SnapshotIntent, SnapshotRunner, collect_snapshot},
+        },
+        store::CurrentObservation,
     },
 };
-use std::{ffi::OsString, fs, os::unix::ffi::OsStrExt, path::PathBuf};
+use std::{
+    ffi::OsString,
+    fs,
+    os::unix::ffi::OsStrExt,
+    path::{Path, PathBuf},
+};
 use support::{GIT, GitFixture, Runner, authority_for, collect};
+
+/// Adapts the shared process runner with one Workspace-certified current source observation.
+struct CurrentRunner {
+    /// Existing exact-child Execution runner used unchanged for every Git command.
+    inner: Runner,
+    /// Sealed durable currentness proof returned only for its exact raw path.
+    observation: CurrentObservation,
+}
+
+impl SnapshotRunner for CurrentRunner {
+    /// Delegates command ownership, bounded collection, and exact reap to the shared runner.
+    async fn run(
+        &mut self,
+        intent: SnapshotIntent,
+    ) -> Result<agent_ide::execution::CapturedProcessEvidence, GitError> {
+        self.inner.run(intent).await
+    }
+
+    /// Returns the sealed observation only for its exact raw source path.
+    fn current_observation(
+        &mut self,
+        _authority: &agent_ide::workspace::authority::AuthorityStamp,
+        path: &Path,
+    ) -> Option<CurrentObservation> {
+        (self.observation.observation().path() == path).then(|| self.observation.clone())
+    }
+}
 
 /// Proves clean/smudge/process, textconv, external-diff and fsmonitor helpers never run in any mode.
 #[tokio::test]
@@ -465,13 +500,28 @@ async fn source_digest_revision_and_sequence_are_correlated() {
     else {
         panic!("source persisted")
     };
-    let mut runner = Runner {
-        source_observation: Some(observation.clone()),
-        ..Runner::default()
+    let mut runner = CurrentRunner {
+        observation: workspace
+            .confirm_current(
+                OperationId::new("confirm-source").unwrap(),
+                observation.clone(),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        inner: Runner::default(),
     };
-    let snapshot = support::capture_with_authority(&authority, DiffMode::Unstaged, &mut runner)
-        .await
-        .unwrap();
+    let snapshot = collect_snapshot(
+        &authority,
+        Path::new(GIT),
+        DiffMode::Unstaged,
+        1,
+        "snapshot-operation",
+        BaselineContext::new("baseline", BaselineCoverage::Partial).unwrap(),
+        &mut runner,
+    )
+    .await
+    .unwrap();
     let source = snapshot.paths()[0].source().unwrap();
     assert_eq!(source.observation(), Some(&observation));
     assert_eq!(source.bytes(), observation.bytes());
@@ -485,7 +535,16 @@ async fn source_digest_revision_and_sequence_are_correlated() {
     );
     fixture.write(b"unstaged.txt", b"newer bytes\n");
     assert!(matches!(
-        support::capture_with_authority(&authority, DiffMode::Unstaged, &mut runner).await,
+        collect_snapshot(
+            &authority,
+            Path::new(GIT),
+            DiffMode::Unstaged,
+            1,
+            "snapshot-operation",
+            BaselineContext::new("baseline", BaselineCoverage::Partial).unwrap(),
+            &mut runner,
+        )
+        .await,
         Err(GitError::UnstableSnapshot)
     ));
 }
@@ -707,6 +766,14 @@ async fn conflicts_retain_actual_stage_modes_and_objects() {
         .unwrap();
     let conflict = &snapshot.status().conflicts()[0];
     assert_eq!(conflict.status(), None);
+    let comparison = snapshot.comparison().clone();
+    let result = compose_diff(
+        snapshot.scope(),
+        &comparison,
+        snapshot.clone(),
+        DiffSelectionBudget::default(),
+    );
+    assert_eq!(result.freshness(), DiffFreshness::Unknown);
     let stages = conflict.conflict_stages();
     assert_eq!(stages.len(), 2);
     assert_eq!(
