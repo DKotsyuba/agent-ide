@@ -686,7 +686,9 @@ pub fn parse_porcelain_v2_z(value: &[u8]) -> Result<GitStatus, GitError> {
             b'2' => {
                 let mut entry = parse_tracked(record, StatusKind::RenamedOrCopied, 9, None)?;
                 let original = records.next().ok_or(GitError::InvalidPorcelain)?;
-                if !super::observation::valid_relative_path(&raw_path(original)) {
+                if original.is_empty()
+                    || !super::observation::valid_relative_path(&raw_path(original))
+                {
                     return Err(GitError::InvalidPorcelain);
                 }
                 entry.original_path = Some(raw_path(original));
@@ -784,6 +786,9 @@ fn parse_tracked(
                     object,
                 });
             }
+        }
+        if conflict_stages.is_empty() {
+            return Err(GitError::InvalidPorcelain);
         }
     }
     Ok(PathStatus {

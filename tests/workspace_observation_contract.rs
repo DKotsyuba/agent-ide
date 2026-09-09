@@ -12,7 +12,7 @@ use std::{
 use agent_ide::{
     app::{
         config::StoreConfig,
-        store::{OperationId, Store},
+        store::{OperationId, Store, StoreError},
     },
     workspace::{
         authority::WorktreeRef,
@@ -401,6 +401,113 @@ async fn workspace_source_observations_are_durable_bounded_and_honest() {
             .unwrap(),
         RenameReconciliation::DeleteAndCreate { .. }
     ));
+}
+
+/// Full receipt capacity refuses new effects while exact observation retries remain recoverable.
+#[tokio::test]
+async fn receipt_exhaustion_preserves_exact_observation_recovery() {
+    let root = temporary("receipt-root");
+    fs::create_dir(&root).unwrap();
+    let tree = worktree(&root);
+    let database = temporary("receipt-database").with_extension("sqlite");
+    let mut limited = config();
+    limited.receipt_capacity = 8;
+    let store = Store::open(&database, limited).unwrap();
+    let workspace = WorkspaceStore::new(&store);
+    workspace.install_schema().await.unwrap();
+    let original = ObservationDraft::present(
+        tree.clone(),
+        1,
+        operation("recoverable"),
+        reference("recoverable"),
+        "raw-path".into(),
+        SourceBytes::from_bytes(b"one"),
+        revision("revision-one"),
+        SourceCoverage::Complete,
+    )
+    .unwrap();
+    let ObservationAdmission::Recorded(recorded) =
+        workspace.record(original.clone()).await.unwrap()
+    else {
+        panic!("initial observation must commit")
+    };
+    store
+        .execute(operation("change-persisted-identity"), |tx| {
+            tx.execute(
+                "UPDATE workspace_source_observations SET source_revision='revision-two' WHERE operation_id='recoverable'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        workspace
+            .freshness(operation("receipt-free-freshness"), &recorded)
+            .await
+            .unwrap(),
+        ObservationFreshness::Stale,
+        "same-sequence rows with different source identity are not current"
+    );
+    loop {
+        let count = store
+            .read_one(
+                "SELECT count(*) FROM application_operation_receipts",
+                vec![],
+                |row| row.get::<_, usize>(0),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        if count == limited.receipt_capacity {
+            break;
+        }
+        store
+            .execute(operation(&format!("receipt-fill-{count}")), |_| Ok(()))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        workspace.record(original).await.unwrap(),
+        ObservationAdmission::Conflict
+    );
+    let exact = ObservationDraft::present(
+        tree.clone(),
+        1,
+        operation("recoverable"),
+        reference("recoverable"),
+        "raw-path".into(),
+        SourceBytes::from_bytes(b"one"),
+        revision("revision-two"),
+        SourceCoverage::Complete,
+    )
+    .unwrap();
+    assert_eq!(
+        workspace.record(exact).await.unwrap(),
+        ObservationAdmission::AlreadyRecorded
+    );
+    let unrelated = ObservationDraft::present(
+        tree,
+        1,
+        operation("new-effect"),
+        reference("new-effect"),
+        "other-path".into(),
+        SourceBytes::from_bytes(b"two"),
+        revision("revision-two"),
+        SourceCoverage::Complete,
+    )
+    .unwrap();
+    assert_eq!(
+        workspace.record(unrelated).await,
+        Err(
+            agent_ide::workspace::store::WorkspaceStoreError::Application(
+                StoreError::ReceiptCapacityExhausted
+            )
+        )
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_file(database);
 }
 
 /// Ignores stale/cross-worktree hints, never certifies a Boolean rename, and distinguishes root loss.

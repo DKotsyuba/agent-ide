@@ -18,6 +18,8 @@ fn terminal_discovery_removes_only_the_final_lf() {
 #[test]
 fn porcelain_v2_preserves_raw_paths_and_separate_untracked() {
     assert!(parse_porcelain_v2_z(b"? unterminated").is_err());
+    assert!(parse_porcelain_v2_z(b"2 R. N... 100644 100644 100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb R100 renamed\0").is_err());
+    assert!(parse_porcelain_v2_z(b"u UU N... 000000 000000 000000 100644 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 conflict\0").is_err());
     let raw = b"1 M. N... 100644 100644 100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb - spaced name\0u UU N... 100644 100644 100644 100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccccccccccccc conflict\0? -leading\npath\x002 R. N... 100644 100644 100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb R100 renamed\0old name\0";
     let status = parse_porcelain_v2_z(raw).expect("fixed porcelain records parse");
     assert_eq!(status.tracked().len(), 2);
