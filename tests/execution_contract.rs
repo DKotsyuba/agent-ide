@@ -261,15 +261,19 @@ async fn observed_request_rejects_missing_fresh_use_at_spawn() {
     .unwrap();
     let command = ControlledCommand::from_validated_peer(
         CommandKind::Job,
-        PathBuf::from("/bin/true"),
+        PathBuf::from("/usr/bin/true"),
         Vec::new(),
         PathBuf::from("/private/tmp"),
         BTreeMap::new(),
     )
     .unwrap();
-    let policy =
-        LocalExecutionPolicy::new(BTreeSet::from([PathBuf::from("/bin/true")]), 1, 0, false)
-            .unwrap();
+    let policy = LocalExecutionPolicy::new(
+        BTreeSet::from([PathBuf::from("/usr/bin/true")]),
+        1,
+        0,
+        false,
+    )
+    .unwrap();
     let request =
         ValidatedExecutionRequest::validate(execution, authority, command, &policy, &catalog)
             .unwrap();
