@@ -988,8 +988,18 @@ impl<'a> Worker<'a> {
             .await;
         let launches = job.target.providers.clone();
         let managed_sandbox = providers::managed_sandbox_from_job(job);
-        let cache_retained =
-            self.retain_worktree_caches(&binding, &authority, &launches, managed_sandbox);
+        // A second concurrent actor on the same physical worktree cannot share a single-owner
+        // namespace: fail its activation with the finite reason and roll its own grant back, so the
+        // actor that already owns the cache keeps running and can hand off after it stops.
+        if let Err(code) =
+            self.retain_worktree_caches(&binding, &authority, &launches, managed_sandbox)
+        {
+            if let Ok(mut guard) = self.shared.bindings.lock() {
+                let _ = guard.stop_binding(&binding);
+            }
+            let _ = self.revoke(&binding, &job.reference).await;
+            return Err(code);
+        }
         self.shared.active(&binding)?;
         let baseline = match baseline {
             Ok(baseline) => {
@@ -1007,13 +1017,8 @@ impl<'a> Worker<'a> {
             PeerReply::Complete {
                 kind: ResultKind::Activation,
                 text: format!(
-                    "Workspace activated; authority_epoch: {}; baseline: {baseline}; worktree_cache: {}. Provider readiness is not implied.",
+                    "Workspace activated; authority_epoch: {}; baseline: {baseline}; worktree_cache: retained. Provider readiness is not implied.",
                     authority.epoch(),
-                    if cache_retained {
-                        "retained"
-                    } else {
-                        "unknown"
-                    },
                 ),
                 detail_ref: Some(job.reference.clone()),
                 truncated: false,

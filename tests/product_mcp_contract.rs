@@ -1507,11 +1507,13 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
     let program = fixture.base.join("slow-provider");
     let marker = fixture.base.join("provider-pid");
     let environment = fixture.base.join("provider-environment");
+    let environment_keys = fixture.base.join("provider-environment-keys");
     std::fs::write(
         &program,
         format!(
-            "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n%s\\n%s\\n%s' \"$GOPLSCACHE\" \"$GOCACHE\" \"$GOMODCACHE\" \"$GOTMPDIR\" \"$TMPDIR\" \"$PATH\" > '{}'\nprintf '%s' $$ > '{}'\nexec /bin/sleep 30\n",
+            "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n%s\\n%s\\n%s' \"$GOPLSCACHE\" \"$GOCACHE\" \"$GOMODCACHE\" \"$GOTMPDIR\" \"$TMPDIR\" \"$PATH\" > '{}'\nenv | sed 's/=.*//' | sort > '{}'\nprintf '%s' $$ > '{}'\nexec /bin/sleep 30\n",
             environment.display(),
+            environment_keys.display(),
             marker.display(),
         ),
     )
@@ -1563,6 +1565,26 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
             namespace.join("tmp").to_str().unwrap(),
             "/usr/bin",
         ]
+    );
+    // `/bin/sh` sets PWD, SHLVL and _ in the fixture script itself; every other name in the
+    // dumped set was delivered by the daemon, so an extra inherited or leaked variable fails here.
+    assert_eq!(
+        std::fs::read_to_string(&environment_keys)
+            .unwrap()
+            .lines()
+            .filter(|key| !matches!(*key, "PWD" | "SHLVL" | "_"))
+            .collect::<Vec<_>>(),
+        vec![
+            "AGENT_IDE_GOPLS_PROFILE",
+            "GOCACHE",
+            "GOMODCACHE",
+            "GOPLSCACHE",
+            "GOTMPDIR",
+            "GOTOOLCHAIN",
+            "PATH",
+            "TMPDIR",
+        ],
+        "the provider environment must be exactly this finite cleared set"
     );
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     // The provider never created its socket, so `close_provider` cannot prove the on-disk socket's

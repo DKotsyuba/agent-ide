@@ -10,7 +10,7 @@ use std::{
 
 use agent_ide::{
     app::{
-        cache::{CacheNamespaceId, CacheRoot, VerifiedCacheRetirement},
+        cache::{CacheNamespaceId, CacheRoot},
         config::StoreConfig,
         store::{OperationId, Store},
     },
@@ -20,6 +20,7 @@ use agent_ide::{
     },
     workspace::{
         authority::WorktreeRef,
+        durable::DurableWorkspace,
         observation::{ObservationRef, SourceBytes, SourceCoverage, SourceRevision},
         store::{ObservationAdmission, ObservationDraft, WorkspaceStore},
     },
@@ -229,6 +230,41 @@ async fn diagnostics_are_bounded_and_cache_reuse_requires_quiescent_compatibilit
     }
     assert_eq!(view.diagnostic_deltas().references().len(), 2);
     assert!(view.diagnostic_deltas().overflowed());
+    // Retirement authority must be Workspace's own private-field closure receipt, so this section
+    // commits two real durable closures instead of naming a publicly constructible reason.
+    // Native identity refuses symlinked components, so this real worktree lives under
+    // `/private/tmp` rather than behind Darwin's `/tmp` and `/var` aliases.
+    let tree_root = PathBuf::from(format!(
+        "/private/tmp/agent-ide-freshness-{}-{}-closable-worktree",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(tree_root.join(".git")).unwrap();
+    let durable_database = temporary("durable").with_extension("sqlite");
+    let durable_store =
+        Store::open_with_backup_root(&durable_database, &temporary("durable-backups"), config())
+            .unwrap();
+    let owner = DurableWorkspace::open(&durable_store).await.unwrap();
+    let owned_tree = owner
+        .resolve_worktree(tree_root.clone(), tree_root.clone(), PathBuf::from(".git"))
+        .await
+        .unwrap();
+    let closure = owner
+        .close_worktree(OperationId::new("close-cache-owner").unwrap(), &owned_tree)
+        .await
+        .unwrap();
+    let reopened = owner
+        .resolve_worktree(tree_root.clone(), tree_root.clone(), PathBuf::from(".git"))
+        .await
+        .unwrap();
+    let other_closure = owner
+        .close_worktree(
+            OperationId::new("close-other-incarnation").unwrap(),
+            &reopened,
+        )
+        .await
+        .unwrap();
+    assert_ne!(other_closure.incarnation(), closure.incarnation());
     let cache_path = temporary("cache");
     let cache_root = CacheRoot::prepare(&cache_path).unwrap();
     let identity = CacheIdentity::new(
@@ -253,36 +289,52 @@ async fn diagnostics_are_bounded_and_cache_reuse_requires_quiescent_compatibilit
         &cache_root,
         CacheNamespaceId::new("freshness").unwrap(),
         identity.clone(),
+        &owned_tree,
     )
     .unwrap();
+    assert_eq!(
+        cache.namespace_path(),
+        Some(cache_path.join("freshness").as_path()),
+        "the retained lifecycle is the single source of the provider's cache path"
+    );
     assert!(!cache.handoff(&identity));
+    assert!(!cache.quiescent());
     cache.quiesce();
+    assert!(cache.quiescent());
     assert!(cache.handoff(&identity));
     assert!(!cache.handoff(&incompatible));
     assert!(cache.retained());
-    cache.retire(VerifiedCacheRetirement::Closed).unwrap();
+    assert!(
+        cache.retire(&other_closure).is_err(),
+        "a closure of another worktree incarnation must retire nothing"
+    );
+    assert!(cache.retained());
+    cache.retire(&closure).unwrap();
     assert!(!cache.retained());
+    assert_eq!(cache.namespace_path(), None);
     let mut failed_cache = CacheLifecycle::retain(
         &cache_root,
         CacheNamespaceId::new("failed-retirement").unwrap(),
         identity.clone(),
+        &owned_tree,
     )
     .unwrap();
     let failed_path = cache_path.join("failed-retirement");
     assert!(
-        failed_cache.retire(VerifiedCacheRetirement::Reset).is_err(),
+        failed_cache.retire(&closure).is_err(),
         "retire must refuse a still-active (non-quiescent) lifecycle"
     );
     assert!(failed_cache.retained());
     failed_cache.quiesce();
     fs::set_permissions(&failed_path, fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(failed_cache.retire(VerifiedCacheRetirement::Reset).is_err());
+    assert!(failed_cache.retire(&closure).is_err());
     assert!(failed_cache.retained());
     assert!(!failed_cache.handoff(&identity));
     fs::set_permissions(&failed_path, fs::Permissions::from_mode(0o700)).unwrap();
-    failed_cache.retire(VerifiedCacheRetirement::Reset).unwrap();
+    failed_cache.retire(&closure).unwrap();
     assert!(!failed_cache.retained());
     fs::remove_dir_all(root).unwrap();
     fs::remove_file(database).unwrap();
     fs::remove_dir_all(cache_path).unwrap();
+    fs::remove_dir_all(tree_root).unwrap();
 }

@@ -71,13 +71,26 @@ impl CacheNamespaceId {
     }
 }
 
-/// Captures an explicit peer-supplied verified reason that permits cache retirement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VerifiedCacheRetirement {
-    /// The peer verified the canonical worktree incarnation has closed.
-    Closed,
-    /// The peer verified an explicit cache reset for the canonical worktree incarnation.
-    Reset,
+/// Carries an unforgeable peer-minted fact that permits one cache retirement attempt.
+///
+/// The single field is private and the constructor is crate-internal, so no caller outside this
+/// crate can name a variant and thereby claim retirement authority it never proved. Application
+/// deliberately learns nothing about *which* lifecycle fact was verified: deciding that a closure
+/// is real, exact, and complete stays with the owning peer domain, and Application only refuses to
+/// delete anything without the token. The token is neither `Copy` nor `Clone`, so each retirement
+/// attempt consumes a freshly minted fact instead of replaying an old one.
+#[derive(Debug)]
+pub struct VerifiedCacheRetirement(());
+
+impl VerifiedCacheRetirement {
+    /// Mints the token for a peer domain that has already verified an exact lifecycle closure.
+    ///
+    /// Callers must have matched the closure against the canonical worktree incarnation that owns
+    /// the namespace and must have completed admission revocation and provider quiescence first;
+    /// this constructor performs no check of its own and grants no policy authority.
+    pub(crate) const fn verified() -> Self {
+        Self(())
+    }
 }
 
 /// Represents one retained private cache namespace and exposes no compatibility interpretation.
@@ -92,12 +105,13 @@ impl CacheNamespace {
         &self.path
     }
 
-    /// Retires this namespace only after a peer supplies a verified closure or reset fact.
+    /// Retires this namespace only after a peer mints an unforgeable verified-closure token.
     ///
     /// The fact is intentionally required at the call boundary: stop, handoff, a missing path,
-    /// provider incompatibility, and Application failures are not retirement evidence. The
-    /// namespace is borrowed so a caller retains its lifecycle handle and can retry after a
-    /// temporary filesystem validation or removal failure.
+    /// provider incompatibility, and Application failures are not retirement evidence. Because the
+    /// token cannot be constructed outside this crate, an untrusted caller has no reset or closure
+    /// spelling that reaches this deletion. The namespace is borrowed so a caller retains its
+    /// lifecycle handle and can retry after a temporary filesystem validation or removal failure.
     pub fn retire(&self, _verified: VerifiedCacheRetirement) -> Result<(), AppError> {
         let metadata = fs::symlink_metadata(&self.path)?;
         validate_private_directory(&self.path, &metadata)?;
