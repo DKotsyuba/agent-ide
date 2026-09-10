@@ -51,7 +51,10 @@ impl ProviderSettings {
     fn configuration(&self) -> serde_json::Value {
         match self {
             Self::GoplsDefaults => serde_json::Value::Null,
-            Self::Rust(_) => serde_json::json!({"cachePriming":{"enable":false}}),
+            Self::Rust(profile) => serde_json::json!({
+                "cachePriming":{"enable":false},
+                "procMacro":{"enable":!profile.proc_macros_disabled()}
+            }),
         }
     }
 

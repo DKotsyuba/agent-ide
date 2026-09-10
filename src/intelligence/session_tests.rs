@@ -308,6 +308,11 @@ async fn eof_never_becomes_provider_readiness() {
 
 /// Returns the accepted immutable Rust identity for controlled protocol peers without spawning a server.
 fn rust_settings() -> ProviderSettings {
+    rust_settings_with_configuration("cache-priming-disabled-v1")
+}
+
+/// Returns a Rust identity with one explicit accepted initialization configuration.
+fn rust_settings_with_configuration(configuration: &str) -> ProviderSettings {
     ProviderSettings::Rust(
         RustProfile::new(super::super::rust::RustProfileIdentity {
             binary: "/usr/bin/true".into(),
@@ -315,13 +320,33 @@ fn rust_settings() -> ProviderSettings {
             cargo_version: "cargo-test".into(),
             rustc_version: "rustc-test".into(),
             rustup_toolchain: "test-toolchain".into(),
-            configuration: "cache-priming-disabled-v1".into(),
+            configuration: configuration.into(),
             trust: "test".into(),
             transport: "stdio-v1".into(),
             cache_namespace: "test".into(),
         })
         .unwrap(),
     )
+}
+
+/// Managed sandbox initialization disables proc macros while retaining cache-priming suppression.
+#[test]
+fn managed_rust_settings_disable_proc_macro_expansion() {
+    let settings = rust_settings_with_configuration("cache-priming-and-proc-macro-disabled-v1");
+    assert_eq!(
+        settings.configuration(),
+        serde_json::json!({
+            "cachePriming":{"enable":false},
+            "procMacro":{"enable":false}
+        })
+    );
+    assert_eq!(
+        rust_settings().configuration(),
+        serde_json::json!({
+            "cachePriming":{"enable":false},
+            "procMacro":{"enable":true}
+        })
+    );
 }
 
 /// Negotiates exact gopls/Rust settings and refuses wrong Rust identity or an incomplete/unhealthy barrier.

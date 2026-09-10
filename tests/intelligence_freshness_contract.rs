@@ -243,10 +243,10 @@ async fn diagnostics_are_bounded_and_cache_reuse_requires_quiescent_compatibilit
     let incompatible = CacheIdentity::new(
         "gopls",
         "shared",
-        "other",
+        "config",
         "toolchain",
         "trusted",
-        "tree-state",
+        "other-tree-state",
     )
     .unwrap();
     let mut cache = CacheLifecycle::retain(

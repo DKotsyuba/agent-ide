@@ -48,24 +48,29 @@ fn worktree(path: &str, incarnation: u64) -> RustWorktree {
 }
 
 /// Builds the complete fixed Rust compatibility identity used by every exclusive request.
-fn profile() -> RustProfile {
+/// `cache_namespace` must be a verified absolute directory, never a bare relative label, so
+/// `command`'s derived `CARGO_HOME`/`CARGO_TARGET_DIR`/`TMPDIR` resolve without depending on the
+/// spawned process's working directory.
+fn profile(cache_namespace: &Path) -> RustProfile {
     RustProfile::new(RustProfileIdentity {
         binary: PathBuf::from("/Users/pluto/.local/bin/rust-analyzer"),
         rust_analyzer_version: format!("rust-analyzer {ANALYZER_VERSION}"),
         cargo_version: "cargo 1.98.1".into(),
         rustc_version: "rustc 1.98.1".into(),
         rustup_toolchain: "1.98.1-aarch64-apple-darwin".into(),
-        configuration: "cache-priming-disabled-v1".into(),
+        configuration: "cache-priming-and-proc-macro-disabled-v1".into(),
         trust: "local-trusted-v1".into(),
         transport: "stdio-v1".into(),
-        cache_namespace: "rust-native-v1".into(),
+        cache_namespace: cache_namespace.display().to_string(),
     })
     .unwrap()
 }
 
-/// Creates a private Cargo project whose `item` returns the given Rust type and expression.
-/// Returns its root and source URI; the successful caller removes the generated project.
-fn project(label: &str, result: &str, expression: &str) -> (PathBuf, String) {
+/// Creates a private Cargo project and its profile-local writable cache directories.
+/// `item` returns the given Rust type and expression; returns the project root, its `src/lib.rs`
+/// URI, and the verified absolute cache namespace prepared under that same root. The successful
+/// caller removes the root, which also reclaims the namespace.
+fn project(label: &str, result: &str, expression: &str) -> (PathBuf, String, PathBuf) {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let root = std::env::temp_dir().join(format!(
         "agent-ide-rust-contract-{label}-{}-{}",
@@ -73,6 +78,10 @@ fn project(label: &str, result: &str, expression: &str) -> (PathBuf, String) {
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir_all(root.join("src")).unwrap();
+    let cache_namespace = root.join("rust-native-v1");
+    for directory in ["cargo", "target", "tmp"] {
+        fs::create_dir_all(cache_namespace.join(directory)).unwrap();
+    }
     fs::write(
         root.join("Cargo.toml"),
         "[package]\nname = \"contract\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
@@ -86,7 +95,7 @@ fn project(label: &str, result: &str, expression: &str) -> (PathBuf, String) {
     )
     .unwrap();
     let uri = format!("file://{}", root.join("src/lib.rs").display());
-    (root, uri)
+    (root, uri, cache_namespace)
 }
 
 /// Retains genuine host-bound scope; each actual spawn consumes a new ActiveBindingUse from its guard.
@@ -321,7 +330,7 @@ async fn semantic_probe(
 fn exclusive_rust_requests_are_distinct_and_source_results_are_generation_scoped() {
     let first_worktree = worktree("/private/tmp/agent-ide-rust-first", 1);
     let second_worktree = worktree("/private/tmp/agent-ide-rust-second", 1);
-    let profile = profile();
+    let profile = profile(Path::new("/private/tmp/agent-ide-rust-cache-native-v1"));
     assert_ne!(
         profile.compatibility_key(&first_worktree),
         profile.compatibility_key(&second_worktree)
@@ -396,20 +405,27 @@ async fn real_rust_analyzer_is_exclusive_across_divergent_worktrees() {
         std::env::var("AGENT_IDE_RUST_ANALYZER")
             .expect("AGENT_IDE_RUST_ANALYZER must name the verified rust-analyzer binary"),
     );
-    let profile = RustProfile::new(RustProfileIdentity {
-        binary: analyzer,
-        rust_analyzer_version: format!("rust-analyzer {ANALYZER_VERSION}"),
-        cargo_version: "cargo 1.98.1".into(),
-        rustc_version: "rustc 1.98.1".into(),
-        rustup_toolchain: "1.98.1-aarch64-apple-darwin".into(),
-        configuration: "cache-priming-disabled-v1".into(),
-        trust: "local-trusted-v1".into(),
-        transport: "stdio-v1".into(),
-        cache_namespace: "rust-native-v1".into(),
-    })
-    .unwrap();
-    let (first_root, first_uri) = project("first", "u32", "42");
-    let (second_root, second_uri) = project("second", "String", "String::new()");
+    let (first_root, first_uri, first_cache_namespace) = project("first", "u32", "42");
+    let (second_root, second_uri, second_cache_namespace) =
+        project("second", "String", "String::new()");
+    // Each worktree gets its own verified absolute cache namespace: divergent worktrees never
+    // share a physical Cargo/target directory, even under an otherwise identical profile.
+    let build_profile = |cache_namespace: &Path| {
+        RustProfile::new(RustProfileIdentity {
+            binary: analyzer.clone(),
+            rust_analyzer_version: format!("rust-analyzer {ANALYZER_VERSION}"),
+            cargo_version: "cargo 1.98.1".into(),
+            rustc_version: "rustc 1.98.1".into(),
+            rustup_toolchain: "1.98.1-aarch64-apple-darwin".into(),
+            configuration: "cache-priming-and-proc-macro-disabled-v1".into(),
+            trust: "local-trusted-v1".into(),
+            transport: "stdio-v1".into(),
+            cache_namespace: cache_namespace.display().to_string(),
+        })
+        .unwrap()
+    };
+    let first_profile = build_profile(&first_cache_namespace);
+    let second_profile = build_profile(&second_cache_namespace);
     let first_worktree = worktree(first_root.to_str().unwrap(), 1);
     let second_worktree = worktree(second_root.to_str().unwrap(), 1);
     let mut admission = AdmissionController::new(AdmissionLimits {
@@ -428,7 +444,7 @@ async fn real_rust_analyzer_is_exclusive_across_divergent_worktrees() {
     let mut views = RustViews::default();
     let owner = OwnerId::new("real-rust-contract").unwrap();
     let first = match views.request(
-        &profile,
+        &first_profile,
         &first_worktree,
         &mut registry,
         &mut admission,
@@ -438,7 +454,7 @@ async fn real_rust_analyzer_is_exclusive_across_divergent_worktrees() {
         RustViewAdmission::Granted(view) => view,
         outcome => panic!("first Rust request was not admitted: {outcome:?}"),
     };
-    let mut first_request = request(&profile, &first_worktree);
+    let mut first_request = request(&first_profile, &first_worktree);
     let first_active = first_request.fresh();
     let first_child = RustProtocolChild::spawn(
         &first_request.request,
@@ -456,7 +472,7 @@ async fn real_rust_analyzer_is_exclusive_across_divergent_worktrees() {
     ));
     assert!(matches!(
         views.request(
-            &profile,
+            &second_profile,
             &second_worktree,
             &mut registry,
             &mut admission,
@@ -476,7 +492,7 @@ async fn real_rust_analyzer_is_exclusive_across_divergent_worktrees() {
     assert_eq!(promotions.len(), 1);
     let second = views
         .promote(
-            &profile,
+            &second_profile,
             &second_worktree,
             &mut registry,
             &mut admission,
@@ -484,7 +500,7 @@ async fn real_rust_analyzer_is_exclusive_across_divergent_worktrees() {
         )
         .unwrap();
     assert_eq!(admission.running_count(), 1);
-    let mut second_request = request(&profile, &second_worktree);
+    let mut second_request = request(&second_profile, &second_worktree);
     let second_active = second_request.fresh();
     let second_child = RustProtocolChild::spawn(
         &second_request.request,
@@ -507,9 +523,10 @@ async fn real_rust_analyzer_is_exclusive_across_divergent_worktrees() {
     );
     assert_eq!(admission.running_count(), 0);
     assert_ne!(
-        profile.compatibility_key(&first_worktree),
-        profile.compatibility_key(&second_worktree)
+        first_profile.compatibility_key(&first_worktree),
+        second_profile.compatibility_key(&second_worktree)
     );
+    assert_ne!(first_cache_namespace, second_cache_namespace);
     fs::remove_dir_all(first_root).unwrap();
     fs::remove_dir_all(second_root).unwrap();
 }
@@ -532,8 +549,8 @@ async fn real_rust_production_session_uses_exact_profile_and_barrier() {
             store::{ObservationAdmission, ObservationDraft, WorkspaceStore},
         },
     };
-    let profile = profile();
-    let (root, _) = project("production", "u32", "42");
+    let (root, _, cache_namespace) = project("production", "u32", "42");
+    let profile = profile(&cache_namespace);
     let worktree = worktree(root.to_str().unwrap(), 1);
     let text = fs::read_to_string(root.join("src/lib.rs")).unwrap();
     let store = Store::open(
@@ -609,7 +626,7 @@ async fn real_rust_production_session_uses_exact_profile_and_barrier() {
     let outcome=with_session(stdout,stdin,worktree.worktree().clone(),1,ViewGeneration {backend:view.generation(),configuration:1,toolchain:1,view:1},ProviderSettings::Rust(profile.clone()),SessionOptions{request_timeout:Duration::from_secs(40),lifetime:Duration::from_secs(70)},|mut session|async move{
         assert!(session.provider_readiness().is_rust_healthy_quiescent());
         assert_eq!(session.capabilities().server_info.as_ref().unwrap().version.as_deref(),Some(ANALYZER_VERSION));
-        assert!(matches!(session.settings(),ProviderSettings::Rust(profile) if profile.configuration()=="cache-priming-disabled-v1"));
+        assert!(matches!(session.settings(),ProviderSettings::Rust(profile) if profile.configuration()=="cache-priming-and-proc-macro-disabled-v1"));
         let context=session.context(&observed,text.as_bytes(),ContextQuery::Symbol{byte_offset:text.rfind("answer").unwrap()}).await?;
         assert_eq!(context.mode,ContextMode::Semantic,"{context:?}");assert!(!context.definitions.unwrap().is_empty());
         assert_eq!(session.diagnostics().readiness,DiagnosticReadiness::Unknown);

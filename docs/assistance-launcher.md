@@ -58,6 +58,11 @@ Go executable as `toolchain` and absent/null `cargo_version` and `rustc_version`
 `rust_cache_priming_disabled_v1` requires a nonempty rustup toolchain selector plus accepted
 nonempty `cargo_version` and `rustc_version` identities. Arbitrary settings objects and
 duplicate language/settings entries are rejected.
+`cache_namespace` is a bounded compatibility label, not a filesystem path or
+authority grant. Assistance combines it with the verified durable worktree and
+accepted provider identities to retain a private directory, then supplies only
+that derived directory through the provider's cleared environment. Configuration
+cannot select `HOME` or another writable host path.
 
 Limits are explicit: 1–64 queued operations, 1–128 retained details, 1–300000 ms per
 operation, and 1–1048576 retained bytes per output stream. There are at most 64 distinct

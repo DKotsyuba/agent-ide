@@ -140,6 +140,7 @@ impl GoplsProfile {
     }
 
     /// Builds a profile-owned provider command with a cleared, finite Go environment.
+    /// Go build, module, and temporary writes remain inside the verified cache namespace.
     fn command(
         &self,
         authority: &WorkspaceAuthority,
@@ -154,6 +155,26 @@ impl GoplsProfile {
                 io::Error::new(io::ErrorKind::InvalidInput, "go toolchain has no parent")
             })?;
         environment.insert(OsString::from("PATH"), go_parent.as_os_str().to_os_string());
+        environment.insert(
+            OsString::from("GOPLSCACHE"),
+            OsString::from(Path::new(&self.cache_namespace).join("gopls")),
+        );
+        environment.insert(
+            OsString::from("GOCACHE"),
+            OsString::from(Path::new(&self.cache_namespace).join("go-build")),
+        );
+        environment.insert(
+            OsString::from("GOMODCACHE"),
+            OsString::from(Path::new(&self.cache_namespace).join("go-mod")),
+        );
+        environment.insert(
+            OsString::from("GOTMPDIR"),
+            OsString::from(Path::new(&self.cache_namespace).join("tmp")),
+        );
+        environment.insert(
+            OsString::from("TMPDIR"),
+            OsString::from(Path::new(&self.cache_namespace).join("tmp")),
+        );
         environment.insert(
             OsString::from("AGENT_IDE_GOPLS_PROFILE"),
             OsString::from(&self.revision),
