@@ -47,13 +47,15 @@ pub struct ProductDispatcher {
     helper_binary: Option<std::path::PathBuf>,
     /// Daemon runtime directory, captured at initialize for the helper's socket argument.
     runtime_dir: Arc<Mutex<Option<std::path::PathBuf>>>,
+    /// Private helper claim/finish endpoint, bound once at initialize and unlinked on drop.
+    endpoint: Mutex<Option<super::claude_helper::HelperEndpoint>>,
 }
 
 /// Returns a monotonic millisecond reading for ticket deadlines.
 ///
 /// The value is only ever compared against other readings from this function within one daemon
 /// boot; it is not a wall clock and carries no host, actor or timing information off the daemon.
-fn monotonic_ms() -> u64 {
+pub(crate) fn monotonic_ms() -> u64 {
     static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     ORIGIN
         .get_or_init(std::time::Instant::now)
@@ -87,6 +89,7 @@ impl Default for ProductDispatcher {
                 .ok()
                 .filter(|path| path.is_absolute()),
             runtime_dir: Arc::new(Mutex::new(None)),
+            endpoint: Mutex::new(None),
         }
     }
 }
@@ -180,10 +183,7 @@ impl ProductDispatcher {
                 deadline_ms: worker.limits().operation_ms,
             },
         };
-        let Ok(actor) = HelperActor::new(
-            invocation.actor_id(),
-            (invocation.actor_id() != invocation.call_id()).then_some(invocation.actor_id()),
-        ) else {
+        let Ok(actor) = HelperActor::new(invocation.actor_id(), None) else {
             return error(FailureCode::Internal);
         };
         let deadline = monotonic_ms().saturating_add(worker.limits().operation_ms);
@@ -323,12 +323,17 @@ impl ProductDispatcher {
                 // Ordinary host permission and sandbox evaluation of the unchanged command is
                 // what authorizes the launch; a non-matching payload is discarded here.
                 if let (Some(launch), Some(call_id)) = (event.launch(), event.optional_call_id())
+                    // The hook actor is already the distinguishing identity: a subagent's exact
+                    // agent_id, or the root session_id for a parent. Both sides derive it the
+                    // same way, so a parent and its child are never interchangeable.
+                    && let Ok(actor) = HelperActor::new(event.actor_id(), event.session_id())
                     && let Ok(mut launches) = self.launches.lock()
                 {
                     launches.recognize(
                         launch.command(),
                         launch.run_in_background(),
                         call_id,
+                        &actor,
                         monotonic_ms(),
                     );
                 }
@@ -536,6 +541,11 @@ impl AssistanceDispatcher for ProductDispatcher {
             if let Ok(mut captured) = self.runtime_dir.lock() {
                 *captured = Some(runtime_dir.to_path_buf());
             }
+            // Bound after Application owns the daemon lock, so no two boots share an endpoint.
+            // Failure to bind simply leaves the Claude path unavailable; Codex is unaffected.
+            if let Ok(mut endpoint) = self.endpoint.lock() {
+                *endpoint = super::claude_helper::serve(runtime_dir, self.launches.clone());
+            }
             match &self.worker {
                 Some(worker) => worker
                     .start(runtime_dir)
@@ -550,6 +560,11 @@ impl AssistanceDispatcher for ProductDispatcher {
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<(), AssistanceDispatchUnavailable>> + Send + '_>> {
         Box::pin(async move {
+            // Drops the private endpoint before provider cleanup: no helper may claim during
+            // shutdown, and the socket path never outlives the daemon that bound it.
+            if let Ok(mut endpoint) = self.endpoint.lock() {
+                endpoint.take();
+            }
             match &self.worker {
                 Some(worker) => worker
                     .shutdown()

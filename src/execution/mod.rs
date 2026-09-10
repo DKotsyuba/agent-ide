@@ -3664,5 +3664,113 @@ fn local_sandbox_cwd(raw: &str) -> Result<PathBuf, SandboxStateError> {
     }
 }
 
+/// Returns the fixed argument vector for one Git discovery query run by an inherited-sandbox child.
+///
+/// This is the same fixed argv the managed Codex path builds, exposed for a caller that already
+/// runs inside a sandbox it did not create. It selects nothing from model input: the query is a
+/// closed enum and `candidate` is the trusted launcher-configured path.
+pub fn inherited_git_arguments(query: GitDiscoveryQuery, candidate: &Path) -> Vec<OsString> {
+    let mut args = vec![OsString::from("-C"), candidate.as_os_str().to_owned()];
+    match query {
+        GitDiscoveryQuery::ShowTopLevel => args.extend([
+            OsString::from("rev-parse"),
+            OsString::from("--show-toplevel"),
+        ]),
+        GitDiscoveryQuery::GitCommonDir => args.extend([
+            OsString::from("rev-parse"),
+            OsString::from("--path-format=absolute"),
+            OsString::from("--git-common-dir"),
+        ]),
+        GitDiscoveryQuery::WorktreeListPorcelainZ => args.extend([
+            OsString::from("worktree"),
+            OsString::from("list"),
+            OsString::from("--porcelain"),
+            OsString::from("-z"),
+        ]),
+    }
+    args
+}
+
+/// Reports one settled inherited-sandbox child without exposing OS or provider payloads.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InheritedChildOutcome {
+    /// Whether the child exited successfully.
+    pub success: bool,
+    /// Captured stdout, truncated at the caller's byte cap.
+    pub stdout: Vec<u8>,
+    /// True when the cap discarded trailing output.
+    pub truncated: bool,
+}
+
+/// Runs one direct child that inherits its caller's existing sandbox, then reaps it.
+///
+/// This is the minimum distinct boundary for a host that enforces its own sandbox on the calling
+/// process. It is deliberately separate from the managed Codex path: it takes no
+/// `ObservedSandboxState`, mints no permit, consumes no admission lease, and uses no wrapper
+/// executable, so no synthetic sandbox observation can ever reach Codex Execution through it.
+/// The caller must therefore already be inside the sandbox it intends the child to run under.
+///
+/// `program` must be an accepted absolute executable and `args` a fixed argument vector; neither
+/// is ever derived from model input. Output is capped at `output_cap` bytes per the caller's
+/// budget and the child is killed and reaped if it outlives `deadline`.
+///
+/// Returns `Err(true)` when the child provably never started (so it was never a child to reap),
+/// and `Err(false)` when it started but could not be settled — the caller must then report it as
+/// unreaped rather than assuming cleanup.
+pub async fn run_inherited_child(
+    program: &Path,
+    args: Vec<OsString>,
+    cwd: &Path,
+    output_cap: usize,
+    deadline: std::time::Duration,
+) -> Result<InheritedChildOutcome, bool> {
+    if !is_normal_absolute(program) || output_cap == 0 {
+        return Err(true);
+    }
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|_| true)?;
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill().await;
+        return Err(false);
+    };
+    let capture = async {
+        let mut buffer = Vec::new();
+        let _ = tokio::io::AsyncReadExt::take(&mut stdout, output_cap as u64 + 1)
+            .read_to_end(&mut buffer)
+            .await;
+        buffer
+    };
+    let settled = tokio::time::timeout(deadline, async {
+        let buffer = capture.await;
+        child.wait().await.map(|status| (status, buffer))
+    })
+    .await;
+    match settled {
+        Ok(Ok((status, mut buffer))) => {
+            let truncated = buffer.len() > output_cap;
+            buffer.truncate(output_cap);
+            Ok(InheritedChildOutcome {
+                success: status.success(),
+                stdout: buffer,
+                truncated,
+            })
+        }
+        // Started but unsettled: kill, then only claim settlement if the reap actually succeeded.
+        _ => {
+            let killed = child.kill().await.is_ok() && child.wait().await.is_ok();
+            let _ = killed;
+            Err(false)
+        }
+    }
+}
+
 #[cfg(test)]
 mod linear_tests;
