@@ -22,7 +22,10 @@ const MAX_REPLAY_CHANNELS: usize = 64;
 /// Bounds host/actor replay scopes independently within each retained channel.
 const MAX_REPLAY_SCOPES_PER_CHANNEL: usize = 64;
 /// Bounds retained rejected or completed call identities within one exact scope.
-const MAX_REPLAYS_PER_SCOPE: usize = 64;
+///
+/// The allowance matches the former daemon-wide replay budget so one long-lived shipped host
+/// actor can complete provider warm-up polling without weakening permanent replay rejection.
+const MAX_REPLAYS_PER_SCOPE: usize = 1024;
 const MAX_SANDBOX_STATE_BYTES: usize = 64 * 1024;
 const TURN_METADATA: &str = "x-codex-turn-metadata";
 const SANDBOX_STATE_METADATA: &str = "codex/sandbox-state-meta";
