@@ -1,6 +1,7 @@
 //! Closed, serialized-size-bounded Assistance outcomes with no transport or authority secrets.
 
 use crate::app::transport::OpaqueJson;
+use rmcp::model::{CallToolResult, ContentBlock};
 use serde::{Deserialize, Serialize};
 
 /// Maximum complete Assistance JSON envelope including escaped text and all keys.
@@ -178,6 +179,46 @@ impl PeerReply {
             !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
         })
     }
+}
+
+/// Builds the exact complete MCP tool result for one reply without ever shrinking its text.
+///
+/// This is the sole envelope constructor shared by transport rendering
+/// ([`crate::assistance::facade::render_reply`]) and whole-hunk page fitting
+/// ([`crate::assistance::worker::fit_diff_page`]), so both measure the same bytes that are
+/// actually sent to the MCP host: [`CallToolResult::structured`]/[`CallToolResult::structured_error`]
+/// duplicate `reply`'s JSON into both `content[0].text` and `structured_content`, and this prepends
+/// the fixed one-line summary exactly as the real response does. A page proven to fit by
+/// [`call_tool_result_fits`] on the result of this function is therefore never cut mid-hunk by a
+/// later, independently computed reserve.
+pub(crate) fn render_call_tool_result(reply: &PeerReply) -> Option<CallToolResult> {
+    let value = serde_json::to_value(reply).ok()?;
+    let summary = match reply {
+        PeerReply::Pending { .. } => {
+            "Assistance work is pending; use ide.inspect with the returned detail_ref"
+        }
+        PeerReply::Error { .. } => {
+            "Assistance could not complete this operation; inspect the typed error and continue with native tools"
+        }
+        _ => "Assistance returned the current owner result",
+    };
+    let mut rendered = if matches!(reply, PeerReply::Error { .. }) {
+        CallToolResult::structured_error(value)
+    } else {
+        CallToolResult::structured(value)
+    };
+    rendered.content.insert(0, ContentBlock::text(summary));
+    Some(rendered)
+}
+
+/// True when `rendered`'s exact serialized bytes fit the bounded MCP reply budget.
+///
+/// This is the exact predicate every accepted page and every final rendered reply must satisfy;
+/// callers must not substitute an approximate reserve computed over a narrower value (such as the
+/// unduplicated [`PeerReply`] alone), because that undercounts the real envelope and can accept a
+/// page that [`render_reply`](crate::assistance::facade::render_reply) then has to shrink.
+pub(crate) fn call_tool_result_fits(rendered: &CallToolResult) -> bool {
+    serde_json::to_vec(rendered).is_ok_and(|bytes| bytes.len() <= MAX_REPLY_BYTES - MCP_RESERVE)
 }
 
 /// Includes escaping/framing costs, preserves Unicode boundaries, and rejects unknown envelope fields.

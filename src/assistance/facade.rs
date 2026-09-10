@@ -29,7 +29,10 @@ use crate::{
             HookEvent, HookPhase, HostBindingGuard, HostKind, parse_candidate,
             parse_claude_call_id, parse_hook_event, parse_host_kind,
         },
-        reply::{MAX_FEEDBACK_BYTES, MAX_REPLY_BYTES, MissingPeer, PeerReply, ResultKind},
+        reply::{
+            MAX_FEEDBACK_BYTES, MAX_REPLY_BYTES, MissingPeer, PeerReply, ResultKind,
+            call_tool_result_fits, render_call_tool_result,
+        },
     },
     workspace::authority::{
         AuthorityError, AuthorityRegistry, AuthorityRevoked, AuthorityStamp, StopBindingHandoff,
@@ -818,28 +821,18 @@ impl StdioFacade {
     }
 }
 
-/// Budgets both MCP's structured result and its escaped text fallback, reserving protocol framing.
+/// Budgets the complete MCP result by shrinking owner text until it fits the same exact envelope
+/// [`fit_diff_page`](crate::assistance::worker::fit_diff_page) already proved a Diff page fits.
+///
+/// Both callers share [`render_call_tool_result`] and [`call_tool_result_fits`] so a page accepted
+/// during pagination is measured by the identical predicate here and is never re-cut mid-hunk by an
+/// independently computed reserve; only a non-Diff reply too large on arrival (never proven to fit
+/// upstream) ever reaches the shrink loop below.
 fn render_reply(mut reply: PeerReply) -> CallToolResult {
     loop {
-        let summary = match &reply {
-            PeerReply::Pending { .. } => {
-                "Assistance work is pending; use ide.inspect with the returned detail_ref"
-            }
-            PeerReply::Error { .. } => {
-                "Assistance could not complete this operation; inspect the typed error and continue with native tools"
-            }
-            _ => "Assistance returned the current owner result",
-        };
-        let Ok(value) = serde_json::to_value(&reply) else {
-            break;
-        };
-        let mut rendered = if matches!(reply, PeerReply::Error { .. }) {
-            CallToolResult::structured_error(value)
-        } else {
-            CallToolResult::structured(value)
-        };
-        rendered.content.insert(0, ContentBlock::text(summary));
-        if serde_json::to_vec(&rendered).is_ok_and(|bytes| bytes.len() <= MAX_REPLY_BYTES - 1024) {
+        if let Some(rendered) = render_call_tool_result(&reply)
+            && call_tool_result_fits(&rendered)
+        {
             return rendered;
         }
         if !reply.shrink_text() {
@@ -860,7 +853,7 @@ fn rendered_reply_bounds_the_complete_mcp_result() {
         detail_ref: Some("same-binding-detail".into()),
         truncated: false,
     });
-    assert!(serde_json::to_vec(&rendered).unwrap().len() <= MAX_REPLY_BYTES - 1024);
+    assert!(call_tool_result_fits(&rendered));
     let result = rendered.structured_content.unwrap();
     assert_eq!(result["truncated"], true);
     assert_eq!(result["detail_ref"], "same-binding-detail");

@@ -1831,6 +1831,14 @@ fn escape_heavy(marker: &str, lines: usize) -> String {
         .collect()
 }
 
+/// Builds plain-ASCII content with no JSON escaping overhead, so its serialized size stays close
+/// to its raw byte length even when the raw size alone exceeds a prior, since-removed half-budget.
+fn plain_ascii(marker: &str, lines: usize) -> String {
+    (0..lines)
+        .map(|line| format!("{marker} plain unescaped content line {line:04}\n"))
+        .collect()
+}
+
 /// Verifies whole-hunk pagination, serialized bounds, deferred delivery, and snapshot freshness.
 ///
 /// Gates the fixed Git snapshot behind a fixture marker so the first `ide.diff` is provably
@@ -1862,9 +1870,13 @@ async fn diff_pagination_delivers_every_whole_hunk_once_with_truthful_freshness(
         )
         .unwrap();
     }
+    // Plain ASCII, not escape-heavy: its raw byte length alone exceeds the prior 24 KiB
+    // half-budget a since-removed shrinking-byte-ceiling approach used to test against, but with
+    // negligible JSON escaping overhead it still fits the final duplicated MCP envelope as its own
+    // page, unlike an escape-heavy hunk of the same raw size would.
     std::fs::write(
         fixture.root.join("many-big.txt"),
-        escape_heavy("hunkmark-big", 640),
+        plain_ascii("hunkmark-big", 600),
     )
     .unwrap();
     std::fs::write(fixture.root.join("many-raw.bin"), [0xff_u8; 64]).unwrap();
@@ -1998,6 +2010,57 @@ async fn diff_pagination_delivers_every_whole_hunk_once_with_truthful_freshness(
     let mismatched = actor.settle(&fixture, mismatched).await;
     assert_eq!(mismatched["state"], "error", "{mismatched}");
     assert_eq!(mismatched["code"], "source_unavailable", "{mismatched}");
+
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A single hunk can be small enough in raw bytes to be selected by `select_hunks` (well under the
+/// captured byte ceiling) yet still too large, once escaping and the duplicated MCP envelope are
+/// accounted for, to ever fit a page by itself. Proves this reports an explicit `capacity` failure
+/// — never a truncated hunk delivered as complete, and never state corrupted so a retry regresses
+/// to something other than the same explicit failure.
+#[tokio::test]
+async fn diff_oversized_single_hunk_reports_capacity_without_false_continuation() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(fixture.root.join("huge.txt"), "base\n").unwrap();
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "huge"]);
+    // Raw patch bytes stay well under the 48 KiB captured byte ceiling, so this hunk is selected
+    // rather than permanently skipped by `select_hunks`; its escape-heavy JSON form is what makes
+    // the actual duplicated MCP envelope impossible to fit.
+    std::fs::write(
+        fixture.root.join("huge.txt"),
+        escape_heavy("hunkmark-huge", 800),
+    )
+    .unwrap();
+
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "product-root").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"start"}))
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    let first = actor
+        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let first = actor.settle(&fixture, first).await;
+    assert_eq!(first["state"], "error", "{first}");
+    assert_eq!(first["code"], "capacity", "{first}");
+
+    // No continuation was ever retained for this failed capture, so a retry must reach the exact
+    // same explicit failure rather than a stale or corrupted detail reference.
+    let retry = actor
+        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let retry = actor.settle(&fixture, retry).await;
+    assert_eq!(retry["state"], "error", "{retry}");
+    assert_eq!(retry["code"], "capacity", "{retry}");
 
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");

@@ -287,12 +287,6 @@ fn hex_encode(bytes: &[u8]) -> String {
         })
 }
 
-/// Headroom kept between one composed Diff reply and the hard transport ceiling. It must stay at
-/// or above `reply::MCP_RESERVE`, the margin [`PeerReply::encode`] itself enforces, so a page this
-/// module already proved to fit is never shrunk again (and therefore never cut mid-hunk) by the
-/// generic encoder; the surplus absorbs the transport envelope around the reply.
-const REPLY_METADATA_RESERVE: usize = 2048;
-
 /// Composes one whole-hunk Diff page that provably fits the actual serialized reply envelope.
 ///
 /// This is the single fitting path shared by the initial composition in [`Worker::diff`] and by
@@ -300,6 +294,14 @@ const REPLY_METADATA_RESERVE: usize = 2048;
 /// selecting *fewer whole hunks*, never by lowering the captured byte ceiling and never by cutting
 /// rendered text. `compose` is invoked with a candidate hunk count and must return the selection
 /// for exactly that count under the originally captured byte budget.
+///
+/// Fitting is measured through [`render_call_tool_result`] and [`call_tool_result_fits`], the same
+/// exact envelope construction and predicate `render_reply` uses to build the complete MCP result
+/// the host actually receives. Using anything narrower here — such as the raw serialized
+/// [`PeerReply`] with an approximate fixed reserve — undercounts the real envelope, because the
+/// MCP result duplicates the reply's JSON into both `content` and `structured_content`; a page
+/// accepted under that narrower measurement could then be silently cut mid-hunk by `render_reply`'s
+/// own shrink loop after the cursor already advanced past it.
 ///
 /// * `mode` — compare mode rendered into the page text.
 /// * `authority_epoch` — current durable epoch rendered as provenance.
@@ -348,9 +350,8 @@ pub(super) fn fit_diff_page(
                 || candidate.overflow_hunks() > 0
                 || candidate.overflow_bytes() > 0,
         };
-        if serde_json::to_string(&reply).is_ok_and(|serialized| {
-            serialized.len().saturating_add(REPLY_METADATA_RESERVE) <= MAX_REPLY_BYTES
-        }) {
+        if render_call_tool_result(&reply).is_some_and(|rendered| call_tool_result_fits(&rendered))
+        {
             return Ok((candidate, reply));
         }
         if max_hunks == 1 {

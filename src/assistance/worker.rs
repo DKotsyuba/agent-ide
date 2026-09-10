@@ -6,7 +6,7 @@ use super::{
         ActiveBindingUse, BindingRef, HostBindingGuard, ObservedSandboxState, ValidatedInvocation,
     },
     launcher::{LaunchTarget, LauncherConfig},
-    reply::{FailureCode, MAX_REPLY_BYTES, PeerReply, ResultKind},
+    reply::{FailureCode, PeerReply, ResultKind, call_tool_result_fits, render_call_tool_result},
 };
 use crate::workspace::observation::SourceObservation;
 use crate::{
