@@ -898,9 +898,10 @@ async fn capture_attempt<R: SnapshotRunner>(
     }
     let head = evidence_identity(b"workspace-git-head-v1", &before[0]);
     let index = evidence_identity(b"workspace-git-index-v1", &before[1]);
-    working.update(&before[1]);
-    working.update(&before[2]);
-    working.update(&before[3]);
+    for component in &before[1..=3] {
+        working.update(&(component.len() as u64).to_le_bytes());
+        working.update(component);
+    }
     let work = evidence_identity(
         b"workspace-git-raw-working-v1",
         working.finalize().as_bytes(),
