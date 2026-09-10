@@ -2,7 +2,10 @@
 
 An explicitly activated coding companion for Codex and Claude Code, designed for Linux and macOS. One coding agent owns one Git worktree. A local broker coordinates isolated analysis views, compatible shared language-server backends and bounded feedback.
 
-Status: the binary assembles the five-tool MCP surface, exact Codex hook-to-MCP binding, durable Workspace activation, source context, safe Git comparisons and owned provider cleanup. Configured process fixtures exercise this assembly; fresh live Codex/Claude acceptance and model-visible feedback delivery remain unverified.
+Status: the binary assembles the five-tool MCP surface, exact Codex hook-to-MCP binding,
+explicit Codex/Claude native ingress, bounded hook context output, durable Workspace activation,
+source context, safe Git comparisons and owned provider cleanup. Host-shaped process tests exercise
+this assembly; fresh live Codex/Claude acceptance and model-visible feedback remain unverified.
 
 Build with `cargo build --locked --bin agent-ide`. Configure an MCP client to launch
 `target/debug/agent-ide mcp --runtime-dir PATH`. Discovery works without a daemon;
@@ -16,6 +19,8 @@ matches exact Codex actor/call hook evidence. Set `AGENT_IDE_LAUNCHER_CONFIG` in
 environment to load the restart-only [trusted execution configuration](docs/assistance-launcher.md).
 Without that configuration, methods report the missing Workspace boundary.
 See [product MCP boundary](docs/assistance-host-binding.md#product-mcp-boundary) for its limits.
+Placeholder-only host examples are shipped for
+[Codex](docs/examples/codex-hooks.toml) and [Claude Code](docs/examples/claude-settings.json).
 
 `agent-ide doctor --runtime-dir PATH` is observational: it reports effective default configuration and local endpoint/lock/protocol state without creating the path or starting services. Workspace scanning, LSP startup, daemon autostart, and cache retirement without a peer-verified closure/reset fact are unsupported.
 

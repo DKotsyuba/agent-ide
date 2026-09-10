@@ -1,0 +1,16 @@
+# Merge after replacing placeholders. Use the same fresh attachment for MCP and hooks.
+
+[[hooks]]
+event = "PreToolUse"
+command = ["<AGENT_IDE_BIN>", "codex-hook", "--runtime-dir", "<RUNTIME_DIR>"]
+env = { AGENT_IDE_HOST_ATTACHMENT = "<FRESH_CHANNEL_ATTACHMENT>" }
+
+[[hooks]]
+event = "PostToolUse"
+command = ["<AGENT_IDE_BIN>", "codex-hook", "--runtime-dir", "<RUNTIME_DIR>"]
+env = { AGENT_IDE_HOST_ATTACHMENT = "<FRESH_CHANNEL_ATTACHMENT>" }
+
+[[hooks]]
+event = "PostToolBatch"
+command = ["<AGENT_IDE_BIN>", "codex-hook", "--runtime-dir", "<RUNTIME_DIR>"]
+env = { AGENT_IDE_HOST_ATTACHMENT = "<FRESH_CHANNEL_ATTACHMENT>" }

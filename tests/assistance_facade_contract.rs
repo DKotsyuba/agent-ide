@@ -5,11 +5,12 @@ use std::{fs, path::PathBuf};
 use agent_ide::{
     assistance::facade::{
         AssistanceFacade, AssistanceTool, FacadeOutcome, FeedbackDelta, FeedbackLedger,
-        FeedbackRecord, FeedbackState, HookIngressOutcome, TrustedTransport, submit_inactive_hook,
-        tool_schemas, validate_call,
+        FeedbackRecord, FeedbackState, HookIngressOutcome, TrustedTransport, render_hook_context,
+        submit_inactive_hook, tool_schemas, validate_call,
     },
     assistance::host_binding::{
-        BindingStatus, HostBindingGuard, parse_candidate, parse_channel_session, parse_hook_event,
+        BindingStatus, HostBindingGuard, parse_candidate, parse_channel_session,
+        parse_claude_hook_event, parse_hook_event,
     },
     workspace::authority::{ActivationRequest, AuthorityRegistry, WorktreeRef},
 };
@@ -170,11 +171,51 @@ fn feedback_deduplicates_rechecks_and_suppresses_after_stop() {
         feedback.mark_delivery_unknown("authority-1", "source-1", "one new fact"),
         Some(FeedbackState::DeliveryUnknown)
     );
+    let stale =
+        FeedbackDelta::new("stale fact", "old version", "none", "superseded", None).unwrap();
+    assert_eq!(
+        feedback.record("authority-1", "source-old", &stale),
+        FeedbackRecord::Pending
+    );
+    assert_eq!(
+        feedback.prepare_delivery("authority-1", "source-old", "stale fact", true, false),
+        Some(FeedbackState::Superseded)
+    );
     feedback.stop_authority("authority-1");
     assert_eq!(
         feedback.record("authority-1", "source-2", &delta),
         FeedbackRecord::Suppressed
     );
+}
+
+/// Emits only bounded post-hook JSON context and never emits context from a pre-hook.
+#[test]
+fn host_feedback_output_is_closed_bounded_and_post_only() {
+    let codex = parse_hook_event(
+        br#"{"hook_event_name":"PostToolUse","session_id":"root","tool_use_id":"call"}"#,
+    )
+    .unwrap();
+    let claude =
+        parse_claude_hook_event(br#"{"hook_event_name":"PostToolBatch","session_id":"root"}"#)
+            .unwrap();
+    for (event, name) in [(&codex, "PostToolUse"), (&claude, "PostToolBatch")] {
+        let output: serde_json::Value =
+            serde_json::from_str(&render_hook_context(event, "one bounded fact").unwrap()).unwrap();
+        assert_eq!(output.as_object().unwrap().len(), 1);
+        assert_eq!(output["hookSpecificOutput"].as_object().unwrap().len(), 2);
+        assert_eq!(output["hookSpecificOutput"]["hookEventName"], name);
+        assert_eq!(
+            output["hookSpecificOutput"]["additionalContext"],
+            "one bounded fact"
+        );
+    }
+    let pre = parse_hook_event(
+        br#"{"hook_event_name":"PreToolUse","session_id":"root","tool_use_id":"call"}"#,
+    )
+    .unwrap();
+    assert!(render_hook_context(&pre, "fact").is_none());
+    assert!(render_hook_context(&codex, "").is_none());
+    assert!(render_hook_context(&codex, &"x".repeat(4097)).is_none());
 }
 
 /// Keeps context source scope and diff modes bounded while rejecting authority-like model inputs.

@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 
 /// Maximum complete Assistance JSON envelope including escaped text and all keys.
 pub const MAX_REPLY_BYTES: usize = 64 * 1024;
+/// Maximum model-visible feedback text returned to a native host hook.
+pub const MAX_FEEDBACK_BYTES: usize = 4 * 1024;
 /// Leaves room for fixed MCP content and protocol wrapper fields.
 const MCP_RESERVE: usize = 1024;
 
@@ -81,6 +83,11 @@ pub enum PeerReply {
     HookSettled {},
     /// Active native lifecycle requested registered-path reconciliation; no effect is inferred.
     NativeHookObserved {},
+    /// One current versioned feedback delta survived native binding and exact-source rechecks.
+    Feedback {
+        /// Bounded fact/evidence/next-step text containing no source or native tool payload.
+        text: String,
+    },
     /// Host binding was revoked before any Workspace authority existed.
     HostStopped {},
     /// Daemon owns the pending work; no successful peer result exists yet.
@@ -158,6 +165,10 @@ impl PeerReply {
     }
     /// Checks reference syntax; ownership and current liveness remain worker admission gates.
     fn valid_reference(&self) -> bool {
+        if matches!(self, Self::Feedback { text } if text.is_empty() || text.len() > MAX_FEEDBACK_BYTES)
+        {
+            return false;
+        }
         let reference = match self {
             Self::Pending { detail_ref } => Some(detail_ref),
             Self::Complete { detail_ref, .. } => detail_ref.as_ref(),

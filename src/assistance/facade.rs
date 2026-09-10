@@ -25,8 +25,10 @@ use crate::{
         },
     },
     assistance::{
-        host_binding::{HostBindingGuard, parse_candidate, parse_hook_event},
-        reply::{MAX_REPLY_BYTES, MissingPeer, PeerReply, ResultKind},
+        host_binding::{
+            HookEvent, HookPhase, HostBindingGuard, HostKind, parse_candidate, parse_hook_event,
+        },
+        reply::{MAX_FEEDBACK_BYTES, MAX_REPLY_BYTES, MissingPeer, PeerReply, ResultKind},
     },
     workspace::authority::{
         AuthorityError, AuthorityRegistry, AuthorityRevoked, AuthorityStamp, StopBindingHandoff,
@@ -420,10 +422,12 @@ impl AssistanceFacade {
 }
 
 /// Reports the result of one fail-open native hook submission without blocking the host tool.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HookIngressOutcome {
     /// The bounded observation reached an already-running daemon; this does not prove model delivery.
     Submitted,
+    /// A current bounded delta is eligible for this exact post-hook model boundary.
+    Feedback(String),
     /// Parsing, connection, framing, dispatch, or reply was unavailable and the hook continued.
     Unavailable,
 }
@@ -440,13 +444,32 @@ pub async fn submit_inactive_hook(
     let Ok(event) = parse_hook_event(payload) else {
         return HookIngressOutcome::Unavailable;
     };
+    submit_hook_event(runtime_dir, host, &event).await
+}
+
+/// Submits one already host-validated event using only its selected identity and lifecycle fields.
+///
+/// The serialized observation explicitly names its host contract. Claude session and optional
+/// agent type are retained for isolation evidence; raw hook fields never enter the transport.
+pub async fn submit_hook_event(
+    runtime_dir: &Path,
+    host: &TrustedTransport,
+    event: &HookEvent,
+) -> HookIngressOutcome {
     let observation = json!({
+        "host": match event.host() {
+            HostKind::Codex => "codex",
+            HostKind::Claude => "claude",
+        },
         "phase": match event.phase() {
-            crate::assistance::host_binding::HookPhase::Pre => "pre",
-            crate::assistance::host_binding::HookPhase::Post => "post",
+            HookPhase::Pre => "pre",
+            HookPhase::Post => "post",
+            HookPhase::PostBatch => "post_batch",
         },
         "actor_id": event.actor_id(),
-        "call_id": event.call_id(),
+        "call_id": event.optional_call_id(),
+        "session_id": event.session_id(),
+        "agent_type": event.agent_type(),
     });
     let Some(observation) = OpaqueJson::from_value(&observation, MAX_HOOK_BYTES) else {
         return HookIngressOutcome::Unavailable;
@@ -467,9 +490,37 @@ pub async fn submit_inactive_hook(
     )
     .await
     {
-        HookSubmitTransportResult::Dispatched { .. } => HookIngressOutcome::Submitted,
+        HookSubmitTransportResult::Dispatched {
+            opaque_reply_json, ..
+        } => match PeerReply::decode(opaque_reply_json.as_str()) {
+            Some(PeerReply::Feedback { text }) => HookIngressOutcome::Feedback(text),
+            _ => HookIngressOutcome::Submitted,
+        },
         HookSubmitTransportResult::Unavailable => HookIngressOutcome::Unavailable,
     }
+}
+
+/// Encodes one bounded post-hook delta in the model-context schema required by its explicit host.
+///
+/// Pre-hooks, empty/oversized text, and invalid JSON serialization produce no output. Both current
+/// host contracts use `hookSpecificOutput`, but the event name is selected from the validated host
+/// event rather than copied from arbitrary input.
+pub fn render_hook_context(event: &HookEvent, text: &str) -> Option<String> {
+    if text.is_empty() || text.len() > MAX_FEEDBACK_BYTES {
+        return None;
+    }
+    let hook_event_name = match event.phase() {
+        HookPhase::Pre => return None,
+        HookPhase::Post => "PostToolUse",
+        HookPhase::PostBatch => "PostToolBatch",
+    };
+    serde_json::to_string(&json!({
+        "hookSpecificOutput": {
+            "hookEventName": hook_event_name,
+            "additionalContext": text,
+        }
+    }))
+    .ok()
 }
 
 /// Stops the exact Assistance binding before asking Workspace to revoke that same authority stamp.

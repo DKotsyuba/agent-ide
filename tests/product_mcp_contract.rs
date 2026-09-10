@@ -339,6 +339,24 @@ fn hook_process(runtime: &Path, attachment: Option<&str>) -> Child {
     command.spawn().unwrap()
 }
 
+/// Starts the real Claude hook mode with the same bounded environment as the Codex helper.
+fn claude_hook_process(runtime: &Path, attachment: Option<&str>) -> Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
+    command.env("TOKIO_WORKER_THREADS", "1");
+    command
+        .args(["claude-hook", "--runtime-dir"])
+        .arg(runtime)
+        .env_remove("AGENT_IDE_HOST_ATTACHMENT")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(attachment) = attachment {
+        command.env("AGENT_IDE_HOST_ATTACHMENT", attachment);
+    }
+    command.spawn().unwrap()
+}
+
 /// Submits native-shaped hook JSON through the executable and requires silent fail-open completion.
 async fn hook(runtime: &Path, phase: &str, field: &str, actor: &str, call: &str) {
     let payload = json!({"hook_event_name":phase,field:actor,"tool_use_id":call,
@@ -525,6 +543,76 @@ async fn binary_codex_hook_fail_open_inactive_invalid_and_stdin_deadline() {
     assert!(!runtime.exists());
 }
 
+/// Claude ingress is silent on malformed identity and daemon loss, without creating runtime state.
+#[tokio::test]
+async fn binary_claude_hook_is_silent_when_input_or_daemon_is_unavailable() {
+    let runtime = runtime();
+    for payload in [
+        br#"{"hook_event_name":"PostToolUse","agent_id":"child","tool_use_id":"call"}"#.as_slice(),
+        br#"{"hook_event_name":"PostToolUse","session_id":"session","agent_id":"child","agent_id":"other","tool_use_id":"call"}"#.as_slice(),
+        br#"{"hook_event_name":"PostToolBatch","session_id":"session","agent_id":"child","permission_mode":"bypassPermissions"}"#.as_slice(),
+    ] {
+        let mut child = claude_hook_process(&runtime, Some("private-host-channel"));
+        child.stdin.take().unwrap().write_all(payload).await.unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty() && output.stderr.is_empty());
+    }
+    assert!(!runtime.exists());
+}
+
+/// Exercises the shipping Claude command and accepts only the bounded additional-context schema.
+#[tokio::test]
+async fn binary_claude_post_emits_closed_model_context_from_typed_feedback() {
+    use tokio::net::UnixListener;
+    let runtime = runtime();
+    std::fs::create_dir(&runtime).unwrap();
+    let listener = UnixListener::bind(runtime.join("agent-ide.sock")).unwrap();
+    let mut child = claude_hook_process(&runtime, Some("private-host-channel"));
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            br#"{"hook_event_name":"PostToolUse","session_id":"root","tool_use_id":"call","tool_input":{"secret":"hidden"}}"#,
+        )
+        .await
+        .unwrap();
+    let server = async {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let size = stream.read_u32().await.unwrap();
+        let mut body = vec![0; size as usize];
+        stream.read_exact(&mut body).await.unwrap();
+        let request: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(request["sanitized_observation_json"]["host"], "claude");
+        assert_eq!(request["sanitized_observation_json"]["session_id"], "root");
+        assert!(!String::from_utf8(body).unwrap().contains("hidden"));
+        let reply = serde_json::to_vec(&json!({
+            "version": 2,
+            "request_id": request["request_id"],
+            "correlation_id": request["correlation_id"],
+            "opaque_reply_json": {"state":"feedback","text":"one bounded fact"}
+        }))
+        .unwrap();
+        stream.write_u32(reply.len() as u32).await.unwrap();
+        stream.write_all(&reply).await.unwrap();
+    };
+    let (output, ()) = tokio::join!(child.wait_with_output(), server);
+    let output = output.unwrap();
+    assert!(output.status.success() && output.stderr.is_empty());
+    let rendered: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(rendered.as_object().unwrap().len(), 1);
+    assert_eq!(
+        rendered["hookSpecificOutput"],
+        json!({"hookEventName":"PostToolUse","additionalContext":"one bounded fact"})
+    );
+    drop(listener);
+    std::fs::remove_dir_all(runtime).unwrap();
+}
+
 /// Captures the real hook IPC frame while withholding a reply, proving sanitization and total deadline.
 #[tokio::test]
 async fn binary_codex_hook_hung_daemon_deadline_sends_only_selected_fields() {
@@ -554,7 +642,8 @@ async fn binary_codex_hook_hung_daemon_deadline_sends_only_selected_fields() {
         let frame: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
             frame["sanitized_observation_json"],
-            json!({"phase":"pre","actor_id":"child","call_id":"hung"})
+            json!({"host":"codex","phase":"pre","actor_id":"child","call_id":"hung",
+                "session_id":null,"agent_type":null})
         );
         let wire = String::from_utf8(bytes).unwrap();
         for private in [
@@ -595,7 +684,8 @@ async fn post_ack(runtime: &Path, actor: &str, call: &str) -> Value {
         call,
         "private-host-channel",
         OpaqueJson::from_value(
-            &json!({"phase":"post","actor_id":actor,"call_id":call}),
+            &json!({"host":"codex","phase":"post","actor_id":actor,"call_id":call,
+                "session_id":null,"agent_type":null}),
             1024,
         )
         .unwrap(),

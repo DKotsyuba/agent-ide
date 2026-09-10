@@ -1,15 +1,15 @@
 # Assistance host binding
 
-Revision: r2 (accepted by Assistance, Application, Workspace, and Execution). The Rust module
+Revision: r3 (accepted by Assistance; Application still transports the hook reply opaquely). The Rust module
 implements this bounded binding/state boundary; Application separately owns its IPC framing.
 
-`assistance::host_binding` accepts only metadata that a trusted MCP or hook ingress has already separated from model tool arguments. It parses Codex `_meta.threadId`, `_meta.callId`, and the required `x-codex-turn-metadata` object into a `CandidateInvocation`. A candidate is a transport observation, never a workspace authority grant.
+`assistance::host_binding` accepts only metadata that a trusted MCP or hook ingress has already separated from model tool arguments. Host kind is selected explicitly and is never inferred from CWD, PID, timing, permission mode, or arbitrary arguments. It parses Codex `_meta.threadId`, `_meta.callId`, and the required `x-codex-turn-metadata` object into a `CandidateInvocation`. A candidate is a transport observation, never a workspace authority grant.
 
 `HostBindingGuard` first buffers the exact native `PreToolUse` event. The MCP handler then validates its candidate against that pre-observation and can return its result without waiting for `PostToolUse`. The sequence is `PreToolUse` → MCP validation/result → `PostToolUse`: post is later settlement evidence, not a condition for invocation validation. Child events use `agent_id`; root events use `session_id`; `tool_use_id` must match `_meta.callId`. Missing, ambiguous, mismatched, repeated, oversized, or post-stop data is `Unavailable`. The guard retains bounded pre-observed, active, and completed identifiers and refuses new input when its fixed storage cap is exhausted rather than discarding replay evidence.
 
 The provider surface is deliberately small: `parse_candidate`, `parse_channel_session`, and `parse_hook_event` create bounded ingress values; `HostBindingGuard::observe_hook`, `establish_start`, `validate_active`, `take_native_change_hint`, `check_active`, `consume_active`, `stop_binding`, and `stop` manage lifecycle. `ValidatedInvocation` exposes only actor ID, call ID, and opaque `BindingRef`; `ActiveBindingUse` exposes only its same opaque ref. Workspace consumes only `ValidatedInvocation` plus a fresh `ActiveBindingUse`; `PreObserved` and `Settled` are lifecycle observations; `NativeObserved` is only an active registered-path recheck hint, while `Unavailable` grants nothing. Application owns crate-root exposure and consumer wiring.
 
-The hook parser retains only phase, actor ID, and call ID. It never returns tool input, tool output, source, cwd, transcript paths, or other raw hook fields. Its failure is local and fail-open: it makes the Assistance claim unavailable but cannot block an ordinary native tool, host completion, or existing host permissions.
+The Codex parser preserves the established root `session_id` versus child `agent_id` mapping and exact `tool_use_id`. The Claude parser requires exact `session_id`, selects optional `agent_id` as the subagent actor, and retains optional `agent_type` only as descriptive data. It never treats `permission_mode` as OS sandbox authority. `PostToolBatch` without a tool ID remains uncorrelated rather than being synthesized as `session_id`. Both parsers discard tool input/output, source, paths, permission data, and unknown fields. Failure is local and fail-open.
 
 ## Application transport
 
@@ -40,9 +40,10 @@ starts a daemon, or repairs transport. Start `agent-ide daemon --runtime-dir PAT
 separately. Its `ProductDispatcher` retains one bounded `HostBindingGuard` for the daemon
 lifetime, serialized across all finite Unix IPC connections.
 
-For Codex, configure **both** native `PreToolUse` and `PostToolUse` commands to invoke
+For Codex, configure native `PreToolUse`, `PostToolUse`, and available `PostToolBatch` commands to invoke
 `agent-ide codex-hook --runtime-dir PATH` for supported native tools as well as this MCP
-server's five `ide.*` tools. Supply the same `AGENT_IDE_HOST_ATTACHMENT` launch
+server's five `ide.*` tools. The placeholder-only example is
+[`docs/examples/codex-hooks.toml`](examples/codex-hooks.toml). Supply the same `AGENT_IDE_HOST_ATTACHMENT` launch
 environment value to those commands and the MCP process. It must be a fresh opaque
 handle for that host channel/session, nonempty UTF-8 and at most 128 bytes. Distinct host
 sessions must use distinct handles; root and native children in the same channel may
@@ -50,6 +51,13 @@ share one. Do not put the handle in model arguments or tool output. Missing hook
 configuration or mismatched handles leaves calls unavailable. Ordinary edits, deletes,
 renames and failed commands must remain observable after activation; their hook payloads
 are not a source-effect authority.
+
+Claude Code uses the separate explicit `claude-hook` mode and its documented `session_id`,
+optional `agent_id`, and optional `agent_type` fields. The placeholder-only example is
+[`docs/examples/claude-settings.json`](examples/claude-settings.json). Claude hook ingress is
+implemented, but Claude MCP calls do not claim Codex sandbox evidence. Without a separately proven
+execution profile, provider children remain fail closed; `permission_mode` is never mapped to OS
+authority. Already-authorized product state may still return safe current source feedback.
 
 The hook command reads at most 64 KiB plus one overflow byte and uses a separate **250 ms
 total deadline** for stdin, parsing, connect, dispatch and reply. An open stdin pipe cannot
@@ -59,10 +67,11 @@ without stdout or stderr. It performs one connect-only submission, with no retry
 autostart, workspace scan or LSP work. Configure the command as written; malformed CLI
 syntax is a command configuration error, not a hook payload result.
 
-Hook parsing rejects duplicate known JSON keys and retains only phase, actor and call
-ID. Root events require `session_id`; child events require `agent_id`; supplying both is
-ambiguous. `tool_use_id` identifies the exact call. Tool input/output, cwd, transcript
-paths and all other raw fields are discarded before IPC. The raw hook payload is never
+Hook parsing rejects duplicate known JSON keys and retains only explicit host, phase, bounded
+identity, and optional call ID. Codex root events require `session_id`, Codex child events require
+`agent_id`, and supplying both is ambiguous. Claude always retains `session_id` and selects its
+optional `agent_id` as the child actor. `tool_use_id` identifies an exact per-tool call; a batch
+does not fabricate one. Tool input/output, cwd, transcript paths and all other raw fields are discarded before IPC. The raw hook payload is never
 logged or retained in daemon state. `Debug` formatting of the trusted transport, opaque
 JSON, hook/method requests and nested dispatch/reply wrappers redacts private fields,
 including echoed hook correlations; it cannot be used to print attachment or payload data.
@@ -108,6 +117,7 @@ Closed daemon outcomes are:
 | `{"state":"hook_observed"}` | One pre-hook was retained; no authority or delivery claim. |
 | `{"state":"hook_settled"}` | One exact post-hook settled a validated invocation. |
 | `{"state":"native_hook_observed"}` | Active native lifecycle requested a registered-path recheck; no source effect is claimed. |
+| `{"state":"feedback","text":"..."}` | One positive-version delta survived the current binding and exact-source recheck. |
 | `{"state":"host_stopped"}` | The exact host binding was revoked; no Workspace authority was created. |
 
 The MCP facade renders only the corresponding closed method outcomes. Without trusted
@@ -119,8 +129,9 @@ This adapter relies on the trusted launcher and the existing private local daemo
 it does not cryptographically authenticate local processes or attest sandbox enforcement.
 Physical execution requires trusted configured profile evidence and a fresh spawn use.
 Configured product fixtures exercise `start → context`, `start → diff` and `stop` through
-the shipping CLI/MCP boundary. These fixtures do not establish `model_seen`, live Claude
-support or end-user IDE readiness.
+the shipping CLI/MCP boundary. Host-shaped fixtures also exercise parent/subagent parsing,
+closed output JSON, stale suppression, malformed input and daemon loss. They do not establish
+`model_seen`, live-host support or end-user IDE readiness.
 
 Verify with `cargo test --offline --test product_mcp_contract --test assistance_binding_contract
 --test assistance_facade_contract --test app_ipc_contract` (one command). The real binary
@@ -129,9 +140,10 @@ IDs, cross-actor rejection, stop isolation, replay/order failures, daemon loss, 
 and malformed hooks, open stdin and hung-daemon deadlines, and discarded payload fields.
 Native edit/delete/rename and failed-command-shaped lifecycle fixtures verify coalesced
 active hints and suppression after stop, without claiming those fixtures changed source.
-These are controlled host-shaped process tests using the established Codex field contract;
-they do not substitute for a fresh live Codex host acceptance scenario. Live Claude
-root/subagent behavior and feedback delivery are unverified.
+These are controlled host-shaped process tests, not live-host proof. Still unverified are fresh
+Codex and Claude CLI acceptance on macOS and Linux, Claude MCP invocation correlation/activation,
+real `PostToolBatch` availability in supported host versions, and model-visible delivery of a
+real-provider delta after an actual edit.
 
 The executable deadline regressions enforce a 450 ms wall-clock ceiling: the 250 ms
 product deadline plus 200 ms for child startup and scheduling. Child-process Tokio clocks
@@ -182,7 +194,12 @@ unavailable providers return explicit lexical context. Compatible Go worktrees s
 accounted listener with separate protocol forwarders; Rust uses an exclusive session.
 Semantic replies include only bounded diagnostics from the same Session when source binding,
 provider generation, and positive document version all match the returned context. Push feedback
-is labelled provisional; stale or unversioned diagnostics produce no current feedback delta.
+is labelled provisional. One nonempty current delta per binding is retained. A later native post
+increments that binding's epoch, rechecks the exact registered bytes, consumes the delta once, and
+emits only `hookSpecificOutput.{hookEventName,additionalContext}`. Changed, empty, stale,
+unversioned, stopped, missing-daemon and already-consumed feedback emits no model context. Hook
+output never includes source bodies, raw diagnostics, native tool input/output, attachments or
+launcher data.
 Requests have at most a 60-second protocol deadline within the configured operation budget;
 warmup remains pending while short inspections and stop remain available.
 

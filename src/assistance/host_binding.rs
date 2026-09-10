@@ -1,4 +1,4 @@
-//! Codex-specific transport validation for an MCP invocation and its native hook lifecycle.
+//! Explicit Codex and Claude host validation for MCP invocation and native hook lifecycles.
 //!
 //! A parsed candidate is not an authority claim. A matching trusted `PreToolUse` yields a
 //! [`ValidatedInvocation`] before MCP result delivery; later `PostToolUse` is settlement
@@ -34,7 +34,11 @@ const SANDBOX_STATE_FIELDS: &[&str] = &[
 /// field comes from tool arguments. This candidate is transport observation, not authority.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CandidateInvocation {
+    /// Explicit host contract; current trusted MCP metadata creates only Codex candidates.
+    host: HostKind,
+    /// Exact host actor selected from trusted request metadata.
     actor_id: String,
+    /// Exact host tool call selected from trusted request metadata.
     call_id: String,
 }
 
@@ -83,8 +87,13 @@ pub fn parse_channel_session(attachment: &[u8]) -> Result<ChannelSessionRef, Bin
 /// inspect, or turn it into Workspace authority, an Execution permit, or host evidence.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct BindingRef {
+    /// Explicit host contract prevents attachment/actor collisions across adapters.
+    host: HostKind,
+    /// Exact host actor owning this generation.
     actor_id: String,
+    /// Private daemon-scoped transport channel.
     channel: ChannelSessionRef,
+    /// Nonzero monotonic generation within this guard.
     generation: u64,
 }
 
@@ -95,6 +104,10 @@ impl BindingRef {
         let mut hash = blake3::Hasher::new();
         hash.update(b"assistance-binding-identity-v1");
         for value in [
+            match self.host {
+                HostKind::Codex => b"codex".as_slice(),
+                HostKind::Claude => b"claude".as_slice(),
+            },
             self.actor_id.as_bytes(),
             self.channel.0.as_bytes(),
             &self.generation.to_le_bytes(),
@@ -120,24 +133,44 @@ impl ActiveBindingUse {
     }
 }
 
-/// Identifies the two native Codex hook lifecycle points that can validate a candidate.
+/// Identifies native per-tool and batch lifecycle points accepted by explicit host adapters.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HookPhase {
     /// The native host is about to execute the selected tool call.
     Pre,
     /// The native host has finished the selected tool call.
     Post,
+    /// The native host has completed a batch without supplying one synthetic tool-call identity.
+    PostBatch,
 }
 
-/// Holds the bounded, selected fields extracted from one native Codex hook payload.
+/// Names the host contract that supplied one native event; it is never inferred from process state.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum HostKind {
+    /// OpenAI Codex hook fields and output contract.
+    Codex,
+    /// Anthropic Claude Code hook fields and output contract.
+    Claude,
+}
+
+/// Holds bounded selected fields extracted from one native Codex or Claude hook payload.
 ///
 /// The parser discards tool input, tool response, cwd, transcript paths, and all other hook
 /// payload fields before returning this value.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HookEvent {
+    /// Explicit parser contract that accepted the event.
+    host: HostKind,
+    /// Normalized non-authorizing lifecycle phase.
     phase: HookPhase,
+    /// Root session or exact subagent identity selected by the host-specific parser.
     actor_id: String,
-    call_id: String,
+    /// Exact tool ID, absent only when the host supplied an uncorrelated batch boundary.
+    call_id: Option<String>,
+    /// Claude's required root session identity, including on child events; absent for Codex.
+    session_id: Option<String>,
+    /// Claude's optional descriptive subagent type; absent for Codex and parent events.
+    agent_type: Option<String>,
 }
 
 impl HookEvent {
@@ -146,14 +179,34 @@ impl HookEvent {
         self.phase
     }
 
+    /// Returns the explicit host contract used to validate this event.
+    pub fn host(&self) -> HostKind {
+        self.host
+    }
+
     /// Returns the selected hook actor: child `agent_id` or root `session_id`.
     pub fn actor_id(&self) -> &str {
         &self.actor_id
     }
 
-    /// Returns the selected hook `tool_use_id`, which must equal MCP `_meta.callId`.
+    /// Returns the selected hook `tool_use_id`, or an empty value for an uncorrelated batch event.
     pub fn call_id(&self) -> &str {
-        &self.call_id
+        self.call_id.as_deref().unwrap_or("")
+    }
+
+    /// Returns the optional exact tool identity without fabricating one for `PostToolBatch`.
+    pub fn optional_call_id(&self) -> Option<&str> {
+        self.call_id.as_deref()
+    }
+
+    /// Returns Claude's exact root session identity, retained even for a subagent event.
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    /// Returns Claude's optional declared subagent type without using it as authority.
+    pub fn agent_type(&self) -> Option<&str> {
+        self.agent_type.as_deref()
     }
 }
 
@@ -168,7 +221,7 @@ pub enum BindingUnavailable {
     InvalidField(&'static str),
     /// The private Application attachment was not valid bounded opaque channel-session data.
     InvalidAttachment,
-    /// The hook phase was not the native `PreToolUse` or `PostToolUse` form.
+    /// The hook phase was not a supported per-tool or post-batch form.
     UnsupportedHookPhase,
     /// A hook could not be linked exactly to one registered MCP candidate.
     Mismatch,
@@ -314,7 +367,7 @@ pub struct HostBindingGuard {
     pre_observed: BTreeSet<(CandidateInvocation, ChannelSessionRef)>,
     settling: BTreeMap<(CandidateInvocation, ChannelSessionRef), BindingRef>,
     completed: BTreeSet<(CandidateInvocation, ChannelSessionRef)>,
-    bindings: BTreeMap<(String, ChannelSessionRef), BindingRef>,
+    bindings: BTreeMap<(HostKind, String, ChannelSessionRef), BindingRef>,
     next_generation: u64,
     /// Coalesced native lifecycle hints, at most one per active binding and no raw tool data.
     native_hints: BTreeSet<BindingRef>,
@@ -350,7 +403,7 @@ impl HostBindingGuard {
         if self.settling.len() >= MAX_PENDING || self.completed.len() >= MAX_COMPLETED {
             return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
         }
-        let binding_key = (candidate.actor_id.clone(), channel.clone());
+        let binding_key = (candidate.host, candidate.actor_id.clone(), channel.clone());
         let binding = if let Some(existing) = self.bindings.get(&binding_key) {
             existing.clone()
         } else {
@@ -362,6 +415,7 @@ impl HostBindingGuard {
             };
             self.next_generation = generation;
             let binding = BindingRef {
+                host: candidate.host,
                 actor_id: candidate.actor_id.clone(),
                 channel,
                 generation,
@@ -400,7 +454,7 @@ impl HostBindingGuard {
         }
         let Some(binding) = self
             .bindings
-            .get(&(candidate.actor_id.clone(), channel))
+            .get(&(candidate.host, candidate.actor_id.clone(), channel))
             .cloned()
         else {
             self.rejected.insert(invocation);
@@ -413,7 +467,7 @@ impl HostBindingGuard {
         BindingStatus::Validated(validated(candidate, binding))
     }
 
-    /// Buffers a native pre-hook or records post-hook settlement for a channel-bound invocation.
+    /// Buffers a native pre-hook or records a per-tool/batch post for a channel-bound invocation.
     ///
     /// Duplicate pre-hooks and post-before-MCP lifecycles prevent later MCP validation.
     /// For an already active binding, a complete Pre/Post without MCP also coalesces one
@@ -422,9 +476,23 @@ impl HostBindingGuard {
     /// A pre-hook is not an authority claim. A post-hook never gates MCP result acceptance: it
     /// only settles a call that was already validated by `establish_start` or `validate_active`.
     pub fn observe_hook(&mut self, event: HookEvent, channel: ChannelSessionRef) -> BindingStatus {
+        if event.phase == HookPhase::PostBatch {
+            let Some(binding) = self
+                .bindings
+                .get(&(event.host, event.actor_id, channel))
+                .cloned()
+            else {
+                return BindingStatus::Unavailable(BindingUnavailable::InactiveBinding);
+            };
+            self.native_hints.insert(binding.clone());
+            return BindingStatus::NativeObserved(binding);
+        }
         let candidate = CandidateInvocation {
+            host: event.host,
             actor_id: event.actor_id,
-            call_id: event.call_id,
+            call_id: event
+                .call_id
+                .expect("non-batch hook parsers require a tool-use identity"),
         };
         let invocation = (candidate.clone(), channel);
         if self.rejected.len() >= MAX_COMPLETED {
@@ -460,7 +528,7 @@ impl HostBindingGuard {
                 if self.pre_observed.remove(&invocation) {
                     let binding = self
                         .bindings
-                        .get(&(candidate.actor_id, invocation.1.clone()))
+                        .get(&(candidate.host, candidate.actor_id, invocation.1.clone()))
                         .cloned();
                     self.rejected.insert(invocation);
                     if let Some(binding) = binding {
@@ -480,6 +548,7 @@ impl HostBindingGuard {
                 self.completed.insert(invocation);
                 BindingStatus::Settled(validated(candidate, binding))
             }
+            HookPhase::PostBatch => unreachable!("batch hooks return before invocation matching"),
         }
     }
 
@@ -498,7 +567,11 @@ impl HostBindingGuard {
 
     /// Checks whether one immutable binding generation remains active at this exact boundary.
     pub fn check_active(&self, binding: &BindingRef) -> Result<(), BindingUnavailable> {
-        let key = (binding.actor_id.clone(), binding.channel.clone());
+        let key = (
+            binding.host,
+            binding.actor_id.clone(),
+            binding.channel.clone(),
+        );
         (self.bindings.get(&key) == Some(binding))
             .then_some(())
             .ok_or(BindingUnavailable::InactiveBinding)
@@ -518,14 +591,21 @@ impl HostBindingGuard {
 
     /// Revokes one generation and rejects its pending pre-hooks; later post settlement remains valid.
     pub fn stop_binding(&mut self, binding: &BindingRef) -> Result<(), BindingUnavailable> {
-        let key = (binding.actor_id.clone(), binding.channel.clone());
+        let key = (
+            binding.host,
+            binding.actor_id.clone(),
+            binding.channel.clone(),
+        );
         if self.bindings.get(&key) != Some(binding) {
             return Err(BindingUnavailable::InactiveBinding);
         }
         self.bindings.remove(&key);
         self.native_hints.remove(binding);
         self.pre_observed.retain(|invocation| {
-            if invocation.0.actor_id == binding.actor_id && invocation.1 == binding.channel {
+            if invocation.0.host == binding.host
+                && invocation.0.actor_id == binding.actor_id
+                && invocation.1 == binding.channel
+            {
                 if self.rejected.len() < MAX_COMPLETED {
                     self.rejected.insert(invocation.clone());
                 }
@@ -569,12 +649,13 @@ pub fn parse_candidate(
         return Err(BindingUnavailable::MissingField(TURN_METADATA));
     }
     Ok(CandidateInvocation {
+        host: HostKind::Codex,
         actor_id: required_identifier(meta, "threadId")?,
         call_id: required_identifier(meta, "callId")?,
     })
 }
 
-/// Parses one bounded Codex hook payload while retaining only phase, actor, and call id.
+/// Parses one bounded Codex hook payload while retaining only host, phase, actor, and call ID.
 ///
 /// Child hooks must provide `agent_id`; root hooks must provide `session_id`. A payload with
 /// both or neither, or duplicate known JSON keys, is unavailable because identity is ambiguous.
@@ -588,6 +669,7 @@ pub fn parse_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnavailable>
     let phase = match payload.hook_event_name.as_str() {
         "PreToolUse" => HookPhase::Pre,
         "PostToolUse" => HookPhase::Post,
+        "PostToolBatch" => HookPhase::PostBatch,
         _ => return Err(BindingUnavailable::UnsupportedHookPhase),
     };
     let actor_id = match (payload.agent_id, payload.session_id) {
@@ -596,23 +678,87 @@ pub fn parse_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnavailable>
         (None, None) => return Err(BindingUnavailable::MissingField("hook actor")),
     };
     Ok(HookEvent {
+        host: HostKind::Codex,
         phase,
         actor_id,
-        call_id: checked_identifier(payload.tool_use_id, "tool_use_id")?,
+        call_id: match (phase, payload.tool_use_id) {
+            (HookPhase::PostBatch, None) => None,
+            (_, Some(value)) => Some(checked_identifier(value, "tool_use_id")?),
+            _ => return Err(BindingUnavailable::MissingField("tool_use_id")),
+        },
+        session_id: None,
+        agent_type: None,
+    })
+}
+
+/// Parses Claude Code's documented hook identity without treating permission mode as a sandbox.
+///
+/// `session_id` is always retained. A subagent is identified by its exact optional `agent_id`,
+/// while a parent is identified by `session_id`; `agent_type` is descriptive only. Tool input,
+/// output, permission mode, paths, source, and unknown fields are discarded. `PostToolBatch`
+/// deliberately has no fabricated call identity.
+pub fn parse_claude_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnavailable> {
+    if payload.len() > MAX_HOOK_METADATA_BYTES {
+        return Err(BindingUnavailable::InvalidMetadata);
+    }
+    let payload: ClaudeHookPayload =
+        serde_json::from_slice(payload).map_err(|_| BindingUnavailable::InvalidMetadata)?;
+    let phase = match payload.hook_event_name.as_str() {
+        "PreToolUse" => HookPhase::Pre,
+        "PostToolUse" => HookPhase::Post,
+        "PostToolBatch" => HookPhase::PostBatch,
+        _ => return Err(BindingUnavailable::UnsupportedHookPhase),
+    };
+    let session_id = checked_identifier(payload.session_id, "session_id")?;
+    let agent_id = payload
+        .agent_id
+        .map(|value| checked_identifier(value, "agent_id"))
+        .transpose()?;
+    let agent_type = payload
+        .agent_type
+        .map(|value| checked_identifier(value, "agent_type"))
+        .transpose()?;
+    let call_id = match (phase, payload.tool_use_id) {
+        (HookPhase::PostBatch, None) => None,
+        (_, Some(value)) => Some(checked_identifier(value, "tool_use_id")?),
+        _ => return Err(BindingUnavailable::MissingField("tool_use_id")),
+    };
+    Ok(HookEvent {
+        host: HostKind::Claude,
+        phase,
+        actor_id: agent_id.unwrap_or_else(|| session_id.clone()),
+        call_id,
+        session_id: Some(session_id),
+        agent_type,
     })
 }
 
 /// Selects only Codex correlation fields and rejects duplicate known JSON keys while discarding extras.
 #[derive(Deserialize)]
 struct CodexHookPayload {
-    /// Native lifecycle name, restricted to PreToolUse or PostToolUse after decoding.
+    /// Native lifecycle name, restricted to pre, post, or post-batch after decoding.
     hook_event_name: String,
     /// Root actor identity; absent/null for a child event, bounded after decoding.
     session_id: Option<String>,
     /// Child actor identity; absent/null for a root event, bounded after decoding.
     agent_id: Option<String>,
-    /// Exact native tool-call identifier, nonempty and bounded after decoding.
-    tool_use_id: String,
+    /// Exact native tool-call identifier, optional only for `PostToolBatch`.
+    tool_use_id: Option<String>,
+}
+
+/// Selects only Claude Code correlation fields while Serde rejects duplicate known keys.
+#[derive(Deserialize)]
+struct ClaudeHookPayload {
+    /// Native lifecycle name accepted by the bounded Claude adapter.
+    hook_event_name: String,
+    /// Required exact Claude session identity for parent and subagent events.
+    session_id: String,
+    /// Optional exact subagent identity; when absent the session is the parent actor.
+    agent_id: Option<String>,
+    /// Optional descriptive subagent type, retained but never interpreted as authority.
+    agent_type: Option<String>,
+    /// Exact native tool identity; optional only for `PostToolBatch`.
+    tool_use_id: Option<String>,
 }
 
 /// Parses a complete bounded host sandbox-state observation for one consumed active invocation.

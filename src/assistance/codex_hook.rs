@@ -1,8 +1,8 @@
-//! Fail-open shipping Codex hook entrypoint with a deadline independent of MCP calls.
+//! Fail-open native host hook entrypoint with a deadline independent of MCP calls.
 
 use super::{
-    facade::{TrustedTransport, submit_inactive_hook},
-    host_binding::parse_hook_event,
+    facade::{HookIngressOutcome, TrustedTransport, render_hook_context, submit_hook_event},
+    host_binding::{HostKind, parse_claude_hook_event, parse_hook_event},
 };
 use std::{io::Read, path::Path, time::Duration};
 
@@ -16,7 +16,7 @@ const TOTAL_DEADLINE: Duration = Duration::from_millis(250);
 /// Missing/invalid launcher attachment, malformed input, absent daemon and deadline expiry all
 /// return normally. The detached reader cannot delay process exit if stdin remains open. This
 /// function never creates runtime state, retries, autostarts, or changes native tool permission.
-pub async fn run(runtime_dir: &Path, attachment: Option<String>) {
+pub async fn run(runtime_dir: &Path, attachment: Option<String>, host_kind: HostKind) {
     let _ = tokio::time::timeout(TOTAL_DEADLINE, async {
         let attachment = attachment?;
         TrustedTransport::from_host_ingress("hook", "hook", attachment.clone())?;
@@ -32,10 +32,19 @@ pub async fn run(runtime_dir: &Path, attachment: Option<String>) {
             })
             .ok()?;
         let payload = receiver.await.ok()??;
-        let event = parse_hook_event(&payload).ok()?;
-        let host =
-            TrustedTransport::from_host_ingress(event.call_id(), event.call_id(), attachment)?;
-        let _ = submit_inactive_hook(runtime_dir, &host, &payload).await;
+        let event = match host_kind {
+            HostKind::Codex => parse_hook_event(&payload),
+            HostKind::Claude => parse_claude_hook_event(&payload),
+        }
+        .ok()?;
+        let correlation = event.optional_call_id().unwrap_or("post-tool-batch");
+        let host = TrustedTransport::from_host_ingress(correlation, correlation, attachment)?;
+        if let HookIngressOutcome::Feedback(text) =
+            submit_hook_event(runtime_dir, &host, &event).await
+            && let Some(output) = render_hook_context(&event, &text)
+        {
+            println!("{output}");
+        }
         Some(())
     })
     .await;

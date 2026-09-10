@@ -1,7 +1,7 @@
 use agent_ide::assistance::host_binding::{
-    BindingStatus, BindingUnavailable, ChannelSessionRef, HookPhase, HostBindingGuard,
-    SandboxStateProvenance, parse_candidate, parse_channel_session, parse_hook_event,
-    parse_observed_sandbox_state,
+    BindingStatus, BindingUnavailable, ChannelSessionRef, HookPhase, HostBindingGuard, HostKind,
+    SandboxStateProvenance, parse_candidate, parse_channel_session, parse_claude_hook_event,
+    parse_hook_event, parse_observed_sandbox_state,
 };
 use serde_json::json;
 
@@ -251,6 +251,51 @@ fn hook_parser_does_not_retain_raw_payload_fields() {
     assert!(!format!("{event:?}").contains("never retained"));
     assert!(parse_hook_event(br#"{"hook_event_name":"PreToolUse","session_id":"a","session_id":"b","tool_use_id":"c"}"#).is_err());
     assert!(parse_hook_event(br#"{"hook_event_name":"PreToolUse","session_id":"a","tool_use_id":"c","tool_use_id":"d"}"#).is_err());
+}
+
+/// Preserves Claude's exact session and two distinct subagent identities without permission inference.
+#[test]
+fn claude_parent_and_two_subagents_remain_explicit_and_isolated() {
+    let parent = parse_claude_hook_event(
+        br#"{"hook_event_name":"PostToolUse","session_id":"session","tool_use_id":"parent-call","permission_mode":"bypassPermissions","tool_response":"secret"}"#,
+    )
+    .unwrap();
+    assert_eq!(parent.host(), HostKind::Claude);
+    assert_eq!(parent.actor_id(), "session");
+    assert_eq!(parent.session_id(), Some("session"));
+    assert_eq!(parent.agent_type(), None);
+    for (agent_id, agent_type) in [("child-1", "Explore"), ("child-2", "general-purpose")] {
+        let event = parse_claude_hook_event(
+            json!({"hook_event_name":"PostToolUse","session_id":"session","agent_id":agent_id,
+                "agent_type":agent_type,"tool_use_id":"same-call","permission_mode":"default",
+                "tool_input":{"secret":"discarded"}})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(event.actor_id(), agent_id);
+        assert_eq!(event.session_id(), Some("session"));
+        assert_eq!(event.agent_type(), Some(agent_type));
+        assert!(!format!("{event:?}").contains("discarded"));
+    }
+}
+
+/// Accepts a host-declared batch boundary without fabricating a tool or session-derived call ID.
+#[test]
+fn batch_hook_has_no_synthetic_call_identity() {
+    let event = parse_claude_hook_event(
+        br#"{"hook_event_name":"PostToolBatch","session_id":"session","agent_id":"child"}"#,
+    )
+    .unwrap();
+    assert_eq!(event.phase(), HookPhase::PostBatch);
+    assert_eq!(event.call_id(), "");
+    assert_eq!(event.optional_call_id(), None);
+    assert!(
+        parse_claude_hook_event(
+            br#"{"hook_event_name":"PostToolUse","agent_id":"child","tool_use_id":"call"}"#
+        )
+        .is_err()
+    );
 }
 
 /// Coalesces active native lifecycles without authorizing effects or repairing a premature MCP post.

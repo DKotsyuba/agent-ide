@@ -1,4 +1,4 @@
-//! Bounded host-attachment validation for the Assistance facade.
+//! Bounded explicit-host attachment validation for the Assistance facade.
 //!
 //! This module transports and validates host-origin metadata. It deliberately grants no
 //! workspace authority and never interprets model-provided tool arguments as host identity.
@@ -11,7 +11,7 @@ pub mod assembly;
 
 pub mod host_binding;
 
-/// Exposes the bounded fail-open native Codex hook command.
+/// Exposes the bounded fail-open native Codex and Claude hook command modes.
 pub mod codex_hook;
 
 /// Loads bounded restart-only trusted target and executable/profile configuration.

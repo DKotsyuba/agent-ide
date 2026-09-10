@@ -10,7 +10,8 @@ use agent_ide::app::{
     run_daemon_with_assistance,
 };
 use agent_ide::assistance::{
-    assembly::ProductDispatcher, facade::StdioFacade, launcher::LauncherConfig,
+    assembly::ProductDispatcher, facade::StdioFacade, host_binding::HostKind,
+    launcher::LauncherConfig,
 };
 use rmcp::{serve_server, transport::io::stdio};
 
@@ -42,6 +43,16 @@ async fn main() -> ExitCode {
             agent_ide::assistance::codex_hook::run(
                 &runtime_dir,
                 std::env::var("AGENT_IDE_HOST_ATTACHMENT").ok(),
+                HostKind::Codex,
+            )
+            .await;
+            ExitCode::SUCCESS
+        }
+        Ok(Command::ClaudeHook { runtime_dir }) => {
+            agent_ide::assistance::codex_hook::run(
+                &runtime_dir,
+                std::env::var("AGENT_IDE_HOST_ATTACHMENT").ok(),
+                HostKind::Claude,
             )
             .await;
             ExitCode::SUCCESS
@@ -134,6 +145,11 @@ enum Command {
         /// Existing daemon endpoint directory; never created by the hook command.
         runtime_dir: PathBuf,
     },
+    /// Submits one bounded native Claude Code hook and always fails open at host ingress.
+    ClaudeHook {
+        /// Existing daemon endpoint directory; never created by the hook command.
+        runtime_dir: PathBuf,
+    },
     /// Queries an existing daemon without creating a directory or daemon process.
     Doctor { runtime_dir: PathBuf },
 }
@@ -153,6 +169,7 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
         Some("doctor") => Ok(Command::Doctor { runtime_dir }),
         Some("mcp") => Ok(Command::Mcp { runtime_dir }),
         Some("codex-hook") => Ok(Command::CodexHook { runtime_dir }),
+        Some("claude-hook") => Ok(Command::ClaudeHook { runtime_dir }),
         _ => Err(AppError::InvalidResponse),
     }
 }

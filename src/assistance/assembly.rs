@@ -1,11 +1,11 @@
-//! Codex ingress and finite dispatch into one daemon-owned, durable-authorized product worker.
+//! Explicit Codex/Claude ingress and finite dispatch into one daemon-owned product worker.
 
 /// Stable closed result types shared by existing callers of the assembly boundary.
 pub use super::reply::{MissingPeer, PeerReply};
 use super::{
     host_binding::{
-        BindingStatus, HostBindingGuard, parse_candidate, parse_channel_session, parse_hook_event,
-        parse_observed_sandbox_state,
+        BindingStatus, HostBindingGuard, parse_candidate, parse_channel_session,
+        parse_claude_hook_event, parse_hook_event, parse_observed_sandbox_state,
     },
     launcher::LauncherConfig,
     reply::FailureCode,
@@ -84,16 +84,28 @@ impl ProductDispatcher {
                 let observation: Value =
                     serde_json::from_str(hook.sanitized_observation_json().as_str()).ok()?;
                 let object = observation.as_object()?;
-                if object.len() != 3 {
+                if object.len() != 6 {
                     return None;
                 }
                 let phase = match object.get("phase")?.as_str()? {
                     "pre" => "PreToolUse",
                     "post" => "PostToolUse",
+                    "post_batch" => "PostToolBatch",
                     _ => return None,
                 };
-                let event=parse_hook_event(json!({"hook_event_name":phase,"session_id":object.get("actor_id")?,"tool_use_id":object.get("call_id")?}).to_string().as_bytes()).ok()?;
-                if event.call_id() != hook.correlation_id() {
+                let event = match object.get("host")?.as_str()? {
+                    "codex" => parse_hook_event(
+                        json!({"hook_event_name":phase,"session_id":object.get("actor_id")?,"tool_use_id":object.get("call_id")?})
+                            .to_string().as_bytes(),
+                    ),
+                    "claude" => parse_claude_hook_event(
+                        json!({"hook_event_name":phase,"session_id":object.get("session_id")?,"agent_id":(object.get("actor_id")? != object.get("session_id")?).then_some(object.get("actor_id")?),"agent_type":object.get("agent_type")?,"tool_use_id":object.get("call_id")?})
+                            .to_string().as_bytes(),
+                    ),
+                    _ => return None,
+                }
+                .ok()?;
+                if event.optional_call_id().unwrap_or("post-tool-batch") != hook.correlation_id() {
                     return None;
                 }
                 let channel = self.channel(hook.opaque_attachment())?;
@@ -103,7 +115,10 @@ impl ProductDispatcher {
                     BindingStatus::Settled(_) => Some(PeerReply::HookSettled {}),
                     BindingStatus::NativeObserved(binding) => {
                         if let Some(worker) = &self.worker {
-                            worker.native_hint(binding);
+                            worker.native_hint(binding.clone());
+                            if let Some(text) = worker.take_current_feedback(binding).await {
+                                return Some(PeerReply::Feedback { text });
+                            }
                         }
                         Some(PeerReply::NativeHookObserved {})
                     }

@@ -74,6 +74,16 @@ struct Detail {
     native_epoch: u64,
 }
 
+/// Retains one versioned provider delta until a later native post-hook rechecks its exact source.
+struct NativeFeedback {
+    /// Exact source observation whose positive provider version produced the delta.
+    source: SourceObservation,
+    /// Bounded fact/evidence/action rendering; source text and diagnostics are excluded.
+    text: String,
+    /// Native lifecycle epoch at which the provider result was accepted.
+    native_epoch: u64,
+}
+
 /// Shared bounded transport-side bookkeeping; no lock survives an I/O await.
 struct Ledger {
     /// FIFO ordinary jobs; explicit stop is prioritized at the front.
@@ -88,6 +98,8 @@ struct Ledger {
     next: u64,
     /// One bounded monotonic invalidation counter per active binding.
     native_epoch: BTreeMap<BindingRef, u64>,
+    /// At most one undelivered current delta per active binding.
+    feedback: BTreeMap<BindingRef, NativeFeedback>,
 }
 impl Default for Ledger {
     /// Creates empty finite bookkeeping; no file or process work occurs.
@@ -99,6 +111,7 @@ impl Default for Ledger {
             cancellation: BTreeMap::new(),
             next: 0,
             native_epoch: BTreeMap::new(),
+            feedback: BTreeMap::new(),
         }
     }
 }
@@ -349,6 +362,7 @@ impl WorkerHandle {
             ledger.details.retain(|_, detail| detail.binding != binding);
             ledger.starts.retain(|(owner, _), _| owner != &binding);
             ledger.native_epoch.remove(&binding);
+            ledger.feedback.remove(&binding);
         }
         self.shared.notify.notify_one();
         let (send, wait) = oneshot::channel();
@@ -413,6 +427,23 @@ impl WorkerHandle {
             *epoch = epoch.saturating_add(1);
         }
         self.shared.notify.notify_one();
+    }
+
+    /// Returns and consumes one same-binding delta only after a newer native epoch and source recheck.
+    ///
+    /// Missing, stopped, unchanged-epoch, stale, or unversioned feedback returns `None`. The check
+    /// performs no provider execution and does not interpret a Claude permission mode as authority.
+    pub async fn take_current_feedback(&self, binding: BindingRef) -> Option<String> {
+        self.shared.active(&binding).ok()?;
+        let feedback = {
+            let mut ledger = self.shared.ledger.lock().ok()?;
+            let current_epoch = ledger.native_epoch.get(&binding).copied().unwrap_or(0);
+            let feedback = ledger.feedback.remove(&binding)?;
+            (current_epoch > feedback.native_epoch && source_matches(&feedback.source))
+                .then_some(feedback)?
+        };
+        self.shared.active(&binding).ok()?;
+        Some(feedback.text)
     }
 
     /// Atomically bounds and publishes one operation, without file, database or child-process I/O.
@@ -1048,9 +1079,33 @@ impl<'a> Worker<'a> {
                 && diagnostics.freshness == crate::intelligence::freshness::Freshness::Provisional
                 && diagnostics.source.as_ref() == Some(&context.source)
                 && Some(diagnostics.generation) == context.generation
-                && diagnostics.document_version == context.document_version)
-                .then_some(diagnostics)
+                && diagnostics.document_version == context.document_version
+                && diagnostics
+                    .document_version
+                    .is_some_and(|version| version > 0))
+            .then_some(diagnostics)
         });
+        let feedback = diagnostics
+            .as_ref()
+            .filter(|diagnostics| !diagnostics.diagnostics.is_empty())
+            .map(|diagnostics| {
+                FeedbackDelta::new(
+                    format!(
+                        "Provider reported {} diagnostics for this exact source generation.",
+                        diagnostics.diagnostics.len()
+                    ),
+                    format!(
+                        "source_sequence={}; provider_generation={:?}; document_version={:?}",
+                        observed.sequence(),
+                        diagnostics.generation,
+                        diagnostics.document_version
+                    ),
+                    "Review the bounded diagnostic messages in the latest context result.",
+                    "provisional push; exact source and positive provider version matched",
+                    Some(job.reference.clone()),
+                )
+                .expect("fixed feedback envelope is bounded")
+            });
         let diagnostic_text = diagnostics.as_ref().map_or_else(
             || "diagnostics_freshness: unknown\ndiagnostic_count: unknown\nfeedback_delta: none".to_owned(),
             |diagnostics| {
@@ -1060,27 +1115,9 @@ impl<'a> Worker<'a> {
                     .take(8)
                     .map(|diagnostic| diagnostic.message.chars().take(256).collect::<String>())
                     .collect::<Vec<_>>();
-                let feedback = if diagnostics.diagnostics.is_empty() {
-                    "none".to_owned()
-                } else {
-                    FeedbackDelta::new(
-                        format!(
-                            "Provider reported {} diagnostics for this exact source generation.",
-                            diagnostics.diagnostics.len()
-                        ),
-                        format!(
-                            "source_sequence={}; provider_generation={:?}; document_version={:?}",
-                            observed.sequence(),
-                            diagnostics.generation,
-                            diagnostics.document_version
-                        ),
-                        "Review the bounded diagnostic messages in this context result.",
-                        "provisional push; exact source and provider generation matched",
-                        Some(job.reference.clone()),
-                    )
-                    .expect("fixed feedback envelope is bounded")
-                    .render()
-                };
+                let feedback = feedback
+                    .as_ref()
+                    .map_or_else(|| "none".to_owned(), FeedbackDelta::render);
                 format!(
                     "diagnostics_freshness: {:?}\ndiagnostic_readiness: {:?}\ndiagnostic_count: {}\ndiagnostics_truncated: {}\ndiagnostic_messages: {}\nfeedback_delta: {feedback}",
                     diagnostics.freshness,
@@ -1104,6 +1141,20 @@ impl<'a> Worker<'a> {
             serde_json::to_string(&context.lexical_matches).map_err(|_| FailureCode::Internal)?,
             context.text
         );
+        if let Ok(mut ledger) = self.shared.ledger.lock() {
+            if let Some(feedback) = feedback {
+                ledger.feedback.insert(
+                    binding.clone(),
+                    NativeFeedback {
+                        source: observed.clone(),
+                        text: feedback.render(),
+                        native_epoch: epoch,
+                    },
+                );
+            } else {
+                ledger.feedback.remove(&binding);
+            }
+        }
         Ok((
             PeerReply::Complete {
                 kind: ResultKind::Context,
