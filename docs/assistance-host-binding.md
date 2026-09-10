@@ -203,6 +203,12 @@ launcher data.
 Requests have at most a 60-second protocol deadline within the configured operation budget;
 warmup remains pending while short inspections and stop remain available.
 
+An initial operation reserves its independent inspection-channel slot before publishing its
+job, pending detail, or stable start reference. A full live inspection channel returns `capacity`
+without consuming any of those ledgers; a closed inspection service returns `internal`. Graceful
+daemon SIGINT/SIGTERM fences new work, cancels queued and active work, reaps owned providers, and
+removes owned provider sockets before exit. SIGKILL cannot provide those cleanup guarantees.
+
 Git comparisons compose typed HEAD/index/worktree snapshots. Discovery and capture use
 controlled filter-free commands and direct-child reap evidence. Results retain their
 non-atomic snapshot coverage and explicit unknown/not-captured baseline facts. A current stored

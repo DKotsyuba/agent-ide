@@ -262,6 +262,20 @@ impl AssistanceDispatcher for ProductDispatcher {
             }
         })
     }
+    /// Cancels all queued and active work and waits for the worker to reap owned providers.
+    fn shutdown(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AssistanceDispatchUnavailable>> + Send + '_>> {
+        Box::pin(async move {
+            match &self.worker {
+                Some(worker) => worker
+                    .shutdown()
+                    .await
+                    .map_err(|_| AssistanceDispatchUnavailable),
+                None => Ok(()),
+            }
+        })
+    }
     /// Returns bounded closed outcomes; slow jobs become pending while short inspections stay finite.
     fn dispatch(
         &self,

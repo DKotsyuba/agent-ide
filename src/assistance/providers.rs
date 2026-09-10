@@ -92,6 +92,30 @@ impl Providers {
 }
 
 impl Worker<'_> {
+    /// Closes every retained provider view and quiesces its cache before daemon shutdown completes.
+    /// Returns the first cleanup failure after still attempting every independently owned backend.
+    pub(super) async fn close_all_providers(&mut self) -> Result<(), FailureCode> {
+        let bindings = self
+            .providers
+            .go_views
+            .keys()
+            .chain(self.providers.binding_caches.keys())
+            .chain(self.grants.keys())
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut failure = None;
+        for binding in bindings {
+            if let Err(code) = self.close_provider(&binding).await {
+                failure.get_or_insert(code);
+            }
+            self.quiesce_worktree_caches(&binding);
+        }
+        if !self.uncertain.is_empty() {
+            failure.get_or_insert(FailureCode::Internal);
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
     /// Retains or reopens each configured provider cache under canonical worktree identity.
     ///
     /// A quiescent compatible lifecycle is handed to the incoming binding. Failure leaves the

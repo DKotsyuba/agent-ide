@@ -96,7 +96,7 @@ impl GoplsProfile {
     /// Declares the fixed listener command for Execution validation and controlled spawning.
     ///
     /// `socket` must be absolute and owned by the caller. The command deliberately contains one
-    /// explicit Unix listener with no idle timeout and never selects `-remote=auto`.
+    /// explicit Unix listener with a one-minute idle orphan ceiling and never selects `-remote=auto`.
     pub fn listener_command(
         &self,
         authority: &WorkspaceAuthority,
@@ -106,7 +106,7 @@ impl GoplsProfile {
             authority,
             vec![
                 OsString::from(format!("-listen=unix;{}", socket.display())),
-                OsString::from("-listen.timeout=0"),
+                OsString::from("-listen.timeout=1m"),
             ],
         )
     }

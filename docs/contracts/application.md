@@ -12,7 +12,7 @@ It does not authenticate actors, grant Workspace authority, read Git or source, 
 
 [`core-ipc.md`](core-ipc.md) is the complete wire contract. It owns the unchanged v1 health frame and the finite v2 Assistance ingress, including frame and field limits, endpoint ownership, peer-UID check, stale-socket recovery, and the exact `daemon`/`doctor` CLI modes. This contract does not restate that wire format.
 
-`RuntimeDir::prepare_for_daemon` creates or validates one final private real directory. `run_daemon` holds its nonblocking lock, binds one private Unix socket, generates a fresh daemon generation, and serves only health. It does not start Workspace, Execution, Intelligence, or Assistance activity. `doctor` receives a plain path, never creates a directory or starts a daemon, and returns `Healthy { daemon_generation }` or `Unavailable`.
+`RuntimeDir::prepare_for_daemon` creates or validates one final private real directory. `run_daemon` holds its nonblocking lock, binds one private Unix socket, generates a fresh daemon generation, and serves only health. It does not start Workspace, Execution, Intelligence, or Assistance activity. On Unix SIGINT or SIGTERM, both daemon modes stop accepting, cancel active connection tasks, invoke bounded Assistance shutdown when present, and remove their owned endpoint before returning. SIGKILL cannot run cleanup and carries no cleanup claim. `doctor` receives a plain path, never creates a directory or starts a daemon, and returns `Healthy { daemon_generation }` or `Unavailable`.
 
 UID equality is only a local-user transport boundary; it is not actor proof or authority. Assistance must validate any host attachment before it asks a domain to activate. A stale lock pathname, PID, socket closure, or successful local connection alone never establishes host binding.
 
@@ -24,7 +24,7 @@ connection never grants a second full exchange interval. The fake-socket regress
 Tokio's test-only paused clock to spend 60ms before connect completes and 50ms in a silent
 exchange under a 100ms total budget, for both hook and method requests.
 
-The r2 Rust surface is `HookTransportLimits { max_frame_bytes, max_observation_bytes, deadline }`, `HookSubmit { request_id, correlation_id, opaque_attachment, sanitized_observation_json }`, `AssistanceMethod::HookSubmit`, `AssistanceDispatch`, `AssistanceDispatchReply`, `AssistanceDispatcher::dispatch`, `submit_hook_if_running(runtime_dir, request, limits)`, and `run_daemon_with_assistance(runtime_dir, dispatcher, config)`. `AssistanceMethod` has no extensible string variant. `OpaqueAttachmentRef`, request/correlation IDs, and opaque JSON results are bounded transport values; they are not authority assertions or Application-owned semantic types.
+The r2 Rust surface is `HookTransportLimits { max_frame_bytes, max_observation_bytes, deadline }`, `HookSubmit { request_id, correlation_id, opaque_attachment, sanitized_observation_json }`, `AssistanceMethod::HookSubmit`, `AssistanceDispatch`, `AssistanceDispatchReply`, `AssistanceDispatcher::{dispatch, shutdown}`, `submit_hook_if_running(runtime_dir, request, limits)`, and `run_daemon_with_assistance(runtime_dir, dispatcher, config)`. The shutdown default is an immediate no-op for dispatchers with no owned resources. `AssistanceMethod` has no extensible string variant. `OpaqueAttachmentRef`, request/correlation IDs, and opaque JSON results are bounded transport values; they are not authority assertions or Application-owned semantic types.
 
 ## Immutable configuration
 

@@ -144,6 +144,10 @@ struct Shared {
     launcher: LauncherConfig,
     /// Boot-unique opaque prefix prevents detail/SQLite operation collisions after restart.
     nonce: [u8; 32],
+    /// True after daemon shutdown fences admission and requests owned cleanup.
+    shutting_down: std::sync::atomic::AtomicBool,
+    /// First provider cleanup failure retained until the shutdown caller observes it.
+    shutdown_failure: Mutex<Option<FailureCode>>,
 }
 impl Shared {
     /// Acquires a new transient binding use at one exact admission/return boundary.
@@ -226,6 +230,8 @@ impl WorkerHandle {
                 notify: Notify::new(),
                 launcher,
                 nonce,
+                shutting_down: std::sync::atomic::AtomicBool::new(false),
+                shutdown_failure: Mutex::new(None),
             }),
             inspect,
             receiver: Mutex::new(Some(receiver)),
@@ -317,6 +323,43 @@ impl WorkerHandle {
         *self.task.lock().map_err(|_| FailureCode::Internal)? = Some(task);
         wait.await.map_err(|_| FailureCode::Internal)?
     }
+    /// Fences admission, cancels every binding, and waits for the sole worker to reap providers.
+    pub async fn shutdown(&self) -> Result<(), FailureCode> {
+        self.startup_cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.shared
+            .shutting_down
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Ok(mut ledger) = self.shared.ledger.lock() {
+            for sender in ledger.cancellation.values() {
+                let _ = sender.send(true);
+            }
+            ledger.queue.clear();
+            ledger.details.clear();
+            ledger.starts.clear();
+            ledger.feedback.clear();
+        }
+        self.shared.notify.notify_one();
+        let task = self.task.lock().map_err(|_| FailureCode::Internal)?.take();
+        let Some(mut task) = task else {
+            return Ok(());
+        };
+        match tokio::time::timeout(Duration::from_secs(39), &mut task).await {
+            Ok(Ok(())) => self
+                .shared
+                .shutdown_failure
+                .lock()
+                .map_err(|_| FailureCode::Internal)?
+                .take()
+                .map_or(Ok(()), Err),
+            Ok(Err(_)) => Err(FailureCode::Internal),
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                Err(FailureCode::Deadline)
+            }
+        }
+    }
     /// Enqueues or resolves the exact query, returning pending without waiting for provider warmup.
     pub async fn submit(
         &self,
@@ -333,15 +376,21 @@ impl WorkerHandle {
             };
         };
         let expected = Some((tool, selection(&parameters)));
-        let reference =
-            if let Some(reference) = parameters.get("detail_ref").and_then(Value::as_str) {
-                Ok(reference.to_owned())
-            } else {
-                self.enqueue(invocation, observed, tool, parameters, attachment, None)
+        if let Some(reference) = parameters.get("detail_ref").and_then(Value::as_str) {
+            return self
+                .inspect(binding, reference.to_owned(), current, attachment, expected)
+                .await;
+        }
+        let Some(target) = self.shared.launcher.target(attachment).cloned() else {
+            return PeerReply::Error {
+                code: FailureCode::LauncherConfiguration,
             };
-        match reference {
-            Ok(reference) => {
-                self.inspect(binding, reference, current, attachment, expected)
+        };
+        match admit_initial_inspection(&self.inspect, || {
+            self.enqueue(invocation, observed, tool, parameters, attachment, None)
+        }) {
+            Ok((reference, permit)) => {
+                self.inspect_reserved(binding, reference, current, target, expected, permit)
                     .await
             }
             Err(code) => PeerReply::Error { code },
@@ -398,23 +447,33 @@ impl WorkerHandle {
                 code: FailureCode::LauncherConfiguration,
             };
         };
+        let permit = match reserve_inspection(&self.inspect) {
+            Ok(permit) => permit,
+            Err(code) => return PeerReply::Error { code },
+        };
+        self.inspect_reserved(binding, reference, observed, target, expected, permit)
+            .await
+    }
+
+    /// Publishes one fully built inspection through a permit that already owns channel capacity.
+    async fn inspect_reserved(
+        &self,
+        binding: BindingRef,
+        reference: String,
+        observed: ObservedSandboxState,
+        target: LaunchTarget,
+        expected: Option<(AssistanceTool, [u8; 32])>,
+        permit: mpsc::OwnedPermit<Inspection>,
+    ) -> PeerReply {
         let (reply, wait) = oneshot::channel();
-        if self
-            .inspect
-            .try_send(Inspection {
-                binding,
-                reference,
-                observed,
-                target,
-                expected,
-                reply,
-            })
-            .is_err()
-        {
-            return PeerReply::Error {
-                code: FailureCode::Capacity,
-            };
-        }
+        permit.send(Inspection {
+            binding,
+            reference,
+            observed,
+            target,
+            expected,
+            reply,
+        });
         wait.await.unwrap_or(PeerReply::Error {
             code: FailureCode::Internal,
         })
@@ -456,6 +515,13 @@ impl WorkerHandle {
         attachment: &str,
         stop_reply: Option<oneshot::Sender<PeerReply>>,
     ) -> Result<String, FailureCode> {
+        if self
+            .shared
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(FailureCode::Internal);
+        }
         if !self
             .task
             .lock()
@@ -589,7 +655,9 @@ struct Worker<'a> {
 }
 impl<'a> Worker<'a> {
     /// Processes one slow operation at a time; inspections run on an independently scheduled task
-    /// (see `inspection_loop`) so a non-yielding poll of the current operation cannot starve `ide.inspect`.
+    /// (see `inspection_loop`) so a non-yielding poll of the current operation cannot starve
+    /// `ide.inspect`. Shutdown first cancels the current operation, allowing its Rust or forwarder
+    /// child to reap, then this loop closes retained providers before returning.
     async fn run(mut self, inspections: mpsc::Receiver<Inspection>)
     where
         'a: 'static,
@@ -601,6 +669,18 @@ impl<'a> Worker<'a> {
         ));
         let _inspector = AbortOnDrop(inspector);
         loop {
+            if self
+                .shared
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                if let Err(code) = self.close_all_providers().await
+                    && let Ok(mut failure) = self.shared.shutdown_failure.lock()
+                {
+                    *failure = Some(code);
+                }
+                return;
+            }
             let shared = self.shared.clone();
             let wake = shared.notify.notified();
             let job = shared
@@ -1309,6 +1389,29 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
         .send(result.unwrap_or_else(|code| PeerReply::Error { code }));
 }
 
+/// Reserves live inspection capacity, distinguishing saturation from service termination.
+fn reserve_inspection(
+    sender: &mpsc::Sender<Inspection>,
+) -> Result<mpsc::OwnedPermit<Inspection>, FailureCode> {
+    sender
+        .clone()
+        .try_reserve_owned()
+        .map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => FailureCode::Capacity,
+            mpsc::error::TrySendError::Closed(_) => FailureCode::Internal,
+        })
+}
+
+/// Reserves the initial inspection slot before invoking the closure that publishes a job/detail.
+fn admit_initial_inspection(
+    sender: &mpsc::Sender<Inspection>,
+    enqueue: impl FnOnce() -> Result<String, FailureCode>,
+) -> Result<(String, mpsc::OwnedPermit<Inspection>), FailureCode> {
+    let permit = reserve_inspection(sender)?;
+    let reference = enqueue()?;
+    Ok((reference, permit))
+}
+
 /// Rechecks one exact registered path; a missing source never establishes worktree closure.
 fn source_matches(source: &SourceObservation) -> bool {
     use crate::workspace::observation::{
@@ -1358,4 +1461,24 @@ fn selection(parameters: &Value) -> [u8; 32] {
         object.remove("detail_ref");
     }
     *blake3::hash(selected.to_string().as_bytes()).as_bytes()
+}
+
+/// Saturated initial inspection admission must not invoke job/detail publication, while a closed
+/// inspection service is an internal lifecycle fault rather than live capacity exhaustion.
+#[test]
+fn initial_inspection_admission_is_atomic_and_distinguishes_closure() {
+    let (sender, receiver) = mpsc::channel(1);
+    let held = sender.clone().try_reserve_owned().unwrap();
+    let mut published = false;
+    let result = admit_initial_inspection(&sender, || {
+        published = true;
+        Ok("lost-detail".to_owned())
+    });
+    assert!(matches!(result, Err(FailureCode::Capacity)));
+    assert!(!published);
+
+    drop(held);
+    drop(receiver);
+    let result = admit_initial_inspection(&sender, || panic!("closed service published detail"));
+    assert!(matches!(result, Err(FailureCode::Internal)));
 }

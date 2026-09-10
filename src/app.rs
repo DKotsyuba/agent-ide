@@ -184,7 +184,8 @@ impl RuntimeDir {
 ///
 /// The caller must obtain `runtime_dir` through [`RuntimeDir::prepare_for_daemon`]. Starting holds
 /// an exclusive nonblocking lock, creates one fresh daemon generation, and never starts Workspace,
-/// Execution, Intelligence, or Assistance work. It returns only for a setup or listener failure.
+/// Execution, Intelligence, or Assistance work. It returns after bounded SIGINT/SIGTERM cleanup or
+/// for a setup/listener failure; SIGKILL cannot run cleanup.
 pub async fn run_daemon(runtime_dir: RuntimeDir) -> Result<(), AppError> {
     let ipc = config::EffectiveConfig::defaults().ipc();
     run_daemon_inner(runtime_dir, None, ipc, None).await
@@ -194,7 +195,8 @@ pub async fn run_daemon(runtime_dir: RuntimeDir) -> Result<(), AppError> {
 ///
 /// `dispatcher` owns all attachment, host, rendering, and method semantics. Application only
 /// frames, limits, correlates, and times out `assistance.hook_submit` and the closed current-method
-/// dispatch set. Health remains available with its unchanged version-one contract.
+/// dispatch set. Health remains available with its unchanged version-one contract. SIGINT/SIGTERM
+/// stops ingress and awaits the dispatcher's bounded owned-resource cleanup before return.
 pub async fn run_daemon_with_assistance(
     runtime_dir: RuntimeDir,
     dispatcher: Arc<dyn AssistanceDispatcher>,
@@ -210,7 +212,7 @@ pub async fn run_daemon_with_assistance(
     run_daemon_inner(runtime_dir, Some(dispatcher), ipc, Some(limits)).await
 }
 
-/// Binds one daemon endpoint and forwards only the explicitly supplied finite Application transport.
+/// Binds one daemon endpoint until SIGINT/SIGTERM, then drains transport and bounded peer cleanup.
 async fn run_daemon_inner(
     runtime_dir: RuntimeDir,
     dispatcher: Option<Arc<dyn AssistanceDispatcher>>,
@@ -218,14 +220,21 @@ async fn run_daemon_inner(
     transport_limits: Option<HookTransportLimits>,
 ) -> Result<(), AppError> {
     let _lock = DaemonLock::acquire(runtime_dir.lock_path())?;
+    let termination = termination_signal()?;
+    tokio::pin!(termination);
     if let Some(dispatcher) = &dispatcher {
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            dispatcher.initialize(runtime_dir.path()),
-        )
-        .await
-        .map_err(|_| AppError::InvalidResponse)?
-        .map_err(|_| AppError::InvalidResponse)?;
+        tokio::select! {
+            initialized = tokio::time::timeout(
+                Duration::from_secs(5),
+                dispatcher.initialize(runtime_dir.path()),
+            ) => initialized
+                .map_err(|_| AppError::InvalidResponse)?
+                .map_err(|_| AppError::InvalidResponse)?,
+            _ = &mut termination => {
+                shutdown_dispatcher(dispatcher).await?;
+                return Ok(());
+            }
+        }
     }
     let socket_path = runtime_dir.socket_path();
     retire_stale_socket(&socket_path, ipc.connection_deadline).await?;
@@ -234,16 +243,22 @@ async fn run_daemon_inner(
     let _socket = OwnedSocket::new(socket_path)?;
     let generation = new_generation()?;
     let permits = Arc::new(Semaphore::new(ipc.max_connections));
+    let mut connections = tokio::task::JoinSet::new();
 
     loop {
-        let (stream, _) = listener.accept().await?;
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            _ = &mut termination => break,
+            _ = connections.join_next(), if !connections.is_empty() => continue,
+        };
+        let (stream, _) = accepted?;
         let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
             drop(stream);
             continue;
         };
         let generation = generation.clone();
         let dispatcher = dispatcher.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             let _permit = permit;
             let _ = tokio::time::timeout(
                 ipc.connection_deadline,
@@ -253,11 +268,33 @@ async fn run_daemon_inner(
         });
     }
 
-    #[allow(unreachable_code)]
-    {
-        drop((_socket, _lock));
-        Ok(())
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+    if let Some(dispatcher) = &dispatcher {
+        shutdown_dispatcher(dispatcher).await?;
     }
+    drop((_socket, _lock));
+    Ok(())
+}
+
+/// Creates native Tokio SIGINT/SIGTERM streams and resolves after the first delivered signal.
+fn termination_signal() -> io::Result<impl std::future::Future<Output = ()>> {
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    Ok(async move {
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+    })
+}
+
+/// Gives an Assistance peer at most forty seconds to cancel and reap its finite owned process set.
+async fn shutdown_dispatcher(dispatcher: &Arc<dyn AssistanceDispatcher>) -> Result<(), AppError> {
+    tokio::time::timeout(Duration::from_secs(40), dispatcher.shutdown())
+        .await
+        .map_err(|_| AppError::InvalidResponse)?
+        .map_err(|_| AppError::InvalidResponse)
 }
 
 /// Connects to an already-running daemon for one hook submission without preparing or starting it.

@@ -259,6 +259,14 @@ pub trait AssistanceDispatcher: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
+    /// Cancels daemon-owned work and reaps owned resources before daemon exit.
+    /// Default dispatchers own no resources and therefore complete immediately.
+    fn shutdown(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AssistanceDispatchUnavailable>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Starts one finite Assistance operation and resolves its opaque result within the caller budget.
     fn dispatch(
         &self,

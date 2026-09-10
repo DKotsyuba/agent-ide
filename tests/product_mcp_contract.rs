@@ -1448,6 +1448,174 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
     daemon.wait().await.unwrap();
 }
 
+/// SIGTERM stops admission, reaps an active owned provider, and removes both owned socket paths.
+#[tokio::test]
+async fn configured_product_sigterm_reaps_active_provider_and_owned_sockets() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = ProductFixture::new(json!([]));
+    let program = fixture.base.join("signal-provider");
+    let listener_ready = fixture.base.join("listener-ready");
+    let forwarder_ready = fixture.base.join("forwarder-ready");
+    let process = fixture.base.join("provider-process");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in *-listen=unix*) ready='{}';; *) ready='{}';; esac\nprintf '%s\\t%s\\n' $$ \"$*\" >> '{}'\n: > \"$ready\"\nexec /bin/sleep 30\n",
+            listener_ready.display(),
+            forwarder_ready.display(),
+            process.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"signal-fixture-provider"),"settings":"gopls_defaults","toolchain":"/usr/bin/true","cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"signal-fixture-cache"}]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "signal-root").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"signal-start"}),
+        )
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let pending = actor
+        .call(
+            &fixture,
+            "ide.context",
+            json!({"path":"main.go","byte_offset":59}),
+        )
+        .await;
+    assert_eq!(pending["state"], "pending", "{pending}");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !listener_ready.exists() {
+            assert!(daemon.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let listener = std::fs::read_to_string(&process).unwrap();
+    let (listener_pid, listener_arguments) =
+        listener.lines().next().unwrap().split_once('\t').unwrap();
+    let listener_pid: libc::pid_t = listener_pid.parse().unwrap();
+    let listener_socket = listener_arguments
+        .split_whitespace()
+        .find_map(|argument| argument.strip_prefix("-listen=unix;"))
+        .map(PathBuf::from)
+        .unwrap();
+    let _provider_socket = std::os::unix::net::UnixListener::bind(&listener_socket).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !forwarder_ready.exists() {
+            assert!(daemon.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let processes = std::fs::read_to_string(&process).unwrap();
+    let provider_pids = processes
+        .lines()
+        .map(|line| {
+            line.split_once('\t')
+                .unwrap()
+                .0
+                .parse::<libc::pid_t>()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(provider_pids.len(), 2, "{processes}");
+    // SAFETY: signal zero only observes the readiness-marked direct child and changes no state.
+    assert_eq!(unsafe { libc::kill(listener_pid, 0) }, 0);
+    let daemon_pid = daemon.id().unwrap() as libc::pid_t;
+    // SAFETY: this test owns the live daemon subprocess identified by its Tokio Child handle.
+    assert_eq!(unsafe { libc::kill(daemon_pid, libc::SIGTERM) }, 0);
+    let status = tokio::time::timeout(Duration::from_secs(5), daemon.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.success(), "daemon exited with {status}");
+    for provider_pid in provider_pids {
+        // SAFETY: signal zero only verifies a readiness-marked provider PID after daemon completion.
+        assert_eq!(unsafe { libc::kill(provider_pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+    assert!(!listener_socket.exists());
+    assert!(!fixture.runtime.join("agent-ide.sock").exists());
+    actor.mcp.close().await;
+}
+
+/// SIGTERM cooperatively cancels and reaps an in-flight Rust-only provider before daemon exit.
+#[tokio::test]
+async fn configured_product_sigterm_reaps_in_flight_rust_only_provider() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = ProductFixture::new(json!([]));
+    let program = fixture.base.join("signal-rust-provider");
+    let ready = fixture.base.join("rust-provider-ready");
+    let process = fixture.base.join("rust-provider-process");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\nprintf '%s' $$ > '{}'\n: > '{}'\nexec /bin/sleep 30\n",
+            process.display(),
+            ready.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"rust-analyzer signal fixture"),"settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo_version":"cargo 1.98.1","rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"signal-rust-cache"}]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "signal-rust-root").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"signal-rust-start"}),
+        )
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let pending = actor
+        .call(
+            &fixture,
+            "ide.context",
+            json!({"path":"src/lib.rs","byte_offset":48}),
+        )
+        .await;
+    assert_eq!(pending["state"], "pending", "{pending}");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !ready.exists() {
+            assert!(daemon.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let provider_pid: libc::pid_t = std::fs::read_to_string(&process).unwrap().parse().unwrap();
+    // SAFETY: signal zero only observes the readiness-marked direct child and changes no state.
+    assert_eq!(unsafe { libc::kill(provider_pid, 0) }, 0);
+    let daemon_pid = daemon.id().unwrap() as libc::pid_t;
+    // SAFETY: this test owns the live daemon subprocess identified by its Tokio Child handle.
+    assert_eq!(unsafe { libc::kill(daemon_pid, libc::SIGTERM) }, 0);
+    let status = tokio::time::timeout(Duration::from_secs(5), daemon.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.success(), "daemon exited with {status}");
+    // SAFETY: signal zero verifies only the readiness-marked Rust provider after daemon completion.
+    assert_eq!(unsafe { libc::kill(provider_pid, 0) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+    assert!(!fixture.runtime.join("agent-ide.sock").exists());
+    actor.mcp.close().await;
+}
+
 /// Two configured root/child channels keep one compatible listener while isolating current source and stop.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_GOPLS and AGENT_IDE_GO environment"]
