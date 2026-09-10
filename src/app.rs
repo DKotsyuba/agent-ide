@@ -213,8 +213,10 @@ pub async fn run_daemon_with_assistance(
 }
 
 /// Binds one daemon endpoint until SIGINT/SIGTERM, then drains transport and bounded peer cleanup.
-/// After Assistance initializes, every setup or listener failure also takes that common cleanup path;
-/// the original serving failure wins if bounded dispatcher cleanup independently fails.
+/// A dispatcher initialize timeout/error, and every setup or listener failure once serving starts,
+/// take the same bounded shutdown path; the original serving failure wins if cleanup independently
+/// fails. Draining accepted connections is a bounded cancel-and-join of the connection task set, not
+/// a graceful wait for in-flight requests to finish.
 async fn run_daemon_inner(
     runtime_dir: RuntimeDir,
     dispatcher: Option<Arc<dyn AssistanceDispatcher>>,
@@ -226,12 +228,7 @@ async fn run_daemon_inner(
     tokio::pin!(termination);
     if let Some(dispatcher) = &dispatcher {
         tokio::select! {
-            initialized = tokio::time::timeout(
-                Duration::from_secs(5),
-                dispatcher.initialize(runtime_dir.path()),
-            ) => initialized
-                .map_err(|_| AppError::InvalidResponse)?
-                .map_err(|_| AppError::InvalidResponse)?,
+            initialized = initialize_dispatcher(dispatcher, runtime_dir.path()) => initialized?,
             _ = &mut termination => {
                 shutdown_dispatcher(dispatcher).await?;
                 return Ok(());
@@ -244,8 +241,8 @@ async fn run_daemon_inner(
         let socket_path = runtime_dir.socket_path();
         retire_stale_socket(&socket_path, ipc.connection_deadline).await?;
         let listener = UnixListener::bind(&socket_path)?;
+        owned_socket = Some(OwnedSocket::new(socket_path.clone())?);
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
-        owned_socket = Some(OwnedSocket::new(socket_path)?);
         let generation = new_generation()?;
         let permits = Arc::new(Semaphore::new(ipc.max_connections));
 
@@ -279,8 +276,27 @@ async fn run_daemon_inner(
     result
 }
 
-/// Drains accepted connections and shuts down an initialized dispatcher before returning serving state.
-/// Cleanup is attempted in full; an earlier setup or accept error remains the returned error.
+/// Bounds dispatcher initialization; a timeout or initialize error may still leave owned provider
+/// children behind, so bounded shutdown always runs before the original failure is returned.
+async fn initialize_dispatcher(
+    dispatcher: &Arc<dyn AssistanceDispatcher>,
+    runtime_dir: &Path,
+) -> Result<(), AppError> {
+    let initialized =
+        tokio::time::timeout(Duration::from_secs(5), dispatcher.initialize(runtime_dir))
+            .await
+            .map_err(|_| AppError::InvalidResponse)
+            .and_then(|result| result.map_err(|_| AppError::InvalidResponse));
+    if initialized.is_err() {
+        let shutdown = shutdown_dispatcher(dispatcher).await;
+        return initialized.and(shutdown);
+    }
+    initialized
+}
+
+/// Aborts and joins every accepted connection task (cancellation, not a graceful drain of in-flight
+/// requests) and shuts down an initialized dispatcher before returning serving state. Cleanup is
+/// attempted in full; an earlier setup or accept error remains the returned error.
 async fn finish_daemon(
     serving: Result<(), AppError>,
     connections: &mut tokio::task::JoinSet<()>,
@@ -1103,5 +1119,63 @@ mod tests {
         );
         assert!(reaped.load(Ordering::SeqCst));
         assert!(probe.shutdown.load(Ordering::SeqCst));
+    }
+
+    /// Rejects initialization and records whether shutdown still ran on this exact dispatcher.
+    struct FailingInitProbe {
+        /// Becomes true only if shutdown is invoked despite the failed initialize.
+        shutdown_called: AtomicBool,
+    }
+
+    impl AssistanceDispatcher for FailingInitProbe {
+        /// Simulates a dispatcher that already owns partial state before reporting failure.
+        fn initialize<'a>(
+            &'a self,
+            _runtime_dir: &'a Path,
+        ) -> Pin<Box<dyn Future<Output = Result<(), AssistanceDispatchUnavailable>> + Send + 'a>>
+        {
+            Box::pin(async { Err(AssistanceDispatchUnavailable) })
+        }
+
+        /// Records that bounded shutdown ran to reap whatever initialize may have started.
+        fn shutdown(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<(), AssistanceDispatchUnavailable>> + Send + '_>>
+        {
+            Box::pin(async move {
+                self.shutdown_called.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+
+        /// Unreachable in this initialize-failure probe.
+        fn dispatch(
+            &self,
+            _request: AssistanceDispatch,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<AssistanceDispatchReply, AssistanceDispatchUnavailable>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { Err(AssistanceDispatchUnavailable) })
+        }
+    }
+
+    /// Proves a rejected initialize still runs bounded shutdown and preserves the original failure.
+    #[tokio::test]
+    async fn failed_initialize_still_shuts_down_and_preserves_the_original_error() {
+        let probe = Arc::new(FailingInitProbe {
+            shutdown_called: AtomicBool::new(false),
+        });
+        let dispatcher: Arc<dyn AssistanceDispatcher> = probe.clone();
+
+        let error = initialize_dispatcher(&dispatcher, Path::new("unused"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, AppError::InvalidResponse));
+        assert!(probe.shutdown_called.load(Ordering::SeqCst));
     }
 }

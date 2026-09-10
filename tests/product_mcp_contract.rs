@@ -1384,7 +1384,9 @@ async fn configured_product_returns_real_go_and_rust_semantic_context() {
     }
 }
 
-/// Cancels a configured owned provider during warmup and observes direct-child death before successful stop.
+/// Cancels a configured owned provider during warmup: the direct child is still killed and reaped even
+/// though its socket identity was never captured, and the stop honestly reports that uncertainty
+/// instead of a false success.
 #[tokio::test]
 async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
     use std::os::unix::fs::PermissionsExt;
@@ -1435,7 +1437,11 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
     .unwrap();
     let pid: libc::pid_t = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
-    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    // The provider never created its socket, so `close_provider` cannot prove the on-disk socket's
+    // fate; it still kills and reaps the direct child below but reports the cleanup honestly instead
+    // of a false "stop" success.
+    assert_eq!(stopped["code"], "internal", "{stopped}");
+    assert_eq!(stopped["state"], "error", "{stopped}");
     assert!(cache_namespaces[0].is_dir());
     // SAFETY: zero only probes the fixture's previously recorded direct-child PID; it sends no signal.
     assert_eq!(unsafe { libc::kill(pid, 0) }, -1);

@@ -98,6 +98,9 @@ pub(super) struct Providers {
     go: BTreeMap<String, GoBackend>,
     /// One logical Go view for each bound actor/worktree.
     go_views: BTreeMap<BindingRef, GoLease>,
+    /// Per-backend socket path generation, bumped whenever a reap could not prove the on-disk
+    /// socket's fate; a bumped generation forces the next spawn for that backend onto a fresh path.
+    socket_generation: BTreeMap<String, u64>,
     /// Exclusive Rust generation and source bookkeeping.
     rust: RustViews,
     /// Strictly increasing protocol/backend generation within this boot.
@@ -118,6 +121,7 @@ impl Providers {
             .expect("fixed view limits"),
             go: BTreeMap::new(),
             go_views: BTreeMap::new(),
+            socket_generation: BTreeMap::new(),
             rust: RustViews::default(),
             generation: 0,
             caches: BTreeMap::new(),
@@ -439,11 +443,18 @@ impl Worker<'_> {
         )
         .map_err(|_| FailureCode::ExecutionProfile)?;
         let backend = profile.compatibility_key();
+        let socket_generation = self
+            .providers
+            .socket_generation
+            .get(&backend)
+            .copied()
+            .unwrap_or(0);
         let socket_key = blake3::hash(
             format!(
-                "{}{}",
+                "{}{}{}",
                 blake3::Hash::from_bytes(self.shared.nonce).to_hex(),
-                backend
+                backend,
+                socket_generation
             )
             .as_bytes(),
         )
@@ -670,21 +681,30 @@ impl Worker<'_> {
     }
 
     /// Releases the stopped actor's logical view; compatible peers retain their listener and cache identity.
+    ///
+    /// Every step below the removed `go_views` mapping is the only remaining reference to that state,
+    /// so any failure past this point is recorded in `uncertain` rather than silently discarded: the
+    /// binding's view and backend accounting are gone either way, and losing the failure signal would
+    /// let a caller believe cleanup fully succeeded when it did not.
     pub(super) async fn close_provider(&mut self, binding: &BindingRef) -> Result<(), FailureCode> {
         let Some(view) = self.providers.go_views.remove(binding) else {
             return Ok(());
         };
-        let release = self
-            .providers
-            .registry
-            .release(view.lease)
-            .map_err(|_| FailureCode::Internal)?;
+        let release = match self.providers.registry.release(view.lease) {
+            Ok(release) => release,
+            Err(_) => {
+                self.uncertain.insert(binding.clone());
+                return Err(FailureCode::Internal);
+            }
+        };
         if let BackendRelease::ReapOwned(capability) = release {
-            let backend = self
-                .providers
-                .go
-                .remove(&view.backend)
-                .ok_or(FailureCode::Internal)?;
+            let backend = match self.providers.go.remove(&view.backend) {
+                Some(backend) => backend,
+                None => {
+                    self.uncertain.insert(binding.clone());
+                    return Err(FailureCode::Internal);
+                }
+            };
             let completed = match backend
                 .shared
                 .stop(Duration::from_millis(100), Duration::from_millis(500))
@@ -696,15 +716,42 @@ impl Worker<'_> {
                     return Err(FailureCode::Deadline);
                 }
             };
-            self.providers
+            if self
+                .providers
                 .registry
                 .complete_reap(&mut self.admission, capability, completed.settlement)
-                .map_err(|_| FailureCode::Internal)?;
-            backend
-                .socket
-                .ok_or(FailureCode::Internal)?
-                .remove()
-                .map_err(|_| FailureCode::Internal)?;
+                .is_err()
+            {
+                self.uncertain.insert(binding.clone());
+                return Err(FailureCode::Internal);
+            }
+            match backend.socket {
+                Some(identity) => {
+                    if identity.remove().is_err() {
+                        self.uncertain.insert(binding.clone());
+                        *self
+                            .providers
+                            .socket_generation
+                            .entry(view.backend)
+                            .or_insert(0) += 1;
+                        return Err(FailureCode::Internal);
+                    }
+                }
+                None => {
+                    // The process was already stopped and reaped above; only its socket identity was
+                    // never captured (cancelled/deadlined/failed before capture). We cannot prove
+                    // whether a file remains at the deterministic path, so we neither guess-delete nor
+                    // claim success: record uncertainty and retire the path so the next spawn for this
+                    // backend cannot collide with whatever, if anything, is left behind.
+                    self.uncertain.insert(binding.clone());
+                    *self
+                        .providers
+                        .socket_generation
+                        .entry(view.backend)
+                        .or_insert(0) += 1;
+                    return Err(FailureCode::Internal);
+                }
+            }
         }
         Ok(())
     }
