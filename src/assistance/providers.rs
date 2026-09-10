@@ -394,22 +394,29 @@ impl Worker<'_> {
             .execution_request(job, &authority, command, &launch.executable)
             .await?;
         let active = self.shared.active(&binding)?;
-        let view = match self.providers.rust.request(
-            &profile,
-            &worktree,
-            &mut self.providers.registry,
-            &mut self.admission,
-            owner(&binding)?,
-            AdmissionClass::Interactive,
-        ) {
-            RustViewAdmission::Granted(view) => view,
-            RustViewAdmission::Queued(ticket) => {
-                self.providers
-                    .registry
-                    .cancel_pending(&mut self.admission, ticket);
-                return Err(FailureCode::Capacity);
+        // The shared controller guard is confined to this block: it is a `std` mutex the helper
+        // socket task also locks, so it must never reach the awaits below or this worker future
+        // stops being `Send`.
+        let view = {
+            let admission = self.admission.clone();
+            let mut admission = admission
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match self.providers.rust.request(
+                &profile,
+                &worktree,
+                &mut self.providers.registry,
+                &mut admission,
+                owner(&binding)?,
+                AdmissionClass::Interactive,
+            ) {
+                RustViewAdmission::Granted(view) => view,
+                RustViewAdmission::Queued(ticket) => {
+                    self.providers.registry.cancel_pending(&mut admission, ticket);
+                    return Err(FailureCode::Capacity);
+                }
+                _ => return Err(FailureCode::ProviderUnavailable),
             }
-            _ => return Err(FailureCode::ProviderUnavailable),
         };
         self.providers
             .rust
@@ -472,9 +479,13 @@ impl Worker<'_> {
             .release(&mut self.providers.registry, view.lease())
             .map_err(|_| FailureCode::Internal)?;
         let capability = release;
+        let admission = self.admission.clone();
+        let mut admission = admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.providers
             .registry
-            .complete_reap(&mut self.admission, capability, reaped.proof)
+            .complete_reap(&mut admission, capability, reaped.proof)
             .map_err(|_| FailureCode::Internal)?;
         self.shared.active(&binding)?;
         result
@@ -548,8 +559,12 @@ impl Worker<'_> {
                 .execution_request(job, &authority, command, &launch.executable)
                 .await?;
             let active = self.shared.active(&binding)?;
+        let admission = self.admission.clone();
+        let mut admission = admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
             let lease = match self.providers.registry.request(
-                &mut self.admission,
+                &mut admission,
                 owner(&binding)?,
                 AdmissionClass::Interactive,
                 backend.clone(),
@@ -558,9 +573,7 @@ impl Worker<'_> {
             ) {
                 ProviderLeaseAdmission::Granted(lease) => lease,
                 ProviderLeaseAdmission::Queued(ticket) => {
-                    self.providers
-                        .registry
-                        .cancel_pending(&mut self.admission, ticket);
+                    self.providers.registry.cancel_pending(&mut admission, ticket);
                     return Err(FailureCode::Capacity);
                 }
                 _ => return Err(FailureCode::ProviderUnavailable),
@@ -653,19 +666,28 @@ impl Worker<'_> {
             )
             .await?;
         let active = self.shared.active(&binding)?;
-        let admission = self.admit(&binding)?;
-        let capability = match self.providers.registry.take_forwarder_spawn_lease(
-            &mut self.admission,
-            logical.lease,
-            &request,
-            admission,
-        ) {
-            Ok(capability) => capability,
-            Err((_, unused)) => {
-                self.admission
-                    .release(unused)
-                    .map_err(|_| FailureCode::Internal)?;
-                return Err(FailureCode::Internal);
+        let lease = self.admit(&binding)?;
+        // The shared controller guard is confined to this block: it is a `std` mutex the helper
+        // socket task also locks, so it must never reach the awaits below or this worker future
+        // stops being `Send`.
+        let capability = {
+            let controller = self.admission.clone();
+            let mut controller = controller
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match self.providers.registry.take_forwarder_spawn_lease(
+                &mut controller,
+                logical.lease,
+                &request,
+                lease,
+            ) {
+                Ok(capability) => capability,
+                Err((_, unused)) => {
+                    controller
+                        .release(unused)
+                        .map_err(|_| FailureCode::Internal)?;
+                    return Err(FailureCode::Internal);
+                }
             }
         };
         let backend_state = self
@@ -719,9 +741,13 @@ impl Worker<'_> {
                 return Err(FailureCode::Deadline);
             }
         };
+        let admission = self.admission.clone();
+        let mut admission = admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.providers
             .registry
-            .complete_forwarder_reap(&mut self.admission, reaped.proof)
+            .complete_forwarder_reap(&mut admission, reaped.proof)
             .map_err(|_| FailureCode::Internal)?;
         self.providers
             .go
@@ -740,7 +766,13 @@ impl Worker<'_> {
             if self
                 .providers
                 .registry
-                .settle_never_started(&mut self.admission, settlement)
+                .settle_never_started(
+                    &mut self
+                        .admission
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    settlement,
+                )
                 .is_err()
             {
                 self.uncertain.insert(binding.clone());
@@ -778,7 +810,7 @@ impl Worker<'_> {
             };
             reap_owned_backend(
                 &mut self.providers,
-                &mut self.admission,
+                &self.admission,
                 &mut self.uncertain,
                 binding,
                 &view.backend,
@@ -1142,7 +1174,7 @@ fn provider_cache_key(
 /// attempted once `stop` succeeds) before the error is returned.
 async fn reap_owned_backend(
     providers: &mut Providers,
-    admission: &mut crate::execution::AdmissionController,
+    admission: &std::sync::Mutex<crate::execution::AdmissionController>,
     uncertain: &mut std::collections::BTreeSet<BindingRef>,
     binding: &BindingRef,
     view_backend: &str,
@@ -1164,7 +1196,13 @@ async fn reap_owned_backend(
     };
     let reaped = providers
         .registry
-        .complete_reap(admission, capability, completed.settlement);
+        .complete_reap(
+            &mut *admission
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            capability,
+            completed.settlement,
+        );
     let disposed = providers.dispose_socket(view_backend, socket);
     if reaped.is_err() || !disposed {
         uncertain.insert(binding.clone());
@@ -1487,9 +1525,10 @@ mod tests {
             panic!("expected sole ownership")
         };
 
+        let admission = std::sync::Mutex::new(admission);
         let result = reap_owned_backend(
             &mut providers,
-            &mut admission,
+            &admission,
             &mut uncertain,
             &binding,
             "stop-error-backend",
@@ -1521,7 +1560,12 @@ mod tests {
         let reaped_forwarder = open_view.child.reap(Duration::from_secs(1)).await.unwrap();
         providers
             .registry
-            .complete_forwarder_reap(&mut admission, reaped_forwarder.proof)
+            .complete_forwarder_reap(
+                &mut admission
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                reaped_forwarder.proof,
+            )
             .unwrap();
     }
 
@@ -1583,9 +1627,10 @@ mod tests {
 
         // `backend_a` stops cleanly (no open views), but is paired with backend b's mismatched
         // capability, so `complete_reap`'s process/backend identity check must fail.
+        let admission = std::sync::Mutex::new(admission);
         let result = reap_owned_backend(
             &mut providers,
-            &mut admission,
+            &admission,
             &mut uncertain,
             &binding,
             "reap-error-backend-a",

@@ -155,7 +155,7 @@ impl ProductSnapshotRunner<'_, '_> {
             }
         };
         self.worker
-            .admission
+            .admission()
             .release_reaped(completed.settlement)
             .map_err(|_| FailureCode::Internal)?;
         intent
@@ -492,7 +492,7 @@ impl Worker<'_> {
                     return Err(FailureCode::Deadline);
                 }
             };
-            self.admission
+            self.admission()
                 .release_reaped(completed.settlement)
                 .map_err(|_| FailureCode::Internal)?;
             if interrupted {

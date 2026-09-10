@@ -563,7 +563,9 @@ mod tests {
 
     /// Mints and arms one ticket exactly as the daemon ingress and native pre-hook would.
     fn armed(candidate: &Path, runtime: &Path) -> (Arc<Mutex<LaunchLedger>>, String) {
-        let ledger = Arc::new(Mutex::new(LaunchLedger::default()));
+        let ledger = Arc::new(Mutex::new(LaunchLedger::new(Arc::new(Mutex::new(
+            crate::assistance::worker::admission_controller(),
+        )))));
         let actor = HelperActor::new("agent", Some("session")).unwrap();
         let command = LaunchLedger::helper_command(
             Path::new("/usr/local/bin/agent-ide"),
@@ -734,7 +736,9 @@ mod tests {
         let candidate = worktree();
         let runtime = candidate.join("runtime");
         std::fs::create_dir_all(&runtime).unwrap();
-        let ledger = Arc::new(Mutex::new(LaunchLedger::default()));
+        let ledger = Arc::new(Mutex::new(LaunchLedger::new(Arc::new(Mutex::new(
+            crate::assistance::worker::admission_controller(),
+        )))));
         ledger
             .lock()
             .unwrap()
@@ -819,7 +823,9 @@ mod tests {
         let candidate = worktree();
         let runtime = candidate.join("runtime");
         std::fs::create_dir_all(&runtime).unwrap();
-        let ledger = Arc::new(Mutex::new(LaunchLedger::default()));
+        let ledger = Arc::new(Mutex::new(LaunchLedger::new(Arc::new(Mutex::new(
+            crate::assistance::worker::admission_controller(),
+        )))));
         ledger
             .lock()
             .unwrap()

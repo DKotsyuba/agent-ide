@@ -20,7 +20,11 @@ use super::host_binding::BindingRef;
 use super::reply::FailureCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 /// Maximum complete serialized helper frame in either direction, before JSON decoding.
 pub const MAX_HELPER_FRAME_BYTES: usize = 64 * 1024;
@@ -28,13 +32,6 @@ pub const MAX_HELPER_FRAME_BYTES: usize = 64 * 1024;
 pub const HELPER_PROTOCOL: u32 = 1;
 /// Bounds concurrently outstanding launch tickets within one daemon boot.
 pub const MAX_TICKETS: usize = 64;
-/// Bounds concurrently claimed Claude operations, and therefore concurrent physical helper work.
-///
-/// [`MAX_TICKETS`] bounds only how many handles exist; a ticket costs nothing until it is claimed.
-/// This separate ceiling is the one that bounds real concurrent processes, and it is a lease the
-/// ledger itself reserves at claim time. A helper's self-reported [`ChildSettlement`] counts are
-/// evidence about one operation and can never widen it.
-pub const MAX_ACTIVE_CLAIMS: usize = 4;
 /// Maximum accepted length of one exact expected helper command.
 const MAX_COMMAND_BYTES: usize = 4096;
 /// Maximum accepted length of any single identity field carried on the helper wire.
@@ -531,8 +528,10 @@ struct ClaimedWork {
     frame: Option<HelperResult>,
     /// Whether the matching successful `Bash` post-hook has arrived.
     post: Option<bool>,
-    /// Whether this operation still holds its bounded admission lease.
+    /// Whether this operation still holds its slot in the shared Execution budget.
     ///
+    /// The lease itself lives in [`LeasePool`] under this operation's `detail_ref`; this flag is
+    /// the per-operation half of the same fact, so a cloned work record cannot duplicate capacity.
     /// Reserved at claim, released exactly once and only on positive proof: the final frame with
     /// exactly settled children plus the matching successful post. An abandoned, revoked or
     /// unsettled operation keeps the lease, so lost capacity is honest rather than reclaimed on a
@@ -602,7 +601,7 @@ impl LaunchTicket {
     /// positive settlement proof. Nothing will ever consume that evidence now, so continuing to
     /// hold its capacity would strand a slot on work that is provably finished. Work without such
     /// proof keeps its lease, which is the honest outcome for cleanup that was never observed.
-    fn quarantine(&mut self, leases: &mut usize) -> bool {
+    fn quarantine(&mut self, detail_ref: &str, leases: &mut LeasePool) -> bool {
         let retained = match &self.state {
             TicketState::Minted | TicketState::Launched { .. } => None,
             TicketState::Claimed(work) => Some(Some(work.clone())),
@@ -612,7 +611,7 @@ impl LaunchTicket {
             None => false,
             Some(None) => true,
             Some(Some(mut work)) => {
-                LaunchLedger::release_settled_lease(&mut work, leases);
+                LaunchLedger::release_settled_lease(&mut work, detail_ref, leases);
                 self.state = TicketState::Uncertain(work);
                 true
             }
@@ -752,6 +751,87 @@ pub enum LaunchRecognition {
     Recognized,
 }
 
+/// Holds the Claude route's share of the daemon's single Execution admission budget.
+///
+/// The ledger owns no ceiling of its own. Every claimed operation is charged against the same
+/// [`crate::execution::AdmissionController`] the worker uses for discovery, snapshots and language
+/// providers, so an ordinary operation and a Claude helper child contend for one configured global
+/// budget and neither can widen it. The reservation is taken before a job is released, which is why
+/// a helper process can never exist without a lease that was granted first.
+///
+/// Leases are keyed by the owning `detail_ref` rather than stored in [`ClaimedWork`], because
+/// [`crate::execution::AdmissionLease`] is deliberately not `Clone`: capacity is authority, and the
+/// quarantine path clones the work record.
+#[derive(Debug)]
+pub struct LeasePool {
+    /// The daemon's single admission owner, shared with the worker.
+    admission: Arc<Mutex<crate::execution::AdmissionController>>,
+    /// One granted lease for each operation still charged to the budget.
+    held: BTreeMap<String, crate::execution::AdmissionLease>,
+}
+
+impl LeasePool {
+    /// Wraps the daemon's single admission controller; creates no capacity of its own.
+    pub fn new(admission: Arc<Mutex<crate::execution::AdmissionController>>) -> Self {
+        Self {
+            admission,
+            held: BTreeMap::new(),
+        }
+    }
+
+    /// Reserves one global slot for `detail_ref`, owned by `binding`'s generation.
+    ///
+    /// Returns `false` when the shared budget is exhausted or queued: the Claude route never waits
+    /// behind a queue, because the model is already blocked in a foreground `Bash` call, so a
+    /// queued ticket is cancelled and reported as capacity. A second reservation for the same
+    /// handle is refused, so a replayed claim can never take two slots.
+    fn reserve(&mut self, detail_ref: &str, binding: &BindingRef) -> bool {
+        use crate::execution::{Admission, AdmissionClass, OwnerId};
+        if self.held.contains_key(detail_ref) {
+            return false;
+        }
+        let Ok(owner) = OwnerId::new(
+            blake3::Hash::from_bytes(binding.fingerprint())
+                .to_hex()
+                .to_string(),
+        ) else {
+            return false;
+        };
+        let mut admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match admission.submit(owner, AdmissionClass::Interactive) {
+            Admission::Granted(lease) => {
+                self.held.insert(detail_ref.to_owned(), lease);
+                true
+            }
+            Admission::Queued(ticket) => {
+                admission.cancel_ticket(ticket);
+                false
+            }
+            Admission::Refused(_) => false,
+        }
+    }
+
+    /// Returns one held slot to the shared budget; unknown handles change nothing.
+    fn release(&mut self, detail_ref: &str) {
+        let Some(lease) = self.held.remove(detail_ref) else {
+            return;
+        };
+        let _ = self
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .release(lease);
+    }
+
+    /// Returns how many global slots this route currently holds.
+    fn len(&self) -> usize {
+        self.held.len()
+    }
+}
+
 /// Reports the closed outcome of one helper claim attempt over the private socket.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClaimOutcome {
@@ -777,15 +857,26 @@ pub enum Delivery {
 /// The ledger performs no I/O. It exists so that ticket admission, exact command recognition,
 /// single-use claiming, expiry and post-order settlement are one testable atomic unit rather than
 /// state spread across the transport, hook and worker paths.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct LaunchLedger {
     /// Outstanding handles keyed by their action-scoped `detail_ref`.
     tickets: BTreeMap<String, LaunchTicket>,
-    /// Bounded admission leases currently held by claimed operations, at most [`MAX_ACTIVE_CLAIMS`].
-    leases: usize,
+    /// This route's slots in the daemon's single shared Execution budget.
+    leases: LeasePool,
 }
 
 impl LaunchLedger {
+    /// Creates an empty ledger that charges every claim to the daemon's shared admission owner.
+    ///
+    /// The controller is supplied rather than created here: this route must never own a budget of
+    /// its own, or a Claude helper child could run outside the configured global ceiling.
+    pub fn new(admission: Arc<Mutex<crate::execution::AdmissionController>>) -> Self {
+        Self {
+            tickets: BTreeMap::new(),
+            leases: LeasePool::new(admission),
+        }
+    }
+
     /// Renders the exact fixed foreground helper command for one handle.
     ///
     /// The shape is fixed and fully daemon-chosen. It is rendered once, stored as the expected
@@ -893,7 +984,7 @@ impl LaunchLedger {
     /// Rejected: a handle whose native launch was never recognized (a bare copied reference, or a
     /// launch by a different actor, which never reaches `Launched`), a different channel, a
     /// binding generation that is no longer live, an expired deadline, any second or replayed
-    /// claim, and a full [`MAX_ACTIVE_CLAIMS`] lease pool. Every rejection happens before a job is
+    /// claim, and an exhausted shared Execution budget. Every rejection happens before a job is
     /// released, so a refused claim has no Git, source or provider effect whatsoever.
     ///
     /// `live` is asked about the ticket's *own* retained [`BindingRef`], never about a value the
@@ -928,15 +1019,16 @@ impl LaunchLedger {
         if !live(&ticket.binding) {
             return ClaimOutcome::Rejected(FailureCode::WorkspaceAuthority);
         }
-        // The lease is taken before the job is released, so concurrent physical helper work is
-        // bounded by an admission the daemon reserved rather than by counts a helper reports.
-        if self.leases >= MAX_ACTIVE_CLAIMS {
+        // The lease is taken from the daemon's one shared Execution budget before the job is
+        // released, so concurrent physical helper work contends with ordinary worker work rather
+        // than being bounded by a private counter or by counts a helper reports.
+        if !self.leases.reserve(detail_ref, &ticket.binding) {
             return ClaimOutcome::Rejected(FailureCode::Capacity);
         }
         let Some(ticket) = self.tickets.get_mut(detail_ref) else {
+            self.leases.release(detail_ref);
             return ClaimOutcome::Rejected(FailureCode::InvalidDetail);
         };
-        self.leases += 1;
         ticket.state = TicketState::Claimed(ClaimedWork {
             tool_use_id,
             frame: None,
@@ -956,7 +1048,7 @@ impl LaunchLedger {
     /// because nothing further will ever consume it. Live claimed work retains its lease through
     /// settlement so [`Self::settled`] can require it, and releases only when the daemon has
     /// consumed the resulting token through [`Self::release_settled`].
-    fn release_settled_lease(work: &mut ClaimedWork, leases: &mut usize) {
+    fn release_settled_lease(work: &mut ClaimedWork, detail_ref: &str, leases: &mut LeasePool) {
         if work.lease
             && work.post == Some(true)
             && work
@@ -965,7 +1057,7 @@ impl LaunchLedger {
                 .is_some_and(|frame| frame.children.settled())
         {
             work.lease = false;
-            *leases = leases.saturating_sub(1);
+            leases.release(detail_ref);
         }
     }
 
@@ -979,7 +1071,8 @@ impl LaunchLedger {
     /// unconditionally.
     pub fn settle_frame(&mut self, result: HelperResult) -> Result<(), FailureCode> {
         result.validate()?;
-        let Some(ticket) = self.tickets.get_mut(&result.detail_ref) else {
+        let reference = result.detail_ref.clone();
+        let Some(ticket) = self.tickets.get_mut(&reference) else {
             return Err(FailureCode::InvalidDetail);
         };
         let cleanup_only = matches!(ticket.state, TicketState::Uncertain(_));
@@ -991,14 +1084,14 @@ impl LaunchLedger {
         }
         work.frame = Some(result);
         if cleanup_only {
-            Self::release_settled_lease(work, &mut self.leases);
+            Self::release_settled_lease(work, &reference, &mut self.leases);
         }
         Ok(())
     }
 
-    /// Returns the bounded admission leases currently retained by claimed or quarantined work.
+    /// Returns how many shared-budget slots claimed or quarantined work currently retains.
     pub fn active_claims(&self) -> usize {
-        self.leases
+        self.leases.len()
     }
 
     /// Releases the lease of one live claimed operation whose settled token the daemon consumed.
@@ -1017,9 +1110,9 @@ impl LaunchLedger {
         let TicketState::Claimed(work) = &mut ticket.state else {
             return false;
         };
-        let before = self.leases;
-        Self::release_settled_lease(work, &mut self.leases);
-        before != self.leases
+        let before = self.leases.len();
+        Self::release_settled_lease(work, detail_ref, &mut self.leases);
+        before != self.leases.len()
     }
 
     /// Records the matching `Bash` post-hook for one claimed ticket.
@@ -1030,13 +1123,14 @@ impl LaunchLedger {
     /// Quarantined work still accepts its own late post for the same cleanup-only reason as
     /// [`Self::settle_frame`]; the post never restores authority.
     pub fn settle_post(&mut self, tool_use_id: &str, success: bool) -> Result<(), FailureCode> {
-        let Some(ticket) = self
+        let Some((reference, ticket)) = self
             .tickets
-            .values_mut()
-            .find(|ticket| ticket.correlates(tool_use_id))
+            .iter_mut()
+            .find(|(_, ticket)| ticket.correlates(tool_use_id))
         else {
             return Err(FailureCode::InvalidDetail);
         };
+        let reference = reference.clone();
         let cleanup_only = matches!(ticket.state, TicketState::Uncertain(_));
         let (TicketState::Claimed(work) | TicketState::Uncertain(work)) = &mut ticket.state else {
             return Err(FailureCode::InvalidDetail);
@@ -1046,7 +1140,7 @@ impl LaunchLedger {
         }
         work.post = Some(success);
         if cleanup_only {
-            Self::release_settled_lease(work, &mut self.leases);
+            Self::release_settled_lease(work, &reference, &mut self.leases);
         }
         Ok(())
     }
@@ -1139,11 +1233,11 @@ impl LaunchLedger {
     /// being silently reused.
     pub fn expire(&mut self, now_ms: u64) {
         let leases = &mut self.leases;
-        self.tickets.retain(|_, ticket| {
+        self.tickets.retain(|reference, ticket| {
             if now_ms < ticket.deadline_ms {
                 return true;
             }
-            ticket.quarantine(leases)
+            ticket.quarantine(reference, leases)
         });
     }
 
@@ -1163,11 +1257,11 @@ impl LaunchLedger {
     /// `Launched` alone and both [`Self::delivery`] and [`Self::settled`] refuse quarantined work.
     pub fn revoke(&mut self, binding: [u8; 32]) {
         let leases = &mut self.leases;
-        self.tickets.retain(|_, ticket| {
+        self.tickets.retain(|reference, ticket| {
             if ticket.binding.fingerprint() != binding {
                 return true;
             }
-            ticket.quarantine(leases)
+            ticket.quarantine(reference, leases)
         });
     }
 
@@ -1245,7 +1339,16 @@ mod tests {
 
     /// Mints one ticket on a fixed binding/actor/channel with the fixed helper command.
     fn ledger() -> (LaunchLedger, String, HelperActor) {
-        let mut ledger = LaunchLedger::default();
+        let mut ledger = LaunchLedger::new(Arc::new(Mutex::new(
+            crate::execution::AdmissionController::new(crate::execution::AdmissionLimits {
+                total_running: CLAIM_CEILING,
+                per_owner_running: CLAIM_CEILING,
+                per_owner_queued: 1,
+                total_queued: 2,
+                interactive_burst: 8,
+            })
+            .expect("fixture limits"),
+        )));
         let actor = HelperActor::new("agent", Some("session")).unwrap();
         let command = LaunchLedger::helper_command(
             std::path::Path::new("/usr/local/bin/agent-ide"),
@@ -1715,11 +1818,15 @@ mod tests {
         assert!(!settled.children().is_empty());
     }
 
-    /// Concurrent claimed operations are bounded by a daemon lease, not by reported child counts.
+    /// Total running slots the fixture's shared admission controller grants; the ledger owns none.
+    const CLAIM_CEILING: usize = 3;
+
+    /// Concurrent claimed operations are bounded by the shared Execution budget, not by reported
+    /// child counts and not by any ceiling this ledger holds itself.
     #[test]
     fn concurrent_claims_are_bounded_by_a_daemon_reserved_lease() {
         let (mut ledger, _, actor) = ledger();
-        for index in 1..=MAX_ACTIVE_CLAIMS {
+        for index in 1..=CLAIM_CEILING {
             let reference = format!("lease-{index}");
             let command = format!("cmd-lease-{index}");
             ledger
@@ -1744,7 +1851,7 @@ mod tests {
                 ClaimOutcome::Granted(_)
             ));
         }
-        assert_eq!(ledger.active_claims(), MAX_ACTIVE_CLAIMS);
+        assert_eq!(ledger.active_claims(), CLAIM_CEILING);
 
         // The original fixture ticket is recognized and in time, yet admission is full.
         let command = LaunchLedger::helper_command(

@@ -108,6 +108,22 @@ struct NativeFeedback {
     native_epoch: u64,
 }
 
+/// Builds the daemon's single physical-effect admission controller with its fixed process limits.
+///
+/// Exactly one of these exists per daemon boot. Every physical-effect route — discovery, snapshots,
+/// language providers and Claude's foreground helper claims — draws from this one budget, so the
+/// limits below are the real global ceiling and not a per-route hint.
+pub(super) fn admission_controller() -> crate::execution::AdmissionController {
+    crate::execution::AdmissionController::new(crate::execution::AdmissionLimits {
+        total_running: 16,
+        per_owner_running: 2,
+        per_owner_queued: 1,
+        total_queued: 64,
+        interactive_burst: 8,
+    })
+    .expect("fixed process limits")
+}
+
 /// Shared bounded transport-side bookkeeping; no lock survives an I/O await.
 struct Ledger {
     /// FIFO ordinary jobs; explicit stop is prioritized at the front.
@@ -172,6 +188,13 @@ struct Shared {
     shutting_down: std::sync::atomic::AtomicBool,
     /// First provider cleanup failure retained until the shutdown caller observes it.
     shutdown_failure: Mutex<Option<FailureCode>>,
+    /// The daemon's single finite physical-effect admission owner.
+    ///
+    /// It is shared rather than owned by the worker because Claude's foreground helper claims its
+    /// capacity from the private helper socket task, off the worker's own queue. One controller is
+    /// the whole point: ordinary worker work and Claude helper children contend for exactly the
+    /// same configured global budget, and no second counter can widen it.
+    admission: Arc<Mutex<crate::execution::AdmissionController>>,
 }
 impl Shared {
     /// Acquires a new transient binding use at one exact admission/return boundary.
@@ -340,6 +363,7 @@ impl WorkerHandle {
         bindings: Arc<Mutex<HostBindingGuard>>,
         launcher: LauncherConfig,
         nonce: [u8; 32],
+        admission: Arc<Mutex<crate::execution::AdmissionController>>,
     ) -> Self {
         let (inspect, receiver) = mpsc::channel(launcher.limits.queued);
         Self {
@@ -351,6 +375,7 @@ impl WorkerHandle {
                 nonce,
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
                 shutdown_failure: Mutex::new(None),
+                admission,
             }),
             inspect,
             receiver: Mutex::new(Some(receiver)),
@@ -414,6 +439,7 @@ impl WorkerHandle {
             }
             let _ = ready.send(Ok(()));
             Worker {
+                admission: shared.admission.clone(),
                 shared,
                 workspace,
                 observations,
@@ -426,16 +452,6 @@ impl WorkerHandle {
                 uncertain_snapshots: Vec::new(),
                 runtime,
                 providers: providers::Providers::new(),
-                admission: crate::execution::AdmissionController::new(
-                    crate::execution::AdmissionLimits {
-                        total_running: 16,
-                        per_owner_running: 2,
-                        per_owner_queued: 1,
-                        total_queued: 64,
-                        interactive_burst: 8,
-                    },
-                )
-                .expect("fixed process limits"),
             }
             .run(receiver)
             .await;
@@ -870,7 +886,11 @@ struct Worker<'a> {
     /// Boot-unique source observation operation sequence.
     source_sequence: u64,
     /// Finite physical-effect admission, shared by discovery, snapshots and language providers.
-    admission: crate::execution::AdmissionController,
+    ///
+    /// This is a handle to the daemon's single [`Shared::admission`] controller, not a private
+    /// second one, so a Claude helper claim taken on the helper socket task removes capacity this
+    /// worker can no longer grant, and vice versa.
+    admission: Arc<Mutex<crate::execution::AdmissionController>>,
     /// Bindings with uncertain physical/durable completion cannot report successful cleanup.
     uncertain: std::collections::BTreeSet<BindingRef>,
     /// Retains private scratch files when a child has no positive reap evidence. Entries are never
@@ -1040,7 +1060,7 @@ impl<'a> Worker<'a> {
                     return Err(FailureCode::Deadline);
                 }
             };
-            self.admission
+            self.admission()
                 .release_reaped(completed.settlement)
                 .map_err(|_| FailureCode::Internal)?;
             if interrupted {
@@ -1291,6 +1311,17 @@ impl<'a> Worker<'a> {
         ))
     }
 
+    /// Locks the daemon's single admission controller for one synchronous accounting call.
+    ///
+    /// The guard must never be held across an await: it is a `std` mutex shared with the helper
+    /// socket task, and the worker task must stay `Send`. Every caller therefore takes it inside
+    /// one statement.
+    fn admission(&self) -> std::sync::MutexGuard<'_, crate::execution::AdmissionController> {
+        self.admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Allocates one physical slot without waiting behind a retained idle backend; queued tickets are cancelled.
     fn admit(
         &mut self,
@@ -1303,10 +1334,10 @@ impl<'a> Worker<'a> {
                 .to_string(),
         )
         .map_err(|_| FailureCode::Internal)?;
-        match self.admission.submit(owner, AdmissionClass::Interactive) {
+        match self.admission().submit(owner, AdmissionClass::Interactive) {
             Admission::Granted(lease) => Ok(lease),
             Admission::Queued(ticket) => {
-                self.admission.cancel_ticket(ticket);
+                self.admission().cancel_ticket(ticket);
                 Err(FailureCode::Capacity)
             }
             Admission::Refused(_) => Err(FailureCode::Capacity),
@@ -1320,7 +1351,7 @@ impl<'a> Worker<'a> {
         binding: &BindingRef,
     ) -> FailureCode {
         if let crate::execution::ProcessError::NeverStarted { settlement, .. } = error {
-            if self.admission.settle_never_started(settlement).is_err() {
+            if self.admission().settle_never_started(settlement).is_err() {
                 self.uncertain.insert(binding.clone());
             }
         } else {
@@ -2094,6 +2125,7 @@ mod stop_retry_tests {
                 nonce: [7; 32],
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
                 shutdown_failure: Mutex::new(None),
+                admission: Arc::new(Mutex::new(admission_controller())),
             }),
             workspace,
             observations: WorkspaceStore::new(store),
@@ -2102,16 +2134,7 @@ mod stop_retry_tests {
             registered: BTreeMap::new(),
             baselines: BTreeMap::new(),
             source_sequence: 0,
-            admission: crate::execution::AdmissionController::new(
-                crate::execution::AdmissionLimits {
-                    total_running: 16,
-                    per_owner_running: 2,
-                    per_owner_queued: 1,
-                    total_queued: 64,
-                    interactive_burst: 8,
-                },
-            )
-            .expect("fixed process limits"),
+            admission: Arc::new(Mutex::new(admission_controller())),
             uncertain: std::collections::BTreeSet::new(),
             uncertain_snapshots: Vec::new(),
             runtime: std::env::temp_dir(),

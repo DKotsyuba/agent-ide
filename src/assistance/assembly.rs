@@ -49,6 +49,11 @@ pub struct ProductDispatcher {
     runtime_dir: Arc<Mutex<Option<std::path::PathBuf>>>,
     /// Private helper claim/finish endpoint, bound once at initialize and unlinked on drop.
     endpoint: Mutex<Option<super::claude_helper::HelperEndpoint>>,
+    /// The daemon's single physical-effect admission owner.
+    ///
+    /// Held here so the same controller reaches both the worker and the Claude launch ledger:
+    /// ordinary operations and foreground helper children draw from one configured global budget.
+    admission: Arc<Mutex<crate::execution::AdmissionController>>,
 }
 
 /// Returns a monotonic millisecond reading for ticket deadlines.
@@ -75,6 +80,7 @@ impl Default for ProductDispatcher {
     /// Creates an unconfigured host boundary with a fresh process-independent channel nonce.
     /// Entropy failure leaves binding unavailable rather than reusing a prior daemon scope.
     fn default() -> Self {
+        let admission = Arc::new(Mutex::new(super::worker::admission_controller()));
         let mut scope = [0; 32];
         let scope = std::fs::File::open("/dev/urandom")
             .and_then(|mut file| file.read_exact(&mut scope))
@@ -84,7 +90,8 @@ impl Default for ProductDispatcher {
             bindings: Arc::new(Mutex::new(HostBindingGuard::default())),
             worker: None,
             scope,
-            launches: Arc::new(Mutex::new(LaunchLedger::default())),
+            launches: Arc::new(Mutex::new(LaunchLedger::new(admission.clone()))),
+            admission,
             helper_binary: std::env::current_exe()
                 .ok()
                 .filter(|path| path.is_absolute()),
@@ -102,6 +109,7 @@ impl ProductDispatcher {
                 dispatcher.bindings.clone(),
                 launcher,
                 scope,
+                dispatcher.admission.clone(),
             ));
         }
         dispatcher
