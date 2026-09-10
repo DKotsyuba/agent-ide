@@ -213,6 +213,8 @@ pub async fn run_daemon_with_assistance(
 }
 
 /// Binds one daemon endpoint until SIGINT/SIGTERM, then drains transport and bounded peer cleanup.
+/// After Assistance initializes, every setup or listener failure also takes that common cleanup path;
+/// the original serving failure wins if bounded dispatcher cleanup independently fails.
 async fn run_daemon_inner(
     runtime_dir: RuntimeDir,
     dispatcher: Option<Arc<dyn AssistanceDispatcher>>,
@@ -236,45 +238,61 @@ async fn run_daemon_inner(
             }
         }
     }
-    let socket_path = runtime_dir.socket_path();
-    retire_stale_socket(&socket_path, ipc.connection_deadline).await?;
-    let listener = UnixListener::bind(&socket_path)?;
-    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
-    let _socket = OwnedSocket::new(socket_path)?;
-    let generation = new_generation()?;
-    let permits = Arc::new(Semaphore::new(ipc.max_connections));
     let mut connections = tokio::task::JoinSet::new();
+    let mut owned_socket = None;
+    let serving = async {
+        let socket_path = runtime_dir.socket_path();
+        retire_stale_socket(&socket_path, ipc.connection_deadline).await?;
+        let listener = UnixListener::bind(&socket_path)?;
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+        owned_socket = Some(OwnedSocket::new(socket_path)?);
+        let generation = new_generation()?;
+        let permits = Arc::new(Semaphore::new(ipc.max_connections));
 
-    loop {
-        let accepted = tokio::select! {
-            accepted = listener.accept() => accepted,
-            _ = &mut termination => break,
-            _ = connections.join_next(), if !connections.is_empty() => continue,
-        };
-        let (stream, _) = accepted?;
-        let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
-            drop(stream);
-            continue;
-        };
-        let generation = generation.clone();
-        let dispatcher = dispatcher.clone();
-        connections.spawn(async move {
-            let _permit = permit;
-            let _ = tokio::time::timeout(
-                ipc.connection_deadline,
-                serve_connection(stream, generation, dispatcher, transport_limits),
-            )
-            .await;
-        });
+        loop {
+            let accepted = tokio::select! {
+                accepted = listener.accept() => accepted,
+                _ = &mut termination => break,
+                _ = connections.join_next(), if !connections.is_empty() => continue,
+            };
+            let (stream, _) = accepted?;
+            let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                drop(stream);
+                continue;
+            };
+            let generation = generation.clone();
+            let dispatcher = dispatcher.clone();
+            connections.spawn(async move {
+                let _permit = permit;
+                let _ = tokio::time::timeout(
+                    ipc.connection_deadline,
+                    serve_connection(stream, generation, dispatcher, transport_limits),
+                )
+                .await;
+            });
+        }
+        Ok(())
     }
+    .await;
+    let result = finish_daemon(serving, &mut connections, dispatcher.as_ref()).await;
+    drop((owned_socket, _lock));
+    result
+}
 
+/// Drains accepted connections and shuts down an initialized dispatcher before returning serving state.
+/// Cleanup is attempted in full; an earlier setup or accept error remains the returned error.
+async fn finish_daemon(
+    serving: Result<(), AppError>,
+    connections: &mut tokio::task::JoinSet<()>,
+    dispatcher: Option<&Arc<dyn AssistanceDispatcher>>,
+) -> Result<(), AppError> {
     connections.abort_all();
     while connections.join_next().await.is_some() {}
-    if let Some(dispatcher) = &dispatcher {
-        shutdown_dispatcher(dispatcher).await?;
-    }
-    drop((_socket, _lock));
-    Ok(())
+    let shutdown = match dispatcher {
+        Some(dispatcher) => shutdown_dispatcher(dispatcher).await,
+        None => Ok(()),
+    };
+    serving.and(shutdown)
 }
 
 /// Creates native Tokio SIGINT/SIGTERM streams and resolves after the first delivered signal.
@@ -976,4 +994,114 @@ struct HealthResponse {
     request_id: String,
     status: String,
     daemon_generation: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::transport::AssistanceDispatchUnavailable;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Records whether daemon initialization and shutdown reached the owned dispatcher.
+    struct ShutdownProbe {
+        /// Becomes true when the dispatcher owns initialized provider state.
+        initialized: AtomicBool,
+        /// Becomes true only after shutdown observes initialized ownership.
+        shutdown: AtomicBool,
+    }
+
+    impl ShutdownProbe {
+        /// Creates a probe with no initialized or reaped provider state.
+        const fn new() -> Self {
+            Self {
+                initialized: AtomicBool::new(false),
+                shutdown: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl AssistanceDispatcher for ShutdownProbe {
+        /// Marks provider ownership as established; the path is irrelevant to this lifecycle probe.
+        fn initialize<'a>(
+            &'a self,
+            _runtime_dir: &'a Path,
+        ) -> Pin<Box<dyn Future<Output = Result<(), AssistanceDispatchUnavailable>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.initialized.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+
+        /// Proves shutdown runs after initialization and records the simulated provider reap.
+        fn shutdown(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<(), AssistanceDispatchUnavailable>> + Send + '_>>
+        {
+            Box::pin(async move {
+                assert!(self.initialized.load(Ordering::SeqCst));
+                self.shutdown.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+
+        /// Rejects dispatch because this probe exercises only initialized-resource cleanup.
+        fn dispatch(
+            &self,
+            _request: AssistanceDispatch,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<AssistanceDispatchReply, AssistanceDispatchUnavailable>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { Err(AssistanceDispatchUnavailable) })
+        }
+    }
+
+    /// Marks an accepted connection task as reaped when cancellation drops its owned state.
+    struct ReapProbe(Arc<AtomicBool>);
+
+    impl Drop for ReapProbe {
+        /// Records that abort-and-join dropped the task before daemon cleanup returned.
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Preserves an accept failure while still draining connections and reaping initialized providers.
+    #[tokio::test]
+    async fn accept_error_still_drains_connections_and_shuts_down_dispatcher() {
+        let probe = Arc::new(ShutdownProbe::new());
+        probe.initialize(Path::new("unused")).await.unwrap();
+        let dispatcher: Arc<dyn AssistanceDispatcher> = probe.clone();
+        let reaped = Arc::new(AtomicBool::new(false));
+        let mut connections = tokio::task::JoinSet::new();
+        let task_reaped = reaped.clone();
+        connections.spawn(async move {
+            let _probe = ReapProbe(task_reaped);
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+
+        let error = finish_daemon(
+            Err(AppError::Io(io::Error::from_raw_os_error(libc::EMFILE))),
+            &mut connections,
+            Some(&dispatcher),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            match error {
+                AppError::Io(error) => error.raw_os_error(),
+                _ => None,
+            },
+            Some(libc::EMFILE)
+        );
+        assert!(reaped.load(Ordering::SeqCst));
+        assert!(probe.shutdown.load(Ordering::SeqCst));
+    }
 }

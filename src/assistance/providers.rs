@@ -32,10 +32,53 @@ pub(super) struct ProviderContext {
 struct GoBackend {
     /// Exact accepted heavy listener and its per-connection bookkeeping.
     shared: SharedGopls,
-    /// Private socket owned by this boot and backend; never reused across daemon restarts.
-    socket: std::path::PathBuf,
+    /// Created private socket identity, captured before this backend accepts forwarders.
+    socket: Option<OwnedProviderSocket>,
     /// Monotonic backend generation used in semantic provenance.
     generation: u64,
+}
+
+/// Retains one created provider socket's filesystem identity for replacement-safe cleanup.
+#[derive(Debug)]
+struct OwnedProviderSocket {
+    /// Private endpoint path generated for this daemon boot and backend profile.
+    path: std::path::PathBuf,
+    /// Filesystem device containing the created endpoint.
+    device: u64,
+    /// Filesystem inode of the created endpoint.
+    inode: u64,
+}
+
+impl OwnedProviderSocket {
+    /// Captures the object currently at `path`; missing or unreadable metadata is an identity failure.
+    fn capture(path: std::path::PathBuf) -> std::io::Result<Self> {
+        let metadata = std::fs::symlink_metadata(&path)?;
+        Ok(Self {
+            path,
+            device: std::os::unix::fs::MetadataExt::dev(&metadata),
+            inode: std::os::unix::fs::MetadataExt::ino(&metadata),
+        })
+    }
+
+    /// Unlinks this exact object, accepts prior removal, and refuses a replacement at the same path.
+    fn remove(self) -> std::io::Result<()> {
+        let metadata = match std::fs::symlink_metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if std::os::unix::fs::MetadataExt::dev(&metadata) != self.device
+            || std::os::unix::fs::MetadataExt::ino(&metadata) != self.inode
+        {
+            return Err(std::io::Error::other(
+                "provider socket path no longer identifies the owned object",
+            ));
+        }
+        match std::fs::remove_file(&self.path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        }
+    }
 }
 
 /// Holds the reusable logical view while individual stdio forwarders are closed after each request.
@@ -465,7 +508,7 @@ impl Worker<'_> {
                     backend.clone(),
                     GoBackend {
                         shared: listener,
-                        socket: socket.clone(),
+                        socket: None,
                         generation,
                     },
                 );
@@ -479,7 +522,32 @@ impl Worker<'_> {
                 .insert(binding.clone(), view.clone());
             view
         };
-        while !socket.exists() {
+        loop {
+            let already_captured = self
+                .providers
+                .go
+                .get(&backend)
+                .ok_or(FailureCode::Internal)?
+                .socket
+                .is_some();
+            if already_captured {
+                break;
+            }
+            match OwnedProviderSocket::capture(socket.clone()) {
+                Ok(identity) => {
+                    self.providers
+                        .go
+                        .get_mut(&backend)
+                        .ok_or(FailureCode::Internal)?
+                        .socket = Some(identity);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    let _ = self.close_provider(&binding).await;
+                    return Err(FailureCode::Internal);
+                }
+            }
             let failure = if *job.cancel.borrow() || self.shared.active(&binding).is_err() {
                 Some(FailureCode::Cancelled)
             } else if tokio::time::Instant::now() >= job.deadline {
@@ -632,7 +700,11 @@ impl Worker<'_> {
                 .registry
                 .complete_reap(&mut self.admission, capability, completed.settlement)
                 .map_err(|_| FailureCode::Internal)?;
-            let _ = std::fs::remove_file(backend.socket);
+            backend
+                .socket
+                .ok_or(FailureCode::Internal)?
+                .remove()
+                .map_err(|_| FailureCode::Internal)?;
         }
         Ok(())
     }
@@ -709,4 +781,49 @@ async fn session_operation<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncW
     )
     .await
     .map_err(|_| FailureCode::ProviderUnavailable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OwnedProviderSocket;
+
+    /// Verifies absent sockets succeed, replacements survive, and real unlink failures propagate.
+    #[test]
+    fn owned_provider_socket_cleanup_enforces_identity_and_errors() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-ide-provider-socket-cleanup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+
+        let missing = root.join("missing.sock");
+        std::fs::write(&missing, b"owned").unwrap();
+        let missing_identity = OwnedProviderSocket::capture(missing.clone()).unwrap();
+        std::fs::remove_file(&missing).unwrap();
+        missing_identity.remove().unwrap();
+
+        let replaced = root.join("replaced.sock");
+        let original = root.join("original.sock");
+        std::fs::write(&replaced, b"owned").unwrap();
+        let replaced_identity = OwnedProviderSocket::capture(replaced.clone()).unwrap();
+        std::fs::rename(&replaced, &original).unwrap();
+        std::fs::write(&replaced, b"foreign").unwrap();
+        assert!(replaced_identity.remove().is_err());
+        assert_eq!(std::fs::read(&replaced).unwrap(), b"foreign");
+
+        let directory = root.join("directory.sock");
+        std::fs::create_dir(&directory).unwrap();
+        let directory_identity = OwnedProviderSocket::capture(directory.clone()).unwrap();
+        assert!(directory_identity.remove().is_err());
+        assert!(directory.is_dir());
+
+        std::fs::remove_file(replaced).unwrap();
+        std::fs::remove_file(original).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
 }
