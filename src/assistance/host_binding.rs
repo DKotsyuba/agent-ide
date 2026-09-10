@@ -113,6 +113,27 @@ pub struct BindingRef {
 }
 
 impl BindingRef {
+    /// Builds one deterministic binding generation for in-crate tests only.
+    ///
+    /// Production code never constructs a `BindingRef` directly: a generation exists only because
+    /// [`HostBindingGuard`] established it from validated host correlation. Test fixtures still
+    /// need two *distinct* generations to prove fencing, so this constructor is compiled only under
+    /// `cfg(test)` and confers no liveness — a guard that never established it reports it inactive.
+    ///
+    /// `actor` is the distinguishing Claude actor identity and `generation` is the nonzero
+    /// monotonic revision; `channel` is the opaque attachment. Panics if the attachment is not a
+    /// valid bounded identifier, which is a fixture error rather than a runtime condition.
+    #[cfg(test)]
+    pub(crate) fn fixture(actor: &str, channel: &str, generation: u64) -> Self {
+        Self {
+            host: HostKind::Claude,
+            actor_id: actor.to_owned(),
+            channel: parse_channel_session(channel.as_bytes())
+                .expect("fixture attachment is valid"),
+            generation,
+        }
+    }
+
     /// Returns a stable opaque persistence key without exposing actor/channel fields or minting proof.
     /// The domain and length framing preserve distinct actor, channel, and generation identities.
     pub(crate) fn fingerprint(&self) -> [u8; 32] {

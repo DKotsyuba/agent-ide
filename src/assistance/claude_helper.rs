@@ -14,6 +14,7 @@ use super::claude_worker::{
     ChildSettlement, ClaimOutcome, DiscoveryFrame, HelperJob, HelperOperation, HelperOutcome,
     HelperQuery, HelperResult, LaunchLedger, MAX_HELPER_FRAME_BYTES,
 };
+use super::host_binding::BindingRef;
 use super::reply::FailureCode;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -22,6 +23,14 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Reports whether one binding generation is live *right now*.
+///
+/// Supplied by the daemon, which closes over its own [`HostBindingGuard`](super::host_binding::HostBindingGuard).
+/// The endpoint deliberately holds only this narrow question rather than the guard itself: the
+/// claim path needs current liveness of the ticket's own generation and nothing else, and cannot
+/// be allowed to establish, roll back or stop a binding.
+pub type BindingLiveness = Arc<dyn Fn(&BindingRef) -> bool + Send + Sync>;
 
 /// Fixed private endpoint name inside the daemon runtime directory.
 pub const HELPER_SOCKET: &str = "claude-helper.sock";
@@ -93,7 +102,11 @@ async fn read_frame<R: AsyncReadExt + Unpin>(stream: &mut R) -> Result<String, (
 /// [`SESSION_DEADLINE`]; a stuck or hostile peer can never block another helper or the daemon.
 /// Returns the bound path, or `None` when the endpoint could not be created, which simply leaves
 /// the Claude path unavailable.
-pub fn serve(runtime_dir: &Path, ledger: Arc<Mutex<LaunchLedger>>) -> Option<HelperEndpoint> {
+pub fn serve(
+    runtime_dir: &Path,
+    ledger: Arc<Mutex<LaunchLedger>>,
+    live: BindingLiveness,
+) -> Option<HelperEndpoint> {
     let path = runtime_dir.join(HELPER_SOCKET);
     let _ = std::fs::remove_file(&path);
     let listener = tokio::net::UnixListener::bind(&path).ok()?;
@@ -105,8 +118,9 @@ pub fn serve(runtime_dir: &Path, ledger: Arc<Mutex<LaunchLedger>>) -> Option<Hel
     let task = tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             let ledger = ledger.clone();
+            let live = live.clone();
             tokio::spawn(async move {
-                let _ = tokio::time::timeout(SESSION_DEADLINE, session(stream, ledger)).await;
+                let _ = tokio::time::timeout(SESSION_DEADLINE, session(stream, ledger, live)).await;
             });
         }
     });
@@ -144,14 +158,18 @@ impl HelperEndpoint {
 ///
 /// A refused claim closes the connection without releasing a job, so a wrong actor, wrong channel,
 /// replayed handle, stale generation or expired ticket produces no effect whatsoever.
-async fn session(mut stream: tokio::net::UnixStream, ledger: Arc<Mutex<LaunchLedger>>) {
+async fn session(
+    mut stream: tokio::net::UnixStream,
+    ledger: Arc<Mutex<LaunchLedger>>,
+    live: BindingLiveness,
+) {
     let Ok(frame) = read_frame(&mut stream).await else {
         return;
     };
     let Ok(request) = serde_json::from_str::<ClaimRequest>(&frame) else {
         return;
     };
-    let outcome = claim(&request, &ledger);
+    let outcome = claim(&request, &ledger, live.as_ref());
     let candidate = match &outcome {
         ClaimReply::Granted(job) => job.candidate.clone(),
         ClaimReply::Refused { .. } => PathBuf::new(),
@@ -198,7 +216,16 @@ async fn session(mut stream: tokio::net::UnixStream, ledger: Arc<Mutex<LaunchLed
 }
 
 /// Applies one claim against the ledger under its lock, translating the outcome to a wire reply.
-fn claim(request: &ClaimRequest, ledger: &Arc<Mutex<LaunchLedger>>) -> ClaimReply {
+///
+/// `bindings` is the daemon's live binding guard. It is consulted about the ticket's *own* retained
+/// generation, which is the only independent generation check available here: a fingerprint read
+/// out of the same ticket and compared back against it proves nothing. Ownership of the launch is
+/// established separately, by the exact native pre-hook recognition the ledger already performed.
+fn claim(
+    request: &ClaimRequest,
+    ledger: &Arc<Mutex<LaunchLedger>>,
+    live: &(dyn Fn(&BindingRef) -> bool + Send + Sync),
+) -> ClaimReply {
     use super::claude_worker::HELPER_PROTOCOL;
     let refuse = |code| ClaimReply::Refused { code };
     if request.protocol != HELPER_PROTOCOL {
@@ -207,14 +234,11 @@ fn claim(request: &ClaimRequest, ledger: &Arc<Mutex<LaunchLedger>>) -> ClaimRepl
     let Ok(mut ledger) = ledger.lock() else {
         return refuse(FailureCode::Internal);
     };
-    let Some(binding) = ledger.binding_of(&request.detail_ref) else {
-        return refuse(FailureCode::InvalidDetail);
-    };
     match ledger.claim(
         &request.detail_ref,
-        binding,
         &request.attachment,
         super::assembly::monotonic_ms(),
+        live,
     ) {
         ClaimOutcome::Granted(job) => ClaimReply::Granted(job),
         ClaimOutcome::Rejected(code) => refuse(code),
@@ -450,8 +474,26 @@ async fn perform(job: &HelperJob) -> (HelperOutcome, ChildSettlement, Vec<Discov
 mod tests {
     use super::*;
     use crate::assistance::claude_worker::{
-        Delivery, HELPER_PROTOCOL, HelperActor, HelperBudgets, HelperOperation, LaunchRecognition,
+        AcceptedIdentity, Delivery, HELPER_PROTOCOL, HelperActor, HelperBudgets, HelperOperation,
+        LaunchRecognition,
     };
+    use crate::assistance::host_binding::BindingRef;
+
+    /// Returns the fixed binding generation every helper fixture in this module mints under.
+    fn binding_fixture() -> BindingRef {
+        BindingRef::fixture("agent", "attach", 1)
+    }
+
+    /// Returns a liveness probe that reports the fixture generation as currently live.
+    fn live() -> BindingLiveness {
+        Arc::new(|binding: &BindingRef| binding == &binding_fixture())
+    }
+
+    /// Returns an accepted identity fixture with a well-formed digest.
+    fn identity(path: &str) -> AcceptedIdentity {
+        AcceptedIdentity::new(PathBuf::from(path), "fixture", &"ab".repeat(32))
+            .expect("fixture identity is well formed")
+    }
 
     /// Creates one real temporary Git worktree using the installed Git binary.
     fn worktree() -> PathBuf {
@@ -505,12 +547,14 @@ mod tests {
         guard
             .mint(
                 "detail-1",
-                [3; 32],
+                binding_fixture(),
                 actor.clone(),
                 "attach",
                 command.clone(),
                 job(candidate),
                 u64::MAX,
+                identity("/usr/local/bin/agent-ide"),
+                vec![identity("/usr/bin/git")],
             )
             .expect("ticket mints");
         assert_eq!(
@@ -528,7 +572,7 @@ mod tests {
         let runtime = candidate.join("runtime");
         std::fs::create_dir_all(&runtime).unwrap();
         let (ledger, reference) = armed(&candidate, &runtime);
-        let endpoint = serve(&runtime, ledger.clone()).expect("endpoint binds");
+        let endpoint = serve(&runtime, ledger.clone(), live()).expect("endpoint binds");
         assert!(endpoint.path().exists());
 
         let status = execute(&runtime, Some("attach".to_owned()), Some(reference.clone())).await;
@@ -574,15 +618,17 @@ mod tests {
             .unwrap()
             .mint(
                 "detail-1",
-                [3; 32],
+                binding_fixture(),
                 HelperActor::new("agent", None).unwrap(),
                 "attach",
                 "unused-command".to_owned(),
                 job(&candidate),
                 u64::MAX,
+                identity("/usr/local/bin/agent-ide"),
+                vec![identity("/usr/bin/git")],
             )
             .unwrap();
-        let endpoint = serve(&runtime, ledger.clone()).expect("endpoint binds");
+        let endpoint = serve(&runtime, ledger.clone(), live()).expect("endpoint binds");
 
         assert_eq!(
             execute(&runtime, Some("attach".into()), Some("detail-1".into())).await,
@@ -607,7 +653,7 @@ mod tests {
         let runtime = candidate.join("runtime");
         std::fs::create_dir_all(&runtime).unwrap();
         let (ledger, reference) = armed(&candidate, &runtime);
-        let endpoint = serve(&runtime, ledger.clone()).expect("endpoint binds");
+        let endpoint = serve(&runtime, ledger.clone(), live()).expect("endpoint binds");
 
         // Claim exactly as a helper would, then drop the connection before reporting anything.
         {
@@ -657,15 +703,17 @@ mod tests {
             .unwrap()
             .mint(
                 "detail-1",
-                [3; 32],
+                binding_fixture(),
                 HelperActor::new("agent", None).unwrap(),
                 "attach",
                 "never-run".to_owned(),
                 job(&candidate),
                 10,
+                identity("/usr/local/bin/agent-ide"),
+                vec![identity("/usr/bin/git")],
             )
             .unwrap();
-        let endpoint = serve(&runtime, ledger.clone()).expect("endpoint binds");
+        let endpoint = serve(&runtime, ledger.clone(), live()).expect("endpoint binds");
         ledger.lock().unwrap().expire(11);
         assert!(ledger.lock().unwrap().is_empty());
         assert_eq!(

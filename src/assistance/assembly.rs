@@ -4,8 +4,8 @@
 pub use super::reply::{MissingPeer, PeerReply};
 use super::{
     claude_worker::{
-        ClaudeOperatorProfile, HelperActor, HelperBudgets, HelperJob, HelperLanguage,
-        HelperOperation, HelperProvider, LaunchLedger, RustEffectiveSettings,
+        AcceptedIdentity, ClaudeOperatorProfile, HelperActor, HelperBudgets, HelperJob,
+        HelperLanguage, HelperOperation, HelperProvider, LaunchLedger, RustEffectiveSettings,
     },
     host_binding::{
         BindingStatus, HostBindingGuard, HostKind, ValidatedInvocation, parse_candidate,
@@ -186,15 +186,36 @@ impl ProductDispatcher {
         let Ok(actor) = HelperActor::new(invocation.actor_id(), None) else {
             return error(FailureCode::Internal);
         };
+        // The helper is itself an accepted executable, so its own identity is carried and its
+        // current bytes are rechecked at this launch boundary rather than being trusted from a
+        // `current_exe()` path alone. The children the job may start keep their accepted
+        // fingerprints alongside it. Neither is OS attestation: it is the same accepted-executable
+        // contract the managed path already applies, extended to this launch.
+        let helper = match Self::helper_identity(binary) {
+            Ok(helper) => helper,
+            Err(code) => return error(code),
+        };
+        let mut children = Vec::new();
+        for accepted in std::iter::once(&target.git)
+            .chain(target.providers.iter().map(|provider| &provider.executable))
+        {
+            match AcceptedIdentity::new(accepted.path.clone(), &accepted.identity, &accepted.blake3)
+            {
+                Ok(identity) => children.push(identity),
+                Err(code) => return error(code),
+            }
+        }
         let deadline = monotonic_ms().saturating_add(worker.limits().operation_ms);
         match launches.mint(
             &detail_ref,
-            invocation.binding_ref().fingerprint(),
+            invocation.binding_ref().clone(),
             actor,
             attachment,
             command.clone(),
             job,
             deadline,
+            helper,
+            children,
         ) {
             Ok(()) | Err(FailureCode::Conflict) => PeerReply::Pending {
                 detail_ref,
@@ -240,6 +261,46 @@ impl ProductDispatcher {
             },
             Delivery::Failed(code) => PeerReply::Error { code },
         }
+    }
+
+    /// Measures the running executable that the exact helper command names.
+    ///
+    /// `current_exe()` alone is only a path, and a path is not an identity: the bytes behind it can
+    /// change between minting a ticket and settling it. This reads the binary's current bytes,
+    /// bounded, and records their BLAKE3 digest in the ticket so a later settlement is checked
+    /// against a measured identity rather than a filename.
+    ///
+    /// The honest limitation is stated rather than strengthened: this is a same-user self
+    /// measurement taken by the daemon, not third-party attestation, and it cannot close the race
+    /// between measuring the file and the host actually exec'ing it. Returns
+    /// [`FailureCode::ExecutionProfile`] when the file is missing, is not a regular file, exceeds
+    /// the bounded read, or cannot be read — all of which leave the Claude path unavailable.
+    fn helper_identity(
+        binary: &Path,
+    ) -> Result<super::claude_worker::AcceptedIdentity, FailureCode> {
+        /// Bounds one helper-binary measurement; larger files are refused, never partially hashed.
+        const MAX_HELPER_BYTES: u64 = 512 * 1024 * 1024;
+        let metadata = std::fs::metadata(binary).map_err(|_| FailureCode::ExecutionProfile)?;
+        if !metadata.is_file() || metadata.len() > MAX_HELPER_BYTES {
+            return Err(FailureCode::ExecutionProfile);
+        }
+        let mut file = std::fs::File::open(binary).map_err(|_| FailureCode::ExecutionProfile)?;
+        let mut hash = blake3::Hasher::new();
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|_| FailureCode::ExecutionProfile)?;
+            if read == 0 {
+                break;
+            }
+            hash.update(&buffer[..read]);
+        }
+        AcceptedIdentity::new(
+            binary.to_path_buf(),
+            "agent-ide-claude-worker",
+            hash.finalize().to_hex().as_str(),
+        )
     }
 
     /// Selects the single exclusive provider a Claude helper may run for this target.
@@ -578,7 +639,18 @@ impl AssistanceDispatcher for ProductDispatcher {
             // Bound after Application owns the daemon lock, so no two boots share an endpoint.
             // Failure to bind simply leaves the Claude path unavailable; Codex is unaffected.
             if let Ok(mut endpoint) = self.endpoint.lock() {
-                *endpoint = super::claude_helper::serve(runtime_dir, self.launches.clone());
+                let bindings = self.bindings.clone();
+                *endpoint = super::claude_helper::serve(
+                    runtime_dir,
+                    self.launches.clone(),
+                    // The endpoint may only ask whether a generation is live; it can never
+                    // establish, roll back or stop one.
+                    std::sync::Arc::new(move |binding: &super::host_binding::BindingRef| {
+                        bindings
+                            .lock()
+                            .is_ok_and(|mut guard| guard.consume_active(binding).is_ok())
+                    }),
+                );
             }
             match &self.worker {
                 Some(worker) => worker
