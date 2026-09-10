@@ -230,29 +230,68 @@ impl ProductDispatcher {
     /// Only the exact owning binding generation can retrieve a handle. A still-unsettled operation
     /// answers `Pending` without re-issuing the command, and every failed, expired, denied or
     /// uncertain outcome becomes a closed typed error rather than a fabricated success.
-    fn retrieve_claude(&self, invocation: &ValidatedInvocation, detail_ref: &str) -> PeerReply {
-        use super::claude_worker::{Delivery, HelperOutcome};
-        let Ok(launches) = self.launches.lock() else {
-            return PeerReply::Error {
-                code: FailureCode::Internal,
+    async fn retrieve_claude(
+        &self,
+        invocation: &ValidatedInvocation,
+        detail_ref: &str,
+        attachment: &str,
+    ) -> PeerReply {
+        use super::claude_worker::{Delivery, HelperOperation, HelperOutcome};
+        let owner = invocation.binding_ref().fingerprint();
+        // The settled token is minted under the ledger lock and the lock is released before any
+        // await: no daemon lock crosses the Worker call below.
+        let (delivery, settled) = {
+            let Ok(launches) = self.launches.lock() else {
+                return PeerReply::Error {
+                    code: FailureCode::Internal,
+                };
             };
+            if !launches.owned_by(detail_ref, owner) {
+                return PeerReply::Error {
+                    code: FailureCode::InvalidDetail,
+                };
+            }
+            (
+                launches.delivery(detail_ref),
+                launches.settled(detail_ref, owner),
+            )
         };
-        if !launches.owned_by(detail_ref, invocation.binding_ref().fingerprint()) {
-            return PeerReply::Error {
-                code: FailureCode::InvalidDetail,
-            };
-        }
-        match launches.delivery(detail_ref) {
+        match delivery {
             Delivery::Ready(result) => match result.outcome {
-                // A settled helper frame is pre-authority *evidence*, never authority. Discovery
-                // observed under the host sandbox proves what Git reported; it does not resolve a
-                // durable worktree, mint a `StartReceipt`, retain a grant or activate any binding.
-                // Converting it straight into `ResultKind::Activation` published exactly that
-                // unearned claim. Until the settled evidence is routed through the Worker authority
-                // path, the honest answer is that durable Workspace activation has not happened.
-                HelperOutcome::Complete { .. } => PeerReply::Unavailable {
-                    reason: MissingPeer::WorkspaceActivation,
-                },
+                // A settled helper frame is pre-authority *evidence*, never authority. It is
+                // routed through the sole Worker queue, which resolves a durable worktree, mints
+                // the `StartReceipt` and retains the grant. Without a settled token — which
+                // arbitrary helper JSON cannot produce — nothing is published at all.
+                HelperOutcome::Complete { .. } => {
+                    let Some(settled) = settled else {
+                        return PeerReply::Error {
+                            code: FailureCode::WorkspaceAuthority,
+                        };
+                    };
+                    // Only Start has an authority path in this stage; Context and Diff remain
+                    // explicitly unavailable rather than completing on discovery evidence alone.
+                    if settled.operation() != HelperOperation::Start {
+                        return PeerReply::Unavailable {
+                            reason: MissingPeer::WorkspaceActivation,
+                        };
+                    }
+                    let Some(worker) = &self.worker else {
+                        return PeerReply::Unavailable {
+                            reason: MissingPeer::WorkspaceActivation,
+                        };
+                    };
+                    let reply = worker
+                        .complete_claude(invocation.clone(), attachment, settled)
+                        .await;
+                    // The bounded lease is released only once the daemon has actually consumed the
+                    // settled evidence, and only on the same positive proof that minted it.
+                    if matches!(reply, PeerReply::Complete { .. })
+                        && let Ok(mut launches) = self.launches.lock()
+                    {
+                        launches.release_settled(detail_ref, owner);
+                    }
+                    reply
+                }
                 HelperOutcome::Failed { code } => PeerReply::Error { code },
             },
             Delivery::Waiting => PeerReply::Pending {
@@ -567,10 +606,14 @@ impl ProductDispatcher {
                             worker.stop(invocation, method.opaque_attachment()).await
                         }
                         // Pure retrieval: same binding, same generation, no daemon source read.
-                        AssistanceMethod::Inspect => self.retrieve_claude(
-                            &invocation,
-                            call.parameters()["detail_ref"].as_str()?,
-                        ),
+                        AssistanceMethod::Inspect => {
+                            self.retrieve_claude(
+                                &invocation,
+                                call.parameters()["detail_ref"].as_str()?,
+                                method.opaque_attachment(),
+                            )
+                            .await
+                        }
                         _ => {
                             let reply = self.mint_claude(
                                 &invocation,

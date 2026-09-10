@@ -56,6 +56,58 @@ pub fn validate_discovery(
     operation: &DiscoveryOperationRef,
     outputs: &[GitDiscoveryEvidence],
 ) -> Result<DiscoveredWorktree, GitError> {
+    validate_native_identity(
+        candidate_cwd,
+        &parse_discovery_evidence(operation, outputs)?,
+    )
+}
+
+/// The paths and listing bytes one correlated discovery triple asserts, before anything is opened.
+///
+/// This is *evidence*, not identity. Its paths are exactly what Git printed: they have not been
+/// canonicalized, their descriptors have not been inspected, and no Git administrative file has
+/// been read. Only [`validate_native_identity`] or `DurableWorkspace::resolve_worktree` turns it
+/// into an identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedDiscovery {
+    /// Raw `--show-toplevel` path, terminal-parsed but not canonicalized.
+    top: PathBuf,
+    /// Raw absolute `--git-common-dir` path, terminal-parsed but not canonicalized.
+    common: PathBuf,
+    /// Raw NUL-delimited `worktree list --porcelain -z` bytes, structurally unvalidated.
+    listing: Vec<u8>,
+}
+
+impl ParsedDiscovery {
+    /// Returns the asserted top-level path exactly as Git printed it.
+    pub fn top(&self) -> &Path {
+        &self.top
+    }
+    /// Returns the asserted absolute common administrative directory as Git printed it.
+    pub fn common(&self) -> &Path {
+        &self.common
+    }
+    /// Returns the raw worktree listing bytes for later validation against a canonical root.
+    pub fn listing(&self) -> &[u8] {
+        &self.listing
+    }
+}
+
+/// Parses one correlated discovery triple without touching the filesystem.
+///
+/// Checks exactly three correlated outputs, their operation identity, cancellation, exit status,
+/// truncation, drain completeness and byte bounds; rejects a duplicated or missing query slot;
+/// parses the two terminal paths; and requires the common directory to be absolute, as the fixed
+/// `--path-format=absolute` query guarantees. A Git that does not support that flag is reported as
+/// [`GitError::UnsupportedDiscoveryGit`] rather than as malformed output.
+///
+/// Performs no I/O whatsoever: no `stat`, no `open`, no directory traversal, no process. This is
+/// the half the daemon is permitted to run for helper-supplied Claude evidence, where reading
+/// repository source or Git administrative files daemon-side is forbidden.
+pub fn parse_discovery_evidence(
+    operation: &DiscoveryOperationRef,
+    outputs: &[GitDiscoveryEvidence],
+) -> Result<ParsedDiscovery, GitError> {
     if outputs.len() != 3 {
         return Err(GitError::InvalidDiscovery);
     }
@@ -106,19 +158,39 @@ pub fn validate_discovery(
         }
     }
     let top = parse_terminal_path(values[0].ok_or(GitError::InvalidDiscovery)?)?;
-    let (root, _) = real_directory(&top).map_err(|_| GitError::InvalidDiscovery)?;
+    let common = parse_terminal_path(values[1].ok_or(GitError::InvalidDiscovery)?)?;
+    if !common.is_absolute() {
+        return Err(GitError::InvalidDiscovery);
+    }
+    Ok(ParsedDiscovery {
+        top,
+        common,
+        listing: values[2].ok_or(GitError::InvalidDiscovery)?.to_vec(),
+    })
+}
+
+/// Resolves parsed discovery evidence into a native worktree identity.
+///
+/// This is the half that touches the filesystem: it canonicalizes the asserted paths through
+/// descriptor-checked `real_directory`, requires the invocation directory to lie inside the
+/// resolved root, validates the worktree listing against that canonical root, and cross-checks the
+/// candidate's Git administrative backpointers. Symlinked paths, unsupported bare candidates,
+/// foreign or duplicated listing entries and inconsistent backpointers all fail closed.
+///
+/// Callers still pass the returned paths to `DurableWorkspace::resolve_worktree`, which alone mints
+/// durable nonce, native key and incarnation.
+pub fn validate_native_identity(
+    candidate_cwd: &Path,
+    parsed: &ParsedDiscovery,
+) -> Result<DiscoveredWorktree, GitError> {
+    let (root, _) = real_directory(&parsed.top).map_err(|_| GitError::InvalidDiscovery)?;
     let (cwd, _) = real_directory(candidate_cwd).map_err(|_| GitError::InvalidDiscovery)?;
     if !cwd.starts_with(&root) {
         return Err(GitError::InvalidDiscovery);
     }
-    let raw_common = parse_terminal_path(values[1].ok_or(GitError::InvalidDiscovery)?)?;
-    if !raw_common.is_absolute() {
-        return Err(GitError::InvalidDiscovery);
-    }
-    let common = raw_common;
     let (common_dir, common_identity) =
-        real_directory(&common).map_err(|_| GitError::InvalidDiscovery)?;
-    validate_listing(values[2].ok_or(GitError::InvalidDiscovery)?, &root)?;
+        real_directory(&parsed.common).map_err(|_| GitError::InvalidDiscovery)?;
+    validate_listing(&parsed.listing, &root)?;
     let dot_git = root.join(".git");
     if let Ok((directory, identity)) = real_directory(&dot_git) {
         if directory != common_dir || identity != common_identity {
@@ -189,7 +261,10 @@ fn administrative_file(root: &Path, common: &Path, name: &str) -> Result<Vec<u8>
 }
 
 /// Validates complete NUL-delimited porcelain records without normalizing or visiting peer paths.
-fn validate_listing(bytes: &[u8], candidate: &Path) -> Result<(), GitError> {
+///
+/// I/O-free: `candidate` is compared as a path value and no listed worktree is ever opened.
+/// Requires the candidate to appear exactly once and to be neither bare nor prunable.
+pub fn validate_listing(bytes: &[u8], candidate: &Path) -> Result<(), GitError> {
     if bytes.is_empty() || !bytes.ends_with(&[0, 0]) {
         return Err(GitError::InvalidDiscovery);
     }

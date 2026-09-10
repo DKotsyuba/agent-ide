@@ -597,7 +597,12 @@ impl LaunchTicket {
     /// Work that provably never ran (`Minted`, `Launched`) is retired and returns `false`: nothing
     /// physical exists, so dropping it has no effect and cannot be misread as cleanup evidence.
     /// Claimed work is retained with its correlation intact and returns `true`.
-    fn quarantine(&mut self) -> bool {
+    ///
+    /// Quarantining also releases the bounded lease when the retained work *already* carries
+    /// positive settlement proof. Nothing will ever consume that evidence now, so continuing to
+    /// hold its capacity would strand a slot on work that is provably finished. Work without such
+    /// proof keeps its lease, which is the honest outcome for cleanup that was never observed.
+    fn quarantine(&mut self, leases: &mut usize) -> bool {
         let retained = match &self.state {
             TicketState::Minted | TicketState::Launched { .. } => None,
             TicketState::Claimed(work) => Some(Some(work.clone())),
@@ -606,7 +611,8 @@ impl LaunchTicket {
         match retained {
             None => false,
             Some(None) => true,
-            Some(Some(work)) => {
+            Some(Some(mut work)) => {
+                LaunchLedger::release_settled_lease(&mut work, leases);
                 self.state = TicketState::Uncertain(work);
                 true
             }
@@ -1132,11 +1138,12 @@ impl LaunchLedger {
     /// [`TicketState::Uncertain`] and is retained, so its admission stays quarantined instead of
     /// being silently reused.
     pub fn expire(&mut self, now_ms: u64) {
+        let leases = &mut self.leases;
         self.tickets.retain(|_, ticket| {
             if now_ms < ticket.deadline_ms {
                 return true;
             }
-            ticket.quarantine()
+            ticket.quarantine(leases)
         });
     }
 
@@ -1155,11 +1162,12 @@ impl LaunchLedger {
     /// left the bounded lease unreleasable. Authority never returns, because [`Self::claim`] admits
     /// `Launched` alone and both [`Self::delivery`] and [`Self::settled`] refuse quarantined work.
     pub fn revoke(&mut self, binding: [u8; 32]) {
+        let leases = &mut self.leases;
         self.tickets.retain(|_, ticket| {
             if ticket.binding.fingerprint() != binding {
                 return true;
             }
-            ticket.quarantine()
+            ticket.quarantine(leases)
         });
     }
 

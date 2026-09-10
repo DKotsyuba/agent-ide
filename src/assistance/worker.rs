@@ -1,6 +1,7 @@
 //! One daemon-owned worker with bounded jobs/details, durable authorization and revocable work.
 
 use super::{
+    claude_worker::{HelperOperation, SettledClaudeOperation},
     facade::{AssistanceTool, FeedbackDelta},
     host_binding::{
         ActiveBindingUse, BindingRef, HostBindingGuard, ObservedSandboxState, ValidatedInvocation,
@@ -34,8 +35,23 @@ use std::{
 };
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 
+/// Separates daemon-executed evidence from settled Claude foreground-helper evidence.
+///
+/// Private on purpose: the discriminator is how the sole worker knows which evidence a job carries,
+/// and it must never be reachable from the wire. [`JobInput::Claude`] can only be built from a
+/// [`SettledClaudeOperation`], which itself has no public constructor and no `Deserialize`, so no
+/// helper frame can steer a job onto the Claude branch.
+enum JobInput {
+    /// Ordinary daemon-executed work; evidence is produced by this process under `observed`.
+    Managed,
+    /// Positively settled Claude helper evidence, already proven correlated, owned and settled.
+    Claude(Box<SettledClaudeOperation>),
+}
+
 /// A bounded asynchronous operation whose identity never includes the transient MCP call ID.
 struct Job {
+    /// Which evidence family this job carries.
+    input: JobInput,
     /// Same-binding opaque result key retained in the result ledger.
     reference: String,
     /// Validated host invocation for this exact operation.
@@ -491,7 +507,15 @@ impl WorkerHandle {
             };
         };
         match admit_initial_inspection(&self.inspect, || {
-            self.enqueue(invocation, observed, tool, parameters, attachment, None)
+            self.enqueue(
+                invocation,
+                observed,
+                tool,
+                parameters,
+                attachment,
+                None,
+                JobInput::Managed,
+            )
         }) {
             Ok((reference, permit)) => {
                 self.inspect_reserved(binding, reference, current, target, expected, permit)
@@ -526,6 +550,7 @@ impl WorkerHandle {
             serde_json::json!({}),
             attachment,
             Some(send),
+            JobInput::Managed,
         ) {
             return PeerReply::Error { code };
         }
@@ -535,6 +560,75 @@ impl WorkerHandle {
                 code: FailureCode::Deadline,
             },
         }
+    }
+
+    /// Routes one positively settled Claude helper operation through the sole worker queue.
+    ///
+    /// This is the only entry by which helper evidence can reach durable authority, and it accepts
+    /// only a [`SettledClaudeOperation`], which cannot be built from wire data. It adds no second
+    /// grant, baseline or Workspace store: the job runs on the existing queue, the receipt lands in
+    /// the existing `Worker::grants`, and the result lands in the existing detail ledger.
+    ///
+    /// Delivery is idempotent. A repeated call for the same binding and `activation_id` returns the
+    /// already retained result instead of activating again or minting a second receipt, because the
+    /// existing start ledger keys that pair. Returns the bounded activation result, or a closed
+    /// error when admission, liveness or durable activation refuses.
+    pub async fn complete_claude(
+        &self,
+        invocation: ValidatedInvocation,
+        attachment: &str,
+        settled: SettledClaudeOperation,
+    ) -> PeerReply {
+        let binding = invocation.binding_ref().clone();
+        let parameters = settled.job().parameters.clone();
+        let Some(activation) = parameters.get("activation_id").and_then(Value::as_str) else {
+            return PeerReply::Error {
+                code: FailureCode::Internal,
+            };
+        };
+        // Repeated inspection of an already completed activation is retrieval, never a second
+        // activation: answer from the retained detail rather than re-entering the queue.
+        if let Some(retained) = self.retained_start(&binding, activation) {
+            return retained;
+        }
+        let (send, wait) = oneshot::channel();
+        if let Err(code) = self.enqueue(
+            invocation,
+            None,
+            AssistanceTool::Start,
+            parameters,
+            attachment,
+            Some(send),
+            JobInput::Claude(Box::new(settled)),
+        ) {
+            return PeerReply::Error { code };
+        }
+        match tokio::time::timeout(
+            Duration::from_millis(self.shared.launcher.limits.operation_ms),
+            wait,
+        )
+        .await
+        {
+            Ok(Ok(reply)) => reply,
+            _ => PeerReply::Error {
+                code: FailureCode::Deadline,
+            },
+        }
+    }
+
+    /// Returns the retained result of an already completed start for this binding and activation.
+    ///
+    /// Returns `None` while no start exists for the pair, or while its retained reply is still the
+    /// original `Pending` placeholder, so a first call proceeds to the queue exactly once.
+    fn retained_start(&self, binding: &BindingRef, activation: &str) -> Option<PeerReply> {
+        let ledger = self.shared.ledger.lock().ok()?;
+        let reference = ledger
+            .starts
+            .get(&(binding.clone(), activation.to_owned()))?;
+        let detail = ledger.details.get(reference)?;
+        matches!(detail.reply, PeerReply::Pending { .. })
+            .then_some(())
+            .map_or_else(|| Some(detail.reply.clone()), |()| None)
     }
 
     /// Asks the sole worker for a same-binding, current-profile, durably authorized result.
@@ -623,6 +717,7 @@ impl WorkerHandle {
     }
 
     /// Atomically bounds and publishes one operation, without file, database or child-process I/O.
+    #[allow(clippy::too_many_arguments)]
     fn enqueue(
         &self,
         invocation: ValidatedInvocation,
@@ -631,6 +726,7 @@ impl WorkerHandle {
         parameters: Value,
         attachment: &str,
         stop_reply: Option<oneshot::Sender<PeerReply>>,
+        input: JobInput,
     ) -> Result<String, FailureCode> {
         if self
             .shared
@@ -724,6 +820,7 @@ impl WorkerHandle {
             ledger.starts.insert(key, reference.clone());
         }
         let job = Job {
+            input,
             reference: reference.clone(),
             invocation,
             observed,
@@ -851,6 +948,9 @@ impl<'a> Worker<'a> {
                 Err(FailureCode::Deadline)
             } else {
                 match job.tool {
+                    AssistanceTool::Start if matches!(job.input, JobInput::Claude(_)) => {
+                        self.activate_claude(&mut job).await
+                    }
                     AssistanceTool::Start => self.activate(&mut job).await,
                     AssistanceTool::Context => self.context(&mut job).await,
                     AssistanceTool::Diff => self.diff(&mut job).await,
@@ -1063,6 +1163,124 @@ impl<'a> Worker<'a> {
                 kind: ResultKind::Activation,
                 text: format!(
                     "Workspace activated; authority_epoch: {}; baseline: {baseline}; worktree_cache: retained. Provider readiness is not implied.",
+                    authority.epoch(),
+                ),
+                detail_ref: Some(job.reference.clone()),
+                truncated: false,
+            },
+            Some(authority),
+            None,
+        ))
+    }
+
+    /// Activates a worktree from settled Claude helper evidence, without daemon Git or source work.
+    ///
+    /// The daemon interprets only bytes: it rebuilds the closed [`GitDiscoveryEvidence`] triple
+    /// through its validating constructor under the operation identity stored in the daemon ticket,
+    /// then runs the *pure* discovery parser. It never executes Git, reads repository source or
+    /// reads a Git administrative file on this route; the helper already performed the full native
+    /// and administrative validation before reporting `Complete`. `DurableWorkspace` still performs
+    /// its own descriptor-only directory identity checks, and it alone mints the durable nonce,
+    /// native key and incarnation.
+    ///
+    /// Liveness is reconsumed before and after every await, and immediately before the durable
+    /// commit. A commit that raced stop keeps its receipt in `grants` for recoverable revocation
+    /// and publishes no success.
+    ///
+    /// Baseline capture is honestly reported as unknown at this stage: activation precedes baseline
+    /// capture, and pre-activation bytes are never relabelled as an activation baseline.
+    ///
+    /// Returns [`FailureCode::Conflict`] when another actor already owns this worktree, leaving the
+    /// first owner's activation usable, and [`FailureCode::WorkspaceActivation`] when the evidence
+    /// cannot be parsed or the durable row cannot be committed.
+    async fn activate_claude(
+        &mut self,
+        job: &mut Job,
+    ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        let binding = job.invocation.binding_ref().clone();
+        let JobInput::Claude(settled) = &job.input else {
+            return Err(FailureCode::Internal);
+        };
+        // Operation kind and generation ownership are rechecked here, not assumed from the token.
+        if settled.operation() != HelperOperation::Start
+            || settled.binding().fingerprint() != binding.fingerprint()
+        {
+            return Err(FailureCode::WorkspaceAuthority);
+        }
+        let activation = job.parameters["activation_id"]
+            .as_str()
+            .ok_or(FailureCode::Internal)?
+            .to_owned();
+        let (operation, evidence) =
+            super::claude_helper::discovery_evidence(&job.reference, settled.discovery())?;
+        let parsed =
+            crate::workspace::git::discovery::parse_discovery_evidence(&operation, &evidence)
+                .map_err(|error| match error {
+                    crate::workspace::git::GitError::UnsupportedDiscoveryGit => {
+                        FailureCode::UnsupportedGit
+                    }
+                    _ => FailureCode::WorkspaceActivation,
+                })?;
+        let listing = parsed.listing().to_vec();
+        let (top, common) = (parsed.top().to_path_buf(), parsed.common().to_path_buf());
+        self.shared.active(&binding)?;
+        let tree = self
+            .workspace
+            .resolve_worktree(top.clone(), top, common)
+            .await
+            .map_err(|_| FailureCode::WorkspaceActivation)?;
+        // Reconsume the exact binding after the awaited Workspace call, before using its result.
+        self.shared.active(&binding)?;
+        // The listing is validated against the canonical root Workspace resolved, not against a
+        // root the helper asserted. This is byte comparison only; no listed worktree is opened.
+        crate::workspace::git::discovery::validate_listing(&listing, tree.worktree_path())
+            .map_err(|_| FailureCode::WorkspaceActivation)?;
+        let mut identity = blake3::Hasher::new();
+        identity.update(&binding.fingerprint());
+        identity.update(activation.as_bytes());
+        let request = crate::workspace::authority::ActivationRequest::new(
+            identity.finalize().to_hex().to_string(),
+            job.invocation.clone(),
+            // Reauthorize immediately before the durable commit.
+            self.shared.active(&binding)?,
+            tree,
+        )
+        .map_err(|_| FailureCode::WorkspaceActivation)?;
+        let receipt = match self.workspace.activate(request).await {
+            Ok(receipt) => receipt,
+            // A second actor for the same worktree loses; the first owner stays usable.
+            Err(crate::workspace::durable::DurableError::OperationConflict) => {
+                return Err(FailureCode::Conflict);
+            }
+            Err(
+                crate::workspace::durable::DurableError::Application(_)
+                | crate::workspace::durable::DurableError::CorruptState,
+            ) => {
+                self.uncertain.insert(binding.clone());
+                return Err(FailureCode::WorkspaceActivation);
+            }
+            Err(_) => return Err(FailureCode::WorkspaceActivation),
+        };
+        // Retain the receipt before checking whether stop won the race, so an activation that
+        // committed durably is always recoverably revocable rather than orphaned.
+        self.grants.insert(binding.clone(), receipt);
+        let authority = match self.authority(&binding).await {
+            Ok(authority) => authority,
+            Err(error) => {
+                if let Ok(mut guard) = self.shared.bindings.lock() {
+                    let _ = guard.stop_binding(&binding);
+                }
+                let _ = self.revoke(&binding, &job.reference).await;
+                return Err(error);
+            }
+        };
+        self.shared.active(&binding)?;
+        Ok((
+            PeerReply::Complete {
+                kind: ResultKind::Activation,
+                text: format!(
+                    "Workspace activated; authority_epoch: {}; baseline: unknown (not captured at this stage); \
+                     context and diff remain unavailable. Provider readiness is not implied.",
                     authority.epoch(),
                 ),
                 detail_ref: Some(job.reference.clone()),
