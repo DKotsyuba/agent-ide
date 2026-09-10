@@ -35,4 +35,4 @@ The proposed implementation uses Rust and Tokio.
 
 Persistent LSP caches follow the worktree, including sequential coder-to-reviewer handoff. MCP or hook failure must leave ordinary agent work usable, with honest degraded results.
 
-Closing a worktree retires its cache and analysis leases; finishing a coder session does not. Shared backends remain available to other open worktrees.
+Finishing a coder session retains its worktree's cache and analysis leases for reuse; it does not retire them. A verified Workspace closure or reset is the only fact that retires a cache namespace; v0.1 has no worktree-close surface that produces that fact yet, so namespaces accumulate up to a fixed ceiling for the daemon's lifetime rather than being retired automatically. Shared backends remain available to other open worktrees.

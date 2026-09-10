@@ -46,6 +46,7 @@ impl GoplsProfile {
     ) -> io::Result<Self> {
         if !binary.is_absolute()
             || !Path::new(&go_toolchain).is_absolute()
+            || !Path::new(&cache_namespace).is_absolute()
             || [
                 &version,
                 &revision,
@@ -59,7 +60,7 @@ impl GoplsProfile {
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "gopls profile requires absolute binary/toolchain and nonempty identity components",
+                "gopls profile requires an absolute binary/toolchain/cache namespace and nonempty identity components",
             ));
         }
         let binary_digest =

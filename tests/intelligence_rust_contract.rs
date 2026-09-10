@@ -655,3 +655,30 @@ async fn real_rust_production_session_uses_exact_profile_and_barrier() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+/// A relative cache namespace would resolve against the spawned child's working directory (the
+/// worktree root) and write Cargo/target cache into the user's repository; the profile must
+/// refuse it, exactly the state the interrupted fixture in this file once relied on implicitly.
+#[test]
+fn rust_profile_rejects_a_relative_cache_namespace() {
+    let mut identity = RustProfileIdentity {
+        binary: PathBuf::from("/usr/bin/true"),
+        rust_analyzer_version: format!("rust-analyzer {ANALYZER_VERSION}"),
+        cargo_version: "cargo 1.98.1".into(),
+        rustc_version: "rustc 1.98.1".into(),
+        rustup_toolchain: "1.98.1-aarch64-apple-darwin".into(),
+        configuration: "cache-priming-and-proc-macro-disabled-v1".into(),
+        trust: "local-trusted-v1".into(),
+        transport: "stdio-v1".into(),
+        cache_namespace: "relative-cache-label".into(),
+    };
+    assert!(
+        RustProfile::new(identity.clone()).is_err(),
+        "relative cache_namespace must be rejected"
+    );
+    identity.cache_namespace = "/private/tmp/agent-ide-rust-cache-namespace".into();
+    assert!(
+        RustProfile::new(identity).is_ok(),
+        "absolute cache_namespace must be accepted"
+    );
+}
