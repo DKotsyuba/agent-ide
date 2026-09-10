@@ -6,7 +6,7 @@ use super::{
         ActiveBindingUse, BindingRef, HostBindingGuard, ObservedSandboxState, ValidatedInvocation,
     },
     launcher::{LaunchTarget, LauncherConfig},
-    reply::{FailureCode, PeerReply, ResultKind},
+    reply::{FailureCode, MAX_REPLY_BYTES, PeerReply, ResultKind},
 };
 use crate::workspace::observation::SourceObservation;
 use crate::{
@@ -75,6 +75,11 @@ struct Detail {
     /// Retained bounded Changes state for the next Diff page; absent once fully delivered.
     /// Never serialized into a `PeerReply`; it exists only to resume the same owner cursor.
     diff_page: Option<snapshots::DiffPageState>,
+    /// `true` exactly when `reply` holds a Diff page whose text was already composed (by the
+    /// completed job or a prior expansion) but never yet handed to any caller. The first ready
+    /// `ide.inspect` on such a detail must return that already-composed page unchanged instead of
+    /// eagerly expanding past it; every later call then advances.
+    diff_page_fresh: bool,
 }
 
 /// Retains one versioned provider delta until a later native post-hook rechecks its exact source.
@@ -187,14 +192,56 @@ impl Shared {
     }
     /// Retains or clears the bounded Diff pagination state for one same-binding detail reference.
     /// Never touches the serialized reply; only `serve_inspection` may advance or drop this state.
-    fn set_diff_page(&self, reference: &str, page: Option<snapshots::DiffPageState>) {
-        if let Ok(mut ledger) = self.ledger.lock()
-            && let Some(detail) = ledger.details.get_mut(reference)
-        {
-            detail.diff_page = page;
+    /// A newly stashed page is marked "fresh" because its text (in `reply`) was already composed
+    /// by the caller and not yet handed to any inspector. Refuses to retain a *new* page past the
+    /// aggregate retained-evidence ceiling and reports that honestly through its `bool` result;
+    /// it never evicts a page that is not being replaced by this exact call.
+    fn set_diff_page(&self, reference: &str, page: Option<snapshots::DiffPageState>) -> bool {
+        let Ok(mut ledger) = self.ledger.lock() else {
+            return false;
+        };
+        if page.is_some() {
+            let already_retaining = ledger
+                .details
+                .get(reference)
+                .is_some_and(|detail| detail.diff_page.is_some());
+            if !already_retaining {
+                let retained = ledger
+                    .details
+                    .values()
+                    .filter(|detail| detail.diff_page.is_some())
+                    .count();
+                if retained.saturating_add(1) * DIFF_PAGE_RETAINED_BYTES
+                    > MAX_RETAINED_DIFF_PAGE_BYTES
+                {
+                    if let Some(detail) = ledger.details.get_mut(reference) {
+                        detail.diff_page = None;
+                        detail.diff_page_fresh = false;
+                    }
+                    return false;
+                }
+            }
         }
+        let retained = page.is_some();
+        if let Some(detail) = ledger.details.get_mut(reference) {
+            detail.diff_page = page;
+            detail.diff_page_fresh = retained;
+        }
+        retained
     }
 }
+
+/// Worst-case bytes one retained Diff page's evidence can hold: Workspace bounds per-path source
+/// content to `MAX_SNAPSHOT_TOTAL_BYTES` and raw patch bytes to `MAX_SNAPSHOT_PATCH_BYTES`
+/// separately, so a single `GitSnapshot` can approach their sum. Charging this fixed worst case
+/// per retained page (rather than walking every path/patch on each admission check) keeps the
+/// aggregate bound cheap and exact-enough: real usage is always at or under this charge.
+const DIFF_PAGE_RETAINED_BYTES: usize = crate::workspace::git::snapshot::MAX_SNAPSHOT_TOTAL_BYTES
+    + crate::workspace::git::snapshot::MAX_SNAPSHOT_PATCH_BYTES;
+/// Aggregate ceiling for concurrently retained Diff pagination evidence across every detail,
+/// independent of and tighter than the unrelated `details` count limit; a client that never pages
+/// through its Diff details cannot pin unbounded memory just by leaving many of them retained.
+const MAX_RETAINED_DIFF_PAGE_BYTES: usize = 16 * DIFF_PAGE_RETAINED_BYTES;
 
 /// Holds one worker task and its finite ingress channels; dropping it cancels the daemon-owned loop.
 pub struct WorkerHandle {
@@ -609,6 +656,7 @@ impl WorkerHandle {
                     source: None,
                     native_epoch: 0,
                     diff_page: None,
+                    diff_page_fresh: false,
                 },
             );
         }
@@ -1334,7 +1382,7 @@ async fn inspection_loop(
 async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, request: Inspection) {
     let result = async {
         let active = shared.active(&request.binding)?;
-        let (reply, authority, source, native_epoch, diff_page) = {
+        let (reply, authority, source, native_epoch, diff_page, diff_page_fresh) = {
             let ledger = shared.ledger.lock().map_err(|_| FailureCode::Internal)?;
             let detail = ledger
                 .details
@@ -1354,6 +1402,7 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 detail.source.clone(),
                 detail.native_epoch,
                 detail.diff_page.clone(),
+                detail.diff_page_fresh,
             )
         };
         if let Some(authority) = &authority {
@@ -1403,28 +1452,69 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
         let Some(page) = diff_page else {
             return Ok::<_, FailureCode>(reply);
         };
+        if diff_page_fresh {
+            // `reply` already holds this exact page's composed text, produced by the job (page 1)
+            // or a prior expansion, and no caller has retrieved it yet. Hand it over unchanged;
+            // only a later inspection may advance past it.
+            if let Ok(mut ledger) = shared.ledger.lock()
+                && let Some(detail) = ledger.details.get_mut(&request.reference)
+            {
+                detail.diff_page_fresh = false;
+            }
+            return Ok::<_, FailureCode>(reply);
+        }
         let Some(authority) = &authority else {
             return Err(FailureCode::WorkspaceAuthority);
         };
         let expected_scope =
             crate::workspace::git::GitScope::from_authority(authority, page.mode());
-        let advanced = page.expand(&expected_scope);
-        if matches!(
-            advanced.state(),
-            crate::changes::DiffResultState::Unavailable | crate::changes::DiffResultState::Failed
-        ) {
+        // Revalidate the retained evidence's working-tree material against the current worktree
+        // before trusting it: an out-of-band edit with no native hook never bumps native_epoch, so
+        // that check alone cannot catch it. Staged-only comparisons never depend on working-tree
+        // bytes, so this is skipped rather than used as unrelated "proof" for them.
+        if !page.working_tree_bytes_unchanged(authority.worktree()) {
             shared.set_diff_page(&request.reference, None);
             return Err(FailureCode::SourceUnavailable);
         }
-        let text = snapshots::render_diff_text(page.mode(), &advanced, authority.epoch());
-        let truncated = advanced.truncated_output()
-            || advanced.overflow_hunks() > 0
-            || advanced.overflow_bytes() > 0;
-        let next = PeerReply::Complete {
-            kind: ResultKind::Diff,
-            text,
-            detail_ref: Some(request.reference.clone()),
-            truncated,
+        // Reply text must serialize under the actual bounded envelope without `PeerReply::encode`
+        // needing to shrink it: a shrink cuts at a UTF-8 boundary, not a hunk boundary, which would
+        // silently deliver a partial hunk while the cursor still advances past it as if it were
+        // whole. Retry with a shrinking conservative byte budget until the whole-hunk page is
+        // proven to fit, or refuse to advance rather than ever deliver a cut hunk.
+        const REPLY_METADATA_RESERVE: usize = 2048;
+        let mut max_bytes = page.budget().max_bytes;
+        let (advanced, next) = loop {
+            let candidate = page.expand_with_max_bytes(&expected_scope, max_bytes);
+            if matches!(
+                candidate.state(),
+                crate::changes::DiffResultState::Unavailable
+                    | crate::changes::DiffResultState::Failed
+            ) {
+                shared.set_diff_page(&request.reference, None);
+                return Err(FailureCode::SourceUnavailable);
+            }
+            let text = snapshots::render_diff_text(
+                page.mode(),
+                &candidate,
+                authority.epoch(),
+                candidate.detail_cursor().is_some(),
+            );
+            let truncated = candidate.truncated_output()
+                || candidate.overflow_hunks() > 0
+                || candidate.overflow_bytes() > 0;
+            let candidate_reply = PeerReply::Complete {
+                kind: ResultKind::Diff,
+                text,
+                detail_ref: Some(request.reference.clone()),
+                truncated,
+            };
+            let fits = serde_json::to_string(&candidate_reply)
+                .map(|serialized| serialized.len() + REPLY_METADATA_RESERVE <= MAX_REPLY_BYTES)
+                .unwrap_or(false);
+            if fits || max_bytes <= 1 {
+                break (candidate, candidate_reply);
+            }
+            max_bytes /= 2;
         };
         let encoded = next
             .clone()
@@ -1439,6 +1529,7 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
         {
             detail.reply = next.clone();
             detail.diff_page = page.advance(&advanced);
+            detail.diff_page_fresh = false;
         }
         Ok::<_, FailureCode>(next)
     }

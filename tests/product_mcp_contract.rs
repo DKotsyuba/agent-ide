@@ -1813,3 +1813,61 @@ async fn configured_product_rejects_changed_executable_before_opening_workspace(
     assert!(!fixture.runtime.join("state.sqlite").exists());
     assert!(!fixture.runtime.join("agent-ide.sock").exists());
 }
+
+/// F1 regression: the first ready `ide.inspect` after a forced `pending` poll must return page 1
+/// exactly once; only a later inspection may advance to page 2, and page 1's content never repeats.
+#[tokio::test]
+async fn diff_pagination_delivers_page_one_before_any_advance() {
+    let fixture = ProductFixture::new(json!([]));
+    for index in 0..40 {
+        std::fs::write(
+            fixture.root.join(format!("many-{index:02}.txt")),
+            format!("base-{index:02}\n"),
+        )
+        .unwrap();
+    }
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "many"]);
+    for index in 0..40 {
+        std::fs::write(
+            fixture.root.join(format!("many-{index:02}.txt")),
+            format!("changed-{index:02}\n"),
+        )
+        .unwrap();
+    }
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "product-root").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"start"}))
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    // `settle` itself already forces at least one `pending` poll before returning the first
+    // complete reply, matching the exact review scenario.
+    let first_call = actor
+        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let page1 = actor.settle(&fixture, first_call).await;
+    assert_eq!(page1["kind"], "diff", "{page1}");
+    let page1_text = page1["text"].as_str().unwrap().to_owned();
+    assert!(page1_text.contains("changed-00"), "{page1_text}");
+    assert!(!page1_text.contains("changed-39"), "{page1_text}");
+    assert!(page1_text.contains("more_available: true"), "{page1_text}");
+    let reference = page1["detail_ref"].as_str().unwrap().to_owned();
+
+    let page2 = actor
+        .call(&fixture, "ide.inspect", json!({"detail_ref":reference}))
+        .await;
+    assert_eq!(page2["kind"], "diff", "{page2}");
+    let page2_text = page2["text"].as_str().unwrap().to_owned();
+    assert!(page2_text.contains("changed-39"), "{page2_text}");
+    assert!(!page2_text.contains("changed-00"), "{page2_text}");
+    assert_ne!(page1_text, page2_text);
+
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}

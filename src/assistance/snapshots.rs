@@ -72,11 +72,16 @@ impl SnapshotRunner for ProductSnapshotRunner<'_, '_> {
         // Re-verify the binding is still live after the awaited durable I/O before trusting or
         // acting on what it returned.
         self.worker.shared.active(&binding).ok()?;
-        self.worker
+        let confirmed = self
+            .worker
             .observations
             .confirm_current(lookup, latest)
             .await
-            .ok()?
+            .ok()??;
+        // The second await is itself an I/O suspension point; a revocation racing with this
+        // exact call must not let its already-fetched token escape as if still authorized.
+        self.worker.shared.active(&binding).ok()?;
+        Some(confirmed)
     }
 }
 impl ProductSnapshotRunner<'_, '_> {
@@ -172,24 +177,46 @@ impl ProductSnapshotRunner<'_, '_> {
 /// Never serialized; only the same worker that captured `evidence` may expand it further.
 #[derive(Clone)]
 pub(super) struct DiffPageState {
+    /// Exact worktree/incarnation/epoch/mode this page's evidence was captured under; expansion
+    /// fails closed the instant the caller's current authority no longer matches it.
     scope: GitScope,
+    /// Exact comparison identities and baseline context bound to `evidence`; `expand_diff` rejects
+    /// any mismatch against a differently captured comparison.
     comparison: crate::workspace::git::GitComparison,
+    /// Complete retained per-path raw Git evidence this and every later page are selected from.
+    /// This is the heavy payload `MAX_RETAINED_DIFF_PAGE_BYTES` bounds in aggregate across details.
     evidence: crate::workspace::git::snapshot::GitSnapshot,
+    /// Byte/hunk ceiling this comparison was originally captured with; later pages may request a
+    /// smaller ceiling (see `expand_with_max_bytes`) but never a larger one.
     budget: crate::changes::DiffSelectionBudget,
+    /// Exact scope/generation/operation-bound cursor for the next unselected hunk.
     cursor: crate::changes::DiffDetailCursor,
+    /// Compare mode used both to re-derive the expected scope and to render this page's text.
     mode: DiffMode,
 }
 
 impl DiffPageState {
-    /// Expands exactly the next bounded page from the retained evidence and comparison.
-    pub(super) fn expand(&self, expected_scope: &GitScope) -> crate::changes::DiffResult {
+    /// Expands the next bounded page using an explicit byte ceiling instead of the originally
+    /// captured budget, so a caller can shrink it until the rendered page proves to fit the
+    /// actual serialized reply envelope. Never splits a hunk: a smaller budget only ever selects
+    /// fewer whole hunks.
+    pub(super) fn expand_with_max_bytes(
+        &self,
+        expected_scope: &GitScope,
+        max_bytes: usize,
+    ) -> crate::changes::DiffResult {
+        let budget = crate::changes::DiffSelectionBudget::bounded(self.budget.max_hunks, max_bytes);
         crate::changes::expand_diff(
             expected_scope,
             &self.comparison,
             self.evidence.clone(),
             &self.cursor,
-            self.budget,
+            budget,
         )
+    }
+    /// Returns the byte/hunk budget originally captured for this comparison.
+    pub(super) const fn budget(&self) -> crate::changes::DiffSelectionBudget {
+        self.budget
     }
     /// Returns the compare mode used to render this page's text.
     pub(super) const fn mode(&self) -> DiffMode {
@@ -206,30 +233,91 @@ impl DiffPageState {
             mode: self.mode,
         })
     }
+    /// Re-verifies every retained tracked path's working-tree bytes against the current worktree
+    /// using the same no-follow reader Workspace itself captured them with. `Staged` never depends
+    /// on working-tree content, so it is not a meaningful freshness proof there and this always
+    /// reports unchanged; `Head`/`Unstaged` genuinely compare against the working tree, so a
+    /// silent out-of-band edit (no native hook, so `native_epoch` never advanced) is caught here.
+    pub(super) fn working_tree_bytes_unchanged(
+        &self,
+        worktree: &crate::workspace::authority::WorktreeRef,
+    ) -> bool {
+        if self.mode == DiffMode::Staged {
+            return true;
+        }
+        use crate::workspace::observation::{
+            ObservationError, SourceReadLimits, read_authorized_source,
+        };
+        for path in self.evidence.paths() {
+            let Some(source) = path.source() else {
+                continue;
+            };
+            let limits = SourceReadLimits::new(
+                4096,
+                crate::workspace::git::snapshot::MAX_SNAPSHOT_BLOB_BYTES,
+            )
+            .expect("fixed source limits");
+            let current = read_authorized_source(worktree, path.status().path(), limits);
+            let matches = match current {
+                Ok(read) => source.bytes() == Some(read.bytes()),
+                Err(ObservationError::Missing) => source.bytes().is_none(),
+                Err(_) => false,
+            };
+            if !matches {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Hex-encodes raw comparison-side identity bytes for safe inclusion in rendered text.
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
+            out.push_str(&format!("{byte:02x}"));
+            out
+        })
 }
 
 /// Renders the exact typed freshness/coverage/provenance/status facts for one Diff page.
+/// Provenance always carries the scope/comparison/operation fields required to interpret this
+/// page independent of any other request: worktree identity/incarnation, authority epoch,
+/// operation reference, capture generation and both raw comparison-side identities.
 pub(super) fn render_diff_text(
     mode: DiffMode,
     result: &crate::changes::DiffResult,
     authority_epoch: u64,
+    more_available: bool,
 ) -> String {
+    let provenance = result.provenance();
     let mut text = format!(
-        "mode: {:?}\nstate: {:?}\ncoverage: {:?}\nfreshness: {:?}\nauthority_epoch: {}\nbaseline_reference: {}\nbaseline_coverage: {:?}\nbaseline_window: {:?}\ntracked: {}; untracked: {}; conflicted: {}\nomitted_hunks: {}; omitted_bytes: {}; more_available: {}\n",
+        "mode: {:?}\nstate: {:?}\ncoverage: {:?}\nfreshness: {:?}\nauthority_epoch: {}\nworktree_id: {}\nworktree_incarnation: {}\noperation_reference: {}\ncapture_generation: {}\ncomparison_left: {}\ncomparison_right: {}\nbaseline_reference: {}\nbaseline_coverage: {:?}\nbaseline_window: {:?}\ntracked: {}; untracked: {}; conflicted: {}\nomitted_hunks: {}; omitted_bytes: {}; more_available: {}\n",
         mode,
         result.state(),
         result.coverage(),
         result.freshness(),
         authority_epoch,
-        result.provenance().baseline_reference().unwrap_or("none"),
-        result.provenance().baseline_coverage(),
-        result.provenance().baseline_window(),
+        result.worktree_id(),
+        provenance
+            .scope()
+            .map_or(0, |scope| scope.worktree().incarnation()),
+        provenance.operation_reference().unwrap_or("none"),
+        provenance
+            .capture_generation()
+            .map_or_else(|| "none".to_owned(), |generation| generation.to_string()),
+        hex_encode(result.identities().left()),
+        hex_encode(result.identities().right()),
+        provenance.baseline_reference().unwrap_or("none"),
+        provenance.baseline_coverage(),
+        provenance.baseline_window(),
         result.counts().tracked(),
         result.counts().untracked(),
         result.counts().conflicted(),
         result.overflow_hunks(),
         result.overflow_bytes(),
-        result.detail_cursor().is_some(),
+        more_available,
     );
     for path in result.tracked() {
         text.push_str(&format!("tracked_path: {:?}\n", path.path()));
@@ -496,8 +584,8 @@ impl Worker<'_> {
             cursor: cursor.clone(),
             mode,
         });
-        self.shared.set_diff_page(&job.reference, diff_page);
-        let text = render_diff_text(mode, &result, authority.epoch());
+        let more_available = self.shared.set_diff_page(&job.reference, diff_page);
+        let text = render_diff_text(mode, &result, authority.epoch(), more_available);
         let truncated =
             result.truncated_output() || result.overflow_hunks() > 0 || result.overflow_bytes() > 0;
         Ok((
