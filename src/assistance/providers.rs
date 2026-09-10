@@ -136,6 +136,25 @@ impl Providers {
             .ok_or(FailureCode::Capacity)?;
         Ok(self.generation)
     }
+
+    /// Gives one captured provider socket exactly one disposition: identity-checked removal when the
+    /// identity was captured, otherwise a bumped `socket_generation` for `backend` so the next spawn
+    /// cannot adopt whatever, if anything, is left at the deterministic path. Never guess-deletes a
+    /// replacement. The generation is finite and saturates rather than wrapping back to a reused value.
+    /// Returns whether the socket was proven removed (or never existed to remove).
+    fn dispose_socket(&mut self, backend: &str, socket: Option<OwnedProviderSocket>) -> bool {
+        if let Some(identity) = socket
+            && identity.remove().is_ok()
+        {
+            return true;
+        }
+        let generation = self
+            .socket_generation
+            .entry(backend.to_string())
+            .or_insert(0);
+        *generation = generation.saturating_add(1);
+        false
+    }
 }
 
 impl Worker<'_> {
@@ -685,7 +704,10 @@ impl Worker<'_> {
     /// Every step below the removed `go_views` mapping is the only remaining reference to that state,
     /// so any failure past this point is recorded in `uncertain` rather than silently discarded: the
     /// binding's view and backend accounting are gone either way, and losing the failure signal would
-    /// let a caller believe cleanup fully succeeded when it did not.
+    /// let a caller believe cleanup fully succeeded when it did not. Once the backend is removed from
+    /// `providers.go`, its captured socket (if any) gets exactly one disposition on every remaining
+    /// exit from this function, including a `stop`/`complete_reap` failure: `dispose_backend_socket`
+    /// runs unconditionally before any such early return.
     pub(super) async fn close_provider(&mut self, binding: &BindingRef) -> Result<(), FailureCode> {
         let Some(view) = self.providers.go_views.remove(binding) else {
             return Ok(());
@@ -705,52 +727,28 @@ impl Worker<'_> {
                     return Err(FailureCode::Internal);
                 }
             };
-            let completed = match backend
+            let socket = backend.socket;
+            let stop_result = backend
                 .shared
                 .stop(Duration::from_millis(100), Duration::from_millis(500))
-                .await
-            {
+                .await;
+            let completed = match stop_result {
                 Ok(completed) => completed,
                 Err(_) => {
                     self.uncertain.insert(binding.clone());
+                    self.providers.dispose_socket(&view.backend, socket);
                     return Err(FailureCode::Deadline);
                 }
             };
-            if self
-                .providers
-                .registry
-                .complete_reap(&mut self.admission, capability, completed.settlement)
-                .is_err()
-            {
+            let reaped = self.providers.registry.complete_reap(
+                &mut self.admission,
+                capability,
+                completed.settlement,
+            );
+            let disposed = self.providers.dispose_socket(&view.backend, socket);
+            if reaped.is_err() || !disposed {
                 self.uncertain.insert(binding.clone());
                 return Err(FailureCode::Internal);
-            }
-            match backend.socket {
-                Some(identity) => {
-                    if identity.remove().is_err() {
-                        self.uncertain.insert(binding.clone());
-                        *self
-                            .providers
-                            .socket_generation
-                            .entry(view.backend)
-                            .or_insert(0) += 1;
-                        return Err(FailureCode::Internal);
-                    }
-                }
-                None => {
-                    // The process was already stopped and reaped above; only its socket identity was
-                    // never captured (cancelled/deadlined/failed before capture). We cannot prove
-                    // whether a file remains at the deterministic path, so we neither guess-delete nor
-                    // claim success: record uncertainty and retire the path so the next spawn for this
-                    // backend cannot collide with whatever, if anything, is left behind.
-                    self.uncertain.insert(binding.clone());
-                    *self
-                        .providers
-                        .socket_generation
-                        .entry(view.backend)
-                        .or_insert(0) += 1;
-                    return Err(FailureCode::Internal);
-                }
             }
         }
         Ok(())
@@ -832,7 +830,78 @@ async fn session_operation<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncW
 
 #[cfg(test)]
 mod tests {
-    use super::OwnedProviderSocket;
+    use super::{OwnedProviderSocket, Providers};
+
+    /// Forces the exact post-backend-removal failure this fix targets: a captured `Some` socket whose
+    /// identity-checked removal fails (as it would after a `stop`/`complete_reap` error left the file's
+    /// identity unprovable). Proves the socket still gets disposed exactly once, `dispose_socket`
+    /// reports it was not proven removed, and the backend's socket generation advances so a later
+    /// spawn for the same backend key would not reuse the stale path.
+    #[test]
+    fn dispose_socket_bumps_generation_on_unproved_removal_and_leaves_no_stale_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-ide-dispose-socket-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let replaced = root.join("replaced.sock");
+        let original = root.join("original.sock");
+        std::fs::write(&replaced, b"owned").unwrap();
+        let identity = OwnedProviderSocket::capture(replaced.clone()).unwrap();
+        // Simulate a foreign replacement racing in during the unproved window, exactly like the
+        // `OwnedProviderSocket::remove` identity check already refuses.
+        std::fs::rename(&replaced, &original).unwrap();
+        std::fs::write(&replaced, b"foreign").unwrap();
+
+        let mut providers = Providers::new();
+        assert_eq!(providers.socket_generation.get("go-backend-a"), None);
+
+        let disposed = providers.dispose_socket("go-backend-a", Some(identity));
+        assert!(!disposed, "an unproved removal must not be reported clean");
+        assert_eq!(
+            providers.socket_generation.get("go-backend-a").copied(),
+            Some(1),
+            "the backend's next spawn must be forced onto a fresh generation"
+        );
+        assert_eq!(
+            std::fs::read(&replaced).unwrap(),
+            b"foreign",
+            "a replacement must never be guess-deleted"
+        );
+
+        // A concurrent None-socket disposal (identity never captured) for a different backend must
+        // advance only that backend's own generation, keeping map growth bounded per backend.
+        let disposed_none = providers.dispose_socket("go-backend-b", None);
+        assert!(!disposed_none);
+        assert_eq!(
+            providers.socket_generation.get("go-backend-a").copied(),
+            Some(1)
+        );
+        assert_eq!(
+            providers.socket_generation.get("go-backend-b").copied(),
+            Some(1)
+        );
+
+        // A second unproved disposal for the same backend advances the generation again, so a stale
+        // path from generation 0 can never be adopted by a spawn using the current generation.
+        let stale_identity = OwnedProviderSocket::capture(original.clone()).unwrap();
+        let disposed_again = providers.dispose_socket("go-backend-a", Some(stale_identity));
+        assert!(
+            disposed_again,
+            "the untouched original file is genuinely owned and removable"
+        );
+        assert_eq!(
+            providers.socket_generation.get("go-backend-a").copied(),
+            Some(1)
+        );
+
+        std::fs::remove_file(&replaced).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+    }
 
     /// Verifies absent sockets succeed, replacements survive, and real unlink failures propagate.
     #[test]
