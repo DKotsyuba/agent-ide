@@ -4,8 +4,9 @@
 pub use super::reply::{MissingPeer, PeerReply};
 use super::{
     host_binding::{
-        BindingStatus, HostBindingGuard, parse_candidate, parse_channel_session,
-        parse_claude_hook_event, parse_hook_event, parse_observed_sandbox_state,
+        BindingStatus, HostBindingGuard, HostKind, parse_candidate, parse_channel_session,
+        parse_claude_call_id, parse_claude_hook_event, parse_hook_event, parse_host_kind,
+        parse_observed_sandbox_state,
     },
     launcher::LauncherConfig,
     reply::FailureCode,
@@ -132,10 +133,7 @@ impl ProductDispatcher {
                     return None;
                 }
                 let meta = object.get("host_meta")?.as_object()?;
-                let candidate = parse_candidate(meta).ok()?;
-                if candidate.call_id() != method.correlation_id() {
-                    return None;
-                }
+                let host = parse_host_kind(meta).ok()?;
                 let tool = match method.method() {
                     AssistanceMethod::Start => super::facade::AssistanceTool::Start,
                     AssistanceMethod::Context => super::facade::AssistanceTool::Context,
@@ -149,10 +147,29 @@ impl ProductDispatcher {
                 let channel = self.channel(method.opaque_attachment())?;
                 let (invocation, observed) = {
                     let mut bindings = self.bindings.lock().ok()?;
-                    let status = if method.method() == AssistanceMethod::Start {
-                        bindings.establish_start(candidate, channel)
-                    } else {
-                        bindings.validate_active(candidate, channel)
+                    let status = match host {
+                        HostKind::Codex => {
+                            let candidate = parse_candidate(meta).ok()?;
+                            if candidate.call_id() != method.correlation_id() {
+                                return None;
+                            }
+                            if method.method() == AssistanceMethod::Start {
+                                bindings.establish_start(candidate, channel)
+                            } else {
+                                bindings.validate_active(candidate, channel)
+                            }
+                        }
+                        HostKind::Claude => {
+                            let call_id = parse_claude_call_id(meta).ok()?;
+                            if call_id != method.correlation_id() {
+                                return None;
+                            }
+                            if method.method() == AssistanceMethod::Start {
+                                bindings.establish_start_claude(&call_id, channel)
+                            } else {
+                                bindings.validate_active_claude(&call_id, channel)
+                            }
+                        }
                     };
                     let BindingStatus::Validated(invocation) = status else {
                         return None;
@@ -162,15 +179,21 @@ impl ProductDispatcher {
                         (invocation, None)
                     } else {
                         let active = bindings.consume_active(invocation.binding_ref()).ok()?;
-                        let observed =
-                            match parse_observed_sandbox_state(meta, &invocation, &active, true) {
-                                Ok(observed) => observed,
-                                Err(_) => {
-                                    return Some(PeerReply::Error {
-                                        code: FailureCode::SandboxState,
-                                    });
-                                }
-                            };
+                        // Claude never advertises or returns `codex/sandbox-state-meta`; establishing
+                        // its correlation must never invent sandbox authority it was never given.
+                        let observed = match parse_observed_sandbox_state(
+                            meta,
+                            &invocation,
+                            &active,
+                            host == HostKind::Codex,
+                        ) {
+                            Ok(observed) => observed,
+                            Err(_) => {
+                                return Some(PeerReply::Error {
+                                    code: FailureCode::SandboxState,
+                                });
+                            }
+                        };
                         if crate::execution::HostSandboxState::parse(Some(
                             observed.state().as_json().clone(),
                         ))
@@ -294,4 +317,89 @@ fn daemon_scope_is_fresh_without_actor_or_timing_inference() {
         second.channel("same").unwrap()
     );
     assert!(!format!("{first:?}").contains("scope"));
+}
+
+/// Uses host-shaped daemon frames to reject mixed Codex and Claude metadata before correlation.
+#[tokio::test]
+async fn host_shaped_mixed_metadata_is_unavailable_at_daemon_ingress() {
+    use crate::app::transport::{MethodDispatch, OpaqueJson};
+
+    let dispatcher = ProductDispatcher::default();
+    let parameters = OpaqueJson::from_value(
+        &json!({
+            "parameters": {"activation_id":"activate"},
+            "host_meta": {
+                "threadId":"actor",
+                "callId":"call",
+                "x-codex-turn-metadata":{},
+                "claudecode/toolUseId":"call"
+            }
+        }),
+        64 * 1024,
+    )
+    .expect("test frame is bounded");
+    let request = AssistanceDispatch::MethodDispatch(
+        MethodDispatch::new(
+            "request",
+            "call",
+            "attachment",
+            AssistanceMethod::Start,
+            parameters,
+        )
+        .expect("test dispatch is valid"),
+    );
+    assert_eq!(dispatcher.handle(&request).await, None);
+}
+
+/// Uses host-shaped frames to prove Claude correlation stops at sandbox-state failure.
+#[tokio::test]
+async fn host_shaped_claude_start_never_reaches_workspace_without_sandbox_authority() {
+    use crate::app::transport::{HookSubmit, MethodDispatch, OpaqueJson};
+
+    let dispatcher = ProductDispatcher::default();
+    let observation = OpaqueJson::from_value(
+        &json!({
+            "host":"claude",
+            "phase":"pre",
+            "actor_id":"session",
+            "call_id":"call",
+            "session_id":"session",
+            "agent_type":null
+        }),
+        64 * 1024,
+    )
+    .expect("test observation is bounded");
+    let hook = AssistanceDispatch::HookSubmit(
+        HookSubmit::new("request", "call", "attachment", observation)
+            .expect("test hook dispatch is valid"),
+    );
+    assert_eq!(
+        dispatcher.handle(&hook).await,
+        Some(PeerReply::HookObserved {})
+    );
+
+    let parameters = OpaqueJson::from_value(
+        &json!({
+            "parameters":{"activation_id":"activate"},
+            "host_meta":{"claudecode/toolUseId":"call"}
+        }),
+        64 * 1024,
+    )
+    .expect("test frame is bounded");
+    let method = AssistanceDispatch::MethodDispatch(
+        MethodDispatch::new(
+            "request",
+            "call",
+            "attachment",
+            AssistanceMethod::Start,
+            parameters,
+        )
+        .expect("test method dispatch is valid"),
+    );
+    assert_eq!(
+        dispatcher.handle(&method).await,
+        Some(PeerReply::Error {
+            code: FailureCode::SandboxState
+        })
+    );
 }

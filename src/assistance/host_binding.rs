@@ -16,11 +16,18 @@ use serde_json::{Map, Value};
 const MAX_IDENTIFIER_BYTES: usize = 256;
 const MAX_HOOK_METADATA_BYTES: usize = 64 * 1024;
 const MAX_PENDING: usize = 128;
-const MAX_COMPLETED: usize = 1024;
 const MAX_BINDINGS: usize = 64;
+/// Bounds independent channels that can retain replay evidence in one daemon lifetime.
+const MAX_REPLAY_CHANNELS: usize = 64;
+/// Bounds host/actor replay scopes independently within each retained channel.
+const MAX_REPLAY_SCOPES_PER_CHANNEL: usize = 64;
+/// Bounds retained rejected or completed call identities within one exact scope.
+const MAX_REPLAYS_PER_SCOPE: usize = 64;
 const MAX_SANDBOX_STATE_BYTES: usize = 64 * 1024;
 const TURN_METADATA: &str = "x-codex-turn-metadata";
 const SANDBOX_STATE_METADATA: &str = "codex/sandbox-state-meta";
+/// Claude's trusted MCP `_meta` field; Claude never supplies an actor, session, or sandbox field here.
+const CLAUDE_TOOL_USE_ID: &str = "claudecode/toolUseId";
 const SANDBOX_STATE_FIELDS: &[&str] = &[
     "permissionProfile",
     "codexLinuxSandboxExe",
@@ -241,7 +248,7 @@ pub enum BindingUnavailable {
     BindingUseMismatch,
     /// The candidate was observed twice or after it was already validated.
     Replay,
-    /// Bounded pending or completed lifecycle storage is full.
+    /// Bounded pending, binding, channel, scope, or replay storage is full.
     CapacityExceeded,
 }
 
@@ -330,6 +337,21 @@ pub struct ObservedSandboxState {
     state: OpaqueSandboxState,
 }
 
+/// Distinguishes failed correlation from a successfully settled call in one replay record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplayDisposition {
+    /// Correlation failed or a native-only lifecycle consumed this call identity.
+    Rejected,
+    /// A validated invocation received its exact matching post-hook.
+    Completed,
+}
+
+/// Maps bounded call identities to their permanent outcome within one host/actor scope.
+type ReplayCalls = BTreeMap<String, ReplayDisposition>;
+
+/// Maps bounded host/actor scopes to independently budgeted replay records within one channel.
+type ChannelReplayScopes = BTreeMap<(HostKind, String), ReplayCalls>;
+
 impl ObservedSandboxState {
     /// Returns the actor shared with the validated invocation that returned this state.
     pub fn actor_id(&self) -> &str {
@@ -361,18 +383,18 @@ impl ObservedSandboxState {
 ///
 /// One guard belongs to one host connection scope. It never silently reactivates a stopped
 /// binding: only `establish_start` creates a generation, while ordinary calls use
-/// `validate_active`. Completed call capacity is never evicted because it is replay evidence.
+/// `validate_active`. Rejected and completed call evidence is partitioned by channel and scope,
+/// bounded without eviction, and survives ordinary stop/start within this guard.
 #[derive(Debug, Default)]
 pub struct HostBindingGuard {
     pre_observed: BTreeSet<(CandidateInvocation, ChannelSessionRef)>,
     settling: BTreeMap<(CandidateInvocation, ChannelSessionRef), BindingRef>,
-    completed: BTreeSet<(CandidateInvocation, ChannelSessionRef)>,
     bindings: BTreeMap<(HostKind, String, ChannelSessionRef), BindingRef>,
     next_generation: u64,
     /// Coalesced native lifecycle hints, at most one per active binding and no raw tool data.
     native_hints: BTreeSet<BindingRef>,
-    /// Failed or native-only identities cannot be reused for MCP validation in this daemon lifetime.
-    rejected: BTreeSet<(CandidateInvocation, ChannelSessionRef)>,
+    /// Rejected and completed call IDs partitioned by channel and then exact host/actor scope.
+    replays: BTreeMap<ChannelSessionRef, ChannelReplayScopes>,
 }
 
 impl HostBindingGuard {
@@ -387,20 +409,24 @@ impl HostBindingGuard {
         channel: ChannelSessionRef,
     ) -> BindingStatus {
         let invocation = (candidate.clone(), channel.clone());
-        if self.rejected.len() >= MAX_COMPLETED {
-            return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
-        }
-        if self.rejected.contains(&invocation)
+        if self.replay_disposition(&candidate, &channel).is_some()
             || self.settling.contains_key(&invocation)
-            || self.completed.contains(&invocation)
         {
             return BindingStatus::Unavailable(BindingUnavailable::Replay);
         }
+        if self.replay_scope_saturated(&candidate, &channel) {
+            return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
+        }
         if !self.pre_observed.contains(&invocation) {
-            self.rejected.insert(invocation);
+            if self
+                .record_replay(&invocation, ReplayDisposition::Rejected)
+                .is_err()
+            {
+                return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
+            }
             return BindingStatus::Unavailable(BindingUnavailable::MissingPre);
         }
-        if self.settling.len() >= MAX_PENDING || self.completed.len() >= MAX_COMPLETED {
+        if self.settling.len() >= MAX_PENDING {
             return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
         }
         let binding_key = (candidate.host, candidate.actor_id.clone(), channel.clone());
@@ -439,17 +465,21 @@ impl HostBindingGuard {
         channel: ChannelSessionRef,
     ) -> BindingStatus {
         let invocation = (candidate.clone(), channel.clone());
-        if self.rejected.len() >= MAX_COMPLETED {
-            return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
-        }
-        if self.rejected.contains(&invocation)
+        if self.replay_disposition(&candidate, &channel).is_some()
             || self.settling.contains_key(&invocation)
-            || self.completed.contains(&invocation)
         {
             return BindingStatus::Unavailable(BindingUnavailable::Replay);
         }
+        if self.replay_scope_saturated(&candidate, &channel) {
+            return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
+        }
         if !self.pre_observed.remove(&invocation) {
-            self.rejected.insert(invocation);
+            if self
+                .record_replay(&invocation, ReplayDisposition::Rejected)
+                .is_err()
+            {
+                return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
+            }
             return BindingStatus::Unavailable(BindingUnavailable::MissingPre);
         }
         let Some(binding) = self
@@ -457,10 +487,15 @@ impl HostBindingGuard {
             .get(&(candidate.host, candidate.actor_id.clone(), channel))
             .cloned()
         else {
-            self.rejected.insert(invocation);
+            if self
+                .record_replay(&invocation, ReplayDisposition::Rejected)
+                .is_err()
+            {
+                return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
+            }
             return BindingStatus::Unavailable(BindingUnavailable::InactiveBinding);
         };
-        if self.settling.len() >= MAX_PENDING || self.completed.len() >= MAX_COMPLETED {
+        if self.settling.len() >= MAX_PENDING {
             return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
         }
         self.settling.insert(invocation, binding.clone());
@@ -477,6 +512,11 @@ impl HostBindingGuard {
     /// only settles a call that was already validated by `establish_start` or `validate_active`.
     pub fn observe_hook(&mut self, event: HookEvent, channel: ChannelSessionRef) -> BindingStatus {
         if event.phase == HookPhase::PostBatch {
+            // Claude's PostToolUse already fires once per exact tool call; its uncorrelated batch
+            // boundary must never coalesce a native-change hint that Claude never actually proved.
+            if event.host == HostKind::Claude {
+                return BindingStatus::Unavailable(BindingUnavailable::UnsupportedHookPhase);
+            }
             let Some(binding) = self
                 .bindings
                 .get(&(event.host, event.actor_id, channel))
@@ -495,57 +535,61 @@ impl HostBindingGuard {
                 .expect("non-batch hook parsers require a tool-use identity"),
         };
         let invocation = (candidate.clone(), channel);
-        if self.rejected.len() >= MAX_COMPLETED {
-            return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
+        if let Some(disposition) = self.replay_disposition(&candidate, &invocation.1) {
+            return BindingStatus::Unavailable(match disposition {
+                ReplayDisposition::Rejected => BindingUnavailable::Mismatch,
+                ReplayDisposition::Completed => BindingUnavailable::Replay,
+            });
         }
-        if self.rejected.contains(&invocation) {
-            return BindingStatus::Unavailable(BindingUnavailable::Mismatch);
+        if self.replay_scope_saturated(&candidate, &invocation.1)
+            || self.ensure_replay_scope(&candidate, &invocation.1).is_err()
+        {
+            return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
         }
         match event.phase {
             HookPhase::Pre
                 if self.pre_observed.contains(&invocation)
-                    || self.settling.contains_key(&invocation)
-                    || self.completed.contains(&invocation) =>
+                    || self.settling.contains_key(&invocation) =>
             {
                 self.pre_observed.remove(&invocation);
                 self.settling.remove(&invocation);
-                self.rejected.insert(invocation);
+                self.record_replay(&invocation, ReplayDisposition::Rejected)
+                    .expect("the checked rejection scope has capacity");
                 BindingStatus::Unavailable(BindingUnavailable::Replay)
             }
             HookPhase::Pre => {
-                if self.pre_observed.len() + self.settling.len() >= MAX_PENDING
-                    || self.completed.len() >= MAX_COMPLETED
-                {
+                if self.pre_observed.len() + self.settling.len() >= MAX_PENDING {
                     return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
                 }
                 self.pre_observed.insert(invocation);
                 BindingStatus::PreObserved
             }
             HookPhase::Post => {
-                if self.completed.contains(&invocation) {
-                    return BindingStatus::Unavailable(BindingUnavailable::Replay);
-                }
                 if self.pre_observed.remove(&invocation) {
                     let binding = self
                         .bindings
                         .get(&(candidate.host, candidate.actor_id, invocation.1.clone()))
                         .cloned();
-                    self.rejected.insert(invocation);
+                    self.record_replay(&invocation, ReplayDisposition::Rejected)
+                        .expect("the checked rejection scope has capacity");
                     if let Some(binding) = binding {
                         self.native_hints.insert(binding.clone());
                         return BindingStatus::NativeObserved(binding);
                     }
                     return BindingStatus::Unavailable(BindingUnavailable::MissingInvocation);
                 }
-                let Some(binding) = self.settling.remove(&invocation) else {
-                    self.rejected.insert(invocation);
+                let Some(binding) = self.settling.get(&invocation).cloned() else {
+                    self.record_replay(&invocation, ReplayDisposition::Rejected)
+                        .expect("the checked rejection scope has capacity");
                     return BindingStatus::Unavailable(BindingUnavailable::Mismatch);
                 };
-                if self.completed.len() >= MAX_COMPLETED {
-                    self.settling.insert(invocation, binding);
+                if self
+                    .record_replay(&invocation, ReplayDisposition::Completed)
+                    .is_err()
+                {
                     return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
                 }
-                self.completed.insert(invocation);
+                self.settling.remove(&invocation);
                 BindingStatus::Settled(validated(candidate, binding))
             }
             HookPhase::PostBatch => unreachable!("batch hooks return before invocation matching"),
@@ -563,6 +607,135 @@ impl HostBindingGuard {
     ) -> Result<bool, BindingUnavailable> {
         self.check_active(binding)?;
         Ok(self.native_hints.remove(binding))
+    }
+
+    /// Returns retained rejection or completion evidence for one exact scoped call.
+    fn replay_disposition(
+        &self,
+        candidate: &CandidateInvocation,
+        channel: &ChannelSessionRef,
+    ) -> Option<ReplayDisposition> {
+        self.replays
+            .get(channel)?
+            .get(&(candidate.host, candidate.actor_id.clone()))?
+            .get(&candidate.call_id)
+            .copied()
+    }
+
+    /// Returns whether one channel-local host/actor scope exhausted its replay budget.
+    fn replay_scope_saturated(
+        &self,
+        candidate: &CandidateInvocation,
+        channel: &ChannelSessionRef,
+    ) -> bool {
+        self.replays
+            .get(channel)
+            .and_then(|scopes| scopes.get(&(candidate.host, candidate.actor_id.clone())))
+            .is_some_and(|calls| calls.len() >= MAX_REPLAYS_PER_SCOPE)
+    }
+
+    /// Reserves replay storage within independent channel and host/actor budgets.
+    fn ensure_replay_scope(
+        &mut self,
+        candidate: &CandidateInvocation,
+        channel: &ChannelSessionRef,
+    ) -> Result<(), BindingUnavailable> {
+        if !self.replays.contains_key(channel) {
+            if self.replays.len() >= MAX_REPLAY_CHANNELS {
+                return Err(BindingUnavailable::CapacityExceeded);
+            }
+            self.replays.insert(channel.clone(), BTreeMap::new());
+        }
+        let scopes = self
+            .replays
+            .get_mut(channel)
+            .expect("the replay channel was just ensured");
+        let scope = (candidate.host, candidate.actor_id.clone());
+        if scopes.contains_key(&scope) {
+            return Ok(());
+        }
+        if scopes.len() >= MAX_REPLAY_SCOPES_PER_CHANNEL {
+            return Err(BindingUnavailable::CapacityExceeded);
+        }
+        scopes.insert(scope, BTreeMap::new());
+        Ok(())
+    }
+
+    /// Retains one rejected or completed call without eviction or cross-channel budget sharing.
+    fn record_replay(
+        &mut self,
+        invocation: &(CandidateInvocation, ChannelSessionRef),
+        disposition: ReplayDisposition,
+    ) -> Result<(), BindingUnavailable> {
+        self.ensure_replay_scope(&invocation.0, &invocation.1)?;
+        let calls = self
+            .replays
+            .get_mut(&invocation.1)
+            .expect("the replay channel was just ensured")
+            .get_mut(&(invocation.0.host, invocation.0.actor_id.clone()))
+            .expect("the replay scope was just ensured");
+        if calls.contains_key(&invocation.0.call_id) {
+            return Ok(());
+        }
+        if calls.len() >= MAX_REPLAYS_PER_SCOPE {
+            return Err(BindingUnavailable::CapacityExceeded);
+        }
+        calls.insert(invocation.0.call_id.clone(), disposition);
+        Ok(())
+    }
+
+    /// Recovers the exact actor a matching Claude pre-hook already registered for one MCP call.
+    ///
+    /// Claude's trusted MCP metadata carries only `claudecode/toolUseId`, never an actor, session,
+    /// or sandbox field. The actor must come from the trusted native pre-hook already observed for
+    /// this exact channel and tool call. Zero or more than one matching pre-observation is rejected
+    /// rather than guessed, so this can never accept a cross-actor or wrong-channel replay.
+    fn recover_claude_candidate(
+        &self,
+        call_id: &str,
+        channel: &ChannelSessionRef,
+    ) -> Result<CandidateInvocation, BindingUnavailable> {
+        let mut matches = self.pre_observed.iter().filter(|(candidate, observed)| {
+            candidate.host == HostKind::Claude
+                && candidate.call_id == call_id
+                && observed == channel
+        });
+        let candidate = matches
+            .next()
+            .ok_or(BindingUnavailable::MissingPre)?
+            .0
+            .clone();
+        if matches.next().is_some() {
+            return Err(BindingUnavailable::Mismatch);
+        }
+        Ok(candidate)
+    }
+
+    /// Establishes a Claude MCP start binding after recovering its exact registered pre-hook actor.
+    ///
+    /// This is the only entry point for a Claude `_meta["claudecode/toolUseId"]` MCP candidate:
+    /// the caller never constructs a [`CandidateInvocation`] directly from Claude MCP metadata.
+    pub fn establish_start_claude(
+        &mut self,
+        call_id: &str,
+        channel: ChannelSessionRef,
+    ) -> BindingStatus {
+        match self.recover_claude_candidate(call_id, &channel) {
+            Ok(candidate) => self.establish_start(candidate, channel),
+            Err(error) => BindingStatus::Unavailable(error),
+        }
+    }
+
+    /// Validates an ordinary Claude MCP call after recovering its exact registered pre-hook actor.
+    pub fn validate_active_claude(
+        &mut self,
+        call_id: &str,
+        channel: ChannelSessionRef,
+    ) -> BindingStatus {
+        match self.recover_claude_candidate(call_id, &channel) {
+            Ok(candidate) => self.validate_active(candidate, channel),
+            Err(error) => BindingStatus::Unavailable(error),
+        }
     }
 
     /// Checks whether one immutable binding generation remains active at this exact boundary.
@@ -601,18 +774,24 @@ impl HostBindingGuard {
         }
         self.bindings.remove(&key);
         self.native_hints.remove(binding);
+        let pending: Vec<_> = self
+            .pre_observed
+            .iter()
+            .filter(|invocation| {
+                invocation.0.host == binding.host
+                    && invocation.0.actor_id == binding.actor_id
+                    && invocation.1 == binding.channel
+            })
+            .cloned()
+            .collect();
+        for invocation in &pending {
+            // A full scope already rejects every later call, so retaining another ID is unnecessary.
+            let _ = self.record_replay(invocation, ReplayDisposition::Rejected);
+        }
         self.pre_observed.retain(|invocation| {
-            if invocation.0.host == binding.host
-                && invocation.0.actor_id == binding.actor_id
-                && invocation.1 == binding.channel
-            {
-                if self.rejected.len() < MAX_COMPLETED {
-                    self.rejected.insert(invocation.clone());
-                }
-                false
-            } else {
-                true
-            }
+            invocation.0.host != binding.host
+                || invocation.0.actor_id != binding.actor_id
+                || invocation.1 != binding.channel
         });
         Ok(())
     }
@@ -653,6 +832,32 @@ pub fn parse_candidate(
         actor_id: required_identifier(meta, "threadId")?,
         call_id: required_identifier(meta, "callId")?,
     })
+}
+
+/// Selects exactly one complete supported MCP host metadata contract.
+///
+/// Codex identity, turn, and optional sandbox fields cannot coexist with Claude's tool-use field.
+/// A lone field from an otherwise incomplete contract is rejected rather than used to guess a host.
+pub fn parse_host_kind(meta: &Map<String, Value>) -> Result<HostKind, BindingUnavailable> {
+    let has_codex_field = [TURN_METADATA, "threadId", "callId", SANDBOX_STATE_METADATA]
+        .iter()
+        .any(|field| meta.contains_key(*field));
+    let has_claude_field = meta.contains_key(CLAUDE_TOOL_USE_ID);
+    match (has_codex_field, has_claude_field) {
+        (true, false) => parse_candidate(meta).map(|_| HostKind::Codex),
+        (false, true) => parse_claude_call_id(meta).map(|_| HostKind::Claude),
+        _ => Err(BindingUnavailable::InvalidMetadata),
+    }
+}
+
+/// Parses only Claude's trusted MCP `_meta["claudecode/toolUseId"]` field.
+///
+/// Call this only at trusted MCP ingress. Real Claude Code 2.1.267 MCP request metadata carries
+/// this exact bounded string and an unrelated `progressToken`; it never carries an actor, session,
+/// agent, or sandbox field. This call ID alone is not a candidate: [`HostBindingGuard::establish_start_claude`]
+/// and [`HostBindingGuard::validate_active_claude`] recover the actor from the matching pre-hook.
+pub fn parse_claude_call_id(meta: &Map<String, Value>) -> Result<String, BindingUnavailable> {
+    required_identifier(meta, CLAUDE_TOOL_USE_ID)
 }
 
 /// Parses one bounded Codex hook payload while retaining only host, phase, actor, and call ID.
@@ -826,4 +1031,346 @@ fn checked_identifier(value: String, field: &'static str) -> Result<String, Bind
         return Err(BindingUnavailable::InvalidField(field));
     }
     Ok(value)
+}
+
+/// Exercises bounded host-correlation state using parser-shaped metadata and hook observations.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Builds one bounded channel reference for state-machine tests.
+    fn channel(name: &str) -> ChannelSessionRef {
+        parse_channel_session(name.as_bytes()).expect("test channel is valid")
+    }
+
+    /// Builds one Codex candidate through the same metadata parser used at trusted ingress.
+    fn codex_candidate(actor: &str, call: &str) -> CandidateInvocation {
+        parse_candidate(
+            json!({
+                "threadId": actor,
+                "callId": call,
+                "x-codex-turn-metadata": {}
+            })
+            .as_object()
+            .expect("test metadata is an object"),
+        )
+        .expect("test candidate is valid")
+    }
+
+    /// Builds one Claude pre-hook whose actor is either its root session or explicit child ID.
+    fn claude_pre(session: &str, agent: Option<&str>, call: &str) -> HookEvent {
+        parse_claude_hook_event(
+            json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "agent_id": agent,
+                "tool_use_id": call
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("test hook is valid")
+    }
+
+    /// Rejects mixed and partial host-shaped metadata instead of selecting a convenient parser.
+    #[test]
+    fn host_metadata_selection_requires_exactly_one_complete_contract() {
+        for metadata in [
+            json!({}),
+            json!({"threadId":"actor"}),
+            json!({"claudecode/toolUseId":"call","threadId":"actor"}),
+            json!({"claudecode/toolUseId":"call","x-codex-turn-metadata":{}}),
+            json!({"claudecode/toolUseId":"call","codex/sandbox-state-meta":{}}),
+        ] {
+            assert!(matches!(
+                parse_host_kind(metadata.as_object().expect("test metadata is an object")),
+                Err(BindingUnavailable::InvalidMetadata) | Err(BindingUnavailable::MissingField(_))
+            ));
+        }
+        assert_eq!(
+            parse_host_kind(
+                json!({"claudecode/toolUseId":"call","progressToken":1})
+                    .as_object()
+                    .expect("test metadata is an object")
+            ),
+            Ok(HostKind::Claude)
+        );
+        assert_eq!(
+            parse_host_kind(
+                json!({"threadId":"actor","callId":"call","x-codex-turn-metadata":{}})
+                    .as_object()
+                    .expect("test metadata is an object")
+            ),
+            Ok(HostKind::Codex)
+        );
+    }
+
+    /// Consumes one unique same-channel Claude pre-hook and rejects missing or ambiguous matches.
+    #[test]
+    fn claude_start_recovers_one_exact_parent_or_child_pre_observation() {
+        let mut guard = HostBindingGuard::default();
+        let first_channel = channel("first-channel");
+        let other_channel = channel("other-channel");
+        assert!(matches!(
+            guard.establish_start_claude("missing", first_channel.clone()),
+            BindingStatus::Unavailable(BindingUnavailable::MissingPre)
+        ));
+        assert!(matches!(
+            guard.observe_hook(
+                claude_pre("session", None, "parent-call"),
+                first_channel.clone()
+            ),
+            BindingStatus::PreObserved
+        ));
+        assert!(matches!(
+            guard.establish_start_claude("parent-call", other_channel),
+            BindingStatus::Unavailable(BindingUnavailable::MissingPre)
+        ));
+        assert!(matches!(
+            guard.establish_start_claude("parent-call", first_channel.clone()),
+            BindingStatus::Validated(_)
+        ));
+        assert!(matches!(
+            guard.establish_start_claude("parent-call", first_channel.clone()),
+            BindingStatus::Unavailable(BindingUnavailable::MissingPre)
+        ));
+
+        let child_channel = channel("child-channel");
+        assert!(matches!(
+            guard.observe_hook(
+                claude_pre("session", Some("only-child"), "child-call"),
+                child_channel.clone()
+            ),
+            BindingStatus::PreObserved
+        ));
+        let BindingStatus::Validated(child) =
+            guard.establish_start_claude("child-call", child_channel)
+        else {
+            panic!("one exact child pre-hook must validate");
+        };
+        assert_eq!(child.actor_id(), "only-child");
+
+        for agent in ["child-a", "child-b"] {
+            assert!(matches!(
+                guard.observe_hook(
+                    claude_pre("session", Some(agent), "shared-call"),
+                    first_channel.clone()
+                ),
+                BindingStatus::PreObserved
+            ));
+        }
+        assert!(matches!(
+            guard.establish_start_claude("shared-call", first_channel),
+            BindingStatus::Unavailable(BindingUnavailable::Mismatch)
+        ));
+
+        let mut duplicate = HostBindingGuard::default();
+        let duplicate_channel = channel("duplicate-channel");
+        let event = claude_pre("session", Some("child"), "duplicate-call");
+        assert!(matches!(
+            duplicate.observe_hook(event.clone(), duplicate_channel.clone()),
+            BindingStatus::PreObserved
+        ));
+        assert!(matches!(
+            duplicate.observe_hook(event, duplicate_channel.clone()),
+            BindingStatus::Unavailable(BindingUnavailable::Replay)
+        ));
+        assert!(matches!(
+            duplicate.establish_start_claude("duplicate-call", duplicate_channel),
+            BindingStatus::Unavailable(BindingUnavailable::MissingPre)
+        ));
+    }
+
+    /// Fences a saturated scope while preserving unrelated Codex and Claude correlation capacity.
+    #[test]
+    fn rejection_saturation_is_scoped_and_requires_a_fresh_scope() {
+        let mut guard = HostBindingGuard::default();
+        let noisy = channel("noisy-channel");
+        for index in 0..MAX_REPLAYS_PER_SCOPE {
+            assert!(matches!(
+                guard.establish_start(
+                    codex_candidate("noisy-actor", &format!("rejected-{index}")),
+                    noisy.clone()
+                ),
+                BindingStatus::Unavailable(BindingUnavailable::MissingPre)
+            ));
+        }
+        assert!(matches!(
+            guard.establish_start(codex_candidate("noisy-actor", "over-budget"), noisy.clone()),
+            BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded)
+        ));
+        assert!(matches!(
+            guard.observe_hook(
+                parse_hook_event(
+                    br#"{"hook_event_name":"PreToolUse","session_id":"noisy-actor","tool_use_id":"valid"}"#
+                )
+                .expect("test hook is valid"),
+                noisy
+            ),
+            BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded)
+        ));
+
+        let codex_channel = channel("fresh-codex-channel");
+        assert!(matches!(
+            guard.observe_hook(
+                parse_hook_event(
+                    br#"{"hook_event_name":"PreToolUse","session_id":"codex-actor","tool_use_id":"start"}"#
+                )
+                .expect("test hook is valid"),
+                codex_channel.clone()
+            ),
+            BindingStatus::PreObserved
+        ));
+        assert!(matches!(
+            guard.establish_start(codex_candidate("codex-actor", "start"), codex_channel),
+            BindingStatus::Validated(_)
+        ));
+
+        let claude_channel = channel("fresh-claude-channel");
+        assert!(matches!(
+            guard.observe_hook(
+                claude_pre("claude-session", None, "start"),
+                claude_channel.clone()
+            ),
+            BindingStatus::PreObserved
+        ));
+        assert!(matches!(
+            guard.establish_start_claude("start", claude_channel),
+            BindingStatus::Validated(_)
+        ));
+    }
+
+    /// Caps scopes within one channel without consuming an unrelated channel's scope budget.
+    #[test]
+    fn replay_scope_allocation_is_partitioned_by_channel() {
+        let mut guard = HostBindingGuard::default();
+        let noisy_channel = channel("many-scopes-channel");
+        for index in 0..MAX_REPLAY_SCOPES_PER_CHANNEL {
+            assert!(matches!(
+                guard.establish_start(
+                    codex_candidate(&format!("actor-{index}"), "rejected"),
+                    noisy_channel.clone()
+                ),
+                BindingStatus::Unavailable(BindingUnavailable::MissingPre)
+            ));
+        }
+        assert!(matches!(
+            guard.establish_start(codex_candidate("new-actor", "rejected"), noisy_channel),
+            BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded)
+        ));
+
+        let unrelated = channel("unrelated-channel");
+        assert!(matches!(
+            guard.observe_hook(
+                parse_hook_event(
+                    br#"{"hook_event_name":"PreToolUse","session_id":"unrelated","tool_use_id":"start"}"#
+                )
+                .expect("test hook is valid"),
+                unrelated.clone()
+            ),
+            BindingStatus::PreObserved
+        ));
+        assert!(matches!(
+            guard.establish_start(codex_candidate("unrelated", "start"), unrelated),
+            BindingStatus::Validated(_)
+        ));
+    }
+
+    /// Keeps total channel, scope, and record counts within their explicit product bounds.
+    #[test]
+    fn replay_ledger_has_fixed_total_bounds_without_eviction() {
+        let mut guard = HostBindingGuard::default();
+        for index in 0..MAX_REPLAY_CHANNELS {
+            assert!(matches!(
+                guard.establish_start(
+                    codex_candidate("actor", "rejected"),
+                    channel(&format!("channel-{index}"))
+                ),
+                BindingStatus::Unavailable(BindingUnavailable::MissingPre)
+            ));
+        }
+        assert_eq!(guard.replays.len(), MAX_REPLAY_CHANNELS);
+        assert_eq!(
+            guard
+                .replays
+                .values()
+                .flat_map(BTreeMap::values)
+                .map(BTreeMap::len)
+                .sum::<usize>(),
+            MAX_REPLAY_CHANNELS
+        );
+        assert!(matches!(
+            guard.establish_start(
+                codex_candidate("actor", "rejected"),
+                channel("over-channel-budget")
+            ),
+            BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded)
+        ));
+        assert!(matches!(
+            guard.establish_start(codex_candidate("actor", "rejected"), channel("channel-0")),
+            BindingStatus::Unavailable(BindingUnavailable::Replay)
+        ));
+    }
+
+    /// Settles more than the former global limit while keeping a fresh Claude scope usable.
+    #[test]
+    fn completed_replays_do_not_exhaust_unrelated_host_scopes() {
+        let mut guard = HostBindingGuard::default();
+        let codex_channel = channel("settled-codex-channel");
+        for actor_index in 0..17 {
+            let actor = format!("actor-{actor_index}");
+            for call_index in 0..MAX_REPLAYS_PER_SCOPE {
+                let call = format!("call-{call_index}");
+                let pre = parse_hook_event(
+                    json!({
+                        "hook_event_name": "PreToolUse",
+                        "session_id": actor,
+                        "tool_use_id": call
+                    })
+                    .to_string()
+                    .as_bytes(),
+                )
+                .expect("test pre-hook is valid");
+                assert!(matches!(
+                    guard.observe_hook(pre, codex_channel.clone()),
+                    BindingStatus::PreObserved
+                ));
+                let candidate = codex_candidate(&actor, &call);
+                let status = if call_index == 0 {
+                    guard.establish_start(candidate, codex_channel.clone())
+                } else {
+                    guard.validate_active(candidate, codex_channel.clone())
+                };
+                assert!(matches!(status, BindingStatus::Validated(_)));
+                let post = parse_hook_event(
+                    json!({
+                        "hook_event_name": "PostToolUse",
+                        "session_id": actor,
+                        "tool_use_id": call
+                    })
+                    .to_string()
+                    .as_bytes(),
+                )
+                .expect("test post-hook is valid");
+                assert!(matches!(
+                    guard.observe_hook(post, codex_channel.clone()),
+                    BindingStatus::Settled(_)
+                ));
+            }
+        }
+
+        let claude_channel = channel("unrelated-claude-channel");
+        assert!(matches!(
+            guard.observe_hook(
+                claude_pre("claude-session", None, "start"),
+                claude_channel.clone()
+            ),
+            BindingStatus::PreObserved
+        ));
+        assert!(matches!(
+            guard.establish_start_claude("start", claude_channel),
+            BindingStatus::Validated(_)
+        ));
+    }
 }

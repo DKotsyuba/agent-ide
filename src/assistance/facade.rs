@@ -26,7 +26,8 @@ use crate::{
     },
     assistance::{
         host_binding::{
-            HookEvent, HookPhase, HostBindingGuard, HostKind, parse_candidate, parse_hook_event,
+            HookEvent, HookPhase, HostBindingGuard, HostKind, parse_candidate,
+            parse_claude_call_id, parse_hook_event, parse_host_kind,
         },
         reply::{MAX_FEEDBACK_BYTES, MAX_REPLY_BYTES, MissingPeer, PeerReply, ResultKind},
     },
@@ -754,17 +755,31 @@ impl StdioFacade {
         let outcome = match validate_call(tool, parameters.clone()) {
             Ok(_) => {
                 let host = self.attachment.as_ref().and_then(|attachment| {
-                    let candidate = parse_candidate(&context.meta).ok()?;
+                    let (call_id, selected) = match parse_host_kind(&context.meta).ok()? {
+                        HostKind::Codex => {
+                            let candidate = parse_candidate(&context.meta).ok()?;
+                            let mut selected = json!({"threadId":candidate.actor_id(),"callId":candidate.call_id(),"x-codex-turn-metadata":{}});
+                            if let Some(state) = context.meta.get("codex/sandbox-state-meta") {
+                                selected["codex/sandbox-state-meta"] = state.clone();
+                            }
+                            (candidate.call_id().to_owned(), selected)
+                        }
+                        HostKind::Claude => {
+                            // Real Claude Code 2.1.267 MCP `_meta` carries only this call identity
+                            // plus unrelated progress metadata; actor and sandbox values never do.
+                            let call_id = parse_claude_call_id(&context.meta).ok()?;
+                            let selected = json!({"claudecode/toolUseId":call_id});
+                            (call_id, selected)
+                        }
+                    };
                     let mut host = TrustedTransport::from_host_ingress(
                         context.id.to_string(),
-                        candidate.call_id(),
+                        call_id,
                         attachment.clone(),
                     )?;
-                    let mut selected = json!({"threadId":candidate.actor_id(),"callId":candidate.call_id(),"x-codex-turn-metadata":{}});
-                    if let Some(state) = context.meta.get("codex/sandbox-state-meta") {
-                        selected["codex/sandbox-state-meta"] = state.clone();
+                    if serde_json::to_vec(&selected).ok()?.len() > MAX_HOOK_BYTES {
+                        return None;
                     }
-                    if serde_json::to_vec(&selected).ok()?.len() > MAX_HOOK_BYTES { return None; }
                     host.host_meta = Some(selected);
 
                     Some(host)
