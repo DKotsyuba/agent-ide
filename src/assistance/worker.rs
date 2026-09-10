@@ -256,14 +256,17 @@ impl WorkerHandle {
                     return;
                 }
             };
-            let workspace = match DurableWorkspace::open(&store).await {
+            // Leaked once per boot: this owner and its worker task never exit before process shutdown,
+            // and a `'static` reference lets inspection service run in its own scheduled task (see `run`).
+            let store: &'static Store = Box::leak(Box::new(store));
+            let workspace = match DurableWorkspace::open(store).await {
                 Ok(owner) => owner,
                 Err(_) => {
                     let _ = ready.send(Err(FailureCode::WorkspaceActivation));
                     return;
                 }
             };
-            let observations = WorkspaceStore::new(&store);
+            let observations = WorkspaceStore::new(store);
             if !matches!(
                 observations.install_schema().await,
                 Ok(MigrationAdmission::Applied { .. } | MigrationAdmission::AlreadyApplied { .. })
@@ -553,9 +556,19 @@ struct Worker<'a> {
     /// Exact provider/backend/view ownership and generations.
     providers: providers::Providers,
 }
-impl Worker<'_> {
-    /// Processes one slow operation at a time while servicing short same-worker inspections.
-    async fn run(mut self, mut inspections: mpsc::Receiver<Inspection>) {
+impl<'a> Worker<'a> {
+    /// Processes one slow operation at a time; inspections run on an independently scheduled task
+    /// (see `inspection_loop`) so a non-yielding poll of the current operation cannot starve `ide.inspect`.
+    async fn run(mut self, inspections: mpsc::Receiver<Inspection>)
+    where
+        'a: 'static,
+    {
+        let inspector = tokio::spawn(inspection_loop(
+            self.workspace.clone(),
+            self.shared.clone(),
+            inspections,
+        ));
+        let _inspector = AbortOnDrop(inspector);
         loop {
             let shared = self.shared.clone();
             let wake = shared.notify.notified();
@@ -564,15 +577,9 @@ impl Worker<'_> {
                 .lock()
                 .ok()
                 .and_then(|mut ledger| ledger.queue.pop_front());
-            if let Some(job) = job {
-                let workspace = self.workspace.clone();
-                let service = self.perform(job);
-                tokio::pin!(service);
-                loop {
-                    tokio::select! {_= &mut service=>break,Some(request)=inspections.recv()=>serve_inspection(&workspace,&shared,request).await}
-                }
-            } else {
-                tokio::select! {_=wake=>{},Some(request)=inspections.recv()=>serve_inspection(&self.workspace,&shared,request).await}
+            match job {
+                Some(job) => self.perform(job).await,
+                None => wake.await,
             }
         }
     }
@@ -1149,6 +1156,28 @@ impl Worker<'_> {
             None,
             None,
         ))
+    }
+}
+
+/// Aborts the independently scheduled inspection task if the owning worker task exits or panics,
+/// so no detached inspector can outlive the worker it was coupled to.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    /// Aborts the held inspection task; runs on scope exit, unwind, or the outer worker task's own abort.
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Services queued inspections on its own schedule, decoupled from the worker's job loop, so a
+/// synchronous, non-yielding job poll cannot delay a pending `ide.inspect` reply.
+async fn inspection_loop(
+    workspace: DurableWorkspace<'static>,
+    shared: Arc<Shared>,
+    mut inspections: mpsc::Receiver<Inspection>,
+) {
+    while let Some(request) = inspections.recv().await {
+        serve_inspection(&workspace, &shared, request).await;
     }
 }
 
