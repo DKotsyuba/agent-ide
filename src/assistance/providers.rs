@@ -706,7 +706,7 @@ impl Worker<'_> {
     /// binding's view and backend accounting are gone either way, and losing the failure signal would
     /// let a caller believe cleanup fully succeeded when it did not. Once the backend is removed from
     /// `providers.go`, its captured socket (if any) gets exactly one disposition on every remaining
-    /// exit from this function, including a `stop`/`complete_reap` failure: `dispose_backend_socket`
+    /// exit from this function, including a `stop`/`complete_reap` failure: `Providers::dispose_socket`
     /// runs unconditionally before any such early return.
     pub(super) async fn close_provider(&mut self, binding: &BindingRef) -> Result<(), FailureCode> {
         let Some(view) = self.providers.go_views.remove(binding) else {
