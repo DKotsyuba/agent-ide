@@ -745,6 +745,28 @@ impl Worker<'_> {
 /// `socket_generation` so the next spawn for `view_backend` cannot adopt a stale path. This is the
 /// sole production route `close_provider` uses for its `BackendRelease::ReapOwned` case; a `stop` or
 /// `complete_reap` failure still records `uncertain` and still disposes the socket before returning.
+///
+/// `providers` supplies `dispose_socket` and the `registry` that completes the reap, and is mutated
+/// in place; `admission` is the physical-effect controller `complete_reap` releases the settled
+/// reservation into. `uncertain` receives `binding` on every error exit — physical/registry
+/// completion could not be proven, so the caller (`close_provider`) must not report success even
+/// though the view/backend accounting is already gone either way. `binding` identifies the actor
+/// solely for that uncertainty bookkeeping; it plays no role in `backend`'s own identity. `view_backend`
+/// is the backend compatibility key already removed from `providers.go`, used only to key
+/// `socket_generation`. `backend` is consumed: its `shared` listener is stopped and its `socket` (if
+/// captured) is disposed. `capability` is the one-time `BackendReapCapability` obtained from the
+/// `registry.release` call that produced `BackendRelease::ReapOwned`; it is consumed by
+/// `complete_reap` regardless of whether that call succeeds.
+///
+/// Returns `Ok(())` only when `stop` and `complete_reap` both succeed and the socket disposition
+/// proves a clean removal (or no socket was ever captured is not itself an error here — capture
+/// failures are handled by the caller before this backend is ever reaped). Returns
+/// `Err(FailureCode::Deadline)` when `stop` itself fails (the listener could not be confirmed
+/// terminated within its bounded grace/output deadlines, e.g. a forwarder view left open). Returns
+/// `Err(FailureCode::Internal)` when `stop` succeeds but either `complete_reap` rejects the
+/// settlement (a capability/proof mismatch) or the socket disposition could not prove removal; both
+/// conditions still run to completion (the socket is always disposed, `complete_reap` is always
+/// attempted once `stop` succeeds) before the error is returned.
 async fn reap_owned_backend(
     providers: &mut Providers,
     admission: &mut crate::execution::AdmissionController,
@@ -869,6 +891,7 @@ mod tests {
     use serde_json::json;
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
     /// Builds one accepted no-op `BindingRef` for uncertainty bookkeeping only; no daemon involved.
     fn test_binding(label: &str) -> BindingRef {
@@ -933,6 +956,23 @@ mod tests {
 
     /// Spawns one real owned `/usr/bin/true` gopls listener and returns it with the registry view lease
     /// that made this worker its sole owner, plus a real owned socket identity at `socket`.
+    ///
+    /// `providers` and `admission` are mutated in place to register the granted view, take its spawn
+    /// lease and account the started process; both must outlive the returned values, since releasing
+    /// the view or completing its reap later requires the same `providers.registry`/`admission` pair.
+    /// `label` seeds the owner id, execution-request binding, and (via `test-{label}` trust) the
+    /// `GoplsProfile` compatibility key, so two calls with different labels never collide on the same
+    /// backend. `socket` is the path a real file is written to and then captured as this backend's
+    /// `OwnedProviderSocket` identity; the real `/usr/bin/true` listener process itself never creates
+    /// a socket file there.
+    ///
+    /// Returns, in order: the `GoBackend` (owning the started `SharedGopls` listener and the captured
+    /// socket identity, not yet registered in `providers.go`); the `WorkspaceAuthority` and matching
+    /// `WorktreeRef` used to admit the view (needed to build a forwarder request or `open_view` call
+    /// against the same backend); the `ProviderViewLease` granted for this backend, still live in the
+    /// registry (the caller must `release` it to obtain a `BackendReapCapability`, or use it to admit
+    /// a forwarder); and the `GoplsProfile` used to start it, needed to build a matching
+    /// `forwarder_command` against the same compatibility key and socket path.
     fn spawn_owned_backend(
         providers: &mut Providers,
         admission: &mut AdmissionController,
@@ -1056,7 +1096,7 @@ mod tests {
             .take_forwarder_spawn_lease(&mut admission, view, &forwarder_request, slot)
             .unwrap();
         // Left open: never released, so `backend.shared.views` stays non-empty for `stop()`.
-        let _open_view = backend
+        let open_view = backend
             .shared
             .open_view(
                 tree.clone(),
@@ -1102,6 +1142,14 @@ mod tests {
             None,
             "a proven removal must not force the next spawn onto a new generation"
         );
+
+        // Give the auxiliary forwarder child positive settlement: reap its real process and complete
+        // its registry reservation, instead of letting `open_view` drop it with no reap evidence.
+        let reaped_forwarder = open_view.child.reap(Duration::from_secs(1)).await.unwrap();
+        providers
+            .registry
+            .complete_forwarder_reap(&mut admission, reaped_forwarder.proof)
+            .unwrap();
     }
 
     /// Forces `complete_reap` to fail by pairing a real, successfully stopped listener's settlement proof
@@ -1191,8 +1239,17 @@ mod tests {
             "a proven removal must not force the next spawn onto a new generation"
         );
 
-        // Clean up backend b's still-owned listener so the test leaves no live child behind.
-        drop(backend_b);
+        // `capability_b` was deliberately spent above against backend a's settlement proof, so
+        // backend b's own registry admission can never be completed; a registry-only capability for
+        // an unstarted backend cannot substitute here because `complete_reap` validates the exact
+        // spawned process identity, not just a backend key. Still reap its real process directly
+        // through `SharedGopls::stop` (positive evidence a live child is not left behind), rather than
+        // relying on `Drop` to do it.
+        backend_b
+            .shared
+            .stop(Duration::from_millis(100), Duration::from_millis(500))
+            .await
+            .unwrap();
         let _ = std::fs::remove_file(&socket_b);
     }
 
