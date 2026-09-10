@@ -190,8 +190,10 @@ as unknown. Exact activation retries reuse committed facts.
 
 Source context reads one registered relative path under current sandbox and durable authority.
 Optional accepted Go/Rust profiles supply semantic results over those exact bytes; absent or
-unavailable providers return explicit lexical context. Compatible Go worktrees share one
-accounted listener with separate protocol forwarders; Rust uses an exclusive session.
+unavailable providers return explicit lexical context. Go worktrees whose canonical
+effective-rights identity matches share one accounted listener, one shared native cache namespace
+and separate protocol forwarders, while each keeps its own private per-view Go build/module/temp
+namespace; Rust uses an exclusive session.
 Semantic replies include only bounded diagnostics from the same Session when source binding,
 provider generation, and positive document version all match the returned context. Push feedback
 is labelled provisional. One nonempty current delta per binding is retained. A later native post
@@ -218,7 +220,9 @@ their distinct scope and therefore report the baseline as not captured rather th
 `ide.stop` revokes only the exact binding, cancels pending work and reaps its owned provider
 processes before success. A shared listener survives another active Go view. Stop is not a
 worktree closure or cache-retirement fact: configured provider cache namespaces are quiesced and
-retained under canonical worktree/incarnation identity for a compatible successor. Only the
+retained under canonical nonce-bound worktree identity and incarnation for a compatible successor.
+A shared native namespace is reference-counted and quiesces only after the last sharing worktree
+stops; gopls may evict its contents independently, which costs recomputation, not IDE-owned state. Only the
 existing verified Workspace closure or explicit reset fact may retire the retained namespace.
 Restart discards bindings and detail references;
 new activation uses a boot-specific channel identity and the durable native-identity fence.

@@ -337,6 +337,10 @@ impl CacheIdentity {
 pub struct CacheLifecycle {
     /// Compatibility inputs that deliberately omit user/session/authority values.
     identity: CacheIdentity,
+    /// Canonical nonce-bound worktree identity that owns this namespace. The incarnation alone is
+    /// Store-local and repeats across databases, so the exact `WorktreeRef::id()` is recorded
+    /// beside it and both must match a verified closure before anything is deleted.
+    worktree: String,
     /// Canonical worktree incarnation that owns this namespace; only its exact verified closure
     /// may retire it, so a closure of any other durable lifecycle generation is refused.
     incarnation: u64,
@@ -351,9 +355,10 @@ pub struct CacheLifecycle {
 impl CacheLifecycle {
     /// Retains an opaque namespace for one compatible cache identity; this does not create a provider process.
     ///
-    /// `worktree` is the canonical durable worktree whose incarnation owns the namespace; it is
-    /// recorded so retirement can demand that exact incarnation's verified closure. Returns the
-    /// Application error when the private directory cannot be created or validated.
+    /// `worktree` is the canonical durable worktree that owns the namespace; both its nonce-bound
+    /// identity and its incarnation are recorded so retirement can demand that exact worktree's
+    /// verified closure. Returns the Application error when the private directory cannot be created
+    /// or validated.
     pub fn retain(
         root: &CacheRoot,
         namespace: CacheNamespaceId,
@@ -362,6 +367,7 @@ impl CacheLifecycle {
     ) -> Result<Self, crate::app::AppError> {
         Ok(Self {
             identity,
+            worktree: worktree.id().to_owned(),
             incarnation: worktree.incarnation(),
             namespace: Some(root.retain(namespace)?),
             quiescent: false,
@@ -390,6 +396,14 @@ impl CacheLifecycle {
 
     /// Reuses this namespace only for a compatible incoming identity after the old view quiesced.
     pub fn handoff(&mut self, incoming: &CacheIdentity) -> bool {
+        self.handoff_allowed(incoming)
+    }
+
+    /// Returns whether a handoff to `incoming` would be accepted, without claiming one happened.
+    ///
+    /// Retention bookkeeping is decided before any namespace is created, so the caller needs this
+    /// answer while it still only holds a shared borrow of the lifecycle map.
+    pub fn handoff_allowed(&self, incoming: &CacheIdentity) -> bool {
         self.quiescent
             && self.namespace.is_some()
             && !self.retirement_failed
@@ -398,8 +412,9 @@ impl CacheLifecycle {
 
     /// Retires the namespace only for the exact canonical worktree incarnation Workspace closed.
     ///
-    /// `closure` is Workspace's private-field closure receipt; it cannot be forged, and its
-    /// incarnation must equal the one recorded at `retain`, so a closure of a different worktree
+    /// `closure` is Workspace's private-field closure receipt; it cannot be forged, and both its
+    /// nonce-bound worktree identity and its incarnation must equal the ones recorded at `retain`,
+    /// so a closure of a different worktree, of the same incarnation number in a different Store,
     /// or of a reopened later incarnation deletes nothing. Refuses while any view still uses this
     /// lifecycle: retirement must follow admission revocation and provider quiescence, never race
     /// an active owner. There is no reset spelling; an unsupported reset path stays unavailable
@@ -417,10 +432,10 @@ impl CacheLifecycle {
             )
             .into());
         }
-        if closure.incarnation() != self.incarnation {
+        if closure.worktree() != self.worktree || closure.incarnation() != self.incarnation {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "verified closure does not match the worktree incarnation owning this namespace",
+                "verified closure does not match the canonical worktree owning this namespace",
             )
             .into());
         }

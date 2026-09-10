@@ -36,6 +36,21 @@ fn observation(text: &str, sequence: u64) -> SourceObservation {
 }
 
 /// Checks raw URI encoding, Unicode coordinate units, invalid offsets, exact bytes, and lexical limits.
+/// Builds the accepted gopls settings with one absolute private per-worktree Go namespace.
+///
+/// The session always carries a worktree-owned `GoEnv`: the shared listener never receives these
+/// as process environment, so a session without them could only inherit another worktree's cache.
+fn gopls_settings() -> ProviderSettings {
+    ProviderSettings::GoplsDefaults(
+        crate::intelligence::session::GoEnv::new(
+            std::path::PathBuf::from("/private/tmp/agent-ide-session-cache/go-build"),
+            std::path::PathBuf::from("/private/tmp/agent-ide-session-cache/go-mod"),
+            std::path::PathBuf::from("/private/tmp/agent-ide-session-cache/tmp"),
+        )
+        .expect("absolute private go namespace"),
+    )
+}
+
 #[test]
 fn exact_lexical_context_and_positions() {
     let text = "// 🦀\nfunc Hello() { Hello() }\n";
@@ -93,7 +108,7 @@ fn diagnostic_state() -> Arc<Mutex<State>> {
         active: true,
         terminal: false,
         shutdown_complete: false,
-        settings: ProviderSettings::GoplsDefaults,
+        settings: gopls_settings(),
         readiness: watch::channel(UNKNOWN_READINESS).0,
         document: Some(Document {
             uri: context::observation_uri(&observed).unwrap(),
@@ -215,7 +230,16 @@ async fn request_timeout_retires_generation_and_late_results() {
                         })
                         .await
                         .unwrap();
-                    assert_eq!(settings, vec![serde_json::Value::Null]);
+                    // The gopls view is configured with this session's own private per-worktree
+                    // Go namespace; the shared listener never carries it as process environment.
+                    assert_eq!(
+                        settings,
+                        vec![serde_json::json!({"env":{
+                            "GOCACHE":"/private/tmp/agent-ide-session-cache/go-build",
+                            "GOMODCACHE":"/private/tmp/agent-ide-session-cache/go-mod",
+                            "GOTMPDIR":"/private/tmp/agent-ide-session-cache/tmp",
+                        }})]
+                    );
                     Ok(lsp::InitializeResult {
                         capabilities: lsp::ServerCapabilities {
                             text_document_sync: Some(lsp::TextDocumentSyncCapability::Kind(
@@ -244,7 +268,7 @@ async fn request_timeout_retires_generation_and_late_results() {
                 backend: 7,
                 ..Default::default()
             },
-            ProviderSettings::GoplsDefaults,
+            gopls_settings(),
             SessionOptions {
                 request_timeout: Duration::from_millis(50),
                 lifetime: Duration::from_secs(2),
@@ -298,7 +322,7 @@ async fn eof_never_becomes_provider_readiness() {
         tree(),
         1,
         ViewGeneration::default(),
-        ProviderSettings::GoplsDefaults,
+        gopls_settings(),
         SessionOptions::default(),
         |_| async { panic!("EOF must not initialize") },
     )
@@ -355,14 +379,7 @@ fn managed_rust_settings_disable_proc_macro_expansion() {
 #[tokio::test]
 async fn closed_settings_and_rust_status_barrier_match_the_actual_provider() {
     for (settings, name, version, health, quiescent, success) in [
-        (
-            ProviderSettings::GoplsDefaults,
-            "gopls",
-            "test",
-            "ok",
-            true,
-            true,
-        ),
+        (gopls_settings(), "gopls", "test", "ok", true, true),
         (
             rust_settings(),
             "rust-analyzer",
@@ -396,7 +413,7 @@ async fn closed_settings_and_rust_status_barrier_match_the_actual_provider() {
             false,
         ),
         (
-            ProviderSettings::GoplsDefaults,
+            gopls_settings(),
             "rust-analyzer",
             "contract-1",
             "ok",
@@ -601,7 +618,7 @@ async fn post_initialize_transport_failures_are_not_swallowed() {
             tree(),
             1,
             ViewGeneration::default(),
-            ProviderSettings::GoplsDefaults,
+            gopls_settings(),
             SessionOptions {
                 request_timeout: Duration::from_millis(100),
                 lifetime: Duration::from_secs(1),
@@ -673,7 +690,7 @@ async fn post_initialize_output_error_is_propagated() {
         tree(),
         1,
         ViewGeneration::default(),
-        ProviderSettings::GoplsDefaults,
+        gopls_settings(),
         SessionOptions {
             request_timeout: Duration::from_millis(100),
             lifetime: Duration::from_secs(1),
@@ -711,7 +728,7 @@ async fn outbound_budget_retires_full_document_flood_before_unbounded_queueing()
         tree(),
         1,
         ViewGeneration::default(),
-        ProviderSettings::GoplsDefaults,
+        gopls_settings(),
         SessionOptions {
             request_timeout: Duration::from_millis(100),
             lifetime: Duration::from_millis(400),
@@ -738,4 +755,25 @@ async fn outbound_budget_retires_full_document_flood_before_unbounded_queueing()
         result.is_err(),
         "blocked output requires bounded transport failure"
     );
+}
+
+/// A per-worktree Go namespace must be an absolute normal path or the session refuses to exist.
+///
+/// The provider process resolves a relative value against its own cwd, so accepting one would let
+/// worktree-owned build state escape the private namespace this session is accounted for.
+#[test]
+fn go_env_rejects_paths_that_could_escape_the_private_namespace() {
+    use crate::intelligence::session::GoEnv;
+    let good = |name: &str| std::path::PathBuf::from("/private/tmp/agent-ide-go-env").join(name);
+    assert!(GoEnv::new(good("go-build"), good("go-mod"), good("tmp")).is_some());
+    for bad in [
+        std::path::PathBuf::new(),
+        std::path::PathBuf::from("relative/go-build"),
+        std::path::PathBuf::from("/private/tmp/../escape"),
+    ] {
+        assert!(
+            GoEnv::new(bad.clone(), good("go-mod"), good("tmp")).is_none(),
+            "{bad:?} must be refused"
+        );
+    }
 }

@@ -103,6 +103,11 @@ impl StartReceipt {
     pub fn worktree(&self) -> &WorktreeRef {
         &self.worktree
     }
+    /// Returns the host-validated actor this receipt was committed for, for crate-internal
+    /// reconciliation of a pending revoke against a fresh start by the same actor.
+    pub(crate) fn actor(&self) -> &str {
+        &self.actor
+    }
     /// Returns the stable activation operation identifier.
     pub fn operation(&self) -> &str {
         &self.operation
@@ -118,6 +123,9 @@ impl StartReceipt {
 pub struct VerifiedWorktreeClosure {
     /// Exact stable operation that committed closure.
     operation: OperationId,
+    /// Canonical nonce-bound identity of the worktree this closure retired. It is carried beside
+    /// the incarnation because the incarnation counter is Store-local and repeats across databases.
+    worktree: String,
     /// Retired durable lifecycle generation.
     incarnation: u64,
 }
@@ -125,6 +133,10 @@ impl VerifiedWorktreeClosure {
     /// Returns the historical close operation for reconciliation.
     pub fn operation(&self) -> &OperationId {
         &self.operation
+    }
+    /// Returns the canonical nonce-bound identity of the worktree this closure retired.
+    pub fn worktree(&self) -> &str {
+        &self.worktree
     }
     /// Returns the closed incarnation without granting access to a reopened directory.
     pub const fn incarnation(&self) -> u64 {
@@ -344,6 +356,7 @@ impl<'a> DurableWorkspace<'a> {
         }
         Ok(VerifiedWorktreeClosure {
             operation: id,
+            worktree: tree.id().to_owned(),
             incarnation: tree.incarnation(),
         })
     }

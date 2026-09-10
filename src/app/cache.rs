@@ -33,6 +33,14 @@ impl CacheRoot {
         })
     }
 
+    /// Returns whether this namespace already exists under the root, without creating anything.
+    ///
+    /// Callers use it to distinguish a namespace they are about to create from one that was
+    /// already retained, so a failed operation can roll back only its own new directories.
+    pub fn contains(&self, namespace: &CacheNamespaceId) -> bool {
+        fs::symlink_metadata(self.root.join(namespace.as_str())).is_ok()
+    }
+
     /// Creates or reopens one private opaque namespace supplied by the owning peer domain.
     pub fn retain(&self, namespace: CacheNamespaceId) -> Result<CacheNamespace, AppError> {
         let path = self.root.join(namespace.as_str());
@@ -117,6 +125,22 @@ impl CacheNamespace {
         validate_private_directory(&self.path, &metadata)?;
         fs::remove_dir_all(&self.path)?;
         Ok(())
+    }
+}
+
+/// Removes one private directory only while it is still empty, reporting whether it is now gone.
+///
+/// This is deliberately not a retirement: it carries no verified-closure fact and therefore may
+/// only be used on a directory the caller itself just created. `remove_dir` refuses a non-empty
+/// directory, so any content another owner wrote concurrently stops the removal instead of being
+/// destroyed, and the same private-directory validation as every other path in this module rejects
+/// a symlinked or foreign-owned target. An already-absent directory reports success.
+pub fn discard_empty_namespace_directory(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            validate_private_directory(path, &metadata).is_ok() && fs::remove_dir(path).is_ok()
+        }
+        Err(error) => error.kind() == io::ErrorKind::NotFound,
     }
 }
 
