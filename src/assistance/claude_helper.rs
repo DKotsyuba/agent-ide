@@ -356,7 +356,9 @@ async fn execute(
 /// not be reaped is reported as unreaped so the daemon can refuse to call the operation settled.
 /// This function interprets no discovery output; canonical interpretation stays with the daemon.
 async fn perform(job: &HelperJob) -> (HelperOutcome, ChildSettlement, Vec<DiscoveryFrame>) {
-    use crate::execution::{GitDiscoveryQuery, inherited_git_arguments, run_inherited_child};
+    use crate::execution::{
+        GitDiscoveryQuery, InheritedChildFailure, inherited_git_arguments, run_inherited_child,
+    };
     let mut spawned = 0;
     let mut reaped = 0;
     let mut discovery = Vec::new();
@@ -399,15 +401,23 @@ async fn perform(job: &HelperJob) -> (HelperOutcome, ChildSettlement, Vec<Discov
                     truncated: child.truncated,
                 });
             }
-            Err(settled) => {
-                // A child that never started was never a child; anything else stays unreaped.
-                if settled {
-                    spawned -= 1;
-                }
+            Err(failure) => {
+                // Each case charges child accounting differently: a child that never started was
+                // never a child, a positively killed-and-reaped child is settled but failed, and an
+                // unprovable cleanup stays unreaped so the daemon refuses to call this complete.
+                let code = match failure {
+                    InheritedChildFailure::NeverStarted => {
+                        spawned -= 1;
+                        FailureCode::SourceUnavailable
+                    }
+                    InheritedChildFailure::Reaped => {
+                        reaped += 1;
+                        FailureCode::Deadline
+                    }
+                    InheritedChildFailure::Unsettled => FailureCode::Deadline,
+                };
                 return (
-                    HelperOutcome::Failed {
-                        code: FailureCode::SourceUnavailable,
-                    },
+                    HelperOutcome::Failed { code },
                     ChildSettlement { spawned, reaped },
                     discovery,
                 );

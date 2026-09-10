@@ -43,6 +43,13 @@ const HELPER_SUBCOMMAND: &str = "claude-worker";
 /// The daemon never inspects, guesses or mutates live host settings. An operator states the
 /// closed facts below in launcher configuration; an absent or mismatched profile leaves the
 /// Claude execution path unavailable rather than silently degrading to unrestricted execution.
+///
+/// Every field is an **operator assertion**, not a measurement. The daemon does not observe the
+/// containment a helper or its children actually run under, and neither the ticket nor the private
+/// claim socket attests it: correlation and replay exclusion are all they establish. Accordingly no
+/// part of this path may report that the daemon observed inherited containment. Local controlled
+/// process fixtures likewise prove wiring and settlement only; real host containment acceptance is
+/// a separate live exercise against a real Claude host and is never implied by a passing fixture.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClaudeOperatorProfile {
@@ -392,10 +399,16 @@ impl HelperResult {
         {
             return Err(FailureCode::ExecutionProfile);
         }
-        if let HelperOutcome::Complete { text } = &self.outcome
-            && text.len() > MAX_RESULT_TEXT_BYTES
-        {
-            return Err(FailureCode::Capacity);
+        if let HelperOutcome::Complete { text } = &self.outcome {
+            if text.len() > MAX_RESULT_TEXT_BYTES {
+                return Err(FailureCode::Capacity);
+            }
+            // Positive settlement is a precondition of any completed result, not a later report.
+            // Without it a helper claiming spawned=3/reaped=0 would still deliver a success, so the
+            // frame is refused here, before it can change any daemon state.
+            if !self.children.settled() {
+                return Err(FailureCode::Deadline);
+            }
         }
         if self.discovery.len() > 3 {
             return Err(FailureCode::Capacity);
@@ -772,11 +785,19 @@ impl LaunchLedger {
         };
         match &ticket.state {
             TicketState::Uncertain => Delivery::Failed(FailureCode::Deadline),
+            // Delivery re-checks settlement rather than trusting that the frame was validated on
+            // the way in: a completed result requires exact settled child accounting *and* the
+            // final frame *and* the matching successful post, in either order.
             TicketState::Claimed {
                 frame: Some(frame),
                 post: Some(true),
                 ..
-            } => Delivery::Ready(Box::new(frame.clone())),
+            } if frame.children.settled() => Delivery::Ready(Box::new(frame.clone())),
+            TicketState::Claimed {
+                frame: Some(_),
+                post: Some(true),
+                ..
+            } => Delivery::Failed(FailureCode::Deadline),
             TicketState::Claimed {
                 post: Some(false), ..
             } => Delivery::Failed(FailureCode::Cancelled),
@@ -807,12 +828,32 @@ impl LaunchLedger {
         });
     }
 
-    /// Drops every ticket fenced to one revoked binding generation.
+    /// Retires unclaimed work and quarantines claimed work for one revoked binding generation.
     ///
-    /// Stop revokes first; a ticket for a revoked generation can no longer be claimed, so a late
-    /// helper is rejected rather than being allowed to run against stale authority.
+    /// Stop revokes durable authority first; a ticket for a revoked generation can no longer be
+    /// claimed, so a late helper is rejected rather than being allowed to run against stale
+    /// authority. Only work that provably never ran is retired: a `Minted` or `Launched` ticket had
+    /// no claim, so nothing physical exists to settle and dropping it has no effect.
+    ///
+    /// Claimed work is *not* deleted. A claimed, disconnected, expired or unsettled ticket becomes
+    /// [`TicketState::Uncertain`] and is retained, so its admission stays quarantined and it can
+    /// accept only cleanup settlement after revocation. It can never regain authority, because
+    /// [`Self::claim`] admits `Launched` alone. Deleting these tickets was what previously let a
+    /// vanished ticket be read as successful cleanup; disappearance is now never that evidence.
     pub fn revoke(&mut self, binding: [u8; 32]) {
-        self.tickets.retain(|_, ticket| ticket.binding != binding);
+        self.tickets.retain(|_, ticket| {
+            if ticket.binding != binding {
+                return true;
+            }
+            match ticket.state {
+                TicketState::Minted | TicketState::Launched { .. } => false,
+                TicketState::Claimed { .. } => {
+                    ticket.state = TicketState::Uncertain;
+                    true
+                }
+                TicketState::Uncertain => true,
+            }
+        });
     }
 
     /// Returns whether one handle exists and belongs to the supplied binding generation.
@@ -1204,6 +1245,99 @@ mod tests {
             discovery: Vec::new(),
         };
         assert_eq!(forged.validate(), Err(FailureCode::ExecutionProfile));
+    }
+
+    /// Builds one claimed ticket, returning the ledger and its handle, for settlement assertions.
+    ///
+    /// The sequence is the real one: mint, recognize the exact native launch, then claim once.
+    fn claimed() -> (LaunchLedger, String) {
+        let (mut ledger, reference, actor) = ledger();
+        let command = LaunchLedger::helper_command(
+            std::path::Path::new("/usr/local/bin/agent-ide"),
+            std::path::Path::new("/private/tmp/rt"),
+            "attach",
+            "detail-1",
+        );
+        assert_eq!(
+            ledger.recognize(&command, false, "call", &actor, 0),
+            LaunchRecognition::Recognized
+        );
+        assert!(matches!(
+            ledger.claim(&reference, [7; 32], "channel", 0),
+            ClaimOutcome::Granted(_)
+        ));
+        (ledger, reference)
+    }
+
+    /// Renders one complete helper frame with the exact child accounting under test.
+    fn completed(spawned: u32, reaped: u32) -> HelperResult {
+        HelperResult {
+            protocol: HELPER_PROTOCOL,
+            detail_ref: "detail-1".into(),
+            outcome: HelperOutcome::Complete {
+                text: "discovery observed".into(),
+            },
+            children: ChildSettlement { spawned, reaped },
+            discovery: Vec::new(),
+        }
+    }
+
+    /// A completed result requires exact settled child accounting, not a self-reported success.
+    ///
+    /// The previously accepted `spawned=3/reaped=0` frame is refused at validation, so it never
+    /// reaches daemon state, and delivery independently refuses to publish an unsettled frame even
+    /// when the matching successful post has arrived.
+    #[test]
+    fn completed_result_requires_exact_positive_child_settlement() {
+        assert_eq!(completed(3, 0).validate(), Err(FailureCode::Deadline));
+        assert_eq!(completed(3, 2).validate(), Err(FailureCode::Deadline));
+        assert_eq!(completed(3, 3).validate(), Ok(()));
+
+        let (mut ledger, reference) = claimed();
+        assert_eq!(
+            ledger.settle_frame(completed(3, 0)),
+            Err(FailureCode::Deadline)
+        );
+        assert_eq!(ledger.settle_post("call", true), Ok(()));
+        // The refused frame changed nothing, so the operation is still awaiting its evidence.
+        assert_eq!(ledger.delivery(&reference), Delivery::Waiting);
+        assert_eq!(ledger.settle_frame(completed(2, 2)), Ok(()));
+        assert!(matches!(
+            ledger.delivery(&reference),
+            Delivery::Ready(frame) if frame.children.settled()
+        ));
+    }
+
+    /// Revocation retires only work that provably never ran and quarantines claimed work.
+    ///
+    /// A claimed ticket must survive revocation as uncertain: deleting it would let its
+    /// disappearance be read as successful cleanup, and it must never regain authority afterwards.
+    #[test]
+    fn revocation_quarantines_claimed_work_instead_of_deleting_it() {
+        let (mut ledger, reference) = claimed();
+        ledger.revoke([7; 32]);
+        assert!(
+            !ledger.is_empty(),
+            "claimed work must be retained for cleanup settlement after revocation"
+        );
+        // Retained, but never successful and never reclaimable.
+        assert_eq!(
+            ledger.delivery(&reference),
+            Delivery::Failed(FailureCode::Deadline)
+        );
+        assert_eq!(
+            ledger.claim(&reference, [7; 32], "channel", 0),
+            ClaimOutcome::Rejected(FailureCode::InvalidDetail)
+        );
+        // A late frame for revoked work cannot resurrect it into a completed result.
+        assert_eq!(
+            ledger.settle_frame(completed(1, 1)),
+            Err(FailureCode::InvalidDetail)
+        );
+        assert_eq!(
+            ledger.delivery(&reference),
+            Delivery::Failed(FailureCode::Deadline)
+        );
     }
 
     /// Both wire directions reject foreign revisions, unknown fields and over-budget frames.

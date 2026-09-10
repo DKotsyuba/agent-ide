@@ -223,11 +223,14 @@ impl ProductDispatcher {
         }
         match launches.delivery(detail_ref) {
             Delivery::Ready(result) => match result.outcome {
-                HelperOutcome::Complete { text } => PeerReply::Complete {
-                    kind: super::reply::ResultKind::Activation,
-                    text,
-                    detail_ref: Some(detail_ref.to_owned()),
-                    truncated: false,
+                // A settled helper frame is pre-authority *evidence*, never authority. Discovery
+                // observed under the host sandbox proves what Git reported; it does not resolve a
+                // durable worktree, mint a `StartReceipt`, retain a grant or activate any binding.
+                // Converting it straight into `ResultKind::Activation` published exactly that
+                // unearned claim. Until the settled evidence is routed through the Worker authority
+                // path, the honest answer is that durable Workspace activation has not happened.
+                HelperOutcome::Complete { .. } => PeerReply::Unavailable {
+                    reason: MissingPeer::WorkspaceActivation,
                 },
                 HelperOutcome::Failed { code } => PeerReply::Error { code },
             },

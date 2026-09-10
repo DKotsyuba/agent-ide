@@ -3702,30 +3702,49 @@ pub struct InheritedChildOutcome {
     pub truncated: bool,
 }
 
+/// Reports why one inherited-sandbox child produced no usable outcome, and what is known about its
+/// physical settlement.
+///
+/// The three cases are deliberately distinct because they charge child accounting differently. A
+/// child that never existed must not be counted as spawned; a child positively killed and reaped is
+/// a settled child that merely failed; a child whose cleanup could not be observed must keep the
+/// whole operation uncertain and quarantined.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InheritedChildFailure {
+    /// The child provably never started, so it was never a child to reap or to count as spawned.
+    NeverStarted,
+    /// The child outlived its deadline and was killed, and that kill *and* its wait were both
+    /// positively observed to succeed. The child is settled and reaped; only its work failed.
+    Reaped,
+    /// The child started but its physical cleanup could not be observed. The caller must report it
+    /// as unreaped; this is never equivalent to an ordinary failed execution.
+    Unsettled,
+}
+
 /// Runs one direct child that inherits its caller's existing sandbox, then reaps it.
 ///
-/// This is the minimum distinct boundary for a host that enforces its own sandbox on the calling
-/// process. It is deliberately separate from the managed Codex path: it takes no
+/// This is the minimum distinct boundary for a caller that is *itself already inside* the sandbox
+/// it intends the child to run under; containment here is inherited from that calling process and
+/// is asserted by the operator profile, never observed or attested by this function or by the
+/// daemon. It is deliberately separate from the managed Codex path: it takes no
 /// `ObservedSandboxState`, mints no permit, consumes no admission lease, and uses no wrapper
 /// executable, so no synthetic sandbox observation can ever reach Codex Execution through it.
-/// The caller must therefore already be inside the sandbox it intends the child to run under.
 ///
 /// `program` must be an accepted absolute executable and `args` a fixed argument vector; neither
 /// is ever derived from model input. Output is capped at `output_cap` bytes per the caller's
 /// budget and the child is killed and reaped if it outlives `deadline`.
 ///
-/// Returns `Err(true)` when the child provably never started (so it was never a child to reap),
-/// and `Err(false)` when it started but could not be settled — the caller must then report it as
-/// unreaped rather than assuming cleanup.
+/// On failure returns the exact [`InheritedChildFailure`] case, so the caller can distinguish a
+/// child that never existed, one positively reaped after a kill, and one whose cleanup is unproven.
 pub async fn run_inherited_child(
     program: &Path,
     args: Vec<OsString>,
     cwd: &Path,
     output_cap: usize,
     deadline: std::time::Duration,
-) -> Result<InheritedChildOutcome, bool> {
+) -> Result<InheritedChildOutcome, InheritedChildFailure> {
     if !is_normal_absolute(program) || output_cap == 0 {
-        return Err(true);
+        return Err(InheritedChildFailure::NeverStarted);
     }
     let mut command = tokio::process::Command::new(program);
     command
@@ -3736,10 +3755,17 @@ pub async fn run_inherited_child(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    let mut child = command.spawn().map_err(|_| true)?;
+    let mut child = command
+        .spawn()
+        .map_err(|_| InheritedChildFailure::NeverStarted)?;
     let Some(mut stdout) = child.stdout.take() else {
-        let _ = child.kill().await;
-        return Err(false);
+        // The child exists, so its settlement must be positively observed like any other kill path.
+        return Err(
+            match child.kill().await.is_ok() && child.wait().await.is_ok() {
+                true => InheritedChildFailure::Reaped,
+                false => InheritedChildFailure::Unsettled,
+            },
+        );
     };
     let capture = async {
         let mut buffer = Vec::new();
@@ -3763,12 +3789,15 @@ pub async fn run_inherited_child(
                 truncated,
             })
         }
-        // Started but unsettled: kill, then only claim settlement if the reap actually succeeded.
-        _ => {
-            let killed = child.kill().await.is_ok() && child.wait().await.is_ok();
-            let _ = killed;
-            Err(false)
-        }
+        // Started but unsettled: kill, then claim settlement only where the reap actually succeeded.
+        // A positively observed kill+wait is a real reap and is recorded as such; anything less
+        // stays uncertain, which is a stronger condition than an ordinary failed execution.
+        _ => Err(
+            match child.kill().await.is_ok() && child.wait().await.is_ok() {
+                true => InheritedChildFailure::Reaped,
+                false => InheritedChildFailure::Unsettled,
+            },
+        ),
     }
 }
 
