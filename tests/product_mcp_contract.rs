@@ -1341,16 +1341,19 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
         match mode {
             "head" => {
                 assert!(text.contains("-base") && text.contains("+worktree"));
-                assert!(text.contains("session_baseline: Unverified"));
+                assert!(text.contains("baseline_window: Some(Unverified)"), "{text}");
                 diff_ref = diff["detail_ref"].as_str().unwrap().to_owned();
             }
             "staged" => {
                 assert!(text.contains("-base") && text.contains("+index"));
-                assert!(text.contains("session_baseline: NotCaptured"));
+                assert!(
+                    text.contains("baseline_window: Some(NotCaptured)"),
+                    "{text}"
+                );
             }
             _ => {
                 assert!(text.contains("-index") && text.contains("+worktree"));
-                assert!(text.contains("session_baseline: NotCaptured"));
+                assert!(text.contains("baseline_window: Some(NotCaptured)"));
             }
         }
     }
