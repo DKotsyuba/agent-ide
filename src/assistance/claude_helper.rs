@@ -170,10 +170,6 @@ async fn session(
         return;
     };
     let outcome = claim(&request, &ledger, live.as_ref());
-    let candidate = match &outcome {
-        ClaimReply::Granted(job) => job.candidate.clone(),
-        ClaimReply::Refused { .. } => PathBuf::new(),
-    };
     let granted = matches!(outcome, ClaimReply::Granted(_));
     let Ok(encoded) = serde_json::to_string(&outcome) else {
         return;
@@ -186,30 +182,13 @@ async fn session(
     let Ok(frame) = read_frame(&mut stream).await else {
         return;
     };
-    let Ok(mut result) = HelperResult::decode(&frame) else {
+    let Ok(result) = HelperResult::decode(&frame) else {
         return;
     };
-    // The helper reported bytes; the daemon derives the canonical identity from them here, so a
-    // stored result never contains a worktree identity the helper merely asserted. Reconstruction
-    // reads no source and starts no process.
-    if let HelperOutcome::Complete { text } = &result.outcome
-        && !result.discovery.is_empty()
-    {
-        result.outcome = match validated_worktree(&candidate, &result.detail_ref, &result.discovery)
-        {
-            Ok(worktree) => HelperOutcome::Complete {
-                text: format!(
-                    "{text}; canonical worktree {} (repository {}, common dir {}). \
-                     Workspace authority is not implied by discovery alone.",
-                    worktree.root().display(),
-                    worktree.repository_root().display(),
-                    worktree.common_dir().display(),
-                ),
-            },
-            // Discovery that cannot be validated is a closed failure, never a partial success.
-            Err(code) => HelperOutcome::Failed { code },
-        };
-    }
+    // Native and Git-administrative validation of these bytes belongs to the helper, which ran it
+    // before reporting `Complete`; the daemon deliberately does not repeat it here, because doing
+    // so would read Git administrative files daemon-side on the Claude route. What the daemon does
+    // with the bytes later is pure parsing plus its own durable directory identity checks.
     if let Ok(mut ledger) = ledger.lock() {
         let _ = ledger.settle_frame(result);
     }
@@ -260,6 +239,36 @@ pub fn validated_worktree(
     detail_ref: &str,
     frames: &[DiscoveryFrame],
 ) -> Result<crate::workspace::git::discovery::DiscoveredWorktree, FailureCode> {
+    let (operation, evidence) = discovery_evidence(detail_ref, frames)?;
+    crate::workspace::git::discovery::validate_discovery(candidate, &operation, &evidence).map_err(
+        |error| match error {
+            crate::workspace::git::GitError::UnsupportedDiscoveryGit => FailureCode::UnsupportedGit,
+            _ => FailureCode::WorkspaceActivation,
+        },
+    )
+}
+
+/// Rebuilds the closed Execution discovery evidence triple from a helper's raw reported bytes.
+///
+/// Every field the daemon did not observe itself is reconstructed conservatively: descendant
+/// evidence is [`DescendantEvidence::Unverified`], no duration is asserted, and the operation
+/// identity is derived from the daemon's own handle rather than from anything the helper sent. The
+/// evidence is built through [`GitDiscoveryEvidence::new`], its own validating constructor, so a
+/// malformed frame is refused before it can be interpreted.
+///
+/// Refuses a triple that is not exactly three frames, an over-bound frame, and any truncated
+/// stream: truncated discovery output cannot be completed later, so a prefix is never parsed.
+/// Performs no process, source or provider work.
+pub fn discovery_evidence(
+    detail_ref: &str,
+    frames: &[DiscoveryFrame],
+) -> Result<
+    (
+        crate::execution::DiscoveryOperationRef,
+        Vec<crate::execution::GitDiscoveryEvidence>,
+    ),
+    FailureCode,
+> {
     use crate::execution::{
         CapturedOutput, DescendantEvidence, DiscoveryOperationRef, GitDiscoveryEvidence,
         GitDiscoveryQuery,
@@ -303,12 +312,7 @@ pub fn validated_worktree(
             .map_err(|_| FailureCode::WorkspaceActivation)?,
         );
     }
-    crate::workspace::git::discovery::validate_discovery(candidate, &operation, &evidence).map_err(
-        |error| match error {
-            crate::workspace::git::GitError::UnsupportedDiscoveryGit => FailureCode::UnsupportedGit,
-            _ => FailureCode::WorkspaceActivation,
-        },
-    )
+    Ok((operation, evidence))
 }
 
 /// Runs one foreground helper operation and exits; every failure path is finite and silent.
@@ -457,12 +461,35 @@ async fn perform(job: &HelperJob) -> (HelperOutcome, ChildSettlement, Vec<Discov
             discovery,
         );
     }
-    let text = format!(
+    // The helper owns native and Git-administrative validation: it runs inside the host sandbox
+    // where reading those files is permitted, and it must not report `Complete` for evidence the
+    // canonical validator would reject. Discovery that cannot be validated is a closed failure,
+    // never a partial success.
+    let mut text = format!(
         "operation={:?}; {} of {} fixed Git queries observed under the inherited host sandbox",
         job.operation,
         reaped,
         queries.len()
     );
+    if job.operation == HelperOperation::Start {
+        match validated_worktree(&job.candidate, "helper", &discovery) {
+            Ok(worktree) => {
+                text = format!(
+                    "{text}; canonical worktree {} (common dir {}). \
+                     Workspace authority is not implied by discovery alone.",
+                    worktree.root().display(),
+                    worktree.common_dir().display(),
+                );
+            }
+            Err(code) => {
+                return (
+                    HelperOutcome::Failed { code },
+                    ChildSettlement { spawned, reaped },
+                    discovery,
+                );
+            }
+        }
+    }
     (
         HelperOutcome::Complete { text },
         ChildSettlement { spawned, reaped },
@@ -478,6 +505,7 @@ mod tests {
         LaunchRecognition,
     };
     use crate::assistance::host_binding::BindingRef;
+    use crate::assistance::reply::FailureCode;
 
     /// Returns the fixed binding generation every helper fixture in this module mints under.
     fn binding_fixture() -> BindingRef {
@@ -602,6 +630,100 @@ mod tests {
         };
         // Proves the child actually ran in the worktree rather than returning a fabricated root.
         assert!(text.contains(candidate.to_str().unwrap()));
+        drop(endpoint);
+        let _ = std::fs::remove_dir_all(&candidate);
+    }
+
+    /// The real helper process is the only thing that can mint a settled token for a real worktree.
+    ///
+    /// Integrated rather than a private ledger exercise: a real `Bash`-shaped foreground helper
+    /// claims over the real private socket, runs three real Git children against a real worktree,
+    /// reaps them and reports its own frame. Only after that, and after the matching successful
+    /// post, does a token exist. A copied frame, a replayed frame, a frame from a generation that
+    /// is not live, and revoked work all mint nothing.
+    #[tokio::test]
+    async fn only_a_real_settled_helper_process_mints_a_settled_token() {
+        let candidate = worktree();
+        let runtime = candidate.join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let (ledger, reference) = armed(&candidate, &runtime);
+        let endpoint = serve(&runtime, ledger.clone(), live()).expect("endpoint binds");
+        let owner = binding_fixture().fingerprint();
+
+        // A raw frame for work no helper ever claimed changes nothing and mints nothing.
+        let raw = HelperResult {
+            protocol: HELPER_PROTOCOL,
+            detail_ref: reference.clone(),
+            outcome: HelperOutcome::Complete {
+                text: "forged".into(),
+            },
+            children: ChildSettlement {
+                spawned: 0,
+                reaped: 0,
+            },
+            discovery: Vec::new(),
+        };
+        assert_eq!(
+            ledger.lock().unwrap().settle_frame(raw.clone()),
+            Err(FailureCode::InvalidDetail),
+            "an unclaimed handle accepts no frame"
+        );
+        assert!(ledger.lock().unwrap().settled(&reference, owner).is_none());
+
+        assert_eq!(
+            execute(&runtime, Some("attach".to_owned()), Some(reference.clone())).await,
+            "complete"
+        );
+        // The frame arrives on the endpoint task; the post is the second required half.
+        ledger
+            .lock()
+            .unwrap()
+            .settle_post("call", true)
+            .expect("helper post settles");
+        let mut settled = None;
+        for _ in 0..200 {
+            settled = ledger.lock().unwrap().settled(&reference, owner);
+            if settled.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let token = settled.expect("a positively settled real helper operation mints its token");
+        assert_eq!(token.operation(), HelperOperation::Start);
+        assert_eq!(token.discovery().len(), 3);
+        assert!(token.result().children.settled());
+
+        // A wrong generation owns nothing, and the frame cannot be replayed onto the same handle.
+        assert!(
+            ledger
+                .lock()
+                .unwrap()
+                .settled(&reference, [9; 32])
+                .is_none()
+        );
+        assert_eq!(
+            ledger.lock().unwrap().settle_frame(raw),
+            Err(FailureCode::Conflict),
+            "a replayed frame never overwrites settled evidence"
+        );
+
+        // Revocation permanently suppresses the token while retaining cleanup correlation, and the
+        // lease taken at claim is released only once cleanup settlement is positively proven.
+        {
+            let mut guard = ledger.lock().unwrap();
+            assert_eq!(guard.active_claims(), 1);
+            guard.revoke(owner);
+            assert!(
+                guard.settled(&reference, owner).is_none(),
+                "revoked work can never mint a settled token"
+            );
+            assert_eq!(guard.active_claims(), 0);
+            assert_eq!(
+                guard.delivery(&reference),
+                Delivery::Failed(FailureCode::Deadline)
+            );
+        }
+
         drop(endpoint);
         let _ = std::fs::remove_dir_all(&candidate);
     }
