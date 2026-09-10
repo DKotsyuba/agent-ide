@@ -1734,3 +1734,207 @@ fn initial_inspection_admission_is_atomic_and_distinguishes_closure() {
     let result = admit_initial_inspection(&sender, || panic!("closed service published detail"));
     assert!(matches!(result, Err(FailureCode::Internal)));
 }
+
+/// KSC3: a real SQLite writer-lock failure on stop must retain the receipt/pending-recovery marker
+/// and non-quiescent cache instead of returning a client `Deadline`, and a later fresh Start for the
+/// same worktree/actor must commit that pending revoke before minting its own grant.
+#[cfg(test)]
+mod stop_retry_tests {
+    use super::*;
+    use crate::{
+        app::config::StoreConfig,
+        assistance::host_binding::{
+            BindingStatus, parse_candidate, parse_channel_session, parse_hook_event,
+        },
+        workspace::authority::{ActivationRequest, WorktreeRef},
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Separates disposable fixture roots within the current process.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    /// Owns the exact temporary worktree/database pair used by one stop-retry test.
+    struct Fixture {
+        base: std::path::PathBuf,
+        root: std::path::PathBuf,
+    }
+    impl Fixture {
+        /// Creates real directories beneath `/private/tmp`, avoiding Darwin's `/tmp` symlink alias.
+        fn new() -> Self {
+            let base = std::path::PathBuf::from(format!(
+                "/private/tmp/worker-stop-retry-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let root = base.join("worktree");
+            std::fs::create_dir_all(root.join(".git")).unwrap();
+            Self { base, root }
+        }
+        /// Opens the real fixture Store through the existing effective-config path, with a
+        /// store_busy_timeout well below the 800ms host stop window used by `WorkerHandle::stop`.
+        fn store(&self) -> Store {
+            Store::open_with_backup_root(
+                &self.base.join("state.sqlite"),
+                &self.base.join("backups"),
+                StoreConfig {
+                    queue_capacity: 16,
+                    busy_timeout: Duration::from_millis(150),
+                    request_deadline: Duration::from_secs(2),
+                    receipt_capacity: 64,
+                },
+            )
+            .unwrap()
+        }
+    }
+    impl Drop for Fixture {
+        /// Removes only this fixture's uniquely owned directory tree.
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    /// Validates a fresh call under a new actor/channel binding.
+    fn fresh_call(actor: &str, id: &str) -> (HostBindingGuard, ValidatedInvocation) {
+        let mut guard = HostBindingGuard::default();
+        let channel = parse_channel_session(id.as_bytes()).unwrap();
+        let hook = parse_hook_event(
+            serde_json::json!({"hook_event_name":"PreToolUse","session_id":actor,"tool_use_id":id})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+        assert!(matches!(
+            guard.observe_hook(hook, channel.clone()),
+            BindingStatus::PreObserved
+        ));
+        let candidate = parse_candidate(
+            serde_json::json!({"threadId":actor,"callId":id,"x-codex-turn-metadata":{"turn":"stop-retry"}})
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap();
+        let BindingStatus::Validated(invocation) = guard.establish_start(candidate, channel) else {
+            panic!("fixture binding must validate")
+        };
+        (guard, invocation)
+    }
+
+    /// Commits one durable receipt for `actor`/`id` against the fixture worktree, exactly as one
+    /// explicit `ide.start` would after resolving the same canonical worktree.
+    async fn activate_receipt(
+        workspace: &DurableWorkspace<'_>,
+        tree: &WorktreeRef,
+        actor: &str,
+        id: &str,
+    ) -> (BindingRef, StartReceipt) {
+        let (mut guard, invocation) = fresh_call(actor, id);
+        let binding = invocation.binding_ref().clone();
+        let active = guard.consume_active(&binding).unwrap();
+        let request = ActivationRequest::new(id, invocation, active, tree.clone()).unwrap();
+        let receipt = workspace.activate(request).await.unwrap();
+        (binding, receipt)
+    }
+
+    /// Builds the minimal real `Worker` needed to drive `settle_revocation`/`reconcile_pending_revocations`
+    /// against a real Store; bypasses the launcher/git-discovery machinery `ide.start` otherwise needs,
+    /// since neither is part of the durable stop/retry contract under test.
+    fn worker<'a>(store: &'a Store, workspace: DurableWorkspace<'a>) -> Worker<'a> {
+        let launcher = LauncherConfig::parse(
+            br#"{"version":1,"limits":{"queued":8,"details":8,"operation_ms":5000,"output_bytes":1024},"targets":[]}"#,
+        )
+        .unwrap();
+        Worker {
+            shared: Arc::new(Shared {
+                bindings: Arc::new(Mutex::new(HostBindingGuard::default())),
+                ledger: Mutex::new(Ledger::default()),
+                notify: Notify::new(),
+                launcher,
+                nonce: [7; 32],
+                shutting_down: std::sync::atomic::AtomicBool::new(false),
+                shutdown_failure: Mutex::new(None),
+            }),
+            workspace,
+            observations: WorkspaceStore::new(store),
+            grants: BTreeMap::new(),
+            pending_revocations: std::collections::BTreeSet::new(),
+            registered: BTreeMap::new(),
+            baselines: BTreeMap::new(),
+            source_sequence: 0,
+            admission: crate::execution::AdmissionController::new(
+                crate::execution::AdmissionLimits {
+                    total_running: 16,
+                    per_owner_running: 2,
+                    per_owner_queued: 1,
+                    total_queued: 64,
+                    interactive_burst: 8,
+                },
+            )
+            .expect("fixed process limits"),
+            uncertain: std::collections::BTreeSet::new(),
+            uncertain_snapshots: Vec::new(),
+            runtime: std::env::temp_dir(),
+            providers: providers::Providers::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_stop_retains_pending_revoke_and_fresh_start_commits_it_first() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let tree = workspace
+            .resolve_worktree(
+                fixture.root.clone(),
+                fixture.root.clone(),
+                std::path::PathBuf::from(".git"),
+            )
+            .await
+            .unwrap();
+        let (old_binding, old_receipt) =
+            activate_receipt(&workspace, &tree, "actor-1", "call-1").await;
+
+        let mut worker = worker(&store, workspace);
+        worker
+            .grants
+            .insert(old_binding.clone(), old_receipt.clone());
+        worker
+            .registered
+            .entry(old_binding.clone())
+            .or_default()
+            .insert(std::path::PathBuf::from("src/lib.rs"));
+
+        // A second real connection to the same fixture database holds the exact write lock the
+        // durable revoke transaction needs, comfortably inside the reduced busy-timeout window.
+        let lock = rusqlite::Connection::open(fixture.base.join("state.sqlite")).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+        let outcome = worker.revoke(&old_binding, "stop-1").await;
+        assert!(matches!(outcome, Err(FailureCode::WorkspaceAuthority)));
+        assert_eq!(worker.grants.get(&old_binding), Some(&old_receipt));
+        assert!(worker.pending_revocations.contains(&old_binding));
+        assert!(worker.registered.contains_key(&old_binding));
+
+        lock.execute_batch("ROLLBACK;").unwrap();
+        drop(lock);
+
+        // A fresh explicit Start for the same worktree/actor must commit the pending revoke before
+        // its own grant can be minted; an out-of-order activate would fail with an owned-actor conflict.
+        worker.reconcile_pending_revocations(&tree, "actor-1").await;
+        assert!(!worker.grants.contains_key(&old_binding));
+        assert!(worker.pending_revocations.is_empty());
+        assert!(!worker.registered.contains_key(&old_binding));
+
+        let (new_binding, new_receipt) =
+            activate_receipt(&worker.workspace, &tree, "actor-1", "call-2").await;
+        worker.grants.insert(new_binding.clone(), new_receipt);
+
+        assert_eq!(worker.grants.len(), 1);
+        assert!(worker.grants.contains_key(&new_binding));
+        assert!(!worker.grants.contains_key(&old_binding));
+
+        let settled = worker.revoke(&new_binding, "stop-2").await;
+        assert!(settled.is_ok());
+        assert!(!worker.grants.contains_key(&new_binding));
+        assert!(worker.pending_revocations.is_empty());
+    }
+}
