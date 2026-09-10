@@ -256,8 +256,8 @@ impl WorkerHandle {
                     return;
                 }
             };
-            // Leaked once per boot: this owner and its worker task never exit before process shutdown,
-            // and a `'static` reference lets inspection service run in its own scheduled task (see `run`).
+            // ponytail: one process-lifetime Store leak per daemon boot; replace with Arc ownership
+            // only if in-process daemon restart becomes a supported lifecycle.
             let store: &'static Store = Box::leak(Box::new(store));
             let workspace = match DurableWorkspace::open(store).await {
                 Ok(owner) => owner,
