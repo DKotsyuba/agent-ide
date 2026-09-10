@@ -184,8 +184,8 @@ impl PeerReply {
 /// Builds the exact complete MCP tool result for one reply without ever shrinking its text.
 ///
 /// This is the sole envelope constructor shared by transport rendering
-/// ([`crate::assistance::facade::render_reply`]) and whole-hunk page fitting
-/// ([`crate::assistance::worker::fit_diff_page`]), so both measure the same bytes that are
+/// (`facade::render_reply`) and whole-hunk page fitting
+/// (`worker::snapshots::fit_diff_page`), so both measure the same bytes that are
 /// actually sent to the MCP host: [`CallToolResult::structured`]/[`CallToolResult::structured_error`]
 /// duplicate `reply`'s JSON into both `content[0].text` and `structured_content`, and this prepends
 /// the fixed one-line summary exactly as the real response does. A page proven to fit by
@@ -216,7 +216,7 @@ pub(crate) fn render_call_tool_result(reply: &PeerReply) -> Option<CallToolResul
 /// This is the exact predicate every accepted page and every final rendered reply must satisfy;
 /// callers must not substitute an approximate reserve computed over a narrower value (such as the
 /// unduplicated [`PeerReply`] alone), because that undercounts the real envelope and can accept a
-/// page that [`render_reply`](crate::assistance::facade::render_reply) then has to shrink.
+/// page that `facade::render_reply` then has to shrink.
 pub(crate) fn call_tool_result_fits(rendered: &CallToolResult) -> bool {
     serde_json::to_vec(rendered).is_ok_and(|bytes| bytes.len() <= MAX_REPLY_BYTES - MCP_RESERVE)
 }

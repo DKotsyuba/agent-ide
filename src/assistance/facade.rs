@@ -822,7 +822,7 @@ impl StdioFacade {
 }
 
 /// Budgets the complete MCP result by shrinking owner text until it fits the same exact envelope
-/// [`fit_diff_page`](crate::assistance::worker::fit_diff_page) already proved a Diff page fits.
+/// `worker::snapshots::fit_diff_page` already proved a Diff page fits.
 ///
 /// Both callers share [`render_call_tool_result`] and [`call_tool_result_fits`] so a page accepted
 /// during pagination is measured by the identical predicate here and is never re-cut mid-hunk by an
