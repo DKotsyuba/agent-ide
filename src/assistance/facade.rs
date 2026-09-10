@@ -26,7 +26,7 @@ use crate::{
     },
     assistance::{
         host_binding::{
-            HookEvent, HookPhase, HostBindingGuard, HostKind, parse_candidate,
+            HookEvent, HookLaunch, HookPhase, HostBindingGuard, HostKind, parse_candidate,
             parse_claude_call_id, parse_hook_event, parse_host_kind,
         },
         reply::{
@@ -476,6 +476,11 @@ pub async fn submit_hook_event(
         "call_id": event.optional_call_id(),
         "session_id": event.session_id(),
         "agent_type": event.agent_type(),
+        // Present only for a Claude shell pre-hook. The daemon compares these bytes against a
+        // command it generated itself and discards them otherwise; no other tool's arguments,
+        // and no other field of this one, ever reach the transport.
+        "launch_command": event.launch().map(HookLaunch::command),
+        "launch_background": event.launch().map(HookLaunch::run_in_background),
     });
     let Some(observation) = OpaqueJson::from_value(&observation, MAX_HOOK_BYTES) else {
         return HookIngressOutcome::Unavailable;

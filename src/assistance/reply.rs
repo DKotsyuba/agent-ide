@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 pub const MAX_REPLY_BYTES: usize = 64 * 1024;
 /// Maximum model-visible feedback text returned to a native host hook.
 pub const MAX_FEEDBACK_BYTES: usize = 4 * 1024;
+/// Maximum complete foreground-helper instruction carried on a pending reply.
+///
+/// The instruction is never trimmed, so this bound is a hard admission gate: an operation whose
+/// exact command would not fit is refused rather than answered with an unusable partial command.
+pub const MAX_HELPER_INSTRUCTION_BYTES: usize = 8 * 1024;
 /// Leaves room for fixed MCP content and protocol wrapper fields.
 const MCP_RESERVE: usize = 1024;
 
@@ -98,6 +103,15 @@ pub enum PeerReply {
     Pending {
         /// Opaque reference usable only under the same live binding.
         detail_ref: String,
+        /// Complete exact command the model must run before inspecting, for hosts that execute
+        /// their own operation in a foreground helper.
+        ///
+        /// Absent for every daemon-executed operation, so the Codex envelope is byte-identical to
+        /// its previous form. When present it is never trimmed: [`PeerReply::shrink_text`] refuses
+        /// to shrink a pending reply, so an over-budget instruction fails closed instead of being
+        /// silently cut into a command the launch recognizer could never match.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        helper: Option<String>,
     },
     /// Closed failure without provider, OS or host payloads.
     Error {
@@ -173,8 +187,12 @@ impl PeerReply {
         {
             return false;
         }
+        if matches!(self, Self::Pending { helper: Some(helper), .. } if helper.is_empty() || helper.len() > MAX_HELPER_INSTRUCTION_BYTES || helper.chars().any(char::is_control))
+        {
+            return false;
+        }
         let reference = match self {
-            Self::Pending { detail_ref } => Some(detail_ref),
+            Self::Pending { detail_ref, .. } => Some(detail_ref),
             Self::Complete { detail_ref, .. } => detail_ref.as_ref(),
             _ => None,
         };
@@ -191,19 +209,36 @@ impl PeerReply {
 /// (`worker::snapshots::fit_diff_page`), so both measure the same bytes that are
 /// actually sent to the MCP host: [`CallToolResult::structured`]/[`CallToolResult::structured_error`]
 /// duplicate `reply`'s JSON into both `content[0].text` and `structured_content`, and this prepends
-/// the fixed one-line summary exactly as the real response does. A page proven to fit by
+/// the summary line exactly as the real response does. A page proven to fit by
 /// [`call_tool_result_fits`] on the result of this function is therefore never cut mid-hunk by a
 /// later, independently computed reserve.
+///
+/// The summary is fixed for every reply except a foreground-helper [`PeerReply::Pending`], whose
+/// summary carries the exact command verbatim; that command is counted here so an instruction too
+/// large for the envelope fails closed rather than reaching the host truncated.
 pub(crate) fn render_call_tool_result(reply: &PeerReply) -> Option<CallToolResult> {
     let value = serde_json::to_value(reply).ok()?;
     let summary = match reply {
+        // The complete command is rendered verbatim in the summary the model actually reads.
+        // Nothing below can trim it: `shrink_text` refuses pending replies, so an envelope that
+        // cannot hold the exact command becomes an explicit error instead of a cut command.
+        PeerReply::Pending {
+            detail_ref,
+            helper: Some(helper),
+        } => format!(
+            "Assistance work is pending and this host runs it in a foreground helper. \
+             Run exactly this command with Bash, in the foreground (run_in_background must be \
+             false), without editing, wrapping or appending to it:\n{helper}\n\
+             Then use ide.inspect with detail_ref {detail_ref}. \
+             Do not call ide.inspect before that command has completed.",
+        ),
         PeerReply::Pending { .. } => {
-            "Assistance work is pending; use ide.inspect with the returned detail_ref"
+            "Assistance work is pending; use ide.inspect with the returned detail_ref".to_owned()
         }
         PeerReply::Error { .. } => {
-            "Assistance could not complete this operation; inspect the typed error and continue with native tools"
+            "Assistance could not complete this operation; inspect the typed error and continue with native tools".to_owned()
         }
-        _ => "Assistance returned the current owner result",
+        _ => "Assistance returned the current owner result".to_owned(),
     };
     let mut rendered = if matches!(reply, PeerReply::Error { .. }) {
         CallToolResult::structured_error(value)

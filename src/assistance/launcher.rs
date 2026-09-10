@@ -1,5 +1,6 @@
 //! Restart-only trusted launcher configuration, separate from host metadata and model arguments.
 
+use super::claude_worker::ClaudeOperatorProfile;
 use crate::execution::{ExecutionProfileCatalog, HostSandboxState, PersistedProfileRecord};
 use serde::Deserialize;
 use serde_json::Value;
@@ -193,6 +194,12 @@ struct RawTarget {
     profiles: Vec<AcceptedProfile>,
     /// Explicit policy acceptance for an observed disabled host; false never weakens sandboxing.
     allow_disabled_host: bool,
+    /// Operator-declared strict Claude configuration; absent leaves Claude execution unavailable.
+    ///
+    /// Codex targets omit this field entirely and keep their existing behaviour and configuration
+    /// unchanged. It is never inferred from a host observation, a permission mode or process state.
+    #[serde(default)]
+    claude_profile: Option<ClaudeOperatorProfile>,
 }
 
 /// Decodes only the versioned, closed launcher schema.
@@ -222,6 +229,11 @@ pub struct LaunchTarget {
     pub catalog: ExecutionProfileCatalog,
     /// Explicit trusted policy for disabled host observations.
     pub allow_disabled_host: bool,
+    /// Validated strict Claude operator profile; `None` keeps Claude execution unavailable.
+    ///
+    /// Presence is required before any Claude helper may be minted for this target. Its absence is
+    /// never a fallback to unrestricted execution and never affects the Codex path on this target.
+    pub claude_profile: Option<ClaudeOperatorProfile>,
 }
 
 /// Immutable attachment map owned by one daemon generation; Debug always redacts its contents.
@@ -338,6 +350,14 @@ impl LauncherConfig {
                 .collect::<Vec<_>>();
             let catalog = ExecutionProfileCatalog::from_persisted_records(records, &expected)
                 .map_err(|_| LauncherError::Rejected)?;
+            // A declared Claude profile must be complete and strict before it is retained; a
+            // weakened declaration is rejected outright rather than downgraded to "unavailable",
+            // so an operator never believes a partially strict configuration was accepted.
+            if let Some(profile) = target.claude_profile
+                && profile.validate().is_err()
+            {
+                return Err(LauncherError::Rejected);
+            }
             let launch = LaunchTarget {
                 candidate: target.candidate,
                 git: target.git,
@@ -345,6 +365,7 @@ impl LauncherConfig {
                 providers: target.providers,
                 catalog,
                 allow_disabled_host: target.allow_disabled_host,
+                claude_profile: target.claude_profile,
             };
             if targets.insert(target.attachment, launch).is_some() {
                 return Err(LauncherError::Rejected);

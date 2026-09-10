@@ -583,6 +583,19 @@ impl WorkerHandle {
         })
     }
 
+    /// Returns the trusted immutable target mapped to one opaque attachment, if any.
+    ///
+    /// The mapping comes only from restart-loaded launcher configuration; no model argument,
+    /// working directory, PID or timing contributes to it.
+    pub fn target(&self, attachment: &str) -> Option<LaunchTarget> {
+        self.shared.launcher.target(attachment).cloned()
+    }
+
+    /// Returns the shared validated finite worker limits for this daemon boot.
+    pub fn limits(&self) -> super::launcher::ProductLimits {
+        self.shared.launcher.limits
+    }
+
     /// Invalidates cached results on native hints; reads wait for a current MCP sandbox observation.
     pub fn native_hint(&self, binding: BindingRef) {
         if let Ok(mut ledger) = self.shared.ledger.lock() {
@@ -695,6 +708,8 @@ impl WorkerHandle {
                     binding,
                     reply: PeerReply::Pending {
                         detail_ref: reference.clone(),
+                        // Daemon-executed work needs no foreground helper instruction.
+                        helper: None,
                     },
                     selection: (tool, selection(&parameters)),
                     authority: None,
