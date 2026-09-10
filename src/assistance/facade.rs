@@ -516,9 +516,9 @@ pub async fn submit_hook_event(
 
 /// Encodes one bounded post-hook delta in the model-context schema required by its explicit host.
 ///
-/// Pre-hooks, empty/oversized text, and invalid JSON serialization produce no output. Both current
-/// host contracts use `hookSpecificOutput`, but the event name is selected from the validated host
-/// event rather than copied from arbitrary input.
+/// Pre-hooks, empty/oversized text, invalid JSON serialization, and a `PermissionDenied` outcome
+/// all produce no output. Both current host contracts use `hookSpecificOutput`, but the event name
+/// is selected from the validated host event rather than copied from arbitrary input.
 pub fn render_hook_context(event: &HookEvent, text: &str) -> Option<String> {
     if text.is_empty() || text.len() > MAX_FEEDBACK_BYTES {
         return None;

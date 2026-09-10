@@ -1128,6 +1128,143 @@ impl ProductActor {
     }
 }
 
+/// A reused Start with unusable sandbox metadata is refused without disturbing the live binding.
+///
+/// The dispatcher stops a binding a failing Start *created*, which is right for a first call: no
+/// generation may survive metadata it could not validate. The regression is the second case. Once
+/// an actor is already active, the same actor's later Start reuses that existing generation, so
+/// tearing it down on a metadata failure would revoke live authority the model never gave up. Here
+/// the refused reuse must leave the original binding and its Workspace generation fully usable.
+#[tokio::test]
+async fn configured_product_refuses_a_reused_start_with_unusable_sandbox_metadata() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "sandbox-reuse-root").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"first-start"}))
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    // The same live actor reuses its binding and this time carries unusable measured state.
+    let valid = std::mem::replace(&mut actor.state, json!({"permissionProfile":null}));
+    let refused = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"invalid-metadata"}))
+        .await;
+    assert_eq!(
+        refused["code"], "sandbox_state",
+        "a Start whose measured host state cannot be validated must be refused: {refused}"
+    );
+
+    // The original generation is untouched: it still reads source and still stops cleanly.
+    actor.state = valid;
+    let live = actor
+        .call(
+            &fixture,
+            "ide.context",
+            json!({"path":"src/lib.rs","byte_offset":0}),
+        )
+        .await;
+    let live = actor.settle(&fixture, live).await;
+    assert_eq!(
+        live["kind"], "context",
+        "the refused reuse must not revoke the live binding: {live}"
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Bounded host binding generations one daemon retains, mirroring `host_binding::MAX_BINDINGS`.
+const MAX_HOST_BINDINGS: usize = 64;
+
+/// An unknown attachment allocates no channel or scope state on either ingress path.
+///
+/// Both the hook and the method route reject an attachment this daemon's launcher never configured
+/// before a channel is resolved, so an unrecognized host cannot mint a channel session, a binding
+/// generation or a pending scope.
+///
+/// What this pins is the observable end state on both ingress paths: hook submission fails open
+/// silently, method dispatch returns the unavailable envelope rather than any owner result, and
+/// enough distinct stranger actors to fill the bounded binding table leave the configured actor
+/// able to start, read and stop normally. Removing `ProductDispatcher`'s own attachment checks
+/// alone does not make this fail, because the transport refuses an unconfigured attachment before
+/// dispatch as well; the dispatcher check is the second of two layers, and this test proves the
+/// combined ingress contract rather than isolating that inner layer.
+#[tokio::test]
+async fn configured_product_unknown_attachments_allocate_no_channel_or_scope_state() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+
+    // Hook ingress: an unknown attachment is accepted silently and fails open with no output.
+    let mut child = hook_process(&fixture.runtime, Some("unconfigured-channel"));
+    let mut input = child.stdin.take().unwrap();
+    input
+        .write_all(
+            json!({"hook_event_name":"PreToolUse","session_id":"stranger","tool_use_id":"call-1"})
+                .to_string()
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    input.shutdown().await.unwrap();
+    drop(input);
+    let output = tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.success() && output.stdout.is_empty() && output.stderr.is_empty(),
+        "an unknown attachment must fail open with no output"
+    );
+
+    // Method ingress: the same unknown attachment gets the unavailable envelope, never a typed
+    // owner result, so no scope was created to carry one.
+    let mut stranger = ProductActor::new_at(
+        &fixture,
+        "stranger-root",
+        "unconfigured-channel",
+        "session_id",
+        fixture.state(),
+    )
+    .await;
+    stranger.next += 1;
+    let reply=stranger.mcp.exchange(json!({"jsonrpc":"2.0","id":stranger.next,"method":"tools/call","params":{"name":"ide.start","arguments":{"activation_id":"stranger-start"},"_meta":{"threadId":stranger.actor,"callId":"call-1","x-codex-turn-metadata":{},"codex/sandbox-state-meta":stranger.state}}})).await;
+    assert!(
+        reply["result"]["structuredContent"].is_null(),
+        "an unknown attachment must not produce an owner result: {reply}"
+    );
+    assert_eq!(reply["result"]["isError"], json!(true), "{reply}");
+    // Allocation is checked by capacity: enough distinct stranger actors to fill the bounded
+    // binding table are sent, so an ingress that minted a channel and generation for each of them
+    // would leave no room for the configured actor below.
+    for index in 0..MAX_HOST_BINDINGS {
+        stranger.next += 1;
+        let actor = format!("stranger-{index}");
+        let reply=stranger.mcp.exchange(json!({"jsonrpc":"2.0","id":stranger.next,"method":"tools/call","params":{"name":"ide.start","arguments":{"activation_id":"stranger-start"},"_meta":{"threadId":actor,"callId":format!("call-{index}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":stranger.state}}})).await;
+        assert!(
+            reply["result"]["structuredContent"].is_null(),
+            "an unknown attachment must not produce an owner result: {reply}"
+        );
+    }
+    stranger.mcp.close().await;
+
+    // The configured attachment is unaffected and still starts, reads and stops normally.
+    let mut actor = ProductActor::new(&fixture, "configured-root").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"configured-start"}))
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Verifies actual durable activation, exact-file context, safe diff modes, detail scope and native invalidation.
 #[tokio::test]
 async fn configured_product_activates_reads_diffs_invalidates_and_stops() {

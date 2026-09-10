@@ -1372,6 +1372,101 @@ mod tests {
         (ledger, "detail-1".into(), actor)
     }
 
+    /// Ordinary daemon work and a Claude helper claim contend for exactly one configured budget.
+    ///
+    /// This is the distinguishing test for the shared-admission contract. With a ledger-private
+    /// counter both directions pass trivially: ordinary work never sees the helper's slot and the
+    /// helper never sees ordinary work's. Here the budget is exhausted by ordinary work first, so
+    /// the claim must be refused for capacity; and once the helper holds a claim, ordinary work
+    /// must be unable to take that same slot back.
+    #[test]
+    fn ordinary_work_and_a_claude_helper_contend_for_one_configured_budget() {
+        use crate::execution::{Admission, AdmissionClass, OwnerId};
+        let admission = Arc::new(Mutex::new(
+            crate::execution::AdmissionController::new(crate::execution::AdmissionLimits {
+                total_running: 2,
+                per_owner_running: 2,
+                per_owner_queued: 1,
+                total_queued: 2,
+                interactive_burst: 8,
+            })
+            .expect("fixture limits"),
+        ));
+        // One ordinary daemon operation, submitted exactly as the worker submits discovery,
+        // snapshot and provider work.
+        let ordinary = |admission: &Arc<Mutex<crate::execution::AdmissionController>>| {
+            admission
+                .lock()
+                .unwrap()
+                .submit(OwnerId::new(String::from("ordinary-owner")).unwrap(), AdmissionClass::Interactive)
+        };
+        let Admission::Granted(first) = ordinary(&admission) else {
+            panic!("the first ordinary operation must be admitted")
+        };
+        let Admission::Granted(second) = ordinary(&admission) else {
+            panic!("the second ordinary operation must be admitted")
+        };
+
+        let mut ledger = LaunchLedger::new(admission.clone());
+        let actor = HelperActor::new("agent", Some("session")).unwrap();
+        let command = LaunchLedger::helper_command(
+            std::path::Path::new("/usr/local/bin/agent-ide"),
+            std::path::Path::new("/private/tmp/rt"),
+            "attach",
+            "detail-1",
+        );
+        ledger
+            .mint(
+                "detail-1",
+                binding_fixture(),
+                actor.clone(),
+                "channel",
+                command,
+                job(),
+                1000,
+                identity("/usr/local/bin/agent-ide"),
+                vec![identity("/usr/bin/git")],
+            )
+            .expect("ticket mints");
+        assert_eq!(
+            ledger.recognize(
+                &LaunchLedger::helper_command(
+                    std::path::Path::new("/usr/local/bin/agent-ide"),
+                    std::path::Path::new("/private/tmp/rt"),
+                    "attach",
+                    "detail-1",
+                ),
+                false,
+                "call",
+                &actor,
+                0,
+            ),
+            LaunchRecognition::Recognized
+        );
+
+        // Ordinary work holds the whole budget, so no helper child may be released.
+        assert_eq!(
+            ledger.claim("detail-1", "channel", 0, live),
+            ClaimOutcome::Rejected(FailureCode::Capacity)
+        );
+        assert_eq!(ledger.active_claims(), 0);
+
+        // Freeing one ordinary slot is what makes the helper claimable; nothing else changed.
+        admission.lock().unwrap().release(first).expect("release");
+        assert!(matches!(
+            ledger.claim("detail-1", "channel", 0, live),
+            ClaimOutcome::Granted(_)
+        ));
+        assert_eq!(ledger.active_claims(), 1);
+
+        // The helper now genuinely occupies that shared slot: ordinary work cannot retake it.
+        assert!(
+            !matches!(ordinary(&admission), Admission::Granted(_)),
+            "a claimed Claude helper must consume the same global budget as ordinary work"
+        );
+        admission.lock().unwrap().release(second).expect("release");
+    }
+
     /// Only strict macOS operator evidence enables the Claude path; Linux stays unavailable.
     #[test]
     fn only_strict_macos_operator_profile_is_accepted() {
