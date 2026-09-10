@@ -37,7 +37,8 @@ The closed version-one JSON shape is:
           "sandbox_state": {"Execution-owned": "exact supporting measured state"}
         }
       ],
-      "allow_disabled_host": false
+      "allow_disabled_host": false,
+      "claude_profile": null
     }
   ]
 }
@@ -72,3 +73,28 @@ malformed executable digests and mismatched profile evidence are rejected.
 
 Configuration contains private attachment and evidence values. Diagnostic formatting
 redacts the configuration; it must never be rendered in model-facing tool results.
+
+## Optional strict Claude operator profile
+
+A target may declare `claude_profile`. Omit it, or set it to `null`, for a Codex-only target: the
+existing configuration and behaviour are unchanged, and Claude execution simply remains
+unavailable for that target.
+
+```json
+"claude_profile": {
+  "enabled": true,
+  "fail_if_unavailable": true,
+  "allow_unsandboxed_commands": false,
+  "no_matching_excluded_commands": true,
+  "scope_declared": true,
+  "platform": "mac_os"
+}
+```
+
+Every field is an operator statement about the host configuration the daemon is trusted to assume;
+none is measured, inferred or mutated by the daemon. A declared profile must be complete and
+strict — `enabled` and `fail_if_unavailable` true, `allow_unsandboxed_commands` false,
+`no_matching_excluded_commands` and `scope_declared` true, and `platform` `mac_os`. A
+declared-but-weakened profile is rejected at load rather than silently downgraded, so an operator
+never believes a partially strict configuration was accepted. `linux` is accepted by the schema but
+never satisfies validation; see `assistance-claude-worker.md`.

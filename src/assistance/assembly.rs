@@ -265,8 +265,19 @@ impl ProductDispatcher {
         })
     }
 
+    /// Retires overdue helper tickets at every ingress, without a timer task.
+    ///
+    /// Sweeping on ingress keeps deadline handling finite while the daemon is doing work anyway.
+    /// A ticket whose launch was denied or never happened disappears with no effect, because
+    /// nothing ran; a claimed ticket that never settled becomes uncertain and stays quarantined.
+    fn sweep_launches(&self) {
+        if let Ok(mut launches) = self.launches.lock() {
+            launches.expire(monotonic_ms());
+        }
+    }
     /// Parses separated ingress and commits binding transitions before queue, inspection or stop I/O.
     async fn handle(&self, request: &AssistanceDispatch) -> Option<PeerReply> {
+        self.sweep_launches();
         match request {
             AssistanceDispatch::HookSubmit(hook) => {
                 if self

@@ -483,4 +483,79 @@ mod tests {
         drop(endpoint);
         let _ = std::fs::remove_dir_all(&candidate);
     }
+    /// A claimed helper that disconnects without a frame leaves quarantined uncertainty.
+    #[tokio::test]
+    async fn claimed_helper_that_disconnects_is_quarantined_rather_than_completed() {
+        let candidate = worktree();
+        let runtime = candidate.join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let (ledger, reference) = armed(&candidate, &runtime);
+        let endpoint = serve(&runtime, ledger.clone()).expect("endpoint binds");
+
+        // Claim exactly as a helper would, then drop the connection before reporting anything.
+        {
+            let mut stream = tokio::net::UnixStream::connect(runtime.join(HELPER_SOCKET))
+                .await
+                .expect("helper connects");
+            let request = ClaimRequest {
+                protocol: crate::assistance::claude_worker::HELPER_PROTOCOL,
+                detail_ref: reference.clone(),
+                attachment: "attach".to_owned(),
+            };
+            write_frame(&mut stream, &serde_json::to_string(&request).unwrap())
+                .await
+                .expect("claim is written");
+            let reply = read_frame(&mut stream).await.expect("claim is answered");
+            assert!(reply.contains("granted"));
+        }
+
+        // The handle is now consumed: a second helper cannot claim it.
+        assert_eq!(
+            execute(&runtime, Some("attach".into()), Some(reference.clone())).await,
+            "refused"
+        );
+        let mut guard = ledger.lock().unwrap();
+        assert_eq!(guard.delivery(&reference), Delivery::Waiting);
+        // Expiry converts unsettled claimed work into a retained uncertain outcome.
+        guard.expire(u64::MAX);
+        assert_eq!(guard.len(), 1);
+        assert_eq!(
+            guard.delivery(&reference),
+            Delivery::Failed(crate::assistance::reply::FailureCode::Deadline)
+        );
+        drop(guard);
+        drop(endpoint);
+        let _ = std::fs::remove_dir_all(&candidate);
+    }
+
+    /// A launch that the host never ran expires with no effect and no retained work.
+    #[tokio::test]
+    async fn denied_launch_expires_without_any_effect() {
+        let candidate = worktree();
+        let runtime = candidate.join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let ledger = Arc::new(Mutex::new(LaunchLedger::default()));
+        ledger
+            .lock()
+            .unwrap()
+            .mint(
+                "detail-1",
+                [3; 32],
+                HelperActor::new("agent", None).unwrap(),
+                "attach",
+                "never-run".to_owned(),
+                job(&candidate),
+                10,
+            )
+            .unwrap();
+        let endpoint = serve(&runtime, ledger.clone()).expect("endpoint binds");
+        ledger.lock().unwrap().expire(11);
+        assert!(ledger.lock().unwrap().is_empty());
+        assert_eq!(
+            execute(&runtime, Some("attach".into()), Some("detail-1".into())).await,
+            "refused"
+        );
+        drop(endpoint);
+        let _ = std::fs::remove_dir_all(&candidate);
+    }
 }
