@@ -7,6 +7,14 @@
     "PostToolUse": [{
       "matcher": "",
       "hooks": [{"type": "command", "command": "AGENT_IDE_HOST_ATTACHMENT='<FRESH_CHANNEL_ATTACHMENT>' '<AGENT_IDE_BIN>' claude-hook --runtime-dir '<RUNTIME_DIR>'"}]
+    }],
+    "PostToolUseFailure": [{
+      "matcher": "",
+      "hooks": [{"type": "command", "command": "AGENT_IDE_HOST_ATTACHMENT='<FRESH_CHANNEL_ATTACHMENT>' '<AGENT_IDE_BIN>' claude-hook --runtime-dir '<RUNTIME_DIR>'"}]
+    }],
+    "PermissionDenied": [{
+      "matcher": "",
+      "hooks": [{"type": "command", "command": "AGENT_IDE_HOST_ATTACHMENT='<FRESH_CHANNEL_ATTACHMENT>' '<AGENT_IDE_BIN>' claude-hook --runtime-dir '<RUNTIME_DIR>'"}]
     }]
   }
 }

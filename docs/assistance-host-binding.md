@@ -5,7 +5,7 @@ implements this bounded binding/state boundary; Application separately owns its 
 
 `assistance::host_binding` accepts only metadata that a trusted MCP or hook ingress has already separated from model tool arguments. Host kind is selected explicitly and is never inferred from CWD, PID, timing, permission mode, or arbitrary arguments. It parses Codex `_meta.threadId`, `_meta.callId`, and the required `x-codex-turn-metadata` object into a `CandidateInvocation`. A candidate is a transport observation, never a workspace authority grant.
 
-`HostBindingGuard` first buffers the exact native `PreToolUse` event. The MCP handler then validates its candidate against that pre-observation and can return its result without waiting for `PostToolUse`. The sequence is `PreToolUse` → MCP validation/result → `PostToolUse`: post is later settlement evidence, not a condition for invocation validation. Child events use `agent_id`; root events use `session_id`; `tool_use_id` must match `_meta.callId`. Missing, ambiguous, mismatched, repeated, oversized, or post-stop data is `Unavailable`. The guard retains bounded pre-observed, active, and completed identifiers and refuses new input when its fixed storage cap is exhausted rather than discarding replay evidence.
+`HostBindingGuard` first buffers the exact native `PreToolUse` event. The MCP handler then validates its candidate against that pre-observation and can return its result without waiting for `PostToolUse`. The sequence is `PreToolUse` → MCP validation/result → `PostToolUse`: post is later settlement evidence, not a condition for invocation validation. `PostToolUseFailure` settles the same exact call and may request a later registered-path recheck because partial effects remain possible. `PermissionDenied` rejects its exact pending lifecycle without a recheck hint; `PermissionRequest` and manual denial are uncorrelated and unsupported. Child events use `agent_id`; root events use `session_id`; `tool_use_id` must match `_meta.callId`. Missing, ambiguous, mismatched, repeated, oversized, or post-stop data is `Unavailable`. The guard retains bounded pre-observed, active, and completed identifiers and refuses new input when its fixed storage cap is exhausted rather than discarding replay evidence.
 
 The provider surface is deliberately small: `parse_candidate`, `parse_channel_session`, and `parse_hook_event` create bounded ingress values; `HostBindingGuard::observe_hook`, `establish_start`, `validate_active`, `take_native_change_hint`, `check_active`, `consume_active`, `stop_binding`, and `stop` manage lifecycle. `ValidatedInvocation` exposes only actor ID, call ID, and opaque `BindingRef`; `ActiveBindingUse` exposes only its same opaque ref. Workspace consumes only `ValidatedInvocation` plus a fresh `ActiveBindingUse`; `PreObserved` and `Settled` are lifecycle observations; `NativeObserved` is only an active registered-path recheck hint, while `Unavailable` grants nothing. Application owns crate-root exposure and consumer wiring.
 
@@ -51,6 +51,11 @@ share one. Do not put the handle in model arguments or tool output. Missing hook
 configuration or mismatched handles leaves calls unavailable. Ordinary edits, deletes,
 renames and failed commands must remain observable after activation; their hook payloads
 are not a source-effect authority.
+
+Claude Code 2.1.267 is the tested target. Its example config includes exact `PreToolUse`,
+`PostToolUse`, `PostToolUseFailure`, and `PermissionDenied` commands; older Claude versions
+are not certified. `PermissionRequest` has no exact tool-use ID and manual denial has no
+correlated terminal hook, so neither settles a pending call.
 
 Claude Code uses the separate explicit `claude-hook` mode and its documented `session_id`,
 optional `agent_id`, and optional `agent_type` fields. The placeholder-only example is
@@ -101,12 +106,7 @@ exact binding and rejects its pending pre-hooks before any Workspace handoff cou
 Post settlement for already validated calls can still complete. A fresh explicit start
 is required after stop; another actor's binding is unaffected.
 
-State is bounded to 128 pending/settling invocations, 64 active bindings, 1024 completed
-identities, 1024 rejected identities and at most one coalesced native hint per active
-binding. Native lifecycle identities consume the same finite replay budget. Replay
-evidence is never evicted to make room.
-Exhaustion makes further binding operations unavailable. Daemon restart discards all
-bindings and requires fresh exact pre/start input; it does not recover authority.
+State is bounded to 128 pending/settling invocations for each exact channel, host, and actor scope, 64 active bindings, and at most one coalesced native hint per active binding. Rejected and completed identities share a permanent daemon-lifetime capacity of 64 channels × 64 host/actor scopes × 1024 IDs. Replay evidence is never evicted to make room. A full replay scope leaves only that actor unavailable until daemon restart; a missing terminal hook can exhaust only that actor's pending scope. Daemon restart discards all bindings and replay evidence and requires fresh exact pre/start input; it does not recover authority.
 
 Closed daemon outcomes are:
 

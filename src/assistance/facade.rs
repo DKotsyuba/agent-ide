@@ -465,6 +465,8 @@ pub async fn submit_hook_event(
         "phase": match event.phase() {
             HookPhase::Pre => "pre",
             HookPhase::Post => "post",
+            HookPhase::PostFailure => "post_failure",
+            HookPhase::PermissionDenied => "permission_denied",
             HookPhase::PostBatch => "post_batch",
         },
         "actor_id": event.actor_id(),
@@ -513,6 +515,8 @@ pub fn render_hook_context(event: &HookEvent, text: &str) -> Option<String> {
     let hook_event_name = match event.phase() {
         HookPhase::Pre => return None,
         HookPhase::Post => "PostToolUse",
+        HookPhase::PostFailure => "PostToolUseFailure",
+        HookPhase::PermissionDenied => return None,
         HookPhase::PostBatch => "PostToolBatch",
     };
     serde_json::to_string(&json!({

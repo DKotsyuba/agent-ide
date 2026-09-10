@@ -15,7 +15,8 @@ use serde_json::{Map, Value};
 
 const MAX_IDENTIFIER_BYTES: usize = 256;
 const MAX_HOOK_METADATA_BYTES: usize = 64 * 1024;
-const MAX_PENDING: usize = 128;
+/// Bounds observed and settling calls within one exact channel, host, and actor scope.
+const MAX_PENDING_PER_SCOPE: usize = 128;
 const MAX_BINDINGS: usize = 64;
 /// Bounds independent channels that can retain replay evidence in one daemon lifetime.
 const MAX_REPLAY_CHANNELS: usize = 64;
@@ -150,6 +151,10 @@ pub enum HookPhase {
     Pre,
     /// The native host has finished the selected tool call.
     Post,
+    /// The native host reported that tool execution failed after it began.
+    PostFailure,
+    /// The native host denied an exact tool request and ended its matching pending lifecycle.
+    PermissionDenied,
     /// The native host has completed a batch without supplying one synthetic tool-call identity.
     PostBatch,
 }
@@ -283,6 +288,8 @@ pub struct ValidatedInvocation {
     actor_id: String,
     call_id: String,
     binding: BindingRef,
+    /// Whether this exact start invocation created the binding it validated.
+    created_binding: bool,
 }
 
 impl ValidatedInvocation {
@@ -299,6 +306,11 @@ impl ValidatedInvocation {
     /// Returns the immutable active binding generation that this invocation matched.
     pub fn binding_ref(&self) -> &BindingRef {
         &self.binding
+    }
+
+    /// Returns whether this invocation freshly created its binding during `ide.start` validation.
+    pub(crate) const fn created_binding(&self) -> bool {
+        self.created_binding
     }
 }
 
@@ -429,12 +441,9 @@ impl HostBindingGuard {
             }
             return BindingStatus::Unavailable(BindingUnavailable::MissingPre);
         }
-        if self.settling.len() >= MAX_PENDING {
-            return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
-        }
         let binding_key = (candidate.host, candidate.actor_id.clone(), channel.clone());
-        let binding = if let Some(existing) = self.bindings.get(&binding_key) {
-            existing.clone()
+        let (binding, created_binding) = if let Some(existing) = self.bindings.get(&binding_key) {
+            (existing.clone(), false)
         } else {
             if self.bindings.len() >= MAX_BINDINGS {
                 return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
@@ -450,11 +459,11 @@ impl HostBindingGuard {
                 generation,
             };
             self.bindings.insert(binding_key, binding.clone());
-            binding
+            (binding, true)
         };
         self.pre_observed.remove(&invocation);
         self.settling.insert(invocation, binding.clone());
-        BindingStatus::Validated(validated(candidate, binding))
+        BindingStatus::Validated(validated(candidate, binding, created_binding))
     }
 
     /// Validates an ordinary MCP candidate against its active matching actor/channel binding.
@@ -498,11 +507,8 @@ impl HostBindingGuard {
             }
             return BindingStatus::Unavailable(BindingUnavailable::InactiveBinding);
         };
-        if self.settling.len() >= MAX_PENDING {
-            return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
-        }
         self.settling.insert(invocation, binding.clone());
-        BindingStatus::Validated(validated(candidate, binding))
+        BindingStatus::Validated(validated(candidate, binding, false))
     }
 
     /// Buffers a native pre-hook or records a per-tool/batch post for a channel-bound invocation.
@@ -561,13 +567,14 @@ impl HostBindingGuard {
                 BindingStatus::Unavailable(BindingUnavailable::Replay)
             }
             HookPhase::Pre => {
-                if self.pre_observed.len() + self.settling.len() >= MAX_PENDING {
+                if self.pending_in_scope(&candidate, &invocation.1) >= MAX_PENDING_PER_SCOPE {
                     return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
                 }
                 self.pre_observed.insert(invocation);
                 BindingStatus::PreObserved
             }
-            HookPhase::Post => {
+            HookPhase::Post | HookPhase::PostFailure => {
+                let failed = event.phase == HookPhase::PostFailure;
                 if self.pre_observed.remove(&invocation) {
                     let binding = self
                         .bindings
@@ -593,7 +600,22 @@ impl HostBindingGuard {
                     return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
                 }
                 self.settling.remove(&invocation);
-                BindingStatus::Settled(validated(candidate, binding))
+                if failed {
+                    self.native_hints.insert(binding.clone());
+                }
+                BindingStatus::Settled(validated(candidate, binding, false))
+            }
+            HookPhase::PermissionDenied => {
+                if self.pre_observed.remove(&invocation)
+                    || self.settling.remove(&invocation).is_some()
+                {
+                    self.record_replay(&invocation, ReplayDisposition::Rejected)
+                        .expect("the checked rejection scope has capacity");
+                    return BindingStatus::Unavailable(BindingUnavailable::MissingInvocation);
+                }
+                self.record_replay(&invocation, ReplayDisposition::Rejected)
+                    .expect("the checked rejection scope has capacity");
+                BindingStatus::Unavailable(BindingUnavailable::Mismatch)
             }
             HookPhase::PostBatch => unreachable!("batch hooks return before invocation matching"),
         }
@@ -635,6 +657,31 @@ impl HostBindingGuard {
             .get(channel)
             .and_then(|scopes| scopes.get(&(candidate.host, candidate.actor_id.clone())))
             .is_some_and(|calls| calls.len() >= MAX_REPLAYS_PER_SCOPE)
+    }
+
+    /// Counts observed and validated-but-unsettled calls in one exact capacity scope.
+    fn pending_in_scope(
+        &self,
+        candidate: &CandidateInvocation,
+        channel: &ChannelSessionRef,
+    ) -> usize {
+        self.pre_observed
+            .iter()
+            .filter(|(observed, observed_channel)| {
+                observed.host == candidate.host
+                    && observed.actor_id == candidate.actor_id
+                    && observed_channel == channel
+            })
+            .count()
+            + self
+                .settling
+                .keys()
+                .filter(|(observed, observed_channel)| {
+                    observed.host == candidate.host
+                        && observed.actor_id == candidate.actor_id
+                        && observed_channel == channel
+                })
+                .count()
     }
 
     /// Reserves replay storage within independent channel and host/actor budgets.
@@ -811,11 +858,16 @@ impl HostBindingGuard {
 }
 
 /// Builds a public invocation record from a bounded candidate and immutable binding reference.
-fn validated(candidate: CandidateInvocation, binding: BindingRef) -> ValidatedInvocation {
+fn validated(
+    candidate: CandidateInvocation,
+    binding: BindingRef,
+    created_binding: bool,
+) -> ValidatedInvocation {
     ValidatedInvocation {
         actor_id: candidate.actor_id,
         call_id: candidate.call_id,
         binding,
+        created_binding,
     }
 }
 
@@ -877,6 +929,8 @@ pub fn parse_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnavailable>
     let phase = match payload.hook_event_name.as_str() {
         "PreToolUse" => HookPhase::Pre,
         "PostToolUse" => HookPhase::Post,
+        "PostToolUseFailure" => HookPhase::PostFailure,
+        "PermissionDenied" => HookPhase::PermissionDenied,
         "PostToolBatch" => HookPhase::PostBatch,
         _ => return Err(BindingUnavailable::UnsupportedHookPhase),
     };
@@ -914,6 +968,8 @@ pub fn parse_claude_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnava
     let phase = match payload.hook_event_name.as_str() {
         "PreToolUse" => HookPhase::Pre,
         "PostToolUse" => HookPhase::Post,
+        "PostToolUseFailure" => HookPhase::PostFailure,
+        "PermissionDenied" => HookPhase::PermissionDenied,
         "PostToolBatch" => HookPhase::PostBatch,
         _ => return Err(BindingUnavailable::UnsupportedHookPhase),
     };
@@ -1074,6 +1130,130 @@ mod tests {
             .as_bytes(),
         )
         .expect("test hook is valid")
+    }
+
+    /// Builds one parser-shaped Codex lifecycle event for an exact actor and call.
+    fn codex_hook(phase: &str, actor: &str, call: &str) -> HookEvent {
+        parse_hook_event(
+            json!({
+                "hook_event_name": phase,
+                "session_id": actor,
+                "tool_use_id": call
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("test hook is valid")
+    }
+
+    /// Caps pending calls per exact scope so one actor cannot deny a peer in the same channel.
+    #[test]
+    fn pending_capacity_is_actor_local_and_survives_missing_post() {
+        let mut guard = HostBindingGuard::default();
+        let channel = channel("pending-channel");
+        for index in 0..MAX_PENDING_PER_SCOPE {
+            let call = format!("actor-a-{index}");
+            assert!(matches!(
+                guard.observe_hook(codex_hook("PreToolUse", "actor-a", &call), channel.clone()),
+                BindingStatus::PreObserved
+            ));
+        }
+        assert!(matches!(
+            guard.observe_hook(
+                codex_hook("PreToolUse", "actor-a", "over-limit"),
+                channel.clone()
+            ),
+            BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded)
+        ));
+        assert!(matches!(
+            guard.observe_hook(
+                codex_hook("PreToolUse", "actor-b", "start"),
+                channel.clone()
+            ),
+            BindingStatus::PreObserved
+        ));
+        assert!(matches!(
+            guard.establish_start(codex_candidate("actor-b", "start"), channel),
+            BindingStatus::Validated(_)
+        ));
+    }
+
+    /// Settles terminal failures with a hint while exact permission denial only rejects its pre-hook.
+    #[test]
+    fn terminal_failure_and_permission_denial_have_distinct_hint_semantics() {
+        let mut guard = HostBindingGuard::default();
+        let channel = channel("terminal-channel");
+        assert!(matches!(
+            guard.observe_hook(codex_hook("PreToolUse", "actor", "start"), channel.clone()),
+            BindingStatus::PreObserved
+        ));
+        let BindingStatus::Validated(started) =
+            guard.establish_start(codex_candidate("actor", "start"), channel.clone())
+        else {
+            panic!("start must validate");
+        };
+        assert!(matches!(
+            guard.observe_hook(codex_hook("PostToolUse", "actor", "start"), channel.clone()),
+            BindingStatus::Settled(_)
+        ));
+        assert!(matches!(
+            guard.observe_hook(codex_hook("PreToolUse", "actor", "failed"), channel.clone()),
+            BindingStatus::PreObserved
+        ));
+        assert!(matches!(
+            guard.validate_active(codex_candidate("actor", "failed"), channel.clone()),
+            BindingStatus::Validated(_)
+        ));
+        assert!(matches!(
+            guard.observe_hook(
+                codex_hook("PostToolUseFailure", "actor", "failed"),
+                channel.clone()
+            ),
+            BindingStatus::Settled(_)
+        ));
+        assert!(
+            guard
+                .take_native_change_hint(started.binding_ref())
+                .unwrap()
+        );
+        assert!(matches!(
+            guard.observe_hook(codex_hook("PreToolUse", "actor", "denied"), channel.clone()),
+            BindingStatus::PreObserved
+        ));
+        assert!(matches!(
+            guard.validate_active(codex_candidate("actor", "denied"), channel.clone()),
+            BindingStatus::Validated(_)
+        ));
+        assert!(matches!(
+            guard.observe_hook(codex_hook("PermissionDenied", "actor", "denied"), channel),
+            BindingStatus::Unavailable(BindingUnavailable::MissingInvocation)
+        ));
+        assert!(
+            !guard
+                .take_native_change_hint(started.binding_ref())
+                .unwrap()
+        );
+    }
+
+    /// Retains a validated call's replay authority across stop until the daemon guard is dropped.
+    #[test]
+    fn validated_call_cannot_be_replayed_after_stop() {
+        let mut guard = HostBindingGuard::default();
+        let channel = channel("stop-replay-channel");
+        assert!(matches!(
+            guard.observe_hook(codex_hook("PreToolUse", "actor", "start"), channel.clone()),
+            BindingStatus::PreObserved
+        ));
+        let BindingStatus::Validated(started) =
+            guard.establish_start(codex_candidate("actor", "start"), channel.clone())
+        else {
+            panic!("start must validate");
+        };
+        guard.stop_binding(started.binding_ref()).unwrap();
+        assert!(matches!(
+            guard.observe_hook(codex_hook("PreToolUse", "actor", "start"), channel),
+            BindingStatus::Unavailable(BindingUnavailable::Replay)
+        ));
     }
 
     /// Rejects mixed and partial host-shaped metadata instead of selecting a convenient parser.
