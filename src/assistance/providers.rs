@@ -1416,7 +1416,9 @@ mod tests {
             "default".into(),
             "/usr/bin/true".into(),
             format!("test-{label}"),
-            "test".into(),
+            root.join(format!("agent-ide-fixture-cache-{label}"))
+                .to_string_lossy()
+                .into_owned(),
         )
         .unwrap();
         let backend_key = profile.compatibility_key();

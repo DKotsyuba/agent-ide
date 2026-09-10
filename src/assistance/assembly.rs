@@ -886,7 +886,10 @@ async fn host_shaped_claude_start_never_reaches_workspace_without_sandbox_author
             "actor_id":"session",
             "call_id":"next",
             "session_id":"session",
-            "agent_type":null
+            "agent_type":null,
+            "launch_command":null,
+            "launch_background":null,
+            "failed":false
         }),
         64 * 1024,
     )
@@ -917,5 +920,14 @@ async fn host_shaped_claude_start_never_reaches_workspace_without_sandbox_author
         )
         .expect("test method dispatch is valid"),
     );
-    assert_eq!(dispatcher.handle(&next_method).await, None);
+    // A follow-up Claude operation on the same attachment is routed to the foreground helper, which
+    // has no worker here, so it reports the same honest unavailability the refused Start did. What
+    // matters is that it is never a grant and never reaches Workspace: no binding, authority or
+    // helper ticket survived the sandbox-authority refusal above.
+    assert_eq!(
+        dispatcher.handle(&next_method).await,
+        Some(PeerReply::Unavailable {
+            reason: MissingPeer::WorkspaceActivation
+        })
+    );
 }

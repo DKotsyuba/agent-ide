@@ -1145,9 +1145,28 @@ struct ClaudeHookPayload {
     /// Native tool name, used only to decide whether a shell launch may be selected at all.
     tool_name: Option<String>,
     /// Native tool arguments; only a shell launch's two selected fields survive parsing.
+    #[serde(default, deserialize_with = "selected_fields")]
     tool_input: Option<ClaudeToolInput>,
     /// Native tool result; only explicit failure markers survive parsing.
+    #[serde(default, deserialize_with = "selected_fields")]
     tool_response: Option<ClaudeToolResponse>,
+}
+
+/// Keeps one optional native field's selected shape without letting any other shape reject the hook.
+///
+/// Claude types `tool_input` and `tool_response` freely: a shell call carries an object, while many
+/// tools report a bare string or array. Only the object form carries anything this adapter reads,
+/// so any other shape must yield `None` rather than failing the whole payload — a rejected payload
+/// loses the actor and call correlation the binding depends on, which is a far worse outcome than
+/// not observing a launch or a failure marker. The intermediate value is dropped here, so no raw
+/// host field survives into [`HookEvent`].
+fn selected_fields<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(T::deserialize(value).ok())
 }
 
 /// Selects only the explicit failure markers a post payload may carry.
