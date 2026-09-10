@@ -4,7 +4,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use agent_ide::app::cache::{CacheNamespaceId, CacheRoot, VerifiedCacheRetirement};
+use agent_ide::app::cache::{CacheNamespaceId, CacheRoot};
 
 static TEST_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -17,9 +17,15 @@ fn cache_root() -> std::path::PathBuf {
     ))
 }
 
-/// Proves namespaces are private, bounded path components and retain a retryable handle after a failed verified retirement.
+/// Proves namespaces are private bounded path components that reopen instead of being recreated.
+///
+/// Retirement itself is deliberately unreachable from here: `CacheNamespace::retire` consumes an
+/// `app::cache::VerifiedCacheRetirement`, whose only constructor is crate-internal, so no external
+/// caller — including this contract test — can name a closure or reset reason and delete a private
+/// namespace. That path is covered where the authority actually exists, against a real Workspace
+/// closure receipt, in `tests/intelligence_freshness_contract.rs`.
 #[test]
-fn cache_retirement_requires_an_explicit_verified_fact() {
+fn cache_namespaces_are_private_bounded_and_reopened_not_recreated() {
     let root_path = cache_root();
     let root = CacheRoot::prepare(&root_path).unwrap();
     let namespace = root
@@ -32,16 +38,20 @@ fn cache_retirement_requires_an_explicit_verified_fact() {
     assert!(CacheNamespaceId::new("../worktree").is_none());
     assert!(CacheNamespaceId::new("worktree/name").is_none());
     assert!(namespace.path().exists());
-    namespace.retire(VerifiedCacheRetirement::Reset).unwrap();
-    assert!(!root_path.join("worktree_42").exists());
-    let retry = root
-        .retain(CacheNamespaceId::new("retry").unwrap())
+    fs::write(namespace.path().join("opaque"), b"provider bytes").unwrap();
+    let reopened = root
+        .retain(CacheNamespaceId::new("worktree_42").unwrap())
         .unwrap();
-    fs::set_permissions(retry.path(), fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(retry.retire(VerifiedCacheRetirement::Closed).is_err());
-    assert!(retry.path().exists());
-    fs::set_permissions(retry.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    retry.retire(VerifiedCacheRetirement::Closed).unwrap();
-    assert!(!retry.path().exists());
-    fs::remove_dir(root_path).unwrap();
+    assert_eq!(reopened.path(), namespace.path());
+    assert!(
+        reopened.path().join("opaque").exists(),
+        "reopening must never discard retained cache contents"
+    );
+    fs::set_permissions(namespace.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        root.retain(CacheNamespaceId::new("worktree_42").unwrap())
+            .is_err(),
+        "a namespace that stopped being private must not be handed out"
+    );
+    fs::remove_dir_all(root_path).unwrap();
 }

@@ -4,7 +4,11 @@ use std::collections::VecDeque;
 
 use crate::{
     app::cache::{CacheNamespace, CacheNamespaceId, CacheRoot, VerifiedCacheRetirement},
-    workspace::observation::{SourceCoverage, SourceObservation},
+    workspace::{
+        authority::WorktreeRef,
+        durable::VerifiedWorktreeClosure,
+        observation::{SourceCoverage, SourceObservation},
+    },
 };
 
 /// Limits opaque provider and cache identity values before they enter a retained lifecycle record.
@@ -333,6 +337,9 @@ impl CacheIdentity {
 pub struct CacheLifecycle {
     /// Compatibility inputs that deliberately omit user/session/authority values.
     identity: CacheIdentity,
+    /// Canonical worktree incarnation that owns this namespace; only its exact verified closure
+    /// may retire it, so a closure of any other durable lifecycle generation is refused.
+    incarnation: u64,
     /// Retained private namespace until one verified retirement fact completes successfully.
     namespace: Option<CacheNamespace>,
     /// Whether the outgoing view has stopped using this namespace.
@@ -343,17 +350,37 @@ pub struct CacheLifecycle {
 
 impl CacheLifecycle {
     /// Retains an opaque namespace for one compatible cache identity; this does not create a provider process.
+    ///
+    /// `worktree` is the canonical durable worktree whose incarnation owns the namespace; it is
+    /// recorded so retirement can demand that exact incarnation's verified closure. Returns the
+    /// Application error when the private directory cannot be created or validated.
     pub fn retain(
         root: &CacheRoot,
         namespace: CacheNamespaceId,
         identity: CacheIdentity,
+        worktree: &WorktreeRef,
     ) -> Result<Self, crate::app::AppError> {
         Ok(Self {
             identity,
+            incarnation: worktree.incarnation(),
             namespace: Some(root.retain(namespace)?),
             quiescent: false,
             retirement_failed: false,
         })
+    }
+
+    /// Returns the retained namespace's private directory, or `None` once retirement completed.
+    ///
+    /// This is the only source of a provider's effective cache path: reading it from the retained
+    /// lifecycle keeps retention bookkeeping and the directory a provider actually writes to from
+    /// diverging.
+    pub fn namespace_path(&self) -> Option<&std::path::Path> {
+        self.namespace.as_ref().map(CacheNamespace::path)
+    }
+
+    /// Returns whether no view currently uses this namespace, so a handoff or retirement may proceed.
+    pub const fn quiescent(&self) -> bool {
+        self.quiescent
     }
 
     /// Marks a released, stopped, handed-off, or temporarily missing view as quiescent while retaining its namespace.
@@ -369,15 +396,19 @@ impl CacheLifecycle {
             && self.identity.compatible_with(incoming)
     }
 
-    /// Retires the namespace only after Workspace verified an exact closure or reset fact.
+    /// Retires the namespace only for the exact canonical worktree incarnation Workspace closed.
     ///
-    /// Refuses while any view still uses this lifecycle: retirement must follow admission
-    /// revocation and provider reap, never race an active owner. A filesystem failure retains the
-    /// namespace, blocks handoff, and returns the Application error so the caller may retry the
-    /// same verified fact after correcting local conditions.
+    /// `closure` is Workspace's private-field closure receipt; it cannot be forged, and its
+    /// incarnation must equal the one recorded at `retain`, so a closure of a different worktree
+    /// or of a reopened later incarnation deletes nothing. Refuses while any view still uses this
+    /// lifecycle: retirement must follow admission revocation and provider quiescence, never race
+    /// an active owner. There is no reset spelling; an unsupported reset path stays unavailable
+    /// rather than accepting a caller-chosen reason. A filesystem failure retains the namespace,
+    /// blocks handoff, and returns the Application error so the caller may retry the same verified
+    /// closure after correcting local conditions. Retiring an already-retired lifecycle succeeds.
     pub fn retire(
         &mut self,
-        verified: VerifiedCacheRetirement,
+        closure: &VerifiedWorktreeClosure,
     ) -> Result<(), crate::app::AppError> {
         if !self.quiescent {
             return Err(std::io::Error::new(
@@ -386,10 +417,17 @@ impl CacheLifecycle {
             )
             .into());
         }
+        if closure.incarnation() != self.incarnation {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "verified closure does not match the worktree incarnation owning this namespace",
+            )
+            .into());
+        }
         let Some(namespace) = self.namespace.as_ref() else {
             return Ok(());
         };
-        match namespace.retire(verified) {
+        match namespace.retire(VerifiedCacheRetirement::verified()) {
             Ok(()) => {
                 self.namespace = None;
                 self.quiescent = true;
