@@ -150,6 +150,9 @@ impl RuntimeDir {
     /// deliberately accepts a plain `Path` instead, so querying never creates or repairs files.
     pub fn prepare_for_daemon(path: impl AsRef<Path>) -> Result<Self, AppError> {
         let root = path.as_ref();
+        if !root.is_absolute() {
+            return Err(AppError::UnsafeRuntimeDirectory);
+        }
         match fs::symlink_metadata(root) {
             Ok(metadata) => validate_private_directory(root, &metadata)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {

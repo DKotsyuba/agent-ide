@@ -371,12 +371,21 @@ impl CacheLifecycle {
 
     /// Retires the namespace only after Workspace verified an exact closure or reset fact.
     ///
-    /// A filesystem failure retains the namespace, blocks handoff, and returns the Application
-    /// error so the caller may retry the same verified fact after correcting local conditions.
+    /// Refuses while any view still uses this lifecycle: retirement must follow admission
+    /// revocation and provider reap, never race an active owner. A filesystem failure retains the
+    /// namespace, blocks handoff, and returns the Application error so the caller may retry the
+    /// same verified fact after correcting local conditions.
     pub fn retire(
         &mut self,
         verified: VerifiedCacheRetirement,
     ) -> Result<(), crate::app::AppError> {
+        if !self.quiescent {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cannot retire a cache lifecycle while a view still uses it",
+            )
+            .into());
+        }
         let Some(namespace) = self.namespace.as_ref() else {
             return Ok(());
         };

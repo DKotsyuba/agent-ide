@@ -161,9 +161,12 @@ impl RustProfile {
         &self.configuration
     }
 
-    /// Returns whether every fixed compatibility input is present and the executable path is absolute.
+    /// Returns whether every fixed compatibility input is present, the executable path is
+    /// absolute, and the cache namespace is a verified absolute private directory rather than a
+    /// bare label resolved relative to the spawned child's working directory.
     fn valid(&self) -> bool {
         self.binary.is_absolute()
+            && Path::new(&self.cache_namespace).is_absolute()
             && matches!(
                 self.configuration.as_str(),
                 "cache-priming-disabled-v1" | "cache-priming-and-proc-macro-disabled-v1"

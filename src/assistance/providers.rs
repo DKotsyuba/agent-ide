@@ -90,6 +90,12 @@ struct GoLease {
     lease: ProviderViewLease,
 }
 
+/// Bounds the in-memory cache-lifecycle map so an unbounded stream of distinct worktree
+/// incarnations cannot grow it or the retained on-disk namespaces without limit. Matches the fixed
+/// `total_views`/`per_backend_views` provider-lease ceiling; a full map fails new namespaces closed
+/// rather than evicting an unretired one without closure proof.
+const MAX_CACHE_NAMESPACES: usize = 64;
+
 /// Provider state owned by the sole worker; no client holds executable or settlement capabilities.
 pub(super) struct Providers {
     /// Central typed backend/view accounting; physical limits live in the worker admission controller.
@@ -184,13 +190,20 @@ impl Worker<'_> {
 
     /// Retains or reopens each configured provider cache under canonical worktree identity.
     ///
-    /// A quiescent compatible lifecycle is handed to the incoming binding. Failure leaves the
-    /// durable activation valid but returns false so the activation reply cannot claim cache reuse.
+    /// A quiescent compatible lifecycle is handed to the incoming binding. Preparation is
+    /// transactional: every launch's identity, namespace, and required subdirectories are
+    /// validated locally first, and `self.providers.caches`/`binding_caches` are updated only once
+    /// every launch has succeeded. A late failure therefore leaves previously retained lifecycles
+    /// exactly as they were (still owned by whichever binding already held them) instead of
+    /// stranding an unowned, permanently non-quiescent entry that would poison every later
+    /// activation of this worktree. Failure leaves the durable activation valid but returns false
+    /// so the activation reply cannot claim cache reuse.
     pub(super) fn retain_worktree_caches(
         &mut self,
         binding: &BindingRef,
         authority: &AuthorityStamp,
         launches: &[ProviderLaunch],
+        managed_sandbox: bool,
     ) -> bool {
         let Ok(root) = CacheRoot::prepare(self.runtime.join("cache")) else {
             return false;
@@ -200,7 +213,7 @@ impl Worker<'_> {
             authority.worktree().id(),
             authority.worktree().incarnation()
         );
-        let mut keys = Vec::with_capacity(launches.len());
+        let mut prepared = Vec::with_capacity(launches.len());
         for launch in launches {
             let settings = match launch.settings {
                 AcceptedProviderSettings::GoplsDefaults => "gopls-defaults-v1",
@@ -208,10 +221,11 @@ impl Worker<'_> {
                     "rust-cache-priming-disabled-v1"
                 }
             };
+            let configuration = effective_configuration(launch.settings, managed_sandbox);
             let Some(identity) = CacheIdentity::new(
                 launch.executable.identity.clone(),
                 settings,
-                settings,
+                configuration,
                 launch.toolchain.clone(),
                 launch.trust.clone(),
                 worktree_state.clone(),
@@ -222,6 +236,13 @@ impl Worker<'_> {
             let Some(namespace) = CacheNamespaceId::new(key.clone()) else {
                 return false;
             };
+            let already_retained = self.providers.caches.contains_key(&key)
+                || prepared.iter().any(|(existing, _)| existing == &key);
+            if !already_retained
+                && self.providers.caches.len() + prepared.len() >= MAX_CACHE_NAMESPACES
+            {
+                return false;
+            }
             if let Some(cache) = self.providers.caches.get_mut(&key)
                 && !cache.handoff(&identity)
             {
@@ -245,6 +266,10 @@ impl Worker<'_> {
             {
                 return false;
             }
+            prepared.push((key, cache));
+        }
+        let mut keys = Vec::with_capacity(prepared.len());
+        for (key, cache) in prepared {
             self.providers.caches.insert(key.clone(), cache);
             keys.push(key);
         }
@@ -312,10 +337,7 @@ impl Worker<'_> {
         let binding = job.invocation.binding_ref().clone();
         let authority = self.authority(&binding).await?;
         let cache_namespace = self.provider_cache_namespace(&binding, &authority, launch)?;
-        let managed_sandbox =
-            job.observed.as_ref().and_then(|observed| {
-                observed.state().as_json()["permissionProfile"]["type"].as_str()
-            }) == Some("managed");
+        let managed_sandbox = managed_sandbox_from_job(job);
         let profile = RustProfile::new(RustProfileIdentity {
             binary: launch.executable.path.clone(),
             rust_analyzer_version: launch.executable.identity.clone(),
@@ -328,11 +350,7 @@ impl Worker<'_> {
                 .clone()
                 .ok_or(FailureCode::ExecutionProfile)?,
             rustup_toolchain: launch.toolchain.clone(),
-            configuration: if managed_sandbox {
-                "cache-priming-and-proc-macro-disabled-v1".into()
-            } else {
-                "cache-priming-disabled-v1".into()
-            },
+            configuration: effective_configuration(launch.settings, managed_sandbox).into(),
             trust: launch.trust.clone(),
             transport: "stdio-v1".into(),
             cache_namespace,
@@ -794,6 +812,30 @@ fn provider_cache_settings(settings: AcceptedProviderSettings) -> &'static str {
         AcceptedProviderSettings::GoplsDefaults => "gopls-defaults-v1",
         AcceptedProviderSettings::RustCachePrimingDisabledV1 => "rust-cache-priming-disabled-v1",
     }
+}
+
+/// Returns the exact initialization configuration identity a provider command will use, so the
+/// retained `CacheIdentity` never claims compatibility across a managed/non-managed sandbox change
+/// it never actually observed. `gopls` has no managed variant and keeps its one fixed identity.
+fn effective_configuration(
+    settings: AcceptedProviderSettings,
+    managed_sandbox: bool,
+) -> &'static str {
+    match settings {
+        AcceptedProviderSettings::GoplsDefaults => "gopls-defaults-v1",
+        AcceptedProviderSettings::RustCachePrimingDisabledV1 if managed_sandbox => {
+            "cache-priming-and-proc-macro-disabled-v1"
+        }
+        AcceptedProviderSettings::RustCachePrimingDisabledV1 => "cache-priming-disabled-v1",
+    }
+}
+
+/// Returns whether the job's observed sandbox permission profile is the managed Claude profile.
+pub(super) fn managed_sandbox_from_job(job: &Job) -> bool {
+    job.observed
+        .as_ref()
+        .and_then(|observed| observed.state().as_json()["permissionProfile"]["type"].as_str())
+        == Some("managed")
 }
 
 /// Derives one opaque namespace component from durable worktree and accepted provider identities.

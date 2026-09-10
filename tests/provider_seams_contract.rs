@@ -427,7 +427,7 @@ async fn gopls_wrappers_forward_fresh_binding_uses() {
         "default".into(),
         "/usr/bin/true".into(),
         "test".into(),
-        "test".into(),
+        fixture.0.join("gopls-cache").display().to_string(),
     )
     .unwrap();
     let socket = fixture.0.join("unused.sock");
@@ -840,6 +840,7 @@ fn provider_compatibility_uses_measured_executable_bytes() {
     fs::write(&right, "#!/bin/sh\nexit 1\n").unwrap();
     fs::set_permissions(&left, fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(&right, fs::Permissions::from_mode(0o700)).unwrap();
+    let cache_namespace = fixture.0.join("gopls-cache").display().to_string();
     let profile = |binary| {
         GoplsProfile::new(
             binary,
@@ -848,7 +849,7 @@ fn provider_compatibility_uses_measured_executable_bytes() {
             "default".into(),
             "/usr/bin/true".into(),
             "test".into(),
-            "test".into(),
+            cache_namespace.clone(),
         )
         .unwrap()
     };

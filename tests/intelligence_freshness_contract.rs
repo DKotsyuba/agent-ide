@@ -269,10 +269,15 @@ async fn diagnostics_are_bounded_and_cache_reuse_requires_quiescent_compatibilit
     )
     .unwrap();
     let failed_path = cache_path.join("failed-retirement");
+    assert!(
+        failed_cache.retire(VerifiedCacheRetirement::Reset).is_err(),
+        "retire must refuse a still-active (non-quiescent) lifecycle"
+    );
+    assert!(failed_cache.retained());
+    failed_cache.quiesce();
     fs::set_permissions(&failed_path, fs::Permissions::from_mode(0o755)).unwrap();
     assert!(failed_cache.retire(VerifiedCacheRetirement::Reset).is_err());
     assert!(failed_cache.retained());
-    failed_cache.quiesce();
     assert!(!failed_cache.handoff(&identity));
     fs::set_permissions(&failed_path, fs::Permissions::from_mode(0o700)).unwrap();
     failed_cache.retire(VerifiedCacheRetirement::Reset).unwrap();

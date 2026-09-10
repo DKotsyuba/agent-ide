@@ -323,7 +323,7 @@ fn rust_settings_with_configuration(configuration: &str) -> ProviderSettings {
             configuration: configuration.into(),
             trust: "test".into(),
             transport: "stdio-v1".into(),
-            cache_namespace: "test".into(),
+            cache_namespace: "/private/tmp/agent-ide-session-test-cache".into(),
         })
         .unwrap(),
     )

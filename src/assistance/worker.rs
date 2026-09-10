@@ -987,7 +987,9 @@ impl<'a> Worker<'a> {
             .capture_activation_baseline(job, &authority, &activation_operation)
             .await;
         let launches = job.target.providers.clone();
-        let cache_retained = self.retain_worktree_caches(&binding, &authority, &launches);
+        let managed_sandbox = providers::managed_sandbox_from_job(job);
+        let cache_retained =
+            self.retain_worktree_caches(&binding, &authority, &launches, managed_sandbox);
         self.shared.active(&binding)?;
         let baseline = match baseline {
             Ok(baseline) => {

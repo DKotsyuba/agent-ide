@@ -428,7 +428,7 @@ async fn gopls_spawns_require_exact_registry_authority() {
         "test".into(),
         "/usr/bin/true".into(),
         "test".into(),
-        "test".into(),
+        root.join("gopls-authority-contract-cache").display().to_string(),
     )
     .unwrap();
     let socket = root.join("unused-authority-contract.sock");
@@ -910,4 +910,36 @@ async fn dropping_live_gopls_owner_closes_its_owned_listener() {
     let _pending = reap_capability(registry.release(view).unwrap());
 
     assert_eq!(admission.running_count(), 1);
+}
+
+/// A relative cache namespace would resolve against the spawned child's working directory (the
+/// worktree root) and write build/mod cache into the user's repository; the profile must refuse it.
+#[test]
+fn gopls_profile_rejects_a_relative_cache_namespace() {
+    let relative = GoplsProfile::new(
+        PathBuf::from("/usr/bin/true"),
+        "v0.23.0".into(),
+        "v0.1".into(),
+        "contract-config".into(),
+        "/usr/local/go".into(),
+        "trusted".into(),
+        "relative-cache-label".into(),
+    );
+    assert!(
+        relative.is_err(),
+        "relative cache_namespace must be rejected"
+    );
+    let absolute = GoplsProfile::new(
+        PathBuf::from("/usr/bin/true"),
+        "v0.23.0".into(),
+        "v0.1".into(),
+        "contract-config".into(),
+        "/usr/local/go".into(),
+        "trusted".into(),
+        "/private/tmp/agent-ide-cache-namespace".into(),
+    );
+    assert!(
+        absolute.is_ok(),
+        "absolute cache_namespace must be accepted"
+    );
 }
