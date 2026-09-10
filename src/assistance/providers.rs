@@ -218,20 +218,7 @@ impl Worker<'_> {
             ) else {
                 return false;
             };
-            let key = blake3::hash(
-                format!(
-                    "{}\0{}\0{}\0{}\0{}\0{}",
-                    worktree_state,
-                    launch.cache_namespace,
-                    launch.executable.identity,
-                    settings,
-                    launch.toolchain,
-                    launch.trust
-                )
-                .as_bytes(),
-            )
-            .to_hex()
-            .to_string();
+            let key = provider_cache_key(&worktree_state, launch, settings);
             let Some(namespace) = CacheNamespaceId::new(key.clone()) else {
                 return false;
             };
@@ -243,6 +230,21 @@ impl Worker<'_> {
             let Ok(cache) = CacheLifecycle::retain(&root, namespace, identity) else {
                 return false;
             };
+            let namespace = self.runtime.join("cache").join(&key);
+            let required = match launch.settings {
+                AcceptedProviderSettings::GoplsDefaults => {
+                    &["gopls", "go-build", "go-mod", "tmp"][..]
+                }
+                AcceptedProviderSettings::RustCachePrimingDisabledV1 => {
+                    &["cargo", "target", "tmp"][..]
+                }
+            };
+            if required
+                .iter()
+                .any(|directory| CacheRoot::prepare(namespace.join(directory)).is_err())
+            {
+                return false;
+            }
             self.providers.caches.insert(key.clone(), cache);
             keys.push(key);
         }
@@ -309,6 +311,11 @@ impl Worker<'_> {
     ) -> Result<ProviderContext, FailureCode> {
         let binding = job.invocation.binding_ref().clone();
         let authority = self.authority(&binding).await?;
+        let cache_namespace = self.provider_cache_namespace(&binding, &authority, launch)?;
+        let managed_sandbox =
+            job.observed.as_ref().and_then(|observed| {
+                observed.state().as_json()["permissionProfile"]["type"].as_str()
+            }) == Some("managed");
         let profile = RustProfile::new(RustProfileIdentity {
             binary: launch.executable.path.clone(),
             rust_analyzer_version: launch.executable.identity.clone(),
@@ -321,10 +328,14 @@ impl Worker<'_> {
                 .clone()
                 .ok_or(FailureCode::ExecutionProfile)?,
             rustup_toolchain: launch.toolchain.clone(),
-            configuration: "cache-priming-disabled-v1".into(),
+            configuration: if managed_sandbox {
+                "cache-priming-and-proc-macro-disabled-v1".into()
+            } else {
+                "cache-priming-disabled-v1".into()
+            },
             trust: launch.trust.clone(),
             transport: "stdio-v1".into(),
-            cache_namespace: launch.cache_namespace.clone(),
+            cache_namespace,
         })
         .map_err(|_| FailureCode::ExecutionProfile)?;
         let scoped = execution_authority(&authority)?;
@@ -451,6 +462,7 @@ impl Worker<'_> {
             launch.trust,
             blake3::hash(state.to_string().as_bytes()).to_hex()
         );
+        let cache_namespace = self.provider_cache_namespace(&binding, &authority, launch)?;
         let profile = GoplsProfile::new(
             launch.executable.path.clone(),
             launch.executable.identity.clone(),
@@ -458,7 +470,7 @@ impl Worker<'_> {
             "gopls-defaults-v1".into(),
             launch.toolchain.clone(),
             trust,
-            launch.cache_namespace.clone(),
+            cache_namespace,
         )
         .map_err(|_| FailureCode::ExecutionProfile)?;
         let backend = profile.compatibility_key();
@@ -738,6 +750,68 @@ impl Worker<'_> {
         }
         Ok(())
     }
+
+    /// Resolves the already-retained namespace for this exact durable worktree and provider.
+    /// Missing lifecycle ownership is rejected before a provider command can be constructed.
+    fn provider_cache_namespace(
+        &self,
+        binding: &BindingRef,
+        authority: &AuthorityStamp,
+        launch: &ProviderLaunch,
+    ) -> Result<String, FailureCode> {
+        let settings = provider_cache_settings(launch.settings);
+        let worktree_state = format!(
+            "{}:{}",
+            authority.worktree().id(),
+            authority.worktree().incarnation()
+        );
+        let key = provider_cache_key(&worktree_state, launch, settings);
+        let retained = self
+            .providers
+            .binding_caches
+            .get(binding)
+            .is_some_and(|keys| keys.contains(&key))
+            && self
+                .providers
+                .caches
+                .get(&key)
+                .is_some_and(CacheLifecycle::retained);
+        if !retained {
+            return Err(FailureCode::ProviderUnavailable);
+        }
+        self.runtime
+            .join("cache")
+            .join(key)
+            .into_os_string()
+            .into_string()
+            .map_err(|_| FailureCode::ProviderUnavailable)
+    }
+}
+
+/// Returns the immutable settings identity used by cache compatibility and namespace derivation.
+fn provider_cache_settings(settings: AcceptedProviderSettings) -> &'static str {
+    match settings {
+        AcceptedProviderSettings::GoplsDefaults => "gopls-defaults-v1",
+        AcceptedProviderSettings::RustCachePrimingDisabledV1 => "rust-cache-priming-disabled-v1",
+    }
+}
+
+/// Derives one opaque namespace component from durable worktree and accepted provider identities.
+fn provider_cache_key(worktree_state: &str, launch: &ProviderLaunch, settings: &str) -> String {
+    blake3::hash(
+        format!(
+            "{}\0{}\0{}\0{}\0{}\0{}",
+            worktree_state,
+            launch.cache_namespace,
+            launch.executable.identity,
+            settings,
+            launch.toolchain,
+            launch.trust
+        )
+        .as_bytes(),
+    )
+    .to_hex()
+    .to_string()
 }
 
 /// Stops and reaps a backend this worker just became the sole owner of, giving its captured socket

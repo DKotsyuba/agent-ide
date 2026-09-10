@@ -142,7 +142,7 @@ fn request(
             .expect("test profile is valid"),
     ])
     .expect("one test profile is valid");
-    let policy = LocalExecutionPolicy::new(BTreeSet::from([program.to_path_buf()]), 4096, 3, true)
+    let policy = LocalExecutionPolicy::new(BTreeSet::from([program.to_path_buf()]), 4096, 8, true)
         .expect("test policy is valid");
     ValidatedExecutionRequest::validate(
         ValidatedHostInvocation::from_verified_binding("gopls-contract", sandbox)

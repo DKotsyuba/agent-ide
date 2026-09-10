@@ -1326,10 +1326,14 @@ async fn configured_product_returns_real_go_and_rust_semantic_context() {
     for _ in 0..2 {
         let fixture = ProductFixture::new(json!([]));
         let wrapper = fixture.base.join("rust-provider");
-        for directory in ["cache", "cargo", "target"] {
-            std::fs::create_dir(fixture.base.join(directory)).unwrap();
-        }
-        std::fs::write(&wrapper, format!("#!/bin/sh\nexport XDG_CACHE_HOME='{}'\nexport CARGO_HOME='{}'\nexport CARGO_TARGET_DIR='{}'\nexec '{}' \"$@\"\n",fixture.base.join("cache").display(),fixture.base.join("cargo").display(),fixture.base.join("target").display(),analyzer.replace('\'', "'\\''"))).unwrap();
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nexec '{}' \"$@\"\n",
+                analyzer.replace('\'', "'\\''")
+            ),
+        )
+        .unwrap();
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
         let providers = json!([{"executable":accepted_program(&gopls,"golang.org/x/tools/gopls v0.23.0"),"settings":"gopls_defaults","toolchain":go,"cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"fixture-go-cache"},{"executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),"settings":"rust_cache_priming_disabled_v1","toolchain":toolchain,"cargo_version":"cargo 1.98.1","rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"fixture-rust-cache"}]);
         fixture.write_config(providers);
@@ -1403,11 +1407,13 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
     let fixture = ProductFixture::new(json!([]));
     let program = fixture.base.join("slow-provider");
     let marker = fixture.base.join("provider-pid");
+    let environment = fixture.base.join("provider-environment");
     std::fs::write(
         &program,
         format!(
-            "#!/bin/sh\nprintf '%s' $$ > '{}'\nexec /bin/sleep 30\n",
-            marker.display()
+            "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n%s\\n%s\\n%s' \"$GOPLSCACHE\" \"$GOCACHE\" \"$GOMODCACHE\" \"$GOTMPDIR\" \"$TMPDIR\" \"$PATH\" > '{}'\nprintf '%s' $$ > '{}'\nexec /bin/sleep 30\n",
+            environment.display(),
+            marker.display(),
         ),
     )
     .unwrap();
@@ -1446,6 +1452,19 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
     .await
     .unwrap();
     let pid: libc::pid_t = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+    let provider_environment = std::fs::read_to_string(environment).unwrap();
+    let namespace = &cache_namespaces[0];
+    assert_eq!(
+        provider_environment.lines().collect::<Vec<_>>(),
+        vec![
+            namespace.join("gopls").to_str().unwrap(),
+            namespace.join("go-build").to_str().unwrap(),
+            namespace.join("go-mod").to_str().unwrap(),
+            namespace.join("tmp").to_str().unwrap(),
+            namespace.join("tmp").to_str().unwrap(),
+            "/usr/bin",
+        ]
+    );
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     // The provider never created its socket, so `close_provider` cannot prove the on-disk socket's
     // fate; it still kills and reaps the direct child below but reports the cleanup honestly instead
@@ -1573,10 +1592,12 @@ async fn configured_product_sigterm_reaps_in_flight_rust_only_provider() {
     let program = fixture.base.join("signal-rust-provider");
     let ready = fixture.base.join("rust-provider-ready");
     let process = fixture.base.join("rust-provider-process");
+    let environment = fixture.base.join("rust-provider-environment");
     std::fs::write(
         &program,
         format!(
-            "#!/bin/sh\nprintf '%s' $$ > '{}'\n: > '{}'\nexec /bin/sleep 30\n",
+            "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n%s' \"$CARGO_HOME\" \"$CARGO_TARGET_DIR\" \"$TMPDIR\" \"$RUSTUP_TOOLCHAIN\" > '{}'\nprintf '%s' $$ > '{}'\n: > '{}'\nexec /bin/sleep 30\n",
+            environment.display(),
             process.display(),
             ready.display(),
         ),
@@ -1612,6 +1633,24 @@ async fn configured_product_sigterm_reaps_in_flight_rust_only_provider() {
     .await
     .unwrap();
     let provider_pid: libc::pid_t = std::fs::read_to_string(&process).unwrap().parse().unwrap();
+    let namespaces = std::fs::read_dir(fixture.runtime.join("cache"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    assert_eq!(namespaces.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(environment)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            namespaces[0].join("cargo").to_str().unwrap(),
+            namespaces[0].join("target").to_str().unwrap(),
+            namespaces[0].join("tmp").to_str().unwrap(),
+            "stable",
+        ]
+    );
     // SAFETY: signal zero only observes the readiness-marked direct child and changes no state.
     assert_eq!(unsafe { libc::kill(provider_pid, 0) }, 0);
     let daemon_pid = daemon.id().unwrap() as libc::pid_t;
@@ -1632,10 +1671,11 @@ async fn configured_product_sigterm_reaps_in_flight_rust_only_provider() {
     actor.mcp.close().await;
 }
 
-/// Two configured root/child channels keep one compatible listener while isolating current source and stop.
+/// Two configured root/child channels on divergent worktrees each get an isolated compatible
+/// listener even under one configured cache label, while current source and stop stay isolated.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_GOPLS and AGENT_IDE_GO environment"]
-async fn configured_product_shares_go_across_two_exact_actors_without_crossing_views() {
+async fn configured_product_isolates_go_across_two_divergent_worktree_actors() {
     use std::os::unix::fs::PermissionsExt;
     let gopls = std::env::var("AGENT_IDE_GOPLS").unwrap();
     let go = std::env::var("AGENT_IDE_GO").unwrap();
@@ -1748,7 +1788,9 @@ async fn configured_product_shares_go_across_two_exact_actors_without_crossing_v
         .lines()
         .filter(|line| line.contains("-remote=unix;"))
         .collect::<Vec<_>>();
-    assert_eq!(listeners.len(), 1, "{invocations}");
+    // Root and child are divergent worktrees, so strict cache ownership gives each its own
+    // physical backend: two listeners, each with exactly one forwarder view.
+    assert_eq!(listeners.len(), 2, "{invocations}");
     assert_eq!(forwarders.len(), 2, "{invocations}");
     assert!(
         forwarders
@@ -1770,7 +1812,7 @@ async fn configured_product_shares_go_across_two_exact_actors_without_crossing_v
         .filter_map(Result::ok)
         .filter(|entry| entry.file_name().to_string_lossy().starts_with("g-"))
         .count();
-    assert_eq!(sockets, 1);
+    assert_eq!(sockets, 2);
     let stop = root.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stop["kind"], "stop", "{stop}");
     let live = child
