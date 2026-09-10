@@ -47,6 +47,14 @@ fn worktree(path: &str, incarnation: u64) -> RustWorktree {
     RustWorktree::new(worktree, authority).unwrap()
 }
 
+/// Returns the operator-verified absolute path of one binary inside the accepted rustup toolchain,
+/// honoring `AGENT_IDE_RUST_TOOLCHAIN_DIR` when the harness points at a non-default rustup home.
+fn toolchain_bin(tool: &str) -> PathBuf {
+    let root = std::env::var("AGENT_IDE_RUST_TOOLCHAIN_DIR")
+        .unwrap_or_else(|_| "/Users/pluto/.rustup/toolchains/1.98.1-aarch64-apple-darwin".into());
+    PathBuf::from(root).join("bin").join(tool)
+}
+
 /// Builds the complete fixed Rust compatibility identity used by every exclusive request.
 /// `cache_namespace` must be a verified absolute directory, never a bare relative label, so
 /// `command`'s derived `CARGO_HOME`/`CARGO_TARGET_DIR`/`TMPDIR` resolve without depending on the
@@ -55,7 +63,9 @@ fn profile(cache_namespace: &Path) -> RustProfile {
     RustProfile::new(RustProfileIdentity {
         binary: PathBuf::from("/Users/pluto/.local/bin/rust-analyzer"),
         rust_analyzer_version: format!("rust-analyzer {ANALYZER_VERSION}"),
+        cargo: toolchain_bin("cargo"),
         cargo_version: "cargo 1.98.1".into(),
+        rustc: toolchain_bin("rustc"),
         rustc_version: "rustc 1.98.1".into(),
         rustup_toolchain: "1.98.1-aarch64-apple-darwin".into(),
         configuration: "cache-priming-and-proc-macro-disabled-v1".into(),
@@ -414,7 +424,9 @@ async fn real_rust_analyzer_is_exclusive_across_divergent_worktrees() {
         RustProfile::new(RustProfileIdentity {
             binary: analyzer.clone(),
             rust_analyzer_version: format!("rust-analyzer {ANALYZER_VERSION}"),
+            cargo: toolchain_bin("cargo"),
             cargo_version: "cargo 1.98.1".into(),
+            rustc: toolchain_bin("rustc"),
             rustc_version: "rustc 1.98.1".into(),
             rustup_toolchain: "1.98.1-aarch64-apple-darwin".into(),
             configuration: "cache-priming-and-proc-macro-disabled-v1".into(),
@@ -664,7 +676,9 @@ fn rust_profile_rejects_a_relative_cache_namespace() {
     let mut identity = RustProfileIdentity {
         binary: PathBuf::from("/usr/bin/true"),
         rust_analyzer_version: format!("rust-analyzer {ANALYZER_VERSION}"),
+        cargo: PathBuf::from("/usr/bin/true"),
         cargo_version: "cargo 1.98.1".into(),
+        rustc: PathBuf::from("/usr/bin/true"),
         rustc_version: "rustc 1.98.1".into(),
         rustup_toolchain: "1.98.1-aarch64-apple-darwin".into(),
         configuration: "cache-priming-and-proc-macro-disabled-v1".into(),

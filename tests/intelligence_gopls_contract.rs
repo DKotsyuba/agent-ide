@@ -428,7 +428,9 @@ async fn gopls_spawns_require_exact_registry_authority() {
         "test".into(),
         "/usr/bin/true".into(),
         "test".into(),
-        root.join("gopls-authority-contract-cache").display().to_string(),
+        root.join("gopls-authority-contract-cache")
+            .display()
+            .to_string(),
     )
     .unwrap();
     let socket = root.join("unused-authority-contract.sock");

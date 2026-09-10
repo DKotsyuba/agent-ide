@@ -317,7 +317,9 @@ fn rust_settings_with_configuration(configuration: &str) -> ProviderSettings {
         RustProfile::new(super::super::rust::RustProfileIdentity {
             binary: "/usr/bin/true".into(),
             rust_analyzer_version: "rust-analyzer contract-1".into(),
+            cargo: "/usr/bin/true".into(),
             cargo_version: "cargo-test".into(),
+            rustc: "/usr/bin/true".into(),
             rustc_version: "rustc-test".into(),
             rustup_toolchain: "test-toolchain".into(),
             configuration: configuration.into(),
