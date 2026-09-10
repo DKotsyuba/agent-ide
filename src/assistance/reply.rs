@@ -49,7 +49,10 @@ pub enum FailureCode {
     InvalidDetail,
     /// Registered source bytes could not be observed in the authorized scope.
     SourceUnavailable,
-    /// Idempotent operation was retried with different immutable parameters.
+    /// A single-owner resource is already held: an idempotent operation retried with different
+    /// immutable parameters, or another live actor that currently owns this worktree incarnation
+    /// or its provider cache namespace. The refusal never disturbs the actor that already owns it,
+    /// and a handoff becomes possible after that owner stops.
     Conflict,
     /// Unexpected internal failure has no safe owner result.
     Internal,

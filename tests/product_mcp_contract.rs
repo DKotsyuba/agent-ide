@@ -1497,6 +1497,89 @@ async fn configured_product_rust_resolves_definition_across_a_crate_boundary() {
     daemon.wait().await.unwrap();
 }
 
+/// A real second actor on the same worktree is refused as a finite conflict, and hands off on stop.
+///
+/// The refusal comes from durable activation itself (`AuthorityError::WorktreeOwned`), not from the
+/// cache map, so the important part is that the actor which already owns the worktree keeps working
+/// while the second one is told exactly why it cannot start, and that the same second actor starts
+/// successfully once the first has stopped.
+#[tokio::test]
+async fn configured_product_reports_a_second_actor_on_one_worktree_as_a_conflict() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+    let mut second_target = config["targets"][0].clone();
+    second_target["attachment"] = json!("private-second-channel");
+    config["targets"]
+        .as_array_mut()
+        .unwrap()
+        .push(second_target);
+    std::fs::write(&fixture.config, config.to_string()).unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut first = ProductActor::new(&fixture, "owning-view").await;
+    let mut second = ProductActor::new_at(
+        &fixture,
+        "waiting-view",
+        "private-second-channel",
+        "agent_id",
+        fixture.state(),
+    )
+    .await;
+
+    let started = first
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"first-start"}),
+        )
+        .await;
+    let started = first.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    let refused = second
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"second-start"}),
+        )
+        .await;
+    let refused = second.settle(&fixture, refused).await;
+    assert_eq!(
+        refused["code"], "conflict",
+        "a second live actor on one worktree must get the finite ownership conflict: {refused}"
+    );
+
+    // The refusal must not have disturbed the owner: its context still resolves.
+    let live = first
+        .call(
+            &fixture,
+            "ide.context",
+            json!({"path":"src/lib.rs","byte_offset":0}),
+        )
+        .await;
+    let live = first.settle(&fixture, live).await;
+    assert_eq!(live["kind"], "context", "{live}");
+
+    let stopped = first.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+
+    // Handoff after a successful stop: the same second actor now activates.
+    let handed = second
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"second-handoff"}),
+        )
+        .await;
+    let handed = second.settle(&fixture, handed).await;
+    assert_eq!(handed["kind"], "activation", "{handed}");
+    let stopped = second.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    tokio::join!(first.mcp.close(), second.mcp.close());
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Cancels a configured owned provider during warmup: the direct child is still killed and reaped even
 /// though its socket identity was never captured, and the stop honestly reports that uncertainty
 /// instead of a false success.
