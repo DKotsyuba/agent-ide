@@ -16,6 +16,7 @@
 //! attestation. A ticket establishes correlation and replay exclusion only; the authority contract
 //! is the operator-managed strict Claude configuration declared by [`ClaudeOperatorProfile`].
 
+use super::host_binding::BindingRef;
 use super::reply::FailureCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -27,6 +28,13 @@ pub const MAX_HELPER_FRAME_BYTES: usize = 64 * 1024;
 pub const HELPER_PROTOCOL: u32 = 1;
 /// Bounds concurrently outstanding launch tickets within one daemon boot.
 pub const MAX_TICKETS: usize = 64;
+/// Bounds concurrently claimed Claude operations, and therefore concurrent physical helper work.
+///
+/// [`MAX_TICKETS`] bounds only how many handles exist; a ticket costs nothing until it is claimed.
+/// This separate ceiling is the one that bounds real concurrent processes, and it is a lease the
+/// ledger itself reserves at claim time. A helper's self-reported [`ChildSettlement`] counts are
+/// evidence about one operation and can never widen it.
+pub const MAX_ACTIVE_CLAIMS: usize = 4;
 /// Maximum accepted length of one exact expected helper command.
 const MAX_COMMAND_BYTES: usize = 4096;
 /// Maximum accepted length of any single identity field carried on the helper wire.
@@ -500,16 +508,36 @@ enum TicketState {
         tool_use_id: String,
     },
     /// A helper claimed this handle exactly once; a second claim is rejected.
-    Claimed {
-        /// Native tool-call identity carried over from recognition.
-        tool_use_id: String,
-        /// Final helper frame, once it has arrived.
-        frame: Option<HelperResult>,
-        /// Whether the matching successful `Bash` post-hook has arrived.
-        post: Option<bool>,
-    },
-    /// Claimed work whose settlement never became provable; its admission stays quarantined.
-    Uncertain,
+    Claimed(ClaimedWork),
+    /// Claimed work whose result authority is permanently suppressed.
+    ///
+    /// The claimed correlation is *retained*, not discarded: without the exact `tool_use_id`,
+    /// frame slot and lease flag there is nothing a late cleanup frame or post could correlate
+    /// against, so positive cleanup settlement would be impossible and the bounded lease could
+    /// never be released on proof. Suppression is a property of [`LaunchLedger::delivery`] and
+    /// [`LaunchLedger::settled`], not of destroying the identity.
+    Uncertain(ClaimedWork),
+}
+
+/// The correlated state one claimed helper operation accumulates, in either arrival order.
+///
+/// The same value survives revocation and expiry unchanged, which is what makes cleanup-only
+/// settlement possible after authority has been suppressed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClaimedWork {
+    /// Native tool-call identity carried over from recognition; correlates the matching post.
+    tool_use_id: String,
+    /// Final helper frame, once it has arrived.
+    frame: Option<HelperResult>,
+    /// Whether the matching successful `Bash` post-hook has arrived.
+    post: Option<bool>,
+    /// Whether this operation still holds its bounded admission lease.
+    ///
+    /// Reserved at claim, released exactly once and only on positive proof: the final frame with
+    /// exactly settled children plus the matching successful post. An abandoned, revoked or
+    /// unsettled operation keeps the lease, so lost capacity is honest rather than reclaimed on a
+    /// disappearance.
+    lease: bool,
 }
 
 /// One action-scoped, single-use helper handle bound to exactly one Claude operation.
@@ -518,8 +546,15 @@ enum TicketState {
 /// or launch flag is introduced: the ticket is daemon-private bookkeeping hanging off that handle.
 #[derive(Debug)]
 pub struct LaunchTicket {
-    /// Opaque binding-generation fingerprint this ticket is fenced to.
-    binding: [u8; 32],
+    /// Exact binding generation this ticket is fenced to.
+    ///
+    /// The whole reference is retained, not just its fingerprint, so a claim can be checked against
+    /// the *current* liveness of that generation instead of against a value the caller supplied.
+    binding: BindingRef,
+    /// Accepted identity of the helper executable the expected command names.
+    helper: AcceptedIdentity,
+    /// Accepted identities of every executable this job's children may be, preserved for settlement.
+    children: Vec<AcceptedIdentity>,
     /// Exact Claude actor permitted to claim this handle.
     actor: HelperActor,
     /// Opaque private transport channel this handle was minted on.
@@ -543,6 +578,156 @@ impl LaunchTicket {
     /// Returns whether this ticket has been claimed and is awaiting or holding settlement.
     pub fn claimed(&self) -> bool {
         matches!(self.state, TicketState::Claimed { .. })
+    }
+
+    /// Returns whether one native tool-call identity is this ticket's own helper invocation.
+    ///
+    /// Quarantined work still correlates, so a late post arriving after revocation is recognized
+    /// as the helper's own settlement rather than as an unrelated native edit.
+    fn correlates(&self, tool_use_id: &str) -> bool {
+        matches!(
+            &self.state,
+            TicketState::Claimed(work) | TicketState::Uncertain(work)
+                if work.tool_use_id == tool_use_id
+        )
+    }
+
+    /// Suppresses this ticket's authority, returning whether it must be retained.
+    ///
+    /// Work that provably never ran (`Minted`, `Launched`) is retired and returns `false`: nothing
+    /// physical exists, so dropping it has no effect and cannot be misread as cleanup evidence.
+    /// Claimed work is retained with its correlation intact and returns `true`.
+    fn quarantine(&mut self) -> bool {
+        let retained = match &self.state {
+            TicketState::Minted | TicketState::Launched { .. } => None,
+            TicketState::Claimed(work) => Some(Some(work.clone())),
+            TicketState::Uncertain(_) => Some(None),
+        };
+        match retained {
+            None => false,
+            Some(None) => true,
+            Some(Some(work)) => {
+                self.state = TicketState::Uncertain(work);
+                true
+            }
+        }
+    }
+}
+
+/// One accepted executable identity carried into a helper ticket.
+///
+/// This is the ticket-side copy of the launcher's already accepted `AcceptedExecutable` evidence:
+/// the absolute path, its nonempty accepted identity string and its 64-hex BLAKE3 digest. It is
+/// deliberately not deserializable, so a helper frame can never introduce an executable identity;
+/// only the daemon, from trusted launcher configuration, can.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcceptedIdentity {
+    /// Absolute accepted executable path chosen by the launcher.
+    path: PathBuf,
+    /// Nonempty accepted binary/version identity.
+    identity: String,
+    /// 64-character lowercase-or-uppercase hex BLAKE3 digest of the accepted bytes.
+    blake3: String,
+}
+
+impl AcceptedIdentity {
+    /// Builds one identity, rejecting a relative path, empty identity or non-hex/short digest.
+    ///
+    /// Returns [`FailureCode::ExecutionProfile`] on any malformed field, because a missing or
+    /// unusable executable identity is an execution-profile problem and never a runtime failure.
+    pub fn new(path: PathBuf, identity: &str, blake3: &str) -> Result<Self, FailureCode> {
+        if !path.is_absolute()
+            || identity.is_empty()
+            || identity.len() > MAX_IDENTIFIER_BYTES
+            || blake3.len() != 64
+            || !blake3.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(FailureCode::ExecutionProfile);
+        }
+        Ok(Self {
+            path,
+            identity: identity.to_owned(),
+            blake3: blake3.to_owned(),
+        })
+    }
+
+    /// Returns the absolute accepted executable path.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Returns the accepted binary/version identity string.
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    /// Returns the accepted BLAKE3 digest of the executable's bytes.
+    pub fn blake3(&self) -> &str {
+        &self.blake3
+    }
+}
+
+/// Daemon-private proof that exactly one Claude helper operation settled positively.
+///
+/// This token is the only thing that may carry helper evidence into the Worker authority path. It
+/// is produced solely by [`LaunchLedger::settled`], which requires, all at once: exact ticket and
+/// binding ownership; the final frame correlated to that exact handle; a matching successful post;
+/// a `Complete` outcome with exactly settled child accounting; verified helper and child executable
+/// identities; and a still-retained admission lease. It deliberately implements neither
+/// `Deserialize` nor `Default`, and its fields are private with no public constructor, so no amount
+/// of arbitrary `HelperResult` JSON can mint one.
+///
+/// Holding the token asserts settlement only. It is not workspace authority, not a sandbox
+/// observation and not a durable identity: the Worker still resolves and activates a worktree
+/// itself, and still reconsumes binding liveness after every await.
+#[derive(Debug)]
+pub struct SettledClaudeOperation {
+    /// The exact closed job this daemon released to the helper.
+    job: HelperJob,
+    /// The validated final frame the helper reported for that job.
+    result: HelperResult,
+    /// The binding generation the settled ticket was fenced to.
+    binding: BindingRef,
+    /// Verified accepted identity of the helper executable.
+    helper: AcceptedIdentity,
+    /// Verified accepted identities of the job's permitted child executables.
+    children: Vec<AcceptedIdentity>,
+}
+
+impl SettledClaudeOperation {
+    /// Returns the exact daemon-selected job the settled evidence belongs to.
+    pub fn job(&self) -> &HelperJob {
+        &self.job
+    }
+
+    /// Returns the validated final helper frame.
+    pub fn result(&self) -> &HelperResult {
+        &self.result
+    }
+
+    /// Returns the binding generation this settled operation is fenced to.
+    pub fn binding(&self) -> &BindingRef {
+        &self.binding
+    }
+
+    /// Returns the closed operation kind this evidence settles.
+    pub fn operation(&self) -> HelperOperation {
+        self.job.operation
+    }
+
+    /// Returns the raw fixed-query discovery bytes, uninterpreted.
+    pub fn discovery(&self) -> &[DiscoveryFrame] {
+        &self.result.discovery
+    }
+
+    /// Returns the verified helper executable identity.
+    pub fn helper(&self) -> &AcceptedIdentity {
+        &self.helper
+    }
+
+    /// Returns the verified child executable identities preserved from the accepted job.
+    pub fn children(&self) -> &[AcceptedIdentity] {
+        &self.children
     }
 }
 
@@ -590,6 +775,8 @@ pub enum Delivery {
 pub struct LaunchLedger {
     /// Outstanding handles keyed by their action-scoped `detail_ref`.
     tickets: BTreeMap<String, LaunchTicket>,
+    /// Bounded admission leases currently held by claimed operations, at most [`MAX_ACTIVE_CLAIMS`].
+    leases: usize,
 }
 
 impl LaunchLedger {
@@ -619,12 +806,14 @@ impl LaunchLedger {
     pub fn mint(
         &mut self,
         detail_ref: &str,
-        binding: [u8; 32],
+        binding: BindingRef,
         actor: HelperActor,
         channel: &str,
         command: String,
         job: HelperJob,
         deadline_ms: u64,
+        helper: AcceptedIdentity,
+        children: Vec<AcceptedIdentity>,
     ) -> Result<(), FailureCode> {
         if self.tickets.len() >= MAX_TICKETS {
             return Err(FailureCode::Capacity);
@@ -646,6 +835,8 @@ impl LaunchLedger {
             detail_ref.to_owned(),
             LaunchTicket {
                 binding,
+                helper,
+                children,
                 actor,
                 channel: channel.to_owned(),
                 command,
@@ -694,22 +885,30 @@ impl LaunchLedger {
     /// Atomically claims one recognized ticket exactly once and releases its closed job.
     ///
     /// Rejected: a handle whose native launch was never recognized (a bare copied reference, or a
-    /// launch by a different actor, which never reaches `Launched`), a different channel, a stale
-    /// binding generation, an expired deadline, and any second or replayed claim. Every rejection happens before a job is released, so a refused claim has
-    /// no Git, source or provider effect whatsoever.
+    /// launch by a different actor, which never reaches `Launched`), a different channel, a
+    /// binding generation that is no longer live, an expired deadline, any second or replayed
+    /// claim, and a full [`MAX_ACTIVE_CLAIMS`] lease pool. Every rejection happens before a job is
+    /// released, so a refused claim has no Git, source or provider effect whatsoever.
+    ///
+    /// `live` is asked about the ticket's *own* retained [`BindingRef`], never about a value the
+    /// caller supplied. Comparing a caller-supplied fingerprint against the same ticket's stored
+    /// fingerprint validates nothing — it is trivially satisfiable by reading the ticket first —
+    /// so generation validation is exactly two independent facts: the native launch this ledger
+    /// itself recognized for this exact actor, and the current liveness of that generation as the
+    /// binding guard reports it now.
+    ///
+    /// A granted claim reserves one bounded admission lease, which is retained until positive
+    /// settlement proves it may be released.
     pub fn claim(
         &mut self,
         detail_ref: &str,
-        binding: [u8; 32],
         channel: &str,
         now_ms: u64,
+        live: impl FnOnce(&BindingRef) -> bool,
     ) -> ClaimOutcome {
-        let Some(ticket) = self.tickets.get_mut(detail_ref) else {
+        let Some(ticket) = self.tickets.get(detail_ref) else {
             return ClaimOutcome::Rejected(FailureCode::InvalidDetail);
         };
-        if ticket.binding != binding {
-            return ClaimOutcome::Rejected(FailureCode::WorkspaceAuthority);
-        }
         if ticket.channel != channel {
             return ClaimOutcome::Rejected(FailureCode::InvalidDetail);
         }
@@ -720,28 +919,101 @@ impl LaunchLedger {
             return ClaimOutcome::Rejected(FailureCode::InvalidDetail);
         };
         let tool_use_id = tool_use_id.clone();
-        ticket.state = TicketState::Claimed {
+        if !live(&ticket.binding) {
+            return ClaimOutcome::Rejected(FailureCode::WorkspaceAuthority);
+        }
+        // The lease is taken before the job is released, so concurrent physical helper work is
+        // bounded by an admission the daemon reserved rather than by counts a helper reports.
+        if self.leases >= MAX_ACTIVE_CLAIMS {
+            return ClaimOutcome::Rejected(FailureCode::Capacity);
+        }
+        let Some(ticket) = self.tickets.get_mut(detail_ref) else {
+            return ClaimOutcome::Rejected(FailureCode::InvalidDetail);
+        };
+        self.leases += 1;
+        ticket.state = TicketState::Claimed(ClaimedWork {
             tool_use_id,
             frame: None,
             post: None,
-        };
+            lease: true,
+        });
         ClaimOutcome::Granted(Box::new(ticket.job.clone()))
     }
 
+    /// Releases the bounded lease exactly once, and only on positive settlement proof.
+    ///
+    /// Positive proof is the final frame with exactly settled child accounting *and* the matching
+    /// successful post. Anything less leaves the lease held, so capacity lost to unprovable
+    /// cleanup stays lost instead of being silently reclaimed.
+    ///
+    /// Callers decide *when* to ask. Quarantined work releases as soon as cleanup proves settled,
+    /// because nothing further will ever consume it. Live claimed work retains its lease through
+    /// settlement so [`Self::settled`] can require it, and releases only when the daemon has
+    /// consumed the resulting token through [`Self::release_settled`].
+    fn release_settled_lease(work: &mut ClaimedWork, leases: &mut usize) {
+        if work.lease
+            && work.post == Some(true)
+            && work
+                .frame
+                .as_ref()
+                .is_some_and(|frame| frame.children.settled())
+        {
+            work.lease = false;
+            *leases = leases.saturating_sub(1);
+        }
+    }
+
     /// Records the helper's final frame; ordering against the post-hook does not matter.
+    ///
+    /// A frame is accepted for claimed work and for quarantined [`TicketState::Uncertain`] work
+    /// alike. The second case is cleanup-only settlement: the documented contract is that a
+    /// revoked operation still accepts proof that its physical work finished, and refusing that
+    /// proof would make the bounded lease unreleasable forever. Acceptance here never revives
+    /// authority — [`Self::delivery`] and [`Self::settled`] both refuse quarantined work
+    /// unconditionally.
     pub fn settle_frame(&mut self, result: HelperResult) -> Result<(), FailureCode> {
         result.validate()?;
         let Some(ticket) = self.tickets.get_mut(&result.detail_ref) else {
             return Err(FailureCode::InvalidDetail);
         };
-        let TicketState::Claimed { frame, .. } = &mut ticket.state else {
+        let cleanup_only = matches!(ticket.state, TicketState::Uncertain(_));
+        let (TicketState::Claimed(work) | TicketState::Uncertain(work)) = &mut ticket.state else {
             return Err(FailureCode::InvalidDetail);
         };
-        if frame.is_some() {
+        if work.frame.is_some() {
             return Err(FailureCode::Conflict);
         }
-        *frame = Some(result);
+        work.frame = Some(result);
+        if cleanup_only {
+            Self::release_settled_lease(work, &mut self.leases);
+        }
         Ok(())
+    }
+
+    /// Returns the bounded admission leases currently retained by claimed or quarantined work.
+    pub fn active_claims(&self) -> usize {
+        self.leases
+    }
+
+    /// Releases the lease of one live claimed operation whose settled token the daemon consumed.
+    ///
+    /// Requires the same positive proof as any other release, plus ownership by `binding`. Returns
+    /// whether a lease was actually released; a second call for the same handle returns `false`, so
+    /// capacity can never be double-credited. Quarantined work is untouched here: it released on
+    /// cleanup proof and has no token to consume.
+    pub fn release_settled(&mut self, detail_ref: &str, binding: [u8; 32]) -> bool {
+        let Some(ticket) = self.tickets.get_mut(detail_ref) else {
+            return false;
+        };
+        if ticket.binding.fingerprint() != binding {
+            return false;
+        }
+        let TicketState::Claimed(work) = &mut ticket.state else {
+            return false;
+        };
+        let before = self.leases;
+        Self::release_settled_lease(work, &mut self.leases);
+        before != self.leases
     }
 
     /// Records the matching `Bash` post-hook for one claimed ticket.
@@ -749,19 +1021,27 @@ impl LaunchLedger {
     /// This post is special: it settles the helper's own operation and must not be treated as a
     /// generic native edit that invalidates the result the helper just produced. Only later
     /// unrelated native posts advance the native epoch.
+    /// Quarantined work still accepts its own late post for the same cleanup-only reason as
+    /// [`Self::settle_frame`]; the post never restores authority.
     pub fn settle_post(&mut self, tool_use_id: &str, success: bool) -> Result<(), FailureCode> {
-        let Some(ticket) = self.tickets.values_mut().find(|ticket| {
-            matches!(&ticket.state, TicketState::Claimed { tool_use_id: bound, .. } if bound == tool_use_id)
-        }) else {
+        let Some(ticket) = self
+            .tickets
+            .values_mut()
+            .find(|ticket| ticket.correlates(tool_use_id))
+        else {
             return Err(FailureCode::InvalidDetail);
         };
-        let TicketState::Claimed { post, .. } = &mut ticket.state else {
+        let cleanup_only = matches!(ticket.state, TicketState::Uncertain(_));
+        let (TicketState::Claimed(work) | TicketState::Uncertain(work)) = &mut ticket.state else {
             return Err(FailureCode::InvalidDetail);
         };
-        if post.is_some() {
+        if work.post.is_some() {
             return Err(FailureCode::Conflict);
         }
-        *post = Some(success);
+        work.post = Some(success);
+        if cleanup_only {
+            Self::release_settled_lease(work, &mut self.leases);
+        }
         Ok(())
     }
 
@@ -769,8 +1049,45 @@ impl LaunchLedger {
     ///
     /// The hook path uses this to keep a helper's own post from invalidating its own result.
     pub fn owns_post(&self, tool_use_id: &str) -> bool {
-        self.tickets.values().any(|ticket| {
-            matches!(&ticket.state, TicketState::Claimed { tool_use_id: bound, .. } if bound == tool_use_id)
+        self.tickets
+            .values()
+            .any(|ticket| ticket.correlates(tool_use_id))
+    }
+
+    /// Returns the daemon-private settled token for one positively settled Claude operation.
+    ///
+    /// Returns `None` unless every requirement holds at once: the handle exists and is owned by the
+    /// supplied binding generation; the ticket is still `Claimed` rather than quarantined; the
+    /// retained frame names this exact handle; the outcome is `Complete` with exactly settled child
+    /// accounting; the matching post arrived and succeeded; the helper and child executable
+    /// identities are present and well formed; and the admission lease is still retained. Because
+    /// the token has no public constructor and no `Deserialize`, this is the only way one exists.
+    ///
+    /// Reads only ledger state: no Git, source, provider or process effect.
+    pub fn settled(&self, detail_ref: &str, binding: [u8; 32]) -> Option<SettledClaudeOperation> {
+        let ticket = self.tickets.get(detail_ref)?;
+        if ticket.binding.fingerprint() != binding {
+            return None;
+        }
+        let TicketState::Claimed(work) = &ticket.state else {
+            return None;
+        };
+        if !work.lease || work.post != Some(true) {
+            return None;
+        }
+        let frame = work.frame.as_ref()?;
+        if frame.detail_ref != detail_ref
+            || !matches!(frame.outcome, HelperOutcome::Complete { .. })
+            || !frame.children.settled()
+        {
+            return None;
+        }
+        Some(SettledClaudeOperation {
+            job: ticket.job.clone(),
+            result: frame.clone(),
+            binding: ticket.binding.clone(),
+            helper: ticket.helper.clone(),
+            children: ticket.children.clone(),
         })
     }
 
@@ -784,24 +1101,26 @@ impl LaunchLedger {
             return Delivery::Failed(FailureCode::InvalidDetail);
         };
         match &ticket.state {
-            TicketState::Uncertain => Delivery::Failed(FailureCode::Deadline),
+            // Quarantine is unconditional and permanent: a late cleanup frame or post may still be
+            // recorded against retained identity, but it can never produce a visible result.
+            TicketState::Uncertain(_) => Delivery::Failed(FailureCode::Deadline),
             // Delivery re-checks settlement rather than trusting that the frame was validated on
             // the way in: a completed result requires exact settled child accounting *and* the
             // final frame *and* the matching successful post, in either order.
-            TicketState::Claimed {
+            TicketState::Claimed(ClaimedWork {
                 frame: Some(frame),
                 post: Some(true),
                 ..
-            } if frame.children.settled() => Delivery::Ready(Box::new(frame.clone())),
-            TicketState::Claimed {
+            }) if frame.children.settled() => Delivery::Ready(Box::new(frame.clone())),
+            TicketState::Claimed(ClaimedWork {
                 frame: Some(_),
                 post: Some(true),
                 ..
-            } => Delivery::Failed(FailureCode::Deadline),
-            TicketState::Claimed {
+            }) => Delivery::Failed(FailureCode::Deadline),
+            TicketState::Claimed(ClaimedWork {
                 post: Some(false), ..
-            } => Delivery::Failed(FailureCode::Cancelled),
-            TicketState::Claimed { .. } => Delivery::Waiting,
+            }) => Delivery::Failed(FailureCode::Cancelled),
+            TicketState::Claimed(_) => Delivery::Waiting,
             TicketState::Minted | TicketState::Launched { .. } => Delivery::Waiting,
         }
     }
@@ -817,14 +1136,7 @@ impl LaunchLedger {
             if now_ms < ticket.deadline_ms {
                 return true;
             }
-            match ticket.state {
-                TicketState::Minted | TicketState::Launched { .. } => false,
-                TicketState::Claimed { .. } => {
-                    ticket.state = TicketState::Uncertain;
-                    true
-                }
-                TicketState::Uncertain => true,
-            }
+            ticket.quarantine()
         });
     }
 
@@ -835,24 +1147,19 @@ impl LaunchLedger {
     /// authority. Only work that provably never ran is retired: a `Minted` or `Launched` ticket had
     /// no claim, so nothing physical exists to settle and dropping it has no effect.
     ///
-    /// Claimed work is *not* deleted. A claimed, disconnected, expired or unsettled ticket becomes
-    /// [`TicketState::Uncertain`] and is retained, so its admission stays quarantined and it can
-    /// accept only cleanup settlement after revocation. It can never regain authority, because
-    /// [`Self::claim`] admits `Launched` alone. Deleting these tickets was what previously let a
-    /// vanished ticket be read as successful cleanup; disappearance is now never that evidence.
+    /// Claimed work is *not* deleted, and its claimed identity is *not* discarded. A claimed,
+    /// disconnected, expired or unsettled ticket keeps its `tool_use_id`, frame slot and lease and
+    /// becomes [`TicketState::Uncertain`], so its admission stays quarantined and it can still
+    /// accept cleanup-only settlement afterwards. Replacing that identity with a stateless marker
+    /// was the previous defect: it made the documented late cleanup impossible to correlate and
+    /// left the bounded lease unreleasable. Authority never returns, because [`Self::claim`] admits
+    /// `Launched` alone and both [`Self::delivery`] and [`Self::settled`] refuse quarantined work.
     pub fn revoke(&mut self, binding: [u8; 32]) {
         self.tickets.retain(|_, ticket| {
-            if ticket.binding != binding {
+            if ticket.binding.fingerprint() != binding {
                 return true;
             }
-            match ticket.state {
-                TicketState::Minted | TicketState::Launched { .. } => false,
-                TicketState::Claimed { .. } => {
-                    ticket.state = TicketState::Uncertain;
-                    true
-                }
-                TicketState::Uncertain => true,
-            }
+            ticket.quarantine()
         });
     }
 
@@ -863,15 +1170,7 @@ impl LaunchLedger {
     pub fn owned_by(&self, detail_ref: &str, binding: [u8; 32]) -> bool {
         self.tickets
             .get(detail_ref)
-            .is_some_and(|ticket| ticket.binding == binding)
-    }
-
-    /// Returns the binding generation a handle is fenced to, if the handle exists.
-    ///
-    /// Used by the claim endpoint so a claim is checked against the generation the ticket was
-    /// actually minted under, rather than one the caller supplied.
-    pub fn binding_of(&self, detail_ref: &str) -> Option<[u8; 32]> {
-        self.tickets.get(detail_ref).map(|ticket| ticket.binding)
+            .is_some_and(|ticket| ticket.binding.fingerprint() == binding)
     }
 
     /// Returns the number of outstanding tickets for bounded-capacity assertions.
@@ -890,6 +1189,27 @@ mod tests {
     use super::*;
 
     /// Builds one valid Rust-profile job with entirely daemon-selected values.
+    /// Returns the fixed binding generation every ledger fixture mints under.
+    fn binding_fixture() -> BindingRef {
+        BindingRef::fixture("agent", "channel", 1)
+    }
+
+    /// Reports the fixture generation as currently live.
+    fn live(binding: &BindingRef) -> bool {
+        binding == &binding_fixture()
+    }
+
+    /// Reports every generation as no longer live, as a revoked or replaced one would be.
+    fn stale(_: &BindingRef) -> bool {
+        false
+    }
+
+    /// Returns one accepted executable identity fixture with a well-formed digest.
+    fn identity(path: &str) -> AcceptedIdentity {
+        AcceptedIdentity::new(PathBuf::from(path), "fixture", &"ab".repeat(32))
+            .expect("fixture identity is well formed")
+    }
+
     fn job() -> HelperJob {
         HelperJob {
             protocol: HELPER_PROTOCOL,
@@ -928,12 +1248,14 @@ mod tests {
         ledger
             .mint(
                 "detail-1",
-                [7; 32],
+                binding_fixture(),
                 actor.clone(),
                 "channel",
                 command,
                 job(),
                 1000,
+                identity("/usr/local/bin/agent-ide"),
+                vec![identity("/usr/bin/git")],
             )
             .unwrap();
         (ledger, "detail-1".into(), actor)
@@ -1009,7 +1331,7 @@ mod tests {
     fn copied_reference_without_native_launch_is_rejected() {
         let (mut ledger, reference, _actor) = ledger();
         assert_eq!(
-            ledger.claim(&reference, [7; 32], "channel", 0),
+            ledger.claim(&reference, "channel", 0, live),
             ClaimOutcome::Rejected(FailureCode::InvalidDetail)
         );
     }
@@ -1062,20 +1384,20 @@ mod tests {
         );
 
         assert_eq!(
-            ledger.claim(&reference, [7; 32], "other-channel", 0),
+            ledger.claim(&reference, "other-channel", 0, live),
             ClaimOutcome::Rejected(FailureCode::InvalidDetail)
         );
         assert_eq!(
-            ledger.claim(&reference, [9; 32], "channel", 0),
+            ledger.claim(&reference, "channel", 0, stale),
             ClaimOutcome::Rejected(FailureCode::WorkspaceAuthority)
         );
 
         assert!(matches!(
-            ledger.claim(&reference, [7; 32], "channel", 0),
+            ledger.claim(&reference, "channel", 0, live),
             ClaimOutcome::Granted(_)
         ));
         assert_eq!(
-            ledger.claim(&reference, [7; 32], "channel", 0),
+            ledger.claim(&reference, "channel", 0, live),
             ClaimOutcome::Rejected(FailureCode::InvalidDetail)
         );
     }
@@ -1096,7 +1418,7 @@ mod tests {
             LaunchRecognition::Ignored
         );
         assert_eq!(
-            ledger.claim(&reference, [7; 32], "channel", 0),
+            ledger.claim(&reference, "channel", 0, live),
             ClaimOutcome::Rejected(FailureCode::InvalidDetail)
         );
     }
@@ -1123,7 +1445,7 @@ mod tests {
         );
         ledger.recognize(&command, false, "call", &actor, 0);
         assert!(matches!(
-            ledger.claim(&reference, [7; 32], "channel", 0),
+            ledger.claim(&reference, "channel", 0, live),
             ClaimOutcome::Granted(_)
         ));
         ledger.expire(1000);
@@ -1146,7 +1468,7 @@ mod tests {
                 "detail-1",
             );
             ledger.recognize(&command, false, "call", &actor, 0);
-            ledger.claim(&reference, [7; 32], "channel", 0);
+            ledger.claim(&reference, "channel", 0, live);
             assert_eq!(ledger.delivery(&reference), Delivery::Waiting);
 
             let result = HelperResult {
@@ -1186,7 +1508,7 @@ mod tests {
             "detail-1",
         );
         ledger.recognize(&command, false, "call", &actor, 0);
-        ledger.claim(&reference, [7; 32], "channel", 0);
+        ledger.claim(&reference, "channel", 0, live);
         ledger
             .settle_frame(HelperResult {
                 protocol: HELPER_PROTOCOL,
@@ -1217,7 +1539,7 @@ mod tests {
             "detail-1",
         );
         ledger.recognize(&command, false, "call", &actor, 0);
-        ledger.claim(&reference, [7; 32], "channel", 0);
+        ledger.claim(&reference, "channel", 0, live);
         assert!(ledger.owns_post("call"));
         assert!(!ledger.owns_post("some-native-edit"));
     }
@@ -1263,7 +1585,7 @@ mod tests {
             LaunchRecognition::Recognized
         );
         assert!(matches!(
-            ledger.claim(&reference, [7; 32], "channel", 0),
+            ledger.claim(&reference, "channel", 0, live),
             ClaimOutcome::Granted(_)
         ));
         (ledger, reference)
@@ -1315,7 +1637,7 @@ mod tests {
     #[test]
     fn revocation_quarantines_claimed_work_instead_of_deleting_it() {
         let (mut ledger, reference) = claimed();
-        ledger.revoke([7; 32]);
+        ledger.revoke(binding_fixture().fingerprint());
         assert!(
             !ledger.is_empty(),
             "claimed work must be retained for cleanup settlement after revocation"
@@ -1326,18 +1648,140 @@ mod tests {
             Delivery::Failed(FailureCode::Deadline)
         );
         assert_eq!(
-            ledger.claim(&reference, [7; 32], "channel", 0),
+            ledger.claim(&reference, "channel", 0, live),
             ClaimOutcome::Rejected(FailureCode::InvalidDetail)
         );
-        // A late frame for revoked work cannot resurrect it into a completed result.
-        assert_eq!(
-            ledger.settle_frame(completed(1, 1)),
-            Err(FailureCode::InvalidDetail)
-        );
+        // The lease taken at claim is still held: revocation is not proof that the work stopped.
+        assert_eq!(ledger.active_claims(), 1);
+        // Positive late cleanup is *accepted* against the retained claimed identity, which is what
+        // the contract promises and what releases the bounded lease. Rejecting it would strand the
+        // lease permanently and make the documented cleanup path unreachable.
+        assert_eq!(ledger.settle_frame(completed(1, 1)), Ok(()));
+        assert_eq!(ledger.settle_post("call", true), Ok(()));
+        assert_eq!(ledger.active_claims(), 0);
+        // Cleanup releases capacity; it never revives authority.
         assert_eq!(
             ledger.delivery(&reference),
             Delivery::Failed(FailureCode::Deadline)
         );
+        assert!(
+            ledger
+                .settled(&reference, binding_fixture().fingerprint())
+                .is_none(),
+            "revoked work can never mint a settled token"
+        );
+    }
+
+    /// Only a positively settled, correlated, owned and leased operation mints a settled token.
+    ///
+    /// This is the constructor gate for [`SettledClaudeOperation`]: raw helper JSON, a wrong
+    /// binding, a missing post and a frame naming another handle each mint nothing.
+    #[test]
+    fn settled_token_requires_exact_correlated_positive_settlement() {
+        let (mut ledger, reference) = claimed();
+        let owner = binding_fixture().fingerprint();
+
+        // Frame only: the matching successful post has not arrived.
+        assert_eq!(ledger.settle_frame(completed(2, 2)), Ok(()));
+        assert!(ledger.settled(&reference, owner).is_none());
+
+        // A frame naming a different handle never reaches this ticket at all.
+        let mut foreign = completed(1, 1);
+        foreign.detail_ref = "detail-elsewhere".into();
+        assert_eq!(
+            ledger.settle_frame(foreign),
+            Err(FailureCode::InvalidDetail)
+        );
+
+        assert_eq!(ledger.settle_post("call", true), Ok(()));
+        // Another generation owns nothing here, even with the correct handle.
+        assert!(ledger.settled(&reference, [9; 32]).is_none());
+
+        let settled = ledger
+            .settled(&reference, owner)
+            .expect("positively settled work mints its token");
+        assert_eq!(settled.operation(), HelperOperation::Context);
+        assert_eq!(settled.binding().fingerprint(), owner);
+        assert!(settled.result().children.settled());
+        assert_eq!(settled.helper().blake3().len(), 64);
+        assert!(!settled.children().is_empty());
+    }
+
+    /// Concurrent claimed operations are bounded by a daemon lease, not by reported child counts.
+    #[test]
+    fn concurrent_claims_are_bounded_by_a_daemon_reserved_lease() {
+        let (mut ledger, _, actor) = ledger();
+        for index in 1..=MAX_ACTIVE_CLAIMS {
+            let reference = format!("lease-{index}");
+            let command = format!("cmd-lease-{index}");
+            ledger
+                .mint(
+                    &reference,
+                    binding_fixture(),
+                    actor.clone(),
+                    "channel",
+                    command.clone(),
+                    job(),
+                    1000,
+                    identity("/usr/local/bin/agent-ide"),
+                    vec![identity("/usr/bin/git")],
+                )
+                .expect("ticket mints");
+            assert_eq!(
+                ledger.recognize(&command, false, &format!("call-{index}"), &actor, 0),
+                LaunchRecognition::Recognized
+            );
+            assert!(matches!(
+                ledger.claim(&reference, "channel", 0, live),
+                ClaimOutcome::Granted(_)
+            ));
+        }
+        assert_eq!(ledger.active_claims(), MAX_ACTIVE_CLAIMS);
+
+        // The original fixture ticket is recognized and in time, yet admission is full.
+        let command = LaunchLedger::helper_command(
+            std::path::Path::new("/usr/local/bin/agent-ide"),
+            std::path::Path::new("/private/tmp/rt"),
+            "attach",
+            "detail-1",
+        );
+        assert_eq!(
+            ledger.recognize(&command, false, "call", &actor, 0),
+            LaunchRecognition::Recognized
+        );
+        assert_eq!(
+            ledger.claim("detail-1", "channel", 0, live),
+            ClaimOutcome::Rejected(FailureCode::Capacity)
+        );
+    }
+
+    /// A claim is refused when the ticket's own generation is no longer live.
+    ///
+    /// The probe is asked about the generation stored in the ticket, so this cannot be satisfied by
+    /// echoing a fingerprint read out of that same ticket.
+    #[test]
+    fn claim_requires_current_liveness_of_the_tickets_own_generation() {
+        let (mut ledger, reference, actor) = ledger();
+        let command = LaunchLedger::helper_command(
+            std::path::Path::new("/usr/local/bin/agent-ide"),
+            std::path::Path::new("/private/tmp/rt"),
+            "attach",
+            "detail-1",
+        );
+        assert_eq!(
+            ledger.recognize(&command, false, "call", &actor, 0),
+            LaunchRecognition::Recognized
+        );
+        assert_eq!(
+            ledger.claim(&reference, "channel", 0, stale),
+            ClaimOutcome::Rejected(FailureCode::WorkspaceAuthority)
+        );
+        // A refused claim reserves nothing and leaves the ticket claimable by a live generation.
+        assert_eq!(ledger.active_claims(), 0);
+        assert!(matches!(
+            ledger.claim(&reference, "channel", 0, live),
+            ClaimOutcome::Granted(_)
+        ));
     }
 
     /// Both wire directions reject foreign revisions, unknown fields and over-budget frames.
@@ -1374,10 +1818,10 @@ mod tests {
             "detail-1",
         );
         ledger.recognize(&command, false, "call", &actor, 0);
-        ledger.revoke([7; 32]);
+        ledger.revoke(binding_fixture().fingerprint());
         assert!(ledger.is_empty());
         assert_eq!(
-            ledger.claim(&reference, [7; 32], "channel", 0),
+            ledger.claim(&reference, "channel", 0, live),
             ClaimOutcome::Rejected(FailureCode::InvalidDetail)
         );
     }
@@ -1389,12 +1833,14 @@ mod tests {
         assert_eq!(
             ledger.mint(
                 "detail-1",
-                [7; 32],
+                binding_fixture(),
                 actor.clone(),
                 "channel",
                 "cmd".into(),
                 job(),
-                1000
+                1000,
+                identity("/usr/local/bin/agent-ide"),
+                vec![identity("/usr/bin/git")],
             ),
             Err(FailureCode::Conflict)
         );
@@ -1403,12 +1849,14 @@ mod tests {
             ledger
                 .mint(
                     &reference,
-                    [7; 32],
+                    binding_fixture(),
                     actor.clone(),
                     "channel",
                     format!("cmd-{index}"),
                     job(),
                     1000,
+                    identity("/usr/local/bin/agent-ide"),
+                    vec![identity("/usr/bin/git")],
                 )
                 .unwrap();
         }
@@ -1416,12 +1864,14 @@ mod tests {
         assert_eq!(
             ledger.mint(
                 "overflow",
-                [7; 32],
+                binding_fixture(),
                 actor,
                 "channel",
                 "cmd-overflow".into(),
                 job(),
-                1000
+                1000,
+                identity("/usr/local/bin/agent-ide"),
+                vec![identity("/usr/bin/git")],
             ),
             Err(FailureCode::Capacity)
         );
