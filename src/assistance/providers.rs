@@ -704,10 +704,8 @@ impl Worker<'_> {
     /// Every step below the removed `go_views` mapping is the only remaining reference to that state,
     /// so any failure past this point is recorded in `uncertain` rather than silently discarded: the
     /// binding's view and backend accounting are gone either way, and losing the failure signal would
-    /// let a caller believe cleanup fully succeeded when it did not. Once the backend is removed from
-    /// `providers.go`, its captured socket (if any) gets exactly one disposition on every remaining
-    /// exit from this function, including a `stop`/`complete_reap` failure: `Providers::dispose_socket`
-    /// runs unconditionally before any such early return.
+    /// let a caller believe cleanup fully succeeded when it did not. When this release makes the worker
+    /// the backend's sole owner, the entire remaining disposition is delegated to `reap_owned_backend`.
     pub(super) async fn close_provider(&mut self, binding: &BindingRef) -> Result<(), FailureCode> {
         let Some(view) = self.providers.go_views.remove(binding) else {
             return Ok(());
@@ -727,32 +725,57 @@ impl Worker<'_> {
                     return Err(FailureCode::Internal);
                 }
             };
-            let socket = backend.socket;
-            let stop_result = backend
-                .shared
-                .stop(Duration::from_millis(100), Duration::from_millis(500))
-                .await;
-            let completed = match stop_result {
-                Ok(completed) => completed,
-                Err(_) => {
-                    self.uncertain.insert(binding.clone());
-                    self.providers.dispose_socket(&view.backend, socket);
-                    return Err(FailureCode::Deadline);
-                }
-            };
-            let reaped = self.providers.registry.complete_reap(
+            reap_owned_backend(
+                &mut self.providers,
                 &mut self.admission,
+                &mut self.uncertain,
+                binding,
+                &view.backend,
+                backend,
                 capability,
-                completed.settlement,
-            );
-            let disposed = self.providers.dispose_socket(&view.backend, socket);
-            if reaped.is_err() || !disposed {
-                self.uncertain.insert(binding.clone());
-                return Err(FailureCode::Internal);
-            }
+            )
+            .await?;
         }
         Ok(())
     }
+}
+
+/// Stops and reaps a backend this worker just became the sole owner of, giving its captured socket
+/// (if any) exactly one disposition on every exit: identity-checked removal, or a bumped
+/// `socket_generation` so the next spawn for `view_backend` cannot adopt a stale path. This is the
+/// sole production route `close_provider` uses for its `BackendRelease::ReapOwned` case; a `stop` or
+/// `complete_reap` failure still records `uncertain` and still disposes the socket before returning.
+async fn reap_owned_backend(
+    providers: &mut Providers,
+    admission: &mut crate::execution::AdmissionController,
+    uncertain: &mut std::collections::BTreeSet<BindingRef>,
+    binding: &BindingRef,
+    view_backend: &str,
+    backend: GoBackend,
+    capability: crate::execution::BackendReapCapability,
+) -> Result<(), FailureCode> {
+    let socket = backend.socket;
+    let stop_result = backend
+        .shared
+        .stop(Duration::from_millis(100), Duration::from_millis(500))
+        .await;
+    let completed = match stop_result {
+        Ok(completed) => completed,
+        Err(_) => {
+            uncertain.insert(binding.clone());
+            providers.dispose_socket(view_backend, socket);
+            return Err(FailureCode::Deadline);
+        }
+    };
+    let reaped = providers
+        .registry
+        .complete_reap(admission, capability, completed.settlement);
+    let disposed = providers.dispose_socket(view_backend, socket);
+    if reaped.is_err() || !disposed {
+        uncertain.insert(binding.clone());
+        return Err(FailureCode::Internal);
+    }
+    Ok(())
 }
 
 /// Produces only an Execution scope from an already fresh durable stamp; it grants nothing itself.
@@ -830,7 +853,348 @@ async fn session_operation<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncW
 
 #[cfg(test)]
 mod tests {
-    use super::{OwnedProviderSocket, Providers};
+    use super::{FailureCode, GoBackend, OwnedProviderSocket, Providers, reap_owned_backend};
+    use crate::assistance::host_binding::{
+        BindingRef, BindingStatus, HostBindingGuard, parse_candidate, parse_channel_session,
+        parse_hook_event,
+    };
+    use crate::execution::{
+        Admission, AdmissionClass, AdmissionController, AdmissionLimits, BackendRelease,
+        ControlledCommand, ExecutionProfileCatalog, ExecutionProfileTemplate, HostSandboxState,
+        LocalExecutionPolicy, OwnerId, ProviderBackendKind, ProviderLeaseAdmission,
+        ProviderViewLease, ValidatedExecutionRequest, ValidatedHostInvocation, WorkspaceAuthority,
+    };
+    use crate::intelligence::gopls::{GoplsProfile, SharedGopls};
+    use crate::workspace::authority::WorktreeRef;
+    use serde_json::json;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    /// Builds one accepted no-op `BindingRef` for uncertainty bookkeeping only; no daemon involved.
+    fn test_binding(label: &str) -> BindingRef {
+        let mut guard = HostBindingGuard::default();
+        let channel = parse_channel_session(label.as_bytes()).unwrap();
+        let actor = format!("actor-{label}");
+        let hook = parse_hook_event(
+            json!({"hook_event_name":"PreToolUse","session_id":actor,"tool_use_id":"spawn"})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+        assert!(matches!(
+            guard.observe_hook(hook, channel.clone()),
+            BindingStatus::PreObserved
+        ));
+        let candidate = parse_candidate(
+            json!({"threadId":actor,"callId":"spawn","x-codex-turn-metadata":{"turn":"provider-contract"}})
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap();
+        let BindingStatus::Validated(invocation) = guard.establish_start(candidate, channel) else {
+            panic!("valid fixture binding")
+        };
+        invocation.binding_ref().clone()
+    }
+
+    /// Builds one accepted execution request for a real `/usr/bin/true`-backed command, isolated by label.
+    fn test_request(
+        label: &str,
+        authority: &WorkspaceAuthority,
+        command: ControlledCommand,
+    ) -> ValidatedExecutionRequest {
+        let root = std::env::temp_dir();
+        let sandbox = HostSandboxState::parse(Some(json!({
+            "permissionProfile":{"type":"disabled"},
+            "codexLinuxSandboxExe":null,
+            "sandboxCwd":root,
+            "useLegacyLandlock":false
+        })))
+        .unwrap();
+        let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+            ExecutionProfileTemplate::from_execution_evidence(label, 1, &sandbox).unwrap(),
+        ])
+        .unwrap();
+        ValidatedExecutionRequest::validate(
+            ValidatedHostInvocation::from_verified_binding(label, sandbox).unwrap(),
+            authority.clone(),
+            command,
+            &LocalExecutionPolicy::new(
+                BTreeSet::from([PathBuf::from("/usr/bin/true")]),
+                4096,
+                16,
+                true,
+            )
+            .unwrap(),
+            &catalog,
+        )
+        .unwrap()
+    }
+
+    /// Spawns one real owned `/usr/bin/true` gopls listener and returns it with the registry view lease
+    /// that made this worker its sole owner, plus a real owned socket identity at `socket`.
+    fn spawn_owned_backend(
+        providers: &mut Providers,
+        admission: &mut AdmissionController,
+        label: &str,
+        socket: &Path,
+    ) -> (
+        GoBackend,
+        WorkspaceAuthority,
+        WorktreeRef,
+        ProviderViewLease,
+        GoplsProfile,
+    ) {
+        let root = std::env::temp_dir();
+        let tree =
+            WorktreeRef::from_discovery(root.clone(), root.clone(), PathBuf::from(".git"), 1)
+                .unwrap();
+        let authority = WorkspaceAuthority::from_workspace(
+            tree.id().to_string(),
+            tree.incarnation().to_string(),
+            tree.worktree_path().to_path_buf(),
+            1,
+        )
+        .unwrap();
+        let profile = GoplsProfile::new(
+            "/usr/bin/true".into(),
+            "fixture".into(),
+            "v1".into(),
+            "default".into(),
+            "/usr/bin/true".into(),
+            format!("test-{label}"),
+            "test".into(),
+        )
+        .unwrap();
+        let backend_key = profile.compatibility_key();
+        let view = match providers.registry.request(
+            admission,
+            OwnerId::new(label).unwrap(),
+            AdmissionClass::Interactive,
+            backend_key,
+            ProviderBackendKind::OwnedShared,
+            &authority,
+        ) {
+            ProviderLeaseAdmission::Granted(view) => view,
+            _ => panic!("gopls view for {label}"),
+        };
+        let listener_request = test_request(
+            label,
+            &authority,
+            profile.listener_command(&authority, socket).unwrap(),
+        );
+        let shared = SharedGopls::start(
+            &profile,
+            &listener_request,
+            providers.registry.take_spawn_lease(view).unwrap(),
+            None,
+            Path::new("/unused"),
+            64,
+        )
+        .unwrap();
+        std::fs::write(socket, b"owned").unwrap();
+        let identity = OwnedProviderSocket::capture(socket.to_path_buf()).unwrap();
+        (
+            GoBackend {
+                shared,
+                socket: Some(identity),
+                generation: 1,
+            },
+            authority,
+            tree,
+            view,
+            profile,
+        )
+    }
+
+    /// Forces `SharedGopls::stop`'s deterministic, in-memory `!views.is_empty()` failure by leaving one
+    /// forwarder view open (never closed) on the backend passed into `reap_owned_backend` — the same
+    /// route `close_provider` uses for its `BackendRelease::ReapOwned` case. Removing the disposal call
+    /// from `reap_owned_backend`'s stop-error branch would leave `socket` on disk and fail this test.
+    #[tokio::test]
+    async fn reap_owned_backend_stop_error_still_disposes_socket_and_stays_conservative() {
+        let mut providers = Providers::new();
+        let mut admission = AdmissionController::new(AdmissionLimits {
+            total_running: 4,
+            per_owner_running: 4,
+            per_owner_queued: 4,
+            total_queued: 4,
+            interactive_burst: 1,
+        })
+        .unwrap();
+        let mut uncertain = BTreeSet::new();
+        let binding = test_binding("stop-error");
+        let socket = std::env::temp_dir().join(format!(
+            "agent-ide-reap-owned-stop-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let (mut backend, authority, tree, view, profile) = spawn_owned_backend(
+            &mut providers,
+            &mut admission,
+            "stop-error-backend",
+            &socket,
+        );
+        let forwarder_request = test_request(
+            "stop-error-forwarder",
+            &authority,
+            profile.forwarder_command(&authority, &socket).unwrap(),
+        );
+        let slot = match admission.submit(
+            OwnerId::new("forwarder").unwrap(),
+            AdmissionClass::Interactive,
+        ) {
+            Admission::Granted(lease) => lease,
+            _ => panic!("forwarder slot"),
+        };
+        let forwarder_capability = providers
+            .registry
+            .take_forwarder_spawn_lease(&mut admission, view, &forwarder_request, slot)
+            .unwrap();
+        // Left open: never released, so `backend.shared.views` stays non-empty for `stop()`.
+        let _open_view = backend
+            .shared
+            .open_view(
+                tree.clone(),
+                1,
+                &forwarder_request,
+                forwarder_capability,
+                None,
+                Path::new("/unused"),
+                64,
+            )
+            .unwrap();
+
+        let BackendRelease::ReapOwned(capability) = providers.registry.release(view).unwrap()
+        else {
+            panic!("expected sole ownership")
+        };
+
+        let result = reap_owned_backend(
+            &mut providers,
+            &mut admission,
+            &mut uncertain,
+            &binding,
+            "stop-error-backend",
+            backend,
+            capability,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(FailureCode::Deadline)),
+            "a stop error with an open view must surface as Deadline: {result:?}"
+        );
+        assert!(
+            uncertain.contains(&binding),
+            "an unresolved stop must be recorded as uncertain, not silently dropped"
+        );
+        assert!(
+            !socket.exists(),
+            "the captured socket must still be removed on a stop failure"
+        );
+        assert_eq!(
+            providers.socket_generation.get("stop-error-backend"),
+            None,
+            "a proven removal must not force the next spawn onto a new generation"
+        );
+    }
+
+    /// Forces `complete_reap` to fail by pairing a real, successfully stopped listener's settlement proof
+    /// with a mismatched capability captured from a second, independent backend. Removing the disposal
+    /// call from `reap_owned_backend`'s post-`complete_reap` branch would leave `socket` on disk and fail
+    /// this test even though the reap itself is reported as failed.
+    #[tokio::test]
+    async fn reap_owned_backend_complete_reap_error_still_disposes_socket_and_stays_conservative() {
+        let mut providers = Providers::new();
+        let mut admission = AdmissionController::new(AdmissionLimits {
+            total_running: 4,
+            per_owner_running: 4,
+            per_owner_queued: 4,
+            total_queued: 4,
+            interactive_burst: 1,
+        })
+        .unwrap();
+        let mut uncertain = BTreeSet::new();
+        let binding = test_binding("reap-error");
+        let socket_a = std::env::temp_dir().join(format!(
+            "agent-ide-reap-owned-a-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let socket_b = std::env::temp_dir().join(format!(
+            "agent-ide-reap-owned-b-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let (backend_a, _authority_a, _tree_a, view_a, _profile_a) = spawn_owned_backend(
+            &mut providers,
+            &mut admission,
+            "reap-error-backend-a",
+            &socket_a,
+        );
+        let (backend_b, _authority_b, _tree_b, view_b, _profile_b) = spawn_owned_backend(
+            &mut providers,
+            &mut admission,
+            "reap-error-backend-b",
+            &socket_b,
+        );
+
+        let BackendRelease::ReapOwned(_capability_a) = providers.registry.release(view_a).unwrap()
+        else {
+            panic!("expected sole ownership for a")
+        };
+        let BackendRelease::ReapOwned(capability_b) = providers.registry.release(view_b).unwrap()
+        else {
+            panic!("expected sole ownership for b")
+        };
+
+        // `backend_a` stops cleanly (no open views), but is paired with backend b's mismatched
+        // capability, so `complete_reap`'s process/backend identity check must fail.
+        let result = reap_owned_backend(
+            &mut providers,
+            &mut admission,
+            &mut uncertain,
+            &binding,
+            "reap-error-backend-a",
+            backend_a,
+            capability_b,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(FailureCode::Internal)),
+            "a mismatched capability must surface as an honest complete_reap failure: {result:?}"
+        );
+        assert!(
+            uncertain.contains(&binding),
+            "a failed complete_reap must be recorded as uncertain, not silently dropped"
+        );
+        assert!(
+            !socket_a.exists(),
+            "the captured socket must still be disposed even though complete_reap failed"
+        );
+        assert_eq!(
+            providers.socket_generation.get("reap-error-backend-a"),
+            None,
+            "a proven removal must not force the next spawn onto a new generation"
+        );
+
+        // Clean up backend b's still-owned listener so the test leaves no live child behind.
+        drop(backend_b);
+        let _ = std::fs::remove_file(&socket_b);
+    }
 
     /// Forces the exact post-backend-removal failure this fix targets: a captured `Some` socket whose
     /// identity-checked removal fails (as it would after a `stop`/`complete_reap` error left the file's
