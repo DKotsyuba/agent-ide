@@ -35,6 +35,20 @@ fn observation(text: &str, sequence: u64) -> SourceObservation {
     .unwrap()
 }
 
+/// Builds a fixed per-worktree Go cache namespace for tests exercising `GoplsDefaults`.
+fn go_env() -> GoEnv {
+    GoEnv {
+        go_cache: "/tmp/agent-ide-session-test-cache/go-build".into(),
+        go_mod_cache: "/tmp/agent-ide-session-test-cache/go-mod".into(),
+        go_tmp_dir: "/tmp/agent-ide-session-test-cache/tmp".into(),
+    }
+}
+
+/// Returns the exact `workspace/configuration` payload the fixed `go_env()` produces.
+fn go_env_configuration() -> serde_json::Value {
+    ProviderSettings::GoplsDefaults(go_env()).configuration()
+}
+
 /// Checks raw URI encoding, Unicode coordinate units, invalid offsets, exact bytes, and lexical limits.
 #[test]
 fn exact_lexical_context_and_positions() {
@@ -93,7 +107,7 @@ fn diagnostic_state() -> Arc<Mutex<State>> {
         active: true,
         terminal: false,
         shutdown_complete: false,
-        settings: ProviderSettings::GoplsDefaults,
+        settings: ProviderSettings::GoplsDefaults(go_env()),
         readiness: watch::channel(UNKNOWN_READINESS).0,
         document: Some(Document {
             uri: context::observation_uri(&observed).unwrap(),
@@ -215,7 +229,7 @@ async fn request_timeout_retires_generation_and_late_results() {
                         })
                         .await
                         .unwrap();
-                    assert_eq!(settings, vec![serde_json::Value::Null]);
+                    assert_eq!(settings, vec![go_env_configuration()]);
                     Ok(lsp::InitializeResult {
                         capabilities: lsp::ServerCapabilities {
                             text_document_sync: Some(lsp::TextDocumentSyncCapability::Kind(
@@ -244,7 +258,7 @@ async fn request_timeout_retires_generation_and_late_results() {
                 backend: 7,
                 ..Default::default()
             },
-            ProviderSettings::GoplsDefaults,
+            ProviderSettings::GoplsDefaults(go_env()),
             SessionOptions {
                 request_timeout: Duration::from_millis(50),
                 lifetime: Duration::from_secs(2),
@@ -298,7 +312,7 @@ async fn eof_never_becomes_provider_readiness() {
         tree(),
         1,
         ViewGeneration::default(),
-        ProviderSettings::GoplsDefaults,
+        ProviderSettings::GoplsDefaults(go_env()),
         SessionOptions::default(),
         |_| async { panic!("EOF must not initialize") },
     )
@@ -354,7 +368,7 @@ fn managed_rust_settings_disable_proc_macro_expansion() {
 async fn closed_settings_and_rust_status_barrier_match_the_actual_provider() {
     for (settings, name, version, health, quiescent, success) in [
         (
-            ProviderSettings::GoplsDefaults,
+            ProviderSettings::GoplsDefaults(go_env()),
             "gopls",
             "test",
             "ok",
@@ -394,7 +408,7 @@ async fn closed_settings_and_rust_status_barrier_match_the_actual_provider() {
             false,
         ),
         (
-            ProviderSettings::GoplsDefaults,
+            ProviderSettings::GoplsDefaults(go_env()),
             "rust-analyzer",
             "contract-1",
             "ok",
@@ -599,7 +613,7 @@ async fn post_initialize_transport_failures_are_not_swallowed() {
             tree(),
             1,
             ViewGeneration::default(),
-            ProviderSettings::GoplsDefaults,
+            ProviderSettings::GoplsDefaults(go_env()),
             SessionOptions {
                 request_timeout: Duration::from_millis(100),
                 lifetime: Duration::from_secs(1),
@@ -671,7 +685,7 @@ async fn post_initialize_output_error_is_propagated() {
         tree(),
         1,
         ViewGeneration::default(),
-        ProviderSettings::GoplsDefaults,
+        ProviderSettings::GoplsDefaults(go_env()),
         SessionOptions {
             request_timeout: Duration::from_millis(100),
             lifetime: Duration::from_secs(1),
@@ -709,7 +723,7 @@ async fn outbound_budget_retires_full_document_flood_before_unbounded_queueing()
         tree(),
         1,
         ViewGeneration::default(),
-        ProviderSettings::GoplsDefaults,
+        ProviderSettings::GoplsDefaults(go_env()),
         SessionOptions {
             request_timeout: Duration::from_millis(100),
             lifetime: Duration::from_millis(400),

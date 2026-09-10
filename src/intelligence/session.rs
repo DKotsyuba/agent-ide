@@ -37,12 +37,25 @@ const MAX_SESSION_OUTBOUND_BYTES: usize = 8 * 1024 * 1024;
 /// Cumulative client messages accepted before retiring this session's unbounded async-lsp sender.
 const MAX_SESSION_OUTBOUND_MESSAGES: usize = 256;
 
+/// Per-worktree Go build/module/temp namespace delivered only through this session's view
+/// configuration; the shared listener process never receives these as process environment, so a
+/// missing `GoEnv` fails the session closed instead of silently reusing another worktree's cache.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GoEnv {
+    /// Absolute per-worktree `GOCACHE` directory.
+    pub go_cache: std::path::PathBuf,
+    /// Absolute per-worktree `GOMODCACHE` directory.
+    pub go_mod_cache: std::path::PathBuf,
+    /// Absolute per-worktree `GOTMPDIR` directory.
+    pub go_tmp_dir: std::path::PathBuf,
+}
+
 /// Closed provider configurations accepted by the production pipe client.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum ProviderSettings {
-    /// The accepted gopls null/default configuration; never represents a Rust profile.
-    GoplsDefaults,
+    /// The accepted gopls configuration, carrying this session's exact private Go cache namespace.
+    GoplsDefaults(GoEnv),
     /// Exact accepted Rust analyzer/toolchain/configuration identity retained through the session.
     Rust(RustProfile),
 }
@@ -50,7 +63,13 @@ impl ProviderSettings {
     /// Returns the fixed initialize/configuration payload; no dynamic settings or model keys are accepted.
     fn configuration(&self) -> serde_json::Value {
         match self {
-            Self::GoplsDefaults => serde_json::Value::Null,
+            Self::GoplsDefaults(env) => serde_json::json!({
+                "env": {
+                    "GOCACHE": env.go_cache.display().to_string(),
+                    "GOMODCACHE": env.go_mod_cache.display().to_string(),
+                    "GOTMPDIR": env.go_tmp_dir.display().to_string(),
+                }
+            }),
             Self::Rust(profile) => serde_json::json!({
                 "cachePriming":{"enable":false},
                 "procMacro":{"enable":!profile.proc_macros_disabled()}
@@ -61,7 +80,7 @@ impl ProviderSettings {
     /// Refuses a Rust identity under generic defaults and requires exact analyzer identity for Rust.
     fn validate_server(&self, info: Option<&lsp::ServerInfo>) -> io::Result<()> {
         let valid = match self {
-            Self::GoplsDefaults => info.is_none_or(|info| info.name == "gopls"),
+            Self::GoplsDefaults(_) => info.is_none_or(|info| info.name == "gopls"),
             Self::Rust(profile) => info.is_some_and(|info| {
                 info.name == "rust-analyzer"
                     && info.version.as_deref() == Some(profile.initialize_version())
@@ -443,10 +462,7 @@ impl Session {
                     uri: root,
                     name: "workspace".into(),
                 }]),
-                initialization_options: match &self.settings {
-                    ProviderSettings::GoplsDefaults => None,
-                    ProviderSettings::Rust(_) => Some(self.settings.configuration()),
-                },
+                initialization_options: Some(self.settings.configuration()),
                 capabilities: lsp::ClientCapabilities {
                     workspace: Some(lsp::WorkspaceClientCapabilities {
                         configuration: Some(true),

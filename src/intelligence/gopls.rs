@@ -141,7 +141,13 @@ impl GoplsProfile {
     }
 
     /// Builds a profile-owned provider command with a cleared, finite Go environment.
-    /// Go build, module, and temporary writes remain inside the verified cache namespace.
+    ///
+    /// `cache_namespace` here is the *shared* native namespace: gopls 0.23.0's on-disk filecache is
+    /// bound once per process behind a `sync.Once` on `GOPLSCACHE`, so every worktree view on this
+    /// one listener must observe the same value. Per-worktree `GOCACHE`/`GOMODCACHE`/`GOTMPDIR` are
+    /// deliberately never set here: they are delivered per view through the LSP session's
+    /// `initializationOptions`/`workspace/configuration` `env`, so a missing per-view value fails
+    /// that view closed instead of silently reusing this shared namespace for worktree-owned state.
     fn command(
         &self,
         authority: &WorkspaceAuthority,
@@ -159,22 +165,6 @@ impl GoplsProfile {
         environment.insert(
             OsString::from("GOPLSCACHE"),
             OsString::from(Path::new(&self.cache_namespace).join("gopls")),
-        );
-        environment.insert(
-            OsString::from("GOCACHE"),
-            OsString::from(Path::new(&self.cache_namespace).join("go-build")),
-        );
-        environment.insert(
-            OsString::from("GOMODCACHE"),
-            OsString::from(Path::new(&self.cache_namespace).join("go-mod")),
-        );
-        environment.insert(
-            OsString::from("GOTMPDIR"),
-            OsString::from(Path::new(&self.cache_namespace).join("tmp")),
-        );
-        environment.insert(
-            OsString::from("TMPDIR"),
-            OsString::from(Path::new(&self.cache_namespace).join("tmp")),
         );
         environment.insert(
             OsString::from("AGENT_IDE_GOPLS_PROFILE"),

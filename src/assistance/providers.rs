@@ -16,9 +16,10 @@ use crate::{
             RustProfile, RustProfileError, RustProfileIdentity, RustProtocolChild,
             RustViewAdmission, RustViews, RustWorktree,
         },
-        session::{DiagnosticSnapshot, ProviderSettings, SessionOptions, with_session},
+        session::{DiagnosticSnapshot, GoEnv, ProviderSettings, SessionOptions, with_session},
     },
 };
+use std::path::Path;
 
 /// Couples one semantic context result to diagnostics observed by that exact provider session.
 pub(super) struct ProviderContext {
@@ -69,6 +70,12 @@ pub(super) struct Providers {
     caches: BTreeMap<String, CacheLifecycle>,
     /// Cache keys currently used by each actor and quiesced when that actor stops.
     binding_caches: BTreeMap<BindingRef, Vec<String>>,
+    /// Concurrent active bindings retaining each *shared* native cache key. `CacheLifecycle`
+    /// itself models one exclusive owner at a time (handoff only succeeds once quiescent), which
+    /// is correct for a per-worktree namespace but wrong for the one shared namespace multiple
+    /// divergent worktrees legitimately use at once. This count is the source of truth for when
+    /// the shared entry may actually transition to quiescent.
+    shared_cache_refs: BTreeMap<String, usize>,
 }
 impl Providers {
     /// Creates fixed finite provider bookkeeping without launching processes.
@@ -85,6 +92,7 @@ impl Providers {
             generation: 0,
             caches: BTreeMap::new(),
             binding_caches: BTreeMap::new(),
+            shared_cache_refs: BTreeMap::new(),
         }
     }
     /// Mints one checked protocol generation without using timing/PID as actor identity.
@@ -148,6 +156,7 @@ impl Worker<'_> {
             authority.worktree().incarnation()
         );
         let mut prepared = Vec::with_capacity(launches.len());
+        let mut shared_refs = Vec::new();
         for launch in launches {
             let settings = match launch.settings {
                 AcceptedProviderSettings::GoplsDefaults => "gopls-defaults-v1",
@@ -187,9 +196,7 @@ impl Worker<'_> {
             };
             let namespace = self.runtime.join("cache").join(&key);
             let required = match launch.settings {
-                AcceptedProviderSettings::GoplsDefaults => {
-                    &["gopls", "go-build", "go-mod", "tmp"][..]
-                }
+                AcceptedProviderSettings::GoplsDefaults => &["go-build", "go-mod", "tmp"][..],
                 AcceptedProviderSettings::RustCachePrimingDisabledV1 => {
                     &["cargo", "target", "tmp"][..]
                 }
@@ -201,17 +208,80 @@ impl Worker<'_> {
                 return false;
             }
             prepared.push((key, cache));
+            if matches!(launch.settings, AcceptedProviderSettings::GoplsDefaults) {
+                let shared_key = provider_shared_cache_key(launch, settings);
+                let live_refs = self.providers.shared_cache_refs.get(&shared_key).copied();
+                match live_refs {
+                    // A different active binding already keeps this shared listener's namespace
+                    // non-quiescent; equal keys already imply a compatible identity (the key is a
+                    // hash of the exact same executable/settings/toolchain/trust components used
+                    // to build the identity), so it is retained by simply counting this reference.
+                    Some(refs) if refs > 0 => shared_refs.push(shared_key),
+                    _ => {
+                        let Some(shared_namespace) = CacheNamespaceId::new(shared_key.clone())
+                        else {
+                            return false;
+                        };
+                        let Some(shared_identity) = CacheIdentity::new(
+                            launch.executable.identity.clone(),
+                            settings,
+                            configuration,
+                            launch.toolchain.clone(),
+                            launch.trust.clone(),
+                            SHARED_NATIVE_CACHE_STATE,
+                        ) else {
+                            return false;
+                        };
+                        let shared_already_retained =
+                            self.providers.caches.contains_key(&shared_key);
+                        if !shared_already_retained
+                            && self.providers.caches.len() + prepared.len() >= MAX_CACHE_NAMESPACES
+                        {
+                            return false;
+                        }
+                        if let Some(cache) = self.providers.caches.get_mut(&shared_key) {
+                            if !cache.handoff(&shared_identity) {
+                                return false;
+                            }
+                        } else {
+                            let Ok(shared_cache) =
+                                CacheLifecycle::retain(&root, shared_namespace, shared_identity)
+                            else {
+                                return false;
+                            };
+                            prepared.push((shared_key.clone(), shared_cache));
+                        }
+                        let shared_path = self.runtime.join("cache").join(&shared_key);
+                        if CacheRoot::prepare(shared_path.join("gopls")).is_err() {
+                            return false;
+                        }
+                        shared_refs.push(shared_key);
+                    }
+                }
+            }
         }
-        let mut keys = Vec::with_capacity(prepared.len());
+        let mut keys = Vec::with_capacity(prepared.len() + shared_refs.len());
         for (key, cache) in prepared {
-            self.providers.caches.insert(key.clone(), cache);
+            self.providers.caches.entry(key.clone()).or_insert(cache);
             keys.push(key);
+        }
+        for shared_key in shared_refs {
+            *self
+                .providers
+                .shared_cache_refs
+                .entry(shared_key.clone())
+                .or_insert(0) += 1;
+            keys.push(shared_key);
         }
         self.providers.binding_caches.insert(binding.clone(), keys);
         true
     }
 
     /// Quiesces the stopped actor's cache owners without deleting their worktree namespaces.
+    ///
+    /// A shared native namespace key is instead reference-counted: it only becomes quiescent once
+    /// every divergent worktree currently sharing that one heavy listener has stopped, so a still
+    /// non-quiescent shared entry is never falsely retired or handed off to an unrelated actor.
     pub(super) fn quiesce_worktree_caches(&mut self, binding: &BindingRef) {
         for key in self
             .providers
@@ -219,6 +289,12 @@ impl Worker<'_> {
             .remove(binding)
             .unwrap_or_default()
         {
+            if let Some(refs) = self.providers.shared_cache_refs.get_mut(&key) {
+                *refs = refs.saturating_sub(1);
+                if *refs > 0 {
+                    continue;
+                }
+            }
             if let Some(cache) = self.providers.caches.get_mut(&key) {
                 cache.quiesce();
             }
@@ -414,7 +490,13 @@ impl Worker<'_> {
             launch.trust,
             blake3::hash(state.to_string().as_bytes()).to_hex()
         );
-        let cache_namespace = self.provider_cache_namespace(&binding, &authority, launch)?;
+        let worktree_namespace = self.provider_cache_namespace(&binding, &authority, launch)?;
+        let shared_namespace = self.provider_shared_cache_namespace(&binding, launch)?;
+        let go_env = GoEnv {
+            go_cache: Path::new(&worktree_namespace).join("go-build"),
+            go_mod_cache: Path::new(&worktree_namespace).join("go-mod"),
+            go_tmp_dir: Path::new(&worktree_namespace).join("tmp"),
+        };
         let profile = GoplsProfile::new(
             launch.executable.path.clone(),
             launch.executable.identity.clone(),
@@ -422,7 +504,7 @@ impl Worker<'_> {
             "gopls-defaults-v1".into(),
             launch.toolchain.clone(),
             trust,
-            cache_namespace,
+            shared_namespace,
         )
         .map_err(|_| FailureCode::ExecutionProfile)?;
         let backend = profile.compatibility_key();
@@ -584,7 +666,7 @@ impl Worker<'_> {
                     toolchain: 1,
                     view: generation,
                 },
-                ProviderSettings::GoplsDefaults,
+                ProviderSettings::GoplsDefaults(go_env),
                 remaining_options(job),
             );
             tokio::pin!(operation);
@@ -682,15 +764,36 @@ impl Worker<'_> {
             authority.worktree().incarnation()
         );
         let key = provider_cache_key(&worktree_state, launch, settings);
+        self.retained_cache_namespace(binding, &key)
+    }
+
+    /// Resolves the already-retained *shared* native namespace backing every worktree's gopls
+    /// listener for this compatible executable/settings/toolchain/trust identity.
+    fn provider_shared_cache_namespace(
+        &self,
+        binding: &BindingRef,
+        launch: &ProviderLaunch,
+    ) -> Result<String, FailureCode> {
+        let settings = provider_cache_settings(launch.settings);
+        let key = provider_shared_cache_key(launch, settings);
+        self.retained_cache_namespace(binding, &key)
+    }
+
+    /// Returns the retained namespace path for `key` only if this binding still owns a live lifecycle.
+    fn retained_cache_namespace(
+        &self,
+        binding: &BindingRef,
+        key: &str,
+    ) -> Result<String, FailureCode> {
         let retained = self
             .providers
             .binding_caches
             .get(binding)
-            .is_some_and(|keys| keys.contains(&key))
+            .is_some_and(|keys| keys.iter().any(|existing| existing == key))
             && self
                 .providers
                 .caches
-                .get(&key)
+                .get(key)
                 .is_some_and(CacheLifecycle::retained);
         if !retained {
             return Err(FailureCode::ProviderUnavailable);
@@ -734,6 +837,19 @@ pub(super) fn managed_sandbox_from_job(job: &Job) -> bool {
         .as_ref()
         .and_then(|observed| observed.state().as_json()["permissionProfile"]["type"].as_str())
         == Some("managed")
+}
+
+/// Fixed compatibility-identity marker used only by the shared native namespace; it deliberately
+/// excludes any worktree so every divergent worktree with a compatible executable/toolchain/trust
+/// resolves to the same shared key and, through it, the same one heavy `gopls` listener.
+const SHARED_NATIVE_CACHE_STATE: &str = "shared-native-v1";
+
+/// Derives the one opaque shared namespace shared by every worktree's gopls backend for this
+/// executable/settings/toolchain/trust identity. gopls 0.23.0 binds its on-disk filecache to
+/// `GOPLSCACHE` once per process, so this key must never vary by worktree or it would force a
+/// second physical listener for an otherwise-compatible backend.
+fn provider_shared_cache_key(launch: &ProviderLaunch, settings: &str) -> String {
+    provider_cache_key(SHARED_NATIVE_CACHE_STATE, launch, settings)
 }
 
 /// Derives one opaque namespace component from durable worktree and accepted provider identities.
