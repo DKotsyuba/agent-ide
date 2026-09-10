@@ -11,8 +11,8 @@
 //! presents a synthetic sandbox observation.
 
 use super::claude_worker::{
-    ChildSettlement, ClaimOutcome, HelperJob, HelperOperation, HelperOutcome, HelperResult,
-    LaunchLedger, MAX_HELPER_FRAME_BYTES,
+    ChildSettlement, ClaimOutcome, DiscoveryFrame, HelperJob, HelperOperation, HelperOutcome,
+    HelperQuery, HelperResult, LaunchLedger, MAX_HELPER_FRAME_BYTES,
 };
 use super::reply::FailureCode;
 use serde::{Deserialize, Serialize};
@@ -152,6 +152,10 @@ async fn session(mut stream: tokio::net::UnixStream, ledger: Arc<Mutex<LaunchLed
         return;
     };
     let outcome = claim(&request, &ledger);
+    let candidate = match &outcome {
+        ClaimReply::Granted(job) => job.candidate.clone(),
+        ClaimReply::Refused { .. } => PathBuf::new(),
+    };
     let granted = matches!(outcome, ClaimReply::Granted(_));
     let Ok(encoded) = serde_json::to_string(&outcome) else {
         return;
@@ -164,9 +168,30 @@ async fn session(mut stream: tokio::net::UnixStream, ledger: Arc<Mutex<LaunchLed
     let Ok(frame) = read_frame(&mut stream).await else {
         return;
     };
-    let Ok(result) = HelperResult::decode(&frame) else {
+    let Ok(mut result) = HelperResult::decode(&frame) else {
         return;
     };
+    // The helper reported bytes; the daemon derives the canonical identity from them here, so a
+    // stored result never contains a worktree identity the helper merely asserted. Reconstruction
+    // reads no source and starts no process.
+    if let HelperOutcome::Complete { text } = &result.outcome
+        && !result.discovery.is_empty()
+    {
+        result.outcome = match validated_worktree(&candidate, &result.detail_ref, &result.discovery)
+        {
+            Ok(worktree) => HelperOutcome::Complete {
+                text: format!(
+                    "{text}; canonical worktree {} (repository {}, common dir {}). \
+                     Workspace authority is not implied by discovery alone.",
+                    worktree.root().display(),
+                    worktree.repository_root().display(),
+                    worktree.common_dir().display(),
+                ),
+            },
+            // Discovery that cannot be validated is a closed failure, never a partial success.
+            Err(code) => HelperOutcome::Failed { code },
+        };
+    }
     if let Ok(mut ledger) = ledger.lock() {
         let _ = ledger.settle_frame(result);
     }
@@ -194,6 +219,72 @@ fn claim(request: &ClaimRequest, ledger: &Arc<Mutex<LaunchLedger>>) -> ClaimRepl
         ClaimOutcome::Granted(job) => ClaimReply::Granted(job),
         ClaimOutcome::Rejected(code) => refuse(code),
     }
+}
+
+/// Reconstructs canonical Git discovery from a helper's raw bytes and validates the worktree.
+///
+/// This is where a helper's report stops being a claim and becomes evidence. The helper supplies
+/// only raw per-query bytes; the exact same closed validator the managed path uses derives the
+/// worktree, repository root and common directory from them, so a helper cannot assert an identity
+/// it did not actually observe. Returns the validated worktree, or a closed failure when the
+/// triple is incomplete, the bytes are unusable, or the configured Git lacks required discovery
+/// support.
+///
+/// Performs no process, source or provider work: it only interprets bytes already captured.
+pub fn validated_worktree(
+    candidate: &Path,
+    detail_ref: &str,
+    frames: &[DiscoveryFrame],
+) -> Result<crate::workspace::git::discovery::DiscoveredWorktree, FailureCode> {
+    use crate::execution::{
+        CapturedOutput, DescendantEvidence, DiscoveryOperationRef, GitDiscoveryEvidence,
+        GitDiscoveryQuery,
+    };
+    use std::os::unix::process::ExitStatusExt;
+    if frames.len() != 3 {
+        return Err(FailureCode::WorkspaceActivation);
+    }
+    let operation = DiscoveryOperationRef::new(format!("claude-discover-{detail_ref}"))
+        .map_err(|_| FailureCode::Internal)?;
+    let mut evidence = Vec::with_capacity(3);
+    for frame in frames {
+        frame.validate()?;
+        let captured = |bytes: &[u8]| CapturedOutput {
+            bytes: bytes.to_vec(),
+            truncated: frame.truncated,
+            drained_bytes: bytes.len() as u64,
+            complete: !frame.truncated,
+        };
+        // Truncated discovery output cannot be completed later; refuse rather than parse a prefix.
+        if frame.truncated {
+            return Err(FailureCode::WorkspaceActivation);
+        }
+        evidence.push(
+            GitDiscoveryEvidence::new(
+                operation.clone(),
+                match frame.query {
+                    HelperQuery::ShowTopLevel => GitDiscoveryQuery::ShowTopLevel,
+                    HelperQuery::GitCommonDir => GitDiscoveryQuery::GitCommonDir,
+                    HelperQuery::WorktreeListPorcelainZ => {
+                        GitDiscoveryQuery::WorktreeListPorcelainZ
+                    }
+                },
+                captured(&frame.stdout),
+                captured(&frame.stderr),
+                std::process::ExitStatus::from_raw(frame.exit_code.unwrap_or(1) << 8),
+                Duration::ZERO,
+                None,
+                DescendantEvidence::Unverified,
+            )
+            .map_err(|_| FailureCode::WorkspaceActivation)?,
+        );
+    }
+    crate::workspace::git::discovery::validate_discovery(candidate, &operation, &evidence).map_err(
+        |error| match error {
+            crate::workspace::git::GitError::UnsupportedDiscoveryGit => FailureCode::UnsupportedGit,
+            _ => FailureCode::WorkspaceActivation,
+        },
+    )
 }
 
 /// Runs one foreground helper operation and exits; every failure path is finite and silent.
@@ -240,13 +331,14 @@ async fn execute(
         Ok(ClaimReply::Granted(job)) => *job,
         _ => return "refused",
     };
-    let (outcome, children) = perform(&job).await;
+    let (outcome, children, discovery) = perform(&job).await;
     let settled = children.settled();
     let result = HelperResult {
         protocol: HELPER_PROTOCOL,
         detail_ref,
         outcome,
         children,
+        discovery,
     };
     let Ok(encoded) = result.encode() else {
         return "unavailable";
@@ -259,27 +351,34 @@ async fn execute(
 
 /// Executes the claimed operation's own work under the inherited sandbox.
 ///
-/// Returns the bounded outcome together with measured direct-child settlement. Counts are observed,
-/// never assumed: a child that was started but could not be reaped is reported as unreaped so the
-/// daemon can refuse to call the operation settled.
-async fn perform(job: &HelperJob) -> (HelperOutcome, ChildSettlement) {
+/// Returns the bounded outcome, measured direct-child settlement, and the raw bytes of every fixed
+/// discovery query it ran. Counts are observed, never assumed: a child that was started but could
+/// not be reaped is reported as unreaped so the daemon can refuse to call the operation settled.
+/// This function interprets no discovery output; canonical interpretation stays with the daemon.
+async fn perform(job: &HelperJob) -> (HelperOutcome, ChildSettlement, Vec<DiscoveryFrame>) {
     use crate::execution::{GitDiscoveryQuery, inherited_git_arguments, run_inherited_child};
     let mut spawned = 0;
     let mut reaped = 0;
-    let mut lines = Vec::new();
-    let queries: &[GitDiscoveryQuery] = match job.operation {
-        // Activation proves the candidate's real Git identity before any authority is minted.
+    let mut discovery = Vec::new();
+    // Activation reports the complete fixed triple the daemon's discovery validator requires.
+    // Context and diff still confirm the worktree root they are about to read within. Stop
+    // performs no discovery; it exists only to settle and reap.
+    let queries: &[(GitDiscoveryQuery, HelperQuery)] = match job.operation {
         HelperOperation::Start => &[
-            GitDiscoveryQuery::ShowTopLevel,
-            GitDiscoveryQuery::GitCommonDir,
+            (GitDiscoveryQuery::ShowTopLevel, HelperQuery::ShowTopLevel),
+            (GitDiscoveryQuery::GitCommonDir, HelperQuery::GitCommonDir),
+            (
+                GitDiscoveryQuery::WorktreeListPorcelainZ,
+                HelperQuery::WorktreeListPorcelainZ,
+            ),
         ],
-        // Context and diff still confirm the worktree root they are about to read within.
-        HelperOperation::Context | HelperOperation::Diff => &[GitDiscoveryQuery::ShowTopLevel],
-        // Stop performs no discovery; it exists only to settle and reap.
+        HelperOperation::Context | HelperOperation::Diff => {
+            &[(GitDiscoveryQuery::ShowTopLevel, HelperQuery::ShowTopLevel)]
+        }
         HelperOperation::Stop => &[],
     };
     let deadline = Duration::from_millis(job.budgets.deadline_ms.min(60_000));
-    for query in queries {
+    for (query, reported) in queries {
         spawned += 1;
         match run_inherited_child(
             &job.git,
@@ -292,15 +391,13 @@ async fn perform(job: &HelperJob) -> (HelperOutcome, ChildSettlement) {
         {
             Ok(child) => {
                 reaped += 1;
-                if !child.success {
-                    return (
-                        HelperOutcome::Failed {
-                            code: FailureCode::UnsupportedGit,
-                        },
-                        ChildSettlement { spawned, reaped },
-                    );
-                }
-                lines.push(String::from_utf8_lossy(&child.stdout).trim().to_owned());
+                discovery.push(DiscoveryFrame {
+                    query: *reported,
+                    stdout: child.stdout,
+                    stderr: Vec::new(),
+                    exit_code: Some(if child.success { 0 } else { 1 }),
+                    truncated: child.truncated,
+                });
             }
             Err(settled) => {
                 // A child that never started was never a child; anything else stays unreaped.
@@ -312,20 +409,30 @@ async fn perform(job: &HelperJob) -> (HelperOutcome, ChildSettlement) {
                         code: FailureCode::SourceUnavailable,
                     },
                     ChildSettlement { spawned, reaped },
+                    discovery,
                 );
             }
         }
     }
+    if discovery.iter().any(|frame| frame.exit_code != Some(0)) {
+        return (
+            HelperOutcome::Failed {
+                code: FailureCode::UnsupportedGit,
+            },
+            ChildSettlement { spawned, reaped },
+            discovery,
+        );
+    }
     let text = format!(
-        "operation={:?}; git discovery observed {} of {} fixed queries; roots: {}",
+        "operation={:?}; {} of {} fixed Git queries observed under the inherited host sandbox",
         job.operation,
         reaped,
-        queries.len(),
-        lines.join(" | ")
+        queries.len()
     );
     (
         HelperOutcome::Complete { text },
         ChildSettlement { spawned, reaped },
+        discovery,
     )
 }
 
@@ -435,7 +542,7 @@ mod tests {
         let Delivery::Ready(result) = delivery else {
             panic!("both settlement halves arrived");
         };
-        assert!(result.children.settled() && result.children.spawned == 2);
+        assert!(result.children.settled() && result.children.spawned == 3);
         let HelperOutcome::Complete { text } = &result.outcome else {
             panic!("real git discovery completed");
         };

@@ -290,7 +290,7 @@ impl ProductDispatcher {
                 let observation: Value =
                     serde_json::from_str(hook.sanitized_observation_json().as_str()).ok()?;
                 let object = observation.as_object()?;
-                if object.len() != 8 {
+                if object.len() != 9 {
                     return None;
                 }
                 let phase = match object.get("phase")?.as_str()? {
@@ -349,6 +349,7 @@ impl ProductDispatcher {
                     );
                 }
                 let call_id = event.optional_call_id().map(str::to_owned);
+                let failed = event.failed();
                 let status = self.bindings.lock().ok()?.observe_hook(event, channel);
                 match status {
                     BindingStatus::PreObserved => Some(PeerReply::HookObserved {}),
@@ -361,7 +362,10 @@ impl ProductDispatcher {
                             && let Ok(mut launches) = self.launches.lock()
                             && launches.owns_post(call_id)
                         {
-                            let _ = launches.settle_post(call_id, true);
+                            // A failed helper post settles the operation as failed rather than
+                            // leaving it pending: the tool ran, so expiry must not be the only
+                            // thing that ever resolves it.
+                            let _ = launches.settle_post(call_id, !failed);
                             return Some(PeerReply::NativeHookObserved {});
                         }
                         if let Some(worker) = &self.worker {
@@ -488,6 +492,7 @@ impl ProductDispatcher {
                     });
                 };
                 if host == HostKind::Claude {
+                    let established = method.method() == AssistanceMethod::Start;
                     return Some(match method.method() {
                         // Stop revokes the ledger first, so a helper that has not yet claimed can
                         // never claim afterwards, then reuses the ordinary revocation path.
@@ -502,12 +507,27 @@ impl ProductDispatcher {
                             &invocation,
                             call.parameters()["detail_ref"].as_str()?,
                         ),
-                        _ => self.mint_claude(
-                            &invocation,
-                            tool,
-                            call.parameters(),
-                            method.opaque_attachment(),
-                        ),
+                        _ => {
+                            let reply = self.mint_claude(
+                                &invocation,
+                                tool,
+                                call.parameters(),
+                                method.opaque_attachment(),
+                            );
+                            // This call created the generation and then refused its own
+                            // admission. Remove exactly that generation so no false active
+                            // binding remains, without touching a concurrently valid retry.
+                            if established
+                                && matches!(
+                                    reply,
+                                    PeerReply::Error { .. } | PeerReply::Unavailable { .. }
+                                )
+                                && let Ok(mut bindings) = self.bindings.lock()
+                            {
+                                let _ = bindings.rollback_established(invocation.binding_ref());
+                            }
+                            reply
+                        }
                     });
                 }
                 Some(match method.method() {
@@ -693,7 +713,8 @@ async fn host_shaped_claude_start_never_reaches_workspace_without_sandbox_author
             "session_id":"session",
             "agent_type":null,
             "launch_command":null,
-            "launch_background":null
+            "launch_background":null,
+            "failed":false
         }),
         64 * 1024,
     )

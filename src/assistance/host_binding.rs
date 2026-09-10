@@ -192,6 +192,8 @@ pub struct HookEvent {
     agent_type: Option<String>,
     /// Bounded shell launch selected only from a Claude `Bash` pre-hook; absent otherwise.
     launch: Option<HookLaunch>,
+    /// Whether a post reported explicit failure; `false` for every non-post event.
+    failed: bool,
 }
 
 impl HookEvent {
@@ -230,6 +232,15 @@ impl HookEvent {
         self.agent_type.as_deref()
     }
 
+    /// Returns whether a post event carried an explicit failure marker.
+    ///
+    /// `false` means no marker was present, not that success was proven. A post arriving at all
+    /// proves the tool ran; a denied tool call produces no post and is handled by deadline expiry
+    /// rather than by this flag.
+    pub fn failed(&self) -> bool {
+        self.failed
+    }
+
     /// Returns the selected shell launch when this was a Claude `Bash` pre-hook.
     ///
     /// Absent for Codex, for post and batch phases, for every non-`Bash` tool, and whenever the
@@ -252,6 +263,12 @@ impl HookEvent {
             run_in_background,
         });
         Some(self)
+    }
+
+    /// Records a relayed explicit post-failure marker on a reconstructed daemon-side event.
+    pub fn with_failure(mut self, failed: bool) -> Self {
+        self.failed = failed;
+        self
     }
 }
 
@@ -842,6 +859,32 @@ impl HostBindingGuard {
         Ok(ActiveBindingUse(binding.clone()))
     }
 
+    /// Removes only one just-established generation after its own admission refused it.
+    ///
+    /// Use this, never [`Self::stop_binding`], when an `ide.start` established a binding and the
+    /// same call then refused admission. It removes exactly that generation and its settling entry
+    /// and nothing else: unrelated pre-observations in the same scope are untouched, no replay
+    /// record is written, and a concurrently valid retry is neither revoked nor poisoned. Leaving
+    /// the generation in place instead would advertise an active binding that never became usable.
+    ///
+    /// Returns [`BindingUnavailable::InactiveBinding`] when the supplied generation is not the
+    /// currently active one, which means it was already replaced or stopped and must not be
+    /// removed by this caller.
+    pub fn rollback_established(&mut self, binding: &BindingRef) -> Result<(), BindingUnavailable> {
+        let key = (
+            binding.host,
+            binding.actor_id.clone(),
+            binding.channel.clone(),
+        );
+        if self.bindings.get(&key) != Some(binding) {
+            return Err(BindingUnavailable::InactiveBinding);
+        }
+        self.bindings.remove(&key);
+        self.native_hints.remove(binding);
+        self.settling.retain(|_, owner| owner != binding);
+        Ok(())
+    }
+
     /// Revokes one generation and rejects its pending pre-hooks; later post settlement remains valid.
     pub fn stop_binding(&mut self, binding: &BindingRef) -> Result<(), BindingUnavailable> {
         let key = (
@@ -981,6 +1024,7 @@ pub fn parse_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnavailable>
         session_id: None,
         agent_type: None,
         launch: None,
+        failed: false,
     })
 }
 
@@ -1031,6 +1075,14 @@ pub fn parse_claude_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnava
             }),
         _ => None,
     };
+    // Only an explicit marker counts as failure; an absent or unrecognized response never
+    // downgrades a completed tool call, and never upgrades a denied one into a completion.
+    let failed = phase == HookPhase::Post
+        && payload.tool_response.as_ref().is_some_and(|response| {
+            response.success == Some(false)
+                || response.is_error == Some(true)
+                || response.interrupted == Some(true)
+        });
     Ok(HookEvent {
         host: HostKind::Claude,
         phase,
@@ -1039,6 +1091,7 @@ pub fn parse_claude_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnava
         session_id: Some(session_id),
         agent_type,
         launch,
+        failed,
     })
 }
 
@@ -1072,6 +1125,24 @@ struct ClaudeHookPayload {
     tool_name: Option<String>,
     /// Native tool arguments; only a shell launch's two selected fields survive parsing.
     tool_input: Option<ClaudeToolInput>,
+    /// Native tool result; only explicit failure markers survive parsing.
+    tool_response: Option<ClaudeToolResponse>,
+}
+
+/// Selects only the explicit failure markers a post payload may carry.
+///
+/// Claude emits `PostToolUse` for a tool that ran, whether it succeeded or failed, and emits no
+/// post at all when permission was denied. So a post's mere arrival proves execution, not success:
+/// only these explicit markers distinguish the two. Output, content and every other field of the
+/// response are discarded before this value exists.
+#[derive(Deserialize)]
+struct ClaudeToolResponse {
+    /// Explicit success flag when the host supplies one.
+    success: Option<bool>,
+    /// Explicit error flag when the host supplies one instead.
+    is_error: Option<bool>,
+    /// Whether the host interrupted the tool before it finished.
+    interrupted: Option<bool>,
 }
 
 /// Selects only the two shell fields a foreground-helper launch can be recognized by.

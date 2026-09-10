@@ -33,6 +33,8 @@ const MAX_COMMAND_BYTES: usize = 4096;
 const MAX_IDENTIFIER_BYTES: usize = 256;
 /// Maximum bounded owner text one helper result may carry back to the daemon.
 const MAX_RESULT_TEXT_BYTES: usize = 32 * 1024;
+/// Maximum raw bytes one reported discovery stream may carry.
+const MAX_DISCOVERY_STREAM_BYTES: usize = 8 * 1024;
 /// Fixed helper subcommand; the model never selects an executable, argument or shell fragment.
 const HELPER_SUBCOMMAND: &str = "claude-worker";
 
@@ -274,6 +276,52 @@ impl HelperJob {
     }
 }
 
+/// Names the fixed Git discovery queries a helper may report evidence for.
+///
+/// This mirrors Execution's closed discovery query set on the helper wire so the daemon can
+/// reconstruct canonical evidence without accepting an arbitrary command identity from a helper.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HelperQuery {
+    /// `rev-parse --show-toplevel`.
+    ShowTopLevel,
+    /// `rev-parse --path-format=absolute --git-common-dir`.
+    GitCommonDir,
+    /// `worktree list --porcelain -z`.
+    WorktreeListPorcelainZ,
+}
+
+/// One fixed query's bounded raw result, exactly as the helper's own child produced it.
+///
+/// The helper reports raw bytes and the observed exit code and interprets nothing. Canonical
+/// interpretation stays with the daemon's existing discovery validator, so a helper cannot assert
+/// a worktree identity by claiming one — it can only supply the bytes that identity is derived
+/// from. `stdout`/`stderr` are `-z`-safe raw bytes, not text.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryFrame {
+    /// Fixed query these bytes came from.
+    pub query: HelperQuery,
+    /// Raw captured stdout, capped by the job's output budget.
+    pub stdout: Vec<u8>,
+    /// Raw captured stderr, capped by the job's output budget.
+    pub stderr: Vec<u8>,
+    /// Observed process exit code; `None` when the child was signalled.
+    pub exit_code: Option<i32>,
+    /// Whether the caps discarded trailing output on either stream.
+    pub truncated: bool,
+}
+
+impl DiscoveryFrame {
+    /// Rejects an over-bound frame before it can reach the discovery validator.
+    pub fn validate(&self) -> Result<(), FailureCode> {
+        (self.stdout.len() <= MAX_DISCOVERY_STREAM_BYTES
+            && self.stderr.len() <= MAX_DISCOVERY_STREAM_BYTES)
+            .then_some(())
+            .ok_or(FailureCode::Capacity)
+    }
+}
+
 /// Reports how many direct children a helper spawned and how many it actually reaped.
 ///
 /// The helper alone owns, cancels, drains and reaps its Git and provider children. The daemon
@@ -326,6 +374,12 @@ pub struct HelperResult {
     pub outcome: HelperOutcome,
     /// Measured direct-child settlement, never inferred from an exit status alone.
     pub children: ChildSettlement,
+    /// Raw fixed-query discovery bytes, empty for an operation that performed no discovery.
+    ///
+    /// The daemon reconstructs canonical evidence from these bytes; the helper asserts nothing
+    /// about what they mean.
+    #[serde(default)]
+    pub discovery: Vec<DiscoveryFrame>,
 }
 
 impl HelperResult {
@@ -342,6 +396,12 @@ impl HelperResult {
             && text.len() > MAX_RESULT_TEXT_BYTES
         {
             return Err(FailureCode::Capacity);
+        }
+        if self.discovery.len() > 3 {
+            return Err(FailureCode::Capacity);
+        }
+        for frame in &self.discovery {
+            frame.validate()?;
         }
         Ok(())
     }
@@ -1056,6 +1116,7 @@ mod tests {
                     spawned: 2,
                     reaped: 2,
                 },
+                discovery: Vec::new(),
             };
             if frame_first {
                 ledger.settle_frame(result).unwrap();
@@ -1094,6 +1155,7 @@ mod tests {
                     spawned: 1,
                     reaped: 1,
                 },
+                discovery: Vec::new(),
             })
             .unwrap();
         ledger.settle_post("call", false).unwrap();
@@ -1139,6 +1201,7 @@ mod tests {
                 spawned: 1,
                 reaped: 4,
             },
+            discovery: Vec::new(),
         };
         assert_eq!(forged.validate(), Err(FailureCode::ExecutionProfile));
     }

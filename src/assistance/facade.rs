@@ -481,6 +481,9 @@ pub async fn submit_hook_event(
         // and no other field of this one, ever reach the transport.
         "launch_command": event.launch().map(HookLaunch::command),
         "launch_background": event.launch().map(HookLaunch::run_in_background),
+        // Explicit post failure only; a post that carried no marker relays false, which means
+        // "no failure was reported", not "success was proven".
+        "failed": event.failed(),
     });
     let Some(observation) = OpaqueJson::from_value(&observation, MAX_HOOK_BYTES) else {
         return HookIngressOutcome::Unavailable;
