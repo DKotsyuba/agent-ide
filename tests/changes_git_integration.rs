@@ -38,7 +38,7 @@ impl SnapshotRunner for CurrentRunner {
     }
 
     /// Returns the sealed observation only for its exact raw source path.
-    fn current_observation(
+    async fn current_observation(
         &mut self,
         _authority: &agent_ide::workspace::authority::AuthorityStamp,
         path: &Path,
