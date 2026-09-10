@@ -72,6 +72,9 @@ struct Detail {
     source: Option<crate::workspace::observation::SourceObservation>,
     /// Native lifecycle revision associated with this result.
     native_epoch: u64,
+    /// Retained bounded Changes state for the next Diff page; absent once fully delivered.
+    /// Never serialized into a `PeerReply`; it exists only to resume the same owner cursor.
+    diff_page: Option<snapshots::DiffPageState>,
 }
 
 /// Retains one versioned provider delta until a later native post-hook rechecks its exact source.
@@ -180,6 +183,15 @@ impl Shared {
             detail.authority = authority;
             detail.source = source;
             detail.native_epoch = native_epoch;
+        }
+    }
+    /// Retains or clears the bounded Diff pagination state for one same-binding detail reference.
+    /// Never touches the serialized reply; only `serve_inspection` may advance or drop this state.
+    fn set_diff_page(&self, reference: &str, page: Option<snapshots::DiffPageState>) {
+        if let Ok(mut ledger) = self.ledger.lock()
+            && let Some(detail) = ledger.details.get_mut(reference)
+        {
+            detail.diff_page = page;
         }
     }
 }
@@ -596,6 +608,7 @@ impl WorkerHandle {
                     authority: None,
                     source: None,
                     native_epoch: 0,
+                    diff_page: None,
                 },
             );
         }
@@ -646,7 +659,12 @@ struct Worker<'a> {
     admission: crate::execution::AdmissionController,
     /// Bindings with uncertain physical/durable completion cannot report successful cleanup.
     uncertain: std::collections::BTreeSet<BindingRef>,
-    /// Retains private scratch files when a child has no positive reap evidence.
+    /// Retains private scratch files when a child has no positive reap evidence. Entries are never
+    /// deleted automatically: without a positive reap we cannot prove the child is no longer
+    /// writing, so quarantine is the only honest outcome. This list has no fixed capacity today;
+    /// its operational ceiling is one entry per genuinely uncertain reap for this boot, expected to
+    /// be rare, bounded in practice by the daemon's own physical-admission limits rather than by an
+    /// explicit cap on this field.
     uncertain_snapshots: Vec<crate::workspace::git::snapshot::SnapshotIntent>,
     /// Private runtime namespace for current-boot provider sockets.
     runtime: std::path::PathBuf,
@@ -1316,7 +1334,7 @@ async fn inspection_loop(
 async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, request: Inspection) {
     let result = async {
         let active = shared.active(&request.binding)?;
-        let (reply, authority, source, native_epoch) = {
+        let (reply, authority, source, native_epoch, diff_page) = {
             let ledger = shared.ledger.lock().map_err(|_| FailureCode::Internal)?;
             let detail = ledger
                 .details
@@ -1335,6 +1353,7 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 detail.authority.clone(),
                 detail.source.clone(),
                 detail.native_epoch,
+                detail.diff_page.clone(),
             )
         };
         if let Some(authority) = &authority {
@@ -1381,7 +1400,47 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 .map_err(|_| FailureCode::WorkspaceAuthority)?;
         }
         shared.active(&request.binding)?;
-        Ok::<_, FailureCode>(reply)
+        let Some(page) = diff_page else {
+            return Ok::<_, FailureCode>(reply);
+        };
+        let Some(authority) = &authority else {
+            return Err(FailureCode::WorkspaceAuthority);
+        };
+        let expected_scope =
+            crate::workspace::git::GitScope::from_authority(authority, page.mode());
+        let advanced = page.expand(&expected_scope);
+        if matches!(
+            advanced.state(),
+            crate::changes::DiffResultState::Unavailable | crate::changes::DiffResultState::Failed
+        ) {
+            shared.set_diff_page(&request.reference, None);
+            return Err(FailureCode::SourceUnavailable);
+        }
+        let text = snapshots::render_diff_text(page.mode(), &advanced, authority.epoch());
+        let truncated = advanced.truncated_output()
+            || advanced.overflow_hunks() > 0
+            || advanced.overflow_bytes() > 0;
+        let next = PeerReply::Complete {
+            kind: ResultKind::Diff,
+            text,
+            detail_ref: Some(request.reference.clone()),
+            truncated,
+        };
+        let encoded = next
+            .clone()
+            .encode()
+            .and_then(|value| PeerReply::decode(value.as_str()));
+        let Some(next) = encoded else {
+            shared.set_diff_page(&request.reference, None);
+            return Err(FailureCode::Internal);
+        };
+        if let Ok(mut ledger) = shared.ledger.lock()
+            && let Some(detail) = ledger.details.get_mut(&request.reference)
+        {
+            detail.reply = next.clone();
+            detail.diff_page = page.advance(&advanced);
+        }
+        Ok::<_, FailureCode>(next)
     }
     .await;
     let _ = request

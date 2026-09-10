@@ -129,6 +129,84 @@ impl ProductSnapshotRunner<'_, '_> {
     }
 }
 
+/// Retained bounded state needed to resume one Diff detail cursor from `ide.inspect`.
+/// Never serialized; only the same worker that captured `evidence` may expand it further.
+#[derive(Clone)]
+pub(super) struct DiffPageState {
+    scope: GitScope,
+    comparison: crate::workspace::git::GitComparison,
+    evidence: crate::workspace::git::snapshot::GitSnapshot,
+    budget: crate::changes::DiffSelectionBudget,
+    cursor: crate::changes::DiffDetailCursor,
+    mode: DiffMode,
+}
+
+impl DiffPageState {
+    /// Expands exactly the next bounded page from the retained evidence and comparison.
+    pub(super) fn expand(&self, expected_scope: &GitScope) -> crate::changes::DiffResult {
+        crate::changes::expand_diff(
+            expected_scope,
+            &self.comparison,
+            self.evidence.clone(),
+            &self.cursor,
+            self.budget,
+        )
+    }
+    /// Returns the compare mode used to render this page's text.
+    pub(super) const fn mode(&self) -> DiffMode {
+        self.mode
+    }
+    /// Builds the next retained page state, or `None` once selection no longer overflows.
+    pub(super) fn advance(&self, result: &crate::changes::DiffResult) -> Option<Self> {
+        result.detail_cursor().map(|cursor| Self {
+            scope: self.scope.clone(),
+            comparison: self.comparison.clone(),
+            evidence: self.evidence.clone(),
+            budget: self.budget,
+            cursor: cursor.clone(),
+            mode: self.mode,
+        })
+    }
+}
+
+/// Renders the exact typed freshness/coverage/provenance/status facts for one Diff page.
+pub(super) fn render_diff_text(
+    mode: DiffMode,
+    result: &crate::changes::DiffResult,
+    authority_epoch: u64,
+) -> String {
+    let mut text = format!(
+        "mode: {:?}\nstate: {:?}\ncoverage: {:?}\nfreshness: {:?}\nauthority_epoch: {}\nbaseline_reference: {}\nbaseline_coverage: {:?}\nbaseline_window: {:?}\ntracked: {}; untracked: {}; conflicted: {}\n",
+        mode,
+        result.state(),
+        result.coverage(),
+        result.freshness(),
+        authority_epoch,
+        result.provenance().baseline_reference().unwrap_or("none"),
+        result.provenance().baseline_coverage(),
+        result.provenance().baseline_window(),
+        result.counts().tracked(),
+        result.counts().untracked(),
+        result.counts().conflicted()
+    );
+    for path in result.tracked() {
+        text.push_str(&format!("tracked_path: {:?}\n", path.path()));
+    }
+    for path in result.untracked() {
+        text.push_str(&format!("untracked_path: {:?}\n", path.path()));
+    }
+    for path in result.conflicts() {
+        text.push_str(&format!("conflicted_path: {:?}\n", path.path()));
+    }
+    for hunk in result.selected_hunks() {
+        match std::str::from_utf8(hunk.patch()) {
+            Ok(patch) => text.push_str(patch),
+            Err(_) => text.push_str(&format!("raw_patch_hex: {:02x?}\n", hunk.patch())),
+        }
+    }
+    text
+}
+
 impl Worker<'_> {
     /// Captures the activation baseline through fixed Git metadata commands and durable Workspace storage.
     ///
@@ -319,7 +397,6 @@ impl Worker<'_> {
             },
             Ok,
         )?;
-        let baseline_window = baseline.window();
         let mut runner = ProductSnapshotRunner {
             worker: self,
             job,
@@ -346,12 +423,9 @@ impl Worker<'_> {
             }
         };
         let comparison = evidence.comparison().clone();
-        let result = crate::changes::compose_diff(
-            &GitScope::from_authority(&authority, mode),
-            &comparison,
-            evidence,
-            crate::changes::DiffSelectionBudget::bounded(32, 48 * 1024),
-        );
+        let scope = GitScope::from_authority(&authority, mode);
+        let budget = crate::changes::DiffSelectionBudget::bounded(32, 48 * 1024);
+        let result = crate::changes::compose_diff(&scope, &comparison, evidence.clone(), budget);
         if matches!(
             result.state(),
             crate::changes::DiffResultState::Unavailable | crate::changes::DiffResultState::Failed
@@ -372,32 +446,16 @@ impl Worker<'_> {
             return Err(FailureCode::SourceUnavailable);
         }
         self.shared.active(&binding)?;
-        let mut text = format!(
-            "mode: {:?}\nstate: {:?}\ncoverage: {:?}\nfreshness: captured snapshot; not an atomic filesystem transaction\nauthority_epoch: {}\nsession_baseline: {:?}\ntracked: {}; untracked: {}; conflicted: {}\n",
+        let diff_page = result.detail_cursor().map(|cursor| DiffPageState {
+            scope: scope.clone(),
+            comparison: comparison.clone(),
+            evidence,
+            budget,
+            cursor: cursor.clone(),
             mode,
-            result.state(),
-            result.coverage(),
-            authority.epoch(),
-            baseline_window,
-            result.counts().tracked(),
-            result.counts().untracked(),
-            result.counts().conflicted()
-        );
-        for path in result.tracked() {
-            text.push_str(&format!("tracked_path: {:?}\n", path.path()));
-        }
-        for path in result.untracked() {
-            text.push_str(&format!("untracked_path: {:?}\n", path.path()));
-        }
-        for path in result.conflicts() {
-            text.push_str(&format!("conflicted_path: {:?}\n", path.path()));
-        }
-        for hunk in result.selected_hunks() {
-            match std::str::from_utf8(hunk.patch()) {
-                Ok(patch) => text.push_str(patch),
-                Err(_) => text.push_str(&format!("raw_patch_hex: {:02x?}\n", hunk.patch())),
-            }
-        }
+        });
+        self.shared.set_diff_page(&job.reference, diff_page);
+        let text = render_diff_text(mode, &result, authority.epoch());
         let truncated =
             result.truncated_output() || result.overflow_hunks() > 0 || result.overflow_bytes() > 0;
         Ok((
