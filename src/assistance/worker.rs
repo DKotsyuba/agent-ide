@@ -310,6 +310,15 @@ impl Drop for WorkerHandle {
     }
 }
 impl WorkerHandle {
+    /// Returns whether this configured worker owns the exact trusted launcher attachment.
+    ///
+    /// The immutable launcher map is consulted without allocating, performing I/O, or changing a
+    /// binding. Discovery-only dispatchers have no worker and retain their existing unavailable
+    /// behavior.
+    pub fn accepts_attachment(&self, attachment: &str) -> bool {
+        self.shared.launcher.target(attachment).is_some()
+    }
+
     /// Creates finite channels only; Store and Workspace are opened later under the daemon lock.
     pub fn new(
         bindings: Arc<Mutex<HostBindingGuard>>,

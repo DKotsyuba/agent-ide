@@ -82,6 +82,13 @@ impl ProductDispatcher {
     async fn handle(&self, request: &AssistanceDispatch) -> Option<PeerReply> {
         match request {
             AssistanceDispatch::HookSubmit(hook) => {
+                if self
+                    .worker
+                    .as_ref()
+                    .is_some_and(|worker| !worker.accepts_attachment(hook.opaque_attachment()))
+                {
+                    return None;
+                }
                 let observation: Value =
                     serde_json::from_str(hook.sanitized_observation_json().as_str()).ok()?;
                 let object = observation.as_object()?;
@@ -91,6 +98,8 @@ impl ProductDispatcher {
                 let phase = match object.get("phase")?.as_str()? {
                     "pre" => "PreToolUse",
                     "post" => "PostToolUse",
+                    "post_failure" => "PostToolUseFailure",
+                    "permission_denied" => "PermissionDenied",
                     "post_batch" => "PostToolBatch",
                     _ => return None,
                 };
@@ -144,6 +153,13 @@ impl ProductDispatcher {
                 };
                 let call =
                     super::facade::validate_call(tool, object.get("parameters")?.clone()).ok()?;
+                if self
+                    .worker
+                    .as_ref()
+                    .is_some_and(|worker| !worker.accepts_attachment(method.opaque_attachment()))
+                {
+                    return None;
+                }
                 let channel = self.channel(method.opaque_attachment())?;
                 let (invocation, observed) = {
                     let mut bindings = self.bindings.lock().ok()?;
@@ -189,6 +205,11 @@ impl ProductDispatcher {
                         ) {
                             Ok(observed) => observed,
                             Err(_) => {
+                                if method.method() == AssistanceMethod::Start
+                                    && invocation.created_binding()
+                                {
+                                    let _ = bindings.stop_binding(invocation.binding_ref());
+                                }
                                 return Some(PeerReply::Error {
                                     code: FailureCode::SandboxState,
                                 });
@@ -199,6 +220,11 @@ impl ProductDispatcher {
                         ))
                         .is_err()
                         {
+                            if method.method() == AssistanceMethod::Start
+                                && invocation.created_binding()
+                            {
+                                let _ = bindings.stop_binding(invocation.binding_ref());
+                            }
                             return Some(PeerReply::Error {
                                 code: FailureCode::SandboxState,
                             });
@@ -416,4 +442,44 @@ async fn host_shaped_claude_start_never_reaches_workspace_without_sandbox_author
             code: FailureCode::SandboxState
         })
     );
+
+    let next_observation = OpaqueJson::from_value(
+        &json!({
+            "host":"claude",
+            "phase":"pre",
+            "actor_id":"session",
+            "call_id":"next",
+            "session_id":"session",
+            "agent_type":null
+        }),
+        64 * 1024,
+    )
+    .expect("test observation is bounded");
+    let next_hook = AssistanceDispatch::HookSubmit(
+        HookSubmit::new("request", "next", "attachment", next_observation)
+            .expect("test hook dispatch is valid"),
+    );
+    assert_eq!(
+        dispatcher.handle(&next_hook).await,
+        Some(PeerReply::HookObserved {})
+    );
+    let next_parameters = OpaqueJson::from_value(
+        &json!({
+            "parameters":{"path":"tracked.rs"},
+            "host_meta":{"claudecode/toolUseId":"next"}
+        }),
+        64 * 1024,
+    )
+    .expect("test frame is bounded");
+    let next_method = AssistanceDispatch::MethodDispatch(
+        MethodDispatch::new(
+            "request",
+            "next",
+            "attachment",
+            AssistanceMethod::Context,
+            next_parameters,
+        )
+        .expect("test method dispatch is valid"),
+    );
+    assert_eq!(dispatcher.handle(&next_method).await, None);
 }
