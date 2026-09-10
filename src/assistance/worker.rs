@@ -211,9 +211,7 @@ impl Shared {
                     .values()
                     .filter(|detail| detail.diff_page.is_some())
                     .count();
-                if retained.saturating_add(1) * DIFF_PAGE_RETAINED_BYTES
-                    > MAX_RETAINED_DIFF_PAGE_BYTES
-                {
+                if !admits_new_diff_page(retained) {
                     if let Some(detail) = ledger.details.get_mut(reference) {
                         detail.diff_page = None;
                         detail.diff_page_fresh = false;
@@ -242,6 +240,43 @@ const DIFF_PAGE_RETAINED_BYTES: usize = crate::workspace::git::snapshot::MAX_SNA
 /// independent of and tighter than the unrelated `details` count limit; a client that never pages
 /// through its Diff details cannot pin unbounded memory just by leaving many of them retained.
 const MAX_RETAINED_DIFF_PAGE_BYTES: usize = 16 * DIFF_PAGE_RETAINED_BYTES;
+
+/// Decides whether one *additional* Diff page may be retained beside `retained` already-charged
+/// pages, charging each the fixed worst case `DIFF_PAGE_RETAINED_BYTES`.
+///
+/// * `retained` — number of details currently holding a page; replacing one of those is not an
+///   addition and never consults this rule.
+///
+/// Returns `true` only while the aggregate charge stays at or under
+/// `MAX_RETAINED_DIFF_PAGE_BYTES`. Saturating arithmetic keeps an absurd count from wrapping into
+/// a false admission. Pure and total: it performs no I/O and never evicts a live peer's page.
+const fn admits_new_diff_page(retained: usize) -> bool {
+    retained
+        .saturating_add(1)
+        .saturating_mul(DIFF_PAGE_RETAINED_BYTES)
+        <= MAX_RETAINED_DIFF_PAGE_BYTES
+}
+
+/// Proves the exact aggregate retention cap and its refusal boundary, which `set_diff_page` reports
+/// honestly instead of evicting another live peer's retained evidence.
+#[test]
+fn retained_diff_page_admission_caps_sixteen_worst_case_pages() {
+    assert_eq!(DIFF_PAGE_RETAINED_BYTES, 9 * 1024 * 1024);
+    assert_eq!(MAX_RETAINED_DIFF_PAGE_BYTES, 16 * 9 * 1024 * 1024);
+    for (retained, admitted) in [
+        (0, true),
+        (1, true),
+        (15, true),
+        (16, false),
+        (usize::MAX, false),
+    ] {
+        assert_eq!(
+            admits_new_diff_page(retained),
+            admitted,
+            "retained={retained}"
+        );
+    }
+}
 
 /// Holds one worker task and its finite ingress channels; dropping it cancels the daemon-owned loop.
 pub struct WorkerHandle {
@@ -1405,23 +1440,33 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 detail.diff_page_fresh,
             )
         };
+        // Ownership of this exact reference is established above, so releasing its retained page is
+        // safe here and nowhere earlier. Every permanent invalidation below releases that heavy
+        // evidence: the authority/native epoch it was captured under can never return, so retaining
+        // megabytes of snapshot bytes would only pin memory against the aggregate ceiling. Only the
+        // compact retry outcome the caller receives survives.
+        let invalidate = |code: FailureCode| {
+            shared.set_diff_page(&request.reference, None);
+            code
+        };
         if let Some(authority) = &authority {
             workspace
                 .authorize(authority, &active)
                 .await
-                .map_err(|_| FailureCode::WorkspaceAuthority)?;
+                .map_err(|_| invalidate(FailureCode::WorkspaceAuthority))?;
             validate_read_scope(
                 shared,
                 &request.binding,
                 &request.observed,
                 &request.target,
                 authority,
-            )?;
+            )
+            .map_err(invalidate)?;
         }
         if let Some(source) = source
             && !source_matches(&source)
         {
-            return Err(FailureCode::SourceUnavailable);
+            return Err(invalidate(FailureCode::SourceUnavailable));
         }
         if matches!(
             reply,
@@ -1439,14 +1484,14 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
             .unwrap_or(0)
             != native_epoch
         {
-            return Err(FailureCode::SourceUnavailable);
+            return Err(invalidate(FailureCode::SourceUnavailable));
         }
         let active = shared.active(&request.binding)?;
         if let Some(authority) = &authority {
             workspace
                 .authorize(authority, &active)
                 .await
-                .map_err(|_| FailureCode::WorkspaceAuthority)?;
+                .map_err(|_| invalidate(FailureCode::WorkspaceAuthority))?;
         }
         shared.active(&request.binding)?;
         let Some(page) = diff_page else {
@@ -1473,49 +1518,26 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
         // that check alone cannot catch it. Staged-only comparisons never depend on working-tree
         // bytes, so this is skipped rather than used as unrelated "proof" for them.
         if !page.working_tree_bytes_unchanged(authority.worktree()) {
-            shared.set_diff_page(&request.reference, None);
-            return Err(FailureCode::SourceUnavailable);
+            return Err(invalidate(FailureCode::SourceUnavailable));
         }
-        // Reply text must serialize under the actual bounded envelope without `PeerReply::encode`
+        // Expansion uses exactly the same whole-page fitting path as the initial composition, so
+        // reply text always serializes under the bounded envelope without `PeerReply::encode`
         // needing to shrink it: a shrink cuts at a UTF-8 boundary, not a hunk boundary, which would
-        // silently deliver a partial hunk while the cursor still advances past it as if it were
-        // whole. Retry with a shrinking conservative byte budget until the whole-hunk page is
-        // proven to fit, or refuse to advance rather than ever deliver a cut hunk.
-        const REPLY_METADATA_RESERVE: usize = 2048;
-        let mut max_bytes = page.budget().max_bytes;
-        let (advanced, next) = loop {
-            let candidate = page.expand_with_max_bytes(&expected_scope, max_bytes);
-            if matches!(
-                candidate.state(),
-                crate::changes::DiffResultState::Unavailable
-                    | crate::changes::DiffResultState::Failed
-            ) {
-                shared.set_diff_page(&request.reference, None);
-                return Err(FailureCode::SourceUnavailable);
-            }
-            let text = snapshots::render_diff_text(
-                page.mode(),
-                &candidate,
-                authority.epoch(),
-                candidate.detail_cursor().is_some(),
-            );
-            let truncated = candidate.truncated_output()
-                || candidate.overflow_hunks() > 0
-                || candidate.overflow_bytes() > 0;
-            let candidate_reply = PeerReply::Complete {
-                kind: ResultKind::Diff,
-                text,
-                detail_ref: Some(request.reference.clone()),
-                truncated,
-            };
-            let fits = serde_json::to_string(&candidate_reply)
-                .map(|serialized| serialized.len() + REPLY_METADATA_RESERVE <= MAX_REPLY_BYTES)
-                .unwrap_or(false);
-            if fits || max_bytes <= 1 {
-                break (candidate, candidate_reply);
-            }
-            max_bytes /= 2;
-        };
+        // silently deliver a partial hunk while the cursor advanced past it as if it were whole.
+        let (advanced, next) = snapshots::fit_diff_page(
+            page.mode(),
+            authority.epoch(),
+            &request.reference,
+            page.budget().max_hunks,
+            |max_hunks| page.expand_with_max_hunks(&expected_scope, max_hunks),
+        )
+        .map_err(|code| match code {
+            // A structurally unavailable or failed selection can never be repaired by a later page.
+            FailureCode::SourceUnavailable => invalidate(code),
+            // A budget refusal delivered nothing, so the retained evidence stays: dropping the
+            // continuation here would lose hunks the caller can still reach later.
+            code => code,
+        })?;
         let encoded = next
             .clone()
             .encode()

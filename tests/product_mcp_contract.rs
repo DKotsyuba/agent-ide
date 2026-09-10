@@ -1814,27 +1814,79 @@ async fn configured_product_rejects_changed_executable_before_opening_workspace(
     assert!(!fixture.runtime.join("agent-ide.sock").exists());
 }
 
-/// F1 regression: the first ready `ide.inspect` after a forced `pending` poll must return page 1
-/// exactly once; only a later inspection may advance to page 2, and page 1's content never repeats.
+/// Returns one newline- or semicolon-delimited `key: value` field from a Diff page's bounded text.
+fn page_field(text: &str, key: &str) -> String {
+    text.split(['\n', ';'])
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix(&format!("{key}: ")))
+        .unwrap_or_else(|| panic!("missing {key} in page text:\n{text}"))
+        .to_owned()
+}
+
+/// Builds escape-heavy content whose JSON-serialized form is far larger than its raw byte length,
+/// so hunk selection that only counts raw bytes cannot predict whether a page fits the envelope.
+fn escape_heavy(marker: &str, lines: usize) -> String {
+    (0..lines)
+        .map(|line| format!("{marker} {} {line:04}\n", "\\\"".repeat(12)))
+        .collect()
+}
+
+/// Verifies whole-hunk pagination, serialized bounds, deferred delivery, and snapshot freshness.
+///
+/// Gates the fixed Git snapshot behind a fixture marker so the first `ide.diff` is provably
+/// `pending` before any evidence exists, then proves that every whole hunk is delivered exactly
+/// once across pages (never cut, duplicated or permanently skipped by a shrinking budget), that
+/// each page carries valid typed provenance and truthful `Unknown` delivery freshness, and that an
+/// out-of-band edit with no native hook can never yield a retained page presented as current.
 #[tokio::test]
-async fn diff_pagination_delivers_page_one_before_any_advance() {
+async fn diff_pagination_delivers_every_whole_hunk_once_with_truthful_freshness() {
     let fixture = ProductFixture::new(json!([]));
-    for index in 0..40 {
+    // Twelve escape-heavy hunks exceed the serialized envelope together but not the captured raw
+    // byte budget; one much larger hunk exceeds every halved budget the previous implementation
+    // would have tried, and one invalid-UTF-8 file forces the non-text rendering path.
+    for index in 0..12 {
         std::fs::write(
             fixture.root.join(format!("many-{index:02}.txt")),
             format!("base-{index:02}\n"),
         )
         .unwrap();
     }
+    std::fs::write(fixture.root.join("many-big.txt"), "base-big\n").unwrap();
+    std::fs::write(fixture.root.join("many-raw.bin"), "base-raw\n").unwrap();
     fixture.git(&["add", "--", "."]);
     fixture.git(&["commit", "--quiet", "-m", "many"]);
-    for index in 0..40 {
+    for index in 0..12 {
         std::fs::write(
             fixture.root.join(format!("many-{index:02}.txt")),
-            format!("changed-{index:02}\n"),
+            escape_heavy(&format!("hunkmark-{index:02}"), 128),
         )
         .unwrap();
     }
+    std::fs::write(
+        fixture.root.join("many-big.txt"),
+        escape_heavy("hunkmark-big", 640),
+    )
+    .unwrap();
+    std::fs::write(fixture.root.join("many-raw.bin"), [0xff_u8; 64]).unwrap();
+
+    // A gate the fixed snapshot Git must pass through, so the first diff is deterministically
+    // pending until this test releases it.
+    let gate = fixture.base.join("snapshot-gate");
+    let proxy = fixture.base.join("gated-git.sh");
+    std::fs::write(
+        &proxy,
+        format!(
+            "#!/bin/sh\nwhile [ -e {} ]; do sleep 0.05; done\nexec /usr/bin/git \"$@\"\n",
+            gate.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&proxy, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+    config["targets"][0]["git"] = accepted_program(proxy.to_str().unwrap(), "fixture-git");
+    std::fs::write(&fixture.config, config.to_string()).unwrap();
+
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "product-root").await;
     let started = actor
@@ -1843,27 +1895,109 @@ async fn diff_pagination_delivers_page_one_before_any_advance() {
     let started = actor.settle(&fixture, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
 
-    // `settle` itself already forces at least one `pending` poll before returning the first
-    // complete reply, matching the exact review scenario.
+    // Close the gate only after activation, so the snapshot Git of the diff below blocks and its
+    // first reply is forced to be pending rather than an already composed page.
+    std::fs::write(&gate, b"closed").unwrap();
     let first_call = actor
         .call(&fixture, "ide.diff", json!({"mode":"head"}))
         .await;
+    assert_eq!(first_call["state"], "pending", "{first_call}");
+    let reference = first_call["detail_ref"].as_str().unwrap().to_owned();
+    let still_pending = actor
+        .call(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
+        .await;
+    assert_eq!(still_pending["state"], "pending", "{still_pending}");
+    std::fs::remove_file(&gate).unwrap();
+
     let page1 = actor.settle(&fixture, first_call).await;
     assert_eq!(page1["kind"], "diff", "{page1}");
     let page1_text = page1["text"].as_str().unwrap().to_owned();
-    assert!(page1_text.contains("changed-00"), "{page1_text}");
-    assert!(!page1_text.contains("changed-39"), "{page1_text}");
-    assert!(page1_text.contains("more_available: true"), "{page1_text}");
-    let reference = page1["detail_ref"].as_str().unwrap().to_owned();
+    assert!(page1_text.contains("hunkmark-00"), "{page1_text}");
+    assert!(!page1_text.contains("hunkmark-big"), "{page1_text}");
+    assert_eq!(page_field(&page1_text, "more_available"), "true");
+    assert_eq!(page1["detail_ref"].as_str().unwrap(), reference);
 
-    let page2 = actor
-        .call(&fixture, "ide.inspect", json!({"detail_ref":reference}))
+    // Delivery never claims currentness; the capture-time freshness is preserved separately.
+    assert_eq!(page_field(&page1_text, "freshness"), "Unknown");
+    assert!(
+        !page_field(&page1_text, "captured_freshness").is_empty(),
+        "{page1_text}"
+    );
+    // Typed provenance is present and non-placeholder on the delivered page.
+    assert!(
+        !page_field(&page1_text, "worktree_id").is_empty(),
+        "{page1_text}"
+    );
+    assert_ne!(page_field(&page1_text, "worktree_incarnation"), "0");
+    assert_ne!(page_field(&page1_text, "operation_reference"), "none");
+    assert_ne!(page_field(&page1_text, "capture_generation"), "none");
+    assert_eq!(page_field(&page1_text, "comparison_left").len() % 2, 0);
+    assert!(
+        !page_field(&page1_text, "comparison_right").is_empty(),
+        "{page1_text}"
+    );
+
+    let mut pages = vec![page1_text.clone()];
+    while page_field(pages.last().unwrap(), "more_available") == "true" {
+        assert!(pages.len() < 12, "pagination did not terminate");
+        let next = actor
+            .call(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
+            .await;
+        assert_eq!(next["kind"], "diff", "{next}");
+        let text = next["text"].as_str().unwrap().to_owned();
+        assert_eq!(page_field(&text, "freshness"), "Unknown", "{text}");
+        assert_ne!(page_field(&text, "capture_generation"), "none", "{text}");
+        assert!(!pages.contains(&text), "page repeated verbatim:\n{text}");
+        pages.push(text);
+    }
+    // Every whole hunk is delivered exactly once: no page cut one short, repeated one, or advanced
+    // past one that fit the originally captured byte ceiling.
+    for marker in (0..12)
+        .map(|index| format!("hunkmark-{index:02}"))
+        .chain(["hunkmark-big".to_owned()])
+    {
+        let carrying = pages.iter().filter(|text| text.contains(&marker)).count();
+        assert_eq!(carrying, 1, "{marker} appeared on {carrying} pages");
+    }
+
+    // A retained page is an immutable capture: an out-of-band edit with no native hook must make a
+    // later retrieval fail closed instead of delivering evidence presented as current.
+    let reopened = actor
+        .call(&fixture, "ide.diff", json!({"mode":"head"}))
         .await;
-    assert_eq!(page2["kind"], "diff", "{page2}");
-    let page2_text = page2["text"].as_str().unwrap().to_owned();
-    assert!(page2_text.contains("changed-39"), "{page2_text}");
-    assert!(!page2_text.contains("changed-00"), "{page2_text}");
-    assert_ne!(page1_text, page2_text);
+    let reopened = actor.settle(&fixture, reopened).await;
+    assert_eq!(reopened["kind"], "diff", "{reopened}");
+    let reopened_ref = reopened["detail_ref"].as_str().unwrap().to_owned();
+    assert_eq!(
+        page_field(reopened["text"].as_str().unwrap(), "freshness"),
+        "Unknown"
+    );
+    std::fs::write(
+        fixture.root.join("many-00.txt"),
+        escape_heavy("hunkmark-00-edited", 8),
+    )
+    .unwrap();
+    let after_edit = actor
+        .call(&fixture, "ide.inspect", json!({"detail_ref":reopened_ref}))
+        .await;
+    assert_eq!(after_edit["state"], "error", "{after_edit}");
+    assert_eq!(after_edit["code"], "source_unavailable", "{after_edit}");
+
+    // The production snapshot runner correlates each captured path with its durable observation:
+    // a registered path edited without any reconciliation must fail the capture rather than being
+    // silently captured as if the recorded revision still described it.
+    let observed = actor
+        .call(&fixture, "ide.context", json!({"path":"tracked.txt"}))
+        .await;
+    let observed = actor.settle(&fixture, observed).await;
+    assert_eq!(observed["kind"], "context", "{observed}");
+    std::fs::write(fixture.root.join("tracked.txt"), "unreconciled\n").unwrap();
+    let mismatched = actor
+        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let mismatched = actor.settle(&fixture, mismatched).await;
+    assert_eq!(mismatched["state"], "error", "{mismatched}");
+    assert_eq!(mismatched["code"], "source_unavailable", "{mismatched}");
 
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");

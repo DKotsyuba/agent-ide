@@ -196,16 +196,22 @@ pub(super) struct DiffPageState {
 }
 
 impl DiffPageState {
-    /// Expands the next bounded page using an explicit byte ceiling instead of the originally
-    /// captured budget, so a caller can shrink it until the rendered page proves to fit the
-    /// actual serialized reply envelope. Never splits a hunk: a smaller budget only ever selects
-    /// fewer whole hunks.
-    pub(super) fn expand_with_max_bytes(
+    /// Expands the next bounded page with a reduced *hunk count* while preserving the byte ceiling
+    /// this comparison was captured with, so a caller can shrink the page until it proves to fit
+    /// the actual serialized reply envelope.
+    ///
+    /// The captured `max_bytes` is deliberately never lowered: `Changes::select_hunks` treats a
+    /// hunk larger than the current `max_bytes` as one that can never fit any page and advances
+    /// permanently past it, so a shrinking byte budget would silently drop a hunk that fits the
+    /// original ceiling. Reducing only `max_hunks` can never do that — an unselected hunk always
+    /// parks the cursor on itself and is delivered by a later page. Never splits a hunk: a smaller
+    /// count only ever selects fewer whole hunks.
+    pub(super) fn expand_with_max_hunks(
         &self,
         expected_scope: &GitScope,
-        max_bytes: usize,
+        max_hunks: usize,
     ) -> crate::changes::DiffResult {
-        let budget = crate::changes::DiffSelectionBudget::bounded(self.budget.max_hunks, max_bytes);
+        let budget = crate::changes::DiffSelectionBudget::bounded(max_hunks, self.budget.max_bytes);
         crate::changes::expand_diff(
             expected_scope,
             &self.comparison,
@@ -281,10 +287,94 @@ fn hex_encode(bytes: &[u8]) -> String {
         })
 }
 
+/// Headroom kept between one composed Diff reply and the hard transport ceiling. It must stay at
+/// or above `reply::MCP_RESERVE`, the margin [`PeerReply::encode`] itself enforces, so a page this
+/// module already proved to fit is never shrunk again (and therefore never cut mid-hunk) by the
+/// generic encoder; the surplus absorbs the transport envelope around the reply.
+const REPLY_METADATA_RESERVE: usize = 2048;
+
+/// Composes one whole-hunk Diff page that provably fits the actual serialized reply envelope.
+///
+/// This is the single fitting path shared by the initial composition in [`Worker::diff`] and by
+/// every later expansion in `serve_inspection`, so both obey the same rule: shrink the page by
+/// selecting *fewer whole hunks*, never by lowering the captured byte ceiling and never by cutting
+/// rendered text. `compose` is invoked with a candidate hunk count and must return the selection
+/// for exactly that count under the originally captured byte budget.
+///
+/// * `mode` — compare mode rendered into the page text.
+/// * `authority_epoch` — current durable epoch rendered as provenance.
+/// * `reference` — same-binding detail handle echoed as `detail_ref`.
+/// * `max_hunks` — largest count to attempt; halved on each retry and clamped to at least one.
+/// * `compose` — pure selection callback; it must not mutate retained state, because it is called
+///   repeatedly and only the returned result of the accepted attempt is retained.
+///
+/// Returns the accepted selection together with the exact [`PeerReply`] rendered from it; the
+/// caller retains continuation state derived from that same selection.
+///
+/// # Errors
+///
+/// * [`FailureCode::SourceUnavailable`] when a candidate selection is structurally unavailable or
+///   failed, which no smaller page can repair.
+/// * [`FailureCode::Capacity`] when even a single whole hunk cannot fit the serialized envelope.
+///   This is deliberately an explicit finite budget failure: the alternative would be delivering a
+///   silently cut hunk or claiming an undelivered hunk was delivered.
+pub(super) fn fit_diff_page(
+    mode: DiffMode,
+    authority_epoch: u64,
+    reference: &str,
+    max_hunks: usize,
+    compose: impl Fn(usize) -> crate::changes::DiffResult,
+) -> Result<(crate::changes::DiffResult, PeerReply), FailureCode> {
+    let mut max_hunks = max_hunks.max(1);
+    loop {
+        let candidate = compose(max_hunks);
+        if matches!(
+            candidate.state(),
+            crate::changes::DiffResultState::Unavailable | crate::changes::DiffResultState::Failed
+        ) {
+            return Err(FailureCode::SourceUnavailable);
+        }
+        let text = render_diff_text(
+            mode,
+            &candidate,
+            authority_epoch,
+            candidate.detail_cursor().is_some(),
+        );
+        let reply = PeerReply::Complete {
+            kind: ResultKind::Diff,
+            text,
+            detail_ref: Some(reference.to_owned()),
+            truncated: candidate.truncated_output()
+                || candidate.overflow_hunks() > 0
+                || candidate.overflow_bytes() > 0,
+        };
+        if serde_json::to_string(&reply).is_ok_and(|serialized| {
+            serialized.len().saturating_add(REPLY_METADATA_RESERVE) <= MAX_REPLY_BYTES
+        }) {
+            return Ok((candidate, reply));
+        }
+        if max_hunks == 1 {
+            return Err(FailureCode::Capacity);
+        }
+        max_hunks = (max_hunks / 2).max(1);
+    }
+}
+
 /// Renders the exact typed freshness/coverage/provenance/status facts for one Diff page.
 /// Provenance always carries the scope/comparison/operation fields required to interpret this
 /// page independent of any other request: worktree identity/incarnation, authority epoch,
 /// operation reference, capture generation and both raw comparison-side identities.
+///
+/// Delivery freshness is always rendered as [`crate::changes::DiffFreshness::Unknown`], including
+/// the first ready delivery of a freshly captured page. A retained Diff result is an immutable
+/// captured snapshot, not proof of the repository's state at delivery time: the short `ide.inspect`
+/// service deliberately performs no heavyweight Git recapture, so HEAD/index identities, untracked
+/// and conflict sets and durable current-observation tokens are never revalidated before a page is
+/// handed over. Only tracked working-tree bytes are rechecked (see
+/// [`DiffPageState::working_tree_bytes_unchanged`]), which cannot establish complete currentness.
+/// The freshness computed by Changes at capture time is preserved verbatim as `captured_freshness`
+/// alongside the untouched captured comparison identities and provenance, so callers keep the exact
+/// capture-time facts without any claim that they still hold now.
 pub(super) fn render_diff_text(
     mode: DiffMode,
     result: &crate::changes::DiffResult,
@@ -293,10 +383,11 @@ pub(super) fn render_diff_text(
 ) -> String {
     let provenance = result.provenance();
     let mut text = format!(
-        "mode: {:?}\nstate: {:?}\ncoverage: {:?}\nfreshness: {:?}\nauthority_epoch: {}\nworktree_id: {}\nworktree_incarnation: {}\noperation_reference: {}\ncapture_generation: {}\ncomparison_left: {}\ncomparison_right: {}\nbaseline_reference: {}\nbaseline_coverage: {:?}\nbaseline_window: {:?}\ntracked: {}; untracked: {}; conflicted: {}\nomitted_hunks: {}; omitted_bytes: {}; more_available: {}\n",
+        "mode: {:?}\nstate: {:?}\ncoverage: {:?}\nfreshness: {:?}\ncaptured_freshness: {:?}\nauthority_epoch: {}\nworktree_id: {}\nworktree_incarnation: {}\noperation_reference: {}\ncapture_generation: {}\ncomparison_left: {}\ncomparison_right: {}\nbaseline_reference: {}\nbaseline_coverage: {:?}\nbaseline_window: {:?}\ntracked: {}; untracked: {}; conflicted: {}\nomitted_hunks: {}; omitted_bytes: {}; more_available: {}\n",
         mode,
         result.state(),
         result.coverage(),
+        crate::changes::DiffFreshness::Unknown,
         result.freshness(),
         authority_epoch,
         result.worktree_id(),
@@ -555,13 +646,6 @@ impl Worker<'_> {
         let comparison = evidence.comparison().clone();
         let scope = GitScope::from_authority(&authority, mode);
         let budget = crate::changes::DiffSelectionBudget::bounded(32, 48 * 1024);
-        let result = crate::changes::compose_diff(&scope, &comparison, evidence.clone(), budget);
-        if matches!(
-            result.state(),
-            crate::changes::DiffResultState::Unavailable | crate::changes::DiffResultState::Failed
-        ) {
-            return Err(FailureCode::SourceUnavailable);
-        }
         let authority = self.authority(&binding).await?;
         let epoch = self
             .shared
@@ -576,6 +660,23 @@ impl Worker<'_> {
             return Err(FailureCode::SourceUnavailable);
         }
         self.shared.active(&binding)?;
+        // The initial page goes through the same whole-page fitting path as every later expansion,
+        // so it is proven to fit the serialized envelope here instead of being cut mid-hunk later
+        // by the generic `PeerReply::encode` shrink.
+        let (result, reply) = fit_diff_page(
+            mode,
+            authority.epoch(),
+            &reference,
+            budget.max_hunks,
+            |max_hunks| {
+                crate::changes::compose_diff(
+                    &scope,
+                    &comparison,
+                    evidence.clone(),
+                    crate::changes::DiffSelectionBudget::bounded(max_hunks, budget.max_bytes),
+                )
+            },
+        )?;
         let diff_page = result.detail_cursor().map(|cursor| DiffPageState {
             scope: scope.clone(),
             comparison: comparison.clone(),
@@ -584,19 +685,13 @@ impl Worker<'_> {
             cursor: cursor.clone(),
             mode,
         });
-        let more_available = self.shared.set_diff_page(&job.reference, diff_page);
-        let text = render_diff_text(mode, &result, authority.epoch(), more_available);
-        let truncated =
-            result.truncated_output() || result.overflow_hunks() > 0 || result.overflow_bytes() > 0;
-        Ok((
-            PeerReply::Complete {
-                kind: ResultKind::Diff,
-                text,
-                detail_ref: Some(reference),
-                truncated,
-            },
-            Some(authority),
-            None,
-        ))
+        // A page that reports further hunks must be resumable. If the aggregate retention ceiling
+        // refuses to hold that continuation, the omitted hunks are unreachable, so this fails with
+        // an explicit finite budget error rather than delivering a page that claims completeness.
+        let continues = diff_page.is_some();
+        if !self.shared.set_diff_page(&job.reference, diff_page) && continues {
+            return Err(FailureCode::Capacity);
+        }
+        Ok((reply, Some(authority), None))
     }
 }
