@@ -356,37 +356,46 @@ impl HelperResult {
 
 /// Identifies the exact Claude actor a ticket is bound to.
 ///
-/// `session_id` is Claude's root session and `agent_id` the distinct subagent identity when one is
-/// present. Both come from the trusted native hook binding, never from tool arguments.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+/// `actor` is the hook's own distinguishing identity: a subagent's exact `agent_id`, or the root
+/// `session_id` for a parent event. `session` is the root session retained as context only and is
+/// deliberately excluded from equality, so a parent and one of its subagents never compare equal.
+/// Both come from the trusted native hook binding, never from tool arguments.
+#[derive(Clone, Debug)]
 pub struct HelperActor {
-    /// Claude's required root session identity, present on parent and child events alike.
-    session_id: String,
-    /// Claude's distinct subagent identity, absent for a parent-session operation.
-    agent_id: Option<String>,
+    /// Exact distinguishing hook actor: a subagent's `agent_id`, or a parent's `session_id`.
+    actor: String,
+    /// Root session identity retained as context; excluded from identity comparison.
+    #[allow(dead_code)]
+    session: Option<String>,
 }
+
+impl PartialEq for HelperActor {
+    /// Compares only the distinguishing hook actor; retained session context is not identity.
+    fn eq(&self, other: &Self) -> bool {
+        self.actor == other.actor
+    }
+}
+
+impl Eq for HelperActor {}
 
 impl HelperActor {
     /// Builds one bounded actor identity, rejecting empty or over-limit fields.
-    pub fn new(session_id: &str, agent_id: Option<&str>) -> Result<Self, FailureCode> {
+    ///
+    /// `actor` is required; `session` is optional context that never affects comparison.
+    pub fn new(actor: &str, session: Option<&str>) -> Result<Self, FailureCode> {
         let bounded = |value: &str| !value.is_empty() && value.len() <= MAX_IDENTIFIER_BYTES;
-        if !bounded(session_id) || agent_id.is_some_and(|value| !bounded(value)) {
+        if !bounded(actor) || session.is_some_and(|value| !bounded(value)) {
             return Err(FailureCode::Conflict);
         }
         Ok(Self {
-            session_id: session_id.to_owned(),
-            agent_id: agent_id.map(str::to_owned),
+            actor: actor.to_owned(),
+            session: session.map(str::to_owned),
         })
     }
 
-    /// Returns Claude's root session identity.
-    pub fn session_id(&self) -> &str {
-        &self.session_id
-    }
-
-    /// Returns the distinct subagent identity when this actor is a child.
-    pub fn agent_id(&self) -> Option<&str> {
-        self.agent_id.as_deref()
+    /// Returns the exact distinguishing hook actor identity.
+    pub fn actor(&self) -> &str {
+        &self.actor
     }
 }
 
@@ -573,16 +582,18 @@ impl LaunchLedger {
         command: &str,
         run_in_background: bool,
         tool_use_id: &str,
+        actor: &HelperActor,
         now_ms: u64,
     ) -> LaunchRecognition {
         if run_in_background || tool_use_id.is_empty() {
             return LaunchRecognition::Ignored;
         }
-        let Some(ticket) = self
-            .tickets
-            .values_mut()
-            .find(|ticket| ticket.command.as_bytes() == command.as_bytes())
-        else {
+        // Actor equality is enforced here, at the trusted native pre-hook, because this is where
+        // the host itself states who ran the command. A helper process cannot be asked for its own
+        // actor identity: it would only be repeating a value it was handed.
+        let Some(ticket) = self.tickets.values_mut().find(|ticket| {
+            ticket.command.as_bytes() == command.as_bytes() && &ticket.actor == actor
+        }) else {
             return LaunchRecognition::Ignored;
         };
         if ticket.state != TicketState::Minted || now_ms >= ticket.deadline_ms {
@@ -596,15 +607,14 @@ impl LaunchLedger {
 
     /// Atomically claims one recognized ticket exactly once and releases its closed job.
     ///
-    /// Rejected: a handle whose native launch was never recognized (a bare copied reference), a
-    /// different actor or channel, a stale binding generation, an expired deadline, and any second
-    /// or replayed claim. Every rejection happens before a job is released, so a refused claim has
+    /// Rejected: a handle whose native launch was never recognized (a bare copied reference, or a
+    /// launch by a different actor, which never reaches `Launched`), a different channel, a stale
+    /// binding generation, an expired deadline, and any second or replayed claim. Every rejection happens before a job is released, so a refused claim has
     /// no Git, source or provider effect whatsoever.
     pub fn claim(
         &mut self,
         detail_ref: &str,
         binding: [u8; 32],
-        actor: &HelperActor,
         channel: &str,
         now_ms: u64,
     ) -> ClaimOutcome {
@@ -614,7 +624,7 @@ impl LaunchLedger {
         if ticket.binding != binding {
             return ClaimOutcome::Rejected(FailureCode::WorkspaceAuthority);
         }
-        if &ticket.actor != actor || ticket.channel != channel {
+        if ticket.channel != channel {
             return ClaimOutcome::Rejected(FailureCode::InvalidDetail);
         }
         if now_ms >= ticket.deadline_ms {
@@ -742,6 +752,14 @@ impl LaunchLedger {
             .is_some_and(|ticket| ticket.binding == binding)
     }
 
+    /// Returns the binding generation a handle is fenced to, if the handle exists.
+    ///
+    /// Used by the claim endpoint so a claim is checked against the generation the ticket was
+    /// actually minted under, rather than one the caller supplied.
+    pub fn binding_of(&self, detail_ref: &str) -> Option<[u8; 32]> {
+        self.tickets.get(detail_ref).map(|ticket| ticket.binding)
+    }
+
     /// Returns the number of outstanding tickets for bounded-capacity assertions.
     pub fn len(&self) -> usize {
         self.tickets.len()
@@ -786,7 +804,7 @@ mod tests {
     /// Mints one ticket on a fixed binding/actor/channel with the fixed helper command.
     fn ledger() -> (LaunchLedger, String, HelperActor) {
         let mut ledger = LaunchLedger::default();
-        let actor = HelperActor::new("session", Some("agent")).unwrap();
+        let actor = HelperActor::new("agent", Some("session")).unwrap();
         let command = LaunchLedger::helper_command(
             std::path::Path::new("/usr/local/bin/agent-ide"),
             std::path::Path::new("/private/tmp/rt"),
@@ -859,9 +877,9 @@ mod tests {
     /// A bare copied handle without a recognized native launch never releases a job.
     #[test]
     fn copied_reference_without_native_launch_is_rejected() {
-        let (mut ledger, reference, actor) = ledger();
+        let (mut ledger, reference, _actor) = ledger();
         assert_eq!(
-            ledger.claim(&reference, [7; 32], &actor, "channel", 0),
+            ledger.claim(&reference, [7; 32], "channel", 0),
             ClaimOutcome::Rejected(FailureCode::InvalidDetail)
         );
     }
@@ -869,7 +887,7 @@ mod tests {
     /// Only byte-exact foreground commands are recognized; nothing else is retained.
     #[test]
     fn recognition_requires_exact_bytes_and_foreground() {
-        let (mut ledger, _, _) = ledger();
+        let (mut ledger, _, actor) = ledger();
         let exact = LaunchLedger::helper_command(
             std::path::Path::new("/usr/local/bin/agent-ide"),
             std::path::Path::new("/private/tmp/rt"),
@@ -877,23 +895,23 @@ mod tests {
             "detail-1",
         );
         assert_eq!(
-            ledger.recognize(&format!("{exact} ; rm -rf /"), false, "call", 0),
+            ledger.recognize(&format!("{exact} ; rm -rf /"), false, "call", &actor, 0),
             LaunchRecognition::Ignored
         );
         assert_eq!(
-            ledger.recognize("cargo test", false, "call", 0),
+            ledger.recognize("cargo test", false, "call", &actor, 0),
             LaunchRecognition::Ignored
         );
         assert_eq!(
-            ledger.recognize(&exact, true, "call", 0),
+            ledger.recognize(&exact, true, "call", &actor, 0),
             LaunchRecognition::Ignored
         );
         assert_eq!(
-            ledger.recognize(&exact, false, "call", 0),
+            ledger.recognize(&exact, false, "call", &actor, 0),
             LaunchRecognition::Recognized
         );
         assert_eq!(
-            ledger.recognize(&exact, false, "call-2", 0),
+            ledger.recognize(&exact, false, "call-2", &actor, 0),
             LaunchRecognition::Ignored
         );
     }
@@ -909,48 +927,46 @@ mod tests {
             "detail-1",
         );
         assert_eq!(
-            ledger.recognize(&command, false, "call", 0),
+            ledger.recognize(&command, false, "call", &actor, 0),
             LaunchRecognition::Recognized
         );
 
-        let other_actor = HelperActor::new("session", Some("other-agent")).unwrap();
         assert_eq!(
-            ledger.claim(&reference, [7; 32], &other_actor, "channel", 0),
+            ledger.claim(&reference, [7; 32], "other-channel", 0),
             ClaimOutcome::Rejected(FailureCode::InvalidDetail)
         );
         assert_eq!(
-            ledger.claim(&reference, [7; 32], &actor, "other-channel", 0),
-            ClaimOutcome::Rejected(FailureCode::InvalidDetail)
-        );
-        assert_eq!(
-            ledger.claim(&reference, [9; 32], &actor, "channel", 0),
+            ledger.claim(&reference, [9; 32], "channel", 0),
             ClaimOutcome::Rejected(FailureCode::WorkspaceAuthority)
         );
 
         assert!(matches!(
-            ledger.claim(&reference, [7; 32], &actor, "channel", 0),
+            ledger.claim(&reference, [7; 32], "channel", 0),
             ClaimOutcome::Granted(_)
         ));
         assert_eq!(
-            ledger.claim(&reference, [7; 32], &actor, "channel", 0),
+            ledger.claim(&reference, [7; 32], "channel", 0),
             ClaimOutcome::Rejected(FailureCode::InvalidDetail)
         );
     }
 
-    /// A parent-session actor and a subagent of the same session are distinct claimants.
+    /// A parent session running a subagent's exact command never arms that subagent's ticket.
     #[test]
-    fn parent_session_cannot_claim_a_subagent_ticket() {
-        let (mut ledger, reference, _) = ledger();
+    fn parent_session_launch_cannot_arm_a_subagent_ticket() {
+        let (mut ledger, reference, _actor) = ledger();
         let command = LaunchLedger::helper_command(
             std::path::Path::new("/usr/local/bin/agent-ide"),
             std::path::Path::new("/private/tmp/rt"),
             "attach",
             "detail-1",
         );
-        ledger.recognize(&command, false, "call", 0);
         let parent = HelperActor::new("session", None).unwrap();
         assert_eq!(
-            ledger.claim(&reference, [7; 32], &parent, "channel", 0),
+            ledger.recognize(&command, false, "call", &parent, 0),
+            LaunchRecognition::Ignored
+        );
+        assert_eq!(
+            ledger.claim(&reference, [7; 32], "channel", 0),
             ClaimOutcome::Rejected(FailureCode::InvalidDetail)
         );
     }
@@ -959,7 +975,7 @@ mod tests {
     #[test]
     fn unclaimed_expiry_vanishes_and_claimed_expiry_stays_uncertain() {
         {
-            let (mut ledger, reference, _) = ledger();
+            let (mut ledger, reference, _actor) = ledger();
             ledger.expire(1000);
             assert!(ledger.is_empty());
             assert_eq!(
@@ -975,9 +991,9 @@ mod tests {
             "attach",
             "detail-1",
         );
-        ledger.recognize(&command, false, "call", 0);
+        ledger.recognize(&command, false, "call", &actor, 0);
         assert!(matches!(
-            ledger.claim(&reference, [7; 32], &actor, "channel", 0),
+            ledger.claim(&reference, [7; 32], "channel", 0),
             ClaimOutcome::Granted(_)
         ));
         ledger.expire(1000);
@@ -999,8 +1015,8 @@ mod tests {
                 "attach",
                 "detail-1",
             );
-            ledger.recognize(&command, false, "call", 0);
-            ledger.claim(&reference, [7; 32], &actor, "channel", 0);
+            ledger.recognize(&command, false, "call", &actor, 0);
+            ledger.claim(&reference, [7; 32], "channel", 0);
             assert_eq!(ledger.delivery(&reference), Delivery::Waiting);
 
             let result = HelperResult {
@@ -1038,8 +1054,8 @@ mod tests {
             "attach",
             "detail-1",
         );
-        ledger.recognize(&command, false, "call", 0);
-        ledger.claim(&reference, [7; 32], &actor, "channel", 0);
+        ledger.recognize(&command, false, "call", &actor, 0);
+        ledger.claim(&reference, [7; 32], "channel", 0);
         ledger
             .settle_frame(HelperResult {
                 protocol: HELPER_PROTOCOL,
@@ -1068,8 +1084,8 @@ mod tests {
             "attach",
             "detail-1",
         );
-        ledger.recognize(&command, false, "call", 0);
-        ledger.claim(&reference, [7; 32], &actor, "channel", 0);
+        ledger.recognize(&command, false, "call", &actor, 0);
+        ledger.claim(&reference, [7; 32], "channel", 0);
         assert!(ledger.owns_post("call"));
         assert!(!ledger.owns_post("some-native-edit"));
     }
@@ -1131,11 +1147,11 @@ mod tests {
             "attach",
             "detail-1",
         );
-        ledger.recognize(&command, false, "call", 0);
+        ledger.recognize(&command, false, "call", &actor, 0);
         ledger.revoke([7; 32]);
         assert!(ledger.is_empty());
         assert_eq!(
-            ledger.claim(&reference, [7; 32], &actor, "channel", 0),
+            ledger.claim(&reference, [7; 32], "channel", 0),
             ClaimOutcome::Rejected(FailureCode::InvalidDetail)
         );
     }

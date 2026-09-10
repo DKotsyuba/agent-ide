@@ -11,6 +11,9 @@ pub mod assembly;
 
 pub mod host_binding;
 
+/// Serves the private helper claim/finish endpoint and runs the foreground helper itself.
+pub mod claude_helper;
+
 /// Correlates Claude foreground-helper tickets, exact launch recognition and one-use claims.
 pub mod claude_worker;
 

@@ -76,6 +76,19 @@ async fn main() -> ExitCode {
                 Err(_) => fail(AppError::InvalidResponse),
             }
         }
+        Ok(Command::ClaudeWorker {
+            runtime_dir,
+            attachment,
+            detail_ref,
+        }) => {
+            agent_ide::assistance::claude_helper::run(
+                &runtime_dir,
+                Some(attachment),
+                Some(detail_ref),
+            )
+            .await;
+            ExitCode::SUCCESS
+        }
         Ok(Command::Doctor { runtime_dir }) => match doctor_report(&runtime_dir).await {
             Ok(report) => {
                 let healthy = matches!(report.status, DoctorStatus::Healthy { .. });
@@ -150,6 +163,18 @@ enum Command {
         /// Existing daemon endpoint directory; never created by the hook command.
         runtime_dir: PathBuf,
     },
+    /// Runs one bounded foreground Claude helper operation and exits.
+    ///
+    /// Launched by the model through its ordinary shell tool, so every child it starts inherits
+    /// the host's own sandbox. It creates no runtime state and never autostarts a daemon.
+    ClaudeWorker {
+        /// Existing daemon endpoint directory; never created by the helper command.
+        runtime_dir: PathBuf,
+        /// Opaque private transport attachment the operation was minted on.
+        attachment: String,
+        /// Action-scoped single-use handle this helper was launched to claim.
+        detail_ref: String,
+    },
     /// Queries an existing daemon without creating a directory or daemon process.
     Doctor { runtime_dir: PathBuf },
 }
@@ -157,6 +182,35 @@ enum Command {
 /// Rejects unknown, missing, and extra CLI arguments before any filesystem or daemon action.
 fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppError> {
     let arguments = arguments.collect::<Vec<_>>();
+    // The helper command has its own fixed longer shape; every other mode keeps the exact
+    // three-argument form it already had, so no existing invocation changes meaning.
+    if let [
+        mode,
+        runtime_flag,
+        runtime_dir,
+        attachment_flag,
+        attachment,
+        detail_flag,
+        detail_ref,
+    ] = arguments.as_slice()
+        && mode == "claude-worker"
+    {
+        if runtime_flag != "--runtime-dir"
+            || attachment_flag != "--attachment"
+            || detail_flag != "--detail-ref"
+        {
+            return Err(AppError::InvalidResponse);
+        }
+        let (Some(attachment), Some(detail_ref)) = (attachment.to_str(), detail_ref.to_str())
+        else {
+            return Err(AppError::InvalidResponse);
+        };
+        return Ok(Command::ClaudeWorker {
+            runtime_dir: PathBuf::from(runtime_dir),
+            attachment: attachment.to_owned(),
+            detail_ref: detail_ref.to_owned(),
+        });
+    }
     let [mode, flag, runtime_dir] = arguments.as_slice() else {
         return Err(AppError::InvalidResponse);
     };
