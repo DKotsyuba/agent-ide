@@ -13,6 +13,10 @@ The five public MCP tools are unchanged: `start`, `context`, `diff`, `inspect`, 
 tool, reply state or launch flag is introduced; the helper handle is the existing
 `Pending.detail_ref`.
 
+The sections below describe the complete contract. **Implementation status** at the end of this
+document states precisely which parts are wired today and which are not yet, so no reader mistakes
+the contract for shipped behaviour.
+
 ## Operation flow
 
 1. **Mint.** A validated Claude MCP call creates a pending operation and returns the ordinary
@@ -27,8 +31,15 @@ tool, reply state or launch flag is introduced; the helper handle is the existin
    the launch. Every other tool payload is discarded. A launch that is denied or never happens
    simply expires with no effect.
 
-3. **Claim.** The helper opens the private allowlisted Unix socket and claims the bound
-   operation exactly once. It receives a closed daemon-selected job: target and root, accepted
+3. **Claim.** The helper runs as the fixed command
+
+   ```text
+   <agent-ide> claude-worker --runtime-dir <dir> --attachment <opaque> --detail-ref <handle>
+   ```
+
+   It opens `<runtime-dir>/claude-helper.sock`, a private owner-only (mode 0600) endpoint the
+   daemon binds after Application owns the daemon lock and drops before provider cleanup, and
+   claims the bound operation exactly once. It receives a closed daemon-selected job: target and root, accepted
    programs and settings, the known worktree/canonical authority, the selected operation and its
    already validated parameters, finite byte/process/deadline budgets, and the cache scope. Model
    input never selects an executable, shell fragment, scope or permission.
@@ -49,12 +60,16 @@ tool, reply state or launch flag is introduced; the helper handle is the existin
 A ticket establishes **correlation and replay exclusion**. It is not sandbox attestation and
 proves nothing about what the host actually enforced.
 
+Actor identity is checked at the **native pre-hook**, where the host itself states who ran the
+command — not at the socket. A helper process is never asked for its own actor identity, because
+it could only repeat back a value it was handed.
+
 A claim is refused, with no job released and therefore no effect of any kind, when:
 
 | Condition | Outcome |
 |---|---|
 | Handle presented without a recognized native launch (a bare copied reference) | `invalid_detail` |
-| A different actor — including the parent session for a subagent's ticket | `invalid_detail` |
+| A launch by a different actor — including the parent session running a subagent's exact command — which never arms the ticket at all | `invalid_detail` |
 | A different transport channel | `invalid_detail` |
 | A stale or revoked binding generation | `workspace_authority` |
 | A second or replayed claim of the same handle | `invalid_detail` |
@@ -86,7 +101,8 @@ otherwise the outcome is uncertain or a deadline, and the admission stays quaran
 A Claude operation is **per-operation exclusive**: Go or Rust, never both, and each helper reaps
 its provider before exiting.
 
-- **Rust** runs with both `cachePriming` and `procMacro` disabled. Disabling proc-macro
+- **Rust** runs with both `cachePriming` and `procMacro` disabled. This is a Claude-specific
+  effective configuration; the shared managed path disables cache priming only, and is unchanged. Disabling proc-macro
   expansion is a real semantic limitation, not a tuning choice: derive-generated methods,
   macro-expanded items and references into them are invisible to the analyzer, so Rust results
   for such symbols are incomplete under this profile and are reported as such.
@@ -116,3 +132,38 @@ never adds an approval prompt. This matches the accidental cross-actor and out-o
 threat model — it is not malicious same-UID OS attestation.
 
 **Linux remains unavailable** pending equivalent proof of the same guarantees.
+
+## Execution boundary
+
+A helper's children are spawned through a distinct inherited-sandbox boundary, separate from the
+managed Codex path. It takes no observed sandbox state, mints no permit, consumes no admission
+lease and uses no wrapper executable, so no synthetic sandbox observation can reach Codex
+Execution through it. It distinguishes a child that provably never started from one that started
+but could not be settled, so unreaped children are reported rather than assumed.
+
+## Implementation status
+
+Wired and covered by local checks:
+
+- optional strict `claude_profile` on a launcher target, rejected at load when declared weakened;
+- Claude `start`/`context`/`diff` minting a single-use ticket and returning `Pending` with the
+  complete, untruncatable helper command in the summary the model reads;
+- Claude `Bash` pre-hook selection of the command and background flag, exact-byte recognition with
+  actor enforcement, and silent handling with no permission decision or updated input;
+- the private claim/finish socket, the `claude-worker` command, one-use claiming, channel and
+  generation fencing, replay refusal, ingress expiry, and quarantined uncertainty;
+- the inherited-sandbox child boundary and the helper's real fixed Git discovery with measured
+  child settlement;
+- Claude `inspect` as pure same-generation retrieval with no daemon source read, `stop` revoking
+  the ticket ledger first, and a helper's own post settling instead of invalidating its result.
+
+Not yet wired, and therefore not to be assumed:
+
+- minting the canonical durable Workspace grant and baseline from the helper's discovery evidence;
+  `start` currently reports discovery evidence only;
+- the helper's exclusive provider session for Go and Rust, and therefore real `context`/`diff`
+  semantic results and the ready diagnostic delta on the exact post. The accepted Rust
+  configuration value is fixed and tested, but no session consumes it yet;
+- the cache lifecycle: the helper receives an opaque namespace token and derives no paths.
+
+No live Claude host acceptance has been run.

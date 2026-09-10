@@ -136,6 +136,19 @@ impl RustEffectiveSettings {
             .then_some(())
             .ok_or(FailureCode::ExecutionProfile)
     }
+
+    /// Returns the exact analyzer initialization payload a Claude helper must use.
+    ///
+    /// This is deliberately a separate value from the shared managed-path configuration, which
+    /// disables cache priming only. A Claude helper additionally disables proc-macro expansion,
+    /// because a foreground helper cannot own the long-lived expansion server that setting starts.
+    /// Callers must not merge or extend it: the payload is the complete accepted configuration.
+    pub fn configuration(&self) -> Value {
+        serde_json::json!({
+            "cachePriming": {"enable": self.cache_priming},
+            "procMacro": {"enable": self.proc_macro},
+        })
+    }
 }
 
 /// Names one daemon-selected provider a helper may spawn as its own direct child.
@@ -857,6 +870,22 @@ mod tests {
         ] {
             assert_eq!(weakened.validate(), Err(FailureCode::ExecutionProfile));
         }
+    }
+
+    /// The accepted Rust helper payload disables both switches and adds nothing else.
+    #[test]
+    fn rust_helper_configuration_disables_both_switches() {
+        let settings = RustEffectiveSettings {
+            cache_priming: false,
+            proc_macro: false,
+        };
+        assert_eq!(
+            settings.configuration(),
+            serde_json::json!({
+                "cachePriming": {"enable": false},
+                "procMacro": {"enable": false},
+            })
+        );
     }
 
     /// Rust helper settings may never re-enable priming or proc-macro expansion.
