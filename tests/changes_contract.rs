@@ -74,23 +74,41 @@ async fn bounded_selection_keeps_explicit_raw_paths() {
             .iter()
             .any(|hunk| hunk.path() == &std::path::PathBuf::from("special space\n-leading.txt"))
     );
-    for budget in [
+    // A generous byte budget with a tight hunk-count cap defers real, later-followable hunks
+    // and keeps an owner-scoped cursor pointing at the next one.
+    let limited = compose_diff(
+        &scope,
+        &comparison,
+        snapshot.clone(),
         DiffSelectionBudget::bounded(1, 65536),
+    );
+    assert_eq!(limited.state(), DiffResultState::Incomplete);
+    assert_eq!(limited.coverage(), DiffCoverage::Partial);
+    assert!(limited.overflow_hunks() > 0);
+    assert!(limited.overflow_bytes() > 0);
+    assert_eq!(
+        limited.detail_cursor().unwrap().operation_reference(),
+        snapshot.operation_reference()
+    );
+    for hunk in limited.selected_hunks() {
+        assert_eq!(hunk, &full.selected_hunks()[hunk.index()]);
+    }
+
+    // A byte budget too small for any real hunk (including the zero budget clamped to the
+    // minimum progressable request) can never be satisfied by a later page either, so every
+    // hunk is honestly omitted with no cursor rather than parked behind one that can never
+    // resolve.
+    for budget in [
         DiffSelectionBudget::bounded(32, 1),
         DiffSelectionBudget::bounded(0, 0),
     ] {
-        let limited = compose_diff(&scope, &comparison, snapshot.clone(), budget);
-        assert_eq!(limited.state(), DiffResultState::Incomplete);
-        assert_eq!(limited.coverage(), DiffCoverage::Partial);
-        assert!(limited.overflow_hunks() > 0);
-        assert!(limited.overflow_bytes() > 0);
-        assert_eq!(
-            limited.detail_cursor().unwrap().operation_reference(),
-            snapshot.operation_reference()
-        );
-        for hunk in limited.selected_hunks() {
-            assert_eq!(hunk, &full.selected_hunks()[hunk.index()]);
-        }
+        let starved = compose_diff(&scope, &comparison, snapshot.clone(), budget);
+        assert_eq!(starved.state(), DiffResultState::Incomplete);
+        assert_eq!(starved.coverage(), DiffCoverage::Partial);
+        assert_eq!(starved.overflow_hunks(), 3);
+        assert!(starved.overflow_bytes() > 0);
+        assert!(starved.selected_hunks().is_empty());
+        assert!(starved.detail_cursor().is_none());
     }
 }
 
@@ -333,4 +351,66 @@ async fn cursor_expansion_rejects_reference_reuse_across_generations_and_modes()
         .state(),
         DiffResultState::Unavailable
     );
+}
+
+/// A nonsensical zero request is clamped to the smallest budget that can still make progress.
+#[test]
+fn zero_budgets_are_clamped_to_a_minimum_progressable_request() {
+    let budget = DiffSelectionBudget::bounded(0, 0);
+    assert_eq!(budget.max_hunks, 1);
+    assert_eq!(budget.max_bytes, 1);
+}
+
+/// A hunk that can never fit the byte budget is honestly skipped rather than repeated forever,
+/// and repeated expansion of a real deferred page always strictly advances its cursor or ends.
+#[tokio::test]
+async fn oversized_hunk_is_skipped_and_cursor_advances_or_terminates() {
+    use agent_ide::changes::expand_diff;
+    let fixture = GitFixture::new();
+    let snapshot = collect(&fixture, DiffMode::Head, &mut Runner::default())
+        .await
+        .unwrap();
+    let scope = snapshot.scope().clone();
+    let comparison = snapshot.comparison().clone();
+    let full = compose_diff(
+        &scope,
+        &comparison,
+        snapshot.clone(),
+        DiffSelectionBudget::default(),
+    );
+    let largest = full
+        .selected_hunks()
+        .iter()
+        .map(|hunk| hunk.patch().len())
+        .max()
+        .expect("fixture has hunks");
+    assert!(largest > 1, "fixture hunk must exceed a one-byte budget");
+    // Budget deliberately too small for the largest hunk; it can never be selected under this
+    // budget on any page, so it must be permanently skipped instead of stalling pagination.
+    let budget = DiffSelectionBudget::bounded(32, largest - 1);
+
+    let mut current = compose_diff(&scope, &comparison, snapshot.clone(), budget);
+    assert!(
+        current
+            .selected_hunks()
+            .iter()
+            .all(|hunk| hunk.patch().len() < largest)
+    );
+    let mut previous_next_hunk = None;
+    let mut hops = 0;
+    while let Some(cursor) = current.detail_cursor().cloned() {
+        if let Some(previous) = previous_next_hunk {
+            assert!(
+                cursor.next_hunk() > previous,
+                "expand_diff must never return the same cursor twice"
+            );
+        }
+        previous_next_hunk = Some(cursor.next_hunk());
+        current = expand_diff(&scope, &comparison, snapshot.clone(), &cursor, budget);
+        hops += 1;
+        assert!(
+            hops <= 8,
+            "pagination must terminate well within the fixture's hunk count"
+        );
+    }
 }

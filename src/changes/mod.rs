@@ -43,7 +43,13 @@ pub enum DiffFreshness {
     Current,
     /// Evidence belongs to the same worktree incarnation but an older authority epoch.
     Stale,
-    /// Evidence metadata could not be confirmed as current for this request.
+    /// Evidence metadata could not be confirmed as current for this request. This covers two
+    /// distinct causes: (1) structurally unavailable evidence, where scope/cursor/comparison
+    /// mismatched and no epoch relationship could even be evaluated, and (2) a `Ready` result
+    /// whose status still carries unmerged conflicts, since a conflicted comparison cannot itself
+    /// claim to be a clean, current view of the requested scope even though its raw evidence was
+    /// otherwise trusted. Callers must treat both causes as "do not assume current" and never
+    /// infer `Stale` from `Unknown`.
     Unknown,
 }
 
@@ -64,11 +70,13 @@ impl Default for DiffSelectionBudget {
 }
 
 impl DiffSelectionBudget {
-    /// Builds a bounded budget; zero and negative-size requests intentionally return zero budgets.
+    /// Builds a bounded budget. A zero request can never select or page past even one hunk, so it
+    /// is clamped to the minimum budget that still guarantees progress; `usize` has no negative
+    /// values to reject separately.
     pub const fn bounded(max_hunks: usize, max_bytes: usize) -> Self {
         Self {
-            max_hunks,
-            max_bytes,
+            max_hunks: if max_hunks == 0 { 1 } else { max_hunks },
+            max_bytes: if max_bytes == 0 { 1 } else { max_bytes },
         }
     }
 }
@@ -324,6 +332,12 @@ pub struct DiffResult {
     /// Unsliced directly attributed hunks retained within request budgets.
     selected_hunks: Vec<DiffHunk>,
     /// Whether retained raw output was incomplete; minted snapshots require complete streams.
+    /// Always `false` for a `GitSnapshot` that reached composition: Workspace's raw evidence
+    /// constructor rejects any oversized stdout/stderr with `GitError::EvidenceTooLarge` before a
+    /// snapshot can exist, so process-stream truncation can never survive admission. It stays an
+    /// explicit typed field rather than a derived constant so a future evidence source that can
+    /// legitimately truncate does not have to change this struct's shape; hunk-level omission is
+    /// reported separately and exactly via `overflow_hunks`/`overflow_bytes`.
     truncated_output: bool,
     /// Number of complete hunks omitted by request budgets.
     overflow_hunks: usize,
@@ -601,6 +615,13 @@ fn compose_diff_at(
 }
 
 /// Selects exact hunks without splitting payload under configured boundaries.
+///
+/// A hunk whose own byte length exceeds `budget.max_bytes` can never fit in any single page under
+/// this budget, so it is permanently skipped (counted as omitted, never selected) rather than
+/// parked behind a cursor that could never resolve it; this guarantees the returned cursor, if
+/// any, always strictly advances past every hunk already visited by this call. A hunk that could
+/// still fit a future page (only the count/byte budget of *this* call was exhausted) pauses
+/// selection instead, so the caller can resume exactly there with a fresh budget.
 fn select_hunks(
     hunks: Vec<RawHunk>,
     budget: DiffSelectionBudget,
@@ -613,8 +634,9 @@ fn select_hunks(
 
     let mut hunks = hunks.into_iter();
     while let Some(hunk) = hunks.next() {
-        let next = selected.len();
-        if next < budget.max_hunks && selected_bytes + hunk.patch.len() <= budget.max_bytes {
+        let fits_count = selected.len() < budget.max_hunks;
+        let fits_bytes = selected_bytes + hunk.patch.len() <= budget.max_bytes;
+        if fits_count && fits_bytes {
             selected_bytes += hunk.patch.len();
             selected.push(DiffHunk {
                 index: hunk.original_index,
@@ -625,10 +647,17 @@ fn select_hunks(
             continue;
         }
 
+        omitted += 1;
+        omitted_bytes += hunk.patch.len();
+
+        if hunk.patch.len() > budget.max_bytes {
+            // Never fits under this budget regardless of page; advance past it for good.
+            continue;
+        }
+
         cursor = Some(hunk.original_index);
-        omitted = 1 + hunks.len();
-        omitted_bytes =
-            hunk.patch.len() + hunks.map(|remaining| remaining.patch.len()).sum::<usize>();
+        omitted += hunks.len();
+        omitted_bytes += hunks.map(|remaining| remaining.patch.len()).sum::<usize>();
         break;
     }
 
