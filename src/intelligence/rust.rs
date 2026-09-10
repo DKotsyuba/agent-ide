@@ -33,8 +33,12 @@ pub struct RustProfileIdentity {
     pub binary: PathBuf,
     /// Observed rust-analyzer binary version.
     pub rust_analyzer_version: String,
+    /// Absolute operator-declared `cargo` executable; never chosen by model or project input.
+    pub cargo: PathBuf,
     /// Observed Cargo version paired with this profile.
     pub cargo_version: String,
+    /// Absolute operator-declared `rustc` executable; never chosen by model or project input.
+    pub rustc: PathBuf,
     /// Observed rustc version paired with this profile.
     pub rustc_version: String,
     /// Explicit rustup toolchain selector used by the analyzer and its Cargo/rustc subprocesses.
@@ -56,7 +60,13 @@ pub struct RustProfile {
     /// Measured analyzer bytes included in the exclusive backend compatibility identity.
     binary_digest: blake3::Hash,
     rust_analyzer_version: String,
+    cargo: PathBuf,
+    /// Measured `cargo` bytes; binds the declared `cargo_version` to the exact executed binary.
+    cargo_digest: blake3::Hash,
     cargo_version: String,
+    rustc: PathBuf,
+    /// Measured `rustc` bytes; binds the declared `rustc_version` to the exact executed binary.
+    rustc_digest: blake3::Hash,
     rustc_version: String,
     /// Toolchain selector included in command environment and compatibility identity.
     rustup_toolchain: String,
@@ -71,11 +81,19 @@ impl RustProfile {
     pub fn new(identity: RustProfileIdentity) -> Result<Self, RustProfileError> {
         let binary_digest = crate::execution::measured_executable_digest(&identity.binary)
             .map_err(|_| RustProfileError::InvalidProfile)?;
+        let cargo_digest = crate::execution::measured_executable_digest(&identity.cargo)
+            .map_err(|_| RustProfileError::InvalidProfile)?;
+        let rustc_digest = crate::execution::measured_executable_digest(&identity.rustc)
+            .map_err(|_| RustProfileError::InvalidProfile)?;
         let profile = Self {
             binary: identity.binary,
             binary_digest,
             rust_analyzer_version: identity.rust_analyzer_version,
+            cargo: identity.cargo,
+            cargo_digest,
             cargo_version: identity.cargo_version,
+            rustc: identity.rustc,
+            rustc_digest,
             rustc_version: identity.rustc_version,
             rustup_toolchain: identity.rustup_toolchain,
             configuration: identity.configuration,
@@ -90,8 +108,10 @@ impl RustProfile {
     }
 
     /// Returns the worktree-bound stdio command with the selected toolchain and private cache paths.
-    /// No ambient environment is inherited; Cargo artifacts and temporary files stay in the verified
-    /// namespace without granting a broader home directory.
+    /// No ambient environment is inherited: `CARGO`/`RUSTC` name the exact operator-verified
+    /// executables directly so tool discovery never depends on an inherited `PATH`, and Cargo
+    /// artifacts/temporary files stay in the verified namespace without granting a broader home
+    /// directory.
     pub fn command(&self, worktree: &RustWorktree) -> Result<ControlledCommand, RustProfileError> {
         ControlledCommand::from_validated_peer(
             CommandKind::Provider,
@@ -103,6 +123,8 @@ impl RustProfile {
                     OsString::from("RUSTUP_TOOLCHAIN"),
                     OsString::from(&self.rustup_toolchain),
                 ),
+                (OsString::from("CARGO"), OsString::from(&self.cargo)),
+                (OsString::from("RUSTC"), OsString::from(&self.rustc)),
                 (
                     OsString::from("CARGO_HOME"),
                     OsString::from(Path::new(&self.cache_namespace).join("cargo")),
@@ -128,7 +150,11 @@ impl RustProfile {
             self.binary_digest.to_hex().as_str(),
             &self.rust_analyzer_version,
             &RUST_PROFILE_REVISION.to_string(),
+            self.cargo.to_string_lossy().as_ref(),
+            self.cargo_digest.to_hex().as_str(),
             &self.cargo_version,
+            self.rustc.to_string_lossy().as_ref(),
+            self.rustc_digest.to_hex().as_str(),
             &self.rustc_version,
             &self.rustup_toolchain,
             &self.configuration,
@@ -166,6 +192,8 @@ impl RustProfile {
     /// bare label resolved relative to the spawned child's working directory.
     fn valid(&self) -> bool {
         self.binary.is_absolute()
+            && self.cargo.is_absolute()
+            && self.rustc.is_absolute()
             && Path::new(&self.cache_namespace).is_absolute()
             && matches!(
                 self.configuration.as_str(),

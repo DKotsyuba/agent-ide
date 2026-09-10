@@ -341,10 +341,22 @@ impl Worker<'_> {
         let profile = RustProfile::new(RustProfileIdentity {
             binary: launch.executable.path.clone(),
             rust_analyzer_version: launch.executable.identity.clone(),
+            cargo: launch
+                .cargo
+                .as_ref()
+                .ok_or(FailureCode::ExecutionProfile)?
+                .path
+                .clone(),
             cargo_version: launch
                 .cargo_version
                 .clone()
                 .ok_or(FailureCode::ExecutionProfile)?,
+            rustc: launch
+                .rustc
+                .as_ref()
+                .ok_or(FailureCode::ExecutionProfile)?
+                .path
+                .clone(),
             rustc_version: launch
                 .rustc_version
                 .clone()

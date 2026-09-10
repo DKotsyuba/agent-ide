@@ -122,8 +122,14 @@ pub struct ProviderLaunch {
     pub settings: AcceptedProviderSettings,
     /// Accepted toolchain identity; gopls uses an absolute Go executable, Rust a rustup selector.
     pub toolchain: String,
+    /// Absolute operator-declared `cargo` executable for Rust; absent for gopls. Never chosen by
+    /// model or project input; its measured identity must match `cargo_version`.
+    pub cargo: Option<AcceptedExecutable>,
     /// Accepted Cargo identity for Rust; absent for gopls.
     pub cargo_version: Option<String>,
+    /// Absolute operator-declared `rustc` executable for Rust; absent for gopls. Never chosen by
+    /// model or project input; its measured identity must match `rustc_version`.
+    pub rustc: Option<AcceptedExecutable>,
     /// Accepted rustc identity for Rust; absent for gopls.
     pub rustc_version: Option<String>,
     /// Explicit operator trust identity, never derived from a sandbox observation.
@@ -281,14 +287,30 @@ impl LauncherConfig {
                 match provider.settings {
                     AcceptedProviderSettings::GoplsDefaults
                         if !absolute(Path::new(&provider.toolchain))
+                            || provider.cargo.is_some()
                             || provider.cargo_version.is_some()
+                            || provider.rustc.is_some()
                             || provider.rustc_version.is_some() =>
                     {
                         return Err(LauncherError::Rejected);
                     }
                     AcceptedProviderSettings::RustCachePrimingDisabledV1
                         if !provider.cargo_version.as_deref().is_some_and(identifier)
-                            || !provider.rustc_version.as_deref().is_some_and(identifier) =>
+                            || !provider.rustc_version.as_deref().is_some_and(identifier)
+                            || !provider.cargo.as_ref().is_some_and(|cargo| {
+                                cargo.validate().is_ok()
+                                    && Some(cargo.identity.as_str())
+                                        == provider.cargo_version.as_deref()
+                            }) =>
+                    {
+                        return Err(LauncherError::Rejected);
+                    }
+                    AcceptedProviderSettings::RustCachePrimingDisabledV1
+                        if !provider.rustc.as_ref().is_some_and(|rustc| {
+                            rustc.validate().is_ok()
+                                && Some(rustc.identity.as_str())
+                                    == provider.rustc_version.as_deref()
+                        }) =>
                     {
                         return Err(LauncherError::Rejected);
                     }
@@ -344,6 +366,18 @@ impl LauncherConfig {
             for program in std::iter::once(&target.git)
                 .chain(std::iter::once(&target.codex))
                 .chain(target.providers.iter().map(|provider| &provider.executable))
+                .chain(
+                    target
+                        .providers
+                        .iter()
+                        .filter_map(|provider| provider.cargo.as_ref()),
+                )
+                .chain(
+                    target
+                        .providers
+                        .iter()
+                        .filter_map(|provider| provider.rustc.as_ref()),
+                )
             {
                 if let Some(existing) = programs.insert(program.path.as_path(), program)
                     && !existing.blake3.eq_ignore_ascii_case(&program.blake3)

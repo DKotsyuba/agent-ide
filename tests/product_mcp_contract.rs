@@ -1030,6 +1030,14 @@ fn accepted_program(path: &str, identity: &str) -> Value {
     json!({"path":path,"identity":identity,"blake3":blake3::hash(&std::fs::read(path).unwrap()).to_hex().to_string()})
 }
 
+/// Returns the operator-verified absolute path of one binary inside the accepted rustup toolchain,
+/// honoring `AGENT_IDE_RUST_TOOLCHAIN_DIR` when the harness points at a non-default rustup home.
+fn toolchain_bin(tool: &str) -> String {
+    let root = std::env::var("AGENT_IDE_RUST_TOOLCHAIN_DIR")
+        .unwrap_or_else(|_| "/Users/pluto/.rustup/toolchains/1.98.1-aarch64-apple-darwin".into());
+    format!("{root}/bin/{tool}")
+}
+
 /// A real MCP client plus host actor/call correlation owned by one configured test target.
 struct ProductActor {
     /// Actual shipping MCP process; its stdin is closed explicitly at test completion.
@@ -1335,7 +1343,7 @@ async fn configured_product_returns_real_go_and_rust_semantic_context() {
         )
         .unwrap();
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let providers = json!([{"executable":accepted_program(&gopls,"golang.org/x/tools/gopls v0.23.0"),"settings":"gopls_defaults","toolchain":go,"cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"fixture-go-cache"},{"executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),"settings":"rust_cache_priming_disabled_v1","toolchain":toolchain,"cargo_version":"cargo 1.98.1","rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"fixture-rust-cache"}]);
+        let providers = json!([{"executable":accepted_program(&gopls,"golang.org/x/tools/gopls v0.23.0"),"settings":"gopls_defaults","toolchain":go,"cargo":null,"cargo_version":null,"rustc":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"fixture-go-cache"},{"executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),"settings":"rust_cache_priming_disabled_v1","toolchain":toolchain,"cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"fixture-rust-cache"}]);
         fixture.write_config(providers);
         let mut daemon = fixture.daemon().await;
         let mut actor = ProductActor::new(&fixture, "provider-root").await;
@@ -1396,6 +1404,97 @@ async fn configured_product_returns_real_go_and_rust_semantic_context() {
         daemon.kill().await.unwrap();
         daemon.wait().await.unwrap();
     }
+}
+
+/// Proves CARGO/RUSTC threading actually lets rust-analyzer load the Cargo workspace under
+/// `env_clear`: a detached single file cannot resolve a symbol defined only in a path-dependency
+/// crate, so a passing cross-crate definition is real evidence of loaded workspace semantics, not
+/// same-file lexical fallback. The managed-sandbox `procMacro`-disabled route is proven separately
+/// (`session_tests::managed_rust_settings_disable_proc_macro_expansion`); this exercises the same
+/// production Rust profile construction through the disabled-profile fixture route.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN environment"]
+async fn configured_product_rust_resolves_definition_across_a_crate_boundary() {
+    use std::os::unix::fs::PermissionsExt;
+    let toolchain = std::env::var("AGENT_IDE_RUST_TOOLCHAIN").unwrap();
+    let analyzer = std::env::var("AGENT_IDE_RUST_ANALYZER").unwrap();
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::create_dir_all(fixture.root.join("dep/src")).unwrap();
+    std::fs::write(
+        fixture.root.join("dep/Cargo.toml"),
+        "[package]\nname=\"dep\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("dep/src/lib.rs"),
+        "pub fn shared_value() -> i32 { 42 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("Cargo.toml"),
+        "[package]\nname=\"product_fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\n[dependencies]\ndep = { path = \"dep\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "pub fn value() -> i32 { dep::shared_value() }\npub fn caller() -> i32 { value() }\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "-A"]);
+    fixture.git(&["commit", "--quiet", "-m", "cross-crate fixture"]);
+    let wrapper = fixture.base.join("rust-provider");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexec '{}' \"$@\"\n",
+            analyzer.replace('\'', "'\\''")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let providers = json!([{"executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),"settings":"rust_cache_priming_disabled_v1","toolchain":toolchain,"cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"fixture-rust-cross-crate-cache"}]);
+    fixture.write_config(providers);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "cross-crate-root").await;
+    let start = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"cross-crate-start"}),
+        )
+        .await;
+    let start = actor.settle(&fixture, start).await;
+    if start["kind"] != "activation" {
+        actor.mcp.close().await;
+        daemon.kill().await.unwrap();
+        let output = daemon.wait_with_output().await.unwrap();
+        panic!(
+            "{start}; daemon stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let bytes = std::fs::read_to_string(fixture.root.join("src/lib.rs")).unwrap();
+    let offset = bytes.rfind("shared_value()").unwrap();
+    let response = actor
+        .call(
+            &fixture,
+            "ide.context",
+            json!({"path":"src/lib.rs","byte_offset":offset}),
+        )
+        .await;
+    let response = actor.settle(&fixture, response).await;
+    assert_eq!(response["kind"], "context", "{response}");
+    let text = response["text"].as_str().unwrap();
+    assert!(text.contains("mode: semantic"), "{response}");
+    assert!(
+        text.contains("dep/src/lib.rs"),
+        "cross-crate definition did not resolve into the dependency crate: {response}"
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
 }
 
 /// Cancels a configured owned provider during warmup: the direct child is still killed and reaped even
@@ -1604,7 +1703,7 @@ async fn configured_product_sigterm_reaps_in_flight_rust_only_provider() {
     )
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"rust-analyzer signal fixture"),"settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo_version":"cargo 1.98.1","rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"signal-rust-cache"}]));
+    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"rust-analyzer signal fixture"),"settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo":accepted_program("/usr/bin/true","cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program("/usr/bin/true","rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"signal-rust-cache"}]));
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "signal-rust-root").await;
     let started = actor
