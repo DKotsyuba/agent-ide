@@ -30,8 +30,8 @@ use crate::{
             parse_claude_call_id, parse_hook_event, parse_host_kind,
         },
         reply::{
-            MAX_FEEDBACK_BYTES, MissingPeer, PeerReply, ResultKind,
-            call_tool_result_fits, render_call_tool_result,
+            MAX_FEEDBACK_BYTES, MissingPeer, PeerReply, ResultKind, call_tool_result_fits,
+            render_call_tool_result,
         },
     },
     workspace::authority::{

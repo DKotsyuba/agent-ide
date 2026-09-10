@@ -1141,7 +1141,11 @@ async fn configured_product_refuses_a_reused_start_with_unusable_sandbox_metadat
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "sandbox-reuse-root").await;
     let started = actor
-        .call(&fixture, "ide.start", json!({"activation_id":"first-start"}))
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"first-start"}),
+        )
         .await;
     let started = actor.settle(&fixture, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
@@ -1149,7 +1153,11 @@ async fn configured_product_refuses_a_reused_start_with_unusable_sandbox_metadat
     // The same live actor reuses its binding and this time carries unusable measured state.
     let valid = std::mem::replace(&mut actor.state, json!({"permissionProfile":null}));
     let refused = actor
-        .call(&fixture, "ide.start", json!({"activation_id":"invalid-metadata"}))
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"invalid-metadata"}),
+        )
         .await;
     assert_eq!(
         refused["code"], "sandbox_state",
@@ -1254,7 +1262,11 @@ async fn configured_product_unknown_attachments_allocate_no_channel_or_scope_sta
     // The configured attachment is unaffected and still starts, reads and stops normally.
     let mut actor = ProductActor::new(&fixture, "configured-root").await;
     let started = actor
-        .call(&fixture, "ide.start", json!({"activation_id":"configured-start"}))
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"configured-start"}),
+        )
         .await;
     let started = actor.settle(&fixture, started).await;
     assert_eq!(started["kind"], "activation", "{started}");

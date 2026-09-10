@@ -1395,10 +1395,10 @@ mod tests {
         // One ordinary daemon operation, submitted exactly as the worker submits discovery,
         // snapshot and provider work.
         let ordinary = |admission: &Arc<Mutex<crate::execution::AdmissionController>>| {
-            admission
-                .lock()
-                .unwrap()
-                .submit(OwnerId::new(String::from("ordinary-owner")).unwrap(), AdmissionClass::Interactive)
+            admission.lock().unwrap().submit(
+                OwnerId::new(String::from("ordinary-owner")).unwrap(),
+                AdmissionClass::Interactive,
+            )
         };
         let Admission::Granted(first) = ordinary(&admission) else {
             panic!("the first ordinary operation must be admitted")

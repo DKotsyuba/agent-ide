@@ -412,7 +412,9 @@ impl Worker<'_> {
             ) {
                 RustViewAdmission::Granted(view) => view,
                 RustViewAdmission::Queued(ticket) => {
-                    self.providers.registry.cancel_pending(&mut admission, ticket);
+                    self.providers
+                        .registry
+                        .cancel_pending(&mut admission, ticket);
                     return Err(FailureCode::Capacity);
                 }
                 _ => return Err(FailureCode::ProviderUnavailable),
@@ -559,10 +561,10 @@ impl Worker<'_> {
                 .execution_request(job, &authority, command, &launch.executable)
                 .await?;
             let active = self.shared.active(&binding)?;
-        let admission = self.admission.clone();
-        let mut admission = admission
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let admission = self.admission.clone();
+            let mut admission = admission
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let lease = match self.providers.registry.request(
                 &mut admission,
                 owner(&binding)?,
@@ -573,7 +575,9 @@ impl Worker<'_> {
             ) {
                 ProviderLeaseAdmission::Granted(lease) => lease,
                 ProviderLeaseAdmission::Queued(ticket) => {
-                    self.providers.registry.cancel_pending(&mut admission, ticket);
+                    self.providers
+                        .registry
+                        .cancel_pending(&mut admission, ticket);
                     return Err(FailureCode::Capacity);
                 }
                 _ => return Err(FailureCode::ProviderUnavailable),
@@ -1194,15 +1198,13 @@ async fn reap_owned_backend(
             return Err(FailureCode::Deadline);
         }
     };
-    let reaped = providers
-        .registry
-        .complete_reap(
-            &mut *admission
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            capability,
-            completed.settlement,
-        );
+    let reaped = providers.registry.complete_reap(
+        &mut admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        capability,
+        completed.settlement,
+    );
     let disposed = providers.dispose_socket(view_backend, socket);
     if reaped.is_err() || !disposed {
         uncertain.insert(binding.clone());
