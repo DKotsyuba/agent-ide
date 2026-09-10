@@ -1,16 +1,19 @@
-# Merge after replacing placeholders. Use the same fresh attachment for MCP and hooks.
+# Merge into config.toml after replacing placeholders. Use the same fresh attachment
+# for MCP and hooks, and approve these hook definitions through Codex's trust prompt.
+# Placeholders must be absolute paths or an attachment value without single quotes.
 
-[[hooks]]
-event = "PreToolUse"
-command = ["<AGENT_IDE_BIN>", "codex-hook", "--runtime-dir", "<RUNTIME_DIR>"]
-env = { AGENT_IDE_HOST_ATTACHMENT = "<FRESH_CHANNEL_ATTACHMENT>" }
+[[hooks.PreToolUse]]
+matcher = ""
 
-[[hooks]]
-event = "PostToolUse"
-command = ["<AGENT_IDE_BIN>", "codex-hook", "--runtime-dir", "<RUNTIME_DIR>"]
-env = { AGENT_IDE_HOST_ATTACHMENT = "<FRESH_CHANNEL_ATTACHMENT>" }
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "AGENT_IDE_HOST_ATTACHMENT='<FRESH_CHANNEL_ATTACHMENT>' '<AGENT_IDE_BIN>' codex-hook --runtime-dir '<RUNTIME_DIR>'"
+timeout = 1
 
-[[hooks]]
-event = "PostToolBatch"
-command = ["<AGENT_IDE_BIN>", "codex-hook", "--runtime-dir", "<RUNTIME_DIR>"]
-env = { AGENT_IDE_HOST_ATTACHMENT = "<FRESH_CHANNEL_ATTACHMENT>" }
+[[hooks.PostToolUse]]
+matcher = ""
+
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "AGENT_IDE_HOST_ATTACHMENT='<FRESH_CHANNEL_ATTACHMENT>' '<AGENT_IDE_BIN>' codex-hook --runtime-dir '<RUNTIME_DIR>'"
+timeout = 1
