@@ -1164,6 +1164,16 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
     assert_eq!(denied["code"], "execution_profile");
     actor.state["useLegacyLandlock"] = json!(false);
 
+    // Registers a real durable observation for the exact path the diff snapshot below also
+    // covers, so the product worker's `ProductSnapshotRunner::current_observation` must load and
+    // confirm it from the durable store during the diff capture that follows, not merely accept
+    // the trait's default `None`.
+    let tracked_context = actor
+        .call(&fixture, "ide.context", json!({"path":"tracked.txt"}))
+        .await;
+    let tracked_context = actor.settle(&fixture, tracked_context).await;
+    assert_eq!(tracked_context["kind"], "context", "{tracked_context}");
+
     let mut diff_ref = String::new();
     for mode in ["head", "staged", "unstaged"] {
         let diff = actor.call(&fixture, "ide.diff", json!({"mode":mode})).await;

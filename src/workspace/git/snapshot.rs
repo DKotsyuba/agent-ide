@@ -399,13 +399,17 @@ pub trait SnapshotRunner: Send {
         None
     }
     /// Supplies an optional Workspace-certified current observation for this exact path.
-    /// Raw/native hints and merely loaded observations cannot construct the required token.
+    /// Raw/native hints and merely loaded observations cannot construct the required token; only
+    /// a fresh durable re-check (as `WorkspaceStore::confirm_current` performs) may mint one, so
+    /// this is async by design rather than accepting a synchronous or cached guess. Implementations
+    /// that have no durable store, or that cannot confirm this exact path is still current, return
+    /// `None`; a missing or stale row is never converted into a fabricated `Current` token.
     fn current_observation(
         &mut self,
         _authority: &AuthorityStamp,
         _path: &Path,
-    ) -> Option<CurrentObservation> {
-        None
+    ) -> impl std::future::Future<Output = Option<CurrentObservation>> + Send {
+        std::future::ready(None)
     }
 }
 
@@ -784,11 +788,8 @@ async fn capture_attempt<R: SnapshotRunner>(
             continue;
         }
         let index = stages.and_then(|entries| entries.get(&0));
-        let source = SnapshotSource::capture(
-            authority,
-            &path,
-            runner.current_observation(authority, &path),
-        )?;
+        let current = runner.current_observation(authority, &path).await;
+        let source = SnapshotSource::capture(authority, &path, current)?;
         total_bytes += source.contents().len();
         if total_bytes > MAX_SNAPSHOT_TOTAL_BYTES {
             return Err(GitError::EvidenceTooLarge);

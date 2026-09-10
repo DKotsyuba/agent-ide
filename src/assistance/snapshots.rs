@@ -39,6 +39,45 @@ impl SnapshotRunner for ProductSnapshotRunner<'_, '_> {
             }
         }
     }
+    /// Correlates this exact path with its current durable revision/sequence, when one exists.
+    /// Never fabricates a token: an absent row, a store error, or a binding that stopped being
+    /// live across the awaited store round-trip all fall through to `None`, exactly like a path
+    /// Workspace never registered. The whole-snapshot pre/post metadata bracket and the per-path
+    /// re-read consistency check still independently catch a source that changed underfoot; this
+    /// only adds the optional revision/sequence correlation when it can be durably confirmed.
+    async fn current_observation(
+        &mut self,
+        authority: &AuthorityStamp,
+        path: &Path,
+    ) -> Option<crate::workspace::store::CurrentObservation> {
+        if authority.worktree() != self.authority.worktree()
+            || authority.epoch() != self.authority.epoch()
+        {
+            return None;
+        }
+        let binding = self.job.invocation.binding_ref().clone();
+        let lookup =
+            crate::app::store::OperationId::new(format!("snapshot-observe-{}", self.job.reference))
+                .ok()?;
+        let latest = self
+            .worker
+            .observations
+            .load_latest(
+                lookup.clone(),
+                authority.worktree().clone(),
+                path.to_path_buf(),
+            )
+            .await
+            .ok()??;
+        // Re-verify the binding is still live after the awaited durable I/O before trusting or
+        // acting on what it returned.
+        self.worker.shared.active(&binding).ok()?;
+        self.worker
+            .observations
+            .confirm_current(lookup, latest)
+            .await
+            .ok()?
+    }
 }
 impl ProductSnapshotRunner<'_, '_> {
     /// Keeps private snapshot files alive through wait/cancellation/reap; uncertain reaps retain the intent.
@@ -176,7 +215,7 @@ pub(super) fn render_diff_text(
     authority_epoch: u64,
 ) -> String {
     let mut text = format!(
-        "mode: {:?}\nstate: {:?}\ncoverage: {:?}\nfreshness: {:?}\nauthority_epoch: {}\nbaseline_reference: {}\nbaseline_coverage: {:?}\nbaseline_window: {:?}\ntracked: {}; untracked: {}; conflicted: {}\n",
+        "mode: {:?}\nstate: {:?}\ncoverage: {:?}\nfreshness: {:?}\nauthority_epoch: {}\nbaseline_reference: {}\nbaseline_coverage: {:?}\nbaseline_window: {:?}\ntracked: {}; untracked: {}; conflicted: {}\nomitted_hunks: {}; omitted_bytes: {}; more_available: {}\n",
         mode,
         result.state(),
         result.coverage(),
@@ -187,7 +226,10 @@ pub(super) fn render_diff_text(
         result.provenance().baseline_window(),
         result.counts().tracked(),
         result.counts().untracked(),
-        result.counts().conflicted()
+        result.counts().conflicted(),
+        result.overflow_hunks(),
+        result.overflow_bytes(),
+        result.detail_cursor().is_some(),
     );
     for path in result.tracked() {
         text.push_str(&format!("tracked_path: {:?}\n", path.path()));
