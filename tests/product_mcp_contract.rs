@@ -643,7 +643,7 @@ async fn binary_codex_hook_hung_daemon_deadline_sends_only_selected_fields() {
         assert_eq!(
             frame["sanitized_observation_json"],
             json!({"host":"codex","phase":"pre","actor_id":"child","call_id":"hung",
-                "session_id":null,"agent_type":null})
+                "session_id":null,"agent_type":null,"launch_command":null,"launch_background":null})
         );
         let wire = String::from_utf8(bytes).unwrap();
         for private in [
@@ -685,7 +685,7 @@ async fn post_ack(runtime: &Path, actor: &str, call: &str) -> Value {
         "private-host-channel",
         OpaqueJson::from_value(
             &json!({"host":"codex","phase":"post","actor_id":actor,"call_id":call,
-                "session_id":null,"agent_type":null}),
+                "session_id":null,"agent_type":null,"launch_command":null,"launch_background":null}),
             1024,
         )
         .unwrap(),

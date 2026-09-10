@@ -26,7 +26,7 @@ use crate::{
     },
     assistance::{
         host_binding::{
-            HookEvent, HookPhase, HostBindingGuard, HostKind, parse_candidate,
+            HookEvent, HookLaunch, HookPhase, HostBindingGuard, HostKind, parse_candidate,
             parse_claude_call_id, parse_hook_event, parse_host_kind,
         },
         reply::{MAX_FEEDBACK_BYTES, MAX_REPLY_BYTES, MissingPeer, PeerReply, ResultKind},
@@ -471,6 +471,11 @@ pub async fn submit_hook_event(
         "call_id": event.optional_call_id(),
         "session_id": event.session_id(),
         "agent_type": event.agent_type(),
+        // Present only for a Claude shell pre-hook. The daemon compares these bytes against a
+        // command it generated itself and discards them otherwise; no other tool's arguments,
+        // and no other field of this one, ever reach the transport.
+        "launch_command": event.launch().map(HookLaunch::command),
+        "launch_background": event.launch().map(HookLaunch::run_in_background),
     });
     let Some(observation) = OpaqueJson::from_value(&observation, MAX_HOOK_BYTES) else {
         return HookIngressOutcome::Unavailable;
@@ -822,13 +827,26 @@ impl StdioFacade {
 fn render_reply(mut reply: PeerReply) -> CallToolResult {
     loop {
         let summary = match &reply {
+            // The complete command is rendered verbatim in the summary the model actually reads.
+            // Nothing below can trim it: shrink_text refuses pending replies, so an envelope that
+            // cannot hold the exact command becomes an explicit error instead of a cut command.
+            PeerReply::Pending {
+                detail_ref,
+                helper: Some(helper),
+            } => format!(
+                "Assistance work is pending and this host runs it in a foreground helper. \
+                 Run exactly this command with Bash, in the foreground (run_in_background must be \
+                 false), without editing, wrapping or appending to it:\n{helper}\n\
+                 Then use ide.inspect with detail_ref {detail_ref}. \
+                 Do not call ide.inspect before that command has completed.",
+            ),
             PeerReply::Pending { .. } => {
-                "Assistance work is pending; use ide.inspect with the returned detail_ref"
+                "Assistance work is pending; use ide.inspect with the returned detail_ref".to_owned()
             }
             PeerReply::Error { .. } => {
-                "Assistance could not complete this operation; inspect the typed error and continue with native tools"
+                "Assistance could not complete this operation; inspect the typed error and continue with native tools".to_owned()
             }
-            _ => "Assistance returned the current owner result",
+            _ => "Assistance returned the current owner result".to_owned(),
         };
         let Ok(value) = serde_json::to_value(&reply) else {
             break;

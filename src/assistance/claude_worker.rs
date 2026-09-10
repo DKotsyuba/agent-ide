@@ -732,6 +732,16 @@ impl LaunchLedger {
         self.tickets.retain(|_, ticket| ticket.binding != binding);
     }
 
+    /// Returns whether one handle exists and belongs to the supplied binding generation.
+    ///
+    /// Retrieval uses this before reading any outcome, so a handle copied into another actor's
+    /// or another generation's call can never surface a result it does not own.
+    pub fn owned_by(&self, detail_ref: &str, binding: [u8; 32]) -> bool {
+        self.tickets
+            .get(detail_ref)
+            .is_some_and(|ticket| ticket.binding == binding)
+    }
+
     /// Returns the number of outstanding tickets for bounded-capacity assertions.
     pub fn len(&self) -> usize {
         self.tickets.len()
