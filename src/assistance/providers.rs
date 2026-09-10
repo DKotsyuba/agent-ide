@@ -16,9 +16,10 @@ use crate::{
             RustProfile, RustProfileError, RustProfileIdentity, RustProtocolChild,
             RustViewAdmission, RustViews, RustWorktree,
         },
-        session::{DiagnosticSnapshot, ProviderSettings, SessionOptions, with_session},
+        session::{DiagnosticSnapshot, GoEnv, ProviderSettings, SessionOptions, with_session},
     },
 };
+use std::path::Path;
 
 /// Couples one semantic context result to diagnostics observed by that exact provider session.
 pub(super) struct ProviderContext {
@@ -115,6 +116,12 @@ pub(super) struct Providers {
     caches: BTreeMap<String, CacheLifecycle>,
     /// Cache keys currently used by each actor and quiesced when that actor stops.
     binding_caches: BTreeMap<BindingRef, Vec<String>>,
+    /// Concurrent active bindings retaining each *shared* native cache key. `CacheLifecycle` itself
+    /// models one exclusive owner at a time (handoff only succeeds once quiescent), which is right
+    /// for a per-worktree namespace but wrong for the one shared namespace several divergent
+    /// worktrees legitimately use at once. This count is the source of truth for when the shared
+    /// entry may actually transition to quiescent.
+    shared_cache_refs: BTreeMap<String, usize>,
 }
 impl Providers {
     /// Creates fixed finite provider bookkeeping without launching processes.
@@ -132,6 +139,7 @@ impl Providers {
             generation: 0,
             caches: BTreeMap::new(),
             binding_caches: BTreeMap::new(),
+            shared_cache_refs: BTreeMap::new(),
         }
     }
     /// Mints one checked protocol generation without using timing/PID as actor identity.
@@ -203,6 +211,7 @@ impl Worker<'_> {
         authority: &AuthorityStamp,
         launches: &[ProviderLaunch],
         managed_sandbox: bool,
+        rights: &str,
     ) -> Result<(), FailureCode> {
         let root = CacheRoot::prepare(self.runtime.join("cache"))
             .map_err(|_| FailureCode::ProviderUnavailable)?;
@@ -211,42 +220,72 @@ impl Worker<'_> {
             authority.worktree().id(),
             authority.worktree().incarnation()
         );
-        let mut plan = Vec::with_capacity(launches.len());
+        let mut plan = Vec::with_capacity(launches.len() * 2);
         for launch in launches {
             let settings = provider_cache_settings(launch.settings);
-            let identity = CacheIdentity::new(
-                launch.executable.identity.clone(),
-                settings,
-                effective_configuration(launch.settings, managed_sandbox),
-                launch.toolchain.clone(),
-                launch.trust.clone(),
-                worktree_state.clone(),
-            )
-            .ok_or(FailureCode::ProviderUnavailable)?;
+            let configuration = effective_configuration(launch.settings, managed_sandbox);
+            let trust = effective_trust(launch, rights);
             plan.push(CacheRequest {
-                key: provider_cache_key(&worktree_state, launch, settings),
-                identity,
+                key: provider_cache_key(&worktree_state, launch, settings, &trust),
+                identity: CacheIdentity::new(
+                    launch.executable.identity.clone(),
+                    settings,
+                    configuration,
+                    launch.toolchain.clone(),
+                    trust.clone(),
+                    worktree_state.clone(),
+                )
+                .ok_or(FailureCode::ProviderUnavailable)?,
                 required: match launch.settings {
-                    AcceptedProviderSettings::GoplsDefaults => {
-                        &["gopls", "go-build", "go-mod", "tmp"][..]
-                    }
+                    AcceptedProviderSettings::GoplsDefaults => &["go-build", "go-mod", "tmp"][..],
                     AcceptedProviderSettings::RustCachePrimingDisabledV1 => {
                         &["cargo", "target", "tmp"][..]
                     }
                 },
+                shared: false,
             });
+            if matches!(launch.settings, AcceptedProviderSettings::GoplsDefaults) {
+                plan.push(CacheRequest {
+                    key: provider_cache_key(SHARED_NATIVE_CACHE_STATE, launch, settings, &trust),
+                    identity: CacheIdentity::new(
+                        launch.executable.identity.clone(),
+                        settings,
+                        configuration,
+                        launch.toolchain.clone(),
+                        trust,
+                        SHARED_NATIVE_CACHE_STATE,
+                    )
+                    .ok_or(FailureCode::ProviderUnavailable)?,
+                    required: &["gopls", "tmp"][..],
+                    shared: true,
+                });
+            }
         }
         let keys = retain_cache_plan(
             &mut self.providers.caches,
+            &self.providers.shared_cache_refs,
             &root,
             authority.worktree(),
             &plan,
         )?;
+        for request in &plan {
+            if request.shared {
+                *self
+                    .providers
+                    .shared_cache_refs
+                    .entry(request.key.clone())
+                    .or_insert(0) += 1;
+            }
+        }
         self.providers.binding_caches.insert(binding.clone(), keys);
         Ok(())
     }
 
     /// Quiesces the stopped actor's cache owners without deleting their worktree namespaces.
+    ///
+    /// A shared native namespace key is instead reference-counted: it becomes quiescent only once
+    /// every divergent worktree currently sharing that one heavy listener has stopped, so a still
+    /// live shared entry is never falsely retired or handed off to an unrelated actor.
     pub(super) fn quiesce_worktree_caches(&mut self, binding: &BindingRef) {
         for key in self
             .providers
@@ -254,6 +293,13 @@ impl Worker<'_> {
             .remove(binding)
             .unwrap_or_default()
         {
+            if let Some(refs) = self.providers.shared_cache_refs.get_mut(&key) {
+                *refs = refs.saturating_sub(1);
+                if *refs > 0 {
+                    continue;
+                }
+                self.providers.shared_cache_refs.remove(&key);
+            }
             if let Some(cache) = self.providers.caches.get_mut(&key) {
                 cache.quiesce();
             }
@@ -305,7 +351,8 @@ impl Worker<'_> {
     ) -> Result<ProviderContext, FailureCode> {
         let binding = job.invocation.binding_ref().clone();
         let authority = self.authority(&binding).await?;
-        let cache_namespace = self.provider_cache_namespace(&binding, &authority, launch)?;
+        let cache_namespace =
+            self.provider_cache_namespace(&binding, &authority, launch, &launch.trust)?;
         let managed_sandbox = managed_sandbox_from_job(job);
         let profile = RustProfile::new(RustProfileIdentity {
             binary: launch.executable.path.clone(),
@@ -445,23 +492,16 @@ impl Worker<'_> {
         let generation = self.providers.next()?;
         let binding = job.invocation.binding_ref().clone();
         let authority = self.authority(&binding).await?;
-        let mut state = job
-            .observed
-            .as_ref()
-            .ok_or(FailureCode::SandboxState)?
-            .state()
-            .as_json()
-            .clone();
-        state
-            .as_object_mut()
-            .ok_or(FailureCode::SandboxState)?
-            .remove("sandboxCwd");
-        let trust = format!(
-            "{}|{}",
-            launch.trust,
-            blake3::hash(state.to_string().as_bytes()).to_hex()
-        );
-        let cache_namespace = self.provider_cache_namespace(&binding, &authority, launch)?;
+        let trust = effective_trust(launch, &effective_rights_from_job(job)?);
+        let worktree_namespace =
+            self.provider_cache_namespace(&binding, &authority, launch, &trust)?;
+        let shared_namespace = self.provider_shared_cache_namespace(&binding, launch, &trust)?;
+        let go_env = GoEnv::new(
+            Path::new(&worktree_namespace).join("go-build"),
+            Path::new(&worktree_namespace).join("go-mod"),
+            Path::new(&worktree_namespace).join("tmp"),
+        )
+        .ok_or(FailureCode::ProviderUnavailable)?;
         let profile = GoplsProfile::new(
             launch.executable.path.clone(),
             launch.executable.identity.clone(),
@@ -469,7 +509,7 @@ impl Worker<'_> {
             "gopls-defaults-v1".into(),
             launch.toolchain.clone(),
             trust,
-            cache_namespace,
+            shared_namespace,
         )
         .map_err(|_| FailureCode::ExecutionProfile)?;
         let backend = profile.compatibility_key();
@@ -663,7 +703,7 @@ impl Worker<'_> {
                     toolchain: 1,
                     view: generation,
                 },
-                ProviderSettings::GoplsDefaults,
+                ProviderSettings::GoplsDefaults(go_env),
                 remaining_options(job),
             );
             tokio::pin!(operation);
@@ -762,34 +802,76 @@ impl Worker<'_> {
         binding: &BindingRef,
         authority: &AuthorityStamp,
         launch: &ProviderLaunch,
+        trust: &str,
     ) -> Result<String, FailureCode> {
         let worktree_state = format!(
             "{}:{}",
             authority.worktree().id(),
             authority.worktree().incarnation()
         );
-        let key = provider_cache_key(
-            &worktree_state,
-            launch,
-            provider_cache_settings(launch.settings),
-        );
+        self.retained_cache_namespace(
+            binding,
+            &provider_cache_key(
+                &worktree_state,
+                launch,
+                provider_cache_settings(launch.settings),
+                trust,
+            ),
+        )
+    }
+
+    /// Resolves the already-retained *shared* native namespace backing every worktree's gopls
+    /// listener for this compatible executable/settings/toolchain/effective-rights identity.
+    fn provider_shared_cache_namespace(
+        &self,
+        binding: &BindingRef,
+        launch: &ProviderLaunch,
+        trust: &str,
+    ) -> Result<String, FailureCode> {
+        self.retained_cache_namespace(
+            binding,
+            &provider_cache_key(
+                SHARED_NATIVE_CACHE_STATE,
+                launch,
+                provider_cache_settings(launch.settings),
+                trust,
+            ),
+        )
+    }
+
+    /// Returns the retained namespace path for `key` only if this binding still owns a live lifecycle.
+    ///
+    /// The path is read from the retained `CacheLifecycle` itself rather than recomputed from the
+    /// runtime root, so the directory a provider is told to use is by construction the one whose
+    /// retention this worker accounts for; the two cannot drift apart. Missing lifecycle ownership,
+    /// an already-retired namespace, and a non-UTF-8 path are all rejected as
+    /// `ProviderUnavailable` before a provider command can be constructed.
+    fn retained_cache_namespace(
+        &self,
+        binding: &BindingRef,
+        key: &str,
+    ) -> Result<String, FailureCode> {
         if !self
             .providers
             .binding_caches
             .get(binding)
-            .is_some_and(|keys| keys.contains(&key))
+            .is_some_and(|keys| keys.iter().any(|existing| existing == key))
         {
             return Err(FailureCode::ProviderUnavailable);
         }
         self.providers
             .caches
-            .get(&key)
+            .get(key)
             .and_then(CacheLifecycle::namespace_path)
             .and_then(|path| path.to_str())
             .map(str::to_owned)
             .ok_or(FailureCode::ProviderUnavailable)
     }
 }
+
+/// One prepared namespace: its key, the lifecycle retaining it, and the directories this
+/// operation is proven to have created for it and may therefore roll back.
+type PreparedCache = (String, CacheLifecycle, Vec<std::path::PathBuf>);
 
 /// One launch's fully derived retention request, prepared before any lifecycle map is touched.
 pub(super) struct CacheRequest {
@@ -799,6 +881,9 @@ pub(super) struct CacheRequest {
     pub(super) identity: CacheIdentity,
     /// Private subdirectories the provider command needs inside the retained namespace.
     pub(super) required: &'static [&'static str],
+    /// Whether this namespace is the one shared native namespace several concurrently active
+    /// worktrees legitimately hold at once rather than a single-owner worktree namespace.
+    pub(super) shared: bool,
 }
 
 /// Retains every requested namespace as one transaction over `caches`, returning the retained keys.
@@ -817,45 +902,127 @@ pub(super) struct CacheRequest {
 /// does not have. Directories created for earlier requests are deliberately retained on failure.
 fn retain_cache_plan(
     caches: &mut BTreeMap<String, CacheLifecycle>,
+    shared_refs: &BTreeMap<String, usize>,
     root: &CacheRoot,
     worktree: &crate::workspace::authority::WorktreeRef,
     plan: &[CacheRequest],
 ) -> Result<Vec<String>, FailureCode> {
-    let mut prepared: Vec<(String, CacheLifecycle)> = Vec::with_capacity(plan.len());
+    let mut prepared: Vec<PreparedCache> = Vec::with_capacity(plan.len());
+    let mut keys = Vec::with_capacity(plan.len());
     for request in plan {
-        if let Some(existing) = caches.get(&request.key) {
-            if !existing.quiescent() {
-                return Err(FailureCode::Conflict);
+        keys.push(request.key.clone());
+        if request.shared && shared_refs.get(&request.key).is_some_and(|refs| *refs > 0) {
+            // Another active binding already keeps this shared listener's namespace live. An equal
+            // key already implies a compatible identity (it is a hash of the same
+            // executable/settings/toolchain/effective-rights components the identity is built
+            // from), so this reference is retained by counting it, never by a handoff that would
+            // require the still-live peer to have quiesced first.
+            if !caches
+                .get(&request.key)
+                .is_some_and(CacheLifecycle::retained)
+            {
+                return Err(FailureCode::ProviderUnavailable);
             }
-        } else if !prepared.iter().any(|(key, _)| key == &request.key)
-            && caches.len() + prepared.len() >= MAX_CACHE_NAMESPACES
-        {
-            return Err(FailureCode::Capacity);
+            continue;
         }
-        if let Some(existing) = caches.get_mut(&request.key)
-            && !existing.handoff(&request.identity)
-        {
-            return Err(FailureCode::ProviderUnavailable);
+        let mut partial = None;
+        match prepare_cache_request(caches, root, worktree, request, &prepared, &mut partial) {
+            Ok(entry) => prepared.push(entry),
+            Err(code) => {
+                // The failing request's own partially created directories are rolled back on the
+                // same terms as the earlier ones, so a request that fails after creating its
+                // namespace cannot leak it either.
+                prepared.extend(partial);
+                roll_back_prepared(caches, prepared);
+                return Err(code);
+            }
         }
-        let namespace = CacheNamespaceId::new(request.key.clone()).ok_or(FailureCode::Internal)?;
-        let cache = CacheLifecycle::retain(root, namespace, request.identity.clone(), worktree)
-            .map_err(|_| FailureCode::ProviderUnavailable)?;
-        let path = cache.namespace_path().ok_or(FailureCode::Internal)?;
-        if request
-            .required
-            .iter()
-            .any(|directory| CacheRoot::prepare(path.join(directory)).is_err())
-        {
-            return Err(FailureCode::ProviderUnavailable);
-        }
-        prepared.push((request.key.clone(), cache));
     }
-    let mut keys = Vec::with_capacity(prepared.len());
-    for (key, cache) in prepared {
-        caches.insert(key.clone(), cache);
-        keys.push(key);
+    for (key, cache, _) in prepared {
+        // A freshly retained lifecycle is non-quiescent, so it correctly represents the incoming
+        // owner both for a first retention and for an accepted handoff of an existing namespace.
+        caches.insert(key, cache);
     }
     Ok(keys)
+}
+
+/// Validates and creates one request's namespace on disk, reporting the directories it created.
+///
+/// Every existence check happens before the matching creation, so the returned list contains only
+/// directories this call is proven to have created: an already-present namespace or subdirectory
+/// is reported as pre-existing and therefore never becomes rollback-eligible.
+fn prepare_cache_request(
+    caches: &BTreeMap<String, CacheLifecycle>,
+    root: &CacheRoot,
+    worktree: &crate::workspace::authority::WorktreeRef,
+    request: &CacheRequest,
+    prepared: &[PreparedCache],
+    partial: &mut Option<PreparedCache>,
+) -> Result<PreparedCache, FailureCode> {
+    if let Some(existing) = caches.get(&request.key) {
+        if !existing.quiescent() {
+            return Err(FailureCode::Conflict);
+        }
+        if !existing.handoff_allowed(&request.identity) {
+            return Err(FailureCode::ProviderUnavailable);
+        }
+    } else if !prepared.iter().any(|(key, _, _)| key == &request.key)
+        && caches.len() + prepared.len() >= MAX_CACHE_NAMESPACES
+    {
+        return Err(FailureCode::Capacity);
+    }
+    let Some(namespace) = CacheNamespaceId::new(request.key.clone()) else {
+        return Err(FailureCode::Internal);
+    };
+    let namespace_existed = root.contains(&namespace);
+    let Ok(cache) = CacheLifecycle::retain(root, namespace, request.identity.clone(), worktree)
+    else {
+        return Err(FailureCode::ProviderUnavailable);
+    };
+    let Some(path) = cache.namespace_path().map(std::path::Path::to_path_buf) else {
+        return Err(FailureCode::Internal);
+    };
+    let mut created = Vec::new();
+    if !namespace_existed {
+        created.push(path.clone());
+    }
+    for directory in request.required {
+        let directory = path.join(directory);
+        let existed = directory.symlink_metadata().is_ok();
+        if CacheRoot::prepare(&directory).is_err() {
+            *partial = Some((request.key.clone(), cache, created));
+            return Err(FailureCode::ProviderUnavailable);
+        }
+        if !existed && !namespace_existed {
+            created.push(directory);
+        }
+    }
+    Ok((request.key.clone(), cache, created))
+}
+
+/// Removes only the directories a failed activation is proven to have created, never retained state.
+///
+/// Rollback is attempted solely for namespaces whose own directory did not exist before this
+/// operation, and each removal is an identity-checked *empty*-directory removal, so any content a
+/// peer wrote concurrently stops the removal instead of destroying it. A namespace that cannot be
+/// fully removed is not silently leaked: its quiescent lifecycle is recorded in `caches`, where it
+/// counts against `MAX_CACHE_NAMESPACES` and is reusable by an identical retry, so repeated failed
+/// unique activations refuse growth rather than growing the disk without bound.
+fn roll_back_prepared(caches: &mut BTreeMap<String, CacheLifecycle>, prepared: Vec<PreparedCache>) {
+    for (key, mut cache, created) in prepared.into_iter().rev() {
+        if created.is_empty() {
+            continue;
+        }
+        if created
+            .iter()
+            .rev()
+            .all(|path| crate::app::cache::discard_empty_namespace_directory(path))
+        {
+            continue;
+        }
+        cache.quiesce();
+        caches.entry(key).or_insert(cache);
+    }
 }
 
 /// Returns the immutable settings identity used by cache compatibility and namespace derivation.
@@ -890,8 +1057,46 @@ pub(super) fn managed_sandbox_from_job(job: &Job) -> bool {
         == Some("managed")
 }
 
+/// Fixed compatibility-identity marker used only by the shared native namespace.
+///
+/// It deliberately excludes any worktree so every divergent worktree with a compatible
+/// executable/settings/toolchain/effective-rights identity resolves to the same shared key and,
+/// through it, to the same one heavy `gopls` listener.
+pub(super) const SHARED_NATIVE_CACHE_STATE: &str = "shared-native-v1";
+
+/// Returns the one canonical effective-rights identity used by the cache key, the `CacheIdentity`,
+/// the `GoplsProfile` compatibility key, and the shared refcount.
+///
+/// `gopls` backends are shared, so their identity binds the launch trust to the effective rights
+/// the observed sandbox state actually grants (see `HostSandboxState::effective_rights_identity`);
+/// an exclusive Rust view keeps its launch trust unchanged. Deriving all four from this one value
+/// is what prevents a partially normalized hash from admitting an actor to a listener whose cache
+/// key it does not actually match.
+fn effective_trust(launch: &ProviderLaunch, rights: &str) -> String {
+    match launch.settings {
+        AcceptedProviderSettings::GoplsDefaults => format!("{}|{}", launch.trust, rights),
+        AcceptedProviderSettings::RustCachePrimingDisabledV1 => launch.trust.clone(),
+    }
+}
+
+/// Returns the job's canonical effective-rights identity, or the finite missing-state failure.
+pub(super) fn effective_rights_from_job(job: &Job) -> Result<String, FailureCode> {
+    Ok(crate::execution::effective_rights_identity(
+        job.observed
+            .as_ref()
+            .ok_or(FailureCode::SandboxState)?
+            .state()
+            .as_json(),
+    ))
+}
+
 /// Derives one opaque namespace component from durable worktree and accepted provider identities.
-fn provider_cache_key(worktree_state: &str, launch: &ProviderLaunch, settings: &str) -> String {
+fn provider_cache_key(
+    worktree_state: &str,
+    launch: &ProviderLaunch,
+    settings: &str,
+    trust: &str,
+) -> String {
     blake3::hash(
         format!(
             "{}\0{}\0{}\0{}\0{}\0{}",
@@ -900,7 +1105,7 @@ fn provider_cache_key(worktree_state: &str, launch: &ProviderLaunch, settings: &
             launch.executable.identity,
             settings,
             launch.toolchain,
-            launch.trust
+            trust
         )
         .as_bytes(),
     )

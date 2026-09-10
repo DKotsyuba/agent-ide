@@ -393,6 +393,7 @@ impl WorkerHandle {
                 workspace,
                 observations,
                 grants: BTreeMap::new(),
+                pending_revocations: std::collections::BTreeSet::new(),
                 registered: BTreeMap::new(),
                 baselines: BTreeMap::new(),
                 source_sequence: 0,
@@ -722,6 +723,11 @@ impl WorkerHandle {
     }
 }
 
+/// Bounds the in-memory pending-revocation set so an unbounded stream of failed durable revokes
+/// cannot grow it. A full set refuses to record a further pending binding rather than evicting one;
+/// the caller still learns the failure, and a daemon restart boot-fences every old grant anyway.
+const MAX_PENDING_REVOCATIONS: usize = 64;
+
 /// One boot's sequential durable owner; provider operations may be interrupted by inspection service.
 struct Worker<'a> {
     /// Shared bounded ingress and liveness state.
@@ -732,6 +738,10 @@ struct Worker<'a> {
     observations: WorkspaceStore<'a>,
     /// Recoverable committed activation receipts, at most one for each live host binding.
     grants: BTreeMap<BindingRef, StartReceipt>,
+    /// Bindings whose provider settlement succeeded but whose durable revoke failed, so their
+    /// receipt, caches and registrations are deliberately retained for a bounded cleanup-only
+    /// retry. It never carries a physical-process uncertainty, which stays in `uncertain`.
+    pending_revocations: std::collections::BTreeSet<BindingRef>,
     /// Only explicitly requested paths are polled; no directory scanning is performed.
     registered: BTreeMap<BindingRef, std::collections::BTreeSet<std::path::PathBuf>>,
     /// Durable partial activation baselines retained for same-binding diff provenance.
@@ -940,6 +950,8 @@ impl<'a> Worker<'a> {
             )
             .await
             .map_err(|_| FailureCode::WorkspaceActivation)?;
+        self.reconcile_pending_revocations(&tree, job.invocation.actor_id())
+            .await;
         let mut identity = blake3::Hasher::new();
         identity.update(&binding.fingerprint());
         identity.update(
@@ -959,7 +971,13 @@ impl<'a> Worker<'a> {
         // Do not cancel an in-flight durable commit: preserve its recoverable receipt before fencing output.
         let receipt = match self.workspace.activate(request).await {
             Ok(receipt) => receipt,
-            Err(crate::workspace::durable::DurableError::OperationConflict) => {
+            Err(
+                crate::workspace::durable::DurableError::OperationConflict
+                | crate::workspace::durable::DurableError::Authority(
+                    crate::workspace::authority::AuthorityError::WorktreeOwned
+                    | crate::workspace::authority::AuthorityError::ActorAlreadyOwnsWorktree,
+                ),
+            ) => {
                 return Err(FailureCode::Conflict);
             }
             Err(
@@ -979,8 +997,11 @@ impl<'a> Worker<'a> {
                 if let Ok(mut guard) = self.shared.bindings.lock() {
                     let _ = guard.stop_binding(&binding);
                 }
-                let _ = self.revoke(&binding, &job.reference).await;
-                return Err(error);
+                return Err(self
+                    .settle_revocation(&binding)
+                    .await
+                    .err()
+                    .unwrap_or(error));
             }
         };
         let baseline = self
@@ -988,17 +1009,17 @@ impl<'a> Worker<'a> {
             .await;
         let launches = job.target.providers.clone();
         let managed_sandbox = providers::managed_sandbox_from_job(job);
+        let rights = providers::effective_rights_from_job(job)?;
         // A second concurrent actor on the same physical worktree cannot share a single-owner
         // namespace: fail its activation with the finite reason and roll its own grant back, so the
         // actor that already owns the cache keeps running and can hand off after it stops.
         if let Err(code) =
-            self.retain_worktree_caches(&binding, &authority, &launches, managed_sandbox)
+            self.retain_worktree_caches(&binding, &authority, &launches, managed_sandbox, &rights)
         {
             if let Ok(mut guard) = self.shared.bindings.lock() {
                 let _ = guard.stop_binding(&binding);
             }
-            let _ = self.revoke(&binding, &job.reference).await;
-            return Err(code);
+            return Err(self.settle_revocation(&binding).await.err().unwrap_or(code));
         }
         self.shared.active(&binding)?;
         let baseline = match baseline {
@@ -1355,31 +1376,83 @@ impl<'a> Worker<'a> {
         ))
     }
 
+    /// Settles one stop by positively closing this binding's providers first and only then durably
+    /// revoking its grant, so a failed durable half keeps full retry authority.
+    ///
+    /// On durable failure the receipt, this binding's cache keys (still non-quiescent), and its
+    /// registered paths are all deliberately retained and the binding is marked pending, so a later
+    /// fresh start can commit the same revoke before minting a new grant. Nothing here restores the
+    /// stopped binding's source or provider authority and no stop is ever replayed: the host
+    /// binding was already stopped by the ingress path and stays unusable either way. A daemon
+    /// restart boot-fences old grants independently, so pending state is intentionally in-memory.
+    async fn settle_revocation(&mut self, binding: &BindingRef) -> Result<(), FailureCode> {
+        self.close_provider(binding).await?;
+        let Some(receipt) = self.grants.get(binding).cloned() else {
+            self.pending_revocations.remove(binding);
+            self.release_binding_state(binding);
+            return Ok(());
+        };
+        let operation = OperationId::new(format!(
+            "stop-{}",
+            blake3::Hash::from_bytes(binding.fingerprint()).to_hex()
+        ))
+        .map_err(|_| FailureCode::Internal)?;
+        if self
+            .workspace
+            .revoke(operation, &receipt, StopBindingHandoff::Confirmed)
+            .await
+            .is_err()
+        {
+            if self.pending_revocations.len() < MAX_PENDING_REVOCATIONS {
+                self.pending_revocations.insert(binding.clone());
+            }
+            return Err(FailureCode::WorkspaceAuthority);
+        }
+        self.grants.remove(binding);
+        self.pending_revocations.remove(binding);
+        self.release_binding_state(binding);
+        Ok(())
+    }
+
+    /// Releases the binding-owned state that only a committed durable revoke makes safe to clear.
+    fn release_binding_state(&mut self, binding: &BindingRef) {
+        self.quiesce_worktree_caches(binding);
+        self.registered.remove(binding);
+        self.baselines.remove(binding);
+    }
+
+    /// Commits a still-pending revoke that this fresh start would otherwise race, before any new
+    /// grant is minted for the same canonical worktree or the same incoming actor.
+    ///
+    /// This is cleanup-only receipt recovery: it can only retry the exact stop operation the failed
+    /// settlement already derived from that binding, never mint or restore authority.
+    async fn reconcile_pending_revocations(
+        &mut self,
+        tree: &crate::workspace::authority::WorktreeRef,
+        actor: &str,
+    ) {
+        let pending = self
+            .pending_revocations
+            .iter()
+            .filter(|binding| {
+                self.grants.get(*binding).is_some_and(|receipt| {
+                    receipt.worktree().id() == tree.id() || receipt.actor() == actor
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for binding in pending {
+            let _ = self.settle_revocation(&binding).await;
+        }
+    }
+
     /// Revokes a recoverable receipt after host stop; absent grants are explicitly harmless.
     async fn revoke(
         &mut self,
         binding: &BindingRef,
         _reference: &str,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
-        self.close_provider(binding).await?;
-        self.quiesce_worktree_caches(binding);
-        self.registered.remove(binding);
-        self.baselines.remove(binding);
-        if let Some(receipt) = self.grants.get(binding).cloned() {
-            self.workspace
-                .revoke(
-                    OperationId::new(format!(
-                        "stop-{}",
-                        blake3::Hash::from_bytes(binding.fingerprint()).to_hex()
-                    ))
-                    .map_err(|_| FailureCode::Internal)?,
-                    &receipt,
-                    StopBindingHandoff::Confirmed,
-                )
-                .await
-                .map_err(|_| FailureCode::WorkspaceAuthority)?;
-            self.grants.remove(binding);
-        }
+        self.settle_revocation(binding).await?;
         if self.uncertain.contains(binding) {
             return Err(FailureCode::Internal);
         }

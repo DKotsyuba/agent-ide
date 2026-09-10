@@ -1536,7 +1536,9 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .collect::<Vec<_>>();
-    assert_eq!(cache_namespaces.len(), 1);
+    // One shared native namespace (holding only `gopls/`, keyed by executable/settings/toolchain/
+    // trust) plus one private per-worktree namespace (holding `go-build`/`go-mod`/`tmp`).
+    assert_eq!(cache_namespaces.len(), 2);
     let pending = actor
         .call(
             &fixture,
@@ -1554,15 +1556,26 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
     .unwrap();
     let pid: libc::pid_t = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
     let provider_environment = std::fs::read_to_string(environment).unwrap();
-    let namespace = &cache_namespaces[0];
+    let shared_namespace = cache_namespaces
+        .iter()
+        .find(|namespace| namespace.join("gopls").is_dir())
+        .expect("shared native namespace");
+    let worktree_namespace = cache_namespaces
+        .iter()
+        .find(|namespace| namespace.join("go-build").is_dir())
+        .expect("per-worktree namespace");
+    // The shared listener process env carries only the shared, process-global `GOPLSCACHE` and a
+    // backend-scoped native `TMPDIR` inside that same shared namespace; the per-worktree
+    // `GOCACHE`/`GOMODCACHE`/`GOTMPDIR` are never process env (they are delivered per view through
+    // the LSP session instead), so those three are unset here.
     assert_eq!(
         provider_environment.lines().collect::<Vec<_>>(),
         vec![
-            namespace.join("gopls").to_str().unwrap(),
-            namespace.join("go-build").to_str().unwrap(),
-            namespace.join("go-mod").to_str().unwrap(),
-            namespace.join("tmp").to_str().unwrap(),
-            namespace.join("tmp").to_str().unwrap(),
+            shared_namespace.join("gopls").to_str().unwrap(),
+            "",
+            "",
+            "",
+            shared_namespace.join("tmp").to_str().unwrap(),
             "/usr/bin",
         ]
     );
@@ -1576,10 +1589,7 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
             .collect::<Vec<_>>(),
         vec![
             "AGENT_IDE_GOPLS_PROFILE",
-            "GOCACHE",
-            "GOMODCACHE",
             "GOPLSCACHE",
-            "GOTMPDIR",
             "GOTOOLCHAIN",
             "PATH",
             "TMPDIR",
@@ -1592,7 +1602,8 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
     // of a false "stop" success.
     assert_eq!(stopped["code"], "internal", "{stopped}");
     assert_eq!(stopped["state"], "error", "{stopped}");
-    assert!(cache_namespaces[0].is_dir());
+    assert!(shared_namespace.is_dir());
+    assert!(worktree_namespace.is_dir());
     // SAFETY: zero only probes the fixture's previously recorded direct-child PID; it sends no signal.
     assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
     assert_eq!(
@@ -1792,8 +1803,9 @@ async fn configured_product_sigterm_reaps_in_flight_rust_only_provider() {
     actor.mcp.close().await;
 }
 
-/// Two configured root/child channels on divergent worktrees each get an isolated compatible
-/// listener even under one configured cache label, while current source and stop stay isolated.
+/// Two configured root/child channels on divergent worktrees share the one compatible heavy
+/// listener and its shared native namespace, each through its own forwarder view and its own
+/// private Go build/module/temp namespace, while current source and stop stay isolated.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_GOPLS and AGENT_IDE_GO environment"]
 async fn configured_product_isolates_go_across_two_divergent_worktree_actors() {
@@ -1909,9 +1921,11 @@ async fn configured_product_isolates_go_across_two_divergent_worktree_actors() {
         .lines()
         .filter(|line| line.contains("-remote=unix;"))
         .collect::<Vec<_>>();
-    // Root and child are divergent worktrees, so strict cache ownership gives each its own
-    // physical backend: two listeners, each with exactly one forwarder view.
-    assert_eq!(listeners.len(), 2, "{invocations}");
+    // Root and child are divergent worktrees with a compatible executable/settings/toolchain/trust
+    // identity, so they share the one heavy gopls listener (its process-global on-disk filecache is
+    // bound to a single shared native namespace) while each worktree still gets its own forwarder
+    // view and its own private Go build/module/temp namespace.
+    assert_eq!(listeners.len(), 1, "{invocations}");
     assert_eq!(forwarders.len(), 2, "{invocations}");
     assert!(
         forwarders
@@ -1933,9 +1947,40 @@ async fn configured_product_isolates_go_across_two_divergent_worktree_actors() {
         .filter_map(Result::ok)
         .filter(|entry| entry.file_name().to_string_lossy().starts_with("g-"))
         .count();
-    assert_eq!(sockets, 2);
+    assert_eq!(sockets, 1);
+    let cache_root = fixture.runtime.join("cache");
+    let worktree_namespaces_before = std::fs::read_dir(&cache_root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().join("go-build").is_dir())
+        .count();
+    // One shared native namespace (holding `gopls/`) plus one private namespace per worktree
+    // (holding `go-build`/`go-mod`/`tmp`).
+    assert_eq!(worktree_namespaces_before, 2, "{cache_root:?}");
+    assert!(
+        std::fs::read_dir(&cache_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.path().join("gopls").is_dir()),
+        "{cache_root:?}"
+    );
     let stop = root.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stop["kind"], "stop", "{stop}");
+    // Stopping root's actor must not retire child's still-live worktree namespace, and the shared
+    // native namespace and root's own worktree namespace must also survive this handoff.
+    let worktree_namespaces_after = std::fs::read_dir(&cache_root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().join("go-build").is_dir())
+        .count();
+    assert_eq!(worktree_namespaces_after, 2, "{cache_root:?}");
+    assert!(
+        std::fs::read_dir(&cache_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.path().join("gopls").is_dir()),
+        "{cache_root:?}"
+    );
     let live = child
         .call(
             &fixture,
@@ -1945,6 +1990,7 @@ async fn configured_product_isolates_go_across_two_divergent_worktree_actors() {
         .await;
     let live = child.settle(&fixture, live).await;
     assert!(live["text"].as_str().unwrap().contains("mode: semantic"));
+    assert!(live["text"].as_str().unwrap().contains("child-value"));
     let stop = child.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stop["kind"], "stop", "{stop}");
     tokio::join!(root.mcp.close(), child.mcp.close());

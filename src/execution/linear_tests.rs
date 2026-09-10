@@ -281,3 +281,65 @@ fn managed_provider_search_path_is_explicit_and_complete() {
             .to_vec()
     );
 }
+
+/// Two identical relative managed policies under different cwds must not share effective rights.
+///
+/// This is the sharing split GSC1 names: the same policy JSON resolved from `/a` and from `/b`
+/// grants access to different absolute directories, so their identities must differ even though the
+/// literal policy text is byte-identical. The positive half proves the identity is not merely
+/// "hash everything": two states whose roots resolve to the *same* absolute directory share one
+/// identity even though their `sandboxCwd` values differ, and a disabled profile — which applies no
+/// cwd-derived restriction at all — shares across cwd under existing policy.
+#[test]
+fn effective_rights_identity_splits_relative_roots_and_shares_equal_absolute_rights() {
+    use super::effective_rights_identity;
+    let relative = |cwd: &str| {
+        serde_json::json!({
+            "permissionProfile":{"type":"managed","file_system":{"roots":["work"]},"network":false},
+            "codexLinuxSandboxExe":null,"sandboxCwd":cwd,"useLegacyLandlock":false
+        })
+    };
+    assert_ne!(
+        effective_rights_identity(&relative("/private/tmp/a")),
+        effective_rights_identity(&relative("/private/tmp/b")),
+        "a relative root under a different cwd grants different rights and must not be shared"
+    );
+    assert_eq!(
+        effective_rights_identity(&relative("/private/tmp/a")),
+        effective_rights_identity(&serde_json::json!({
+            "permissionProfile":{"type":"managed","file_system":{"roots":["/private/tmp/a/work"]},"network":false},
+            "codexLinuxSandboxExe":null,"sandboxCwd":"/private/tmp/elsewhere","useLegacyLandlock":false
+        })),
+        "equal effective absolute rights share one identity even from a different cwd"
+    );
+    let disabled = |cwd: &str| {
+        serde_json::json!({
+            "permissionProfile":{"type":"disabled"},
+            "codexLinuxSandboxExe":null,"sandboxCwd":cwd,"useLegacyLandlock":false
+        })
+    };
+    assert_eq!(
+        effective_rights_identity(&disabled("/private/tmp/a")),
+        effective_rights_identity(&disabled("/private/tmp/b")),
+        "a disabled profile applies no cwd-derived restriction and stays shareable"
+    );
+    // A managed profile that declares no root, an unwalkable root shape, and a `..` escape all stay
+    // non-shareable across cwd instead of being widened into a match.
+    for unproven in [
+        serde_json::json!({"type":"managed","file_system":{},"network":false}),
+        serde_json::json!({"type":"managed","file_system":{"roots":[{"opaque":1}]},"network":false}),
+        serde_json::json!({"type":"managed","file_system":{"roots":["../escape"]},"network":false}),
+    ] {
+        let state = |cwd: &str| {
+            serde_json::json!({
+                "permissionProfile":unproven,"codexLinuxSandboxExe":null,
+                "sandboxCwd":cwd,"useLegacyLandlock":false
+            })
+        };
+        assert_ne!(
+            effective_rights_identity(&state("/private/tmp/a")),
+            effective_rights_identity(&state("/private/tmp/b")),
+            "an unproven managed policy must fail closed rather than share: {unproven}"
+        );
+    }
+}

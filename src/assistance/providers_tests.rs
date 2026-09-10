@@ -60,11 +60,13 @@ fn plan() -> Vec<CacheRequest> {
             key: "first-provider".to_owned(),
             identity: identity("first"),
             required: &["gopls"],
+            shared: false,
         },
         CacheRequest {
             key: "second-provider".to_owned(),
             identity: identity("second"),
             required: &["target"],
+            shared: false,
         },
     ]
 }
@@ -81,9 +83,10 @@ fn a_late_provider_failure_leaves_earlier_lifecycles_reusable_and_retries_cleanl
     let root = CacheRoot::prepare(&root_path).unwrap();
     let tree = worktree(&temporary());
     let mut caches: BTreeMap<String, CacheLifecycle> = BTreeMap::new();
+    let shared_refs: BTreeMap<String, usize> = BTreeMap::new();
     let plan = plan();
 
-    let keys = retain_cache_plan(&mut caches, &root, &tree, &plan).unwrap();
+    let keys = retain_cache_plan(&mut caches, &shared_refs, &root, &tree, &plan).unwrap();
     assert_eq!(keys, vec!["first-provider", "second-provider"]);
     for cache in caches.values_mut() {
         cache.quiesce();
@@ -95,7 +98,7 @@ fn a_late_provider_failure_leaves_earlier_lifecycles_reusable_and_retries_cleanl
     fs::remove_dir_all(&blocked).unwrap();
     fs::write(&blocked, b"not a directory").unwrap();
     assert_eq!(
-        retain_cache_plan(&mut caches, &root, &tree, &plan),
+        retain_cache_plan(&mut caches, &shared_refs, &root, &tree, &plan),
         Err(FailureCode::ProviderUnavailable)
     );
     assert_eq!(caches.len(), 2);
@@ -120,7 +123,7 @@ fn a_late_provider_failure_leaves_earlier_lifecycles_reusable_and_retries_cleanl
 
     fs::remove_file(&blocked).unwrap();
     assert_eq!(
-        retain_cache_plan(&mut caches, &root, &tree, &plan).unwrap(),
+        retain_cache_plan(&mut caches, &shared_refs, &root, &tree, &plan).unwrap(),
         vec!["first-provider", "second-provider"]
     );
     assert!(caches.values().all(|cache| !cache.quiescent()));
@@ -134,11 +137,12 @@ fn a_live_namespace_owner_is_reported_as_a_conflict_until_it_quiesces() {
     let root = CacheRoot::prepare(&root_path).unwrap();
     let tree = worktree(&temporary());
     let mut caches: BTreeMap<String, CacheLifecycle> = BTreeMap::new();
+    let shared_refs: BTreeMap<String, usize> = BTreeMap::new();
     let plan = plan();
 
-    retain_cache_plan(&mut caches, &root, &tree, &plan).unwrap();
+    retain_cache_plan(&mut caches, &shared_refs, &root, &tree, &plan).unwrap();
     assert_eq!(
-        retain_cache_plan(&mut caches, &root, &tree, &plan),
+        retain_cache_plan(&mut caches, &shared_refs, &root, &tree, &plan),
         Err(FailureCode::Conflict),
         "a concurrent actor must see a finite ownership conflict, not silent unknown reuse"
     );
@@ -151,7 +155,7 @@ fn a_live_namespace_owner_is_reported_as_a_conflict_until_it_quiesces() {
     for cache in caches.values_mut() {
         cache.quiesce();
     }
-    retain_cache_plan(&mut caches, &root, &tree, &plan).expect("handoff after stop");
+    retain_cache_plan(&mut caches, &shared_refs, &root, &tree, &plan).expect("handoff after stop");
 
     // An identical key whose effective configuration changed is an incompatibility, not a conflict.
     for cache in caches.values_mut() {
@@ -161,9 +165,10 @@ fn a_live_namespace_owner_is_reported_as_a_conflict_until_it_quiesces() {
         key: "first-provider".to_owned(),
         identity: identity("relaunched-with-other-configuration"),
         required: &["gopls"],
+        shared: false,
     }];
     assert_eq!(
-        retain_cache_plan(&mut caches, &root, &tree, &incompatible),
+        retain_cache_plan(&mut caches, &shared_refs, &root, &tree, &incompatible),
         Err(FailureCode::ProviderUnavailable)
     );
     fs::remove_dir_all(root_path).unwrap();
@@ -176,6 +181,7 @@ fn bounded_lifecycle_ownership_fails_closed_instead_of_evicting_retained_state()
     let root = CacheRoot::prepare(&root_path).unwrap();
     let tree = worktree(&temporary());
     let mut caches: BTreeMap<String, CacheLifecycle> = BTreeMap::new();
+    let shared_refs: BTreeMap<String, usize> = BTreeMap::new();
     for index in 0..MAX_CACHE_NAMESPACES {
         let key = format!("held-{index}");
         let mut cache = CacheLifecycle::retain(
@@ -189,7 +195,7 @@ fn bounded_lifecycle_ownership_fails_closed_instead_of_evicting_retained_state()
         caches.insert(key, cache);
     }
     assert_eq!(
-        retain_cache_plan(&mut caches, &root, &tree, &plan()),
+        retain_cache_plan(&mut caches, &shared_refs, &root, &tree, &plan()),
         Err(FailureCode::Capacity)
     );
     assert_eq!(caches.len(), MAX_CACHE_NAMESPACES);
@@ -200,8 +206,93 @@ fn bounded_lifecycle_ownership_fails_closed_instead_of_evicting_retained_state()
         key: "held-0".to_owned(),
         identity: identity("held"),
         required: &["gopls"],
+        shared: false,
     }];
-    retain_cache_plan(&mut caches, &root, &tree, &held).expect("reopening a held namespace");
+    retain_cache_plan(&mut caches, &shared_refs, &root, &tree, &held)
+        .expect("reopening a held namespace");
     assert_eq!(caches.len(), MAX_CACHE_NAMESPACES);
+    fs::remove_dir_all(root_path).unwrap();
+}
+
+/// Repeated failed unique activations must not grow the lifecycle map, refcounts, or the disk.
+///
+/// This is the GSC4 regression: every attempt uses a fresh unique first key, so before the rollback
+/// each failure left a newly created namespace behind that no `binding_caches` entry, no lifecycle
+/// map entry and no capacity bound ever accounted for. Only directories this failed operation is
+/// proven to have created are removed, and the pre-existing retained namespace it did not create
+/// keeps both its directory and its contents.
+#[test]
+fn a_failed_later_provider_leaves_no_unaccounted_namespace_or_directory_growth() {
+    let root_path = temporary();
+    let root = CacheRoot::prepare(&root_path).unwrap();
+    let tree = worktree(&temporary());
+    let mut caches: BTreeMap<String, CacheLifecycle> = BTreeMap::new();
+    let shared_refs: BTreeMap<String, usize> = BTreeMap::new();
+
+    // One pre-existing retained namespace with real content the rollback must never touch.
+    let retained = vec![CacheRequest {
+        key: "retained-provider".to_owned(),
+        identity: identity("retained"),
+        required: &["gopls"],
+        shared: false,
+    }];
+    retain_cache_plan(&mut caches, &shared_refs, &root, &tree, &retained).unwrap();
+    let retained_content = root_path.join("retained-provider").join("gopls").join("db");
+    fs::write(&retained_content, b"native cache content").unwrap();
+
+    // A stale regular file blocks the second provider's required directory on every attempt.
+    let blocked_root = root_path.join("blocked-provider");
+    fs::create_dir(&blocked_root).unwrap();
+    fs::set_permissions(
+        &blocked_root,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    fs::write(blocked_root.join("target"), b"not a directory").unwrap();
+
+    for attempt in 0..8 {
+        let plan = vec![
+            CacheRequest {
+                key: format!("unique-provider-{attempt}"),
+                identity: identity("unique"),
+                required: &["gopls", "tmp"],
+                shared: false,
+            },
+            CacheRequest {
+                key: "blocked-provider".to_owned(),
+                identity: identity("blocked"),
+                required: &["target"],
+                shared: false,
+            },
+        ];
+        assert_eq!(
+            retain_cache_plan(&mut caches, &shared_refs, &root, &tree, &plan),
+            Err(FailureCode::ProviderUnavailable)
+        );
+        assert_eq!(
+            caches.len(),
+            1,
+            "attempt {attempt} must leave only the pre-existing retained lifecycle accounted"
+        );
+        assert!(
+            !root_path
+                .join(format!("unique-provider-{attempt}"))
+                .exists(),
+            "attempt {attempt} must roll back the namespace it alone created"
+        );
+    }
+    // Only the retained namespace and the pre-existing blocked directory remain on disk.
+    let mut remaining = fs::read_dir(&root_path)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    remaining.sort();
+    assert_eq!(remaining, vec!["blocked-provider", "retained-provider"]);
+    assert_eq!(
+        fs::read_to_string(&retained_content).unwrap(),
+        "native cache content",
+        "rollback must never remove pre-existing retained contents"
+    );
     fs::remove_dir_all(root_path).unwrap();
 }

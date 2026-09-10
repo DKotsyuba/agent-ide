@@ -3520,6 +3520,133 @@ fn has_multiple_roots(value: &serde_json::Map<String, Value>) -> bool {
     })
 }
 
+/// Returns the canonical effective-rights identity two actors must match to share one provider
+/// backend, its native cache namespace, and its refcount.
+///
+/// The identity covers the whole observed state, never a hand-picked subset, and drops
+/// `sandboxCwd` only once the rights the state actually grants are proven equal without it:
+///
+/// * a `disabled` profile applies no cwd-derived filesystem restriction, so its rights are already
+///   cwd-independent and the cwd is omitted;
+/// * a `managed` profile omits the cwd only when every declared root (`roots`/`*_roots`) resolves
+///   to a *normal absolute* path — a cwd-relative root is resolved against this state's own
+///   absolute sandbox cwd first, so the identity describes absolute rights rather than a relative
+///   policy string;
+/// * every other state — a managed profile that declares no root at all, an unknown or
+///   unparseable envelope, an unsupported cwd, or a root shape this function cannot walk — keeps
+///   `sandboxCwd` in the digest.
+///
+/// That last case is deliberately fail-closed: an identical relative policy under a different cwd
+/// then yields a *different* identity and is never shared, and no sandbox policy is ever broadened
+/// to make two actors match.
+pub fn effective_rights_identity(state: &Value) -> String {
+    let mut canonical = state.clone();
+    if let Some(object) = canonical.as_object_mut() {
+        let profile_type = object
+            .get("permissionProfile")
+            .and_then(Value::as_object)
+            .and_then(|profile| profile.get("type"))
+            .and_then(Value::as_str);
+        let cwd = object
+            .get("sandboxCwd")
+            .and_then(Value::as_str)
+            .and_then(|cwd| local_sandbox_cwd(cwd).ok());
+        let shareable = match (profile_type, cwd) {
+            (Some("disabled"), _) => true,
+            (Some("managed"), Some(cwd)) => object
+                .get("permissionProfile")
+                .and_then(|profile| {
+                    let mut proven = false;
+                    let normalized = normalize_rights_roots(profile, &cwd, 0, &mut proven)?;
+                    proven.then_some(normalized)
+                })
+                .is_some_and(|normalized| {
+                    object.insert("permissionProfile".into(), normalized);
+                    true
+                }),
+            _ => false,
+        };
+        if shareable {
+            object.remove("sandboxCwd");
+        }
+    }
+    blake3::hash(canonical.to_string().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+/// Bounds the permission-profile nesting this module is willing to claim it understands.
+const MAX_RIGHTS_DEPTH: usize = 8;
+
+/// Rewrites every declared sandbox root to its effective absolute path, or refuses the whole value.
+///
+/// Returns `None` as soon as any part of the profile cannot be proven: a root key whose value is
+/// not an array of strings, a root that does not resolve to a normal absolute path, or nesting
+/// deeper than `MAX_RIGHTS_DEPTH`. `proven` is set once at least one root was actually normalized,
+/// so a managed profile that declares no root at all is never treated as cwd-independent.
+fn normalize_rights_roots(
+    value: &Value,
+    cwd: &Path,
+    depth: usize,
+    proven: &mut bool,
+) -> Option<Value> {
+    if depth > MAX_RIGHTS_DEPTH {
+        return None;
+    }
+    match value {
+        Value::Object(object) => {
+            let mut normalized = serde_json::Map::with_capacity(object.len());
+            for (key, child) in object {
+                if key == "roots" || key.ends_with("_roots") {
+                    let roots = child.as_array()?;
+                    let mut absolute = Vec::with_capacity(roots.len());
+                    for root in roots {
+                        absolute.push(Value::String(absolute_rights_root(root.as_str()?, cwd)?));
+                    }
+                    *proven = true;
+                    normalized.insert(key.clone(), Value::Array(absolute));
+                } else {
+                    normalized.insert(
+                        key.clone(),
+                        normalize_rights_roots(child, cwd, depth + 1, proven)?,
+                    );
+                }
+            }
+            Some(Value::Object(normalized))
+        }
+        Value::Array(items) => items
+            .iter()
+            .map(|item| normalize_rights_roots(item, cwd, depth + 1, proven))
+            .collect::<Option<Vec<_>>>()
+            .map(Value::Array),
+        other => Some(other.clone()),
+    }
+}
+
+/// Resolves one declared root against this state's absolute sandbox cwd without widening it.
+///
+/// An already-absolute root is kept, a relative root is joined onto `cwd`, and the result is
+/// accepted only when it is a normal absolute path, so `..` traversal or an unsupported `file://`
+/// spelling refuses the identity instead of inventing a broader right.
+fn absolute_rights_root(raw: &str, cwd: &Path) -> Option<String> {
+    let path = if let Some(path) = raw.strip_prefix("file://") {
+        if path.contains('%') || !path.starts_with('/') {
+            return None;
+        }
+        PathBuf::from(path)
+    } else {
+        PathBuf::from(raw)
+    };
+    let resolved = if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    };
+    is_normal_absolute(&resolved)
+        .then(|| resolved.to_str().map(str::to_owned))
+        .flatten()
+}
+
 /// Derives a local process cwd from a host cwd without modifying the opaque sandbox state.
 fn local_sandbox_cwd(raw: &str) -> Result<PathBuf, SandboxStateError> {
     let path = if let Some(path) = raw.strip_prefix("file://") {

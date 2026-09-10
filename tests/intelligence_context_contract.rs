@@ -15,7 +15,7 @@ use agent_ide::{
     intelligence::{
         context::{ContextMode, ContextQuery},
         freshness::{DiagnosticReadiness, Freshness, ViewGeneration},
-        session::{ProviderSettings, SessionOptions, with_session},
+        session::{GoEnv, ProviderSettings, SessionOptions, with_session},
     },
     workspace::{
         authority::WorktreeRef,
@@ -222,7 +222,14 @@ async fn real_gopls_production_context_tracks_exact_observed_bytes() {
             toolchain: 1,
             view: 1,
         },
-        ProviderSettings::GoplsDefaults,
+        ProviderSettings::GoplsDefaults(
+            GoEnv::new(
+                fixture.root.join("go-cache"),
+                fixture.root.join("module-cache"),
+                fixture.root.join("go-tmp"),
+            )
+            .expect("absolute private go namespace"),
+        ),
         SessionOptions {
             request_timeout: Duration::from_secs(30),
             lifetime: Duration::from_secs(90),

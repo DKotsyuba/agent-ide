@@ -241,9 +241,9 @@ async fn diagnostics_are_bounded_and_cache_reuse_requires_quiescent_compatibilit
     ));
     fs::create_dir_all(tree_root.join(".git")).unwrap();
     let durable_database = temporary("durable").with_extension("sqlite");
+    let durable_backups = temporary("durable-backups");
     let durable_store =
-        Store::open_with_backup_root(&durable_database, &temporary("durable-backups"), config())
-            .unwrap();
+        Store::open_with_backup_root(&durable_database, &durable_backups, config()).unwrap();
     let owner = DurableWorkspace::open(&durable_store).await.unwrap();
     let owned_tree = owner
         .resolve_worktree(tree_root.clone(), tree_root.clone(), PathBuf::from(".git"))
@@ -333,8 +333,93 @@ async fn diagnostics_are_bounded_and_cache_reuse_requires_quiescent_compatibilit
     fs::set_permissions(&failed_path, fs::Permissions::from_mode(0o700)).unwrap();
     failed_cache.retire(&closure).unwrap();
     assert!(!failed_cache.retained());
+
+    // A closure whose incarnation happens to match but whose canonical worktree does not — the
+    // exact same incarnation counter in a second Store, or a caller-built unverified reference —
+    // must delete nothing: the incarnation alone is Store-local, so ownership is the nonce-bound
+    // `WorktreeRef::id()` plus that incarnation.
+    let foreign_database = temporary("foreign").with_extension("sqlite");
+    let foreign_backups = temporary("foreign-backups");
+    let foreign_store =
+        Store::open_with_backup_root(&foreign_database, &foreign_backups, config()).unwrap();
+    let foreign_owner = DurableWorkspace::open(&foreign_store).await.unwrap();
+    let foreign_root = PathBuf::from(format!(
+        "/private/tmp/agent-ide-freshness-{}-{}-foreign-worktree",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(foreign_root.join(".git")).unwrap();
+    let foreign_tree = foreign_owner
+        .resolve_worktree(
+            foreign_root.clone(),
+            foreign_root.clone(),
+            PathBuf::from(".git"),
+        )
+        .await
+        .unwrap();
+    let foreign_closure = foreign_owner
+        .close_worktree(
+            OperationId::new("close-foreign-owner").unwrap(),
+            &foreign_tree,
+        )
+        .await
+        .unwrap();
+    let mut cross_store = CacheLifecycle::retain(
+        &cache_root,
+        CacheNamespaceId::new("cross-store").unwrap(),
+        identity.clone(),
+        &owned_tree,
+    )
+    .unwrap();
+    cross_store.quiesce();
+    assert_eq!(foreign_closure.incarnation(), closure.incarnation());
+    assert_ne!(foreign_closure.worktree(), closure.worktree());
+    assert!(
+        cross_store.retire(&foreign_closure).is_err(),
+        "a same-incarnation closure from another Store must retire nothing"
+    );
+    assert!(cross_store.retained());
+    assert!(cache_path.join("cross-store").is_dir());
+
+    // A caller-built (unverified) reference names the same path and incarnation but cannot produce
+    // the nonce-bound identity the durable owner minted, so it owns no namespace either.
+    let unverified = agent_ide::workspace::authority::WorktreeRef::from_discovery(
+        tree_root.clone(),
+        tree_root.clone(),
+        PathBuf::from(".git"),
+        owned_tree.incarnation(),
+    )
+    .unwrap();
+    assert_ne!(unverified.id(), owned_tree.id());
+    let mut unverified_cache = CacheLifecycle::retain(
+        &cache_root,
+        CacheNamespaceId::new("unverified-owner").unwrap(),
+        identity.clone(),
+        &unverified,
+    )
+    .unwrap();
+    unverified_cache.quiesce();
+    assert!(
+        unverified_cache.retire(&closure).is_err(),
+        "the durable closure must not retire a namespace owned by an unverified reference"
+    );
+    assert!(unverified_cache.retained());
+
     fs::remove_dir_all(root).unwrap();
     fs::remove_file(database).unwrap();
     fs::remove_dir_all(cache_path).unwrap();
     fs::remove_dir_all(tree_root).unwrap();
+    // Retain the durable database and its anonymous backup root until every Workspace and Store
+    // borrowing them has been dropped, then remove both instead of leaking them into the host.
+    drop(foreign_owner);
+    drop(foreign_store);
+    drop(owner);
+    drop(durable_store);
+    fs::remove_dir_all(foreign_root).unwrap();
+    for database in [&durable_database, &foreign_database] {
+        let _ = fs::remove_file(database);
+    }
+    for backups in [&durable_backups, &foreign_backups] {
+        let _ = fs::remove_dir_all(backups);
+    }
 }
