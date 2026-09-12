@@ -217,6 +217,24 @@ impl Default for Ledger {
     }
 }
 
+impl Ledger {
+    /// Retains one newly produced fact unless this binding already received the same issue.
+    ///
+    /// `feedback` is the current producer's bounded fact. An equal delivered identity removes any
+    /// older pending slot and returns `false`; a new identity replaces that slot and returns
+    /// `true`. This does not mark a fact delivered: only a successful inline send or hook
+    /// consumption may update `delivered`.
+    fn retain_feedback(&mut self, binding: &BindingRef, feedback: NativeFeedback) -> bool {
+        if self.delivered.get(binding) == Some(&feedback.identity) {
+            self.feedback.remove(binding);
+            false
+        } else {
+            self.feedback.insert(binding.clone(), feedback);
+            true
+        }
+    }
+}
+
 /// A short read request serviced by the same worker even while provider warmup is pending.
 struct Inspection {
     /// Freshly host-validated caller binding.
@@ -1685,34 +1703,30 @@ impl<'a> Worker<'a> {
             return Err(FailureCode::SourceUnavailable);
         }
         if let Ok(mut ledger) = self.shared.ledger.lock() {
-            match (feedback, diagnostic_fingerprint) {
-                (Some(feedback), Some(diagnostic_fingerprint)) => {
+            match (feedback, diagnostic_fingerprint, source.digest) {
+                (Some(feedback), Some(diagnostic_fingerprint), Some(source_digest)) => {
                     let identity = DeliveredIssue {
                         source_path: std::path::PathBuf::from(&source.path),
-                        source_digest: source.digest.unwrap_or([0; 32]),
+                        source_digest,
                         diagnostic_fingerprint: *diagnostic_fingerprint,
                     };
                     // A redundant helper run for the exact same unchanged issue already reached a
                     // caller (inline or via the hook) — never re-arm it as a fresh undelivered
                     // fact just because this job happened to run again.
-                    if ledger.delivered.get(&binding) == Some(&identity) {
-                        ledger.feedback.remove(&binding);
-                    } else {
-                        ledger.feedback.insert(
-                            binding.clone(),
-                            NativeFeedback {
-                                source: None,
-                                text: feedback.clone(),
-                                native_epoch: epoch,
-                                // Computing this job's reply is not submitting it: the caller may
-                                // still only hold `Pending` until a later Inspect, or lose it to a
-                                // deadline.
-                                inline_delivered: false,
-                                producer: job.reference.clone(),
-                                identity,
-                            },
-                        );
-                    }
+                    ledger.retain_feedback(
+                        &binding,
+                        NativeFeedback {
+                            source: None,
+                            text: feedback.clone(),
+                            native_epoch: epoch,
+                            // Computing this job's reply is not submitting it: the caller may
+                            // still only hold `Pending` until a later Inspect, or lose it to a
+                            // deadline.
+                            inline_delivered: false,
+                            producer: job.reference.clone(),
+                            identity,
+                        },
+                    );
                 }
                 _ => {
                     ledger.feedback.remove(&binding);
@@ -2122,24 +2136,19 @@ impl<'a> Worker<'a> {
                 // A redundant Context job for the exact same unchanged issue already reached a
                 // caller (inline or via the hook) — never re-arm it as a fresh undelivered fact
                 // just because this job happened to run again.
-                if ledger.delivered.get(&binding) == Some(&identity) {
-                    ledger.feedback.remove(&binding);
-                } else {
-                    ledger.feedback.insert(
-                        binding.clone(),
-                        NativeFeedback {
-                            source: Some(observed.clone()),
-                            text: feedback.render(),
-                            native_epoch: epoch,
-                            // Computing this job's reply is not submitting it: the caller may
-                            // still only hold `Pending` until a later Inspect, or lose it to a
-                            // deadline.
-                            inline_delivered: false,
-                            producer: job.reference.clone(),
-                            identity,
-                        },
-                    );
-                }
+                ledger.retain_feedback(
+                    &binding,
+                    NativeFeedback {
+                        source: Some(observed.clone()),
+                        text: feedback.render(),
+                        native_epoch: epoch,
+                        // Computing this job's reply is not submitting it: the caller may still
+                        // only hold `Pending` until a later Inspect, or lose it to a deadline.
+                        inline_delivered: false,
+                        producer: job.reference.clone(),
+                        identity,
+                    },
+                );
             } else {
                 ledger.feedback.remove(&binding);
             }
@@ -2945,6 +2954,46 @@ mod feedback_dedup_tests {
             source_digest: *blake3::hash(tag.as_bytes()).as_bytes(),
             diagnostic_fingerprint: *blake3::hash(tag.as_bytes()).as_bytes(),
         }
+    }
+
+    /// An issue already delivered under one detail reference is not rearmed by another producer,
+    /// while a changed issue remains eligible for one later hook delivery.
+    #[tokio::test]
+    async fn repeated_issue_is_suppressed_but_changed_issue_remains_deliverable() {
+        let (bindings, binding) = active_binding();
+        let handle = handle(bindings);
+        let repeated = identity("same");
+        {
+            let mut ledger = handle.shared.ledger.lock().unwrap();
+            ledger.delivered.insert(binding.clone(), repeated.clone());
+            assert!(!ledger.retain_feedback(
+                &binding,
+                NativeFeedback {
+                    source: None,
+                    text: "Fact: repeated".into(),
+                    native_epoch: 0,
+                    inline_delivered: false,
+                    producer: "detail-2".into(),
+                    identity: repeated,
+                }
+            ));
+            assert!(ledger.retain_feedback(
+                &binding,
+                NativeFeedback {
+                    source: None,
+                    text: "Fact: changed".into(),
+                    native_epoch: 0,
+                    inline_delivered: false,
+                    producer: "detail-3".into(),
+                    identity: identity("changed"),
+                }
+            ));
+        }
+        handle.native_hint(binding.clone());
+        assert_eq!(
+            handle.take_current_feedback(binding).await.as_deref(),
+            Some("Fact: changed")
+        );
     }
 
     /// A background job's fact that finished but was never handed to a live caller (still

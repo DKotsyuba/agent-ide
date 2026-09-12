@@ -3471,9 +3471,8 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
 
 /// Proves Claude Context and Diff execute in the real foreground helper, that a diagnostic
 /// already delivered inline inside a retrieved Context reply is never echoed a second time on the
-/// next ordinary native-edit hook, and that a genuinely different diagnostic — or the same
-/// unchanged one produced again by a redundant Context call — is neither swallowed nor
-/// resurrected.
+/// next ordinary native-edit hook. Cross-production identity replacement is covered by the
+/// worker's bounded ledger regression; this test owns the real Claude helper and host surfaces.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_GOPLS and AGENT_IDE_GO environment"]
 async fn configured_product_claude_helper_returns_context_diff_and_feedback() {
