@@ -411,6 +411,8 @@ fn read_all_recognition_is_closed_over_real_entry_shapes() {
     for refused in [
         // No root entry at all: nothing proves read of `/`.
         serde_json::json!({"access":"read","path":{"path":"/private/tmp","type":"path"}}),
+        // Write authority alone is not accepted as proof of read authority.
+        serde_json::json!({"access":"write","path":{"type":"special","value":{"kind":"root"}}}),
         // An explicit subtraction of access is never recognized.
         serde_json::json!({"access":"none","path":{"type":"special","value":{"kind":"root"}}}),
         // Unknown access, key, special kind, and path type each fail closed.

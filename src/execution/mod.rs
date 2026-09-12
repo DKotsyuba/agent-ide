@@ -3767,7 +3767,7 @@ fn canonical_json(value: &Value) -> String {
 /// * every `path` is either `{"type":"path","path":<normal absolute path>}` or
 ///   `{"type":"special","value":{"kind":<root|slash_tmp|tmpdir>}}`; a relative or cwd-derived path
 ///   and any unknown key, type, or special kind disqualify the profile;
-/// * at least one entry grants the `root` special path, which is the total read grant itself.
+/// * at least one `read` entry grants the `root` special path, which is the total read grant itself.
 ///
 /// Any unrecognized shape returns `false`, which keeps the strict sandbox-cwd equality in force.
 /// This classifier answers one question about declared read authority; it is deliberately not a
@@ -3815,10 +3815,10 @@ fn grants_read_of_all_roots(raw: &Value) -> bool {
         {
             return false;
         }
-        if !matches!(
-            entry.get("access").and_then(Value::as_str),
-            Some("read" | "write")
-        ) {
+        let Some(access) = entry.get("access").and_then(Value::as_str) else {
+            return false;
+        };
+        if !matches!(access, "read" | "write") {
             return false;
         }
         let Some(path) = entry.get("path").and_then(Value::as_object) else {
@@ -3844,7 +3844,8 @@ fn grants_read_of_all_roots(raw: &Value) -> bool {
                     return false;
                 }
                 match special.get("kind").and_then(Value::as_str) {
-                    Some("root") => root_granted = true,
+                    Some("root") if access == "read" => root_granted = true,
+                    Some("root") => {}
                     Some("slash_tmp" | "tmpdir") => {}
                     _ => return false,
                 }
