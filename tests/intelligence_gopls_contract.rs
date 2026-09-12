@@ -599,7 +599,7 @@ async fn shared_gopls_isolates_divergent_worktrees_and_detaches_one_view() {
     );
     let listener_debug = format!("{listener_command:?}");
     assert!(listener_debug.contains("-listen=unix;"));
-    assert!(listener_debug.contains("-listen.timeout=1m"));
+    assert!(listener_debug.contains("-listen.timeout=10m"));
     let mut admission = AdmissionController::new(AdmissionLimits {
         total_running: 4,
         per_owner_running: 1,
