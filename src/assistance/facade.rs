@@ -556,6 +556,23 @@ pub fn stop_binding_then_revoke(
     authorities.revoke(expected, handoff)
 }
 
+/// Content fingerprint of an ordered set of raw diagnostic messages.
+///
+/// Built from the exact typed messages a provider reported, never from any rendered fact text, so
+/// it can be compared across two independent renderings of the same underlying issue. Any change
+/// to the message set — added, removed or reworded diagnostics, even at an unchanged count —
+/// yields a different fingerprint; an unchanged, re-observed set yields the same one regardless of
+/// which job or detail reference produced it.
+pub(super) fn diagnostic_fingerprint(messages: &[&str]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(messages.len() as u64).to_le_bytes());
+    for message in messages {
+        hasher.update(&(message.len() as u64).to_le_bytes());
+        hasher.update(message.as_bytes());
+    }
+    *hasher.finalize().as_bytes()
+}
+
 /// Carries one bounded feedback fact and its rendering envelope before an external channel sees it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeedbackDelta {

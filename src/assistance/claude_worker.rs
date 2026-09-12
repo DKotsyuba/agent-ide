@@ -568,6 +568,14 @@ pub enum HelperPayload {
         source: HelperSource,
         /// Bounded fact/evidence/action delta; absent without matched diagnostics.
         feedback: Option<String>,
+        /// Content fingerprint of the exact ordered raw diagnostic message set backing
+        /// `feedback`, absent exactly when `feedback` is. Computed by the helper from the same
+        /// typed diagnostics before rendering, never from `feedback`'s rendered text, so the
+        /// daemon can recognize a later, unchanged repeat of this same issue without re-parsing
+        /// presentation text. `#[serde(default)]` keeps decoding an older helper frame lacking
+        /// this field closed rather than rejected.
+        #[serde(default)]
+        diagnostic_fingerprint: Option<[u8; 32]>,
         /// Whether source/context/diagnostic selection omitted bounded material.
         truncated: bool,
     },
@@ -2111,6 +2119,7 @@ mod tests {
                 length: 0,
             },
             feedback: None,
+            diagnostic_fingerprint: None,
             truncated: false,
         }
     }

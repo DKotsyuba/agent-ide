@@ -907,6 +907,19 @@ async fn context(
             )
         })
         .map(|feedback| feedback.render());
+    // Built from the same typed diagnostics as `feedback`, never from its rendered text, so a
+    // later unchanged repeat of this exact issue can be recognized without re-parsing the fact.
+    let diagnostic_fingerprint = diagnostics
+        .as_ref()
+        .filter(|diagnostics| !diagnostics.diagnostics.is_empty())
+        .map(|diagnostics| {
+            let messages: Vec<&str> = diagnostics
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect();
+            super::facade::diagnostic_fingerprint(&messages)
+        });
     let diagnostic_text = diagnostics.as_ref().map_or_else(
         || "diagnostics_freshness: unknown\ndiagnostic_count: unknown\nfeedback_delta: none".to_owned(),
         |diagnostics| {
@@ -947,6 +960,7 @@ async fn context(
             length: source_bytes.as_ref().map_or(0, SourceBytes::length),
         },
         feedback,
+        diagnostic_fingerprint,
         truncated: context.truncated || clipped,
     };
     (HelperOutcome::Complete { text }, Some(payload))
