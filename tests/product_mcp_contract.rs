@@ -514,7 +514,7 @@ async fn binary_codex_hook_fail_open_inactive_invalid_and_stdin_deadline() {
     for payload in [
         b"{".to_vec(),
         vec![b'x'; 65537],
-        br#"{"hook_event_name":"PreToolUse","session_id":"a","agent_id":"b","tool_use_id":"c"}"#
+        br#"{"hook_event_name":"PreToolUse","session_id":"","agent_id":"b","tool_use_id":"c"}"#
             .to_vec(),
     ] {
         let mut child = hook_process(&runtime, Some("private-host-channel"));

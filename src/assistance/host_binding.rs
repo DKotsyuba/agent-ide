@@ -1011,9 +1011,11 @@ pub fn parse_claude_call_id(meta: &Map<String, Value>) -> Result<String, Binding
 
 /// Parses one bounded Codex hook payload while retaining only host, phase, actor, and call ID.
 ///
-/// Child hooks must provide `agent_id`; root hooks must provide `session_id`. A payload with
-/// both or neither, or duplicate known JSON keys, is unavailable because identity is ambiguous.
-/// The parser never returns tool input/output, source, cwd, transcript paths, or unknown fields.
+/// Root hooks identify the actor with `session_id`. Native child hooks retain that root session and
+/// additionally provide `agent_id`; the child ID is the actor while the root session is validated
+/// and discarded. A payload with neither identity, an invalid identity, or duplicate known JSON
+/// keys is unavailable. The parser never returns tool input/output, source, cwd, transcript paths,
+/// or unknown fields.
 pub fn parse_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnavailable> {
     if payload.len() > MAX_HOOK_METADATA_BYTES {
         return Err(BindingUnavailable::InvalidMetadata);
@@ -1030,7 +1032,10 @@ pub fn parse_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnavailable>
     };
     let actor_id = match (payload.agent_id, payload.session_id) {
         (Some(actor), None) | (None, Some(actor)) => checked_identifier(actor, "hook actor")?,
-        (Some(_), Some(_)) => return Err(BindingUnavailable::InvalidField("hook actor")),
+        (Some(actor), Some(session)) => {
+            checked_identifier(session, "hook session")?;
+            checked_identifier(actor, "hook actor")?
+        }
         (None, None) => return Err(BindingUnavailable::MissingField("hook actor")),
     };
     Ok(HookEvent {
@@ -1121,7 +1126,7 @@ pub fn parse_claude_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnava
 struct CodexHookPayload {
     /// Native lifecycle name, restricted to pre, post, or post-batch after decoding.
     hook_event_name: String,
-    /// Root actor identity; absent/null for a child event, bounded after decoding.
+    /// Root session identity; retained alongside `agent_id` by native child events.
     session_id: Option<String>,
     /// Child actor identity; absent/null for a root event, bounded after decoding.
     agent_id: Option<String>,

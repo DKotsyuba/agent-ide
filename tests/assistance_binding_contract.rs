@@ -96,7 +96,7 @@ fn pre_then_start_or_active_mcp_then_post_is_exact_for_root_and_child() {
 }
 
 #[test]
-fn missing_or_mismatched_or_ambiguous_host_fields_are_unavailable() {
+fn missing_or_invalid_host_fields_are_unavailable() {
     assert!(matches!(
         parse_candidate(
             json!({ "threadId": "actor", "callId": "call" })
@@ -105,10 +105,15 @@ fn missing_or_mismatched_or_ambiguous_host_fields_are_unavailable() {
         ),
         Err(BindingUnavailable::MissingField("x-codex-turn-metadata"))
     ));
-    assert!(matches!(
-        parse_hook_event(br#"{"hook_event_name":"PreToolUse","session_id":"a","agent_id":"a","tool_use_id":"c"}"#),
-        Err(BindingUnavailable::InvalidField("hook actor"))
-    ));
+    let child = parse_hook_event(
+        br#"{"hook_event_name":"PreToolUse","session_id":"root","agent_id":"child","tool_use_id":"c"}"#,
+    )
+    .unwrap();
+    assert_eq!(child.actor_id(), "child");
+    assert!(parse_hook_event(
+        br#"{"hook_event_name":"PreToolUse","session_id":"","agent_id":"child","tool_use_id":"c"}"#,
+    )
+    .is_err());
     assert!(matches!(
         parse_channel_session(&[0xff]),
         Err(BindingUnavailable::InvalidAttachment)
