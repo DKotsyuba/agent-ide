@@ -325,7 +325,10 @@ impl Worker<'_> {
     /// Test-only read of one cache's quiescence, or `None` if no such key is retained.
     #[cfg(test)]
     pub(super) fn test_cache_quiescent(&self, key: &str) -> Option<bool> {
-        self.providers.caches.get(key).map(CacheLifecycle::quiescent)
+        self.providers
+            .caches
+            .get(key)
+            .map(CacheLifecycle::quiescent)
     }
 
     /// Test-only read of whether `binding` still owns any cache keys.

@@ -341,6 +341,13 @@ fn effective_rights_identity_splits_relative_roots_and_shares_equal_absolute_rig
             "file_system":{"read_roots":[],"entries":[{"path":"work"}]},
             "network":false
         }),
+        // A proven nonempty absolute root cannot make a sibling opaque relative policy safe to
+        // share. The closed schema intentionally refuses `entries` until its semantics are known.
+        serde_json::json!({
+            "type":"managed",
+            "file_system":{"roots":["/private/tmp/shared"],"entries":[{"path":"work"}]},
+            "network":false
+        }),
     ] {
         let state = |cwd: &str| {
             serde_json::json!({
