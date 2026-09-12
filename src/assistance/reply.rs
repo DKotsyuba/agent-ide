@@ -107,7 +107,7 @@ pub enum PeerReply {
         /// their own operation in a foreground helper.
         ///
         /// Absent for every daemon-executed operation, so the Codex envelope is byte-identical to
-        /// its previous form. When present it is never trimmed: [`PeerReply::shrink_text`] refuses
+        /// its previous form. When present it is never trimmed: `PeerReply::shrink_text` refuses
         /// to shrink a pending reply, so an over-budget instruction fails closed instead of being
         /// silently cut into a command the launch recognizer could never match.
         #[serde(default, skip_serializing_if = "Option::is_none")]

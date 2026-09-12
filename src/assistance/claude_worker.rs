@@ -4,17 +4,17 @@
 //! operation therefore runs inside a short foreground `Bash` helper that inherits the host's own
 //! native sandbox. This module owns only the correlation and admission mechanics for that helper:
 //!
-//! * the daemon mints a [`LaunchTicket`] bound to one action-scoped `detail_ref` and returns the
+//! * the daemon mints a `LaunchTicket` bound to one action-scoped `detail_ref` and returns the
 //!   exact helper command in the ordinary bounded reply text;
 //! * the ordinary `Bash` `PreToolUse` hook recognizes that command by comparing it against the
-//!   daemon-stored expected bytes ([`LaunchLedger::recognize`]) and stays silent, so the host's
+//!   daemon-stored expected bytes (`LaunchLedger::recognize`) and stays silent, so the host's
 //!   own permission and sandbox evaluation of the unchanged command is what actually decides;
 //! * the helper claims the bound operation exactly once over the private socket
-//!   ([`LaunchLedger::claim`]) and receives one closed daemon-selected [`HelperJob`].
+//!   (`LaunchLedger::claim`) and receives one closed daemon-selected `HelperJob`.
 //!
 //! Nothing here performs Git, source, provider or process effects, and nothing here is sandbox
 //! attestation. A ticket establishes correlation and replay exclusion only; the authority contract
-//! is the operator-managed strict Claude configuration declared by [`ClaudeOperatorProfile`].
+//! is the operator-managed strict Claude configuration declared by `ClaudeOperatorProfile`.
 
 use super::host_binding::BindingRef;
 use super::reply::FailureCode;
@@ -1014,7 +1014,7 @@ pub enum LaunchRecognition {
 /// budget and neither can widen it. The reservation is taken before a job is released, which is why
 /// a helper process can never exist without a lease that was granted first.
 ///
-/// Leases are keyed by the owning `detail_ref` rather than stored in [`ClaimedWork`], because
+/// Leases are keyed by the owning `detail_ref` rather than stored in `ClaimedWork`, because
 /// [`crate::execution::AdmissionLease`] is deliberately not `Clone`: capacity is authority, and the
 /// quarantine path clones the work record.
 #[derive(Debug)]
@@ -1320,7 +1320,7 @@ impl LaunchLedger {
 
     /// Records the helper's final frame; ordering against the post-hook does not matter.
     ///
-    /// A frame is accepted for claimed work and for quarantined [`TicketState::Uncertain`] work
+    /// A frame is accepted for claimed work and for quarantined `TicketState::Uncertain` work
     /// alike. The second case is cleanup-only settlement: the documented contract is that a
     /// revoked operation still accepts proof that its physical work finished, and refusing that
     /// proof would make the bounded lease unreleasable forever. Acceptance here never revives
@@ -1494,7 +1494,7 @@ impl LaunchLedger {
     ///
     /// An unclaimed ticket is dropped with no effect at all: nothing ran, so nothing must be
     /// cleaned up or reported. A claimed ticket that never settled becomes
-    /// [`TicketState::Uncertain`] and is retained, so its admission stays quarantined instead of
+    /// `TicketState::Uncertain` and is retained, so its admission stays quarantined instead of
     /// being silently reused.
     pub fn expire(&mut self, now_ms: u64) {
         let leases = &mut self.leases;
@@ -1515,7 +1515,7 @@ impl LaunchLedger {
     ///
     /// Claimed work is *not* deleted, and its claimed identity is *not* discarded. A claimed,
     /// disconnected, expired or unsettled ticket keeps its `tool_use_id`, frame slot and lease and
-    /// becomes [`TicketState::Uncertain`], so its admission stays quarantined and it can still
+    /// becomes `TicketState::Uncertain`, so its admission stays quarantined and it can still
     /// accept cleanup-only settlement afterwards. Replacing that identity with a stateless marker
     /// was the previous defect: it made the documented late cleanup impossible to correlate and
     /// left the bounded lease unreleasable. Authority never returns, because [`Self::claim`] admits

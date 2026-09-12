@@ -1237,7 +1237,7 @@ impl<'a> Worker<'a> {
 
     /// Activates a worktree from settled Claude helper evidence, without daemon Git or source work.
     ///
-    /// The daemon interprets only bytes: it rebuilds the closed [`GitDiscoveryEvidence`] triple
+    /// The daemon interprets only bytes: it rebuilds the closed `GitDiscoveryEvidence` triple
     /// through its validating constructor under the operation identity stored in the daemon ticket,
     /// then runs the *pure* discovery parser. It never executes Git, reads repository source or
     /// reads a Git administrative file on this route; the helper already performed the full native

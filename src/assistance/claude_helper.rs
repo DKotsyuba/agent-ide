@@ -1,10 +1,10 @@
 //! Private helper endpoint: the daemon's claim/finish socket and the foreground helper that runs.
 //!
-//! The daemon side ([`serve`]) owns a private Unix listener inside the runtime directory. It
-//! releases one closed [`HelperJob`] per successful atomic claim and records the helper's final
+//! The daemon side (`serve`) owns a private Unix listener inside the runtime directory. It
+//! releases one closed `HelperJob` per successful atomic claim and records the helper's final
 //! frame. It performs no Git, source or provider work of its own for a Claude operation.
 //!
-//! The helper side ([`run`]) is a short foreground process the model launches through its ordinary
+//! The helper side (`run`) is a short foreground process the model launches through its ordinary
 //! `Bash` tool, so every child it starts inherits the host's own real sandbox. It claims its
 //! operation once, performs fixed discovery/baseline/snapshot work and an optional one-shot
 //! provider session, reports bounded evidence with real child-settlement counts, and exits. It
@@ -101,7 +101,7 @@ async fn read_frame<R: AsyncReadExt + Unpin>(stream: &mut R) -> Result<String, (
 ///
 /// Binds `runtime_dir/claude-helper.sock` with owner-only permissions, removing a stale path from
 /// a previous boot first. Each connection is handled independently and bounded by
-/// [`SESSION_DEADLINE`]; a stuck or hostile peer can never block another helper or the daemon.
+/// `SESSION_DEADLINE`; a stuck or hostile peer can never block another helper or the daemon.
 /// Returns the bound path, or `None` when the endpoint could not be created, which simply leaves
 /// the Claude path unavailable.
 pub fn serve(
@@ -253,9 +253,9 @@ pub fn validated_worktree(
 /// Rebuilds the closed Execution discovery evidence triple from a helper's raw reported bytes.
 ///
 /// Every field the daemon did not observe itself is reconstructed conservatively: descendant
-/// evidence is [`DescendantEvidence::Unverified`], no duration is asserted, and the operation
+/// evidence is `DescendantEvidence::Unverified`, no duration is asserted, and the operation
 /// identity is derived from the daemon's own handle rather than from anything the helper sent. The
-/// evidence is built through [`GitDiscoveryEvidence::new`], its own validating constructor, so a
+/// evidence is built through `GitDiscoveryEvidence::new`, its own validating constructor, so a
 /// malformed frame is refused before it can be interpreted.
 ///
 /// Refuses a triple that is not exactly three frames, an over-bound frame, and any truncated
