@@ -943,8 +943,9 @@ impl ProductFixture {
     }
     /// Creates the same fixture, additionally accepting a strict test-only Claude operator profile.
     ///
-    /// This is wiring proof only: it asserts the daemon-side [`ClaudeOperatorProfile::validate`]
-    /// contract, never a real Claude host's actual sandbox enforcement.
+    /// This is wiring proof only: it asserts the daemon-side
+    /// [`agent_ide::assistance::claude_worker::ClaudeOperatorProfile::validate`] contract, never a
+    /// real Claude host's actual sandbox enforcement.
     fn new_claude(providers: Value) -> Self {
         let fixture = Self::new(providers.clone());
         fixture.write_config(
@@ -977,7 +978,8 @@ impl ProductFixture {
     ///
     /// `claude_profile` is `None` for every existing Codex-shaped fixture, keeping their emitted
     /// config byte-for-byte free of the new field; a Claude fixture supplies the strict test-only
-    /// operator profile asserted by [`ClaudeOperatorProfile::validate`].
+    /// operator profile asserted by
+    /// [`agent_ide::assistance::claude_worker::ClaudeOperatorProfile::validate`].
     fn write_config(&self, providers: Value, claude_profile: Option<Value>) {
         use agent_ide::execution::{D03ProfileEvidence, HostSandboxState, PersistedProfileRecord};
         let state = HostSandboxState::parse(Some(self.state())).unwrap();
@@ -995,7 +997,10 @@ impl ProductFixture {
             &state,
         )
         .unwrap();
-        let config = json!({"version":1,"limits":{"queued":16,"details":64,"operation_ms":120000,"output_bytes":1048576},"targets":[{"attachment":"private-host-channel","candidate":self.root,"git":accepted_program("/usr/bin/git","fixture-git"),"codex":accepted_program("/usr/bin/true","unused-disabled-wrapper"),"providers":providers,"profiles":[{"record":serde_json::from_str::<Value>(&record.to_json()).unwrap(),"sandbox_state":self.state()}],"allow_disabled_host":true,"claude_profile":claude_profile}]});
+        let mut config = json!({"version":1,"limits":{"queued":16,"details":64,"operation_ms":120000,"output_bytes":1048576},"targets":[{"attachment":"private-host-channel","candidate":self.root,"git":accepted_program("/usr/bin/git","fixture-git"),"codex":accepted_program("/usr/bin/true","unused-disabled-wrapper"),"providers":providers,"profiles":[{"record":serde_json::from_str::<Value>(&record.to_json()).unwrap(),"sandbox_state":self.state()}],"allow_disabled_host":true}]});
+        if let Some(claude_profile) = claude_profile {
+            config["targets"][0]["claude_profile"] = claude_profile;
+        }
         std::fs::write(&self.config, config.to_string()).unwrap();
     }
     /// Returns the current fixture's complete measured-state-shaped payload outside model arguments.
@@ -1142,14 +1147,21 @@ impl ProductActor {
         assert!(output.status.success() && output.stdout.is_empty() && output.stderr.is_empty());
     }
     /// Runs exact Pre→MCP→Post through the real Claude hook and Claude tool-use metadata shape.
-    async fn call_claude(&mut self, fixture: &ProductFixture, name: &str, arguments: Value) -> Value {
+    async fn call_claude(
+        &mut self,
+        fixture: &ProductFixture,
+        name: &str,
+        arguments: Value,
+    ) -> Value {
         self.next += 1;
         let call = format!("call-{}", self.next);
         self.claude_lifecycle(fixture, "PreToolUse", &call).await;
         let reply = self
             .mcp
-            .exchange(json!({"jsonrpc":"2.0","id":self.next,"method":"tools/call","params":{
-                "name":name,"arguments":arguments,"_meta":{"claudecode/toolUseId":call}}}))
+            .exchange(
+                json!({"jsonrpc":"2.0","id":self.next,"method":"tools/call","params":{
+                "name":name,"arguments":arguments,"_meta":{"claudecode/toolUseId":call}}}),
+            )
             .await;
         self.claude_lifecycle(fixture, "PostToolUse", &call).await;
         assert!(!reply["result"]["structuredContent"].is_null(), "{reply}");
@@ -2665,11 +2677,31 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
 
     let started = claude_start(&mut first, &fixture).await;
     assert_eq!(started["kind"], "activation", "{started}");
+    let detail_ref = started["detail_ref"].as_str().unwrap().to_owned();
+    let database = rusqlite::Connection::open(fixture.runtime.join("state.sqlite")).unwrap();
+    let (operation, actor, outcome, active): (String, String, String, bool) = database
+        .query_row(
+            "SELECT operation, actor, outcome, active FROM workspace_starts",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(actor, "claude-first");
+    assert_eq!(outcome, "granted");
+    assert!(active);
 
     // Re-running the exact same activation end to end is idempotent: the already-durable
     // Workspace publishes the identical retained evidence rather than a second row.
     let reread = claude_start(&mut first, &fixture).await;
     assert_eq!(reread, started, "{reread}");
+    assert_eq!(
+        database
+            .query_row("SELECT COUNT(*) FROM workspace_starts", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1,
+        "replaying the activation must not persist a second receipt"
+    );
 
     // A second actor targeting the same worktree is refused with Conflict while the first
     // actor's own activation stays usable.
@@ -2684,12 +2716,53 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
     let conflicted = claude_start(&mut second, &fixture).await;
     assert_eq!(conflicted["state"], "error", "{conflicted}");
     assert_eq!(conflicted["code"], "conflict", "{conflicted}");
+    assert!(
+        database
+            .query_row(
+                "SELECT active FROM workspace_starts WHERE operation=?1",
+                [&operation],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap(),
+        "the refused actor must not replace the first durable owner"
+    );
 
     let still_usable = claude_start(&mut first, &fixture).await;
     assert_eq!(still_usable, started, "{still_usable}");
 
     let stopped = first.call_claude(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
+    assert!(
+        !database
+            .query_row(
+                "SELECT active FROM workspace_starts WHERE operation=?1",
+                [&operation],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap(),
+        "Stop must durably revoke the original activation"
+    );
+    first.next += 1;
+    let stale_call = format!("call-{}", first.next);
+    first
+        .claude_lifecycle(&fixture, "PreToolUse", &stale_call)
+        .await;
+    let stale_detail = first
+        .mcp
+        .exchange(json!({"jsonrpc":"2.0","id":first.next,"method":"tools/call","params":{
+            "name":"ide.inspect","arguments":{"detail_ref":detail_ref},"_meta":{"claudecode/toolUseId":stale_call}}}))
+        .await;
+    first
+        .claude_lifecycle(&fixture, "PostToolUse", &stale_call)
+        .await;
+    assert_eq!(stale_detail["result"]["isError"], true, "{stale_detail}");
+    assert!(
+        stale_detail["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("host_binding"),
+        "{stale_detail}"
+    );
 
     first.mcp.close().await;
     second.mcp.close().await;
