@@ -509,7 +509,7 @@ impl Worker<'_> {
         let worktree_namespace =
             self.provider_cache_namespace(&binding, &authority, launch, &trust)?;
         let shared_namespace = self.provider_shared_cache_namespace(&binding, launch, &trust)?;
-        let go_env = GoEnv::new(
+        let go_env = GoEnv::prepare(
             Path::new(&worktree_namespace).join("go-build"),
             Path::new(&worktree_namespace).join("go-mod"),
             Path::new(&worktree_namespace).join("tmp"),

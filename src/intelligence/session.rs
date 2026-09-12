@@ -62,6 +62,10 @@ impl GoEnv {
     /// resolved by the provider process against its own cwd and could therefore escape the private
     /// namespace this session is accounted for. Callers pass paths derived from the retained
     /// `CacheLifecycle`, which are absolute by construction, so a rejection is a real defect.
+    ///
+    /// This constructor only validates: it never touches the filesystem, so the three directories
+    /// may still be missing. A caller whose session reaches a real provider must use
+    /// [`GoEnv::prepare`] instead, which additionally creates them.
     pub fn new(
         go_cache: std::path::PathBuf,
         go_mod_cache: std::path::PathBuf,
@@ -83,6 +87,41 @@ impl GoEnv {
                 go_mod_cache,
                 go_tmp_dir,
             })
+    }
+
+    /// Validates the three paths exactly like [`GoEnv::new`] and creates them on disk.
+    ///
+    /// Every session that is about to reach a real `gopls` view must use this constructor rather
+    /// than [`GoEnv::new`]. `go` creates a missing `GOCACHE`/`GOMODCACHE` itself, but it refuses a
+    /// missing `GOTMPDIR` with `creating work dir: stat <path>: no such file or directory`, which
+    /// gopls reports back only as `no package metadata for file ... (jsonrpc error 0)`; the view
+    /// then silently degrades to lexical context instead of failing. The namespace root retained by
+    /// `CacheLifecycle` exists, but the `go-build`/`go-mod`/`tmp` directories under it are this
+    /// session's own, so nothing else creates them.
+    ///
+    /// The directories are created recursively with owner-only `0o700` permissions, matching the
+    /// private cache root they live under; an already existing directory is accepted unchanged and
+    /// no file inside one is ever read or removed here. Returns `None` for a path [`GoEnv::new`]
+    /// refuses and for any directory that cannot be created, because a view whose private namespace
+    /// is unusable must fail closed rather than inherit another worktree's cache.
+    pub fn prepare(
+        go_cache: std::path::PathBuf,
+        go_mod_cache: std::path::PathBuf,
+        go_tmp_dir: std::path::PathBuf,
+    ) -> Option<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        let env = Self::new(go_cache, go_mod_cache, go_tmp_dir)?;
+        [&env.go_cache, &env.go_mod_cache, &env.go_tmp_dir]
+            .iter()
+            .all(|path| {
+                path.is_dir()
+                    || std::fs::DirBuilder::new()
+                        .recursive(true)
+                        .mode(0o700)
+                        .create(path)
+                        .is_ok()
+            })
+            .then_some(env)
     }
 
     /// Returns this view's private `GOCACHE` directory.
