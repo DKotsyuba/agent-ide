@@ -3603,13 +3603,21 @@ fn normalize_rights_roots(
                     for root in roots {
                         absolute.push(Value::String(absolute_rights_root(root.as_str()?, cwd)?));
                     }
-                    *proven = true;
+                    if !absolute.is_empty() {
+                        *proven = true;
+                    }
                     normalized.insert(key.clone(), Value::Array(absolute));
-                } else {
+                } else if key == "type" || key == "network" || key == "file_system" {
                     normalized.insert(
                         key.clone(),
                         normalize_rights_roots(child, cwd, depth + 1, proven)?,
                     );
+                } else {
+                    // An unrecognized key may hide cwd-dependent data (e.g. `entries[].path`) this
+                    // module does not understand how to normalize; refuse rather than pass it through
+                    // unproven, which would let an unrelated `*_roots` key wrongly mark the state
+                    // cwd-independent while this field silently keeps its relative meaning.
+                    return None;
                 }
             }
             Some(Value::Object(normalized))

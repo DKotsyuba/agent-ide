@@ -2021,10 +2021,14 @@ fn initial_inspection_admission_is_atomic_and_distinguishes_closure() {
 mod stop_retry_tests {
     use super::*;
     use crate::{
-        app::config::StoreConfig,
+        app::{
+            cache::{CacheNamespaceId, CacheRoot},
+            config::StoreConfig,
+        },
         assistance::host_binding::{
             BindingStatus, parse_candidate, parse_channel_session, parse_hook_event,
         },
+        intelligence::freshness::{CacheIdentity, CacheLifecycle},
         workspace::authority::{ActivationRequest, WorktreeRef},
     };
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2099,9 +2103,11 @@ mod stop_retry_tests {
     }
 
     /// Commits one durable receipt for `actor`/`id` against the fixture worktree, exactly as one
-    /// explicit `ide.start` would after resolving the same canonical worktree.
+    /// explicit `ide.start` would after resolving the same canonical worktree: it always reconciles
+    /// this worktree's pending revoke first, mirroring `Worker::activate`'s real call order, never a
+    /// manually pre-run reconcile followed by a separate, differently-ordered activation.
     async fn activate_receipt(
-        workspace: &DurableWorkspace<'_>,
+        worker: &mut Worker<'_>,
         tree: &WorktreeRef,
         actor: &str,
         id: &str,
@@ -2110,7 +2116,8 @@ mod stop_retry_tests {
         let binding = invocation.binding_ref().clone();
         let active = guard.consume_active(&binding).unwrap();
         let request = ActivationRequest::new(id, invocation, active, tree.clone()).unwrap();
-        let receipt = workspace.activate(request).await.unwrap();
+        worker.reconcile_pending_revocations(tree, actor).await;
+        let receipt = worker.workspace.activate(request).await.unwrap();
         (binding, receipt)
     }
 
@@ -2161,10 +2168,9 @@ mod stop_retry_tests {
             )
             .await
             .unwrap();
-        let (old_binding, old_receipt) =
-            activate_receipt(&workspace, &tree, "actor-1", "call-1").await;
-
         let mut worker = worker(&store, workspace);
+        let (old_binding, old_receipt) =
+            activate_receipt(&mut worker, &tree, "actor-1", "call-1").await;
         worker
             .grants
             .insert(old_binding.clone(), old_receipt.clone());
@@ -2173,6 +2179,29 @@ mod stop_retry_tests {
             .entry(old_binding.clone())
             .or_default()
             .insert(std::path::PathBuf::from("src/lib.rs"));
+
+        // A real, freshly-retained `CacheLifecycle` owned by `old_binding`: freshly retained means
+        // non-quiescent, i.e. actively owned by the still-live binding, not yet eligible for handoff.
+        let cache_root = CacheRoot::prepare(fixture.base.join("cache")).unwrap();
+        let cache_identity = CacheIdentity::new(
+            "rust-analyzer",
+            "rust-cache-priming-disabled-v1",
+            "config",
+            "1.98.1",
+            "trusted",
+            "tree-state",
+        )
+        .unwrap();
+        let cache_key = "cache-1";
+        let cache = CacheLifecycle::retain(
+            &cache_root,
+            CacheNamespaceId::new(cache_key).unwrap(),
+            cache_identity,
+            &tree,
+        )
+        .unwrap();
+        assert!(!cache.quiescent(), "a freshly retained cache starts owned");
+        worker.install_test_cache(&old_binding, cache_key, cache);
 
         // A second real connection to the same fixture database holds the exact write lock the
         // durable revoke transaction needs, comfortably inside the reduced busy-timeout window.
@@ -2184,19 +2213,56 @@ mod stop_retry_tests {
         assert_eq!(worker.grants.get(&old_binding), Some(&old_receipt));
         assert!(worker.pending_revocations.contains(&old_binding));
         assert!(worker.registered.contains_key(&old_binding));
+        assert_eq!(
+            worker.test_cache_quiescent(cache_key),
+            Some(false),
+            "a failed durable revoke must retain the cache non-quiescent, not release it early"
+        );
+        assert!(
+            worker.test_binding_owns_caches(&old_binding),
+            "the stopped binding still owns its cache keys until the revoke actually commits"
+        );
 
         lock.execute_batch("ROLLBACK;").unwrap();
         drop(lock);
 
-        // A fresh explicit Start for the same worktree/actor must commit the pending revoke before
-        // its own grant can be minted; an out-of-order activate would fail with an owned-actor conflict.
-        worker.reconcile_pending_revocations(&tree, "actor-1").await;
+        // Attempting the fresh Start's durable activation before its pending revoke is reconciled
+        // must conflict: this is the exact out-of-order failure `Worker::activate` avoids by always
+        // reconciling first, so if reconciliation ever moved after activation this assertion (and the
+        // real order exercised by `activate_receipt` below) would catch it.
+        let (mut premature_guard, premature_invocation) = fresh_call("actor-1", "call-2-premature");
+        let premature_binding = premature_invocation.binding_ref().clone();
+        let premature_active = premature_guard.consume_active(&premature_binding).unwrap();
+        let premature_request = ActivationRequest::new(
+            "call-2-premature",
+            premature_invocation,
+            premature_active,
+            tree.clone(),
+        )
+        .unwrap();
+        assert!(
+            worker.workspace.activate(premature_request).await.is_err(),
+            "activating before the pending revoke is reconciled must conflict with the still-owned worktree"
+        );
+        assert!(worker.pending_revocations.contains(&old_binding));
+
+        // The real automatic reconcile-before-activate path: `activate_receipt` reconciles this
+        // worktree's pending revoke first and only then mints the new grant, exactly like
+        // `Worker::activate`; nothing here manually pre-runs reconcile as a separate, earlier step.
+        let (new_binding, new_receipt) =
+            activate_receipt(&mut worker, &tree, "actor-1", "call-2").await;
         assert!(!worker.grants.contains_key(&old_binding));
         assert!(worker.pending_revocations.is_empty());
         assert!(!worker.registered.contains_key(&old_binding));
-
-        let (new_binding, new_receipt) =
-            activate_receipt(&worker.workspace, &tree, "actor-1", "call-2").await;
+        assert_eq!(
+            worker.test_cache_quiescent(cache_key),
+            Some(true),
+            "commiting the pending revoke must quiesce the old binding's cache for reuse/retirement"
+        );
+        assert!(
+            !worker.test_binding_owns_caches(&old_binding),
+            "the old binding must no longer own any cache keys; its source binding is unusable"
+        );
         worker.grants.insert(new_binding.clone(), new_receipt);
 
         assert_eq!(worker.grants.len(), 1);

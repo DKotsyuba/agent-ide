@@ -329,6 +329,18 @@ fn effective_rights_identity_splits_relative_roots_and_shares_equal_absolute_rig
         serde_json::json!({"type":"managed","file_system":{},"network":false}),
         serde_json::json!({"type":"managed","file_system":{"roots":[{"opaque":1}]},"network":false}),
         serde_json::json!({"type":"managed","file_system":{"roots":["../escape"]},"network":false}),
+        // An empty `*_roots` array proves nothing: no root was actually resolved against cwd, so
+        // the policy must not be treated as cwd-independent just because the key is present.
+        serde_json::json!({"type":"managed","file_system":{"roots":[]},"network":false}),
+        // Mixing a proven-looking (but empty) `read_roots` with an unrecognized `entries` shape that
+        // carries its own cwd-dependent relative path ("work") must refuse the whole profile instead
+        // of letting the empty roots key falsely mark it cwd-independent while `entries` silently
+        // keeps unresolved relative meaning.
+        serde_json::json!({
+            "type":"managed",
+            "file_system":{"read_roots":[],"entries":[{"path":"work"}]},
+            "network":false
+        }),
     ] {
         let state = |cwd: &str| {
             serde_json::json!({
