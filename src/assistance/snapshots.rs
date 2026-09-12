@@ -630,12 +630,14 @@ impl Worker<'_> {
         .map_err(|_| FailureCode::WorkspaceAuthority)?;
         // An operator-declared `env` trampoline is the only way a command may run in this
         // worktree while the managed host still reports its own inherited `sandboxCwd`; its
-        // absence simply leaves that case unavailable.
+        // absence simply leaves that case unavailable. The seal is pinned to the digest the
+        // operator declared and startup verified, so a per-request build cannot re-baseline an
+        // executable that changed after the daemon became ready.
         let trampoline = job
             .target
             .cwd_trampoline
             .as_ref()
-            .map(|accepted| ControlledTrampoline::accept(accepted.path.clone()))
+            .map(|accepted| ControlledTrampoline::accept(accepted.path.clone(), &accepted.blake3))
             .transpose()
             .map_err(|_| FailureCode::ExecutionProfile)?;
         let programs = BTreeSet::from([program.path.clone()]);

@@ -1090,6 +1090,15 @@ fn inherited_managed_state(cwd: &Path, recognized: bool) -> serde_json::Value {
     })
 }
 
+/// Seals the platform `/usr/bin/env` against its own current bytes, as an operator would declare
+/// them, or returns `None` where this contract is unavailable or the file cannot be read.
+fn accepted_env_trampoline() -> Option<ControlledTrampoline> {
+    let declared = blake3::hash(&fs::read("/usr/bin/env").ok()?)
+        .to_hex()
+        .to_string();
+    ControlledTrampoline::accept(PathBuf::from("/usr/bin/env"), &declared).ok()
+}
+
 /// Builds a managed invocation for `sandbox_cwd` plus its matching Execution-owned catalog.
 fn inherited_invocation(
     sandbox_cwd: &Path,
@@ -1179,7 +1188,7 @@ fn inherited_sandbox_cwd_validates_only_for_a_recognized_read_all_profile_with_a
         RequestError::WorktreeDenied
     );
 
-    let Ok(trampoline) = ControlledTrampoline::accept(PathBuf::from("/usr/bin/env")) else {
+    let Some(trampoline) = accepted_env_trampoline() else {
         return;
     };
     let accepted =
@@ -1315,7 +1324,7 @@ async fn physical_inherited_cwd_runs_the_marker_only_in_an_accessible_target_wor
         ExecutionProfileTemplate::from_execution_evidence("physical-inherited", 1, &state).unwrap(),
     ])
     .unwrap();
-    let trampoline = ControlledTrampoline::accept(PathBuf::from("/usr/bin/env")).unwrap();
+    let trampoline = accepted_env_trampoline().expect("an accepted /usr/bin/env declaration");
     let policy = LocalExecutionPolicy::with_env_trampoline(
         BTreeSet::from([PathBuf::from("/bin/pwd")]),
         4096,
@@ -1325,10 +1334,14 @@ async fn physical_inherited_cwd_runs_the_marker_only_in_an_accessible_target_wor
     )
     .unwrap();
 
-    // `target` is a real separate worktree; `missing` is removed before the spawn so the marker
-    // cannot be produced from an inaccessible directory.
-    let target = worktree();
-    let missing = worktree();
+    // `target` is a plain temporary directory standing in for a separate operator worktree — this
+    // check is about the launch boundary, not Git discovery — and `missing` is removed before the
+    // spawn so the marker cannot be produced from an inaccessible directory. Both are canonicalized
+    // first: Workspace only ever holds a canonical root, and on a default macOS `TMPDIR` the
+    // symlinked `/var/folders/...` form would otherwise disagree with the real path the child
+    // prints.
+    let target = fs::canonicalize(worktree()).unwrap();
+    let missing = fs::canonicalize(worktree()).unwrap();
     fs::remove_dir(&missing).unwrap();
     for (root, expected) in [(target.clone(), true), (missing.clone(), false)] {
         let authority =
