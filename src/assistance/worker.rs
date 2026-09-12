@@ -2027,9 +2027,10 @@ mod stop_retry_tests {
         },
         assistance::host_binding::{
             BindingStatus, parse_candidate, parse_channel_session, parse_hook_event,
+            parse_observed_sandbox_state,
         },
+        execution::{D03ProfileEvidence, HostSandboxState, PersistedProfileRecord},
         intelligence::freshness::{CacheIdentity, CacheLifecycle},
-        workspace::authority::{ActivationRequest, WorktreeRef},
     };
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2050,7 +2051,15 @@ mod stop_retry_tests {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             let root = base.join("worktree");
-            std::fs::create_dir_all(root.join(".git")).unwrap();
+            std::fs::create_dir_all(&root).unwrap();
+            assert!(
+                std::process::Command::new("/usr/bin/git")
+                    .args(["init", "--quiet"])
+                    .current_dir(&root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
             Self { base, root }
         }
         /// Opens the real fixture Store through the existing effective-config path, with a
@@ -2076,10 +2085,15 @@ mod stop_retry_tests {
         }
     }
 
-    /// Validates a fresh call under a new actor/channel binding.
-    fn fresh_call(actor: &str, id: &str) -> (HostBindingGuard, ValidatedInvocation) {
-        let mut guard = HostBindingGuard::default();
-        let channel = parse_channel_session(id.as_bytes()).unwrap();
+    /// Creates one current host binding and matching disabled sandbox observation for a real start.
+    fn production_call(
+        worker: &Worker<'_>,
+        cwd: &std::path::Path,
+        actor: &str,
+        id: &str,
+    ) -> (ValidatedInvocation, ObservedSandboxState) {
+        let mut guard = worker.shared.bindings.lock().unwrap();
+        let channel = parse_channel_session(b"stop-retry").unwrap();
         let hook = parse_hook_event(
             serde_json::json!({"hook_event_name":"PreToolUse","session_id":actor,"tool_use_id":id})
                 .to_string()
@@ -2099,32 +2113,104 @@ mod stop_retry_tests {
         let BindingStatus::Validated(invocation) = guard.establish_start(candidate, channel) else {
             panic!("fixture binding must validate")
         };
-        (guard, invocation)
+        let active = guard.consume_active(invocation.binding_ref()).unwrap();
+        let state = serde_json::json!({
+            "permissionProfile":{"type":"disabled"},
+            "codexLinuxSandboxExe":null,
+            "sandboxCwd":cwd,
+            "useLegacyLandlock":false
+        });
+        let meta = serde_json::json!({"codex/sandbox-state-meta":state});
+        let observed =
+            parse_observed_sandbox_state(meta.as_object().unwrap(), &invocation, &active, true)
+                .unwrap();
+        (invocation, observed)
     }
 
-    /// Commits one durable receipt for `actor`/`id` against the fixture worktree, exactly as one
-    /// explicit `ide.start` would after resolving the same canonical worktree: it always reconciles
-    /// this worktree's pending revoke first, mirroring `Worker::activate`'s real call order, never a
-    /// manually pre-run reconcile followed by a separate, differently-ordered activation.
-    async fn activate_receipt(
+    /// Builds the closed disabled-host target consumed by the actual `Worker::activate` path.
+    fn production_target(root: &std::path::Path) -> LaunchTarget {
+        let state = HostSandboxState::parse(Some(serde_json::json!({
+            "permissionProfile":{"type":"disabled"},
+            "codexLinuxSandboxExe":null,
+            "sandboxCwd":root,
+            "useLegacyLandlock":false
+        })))
+        .unwrap();
+        let record = PersistedProfileRecord::from_execution_evidence(
+            "stop-retry-disabled",
+            1,
+            D03ProfileEvidence {
+                provider_binary: "fixture-git".into(),
+                toolchain: "fixture-toolchain".into(),
+                configuration: "default".into(),
+                trust: "fixture-local".into(),
+                transport: "direct".into(),
+                d03_evidence: "fixture-d03".into(),
+            },
+            &state,
+        )
+        .unwrap();
+        let git = std::path::Path::new("/usr/bin/git");
+        let executable = serde_json::json!({
+            "path":git,
+            "identity":"fixture-git",
+            "blake3":blake3::hash(&std::fs::read(git).unwrap()).to_hex().to_string()
+        });
+        let config = serde_json::json!({
+            "version":1,
+            "limits":{"queued":8,"details":8,"operation_ms":5000,"output_bytes":1024},
+            "targets":[{
+                "attachment":"stop-retry",
+                "candidate":root,
+                "git":executable,
+                "codex":executable,
+                "providers":[],
+                "profiles":[{"record":serde_json::from_str::<serde_json::Value>(&record.to_json()).unwrap(),"sandbox_state":serde_json::from_str::<serde_json::Value>(state.sandbox_state_json()).unwrap()}],
+                "allow_disabled_host":true
+            }]
+        });
+        LauncherConfig::parse(config.to_string().as_bytes())
+            .unwrap()
+            .target("stop-retry")
+            .unwrap()
+            .clone()
+    }
+
+    /// Runs the actual production `Worker::activate` entry point and returns its durable receipt.
+    async fn production_start(
         worker: &mut Worker<'_>,
-        tree: &WorktreeRef,
         actor: &str,
         id: &str,
     ) -> (BindingRef, StartReceipt) {
-        let (mut guard, invocation) = fresh_call(actor, id);
+        let (invocation, observed) = production_call(worker, &worker.runtime, actor, id);
         let binding = invocation.binding_ref().clone();
-        let active = guard.consume_active(&binding).unwrap();
-        let request = ActivationRequest::new(id, invocation, active, tree.clone()).unwrap();
-        worker.reconcile_pending_revocations(tree, actor).await;
-        let receipt = worker.workspace.activate(request).await.unwrap();
+        let (_cancel_sender, cancel) = watch::channel(false);
+        let mut job = Job {
+            input: JobInput::Managed,
+            reference: format!("production-{id}"),
+            invocation,
+            observed: Some(observed),
+            tool: AssistanceTool::Start,
+            parameters: serde_json::json!({"activation_id":id}),
+            target: production_target(&worker.runtime),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            cancel,
+            stop_reply: None,
+            native_epoch: 0,
+        };
+        worker.activate(&mut job).await.unwrap();
+        let receipt = worker.grants.get(&binding).cloned().unwrap();
         (binding, receipt)
     }
 
     /// Builds the minimal real `Worker` needed to drive `settle_revocation`/`reconcile_pending_revocations`
     /// against a real Store; bypasses the launcher/git-discovery machinery `ide.start` otherwise needs,
     /// since neither is part of the durable stop/retry contract under test.
-    fn worker<'a>(store: &'a Store, workspace: DurableWorkspace<'a>) -> Worker<'a> {
+    fn worker<'a>(
+        store: &'a Store,
+        workspace: DurableWorkspace<'a>,
+        runtime: std::path::PathBuf,
+    ) -> Worker<'a> {
         let launcher = LauncherConfig::parse(
             br#"{"version":1,"limits":{"queued":8,"details":8,"operation_ms":5000,"output_bytes":1024},"targets":[]}"#,
         )
@@ -2150,7 +2236,7 @@ mod stop_retry_tests {
             admission: Arc::new(Mutex::new(admission_controller())),
             uncertain: std::collections::BTreeSet::new(),
             uncertain_snapshots: Vec::new(),
-            runtime: std::env::temp_dir(),
+            runtime,
             providers: providers::Providers::new(),
         }
     }
@@ -2168,12 +2254,8 @@ mod stop_retry_tests {
             )
             .await
             .unwrap();
-        let mut worker = worker(&store, workspace);
-        let (old_binding, old_receipt) =
-            activate_receipt(&mut worker, &tree, "actor-1", "call-1").await;
-        worker
-            .grants
-            .insert(old_binding.clone(), old_receipt.clone());
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        let (old_binding, old_receipt) = production_start(&mut worker, "actor-1", "call-1").await;
         worker
             .registered
             .entry(old_binding.clone())
@@ -2203,6 +2285,18 @@ mod stop_retry_tests {
         assert!(!cache.quiescent(), "a freshly retained cache starts owned");
         worker.install_test_cache(&old_binding, cache_key, cache);
 
+        worker
+            .shared
+            .bindings
+            .lock()
+            .unwrap()
+            .stop_binding(&old_binding)
+            .unwrap();
+        assert!(
+            worker.shared.active(&old_binding).is_err(),
+            "the stopped binding is unusable"
+        );
+
         // A second real connection to the same fixture database holds the exact write lock the
         // durable revoke transaction needs, comfortably inside the reduced busy-timeout window.
         let lock = rusqlite::Connection::open(fixture.base.join("state.sqlite")).unwrap();
@@ -2226,31 +2320,9 @@ mod stop_retry_tests {
         lock.execute_batch("ROLLBACK;").unwrap();
         drop(lock);
 
-        // Attempting the fresh Start's durable activation before its pending revoke is reconciled
-        // must conflict: this is the exact out-of-order failure `Worker::activate` avoids by always
-        // reconciling first, so if reconciliation ever moved after activation this assertion (and the
-        // real order exercised by `activate_receipt` below) would catch it.
-        let (mut premature_guard, premature_invocation) = fresh_call("actor-1", "call-2-premature");
-        let premature_binding = premature_invocation.binding_ref().clone();
-        let premature_active = premature_guard.consume_active(&premature_binding).unwrap();
-        let premature_request = ActivationRequest::new(
-            "call-2-premature",
-            premature_invocation,
-            premature_active,
-            tree.clone(),
-        )
-        .unwrap();
-        assert!(
-            worker.workspace.activate(premature_request).await.is_err(),
-            "activating before the pending revoke is reconciled must conflict with the still-owned worktree"
-        );
-        assert!(worker.pending_revocations.contains(&old_binding));
-
-        // The real automatic reconcile-before-activate path: `activate_receipt` reconciles this
-        // worktree's pending revoke first and only then mints the new grant, exactly like
-        // `Worker::activate`; nothing here manually pre-runs reconcile as a separate, earlier step.
-        let (new_binding, new_receipt) =
-            activate_receipt(&mut worker, &tree, "actor-1", "call-2").await;
+        // This enters `Worker::activate` itself. Its reconciliation call must commit the pending
+        // revoke before the real durable activation below can mint a new grant.
+        let (new_binding, new_receipt) = production_start(&mut worker, "actor-1", "call-2").await;
         assert!(!worker.grants.contains_key(&old_binding));
         assert!(worker.pending_revocations.is_empty());
         assert!(!worker.registered.contains_key(&old_binding));
@@ -2263,10 +2335,9 @@ mod stop_retry_tests {
             !worker.test_binding_owns_caches(&old_binding),
             "the old binding must no longer own any cache keys; its source binding is unusable"
         );
-        worker.grants.insert(new_binding.clone(), new_receipt);
-
         assert_eq!(worker.grants.len(), 1);
         assert!(worker.grants.contains_key(&new_binding));
+        assert_eq!(worker.grants.get(&new_binding), Some(&new_receipt));
         assert!(!worker.grants.contains_key(&old_binding));
 
         let settled = worker.revoke(&new_binding, "stop-2").await;
