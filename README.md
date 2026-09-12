@@ -7,8 +7,8 @@ explicit Codex/Claude native ingress, bounded hook context output, durable Works
 source context, safe Git comparisons and owned provider cleanup. Host-shaped process tests exercise
 Claude foreground-helper activation, Go/Rust Context, Diff and emitted additional context.
 Live macOS checks cover Claude Go/Rust and parallel native actors with sequential handoff,
-plus the Codex Go context/edit/diff/stop loop. Codex native actors with distinct worktree roots,
-complete delivery accounting and the remaining roadmap acceptance checks are still open.
+plus Codex Go context/edit/diff/stop and parent/native-child isolation across distinct worktree
+roots. Complete delivery accounting and the remaining roadmap acceptance checks are still open.
 
 Build with `cargo build --locked --bin agent-ide`. Configure an MCP client to launch
 `target/debug/agent-ide mcp --runtime-dir PATH`. Discovery works without a daemon;

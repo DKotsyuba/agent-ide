@@ -5,11 +5,11 @@ implements this bounded binding/state boundary; Application separately owns its 
 
 `assistance::host_binding` accepts only metadata that a trusted MCP or hook ingress has already separated from model tool arguments. Host kind is selected explicitly and is never inferred from CWD, PID, timing, permission mode, or arbitrary arguments. It parses Codex `_meta.threadId`, `_meta.callId`, and the required `x-codex-turn-metadata` object into a `CandidateInvocation`. A candidate is a transport observation, never a workspace authority grant.
 
-`HostBindingGuard` first buffers the exact native `PreToolUse` event. The MCP handler then validates its candidate against that pre-observation and can return its result without waiting for `PostToolUse`. The sequence is `PreToolUse` → MCP validation/result → `PostToolUse`: post is later settlement evidence, not a condition for invocation validation. `PostToolUseFailure` settles the same exact call and may request a later registered-path recheck because partial effects remain possible. `PermissionDenied` rejects its exact pending lifecycle without a recheck hint; `PermissionRequest` and manual denial are uncorrelated and unsupported. Child events use `agent_id`; root events use `session_id`; `tool_use_id` must match `_meta.callId`. Missing, ambiguous, mismatched, repeated, oversized, or post-stop data is `Unavailable`. The guard retains bounded pre-observed, active, and completed identifiers and refuses new input when its fixed storage cap is exhausted rather than discarding replay evidence.
+`HostBindingGuard` first buffers the exact native `PreToolUse` event. The MCP handler then validates its candidate against that pre-observation and can return its result without waiting for `PostToolUse`. The sequence is `PreToolUse` → MCP validation/result → `PostToolUse`: post is later settlement evidence, not a condition for invocation validation. `PostToolUseFailure` settles the same exact call and may request a later registered-path recheck because partial effects remain possible. `PermissionDenied` rejects its exact pending lifecycle without a recheck hint; `PermissionRequest` and manual denial are uncorrelated and unsupported. Child events select `agent_id` while validating the accompanying root `session_id`; root events use `session_id`. `tool_use_id` must match `_meta.callId`. Missing, invalid, mismatched, repeated, oversized, or post-stop data is `Unavailable`. The guard retains bounded pre-observed, active, and completed identifiers and refuses new input when its fixed storage cap is exhausted rather than discarding replay evidence.
 
 The provider surface is deliberately small: `parse_candidate`, `parse_channel_session`, and `parse_hook_event` create bounded ingress values; `HostBindingGuard::observe_hook`, `establish_start`, `validate_active`, `take_native_change_hint`, `check_active`, `consume_active`, `stop_binding`, and `stop` manage lifecycle. `ValidatedInvocation` exposes only actor ID, call ID, and opaque `BindingRef`; `ActiveBindingUse` exposes only its same opaque ref. Workspace consumes only `ValidatedInvocation` plus a fresh `ActiveBindingUse`; `PreObserved` and `Settled` are lifecycle observations; `NativeObserved` is only an active registered-path recheck hint, while `Unavailable` grants nothing. Application owns crate-root exposure and consumer wiring.
 
-The Codex parser preserves the established root `session_id` versus child `agent_id` mapping and exact `tool_use_id`. The Claude parser requires exact `session_id`, selects optional `agent_id` as the subagent actor, and retains optional `agent_type` only as descriptive data. It never treats `permission_mode` as OS sandbox authority. `PostToolBatch` without a tool ID remains uncorrelated rather than being synthesized as `session_id`. Both parsers discard tool input/output, source, paths, permission data, and unknown fields. Failure is local and fail-open.
+The Codex parser selects root `session_id` for a parent. A native child supplies both its own `agent_id` and the root `session_id`; the parser validates both identifiers, selects `agent_id` as the actor, and discards the root session before binding. It preserves exact `tool_use_id`. The Claude parser requires exact `session_id`, selects optional `agent_id` as the subagent actor, and retains optional `agent_type` only as descriptive data. It never treats `permission_mode` as OS sandbox authority. `PostToolBatch` without a tool ID remains uncorrelated rather than being synthesized as `session_id`. Both parsers discard tool input/output, source, paths, permission data, and unknown fields. Failure is local and fail-open.
 
 ## Application transport
 
@@ -73,8 +73,8 @@ autostart, workspace scan or LSP work. Configure the command as written; malform
 syntax is a command configuration error, not a hook payload result.
 
 Hook parsing rejects duplicate known JSON keys and retains only explicit host, phase, bounded
-identity, and optional call ID. Codex root events require `session_id`, Codex child events require
-`agent_id`, and supplying both is ambiguous. Claude always retains `session_id` and selects its
+identity, and optional call ID. Codex root events require `session_id`; native child events carry
+both root `session_id` and child `agent_id`, with the child selected as actor. Claude always retains `session_id` and selects its
 optional `agent_id` as the child actor. `tool_use_id` identifies an exact per-tool call; a batch
 does not fabricate one. Tool input/output, cwd, transcript paths and all other raw fields are discarded before IPC. The raw hook payload is never
 logged or retained in daemon state. `Debug` formatting of the trusted transport, opaque
@@ -140,11 +140,12 @@ IDs, cross-actor rejection, stop isolation, replay/order failures, daemon loss, 
 and malformed hooks, open stdin and hung-daemon deadlines, and discarded payload fields.
 Native edit/delete/rename and failed-command-shaped lifecycle fixtures verify coalesced
 active hints and suppression after stop, without claiming those fixtures changed source.
-These are controlled host-shaped process tests, not live-host proof. The Claude product fixture now
-proves its shipping MCP/hook/private-socket/helper path through durable activation/baseline, real Go
-and Rust Context, current Diff, and emitted `additionalContext`. Still unverified are fresh Codex and
-Claude CLI acceptance on macOS and Linux, real `PostToolBatch` availability in supported host
-versions, and host-observed `model_seen` delivery after an actual native edit.
+The controlled process tests are complemented by live macOS checks. Claude Code 2.1.267 completed
+Go and Rust Context, native-edit diagnostics, Diff, Stop, parallel isolation and sequential handoff.
+Codex CLI 0.154.0 completed parent plus parallel native-child Go isolation: A observed only its
+int/string diagnostic, B stayed semantic after A stopped, and a fresh child independently acquired
+A's worktree and read its final bytes. Linux, real `PostToolBatch` availability, and formal
+host-confirmed `model_seen` delivery remain unverified.
 
 The executable deadline regressions enforce a 450 ms wall-clock ceiling: the 250 ms
 product deadline plus 200 ms for child startup and scheduling. Child-process Tokio clocks

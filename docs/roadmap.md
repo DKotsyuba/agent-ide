@@ -37,6 +37,14 @@ Only types, tables and settings actually consumed by this path are implemented. 
 
 The target platforms are Linux and macOS. Current v0.1 acceptance runs real Codex CLI and Claude CLI scenarios on the available Mac, including native coding subagents. Linux validation is deferred and must remain explicitly unverified; it does not block this delivery. A single passing host cell is still only an intermediate milestone. Record exact versions and explicit `not_tested`, `mocked`, or `real_pass` evidence; a passing mock never grants support status.
 
+| Host/provider cell | Current evidence |
+|---|---|
+| macOS 26.6.2, Codex CLI 0.154.0, Go/gopls 0.23.0 | `real_pass`: parent plus parallel native children in divergent worktrees, scoped diagnostic, peer survival and fresh sequential handoff |
+| macOS 26.6.2, Codex CLI 0.154.0, Rust/rust-analyzer 1.98.1 | `real_pass` for the managed product/provider contract; live model CLI cell `not_tested` |
+| macOS 26.6.2, Claude Code 2.1.267, Go/gopls 0.23.0 | `real_pass`: foreground helper, native-edit diagnostic, Diff, Stop and parallel actor isolation |
+| macOS 26.6.2, Claude Code 2.1.267, Rust/rust-analyzer 1.98.1 | `real_pass`: foreground helper semantic context, native-edit diagnostic, Diff and Stop |
+| Linux, both hosts/providers | `not_tested`; outside the current Mac-only release gate |
+
 Checks cover isolation between divergent worktrees, stale source/provider results, inactive hooks, stop and handoff, daemon/provider crashes, cancellation, bounded queues/output, and preservation of native tool/turn behavior. Productivity evaluation includes correctness, full model-visible context, cold/warm/handoff time, and the complete process tree's resource use. Fewer tool calls alone do not establish improvement.
 
 Caches follow the worktree across stop and sequential handoff. Actor termination does not delete a valid worktree cache; verified worktree closure/reset retires its owned namespace. Hot memory and durable cache are distinct. The scope of this retention guarantee for opaque provider-internal indexes still needs an explicit decision; no provider profile may silently weaken the current strict requirement.
