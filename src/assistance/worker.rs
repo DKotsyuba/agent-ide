@@ -122,6 +122,31 @@ struct NativeFeedback {
     /// must name this exact producer, not just the epoch, so retrieving an older, already
     /// superseded detail can never mark the *current* (different) fact as delivered.
     producer: String,
+    /// Bounded content identity of the underlying issue, used only to recognize a later,
+    /// redundant Context job for the exact same unchanged issue; see `DeliveredIssue`.
+    identity: DeliveredIssue,
+}
+
+/// Bounded content identity of one diagnostic issue, stable across repeated, unrelated
+/// re-observation of unchanged bytes.
+///
+/// Deliberately excludes every volatile field that changes on mere re-observation without any
+/// real change to the issue itself: the job's `detail_ref`, the source's per-read
+/// `source_sequence`, and the native-hook epoch. It is never inferred by parsing rendered model
+/// text; both producers build it from the same typed source digest and raw diagnostic messages
+/// they already hold before rendering. Two identities are equal only when the observed source
+/// path and content digest and the exact ordered diagnostic message set all match — any change to
+/// source bytes, provider/document generation (which gates whether diagnostics attach at all), or
+/// the issue set (added, removed or reworded messages, even at an unchanged count) yields a
+/// different identity.
+#[derive(Clone, Eq, PartialEq)]
+struct DeliveredIssue {
+    /// Exact registered path the issue was raised against.
+    source_path: std::path::PathBuf,
+    /// Content digest of the exact source bytes the issue was raised against.
+    source_digest: [u8; 32],
+    /// Content fingerprint of the exact ordered diagnostic message set.
+    diagnostic_fingerprint: [u8; 32],
 }
 
 /// Retains daemon-derived scope, baseline and cache paths for later Claude helper jobs.
@@ -167,6 +192,11 @@ struct Ledger {
     native_epoch: BTreeMap<BindingRef, u64>,
     /// At most one undelivered current delta per active binding.
     feedback: BTreeMap<BindingRef, NativeFeedback>,
+    /// Identity of the single most recently delivered (inline-submitted or hook-consumed) issue
+    /// per active binding, retained across replacement or removal of `feedback`'s pending slot so
+    /// a later, redundant Context job for the exact same unchanged issue is never re-armed as a
+    /// fresh undelivered fact. Cleared at the same points `feedback` is cleared.
+    delivered: BTreeMap<BindingRef, DeliveredIssue>,
     /// Active Claude bindings available to mint post-activation helper jobs.
     claude: BTreeMap<BindingRef, ClaudeBindingState>,
 }
@@ -181,6 +211,7 @@ impl Default for Ledger {
             next: 0,
             native_epoch: BTreeMap::new(),
             feedback: BTreeMap::new(),
+            delivered: BTreeMap::new(),
             claude: BTreeMap::new(),
         }
     }
@@ -278,25 +309,50 @@ impl Shared {
         reference: &str,
         reply: &PeerReply,
     ) {
-        let Ok(mut ledger) = self.ledger.lock() else {
-            return;
+        // First pass: cheaply confirm there is still a same-producer entry worth checking, and
+        // take the exact fact text under the lock, before doing any rendering work outside it.
+        let fact = {
+            let Ok(ledger) = self.ledger.lock() else {
+                return;
+            };
+            let Some(feedback) = ledger.feedback.get(binding) else {
+                return;
+            };
+            if feedback.producer != reference {
+                return;
+            }
+            feedback.text.clone()
         };
-        let Some(feedback) = ledger.feedback.get_mut(binding) else {
-            return;
-        };
-        if feedback.producer != reference {
-            return;
-        }
-        let fact = feedback.text.clone();
+        // Rendering runs the real shrink loop; keep it off the ledger lock so a large reply never
+        // holds up unrelated bindings.
         let survives = render_reply(reply.clone())
             .structured_content
             .as_ref()
             .and_then(|value| value.get("text"))
             .and_then(serde_json::Value::as_str)
             .is_some_and(|text| text.contains(&fact));
-        if survives {
-            feedback.inline_delivered = true;
+        if !survives {
+            return;
         }
+        // Second pass: re-take the lock and recheck the exact same producer identity before
+        // writing. Nothing awaited between the two locks, but another task (a concurrent hook
+        // consuming this same entry, or a newer Context job overwriting the single slot) could
+        // have mutated it meanwhile; a stale write here would either resurrect a fact the hook
+        // path already consumed or wrongly stamp a different, newer fact as delivered.
+        let Ok(mut ledger) = self.ledger.lock() else {
+            return;
+        };
+        let identity = {
+            let Some(feedback) = ledger.feedback.get_mut(binding) else {
+                return;
+            };
+            if feedback.producer != reference {
+                return;
+            }
+            feedback.inline_delivered = true;
+            feedback.identity.clone()
+        };
+        ledger.delivered.insert(binding.clone(), identity);
     }
     /// Retains or clears the bounded Diff pagination state for one same-binding detail reference.
     /// Never touches the serialized reply; only `serve_inspection` may advance or drop this state.
@@ -543,6 +599,7 @@ impl WorkerHandle {
             ledger.details.clear();
             ledger.starts.clear();
             ledger.feedback.clear();
+            ledger.delivered.clear();
         }
         self.shared.notify.notify_one();
         let task = self.task.lock().map_err(|_| FailureCode::Internal)?.take();
@@ -625,6 +682,7 @@ impl WorkerHandle {
             ledger.starts.retain(|(owner, _), _| owner != &binding);
             ledger.native_epoch.remove(&binding);
             ledger.feedback.remove(&binding);
+            ledger.delivered.remove(&binding);
         }
         self.shared.notify.notify_one();
         let (send, wait) = oneshot::channel();
@@ -811,10 +869,17 @@ impl WorkerHandle {
             let mut ledger = self.shared.ledger.lock().ok()?;
             let current_epoch = ledger.native_epoch.get(&binding).copied().unwrap_or(0);
             let feedback = ledger.feedback.remove(&binding)?;
-            (current_epoch > feedback.native_epoch
+            let feedback = (current_epoch > feedback.native_epoch
                 && !feedback.inline_delivered
                 && feedback.source.as_ref().is_none_or(source_matches))
-            .then_some(feedback)?
+            .then_some(feedback)?;
+            // A hook consumption counts toward the same dedup state as an inline submission: a
+            // later, redundant Context job reproducing this exact unchanged issue must not
+            // re-arm it, even though this single-slot entry is gone.
+            ledger
+                .delivered
+                .insert(binding.clone(), feedback.identity.clone());
+            feedback
         };
         self.shared.active(&binding).ok()?;
         Some(feedback.text)
@@ -1593,6 +1658,7 @@ impl<'a> Worker<'a> {
         let Some(super::claude_worker::HelperPayload::Context {
             source,
             feedback,
+            diagnostic_fingerprint,
             truncated,
         }) = settled.result().payload.as_ref()
         else {
@@ -1619,21 +1685,38 @@ impl<'a> Worker<'a> {
             return Err(FailureCode::SourceUnavailable);
         }
         if let Ok(mut ledger) = self.shared.ledger.lock() {
-            if let Some(feedback) = feedback {
-                ledger.feedback.insert(
-                    binding.clone(),
-                    NativeFeedback {
-                        source: None,
-                        text: feedback.clone(),
-                        native_epoch: epoch,
-                        // Computing this job's reply is not submitting it: the caller may still
-                        // only hold `Pending` until a later Inspect, or lose it to a deadline.
-                        inline_delivered: false,
-                        producer: job.reference.clone(),
-                    },
-                );
-            } else {
-                ledger.feedback.remove(&binding);
+            match (feedback, diagnostic_fingerprint) {
+                (Some(feedback), Some(diagnostic_fingerprint)) => {
+                    let identity = DeliveredIssue {
+                        source_path: std::path::PathBuf::from(&source.path),
+                        source_digest: source.digest.unwrap_or([0; 32]),
+                        diagnostic_fingerprint: *diagnostic_fingerprint,
+                    };
+                    // A redundant helper run for the exact same unchanged issue already reached a
+                    // caller (inline or via the hook) — never re-arm it as a fresh undelivered
+                    // fact just because this job happened to run again.
+                    if ledger.delivered.get(&binding) == Some(&identity) {
+                        ledger.feedback.remove(&binding);
+                    } else {
+                        ledger.feedback.insert(
+                            binding.clone(),
+                            NativeFeedback {
+                                source: None,
+                                text: feedback.clone(),
+                                native_epoch: epoch,
+                                // Computing this job's reply is not submitting it: the caller may
+                                // still only hold `Pending` until a later Inspect, or lose it to a
+                                // deadline.
+                                inline_delivered: false,
+                                producer: job.reference.clone(),
+                                identity,
+                            },
+                        );
+                    }
+                }
+                _ => {
+                    ledger.feedback.remove(&binding);
+                }
             }
         }
         Ok((
@@ -2018,18 +2101,45 @@ impl<'a> Worker<'a> {
         );
         if let Ok(mut ledger) = self.shared.ledger.lock() {
             if let Some(feedback) = feedback {
-                ledger.feedback.insert(
-                    binding.clone(),
-                    NativeFeedback {
-                        source: Some(observed.clone()),
-                        text: feedback.render(),
-                        native_epoch: epoch,
-                        // Computing this job's reply is not submitting it: the caller may still
-                        // only hold `Pending` until a later Inspect, or lose it to a deadline.
-                        inline_delivered: false,
-                        producer: job.reference.clone(),
-                    },
-                );
+                let messages: Vec<&str> = diagnostics
+                    .as_ref()
+                    .map(|diagnostics| {
+                        diagnostics
+                            .diagnostics
+                            .iter()
+                            .map(|diagnostic| diagnostic.message.as_str())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let identity = DeliveredIssue {
+                    source_path: observed.path().to_path_buf(),
+                    source_digest: observed
+                        .bytes()
+                        .map(|bytes| *bytes.digest())
+                        .unwrap_or([0; 32]),
+                    diagnostic_fingerprint: super::facade::diagnostic_fingerprint(&messages),
+                };
+                // A redundant Context job for the exact same unchanged issue already reached a
+                // caller (inline or via the hook) — never re-arm it as a fresh undelivered fact
+                // just because this job happened to run again.
+                if ledger.delivered.get(&binding) == Some(&identity) {
+                    ledger.feedback.remove(&binding);
+                } else {
+                    ledger.feedback.insert(
+                        binding.clone(),
+                        NativeFeedback {
+                            source: Some(observed.clone()),
+                            text: feedback.render(),
+                            native_epoch: epoch,
+                            // Computing this job's reply is not submitting it: the caller may
+                            // still only hold `Pending` until a later Inspect, or lose it to a
+                            // deadline.
+                            inline_delivered: false,
+                            producer: job.reference.clone(),
+                            identity,
+                        },
+                    );
+                }
             } else {
                 ledger.feedback.remove(&binding);
             }
@@ -2091,6 +2201,7 @@ impl<'a> Worker<'a> {
         self.baselines.remove(binding);
         if let Ok(mut ledger) = self.shared.ledger.lock() {
             ledger.feedback.remove(binding);
+            ledger.delivered.remove(binding);
             ledger.claude.remove(binding);
         }
     }
@@ -2824,6 +2935,18 @@ mod feedback_dedup_tests {
         }
     }
 
+    /// Builds one bounded issue identity for a fixed tag; distinct tags never compare equal.
+    /// These unit tests exercise the delivery-marking and consumption boundary directly, so the
+    /// identity's own content only needs to vary by tag — real content derivation is exercised by
+    /// the production `context`/`context_claude` regressions in `tests/product_mcp_contract.rs`.
+    fn identity(tag: &str) -> DeliveredIssue {
+        DeliveredIssue {
+            source_path: std::path::PathBuf::from("main.rs"),
+            source_digest: *blake3::hash(tag.as_bytes()).as_bytes(),
+            diagnostic_fingerprint: *blake3::hash(tag.as_bytes()).as_bytes(),
+        }
+    }
+
     /// A background job's fact that finished but was never handed to a live caller (still
     /// `Pending`/lost to a deadline from the caller's view) stays a pending new fact: the first
     /// eligible ordinary hook may deliver it once, and a second post must not resurrect it.
@@ -2841,6 +2964,7 @@ mod feedback_dedup_tests {
                     native_epoch: 0,
                     inline_delivered: false,
                     producer: "detail-1".into(),
+                    identity: identity("t1"),
                 },
             );
         }
@@ -2873,6 +2997,7 @@ mod feedback_dedup_tests {
                     native_epoch: 0,
                     inline_delivered: false,
                     producer: "detail-1".into(),
+                    identity: identity("t2"),
                 },
             );
         }
@@ -2908,6 +3033,7 @@ mod feedback_dedup_tests {
                     native_epoch: 0,
                     inline_delivered: false,
                     producer: "detail-A".into(),
+                    identity: identity("A"),
                 },
             );
             ledger.feedback.insert(
@@ -2918,6 +3044,7 @@ mod feedback_dedup_tests {
                     native_epoch: 0,
                     inline_delivered: false,
                     producer: "detail-B".into(),
+                    identity: identity("B"),
                 },
             );
         }
@@ -2935,10 +3062,13 @@ mod feedback_dedup_tests {
         );
     }
 
-    /// A carrier whose final fitting dropped the fact — a different reply, a shrunk/truncated
-    /// text that no longer contains it, or a closed/error transport — must never be mislabeled as
-    /// delivered: the fact stays eligible. Proves `mark_feedback_inline_delivered` checks the
-    /// fact's actual presence in the traced final carrier, not merely that some reply was sent.
+    /// A same-producer *value* that never actually carries the fact — a shrunk/trimmed text that
+    /// no longer contains it, or an `Error` value passed in place of `Complete` (standing in for
+    /// a capped/failed transport) — must never be mislabeled as delivered: the fact stays
+    /// eligible. This exercises only `mark_feedback_inline_delivered`'s own content-survival
+    /// check on the reply value it is given; it does not exercise closed-receiver ordering, which
+    /// is a property of its callers (`serve_inspection`/`perform` only invoke it after their own
+    /// `send()` already succeeded) rather than of this function.
     #[tokio::test]
     async fn a_carrier_that_dropped_the_fact_is_not_treated_as_delivered() {
         let (bindings, binding) = active_binding();
@@ -2953,6 +3083,7 @@ mod feedback_dedup_tests {
                     native_epoch: 0,
                     inline_delivered: false,
                     producer: "detail-1".into(),
+                    identity: identity("t3"),
                 },
             );
         }
@@ -2993,6 +3124,7 @@ mod feedback_dedup_tests {
                     native_epoch: 0,
                     inline_delivered: false,
                     producer: "detail-1".into(),
+                    identity: identity("t4"),
                 },
             );
         }
