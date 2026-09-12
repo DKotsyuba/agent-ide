@@ -938,7 +938,26 @@ impl ProductFixture {
         std::fs::write(fixture.root.join("tracked.txt"), "index\n").unwrap();
         fixture.git(&["add", "--", "tracked.txt"]);
         std::fs::write(fixture.root.join("tracked.txt"), "worktree\n").unwrap();
-        fixture.write_config(providers);
+        fixture.write_config(providers, None);
+        fixture
+    }
+    /// Creates the same fixture, additionally accepting a strict test-only Claude operator profile.
+    ///
+    /// This is wiring proof only: it asserts the daemon-side [`ClaudeOperatorProfile::validate`]
+    /// contract, never a real Claude host's actual sandbox enforcement.
+    fn new_claude(providers: Value) -> Self {
+        let fixture = Self::new(providers.clone());
+        fixture.write_config(
+            providers,
+            Some(json!({
+                "enabled": true,
+                "fail_if_unavailable": true,
+                "allow_unsandboxed_commands": false,
+                "no_matching_excluded_commands": true,
+                "scope_declared": true,
+                "platform": "mac_os"
+            })),
+        );
         fixture
     }
     /// Runs fixed local fixture setup with all user/system Git configuration excluded.
@@ -955,7 +974,11 @@ impl ProductFixture {
         assert!(output.status.success(), "fixture Git failed");
     }
     /// Writes only synthetic fixture acceptance records; this is not live Codex/D03 certification.
-    fn write_config(&self, providers: Value) {
+    ///
+    /// `claude_profile` is `None` for every existing Codex-shaped fixture, keeping their emitted
+    /// config byte-for-byte free of the new field; a Claude fixture supplies the strict test-only
+    /// operator profile asserted by [`ClaudeOperatorProfile::validate`].
+    fn write_config(&self, providers: Value, claude_profile: Option<Value>) {
         use agent_ide::execution::{D03ProfileEvidence, HostSandboxState, PersistedProfileRecord};
         let state = HostSandboxState::parse(Some(self.state())).unwrap();
         let record = PersistedProfileRecord::from_execution_evidence(
@@ -972,7 +995,7 @@ impl ProductFixture {
             &state,
         )
         .unwrap();
-        let config = json!({"version":1,"limits":{"queued":16,"details":64,"operation_ms":120000,"output_bytes":1048576},"targets":[{"attachment":"private-host-channel","candidate":self.root,"git":accepted_program("/usr/bin/git","fixture-git"),"codex":accepted_program("/usr/bin/true","unused-disabled-wrapper"),"providers":providers,"profiles":[{"record":serde_json::from_str::<Value>(&record.to_json()).unwrap(),"sandbox_state":self.state()}],"allow_disabled_host":true}]});
+        let config = json!({"version":1,"limits":{"queued":16,"details":64,"operation_ms":120000,"output_bytes":1048576},"targets":[{"attachment":"private-host-channel","candidate":self.root,"git":accepted_program("/usr/bin/git","fixture-git"),"codex":accepted_program("/usr/bin/true","unused-disabled-wrapper"),"providers":providers,"profiles":[{"record":serde_json::from_str::<Value>(&record.to_json()).unwrap(),"sandbox_state":self.state()}],"allow_disabled_host":true,"claude_profile":claude_profile}]});
         std::fs::write(&self.config, config.to_string()).unwrap();
     }
     /// Returns the current fixture's complete measured-state-shaped payload outside model arguments.
@@ -1099,6 +1122,38 @@ impl ProductActor {
             .unwrap()
             .unwrap();
         assert!(output.status.success() && output.stdout.is_empty() && output.stderr.is_empty());
+    }
+    /// Submits the same root/child correlation hook through the real shipping Claude command.
+    async fn claude_lifecycle(&self, fixture: &ProductFixture, phase: &str, call: &str) {
+        let mut child = claude_hook_process(&fixture.runtime, Some(self.attachment));
+        let payload =
+            json!({"hook_event_name":phase,self.actor_field:self.actor,"tool_use_id":call});
+        let mut input = child.stdin.take().unwrap();
+        input
+            .write_all(payload.to_string().as_bytes())
+            .await
+            .unwrap();
+        input.shutdown().await.unwrap();
+        drop(input);
+        let output = tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(output.status.success() && output.stdout.is_empty() && output.stderr.is_empty());
+    }
+    /// Runs exact Pre→MCP→Post through the real Claude hook and Claude tool-use metadata shape.
+    async fn call_claude(&mut self, fixture: &ProductFixture, name: &str, arguments: Value) -> Value {
+        self.next += 1;
+        let call = format!("call-{}", self.next);
+        self.claude_lifecycle(fixture, "PreToolUse", &call).await;
+        let reply = self
+            .mcp
+            .exchange(json!({"jsonrpc":"2.0","id":self.next,"method":"tools/call","params":{
+                "name":name,"arguments":arguments,"_meta":{"claudecode/toolUseId":call}}}))
+            .await;
+        self.claude_lifecycle(fixture, "PostToolUse", &call).await;
+        assert!(!reply["result"]["structuredContent"].is_null(), "{reply}");
+        reply["result"]["structuredContent"].clone()
     }
     /// Runs exact Pre→MCP→Post with current host state separated from bounded model arguments.
     async fn call(&mut self, fixture: &ProductFixture, name: &str, arguments: Value) -> Value {
@@ -1496,7 +1551,7 @@ async fn configured_product_returns_real_go_and_rust_semantic_context() {
         .unwrap();
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
         let providers = json!([{"executable":accepted_program(&gopls,"golang.org/x/tools/gopls v0.23.0"),"settings":"gopls_defaults","toolchain":go,"cargo":null,"cargo_version":null,"rustc":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"fixture-go-cache"},{"executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),"settings":"rust_cache_priming_disabled_v1","toolchain":toolchain,"cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"fixture-rust-cache"}]);
-        fixture.write_config(providers);
+        fixture.write_config(providers, None);
         let mut daemon = fixture.daemon().await;
         let mut actor = ProductActor::new(&fixture, "provider-root").await;
         let start = actor
@@ -1605,7 +1660,7 @@ async fn configured_product_rust_resolves_definition_across_a_crate_boundary() {
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let providers = json!([{"executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),"settings":"rust_cache_priming_disabled_v1","toolchain":toolchain,"cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"fixture-rust-cross-crate-cache"}]);
-    fixture.write_config(providers);
+    fixture.write_config(providers, None);
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "cross-crate-root").await;
     let start = actor
@@ -1754,7 +1809,7 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
     )
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"slow-fixture-provider"),"settings":"gopls_defaults","toolchain":"/usr/bin/true","cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"slow-fixture-cache"}]));
+    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"slow-fixture-provider"),"settings":"gopls_defaults","toolchain":"/usr/bin/true","cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"slow-fixture-cache"}]), None);
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "cancel-root").await;
     let started = actor
@@ -1870,7 +1925,7 @@ async fn configured_product_sigterm_reaps_active_provider_and_owned_sockets() {
     )
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"signal-fixture-provider"),"settings":"gopls_defaults","toolchain":"/usr/bin/true","cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"signal-fixture-cache"}]));
+    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"signal-fixture-provider"),"settings":"gopls_defaults","toolchain":"/usr/bin/true","cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"signal-fixture-cache"}]), None);
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "signal-root").await;
     let started = actor
@@ -1971,7 +2026,7 @@ async fn configured_product_sigterm_reaps_in_flight_rust_only_provider() {
     )
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"rust-analyzer signal fixture"),"settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo":accepted_program("/usr/bin/true","cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program("/usr/bin/true","rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"signal-rust-cache"}]));
+    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"rust-analyzer signal fixture"),"settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo":accepted_program("/usr/bin/true","cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program("/usr/bin/true","rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"signal-rust-cache"}]), None);
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "signal-rust-root").await;
     let started = actor
@@ -2060,7 +2115,7 @@ async fn configured_product_isolates_go_across_two_divergent_worktree_actors() {
     )
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
-    fixture.write_config(json!([{"executable":accepted_program(wrapper.to_str().unwrap(),"golang.org/x/tools/gopls v0.23.0"),"settings":"gopls_defaults","toolchain":go,"cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"shared-fixture-cache"}]));
+    fixture.write_config(json!([{"executable":accepted_program(wrapper.to_str().unwrap(),"golang.org/x/tools/gopls v0.23.0"),"settings":"gopls_defaults","toolchain":go,"cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"shared-fixture-cache"}]), None);
     let child_root = fixture.base.join("child");
     std::fs::create_dir(&child_root).unwrap();
     let git = |args: &[&str]| {
@@ -2509,6 +2564,135 @@ async fn diff_oversized_single_hunk_reports_capacity_without_false_continuation(
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Drives one real foreground Claude helper launch end to end: `ide.start` returns the exact
+/// helper instruction, a native Bash pre-hook arms it, the fixed helper subcommand runs as a real
+/// process and claims it over the private socket, a matching Bash post-hook settles it, and
+/// `ide.inspect` is the only route that ever publishes a durable Workspace row from that evidence.
+///
+/// The accepted `claude_profile` here is the fixture's test-only disabled launcher wiring proof,
+/// not a real host sandbox measurement: it only proves the daemon→hook→helper→daemon correlation
+/// and admission plumbing settle correctly, never that a live Claude host actually contained the
+/// helper.
+#[tokio::test]
+async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor_then_stops() {
+    /// Runs one complete Claude `ide.start` round trip: mint, arm, real helper process, settle.
+    async fn claude_start(actor: &mut ProductActor, fixture: &ProductFixture) -> Value {
+        let pending = actor
+            .call_claude(fixture, "ide.start", json!({"activation_id":"start"}))
+            .await;
+        assert_eq!(pending["state"], "pending", "{pending}");
+        let detail_ref = pending["detail_ref"].as_str().unwrap().to_owned();
+        let helper = pending["helper"].as_str().unwrap().to_owned();
+        assert!(helper.contains("claude-worker"), "{helper}");
+
+        // The ordinary Bash pre-hook recognizes the exact expected command; this is silent by
+        // construction and performs no admission decision itself. Each invocation needs its own
+        // unique tool-call id: a repeated helper launch under the same id would let the post-hook
+        // settle a still-open earlier ticket instead of this one.
+        let launch_call = format!("bash-launch-{detail_ref}");
+        let launch_call = launch_call.as_str();
+        let mut arm = claude_hook_process(&fixture.runtime, Some(actor.attachment));
+        arm.stdin
+            .take()
+            .unwrap()
+            .write_all(
+                json!({"hook_event_name":"PreToolUse","session_id":actor.actor,
+                    "tool_use_id":launch_call,"tool_name":"Bash",
+                    "tool_input":{"command":helper}})
+                .to_string()
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let armed = tokio::time::timeout(Duration::from_secs(2), arm.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(armed.status.success() && armed.stdout.is_empty() && armed.stderr.is_empty());
+
+        // Runs the fixed helper command as a real foreground process, exactly as a native Bash
+        // tool call would; it claims the ticket once over the private socket and performs real
+        // Git discovery against the fixture's worktree.
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            Command::new("/bin/sh").arg("-c").arg(&helper).output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "helper failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("claude-worker"),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+
+        // The matching Bash post-hook settles the claimed ticket.
+        let mut post = claude_hook_process(&fixture.runtime, Some(actor.attachment));
+        post.stdin
+            .take()
+            .unwrap()
+            .write_all(
+                json!({"hook_event_name":"PostToolUse","session_id":actor.actor,
+                    "tool_use_id":launch_call,"tool_response":{"success":true}})
+                .to_string()
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let settled = tokio::time::timeout(Duration::from_secs(2), post.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(settled.status.success() && settled.stdout.is_empty() && settled.stderr.is_empty());
+
+        actor
+            .call_claude(fixture, "ide.inspect", json!({"detail_ref":detail_ref}))
+            .await
+    }
+
+    let fixture = ProductFixture::new_claude(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut first = ProductActor::new(&fixture, "claude-first").await;
+
+    let started = claude_start(&mut first, &fixture).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    // Re-running the exact same activation end to end is idempotent: the already-durable
+    // Workspace publishes the identical retained evidence rather than a second row.
+    let reread = claude_start(&mut first, &fixture).await;
+    assert_eq!(reread, started, "{reread}");
+
+    // A second actor targeting the same worktree is refused with Conflict while the first
+    // actor's own activation stays usable.
+    let mut second = ProductActor::new_at(
+        &fixture,
+        "claude-second",
+        "private-host-channel",
+        "session_id",
+        fixture.state(),
+    )
+    .await;
+    let conflicted = claude_start(&mut second, &fixture).await;
+    assert_eq!(conflicted["state"], "error", "{conflicted}");
+    assert_eq!(conflicted["code"], "conflict", "{conflicted}");
+
+    let still_usable = claude_start(&mut first, &fixture).await;
+    assert_eq!(still_usable, started, "{still_usable}");
+
+    let stopped = first.call_claude(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+
+    first.mcp.close().await;
+    second.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
 }
