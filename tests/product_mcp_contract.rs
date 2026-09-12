@@ -3317,25 +3317,16 @@ async fn configured_product_claude_helper_returns_context_diff_and_feedback() {
         context_text.contains("diagnostic_count: 1"),
         "{context_text}"
     );
+    // The diagnostic delta above was already handed to this same caller inline, inside the
+    // retrieved `ide.context` reply. An ordinary native-edit post hook that follows must not echo
+    // that already-submitted fact on the second channel: `claude_lifecycle` asserts empty stdout,
+    // the same bar every other no-feedback hook in this file is held to.
     actor
         .claude_lifecycle(&fixture, "PreToolUse", "native-edit-after-context")
         .await;
-    let feedback = actor
-        .claude_lifecycle_output(&fixture, "PostToolUse", "native-edit-after-context")
+    actor
+        .claude_lifecycle(&fixture, "PostToolUse", "native-edit-after-context")
         .await;
-    assert!(feedback.status.success() && feedback.stderr.is_empty());
-    let feedback: Value = serde_json::from_slice(&feedback.stdout).unwrap();
-    let additional = feedback["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap();
-    assert!(
-        additional.contains("Provider reported 1 diagnostics"),
-        "{additional}"
-    );
-    assert!(
-        additional.contains("provisional helper snapshot"),
-        "{additional}"
-    );
 
     let rust_source = std::fs::read_to_string(fixture.root.join("src/lib.rs")).unwrap();
     let pending = actor
