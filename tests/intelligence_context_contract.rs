@@ -223,7 +223,7 @@ async fn real_gopls_production_context_tracks_exact_observed_bytes() {
             view: 1,
         },
         ProviderSettings::GoplsDefaults(
-            GoEnv::new(
+            GoEnv::prepare(
                 fixture.root.join("go-cache"),
                 fixture.root.join("module-cache"),
                 fixture.root.join("go-tmp"),

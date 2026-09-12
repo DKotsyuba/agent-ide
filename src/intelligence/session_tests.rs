@@ -777,3 +777,37 @@ fn go_env_rejects_paths_that_could_escape_the_private_namespace() {
         );
     }
 }
+
+/// `prepare` must materialize every private Go directory a real view is configured to use.
+///
+/// A missing `GOTMPDIR` makes `go` refuse to create its work directory, which gopls surfaces only
+/// as `no package metadata for file ... (jsonrpc error 0)`, silently demoting the view to lexical
+/// context; the namespace root exists but these three subdirectories belong to the session alone.
+/// The same refusals as `new` still apply before anything is created.
+#[test]
+fn go_env_prepare_creates_the_private_namespace_directories() {
+    use crate::intelligence::session::GoEnv;
+    let root = std::path::PathBuf::from("/private/tmp").join(format!(
+        "agent-ide-go-env-prepare-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let paths = ["go-build", "go-mod", "tmp"].map(|name| root.join("nested").join(name));
+    let env = GoEnv::prepare(paths[0].clone(), paths[1].clone(), paths[2].clone())
+        .expect("an absolute private namespace is creatable");
+    for path in &paths {
+        assert!(path.is_dir(), "{path:?} must exist before a view uses it");
+    }
+    assert_eq!(env.go_tmp_dir(), paths[2]);
+    assert!(
+        GoEnv::prepare(
+            std::path::PathBuf::from("relative/go-build"),
+            paths[1].clone(),
+            paths[2].clone(),
+        )
+        .is_none(),
+        "prepare must keep every rejection new performs"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
