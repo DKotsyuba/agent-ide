@@ -92,13 +92,15 @@ The helper's own post is special: it settles the operation it belongs to and nev
 the result that same helper just produced. Ordinary later native posts still advance the native
 epoch and invalidate earlier results as usual.
 
-`inspect` for Claude is same-binding, same-generation retrieval only. It performs no daemon source
-read, and labels helper-observed source and diagnostic freshness provisional rather than presenting
+`inspect`, or `context`/`diff` carrying their optional `detail_ref`, is same-binding,
+same-generation retrieval only. Retrieval launches no second helper and performs no daemon source
+read. Helper-observed source and diagnostic freshness remain provisional rather than presenting
 unobserved out-of-band changes as current. A later ordinary native Pre/Post pair may consume that
 delta once; delivery advances the binding epoch but does not pretend the daemon re-read source.
 
-`stop` revokes and cancels first. It is reported complete only on actual child settlement;
-otherwise the outcome is uncertain or a deadline, and the admission stays quarantined.
+`stop` is daemon-owned and never launches a helper. It revokes and cancels tickets first; any
+already-running helper may report late cleanup evidence, but cannot revive authority. Stop success
+still requires the daemon's actual provider/revocation settlement.
 
 ## Supported profiles
 
