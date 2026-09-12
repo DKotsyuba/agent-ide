@@ -491,7 +491,7 @@ fn managed_argv_is_unchanged_without_a_trampoline_and_only_wrapped_with_one() {
             OsString::from("--version"),
         ]
     );
-    let Ok(trampoline) = ControlledTrampoline::accept(PathBuf::from("/usr/bin/env")) else {
+    let Some(trampoline) = accepted_env_trampoline() else {
         return;
     };
     let (wrapped_program, wrapped) = argv(Some(&trampoline));
@@ -513,11 +513,20 @@ fn managed_argv_is_unchanged_without_a_trampoline_and_only_wrapped_with_one() {
     );
 }
 
+/// Seals the platform `/usr/bin/env` against its own current bytes, as an operator would declare
+/// them, or returns `None` where this contract is unavailable or the file cannot be read.
+fn accepted_env_trampoline() -> Option<ControlledTrampoline> {
+    let declared = blake3::hash(&std::fs::read("/usr/bin/env").ok()?)
+        .to_hex()
+        .to_string();
+    ControlledTrampoline::accept(PathBuf::from("/usr/bin/env"), &declared).ok()
+}
+
 /// Only `/usr/bin/env` is accepted, and a program `env` would read as an assignment is refused.
 #[test]
 fn trampoline_acceptance_is_closed_and_rejects_assignment_programs() {
     assert_eq!(
-        ControlledTrampoline::accept(PathBuf::from("/private/tmp/wrapper.sh")),
+        ControlledTrampoline::accept(PathBuf::from("/private/tmp/wrapper.sh"), &"0".repeat(64)),
         Err(RequestError::TrampolineUnavailable)
     );
     assert_eq!(
@@ -528,4 +537,56 @@ fn trampoline_acceptance_is_closed_and_rejects_assignment_programs() {
         ControlledTrampoline::accepts_program(Path::new("/usr/bin/true")),
         Ok(())
     );
+}
+
+/// The seal is pinned to the operator's declaration and to the bytes measured at that moment.
+///
+/// An executable whose current bytes contradict the declared digest is never adopted as a new
+/// baseline, and an identity that no longer describes the file on disk refuses to launch. Both
+/// halves are exercised without touching the protected system `/usr/bin/env`.
+#[cfg(target_os = "macos")]
+#[test]
+fn trampoline_seal_requires_the_declared_digest_and_refuses_a_changed_object() {
+    assert_eq!(
+        ControlledTrampoline::accept(PathBuf::from("/usr/bin/env"), &"0".repeat(64)),
+        Err(RequestError::ExecutableUnavailable),
+        "a wrong declared digest must not be re-baselined to whatever bytes are present"
+    );
+    let Some(mut trampoline) = accepted_env_trampoline() else {
+        return;
+    };
+    trampoline.verified_path().unwrap();
+    // Altering only the retained expected identity models an executable replaced after the
+    // operator's declaration was accepted; the pre-spawn recheck must refuse it.
+    trampoline.identity.digest = blake3::hash(b"replaced trampoline bytes");
+    assert_eq!(
+        trampoline.verified_path(),
+        Err(RequestError::ExecutableUnavailable)
+    );
+}
+
+/// An unknown key on the permission profile itself disqualifies read-all recognition.
+///
+/// The inner filesystem checks cannot see a profile-level permission this build has never parsed,
+/// so the envelope is closed separately; opaque parsing and byte-exact replay stay unaffected.
+#[test]
+fn read_all_recognition_rejects_unknown_permission_profile_keys() {
+    let mut state = real_managed_state("file:///private/tmp/host/work");
+    assert!(grants_read_of_all_roots(&state));
+    state["permissionProfile"]["future_permission"] = serde_json::json!({"deny": ["/"]});
+    assert!(
+        !grants_read_of_all_roots(&state),
+        "an unrecognized profile-level permission must keep strict sandbox-cwd equality"
+    );
+    // The same state still parses and replays unchanged for ordinary same-cwd execution.
+    let parsed = HostSandboxState::parse(Some(state.clone())).unwrap();
+    assert_eq!(parsed.class(), ProfileClass::Managed);
+    assert_eq!(parsed.sandbox_state_json(), state.to_string());
+    // A profile missing one of the three known keys is equally unrecognized.
+    let mut narrowed = real_managed_state("file:///private/tmp/host/work");
+    narrowed["permissionProfile"]
+        .as_object_mut()
+        .unwrap()
+        .remove("network");
+    assert!(!grants_read_of_all_roots(&narrowed));
 }

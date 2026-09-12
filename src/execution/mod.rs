@@ -1066,9 +1066,12 @@ const TRAMPOLINE_PROGRAM: &str = "/usr/bin/env";
 /// allowlist are all unchanged, and `env` execs the same child, so process, group, and lease
 /// accounting still describe one direct child.
 ///
-/// Acceptance measures the executable object once (declaration fingerprint) and that identity is
-/// rechecked immediately before spawn, so a replaced `/usr/bin/env` fails closed with
-/// [`RequestError::ExecutableUnavailable`] instead of launching.
+/// Acceptance is pinned to the operator's own declaration, never to whatever bytes happen to be on
+/// disk when a request is built: the measured digest must equal the declared BLAKE3 accepted at
+/// configuration load, and only then is the measured object identity sealed. That sealed identity
+/// is rechecked immediately before spawn, so an executable replaced at any point — before or after
+/// acceptance — fails closed with [`RequestError::ExecutableUnavailable`] instead of being
+/// re-sealed as trusted and launched.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControlledTrampoline {
     /// Absolute accepted trampoline path; always exactly [`TRAMPOLINE_PROGRAM`].
@@ -1078,26 +1081,40 @@ pub struct ControlledTrampoline {
 }
 
 impl ControlledTrampoline {
-    /// Accepts one operator-declared trampoline path, measuring its identity at declaration time.
+    /// Seals one operator-declared trampoline against the exact digest that declaration accepted.
     ///
-    /// `path` must be exactly `/usr/bin/env`. Returns [`RequestError::TrampolineUnavailable`] for
-    /// any other path and on every platform other than macOS, where this contract's `env -C`
-    /// behaviour and the nested-sandbox constraints were actually established; Linux acceptance is
-    /// deliberately not offered rather than assumed. Returns
-    /// [`RequestError::ExecutableUnavailable`] when the path is not one stable readable regular
-    /// executable object.
-    pub fn accept(path: PathBuf) -> Result<Self, RequestError> {
+    /// `path` must be exactly `/usr/bin/env`; `declared_blake3` is the operator's configured
+    /// hexadecimal BLAKE3 of that executable, the same value verified once at daemon startup. The
+    /// bytes are measured here and compared with it, so a build that happens later in the daemon's
+    /// life can never adopt a changed executable as a new baseline.
+    ///
+    /// Returns [`RequestError::TrampolineUnavailable`] for any other path and on every platform
+    /// other than macOS, where this contract's `env -C` behaviour and the nested-sandbox
+    /// constraints were actually established; Linux acceptance is deliberately not offered rather
+    /// than assumed. Returns [`RequestError::ExecutableUnavailable`] when the path is not one
+    /// stable readable regular executable object, or when its measured bytes do not match
+    /// `declared_blake3`.
+    pub fn accept(path: PathBuf, declared_blake3: &str) -> Result<Self, RequestError> {
         if path != Path::new(TRAMPOLINE_PROGRAM) || !cfg!(target_os = "macos") {
             return Err(RequestError::TrampolineUnavailable);
         }
         let identity = executable_identity(&path)?;
+        if !identity
+            .digest
+            .to_hex()
+            .as_str()
+            .eq_ignore_ascii_case(declared_blake3)
+        {
+            return Err(RequestError::ExecutableUnavailable);
+        }
         Ok(Self { path, identity })
     }
 
     /// Returns the accepted path after rechecking that the executable object is byte-unchanged.
     ///
-    /// Returns [`RequestError::ExecutableUnavailable`] when the object or its bytes changed since
-    /// acceptance, so a swapped trampoline can never be executed.
+    /// The comparison is against the identity sealed at acceptance, which itself had to match the
+    /// operator's declared digest. Returns [`RequestError::ExecutableUnavailable`] when the object
+    /// or its bytes changed since then, so a swapped trampoline can never be executed.
     fn verified_path(&self) -> Result<&Path, RequestError> {
         if executable_identity(&self.path)? != self.identity {
             return Err(RequestError::ExecutableUnavailable);
@@ -3737,8 +3754,11 @@ fn canonical_json(value: &Value) -> String {
 /// Recognizes the one closed managed filesystem profile that already grants read access to `/`.
 ///
 /// `raw` is a complete host sandbox state. The profile qualifies only when every part of its
-/// `permissionProfile.file_system` value is understood here:
+/// `permissionProfile` value is understood here:
 ///
+/// * the profile holds exactly the three known managed keys `type`, `file_system`, and `network`;
+///   an unknown profile-level key may carry a permission this build cannot interpret, so it
+///   disqualifies recognition even though the opaque state still parses and replays normally;
 /// * `file_system` holds exactly `type` and `entries`, and `type` is `restricted`;
 /// * every entry holds only `access`, `path`, and the optional `missing_path_behavior`, whose only
 ///   accepted value is `skip`;
@@ -3753,12 +3773,22 @@ fn canonical_json(value: &Value) -> String {
 /// This classifier answers one question about declared read authority; it is deliberately not a
 /// general permissions evaluator, and it never decides write, network, or execution authority.
 fn grants_read_of_all_roots(raw: &Value) -> bool {
-    let Some(file_system) = raw
-        .get("permissionProfile")
-        .and_then(Value::as_object)
-        .and_then(|profile| profile.get("file_system"))
-        .and_then(Value::as_object)
-    else {
+    let Some(profile) = raw.get("permissionProfile").and_then(Value::as_object) else {
+        return false;
+    };
+    // The envelope itself must be closed, not merely its filesystem section: a profile-level key
+    // this build has never seen may carry a permission that subtracts from the declared read
+    // grant, so an unknown key disqualifies the whole recognition. Opaque parsing and replay
+    // elsewhere still accept and preserve such a state untouched; only this read-scope
+    // recognizer is strict, and it reads neither `type` nor `network` as authority.
+    if profile.len() != 3
+        || profile
+            .keys()
+            .any(|key| !matches!(key.as_str(), "type" | "file_system" | "network"))
+    {
+        return false;
+    }
+    let Some(file_system) = profile.get("file_system").and_then(Value::as_object) else {
         return false;
     };
     if file_system.len() != 2
