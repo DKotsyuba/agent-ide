@@ -176,4 +176,9 @@ Wired and covered by local checks:
   backend or opaque-index reuse claim. Claude Go remains per-operation exclusive; the compatible
   two-worktree shared-gopls guarantee belongs only to the managed Codex matrix.
 
-No live Claude host acceptance or `model_seen` proof has been run.
+Live checks with Claude Code 2.1.267 on macOS 26.6.2 exercised Go and Rust semantic
+context, diagnostic changes after native edits, actual Git diff and Stop. Parallel native
+actors in separate roots preserved their own source and diagnostics; an attempted context
+request through another actor's attachment was refused, a peer remained usable after Stop,
+and a fresh actor activated the stopped worktree with a new authority epoch. These checks
+do not establish hot-index retention or formal per-event `model_seen` accounting.

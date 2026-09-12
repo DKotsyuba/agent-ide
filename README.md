@@ -5,8 +5,10 @@ An explicitly activated coding companion for Codex and Claude Code, designed for
 Status: the binary assembles the five-tool MCP surface, exact Codex hook-to-MCP binding,
 explicit Codex/Claude native ingress, bounded hook context output, durable Workspace activation,
 source context, safe Git comparisons and owned provider cleanup. Host-shaped process tests exercise
-Claude foreground-helper activation, Go/Rust Context, Diff and emitted additional context; fresh
-live Codex/Claude acceptance and host-observed model visibility remain unverified.
+Claude foreground-helper activation, Go/Rust Context, Diff and emitted additional context.
+Live macOS checks cover Claude Go/Rust and parallel native actors with sequential handoff,
+plus the Codex Go context/edit/diff/stop loop. Codex native actors with distinct worktree roots,
+complete delivery accounting and the remaining roadmap acceptance checks are still open.
 
 Build with `cargo build --locked --bin agent-ide`. Configure an MCP client to launch
 `target/debug/agent-ide mcp --runtime-dir PATH`. Discovery works without a daemon;
@@ -32,10 +34,10 @@ Earlier design documents (subject to the current roadmap and interface renegotia
 - [Product requirements](docs/product.md)
 - [Architecture](docs/architecture.md)
 
-The proposed implementation uses Rust and Tokio.
+The implementation uses Rust and Tokio.
 
 Persistent LSP caches follow the worktree, including sequential coder-to-reviewer handoff. MCP or hook failure must leave ordinary agent work usable, with honest degraded results.
 
-Finishing a coder session retains its worktree's cache and analysis leases for reuse; it does not retire them. A verified Workspace closure or reset is the only fact that retires a cache namespace; v0.1 has no worktree-close surface that produces that fact yet, so namespaces accumulate up to a fixed ceiling for the daemon's lifetime rather than being retired automatically. Shared backends remain available to other open worktrees.
+Stopping a coder releases its analysis leases and retains its worktree's cache directories. A verified Workspace closure or reset is the only fact that retires a cache namespace; v0.1 has no worktree-close surface that produces that fact yet, so namespaces accumulate up to a fixed ceiling for the daemon's lifetime rather than being retired automatically. Shared backends remain available to other open worktrees. Retained directories do not imply retained hot provider indexes; the strict retention requirement in the [roadmap](docs/roadmap.md#acceptance) remains unresolved.
 
 Go worktrees split their cache in two. Each worktree keeps a private namespace holding its own `GOCACHE`/`GOMODCACHE`/`GOTMPDIR`, delivered per LSP view rather than as process environment, so a view without one fails closed instead of reading another worktree's build state. Compatible worktrees additionally share one backend-scoped native namespace holding gopls' own on-disk filecache and the listener's temporary directory: gopls binds that filecache once per process, so sharing it is what lets divergent worktrees run on a single physical listener with one forwarder each. Compatibility is one canonical effective-rights identity — provider, settings, toolchain, and the rights the observed sandbox state actually grants; cwd-relative sandbox roots are resolved to absolute rights first, and any policy whose rights cannot be proven equal is never shared. The shared namespace is reference-counted, so it survives a partial stop while any sharing worktree is still live, and both namespaces persist across stop and handoff. gopls manages the contents of its shared native namespace itself and may evict them at any time; that eviction is a cache miss, never a loss of IDE-owned worktree state.
