@@ -330,6 +330,59 @@ fn snapshot_intents_own_private_file_cleanup() {
     );
 }
 
+/// Writer proving the private scratch root follows the process TMPDIR, not a hardcoded `/tmp`.
+/// Run only via the exact-process fixture below so peer tests never race environment mutation.
+#[test]
+fn snapshot_directory_honors_host_temp_writer() {
+    let Ok(custom_temp) = std::env::var("AGENT_IDE_SNAPSHOT_TEMP_FIXTURE") else {
+        return;
+    };
+    let fixture = GitFixture::new();
+    let scope = agent_ide::workspace::git::GitScope::from_authority(
+        &authority_for(&fixture),
+        DiffMode::Head,
+    );
+    let intent =
+        SnapshotIntent::compare(scope, std::path::Path::new(GIT), b"left", b"right").unwrap();
+    let dir = intent.snapshot_directory().unwrap().to_path_buf();
+    let expected_parent = fs::canonicalize(&custom_temp).expect("fixture temp dir exists");
+    assert_eq!(
+        dir.parent().expect("scratch dir has a parent"),
+        expected_parent,
+        "scratch directory must live under the process TMPDIR, not a hardcoded /tmp"
+    );
+}
+
+/// Spawns the writer above with an isolated TMPDIR so no peer test races process-global environment.
+#[test]
+fn snapshot_directory_follows_process_tmpdir() {
+    let tick = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after epoch")
+        .as_nanos();
+    let custom_temp = PathBuf::from(format!(
+        "/private/tmp/agent-ide-alt-scratch-{}-{tick}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&custom_temp).expect("alternate temp root is creatable");
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "snapshot_directory_honors_host_temp_writer",
+            "--nocapture",
+        ])
+        .env("TMPDIR", &custom_temp)
+        .env("AGENT_IDE_SNAPSHOT_TEMP_FIXTURE", &custom_temp)
+        .output()
+        .expect("writer process starts");
+    fs::remove_dir_all(&custom_temp).ok();
+    assert!(
+        child.status.success(),
+        "writer failed: {}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+}
+
 /// Fixture output cannot mint actual-wait identity or release files, even with an apparent success exit.
 #[tokio::test]
 async fn incomplete_execution_never_becomes_snapshot_evidence() {

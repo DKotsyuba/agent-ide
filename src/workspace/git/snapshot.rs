@@ -74,7 +74,7 @@ enum ScratchLifecycle {
 impl SnapshotDirectory {
     /// Creates a unique exclusive scratch directory; rejects repositories containing the temp root.
     fn new(scope: &GitScope) -> Result<Arc<Self>, GitError> {
-        let temp = fs::canonicalize("/tmp").map_err(|_| GitError::SnapshotIo)?;
+        let temp = fs::canonicalize(std::env::temp_dir()).map_err(|_| GitError::SnapshotIo)?;
         let root =
             fs::canonicalize(scope.worktree().worktree_path()).map_err(|_| GitError::SnapshotIo)?;
         if temp.starts_with(&root) {
