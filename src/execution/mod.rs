@@ -328,6 +328,16 @@ impl HostSandboxState {
         &self.sandbox_cwd
     }
 
+    /// Reports whether this exact state already grants read access to the whole filesystem root.
+    ///
+    /// Only a `managed` class whose own `permissionProfile.file_system` is a recognized closed
+    /// restricted profile qualifies; see [`grants_read_of_all_roots`] for the recognized shape.
+    /// This is a read-authority classification of the replayed state, never a widening of it: the
+    /// raw JSON is untouched and no path is resolved, expanded, or added.
+    fn grants_read_of_all_roots(&self) -> bool {
+        self.class == ProfileClass::Managed && grants_read_of_all_roots(&self.raw)
+    }
+
     /// Serializes the complete original state for the Codex sandbox command.
     fn json_argument(&self) -> &str {
         &self.raw_json
@@ -953,6 +963,7 @@ impl ValidatedGitDiscovery {
             &self.invocation.sandbox,
             settlement,
             codex_executable,
+            None,
             self.output_cap,
         )?;
         Ok(OwnedGitDiscovery {
@@ -1042,6 +1053,78 @@ fn discovery_result(
     }
 }
 
+/// The only trampoline program this contract accepts; an arbitrary script is never accepted.
+const TRAMPOLINE_PROGRAM: &str = "/usr/bin/env";
+
+/// Carries the operator-accepted `/usr/bin/env` used to run a validated command in the
+/// authoritative worktree while the host sandbox state is replayed byte-for-byte.
+///
+/// The trampoline exists for exactly one case: a managed host whose `sandboxCwd` is the parent's
+/// inherited directory rather than this worktree. `codex sandbox` sets the child cwd from that
+/// state, so the utility is wrapped as `env -C <authority root> <program> <args>` *inside* the
+/// unchanged sandbox argv. It grants nothing: the sandbox policy, its raw JSON, and the program
+/// allowlist are all unchanged, and `env` execs the same child, so process, group, and lease
+/// accounting still describe one direct child.
+///
+/// Acceptance measures the executable object once (declaration fingerprint) and that identity is
+/// rechecked immediately before spawn, so a replaced `/usr/bin/env` fails closed with
+/// [`RequestError::ExecutableUnavailable`] instead of launching.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ControlledTrampoline {
+    /// Absolute accepted trampoline path; always exactly [`TRAMPOLINE_PROGRAM`].
+    path: PathBuf,
+    /// Executable object and byte identity measured when the operator's declaration was accepted.
+    identity: ExecutableIdentity,
+}
+
+impl ControlledTrampoline {
+    /// Accepts one operator-declared trampoline path, measuring its identity at declaration time.
+    ///
+    /// `path` must be exactly `/usr/bin/env`. Returns [`RequestError::TrampolineUnavailable`] for
+    /// any other path and on every platform other than macOS, where this contract's `env -C`
+    /// behaviour and the nested-sandbox constraints were actually established; Linux acceptance is
+    /// deliberately not offered rather than assumed. Returns
+    /// [`RequestError::ExecutableUnavailable`] when the path is not one stable readable regular
+    /// executable object.
+    pub fn accept(path: PathBuf) -> Result<Self, RequestError> {
+        if path != Path::new(TRAMPOLINE_PROGRAM) || !cfg!(target_os = "macos") {
+            return Err(RequestError::TrampolineUnavailable);
+        }
+        let identity = executable_identity(&path)?;
+        Ok(Self { path, identity })
+    }
+
+    /// Returns the accepted path after rechecking that the executable object is byte-unchanged.
+    ///
+    /// Returns [`RequestError::ExecutableUnavailable`] when the object or its bytes changed since
+    /// acceptance, so a swapped trampoline can never be executed.
+    fn verified_path(&self) -> Result<&Path, RequestError> {
+        if executable_identity(&self.path)? != self.identity {
+            return Err(RequestError::ExecutableUnavailable);
+        }
+        Ok(&self.path)
+    }
+
+    /// Rejects a program path BSD `env` would consume as an environment assignment.
+    ///
+    /// `env` treats its first non-flag argument containing `=` as `NAME=VALUE` rather than the
+    /// utility to exec, so such a program is refused before spawn instead of silently launching a
+    /// different process.
+    fn accepts_program(program: &Path) -> Result<(), RequestError> {
+        if program.as_os_str().as_encoded_bytes().contains(&b'=') {
+            return Err(RequestError::TrampolineProgramRejected);
+        }
+        Ok(())
+    }
+
+    /// Returns the extra argv bytes this trampoline adds, so local ceilings still bound the spawn.
+    fn additional_argv_bytes(command: &ControlledCommand) -> usize {
+        os_bytes(&OsString::from("-C"))
+            + os_bytes(&command.cwd.clone().into_os_string())
+            + os_bytes(&command.program.clone().into_os_string())
+    }
+}
+
 /// Applies local ceilings to already validated peer input without widening host permissions.
 #[derive(Clone, Debug)]
 pub struct LocalExecutionPolicy {
@@ -1053,15 +1136,60 @@ pub struct LocalExecutionPolicy {
     max_environment_entries: usize,
     /// Whether this policy explicitly permits a host that declared no outer sandbox.
     allow_explicit_disabled_host: bool,
+    /// Operator-accepted `env` trampoline; `None` leaves a differing sandbox cwd unavailable.
+    trampoline: Option<ControlledTrampoline>,
 }
 
 impl LocalExecutionPolicy {
     /// Creates a policy whose program allowlist and numeric limits are independently validated.
+    ///
+    /// The resulting policy has no trampoline, so a command whose worktree differs from the host's
+    /// own `sandboxCwd` remains rejected; use [`LocalExecutionPolicy::with_env_trampoline`] to
+    /// accept one.
     pub fn new(
         allowed_programs: BTreeSet<PathBuf>,
         max_argv_bytes: usize,
         max_environment_entries: usize,
         allow_explicit_disabled_host: bool,
+    ) -> Result<Self, RequestError> {
+        Self::build(
+            allowed_programs,
+            max_argv_bytes,
+            max_environment_entries,
+            allow_explicit_disabled_host,
+            None,
+        )
+    }
+
+    /// Creates a policy that may additionally run a validated command in an authoritative worktree
+    /// other than the managed host's own `sandboxCwd`, through `trampoline`.
+    ///
+    /// The trampoline is used only when the observed managed profile already grants read of `/`;
+    /// it never relaxes the program allowlist, the worktree authority check, or the replayed
+    /// sandbox state.
+    pub fn with_env_trampoline(
+        allowed_programs: BTreeSet<PathBuf>,
+        max_argv_bytes: usize,
+        max_environment_entries: usize,
+        allow_explicit_disabled_host: bool,
+        trampoline: ControlledTrampoline,
+    ) -> Result<Self, RequestError> {
+        Self::build(
+            allowed_programs,
+            max_argv_bytes,
+            max_environment_entries,
+            allow_explicit_disabled_host,
+            Some(trampoline),
+        )
+    }
+
+    /// Validates the shared ceilings both constructors require.
+    fn build(
+        allowed_programs: BTreeSet<PathBuf>,
+        max_argv_bytes: usize,
+        max_environment_entries: usize,
+        allow_explicit_disabled_host: bool,
+        trampoline: Option<ControlledTrampoline>,
     ) -> Result<Self, RequestError> {
         if allowed_programs.is_empty() || max_argv_bytes == 0 {
             return Err(RequestError::InvalidPolicy);
@@ -1071,6 +1199,7 @@ impl LocalExecutionPolicy {
             max_argv_bytes,
             max_environment_entries,
             allow_explicit_disabled_host,
+            trampoline,
         })
     }
 }
@@ -1116,6 +1245,11 @@ pub enum RequestError {
     InvalidDiscoveryPolicy,
     /// Fixed-query fixture/capture metadata is oversized or contradicts its exit/drain evidence.
     InvalidDiscoveryEvidence,
+    /// A differing-cwd managed launch has no operator-accepted `/usr/bin/env` trampoline, or this
+    /// platform is not one where the trampoline contract is supported.
+    TrampolineUnavailable,
+    /// A trampolined program path would be misread by BSD `env` as an environment assignment.
+    TrampolineProgramRejected,
 }
 
 /// Couples the only inputs permitted to reach an owned operating-system spawn.
@@ -1129,11 +1263,21 @@ pub struct ValidatedExecutionRequest {
     permit: ExecutionProfilePermit,
     /// Fully controlled executable invocation ready for admission and later owned spawn.
     command: ControlledCommand,
+    /// Accepted `env` trampoline retained only when the worktree differs from the host sandbox cwd.
+    trampoline: Option<ControlledTrampoline>,
 }
 
 /// Rechecks current host state for a durable-authorized Workspace read or cached-result delivery.
-/// Consumes fresh binding liveness, requires exact sandbox cwd/root and the accepted current profile,
-/// and applies local disabled-host policy without fabricating a command, child, or new Workspace grant.
+/// Consumes fresh binding liveness, requires the accepted current profile, and applies local
+/// disabled-host policy without fabricating a command, child, or new Workspace grant.
+///
+/// The host's `sandboxCwd` must be this worktree root, with one exception: a managed state whose
+/// own recognized restricted profile already grants read of the whole filesystem root reads this
+/// worktree under its unchanged policy, so its inherited parent cwd is accepted. Every other
+/// state — including any profile shape this module does not fully recognize — keeps strict
+/// equality.
+/// Nothing else is relaxed: a stale binding, a mismatched authority, or an unaccepted profile
+/// still fails, and no permission is rewritten or widened.
 pub fn validate_workspace_read(
     active_use: ActiveBindingUse,
     observed: ObservedSandboxState,
@@ -1142,7 +1286,9 @@ pub fn validate_workspace_read(
     allow_explicit_disabled_host: bool,
 ) -> Result<ExecutionProfilePermit, RequestError> {
     let invocation = ValidatedHostInvocation::from_active_observation(active_use, observed)?;
-    if invocation.sandbox.cwd() != authority.root() {
+    if invocation.sandbox.cwd() != authority.root()
+        && !invocation.sandbox.grants_read_of_all_roots()
+    {
         return Err(RequestError::SandboxCwdMismatch);
     }
     if invocation.sandbox.class() == ProfileClass::Disabled && !allow_explicit_disabled_host {
@@ -1153,6 +1299,15 @@ pub fn validate_workspace_read(
 
 impl ValidatedExecutionRequest {
     /// Intersects host state, local policy, and Workspace authority before an admission request.
+    ///
+    /// The command always runs in the current authoritative worktree. When the managed host's own
+    /// `sandboxCwd` is a different inherited directory, that is accepted only when the observed
+    /// state already grants read of the whole filesystem root and the policy carries an accepted
+    /// `env` trampoline; the request then retains that trampoline so the spawn can enter the
+    /// worktree inside the unchanged sandbox argv. Without such a profile the cwd must match
+    /// exactly ([`RequestError::SandboxCwdMismatch`]); with such a profile but no accepted
+    /// trampoline the request is unavailable ([`RequestError::TrampolineUnavailable`]). The extra
+    /// trampoline argv bytes count against `policy.max_argv_bytes`.
     pub fn validate(
         invocation: ValidatedHostInvocation,
         authority: WorkspaceAuthority,
@@ -1166,10 +1321,23 @@ impl ValidatedExecutionRequest {
         if command.cwd != authority.root {
             return Err(RequestError::WorktreeDenied);
         }
-        if command.cwd != invocation.sandbox.cwd {
+        let trampoline = if command.cwd == invocation.sandbox.cwd {
+            None
+        } else if invocation.sandbox.grants_read_of_all_roots() {
+            let trampoline = policy
+                .trampoline
+                .clone()
+                .ok_or(RequestError::TrampolineUnavailable)?;
+            ControlledTrampoline::accepts_program(&command.program)?;
+            Some(trampoline)
+        } else {
             return Err(RequestError::SandboxCwdMismatch);
-        }
-        if command.args.iter().map(os_bytes).sum::<usize>() > policy.max_argv_bytes {
+        };
+        let argv_bytes = command.args.iter().map(os_bytes).sum::<usize>()
+            + trampoline
+                .as_ref()
+                .map_or(0, |_| ControlledTrampoline::additional_argv_bytes(&command));
+        if argv_bytes > policy.max_argv_bytes {
             return Err(RequestError::ArgvTooLarge);
         }
         if command.env.len() > policy.max_environment_entries {
@@ -1186,6 +1354,7 @@ impl ValidatedExecutionRequest {
             authority,
             permit,
             command,
+            trampoline,
         })
     }
 
@@ -2807,6 +2976,7 @@ impl OwnedChild {
             &request.invocation.sandbox,
             settlement,
             codex_executable,
+            request.trampoline.as_ref(),
             output_cap,
         )
     }
@@ -2832,6 +3002,7 @@ impl OwnedChild {
             &request.invocation.sandbox,
             settlement,
             codex_executable,
+            request.trampoline.as_ref(),
             output_cap,
         )
     }
@@ -2842,6 +3013,7 @@ impl OwnedChild {
         sandbox: &HostSandboxState,
         settlement: SpawnNeverStarted,
         codex_executable: &Path,
+        trampoline: Option<&ControlledTrampoline>,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
         let (mut child, identity) = match launch_child(
@@ -2849,6 +3021,7 @@ impl OwnedChild {
             sandbox,
             &settlement,
             codex_executable,
+            trampoline,
             output_cap,
             false,
         ) {
@@ -3059,6 +3232,7 @@ impl OwnedProtocolChild {
             &request.invocation.sandbox,
             &settlement,
             codex_executable,
+            request.trampoline.as_ref(),
             output_cap,
             true,
         ) {
@@ -3145,6 +3319,7 @@ fn launch_child(
     sandbox: &HostSandboxState,
     settlement: &SpawnNeverStarted,
     codex_executable: &Path,
+    trampoline: Option<&ControlledTrampoline>,
     output_cap: usize,
     protocol: bool,
 ) -> Result<(Child, ProcessIdentityData), ProcessError> {
@@ -3173,7 +3348,7 @@ fn launch_child(
     {
         return Err(ProcessError::Request(RequestError::ExecutableUnavailable));
     }
-    let mut process = build_command(command, sandbox, codex_executable)?;
+    let mut process = build_command(command, sandbox, codex_executable, trampoline)?;
     process.stdout(Stdio::piped()).stderr(Stdio::piped());
     if protocol {
         process.stdin(Stdio::piped());
@@ -3298,10 +3473,22 @@ impl BorrowedEndpoint {
 ///
 /// Managed Codex wrappers receive only the executable's own directory as `PATH` so an env-based
 /// Node launcher can start without inheriting arbitrary parent environment entries.
+///
+/// `trampoline` is `Some` only for a managed request whose authoritative worktree differs from the
+/// host's own `sandboxCwd` (see [`ValidatedExecutionRequest::validate`]). The sandbox argv and its
+/// replayed state are identical in both cases; the trampoline only inserts
+/// `/usr/bin/env -C <worktree>` before the validated program, because `codex sandbox` otherwise
+/// overrides the child cwd with `sandboxCwd`. A same-cwd managed command therefore produces
+/// byte-identical argv to before this contract existed. A disabled profile never receives a
+/// trampoline and ignores one.
+///
+/// Returns [`RequestError::ExecutableUnavailable`] through [`ProcessError::Request`] when the
+/// accepted trampoline's bytes changed since acceptance.
 fn build_command(
     command: &ControlledCommand,
     sandbox: &HostSandboxState,
     codex_executable: &Path,
+    trampoline: Option<&ControlledTrampoline>,
 ) -> Result<Command, ProcessError> {
     let mut process = match sandbox.class {
         ProfileClass::Managed => {
@@ -3310,8 +3497,14 @@ fn build_command(
                 .arg("sandbox")
                 .arg("--sandbox-state-json")
                 .arg(sandbox.json_argument())
-                .arg("--")
-                .arg(&command.program);
+                .arg("--");
+            if let Some(trampoline) = trampoline {
+                let path = trampoline.verified_path().map_err(ProcessError::Request)?;
+                ControlledTrampoline::accepts_program(&command.program)
+                    .map_err(ProcessError::Request)?;
+                sandbox_command.arg(path).arg("-C").arg(&command.cwd);
+            }
+            sandbox_command.arg(&command.program);
             sandbox_command
         }
         ProfileClass::Disabled => Command::new(&command.program),
@@ -3529,6 +3722,97 @@ fn canonical_json(value: &Value) -> String {
         ),
         _ => value.to_string(),
     }
+}
+
+/// Recognizes the one closed managed filesystem profile that already grants read access to `/`.
+///
+/// `raw` is a complete host sandbox state. The profile qualifies only when every part of its
+/// `permissionProfile.file_system` value is understood here:
+///
+/// * `file_system` holds exactly `type` and `entries`, and `type` is `restricted`;
+/// * every entry holds only `access`, `path`, and the optional `missing_path_behavior`, whose only
+///   accepted value is `skip`;
+/// * every `access` is `read` or `write` — an `access` of `none`, or any other value, disqualifies
+///   the whole profile because it can subtract from an otherwise total read grant;
+/// * every `path` is either `{"type":"path","path":<normal absolute path>}` or
+///   `{"type":"special","value":{"kind":<root|slash_tmp|tmpdir>}}`; a relative or cwd-derived path
+///   and any unknown key, type, or special kind disqualify the profile;
+/// * at least one entry grants the `root` special path, which is the total read grant itself.
+///
+/// Any unrecognized shape returns `false`, which keeps the strict sandbox-cwd equality in force.
+/// This classifier answers one question about declared read authority; it is deliberately not a
+/// general permissions evaluator, and it never decides write, network, or execution authority.
+fn grants_read_of_all_roots(raw: &Value) -> bool {
+    let Some(file_system) = raw
+        .get("permissionProfile")
+        .and_then(Value::as_object)
+        .and_then(|profile| profile.get("file_system"))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    if file_system.len() != 2
+        || file_system.get("type").and_then(Value::as_str) != Some("restricted")
+    {
+        return false;
+    }
+    let Some(entries) = file_system.get("entries").and_then(Value::as_array) else {
+        return false;
+    };
+    let mut root_granted = false;
+    for entry in entries {
+        let Some(entry) = entry.as_object() else {
+            return false;
+        };
+        if entry
+            .keys()
+            .any(|key| !matches!(key.as_str(), "access" | "path" | "missing_path_behavior"))
+        {
+            return false;
+        }
+        if let Some(behavior) = entry.get("missing_path_behavior")
+            && behavior.as_str() != Some("skip")
+        {
+            return false;
+        }
+        if !matches!(
+            entry.get("access").and_then(Value::as_str),
+            Some("read" | "write")
+        ) {
+            return false;
+        }
+        let Some(path) = entry.get("path").and_then(Value::as_object) else {
+            return false;
+        };
+        if path.len() != 2 {
+            return false;
+        }
+        match path.get("type").and_then(Value::as_str) {
+            Some("path") => {
+                let Some(value) = path.get("path").and_then(Value::as_str) else {
+                    return false;
+                };
+                if !is_normal_absolute(Path::new(value)) {
+                    return false;
+                }
+            }
+            Some("special") => {
+                let Some(special) = path.get("value").and_then(Value::as_object) else {
+                    return false;
+                };
+                if special.len() != 1 {
+                    return false;
+                }
+                match special.get("kind").and_then(Value::as_str) {
+                    Some("root") => root_granted = true,
+                    Some("slash_tmp" | "tmpdir") => {}
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        }
+    }
+    root_granted
 }
 
 /// Detects unsupported multi-root profile fields without resolving or expanding any root path.

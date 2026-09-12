@@ -18,14 +18,15 @@ use assistance::host_binding::{
     BindingStatus, ChannelSessionRef, HostBindingGuard, parse_candidate, parse_channel_session,
     parse_hook_event, parse_observed_sandbox_state,
 };
+use execution::ControlledTrampoline;
 use execution::{
     Admission, AdmissionClass, AdmissionController, AdmissionLimits, BorrowedEndpoint, CommandKind,
     ControlledCommand, D03ProfileEvidence, DiscoverWorktreeRequest, DiscoveryOperationRef,
     EndpointOwnership, ExecutionProfileCatalog, ExecutionProfileTemplate, GitDiscoveryPolicy,
     GitDiscoveryQuery, HostSandboxState, LocalExecutionPolicy, OwnerId, PersistedProfileRecord,
     ProfileClass, ProviderBackendKind, ProviderLeaseAdmission, ProviderLeaseLimits,
-    ProviderLeaseRegistry, SandboxStateError, ValidatedExecutionRequest, ValidatedHostInvocation,
-    WorkspaceAuthority,
+    ProviderLeaseRegistry, RequestError, SandboxStateError, ValidatedExecutionRequest,
+    ValidatedHostInvocation, WorkspaceAuthority,
 };
 use serde_json::json;
 use tokio::io::AsyncReadExt;
@@ -1060,4 +1061,337 @@ async fn dropping_owned_children_and_reap_futures_kills_without_freeing_uncertai
     }
     borrowed.kill().await.unwrap();
     borrowed.wait().await.unwrap();
+}
+
+/// Returns the real captured default Codex managed state under `cwd`, optionally made unrecognized.
+///
+/// `recognized == false` replaces the root entry's access with `none`, which is exactly the shape
+/// that may subtract read authority and must therefore keep strict sandbox-cwd equality.
+fn inherited_managed_state(cwd: &Path, recognized: bool) -> serde_json::Value {
+    json!({
+        "codexLinuxSandboxExe": null,
+        "permissionProfile": {
+            "file_system": {
+                "entries": [
+                    {"access": if recognized {"read"} else {"none"},
+                     "path":{"type":"special","value":{"kind":"root"}}},
+                    {"access":"write","path":{"path": cwd, "type":"path"}},
+                    {"access":"write","path":{"type":"special","value":{"kind":"slash_tmp"}}},
+                    {"access":"read","missing_path_behavior":"skip",
+                     "path":{"path": cwd.join(".git"), "type":"path"}}
+                ],
+                "type": "restricted"
+            },
+            "network": "enabled",
+            "type": "managed"
+        },
+        "sandboxCwd": cwd,
+        "useLegacyLandlock": false
+    })
+}
+
+/// Builds a managed invocation for `sandbox_cwd` plus its matching Execution-owned catalog.
+fn inherited_invocation(
+    sandbox_cwd: &Path,
+    recognized: bool,
+) -> (ValidatedHostInvocation, ExecutionProfileCatalog) {
+    let state =
+        HostSandboxState::parse(Some(inherited_managed_state(sandbox_cwd, recognized))).unwrap();
+    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence("inherited-cwd-case", 1, &state).unwrap(),
+    ])
+    .unwrap();
+    (
+        ValidatedHostInvocation::from_verified_binding("inherited-bound", state).unwrap(),
+        catalog,
+    )
+}
+
+/// A native child inherits its parent's `sandboxCwd`, so a separate operator worktree must still
+/// validate — but only under a profile that already grants read of the whole filesystem root, and
+/// only with an accepted `/usr/bin/env` trampoline.
+#[test]
+fn inherited_sandbox_cwd_validates_only_for_a_recognized_read_all_profile_with_a_trampoline() {
+    let root = worktree();
+    let inherited = worktree();
+    let authority =
+        WorkspaceAuthority::from_workspace("inherited-worktree", "1", root.clone(), 7).unwrap();
+    let command = || {
+        ControlledCommand::from_validated_peer(
+            CommandKind::Job,
+            PathBuf::from("/usr/bin/true"),
+            vec![OsString::from("--version")],
+            root.clone(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+    };
+    let programs = || BTreeSet::from([PathBuf::from("/usr/bin/true")]);
+    let plain = LocalExecutionPolicy::new(programs(), 4096, 4, false).unwrap();
+
+    // An unrecognized profile keeps the original strict equality even with a trampoline available.
+    let (invocation, catalog) = inherited_invocation(&inherited, false);
+    assert_eq!(
+        ValidatedExecutionRequest::validate(
+            invocation,
+            authority.clone(),
+            command(),
+            &plain,
+            &catalog
+        )
+        .unwrap_err(),
+        RequestError::SandboxCwdMismatch
+    );
+
+    // A recognized profile without an accepted trampoline is unavailable, never silently allowed.
+    let (invocation, catalog) = inherited_invocation(&inherited, true);
+    assert_eq!(
+        ValidatedExecutionRequest::validate(
+            invocation,
+            authority.clone(),
+            command(),
+            &plain,
+            &catalog
+        )
+        .unwrap_err(),
+        RequestError::TrampolineUnavailable
+    );
+
+    // A command outside the authoritative worktree still fails first, trampoline or not.
+    let (invocation, catalog) = inherited_invocation(&inherited, true);
+    let elsewhere = ControlledCommand::from_validated_peer(
+        CommandKind::Job,
+        PathBuf::from("/usr/bin/true"),
+        Vec::new(),
+        inherited.clone(),
+        BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        ValidatedExecutionRequest::validate(
+            invocation,
+            authority.clone(),
+            elsewhere,
+            &plain,
+            &catalog
+        )
+        .unwrap_err(),
+        RequestError::WorktreeDenied
+    );
+
+    let Ok(trampoline) = ControlledTrampoline::accept(PathBuf::from("/usr/bin/env")) else {
+        return;
+    };
+    let accepted =
+        LocalExecutionPolicy::with_env_trampoline(programs(), 4096, 4, false, trampoline.clone())
+            .unwrap();
+
+    // The recognized profile plus an accepted trampoline is the one admitted combination, and the
+    // replayed state keeps its exact original bytes.
+    let (invocation, catalog) = inherited_invocation(&inherited, true);
+    let raw = invocation.sandbox().sandbox_state_json().to_owned();
+    let request = ValidatedExecutionRequest::validate(
+        invocation,
+        authority.clone(),
+        command(),
+        &accepted,
+        &catalog,
+    )
+    .unwrap();
+    assert_eq!(request.kind(), CommandKind::Job);
+    assert_eq!(request.authority().root(), root.as_path());
+    assert_eq!(
+        raw,
+        inherited_managed_state(&inherited, true).to_string(),
+        "sandboxCwd is never rewritten toward the target worktree"
+    );
+
+    // A stale catalog still refuses the same admitted shape.
+    let (invocation, _) = inherited_invocation(&inherited, true);
+    let (_, foreign) = inherited_invocation(&worktree(), true);
+    assert_eq!(
+        ValidatedExecutionRequest::validate(
+            invocation,
+            authority.clone(),
+            command(),
+            &accepted,
+            &foreign
+        )
+        .unwrap_err(),
+        RequestError::ExecutionProfileDenied
+    );
+
+    // The added `-C <root> <program>` bytes count against the local argv ceiling.
+    let tight = LocalExecutionPolicy::with_env_trampoline(
+        programs(),
+        "--version".len() + 1,
+        4,
+        false,
+        trampoline,
+    )
+    .unwrap();
+    let (invocation, catalog) = inherited_invocation(&inherited, true);
+    assert_eq!(
+        ValidatedExecutionRequest::validate(invocation, authority, command(), &tight, &catalog)
+            .unwrap_err(),
+        RequestError::ArgvTooLarge
+    );
+}
+
+/// A durable-authorized native read accepts the inherited parent cwd only under the same
+/// recognized read-all profile, and never accepts a changed authority or an unrecognized one.
+#[test]
+fn native_read_accepts_an_inherited_cwd_only_under_a_recognized_read_all_profile() {
+    let root = worktree();
+    let inherited = worktree();
+    let authority =
+        WorkspaceAuthority::from_workspace("inherited-read", "1", root.clone(), 3).unwrap();
+    let read = |recognized: bool, authority: &WorkspaceAuthority| {
+        let mut guard = HostBindingGuard::default();
+        let channel = channel();
+        assert!(matches!(
+            guard.observe_hook(pre_hook("actor", "call"), channel.clone()),
+            BindingStatus::PreObserved
+        ));
+        let BindingStatus::Validated(invocation) =
+            guard.establish_start(candidate("actor", "call"), channel)
+        else {
+            panic!("explicit start must establish the binding");
+        };
+        let active = guard.consume_active(invocation.binding_ref()).unwrap();
+        let state = inherited_managed_state(&inherited, recognized);
+        let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+            ExecutionProfileTemplate::from_execution_evidence(
+                "inherited-read-case",
+                1,
+                &HostSandboxState::parse(Some(state.clone())).unwrap(),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let observed = parse_observed_sandbox_state(
+            json!({"codex/sandbox-state-meta": state})
+                .as_object()
+                .unwrap(),
+            &invocation,
+            &active,
+            true,
+        )
+        .unwrap();
+        execution::validate_workspace_read(active, observed, authority, &catalog, false)
+    };
+    read(true, &authority).unwrap();
+    assert_eq!(
+        read(false, &authority).unwrap_err(),
+        RequestError::SandboxCwdMismatch
+    );
+    // A read-all profile is cwd-independent by construction, so a second Workspace-granted root is
+    // served by the same state; the Workspace authority, not the cwd string, is what bounds it.
+    let other = WorkspaceAuthority::from_workspace("other-read", "1", worktree(), 3).unwrap();
+    read(true, &other).unwrap();
+}
+
+/// Proves physically that a real accepted Codex sandbox plus `/usr/bin/env` runs the utility in a
+/// separate operator worktree, and that an inaccessible target never executes the marker.
+///
+/// Ignored by default: it spawns the operator's real `codex` binary and must run from an outer,
+/// already-approved unsandboxed runner, because macOS refuses a nested `sandbox_apply`. Supply
+/// `AGENT_IDE_PHYSICAL_CODEX` (absolute accepted `codex` path) and `AGENT_IDE_PHYSICAL_STATE`
+/// (file holding the captured default `codex/sandbox-state-meta` JSON, whose `sandboxCwd` is the
+/// inherited parent directory and whose profile grants read of `/`). Both absent, the test skips.
+#[tokio::test]
+#[ignore = "spawns the operator's real Codex binary; needs an outer unsandboxed runner"]
+async fn physical_inherited_cwd_runs_the_marker_only_in_an_accessible_target_worktree() {
+    let (Ok(codex), Ok(state_path)) = (
+        std::env::var("AGENT_IDE_PHYSICAL_CODEX"),
+        std::env::var("AGENT_IDE_PHYSICAL_STATE"),
+    ) else {
+        eprintln!("skipped: AGENT_IDE_PHYSICAL_CODEX/AGENT_IDE_PHYSICAL_STATE are unset");
+        return;
+    };
+    let raw = fs::read_to_string(&state_path).unwrap();
+    let state = HostSandboxState::parse_json(raw.trim()).unwrap();
+    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence("physical-inherited", 1, &state).unwrap(),
+    ])
+    .unwrap();
+    let trampoline = ControlledTrampoline::accept(PathBuf::from("/usr/bin/env")).unwrap();
+    let policy = LocalExecutionPolicy::with_env_trampoline(
+        BTreeSet::from([PathBuf::from("/bin/pwd")]),
+        4096,
+        0,
+        false,
+        trampoline,
+    )
+    .unwrap();
+
+    // `target` is a real separate worktree; `missing` is removed before the spawn so the marker
+    // cannot be produced from an inaccessible directory.
+    let target = worktree();
+    let missing = worktree();
+    fs::remove_dir(&missing).unwrap();
+    for (root, expected) in [(target.clone(), true), (missing.clone(), false)] {
+        let authority =
+            WorkspaceAuthority::from_workspace("physical-worktree", "1", root.clone(), 1).unwrap();
+        let command = ControlledCommand::from_validated_peer(
+            CommandKind::Job,
+            PathBuf::from("/bin/pwd"),
+            Vec::new(),
+            root.clone(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let invocation =
+            ValidatedHostInvocation::from_verified_binding("physical-bound", state.clone())
+                .unwrap();
+        assert_ne!(
+            state.cwd(),
+            root.as_path(),
+            "the captured state must describe the inherited parent cwd, not the target worktree"
+        );
+        let request =
+            ValidatedExecutionRequest::validate(invocation, authority, command, &policy, &catalog)
+                .unwrap();
+        let mut admission = AdmissionController::new(AdmissionLimits {
+            total_running: 1,
+            per_owner_running: 1,
+            per_owner_queued: 1,
+            total_queued: 1,
+            interactive_burst: 1,
+        })
+        .unwrap();
+        let Admission::Granted(lease) = admission.submit(
+            OwnerId::new("physical").unwrap(),
+            AdmissionClass::Interactive,
+        ) else {
+            panic!("physical spawn must be admitted");
+        };
+        let child = execution::OwnedChild::spawn_captured(
+            &request,
+            lease,
+            None,
+            Path::new(&codex),
+            64 * 1024,
+        );
+        let marker = root.to_string_lossy().to_string();
+        match child {
+            Ok(child) => {
+                let captured = child
+                    .reap(Duration::from_secs(30), Duration::from_secs(30))
+                    .await
+                    .unwrap();
+                let stdout = String::from_utf8_lossy(&captured.evidence.stdout().bytes).to_string();
+                assert_eq!(
+                    stdout.trim() == marker,
+                    expected,
+                    "target worktree marker presence must match accessibility: {stdout:?}"
+                );
+            }
+            Err(error) => assert!(
+                !expected,
+                "an accessible target must physically launch, got {error:?}"
+            ),
+        }
+    }
+    fs::remove_dir_all(target).unwrap();
 }
