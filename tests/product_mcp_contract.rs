@@ -1564,6 +1564,67 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
     daemon.wait().await.unwrap();
 }
 
+/// Holds SQLite's real write lock while a shipping Start needs durable activation, proving the
+/// frontend fails closed without delaying the independent host hook or ordinary native command.
+#[tokio::test]
+async fn configured_product_db_write_contention_fails_open_without_blocking_native_turn() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "db-contention-root").await;
+    let lock = rusqlite::Connection::open(fixture.runtime.join("state.sqlite")).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+    actor.next += 1;
+    let start_call = format!("call-{}", actor.next);
+    let hook_started = std::time::Instant::now();
+    actor.lifecycle(&fixture, "PreToolUse", &start_call).await;
+    assert!(
+        hook_started.elapsed() < Duration::from_secs(2),
+        "the shipping hook must retain its independent bounded completion"
+    );
+    let pending = actor
+        .mcp
+        .exchange(json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{"name":"ide.start","arguments":{"activation_id":"blocked-start"},"_meta":{"threadId":actor.actor,"callId":start_call,"x-codex-turn-metadata":{},"codex/sandbox-state-meta":actor.state}}}))
+        .await;
+    actor.lifecycle(&fixture, "PostToolUse", &start_call).await;
+    assert!(
+        !pending["result"]["structuredContent"].is_null(),
+        "{pending}"
+    );
+    let blocked = actor
+        .settle(&fixture, pending["result"]["structuredContent"].clone())
+        .await;
+    assert_eq!(blocked["state"], "error", "{blocked}");
+    assert_eq!(blocked["code"], "workspace_activation", "{blocked}");
+    assert_ne!(blocked["kind"], "activation", "{blocked}");
+
+    let native_call = format!("call-{}", actor.next + 1);
+    let native_hook_started = std::time::Instant::now();
+    actor.lifecycle(&fixture, "PreToolUse", &native_call).await;
+    let native = tokio::time::timeout(
+        Duration::from_secs(2),
+        Command::new("/bin/sh")
+            .args(["-c", "test -f tracked.txt"])
+            .current_dir(&fixture.root)
+            .status(),
+    )
+    .await
+    .expect("ordinary native command must not wait for SQLite")
+    .unwrap();
+    actor.lifecycle(&fixture, "PostToolUse", &native_call).await;
+    assert!(native.success());
+    assert!(
+        native_hook_started.elapsed() < Duration::from_secs(2),
+        "the hook around the ordinary native command must remain bounded"
+    );
+
+    lock.execute_batch("ROLLBACK;").unwrap();
+    drop(lock);
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Reclaims only the stopped actor's bounded result capacity while preserving its live peer's handles.
 #[tokio::test]
 async fn configured_product_stop_reclaims_only_its_binding_details() {
