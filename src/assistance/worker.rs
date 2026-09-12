@@ -2203,9 +2203,9 @@ mod stop_retry_tests {
         (binding, receipt)
     }
 
-    /// Builds the minimal real `Worker` needed to drive `settle_revocation`/`reconcile_pending_revocations`
-    /// against a real Store; bypasses the launcher/git-discovery machinery `ide.start` otherwise needs,
-    /// since neither is part of the durable stop/retry contract under test.
+    /// Builds a Worker with real Store, binding and admission state for activation/revoke checks.
+    /// Each test job supplies its own configured target and runs actual Git discovery; no background
+    /// dispatcher is spawned by this fixture constructor.
     fn worker<'a>(
         store: &'a Store,
         workspace: DurableWorkspace<'a>,
