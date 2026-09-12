@@ -2509,6 +2509,20 @@ async fn configured_product_cold_go_burst_preserves_admission_and_peer_view() {
     child_target["candidate"] = json!(child_root);
     config["targets"].as_array_mut().unwrap().push(child_target);
     std::fs::write(&fixture.config, config.to_string()).unwrap();
+    for index in 0..15 {
+        std::fs::write(
+            fixture.root.join(format!("burst-{index}.go")),
+            format!(
+                "package main\nfunc Burst{index}() string {{ return \"burst-{index}\" }}\nfunc callBurst{index}() {{ _ = Burst{index}() }}\n"
+            ),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        fixture.root.join("burst-overflow.go"),
+        "package main\nfunc BurstOverflow() string { return \"burst-overflow\" }\nfunc callBurstOverflow() { _ = BurstOverflow() }\n",
+    )
+    .unwrap();
     let mut daemon = fixture.daemon().await;
     let mut root = ProductActor::new(&fixture, "cold-root").await;
     let mut child_state = fixture.state();
@@ -2556,20 +2570,29 @@ async fn configured_product_cold_go_burst_preserves_admission_and_peer_view() {
     assert_eq!(root_pending["state"], "pending", "{root_pending}");
     assert_eq!(child_pending["state"], "pending", "{child_pending}");
     for index in 0..15 {
+        let name = format!("burst-{index}.go");
+        let offset = std::fs::read_to_string(fixture.root.join(&name))
+            .unwrap()
+            .rfind(&format!("Burst{index}()"))
+            .unwrap();
         let queued = root
             .call(
                 &fixture,
                 "ide.context",
-                json!({"path":format!("missing-{index}.go")}),
+                json!({"path":name,"byte_offset":offset}),
             )
             .await;
         assert_eq!(queued["state"], "pending", "{queued}");
     }
+    let overflow_offset = std::fs::read_to_string(fixture.root.join("burst-overflow.go"))
+        .unwrap()
+        .rfind("BurstOverflow()")
+        .unwrap();
     let refused = root
         .call(
             &fixture,
             "ide.context",
-            json!({"path":"missing-overflow.go"}),
+            json!({"path":"burst-overflow.go","byte_offset":overflow_offset}),
         )
         .await;
     assert_eq!(refused["state"], "error", "{refused}");
@@ -2598,6 +2621,13 @@ async fn configured_product_cold_go_burst_preserves_admission_and_peer_view() {
         child_context["text"]
             .as_str()
             .unwrap()
+            .contains("mode: semantic"),
+        "{child_context}"
+    );
+    assert!(
+        child_context["text"]
+            .as_str()
+            .unwrap()
             .contains("cold-child"),
         "{child_context}"
     );
@@ -2617,16 +2647,34 @@ async fn configured_product_cold_go_burst_preserves_admission_and_peer_view() {
     assert_eq!(unsafe { libc::kill(listener_pid, 0) }, 0);
     let stopped = root.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
+    // Change the child's own source after root's actor has fully torn down, so a stale/cached
+    // answer or a dead peer backend cannot coincidentally still satisfy this assertion.
+    std::fs::write(
+        child_root.join("main.go"),
+        "package main\nfunc Value() string { return \"cold-child-poststop\" }\nfunc main() { _ = Value() }\n",
+    )
+    .unwrap();
+    let child_offset_after_edit = std::fs::read_to_string(child_root.join("main.go"))
+        .unwrap()
+        .rfind("Value()")
+        .unwrap();
     let live = child
         .call(
             &fixture,
             "ide.context",
-            json!({"path":"main.go","byte_offset":child_offset}),
+            json!({"path":"main.go","byte_offset":child_offset_after_edit}),
         )
         .await;
     let live = child.settle(&fixture, live).await;
     assert!(
-        live["text"].as_str().unwrap().contains("cold-child"),
+        live["text"].as_str().unwrap().contains("mode: semantic"),
+        "{live}"
+    );
+    assert!(
+        live["text"]
+            .as_str()
+            .unwrap()
+            .contains("cold-child-poststop"),
         "{live}"
     );
     assert_eq!(
