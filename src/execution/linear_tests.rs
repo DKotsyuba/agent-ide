@@ -268,7 +268,8 @@ fn managed_provider_search_path_is_explicit_and_complete() {
         BTreeMap::from([(OsString::from("PATH"), OsString::from("/toolchain/bin"))]),
     )
     .unwrap();
-    let process = build_command(&command, &sandbox, Path::new("/opt/codex/bin/codex")).unwrap();
+    let process =
+        build_command(&command, &sandbox, Path::new("/opt/codex/bin/codex"), None).unwrap();
     let path = process
         .as_std()
         .get_envs()
@@ -361,4 +362,170 @@ fn effective_rights_identity_splits_relative_roots_and_shares_equal_absolute_rig
             "an unproven managed policy must fail closed rather than share: {unproven}"
         );
     }
+}
+
+/// Returns the real captured default Codex managed state, with `sandboxCwd` replaced by `cwd`.
+///
+/// The entry shapes are the actual `permissionProfile.file_system.entries` a default Codex host
+/// advertises, so the recognizer is exercised against real metadata rather than an invented schema.
+fn real_managed_state(cwd: &str) -> serde_json::Value {
+    serde_json::json!({
+        "codexLinuxSandboxExe": null,
+        "permissionProfile": {
+            "file_system": {
+                "entries": [
+                    {"access":"read","path":{"type":"special","value":{"kind":"root"}}},
+                    {"access":"write","path":{"path":"/private/tmp/host/work","type":"path"}},
+                    {"access":"write","path":{"type":"special","value":{"kind":"slash_tmp"}}},
+                    {"access":"write","path":{"type":"special","value":{"kind":"tmpdir"}}},
+                    {"access":"read","missing_path_behavior":"skip",
+                     "path":{"path":"/private/tmp/host/work/.git","type":"path"}}
+                ],
+                "type": "restricted"
+            },
+            "network": "enabled",
+            "type": "managed"
+        },
+        "sandboxCwd": cwd,
+        "useLegacyLandlock": false
+    })
+}
+
+/// The recognizer accepts the real default managed entries and refuses every unrecognized shape.
+#[test]
+fn read_all_recognition_is_closed_over_real_entry_shapes() {
+    assert!(
+        grants_read_of_all_roots(&real_managed_state("file:///private/tmp/host/work")),
+        "the captured default Codex profile grants read of the whole root"
+    );
+    let entries = |extra: serde_json::Value| {
+        serde_json::json!({
+            "permissionProfile": {
+                "file_system": {"entries": [extra], "type": "restricted"},
+                "network": "enabled",
+                "type": "managed"
+            },
+            "sandboxCwd": "file:///private/tmp/host/work"
+        })
+    };
+    for refused in [
+        // No root entry at all: nothing proves read of `/`.
+        serde_json::json!({"access":"read","path":{"path":"/private/tmp","type":"path"}}),
+        // An explicit subtraction of access is never recognized.
+        serde_json::json!({"access":"none","path":{"type":"special","value":{"kind":"root"}}}),
+        // Unknown access, key, special kind, and path type each fail closed.
+        serde_json::json!({"access":"append","path":{"type":"special","value":{"kind":"root"}}}),
+        serde_json::json!({"access":"read","unknown":1,
+                           "path":{"type":"special","value":{"kind":"root"}}}),
+        serde_json::json!({"access":"read","path":{"type":"special","value":{"kind":"home"}}}),
+        serde_json::json!({"access":"read","path":{"type":"glob","value":"/**"}}),
+        // A relative or cwd-derived path is never resolved here.
+        serde_json::json!({"access":"read","path":{"path":"work","type":"path"}}),
+        serde_json::json!({"access":"read","path":{"path":"/private/tmp/../etc","type":"path"}}),
+        // An unrecognized missing-path behaviour changes what the entries mean.
+        serde_json::json!({"access":"read","missing_path_behavior":"error",
+                           "path":{"type":"special","value":{"kind":"root"}}}),
+    ] {
+        assert!(
+            !grants_read_of_all_roots(&entries(refused.clone())),
+            "unrecognized entry must keep strict sandbox-cwd equality: {refused}"
+        );
+    }
+    // A read-restricted or otherwise unrecognized file-system envelope is refused whole.
+    for profile in [
+        serde_json::json!({"file_system":{"type":"unrestricted"},"network":"enabled",
+                           "type":"managed"}),
+        serde_json::json!({"file_system":{"entries":[],"type":"restricted","extra":1},
+                           "network":"enabled","type":"managed"}),
+        serde_json::json!({"type":"disabled"}),
+    ] {
+        assert!(
+            !grants_read_of_all_roots(&serde_json::json!({
+                "permissionProfile": profile.clone(),
+                "sandboxCwd": "file:///private/tmp/host/work"
+            })),
+            "unrecognized profile envelope must fail closed: {profile}"
+        );
+    }
+}
+
+/// A same-cwd managed launch keeps byte-identical argv; a differing cwd adds only `env -C <root>`.
+#[test]
+fn managed_argv_is_unchanged_without_a_trampoline_and_only_wrapped_with_one() {
+    let sandbox = HostSandboxState::parse(Some(real_managed_state("/private/tmp"))).unwrap();
+    let command = ControlledCommand::from_validated_peer(
+        CommandKind::Provider,
+        PathBuf::from("/usr/bin/true"),
+        vec![OsString::from("--version")],
+        PathBuf::from("/private/tmp"),
+        BTreeMap::new(),
+    )
+    .unwrap();
+    let argv = |trampoline: Option<&ControlledTrampoline>| {
+        let process = build_command(
+            &command,
+            &sandbox,
+            Path::new("/opt/codex/bin/codex"),
+            trampoline,
+        )
+        .unwrap();
+        let std_process = process.as_std();
+        (
+            std_process.get_program().to_owned(),
+            std_process
+                .get_args()
+                .map(OsString::from)
+                .collect::<Vec<_>>(),
+        )
+    };
+    let (program, plain) = argv(None);
+    assert_eq!(program, OsString::from("/opt/codex/bin/codex"));
+    assert_eq!(
+        plain,
+        [
+            OsString::from("sandbox"),
+            OsString::from("--sandbox-state-json"),
+            OsString::from(sandbox.sandbox_state_json()),
+            OsString::from("--"),
+            OsString::from("/usr/bin/true"),
+            OsString::from("--version"),
+        ]
+    );
+    let Ok(trampoline) = ControlledTrampoline::accept(PathBuf::from("/usr/bin/env")) else {
+        return;
+    };
+    let (wrapped_program, wrapped) = argv(Some(&trampoline));
+    assert_eq!(wrapped_program, program, "the sandbox wrapper is unchanged");
+    assert_eq!(
+        wrapped,
+        [
+            OsString::from("sandbox"),
+            OsString::from("--sandbox-state-json"),
+            OsString::from(sandbox.sandbox_state_json()),
+            OsString::from("--"),
+            OsString::from("/usr/bin/env"),
+            OsString::from("-C"),
+            OsString::from("/private/tmp"),
+            OsString::from("/usr/bin/true"),
+            OsString::from("--version"),
+        ],
+        "only the fixed trampoline prefix is inserted, and the replayed state is untouched"
+    );
+}
+
+/// Only `/usr/bin/env` is accepted, and a program `env` would read as an assignment is refused.
+#[test]
+fn trampoline_acceptance_is_closed_and_rejects_assignment_programs() {
+    assert_eq!(
+        ControlledTrampoline::accept(PathBuf::from("/private/tmp/wrapper.sh")),
+        Err(RequestError::TrampolineUnavailable)
+    );
+    assert_eq!(
+        ControlledTrampoline::accepts_program(Path::new("/private/tmp/NAME=value")),
+        Err(RequestError::TrampolineProgramRejected)
+    );
+    assert_eq!(
+        ControlledTrampoline::accepts_program(Path::new("/usr/bin/true")),
+        Ok(())
+    );
 }

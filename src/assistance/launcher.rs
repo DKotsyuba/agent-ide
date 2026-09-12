@@ -188,6 +188,13 @@ struct RawTarget {
     git: AcceptedExecutable,
     /// Accepted Codex wrapper executable used for managed sandbox replay.
     codex: AcceptedExecutable,
+    /// Operator-declared `/usr/bin/env` trampoline; absent leaves a differing worktree unavailable.
+    ///
+    /// Present only to run a validated command in this target's worktree when the managed host's
+    /// own `sandboxCwd` is an inherited parent directory. Its path must be exactly `/usr/bin/env`;
+    /// an arbitrary script is rejected, and the field is never inferred from a host observation.
+    #[serde(default)]
+    cwd_trampoline: Option<AcceptedExecutable>,
     /// At most the two current language profiles; duplicate settings/languages are rejected.
     providers: Vec<ProviderLaunch>,
     /// Trusted Execution records and exact evidence states, limited to two supported profile classes.
@@ -223,6 +230,12 @@ pub struct LaunchTarget {
     pub git: AcceptedExecutable,
     /// Trusted accepted Codex sandbox wrapper identity.
     pub codex: AcceptedExecutable,
+    /// Validated `/usr/bin/env` trampoline; `None` keeps a differing sandbox cwd unavailable.
+    ///
+    /// Presence is required before a command may run in this target's worktree while the managed
+    /// host reports a different inherited `sandboxCwd`. It widens no sandbox policy and is never a
+    /// fallback to unrestricted execution.
+    pub cwd_trampoline: Option<AcceptedExecutable>,
     /// Accepted closed provider profiles for this candidate.
     pub providers: Vec<ProviderLaunch>,
     /// Execution-minted catalog reconstructed only from trusted matching profile evidence.
@@ -285,6 +298,14 @@ impl LauncherConfig {
             }
             target.git.validate()?;
             target.codex.validate()?;
+            // The trampoline contract accepts exactly one program: a declaration naming any other
+            // path is rejected outright rather than accepted as an arbitrary wrapper script.
+            if let Some(trampoline) = &target.cwd_trampoline {
+                trampoline.validate()?;
+                if trampoline.path != Path::new("/usr/bin/env") {
+                    return Err(LauncherError::Rejected);
+                }
+            }
             let mut provider_kinds = Vec::new();
             for provider in &target.providers {
                 provider.executable.validate()?;
@@ -362,6 +383,7 @@ impl LauncherConfig {
                 candidate: target.candidate,
                 git: target.git,
                 codex: target.codex,
+                cwd_trampoline: target.cwd_trampoline,
                 providers: target.providers,
                 catalog,
                 allow_disabled_host: target.allow_disabled_host,
@@ -386,6 +408,7 @@ impl LauncherConfig {
         for target in self.targets.values() {
             for program in std::iter::once(&target.git)
                 .chain(std::iter::once(&target.codex))
+                .chain(target.cwd_trampoline.iter())
                 .chain(target.providers.iter().map(|provider| &provider.executable))
                 .chain(
                     target

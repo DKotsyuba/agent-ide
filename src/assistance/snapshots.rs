@@ -3,8 +3,8 @@
 use super::*;
 use crate::{
     execution::{
-        CapturedProcessEvidence, ControlledCommand, LocalExecutionPolicy, OwnedChild,
-        ValidatedExecutionRequest, ValidatedHostInvocation, WorkspaceAuthority,
+        CapturedProcessEvidence, ControlledCommand, ControlledTrampoline, LocalExecutionPolicy,
+        OwnedChild, ValidatedExecutionRequest, ValidatedHostInvocation, WorkspaceAuthority,
     },
     workspace::{
         authority::AuthorityStamp,
@@ -628,12 +628,29 @@ impl Worker<'_> {
             authority.epoch(),
         )
         .map_err(|_| FailureCode::WorkspaceAuthority)?;
-        let policy = LocalExecutionPolicy::new(
-            BTreeSet::from([program.path.clone()]),
-            64 * 1024,
-            16,
-            job.target.allow_disabled_host,
-        )
+        // An operator-declared `env` trampoline is the only way a command may run in this
+        // worktree while the managed host still reports its own inherited `sandboxCwd`; its
+        // absence simply leaves that case unavailable.
+        let trampoline = job
+            .target
+            .cwd_trampoline
+            .as_ref()
+            .map(|accepted| ControlledTrampoline::accept(accepted.path.clone()))
+            .transpose()
+            .map_err(|_| FailureCode::ExecutionProfile)?;
+        let programs = BTreeSet::from([program.path.clone()]);
+        let policy = match trampoline {
+            Some(trampoline) => LocalExecutionPolicy::with_env_trampoline(
+                programs,
+                64 * 1024,
+                16,
+                job.target.allow_disabled_host,
+                trampoline,
+            ),
+            None => {
+                LocalExecutionPolicy::new(programs, 64 * 1024, 16, job.target.allow_disabled_host)
+            }
+        }
         .map_err(|_| FailureCode::ExecutionProfile)?;
         ValidatedExecutionRequest::validate(
             invocation,

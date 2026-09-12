@@ -30,6 +30,7 @@ The closed version-one JSON shape is:
         "identity": "accepted-wrapper-identity",
         "blake3": "64-hex-digit-accepted-executable-digest"
       },
+      "cwd_trampoline": null,
       "providers": [],
       "profiles": [
         {
@@ -52,6 +53,17 @@ invocation still needs its own exact host-correlated state and fresh binding liv
 Each distinct configured executable fingerprint is checked once in a cancellable blocking
 startup task before the worker becomes ready. Selected executable bytes must remain
 immutable for that daemon boot; changes require restart and fresh verification.
+
+`cwd_trampoline` is optional and defaults to absent. Its only accepted `path` is
+`/usr/bin/env`; any other path is rejected rather than accepted as a wrapper script. Declare it
+only when this target's worktree differs from the `sandboxCwd` a managed host reports — a native
+child inherits its parent's `sandboxCwd`, so the utility is then run as
+`env -C <worktree> <program> <args>` *inside* the unchanged `codex sandbox` argv. The replayed
+sandbox state is never rewritten and no permission is widened: the wrapping is admitted only when
+the observed managed profile already grants read of the whole filesystem root. Its fingerprint is
+verified at startup like every other configured executable and rechecked immediately before spawn.
+Absent, a differing worktree simply stays unavailable, and same-cwd argv is unchanged. The
+contract is supported on macOS; other platforms report the case unavailable.
 
 Each optional provider has `executable` in the same shape as `git`, a closed `settings`
 value, `toolchain`, `trust`, and `cache_namespace`. `gopls_defaults` requires an absolute
