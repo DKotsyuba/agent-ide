@@ -55,6 +55,10 @@ impl Fixture {
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         fs::create_dir(&root)?;
+        // `GoplsProfile` gives its listener these shared paths; unlike the production cache
+        // lifecycle, this direct fixture must materialize them itself before the listener starts.
+        fs::create_dir_all(root.join("cache/gopls"))?;
+        fs::create_dir_all(root.join("cache/tmp"))?;
         for (name, return_type, value) in [("left", "int", "7"), ("right", "string", "\"seven\"")] {
             let worktree = root.join(name);
             fs::create_dir(&worktree)?;
