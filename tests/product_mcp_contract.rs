@@ -2569,6 +2569,7 @@ async fn configured_product_cold_go_burst_preserves_admission_and_peer_view() {
     );
     assert_eq!(root_pending["state"], "pending", "{root_pending}");
     assert_eq!(child_pending["state"], "pending", "{child_pending}");
+    let mut burst_pending = Vec::with_capacity(15);
     for index in 0..15 {
         let name = format!("burst-{index}.go");
         let offset = std::fs::read_to_string(fixture.root.join(&name))
@@ -2583,6 +2584,7 @@ async fn configured_product_cold_go_burst_preserves_admission_and_peer_view() {
             )
             .await;
         assert_eq!(queued["state"], "pending", "{queued}");
+        burst_pending.push((index, queued));
     }
     let overflow_offset = std::fs::read_to_string(fixture.root.join("burst-overflow.go"))
         .unwrap()
@@ -2631,6 +2633,22 @@ async fn configured_product_cold_go_burst_preserves_admission_and_peer_view() {
             .contains("cold-child"),
         "{child_context}"
     );
+    // Settle every accepted burst reply too: this is the full set of 17 admitted operations
+    // (root + child + 15 burst), not an arbitrary early prefix of the invocation log.
+    for (index, pending) in burst_pending {
+        let settled = root.settle(&fixture, pending).await;
+        assert!(
+            settled["text"].as_str().unwrap().contains("mode: semantic"),
+            "burst-{index}: {settled}"
+        );
+        assert!(
+            settled["text"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("burst-{index}")),
+            "burst-{index}: {settled}"
+        );
+    }
     let invocations = std::fs::read_to_string(&invocation_log).unwrap();
     let listeners = invocations
         .lines()
@@ -2641,12 +2659,46 @@ async fn configured_product_cold_go_burst_preserves_admission_and_peer_view() {
         .filter(|line| line.contains("-remote=unix;"))
         .collect::<Vec<_>>();
     assert_eq!(listeners.len(), 1, "{invocations}");
-    assert_eq!(forwarders.len(), 2, "{invocations}");
+    assert_eq!(forwarders.len(), 17, "{invocations}");
+    let root_forwarders = forwarders
+        .iter()
+        .filter(|line| line.contains(fixture.root.to_str().unwrap()))
+        .count();
+    let child_forwarders = forwarders
+        .iter()
+        .filter(|line| line.contains(child_root.to_str().unwrap()))
+        .count();
+    assert_eq!(root_forwarders, 16, "{invocations}");
+    assert_eq!(child_forwarders, 1, "{invocations}");
     let listener_pid: libc::pid_t = listeners[0].split('\t').next().unwrap().parse().unwrap();
-    // SAFETY: signal zero observes only the wrapper-recorded listener PID.
+    let forwarder_pids: Vec<libc::pid_t> = forwarders
+        .iter()
+        .map(|line| line.split('\t').next().unwrap().parse().unwrap())
+        .collect();
+    let mut unique_pids: std::collections::BTreeSet<libc::pid_t> =
+        forwarder_pids.iter().copied().collect();
+    assert_eq!(unique_pids.len(), forwarder_pids.len(), "{invocations}");
+    unique_pids.insert(listener_pid);
+    assert_eq!(unique_pids.len(), forwarder_pids.len() + 1, "{invocations}");
+    // SAFETY: signal zero only observes the wrapper-recorded listener PID and changes no process
+    // state.
     assert_eq!(unsafe { libc::kill(listener_pid, 0) }, 0);
+    // Every forwarder above is a one-shot process the product reaps immediately after its own
+    // exchange settles (see `SharedGopls::open_view`/`cancel_and_reap`), so now that every reply
+    // has settled none of the recorded PIDs should still be running.
+    for pid in &forwarder_pids {
+        // SAFETY: signal zero only observes a recorded PID and changes no process state.
+        assert_ne!(
+            unsafe { libc::kill(*pid, 0) },
+            0,
+            "settled forwarder pid {pid} is still alive: {invocations}"
+        );
+    }
     let stopped = root.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
+    // SAFETY: signal zero only observes the wrapper-recorded listener PID and changes no process
+    // state.
+    assert_eq!(unsafe { libc::kill(listener_pid, 0) }, 0);
     // Change the child's own source after root's actor has fully torn down, so a stale/cached
     // answer or a dead peer backend cannot coincidentally still satisfy this assertion.
     std::fs::write(
@@ -2676,6 +2728,29 @@ async fn configured_product_cold_go_burst_preserves_admission_and_peer_view() {
             .unwrap()
             .contains("cold-child-poststop"),
         "{live}"
+    );
+    let invocations_after_stop = std::fs::read_to_string(&invocation_log).unwrap();
+    let listeners_after_stop = invocations_after_stop
+        .lines()
+        .filter(|line| line.contains("-listen=unix;"))
+        .collect::<Vec<_>>();
+    let forwarders_after_stop = invocations_after_stop
+        .lines()
+        .filter(|line| line.contains("-remote=unix;"))
+        .collect::<Vec<_>>();
+    assert_eq!(listeners_after_stop.len(), 1, "{invocations_after_stop}");
+    assert_eq!(forwarders_after_stop.len(), 18, "{invocations_after_stop}");
+    let new_forwarders: Vec<&&str> = forwarders_after_stop
+        .iter()
+        .filter(|line| {
+            let pid: libc::pid_t = line.split('\t').next().unwrap().parse().unwrap();
+            !forwarder_pids.contains(&pid)
+        })
+        .collect();
+    assert_eq!(new_forwarders.len(), 1, "{invocations_after_stop}");
+    assert!(
+        new_forwarders[0].contains(child_root.to_str().unwrap()),
+        "{invocations_after_stop}"
     );
     assert_eq!(
         child.call(&fixture, "ide.stop", json!({})).await["kind"],
