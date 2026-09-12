@@ -306,6 +306,34 @@ impl Worker<'_> {
         }
     }
 
+    /// Test-only direct installer for one real `CacheLifecycle`/binding association, bypassing the
+    /// launcher/provider plumbing `retain_worktree_caches` otherwise needs, so revoke-retry tests can
+    /// exercise real quiescence bookkeeping without spawning a provider.
+    #[cfg(test)]
+    pub(super) fn install_test_cache(
+        &mut self,
+        binding: &BindingRef,
+        key: &str,
+        cache: CacheLifecycle,
+    ) {
+        self.providers.caches.insert(key.to_owned(), cache);
+        self.providers
+            .binding_caches
+            .insert(binding.clone(), vec![key.to_owned()]);
+    }
+
+    /// Test-only read of one cache's quiescence, or `None` if no such key is retained.
+    #[cfg(test)]
+    pub(super) fn test_cache_quiescent(&self, key: &str) -> Option<bool> {
+        self.providers.caches.get(key).map(CacheLifecycle::quiescent)
+    }
+
+    /// Test-only read of whether `binding` still owns any cache keys.
+    #[cfg(test)]
+    pub(super) fn test_binding_owns_caches(&self, binding: &BindingRef) -> bool {
+        self.providers.binding_caches.contains_key(binding)
+    }
+
     /// Selects only an operator-configured language profile; absent profiles stay explicitly lexical.
     pub(super) async fn semantic_context(
         &mut self,
