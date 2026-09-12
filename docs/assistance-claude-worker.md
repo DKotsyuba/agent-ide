@@ -44,6 +44,9 @@ the contract for shipped behaviour.
    already validated parameters, finite byte/process/deadline budgets, and the cache scope. Model
    input never selects an executable, shell fragment, scope or permission.
 
+   Each length-prefixed helper frame is capped at 256 KiB before allocation or JSON decoding. Raw
+   discovery/baseline streams remain capped at 8 KiB each and rendered owner text at 32 KiB.
+
 4. **Work.** All Git discovery, baseline capture, source reads and language-server traffic for a
    Claude operation happen inside that helper, under the sandbox it inherited from `Bash`. The
    daemon reads no source at any point, including during `inspect` freshness checks and feedback
@@ -89,9 +92,10 @@ The helper's own post is special: it settles the operation it belongs to and nev
 the result that same helper just produced. Ordinary later native posts still advance the native
 epoch and invalidate earlier results as usual.
 
-`inspect` for Claude is same-binding, same-generation, same-native-epoch retrieval only. It
-performs no daemon source read, and it labels observation coverage and provisional freshness
-honestly rather than presenting unobserved out-of-band changes as current.
+`inspect` for Claude is same-binding, same-generation retrieval only. It performs no daemon source
+read, and labels helper-observed source and diagnostic freshness provisional rather than presenting
+unobserved out-of-band changes as current. A later ordinary native Pre/Post pair may consume that
+delta once; delivery advances the binding epoch but does not pretend the daemon re-read source.
 
 `stop` revokes and cancels first. It is reported complete only on actual child settlement;
 otherwise the outcome is uncertain or a deadline, and the admission stays quarantined.
@@ -111,9 +115,13 @@ its provider before exiting.
   listener across operations. That matrix cell remains covered by the existing Codex shared
   listener, which is unchanged.
 
-Stop and handoff retain the IDE-owned worktree cache; no analysis runs while inactive. The
-helper receives its cache scope as an opaque namespace token in the job and derives no paths of
-its own.
+Stop and handoff retain the IDE-owned worktree cache directories; no analysis runs while inactive.
+The daemon derives their private absolute paths from the durable worktree identity/incarnation,
+daemon nonce, accepted provider/profile/toolchain/trust, and strict-Claude rights identity. The
+helper receives only that selected directory and derives no host path from launcher labels or model
+input. Each provider process is still one-shot and is reaped before helper exit: no listener or
+in-memory index survives, and retained opaque provider files are not claimed as a proven warm or
+reusable native index.
 
 ## Authority contract
 
@@ -136,10 +144,11 @@ threat model — it is not malicious same-UID OS attestation.
 ## Execution boundary
 
 A helper's children are spawned through a distinct inherited-sandbox boundary, separate from the
-managed Codex path. It takes no observed sandbox state, mints no permit, consumes no admission
-lease and uses no wrapper executable, so no synthetic sandbox observation can reach Codex
-Execution through it. It distinguishes a child that provably never started from one that started
-but could not be settled, so unreaped children are reported rather than assumed.
+managed Codex path. The ticket claim already consumes one lease from the daemon's shared Execution
+controller; sequential Git/provider children consume no second lease or private budget. This path
+takes no observed sandbox state and uses no wrapper executable, so no synthetic sandbox observation
+can reach Codex Execution through it. It distinguishes a child that provably never started from one
+that started but could not be settled, so unreaped children are reported rather than assumed.
 
 ## Implementation status
 
@@ -155,15 +164,14 @@ Wired and covered by local checks:
 - the inherited-sandbox child boundary and the helper's real fixed Git discovery with measured
   child settlement;
 - Claude `inspect` as pure same-generation retrieval with no daemon source read, `stop` revoking
-  the ticket ledger first, and a helper's own post settling instead of invalidating its result.
+  the ticket ledger first, and a helper's own post settling instead of invalidating its result;
+- canonical durable Workspace activation plus a partial/unverified stored baseline built from six
+  real settled Git children, with unknown baseline coverage preserved on invalid capture;
+- helper-owned bounded source reads, one-shot exclusive Go and Rust provider sessions, durable
+  source metadata, composed Workspace/Changes Diff, and one provisional diagnostic delta delivered
+  through an ordinary later native hook;
+- rights-aware durable worktree cache directory retention across Stop/handoff, without a warm native
+  backend or opaque-index reuse claim. Claude Go remains per-operation exclusive; the compatible
+  two-worktree shared-gopls guarantee belongs only to the managed Codex matrix.
 
-Not yet wired, and therefore not to be assumed:
-
-- minting the canonical durable Workspace grant and baseline from the helper's discovery evidence;
-  `start` currently reports discovery evidence only;
-- the helper's exclusive provider session for Go and Rust, and therefore real `context`/`diff`
-  semantic results and the ready diagnostic delta on the exact post. The accepted Rust
-  configuration value is fixed and tested, but no session consumes it yet;
-- the cache lifecycle: the helper receives an opaque namespace token and derives no paths.
-
-No live Claude host acceptance has been run.
+No live Claude host acceptance or `model_seen` proof has been run.

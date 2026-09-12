@@ -141,6 +141,17 @@ impl SourceBytes {
         }
     }
 
+    /// Rebuilds metadata reported by a verified foreground helper without reopening source.
+    ///
+    /// The caller must separately preserve the helper's bounded read and settlement proof. Length
+    /// remains capped at the Workspace source ceiling; the digest is exact and never inferred from
+    /// a rendered prefix.
+    pub(crate) fn from_reported(digest: [u8; 32], length: u64) -> Result<Self, ObservationError> {
+        (length <= MAX_SOURCE_BYTES as u64)
+            .then_some(Self { digest, length })
+            .ok_or(ObservationError::TooLarge)
+    }
+
     /// Rebuilds trusted persisted metadata after validating its fixed digest and nonnegative length.
     pub(crate) fn from_persisted(digest: Vec<u8>, length: i64) -> Result<Self, ObservationError> {
         let digest = digest

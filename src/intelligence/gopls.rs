@@ -140,6 +140,17 @@ impl GoplsProfile {
         )
     }
 
+    /// Declares one helper-private stdio gopls process for a foreground Claude operation.
+    ///
+    /// Unlike the daemon path this process is never shared across worktrees or operations; the
+    /// caller owns its pipes and must reap it before the helper exits.
+    pub(crate) fn standalone_command(
+        &self,
+        authority: &WorkspaceAuthority,
+    ) -> io::Result<ControlledCommand> {
+        self.command(authority, Vec::new())
+    }
+
     /// Builds a profile-owned provider command with a cleared, finite Go environment.
     ///
     /// `cache_namespace` here is the *shared* native namespace: gopls 0.23.0 binds its on-disk

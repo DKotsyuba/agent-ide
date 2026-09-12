@@ -204,13 +204,16 @@ impl Worker<'_> {
     /// `Conflict` when another actor still actively owns this worktree's namespace, `Capacity` when
     /// in-memory lifecycle ownership is full, and `ProviderUnavailable` for a local cache-directory
     /// or identity failure. `Internal` reports a namespace component this module itself derived
-    /// wrongly. No failure deletes or quiesces a retained namespace.
+    /// wrongly. `shared_go` retains the extra listener namespace only for the managed shared-gopls
+    /// path; one-shot Claude helpers pass false and retain only their worktree namespace. No failure
+    /// deletes or quiesces a retained namespace.
     pub(super) fn retain_worktree_caches(
         &mut self,
         binding: &BindingRef,
         authority: &AuthorityStamp,
         launches: &[ProviderLaunch],
         managed_sandbox: bool,
+        shared_go: bool,
         rights: &str,
     ) -> Result<(), FailureCode> {
         let root = CacheRoot::prepare(self.runtime.join("cache"))
@@ -237,14 +240,16 @@ impl Worker<'_> {
                 )
                 .ok_or(FailureCode::ProviderUnavailable)?,
                 required: match launch.settings {
-                    AcceptedProviderSettings::GoplsDefaults => &["go-build", "go-mod", "tmp"][..],
+                    AcceptedProviderSettings::GoplsDefaults => {
+                        &["go-build", "go-mod", "gopls", "tmp"][..]
+                    }
                     AcceptedProviderSettings::RustCachePrimingDisabledV1 => {
                         &["cargo", "target", "tmp"][..]
                     }
                 },
                 shared: false,
             });
-            if matches!(launch.settings, AcceptedProviderSettings::GoplsDefaults) {
+            if shared_go && matches!(launch.settings, AcceptedProviderSettings::GoplsDefaults) {
                 plan.push(CacheRequest {
                     key: provider_cache_key(SHARED_NATIVE_CACHE_STATE, launch, settings, &trust),
                     identity: CacheIdentity::new(
@@ -279,6 +284,27 @@ impl Worker<'_> {
         }
         self.providers.binding_caches.insert(binding.clone(), keys);
         Ok(())
+    }
+
+    /// Resolves each configured provider's already-retained worktree namespace for Claude jobs.
+    ///
+    /// Paths come from live `CacheLifecycle` entries and the same rights-aware key used during
+    /// retention; launcher labels and caller input are never exposed as filesystem locations.
+    pub(super) fn helper_cache_namespaces(
+        &self,
+        binding: &BindingRef,
+        authority: &AuthorityStamp,
+        launches: &[ProviderLaunch],
+        rights: &str,
+    ) -> Result<Vec<(AcceptedProviderSettings, String)>, FailureCode> {
+        launches
+            .iter()
+            .map(|launch| {
+                let trust = effective_trust(launch, rights);
+                self.provider_cache_namespace(binding, authority, launch, &trust)
+                    .map(|path| (launch.settings, path))
+            })
+            .collect()
     }
 
     /// Quiesces the stopped actor's cache owners without deleting their worktree namespaces.

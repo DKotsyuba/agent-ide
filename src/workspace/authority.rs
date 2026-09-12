@@ -71,6 +71,30 @@ impl WorktreeRef {
         })
     }
 
+    /// Rebuilds the non-authorizing view carried to a verified foreground helper.
+    ///
+    /// The durable ID and descriptor-derived root identity come from the daemon's current grant,
+    /// while the absence of `native_key` and `durable_nonce` makes this value unusable for a new
+    /// activation. It exists only for replacement-safe source and Git reads inside that helper.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_inherited_scope(
+        id: String,
+        incarnation: u64,
+        worktree_path: PathBuf,
+        repository_root: PathBuf,
+        git_common_dir: PathBuf,
+        native_root_identity: [u8; 32],
+    ) -> Result<Self, AuthorityError> {
+        let mut worktree =
+            Self::from_discovery(worktree_path, repository_root, git_common_dir, incarnation)?;
+        if id.is_empty() || id.len() > 256 {
+            return Err(AuthorityError::InvalidWorktreeIdentity);
+        }
+        worktree.id = id;
+        worktree.native_root_identity = Some(native_root_identity);
+        Ok(worktree)
+    }
+
     /// Binds the public identity to this database's unpredictable lifecycle nonce.
     pub(super) fn set_durable_nonce(&mut self, nonce: [u8; 32]) {
         let mut hash = blake3::Hasher::new();
@@ -104,6 +128,11 @@ impl WorktreeRef {
     /// Returns the exact raw Git common-directory value supplied by Git discovery.
     pub fn git_common_dir(&self) -> &Path {
         &self.git_common_dir
+    }
+
+    /// Returns the descriptor-derived root identity for a replacement-safe inherited helper view.
+    pub(crate) fn native_root_identity(&self) -> Option<[u8; 32]> {
+        self.native_root_identity
     }
 }
 

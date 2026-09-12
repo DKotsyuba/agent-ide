@@ -640,6 +640,25 @@ impl ControlledCommand {
             program_identity,
         })
     }
+
+    /// Rebuilds this exact command for a verified foreground helper's inherited sandbox.
+    ///
+    /// The executable object and bytes are rechecked immediately before spawn. The returned
+    /// command has a cleared environment, fixed cwd/argv, kill-on-drop and its own process group;
+    /// the caller still owns pipe selection, bounded cancellation and direct-child wait evidence.
+    pub(crate) fn inherited_process(&self) -> Result<Command, RequestError> {
+        if executable_identity(&self.program)? != self.program_identity {
+            return Err(RequestError::ExecutableUnavailable);
+        }
+        let mut process = Command::new(&self.program);
+        process
+            .args(&self.args)
+            .current_dir(&self.cwd)
+            .env_clear()
+            .envs(&self.env);
+        configure_process_group(&mut process);
+        Ok(process)
+    }
 }
 
 /// Identifies one Workspace discovery operation without granting worktree authority.
@@ -3710,6 +3729,14 @@ pub struct InheritedChildOutcome {
     pub truncated: bool,
 }
 
+/// Returns one inherited controlled child's exact process evidence and scratch binding token.
+pub struct InheritedCapturedOutcome {
+    /// Bounded stdout/stderr plus actual direct-wait identity.
+    pub evidence: CapturedProcessEvidence,
+    /// One-time launch identity consumed by a Workspace snapshot intent.
+    pub launch_identity: ProcessIdentity,
+}
+
 /// Reports why one inherited-sandbox child produced no usable outcome, and what is known about its
 /// physical settlement.
 ///
@@ -3727,6 +3754,86 @@ pub enum InheritedChildFailure {
     /// The child started but its physical cleanup could not be observed. The caller must report it
     /// as unreaped; this is never equivalent to an ordinary failed execution.
     Unsettled,
+}
+
+/// Runs one Workspace-built controlled command inside the caller's inherited sandbox.
+///
+/// The surrounding Claude ticket already owns the daemon's shared admission lease, so this path
+/// deliberately consumes no second lease. It still rechecks executable identity, clears the
+/// environment, bounds both streams, owns the process group, and returns actual direct-wait proof
+/// that a snapshot scratch directory can correlate before cleanup.
+pub async fn run_inherited_controlled_child(
+    command: &ControlledCommand,
+    output_cap: usize,
+    deadline: std::time::Duration,
+) -> Result<InheritedCapturedOutcome, InheritedChildFailure> {
+    if output_cap == 0 || output_cap > MAX_CAPTURED_PROCESS_BYTES || deadline.is_zero() {
+        return Err(InheritedChildFailure::NeverStarted);
+    }
+    let mut process = command
+        .inherited_process()
+        .map_err(|_| InheritedChildFailure::NeverStarted)?;
+    process
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let generation = launch_generation().map_err(|_| InheritedChildFailure::NeverStarted)?;
+    let mut child = process
+        .spawn()
+        .map_err(|_| InheritedChildFailure::NeverStarted)?;
+    let identity = ProcessIdentityData {
+        generation,
+        pid: child.id().expect("new child PID"),
+    };
+    let Some(stdout) = child.stdout.take() else {
+        return Err(
+            if child.kill().await.is_ok() && child.wait().await.is_ok() {
+                InheritedChildFailure::Reaped
+            } else {
+                InheritedChildFailure::Unsettled
+            },
+        );
+    };
+    let Some(stderr) = child.stderr.take() else {
+        return Err(
+            if child.kill().await.is_ok() && child.wait().await.is_ok() {
+                InheritedChildFailure::Reaped
+            } else {
+                InheritedChildFailure::Unsettled
+            },
+        );
+    };
+    let stdout = tokio::spawn(drain(stdout, output_cap));
+    let stderr = tokio::spawn(drain(stderr, output_cap));
+    let status = match timeout(deadline.min(Duration::from_secs(60)), child.wait()).await {
+        Ok(Ok(status)) => status,
+        _ => {
+            stdout.abort();
+            stderr.abort();
+            return Err(
+                if child.kill().await.is_ok() && child.wait().await.is_ok() {
+                    InheritedChildFailure::Reaped
+                } else {
+                    InheritedChildFailure::Unsettled
+                },
+            );
+        }
+    };
+    let (stdout, stderr) = tokio::join!(
+        collect_drain(stdout, Duration::from_secs(1)),
+        collect_drain(stderr, Duration::from_secs(1)),
+    );
+    Ok(InheritedCapturedOutcome {
+        evidence: CapturedProcessEvidence {
+            reap_identity: Some(ReapedChildIdentity(identity)),
+            status,
+            cancellation: None,
+            stdout,
+            stderr,
+            descendants: DescendantEvidence::Unverified,
+        },
+        launch_identity: ProcessIdentity(identity),
+    })
 }
 
 /// Runs one direct child that inherits its caller's existing sandbox, then reaps it.

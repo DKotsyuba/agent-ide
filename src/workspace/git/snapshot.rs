@@ -9,11 +9,14 @@ use crate::{
         CapturedProcessEvidence, CommandKind, ControlledCommand, ProcessIdentity,
         WorkspaceAuthority,
     },
-    workspace::observation::{
-        ObservationError, SourceBytes, SourceCoverage, SourceObservation, SourceRead,
-        SourceReadLimits, read_authorized_source,
-    },
     workspace::store::CurrentObservation,
+    workspace::{
+        authority::WorktreeRef,
+        observation::{
+            ObservationError, SourceBytes, SourceCoverage, SourceObservation, SourceRead,
+            SourceReadLimits, read_authorized_source,
+        },
+    },
 };
 use std::{
     collections::BTreeMap,
@@ -220,12 +223,13 @@ impl SnapshotIntent {
         .map_err(|_| GitError::IncompleteIdentity)
     }
     /// Creates a metadata command using only the existing safe fixed-query constructor.
-    fn metadata(
-        authority: &AuthorityStamp,
-        program: &Path,
-        query: GitReadQuery,
-    ) -> Result<Self, GitError> {
-        let intent = GitReadIntent::new(authority, program.to_path_buf(), query)?;
+    fn metadata(scope: &GitScope, program: &Path, query: GitReadQuery) -> Result<Self, GitError> {
+        let query_scope = GitScope::from_inherited(
+            scope.worktree().clone(),
+            scope.authority_epoch(),
+            query.mode(),
+        )?;
+        let intent = GitReadIntent::from_scope(query_scope, program.to_path_buf(), query)?;
         Ok(Self {
             scope: intent.scope().clone(),
             command: intent.controlled_command()?,
@@ -433,12 +437,13 @@ impl SnapshotSource {
     }
     /// Reads bytes only through Workspace's no-follow reader and checks supplied observation identity.
     fn capture(
-        authority: &AuthorityStamp,
+        worktree: &WorktreeRef,
+        authority_epoch: u64,
         path: &Path,
         observation: Option<CurrentObservation>,
     ) -> Result<Self, GitError> {
         let read = match read_authorized_source(
-            authority.worktree(),
+            worktree,
             path,
             SourceReadLimits::new(4096, MAX_SNAPSHOT_BLOB_BYTES)
                 .map_err(|_| GitError::EvidenceTooLarge)?,
@@ -454,8 +459,8 @@ impl SnapshotSource {
         };
         let observation = observation.map(CurrentObservation::into_observation);
         if let Some(obs) = &observation
-            && (obs.worktree() != authority.worktree()
-                || obs.authority_epoch() != authority.epoch()
+            && (obs.worktree() != worktree
+                || obs.authority_epoch() != authority_epoch
                 || obs.path().as_os_str().as_bytes() != path.as_os_str().as_bytes()
                 || obs.coverage() != SourceCoverage::Complete
                 || matches!(
@@ -570,10 +575,36 @@ pub async fn collect_snapshot<R: SnapshotRunner>(
     baseline: BaselineContext,
     runner: &mut R,
 ) -> Result<GitSnapshot, GitError> {
+    collect_snapshot_scoped(
+        GitScope::from_authority(authority, mode),
+        Some(authority),
+        program,
+        generation,
+        operation,
+        baseline,
+        runner,
+    )
+    .await
+}
+
+/// Collects a complete snapshot inside a verified inherited helper without minting authority.
+///
+/// The caller supplies a daemon-derived scope whose worktree carries descriptor root identity.
+/// Durable current-observation correlation is unavailable in the helper, so path snapshots retain
+/// exact bytes but no fabricated [`CurrentObservation`] token.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn collect_snapshot_scoped<R: SnapshotRunner>(
+    scope: GitScope,
+    authority: Option<&AuthorityStamp>,
+    program: &Path,
+    generation: u64,
+    operation: &str,
+    baseline: BaselineContext,
+    runner: &mut R,
+) -> Result<GitSnapshot, GitError> {
     if generation == 0 || operation.is_empty() || operation.len() > 128 {
         return Err(GitError::InvalidOperationReference);
     }
-    let scope = GitScope::from_authority(authority, mode);
     if !baseline.matches_scope(&scope) {
         return Err(GitError::IncompleteIdentity);
     }
@@ -598,7 +629,7 @@ pub async fn collect_snapshot<R: SnapshotRunner>(
 
 /// Collects one complete metadata bracket without ever invoking porcelain status or filters.
 async fn metadata<R: SnapshotRunner>(
-    authority: &AuthorityStamp,
+    scope: &GitScope,
     program: &Path,
     runner: &mut R,
 ) -> Result<[Vec<u8>; 4], GitError> {
@@ -612,7 +643,7 @@ async fn metadata<R: SnapshotRunner>(
     .into_iter()
     .enumerate()
     {
-        let intent = SnapshotIntent::metadata(authority, program, query)?;
+        let intent = SnapshotIntent::metadata(scope, program, query)?;
         let output = runner.run(intent.clone()).await?;
         if query == GitReadQuery::HeadIdentity
             && output.status().code() == Some(1)
@@ -699,7 +730,7 @@ fn parse_entries(
 /// Rename inference is deliberately absent: old/new raw identities are separate delete/add records.
 #[allow(clippy::too_many_arguments)]
 async fn capture_attempt<R: SnapshotRunner>(
-    authority: &AuthorityStamp,
+    authority: Option<&AuthorityStamp>,
     program: &Path,
     scope: GitScope,
     generation: u64,
@@ -707,7 +738,7 @@ async fn capture_attempt<R: SnapshotRunner>(
     baseline: BaselineContext,
     runner: &mut R,
 ) -> Result<GitSnapshot, GitError> {
-    let before = metadata(authority, program, runner).await?;
+    let before = metadata(&scope, program, runner).await?;
     let head_entries = parse_entries(&before[2], false)?;
     let index_entries = parse_entries(&before[1], true)?;
     let union: std::collections::BTreeSet<_> = head_entries
@@ -756,7 +787,7 @@ async fn capture_attempt<R: SnapshotRunner>(
         return Err(GitError::EvidenceTooLarge);
     }
     for entry in status.untracked() {
-        inspect_untracked(authority, entry.path())?;
+        inspect_untracked(scope.worktree(), entry.path())?;
     }
     let mut blobs = BTreeMap::new();
     let mut paths = Vec::new();
@@ -788,8 +819,12 @@ async fn capture_attempt<R: SnapshotRunner>(
             continue;
         }
         let index = stages.and_then(|entries| entries.get(&0));
-        let current = runner.current_observation(authority, &path).await;
-        let source = SnapshotSource::capture(authority, &path, current)?;
+        let current = match authority {
+            Some(authority) => runner.current_observation(authority, &path).await,
+            None => None,
+        };
+        let source =
+            SnapshotSource::capture(scope.worktree(), scope.authority_epoch(), &path, current)?;
         total_bytes += source.contents().len();
         if total_bytes > MAX_SNAPSHOT_TOTAL_BYTES {
             return Err(GitError::EvidenceTooLarge);
@@ -886,15 +921,15 @@ async fn capture_attempt<R: SnapshotRunner>(
     }
     // Exact safe reads cover every union path, not only paths Git's stat cache happened to mark dirty.
     for (path, source) in &sources {
-        let after = SnapshotSource::capture(authority, path, None)?;
+        let after = SnapshotSource::capture(scope.worktree(), scope.authority_epoch(), path, None)?;
         if after.read != source.read {
             return Err(GitError::UnstableSnapshot);
         }
     }
     for entry in status.untracked() {
-        inspect_untracked(authority, entry.path())?;
+        inspect_untracked(scope.worktree(), entry.path())?;
     }
-    if metadata(authority, program, runner).await? != before {
+    if metadata(&scope, program, runner).await? != before {
         return Err(GitError::UnstableSnapshot);
     }
     let head = evidence_identity(b"workspace-git-head-v1", &before[0]);
@@ -959,9 +994,9 @@ async fn blob_bytes<R: SnapshotRunner>(
 }
 
 /// Rejects untracked symlink/special entries without reading bytes; disappearing paths trigger retry.
-fn inspect_untracked(authority: &AuthorityStamp, path: &Path) -> Result<(), GitError> {
-    crate::workspace::observation::inspect_authorized_source_kind(authority.worktree(), path)
-        .map_err(|error| match error {
+fn inspect_untracked(worktree: &WorktreeRef, path: &Path) -> Result<(), GitError> {
+    crate::workspace::observation::inspect_authorized_source_kind(worktree, path).map_err(|error| {
+        match error {
             ObservationError::SymlinkEscape | ObservationError::NotRegularFile => {
                 GitError::UnsupportedSnapshot
             }
@@ -969,5 +1004,6 @@ fn inspect_untracked(authority: &AuthorityStamp, path: &Path) -> Result<(), GitE
                 GitError::UnstableSnapshot
             }
             _ => GitError::SnapshotIo,
-        })
+        }
+    })
 }

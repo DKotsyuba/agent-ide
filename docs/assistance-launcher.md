@@ -64,6 +64,9 @@ authority grant. Assistance combines it with the verified durable worktree and
 accepted provider identities to retain a private directory, then supplies only
 that derived directory through the provider's cleared environment. Configuration
 cannot select `HOME` or another writable host path.
+Claude helpers receive the same retained worktree directory after durable Start, but each
+provider process is one-shot and reaped with the helper. Directory retention does not claim a
+surviving backend or proven warm opaque provider index.
 
 Limits are explicit: 1–64 queued operations, 1–128 retained details, 1–300000 ms per
 operation, and 1–1048576 retained bytes per output stream. There are at most 64 distinct

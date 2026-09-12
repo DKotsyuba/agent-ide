@@ -177,17 +177,50 @@ impl ProductDispatcher {
         hash.update(invocation.call_id().as_bytes());
         let detail_ref = hash.finalize().to_hex().to_string();
         let command = LaunchLedger::helper_command(binary, &runtime_dir, attachment, &detail_ref);
+        let state = match operation {
+            HelperOperation::Start => None,
+            _ => match worker.claude_state(invocation.binding_ref()) {
+                Some(state) => Some(state),
+                None => return error(FailureCode::WorkspaceAuthority),
+            },
+        };
+        let provider = if operation == HelperOperation::Context {
+            let required = match parameters["path"]
+                .as_str()
+                .and_then(|path| path.rsplit('.').next())
+            {
+                Some("go") => Some(AcceptedProviderSettings::GoplsDefaults),
+                Some("rs") => Some(AcceptedProviderSettings::RustCachePrimingDisabledV1),
+                _ => None,
+            };
+            required.and_then(|settings| {
+                let cache = state.as_ref()?.caches.iter().find_map(|(accepted, path)| {
+                    (*accepted == settings).then_some(path.as_str())
+                })?;
+                Self::helper_provider(&target, settings, cache)
+            })
+        } else {
+            None
+        };
         let job = HelperJob {
             protocol: super::claude_worker::HELPER_PROTOCOL,
             operation,
             candidate: target.candidate.clone(),
             git: target.git.path.clone(),
-            canonical_root: None,
-            provider: Self::helper_provider(&target),
+            canonical_root: state.as_ref().map(|state| state.scope.root.clone()),
+            scope: state.as_ref().map(|state| state.scope.clone()),
+            baseline: (operation == HelperOperation::Diff)
+                .then(|| state.as_ref().expect("Diff state exists").baseline.clone()),
+            provider,
             parameters: parameters.clone(),
             budgets: HelperBudgets {
                 output_bytes: worker.limits().output_bytes,
-                processes: 4,
+                processes: match operation {
+                    HelperOperation::Start => 6,
+                    HelperOperation::Context => 2,
+                    HelperOperation::Diff => 64,
+                    HelperOperation::Stop => 1,
+                },
                 deadline_ms: worker.limits().operation_ms,
             },
         };
@@ -244,7 +277,7 @@ impl ProductDispatcher {
         detail_ref: &str,
         attachment: &str,
     ) -> PeerReply {
-        use super::claude_worker::{Delivery, HelperOperation, HelperOutcome};
+        use super::claude_worker::{Delivery, HelperOutcome};
         let owner = invocation.binding_ref().fingerprint();
         // The settled token is minted under the ledger lock and the lock is released before any
         // await: no daemon lock crosses the Worker call below.
@@ -276,13 +309,6 @@ impl ProductDispatcher {
                             code: FailureCode::WorkspaceAuthority,
                         };
                     };
-                    // Only Start has an authority path in this stage; Context and Diff remain
-                    // explicitly unavailable rather than completing on discovery evidence alone.
-                    if settled.operation() != HelperOperation::Start {
-                        return PeerReply::Unavailable {
-                            reason: MissingPeer::WorkspaceActivation,
-                        };
-                    }
                     let Some(worker) = &self.worker else {
                         return PeerReply::Unavailable {
                             reason: MissingPeer::WorkspaceActivation,
@@ -356,8 +382,15 @@ impl ProductDispatcher {
     /// Git-only work. Rust is always pinned to disabled cache priming and disabled proc-macro
     /// expansion. Shared multi-worktree gopls is deliberately not offered here: a foreground
     /// helper cannot retain a safe shared listener, so Go runs on a helper-private view only.
-    fn helper_provider(target: &LaunchTarget) -> Option<HelperProvider> {
-        let provider = target.providers.first()?;
+    fn helper_provider(
+        target: &LaunchTarget,
+        settings: AcceptedProviderSettings,
+        cache_namespace: &str,
+    ) -> Option<HelperProvider> {
+        let provider = target
+            .providers
+            .iter()
+            .find(|provider| provider.settings == settings)?;
         let (language, rust_settings) = match provider.settings {
             AcceptedProviderSettings::GoplsDefaults => (HelperLanguage::Go, None),
             AcceptedProviderSettings::RustCachePrimingDisabledV1 => (
@@ -370,9 +403,16 @@ impl ProductDispatcher {
         };
         Some(HelperProvider {
             executable: provider.executable.path.clone(),
+            version: provider.executable.identity.clone(),
             language,
             rust_settings,
-            cache_namespace: provider.cache_namespace.clone(),
+            toolchain: provider.toolchain.clone(),
+            cargo: provider.cargo.as_ref().map(|program| program.path.clone()),
+            cargo_version: provider.cargo_version.clone(),
+            rustc: provider.rustc.as_ref().map(|program| program.path.clone()),
+            rustc_version: provider.rustc_version.clone(),
+            trust: provider.trust.clone(),
+            cache_namespace: cache_namespace.to_owned(),
         })
     }
 

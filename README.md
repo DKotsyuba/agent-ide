@@ -5,7 +5,8 @@ An explicitly activated coding companion for Codex and Claude Code, designed for
 Status: the binary assembles the five-tool MCP surface, exact Codex hook-to-MCP binding,
 explicit Codex/Claude native ingress, bounded hook context output, durable Workspace activation,
 source context, safe Git comparisons and owned provider cleanup. Host-shaped process tests exercise
-this assembly; fresh live Codex/Claude acceptance and model-visible feedback remain unverified.
+Claude foreground-helper activation, Go/Rust Context, Diff and emitted additional context; fresh
+live Codex/Claude acceptance and host-observed model visibility remain unverified.
 
 Build with `cargo build --locked --bin agent-ide`. Configure an MCP client to launch
 `target/debug/agent-ide mcp --runtime-dir PATH`. Discovery works without a daemon;

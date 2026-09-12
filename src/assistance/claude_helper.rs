@@ -6,19 +6,21 @@
 //!
 //! The helper side ([`run`]) is a short foreground process the model launches through its ordinary
 //! `Bash` tool, so every child it starts inherits the host's own real sandbox. It claims its
-//! operation once, performs the fixed Git discovery itself, reports bounded evidence with real
-//! child-settlement counts, and exits. It never re-enters the Codex execution path and never
-//! presents a synthetic sandbox observation.
+//! operation once, performs fixed discovery/baseline/snapshot work and an optional one-shot
+//! provider session, reports bounded evidence with real child-settlement counts, and exits. It
+//! never re-enters the managed Codex execution path or presents a synthetic sandbox observation.
 
 use super::claude_worker::{
-    ChildSettlement, ClaimOutcome, DiscoveryFrame, HelperJob, HelperOperation, HelperOutcome,
-    HelperQuery, HelperResult, LaunchLedger, MAX_HELPER_FRAME_BYTES,
+    ChildSettlement, ClaimOutcome, DiscoveryFrame, HelperBaselineFrame, HelperBaselineQuery,
+    HelperJob, HelperLanguage, HelperOperation, HelperOutcome, HelperPayload, HelperQuery,
+    HelperResult, HelperSource, LaunchLedger, MAX_HELPER_FRAME_BYTES, MAX_RESULT_TEXT_BYTES,
 };
 use super::host_binding::BindingRef;
 use super::reply::FailureCode;
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
+    process::Stdio,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -359,7 +361,7 @@ async fn execute(
         Ok(ClaimReply::Granted(job)) => *job,
         _ => return "refused",
     };
-    let (outcome, children, discovery) = perform(&job).await;
+    let (outcome, children, discovery, payload) = perform(&job).await;
     let settled = children.settled();
     let result = HelperResult {
         protocol: HELPER_PROTOCOL,
@@ -367,6 +369,7 @@ async fn execute(
         outcome,
         children,
         discovery,
+        payload,
     };
     let Ok(encoded) = result.encode() else {
         return "unavailable";
@@ -383,7 +386,10 @@ async fn execute(
 /// discovery query it ran. Counts are observed, never assumed: a child that was started but could
 /// not be reaped is reported as unreaped so the daemon can refuse to call the operation settled.
 /// This function interprets no discovery output; canonical interpretation stays with the daemon.
-async fn perform(job: &HelperJob) -> (HelperOutcome, ChildSettlement, Vec<DiscoveryFrame>) {
+async fn perform_discovery(
+    job: &HelperJob,
+    deadline: tokio::time::Instant,
+) -> (HelperOutcome, ChildSettlement, Vec<DiscoveryFrame>) {
     use crate::execution::{
         GitDiscoveryQuery, InheritedChildFailure, inherited_git_arguments, run_inherited_child,
     };
@@ -407,7 +413,6 @@ async fn perform(job: &HelperJob) -> (HelperOutcome, ChildSettlement, Vec<Discov
         }
         HelperOperation::Stop => &[],
     };
-    let deadline = Duration::from_millis(job.budgets.deadline_ms.min(60_000));
     for (query, reported) in queries {
         spawned += 1;
         match run_inherited_child(
@@ -415,7 +420,9 @@ async fn perform(job: &HelperJob) -> (HelperOutcome, ChildSettlement, Vec<Discov
             inherited_git_arguments(*query, &job.candidate),
             &job.candidate,
             job.budgets.output_bytes,
-            deadline,
+            deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(Duration::from_secs(60)),
         )
         .await
         {
@@ -497,6 +504,859 @@ async fn perform(job: &HelperJob) -> (HelperOutcome, ChildSettlement, Vec<Discov
     )
 }
 
+/// Executes the operation-specific work after the fixed discovery boundary succeeds.
+async fn perform(
+    job: &HelperJob,
+) -> (
+    HelperOutcome,
+    ChildSettlement,
+    Vec<DiscoveryFrame>,
+    Option<HelperPayload>,
+) {
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_millis(job.budgets.deadline_ms.min(300_000));
+    let (discovery_outcome, mut children, discovery) = perform_discovery(job, deadline).await;
+    if let HelperOutcome::Failed { code } = discovery_outcome {
+        return failed(code, children.spawned, children.reaped, discovery);
+    }
+    if job.operation == HelperOperation::Start {
+        let baseline = match collect_baseline(
+            job,
+            deadline,
+            &mut children.spawned,
+            &mut children.reaped,
+        )
+        .await
+        {
+            Ok(baseline) => baseline,
+            Err(code) => return failed(code, children.spawned, children.reaped, discovery),
+        };
+        return (
+            HelperOutcome::Complete {
+                text: "fixed discovery and activation baseline evidence settled; Workspace authority is not implied by helper evidence alone".into(),
+            },
+            children,
+            discovery,
+            Some(HelperPayload::Start { baseline }),
+        );
+    }
+    let Some(scope) = job.scope.as_ref() else {
+        return failed(
+            FailureCode::WorkspaceAuthority,
+            children.spawned,
+            children.reaped,
+            discovery,
+        );
+    };
+    if discovery
+        .first()
+        .and_then(|frame| crate::workspace::git::parse_terminal_path(&frame.stdout).ok())
+        .as_deref()
+        != Some(scope.root.as_path())
+    {
+        return failed(
+            FailureCode::WorkspaceAuthority,
+            children.spawned,
+            children.reaped,
+            discovery,
+        );
+    }
+    let worktree = match crate::workspace::authority::WorktreeRef::from_inherited_scope(
+        scope.worktree_id.clone(),
+        scope.incarnation,
+        scope.root.clone(),
+        scope.repository_root.clone(),
+        scope.git_common_dir.clone(),
+        scope.native_root_identity,
+    ) {
+        Ok(worktree) => worktree,
+        Err(_) => {
+            return failed(
+                FailureCode::WorkspaceAuthority,
+                children.spawned,
+                children.reaped,
+                discovery,
+            );
+        }
+    };
+    let (outcome, payload) = match job.operation {
+        HelperOperation::Context => {
+            context(
+                job,
+                deadline,
+                worktree,
+                &mut children.spawned,
+                &mut children.reaped,
+            )
+            .await
+        }
+        HelperOperation::Diff => {
+            diff(
+                job,
+                deadline,
+                worktree,
+                &mut children.spawned,
+                &mut children.reaped,
+            )
+            .await
+        }
+        _ => (
+            HelperOutcome::Failed {
+                code: FailureCode::Internal,
+            },
+            None,
+        ),
+    };
+    (outcome, children, discovery, payload)
+}
+
+/// Returns one closed failure while preserving actual child settlement counts and discovery bytes.
+fn failed(
+    code: FailureCode,
+    spawned: u32,
+    reaped: u32,
+    discovery: Vec<DiscoveryFrame>,
+) -> (
+    HelperOutcome,
+    ChildSettlement,
+    Vec<DiscoveryFrame>,
+    Option<HelperPayload>,
+) {
+    (
+        HelperOutcome::Failed { code },
+        ChildSettlement { spawned, reaped },
+        discovery,
+        None,
+    )
+}
+
+/// Updates child counts from one inherited-child failure and returns its closed product code.
+fn account_failure(
+    failure: crate::execution::InheritedChildFailure,
+    spawned: &mut u32,
+    reaped: &mut u32,
+) -> FailureCode {
+    match failure {
+        crate::execution::InheritedChildFailure::NeverStarted => {
+            *spawned = spawned.saturating_sub(1);
+            FailureCode::SourceUnavailable
+        }
+        crate::execution::InheritedChildFailure::Reaped => {
+            *reaped = reaped.saturating_add(1);
+            FailureCode::Deadline
+        }
+        crate::execution::InheritedChildFailure::Unsettled => FailureCode::Deadline,
+    }
+}
+
+/// Runs the three Workspace-owned baseline commands and returns only bounded raw evidence.
+async fn collect_baseline(
+    job: &HelperJob,
+    deadline: tokio::time::Instant,
+    spawned: &mut u32,
+    reaped: &mut u32,
+) -> Result<Vec<HelperBaselineFrame>, FailureCode> {
+    use crate::workspace::git::GitReadQuery;
+    let queries = [
+        (GitReadQuery::HeadTree, HelperBaselineQuery::HeadTree),
+        (
+            GitReadQuery::UntrackedPaths,
+            HelperBaselineQuery::UntrackedPaths,
+        ),
+        (
+            GitReadQuery::HeadIdentity,
+            HelperBaselineQuery::HeadIdentity,
+        ),
+    ];
+    let mut frames = Vec::with_capacity(queries.len());
+    for (query, reported) in queries {
+        if *spawned >= job.budgets.processes {
+            return Err(FailureCode::Capacity);
+        }
+        let command =
+            crate::workspace::git::inherited_baseline_command(&job.git, &job.candidate, query)
+                .map_err(|_| FailureCode::UnsupportedGit)?;
+        *spawned += 1;
+        let completed = match crate::execution::run_inherited_controlled_child(
+            &command,
+            job.budgets.output_bytes.min(8 * 1024),
+            deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(Duration::from_secs(60)),
+        )
+        .await
+        {
+            Ok(completed) => completed,
+            Err(failure) => return Err(account_failure(failure, spawned, reaped)),
+        };
+        *reaped += 1;
+        let stdout = completed.evidence.stdout();
+        let stderr = completed.evidence.stderr();
+        frames.push(HelperBaselineFrame {
+            query: reported,
+            stdout: stdout.bytes.clone(),
+            stderr: stderr.bytes.clone(),
+            exit_code: completed.evidence.status().code(),
+            truncated: stdout.truncated || stderr.truncated || !stdout.complete || !stderr.complete,
+        });
+    }
+    Ok(frames)
+}
+
+/// Produces bounded source context inside the inherited sandbox.
+async fn context(
+    job: &HelperJob,
+    deadline: tokio::time::Instant,
+    worktree: crate::workspace::authority::WorktreeRef,
+    spawned: &mut u32,
+    reaped: &mut u32,
+) -> (HelperOutcome, Option<HelperPayload>) {
+    use crate::{
+        intelligence::{
+            context::{ContextMode, ContextQuery, lexical_context},
+            freshness::Freshness,
+        },
+        workspace::observation::{
+            ObservationRef, ObservedState, SourceBytes, SourceCoverage, SourceObservation,
+            SourceReadLimits, SourceRevision, read_authorized_source,
+        },
+    };
+    let Some(scope) = job.scope.as_ref() else {
+        return (
+            HelperOutcome::Failed {
+                code: FailureCode::WorkspaceAuthority,
+            },
+            None,
+        );
+    };
+    let Some(path) = job.parameters["path"].as_str() else {
+        return (
+            HelperOutcome::Failed {
+                code: FailureCode::SourceUnavailable,
+            },
+            None,
+        );
+    };
+    let relative = PathBuf::from(path);
+    let read = read_authorized_source(
+        &worktree,
+        &relative,
+        match SourceReadLimits::new(1024, job.budgets.output_bytes) {
+            Ok(limits) => limits,
+            Err(_) => {
+                return (
+                    HelperOutcome::Failed {
+                        code: FailureCode::Capacity,
+                    },
+                    None,
+                );
+            }
+        },
+    );
+    let (bytes, source_bytes, state, revision) = match read {
+        Ok(read) => {
+            let bytes = read.contents().to_vec();
+            let metadata = read.bytes().clone();
+            let revision = blake3::hash(&bytes).to_hex().to_string();
+            (bytes, Some(metadata), ObservedState::Present, revision)
+        }
+        Err(crate::workspace::observation::ObservationError::Missing) => {
+            (Vec::new(), None, ObservedState::Missing, "missing".into())
+        }
+        Err(_) => {
+            return (
+                HelperOutcome::Failed {
+                    code: FailureCode::SourceUnavailable,
+                },
+                None,
+            );
+        }
+    };
+    let observation = match SourceObservation::new(
+        worktree,
+        scope.authority_epoch,
+        1,
+        match ObservationRef::new("claude-helper-context") {
+            Ok(reference) => reference,
+            Err(_) => {
+                return (
+                    HelperOutcome::Failed {
+                        code: FailureCode::Internal,
+                    },
+                    None,
+                );
+            }
+        },
+        relative,
+        source_bytes.clone(),
+        match SourceRevision::new(revision) {
+            Ok(revision) => revision,
+            Err(_) => {
+                return (
+                    HelperOutcome::Failed {
+                        code: FailureCode::Internal,
+                    },
+                    None,
+                );
+            }
+        },
+        SourceCoverage::Complete,
+        state,
+    ) {
+        Ok(observation) => observation,
+        Err(_) => {
+            return (
+                HelperOutcome::Failed {
+                    code: FailureCode::SourceUnavailable,
+                },
+                None,
+            );
+        }
+    };
+    let query = job
+        .parameters
+        .get("byte_offset")
+        .and_then(serde_json::Value::as_u64)
+        .map_or(ContextQuery::File, |byte_offset| ContextQuery::Symbol {
+            byte_offset: byte_offset as usize,
+        });
+    let semantic = if source_bytes.is_some() && job.provider.is_some() {
+        provider_context(job, deadline, &observation, &bytes, query, spawned, reaped).await
+    } else {
+        Ok(None)
+    };
+    let (context, diagnostics) = match semantic {
+        Ok(Some(result)) => result,
+        Ok(None) => match lexical_context(
+            &observation,
+            &bytes,
+            query,
+            "no accepted provider is configured for this source, or the registered path is missing",
+        ) {
+            Ok(context) => (context, None),
+            Err(_) => {
+                return (
+                    HelperOutcome::Failed {
+                        code: FailureCode::SourceUnavailable,
+                    },
+                    None,
+                );
+            }
+        },
+        Err(FailureCode::ProviderUnavailable) => match lexical_context(
+            &observation,
+            &bytes,
+            query,
+            "accepted semantic provider is unavailable",
+        ) {
+            Ok(context) => (context, None),
+            Err(_) => {
+                return (
+                    HelperOutcome::Failed {
+                        code: FailureCode::SourceUnavailable,
+                    },
+                    None,
+                );
+            }
+        },
+        Err(code) => return (HelperOutcome::Failed { code }, None),
+    };
+    if tokio::time::Instant::now() >= deadline {
+        return (
+            HelperOutcome::Failed {
+                code: FailureCode::Deadline,
+            },
+            None,
+        );
+    }
+    let mode = match &context.mode {
+        ContextMode::Semantic => "semantic".to_owned(),
+        ContextMode::Lexical { reason } => format!("lexical ({reason})"),
+    };
+    let diagnostics = diagnostics.and_then(|diagnostics| {
+        (context.freshness == Freshness::Current
+            && diagnostics.freshness == Freshness::Provisional
+            && diagnostics.source.as_ref() == Some(&context.source)
+            && Some(diagnostics.generation) == context.generation
+            && diagnostics.document_version == context.document_version
+            && diagnostics
+                .document_version
+                .is_some_and(|version| version > 0))
+        .then_some(diagnostics)
+    });
+    let feedback = diagnostics
+        .as_ref()
+        .filter(|diagnostics| !diagnostics.diagnostics.is_empty())
+        .and_then(|diagnostics| {
+            super::facade::FeedbackDelta::new(
+                format!(
+                    "Provider reported {} diagnostics for the exact source bytes observed by the Claude helper.",
+                    diagnostics.diagnostics.len()
+                ),
+                format!(
+                    "source_digest={}; provider_generation={:?}; document_version={:?}",
+                    source_bytes
+                        .as_ref()
+                        .map(|bytes| blake3::Hash::from_bytes(*bytes.digest()).to_hex().to_string())
+                        .unwrap_or_else(|| "missing".into()),
+                    diagnostics.generation,
+                    diagnostics.document_version
+                ),
+                "Review the bounded diagnostic messages in the latest context result.",
+                "provisional helper snapshot; no delivery-time daemon source read",
+                None,
+            )
+        })
+        .map(|feedback| feedback.render());
+    let diagnostic_text = diagnostics.as_ref().map_or_else(
+        || "diagnostics_freshness: unknown\ndiagnostic_count: unknown\nfeedback_delta: none".to_owned(),
+        |diagnostics| {
+            let messages = diagnostics
+                .diagnostics
+                .iter()
+                .take(8)
+                .map(|diagnostic| diagnostic.message.chars().take(256).collect::<String>())
+                .collect::<Vec<_>>();
+            format!(
+                "diagnostics_freshness: {:?}\ndiagnostic_readiness: {:?}\ndiagnostic_count: {}\ndiagnostics_truncated: {}\ndiagnostic_messages: {}\nfeedback_delta: {}",
+                diagnostics.freshness,
+                diagnostics.readiness,
+                diagnostics.diagnostics.len(),
+                diagnostics.truncated || diagnostics.diagnostics.len() > messages.len(),
+                serde_json::to_string(&messages).unwrap_or_else(|_| "[]".into()),
+                feedback.as_deref().unwrap_or("none"),
+            )
+        },
+    );
+    let rendered = format!(
+        "mode: {mode}\npath: {path}\nsource_state: {:?}\ncoverage: complete helper-observed path\nposition_encoding: {:?}\nprovider_generation: {:?}\ndocument_version: {:?}\n{diagnostic_text}\ndefinitions: {}\nreferences: {}\nlexical_matches: {}\n\n{}",
+        observation.state(),
+        context.position_encoding,
+        context.generation,
+        context.document_version,
+        serde_json::to_string(&context.definitions).unwrap_or_else(|_| "null".into()),
+        serde_json::to_string(&context.references).unwrap_or_else(|_| "null".into()),
+        serde_json::to_string(&context.lexical_matches).unwrap_or_else(|_| "[]".into()),
+        context.text,
+    );
+    let (text, clipped) = fit_result_text(rendered);
+    let payload = HelperPayload::Context {
+        source: HelperSource {
+            path: path.to_owned(),
+            present: source_bytes.is_some(),
+            digest: source_bytes.as_ref().map(|bytes| *bytes.digest()),
+            length: source_bytes.as_ref().map_or(0, SourceBytes::length),
+        },
+        feedback,
+        truncated: context.truncated || clipped,
+    };
+    (HelperOutcome::Complete { text }, Some(payload))
+}
+
+/// Runs one accepted provider over exact helper-observed bytes, then reaps it before returning.
+async fn provider_context(
+    job: &HelperJob,
+    deadline: tokio::time::Instant,
+    source: &crate::workspace::observation::SourceObservation,
+    bytes: &[u8],
+    query: crate::intelligence::context::ContextQuery,
+    spawned: &mut u32,
+    reaped: &mut u32,
+) -> Result<
+    Option<(
+        crate::intelligence::context::ContextResult,
+        Option<crate::intelligence::session::DiagnosticSnapshot>,
+    )>,
+    FailureCode,
+> {
+    use crate::{
+        execution::WorkspaceAuthority,
+        intelligence::{
+            freshness::ViewGeneration,
+            gopls::GoplsProfile,
+            rust::{RustProfile, RustProfileIdentity, RustWorktree},
+            session::{GoEnv, ProviderSettings, SessionOptions, with_session},
+        },
+    };
+    let Some(provider) = job.provider.as_ref() else {
+        return Ok(None);
+    };
+    if *spawned >= job.budgets.processes {
+        return Err(FailureCode::Capacity);
+    }
+    let authority = WorkspaceAuthority::from_workspace(
+        source.worktree().id(),
+        source.worktree().incarnation().to_string(),
+        source.worktree().worktree_path().to_path_buf(),
+        source.authority_epoch(),
+    )
+    .map_err(|_| FailureCode::WorkspaceAuthority)?;
+    let cache = Path::new(&provider.cache_namespace);
+    let (command, settings) = match provider.language {
+        HelperLanguage::Go => {
+            let env = GoEnv::prepare(
+                cache.join("go-build"),
+                cache.join("go-mod"),
+                cache.join("tmp"),
+            )
+            .ok_or(FailureCode::ProviderUnavailable)?;
+            let profile = GoplsProfile::new(
+                provider.executable.clone(),
+                provider.version.clone(),
+                "gopls-v1".into(),
+                "gopls-defaults-v1".into(),
+                provider.toolchain.clone(),
+                provider.trust.clone(),
+                provider.cache_namespace.clone(),
+            )
+            .map_err(|_| FailureCode::ExecutionProfile)?;
+            (
+                profile
+                    .standalone_command(&authority)
+                    .map_err(|_| FailureCode::ExecutionProfile)?,
+                ProviderSettings::GoplsDefaults(env),
+            )
+        }
+        HelperLanguage::Rust => {
+            let profile = RustProfile::new(RustProfileIdentity {
+                binary: provider.executable.clone(),
+                rust_analyzer_version: provider.version.clone(),
+                cargo: provider
+                    .cargo
+                    .clone()
+                    .ok_or(FailureCode::ExecutionProfile)?,
+                cargo_version: provider
+                    .cargo_version
+                    .clone()
+                    .ok_or(FailureCode::ExecutionProfile)?,
+                rustc: provider
+                    .rustc
+                    .clone()
+                    .ok_or(FailureCode::ExecutionProfile)?,
+                rustc_version: provider
+                    .rustc_version
+                    .clone()
+                    .ok_or(FailureCode::ExecutionProfile)?,
+                rustup_toolchain: provider.toolchain.clone(),
+                configuration: "cache-priming-and-proc-macro-disabled-v1".into(),
+                trust: provider.trust.clone(),
+                transport: "stdio-v1".into(),
+                cache_namespace: provider.cache_namespace.clone(),
+            })
+            .map_err(|_| FailureCode::ExecutionProfile)?;
+            let worktree = RustWorktree::new(source.worktree().clone(), authority)
+                .map_err(|_| FailureCode::WorkspaceAuthority)?;
+            (
+                profile
+                    .command(&worktree)
+                    .map_err(|_| FailureCode::ExecutionProfile)?,
+                ProviderSettings::Rust(profile),
+            )
+        }
+    };
+    let mut process = command
+        .inherited_process()
+        .map_err(|_| FailureCode::ExecutionProfile)?;
+    process
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    *spawned += 1;
+    let mut child = match process.spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            *spawned = spawned.saturating_sub(1);
+            return Err(FailureCode::ProviderUnavailable);
+        }
+    };
+    let (Some(mut input), Some(mut output)) = (child.stdout.take(), child.stdin.take()) else {
+        let settled = child.kill().await.is_ok() && child.wait().await.is_ok();
+        *reaped += u32::from(settled);
+        return Err(if settled {
+            FailureCode::ProviderUnavailable
+        } else {
+            FailureCode::Deadline
+        });
+    };
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        let settled = child.kill().await.is_ok() && child.wait().await.is_ok();
+        *reaped += u32::from(settled);
+        return Err(FailureCode::Deadline);
+    }
+    let operation = with_session(
+        &mut input,
+        &mut output,
+        source.worktree().clone(),
+        source.authority_epoch(),
+        ViewGeneration {
+            backend: 1,
+            configuration: 1,
+            toolchain: 1,
+            view: 1,
+        },
+        settings,
+        SessionOptions {
+            request_timeout: remaining.min(Duration::from_secs(60)),
+            lifetime: remaining,
+        },
+        |mut session| async move {
+            let context = session.context(source, bytes, query).await?;
+            let diagnostics = session.diagnostics();
+            session.shutdown().await?;
+            Ok((context, Some(diagnostics)))
+        },
+    )
+    .await;
+    drop(input);
+    drop(output);
+    let status = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    match status {
+        Ok(Ok(status)) if status.success() => *reaped += 1,
+        _ => {
+            let settled = child.kill().await.is_ok() && child.wait().await.is_ok();
+            *reaped += u32::from(settled);
+            return Err(if settled {
+                FailureCode::ProviderUnavailable
+            } else {
+                FailureCode::Deadline
+            });
+        }
+    }
+    operation
+        .map(Some)
+        .map_err(|_| FailureCode::ProviderUnavailable)
+}
+
+/// Truncates one helper result only at a UTF-8 boundary and marks the omission explicitly.
+fn fit_result_text(mut text: String) -> (String, bool) {
+    if text.len() <= MAX_RESULT_TEXT_BYTES {
+        return (text, false);
+    }
+    let suffix = "\n[helper result truncated]";
+    let mut end = MAX_RESULT_TEXT_BYTES.saturating_sub(suffix.len());
+    while !text.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    text.truncate(end);
+    text.push_str(suffix);
+    (text, true)
+}
+
+/// Produces one bounded current Git comparison inside the inherited sandbox.
+async fn diff(
+    job: &HelperJob,
+    deadline: tokio::time::Instant,
+    worktree: crate::workspace::authority::WorktreeRef,
+    spawned: &mut u32,
+    reaped: &mut u32,
+) -> (HelperOutcome, Option<HelperPayload>) {
+    use crate::workspace::git::{BaselineContext, DiffMode, GitScope};
+    let Some(helper_scope) = job.scope.as_ref() else {
+        return (
+            HelperOutcome::Failed {
+                code: FailureCode::WorkspaceAuthority,
+            },
+            None,
+        );
+    };
+    let Some(helper_baseline) = job.baseline.as_ref() else {
+        return (
+            HelperOutcome::Failed {
+                code: FailureCode::WorkspaceAuthority,
+            },
+            None,
+        );
+    };
+    let mode = match job.parameters["mode"].as_str() {
+        Some("head") => DiffMode::Head,
+        Some("staged") => DiffMode::Staged,
+        Some("unstaged") => DiffMode::Unstaged,
+        _ => {
+            return (
+                HelperOutcome::Failed {
+                    code: FailureCode::Internal,
+                },
+                None,
+            );
+        }
+    };
+    let scope = match GitScope::from_inherited(worktree, helper_scope.authority_epoch, mode) {
+        Ok(scope) => scope,
+        Err(_) => {
+            return (
+                HelperOutcome::Failed {
+                    code: FailureCode::WorkspaceAuthority,
+                },
+                None,
+            );
+        }
+    };
+    let baseline = match BaselineContext::from_inherited(
+        helper_baseline.reference.clone(),
+        helper_baseline.captured,
+        helper_baseline.digest,
+        GitScope::from_inherited(
+            scope.worktree().clone(),
+            scope.authority_epoch(),
+            DiffMode::Head,
+        )
+        .expect("validated helper scope"),
+    ) {
+        Ok(baseline) => baseline,
+        Err(_) => {
+            return (
+                HelperOutcome::Failed {
+                    code: FailureCode::WorkspaceAuthority,
+                },
+                None,
+            );
+        }
+    };
+    let mut runner = HelperSnapshotRunner {
+        output_cap: job.budgets.output_bytes,
+        remaining_processes: job.budgets.processes.saturating_sub(*spawned),
+        deadline,
+        spawned: 0,
+        reaped: 0,
+        failure: None,
+    };
+    let evidence = crate::workspace::git::snapshot::collect_snapshot_scoped(
+        scope.clone(),
+        None,
+        &job.git,
+        1,
+        "claude-helper-diff",
+        baseline,
+        &mut runner,
+    )
+    .await;
+    *spawned = spawned.saturating_add(runner.spawned);
+    *reaped = reaped.saturating_add(runner.reaped);
+    let evidence = match evidence {
+        Ok(evidence) => evidence,
+        Err(_) => {
+            return (
+                HelperOutcome::Failed {
+                    code: runner.failure.unwrap_or(FailureCode::SourceUnavailable),
+                },
+                None,
+            );
+        }
+    };
+    if tokio::time::Instant::now() >= deadline {
+        return (
+            HelperOutcome::Failed {
+                code: FailureCode::Deadline,
+            },
+            None,
+        );
+    }
+    let comparison = evidence.comparison().clone();
+    let mut max_hunks = 32;
+    loop {
+        let result = crate::changes::compose_diff(
+            &scope,
+            &comparison,
+            evidence.clone(),
+            crate::changes::DiffSelectionBudget::bounded(max_hunks, 24 * 1024),
+        );
+        let text = crate::assistance::worker::snapshots::render_diff_text(
+            mode,
+            &result,
+            helper_scope.authority_epoch,
+            false,
+        );
+        if text.len() <= MAX_RESULT_TEXT_BYTES {
+            let truncated = result.truncated_output()
+                || result.overflow_hunks() > 0
+                || result.overflow_bytes() > 0;
+            return (
+                HelperOutcome::Complete { text },
+                Some(HelperPayload::Diff { truncated }),
+            );
+        }
+        if max_hunks == 1 {
+            return (
+                HelperOutcome::Failed {
+                    code: FailureCode::Capacity,
+                },
+                None,
+            );
+        }
+        max_hunks = (max_hunks / 2).max(1);
+    }
+}
+
+/// Executes Workspace snapshot intents sequentially under the one already-held helper admission.
+struct HelperSnapshotRunner {
+    /// Per-stream retained-byte cap.
+    output_cap: usize,
+    /// Maximum additional direct children this helper job may start.
+    remaining_processes: u32,
+    /// Per-child upper bound within the helper's finite operation lifetime.
+    deadline: tokio::time::Instant,
+    /// Direct children actually started.
+    spawned: u32,
+    /// Direct children positively waited or killed and waited.
+    reaped: u32,
+    /// First product failure retained separately from Workspace parsing.
+    failure: Option<FailureCode>,
+}
+
+impl crate::workspace::git::snapshot::SnapshotRunner for HelperSnapshotRunner {
+    /// Runs one immutable intent and correlates its scratch lifecycle with actual wait evidence.
+    async fn run(
+        &mut self,
+        intent: crate::workspace::git::snapshot::SnapshotIntent,
+    ) -> Result<crate::execution::CapturedProcessEvidence, crate::workspace::git::GitError> {
+        use crate::{execution::InheritedChildFailure, workspace::git::GitError};
+        if self.spawned >= self.remaining_processes {
+            self.failure = Some(FailureCode::Capacity);
+            return Err(GitError::EvidenceTooLarge);
+        }
+        let command = intent.command()?;
+        let remaining = self
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .min(Duration::from_secs(60));
+        if remaining.is_zero() {
+            self.failure = Some(FailureCode::Deadline);
+            return Err(GitError::IncompleteIdentity);
+        }
+        self.spawned += 1;
+        let completed = match crate::execution::run_inherited_controlled_child(
+            &command,
+            self.output_cap,
+            remaining,
+        )
+        .await
+        {
+            Ok(completed) => completed,
+            Err(InheritedChildFailure::NeverStarted) => {
+                self.spawned -= 1;
+                self.failure = Some(FailureCode::SourceUnavailable);
+                return Err(GitError::IncompleteIdentity);
+            }
+            Err(InheritedChildFailure::Reaped) => {
+                self.reaped += 1;
+                self.failure = Some(FailureCode::Deadline);
+                return Err(GitError::IncompleteIdentity);
+            }
+            Err(InheritedChildFailure::Unsettled) => {
+                self.failure = Some(FailureCode::Deadline);
+                return Err(GitError::IncompleteIdentity);
+            }
+        };
+        self.reaped += 1;
+        if intent.snapshot_directory().is_some() {
+            intent.bind_process(completed.launch_identity)?;
+        }
+        intent.acknowledge_reap(&completed.evidence)?;
+        Ok(completed.evidence)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,11 +1411,13 @@ mod tests {
             candidate: candidate.to_path_buf(),
             git: PathBuf::from("/usr/bin/git"),
             canonical_root: None,
+            scope: None,
+            baseline: None,
             provider: None,
             parameters: serde_json::json!({"activation_id": "activate"}),
             budgets: HelperBudgets {
                 output_bytes: 4096,
-                processes: 4,
+                processes: 6,
                 deadline_ms: 30_000,
             },
         }
@@ -626,12 +1488,16 @@ mod tests {
         let Delivery::Ready(result) = delivery else {
             panic!("both settlement halves arrived");
         };
-        assert!(result.children.settled() && result.children.spawned == 3);
+        assert!(result.children.settled() && result.children.spawned == 6);
         let HelperOutcome::Complete { text } = &result.outcome else {
             panic!("real git discovery completed");
         };
-        // Proves the child actually ran in the worktree rather than returning a fabricated root.
-        assert!(text.contains(candidate.to_str().unwrap()));
+        assert!(text.contains("activation baseline"));
+        let Some(HelperPayload::Start { baseline }) = &result.payload else {
+            panic!("real baseline evidence completed");
+        };
+        assert_eq!(result.discovery.len(), 3);
+        assert_eq!(baseline.len(), 3);
         drop(endpoint);
         let _ = std::fs::remove_dir_all(&candidate);
     }
@@ -639,7 +1505,7 @@ mod tests {
     /// The real helper process is the only thing that can mint a settled token for a real worktree.
     ///
     /// Integrated rather than a private ledger exercise: a real `Bash`-shaped foreground helper
-    /// claims over the real private socket, runs three real Git children against a real worktree,
+    /// claims over the real private socket, runs six real Git children against a real worktree,
     /// reaps them and reports its own frame. Only after that, and after the matching successful
     /// post, does a token exist. A copied frame, a replayed frame, a frame from a generation that
     /// is not live, and revoked work all mint nothing.
@@ -664,6 +1530,7 @@ mod tests {
                 reaped: 0,
             },
             discovery: Vec::new(),
+            payload: None,
         };
         assert_eq!(
             ledger.lock().unwrap().settle_frame(raw.clone()),

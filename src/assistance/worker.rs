@@ -1,12 +1,14 @@
 //! One daemon-owned worker with bounded jobs/details, durable authorization and revocable work.
 
 use super::{
-    claude_worker::{HelperOperation, SettledClaudeOperation},
+    claude_worker::{
+        HelperBaseline, HelperOperation, HelperOutcome, HelperScope, SettledClaudeOperation,
+    },
     facade::{AssistanceTool, FeedbackDelta},
     host_binding::{
         ActiveBindingUse, BindingRef, HostBindingGuard, ObservedSandboxState, ValidatedInvocation,
     },
-    launcher::{LaunchTarget, LauncherConfig},
+    launcher::{AcceptedProviderSettings, LaunchTarget, LauncherConfig},
     reply::{FailureCode, PeerReply, ResultKind, call_tool_result_fits, render_call_tool_result},
 };
 use crate::workspace::observation::SourceObservation;
@@ -24,7 +26,7 @@ use crate::{
 #[path = "providers.rs"]
 mod providers;
 #[path = "snapshots.rs"]
-mod snapshots;
+pub(super) mod snapshots;
 
 use serde_json::Value;
 use std::{
@@ -100,12 +102,23 @@ struct Detail {
 
 /// Retains one versioned provider delta until a later native post-hook rechecks its exact source.
 struct NativeFeedback {
-    /// Exact source observation whose positive provider version produced the delta.
-    source: SourceObservation,
+    /// Exact source observation for daemon-managed feedback; absent for a helper-owned snapshot.
+    source: Option<SourceObservation>,
     /// Bounded fact/evidence/action rendering; source text and diagnostics are excluded.
     text: String,
     /// Native lifecycle epoch at which the provider result was accepted.
     native_epoch: u64,
+}
+
+/// Retains daemon-derived scope, baseline and cache paths for later Claude helper jobs.
+#[derive(Clone)]
+pub(super) struct ClaudeBindingState {
+    /// Durable current scope with replacement-safe root identity.
+    pub(super) scope: HelperScope,
+    /// Partial stored baseline or explicit unknown baseline.
+    pub(super) baseline: HelperBaseline,
+    /// Retained worktree cache path for each configured provider profile.
+    pub(super) caches: Vec<(AcceptedProviderSettings, String)>,
 }
 
 /// Builds the daemon's single physical-effect admission controller with its fixed process limits.
@@ -140,6 +153,8 @@ struct Ledger {
     native_epoch: BTreeMap<BindingRef, u64>,
     /// At most one undelivered current delta per active binding.
     feedback: BTreeMap<BindingRef, NativeFeedback>,
+    /// Active Claude bindings available to mint post-activation helper jobs.
+    claude: BTreeMap<BindingRef, ClaudeBindingState>,
 }
 impl Default for Ledger {
     /// Creates empty finite bookkeeping; no file or process work occurs.
@@ -152,6 +167,7 @@ impl Default for Ledger {
             next: 0,
             native_epoch: BTreeMap::new(),
             feedback: BTreeMap::new(),
+            claude: BTreeMap::new(),
         }
     }
 }
@@ -580,15 +596,13 @@ impl WorkerHandle {
 
     /// Routes one positively settled Claude helper operation through the sole worker queue.
     ///
-    /// This is the only entry by which helper evidence can reach durable authority, and it accepts
-    /// only a [`SettledClaudeOperation`], which cannot be built from wire data. It adds no second
-    /// grant, baseline or Workspace store: the job runs on the existing queue, the receipt lands in
-    /// the existing `Worker::grants`, and the result lands in the existing detail ledger.
+    /// This is the only entry by which helper evidence can reach durable state, and it accepts
+    /// only a [`SettledClaudeOperation`], which cannot be built from wire data. It adds only one
+    /// job on the existing queue; Start mints authority/baseline, Context records source metadata,
+    /// and Diff publishes only helper-composed current evidence.
     ///
-    /// Delivery is idempotent. A repeated call for the same binding and `activation_id` returns the
-    /// already retained result instead of activating again or minting a second receipt, because the
-    /// existing start ledger keys that pair. Returns the bounded activation result, or a closed
-    /// error when admission, liveness or durable activation refuses.
+    /// Start delivery is idempotent by the existing `(binding, activation_id)` ledger. Context and
+    /// Diff consume one settled helper token each and still require current durable authority.
     pub async fn complete_claude(
         &self,
         invocation: ValidatedInvocation,
@@ -597,21 +611,33 @@ impl WorkerHandle {
     ) -> PeerReply {
         let binding = invocation.binding_ref().clone();
         let parameters = settled.job().parameters.clone();
-        let Some(activation) = parameters.get("activation_id").and_then(Value::as_str) else {
-            return PeerReply::Error {
-                code: FailureCode::Internal,
-            };
+        let tool = match settled.operation() {
+            HelperOperation::Start => AssistanceTool::Start,
+            HelperOperation::Context => AssistanceTool::Context,
+            HelperOperation::Diff => AssistanceTool::Diff,
+            HelperOperation::Stop => {
+                return PeerReply::Error {
+                    code: FailureCode::Internal,
+                };
+            }
         };
         // Repeated inspection of an already completed activation is retrieval, never a second
         // activation: answer from the retained detail rather than re-entering the queue.
-        if let Some(retained) = self.retained_start(&binding, activation) {
-            return retained;
+        if tool == AssistanceTool::Start {
+            let Some(activation) = parameters.get("activation_id").and_then(Value::as_str) else {
+                return PeerReply::Error {
+                    code: FailureCode::Internal,
+                };
+            };
+            if let Some(retained) = self.retained_start(&binding, activation) {
+                return retained;
+            }
         }
         let (send, wait) = oneshot::channel();
         if let Err(code) = self.enqueue(
             invocation,
             None,
-            AssistanceTool::Start,
+            tool,
             parameters,
             attachment,
             Some(send),
@@ -701,6 +727,15 @@ impl WorkerHandle {
         self.shared.launcher.target(attachment).cloned()
     }
 
+    /// Returns the daemon-derived current scope and retained cache paths for one Claude binding.
+    ///
+    /// Missing state means Start has not committed, Stop removed it, or the generation is stale.
+    /// This is pure bounded bookkeeping and performs no Git, source, provider or Store I/O.
+    pub(super) fn claude_state(&self, binding: &BindingRef) -> Option<ClaudeBindingState> {
+        self.shared.active(binding).ok()?;
+        self.shared.ledger.lock().ok()?.claude.get(binding).cloned()
+    }
+
     /// Returns the shared validated finite worker limits for this daemon boot.
     pub fn limits(&self) -> super::launcher::ProductLimits {
         self.shared.launcher.limits
@@ -725,8 +760,9 @@ impl WorkerHandle {
             let mut ledger = self.shared.ledger.lock().ok()?;
             let current_epoch = ledger.native_epoch.get(&binding).copied().unwrap_or(0);
             let feedback = ledger.feedback.remove(&binding)?;
-            (current_epoch > feedback.native_epoch && source_matches(&feedback.source))
-                .then_some(feedback)?
+            (current_epoch > feedback.native_epoch
+                && feedback.source.as_ref().is_none_or(source_matches))
+            .then_some(feedback)?
         };
         self.shared.active(&binding).ok()?;
         Some(feedback.text)
@@ -971,6 +1007,18 @@ impl<'a> Worker<'a> {
                     AssistanceTool::Start if matches!(job.input, JobInput::Claude(_)) => {
                         self.activate_claude(&mut job).await
                     }
+                    AssistanceTool::Context if matches!(job.input, JobInput::Claude(_)) => {
+                        self.context_claude(&mut job).await
+                    }
+                    AssistanceTool::Diff if matches!(job.input, JobInput::Claude(_)) => {
+                        self.diff_claude(&mut job).await
+                    }
+                    AssistanceTool::Context if matches!(job.input, JobInput::Claude(_)) => {
+                        self.context_claude(&mut job).await
+                    }
+                    AssistanceTool::Diff if matches!(job.input, JobInput::Claude(_)) => {
+                        self.diff_claude(&mut job).await
+                    }
                     AssistanceTool::Start => self.activate(&mut job).await,
                     AssistanceTool::Context => self.context(&mut job).await,
                     AssistanceTool::Diff => self.diff(&mut job).await,
@@ -1157,9 +1205,14 @@ impl<'a> Worker<'a> {
         // A second concurrent actor on the same physical worktree cannot share a single-owner
         // namespace: fail its activation with the finite reason and roll its own grant back, so the
         // actor that already owns the cache keeps running and can hand off after it stops.
-        if let Err(code) =
-            self.retain_worktree_caches(&binding, &authority, &launches, managed_sandbox, &rights)
-        {
+        if let Err(code) = self.retain_worktree_caches(
+            &binding,
+            &authority,
+            &launches,
+            managed_sandbox,
+            true,
+            &rights,
+        ) {
             if let Ok(mut guard) = self.shared.bindings.lock() {
                 let _ = guard.stop_binding(&binding);
             }
@@ -1207,8 +1260,9 @@ impl<'a> Worker<'a> {
     /// commit. A commit that raced stop keeps its receipt in `grants` for recoverable revocation
     /// and publishes no success.
     ///
-    /// Baseline capture is honestly reported as unknown at this stage: activation precedes baseline
-    /// capture, and pre-activation bytes are never relabelled as an activation baseline.
+    /// The helper also supplies the fixed baseline Git reads. They become a durable partial baseline
+    /// only after activation and a fresh authority check; invalid evidence leaves baseline coverage
+    /// unknown without undoing an already-committed grant.
     ///
     /// Returns [`FailureCode::Conflict`] when another actor already owns this worktree, leaving the
     /// first owner's activation usable, and [`FailureCode::WorkspaceActivation`] when the evidence
@@ -1227,6 +1281,11 @@ impl<'a> Worker<'a> {
         {
             return Err(FailureCode::WorkspaceAuthority);
         }
+        let Some(super::claude_worker::HelperPayload::Start { baseline }) =
+            settled.result().payload.as_ref()
+        else {
+            return Err(FailureCode::SourceUnavailable);
+        };
         let activation = job.parameters["activation_id"]
             .as_str()
             .ok_or(FailureCode::Internal)?
@@ -1289,6 +1348,7 @@ impl<'a> Worker<'a> {
         };
         // Retain the receipt before checking whether stop won the race, so an activation that
         // committed durably is always recoverably revocable rather than orphaned.
+        let activation_operation = receipt.operation().to_owned();
         self.grants.insert(binding.clone(), receipt);
         let authority = match self.authority(&binding).await {
             Ok(authority) => authority,
@@ -1300,17 +1360,274 @@ impl<'a> Worker<'a> {
                 return Err(error);
             }
         };
+        let launches = job.target.providers.clone();
+        let profile = job
+            .target
+            .claude_profile
+            .ok_or(FailureCode::ExecutionProfile)?;
+        let rights = profile.rights_identity()?;
+        if let Err(code) =
+            self.retain_worktree_caches(&binding, &authority, &launches, true, false, rights)
+        {
+            if let Ok(mut guard) = self.shared.bindings.lock() {
+                let _ = guard.stop_binding(&binding);
+            }
+            return Err(self.settle_revocation(&binding).await.err().unwrap_or(code));
+        }
+        let caches = self.helper_cache_namespaces(&binding, &authority, &launches, rights)?;
+        let baseline = self
+            .capture_claude_baseline(&binding, &authority, &activation_operation, baseline)
+            .await;
+        let helper_baseline = match baseline {
+            Ok(baseline) => {
+                let digest = baseline.capture_digest().copied();
+                let value = HelperBaseline {
+                    reference: baseline.reference().to_owned(),
+                    captured: digest.is_some(),
+                    digest,
+                };
+                self.baselines.insert(binding.clone(), baseline);
+                value
+            }
+            Err(_) => HelperBaseline {
+                reference: format!("baseline-{activation_operation}"),
+                captured: false,
+                digest: None,
+            },
+        };
+        let worktree = authority.worktree();
+        let scope = HelperScope {
+            worktree_id: worktree.id().to_owned(),
+            incarnation: worktree.incarnation(),
+            root: worktree.worktree_path().to_path_buf(),
+            repository_root: worktree.repository_root().to_path_buf(),
+            git_common_dir: worktree.git_common_dir().to_path_buf(),
+            native_root_identity: worktree
+                .native_root_identity()
+                .ok_or(FailureCode::WorkspaceAuthority)?,
+            authority_epoch: authority.epoch(),
+        };
         self.shared.active(&binding)?;
+        self.shared
+            .ledger
+            .lock()
+            .map_err(|_| FailureCode::Internal)?
+            .claude
+            .insert(
+                binding.clone(),
+                ClaudeBindingState {
+                    scope,
+                    baseline: helper_baseline.clone(),
+                    caches,
+                },
+            );
         Ok((
             PeerReply::Complete {
                 kind: ResultKind::Activation,
                 text: format!(
-                    "Workspace activated; authority_epoch: {}; baseline: unknown (not captured at this stage); \
-                     context and diff remain unavailable. Provider readiness is not implied.",
+                    "Workspace activated; authority_epoch: {}; baseline: {}; worktree_cache: retained. Provider readiness is not implied.",
                     authority.epoch(),
+                    if helper_baseline.captured {
+                        "partial (Unverified; durable capture true)"
+                    } else {
+                        "unknown (durable capture unavailable)"
+                    },
                 ),
                 detail_ref: Some(job.reference.clone()),
                 truncated: false,
+            },
+            Some(authority),
+            None,
+        ))
+    }
+
+    /// Records helper-observed source metadata without reopening the source in the daemon.
+    async fn record_claude_source(
+        &mut self,
+        binding: &BindingRef,
+        source: &super::claude_worker::HelperSource,
+    ) -> Result<SourceObservation, FailureCode> {
+        use crate::workspace::{
+            observation::{ObservationRef, SourceBytes, SourceCoverage, SourceRevision},
+            store::{ObservationAdmission, ObservationDraft},
+        };
+        let authority = self.authority(binding).await?;
+        let path = std::path::PathBuf::from(&source.path);
+        self.source_sequence = self
+            .source_sequence
+            .checked_add(1)
+            .ok_or(FailureCode::Capacity)?;
+        let key = format!(
+            "source-{}-{}",
+            blake3::Hash::from_bytes(self.shared.nonce).to_hex(),
+            self.source_sequence
+        );
+        let operation = OperationId::new(key.clone()).map_err(|_| FailureCode::Internal)?;
+        let reference = ObservationRef::new(key).map_err(|_| FailureCode::Internal)?;
+        let draft = match (source.present, source.digest) {
+            (true, Some(digest)) => ObservationDraft::present(
+                authority.worktree().clone(),
+                authority.epoch(),
+                operation,
+                reference,
+                path.clone(),
+                SourceBytes::from_reported(digest, source.length)
+                    .map_err(|_| FailureCode::SourceUnavailable)?,
+                SourceRevision::new(blake3::Hash::from_bytes(digest).to_hex().to_string())
+                    .map_err(|_| FailureCode::Internal)?,
+                SourceCoverage::Complete,
+            ),
+            (false, None) if source.length == 0 => ObservationDraft::missing(
+                authority.worktree().clone(),
+                authority.epoch(),
+                operation,
+                reference,
+                path.clone(),
+                SourceRevision::new("missing").map_err(|_| FailureCode::Internal)?,
+                SourceCoverage::Complete,
+            ),
+            _ => return Err(FailureCode::SourceUnavailable),
+        }
+        .map_err(|_| FailureCode::SourceUnavailable)?;
+        self.workspace
+            .authorize(&authority, &self.shared.active(binding)?)
+            .await
+            .map_err(|_| FailureCode::WorkspaceAuthority)?;
+        let ObservationAdmission::Recorded(observed) = self
+            .observations
+            .record(draft)
+            .await
+            .map_err(|_| FailureCode::SourceUnavailable)?
+        else {
+            return Err(FailureCode::SourceUnavailable);
+        };
+        self.shared.active(binding)?;
+        let paths = self.registered.entry(binding.clone()).or_default();
+        if paths.len() >= self.shared.launcher.limits.details && !paths.contains(&path) {
+            return Err(FailureCode::Capacity);
+        }
+        paths.insert(path);
+        Ok(observed)
+    }
+
+    /// Publishes one settled helper Context after durable authority and source-metadata admission.
+    async fn context_claude(
+        &mut self,
+        job: &mut Job,
+    ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        let binding = job.invocation.binding_ref().clone();
+        let JobInput::Claude(settled) = &job.input else {
+            return Err(FailureCode::Internal);
+        };
+        if settled.operation() != HelperOperation::Context
+            || settled.binding().fingerprint() != binding.fingerprint()
+        {
+            return Err(FailureCode::WorkspaceAuthority);
+        }
+        let Some(super::claude_worker::HelperPayload::Context {
+            source,
+            feedback,
+            truncated,
+        }) = settled.result().payload.as_ref()
+        else {
+            return Err(FailureCode::SourceUnavailable);
+        };
+        if job.parameters["path"].as_str() != Some(source.path.as_str()) {
+            return Err(FailureCode::SourceUnavailable);
+        }
+        let HelperOutcome::Complete { text } = &settled.result().outcome else {
+            return Err(FailureCode::SourceUnavailable);
+        };
+        let observed = self.record_claude_source(&binding, source).await?;
+        let authority = self.authority(&binding).await?;
+        let epoch = self
+            .shared
+            .ledger
+            .lock()
+            .map_err(|_| FailureCode::Internal)?
+            .native_epoch
+            .get(&binding)
+            .copied()
+            .unwrap_or(0);
+        if epoch != job.native_epoch || tokio::time::Instant::now() >= job.deadline {
+            return Err(FailureCode::SourceUnavailable);
+        }
+        if let Ok(mut ledger) = self.shared.ledger.lock() {
+            if let Some(feedback) = feedback {
+                ledger.feedback.insert(
+                    binding.clone(),
+                    NativeFeedback {
+                        source: None,
+                        text: feedback.clone(),
+                        native_epoch: epoch,
+                    },
+                );
+            } else {
+                ledger.feedback.remove(&binding);
+            }
+        }
+        Ok((
+            PeerReply::Complete {
+                kind: ResultKind::Context,
+                text: format!(
+                    "source_sequence: {}\nauthority_epoch: {}\n{}",
+                    observed.sequence(),
+                    authority.epoch(),
+                    text
+                ),
+                detail_ref: Some(job.reference.clone()),
+                truncated: *truncated,
+            },
+            Some(authority),
+            Some(observed),
+        ))
+    }
+
+    /// Publishes one settled helper-composed Diff after current authority and scope rechecks.
+    async fn diff_claude(
+        &mut self,
+        job: &mut Job,
+    ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        let binding = job.invocation.binding_ref().clone();
+        let JobInput::Claude(settled) = &job.input else {
+            return Err(FailureCode::Internal);
+        };
+        if settled.operation() != HelperOperation::Diff
+            || settled.binding().fingerprint() != binding.fingerprint()
+        {
+            return Err(FailureCode::WorkspaceAuthority);
+        }
+        let Some(super::claude_worker::HelperPayload::Diff { truncated }) =
+            settled.result().payload.as_ref()
+        else {
+            return Err(FailureCode::SourceUnavailable);
+        };
+        let HelperOutcome::Complete { text } = &settled.result().outcome else {
+            return Err(FailureCode::SourceUnavailable);
+        };
+        let authority = self.authority(&binding).await?;
+        let state = self
+            .shared
+            .ledger
+            .lock()
+            .map_err(|_| FailureCode::Internal)?
+            .claude
+            .get(&binding)
+            .cloned()
+            .ok_or(FailureCode::WorkspaceAuthority)?;
+        if state.scope.authority_epoch != authority.epoch()
+            || state.scope.worktree_id != authority.worktree().id()
+            || tokio::time::Instant::now() >= job.deadline
+        {
+            return Err(FailureCode::WorkspaceAuthority);
+        }
+        self.shared.active(&binding)?;
+        Ok((
+            PeerReply::Complete {
+                kind: ResultKind::Diff,
+                text: text.clone(),
+                detail_ref: Some(job.reference.clone()),
+                truncated: *truncated,
             },
             Some(authority),
             None,
@@ -1634,7 +1951,7 @@ impl<'a> Worker<'a> {
                 ledger.feedback.insert(
                     binding.clone(),
                     NativeFeedback {
-                        source: observed.clone(),
+                        source: Some(observed.clone()),
                         text: feedback.render(),
                         native_epoch: epoch,
                     },
@@ -1698,6 +2015,10 @@ impl<'a> Worker<'a> {
         self.quiesce_worktree_caches(binding);
         self.registered.remove(binding);
         self.baselines.remove(binding);
+        if let Ok(mut ledger) = self.shared.ledger.lock() {
+            ledger.feedback.remove(binding);
+            ledger.claude.remove(binding);
+        }
     }
 
     /// Commits a still-pending revoke that this fresh start would otherwise race, before any new

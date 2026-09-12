@@ -27,9 +27,9 @@ use std::{
 };
 
 /// Maximum complete serialized helper frame in either direction, before JSON decoding.
-pub const MAX_HELPER_FRAME_BYTES: usize = 64 * 1024;
+pub const MAX_HELPER_FRAME_BYTES: usize = 256 * 1024;
 /// Only this closed helper wire revision is accepted in either direction.
-pub const HELPER_PROTOCOL: u32 = 1;
+pub const HELPER_PROTOCOL: u32 = 2;
 /// Bounds concurrently outstanding launch tickets within one daemon boot.
 pub const MAX_TICKETS: usize = 64;
 /// Maximum accepted length of one exact expected helper command.
@@ -37,7 +37,7 @@ const MAX_COMMAND_BYTES: usize = 4096;
 /// Maximum accepted length of any single identity field carried on the helper wire.
 const MAX_IDENTIFIER_BYTES: usize = 256;
 /// Maximum bounded owner text one helper result may carry back to the daemon.
-const MAX_RESULT_TEXT_BYTES: usize = 32 * 1024;
+pub(super) const MAX_RESULT_TEXT_BYTES: usize = 32 * 1024;
 /// Maximum raw bytes one reported discovery stream may carry.
 const MAX_DISCOVERY_STREAM_BYTES: usize = 8 * 1024;
 /// Fixed helper subcommand; the model never selects an executable, argument or shell fragment.
@@ -95,6 +95,15 @@ impl ClaudeOperatorProfile {
             && self.scope_declared
             && self.platform == HelperPlatform::MacOs;
         strict.then_some(()).ok_or(FailureCode::ExecutionProfile)
+    }
+
+    /// Returns the canonical cache-rights identity for the one accepted strict profile.
+    ///
+    /// Validation must succeed first. The value names the complete fixed profile rather than any
+    /// model or hook field, so cache compatibility cannot be widened by an invocation.
+    pub fn rights_identity(&self) -> Result<&'static str, FailureCode> {
+        self.validate()?;
+        Ok("claude-strict-macos-v1")
     }
 }
 
@@ -171,11 +180,25 @@ impl RustEffectiveSettings {
 pub struct HelperProvider {
     /// Absolute accepted analyzer executable chosen by the daemon, never by model input.
     pub executable: PathBuf,
+    /// Accepted provider version string paired with the executable identity.
+    pub version: String,
     /// Exclusive language profile for this one operation.
     pub language: HelperLanguage,
     /// Effective Rust settings; present only for [`HelperLanguage::Rust`].
     pub rust_settings: Option<RustEffectiveSettings>,
-    /// Persistent IDE-owned cache namespace retained across stop and handoff.
+    /// Accepted Go executable path or Rust toolchain selector.
+    pub toolchain: String,
+    /// Accepted Cargo executable for Rust; absent for Go.
+    pub cargo: Option<PathBuf>,
+    /// Accepted Cargo version for Rust; absent for Go.
+    pub cargo_version: Option<String>,
+    /// Accepted rustc executable for Rust; absent for Go.
+    pub rustc: Option<PathBuf>,
+    /// Accepted rustc version for Rust; absent for Go.
+    pub rustc_version: Option<String>,
+    /// Operator trust identity retained in the provider profile.
+    pub trust: String,
+    /// Absolute persistent IDE-owned cache namespace retained across stop and handoff.
     pub cache_namespace: String,
 }
 
@@ -183,16 +206,101 @@ impl HelperProvider {
     /// Checks absolute executable, language/settings agreement and a bounded cache namespace.
     pub fn validate(&self) -> Result<(), FailureCode> {
         if !self.executable.is_absolute()
-            || self.cache_namespace.is_empty()
-            || self.cache_namespace.len() > MAX_IDENTIFIER_BYTES
+            || self.version.is_empty()
+            || self.toolchain.is_empty()
+            || self.trust.is_empty()
+            || !PathBuf::from(&self.cache_namespace).is_absolute()
+            || self.cache_namespace.len() > 4096
         {
             return Err(FailureCode::ExecutionProfile);
         }
-        match (self.language, self.rust_settings.as_ref()) {
-            (HelperLanguage::Rust, Some(settings)) => settings.validate(),
-            (HelperLanguage::Go, None) => Ok(()),
+        match (
+            self.language,
+            self.rust_settings.as_ref(),
+            self.cargo.as_ref(),
+            self.cargo_version.as_ref(),
+            self.rustc.as_ref(),
+            self.rustc_version.as_ref(),
+        ) {
+            (HelperLanguage::Rust, Some(settings), Some(cargo), Some(_), Some(rustc), Some(_))
+                if cargo.is_absolute() && rustc.is_absolute() =>
+            {
+                settings.validate()
+            }
+            (HelperLanguage::Go, None, None, None, None, None)
+                if PathBuf::from(&self.toolchain).is_absolute() =>
+            {
+                Ok(())
+            }
             _ => Err(FailureCode::ExecutionProfile),
         }
+    }
+}
+
+/// Carries the durable scope a post-activation helper may inspect without minting authority.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HelperScope {
+    /// Opaque durable worktree identity supplied by Workspace.
+    pub worktree_id: String,
+    /// Durable lifecycle incarnation for this exact root object.
+    pub incarnation: u64,
+    /// Canonical worktree root.
+    pub root: PathBuf,
+    /// Canonical repository root returned by Git discovery.
+    pub repository_root: PathBuf,
+    /// Raw Git common directory, which may be relative to `root`.
+    pub git_common_dir: PathBuf,
+    /// Descriptor-derived root identity for replacement checks inside the helper.
+    pub native_root_identity: [u8; 32],
+    /// Current durable Workspace authority epoch.
+    pub authority_epoch: u64,
+}
+
+impl HelperScope {
+    /// Rejects incomplete or non-canonical daemon scope before a helper reads source or Git state.
+    pub fn validate(&self) -> Result<(), FailureCode> {
+        let normal = |path: &PathBuf| {
+            path.is_absolute()
+                && path.components().all(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::RootDir | std::path::Component::Normal(_)
+                    )
+                })
+        };
+        (!self.worktree_id.is_empty()
+            && self.worktree_id.len() <= MAX_IDENTIFIER_BYTES
+            && self.incarnation > 0
+            && self.authority_epoch > 0
+            && normal(&self.root)
+            && normal(&self.repository_root)
+            && !self.git_common_dir.as_os_str().is_empty())
+        .then_some(())
+        .ok_or(FailureCode::WorkspaceAuthority)
+    }
+}
+
+/// Carries one durable activation baseline into a later helper Diff without exposing source bytes.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HelperBaseline {
+    /// Stable Workspace baseline operation reference.
+    pub reference: String,
+    /// True only when Workspace committed a partial v0.1 capture with an unverified window.
+    pub captured: bool,
+    /// Stored capture digest; present exactly when `captured` is true.
+    pub digest: Option<[u8; 32]>,
+}
+
+impl HelperBaseline {
+    /// Checks the closed partial-or-unknown baseline shape.
+    pub fn validate(&self) -> Result<(), FailureCode> {
+        (!self.reference.is_empty()
+            && self.reference.len() <= 128
+            && self.captured == self.digest.is_some())
+        .then_some(())
+        .ok_or(FailureCode::WorkspaceAuthority)
     }
 }
 
@@ -212,7 +320,7 @@ impl HelperBudgets {
     /// Rejects zero or unbounded budgets so no helper can run without a finite ceiling.
     pub fn validate(&self) -> Result<(), FailureCode> {
         let bounded = (1..=1024 * 1024).contains(&self.output_bytes)
-            && (1..=8).contains(&self.processes)
+            && (1..=64).contains(&self.processes)
             && (1..=300_000).contains(&self.deadline_ms);
         bounded.then_some(()).ok_or(FailureCode::ExecutionProfile)
     }
@@ -236,6 +344,10 @@ pub struct HelperJob {
     pub git: PathBuf,
     /// Canonical Workspace root when the daemon already knows it; absent before activation.
     pub canonical_root: Option<PathBuf>,
+    /// Durable post-activation scope; absent only for Start.
+    pub scope: Option<HelperScope>,
+    /// Durable activation baseline supplied only to Diff.
+    pub baseline: Option<HelperBaseline>,
     /// Per-operation exclusive provider; absent when the operation needs no analyzer.
     pub provider: Option<HelperProvider>,
     /// Already validated closed method parameters carrying no target, profile or authority data.
@@ -265,6 +377,35 @@ impl HelperJob {
         match &self.provider {
             Some(provider) => provider.validate(),
             None => Ok(()),
+        }?;
+        match self.operation {
+            HelperOperation::Start
+                if self.canonical_root.is_none()
+                    && self.scope.is_none()
+                    && self.baseline.is_none()
+                    && self.provider.is_none() =>
+            {
+                Ok(())
+            }
+            HelperOperation::Context
+                if self.scope.as_ref().is_some_and(|scope| {
+                    scope.validate().is_ok() && self.canonical_root.as_ref() == Some(&scope.root)
+                }) && self.baseline.is_none() =>
+            {
+                Ok(())
+            }
+            HelperOperation::Diff
+                if self.scope.as_ref().is_some_and(|scope| {
+                    scope.validate().is_ok() && self.canonical_root.as_ref() == Some(&scope.root)
+                }) && self
+                    .baseline
+                    .as_ref()
+                    .is_some_and(|baseline| baseline.validate().is_ok())
+                    && self.provider.is_none() =>
+            {
+                Ok(())
+            }
+            _ => Err(FailureCode::ExecutionProfile),
         }
     }
 
@@ -358,13 +499,92 @@ impl ChildSettlement {
     }
 }
 
+/// Names one fixed activation-baseline query returned by the helper.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HelperBaselineQuery {
+    /// Complete recursive HEAD tree listing.
+    HeadTree,
+    /// Complete NUL-delimited untracked path listing.
+    UntrackedPaths,
+    /// Exact HEAD object identity.
+    HeadIdentity,
+}
+
+/// Carries one fixed baseline child's bounded raw output and actual exit status.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HelperBaselineFrame {
+    /// Fixed query whose output is carried.
+    pub query: HelperBaselineQuery,
+    /// Complete bounded stdout bytes.
+    pub stdout: Vec<u8>,
+    /// Complete bounded stderr bytes.
+    pub stderr: Vec<u8>,
+    /// Direct-child exit status when observed.
+    pub exit_code: Option<i32>,
+    /// True when either stream exceeded its configured bound.
+    pub truncated: bool,
+}
+
+/// Identifies exact source bytes observed by a Context helper without returning the full file twice.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HelperSource {
+    /// Validated relative UTF-8 path selected by the Context call.
+    pub path: String,
+    /// Whether the path was a regular file; false means a bounded missing-path observation.
+    pub present: bool,
+    /// Digest of the complete bounded file, absent for a missing path.
+    pub digest: Option<[u8; 32]>,
+    /// Complete file byte length, zero for a missing path.
+    pub length: u64,
+}
+
+/// Adds operation-specific evidence to a completed helper result.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HelperPayload {
+    /// Raw fixed baseline reads collected with Start discovery.
+    Start {
+        /// Exactly the three baseline frames, in the daemon-selected query set.
+        baseline: Vec<HelperBaselineFrame>,
+    },
+    /// Current bounded source context and optional provisional diagnostic delta.
+    Context {
+        /// Exact source digest/length and selected path.
+        source: HelperSource,
+        /// Bounded fact/evidence/action delta; absent without matched diagnostics.
+        feedback: Option<String>,
+        /// Whether source/context/diagnostic selection omitted bounded material.
+        truncated: bool,
+    },
+    /// Current composed Git comparison text.
+    Diff {
+        /// Whether bounded hunk selection omitted material.
+        truncated: bool,
+    },
+}
+
+impl HelperPayload {
+    /// Returns the closed operation this payload can settle.
+    pub const fn operation(&self) -> HelperOperation {
+        match self {
+            Self::Start { .. } => HelperOperation::Start,
+            Self::Context { .. } => HelperOperation::Context,
+            Self::Diff { .. } => HelperOperation::Diff,
+        }
+    }
+}
+
 /// The bounded outcome one helper reports before closing its socket and exiting.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HelperOutcome {
     /// The operation produced owner evidence rendered as bounded text.
     Complete {
-        /// Bounded owner text containing no raw source, diagnostics or host configuration.
+        /// Bounded owner text containing only the selected source/diff and diagnostic messages,
+        /// with no launcher, attachment, host configuration or unbounded provider payload.
         text: String,
     },
     /// The operation reached a closed failure category without owner evidence.
@@ -392,6 +612,8 @@ pub struct HelperResult {
     /// about what they mean.
     #[serde(default)]
     pub discovery: Vec<DiscoveryFrame>,
+    /// Operation-specific evidence produced by the verified helper binary.
+    pub payload: Option<HelperPayload>,
 }
 
 impl HelperResult {
@@ -420,6 +642,27 @@ impl HelperResult {
         }
         for frame in &self.discovery {
             frame.validate()?;
+        }
+        if let Some(HelperPayload::Start { baseline }) = &self.payload
+            && (baseline.len() != 3
+                || baseline.iter().any(|frame| {
+                    frame.stdout.len() > MAX_DISCOVERY_STREAM_BYTES
+                        || frame.stderr.len() > MAX_DISCOVERY_STREAM_BYTES
+                }))
+        {
+            return Err(FailureCode::Capacity);
+        }
+        if let Some(HelperPayload::Context {
+            source, feedback, ..
+        }) = &self.payload
+            && (source.path.is_empty()
+                || source.path.len() > 1024
+                || source.length > 1024 * 1024
+                || source.present != source.digest.is_some()
+                || (!source.present && source.length != 0)
+                || feedback.as_ref().is_some_and(|text| text.len() > 4096))
+        {
+            return Err(FailureCode::Capacity);
         }
         Ok(())
     }
@@ -1082,6 +1325,14 @@ impl LaunchLedger {
         if work.frame.is_some() {
             return Err(FailureCode::Conflict);
         }
+        if matches!(result.outcome, HelperOutcome::Complete { .. })
+            && result
+                .payload
+                .as_ref()
+                .is_none_or(|payload| payload.operation() != ticket.job.operation)
+        {
+            return Err(FailureCode::ExecutionProfile);
+        }
         work.frame = Some(result);
         if cleanup_only {
             Self::release_settled_lease(work, &reference, &mut self.leases);
@@ -1318,15 +1569,32 @@ mod tests {
             operation: HelperOperation::Context,
             candidate: PathBuf::from("/private/tmp/work"),
             git: PathBuf::from("/usr/bin/git"),
-            canonical_root: None,
+            canonical_root: Some(PathBuf::from("/private/tmp/work")),
+            scope: Some(HelperScope {
+                worktree_id: "worktree".into(),
+                incarnation: 1,
+                root: PathBuf::from("/private/tmp/work"),
+                repository_root: PathBuf::from("/private/tmp/work"),
+                git_common_dir: PathBuf::from(".git"),
+                native_root_identity: [1; 32],
+                authority_epoch: 1,
+            }),
+            baseline: None,
             provider: Some(HelperProvider {
                 executable: PathBuf::from("/Users/pluto/.local/bin/rust-analyzer"),
+                version: "rust-analyzer fixture".into(),
                 language: HelperLanguage::Rust,
                 rust_settings: Some(RustEffectiveSettings {
                     cache_priming: false,
                     proc_macro: false,
                 }),
-                cache_namespace: "ns-1".into(),
+                toolchain: "fixture".into(),
+                cargo: Some(PathBuf::from("/usr/bin/true")),
+                cargo_version: Some("cargo fixture".into()),
+                rustc: Some(PathBuf::from("/usr/bin/true")),
+                rustc_version: Some("rustc fixture".into()),
+                trust: "fixture".into(),
+                cache_namespace: "/private/tmp/ns-1".into(),
             }),
             parameters: serde_json::json!({"query": "x"}),
             budgets: HelperBudgets {
@@ -1529,6 +1797,11 @@ mod tests {
         assert_eq!(job.validate(), Err(FailureCode::ExecutionProfile));
         job.provider.as_mut().unwrap().language = HelperLanguage::Go;
         job.provider.as_mut().unwrap().rust_settings = None;
+        job.provider.as_mut().unwrap().toolchain = "/usr/bin/go".into();
+        job.provider.as_mut().unwrap().cargo = None;
+        job.provider.as_mut().unwrap().cargo_version = None;
+        job.provider.as_mut().unwrap().rustc = None;
+        job.provider.as_mut().unwrap().rustc_version = None;
         assert_eq!(job.validate(), Ok(()));
     }
 
@@ -1686,6 +1959,7 @@ mod tests {
                     reaped: 2,
                 },
                 discovery: Vec::new(),
+                payload: Some(context_payload()),
             };
             if frame_first {
                 ledger.settle_frame(result).unwrap();
@@ -1725,6 +1999,7 @@ mod tests {
                     reaped: 1,
                 },
                 discovery: Vec::new(),
+                payload: Some(context_payload()),
             })
             .unwrap();
         ledger.settle_post("call", false).unwrap();
@@ -1771,6 +2046,7 @@ mod tests {
                 reaped: 4,
             },
             discovery: Vec::new(),
+            payload: None,
         };
         assert_eq!(forged.validate(), Err(FailureCode::ExecutionProfile));
     }
@@ -1807,6 +2083,21 @@ mod tests {
             },
             children: ChildSettlement { spawned, reaped },
             discovery: Vec::new(),
+            payload: Some(context_payload()),
+        }
+    }
+
+    /// Returns the minimal valid Context payload for ledger-only settlement tests.
+    fn context_payload() -> HelperPayload {
+        HelperPayload::Context {
+            source: HelperSource {
+                path: "main.rs".into(),
+                present: false,
+                digest: None,
+                length: 0,
+            },
+            feedback: None,
+            truncated: false,
         }
     }
 
@@ -2000,17 +2291,17 @@ mod tests {
         let encoded = job().encode().unwrap();
         assert_eq!(HelperJob::decode(&encoded).unwrap(), job());
         for raw in [
-            r#"{"protocol":2,"operation":"context","candidate":"/a","git":"/b","canonical_root":null,"provider":null,"parameters":{},"budgets":{"output_bytes":1,"processes":1,"deadline_ms":1}}"#,
-            r#"{"protocol":1,"operation":"context","candidate":"relative","git":"/b","canonical_root":null,"provider":null,"parameters":{},"budgets":{"output_bytes":1,"processes":1,"deadline_ms":1}}"#,
-            r#"{"protocol":1,"operation":"inspect","candidate":"/a","git":"/b","canonical_root":null,"provider":null,"parameters":{},"budgets":{"output_bytes":1,"processes":1,"deadline_ms":1}}"#,
-            r#"{"protocol":1,"operation":"context","candidate":"/a","git":"/b","canonical_root":null,"provider":null,"parameters":{},"budgets":{"output_bytes":1,"processes":1,"deadline_ms":1},"extra":1}"#,
+            r#"{"protocol":3,"operation":"context","candidate":"/a","git":"/b","canonical_root":null,"provider":null,"parameters":{},"budgets":{"output_bytes":1,"processes":1,"deadline_ms":1}}"#,
+            r#"{"protocol":2,"operation":"context","candidate":"relative","git":"/b","canonical_root":null,"provider":null,"parameters":{},"budgets":{"output_bytes":1,"processes":1,"deadline_ms":1}}"#,
+            r#"{"protocol":2,"operation":"inspect","candidate":"/a","git":"/b","canonical_root":null,"provider":null,"parameters":{},"budgets":{"output_bytes":1,"processes":1,"deadline_ms":1}}"#,
+            r#"{"protocol":2,"operation":"context","candidate":"/a","git":"/b","canonical_root":null,"provider":null,"parameters":{},"budgets":{"output_bytes":1,"processes":1,"deadline_ms":1},"extra":1}"#,
         ] {
             assert!(HelperJob::decode(raw).is_err());
         }
         for raw in [
-            r#"{"protocol":2,"detail_ref":"d","outcome":"failed","code":"internal","children":{"spawned":0,"reaped":0}}"#,
-            r#"{"protocol":1,"detail_ref":"","outcome":"failed","code":"internal","children":{"spawned":0,"reaped":0}}"#,
-            r#"{"protocol":1,"detail_ref":"d","outcome":"unknown","children":{"spawned":0,"reaped":0}}"#,
+            r#"{"protocol":3,"detail_ref":"d","outcome":"failed","code":"internal","children":{"spawned":0,"reaped":0}}"#,
+            r#"{"protocol":2,"detail_ref":"","outcome":"failed","code":"internal","children":{"spawned":0,"reaped":0}}"#,
+            r#"{"protocol":2,"detail_ref":"d","outcome":"unknown","children":{"spawned":0,"reaped":0}}"#,
         ] {
             assert!(HelperResult::decode(raw).is_err());
         }

@@ -1130,6 +1130,16 @@ impl ProductActor {
     }
     /// Submits the same root/child correlation hook through the real shipping Claude command.
     async fn claude_lifecycle(&self, fixture: &ProductFixture, phase: &str, call: &str) {
+        let output = self.claude_lifecycle_output(fixture, phase, call).await;
+        assert!(output.status.success() && output.stdout.is_empty() && output.stderr.is_empty());
+    }
+    /// Returns the shipping Claude hook output so a feedback assertion can inspect additionalContext.
+    async fn claude_lifecycle_output(
+        &self,
+        fixture: &ProductFixture,
+        phase: &str,
+        call: &str,
+    ) -> std::process::Output {
         let mut child = claude_hook_process(&fixture.runtime, Some(self.attachment));
         let payload =
             json!({"hook_event_name":phase,self.actor_field:self.actor,"tool_use_id":call});
@@ -1140,11 +1150,10 @@ impl ProductActor {
             .unwrap();
         input.shutdown().await.unwrap();
         drop(input);
-        let output = tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
+        tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
             .await
             .unwrap()
-            .unwrap();
-        assert!(output.status.success() && output.stdout.is_empty() && output.stderr.is_empty());
+            .unwrap()
     }
     /// Runs exact Pre→MCP→Post through the real Claude hook and Claude tool-use metadata shape.
     async fn call_claude(
@@ -1166,6 +1175,83 @@ impl ProductActor {
         self.claude_lifecycle(fixture, "PostToolUse", &call).await;
         assert!(!reply["result"]["structuredContent"].is_null(), "{reply}");
         reply["result"]["structuredContent"].clone()
+    }
+    /// Runs the exact foreground helper named by a pending reply, then inspects its settled result.
+    ///
+    /// Returns the structured result and the inspect call's post-hook stdout. Start/Diff produce an
+    /// empty hook output; Context may produce the actual bounded `additionalContext` delta.
+    async fn complete_claude_pending(
+        &mut self,
+        fixture: &ProductFixture,
+        pending: &Value,
+    ) -> (Value, Vec<u8>) {
+        assert_eq!(pending["state"], "pending", "{pending}");
+        let detail_ref = pending["detail_ref"].as_str().unwrap().to_owned();
+        let helper = pending["helper"].as_str().unwrap().to_owned();
+        let launch_call = format!("bash-launch-{detail_ref}");
+        let mut arm = claude_hook_process(&fixture.runtime, Some(self.attachment));
+        arm.stdin
+            .take()
+            .unwrap()
+            .write_all(
+                json!({"hook_event_name":"PreToolUse","session_id":self.actor,
+                    "tool_use_id":launch_call,"tool_name":"Bash",
+                    "tool_input":{"command":helper}})
+                .to_string()
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let armed = arm.wait_with_output().await.unwrap();
+        assert!(armed.status.success() && armed.stdout.is_empty() && armed.stderr.is_empty());
+        let helper_output = tokio::time::timeout(
+            Duration::from_secs(90),
+            Command::new("/bin/sh").arg("-c").arg(&helper).output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            helper_output.status.success(),
+            "helper failed: {}",
+            String::from_utf8_lossy(&helper_output.stderr)
+        );
+        let mut post = claude_hook_process(&fixture.runtime, Some(self.attachment));
+        post.stdin
+            .take()
+            .unwrap()
+            .write_all(
+                json!({"hook_event_name":"PostToolUse","session_id":self.actor,
+                    "tool_use_id":launch_call,"tool_response":{"success":true}})
+                .to_string()
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let post = post.wait_with_output().await.unwrap();
+        assert!(post.status.success() && post.stdout.is_empty() && post.stderr.is_empty());
+
+        self.next += 1;
+        let inspect_call = format!("call-{}", self.next);
+        self.claude_lifecycle(fixture, "PreToolUse", &inspect_call)
+            .await;
+        let reply = self
+            .mcp
+            .exchange(
+                json!({"jsonrpc":"2.0","id":self.next,"method":"tools/call","params":{
+                "name":"ide.inspect","arguments":{"detail_ref":detail_ref},
+                "_meta":{"claudecode/toolUseId":inspect_call}}}),
+            )
+            .await;
+        let feedback = self
+            .claude_lifecycle_output(fixture, "PostToolUse", &inspect_call)
+            .await;
+        assert!(feedback.status.success() && feedback.stderr.is_empty());
+        assert!(!reply["result"]["structuredContent"].is_null(), "{reply}");
+        (
+            reply["result"]["structuredContent"].clone(),
+            feedback.stdout,
+        )
     }
     /// Runs exact Pre→MCP→Post with current host state separated from bounded model arguments.
     async fn call(&mut self, fixture: &ProductFixture, name: &str, arguments: Value) -> Value {
@@ -2766,6 +2852,168 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
 
     first.mcp.close().await;
     second.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Proves Claude Context and Diff execute in the real foreground helper and publish one hook delta.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_GOPLS and AGENT_IDE_GO environment"]
+async fn configured_product_claude_helper_returns_context_diff_and_feedback() {
+    let gopls = std::env::var("AGENT_IDE_GOPLS").unwrap();
+    let go = std::env::var("AGENT_IDE_GO").unwrap();
+    let rust_analyzer = std::env::var("AGENT_IDE_RUST_ANALYZER").unwrap();
+    let toolchain = std::env::var("AGENT_IDE_RUST_TOOLCHAIN").unwrap();
+    let providers = json!([
+        {
+            "executable":accepted_program(&gopls,"golang.org/x/tools/gopls v0.23.0"),
+            "settings":"gopls_defaults",
+            "toolchain":go,
+            "cargo":null,
+            "cargo_version":null,
+            "rustc":null,
+            "rustc_version":null,
+            "trust":"fixture-disabled",
+            "cache_namespace":"fixture-claude-go-cache"
+        },
+        {
+            "executable":accepted_program(&rust_analyzer,"1.98.1 (48a229ce 2026-09-01)"),
+            "settings":"rust_cache_priming_disabled_v1",
+            "toolchain":toolchain,
+            "cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),
+            "cargo_version":"cargo 1.98.1",
+            "rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),
+            "rustc_version":"rustc 1.98.1",
+            "trust":"fixture-disabled",
+            "cache_namespace":"fixture-claude-rust-cache"
+        }
+    ]);
+    let fixture = ProductFixture::new_claude(providers);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "claude-context").await;
+
+    let pending = actor
+        .call_claude(&fixture, "ide.start", json!({"activation_id":"start"}))
+        .await;
+    let (started, feedback) = actor.complete_claude_pending(&fixture, &pending).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    assert!(
+        started["text"]
+            .as_str()
+            .unwrap()
+            .contains("durable capture true"),
+        "{started}"
+    );
+    assert!(feedback.is_empty());
+
+    std::fs::write(
+        fixture.root.join("main.go"),
+        "package main\nfunc Value() int { return \"bad\" }\nfunc main() { _ = Value() }\n",
+    )
+    .unwrap();
+    let offset = std::fs::read_to_string(fixture.root.join("main.go"))
+        .unwrap()
+        .find("Value")
+        .unwrap();
+    let pending = actor
+        .call_claude(
+            &fixture,
+            "ide.context",
+            json!({"path":"main.go","byte_offset":offset}),
+        )
+        .await;
+    let (context, inspect_feedback) = actor.complete_claude_pending(&fixture, &pending).await;
+    assert_eq!(context["kind"], "context", "{context}");
+    let context_text = context["text"].as_str().unwrap();
+    assert!(context_text.contains("mode: semantic"), "{context_text}");
+    assert!(context_text.contains("return \"bad\""), "{context_text}");
+    assert!(
+        context_text.contains("diagnostic_count: 1"),
+        "{context_text}"
+    );
+    assert!(inspect_feedback.is_empty());
+    actor
+        .claude_lifecycle(&fixture, "PreToolUse", "native-edit-after-context")
+        .await;
+    let feedback = actor
+        .claude_lifecycle_output(&fixture, "PostToolUse", "native-edit-after-context")
+        .await;
+    assert!(feedback.status.success() && feedback.stderr.is_empty());
+    let feedback: Value = serde_json::from_slice(&feedback.stdout).unwrap();
+    let additional = feedback["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(
+        additional.contains("Provider reported 1 diagnostics"),
+        "{additional}"
+    );
+    assert!(
+        additional.contains("provisional helper snapshot"),
+        "{additional}"
+    );
+
+    let rust_source = std::fs::read_to_string(fixture.root.join("src/lib.rs")).unwrap();
+    let pending = actor
+        .call_claude(
+            &fixture,
+            "ide.context",
+            json!({"path":"src/lib.rs","byte_offset":rust_source.find("value").unwrap()}),
+        )
+        .await;
+    let (rust_context, feedback) = actor.complete_claude_pending(&fixture, &pending).await;
+    assert_eq!(rust_context["kind"], "context", "{rust_context}");
+    let rust_text = rust_context["text"].as_str().unwrap();
+    assert!(rust_text.contains("mode: semantic"), "{rust_text}");
+    assert!(rust_text.contains("pub fn value()"), "{rust_text}");
+    assert!(
+        rust_text.contains("provider_generation: Some"),
+        "{rust_text}"
+    );
+    assert!(feedback.is_empty());
+
+    let pending = actor
+        .call_claude(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let (diff, feedback) = actor.complete_claude_pending(&fixture, &pending).await;
+    assert_eq!(diff["kind"], "diff", "{diff}");
+    let diff_text = diff["text"].as_str().unwrap();
+    assert!(
+        diff_text.contains("baseline_coverage: Some(Partial)"),
+        "{diff_text}"
+    );
+    assert!(
+        diff_text.contains("baseline_window: Some(Unverified)"),
+        "{diff_text}"
+    );
+    assert!(
+        diff_text.contains("tracked_path: \"main.go\""),
+        "{diff_text}"
+    );
+    assert!(diff_text.contains("return \"bad\""), "{diff_text}");
+    assert!(feedback.is_empty());
+
+    let mut retained = std::fs::read_dir(fixture.runtime.join("cache"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    retained.sort();
+    assert_eq!(
+        retained.len(),
+        2,
+        "one worktree namespace per one-shot provider"
+    );
+    let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    let mut after_stop = std::fs::read_dir(fixture.runtime.join("cache"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    after_stop.sort();
+    assert_eq!(
+        after_stop, retained,
+        "Stop retains compatible cache directories"
+    );
+    actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
 }

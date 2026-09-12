@@ -376,7 +376,7 @@ pub(super) fn fit_diff_page(
 /// The freshness computed by Changes at capture time is preserved verbatim as `captured_freshness`
 /// alongside the untouched captured comparison identities and provenance, so callers keep the exact
 /// capture-time facts without any claim that they still hold now.
-pub(super) fn render_diff_text(
+pub(crate) fn render_diff_text(
     mode: DiffMode,
     result: &crate::changes::DiffResult,
     authority_epoch: u64,
@@ -430,6 +430,71 @@ pub(super) fn render_diff_text(
 }
 
 impl Worker<'_> {
+    /// Persists the fixed baseline reads a settled Start helper collected under inherited sandbox.
+    ///
+    /// The daemon performs no Git or source read: it checks the exact closed query order, rebuilds
+    /// scoped `RawGitEvidence`, reauthorizes the durable grant, and lets Workspace commit the same
+    /// partial/unverified v0.1 baseline shape as the managed route.
+    pub(super) async fn capture_claude_baseline(
+        &mut self,
+        binding: &BindingRef,
+        authority: &AuthorityStamp,
+        activation_operation: &str,
+        frames: &[crate::assistance::claude_worker::HelperBaselineFrame],
+    ) -> Result<BaselineContext, FailureCode> {
+        use crate::assistance::claude_worker::HelperBaselineQuery;
+        let expected = [
+            (HelperBaselineQuery::HeadTree, GitReadQuery::HeadTree),
+            (
+                HelperBaselineQuery::UntrackedPaths,
+                GitReadQuery::UntrackedPaths,
+            ),
+            (
+                HelperBaselineQuery::HeadIdentity,
+                GitReadQuery::HeadIdentity,
+            ),
+        ];
+        if frames.len() != expected.len() {
+            return Err(FailureCode::SourceUnavailable);
+        }
+        let scope = GitScope::from_authority(authority, DiffMode::Head);
+        let git = frames
+            .iter()
+            .zip(expected)
+            .map(|(frame, (reported, query))| {
+                if frame.query != reported {
+                    return Err(FailureCode::SourceUnavailable);
+                }
+                RawGitEvidence::new(
+                    format!("baseline-{activation_operation}-{query:?}"),
+                    scope.clone(),
+                    query,
+                    frame.stdout.clone(),
+                    frame.stderr.clone(),
+                    frame.exit_code,
+                    frame.truncated,
+                    frame.truncated,
+                )
+                .map_err(|_| FailureCode::SourceUnavailable)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.workspace
+            .authorize(authority, &self.shared.active(binding)?)
+            .await
+            .map_err(|_| FailureCode::WorkspaceAuthority)?;
+        self.workspace
+            .capture_baseline(
+                OperationId::new(format!("baseline-{activation_operation}"))
+                    .map_err(|_| FailureCode::Internal)?,
+                authority,
+                &self.shared.active(binding)?,
+                git,
+                Vec::new(),
+            )
+            .await
+            .map_err(|_| FailureCode::SourceUnavailable)
+    }
+
     /// Captures the activation baseline through fixed Git metadata commands and durable Workspace storage.
     ///
     /// The result remains partial because v0.1 cannot prove an atomic Git/source window. Any command,

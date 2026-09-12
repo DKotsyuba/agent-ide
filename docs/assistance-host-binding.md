@@ -140,10 +140,11 @@ IDs, cross-actor rejection, stop isolation, replay/order failures, daemon loss, 
 and malformed hooks, open stdin and hung-daemon deadlines, and discarded payload fields.
 Native edit/delete/rename and failed-command-shaped lifecycle fixtures verify coalesced
 active hints and suppression after stop, without claiming those fixtures changed source.
-These are controlled host-shaped process tests, not live-host proof. Still unverified are fresh
-Codex and Claude CLI acceptance on macOS and Linux, Claude MCP invocation correlation/activation,
-real `PostToolBatch` availability in supported host versions, and model-visible delivery of a
-real-provider delta after an actual edit.
+These are controlled host-shaped process tests, not live-host proof. The Claude product fixture now
+proves its shipping MCP/hook/private-socket/helper path through durable activation/baseline, real Go
+and Rust Context, current Diff, and emitted `additionalContext`. Still unverified are fresh Codex and
+Claude CLI acceptance on macOS and Linux, real `PostToolBatch` availability in supported host
+versions, and host-observed `model_seen` delivery after an actual native edit.
 
 The executable deadline regressions enforce a 450 ms wall-clock ceiling: the 250 ms
 product deadline plus 200 ms for child startup and scheduling. Child-process Tokio clocks

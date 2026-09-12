@@ -113,6 +113,23 @@ impl BaselineContext {
         Ok(context)
     }
 
+    /// Rebuilds the exact baseline context supplied to a verified inherited helper.
+    ///
+    /// `captured` requires the durable digest and produces the same partial/unverified shape as a
+    /// Workspace-loaded row. An uncaptured value remains explicitly unknown and unscoped.
+    pub(crate) fn from_inherited(
+        reference: String,
+        captured: bool,
+        digest: Option<[u8; 32]>,
+        scope: GitScope,
+    ) -> Result<Self, GitError> {
+        match (captured, digest) {
+            (true, Some(digest)) => Self::from_stored(reference, scope, digest),
+            (false, None) => Self::new(reference, BaselineCoverage::Unknown),
+            _ => Err(GitError::IncompleteIdentity),
+        }
+    }
+
     /// Returns the explicit capture-window status, never an inferred complete snapshot.
     pub const fn window(&self) -> BaselineWindow {
         self.window
@@ -265,6 +282,19 @@ impl GitReadIntent {
         program: PathBuf,
         query: GitReadQuery,
     ) -> Result<Self, GitError> {
+        Self::from_scope(
+            GitScope::from_authority(authority, query.mode()),
+            program,
+            query,
+        )
+    }
+
+    /// Creates the same fixed metadata intent for a verified inherited-helper scope.
+    pub(super) fn from_scope(
+        scope: GitScope,
+        program: PathBuf,
+        query: GitReadQuery,
+    ) -> Result<Self, GitError> {
         if !is_normal_absolute(&program) {
             return Err(GitError::InvalidGitProgram);
         }
@@ -277,9 +307,11 @@ impl GitReadIntent {
         ) {
             return Err(GitError::SnapshotRequired);
         }
-        let mode = query.mode();
+        if scope.mode() != query.mode() {
+            return Err(GitError::IncompleteIdentity);
+        }
         Ok(Self {
-            scope: GitScope::from_authority(authority, mode),
+            scope,
             program,
             query,
         })
@@ -330,6 +362,22 @@ impl GitScope {
             authority_epoch,
             mode: DiffMode::Head,
         }
+    }
+
+    /// Builds a non-authorizing scope for a verified inherited helper's current grant.
+    pub(crate) fn from_inherited(
+        worktree: WorktreeRef,
+        authority_epoch: u64,
+        mode: DiffMode,
+    ) -> Result<Self, GitError> {
+        if authority_epoch == 0 {
+            return Err(GitError::IncompleteIdentity);
+        }
+        Ok(Self {
+            worktree,
+            authority_epoch,
+            mode,
+        })
     }
 
     /// Copies only scope data from a current Workspace authority for peer-facing raw Git evidence.
@@ -853,6 +901,34 @@ fn read_args(query: GitReadQuery) -> Vec<OsString> {
         }
     }
     args
+}
+
+/// Builds one fixed baseline read for a pre-activation inherited helper.
+///
+/// Start has no Workspace authority yet, so the command carries no `GitScope`; only the settled
+/// helper's raw output may later be scoped after durable activation. Query selection, executable,
+/// cwd and cleared environment remain Workspace-owned typed inputs.
+pub(crate) fn inherited_baseline_command(
+    program: &Path,
+    candidate: &Path,
+    query: GitReadQuery,
+) -> Result<ControlledCommand, GitError> {
+    if !matches!(
+        query,
+        GitReadQuery::HeadTree | GitReadQuery::UntrackedPaths | GitReadQuery::HeadIdentity
+    ) || !is_normal_absolute(program)
+        || !is_normal_absolute(candidate)
+    {
+        return Err(GitError::InvalidGitProgram);
+    }
+    ControlledCommand::from_validated_peer(
+        CommandKind::Git,
+        program.to_path_buf(),
+        read_args(query),
+        candidate.to_path_buf(),
+        safe_git_environment(),
+    )
+    .map_err(|_| GitError::InvalidGitProgram)
 }
 
 /// Full immutable Git object name accepted only as 40 or 64 ASCII hexadecimal bytes.
