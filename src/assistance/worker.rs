@@ -4,7 +4,7 @@ use super::{
     claude_worker::{
         HelperBaseline, HelperOperation, HelperOutcome, HelperScope, SettledClaudeOperation,
     },
-    facade::{AssistanceTool, FeedbackDelta},
+    facade::{AssistanceTool, FeedbackDelta, render_reply},
     host_binding::{
         ActiveBindingUse, BindingRef, HostBindingGuard, ObservedSandboxState, ValidatedInvocation,
     },
@@ -108,6 +108,20 @@ struct NativeFeedback {
     text: String,
     /// Native lifecycle epoch at which the provider result was accepted.
     native_epoch: u64,
+    /// `true` once this exact fact was actually handed to a live caller inside a submitted
+    /// Context/Inspect reply — never set merely because the owning job finished computing it.
+    /// A completed job whose reply nobody has retrieved yet (still `Pending` to its caller, or
+    /// lost to a deadline) leaves this `false`, so the fact remains eligible for exactly one
+    /// later hook delivery. This never asserts the model read the text, only that this process
+    /// handed it to the transport once; see `take_current_feedback`.
+    inline_delivered: bool,
+    /// Exact detail reference of the job that produced this fact.
+    ///
+    /// The per-binding slot is single-slot: a second Context job at the *same* native epoch can
+    /// overwrite it with a different fact before any caller retrieves either one. Acknowledgement
+    /// must name this exact producer, not just the epoch, so retrieving an older, already
+    /// superseded detail can never mark the *current* (different) fact as delivered.
+    producer: String,
 }
 
 /// Retains daemon-derived scope, baseline and cache paths for later Claude helper jobs.
@@ -243,6 +257,45 @@ impl Shared {
             detail.authority = authority;
             detail.source = source;
             detail.native_epoch = native_epoch;
+        }
+    }
+    /// Marks `binding`'s retained feedback as already submitted to a live caller, but only when
+    /// three things hold: the retained fact is still the exact one produced by `reference` (never
+    /// a different, later fact that overwrote the same single-slot binding entry), `reply` is the
+    /// exact value that was actually handed to a still-live receiver, and that fact's rendered
+    /// text still survives the real, final MCP/IPC fitting (`facade::render_reply`) applied to
+    /// `reply` — the same shrink/encode boundary the real transport response goes through, so a
+    /// trimmed or capped carrier is never mislabeled as delivered.
+    ///
+    /// This is the sole write side of cross-channel dedup: callers must invoke it only after
+    /// confirming the reply actually reached a live receiver, never merely because a job finished
+    /// or a reply merely encodes to *some* fitted value. A producer mismatch, closed receiver, or
+    /// a carrier whose fitting dropped the fact is a no-op — it never resurrects, replaces or
+    /// fabricates a fact.
+    fn mark_feedback_inline_delivered(
+        &self,
+        binding: &BindingRef,
+        reference: &str,
+        reply: &PeerReply,
+    ) {
+        let Ok(mut ledger) = self.ledger.lock() else {
+            return;
+        };
+        let Some(feedback) = ledger.feedback.get_mut(binding) else {
+            return;
+        };
+        if feedback.producer != reference {
+            return;
+        }
+        let fact = feedback.text.clone();
+        let survives = render_reply(reply.clone())
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.get("text"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| text.contains(&fact));
+        if survives {
+            feedback.inline_delivered = true;
         }
     }
     /// Retains or clears the bounded Diff pagination state for one same-binding detail reference.
@@ -747,8 +800,11 @@ impl WorkerHandle {
 
     /// Returns and consumes one same-binding delta only after a newer native epoch and source recheck.
     ///
-    /// Missing, stopped, unchanged-epoch, stale, or unversioned feedback returns `None`. The check
-    /// performs no provider execution and does not interpret a Claude permission mode as authority.
+    /// Missing, stopped, unchanged-epoch, stale, unversioned, or already-inline-delivered feedback
+    /// returns `None`. A fact already handed to a live caller in a submitted Context/Inspect reply
+    /// is still removed here (so it can never resurrect on a later hook) but its text is withheld,
+    /// because it already reached the transport once. The check performs no provider execution and
+    /// does not interpret a Claude permission mode as authority.
     pub async fn take_current_feedback(&self, binding: BindingRef) -> Option<String> {
         self.shared.active(&binding).ok()?;
         let feedback = {
@@ -756,6 +812,7 @@ impl WorkerHandle {
             let current_epoch = ledger.native_epoch.get(&binding).copied().unwrap_or(0);
             let feedback = ledger.feedback.remove(&binding)?;
             (current_epoch > feedback.native_epoch
+                && !feedback.inline_delivered
                 && feedback.source.as_ref().is_none_or(source_matches))
             .then_some(feedback)?
         };
@@ -1027,7 +1084,27 @@ impl<'a> Worker<'a> {
             job.native_epoch,
         );
         if let Some(sender) = job.stop_reply.take() {
-            let _ = sender.send(reply);
+            // The oneshot send is the actual submission boundary for this synchronous-wait path
+            // (Claude Start/Context/Diff/Stop): it only succeeds while the caller's own `wait`
+            // has not already been dropped by its deadline. Only a reply that both reached a live
+            // receiver and still carries its fact after `mark_feedback_inline_delivered` traces
+            // the same final MCP/IPC fitting the real transport applies may be marked delivered;
+            // a closed receiver or a carrier that fitting trimmed leaves the fact eligible for
+            // exactly one later hook delivery instead of being marked as already submitted.
+            let is_context = matches!(
+                reply,
+                PeerReply::Complete {
+                    kind: ResultKind::Context,
+                    ..
+                }
+            );
+            let mark_reply = is_context.then(|| reply.clone());
+            if sender.send(reply).is_ok()
+                && let Some(mark_reply) = mark_reply
+            {
+                self.shared
+                    .mark_feedback_inline_delivered(&binding, &job.reference, &mark_reply);
+            }
         }
     }
     /// Runs only the fixed catalog-admitted discovery commands, settling each child before parsing.
@@ -1549,6 +1626,10 @@ impl<'a> Worker<'a> {
                         source: None,
                         text: feedback.clone(),
                         native_epoch: epoch,
+                        // Computing this job's reply is not submitting it: the caller may still
+                        // only hold `Pending` until a later Inspect, or lose it to a deadline.
+                        inline_delivered: false,
+                        producer: job.reference.clone(),
                     },
                 );
             } else {
@@ -1943,6 +2024,10 @@ impl<'a> Worker<'a> {
                         source: Some(observed.clone()),
                         text: feedback.render(),
                         native_epoch: epoch,
+                        // Computing this job's reply is not submitting it: the caller may still
+                        // only hold `Pending` until a later Inspect, or lose it to a deadline.
+                        inline_delivered: false,
+                        producer: job.reference.clone(),
                     },
                 );
             } else {
@@ -2225,9 +2310,23 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
         Ok::<_, FailureCode>(next)
     }
     .await;
-    let _ = request
-        .reply
-        .send(result.unwrap_or_else(|code| PeerReply::Error { code }));
+    let reply = result.unwrap_or_else(|code| PeerReply::Error { code });
+    // This is the actual submission boundary for the managed path: `reply` is about to be handed
+    // to the real caller of either the initial `submit()` or a later `ide.inspect`. Marking must
+    // wait for the send's own outcome — a request whose receiving side already closed must not
+    // have its fact treated as delivered — and must trace the exact reference that produced the
+    // retained fact, since a same-epoch, different-detail Context job can have overwritten the
+    // single per-binding slot before this reply was ever composed.
+    let is_context = matches!(
+        reply,
+        PeerReply::Complete {
+            kind: ResultKind::Context,
+            ..
+        }
+    );
+    if request.reply.send(reply.clone()).is_ok() && is_context {
+        shared.mark_feedback_inline_delivered(&request.binding, &request.reference, &reply);
+    }
 }
 
 /// Reserves live inspection capacity, distinguishing saturation from service termination.
@@ -2654,5 +2753,263 @@ mod stop_retry_tests {
         assert!(settled.is_ok());
         assert!(!worker.grants.contains_key(&new_binding));
         assert!(worker.pending_revocations.is_empty());
+    }
+}
+
+/// Cross-channel feedback dedup: a fact is consumed on submission to a real caller, never on the
+/// producing job merely finishing. These tests exercise `NativeFeedback`, `take_current_feedback`
+/// and `Shared::mark_feedback_inline_delivered` directly, without a durable Workspace/provider.
+#[cfg(test)]
+mod feedback_dedup_tests {
+    use super::*;
+    use crate::assistance::host_binding::{
+        BindingStatus, parse_candidate, parse_channel_session, parse_hook_event,
+    };
+
+    /// Establishes one real Codex binding directly through the host-binding guard; these tests
+    /// only exercise the feedback ledger, so no sandbox, worktree or provider setup is needed.
+    fn active_binding() -> (Arc<Mutex<HostBindingGuard>>, BindingRef) {
+        let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
+        let mut guard = bindings.lock().unwrap();
+        let channel = parse_channel_session(b"feedback-dedup").unwrap();
+        let hook = parse_hook_event(
+            serde_json::json!({"hook_event_name":"PreToolUse","session_id":"actor","tool_use_id":"call-1"})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+        assert!(matches!(
+            guard.observe_hook(hook, channel.clone()),
+            BindingStatus::PreObserved
+        ));
+        let candidate = parse_candidate(
+            serde_json::json!({"threadId":"actor","callId":"call-1","x-codex-turn-metadata":{}})
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap();
+        let BindingStatus::Validated(invocation) = guard.establish_start(candidate, channel) else {
+            panic!("fixture binding must validate")
+        };
+        let binding = invocation.binding_ref().clone();
+        guard.consume_active(&binding).unwrap();
+        drop(guard);
+        (bindings, binding)
+    }
+
+    /// Builds a bare `WorkerHandle` with no configured targets; these tests touch only the ledger
+    /// and never call `enqueue`/`submit`/`start`.
+    fn handle(bindings: Arc<Mutex<HostBindingGuard>>) -> WorkerHandle {
+        let launcher = LauncherConfig::parse(
+            br#"{"version":1,"limits":{"queued":8,"details":8,"operation_ms":5000,"output_bytes":1024},"targets":[]}"#,
+        )
+        .unwrap();
+        WorkerHandle::new(
+            bindings,
+            launcher,
+            [9; 32],
+            Arc::new(Mutex::new(admission_controller())),
+        )
+    }
+
+    /// Builds the exact submitted-carrier shape `mark_feedback_inline_delivered` traces: a
+    /// `Complete{Context}` reply whose composed text embeds (or, for the trimmed case, omits)
+    /// the fact under test, exactly as the real `feedback_delta:` header does in production.
+    fn context_reply(detail_ref: &str, text: impl Into<String>) -> PeerReply {
+        PeerReply::Complete {
+            kind: ResultKind::Context,
+            text: text.into(),
+            detail_ref: Some(detail_ref.into()),
+            truncated: false,
+        }
+    }
+
+    /// A background job's fact that finished but was never handed to a live caller (still
+    /// `Pending`/lost to a deadline from the caller's view) stays a pending new fact: the first
+    /// eligible ordinary hook may deliver it once, and a second post must not resurrect it.
+    #[tokio::test]
+    async fn undelivered_fact_is_deliverable_exactly_once() {
+        let (bindings, binding) = active_binding();
+        let handle = handle(bindings);
+        {
+            let mut ledger = handle.shared.ledger.lock().unwrap();
+            ledger.feedback.insert(
+                binding.clone(),
+                NativeFeedback {
+                    source: None,
+                    text: "Fact: one bounded fact".into(),
+                    native_epoch: 0,
+                    inline_delivered: false,
+                    producer: "detail-1".into(),
+                },
+            );
+        }
+        handle.native_hint(binding.clone());
+        assert_eq!(
+            handle
+                .take_current_feedback(binding.clone())
+                .await
+                .as_deref(),
+            Some("Fact: one bounded fact")
+        );
+        assert_eq!(handle.take_current_feedback(binding).await, None);
+    }
+
+    /// A fact already handed to a live caller inside a submitted Context/Inspect reply must never
+    /// be echoed by a later ordinary hook. This inverts the old assertion that pinned the
+    /// cross-channel duplicate, and proves the mark is honored only when set at the real
+    /// submission boundary (`mark_feedback_inline_delivered`), never at job production.
+    #[tokio::test]
+    async fn inline_delivered_fact_is_never_echoed_by_a_later_hook() {
+        let (bindings, binding) = active_binding();
+        let handle = handle(bindings);
+        {
+            let mut ledger = handle.shared.ledger.lock().unwrap();
+            ledger.feedback.insert(
+                binding.clone(),
+                NativeFeedback {
+                    source: None,
+                    text: "Fact: one bounded fact".into(),
+                    native_epoch: 0,
+                    inline_delivered: false,
+                    producer: "detail-1".into(),
+                },
+            );
+        }
+        let reply = context_reply(
+            "detail-1",
+            "diagnostic_count: 1\nfeedback_delta: Fact: one bounded fact",
+        );
+        handle
+            .shared
+            .mark_feedback_inline_delivered(&binding, "detail-1", &reply);
+        handle.native_hint(binding.clone());
+        assert_eq!(handle.take_current_feedback(binding).await, None);
+    }
+
+    /// Two different Context jobs at the *same* native epoch (no intervening native edit) can
+    /// each overwrite the single per-binding slot with a different fact. Retrieving the older,
+    /// already-superseded detail (A) must never mark the *current*, different fact (B) delivered
+    /// — acknowledgement is bound to the exact producing detail, never just the epoch. Regresses
+    /// the defect where `mark_feedback_inline_delivered` matched on epoch alone.
+    #[tokio::test]
+    async fn retrieving_an_old_detail_cannot_consume_a_different_same_epoch_fact() {
+        let (bindings, binding) = active_binding();
+        let handle = handle(bindings);
+        {
+            let mut ledger = handle.shared.ledger.lock().unwrap();
+            // Detail A's fact is inserted, then Detail B's Context job overwrites the same slot
+            // at the same native epoch — exactly the production single-slot race.
+            ledger.feedback.insert(
+                binding.clone(),
+                NativeFeedback {
+                    source: None,
+                    text: "Fact: A's fact".into(),
+                    native_epoch: 0,
+                    inline_delivered: false,
+                    producer: "detail-A".into(),
+                },
+            );
+            ledger.feedback.insert(
+                binding.clone(),
+                NativeFeedback {
+                    source: None,
+                    text: "Fact: B's fact".into(),
+                    native_epoch: 0,
+                    inline_delivered: false,
+                    producer: "detail-B".into(),
+                },
+            );
+        }
+        // A caller retrieves the stale detail A (e.g. a retry against an old detail_ref) and A's
+        // own reply is handed to it; A's producer no longer matches the retained (B) entry.
+        let reply_a = context_reply("detail-A", "feedback_delta: Fact: A's fact");
+        handle
+            .shared
+            .mark_feedback_inline_delivered(&binding, "detail-A", &reply_a);
+        handle.native_hint(binding.clone());
+        assert_eq!(
+            handle.take_current_feedback(binding).await.as_deref(),
+            Some("Fact: B's fact"),
+            "B's fact must still be eligible: only A's stale detail was retrieved, not B's"
+        );
+    }
+
+    /// A carrier whose final fitting dropped the fact — a different reply, a shrunk/truncated
+    /// text that no longer contains it, or a closed/error transport — must never be mislabeled as
+    /// delivered: the fact stays eligible. Proves `mark_feedback_inline_delivered` checks the
+    /// fact's actual presence in the traced final carrier, not merely that some reply was sent.
+    #[tokio::test]
+    async fn a_carrier_that_dropped_the_fact_is_not_treated_as_delivered() {
+        let (bindings, binding) = active_binding();
+        let handle = handle(bindings);
+        {
+            let mut ledger = handle.shared.ledger.lock().unwrap();
+            ledger.feedback.insert(
+                binding.clone(),
+                NativeFeedback {
+                    source: None,
+                    text: "Fact: one bounded fact".into(),
+                    native_epoch: 0,
+                    inline_delivered: false,
+                    producer: "detail-1".into(),
+                },
+            );
+        }
+        // Same producer, but the rendered text this specific carrier actually holds omits the
+        // fact (a trimmed/shrunk or otherwise unrelated body).
+        let trimmed = context_reply("detail-1", "diagnostic_count: 1\nfeedback_delta: none");
+        handle
+            .shared
+            .mark_feedback_inline_delivered(&binding, "detail-1", &trimmed);
+        // A closed/failed transport for the same producer.
+        let closed = PeerReply::Error {
+            code: FailureCode::Deadline,
+        };
+        handle
+            .shared
+            .mark_feedback_inline_delivered(&binding, "detail-1", &closed);
+        handle.native_hint(binding.clone());
+        assert_eq!(
+            handle.take_current_feedback(binding).await.as_deref(),
+            Some("Fact: one bounded fact")
+        );
+    }
+
+    /// Repeated Context/Inspect retrieval of the same observation (the same native epoch) must
+    /// not resurrect a fact this process already consumed via the hook channel: the single-slot
+    /// remove in `take_current_feedback` is the identity, not a string comparison of raw text.
+    #[tokio::test]
+    async fn hook_consumed_fact_is_not_resurrected_by_a_later_delivery_mark() {
+        let (bindings, binding) = active_binding();
+        let handle = handle(bindings);
+        {
+            let mut ledger = handle.shared.ledger.lock().unwrap();
+            ledger.feedback.insert(
+                binding.clone(),
+                NativeFeedback {
+                    source: None,
+                    text: "Fact: one bounded fact".into(),
+                    native_epoch: 0,
+                    inline_delivered: false,
+                    producer: "detail-1".into(),
+                },
+            );
+        }
+        handle.native_hint(binding.clone());
+        assert_eq!(
+            handle
+                .take_current_feedback(binding.clone())
+                .await
+                .as_deref(),
+            Some("Fact: one bounded fact")
+        );
+        // The entry is already gone; marking the same producer delivered afterward is a no-op and
+        // must not fabricate a new retained fact.
+        let reply = context_reply("detail-1", "feedback_delta: Fact: one bounded fact");
+        handle
+            .shared
+            .mark_feedback_inline_delivered(&binding, "detail-1", &reply);
+        assert_eq!(handle.take_current_feedback(binding).await, None);
     }
 }

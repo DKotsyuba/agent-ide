@@ -1112,6 +1112,16 @@ impl ProductActor {
     }
     /// Submits one exact root/child hook through the shipping command with the configured attachment.
     async fn lifecycle(&self, fixture: &ProductFixture, phase: &str, call: &str) {
+        let output = self.lifecycle_output(fixture, phase, call).await;
+        assert!(output.status.success() && output.stdout.is_empty() && output.stderr.is_empty());
+    }
+    /// Returns the shipping Codex hook output so a feedback assertion can inspect additionalContext.
+    async fn lifecycle_output(
+        &self,
+        fixture: &ProductFixture,
+        phase: &str,
+        call: &str,
+    ) -> std::process::Output {
         let mut child = hook_process(&fixture.runtime, Some(self.attachment));
         let payload =
             json!({"hook_event_name":phase,self.actor_field:self.actor,"tool_use_id":call});
@@ -1122,11 +1132,10 @@ impl ProductActor {
             .unwrap();
         input.shutdown().await.unwrap();
         drop(input);
-        let output = tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
+        tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
             .await
             .unwrap()
-            .unwrap();
-        assert!(output.status.success() && output.stdout.is_empty() && output.stderr.is_empty());
+            .unwrap()
     }
     /// Submits the same root/child correlation hook through the real shipping Claude command.
     async fn claude_lifecycle(&self, fixture: &ProductFixture, phase: &str, call: &str) {
@@ -2875,6 +2884,121 @@ async fn configured_product_cold_go_burst_preserves_admission_and_peer_view() {
     daemon.wait().await.unwrap();
 }
 
+/// A real background Context job that finishes while its own caller only ever saw `Pending`
+/// leaves a genuinely undelivered new fact: the first eligible native-edit hook must deliver it
+/// once, and a second must not resurrect it. This drives the actual product Worker/dispatcher
+/// entry path end to end (real daemon, real gopls, real hook binary) — `ide.inspect` is never
+/// called for this detail, so nothing but the job's own completion and the hook can be the source
+/// of delivery.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_GOPLS and AGENT_IDE_GO environment"]
+async fn configured_product_pending_context_job_completes_and_native_hook_delivers_its_feedback_once()
+ {
+    use std::os::unix::fs::PermissionsExt;
+    let gopls = std::env::var("AGENT_IDE_GOPLS").unwrap();
+    let go = std::env::var("AGENT_IDE_GO").unwrap();
+    let fixture = ProductFixture::new(json!([]));
+    // gopls cannot start until this test releases the gate, so the very first `ide.context` must
+    // observe the job still queued (`Pending`) rather than racing a fast real provider.
+    let gate = fixture.base.join("release-gopls-listener");
+    let wrapper = fixture.base.join("gopls-gated-provider");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nwhile [ ! -f '{}' ]; do sleep 0.02; done\nexec '{}' \"$@\"\n",
+            gate.display(),
+            gopls.replace('\'', "'\\''")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let providers = json!([{
+        "executable":accepted_program(wrapper.to_str().unwrap(),"golang.org/x/tools/gopls v0.23.0"),
+        "settings":"gopls_defaults",
+        "toolchain":go,
+        "cargo":null,
+        "cargo_version":null,
+        "rustc":null,
+        "rustc_version":null,
+        "trust":"fixture-disabled",
+        "cache_namespace":"fixture-pending-feedback-cache"
+    }]);
+    fixture.write_config(providers, None);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "pending-feedback-root").await;
+    let start = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"pending-start"}),
+        )
+        .await;
+    let start = actor.settle(&fixture, start).await;
+    assert_eq!(start["kind"], "activation", "{start}");
+
+    std::fs::write(
+        fixture.root.join("main.go"),
+        "package main\nfunc Value() int { return \"bad\" }\nfunc main() { _ = Value() }\n",
+    )
+    .unwrap();
+    let offset = std::fs::read_to_string(fixture.root.join("main.go"))
+        .unwrap()
+        .find("Value")
+        .unwrap();
+    let response = actor
+        .call(
+            &fixture,
+            "ide.context",
+            json!({"path":"main.go","byte_offset":offset}),
+        )
+        .await;
+    assert_eq!(
+        response["state"], "pending",
+        "gopls is gated and must not have answered synchronously: {response}"
+    );
+
+    // Release the gate: the job now finishes for real inside the daemon's own worker loop. This
+    // caller never calls `ide.inspect` for it — the completed reply is retained but unretrieved.
+    std::fs::write(&gate, b"go").unwrap();
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
+    actor
+        .lifecycle(&fixture, "PreToolUse", "native-edit-1")
+        .await;
+    let first = actor
+        .lifecycle_output(&fixture, "PostToolUse", "native-edit-1")
+        .await;
+    assert!(first.status.success() && first.stderr.is_empty());
+    assert!(
+        !first.stdout.is_empty(),
+        "a completed-but-unretrieved fact must deliver on the first eligible hook: got empty stdout"
+    );
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+    let additional = first["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(additional.contains("Provider reported"), "{additional}");
+
+    actor
+        .lifecycle(&fixture, "PreToolUse", "native-edit-2")
+        .await;
+    let second = actor
+        .lifecycle_output(&fixture, "PostToolUse", "native-edit-2")
+        .await;
+    assert!(second.status.success() && second.stderr.is_empty());
+    assert!(
+        second.stdout.is_empty(),
+        "the already-delivered fact must not resurrect on a second hook: {:?}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Wrong executable bytes prevent worker readiness and durable boot side effects.
 #[tokio::test]
 async fn configured_product_rejects_changed_executable_before_opening_workspace() {
@@ -3431,25 +3555,16 @@ async fn configured_product_claude_helper_returns_context_diff_and_feedback() {
         context_text.contains("diagnostic_count: 1"),
         "{context_text}"
     );
+    // The diagnostic delta above was already handed to this same caller inline, inside the
+    // retrieved `ide.context` reply. An ordinary native-edit post hook that follows must not echo
+    // that already-submitted fact on the second channel: `claude_lifecycle` asserts empty stdout,
+    // the same bar every other no-feedback hook in this file is held to.
     actor
         .claude_lifecycle(&fixture, "PreToolUse", "native-edit-after-context")
         .await;
-    let feedback = actor
-        .claude_lifecycle_output(&fixture, "PostToolUse", "native-edit-after-context")
+    actor
+        .claude_lifecycle(&fixture, "PostToolUse", "native-edit-after-context")
         .await;
-    assert!(feedback.status.success() && feedback.stderr.is_empty());
-    let feedback: Value = serde_json::from_slice(&feedback.stdout).unwrap();
-    let additional = feedback["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap();
-    assert!(
-        additional.contains("Provider reported 1 diagnostics"),
-        "{additional}"
-    );
-    assert!(
-        additional.contains("provisional helper snapshot"),
-        "{additional}"
-    );
 
     let rust_source = std::fs::read_to_string(fixture.root.join("src/lib.rs")).unwrap();
     let pending = actor

@@ -840,7 +840,10 @@ impl StdioFacade {
 /// during pagination is measured by the identical predicate here and is never re-cut mid-hunk by an
 /// independently computed reserve; only a non-Diff reply too large on arrival (never proven to fit
 /// upstream) ever reaches the shrink loop below.
-fn render_reply(mut reply: PeerReply) -> CallToolResult {
+///
+/// `pub(super)` so `worker::Shared::mark_feedback_inline_delivered` can trace the exact same
+/// final carrier a live caller would receive, instead of re-approximating the fitting boundary.
+pub(super) fn render_reply(mut reply: PeerReply) -> CallToolResult {
     loop {
         if let Some(rendered) = render_call_tool_result(&reply)
             && call_tool_result_fits(&rendered)
