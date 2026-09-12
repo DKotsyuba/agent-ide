@@ -13,3 +13,20 @@ The control test launches a real host parent and two native subagents with ident
 Separately, any later daemon/provider launch requires real proof that the chosen execution profile enforces the actual host sandbox contract, including an allowed fixture operation and a genuinely denied operation. This recorder does not perform that launch or claim sandbox propagation.
 
 Verification covers a real stdio MCP handshake, exact one-tool discovery, a call returning unproven binding, clean EOF, and hook valid/malformed/oversized-input cases. Log tests check that secret marker strings are absent, exact key sizing is enforced, dynamic key fingerprints differ, and limits hold. Real Codex/Claude host observation is separate from those protocol tests and is recorded with exact host/OS versions.
+
+## Observed Codex field contract
+
+Codex CLI 0.154.0 on macOS 26.6.2 arm64 was exercised with a real parent and two native subagents. Each actor completed exactly one `probe_observe({})` call. Host traces confirmed the empty arguments; all three calls had distinct actor and invocation identities, with exactly one matching PreToolUse and PostToolUse event each.
+
+| MCP field | Matching hook field | Meaning |
+|---|---|---|
+| `_meta.threadId`, parent call | `session_id` | Parent actor |
+| `_meta.threadId`, subagent call | `agent_id` | Individual subagent actor |
+| `_meta.callId` | `tool_use_id` | Exact invocation |
+| `_meta["x-codex-turn-metadata"].session_id` | `session_id` | Common root session, shared by both subagents |
+
+SubagentStart and SubagentStop carried the same individual `agent_id` values. The common root session therefore cannot distinguish sibling actors. The validator must use the exact actor/invocation relation within its configured channel; the diagnostic result remains `binding_unproven` because the recorder grants no authority.
+
+The associated captured managed workspace profile also passed the three real `execution_d03` tests, including profile-boundary enforcement and fixed Git discovery. Correlation, execution-profile enforcement, and product feedback delivery remain separate acceptance checks.
+
+This run used workspace-write sandboxing with restricted command network access and on-request approvals. The four diagnostic hook definitions were individually reviewed through the normal hook trust UI. New or changed hook definitions must be trusted before this probe can produce hook evidence.
