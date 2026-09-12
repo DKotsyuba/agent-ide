@@ -397,8 +397,8 @@ async fn perform_discovery(
     let mut reaped = 0;
     let mut discovery = Vec::new();
     // Activation reports the complete fixed triple the daemon's discovery validator requires.
-    // Context and diff still confirm the worktree root they are about to read within. Stop
-    // performs no discovery; it exists only to settle and reap.
+    // Context and diff still confirm the worktree root they are about to read within. Stop is
+    // daemon-owned and never constructs a helper job.
     let queries: &[(GitDiscoveryQuery, HelperQuery)] = match job.operation {
         HelperOperation::Start => &[
             (GitDiscoveryQuery::ShowTopLevel, HelperQuery::ShowTopLevel),
@@ -411,7 +411,6 @@ async fn perform_discovery(
         HelperOperation::Context | HelperOperation::Diff => {
             &[(GitDiscoveryQuery::ShowTopLevel, HelperQuery::ShowTopLevel)]
         }
-        HelperOperation::Stop => &[],
     };
     for (query, reported) in queries {
         spawned += 1;
@@ -600,7 +599,7 @@ async fn perform(
             )
             .await
         }
-        _ => (
+        HelperOperation::Start => (
             HelperOutcome::Failed {
                 code: FailureCode::Internal,
             },

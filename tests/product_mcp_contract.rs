@@ -1176,15 +1176,8 @@ impl ProductActor {
         assert!(!reply["result"]["structuredContent"].is_null(), "{reply}");
         reply["result"]["structuredContent"].clone()
     }
-    /// Runs the exact foreground helper named by a pending reply, then inspects its settled result.
-    ///
-    /// Returns the structured result and the inspect call's post-hook stdout. Start/Diff produce an
-    /// empty hook output; Context may produce the actual bounded `additionalContext` delta.
-    async fn complete_claude_pending(
-        &mut self,
-        fixture: &ProductFixture,
-        pending: &Value,
-    ) -> (Value, Vec<u8>) {
+    /// Runs the exact foreground helper named by a pending reply and returns its owned handle.
+    async fn launch_claude_pending(&self, fixture: &ProductFixture, pending: &Value) -> String {
         assert_eq!(pending["state"], "pending", "{pending}");
         let detail_ref = pending["detail_ref"].as_str().unwrap().to_owned();
         let helper = pending["helper"].as_str().unwrap().to_owned();
@@ -1230,7 +1223,18 @@ impl ProductActor {
             .unwrap();
         let post = post.wait_with_output().await.unwrap();
         assert!(post.status.success() && post.stdout.is_empty() && post.stderr.is_empty());
-
+        detail_ref
+    }
+    /// Runs the exact foreground helper named by a pending reply, then inspects its settled result.
+    ///
+    /// Returns the structured result and the inspect call's post-hook stdout. Start/Diff produce an
+    /// empty hook output; Context may produce the actual bounded `additionalContext` delta.
+    async fn complete_claude_pending(
+        &mut self,
+        fixture: &ProductFixture,
+        pending: &Value,
+    ) -> (Value, Vec<u8>) {
+        let detail_ref = self.launch_claude_pending(fixture, pending).await;
         self.next += 1;
         let inspect_call = format!("call-{}", self.next);
         self.claude_lifecycle(fixture, "PreToolUse", &inspect_call)
@@ -1985,8 +1989,9 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .collect::<Vec<_>>();
-    // One shared native namespace (holding only `gopls/`, keyed by executable/settings/toolchain/
-    // trust) plus one private per-worktree namespace (holding `go-build`/`go-mod`/`tmp`).
+    // One shared native namespace (holding `gopls/`/`tmp`, keyed by executable/settings/toolchain/
+    // trust) plus one private per-worktree namespace (also holding `gopls/`, with
+    // `go-build`/`go-mod` distinguishing it from the shared namespace).
     assert_eq!(cache_namespaces.len(), 2);
     let pending = actor
         .call(
@@ -2007,12 +2012,13 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
     let provider_environment = std::fs::read_to_string(environment).unwrap();
     let shared_namespace = cache_namespaces
         .iter()
-        .find(|namespace| namespace.join("gopls").is_dir())
+        .find(|namespace| namespace.join("gopls").is_dir() && !namespace.join("go-build").exists())
         .expect("shared native namespace");
     let worktree_namespace = cache_namespaces
         .iter()
         .find(|namespace| namespace.join("go-build").is_dir())
         .expect("per-worktree namespace");
+    assert!(worktree_namespace.join("gopls").is_dir());
     // The shared listener process env carries only the shared, process-global `GOPLSCACHE` and a
     // backend-scoped native `TMPDIR` inside that same shared namespace; the per-worktree
     // `GOCACHE`/`GOMODCACHE`/`GOTMPDIR` are never process env (they are delivered per view through
@@ -2983,8 +2989,19 @@ async fn configured_product_claude_helper_returns_context_diff_and_feedback() {
             json!({"path":"main.go","byte_offset":offset}),
         )
         .await;
-    let (context, inspect_feedback) = actor.complete_claude_pending(&fixture, &pending).await;
+    let detail_ref = actor.launch_claude_pending(&fixture, &pending).await;
+    let context = actor
+        .call_claude(
+            &fixture,
+            "ide.context",
+            json!({"path":"main.go","byte_offset":offset,"detail_ref":detail_ref}),
+        )
+        .await;
     assert_eq!(context["kind"], "context", "{context}");
+    assert!(
+        context["helper"].is_null(),
+        "retrieval must not mint another helper: {context}"
+    );
     let context_text = context["text"].as_str().unwrap();
     assert!(context_text.contains("mode: semantic"), "{context_text}");
     assert!(context_text.contains("return \"bad\""), "{context_text}");
@@ -2992,7 +3009,6 @@ async fn configured_product_claude_helper_returns_context_diff_and_feedback() {
         context_text.contains("diagnostic_count: 1"),
         "{context_text}"
     );
-    assert!(inspect_feedback.is_empty());
     actor
         .claude_lifecycle(&fixture, "PreToolUse", "native-edit-after-context")
         .await;
@@ -3035,8 +3051,19 @@ async fn configured_product_claude_helper_returns_context_diff_and_feedback() {
     let pending = actor
         .call_claude(&fixture, "ide.diff", json!({"mode":"head"}))
         .await;
-    let (diff, feedback) = actor.complete_claude_pending(&fixture, &pending).await;
+    let detail_ref = actor.launch_claude_pending(&fixture, &pending).await;
+    let diff = actor
+        .call_claude(
+            &fixture,
+            "ide.diff",
+            json!({"mode":"head","detail_ref":detail_ref}),
+        )
+        .await;
     assert_eq!(diff["kind"], "diff", "{diff}");
+    assert!(
+        diff["helper"].is_null(),
+        "retrieval must not mint another helper: {diff}"
+    );
     let diff_text = diff["text"].as_str().unwrap();
     assert!(
         diff_text.contains("baseline_coverage: Some(Partial)"),
@@ -3051,7 +3078,6 @@ async fn configured_product_claude_helper_returns_context_diff_and_feedback() {
         "{diff_text}"
     );
     assert!(diff_text.contains("return \"bad\""), "{diff_text}");
-    assert!(feedback.is_empty());
 
     let mut retained = std::fs::read_dir(fixture.runtime.join("cache"))
         .unwrap()

@@ -615,11 +615,6 @@ impl WorkerHandle {
             HelperOperation::Start => AssistanceTool::Start,
             HelperOperation::Context => AssistanceTool::Context,
             HelperOperation::Diff => AssistanceTool::Diff,
-            HelperOperation::Stop => {
-                return PeerReply::Error {
-                    code: FailureCode::Internal,
-                };
-            }
         };
         // Repeated inspection of an already completed activation is retrieval, never a second
         // activation: answer from the retained detail rather than re-entering the queue.
@@ -1006,12 +1001,6 @@ impl<'a> Worker<'a> {
                 match job.tool {
                     AssistanceTool::Start if matches!(job.input, JobInput::Claude(_)) => {
                         self.activate_claude(&mut job).await
-                    }
-                    AssistanceTool::Context if matches!(job.input, JobInput::Claude(_)) => {
-                        self.context_claude(&mut job).await
-                    }
-                    AssistanceTool::Diff if matches!(job.input, JobInput::Claude(_)) => {
-                        self.diff_claude(&mut job).await
                     }
                     AssistanceTool::Context if matches!(job.input, JobInput::Claude(_)) => {
                         self.context_claude(&mut job).await

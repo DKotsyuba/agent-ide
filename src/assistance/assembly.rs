@@ -219,7 +219,6 @@ impl ProductDispatcher {
                     HelperOperation::Start => 6,
                     HelperOperation::Context => 2,
                     HelperOperation::Diff => 64,
-                    HelperOperation::Stop => 1,
                 },
                 deadline_ms: worker.limits().operation_ms,
             },
@@ -653,7 +652,19 @@ impl ProductDispatcher {
                             }
                             worker.stop(invocation, method.opaque_attachment()).await
                         }
-                        // Pure retrieval: same binding, same generation, no daemon source read.
+                        // Context/Diff preserve the shared facade's optional detail retrieval:
+                        // the handle names already-settled work and never starts another helper.
+                        AssistanceMethod::Context | AssistanceMethod::Diff
+                            if call.parameters().get("detail_ref").is_some() =>
+                        {
+                            self.retrieve_claude(
+                                &invocation,
+                                call.parameters()["detail_ref"].as_str()?,
+                                method.opaque_attachment(),
+                            )
+                            .await
+                        }
+                        // Inspect is pure retrieval: same binding/generation, no daemon source read.
                         AssistanceMethod::Inspect => {
                             self.retrieve_claude(
                                 &invocation,

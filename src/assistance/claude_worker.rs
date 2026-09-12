@@ -43,6 +43,14 @@ const MAX_DISCOVERY_STREAM_BYTES: usize = 8 * 1024;
 /// Fixed helper subcommand; the model never selects an executable, argument or shell fragment.
 const HELPER_SUBCOMMAND: &str = "claude-worker";
 
+/// Quotes one daemon-selected UTF-8 argument as a single POSIX shell word.
+///
+/// Single quotes are closed, emitted through a quoted backslash escape, then reopened. The caller
+/// measures the expanded command afterward, so escaping cannot bypass the command byte ceiling.
+fn shell_word(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// Declares the operator-managed strict Claude configuration this profile is accepted under.
 ///
 /// The daemon never inspects, guesses or mutates live host settings. An operator states the
@@ -120,8 +128,6 @@ pub enum HelperOperation {
     Context,
     /// Composed comparison evidence for the current Workspace scope.
     Diff,
-    /// Revocation, provider reaping and child settlement.
-    Stop,
 }
 
 /// Names the per-operation exclusive language profile a helper may run.
@@ -466,12 +472,17 @@ pub struct DiscoveryFrame {
 }
 
 impl DiscoveryFrame {
-    /// Rejects an over-bound frame before it can reach the discovery validator.
+    /// Rejects an over-bound stream or non-Unix exit code before discovery status conversion.
     pub fn validate(&self) -> Result<(), FailureCode> {
-        (self.stdout.len() <= MAX_DISCOVERY_STREAM_BYTES
-            && self.stderr.len() <= MAX_DISCOVERY_STREAM_BYTES)
+        if self.stdout.len() > MAX_DISCOVERY_STREAM_BYTES
+            || self.stderr.len() > MAX_DISCOVERY_STREAM_BYTES
+        {
+            return Err(FailureCode::Capacity);
+        }
+        self.exit_code
+            .is_none_or(|code| (0..=255).contains(&code))
             .then_some(())
-            .ok_or(FailureCode::Capacity)
+            .ok_or(FailureCode::ExecutionProfile)
     }
 }
 
@@ -492,8 +503,9 @@ pub struct ChildSettlement {
 impl ChildSettlement {
     /// Returns whether every spawned direct child was actually reaped.
     ///
-    /// A stop result may only be reported complete when this holds; otherwise the operation is
-    /// uncertain and its admission stays quarantined.
+    /// A completed helper result may only be reported when this holds; otherwise the operation is
+    /// uncertain and its admission stays quarantined. Stop itself is daemon-owned and launches no
+    /// helper.
     pub fn settled(&self) -> bool {
         self.spawned == self.reaped
     }
@@ -1122,9 +1134,9 @@ impl LaunchLedger {
 
     /// Renders the exact fixed foreground helper command for one handle.
     ///
-    /// The shape is fixed and fully daemon-chosen. It is rendered once, stored as the expected
-    /// bytes, and returned to the model verbatim; recognition later compares bytes rather than
-    /// parsing arbitrary shell syntax.
+    /// The shape is fixed and fully daemon-chosen. Each value is one POSIX-quoted word; the full
+    /// expanded command is then bounded by [`Self::mint`], stored as expected bytes, and returned
+    /// verbatim. Recognition later compares bytes rather than parsing arbitrary shell syntax.
     pub fn helper_command(
         binary: &std::path::Path,
         runtime_dir: &std::path::Path,
@@ -1132,9 +1144,11 @@ impl LaunchLedger {
         detail_ref: &str,
     ) -> String {
         format!(
-            "{} {HELPER_SUBCOMMAND} --runtime-dir {} --attachment {attachment} --detail-ref {detail_ref}",
-            binary.display(),
-            runtime_dir.display(),
+            "{} {HELPER_SUBCOMMAND} --runtime-dir {} --attachment {} --detail-ref {}",
+            shell_word(&binary.to_string_lossy()),
+            shell_word(&runtime_dir.to_string_lossy()),
+            shell_word(attachment),
+            shell_word(detail_ref),
         )
     }
 
@@ -1165,7 +1179,7 @@ impl LaunchLedger {
             || channel.is_empty()
             || channel.len() > MAX_IDENTIFIER_BYTES
         {
-            return Err(FailureCode::Conflict);
+            return Err(FailureCode::ExecutionProfile);
         }
         if self.tickets.contains_key(detail_ref) {
             return Err(FailureCode::Conflict);
@@ -1541,7 +1555,6 @@ impl LaunchLedger {
 mod tests {
     use super::*;
 
-    /// Builds one valid Rust-profile job with entirely daemon-selected values.
     /// Returns the fixed binding generation every ledger fixture mints under.
     fn binding_fixture() -> BindingRef {
         BindingRef::fixture("agent", "channel", 1)
@@ -1563,6 +1576,7 @@ mod tests {
             .expect("fixture identity is well formed")
     }
 
+    /// Builds one valid Rust-profile job with entirely daemon-selected values.
     fn job() -> HelperJob {
         HelperJob {
             protocol: HELPER_PROTOCOL,
@@ -2308,6 +2322,27 @@ mod tests {
         assert!(HelperJob::decode(&"x".repeat(MAX_HELPER_FRAME_BYTES + 1)).is_err());
     }
 
+    /// Discovery exit status accepts one Unix byte and rejects values that would fold to success.
+    #[test]
+    fn discovery_exit_status_rejects_negative_overflow_and_wrapping_values() {
+        let frame = |exit_code| DiscoveryFrame {
+            query: HelperQuery::ShowTopLevel,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            exit_code,
+            truncated: false,
+        };
+        for valid in [None, Some(0), Some(255)] {
+            assert_eq!(frame(valid).validate(), Ok(()));
+        }
+        for invalid in [Some(-1), Some(256), Some(8_388_608), Some(16_777_216)] {
+            assert_eq!(
+                frame(invalid).validate(),
+                Err(FailureCode::ExecutionProfile)
+            );
+        }
+    }
+
     /// Stop revokes first: a ticket on a revoked generation can no longer be claimed.
     #[test]
     fn revocation_removes_tickets_before_a_late_helper_can_claim() {
@@ -2345,6 +2380,30 @@ mod tests {
             ),
             Err(FailureCode::Conflict)
         );
+        let retained = ledger.len();
+        let quoted_runtime = format!("/{}", "'".repeat(1024));
+        let expanded = LaunchLedger::helper_command(
+            std::path::Path::new("/agent ide"),
+            std::path::Path::new(&quoted_runtime),
+            "channel with space",
+            "malformed-command",
+        );
+        assert!(expanded.len() > MAX_COMMAND_BYTES && expanded.contains("'\\''"));
+        assert_eq!(
+            ledger.mint(
+                "malformed-command",
+                binding_fixture(),
+                actor.clone(),
+                "channel",
+                expanded,
+                job(),
+                1000,
+                identity("/usr/local/bin/agent-ide"),
+                vec![identity("/usr/bin/git")],
+            ),
+            Err(FailureCode::ExecutionProfile)
+        );
+        assert_eq!(ledger.len(), retained, "malformed input mints no ticket");
         for index in 1..MAX_TICKETS {
             let reference = format!("detail-{}", index + 1);
             ledger
