@@ -2070,6 +2070,120 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
     daemon.wait().await.unwrap();
 }
 
+/// A provider that exits before ever attempting to bind its listener (a sandboxed `gopls` refused the
+/// `bind()` syscall is the real-world case) must fall back to a lexical `ide.context` result almost
+/// immediately, never by exhausting the 120s operation budget polling a socket that has not appeared
+/// yet. `context` treats `FailureCode::ProviderUnavailable` as a deliberate lexical fallback rather
+/// than a fatal error, so the settled reply is `state: "complete"` carrying the fallback reason, not
+/// `state: "error"`. This fixture's provider never touches its socket path at all, so its cleanup
+/// stays exactly as unproved/uncertain as the still-alive never-ready case (preceding test): Stop
+/// still honestly reports `internal` here, since nothing ever proved that path clean; what changed is
+/// only that `ide.context` no longer waits out the full operation deadline to learn that. A fresh
+/// restart afterward must still work end to end, proving no leaked capacity or process from the first
+/// failure.
+#[tokio::test]
+async fn configured_product_context_settles_promptly_when_provider_exits_before_bind() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = ProductFixture::new(json!([]));
+    let program = fixture.base.join("exit-before-bind-provider");
+    let marker = fixture.base.join("exit-before-bind-marker");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\nprintf 'contract-fixture: exit before bind\\n' >&2\n: > '{}'\nexit 2\n",
+            marker.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    fixture.write_config(
+        json!([{"executable":accepted_program(program.to_str().unwrap(),"exit-before-bind-fixture-provider"),"settings":"gopls_defaults","toolchain":"/usr/bin/true","cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"exit-before-bind-fixture-cache"}]),
+        None,
+    );
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "exit-before-bind-root").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"exit-before-bind-start"}),
+        )
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    let pending = actor
+        .call(
+            &fixture,
+            "ide.context",
+            json!({"path":"main.go","byte_offset":59}),
+        )
+        .await;
+    assert_eq!(pending["state"], "pending", "{pending}");
+    let began = tokio::time::Instant::now();
+    let settled = actor.settle(&fixture, pending).await;
+    let elapsed = began.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "an already-dead listener must settle well before the 120s operation budget, took {elapsed:?}"
+    );
+    assert_eq!(settled["state"], "complete", "{settled}");
+    assert!(
+        settled["text"]
+            .as_str()
+            .unwrap()
+            .contains("accepted semantic provider is unavailable"),
+        "{settled}"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    // This provider never touches its socket path, so nothing ever proves that path clean; Stop
+    // honestly reports the same unproved `internal` disposition as the still-alive never-ready case,
+    // exactly like `configured_product_stop_reaps_a_provider_that_never_becomes_ready` above.
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["state"], "error", "{stopped}");
+    assert_eq!(stopped["code"], "internal", "{stopped}");
+
+    // A fresh Start/Context cycle against the same always-failing configured provider must still
+    // work end to end, proving no quarantined capacity or leaked process from the first failure.
+    let restarted = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"exit-before-bind-restart"}),
+        )
+        .await;
+    let restarted = actor.settle(&fixture, restarted).await;
+    assert_eq!(restarted["kind"], "activation", "{restarted}");
+    let refreshed = actor
+        .call(
+            &fixture,
+            "ide.context",
+            json!({"path":"main.go","byte_offset":59}),
+        )
+        .await;
+    assert_eq!(refreshed["state"], "pending", "{refreshed}");
+    let refreshed = actor.settle(&fixture, refreshed).await;
+    assert_eq!(refreshed["state"], "complete", "{refreshed}");
+    assert!(
+        refreshed["text"]
+            .as_str()
+            .unwrap()
+            .contains("accepted semantic provider is unavailable"),
+        "{refreshed}"
+    );
+
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// SIGTERM stops admission, reaps an active owned provider, and removes both owned socket paths.
 #[tokio::test]
 async fn configured_product_sigterm_reaps_active_provider_and_owned_sockets() {

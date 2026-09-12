@@ -257,6 +257,17 @@ impl SharedGopls {
         &self.compatibility_key
     }
 
+    /// Observes whether the owned listener has already exited without blocking or signaling.
+    ///
+    /// `Ok(None)` means the listener still appears alive and must keep its existing cancellation and
+    /// deadline bounds; `Ok(Some(status))` is definite, stable readiness evidence that no future
+    /// signal can revive. It never substitutes for `stop`: the caller must still route the owned
+    /// listener through `stop` to drain output and release its Execution admission slot exactly once.
+    /// The underlying nonblocking wait may reap the OS child while retaining that logical ownership.
+    pub fn listener_exit_status(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.listener.try_exit_status()
+    }
+
     /// Opens one separately piped forwarder and records independent request, source and lease state.
     ///
     /// Requires the exact canonical worktree identity, incarnation and root in the validated

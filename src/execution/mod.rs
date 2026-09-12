@@ -3075,6 +3075,16 @@ impl OwnedChild {
         self.finish(status, cancellation, output_deadline).await
     }
 
+    /// Peeks whether the direct child has already exited, without blocking, signaling, or consuming
+    /// ownership. `Ok(None)` means the process still appears alive; a definite `Ok(Some(status))` is
+    /// stable and repeatable once observed, since Tokio retains the reaped status internally. Callers
+    /// still must route through `cancel_bounded`/`cancel_and_reap`/`wait` to drain output and release
+    /// admission. Tokio may reap the OS child here; this observation never produces Execution's
+    /// settlement proof or releases the logical ownership.
+    pub fn try_exit_status(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.process.child.try_wait()
+    }
+
     /// Borrows the direct child for a bounded, cancellation-safe wait without consuming ownership.
     /// A successful wait is retained by Tokio; consuming reap still owns output/proof completion.
     pub async fn wait(&mut self, deadline: Duration) -> Result<ExitStatus, ProcessError> {

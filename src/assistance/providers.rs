@@ -703,7 +703,24 @@ impl Worker<'_> {
                     return Err(FailureCode::Internal);
                 }
             }
-            let failure = if *job.cancel.borrow() || self.shared.active(&binding).is_err() {
+            // A listener that has already exited cannot make further progress toward binding on
+            // its own; settle this request immediately instead of polling it all the way to its
+            // full operation deadline. This only shortens how long *this* request waits; it does
+            // not change the established, unmodified socket cleanup this triggers via
+            // `close_provider`/`reap_owned_backend` below.
+            let listener_exited = self
+                .providers
+                .go
+                .get_mut(&backend)
+                .ok_or(FailureCode::Internal)?
+                .shared
+                .listener_exit_status()
+                .ok()
+                .flatten()
+                .is_some();
+            let failure = if listener_exited {
+                Some(FailureCode::ProviderUnavailable)
+            } else if *job.cancel.borrow() || self.shared.active(&binding).is_err() {
                 Some(FailureCode::Cancelled)
             } else if tokio::time::Instant::now() >= job.deadline {
                 Some(FailureCode::Deadline)
@@ -1232,7 +1249,13 @@ fn provider_cache_key(
 /// `Err(FailureCode::Internal)` when `stop` succeeds but either `complete_reap` rejects the
 /// settlement (a capability/proof mismatch) or the socket disposition could not prove removal; both
 /// conditions still run to completion (the socket is always disposed, `complete_reap` is always
-/// attempted once `stop` succeeds) before the error is returned.
+/// attempted once `stop` succeeds) before the error is returned. `backend.socket` being `None` is
+/// never upgraded to a proof of absence here, including when the listener is already confirmed
+/// exited: the only identity this function ever disposes is one this worker itself already
+/// captured, so a `None` always takes the conservative, unproved `dispose_socket` disposition —
+/// deliberately, since a fresh post-exit capture at this point would grant deletion authority over
+/// whatever object currently occupies the path, not necessarily the one this worker's own listener
+/// created.
 async fn reap_owned_backend(
     providers: &mut Providers,
     admission: &std::sync::Mutex<crate::execution::AdmissionController>,
@@ -1730,6 +1753,108 @@ mod tests {
             .await
             .unwrap();
         let _ = std::fs::remove_file(&socket_b);
+    }
+
+    /// Regression proving `reap_owned_backend` never grants itself deletion authority over whatever
+    /// object currently occupies the deterministic path just because `backend.socket` is `None` and
+    /// the direct child is confirmed exited. `None` only ever means this worker never retained a
+    /// deletion identity there — not that the path is empty, and not that anything found there now
+    /// was created by this worker's own listener. Fresh metadata readback proves only the current
+    /// inode, never ownership by the dead provider. This leaves a real object at the socket path that
+    /// this worker's own capture never ran against, waits for the real spawned listener to actually
+    /// exit, and proves the object survives byte-for-byte, the endpoint generation is still fenced
+    /// forward exactly as any other unproved `None` disposal, and the outcome is the existing honest
+    /// `Internal`/uncertain result — never a new success proof for a clean no-socket exit.
+    #[tokio::test]
+    async fn reap_owned_backend_never_deletes_an_uncaptured_preexisting_object() {
+        let mut providers = Providers::new();
+        let mut admission = AdmissionController::new(AdmissionLimits {
+            total_running: 4,
+            per_owner_running: 4,
+            per_owner_queued: 4,
+            total_queued: 4,
+            interactive_burst: 1,
+        })
+        .unwrap();
+        let mut uncertain = BTreeSet::new();
+        let binding = test_binding("preexisting-object");
+        let socket = std::env::temp_dir().join(format!(
+            "agent-ide-reap-owned-preexisting-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let (mut backend, _authority, _tree, view, _profile) = spawn_owned_backend(
+            &mut providers,
+            &mut admission,
+            "preexisting-object-backend",
+            &socket,
+        );
+        // `spawn_owned_backend` captures its own identity for its own fixture bookkeeping; discard
+        // it so `backend.socket` matches production reality after a genuinely missed poll: `None`,
+        // with no retained deletion identity for anything at this path.
+        backend.socket = None;
+        // Wait for the real spawned listener to actually exit: a confirmed-dead direct child is
+        // exactly the condition the rejected shortcut used to justify a late, unauthorized capture.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while backend.shared.listener_exit_status().unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // Only now does a real, pre-existing object occupy this exact path — never captured by this
+        // backend, and not created by the fixture's already-exited listener either.
+        let preexisting_bytes = b"pre-existing-object-not-owned-by-this-listener";
+        std::fs::write(&socket, preexisting_bytes).unwrap();
+
+        let BackendRelease::ReapOwned(capability) = providers.registry.release(view).unwrap()
+        else {
+            panic!("expected sole ownership")
+        };
+
+        let admission = std::sync::Mutex::new(admission);
+        let result = reap_owned_backend(
+            &mut providers,
+            &admission,
+            &mut uncertain,
+            &binding,
+            "preexisting-object-backend",
+            backend,
+            capability,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(FailureCode::Internal)),
+            "an uncaptured object must stay unproved/uncertain, never a new clean success: {result:?}"
+        );
+        assert!(
+            uncertain.contains(&binding),
+            "an unproved disposition must still be recorded as uncertain, not silently dropped"
+        );
+        assert!(
+            socket.exists(),
+            "an object this worker never captured must never be deleted"
+        );
+        assert_eq!(
+            std::fs::read(&socket).unwrap(),
+            preexisting_bytes,
+            "the pre-existing object's bytes must be completely untouched"
+        );
+        assert_eq!(
+            providers
+                .socket_generation
+                .get("preexisting-object-backend")
+                .copied(),
+            Some(1),
+            "an unproved disposition must still fence the next spawn onto a fresh generation"
+        );
+
+        std::fs::remove_file(&socket).unwrap();
     }
 
     /// Forces the exact post-backend-removal failure this fix targets: a captured `Some` socket whose
