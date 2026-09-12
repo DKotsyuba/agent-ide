@@ -2453,6 +2453,191 @@ async fn configured_product_isolates_go_across_two_divergent_worktree_actors() {
     daemon.wait().await.unwrap();
 }
 
+/// Holds the first real shared gopls listener before startup, then proves a bounded product burst
+/// queues valid work, refuses overflow, starts one listener/two forwarders, and keeps the peer view.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_GOPLS and AGENT_IDE_GO environment"]
+async fn configured_product_cold_go_burst_preserves_admission_and_peer_view() {
+    use std::os::unix::fs::PermissionsExt;
+    let gopls = std::env::var("AGENT_IDE_GOPLS").unwrap();
+    let go = std::env::var("AGENT_IDE_GO").unwrap();
+    let fixture = ProductFixture::new(json!([]));
+    let gate = fixture.base.join("release-gopls-listener");
+    let invocation_log = fixture.base.join("gopls-cold-invocations");
+    let wrapper = fixture.base.join("gopls-cold-provider");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nprintf '%s\\t%s\\t%s\\n' \"$$\" \"$PWD\" \"$*\" >> '{}'\ncase \"$*\" in *'-listen=unix;'*) while [ ! -f '{}' ]; do sleep 0.01; done;; esac\nexec '{}' \"$@\"\n",
+            invocation_log.display(),
+            gate.display(),
+            gopls.replace('\'', "'\\''")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    fixture.write_config(json!([{"executable":accepted_program(wrapper.to_str().unwrap(),"golang.org/x/tools/gopls v0.23.0"),"settings":"gopls_defaults","toolchain":go,"cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"cold-shared-fixture-cache"}]), None);
+    let child_root = fixture.base.join("cold-child");
+    std::fs::create_dir(&child_root).unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("/usr/bin/git")
+            .env_clear()
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .arg("-C")
+            .arg(&child_root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+    };
+    std::fs::write(
+        child_root.join("go.mod"),
+        "module contract.local/cold-child\n\ngo 1.25.0\n",
+    )
+    .unwrap();
+    std::fs::write(child_root.join("main.go"), "package main\nfunc Value() string { return \"cold-child\" }\nfunc main() { _ = Value() }\n").unwrap();
+    git(&["init", "--quiet"]);
+    git(&["config", "user.email", "fixture@example.invalid"]);
+    git(&["config", "user.name", "Fixture"]);
+    git(&["add", "--", "."]);
+    git(&["commit", "--quiet", "-m", "fixture"]);
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+    let mut child_target = config["targets"][0].clone();
+    child_target["attachment"] = json!("private-child-channel");
+    child_target["candidate"] = json!(child_root);
+    config["targets"].as_array_mut().unwrap().push(child_target);
+    std::fs::write(&fixture.config, config.to_string()).unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut root = ProductActor::new(&fixture, "cold-root").await;
+    let mut child_state = fixture.state();
+    child_state["sandboxCwd"] = json!(child_root);
+    let mut child = ProductActor::new_at(
+        &fixture,
+        "cold-child",
+        "private-child-channel",
+        "agent_id",
+        child_state,
+    )
+    .await;
+    let (root_start, child_start) = tokio::join!(
+        root.call(&fixture, "ide.start", json!({"activation_id":"cold-start"})),
+        child.call(&fixture, "ide.start", json!({"activation_id":"cold-start"}))
+    );
+    assert_eq!(
+        root.settle(&fixture, root_start).await["kind"],
+        "activation"
+    );
+    assert_eq!(
+        child.settle(&fixture, child_start).await["kind"],
+        "activation"
+    );
+    let root_offset = std::fs::read_to_string(fixture.root.join("main.go"))
+        .unwrap()
+        .rfind("Value()")
+        .unwrap();
+    let child_offset = std::fs::read_to_string(child_root.join("main.go"))
+        .unwrap()
+        .rfind("Value()")
+        .unwrap();
+    let (root_pending, child_pending) = tokio::join!(
+        root.call(
+            &fixture,
+            "ide.context",
+            json!({"path":"main.go","byte_offset":root_offset})
+        ),
+        child.call(
+            &fixture,
+            "ide.context",
+            json!({"path":"main.go","byte_offset":child_offset})
+        )
+    );
+    assert_eq!(root_pending["state"], "pending", "{root_pending}");
+    assert_eq!(child_pending["state"], "pending", "{child_pending}");
+    for index in 0..15 {
+        let queued = root
+            .call(
+                &fixture,
+                "ide.context",
+                json!({"path":format!("missing-{index}.go")}),
+            )
+            .await;
+        assert_eq!(queued["state"], "pending", "{queued}");
+    }
+    let refused = root
+        .call(
+            &fixture,
+            "ide.context",
+            json!({"path":"missing-overflow.go"}),
+        )
+        .await;
+    assert_eq!(refused["state"], "error", "{refused}");
+    assert_eq!(refused["code"], "capacity", "{refused}");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !std::fs::read_to_string(&invocation_log)
+            .ok()
+            .is_some_and(|log| log.contains("-listen=unix;"))
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("listener wrapper must record the gated cold start");
+    std::fs::write(&gate, "release\n").unwrap();
+    let root_context = root.settle(&fixture, root_pending).await;
+    let child_context = child.settle(&fixture, child_pending).await;
+    assert!(
+        root_context["text"]
+            .as_str()
+            .unwrap()
+            .contains("mode: semantic"),
+        "{root_context}"
+    );
+    assert!(
+        child_context["text"]
+            .as_str()
+            .unwrap()
+            .contains("cold-child"),
+        "{child_context}"
+    );
+    let invocations = std::fs::read_to_string(&invocation_log).unwrap();
+    let listeners = invocations
+        .lines()
+        .filter(|line| line.contains("-listen=unix;"))
+        .collect::<Vec<_>>();
+    let forwarders = invocations
+        .lines()
+        .filter(|line| line.contains("-remote=unix;"))
+        .collect::<Vec<_>>();
+    assert_eq!(listeners.len(), 1, "{invocations}");
+    assert_eq!(forwarders.len(), 2, "{invocations}");
+    let listener_pid: libc::pid_t = listeners[0].split('\t').next().unwrap().parse().unwrap();
+    // SAFETY: signal zero observes only the wrapper-recorded listener PID.
+    assert_eq!(unsafe { libc::kill(listener_pid, 0) }, 0);
+    let stopped = root.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    let live = child
+        .call(
+            &fixture,
+            "ide.context",
+            json!({"path":"main.go","byte_offset":child_offset}),
+        )
+        .await;
+    let live = child.settle(&fixture, live).await;
+    assert!(
+        live["text"].as_str().unwrap().contains("cold-child"),
+        "{live}"
+    );
+    assert_eq!(
+        child.call(&fixture, "ide.stop", json!({})).await["kind"],
+        "stop"
+    );
+    tokio::join!(root.mcp.close(), child.mcp.close());
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Wrong executable bytes prevent worker readiness and durable boot side effects.
 #[tokio::test]
 async fn configured_product_rejects_changed_executable_before_opening_workspace() {
