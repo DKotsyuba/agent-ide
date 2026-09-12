@@ -1269,7 +1269,13 @@ impl<'a> Worker<'a> {
         let receipt = match self.workspace.activate(request).await {
             Ok(receipt) => receipt,
             // A second actor for the same worktree loses; the first owner stays usable.
-            Err(crate::workspace::durable::DurableError::OperationConflict) => {
+            Err(
+                crate::workspace::durable::DurableError::OperationConflict
+                | crate::workspace::durable::DurableError::Authority(
+                    crate::workspace::authority::AuthorityError::WorktreeOwned
+                    | crate::workspace::authority::AuthorityError::ActorAlreadyOwnsWorktree,
+                ),
+            ) => {
                 return Err(FailureCode::Conflict);
             }
             Err(
