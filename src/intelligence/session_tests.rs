@@ -58,7 +58,8 @@ fn pyright_settings() -> ProviderSettings {
             crate::intelligence::pyright::PyrightProfileIdentity {
                 binary: "/usr/bin/true".into(),
                 version: "pyright-test".into(),
-                node_toolchain: "/usr/bin/true".into(),
+                node: "/usr/bin/true".into(),
+                node_identity: "node-test".into(),
                 trust: "test".into(),
                 cache_namespace: "/private/tmp/agent-ide-pyright-session-test-cache".into(),
             },
@@ -158,6 +159,7 @@ fn diagnostic_state() -> Arc<Mutex<State>> {
         shutdown_complete: false,
         settings: gopls_settings(),
         readiness: watch::channel(UNKNOWN_READINESS).0,
+        diagnostic_revision: watch::channel(0).0,
         document: Some(Document {
             uri: context::observation_uri(&observed).unwrap(),
             source: SourceBinding::from_observation(&observed),
@@ -177,6 +179,45 @@ fn diagnostic_state() -> Arc<Mutex<State>> {
             truncated: false,
         },
     }))
+}
+
+/// Confirms an accepted versioned diagnostic callback wakes the bounded exact-document wait.
+#[tokio::test]
+async fn matching_diagnostics_notification_wakes_waiter() {
+    let state = diagnostic_state();
+    let waiting = tokio::spawn({
+        let state = state.clone();
+        async move {
+            wait_for_matching_diagnostics(&state, Instant::now() + Duration::from_secs(1)).await
+        }
+    });
+    tokio::task::yield_now().await;
+    let mut router = client_router(state.clone());
+    let uri = context::observation_uri(&observation("package main", 1)).unwrap();
+    let notification = serde_json::from_value(json!({"method":"textDocument/publishDiagnostics", "params":{"uri":uri,"version":2,"diagnostics":[]}})).unwrap();
+    assert!(matches!(
+        router.notify(notification),
+        ControlFlow::Continue(())
+    ));
+    assert!(waiting.await.unwrap());
+}
+
+/// Confirms stale versioned notifications do not wake the waiter and deadline preserves unknown evidence.
+#[tokio::test]
+async fn stale_diagnostics_notification_does_not_wake_waiter() {
+    let state = diagnostic_state();
+    let mut router = client_router(state.clone());
+    let uri = context::observation_uri(&observation("package main", 1)).unwrap();
+    let notification = serde_json::from_value(json!({"method":"textDocument/publishDiagnostics", "params":{"uri":uri,"version":1,"diagnostics":[]}})).unwrap();
+    assert!(matches!(
+        router.notify(notification),
+        ControlFlow::Continue(())
+    ));
+    assert!(!wait_for_matching_diagnostics(&state, Instant::now()).await);
+    assert_eq!(
+        state.lock().unwrap().diagnostics.freshness,
+        Freshness::Unknown
+    );
 }
 
 /// Proves versioned/unversioned pushes cannot claim clean, late versions cannot replace current evidence,

@@ -363,6 +363,8 @@ struct State {
     settings: ProviderSettings,
     /// Current provider-specific status, independently observable by the initialize barrier.
     readiness: watch::Sender<ProviderReadiness>,
+    /// Monotonic notification revision advanced only for an accepted, versioned current-document push.
+    diagnostic_revision: watch::Sender<u64>,
     /// Current document; only one exact file is retained.
     document: Option<Document>,
     /// Last bounded push evidence, cleared on source changes and invalidation.
@@ -453,6 +455,7 @@ where
         shutdown_complete: false,
         settings: settings.clone(),
         readiness: watch::channel(UNKNOWN_READINESS).0,
+        diagnostic_revision: watch::channel(0).0,
         document: None,
         diagnostics: DiagnosticSnapshot {
             source: None,
@@ -648,6 +651,17 @@ impl Session {
     /// Returns bounded diagnostic observations; no push or missing message establishes cleanliness.
     pub fn diagnostics(&self) -> DiagnosticSnapshot {
         self.state.lock().expect("session lock").diagnostics.clone()
+    }
+
+    /// Waits at most two seconds, and never beyond the current request deadline, for the current
+    /// Pyright document's first versioned diagnostic push. A timeout deliberately leaves diagnostic
+    /// evidence unknown and does not affect already-computed semantic context.
+    pub(crate) async fn wait_for_matching_diagnostics(&self) {
+        let deadline = std::cmp::min(
+            self.exchange_deadline(),
+            Instant::now() + Duration::from_secs(2),
+        );
+        let _ = wait_for_matching_diagnostics(&self.state, deadline).await;
     }
 
     /// Synchronizes exact observation bytes, then requests advertised definition/reference methods.
@@ -968,6 +982,41 @@ impl Session {
     }
 }
 
+/// Waits for the current document's exact versioned diagnostic snapshot without treating a push as
+/// clean readiness. The revision subscription is installed before the snapshot check, so accepted
+/// callback updates cannot be lost between checking state and waiting; deadline or stale pushes
+/// return `false` without changing session state.
+async fn wait_for_matching_diagnostics(state: &Arc<Mutex<State>>, deadline: Instant) -> bool {
+    let (source, version, mut revisions) = {
+        let state = state.lock().expect("session lock");
+        let Some(document) = &state.document else {
+            return false;
+        };
+        let revisions = state.diagnostic_revision.subscribe();
+        if state.diagnostics.source.as_ref() == Some(&document.source)
+            && state.diagnostics.document_version == Some(document.version)
+        {
+            return true;
+        }
+        (document.source.clone(), document.version, revisions)
+    };
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            if revisions.changed().await.is_err() {
+                return false;
+            }
+            let state = state.lock().expect("session lock");
+            if state.diagnostics.source.as_ref() == Some(&source)
+                && state.diagnostics.document_version == Some(version)
+            {
+                return true;
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// Maps one observed filename to the fixed LSP language identifier used for document open.
 /// Unknown extensions deliberately remain plaintext so only configured provider routing can add
 /// semantic behavior.
@@ -1059,6 +1108,7 @@ fn client_router(state: Arc<Mutex<State>>) -> Router<Arc<Mutex<State>>> {
             return ControlFlow::Continue(());
         }
         let binding = params.version.map(|_| document.source.clone());
+        let document_version = document.version;
         state.diagnostics.source = binding;
         state.diagnostics.document_version = params.version;
         state.diagnostics.freshness = Freshness::Provisional;
@@ -1068,6 +1118,12 @@ fn client_router(state: Arc<Mutex<State>>) -> Router<Arc<Mutex<State>>> {
             .into_iter()
             .take(MAX_CONTEXT_ITEMS)
             .collect();
+        if params.version == Some(document_version) {
+            let revision = *state.diagnostic_revision.borrow();
+            state
+                .diagnostic_revision
+                .send_replace(revision.wrapping_add(1));
+        }
         ControlFlow::Continue(())
     });
     router.notification::<RustServerStatus>(|state, status| {

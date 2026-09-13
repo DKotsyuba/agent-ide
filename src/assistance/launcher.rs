@@ -125,6 +125,9 @@ pub struct ProviderLaunch {
     pub settings: AcceptedProviderSettings,
     /// Accepted toolchain identity; gopls and Pyright use absolute executables, Rust a rustup selector.
     pub toolchain: String,
+    /// Absolute operator-declared Node executable for Pyright; absent for Go and Rust. Its measured
+    /// identity must match `toolchain`, and it is the only program permitted to start Pyright.
+    pub node: Option<AcceptedExecutable>,
     /// Absolute operator-declared `cargo` executable for Rust; absent for gopls. Never chosen by
     /// model or project input; its measured identity must match `cargo_version`.
     pub cargo: Option<AcceptedExecutable>,
@@ -277,7 +280,8 @@ impl LauncherConfig {
             .map_err(|_| LauncherError::Invalid)?;
         Self::parse(&bytes)
     }
-    /// Validates bounded trusted JSON without host inference, network access or process effects.
+    /// Validates bounded trusted JSON, including the ceiling of three provider languages per target,
+    /// without host inference, network access, or process effects.
     pub fn parse(bytes: &[u8]) -> Result<Self, LauncherError> {
         if bytes.len() > MAX_CONFIG_BYTES {
             return Err(LauncherError::Invalid);
@@ -322,6 +326,7 @@ impl LauncherConfig {
                 match provider.settings {
                     AcceptedProviderSettings::GoplsDefaults
                         if !absolute(Path::new(&provider.toolchain))
+                            || provider.node.is_some()
                             || provider.cargo.is_some()
                             || provider.cargo_version.is_some()
                             || provider.rustc.is_some()
@@ -330,8 +335,9 @@ impl LauncherConfig {
                         return Err(LauncherError::Rejected);
                     }
                     AcceptedProviderSettings::PyrightDefaultsV1
-                        if !absolute(Path::new(&provider.toolchain))
-                            || provider.cargo.is_some()
+                        if !provider.node.as_ref().is_some_and(|node| {
+                            node.validate().is_ok() && provider.toolchain == node.identity
+                        }) || provider.cargo.is_some()
                             || provider.cargo_version.is_some()
                             || provider.rustc.is_some()
                             || provider.rustc_version.is_some() =>
@@ -339,7 +345,8 @@ impl LauncherConfig {
                         return Err(LauncherError::Rejected);
                     }
                     AcceptedProviderSettings::RustCachePrimingDisabledV1
-                        if !provider.cargo_version.as_deref().is_some_and(identifier)
+                        if provider.node.is_some()
+                            || !provider.cargo_version.as_deref().is_some_and(identifier)
                             || !provider.rustc_version.as_deref().is_some_and(identifier)
                             || !provider.cargo.as_ref().is_some_and(|cargo| {
                                 cargo.validate().is_ok()
@@ -355,14 +362,6 @@ impl LauncherConfig {
                                 && Some(rustc.identity.as_str())
                                     == provider.rustc_version.as_deref()
                         }) =>
-                    {
-                        return Err(LauncherError::Rejected);
-                    }
-                    AcceptedProviderSettings::PyrightDefaultsV1
-                        if provider.cargo.is_some()
-                            || provider.cargo_version.is_some()
-                            || provider.rustc.is_some()
-                            || provider.rustc_version.is_some() =>
                     {
                         return Err(LauncherError::Rejected);
                     }
@@ -429,6 +428,12 @@ impl LauncherConfig {
                 .chain(std::iter::once(&target.codex))
                 .chain(target.cwd_trampoline.iter())
                 .chain(target.providers.iter().map(|provider| &provider.executable))
+                .chain(
+                    target
+                        .providers
+                        .iter()
+                        .filter_map(|provider| provider.node.as_ref()),
+                )
                 .chain(
                     target
                         .providers
@@ -516,7 +521,7 @@ fn launcher_mapping_is_closed_bounded_and_restart_only() {
     invalid["targets"][0]["profiles"][0]["record"]["semantic_state"] = json!("forged");
     assert!(LauncherConfig::parse(invalid.to_string().as_bytes()).is_err());
 
-    let provider = |settings: &str| json!({"executable":executable,"settings":settings,"toolchain":"/usr/bin/true","cargo":null,"cargo_version":null,"rustc":null,"rustc_version":null,"trust":"accepted-local","cache_namespace":"pyright-cache"});
+    let provider = |settings: &str| json!({"executable":executable,"settings":settings,"toolchain":"accepted-git","node":executable,"cargo":null,"cargo_version":null,"rustc":null,"rustc_version":null,"trust":"accepted-local","cache_namespace":"pyright-cache"});
     let mut python_target = target.clone();
     python_target["providers"] = json!([
         provider("pyright_defaults_v1"),

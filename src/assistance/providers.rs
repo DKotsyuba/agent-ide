@@ -420,10 +420,12 @@ impl Worker<'_> {
         let authority = self.authority(&binding).await?;
         let cache_namespace =
             self.provider_cache_namespace(&binding, &authority, launch, &launch.trust)?;
+        let node = launch.node.as_ref().ok_or(FailureCode::ExecutionProfile)?;
         let profile = PyrightProfile::new(PyrightProfileIdentity {
             binary: launch.executable.path.clone(),
             version: launch.executable.identity.clone(),
-            node_toolchain: launch.toolchain.clone(),
+            node: node.path.clone(),
+            node_identity: node.identity.clone(),
             trust: launch.trust.clone(),
             cache_namespace,
         })
@@ -437,7 +439,7 @@ impl Worker<'_> {
             .command(&worktree)
             .map_err(|_| FailureCode::ExecutionProfile)?;
         let request = self
-            .execution_request(job, &authority, command, &launch.executable)
+            .execution_request(job, &authority, command, node)
             .await?;
         let active = self.shared.active(&binding)?;
         let generation = self.providers.next()?;
@@ -1488,6 +1490,9 @@ async fn session_operation<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncW
         options,
         |mut session| async move {
             let context = session.context(&source, &bytes, query).await?;
+            if matches!(session.settings(), ProviderSettings::Pyright(_)) {
+                session.wait_for_matching_diagnostics().await;
+            }
             let diagnostics = session.diagnostics();
             let _ = session.shutdown().await;
             Ok(ProviderContext {

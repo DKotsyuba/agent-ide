@@ -1795,10 +1795,12 @@ async fn configured_product_returns_real_go_and_rust_semantic_context() {
 async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
     let pyright = std::env::var("AGENT_IDE_PYRIGHT").unwrap();
     let node = std::env::var("AGENT_IDE_NODE").unwrap();
+    let node_identity = "node-fixture";
     let providers = json!([{
         "executable":accepted_program(&pyright,"pyright 1.1.413"),
         "settings":"pyright_defaults_v1",
-        "toolchain":node,
+        "toolchain":node_identity,
+        "node":accepted_program(&node,node_identity),
         "cargo":null,
         "cargo_version":null,
         "rustc":null,
@@ -1846,11 +1848,11 @@ async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
     let text = response["text"].as_str().unwrap();
     assert!(text.contains("definitions: [{"), "{response}");
     assert!(text.contains("references: [{"), "{response}");
-    // Per-operation Pyright owns a fresh session, and the current five-tool renderer exposes
-    // neither raw diagnostic messages nor a completed diagnostic barrier for this response.
-    // `detail_ref` is the bounded retrieval path; semantic locations and exact source are the
-    // strongest currently rendered evidence without expanding the facade.
-    assert!(text.contains("diagnostic_count: unknown"), "{response}");
+    assert!(text.contains("diagnostic_count: 1"), "{response}");
+    assert!(
+        text.contains("Type \\\"Literal['bad']\\\" is not assignable to return type \\\"int\\\""),
+        "{response}"
+    );
     assert!(text.contains("return \"bad\""), "{response}");
     std::fs::write(
         &path,
@@ -1875,7 +1877,7 @@ async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
         "{fixed_response}"
     );
     assert!(
-        !fixed_text.contains("return \"bad\"") && fixed_text.contains("diagnostic_count: unknown"),
+        !fixed_text.contains("return \"bad\"") && !fixed_text.contains("Literal['bad']"),
         "stale Pyright diagnostic survived corrected retry: {fixed_response}"
     );
     let diff = actor.call(&fixture, "ide.diff", json!({})).await;
