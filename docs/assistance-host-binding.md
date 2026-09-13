@@ -5,7 +5,7 @@ implements this bounded binding/state boundary; Application separately owns its 
 
 `assistance::host_binding` accepts only metadata that a trusted MCP or hook ingress has already separated from model tool arguments. Host kind is selected explicitly and is never inferred from CWD, PID, timing, permission mode, or arbitrary arguments. It parses Codex `_meta.threadId`, `_meta.callId`, and the required `x-codex-turn-metadata` object into a `CandidateInvocation`. A candidate is a transport observation, never a workspace authority grant.
 
-`HostBindingGuard` first buffers the exact native `PreToolUse` event. The MCP handler then validates its candidate against that pre-observation and can return its result without waiting for `PostToolUse`. The sequence is `PreToolUse` → MCP validation/result → `PostToolUse`: post is later settlement evidence, not a condition for invocation validation. `PostToolUseFailure` settles the same exact call and may request a later registered-path recheck because partial effects remain possible. `PermissionDenied` rejects its exact pending lifecycle without a recheck hint; `PermissionRequest` and manual denial are uncorrelated and unsupported. Child events select `agent_id` while validating the accompanying root `session_id`; root events use `session_id`. `tool_use_id` must match `_meta.callId`. Missing, invalid, mismatched, repeated, oversized, or post-stop data is `Unavailable`. The guard retains bounded pre-observed, active, and completed identifiers and refuses new input when its fixed storage cap is exhausted rather than discarding replay evidence.
+In legacy Codex and Claude mode, `HostBindingGuard` first buffers the exact native `PreToolUse` event. The MCP handler then validates its candidate against that pre-observation and can return its result without waiting for `PostToolUse`. The sequence is `PreToolUse` → MCP validation/result → `PostToolUse`: post is later settlement evidence, not a condition for invocation validation. `PostToolUseFailure` settles the same exact call and may request a later registered-path recheck because partial effects remain possible. `PermissionDenied` rejects its exact pending lifecycle without a recheck hint; `PermissionRequest` and manual denial are uncorrelated and unsupported. Child events select `agent_id` while validating the accompanying root `session_id`; root events use `session_id`. `tool_use_id` must match `_meta.callId`. Missing, invalid, mismatched, repeated, oversized, or post-stop data is `Unavailable`. The guard retains bounded pre-observed, active, and completed identifiers and refuses new input when its fixed storage cap is exhausted rather than discarding replay evidence.
 
 The provider surface is deliberately small: `parse_candidate`, `parse_channel_session`, and `parse_hook_event` create bounded ingress values; `HostBindingGuard::observe_hook`, `establish_start`, `validate_active`, `take_native_change_hint`, `check_active`, `consume_active`, `stop_binding`, and `stop` manage lifecycle. `ValidatedInvocation` exposes only actor ID, call ID, and opaque `BindingRef`; `ActiveBindingUse` exposes only its same opaque ref. Workspace consumes only `ValidatedInvocation` plus a fresh `ActiveBindingUse`; `PreObserved` and `Settled` are lifecycle observations; `NativeObserved` is only an active registered-path recheck hint, while `Unavailable` grants nothing. Application owns crate-root exposure and consumer wiring.
 
@@ -33,14 +33,21 @@ This validation proves only that the supported host metadata and native hook lif
 
 ## Product MCP boundary
 
-`agent-ide mcp --runtime-dir PATH` serves exactly `ide.start`, `ide.context`,
-`ide.diff`, `ide.inspect`, and `ide.stop` over stdio. It validates closed model-argument
-schemas, writes only MCP protocol messages to stdout, and never creates runtime state,
-starts a daemon, or repairs transport. Start `agent-ide daemon --runtime-dir PATH`
-separately. Its `ProductDispatcher` retains one bounded `HostBindingGuard` for the daemon
-lifetime, serialized across all finite Unix IPC connections.
+`agent-ide mcp --launcher-template ABSOLUTE_PATH` is the standard self-contained Codex entrypoint.
+It serves exactly `ide.start`, `ide.context`, `ide.diff`, `ide.inspect`, and `ide.stop` over stdio.
+At startup it captures the subprocess current directory once, creates one fresh private runtime,
+rebinds only the attachment and candidate of an otherwise unchanged single-target launcher
+template, validates the existing launcher/execution evidence, and starts and health-checks one owned
+daemon. Stdio EOF, cancellation, SIGINT, SIGTERM, and startup failure terminate and reap that exact
+daemon before identity-checked removal of its runtime tree. A failed startup serves the same static
+tool list through a deliberately disconnected facade whose calls return bounded native fallback.
 
-For Codex, configure native `PreToolUse`, `PostToolUse`, and available `PostToolBatch` commands to invoke
+Legacy `agent-ide mcp --runtime-dir PATH` remains connect-only: it never creates runtime state,
+starts a daemon, or repairs transport, and its separately started daemon retains the existing
+hook-correlated behavior. Both forms validate the same closed model-argument schemas and write only
+MCP protocol messages to stdout.
+
+For legacy Codex mode, configure native `PreToolUse`, `PostToolUse`, and available `PostToolBatch` commands to invoke
 `agent-ide codex-hook --runtime-dir PATH` for supported native tools as well as this MCP
 server's five `ide.*` tools. The placeholder-only example is
 [`docs/examples/codex-hooks.toml`](examples/codex-hooks.toml). Supply the same `AGENT_IDE_HOST_ATTACHMENT` launch
@@ -91,7 +98,15 @@ correlated sandbox observation and Execution's supported profile shape. Assistan
 and exact call ID remain finite transport request/correlation values. All matching is by
 **attachment + actor + call**, never argument equality, timing, CWD, PID or parent identity.
 
-Only an exact pre-hook followed by `ide.start` creates an actor/channel binding. Later
+In managed Codex mode, `ide.start` creates its binding directly from trusted MCP
+`_meta.threadId`, `_meta.callId`, and advertised/returned `codex/sandbox-state-meta` on the fresh
+process-private attachment. Tool arguments cannot supply actor, candidate, or sandbox state.
+Context and Diff request the existing registered-path reconciliation before capture; Inspect applies
+the same current-byte/stale-detail fencing and queues reconciliation for the next capture, so native
+edits need no Codex hook or watcher. Actors remain isolated by attachment, actor, and binding
+generation. Claude and legacy Codex do not use this direct path.
+
+In legacy mode, only an exact pre-hook followed by `ide.start` creates an actor/channel binding. Later
 ordinary methods require their own matching pre-hook and that binding's current liveness.
 Post-hooks settle previously validated invocations after MCP result delivery. A complete
 native Pre/Post lifecycle without an MCP invocation coalesces a registered-path recheck

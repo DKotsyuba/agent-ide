@@ -73,6 +73,33 @@ impl Mcp {
         mcp
     }
 
+    /// Starts the shipping self-contained managed MCP in `candidate` from one launcher template.
+    async fn start_managed(template: &Path, candidate: &Path) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
+        command
+            .env("TOKIO_WORKER_THREADS", "1")
+            .args(["mcp", "--launcher-template"])
+            .arg(template)
+            .current_dir(candidate)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let mut mcp = Self {
+            input: child.stdin.take().unwrap(),
+            output: BufReader::new(child.stdout.take().unwrap()),
+            child,
+        };
+        let response = mcp.exchange(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"managed-product-contract","version":"1"}
+        }})).await;
+        assert!(response.get("result").is_some(), "{response}");
+        mcp.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+            .await;
+        mcp
+    }
+
     /// Writes and flushes one JSON protocol message without awaiting a response.
     async fn send(&mut self, request: Value) {
         self.input
@@ -118,6 +145,49 @@ impl Mcp {
                 .success()
         );
     }
+}
+
+/// Calls one managed Codex tool using only trusted request metadata for actor and sandbox identity.
+async fn managed_call(
+    mcp: &mut Mcp,
+    id: usize,
+    actor: &str,
+    name: &str,
+    arguments: Value,
+    state: &Value,
+) -> Value {
+    let reply=mcp.exchange(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments,"_meta":{"threadId":actor,"callId":format!("managed-{actor}-{id}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":state}}})).await;
+    reply["result"]["structuredContent"].clone()
+}
+
+/// Polls one managed pending operation through same-actor `ide.inspect` calls until it settles.
+async fn settle_managed(
+    mcp: &mut Mcp,
+    next: &mut usize,
+    actor: &str,
+    state: &Value,
+    mut reply: Value,
+) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while reply["state"] == "pending" {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "managed operation did not settle"
+        );
+        let reference = reply["detail_ref"].as_str().unwrap().to_owned();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        *next += 1;
+        reply = managed_call(
+            mcp,
+            *next,
+            actor,
+            "ide.inspect",
+            json!({"detail_ref":reference}),
+            state,
+        )
+        .await;
+    }
+    reply
 }
 
 /// Supplies valid host-shaped request metadata, outside the model-owned arguments object.
@@ -202,6 +272,52 @@ async fn binary_discovery_is_static_and_inactive_calls_are_fail_open() {
     );
     mcp.close().await;
     assert!(!runtime.exists());
+}
+
+/// Managed startup failure remains a disconnected static five-tool MCP with bounded fallback calls.
+#[tokio::test]
+async fn managed_startup_failure_serves_exact_static_tools_without_ipc() {
+    let candidate = std::env::current_dir().unwrap();
+    let mut mcp = Mcp::start_managed(
+        Path::new("/private/tmp/agent-ide-missing-launcher-template"),
+        &candidate,
+    )
+    .await;
+    let discovery = mcp
+        .exchange(json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
+        .await;
+    let mut names = discovery["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "ide.context",
+            "ide.diff",
+            "ide.inspect",
+            "ide.start",
+            "ide.stop"
+        ]
+    );
+    let unavailable = mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+                "name":"ide.start","arguments":{"activation_id":"fallback"},"_meta":metadata(3)
+            }}),
+        )
+        .await;
+    assert_eq!(unavailable["result"]["isError"], true, "{unavailable}");
+    assert!(
+        unavailable["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("continue with native tools")
+    );
+    mcp.close().await;
 }
 
 /// Proves all five shipping handlers reach the real daemon only after separated launcher and request ingress.
@@ -1292,6 +1408,106 @@ impl ProductActor {
         }
         reply
     }
+}
+
+/// Lists live short managed runtime directories so EOF cleanup can be observed at the product edge.
+fn managed_runtime_paths() -> std::collections::BTreeSet<PathBuf> {
+    std::fs::read_dir(std::fs::canonicalize(std::env::temp_dir()).unwrap())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("ai-") && name.len() == 19)
+        })
+        .collect()
+}
+
+/// Proves managed Codex needs no hooks, observes native edits, isolates actors, and cleans on EOF.
+#[tokio::test]
+async fn managed_codex_smoke_and_eof_cleanup() {
+    let fixture = ProductFixture::new(json!([]));
+    let before = managed_runtime_paths();
+    let mut mcp = Mcp::start_managed(&fixture.config, &fixture.root).await;
+    let during = managed_runtime_paths();
+    assert_eq!(
+        during.difference(&before).count(),
+        1,
+        "{before:?} -> {during:?}"
+    );
+    let state = fixture.state();
+    let actor = "managed-root";
+    let mut next = 10;
+
+    let started = managed_call(
+        &mut mcp,
+        next,
+        actor,
+        "ide.start",
+        json!({"activation_id":"managed-start"}),
+        &state,
+    )
+    .await;
+    let started = settle_managed(&mut mcp, &mut next, actor, &state, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    next += 1;
+    let original = managed_call(
+        &mut mcp,
+        next,
+        actor,
+        "ide.context",
+        json!({"path":"tracked.txt"}),
+        &state,
+    )
+    .await;
+    let original = settle_managed(&mut mcp, &mut next, actor, &state, original).await;
+    assert!(original["text"].as_str().unwrap().contains("worktree"));
+
+    std::fs::write(fixture.root.join("tracked.txt"), "managed-native-edit\n").unwrap();
+    next += 1;
+    let refreshed = managed_call(
+        &mut mcp,
+        next,
+        actor,
+        "ide.context",
+        json!({"path":"tracked.txt"}),
+        &state,
+    )
+    .await;
+    let refreshed = settle_managed(&mut mcp, &mut next, actor, &state, refreshed).await;
+    assert!(
+        refreshed["text"]
+            .as_str()
+            .unwrap()
+            .contains("managed-native-edit")
+    );
+
+    next += 1;
+    let diff = managed_call(&mut mcp, next, actor, "ide.diff", json!({}), &state).await;
+    let diff = settle_managed(&mut mcp, &mut next, actor, &state, diff).await;
+    assert_eq!(diff["kind"], "diff", "{diff}");
+    assert!(
+        diff["text"]
+            .as_str()
+            .unwrap()
+            .contains("managed-native-edit")
+    );
+
+    next += 1;
+    let forged = mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.context","arguments":{"path":"tracked.txt","actor_id":"forged","sandbox":state},"_meta":{"threadId":actor,"callId":format!("managed-{actor}-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":fixture.state()}}})).await;
+    assert_eq!(forged["result"]["isError"], true, "{forged}");
+
+    next += 1;
+    let isolated = mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.context","arguments":{"path":"tracked.txt"},"_meta":{"threadId":"managed-stranger","callId":format!("managed-stranger-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":fixture.state()}}})).await;
+    assert_eq!(isolated["result"]["isError"], true, "{isolated}");
+
+    next += 1;
+    let stopped = managed_call(&mut mcp, next, actor, "ide.stop", json!({}), &state).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    mcp.close().await;
+    assert_eq!(managed_runtime_paths(), before);
 }
 
 /// A reused Start with unusable sandbox metadata is refused without disturbing the live binding.

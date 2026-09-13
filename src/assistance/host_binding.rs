@@ -481,6 +481,86 @@ pub struct HostBindingGuard {
 }
 
 impl HostBindingGuard {
+    /// Establishes a Codex binding directly from trusted managed-MCP metadata.
+    ///
+    /// This path is reserved for a fresh process-private attachment whose dispatcher explicitly
+    /// selected managed Codex mode. It requires no native hook: the trusted MCP adapter has already
+    /// separated `_meta.threadId` and `_meta.callId` from model arguments. The call identity is
+    /// completed immediately for replay protection, and an existing actor/channel generation is
+    /// reused for idempotent explicit starts. Claude and legacy callers continue through their
+    /// hook-correlated methods.
+    pub fn establish_managed_codex_start(
+        &mut self,
+        candidate: CandidateInvocation,
+        channel: ChannelSessionRef,
+    ) -> BindingStatus {
+        self.validate_managed_codex(candidate, channel, true)
+    }
+
+    /// Validates one ordinary Codex invocation on an active managed-MCP actor/channel binding.
+    ///
+    /// The trusted candidate never comes from tool arguments. This method cannot establish or
+    /// reactivate a binding, rejects repeated call IDs permanently within the guard, and is not
+    /// used by hook-correlated legacy or Claude dispatch.
+    pub fn validate_managed_codex_active(
+        &mut self,
+        candidate: CandidateInvocation,
+        channel: ChannelSessionRef,
+    ) -> BindingStatus {
+        self.validate_managed_codex(candidate, channel, false)
+    }
+
+    /// Applies the shared bounded binding and replay rules to one direct managed Codex call.
+    fn validate_managed_codex(
+        &mut self,
+        candidate: CandidateInvocation,
+        channel: ChannelSessionRef,
+        establish: bool,
+    ) -> BindingStatus {
+        let invocation = (candidate.clone(), channel.clone());
+        if candidate.host != HostKind::Codex
+            || self.replay_disposition(&candidate, &channel).is_some()
+            || self.pre_observed.contains(&invocation)
+            || self.settling.contains_key(&invocation)
+        {
+            return BindingStatus::Unavailable(BindingUnavailable::Replay);
+        }
+        if self.replay_scope_saturated(&candidate, &channel)
+            || self.ensure_replay_scope(&candidate, &channel).is_err()
+        {
+            return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
+        }
+        let binding_key = (candidate.host, candidate.actor_id.clone(), channel.clone());
+        let (binding, created_binding) = match self.bindings.get(&binding_key).cloned() {
+            Some(binding) => (binding, false),
+            None if establish => {
+                if self.bindings.len() >= MAX_BINDINGS {
+                    return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
+                }
+                let Some(generation) = self.next_generation.checked_add(1) else {
+                    return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
+                };
+                self.next_generation = generation;
+                let binding = BindingRef {
+                    host: candidate.host,
+                    actor_id: candidate.actor_id.clone(),
+                    channel,
+                    generation,
+                };
+                self.bindings.insert(binding_key, binding.clone());
+                (binding, true)
+            }
+            None => {
+                self.record_replay(&invocation, ReplayDisposition::Rejected)
+                    .expect("the checked managed replay scope has capacity");
+                return BindingStatus::Unavailable(BindingUnavailable::InactiveBinding);
+            }
+        };
+        self.record_replay(&invocation, ReplayDisposition::Completed)
+            .expect("the checked managed replay scope has capacity");
+        BindingStatus::Validated(validated(candidate, binding, created_binding))
+    }
+
     /// Establishes an explicit start binding after its exact native pre-hook is already observed.
     ///
     /// Missing pre-observation rejects this invocation permanently within the daemon lifetime.
@@ -700,6 +780,19 @@ impl HostBindingGuard {
     ) -> Result<bool, BindingUnavailable> {
         self.check_active(binding)?;
         Ok(self.native_hints.remove(binding))
+    }
+
+    /// Requests registered-path reconciliation for one active managed Codex binding.
+    ///
+    /// Unlike a native hook observation, this records no tool lifecycle or claimed source effect.
+    /// It only coalesces the same worker hint so the next read job reuses existing reconciliation.
+    pub(crate) fn request_registered_path_reconciliation(
+        &mut self,
+        binding: &BindingRef,
+    ) -> Result<(), BindingUnavailable> {
+        self.check_active(binding)?;
+        self.native_hints.insert(binding.clone());
+        Ok(())
     }
 
     /// Returns retained rejection or completion evidence for one exact scoped call.
@@ -1347,6 +1440,45 @@ mod tests {
             .as_bytes(),
         )
         .expect("test hook is valid")
+    }
+
+    /// Direct managed Codex binding needs no hook, rejects replay, and isolates actors by channel.
+    #[test]
+    fn managed_codex_binding_is_direct_replay_safe_and_actor_isolated() {
+        let mut guard = HostBindingGuard::default();
+        let channel = channel("managed-channel");
+        let BindingStatus::Validated(started) = guard
+            .establish_managed_codex_start(codex_candidate("actor-a", "start"), channel.clone())
+        else {
+            panic!("managed start must bind directly");
+        };
+        assert!(started.created_binding());
+        assert!(matches!(
+            guard.validate_managed_codex_active(
+                codex_candidate("actor-a", "context"),
+                channel.clone()
+            ),
+            BindingStatus::Validated(_)
+        ));
+        assert!(matches!(
+            guard.validate_managed_codex_active(
+                codex_candidate("actor-a", "context"),
+                channel.clone()
+            ),
+            BindingStatus::Unavailable(BindingUnavailable::Replay)
+        ));
+        assert!(matches!(
+            guard.validate_managed_codex_active(
+                codex_candidate("actor-b", "context"),
+                channel.clone()
+            ),
+            BindingStatus::Unavailable(BindingUnavailable::InactiveBinding)
+        ));
+        assert!(matches!(
+            guard.establish_start(codex_candidate("actor-b", "legacy"), channel),
+            BindingStatus::Unavailable(BindingUnavailable::MissingPre)
+        ));
+        guard.stop_binding(started.binding_ref()).unwrap();
     }
 
     /// Caps pending calls per exact scope so one actor cannot deny a peer in the same channel.

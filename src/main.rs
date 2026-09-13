@@ -1,10 +1,13 @@
 //! Command-line entrypoint for the MCP facade, Codex hook, local daemon, and doctor.
 
 use std::ffi::OsString;
-use std::io::Read;
-use std::path::PathBuf;
-use std::process::ExitCode;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
+use std::process::{ExitCode, Stdio};
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent_ide::app::{
     AppError, DoctorReport, DoctorStatus, RuntimeDir, config::EffectiveConfig, doctor_report,
@@ -28,6 +31,13 @@ async fn main() -> ExitCode {
                 runtime_dir,
                 Arc::new(match std::env::var("AGENT_IDE_LAUNCHER_CONFIG") {
                     Ok(path) => match LauncherConfig::read(std::path::Path::new(&path)) {
+                        Ok(config)
+                            if std::env::var("AGENT_IDE_MANAGED_CODEX_ATTACHMENT")
+                                .ok()
+                                .is_some_and(|attachment| config.target(&attachment).is_some()) =>
+                        {
+                            ProductDispatcher::with_managed_codex_launcher(config)
+                        }
                         Ok(config) => ProductDispatcher::with_launcher(config),
                         Err(_) => return fail(AppError::InvalidResponse),
                     },
@@ -79,6 +89,11 @@ async fn main() -> ExitCode {
                 },
                 Err(_) => fail(AppError::InvalidResponse),
             }
+        }
+        Ok(Command::ManagedMcp { launcher_template }) => {
+            // Capture exactly once before setup or any async work can change process state.
+            let candidate = std::env::current_dir();
+            run_managed_mcp(launcher_template, candidate).await
         }
         Ok(Command::ClaudeWorker {
             runtime_dir,
@@ -279,6 +294,11 @@ enum Command {
     Daemon { runtime_dir: PathBuf },
     /// Serves the static five-tool MCP surface on stdio without creating local runtime state.
     Mcp { runtime_dir: PathBuf },
+    /// Owns one private daemon and serves the same static five-tool surface until stdio ends.
+    ManagedMcp {
+        /// Absolute one-target launcher template rebound to this process and captured candidate.
+        launcher_template: PathBuf,
+    },
     /// Submits one bounded native Codex hook and exits successfully on every ingress failure.
     CodexHook {
         /// Existing daemon endpoint directory; never created by the hook command.
@@ -454,13 +474,18 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
             path: PathBuf::from(path),
         });
     }
-    let [mode, flag, runtime_dir] = arguments.as_slice() else {
+    let [mode, flag, value] = arguments.as_slice() else {
         return Err(AppError::InvalidResponse);
     };
+    if mode == "mcp" && flag == "--launcher-template" {
+        return Ok(Command::ManagedMcp {
+            launcher_template: PathBuf::from(value),
+        });
+    }
     if flag != "--runtime-dir" {
         return Err(AppError::InvalidResponse);
     }
-    let runtime_dir = PathBuf::from(runtime_dir);
+    let runtime_dir = PathBuf::from(value);
     match mode.to_str() {
         Some("daemon") => Ok(Command::Daemon { runtime_dir }),
         Some("doctor") => Ok(Command::Doctor { runtime_dir }),
@@ -468,6 +493,261 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
         Some("codex-hook") => Ok(Command::CodexHook { runtime_dir }),
         Some("claude-hook") => Ok(Command::ClaudeHook { runtime_dir }),
         _ => Err(AppError::InvalidResponse),
+    }
+}
+
+/// Owns the identity of one freshly created managed runtime tree.
+///
+/// The recorded device and inode fence cleanup against pathname replacement. The directory is
+/// private to this MCP process and must be removed only after its exact daemon child is reaped.
+struct ManagedRuntime {
+    /// Short absolute directory used by the owned daemon's Unix socket and private state.
+    path: PathBuf,
+    /// Device identity captured immediately after exclusive creation.
+    device: u64,
+    /// Inode identity captured immediately after exclusive creation.
+    inode: u64,
+}
+
+impl ManagedRuntime {
+    /// Creates one unpredictable private directory below the canonical OS temp root with mode `0700`.
+    ///
+    /// At most sixteen exclusive attempts are made. No existing path is opened, repaired, or
+    /// removed. Returns an I/O error when entropy, creation, or identity capture fails.
+    fn create() -> std::io::Result<Self> {
+        let temporary_root = fs::canonicalize(std::env::temp_dir())?;
+        for _ in 0..16 {
+            let name = format!("ai-{}", random_hex(8)?);
+            let path = temporary_root.join(name);
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&path) {
+                Ok(()) => {
+                    let metadata = fs::symlink_metadata(&path)?;
+                    return Ok(Self {
+                        path,
+                        device: metadata.dev(),
+                        inode: metadata.ino(),
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "managed runtime collision limit reached",
+        ))
+    }
+
+    /// Writes the already validated bound launcher bytes once with mode `0600`.
+    ///
+    /// The returned absolute path is passed only to the exact daemon child. Existing files are
+    /// never overwritten, and a short write leaves managed startup unavailable.
+    fn write_launcher(&self, bytes: &[u8]) -> std::io::Result<PathBuf> {
+        let path = self.path.join("launcher.json");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(path)
+    }
+
+    /// Removes this runtime tree only while its original private directory identity still matches.
+    ///
+    /// A missing tree is already clean. A symlink, owner/mode change, device change, or inode
+    /// replacement is left untouched and reported as an error. Callers must reap the daemon first.
+    fn remove(self) -> std::io::Result<()> {
+        let metadata = match fs::symlink_metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o077 != 0
+            || metadata.dev() != self.device
+            || metadata.ino() != self.inode
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "managed runtime identity changed",
+            ));
+        }
+        fs::remove_dir_all(self.path)
+    }
+}
+
+/// Returns `bytes` of operating-system randomness as lowercase hexadecimal.
+///
+/// The output is used only for unguessable private runtime and attachment names. Entropy failure
+/// rejects managed startup rather than falling back to PID, time, or a reusable identifier.
+fn random_hex(bytes: usize) -> std::io::Result<String> {
+    let mut random = vec![0_u8; bytes];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+    Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Returns whether a path is absolute and lexically normalized without parent traversal.
+fn absolute_local_path(path: &Path) -> bool {
+    path.is_absolute()
+        && path
+            .components()
+            .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+}
+
+/// Starts, health-checks, serves, and tears down one self-contained managed MCP generation.
+///
+/// Setup failure still serves the static five tools through a connect-only unavailable facade.
+/// Successful setup binds one captured local candidate to one random attachment, starts exactly
+/// one daemon child, and tears it down on stdio EOF, MCP cancellation, SIGINT, or SIGTERM.
+async fn run_managed_mcp(
+    launcher_template: PathBuf,
+    candidate: std::io::Result<PathBuf>,
+) -> ExitCode {
+    let Ok(runtime) = ManagedRuntime::create() else {
+        return serve_managed_stdio(StdioFacade::unavailable(), None, None).await;
+    };
+    let runtime_path = runtime.path.clone();
+    let started = start_managed_daemon(&runtime, &launcher_template, candidate).await;
+    match started {
+        Ok((attachment, child)) => {
+            let Some(facade) = StdioFacade::with_host_attachment(runtime_path, attachment) else {
+                terminate_owned_daemon(child).await;
+                let _ = runtime.remove();
+                return serve_managed_stdio(StdioFacade::unavailable(), None, None).await;
+            };
+            serve_managed_stdio(facade, Some(child), Some(runtime)).await
+        }
+        Err(()) => {
+            let _ = runtime.remove();
+            serve_managed_stdio(StdioFacade::unavailable(), None, None).await
+        }
+    }
+}
+
+/// Validates the managed inputs and returns the exact healthy daemon child and private attachment.
+///
+/// The candidate must be the one captured by the parent and remain an absolute local directory.
+/// Git identity is deliberately discovered later by the existing worker activation path. Launcher
+/// executables and profiles are validated through [`LauncherConfig`] before the child starts.
+async fn start_managed_daemon(
+    runtime: &ManagedRuntime,
+    launcher_template: &Path,
+    candidate: std::io::Result<PathBuf>,
+) -> Result<(String, tokio::process::Child), ()> {
+    let candidate = candidate.map_err(|_| ())?;
+    if !absolute_local_path(&candidate)
+        || !fs::symlink_metadata(&candidate).is_ok_and(|metadata| metadata.is_dir())
+        || !absolute_local_path(launcher_template)
+    {
+        return Err(());
+    }
+    let attachment = random_hex(32).map_err(|_| ())?;
+    let (launcher, bytes) =
+        LauncherConfig::bind_one_candidate(launcher_template, &attachment, &candidate)
+            .map_err(|_| ())?;
+    launcher.verify().map_err(|_| ())?;
+    let launcher_path = runtime.write_launcher(&bytes).map_err(|_| ())?;
+    let mut child = tokio::process::Command::new(std::env::current_exe().map_err(|_| ())?)
+        .args(["daemon", "--runtime-dir"])
+        .arg(&runtime.path)
+        .env("AGENT_IDE_LAUNCHER_CONFIG", launcher_path)
+        .env("AGENT_IDE_MANAGED_CODEX_ATTACHMENT", &attachment)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| ())?;
+    if !health_check_owned_daemon(&mut child, &runtime.path).await {
+        terminate_owned_daemon(child).await;
+        return Err(());
+    }
+    Ok((attachment, child))
+}
+
+/// Waits a bounded interval for the exact child to answer the existing side-effect-free health RPC.
+async fn health_check_owned_daemon(child: &mut tokio::process::Child, runtime: &Path) -> bool {
+    tokio::time::timeout(Duration::from_secs(7), async {
+        loop {
+            if child.try_wait().ok().flatten().is_some() {
+                return false;
+            }
+            if doctor_report(runtime)
+                .await
+                .is_ok_and(|report| matches!(report.status, DoctorStatus::Healthy { .. }))
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Serves one static MCP facade and always cleans up an optional owned daemon/runtime generation.
+async fn serve_managed_stdio(
+    facade: StdioFacade,
+    child: Option<tokio::process::Child>,
+    runtime: Option<ManagedRuntime>,
+) -> ExitCode {
+    let served = match serve_server(facade, stdio()).await {
+        Ok(service) => {
+            tokio::select! {
+                result = service.waiting() => result.is_ok(),
+                () = managed_termination_signal() => true,
+            }
+        }
+        Err(_) => false,
+    };
+    if let Some(child) = child {
+        terminate_owned_daemon(child).await;
+    }
+    if let Some(runtime) = runtime {
+        let _ = runtime.remove();
+    }
+    if served {
+        ExitCode::SUCCESS
+    } else {
+        fail(AppError::InvalidResponse)
+    }
+}
+
+/// Resolves after the first process SIGINT or SIGTERM; registration failure waits for stdio EOF.
+async fn managed_termination_signal() {
+    let (Ok(mut interrupt), Ok(mut terminate)) = (
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()),
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()),
+    ) else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    tokio::select! {
+        _ = interrupt.recv() => {}
+        _ = terminate.recv() => {}
+    }
+}
+
+/// Sends SIGTERM to the exact owned daemon PID, waits for its provider cleanup, then force-reaps.
+async fn terminate_owned_daemon(mut child: tokio::process::Child) {
+    if child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+    if let Some(pid) = child.id() {
+        let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    }
+    if tokio::time::timeout(Duration::from_secs(42), child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
     }
 }
 
@@ -626,5 +906,19 @@ mod tests {
             Err(AppError::InvalidResponse)
         ));
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// Managed MCP uses its distinct absolute launcher-template form while legacy MCP is unchanged.
+    #[test]
+    fn managed_and_legacy_mcp_cli_forms_are_distinct() {
+        assert!(matches!(
+            command(args(&["mcp", "--launcher-template", "/private/tmp/template.json"])),
+            Ok(Command::ManagedMcp { launcher_template })
+                if launcher_template == Path::new("/private/tmp/template.json")
+        ));
+        assert!(matches!(
+            command(args(&["mcp", "--runtime-dir", "/private/tmp/runtime"])),
+            Ok(Command::Mcp { runtime_dir }) if runtime_dir == Path::new("/private/tmp/runtime")
+        ));
     }
 }

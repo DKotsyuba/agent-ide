@@ -874,6 +874,22 @@ impl WorkerHandle {
         self.shared.notify.notify_one();
     }
 
+    /// Coalesces managed-Codex registered-path reconciliation at a trusted read boundary.
+    ///
+    /// `invalidate` is true for new Context/Diff captures, which must fence older retained output;
+    /// Inspect instead performs its existing direct current-byte checks and leaves a hint for the
+    /// next worker job without invalidating a pending result merely because it was polled.
+    pub fn managed_read_boundary(&self, binding: BindingRef, invalidate: bool) {
+        if self.shared.bindings.lock().is_ok_and(|mut guard| {
+            guard
+                .request_registered_path_reconciliation(&binding)
+                .is_ok()
+        }) && invalidate
+        {
+            self.native_hint(binding);
+        }
+    }
+
     /// Returns and consumes one same-binding delta only after a newer native epoch and source recheck.
     ///
     /// Missing, stopped, unchanged-epoch, stale, unversioned, or already-inline-delivered feedback

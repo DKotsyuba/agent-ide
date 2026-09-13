@@ -17,10 +17,22 @@ authenticated GitHub CLI, verifies `SHA256SUMS`, and atomically installs to
 `~/.local/bin` (override with `AGENT_IDE_INSTALL_DIR`). It does not edit MCP or hook
 configuration.
 
-Build locally with `cargo build --locked --bin agent-ide`. Configure an MCP client to launch
-`target/debug/agent-ide mcp --runtime-dir PATH`. Discovery works without a daemon;
-inactive calls return a bounded error directing the caller to native tools. Start the
-daemon separately with `target/debug/agent-ide daemon --runtime-dir PATH`.
+Build locally with `cargo build --locked --bin agent-ide`. The standard Codex setup is one
+machine-local entry in `~/.codex/config.toml` (replace both absolute paths):
+
+```toml
+[mcp_servers.agent-ide]
+command = "/absolute/path/to/agent-ide"
+args = ["mcp", "--launcher-template", "/absolute/path/to/launcher.json"]
+```
+
+The launcher file uses the existing schema and must contain exactly one target. Managed MCP captures
+the host-selected current directory, replaces only that target's candidate and a fresh internal
+attachment, validates the result, and owns its private daemon until stdio closes. Startup failure
+still exposes the same five tools with disconnected native-fallback results. A repository plugin
+manifest cannot safely supply the machine-specific template path, so it remains normal host config.
+Legacy `agent-ide mcp --runtime-dir PATH` remains connect-only and compatible with separately
+started `agent-ide daemon --runtime-dir PATH` instances.
 
 The separate launcher environment variable `AGENT_IDE_HOST_ATTACHMENT` enables
 connect-only routing when supported host request metadata is also present. It is an

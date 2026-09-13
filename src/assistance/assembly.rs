@@ -54,6 +54,8 @@ pub struct ProductDispatcher {
     /// Held here so the same controller reaches both the worker and the Claude launch ledger:
     /// ordinary operations and foreground helper children draw from one configured global budget.
     admission: Arc<Mutex<crate::execution::AdmissionController>>,
+    /// Enables direct trusted Codex metadata binding only for an owned managed-MCP daemon.
+    managed_codex: bool,
 }
 
 /// Returns a monotonic millisecond reading for ticket deadlines.
@@ -97,6 +99,7 @@ impl Default for ProductDispatcher {
                 .filter(|path| path.is_absolute()),
             runtime_dir: Arc::new(Mutex::new(None)),
             endpoint: Mutex::new(None),
+            managed_codex: false,
         }
     }
 }
@@ -112,6 +115,16 @@ impl ProductDispatcher {
                 dispatcher.admission.clone(),
             ));
         }
+        dispatcher
+    }
+    /// Installs one launcher for an owned managed-MCP daemon with direct Codex metadata binding.
+    ///
+    /// The caller must supply the fresh process-private attachment configuration produced by
+    /// [`LauncherConfig::bind_one_candidate`]. Legacy daemon construction remains hook-correlated,
+    /// and Claude always retains its existing hook/helper lifecycle.
+    pub fn with_managed_codex_launcher(launcher: LauncherConfig) -> Self {
+        let mut dispatcher = Self::with_launcher(launcher);
+        dispatcher.managed_codex = true;
         dispatcher
     }
     /// Derives the same opaque channel for hook/MCP input under this exact daemon nonce.
@@ -565,7 +578,11 @@ impl ProductDispatcher {
                             if candidate.call_id() != method.correlation_id() {
                                 return None;
                             }
-                            if method.method() == AssistanceMethod::Start {
+                            if self.managed_codex && method.method() == AssistanceMethod::Start {
+                                bindings.establish_managed_codex_start(candidate, channel)
+                            } else if self.managed_codex {
+                                bindings.validate_managed_codex_active(candidate, channel)
+                            } else if method.method() == AssistanceMethod::Start {
                                 bindings.establish_start(candidate, channel)
                             } else {
                                 bindings.validate_active(candidate, channel)
@@ -697,6 +714,22 @@ impl ProductDispatcher {
                             reply
                         }
                     });
+                }
+                if self.managed_codex
+                    && matches!(
+                        method.method(),
+                        AssistanceMethod::Context
+                            | AssistanceMethod::Diff
+                            | AssistanceMethod::Inspect
+                    )
+                {
+                    // Managed Codex has no native hook stream. Treat every read boundary as a
+                    // possible native edit and reuse the worker's registered-path reconciliation
+                    // and stale-detail fencing instead of adding a watcher or trusting tool args.
+                    worker.managed_read_boundary(
+                        invocation.binding_ref().clone(),
+                        method.method() != AssistanceMethod::Inspect,
+                    );
                 }
                 Some(match method.method() {
                     AssistanceMethod::Stop => {

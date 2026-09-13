@@ -300,6 +300,58 @@ impl LauncherConfig {
             .map_err(|_| LauncherError::Invalid)?;
         Self::parse(&bytes)
     }
+    /// Clones one trusted single-target template onto a fresh attachment and host-selected candidate.
+    ///
+    /// `path` is read under the normal launcher byte bound. The template must already satisfy the
+    /// complete launcher schema and contain exactly one target; only that target's `attachment` and
+    /// `candidate` values are replaced. `attachment` is the private process-generated channel and
+    /// `candidate` is the absolute local directory captured by managed MCP startup. The returned
+    /// bytes are the exact validated configuration suitable for the owned daemon subprocess.
+    /// Multi-target parsing and legacy launcher loading remain unchanged. Returns `Rejected` for a
+    /// non-single-target template or malformed replacement and `Invalid` for unreadable/invalid JSON.
+    pub fn bind_one_candidate(
+        path: &Path,
+        attachment: &str,
+        candidate: &Path,
+    ) -> Result<(Self, Vec<u8>), LauncherError> {
+        let mut bytes = Vec::new();
+        File::open(path)
+            .and_then(|file| {
+                file.take((MAX_CONFIG_BYTES + 1) as u64)
+                    .read_to_end(&mut bytes)
+            })
+            .map_err(|_| LauncherError::Invalid)?;
+        if bytes.len() > MAX_CONFIG_BYTES {
+            return Err(LauncherError::Invalid);
+        }
+        let mut template: Value =
+            serde_json::from_slice(&bytes).map_err(|_| LauncherError::Invalid)?;
+        let targets = template
+            .as_object_mut()
+            .and_then(|object| object.get_mut("targets"))
+            .and_then(Value::as_array_mut)
+            .ok_or(LauncherError::Invalid)?;
+        let [target] = targets.as_mut_slice() else {
+            return Err(LauncherError::Rejected);
+        };
+        let target = target.as_object_mut().ok_or(LauncherError::Invalid)?;
+        if !target.contains_key("attachment") || !target.contains_key("candidate") {
+            return Err(LauncherError::Rejected);
+        }
+        target.insert("attachment".into(), Value::String(attachment.to_owned()));
+        target.insert(
+            "candidate".into(),
+            Value::String(
+                candidate
+                    .to_str()
+                    .ok_or(LauncherError::Rejected)?
+                    .to_owned(),
+            ),
+        );
+        let bytes = serde_json::to_vec(&template).map_err(|_| LauncherError::Invalid)?;
+        let launcher = Self::parse(&bytes)?;
+        Ok((launcher, bytes))
+    }
     /// Validates bounded trusted JSON, including the ceiling of three provider languages per target,
     /// without host inference, network access, or process effects.
     pub fn parse(bytes: &[u8]) -> Result<Self, LauncherError> {
@@ -535,6 +587,27 @@ fn launcher_mapping_is_closed_bounded_and_restart_only() {
     );
     assert!(loaded.target("different").is_none());
     assert!(!format!("{loaded:?}").contains("private-attachment"));
+    let template_path = std::env::temp_dir().join(format!(
+        "agent-ide-bind-one-template-{}.json",
+        std::process::id()
+    ));
+    std::fs::write(&template_path, config.to_string()).unwrap();
+    let (bound, bound_bytes) = LauncherConfig::bind_one_candidate(
+        &template_path,
+        "fresh-managed-attachment",
+        Path::new("/private/tmp/captured-worktree"),
+    )
+    .unwrap();
+    assert_eq!(
+        bound.target("fresh-managed-attachment").unwrap().candidate,
+        PathBuf::from("/private/tmp/captured-worktree")
+    );
+    let rebound: Value = serde_json::from_slice(&bound_bytes).unwrap();
+    let mut expected = config.clone();
+    expected["targets"][0]["attachment"] = Value::String("fresh-managed-attachment".into());
+    expected["targets"][0]["candidate"] = Value::String("/private/tmp/captured-worktree".into());
+    assert_eq!(rebound, expected);
+    std::fs::remove_file(template_path).unwrap();
     for changed in [
         json!({"version":2,"limits":config["limits"],"targets":[]}),
         json!({"version":1,"limits":config["limits"],"targets":[target.clone(),target.clone()]}),

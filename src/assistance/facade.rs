@@ -351,7 +351,8 @@ pub enum FacadeOutcome {
 /// Owns one local facade endpoint and the finite limits for every connect-only dispatch.
 #[derive(Clone, Debug)]
 pub struct AssistanceFacade {
-    runtime_dir: PathBuf,
+    /// Connect-only endpoint root, absent for a deliberately disconnected facade.
+    runtime_dir: Option<PathBuf>,
     limits: HookTransportLimits,
 }
 
@@ -359,7 +360,20 @@ impl AssistanceFacade {
     /// Creates a facade that never prepares a runtime directory or starts a daemon.
     pub fn new(runtime_dir: PathBuf) -> Self {
         Self {
-            runtime_dir,
+            runtime_dir: Some(runtime_dir),
+            limits: HookTransportLimits::new(128 * 1024, MAX_HOOK_BYTES, Duration::from_secs(1))
+                .expect("fixed Assistance transport limits are valid"),
+        }
+    }
+
+    /// Creates a facade that exposes static schemas but can never attempt local IPC.
+    ///
+    /// This is the managed-startup failure state: calls still receive bounded validation and an
+    /// honest unavailable result, while no predictable or caller-derived socket path can receive
+    /// trusted host metadata.
+    pub fn unavailable() -> Self {
+        Self {
+            runtime_dir: None,
             limits: HookTransportLimits::new(128 * 1024, MAX_HOOK_BYTES, Duration::from_secs(1))
                 .expect("fixed Assistance transport limits are valid"),
         }
@@ -378,6 +392,9 @@ impl AssistanceFacade {
         let Ok(call) = validate_call(tool, parameters) else {
             return FacadeOutcome::InvalidParameters;
         };
+        let Some(runtime_dir) = &self.runtime_dir else {
+            return FacadeOutcome::Unavailable;
+        };
         let Some(parameters) = OpaqueJson::from_value(
             &json!({"parameters":call.parameters(),"host_meta":host.host_meta}),
             MAX_HOOK_BYTES,
@@ -393,7 +410,7 @@ impl AssistanceFacade {
         ) else {
             return FacadeOutcome::Unavailable;
         };
-        match dispatch_method_if_running(&self.runtime_dir, request, self.limits).await {
+        match dispatch_method_if_running(runtime_dir, request, self.limits).await {
             MethodDispatchTransportResult::Unavailable => FacadeOutcome::Unavailable,
             MethodDispatchTransportResult::Dispatched { opaque_result_json } => {
                 match PeerReply::decode(opaque_result_json.as_str()) {
@@ -756,6 +773,19 @@ impl StdioFacade {
     pub fn new(runtime_dir: PathBuf) -> Self {
         Self {
             facade: AssistanceFacade::new(runtime_dir),
+            attachment: None,
+            router: Self::tool_router(),
+        }
+    }
+
+    /// Creates a disconnected five-tool facade for managed startup failure.
+    ///
+    /// Discovery remains static and calls validate normally before returning unavailable. The
+    /// facade contains neither a host attachment nor an IPC path, so it cannot disclose request
+    /// metadata to an unrelated local socket.
+    pub fn unavailable() -> Self {
+        Self {
+            facade: AssistanceFacade::unavailable(),
             attachment: None,
             router: Self::tool_router(),
         }
