@@ -29,7 +29,7 @@ pub struct PyrightProfileIdentity {
     pub binary: PathBuf,
     /// Nonempty accepted Pyright version identity.
     pub version: String,
-    /// Nonempty accepted Node toolchain identity; it is never inferred from source or environment.
+    /// Absolute accepted Node executable; it is never inferred from source or environment.
     pub node_toolchain: String,
     /// Explicit operator trust identity retained in the exclusive compatibility key.
     pub trust: String,
@@ -46,8 +46,10 @@ pub struct PyrightProfile {
     binary_digest: blake3::Hash,
     /// Accepted Pyright version identity.
     version: String,
-    /// Accepted Node toolchain identity.
-    node_toolchain: String,
+    /// Absolute accepted Node executable used by the Pyright launcher.
+    node_toolchain: PathBuf,
+    /// Measured Node executable bytes retained in the compatibility key.
+    node_toolchain_digest: blake3::Hash,
     /// Explicit operator trust identity.
     trust: String,
     /// Absolute private cache namespace.
@@ -55,15 +57,22 @@ pub struct PyrightProfile {
 }
 
 impl PyrightProfile {
-    /// Validates and measures one accepted executable without consulting project Python settings.
+    /// Validates and measures accepted Pyright and Node executables without consulting project Python settings.
     pub fn new(identity: PyrightProfileIdentity) -> Result<Self, PyrightProfileError> {
         let binary_digest = crate::execution::measured_executable_digest(&identity.binary)
+            .map_err(|_| PyrightProfileError::InvalidProfile)?;
+        let node_toolchain = PathBuf::from(identity.node_toolchain);
+        if !node_toolchain.is_absolute() {
+            return Err(PyrightProfileError::InvalidProfile);
+        }
+        let node_toolchain_digest = crate::execution::measured_executable_digest(&node_toolchain)
             .map_err(|_| PyrightProfileError::InvalidProfile)?;
         let profile = Self {
             binary: identity.binary,
             binary_digest,
             version: identity.version,
-            node_toolchain: identity.node_toolchain,
+            node_toolchain,
+            node_toolchain_digest,
             trust: identity.trust,
             cache_namespace: identity.cache_namespace,
         };
@@ -73,23 +82,30 @@ impl PyrightProfile {
             .ok_or(PyrightProfileError::InvalidProfile)
     }
 
-    /// Builds fixed `pyright-langserver --stdio` with only the launcher directory on `PATH`.
+    /// Builds fixed `pyright-langserver --stdio` with launcher and configured Node parents on `PATH`.
     pub fn command(
         &self,
         worktree: &PyrightWorktree,
     ) -> Result<ControlledCommand, PyrightProfileError> {
-        let parent = self
+        let launcher_parent = self
             .binary
             .parent()
             .filter(|path| path.is_absolute())
             .ok_or(PyrightProfileError::InvalidProfile)?;
+        let node_parent = self
+            .node_toolchain
+            .parent()
+            .filter(|path| path.is_absolute())
+            .ok_or(PyrightProfileError::InvalidProfile)?;
+        let path = std::env::join_paths([launcher_parent, node_parent])
+            .map_err(|_| PyrightProfileError::InvalidProfile)?;
         ControlledCommand::from_validated_peer(
             CommandKind::Provider,
             self.binary.clone(),
             vec![OsString::from("--stdio")],
             worktree.worktree().worktree_path().to_path_buf(),
             BTreeMap::from([
-                (OsString::from("PATH"), parent.as_os_str().to_os_string()),
+                (OsString::from("PATH"), path),
                 (
                     OsString::from("TMPDIR"),
                     OsString::from(Path::new(&self.cache_namespace).join("tmp")),
@@ -132,11 +148,12 @@ impl PyrightProfile {
     fn compatibility_key(&self, worktree: &PyrightWorktree) -> String {
         blake3::hash(
             format!(
-                "{}\0{}\0{}\0{}\0{}\0{}\0{}",
+                "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
                 self.binary.display(),
                 self.binary_digest,
                 self.version,
-                self.node_toolchain,
+                self.node_toolchain.display(),
+                self.node_toolchain_digest,
                 self.trust,
                 self.cache_namespace,
                 worktree.worktree().incarnation(),
@@ -150,15 +167,11 @@ impl PyrightProfile {
     /// Checks the closed profile invariants before any admission or command construction.
     fn valid(&self) -> bool {
         self.binary.is_absolute()
+            && self.node_toolchain.is_absolute()
             && Path::new(&self.cache_namespace).is_absolute()
-            && [
-                &self.version,
-                &self.node_toolchain,
-                &self.trust,
-                &self.cache_namespace,
-            ]
-            .iter()
-            .all(|value| !value.is_empty() && value.len() <= 4096)
+            && [&self.version, &self.trust, &self.cache_namespace]
+                .iter()
+                .all(|value| !value.is_empty() && value.len() <= 4096)
     }
 }
 
@@ -322,5 +335,74 @@ impl PyrightProtocolChild {
             .cancel_and_reap(grace, deadline)
             .await
             .map_err(PyrightProfileError::Process)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a canonical worktree/authority pair for profile-only command construction tests.
+    fn worktree() -> PyrightWorktree {
+        let root = std::env::temp_dir();
+        let worktree =
+            WorktreeRef::from_discovery(root.clone(), root.clone(), root.join(".git"), 1).unwrap();
+        let authority = WorkspaceAuthority::from_workspace(
+            worktree.id(),
+            worktree.incarnation().to_string(),
+            root,
+            1,
+        )
+        .unwrap();
+        PyrightWorktree::new(worktree, authority).unwrap()
+    }
+
+    /// Builds one measured Pyright profile for a supplied operator-declared Node executable.
+    fn profile(node_toolchain: &str) -> Result<PyrightProfile, PyrightProfileError> {
+        PyrightProfile::new(PyrightProfileIdentity {
+            binary: "/usr/bin/true".into(),
+            version: "pyright-test".into(),
+            node_toolchain: node_toolchain.into(),
+            trust: "test".into(),
+            cache_namespace: "/private/tmp/agent-ide-pyright-profile-test-cache".into(),
+        })
+    }
+
+    /// Requires an absolute measured Node executable and carries its identity into command compatibility.
+    #[test]
+    fn profile_requires_node_executable_and_builds_complete_path() {
+        assert!(matches!(
+            profile("node"),
+            Err(PyrightProfileError::InvalidProfile)
+        ));
+
+        let worktree = worktree();
+        let pyright_profile = profile("/bin/echo").unwrap();
+        let expected = ControlledCommand::from_validated_peer(
+            CommandKind::Provider,
+            "/usr/bin/true".into(),
+            vec![OsString::from("--stdio")],
+            worktree.worktree().worktree_path().to_path_buf(),
+            BTreeMap::from([
+                (
+                    OsString::from("PATH"),
+                    std::env::join_paths([Path::new("/usr/bin"), Path::new("/bin")]).unwrap(),
+                ),
+                (
+                    OsString::from("TMPDIR"),
+                    OsString::from(
+                        Path::new("/private/tmp/agent-ide-pyright-profile-test-cache").join("tmp"),
+                    ),
+                ),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(pyright_profile.command(&worktree).unwrap(), expected);
+        assert_ne!(
+            pyright_profile.compatibility_key(&worktree),
+            profile("/usr/bin/env")
+                .unwrap()
+                .compatibility_key(&worktree)
+        );
     }
 }

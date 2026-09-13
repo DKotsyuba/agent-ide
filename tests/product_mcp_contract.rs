@@ -1788,8 +1788,8 @@ async fn configured_product_returns_real_go_and_rust_semantic_context() {
 /// Exercises the accepted exclusive Pyright process through the five-tool Codex product loop.
 ///
 /// The test requires launcher-owned executable and Node identities. It proves a `.py` session
-/// reaches semantic context, observes a native source correction, returns a diff, then stops and
-/// reaps the child without introducing a shared cross-worktree provider.
+/// reaches semantic definition/reference and the currently rendered diagnostic state, then proves
+/// a corrected retry is fresh before returning a diff and reaping the owned child.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
 async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
@@ -1810,7 +1810,7 @@ async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
     let path = fixture.root.join("main.py");
     std::fs::write(
         &path,
-        "def value() -> int:\n    return 7\n\ndef caller() -> int:\n    return value()\n",
+        "def value() -> int:\n    return \"bad\"\n\ndef caller() -> int:\n    return value()\n",
     )
     .unwrap();
     fixture.git(&["add", "--", "main.py"]);
@@ -1843,6 +1843,15 @@ async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
             .contains("mode: semantic"),
         "{response}"
     );
+    let text = response["text"].as_str().unwrap();
+    assert!(text.contains("definitions: [{"), "{response}");
+    assert!(text.contains("references: [{"), "{response}");
+    // Per-operation Pyright owns a fresh session, and the current five-tool renderer exposes
+    // neither raw diagnostic messages nor a completed diagnostic barrier for this response.
+    // `detail_ref` is the bounded retrieval path; semantic locations and exact source are the
+    // strongest currently rendered evidence without expanding the facade.
+    assert!(text.contains("diagnostic_count: unknown"), "{response}");
+    assert!(text.contains("return \"bad\""), "{response}");
     std::fs::write(
         &path,
         "def value() -> int:\n    return 8\n\ndef caller() -> int:\n    return value()\n",
@@ -1858,6 +1867,17 @@ async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
         .await;
     let fixed_response = actor.settle(&fixture, fixed_response).await;
     assert_eq!(fixed_response["kind"], "context", "{fixed_response}");
+    let fixed_text = fixed_response["text"].as_str().unwrap();
+    assert!(fixed_text.contains("mode: semantic"), "{fixed_response}");
+    assert!(fixed_text.contains("return 8"), "{fixed_response}");
+    assert!(
+        fixed_text.contains("source_sequence: 2"),
+        "{fixed_response}"
+    );
+    assert!(
+        !fixed_text.contains("return \"bad\"") && fixed_text.contains("diagnostic_count: unknown"),
+        "stale Pyright diagnostic survived corrected retry: {fixed_response}"
+    );
     let diff = actor.call(&fixture, "ide.diff", json!({})).await;
     let diff = actor.settle(&fixture, diff).await;
     assert_eq!(diff["kind"], "diff", "{diff}");

@@ -123,7 +123,7 @@ pub struct ProviderLaunch {
     pub executable: AcceptedExecutable,
     /// Closed settings contract whose exact identifier participates in compatibility checks.
     pub settings: AcceptedProviderSettings,
-    /// Accepted toolchain identity; gopls uses an absolute Go executable, Rust a rustup selector.
+    /// Accepted toolchain identity; gopls and Pyright use absolute executables, Rust a rustup selector.
     pub toolchain: String,
     /// Absolute operator-declared `cargo` executable for Rust; absent for gopls. Never chosen by
     /// model or project input; its measured identity must match `cargo_version`.
@@ -329,6 +329,15 @@ impl LauncherConfig {
                     {
                         return Err(LauncherError::Rejected);
                     }
+                    AcceptedProviderSettings::PyrightDefaultsV1
+                        if !absolute(Path::new(&provider.toolchain))
+                            || provider.cargo.is_some()
+                            || provider.cargo_version.is_some()
+                            || provider.rustc.is_some()
+                            || provider.rustc_version.is_some() =>
+                    {
+                        return Err(LauncherError::Rejected);
+                    }
                     AcceptedProviderSettings::RustCachePrimingDisabledV1
                         if !provider.cargo_version.as_deref().is_some_and(identifier)
                             || !provider.rustc_version.as_deref().is_some_and(identifier)
@@ -507,7 +516,7 @@ fn launcher_mapping_is_closed_bounded_and_restart_only() {
     invalid["targets"][0]["profiles"][0]["record"]["semantic_state"] = json!("forged");
     assert!(LauncherConfig::parse(invalid.to_string().as_bytes()).is_err());
 
-    let provider = |settings: &str| json!({"executable":executable,"settings":settings,"toolchain":"node-test","cargo":null,"cargo_version":null,"rustc":null,"rustc_version":null,"trust":"accepted-local","cache_namespace":"pyright-cache"});
+    let provider = |settings: &str| json!({"executable":executable,"settings":settings,"toolchain":"/usr/bin/true","cargo":null,"cargo_version":null,"rustc":null,"rustc_version":null,"trust":"accepted-local","cache_namespace":"pyright-cache"});
     let mut python_target = target.clone();
     python_target["providers"] = json!([
         provider("pyright_defaults_v1"),
@@ -516,6 +525,9 @@ fn launcher_mapping_is_closed_bounded_and_restart_only() {
     ]);
     let python_config = json!({"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[python_target.clone()]});
     assert!(LauncherConfig::parse(python_config.to_string().as_bytes()).is_ok());
+    let mut relative_node = python_config.clone();
+    relative_node["targets"][0]["providers"][0]["toolchain"] = json!("node");
+    assert!(LauncherConfig::parse(relative_node.to_string().as_bytes()).is_err());
     python_target["providers"][0]["cargo"] = executable;
     assert!(LauncherConfig::parse(json!({"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[python_target]}).to_string().as_bytes()).is_err());
 }
