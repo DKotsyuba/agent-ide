@@ -12,6 +12,10 @@ use crate::{
         context::{ContextQuery, ContextResult},
         freshness::{CacheIdentity, CacheLifecycle, ViewGeneration},
         gopls::{GoplsProfile, SharedGopls},
+        pyright::{
+            PyrightProfile, PyrightProfileError, PyrightProfileIdentity, PyrightProtocolChild,
+            PyrightViewAdmission, PyrightWorktree,
+        },
         rust::{
             RustProfile, RustProfileError, RustProfileIdentity, RustProtocolChild,
             RustViewAdmission, RustViews, RustWorktree,
@@ -246,6 +250,7 @@ impl Worker<'_> {
                     AcceptedProviderSettings::RustCachePrimingDisabledV1 => {
                         &["cargo", "target", "tmp"][..]
                     }
+                    AcceptedProviderSettings::PyrightDefaultsV1 => &["tmp"][..],
                 },
                 shared: false,
             });
@@ -374,6 +379,7 @@ impl Worker<'_> {
         let required = match source.path().extension().and_then(|value| value.to_str()) {
             Some("go") => AcceptedProviderSettings::GoplsDefaults,
             Some("rs") => AcceptedProviderSettings::RustCachePrimingDisabledV1,
+            Some("py") | Some("pyi") => AcceptedProviderSettings::PyrightDefaultsV1,
             _ => return Ok(None),
         };
         let Some(profile) = job
@@ -394,7 +400,132 @@ impl Worker<'_> {
                 .rust_context(job, &profile, source, bytes, query)
                 .await
                 .map(Some),
+            AcceptedProviderSettings::PyrightDefaultsV1 => self
+                .pyright_context(job, &profile, source, bytes, query)
+                .await
+                .map(Some),
         }
+    }
+
+    /// Starts one exclusive accepted Pyright session and settles it only after direct-child reap.
+    async fn pyright_context(
+        &mut self,
+        job: &mut Job,
+        launch: &ProviderLaunch,
+        source: &SourceObservation,
+        bytes: &[u8],
+        query: ContextQuery,
+    ) -> Result<ProviderContext, FailureCode> {
+        let binding = job.invocation.binding_ref().clone();
+        let authority = self.authority(&binding).await?;
+        let cache_namespace =
+            self.provider_cache_namespace(&binding, &authority, launch, &launch.trust)?;
+        let profile = PyrightProfile::new(PyrightProfileIdentity {
+            binary: launch.executable.path.clone(),
+            version: launch.executable.identity.clone(),
+            node_toolchain: launch.toolchain.clone(),
+            trust: launch.trust.clone(),
+            cache_namespace,
+        })
+        .map_err(|_| FailureCode::ExecutionProfile)?;
+        let worktree = PyrightWorktree::new(
+            authority.worktree().clone(),
+            execution_authority(&authority)?,
+        )
+        .map_err(|_| FailureCode::WorkspaceAuthority)?;
+        let command = profile
+            .command(&worktree)
+            .map_err(|_| FailureCode::ExecutionProfile)?;
+        let request = self
+            .execution_request(job, &authority, command, &launch.executable)
+            .await?;
+        let active = self.shared.active(&binding)?;
+        let generation = self.providers.next()?;
+        let view = {
+            let admission = self.admission.clone();
+            let mut admission = admission
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match PyrightProfile::request_view(
+                &profile,
+                &worktree,
+                &mut self.providers.registry,
+                &mut admission,
+                owner(&binding)?,
+                AdmissionClass::Interactive,
+                generation,
+            ) {
+                PyrightViewAdmission::Granted(view) => view,
+                PyrightViewAdmission::Queued(ticket) => {
+                    self.providers
+                        .registry
+                        .cancel_pending(&mut admission, ticket);
+                    return Err(FailureCode::Capacity);
+                }
+                _ => return Err(FailureCode::ProviderUnavailable),
+            }
+        };
+        let mut child = match PyrightProtocolChild::spawn(
+            &request,
+            &worktree,
+            &mut self.providers.registry,
+            view.lease(),
+            Some(active),
+            &job.target.codex.path,
+            self.shared.launcher.limits.output_bytes,
+        ) {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = view.release(&mut self.providers.registry);
+                if let PyrightProfileError::Process(error) = error {
+                    self.provider_spawn_failure(error, &binding);
+                }
+                return Err(FailureCode::ProviderUnavailable);
+            }
+        };
+        let result = {
+            let (input, output) = child.pipes();
+            let operation = session_operation(
+                input,
+                output,
+                source.clone(),
+                bytes.to_vec(),
+                query,
+                ViewGeneration {
+                    backend: view.generation(),
+                    configuration: 1,
+                    toolchain: 1,
+                    view: view.generation(),
+                },
+                ProviderSettings::Pyright(profile),
+                remaining_options(job),
+            );
+            tokio::pin!(operation);
+            tokio::select! {result=&mut operation=>result,_=job.cancel.changed()=>Err(FailureCode::Cancelled)}
+        };
+        let reaped = match child
+            .cancel_and_reap(Duration::from_millis(100), Duration::from_millis(500))
+            .await
+        {
+            Ok(reaped) => reaped,
+            Err(_) => {
+                self.uncertain.insert(binding);
+                return Err(FailureCode::Deadline);
+            }
+        };
+        let capability = view
+            .release(&mut self.providers.registry)
+            .map_err(|_| FailureCode::Internal)?;
+        let admission = self.admission.clone();
+        let mut admission = admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.providers
+            .registry
+            .complete_reap(&mut admission, capability, reaped.proof)
+            .map_err(|_| FailureCode::Internal)?;
+        self.shared.active(&binding)?;
+        result
     }
 
     /// Starts one exclusive accepted Rust session and settles it only after bounded direct-child reap.
@@ -1140,6 +1271,7 @@ fn provider_cache_settings(settings: AcceptedProviderSettings) -> &'static str {
     match settings {
         AcceptedProviderSettings::GoplsDefaults => "gopls-defaults-v1",
         AcceptedProviderSettings::RustCachePrimingDisabledV1 => "rust-cache-priming-disabled-v1",
+        AcceptedProviderSettings::PyrightDefaultsV1 => "pyright-defaults-v1",
     }
 }
 
@@ -1156,6 +1288,7 @@ fn effective_configuration(
             "cache-priming-and-proc-macro-disabled-v1"
         }
         AcceptedProviderSettings::RustCachePrimingDisabledV1 => "cache-priming-disabled-v1",
+        AcceptedProviderSettings::PyrightDefaultsV1 => "pyright-defaults-v1",
     }
 }
 
@@ -1186,6 +1319,7 @@ fn effective_trust(launch: &ProviderLaunch, rights: &str) -> String {
     match launch.settings {
         AcceptedProviderSettings::GoplsDefaults => format!("{}|{}", launch.trust, rights),
         AcceptedProviderSettings::RustCachePrimingDisabledV1 => launch.trust.clone(),
+        AcceptedProviderSettings::PyrightDefaultsV1 => launch.trust.clone(),
     }
 }
 

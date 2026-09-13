@@ -1785,6 +1785,90 @@ async fn configured_product_returns_real_go_and_rust_semantic_context() {
     }
 }
 
+/// Exercises the accepted exclusive Pyright process through the five-tool Codex product loop.
+///
+/// The test requires launcher-owned executable and Node identities. It proves a `.py` session
+/// reaches semantic context, observes a native source correction, returns a diff, then stops and
+/// reaps the child without introducing a shared cross-worktree provider.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
+async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
+    let pyright = std::env::var("AGENT_IDE_PYRIGHT").unwrap();
+    let node = std::env::var("AGENT_IDE_NODE").unwrap();
+    let providers = json!([{
+        "executable":accepted_program(&pyright,"pyright 1.1.413"),
+        "settings":"pyright_defaults_v1",
+        "toolchain":node,
+        "cargo":null,
+        "cargo_version":null,
+        "rustc":null,
+        "rustc_version":null,
+        "trust":"fixture-disabled",
+        "cache_namespace":"fixture-pyright-cache"
+    }]);
+    let fixture = ProductFixture::new(providers);
+    let path = fixture.root.join("main.py");
+    std::fs::write(
+        &path,
+        "def value() -> int:\n    return 7\n\ndef caller() -> int:\n    return value()\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "main.py"]);
+    fixture.git(&["commit", "--quiet", "-m", "python fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "pyright-root").await;
+    let start = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"pyright-start"}),
+        )
+        .await;
+    let start = actor.settle(&fixture, start).await;
+    assert_eq!(start["kind"], "activation", "{start}");
+    let source = std::fs::read_to_string(&path).unwrap();
+    let response = actor
+        .call(
+            &fixture,
+            "ide.context",
+            json!({"path":"main.py","byte_offset":source.rfind("value()").unwrap()}),
+        )
+        .await;
+    let response = actor.settle(&fixture, response).await;
+    assert_eq!(response["kind"], "context", "{response}");
+    assert!(
+        response["text"]
+            .as_str()
+            .unwrap()
+            .contains("mode: semantic"),
+        "{response}"
+    );
+    std::fs::write(
+        &path,
+        "def value() -> int:\n    return 8\n\ndef caller() -> int:\n    return value()\n",
+    )
+    .unwrap();
+    let fixed = std::fs::read_to_string(&path).unwrap();
+    let fixed_response = actor
+        .call(
+            &fixture,
+            "ide.context",
+            json!({"path":"main.py","byte_offset":fixed.rfind("value()").unwrap()}),
+        )
+        .await;
+    let fixed_response = actor.settle(&fixture, fixed_response).await;
+    assert_eq!(fixed_response["kind"], "context", "{fixed_response}");
+    let diff = actor.call(&fixture, "ide.diff", json!({})).await;
+    let diff = actor.settle(&fixture, diff).await;
+    assert_eq!(diff["kind"], "diff", "{diff}");
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    let stopped = actor.settle(&fixture, stopped).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Proves CARGO/RUSTC threading actually lets rust-analyzer load the Cargo workspace under
 /// `env_clear`: a detached single file cannot resolve a symbol defined only in a path-dependency
 /// crate, so a passing cross-crate definition is real evidence of loaded workspace semantics, not

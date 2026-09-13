@@ -149,6 +149,8 @@ pub enum ProviderSettings {
     GoplsDefaults(GoEnv),
     /// Exact accepted Rust analyzer/toolchain/configuration identity retained through the session.
     Rust(RustProfile),
+    /// The fixed Pyright configuration for one exclusive Python stdio session.
+    Pyright(crate::intelligence::pyright::PyrightProfile),
 }
 impl ProviderSettings {
     /// Returns the fixed initialize/configuration payload; no dynamic settings or model keys are accepted.
@@ -165,6 +167,7 @@ impl ProviderSettings {
                 "cachePriming":{"enable":false},
                 "procMacro":{"enable":!profile.proc_macros_disabled()}
             }),
+            Self::Pyright(_) => serde_json::json!({}),
         }
     }
 
@@ -176,6 +179,7 @@ impl ProviderSettings {
                 info.name == "rust-analyzer"
                     && info.version.as_deref() == Some(profile.initialize_version())
             }),
+            Self::Pyright(_) => info.is_none_or(|info| info.name == "pyright"),
         };
         if valid {
             Ok(())
@@ -869,15 +873,7 @@ impl Session {
             )
             .map_err(io::Error::other)?;
         } else {
-            let language_id = match observation
-                .path()
-                .extension()
-                .and_then(|extension| extension.to_str())
-            {
-                Some("go") => "go",
-                Some("rs") => "rust",
-                _ => "plaintext",
-            };
+            let language_id = language_id(observation.path());
             send_notification::<lsp::notification::DidOpenTextDocument>(
                 &self.server,
                 &mut self.budget,
@@ -969,6 +965,18 @@ impl Session {
         self.state.lock().expect("session lock").shutdown_complete = true;
         guard.completed = true;
         Ok(())
+    }
+}
+
+/// Maps one observed filename to the fixed LSP language identifier used for document open.
+/// Unknown extensions deliberately remain plaintext so only configured provider routing can add
+/// semantic behavior.
+fn language_id(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("go") => "go",
+        Some("rs") => "rust",
+        Some("py") | Some("pyi") => "python",
+        _ => "plaintext",
     }
 }
 

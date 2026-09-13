@@ -381,6 +381,7 @@ impl ProductDispatcher {
     /// Git-only work. Rust is always pinned to disabled cache priming and disabled proc-macro
     /// expansion. Shared multi-worktree gopls is deliberately not offered here: a foreground
     /// helper cannot retain a safe shared listener, so Go runs on a helper-private view only.
+    /// Pyright is deliberately unavailable to Claude helpers and therefore remains lexical.
     fn helper_provider(
         target: &LaunchTarget,
         settings: AcceptedProviderSettings,
@@ -399,6 +400,7 @@ impl ProductDispatcher {
                     proc_macro: false,
                 }),
             ),
+            AcceptedProviderSettings::PyrightDefaultsV1 => return None,
         };
         Some(HelperProvider {
             executable: provider.executable.path.clone(),

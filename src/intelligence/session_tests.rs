@@ -51,6 +51,54 @@ fn gopls_settings() -> ProviderSettings {
     )
 }
 
+/// Builds fixed Pyright settings against a measured harmless executable for protocol-only tests.
+fn pyright_settings() -> ProviderSettings {
+    ProviderSettings::Pyright(
+        crate::intelligence::pyright::PyrightProfile::new(
+            crate::intelligence::pyright::PyrightProfileIdentity {
+                binary: "/usr/bin/true".into(),
+                version: "pyright-test".into(),
+                node_toolchain: "node-test".into(),
+                trust: "test".into(),
+                cache_namespace: "/private/tmp/agent-ide-pyright-session-test-cache".into(),
+            },
+        )
+        .unwrap(),
+    )
+}
+
+/// Confirms fixed Pyright settings accept omitted server metadata and reject a wrong identity.
+#[test]
+fn pyright_settings_are_closed_and_allow_omitted_server_info() {
+    let settings = pyright_settings();
+    assert_eq!(settings.configuration(), serde_json::json!({}));
+    assert!(settings.validate_server(None).is_ok());
+    assert!(
+        settings
+            .validate_server(Some(&lsp::ServerInfo {
+                name: "pyright".into(),
+                version: Some("1.1.413".into()),
+            }))
+            .is_ok()
+    );
+    assert!(
+        settings
+            .validate_server(Some(&lsp::ServerInfo {
+                name: "gopls".into(),
+                version: None,
+            }))
+            .is_err()
+    );
+}
+
+/// Maps Python implementation and interface files to Python while preserving lexical fallback ids.
+#[test]
+fn python_file_extensions_use_python_language_id() {
+    assert_eq!(language_id(std::path::Path::new("module.py")), "python");
+    assert_eq!(language_id(std::path::Path::new("module.pyi")), "python");
+    assert_eq!(language_id(std::path::Path::new("module.txt")), "plaintext");
+}
+
 #[test]
 fn exact_lexical_context_and_positions() {
     let text = "// 🦀\nfunc Hello() { Hello() }\n";

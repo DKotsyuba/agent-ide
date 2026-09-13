@@ -8,7 +8,7 @@ A coding actor explicitly activates assistance for its own Git worktree. The ini
 
 Activation is actor-specific. Native subagents do not inherit it. The host adapter must prove the relation between the actor, MCP invocation, and hook/delivery channel; model arguments, working directory, timing, parent IDs, and peer user identity alone are insufficient proof. A failed or unavailable IDE must leave native tools and turn completion usable. Hooks have independently enforced deadlines and never wait for compiler warmup.
 
-The real provider loop covers shared Go/gopls and a bounded exclusive Rust profile. Intelligence chooses the provider topology; Execution admits and supervises physical processes and forwarders. Unsupported sharing stays explicitly unsupported. A shared daemon must not gain authority beyond the host's verified execution profile. Where enforcement is unproven, affected execution is unavailable.
+The real provider loop covers shared Go/gopls, a bounded exclusive Rust profile, and a bounded exclusive Pyright profile for Codex Python (`.py` and `.pyi`) on macOS. Pyright is always one worktree-isolated stdio child with fixed configuration; Claude Python stays unsupported and lexical. Intelligence chooses the provider topology; Execution admits and supervises physical processes and forwarders. Unsupported sharing stays explicitly unsupported. A shared daemon must not gain authority beyond the host's verified execution profile. Where enforcement is unproven, affected execution is unavailable.
 
 ### Responsibilities
 
@@ -41,8 +41,10 @@ The target platforms are Linux and macOS. Current v0.1 acceptance runs real Code
 |---|---|
 | macOS 26.6.2, Codex CLI 0.154.0, Go/gopls 0.23.0 | `real_pass`: parent plus parallel native children in divergent worktrees, scoped diagnostic, peer survival and fresh sequential handoff |
 | macOS 26.6.2, Codex CLI 0.154.0, Rust/rust-analyzer 1.98.1 | `real_pass` for the managed product/provider contract; live model CLI cell `not_tested` |
+| macOS, Codex CLI, Python/Pyright 1.1.413 | `real_pass` for the bounded product/provider contract |
 | macOS 26.6.2, Claude Code 2.1.267, Go/gopls 0.23.0 | `real_pass`: foreground helper, native-edit diagnostic, Diff, Stop and parallel actor isolation |
 | macOS 26.6.2, Claude Code 2.1.267, Rust/rust-analyzer 1.98.1 | `real_pass`: foreground helper semantic context, native-edit diagnostic, Diff and Stop |
+| macOS, Claude Code, Python/Pyright | `unsupported`; lexical fallback only |
 | Linux, both hosts/providers | `not_tested`; outside the current Mac-only release gate |
 
 Checks cover isolation between divergent worktrees, stale source/provider results, inactive hooks, stop and handoff, daemon/provider crashes, cancellation, bounded queues/output, and preservation of native tool/turn behavior. Productivity evaluation includes correctness, full model-visible context, cold/warm/handoff time, and the complete process tree's resource use. Fewer tool calls alone do not establish improvement.
@@ -53,15 +55,47 @@ Caches follow the worktree across stop and sequential handoff. Actor termination
 
 These are roadmap boundaries, not authorization to scaffold their APIs now.
 
+The immediate product priority is one measured integrated coding loop rather than
+the previously ordered history-first increment. Work proceeds in this order:
+
+1. Add bounded local usage telemetry to the existing five tools and native-change
+   hooks. It records structured metadata for adoption, fallback reason, outcome,
+   latency, provider/language, cache reuse, diagnostics, output size and resource
+   cost. Raw source, prompts, credentials, arbitrary arguments and command bodies
+   are excluded by default. Telemetry failure remains fail-open and cannot delay a
+   coding operation.
+2. Add a language-neutral `ide.edit` MVP as the preferred active-session source
+   mutation path. The first contract is a single-file create-or-replace-if-current operation
+   with an exact effects receipt, refreshed source observation, diagnostic feedback
+   and the existing diff flow. Stale input performs no write. Unknown outcome names
+   the affected path and requires inspection before retry. Native editing remains
+   available when the IDE is inactive, unavailable, unsupported or explicitly
+   bypassed; host guidance prefers `ide.edit` and telemetry measures every fallback
+   without denying it.
+3. Add JavaScript/TypeScript/Node.js provider profiles through the same bounded
+   context/diagnostic/edit/diff/stop scenario. Node/TypeScript project resolution
+   is part of the supported profile; an installed binary alone does not establish
+   support. Python is delivered in v0.1.1 for Codex/macOS; Claude Python remains
+   lexical and unsupported.
+4. Accept the increment only after real Codex and Claude macOS scenarios cover
+   `start -> context -> edit -> diagnostic -> fix -> diff -> stop`, stale-edit
+   refusal, native fallback, restart-safe telemetry and two-worktree isolation.
+   Linux remains explicit `not_tested` until a real host cell passes.
+
+This increment does not add a remote analytics service, dashboard, arbitrary shell
+execution, multi-file atomicity, semantic rename, test/check orchestration or DAP.
+Local statistics need a bounded query/export surface; visualization can be added
+after the collected events show that it is useful.
+
 | Version | Added result |
 |---|---|
-| v0.2 | ChangeSet, Git/source context and history |
+| v0.2 | Local usage telemetry; preferred single-file `ide.edit` with native fallback; JavaScript/TypeScript/Node.js profiles |
 | v0.3 | Explicit known checks, evidence and local finish; `ide.check` and `ide.finish` |
-| v0.4 | Scope WorkBundle, CodeBinding and computed CriterionAssessment |
-| v0.5 | Task Context Compiler, contract-aware impact and evaluator registry |
-| v0.6 | Cost-aware verification planner and approved automatic checks |
+| v0.4 | ChangeSet, Git/source context and history; Scope WorkBundle and CodeBinding |
+| v0.5 | Computed CriterionAssessment, Task Context Compiler and contract-aware impact |
+| v0.6 | Evaluator registry, cost-aware verification planner and approved automatic checks |
 | v0.7 | Scope adapter, immutable knowledge, publication outbox and baseline/result acceptance |
-| v0.8 | Own edits, journal, rename and recovery; `ide.edit` |
+| v0.8 | Multi-file edit journal, semantic rename and recovery |
 | v0.9 | Failure context and approved DAP debugging |
 | v1.0 | Cumulative hardening and independent evaluation |
 

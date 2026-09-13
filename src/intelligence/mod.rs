@@ -6,6 +6,9 @@ pub mod freshness;
 /// Defines the exclusive rust-analyzer v0.1 profile and its view lifecycle.
 pub mod rust;
 
+/// Defines the exclusive Pyright v0.1.1 profile and its owned stdio lifecycle.
+pub mod pyright;
+
 /// Validates bounded framing before production sessions decode provider messages.
 #[allow(dead_code)]
 pub(crate) mod wire;

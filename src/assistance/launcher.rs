@@ -111,6 +111,8 @@ pub enum AcceptedProviderSettings {
     GoplsDefaults,
     /// Accepted Rust profile with cache priming disabled and server-status synchronization.
     RustCachePrimingDisabledV1,
+    /// Accepted Pyright defaults over one exclusive, worktree-isolated stdio child.
+    PyrightDefaultsV1,
 }
 
 /// Trusted provider identity; populated only by the restart-loaded launcher file.
@@ -292,7 +294,7 @@ impl LauncherConfig {
                 || !absolute(&target.candidate)
                 || target.profiles.is_empty()
                 || target.profiles.len() > 2
-                || target.providers.len() > 2
+                || target.providers.len() > 3
             {
                 return Err(LauncherError::Rejected);
             }
@@ -344,6 +346,14 @@ impl LauncherConfig {
                                 && Some(rustc.identity.as_str())
                                     == provider.rustc_version.as_deref()
                         }) =>
+                    {
+                        return Err(LauncherError::Rejected);
+                    }
+                    AcceptedProviderSettings::PyrightDefaultsV1
+                        if provider.cargo.is_some()
+                            || provider.cargo_version.is_some()
+                            || provider.rustc.is_some()
+                            || provider.rustc_version.is_some() =>
                     {
                         return Err(LauncherError::Rejected);
                     }
@@ -496,6 +506,18 @@ fn launcher_mapping_is_closed_bounded_and_restart_only() {
     let mut invalid = config;
     invalid["targets"][0]["profiles"][0]["record"]["semantic_state"] = json!("forged");
     assert!(LauncherConfig::parse(invalid.to_string().as_bytes()).is_err());
+
+    let provider = |settings: &str| json!({"executable":executable,"settings":settings,"toolchain":"node-test","cargo":null,"cargo_version":null,"rustc":null,"rustc_version":null,"trust":"accepted-local","cache_namespace":"pyright-cache"});
+    let mut python_target = target.clone();
+    python_target["providers"] = json!([
+        provider("pyright_defaults_v1"),
+        json!({"executable":executable,"settings":"gopls_defaults","toolchain":"/usr/bin/true","cargo":null,"cargo_version":null,"rustc":null,"rustc_version":null,"trust":"accepted-local","cache_namespace":"go-cache"}),
+        json!({"executable":executable,"settings":"rust_cache_priming_disabled_v1","toolchain":"rust-test","cargo":executable,"cargo_version":"accepted-git","rustc":executable,"rustc_version":"accepted-git","trust":"accepted-local","cache_namespace":"rust-cache"})
+    ]);
+    let python_config = json!({"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[python_target.clone()]});
+    assert!(LauncherConfig::parse(python_config.to_string().as_bytes()).is_ok());
+    python_target["providers"][0]["cargo"] = executable;
+    assert!(LauncherConfig::parse(json!({"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[python_target]}).to_string().as_bytes()).is_err());
 }
 
 /// Detects a changed executable without launching it or consulting cwd/environment identities.
