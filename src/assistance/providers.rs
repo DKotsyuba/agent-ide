@@ -420,11 +420,17 @@ impl Worker<'_> {
         let authority = self.authority(&binding).await?;
         let cache_namespace =
             self.provider_cache_namespace(&binding, &authority, launch, &launch.trust)?;
-        let node = verify_pyright_executables(launch)?;
+        let node = launch.node.as_ref().ok_or(FailureCode::ExecutionProfile)?;
+        let accepted_script_digest = blake3::Hash::from_hex(&launch.executable.blake3)
+            .map_err(|_| FailureCode::ExecutionProfile)?;
+        let accepted_node_digest =
+            blake3::Hash::from_hex(&node.blake3).map_err(|_| FailureCode::ExecutionProfile)?;
         let profile = PyrightProfile::new(PyrightProfileIdentity {
             binary: launch.executable.path.clone(),
+            accepted_script_digest,
             version: launch.executable.identity.clone(),
             node: node.path.clone(),
+            accepted_node_digest,
             node_identity: node.identity.clone(),
             trust: launch.trust.clone(),
             cache_namespace,
@@ -469,6 +475,7 @@ impl Worker<'_> {
         };
         let mut child = match PyrightProtocolChild::spawn(
             &request,
+            &profile,
             &worktree,
             &mut self.providers.registry,
             view.lease(),
@@ -1294,22 +1301,6 @@ fn effective_configuration(
     }
 }
 
-/// Rechecks the Pyright script and exact configured Node bytes against their launcher-accepted
-/// digests immediately before profile construction and provider admission. A mismatch fails before
-/// reserving capacity or starting a child; Execution separately rechecks the resulting Node command
-/// identity immediately before spawn, subject to its documented narrow same-user substitution race.
-fn verify_pyright_executables(
-    launch: &ProviderLaunch,
-) -> Result<&crate::assistance::launcher::AcceptedExecutable, FailureCode> {
-    let node = launch.node.as_ref().ok_or(FailureCode::ExecutionProfile)?;
-    launch
-        .executable
-        .verify()
-        .map_err(|_| FailureCode::ExecutionProfile)?;
-    node.verify().map_err(|_| FailureCode::ExecutionProfile)?;
-    Ok(node)
-}
-
 /// Returns whether the job's observed sandbox permission profile is the managed Claude profile.
 pub(super) fn managed_sandbox_from_job(job: &Job) -> bool {
     job.observed
@@ -1523,16 +1514,10 @@ async fn session_operation<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncW
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        FailureCode, GoBackend, OwnedProviderSocket, Providers, reap_owned_backend,
-        verify_pyright_executables,
-    };
+    use super::{FailureCode, GoBackend, OwnedProviderSocket, Providers, reap_owned_backend};
     use crate::assistance::host_binding::{
         BindingRef, BindingStatus, HostBindingGuard, parse_candidate, parse_channel_session,
         parse_hook_event,
-    };
-    use crate::assistance::launcher::{
-        AcceptedExecutable, AcceptedProviderSettings, ProviderLaunch,
     };
     use crate::execution::{
         Admission, AdmissionClass, AdmissionController, AdmissionLimits, BackendRelease,
@@ -1546,56 +1531,6 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
-
-    /// Proves a script or Node replacement after launcher acceptance is rejected before provider
-    /// admission instead of becoming the operation's new trusted executable baseline.
-    #[test]
-    fn pyright_operation_rechecks_launcher_accepted_executable_bytes() {
-        let root = std::env::temp_dir().join(format!(
-            "agent-ide-pyright-accepted-recheck-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir(&root).unwrap();
-        let script = root.join("pyright-langserver");
-        let node = root.join("node");
-        std::fs::write(&script, b"accepted script").unwrap();
-        std::fs::write(&node, b"accepted node").unwrap();
-        let accepted =
-            |path: std::path::PathBuf, identity: &str, bytes: &[u8]| AcceptedExecutable {
-                path,
-                identity: identity.into(),
-                blake3: blake3::hash(bytes).to_hex().to_string(),
-            };
-        let launch = ProviderLaunch {
-            executable: accepted(script.clone(), "pyright-test", b"accepted script"),
-            settings: AcceptedProviderSettings::PyrightDefaultsV1,
-            toolchain: "node-test".into(),
-            node: Some(accepted(node.clone(), "node-test", b"accepted node")),
-            cargo: None,
-            cargo_version: None,
-            rustc: None,
-            rustc_version: None,
-            trust: "test".into(),
-            cache_namespace: "test-cache".into(),
-        };
-        assert!(verify_pyright_executables(&launch).is_ok());
-
-        std::fs::write(&node, b"replaced node").unwrap();
-        assert!(matches!(
-            verify_pyright_executables(&launch),
-            Err(FailureCode::ExecutionProfile)
-        ));
-        std::fs::write(&node, b"accepted node").unwrap();
-        std::fs::write(&script, b"replaced script").unwrap();
-        assert!(matches!(
-            verify_pyright_executables(&launch),
-            Err(FailureCode::ExecutionProfile)
-        ));
-
-        std::fs::remove_file(script).unwrap();
-        std::fs::remove_file(node).unwrap();
-        std::fs::remove_dir(root).unwrap();
-    }
 
     /// Builds one accepted no-op `BindingRef` for uncertainty bookkeeping only; no daemon involved.
     fn test_binding(label: &str) -> BindingRef {

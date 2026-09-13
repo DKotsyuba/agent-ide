@@ -651,6 +651,14 @@ impl ControlledCommand {
         })
     }
 
+    /// Reports whether this command's construction-time program digest equals `expected`.
+    ///
+    /// This performs no I/O and does not revalidate the executable; callers use it to bind a newly
+    /// captured command to an independently accepted digest before later spawn-time revalidation.
+    pub(crate) fn has_program_digest(&self, expected: &blake3::Hash) -> bool {
+        self.program_identity.digest == *expected
+    }
+
     /// Rebuilds this exact command for a verified foreground helper's inherited sandbox.
     ///
     /// The executable object and bytes are rechecked immediately before spawn. The returned

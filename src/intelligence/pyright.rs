@@ -27,10 +27,14 @@ use crate::{
 pub struct PyrightProfileIdentity {
     /// Absolute accepted `pyright-langserver` executable measured at construction.
     pub binary: PathBuf,
+    /// Launcher-accepted BLAKE3 digest of the Pyright script bytes; construction rejects drift.
+    pub accepted_script_digest: blake3::Hash,
     /// Nonempty accepted Pyright version identity.
     pub version: String,
     /// Absolute accepted Node executable; it is never inferred from source or environment.
     pub node: PathBuf,
+    /// Launcher-accepted BLAKE3 digest of the Node executable bytes; construction rejects drift.
+    pub accepted_node_digest: blake3::Hash,
     /// Nonempty accepted Node identity matched to the configured provider toolchain.
     pub node_identity: String,
     /// Explicit operator trust identity retained in the exclusive compatibility key.
@@ -44,14 +48,14 @@ pub struct PyrightProfileIdentity {
 pub struct PyrightProfile {
     /// Absolute accepted `pyright-langserver` executable.
     binary: PathBuf,
-    /// Measured executable bytes retained in the compatibility key.
-    binary_digest: blake3::Hash,
+    /// Launcher-accepted Pyright script bytes retained in the compatibility key.
+    accepted_script_digest: blake3::Hash,
     /// Accepted Pyright version identity.
     version: String,
     /// Absolute accepted Node executable that runs the Pyright script.
     node: PathBuf,
-    /// Measured Node executable bytes retained in the compatibility key.
-    node_digest: blake3::Hash,
+    /// Launcher-accepted Node executable bytes retained in the compatibility key.
+    accepted_node_digest: blake3::Hash,
     /// Accepted Node identity retained in the compatibility key.
     node_identity: String,
     /// Explicit operator trust identity.
@@ -61,21 +65,27 @@ pub struct PyrightProfile {
 }
 
 impl PyrightProfile {
-    /// Validates and measures accepted Pyright and Node executables without consulting project Python settings.
+    /// Validates current Pyright script and Node bytes against launcher-accepted identities without consulting project Python settings.
     pub fn new(identity: PyrightProfileIdentity) -> Result<Self, PyrightProfileError> {
-        let binary_digest = crate::execution::measured_executable_digest(&identity.binary)
+        let script_digest = crate::execution::measured_executable_digest(&identity.binary)
             .map_err(|_| PyrightProfileError::InvalidProfile)?;
+        if script_digest != identity.accepted_script_digest {
+            return Err(PyrightProfileError::InvalidProfile);
+        }
         if !identity.node.is_absolute() {
             return Err(PyrightProfileError::InvalidProfile);
         }
         let node_digest = crate::execution::measured_executable_digest(&identity.node)
             .map_err(|_| PyrightProfileError::InvalidProfile)?;
+        if node_digest != identity.accepted_node_digest {
+            return Err(PyrightProfileError::InvalidProfile);
+        }
         let profile = Self {
             binary: identity.binary,
-            binary_digest,
+            accepted_script_digest: identity.accepted_script_digest,
             version: identity.version,
             node: identity.node,
-            node_digest,
+            accepted_node_digest: identity.accepted_node_digest,
             node_identity: identity.node_identity,
             trust: identity.trust,
             cache_namespace: identity.cache_namespace,
@@ -87,6 +97,9 @@ impl PyrightProfile {
     }
 
     /// Builds fixed `node <absolute-pyright-script> --stdio` with only Node's parent on `PATH`.
+    ///
+    /// The command is admitted only when its captured Node identity equals the launcher's accepted
+    /// digest, so replacement after profile construction fails before admission.
     pub fn command(
         &self,
         worktree: &PyrightWorktree,
@@ -98,7 +111,7 @@ impl PyrightProfile {
             .ok_or(PyrightProfileError::InvalidProfile)?;
         let path =
             std::env::join_paths([node_parent]).map_err(|_| PyrightProfileError::InvalidProfile)?;
-        ControlledCommand::from_validated_peer(
+        let command = ControlledCommand::from_validated_peer(
             CommandKind::Provider,
             self.node.clone(),
             vec![
@@ -114,7 +127,23 @@ impl PyrightProfile {
                 ),
             ]),
         )
-        .map_err(|_| PyrightProfileError::InvalidProfile)
+        .map_err(|_| PyrightProfileError::InvalidProfile)?;
+        command
+            .has_program_digest(&self.accepted_node_digest)
+            .then_some(command)
+            .ok_or(PyrightProfileError::InvalidProfile)
+    }
+
+    /// Remeasures the Pyright script and rejects replacement before a provider spawn lease is taken.
+    ///
+    /// The final Execution Node recheck immediately before spawn leaves only its already acknowledged
+    /// narrow same-user race after those final pre-spawn checks.
+    pub fn verify_script(&self) -> Result<(), PyrightProfileError> {
+        (crate::execution::measured_executable_digest(&self.binary)
+            .map_err(|_| PyrightProfileError::InvalidProfile)?
+            == self.accepted_script_digest)
+            .then_some(())
+            .ok_or(PyrightProfileError::InvalidProfile)
     }
 
     /// Requests one exclusive Execution view; queued and rejected outcomes retain no child.
@@ -152,10 +181,10 @@ impl PyrightProfile {
             format!(
                 "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
                 self.binary.display(),
-                self.binary_digest,
+                self.accepted_script_digest,
                 self.version,
                 self.node.display(),
-                self.node_digest,
+                self.accepted_node_digest,
                 self.node_identity,
                 self.trust,
                 self.cache_namespace,
@@ -292,8 +321,10 @@ pub struct PyrightProtocolChild {
 
 impl PyrightProtocolChild {
     /// Consumes the view launch capability to start one authority-bound Pyright child.
+    #[allow(clippy::too_many_arguments)] // The owned-spawn boundary carries the independently validated capabilities.
     pub fn spawn(
         request: &ValidatedExecutionRequest,
+        profile: &PyrightProfile,
         worktree: &PyrightWorktree,
         registry: &mut ProviderLeaseRegistry,
         view: ProviderViewLease,
@@ -301,6 +332,7 @@ impl PyrightProtocolChild {
         codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, PyrightProfileError> {
+        profile.verify_script()?;
         let capability = registry
             .take_spawn_lease(view)
             .map_err(PyrightProfileError::Execution)?;
@@ -350,7 +382,7 @@ impl PyrightProtocolChild {
 mod tests {
     use super::*;
 
-    /// Builds a canonical worktree/authority pair for profile-only command construction tests.
+    /// Builds a canonical worktree/authority pair for fixed-profile command construction tests.
     fn worktree() -> PyrightWorktree {
         let root = std::env::temp_dir();
         let worktree =
@@ -365,53 +397,92 @@ mod tests {
         PyrightWorktree::new(worktree, authority).unwrap()
     }
 
-    /// Builds one measured Pyright profile for a supplied operator-declared Node executable and identity.
-    fn profile(node: &str) -> Result<PyrightProfile, PyrightProfileError> {
+    /// Creates one unique temporary directory for a test-owned executable fixture.
+    fn temporary_directory() -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "agent-ide-pyright-profile-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        directory
+    }
+
+    /// Writes executable fixture bytes under `directory` and returns its absolute path.
+    fn executable(directory: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = directory.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    /// Builds one profile whose accepted digests match the supplied script and Node fixtures.
+    fn profile(script: &Path, node: &Path) -> Result<PyrightProfile, PyrightProfileError> {
         PyrightProfile::new(PyrightProfileIdentity {
-            binary: "/usr/bin/true".into(),
+            binary: script.to_path_buf(),
+            accepted_script_digest: crate::execution::measured_executable_digest(script).unwrap(),
             version: "pyright-test".into(),
-            node: node.into(),
+            node: node.to_path_buf(),
+            accepted_node_digest: crate::execution::measured_executable_digest(node).unwrap(),
             node_identity: "node-test".into(),
             trust: "test".into(),
             cache_namespace: "/private/tmp/agent-ide-pyright-profile-test-cache".into(),
         })
     }
 
-    /// Requires an absolute measured Node executable and runs the script through that exact executable.
+    /// Admits a profile whose current script and Node fixture bytes equal their accepted digests.
     #[test]
-    fn profile_requires_node_executable_and_builds_complete_path() {
+    fn accepted_profile_builds_command() {
+        let directory = temporary_directory();
+        let script = executable(&directory, "pyright", b"#!/bin/sh\nexit 0\n");
+        let node = executable(&directory, "node", b"#!/bin/sh\nexit 0\n");
+
+        assert!(
+            profile(&script, &node)
+                .unwrap()
+                .command(&worktree())
+                .is_ok()
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Rejects command construction when Node is replaced after the profile captured its accepted digest.
+    #[test]
+    fn replaced_node_after_profile_creation_rejects_command() {
+        let directory = temporary_directory();
+        let script = executable(&directory, "pyright", b"#!/bin/sh\nexit 0\n");
+        let node = executable(&directory, "node", b"#!/bin/sh\nexit 0\n");
+        let profile = profile(&script, &node).unwrap();
+        std::fs::write(&node, b"#!/bin/sh\nexit 1\n").unwrap();
+
         assert!(matches!(
-            profile("node"),
+            profile.command(&worktree()),
             Err(PyrightProfileError::InvalidProfile)
         ));
 
-        let worktree = worktree();
-        let pyright_profile = profile("/bin/echo").unwrap();
-        let expected = ControlledCommand::from_validated_peer(
-            CommandKind::Provider,
-            "/bin/echo".into(),
-            vec![OsString::from("/usr/bin/true"), OsString::from("--stdio")],
-            worktree.worktree().worktree_path().to_path_buf(),
-            BTreeMap::from([
-                (
-                    OsString::from("PATH"),
-                    std::env::join_paths([Path::new("/bin")]).unwrap(),
-                ),
-                (
-                    OsString::from("TMPDIR"),
-                    OsString::from(
-                        Path::new("/private/tmp/agent-ide-pyright-profile-test-cache").join("tmp"),
-                    ),
-                ),
-            ]),
-        )
-        .unwrap();
-        assert_eq!(pyright_profile.command(&worktree).unwrap(), expected);
-        assert_ne!(
-            pyright_profile.compatibility_key(&worktree),
-            profile("/usr/bin/env")
-                .unwrap()
-                .compatibility_key(&worktree)
-        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Rejects a replaced script in the pre-spawn verification that runs before a lease is consumed.
+    #[test]
+    fn replaced_script_after_profile_creation_rejects_pre_spawn_verification() {
+        let directory = temporary_directory();
+        let script = executable(&directory, "pyright", b"#!/bin/sh\nexit 0\n");
+        let node = executable(&directory, "node", b"#!/bin/sh\nexit 0\n");
+        let profile = profile(&script, &node).unwrap();
+        std::fs::write(&script, b"#!/bin/sh\nexit 1\n").unwrap();
+
+        assert!(matches!(
+            profile.verify_script(),
+            Err(PyrightProfileError::InvalidProfile)
+        ));
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

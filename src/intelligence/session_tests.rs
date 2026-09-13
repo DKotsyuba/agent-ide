@@ -57,8 +57,16 @@ fn pyright_settings() -> ProviderSettings {
         crate::intelligence::pyright::PyrightProfile::new(
             crate::intelligence::pyright::PyrightProfileIdentity {
                 binary: "/usr/bin/true".into(),
+                accepted_script_digest: crate::execution::measured_executable_digest(
+                    std::path::Path::new("/usr/bin/true"),
+                )
+                .unwrap(),
                 version: "pyright-test".into(),
                 node: "/usr/bin/true".into(),
+                accepted_node_digest: crate::execution::measured_executable_digest(
+                    std::path::Path::new("/usr/bin/true"),
+                )
+                .unwrap(),
                 node_identity: "node-test".into(),
                 trust: "test".into(),
                 cache_namespace: "/private/tmp/agent-ide-pyright-session-test-cache".into(),
