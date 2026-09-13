@@ -1,0 +1,22 @@
+{
+  "name": "agent-ide",
+  "version": "0.1.2",
+  "description": "Agent IDE coding-companion skill exposing the bounded ide.start/context/diff/inspect/stop workflow for active-session source edits.",
+  "author": {
+    "name": "DKotsyuba"
+  },
+  "homepage": "https://github.com/DKotsyuba/agent-ide",
+  "repository": "https://github.com/DKotsyuba/agent-ide",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Agent IDE",
+    "shortDescription": "Bounded ide.* workflow for active-session source edits",
+    "longDescription": "Loads the agent-ide skill so a coder subagent uses the ide.start/context/diff/inspect/stop workflow when the Agent IDE MCP tools are active, with fail-open native fallback when they are not.",
+    "developerName": "DKotsyuba",
+    "category": "Development",
+    "capabilities": ["Interactive"],
+    "defaultPrompt": [
+      "Use $agent-ide while editing this worktree."
+    ]
+  }
+}

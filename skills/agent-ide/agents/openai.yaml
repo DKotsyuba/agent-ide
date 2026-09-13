@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent IDE"
+  short_description: "Bounded ide.* workflow for active-session source edits"
+  default_prompt: "Use $agent-ide to run the ide.start/context/diff/stop workflow while I edit this worktree."

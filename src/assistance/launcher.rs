@@ -101,6 +101,26 @@ impl AcceptedExecutable {
         }
         Ok(())
     }
+    /// Builds one accepted executable identity by measuring `path`'s current regular-file bytes.
+    ///
+    /// Reuses the same content digest `crate::execution::measured_executable_digest` computes
+    /// before a controlled child spawns, so the emitted `path`/`identity`/`blake3` triple is
+    /// byte-identical to what [`Self::verify`] later accepts for the same file. `path` must be
+    /// absolute; `identity` must be a nonempty bounded identifier. Returns
+    /// [`LauncherError::Rejected`] for a malformed path or identity, or
+    /// [`LauncherError::ExecutableChanged`] when `path` cannot be opened, hashed, or is not a
+    /// regular executable file.
+    pub fn from_path(path: PathBuf, identity: impl Into<String>) -> Result<Self, LauncherError> {
+        let digest = crate::execution::measured_executable_digest(&path)
+            .map_err(|_| LauncherError::ExecutableChanged)?;
+        let executable = Self {
+            path,
+            identity: identity.into(),
+            blake3: digest.to_hex().to_string(),
+        };
+        executable.validate()?;
+        Ok(executable)
+    }
 }
 
 /// Closed effective provider configuration; arbitrary settings JSON is never accepted.
@@ -459,6 +479,14 @@ impl LauncherConfig {
         }
         Ok(())
     }
+    /// Verifies every configured executable's current bytes without starting a daemon or worker.
+    ///
+    /// Delegates to `Self::verify_executables` with a fresh, never-cancelled flag, so a
+    /// startup-only caller (such as the `agent-ide launcher check` command) observes the exact
+    /// same content check the daemon performs before its worker becomes visible.
+    pub fn verify(&self) -> Result<(), LauncherError> {
+        self.verify_executables(&std::sync::atomic::AtomicBool::new(false))
+    }
     /// Returns only the target keyed by an exact separately supplied launcher attachment.
     pub fn target(&self, attachment: &str) -> Option<&LaunchTarget> {
         self.targets.get(attachment)
@@ -551,6 +579,48 @@ fn accepted_executable_requires_exact_current_bytes() {
     executable.verify().unwrap();
     std::fs::write(&path, b"changed bytes").unwrap();
     assert_eq!(executable.verify(), Err(LauncherError::ExecutableChanged));
+    std::fs::remove_file(path).unwrap();
+}
+
+/// `AcceptedExecutable::from_path` measures real bytes into a triple that round-trips through
+/// `LauncherConfig::verify`, and `verify` reports the exact same executable's later corruption
+/// without starting a daemon.
+#[test]
+fn launcher_verify_checks_current_executable_bytes_without_a_daemon() {
+    use crate::execution::D03ProfileEvidence;
+    use serde_json::json;
+    use std::os::unix::fs::PermissionsExt;
+    let path =
+        std::env::temp_dir().join(format!("agent-ide-launcher-check-{}", std::process::id()));
+    std::fs::write(&path, b"#!/bin/sh\necho ok\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let executable = AcceptedExecutable::from_path(path.clone(), "accepted-git").unwrap();
+    let executable_json = json!({"path": executable.path, "identity": executable.identity, "blake3": executable.blake3});
+    let state = HostSandboxState::parse(Some(json!({"permissionProfile":{"type":"disabled"},"codexLinuxSandboxExe":null,"sandboxCwd":"/private/tmp","useLegacyLandlock":false}))).unwrap();
+    let record = PersistedProfileRecord::from_execution_evidence(
+        "accepted-disabled",
+        1,
+        D03ProfileEvidence {
+            provider_binary: "accepted-git".into(),
+            toolchain: "toolchain".into(),
+            configuration: "default".into(),
+            trust: "accepted-local".into(),
+            transport: "direct".into(),
+            d03_evidence: "accepted-d03".into(),
+        },
+        &state,
+    )
+    .unwrap();
+    let target = json!({"attachment":"verify-attachment","candidate":"/private/tmp/worktree","git":executable_json,"codex":executable_json,"providers":[],"profiles":[{"record":serde_json::from_str::<Value>(&record.to_json()).unwrap(),"sandbox_state":serde_json::from_str::<Value>(state.sandbox_state_json()).unwrap()}],"allow_disabled_host":true});
+    let config = LauncherConfig::parse(
+        json!({"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[target]})
+            .to_string()
+            .as_bytes(),
+    )
+    .unwrap();
+    config.verify().unwrap();
+    std::fs::write(&path, b"#!/bin/sh\necho changed\n").unwrap();
+    assert_eq!(config.verify(), Err(LauncherError::ExecutableChanged));
     std::fs::remove_file(path).unwrap();
 }
 

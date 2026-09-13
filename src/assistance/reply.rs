@@ -213,9 +213,15 @@ impl PeerReply {
 /// [`call_tool_result_fits`] on the result of this function is therefore never cut mid-hunk by a
 /// later, independently computed reserve.
 ///
-/// The summary is fixed for every reply except a foreground-helper [`PeerReply::Pending`], whose
-/// summary carries the exact command verbatim; that command is counted here so an instruction too
-/// large for the envelope fails closed rather than reaching the host truncated.
+/// The summary is deterministic, drawn only from `reply`'s own closed shape (no LLM, state or
+/// telemetry), and gives the model its next bounded step: a foreground-helper [`PeerReply::Pending`]
+/// carries the exact command verbatim followed by the required `ide.inspect` order; a queued
+/// [`PeerReply::Pending`] names the exact `detail_ref` to inspect; a [`PeerReply::Complete`] names
+/// the next tool by [`ResultKind`] (`ide.context` before editing after Activation or a fresh
+/// Context, `ide.inspect` for a truncated Context/Diff, `ide.stop` after a reviewed Diff, and that
+/// native edits remain on disk after Stop). A foreground-helper command is never trimmed: that
+/// command is counted here so an instruction too large for the envelope fails closed rather than
+/// reaching the host truncated.
 pub(crate) fn render_call_tool_result(reply: &PeerReply) -> Option<CallToolResult> {
     let value = serde_json::to_value(reply).ok()?;
     let summary = match reply {
@@ -232,12 +238,49 @@ pub(crate) fn render_call_tool_result(reply: &PeerReply) -> Option<CallToolResul
              Then use ide.inspect with detail_ref {detail_ref}. \
              Do not call ide.inspect before that command has completed.",
         ),
-        PeerReply::Pending { .. } => {
-            "Assistance work is pending; use ide.inspect with the returned detail_ref".to_owned()
-        }
+        PeerReply::Pending {
+            detail_ref,
+            helper: None,
+        } => format!("Assistance work is pending; use ide.inspect with detail_ref {detail_ref}."),
         PeerReply::Error { .. } => {
             "Assistance could not complete this operation; inspect the typed error and continue with native tools".to_owned()
         }
+        PeerReply::Complete {
+            kind: ResultKind::Activation,
+            ..
+        } => "Workspace is active; call ide.context before editing source with native host tools"
+            .to_owned(),
+        PeerReply::Complete {
+            kind: ResultKind::Context,
+            detail_ref: Some(detail_ref),
+            truncated: true,
+            ..
+        } => format!(
+            "Context is truncated; use ide.inspect with detail_ref {detail_ref} for the rest before editing"
+        ),
+        PeerReply::Complete {
+            kind: ResultKind::Context,
+            ..
+        } => {
+            "Edit with native host tools, then call ide.context again to refresh".to_owned()
+        }
+        PeerReply::Complete {
+            kind: ResultKind::Diff,
+            detail_ref: Some(detail_ref),
+            truncated: true,
+            ..
+        } => format!(
+            "Diff is truncated; use ide.inspect with detail_ref {detail_ref} for the remaining hunks, then call ide.stop when finished"
+        ),
+        PeerReply::Complete {
+            kind: ResultKind::Diff,
+            ..
+        } => "Review this diff, then call ide.stop when finished".to_owned(),
+        PeerReply::Complete {
+            kind: ResultKind::Stop,
+            ..
+        } => "Workspace authority is stopped; files already edited by native host tools remain on disk"
+            .to_owned(),
         _ => "Assistance returned the current owner result".to_owned(),
     };
     let mut rendered = if matches!(reply, PeerReply::Error { .. }) {
@@ -284,4 +327,63 @@ fn envelopes_are_closed_and_fit_serialized_budget() {
     ] {
         assert!(PeerReply::decode(raw).is_none());
     }
+}
+
+/// Each summary names the exact next-step tool for its `ResultKind`/`Pending` shape, without
+/// pinning the full sentence, so the guidance can be reworded freely as long as the named tool
+/// stays correct.
+#[test]
+fn summary_names_the_next_step_tool_for_each_reply_shape() {
+    fn summary(reply: PeerReply) -> String {
+        let rendered = render_call_tool_result(&reply).unwrap();
+        let ContentBlock::Text(text) = &rendered.content[0] else {
+            panic!("summary is a text block");
+        };
+        text.text.clone()
+    }
+    let queued = summary(PeerReply::Pending {
+        detail_ref: "detail-1".into(),
+        helper: None,
+    });
+    assert!(queued.contains("ide.inspect") && queued.contains("detail-1"));
+    let helper = summary(PeerReply::Pending {
+        detail_ref: "detail-2".into(),
+        helper: Some("run-me".into()),
+    });
+    assert!(helper.contains("run-me") && helper.contains("ide.inspect"));
+    let activation = summary(PeerReply::Complete {
+        kind: ResultKind::Activation,
+        text: String::new(),
+        detail_ref: Some("detail-3".into()),
+        truncated: false,
+    });
+    assert!(activation.contains("ide.context"));
+    let truncated_context = summary(PeerReply::Complete {
+        kind: ResultKind::Context,
+        text: String::new(),
+        detail_ref: Some("detail-4".into()),
+        truncated: true,
+    });
+    assert!(truncated_context.contains("ide.inspect") && truncated_context.contains("detail-4"));
+    let fresh_context = summary(PeerReply::Complete {
+        kind: ResultKind::Context,
+        text: String::new(),
+        detail_ref: Some("detail-5".into()),
+        truncated: false,
+    });
+    assert!(!fresh_context.contains("ide.inspect"));
+    let diff = summary(PeerReply::Complete {
+        kind: ResultKind::Diff,
+        text: String::new(),
+        detail_ref: Some("detail-6".into()),
+        truncated: false,
+    });
+    assert!(diff.contains("ide.stop"));
+    let stop = summary(PeerReply::Complete {
+        kind: ResultKind::Stop,
+        text: String::new(),
+        detail_ref: None,
+        truncated: false,
+    });
+    assert!(stop.contains("remain on disk"));
 }

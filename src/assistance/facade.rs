@@ -894,7 +894,7 @@ fn rendered_reply_bounds_the_complete_mcp_result() {
 
 #[tool_router]
 impl StdioFacade {
-    /// Routes a stable activation ID and separately supplied host context through the bounded call boundary.
+    /// Activates this actor/worktree once; call `ide.context` next before a native source edit.
     #[tool(name = "ide.start", input_schema = tool_schemas()[0].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn start(
         &self,
@@ -904,7 +904,7 @@ impl StdioFacade {
         self.call(AssistanceTool::Start, parameters, context).await
     }
 
-    /// Routes bounded context parameters and host request context without accepting model-owned identity.
+    /// Reads bounded source and diagnostics before or after editing with the native host writer.
     #[tool(name = "ide.context", input_schema = tool_schemas()[1].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn context(
         &self,
@@ -915,7 +915,7 @@ impl StdioFacade {
             .await
     }
 
-    /// Routes bounded diff parameters and host context; absent Changes results never imply a ready diff.
+    /// Reviews the accumulated native edits before the task finishes and `ide.stop` releases them.
     #[tool(name = "ide.diff", input_schema = tool_schemas()[2].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn diff(
         &self,
@@ -925,7 +925,7 @@ impl StdioFacade {
         self.call(AssistanceTool::Diff, parameters, context).await
     }
 
-    /// Routes a bounded detail reference and host context; unavailable owner peers produce no expansion.
+    /// Expands only a `detail_ref` returned by a pending or truncated IDE reply.
     #[tool(name = "ide.inspect", input_schema = tool_schemas()[3].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn inspect(
         &self,
@@ -936,7 +936,7 @@ impl StdioFacade {
             .await
     }
 
-    /// Routes an empty stop object and host context without claiming revocation from an unavailable peer.
+    /// Releases this actor's IDE binding at task end or handoff; edited files remain on disk.
     #[tool(name = "ide.stop", input_schema = tool_schemas()[4].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn stop(
         &self,
