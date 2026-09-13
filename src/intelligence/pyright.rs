@@ -320,7 +320,9 @@ pub struct PyrightProtocolChild {
 }
 
 impl PyrightProtocolChild {
-    /// Consumes the view launch capability to start one authority-bound Pyright child.
+    /// Starts one authority-bound Pyright child from the view capability after rechecking the
+    /// accepted script. A script mismatch uses `admission` to cancel the still-unconsumed view and
+    /// release its backend slot; successful verification consumes the capability exactly once.
     #[allow(clippy::too_many_arguments)] // The owned-spawn boundary carries the independently validated capabilities.
     pub fn spawn(
         request: &ValidatedExecutionRequest,
