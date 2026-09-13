@@ -59,7 +59,7 @@ pub struct ExecutionProfileTemplate {
     version: u32,
     /// Host profile class covered by this template.
     class: ProfileClass,
-    /// Effective permission/trust value proven by this template, excluding only sandbox cwd identity.
+    /// Effective permission/trust value proven by this template, portable across equivalent worktrees.
     profile_digest: blake3::Hash,
 }
 
@@ -94,11 +94,11 @@ pub struct PersistedProfileRecord {
     pub trust: String,
     /// Sandbox transport/mechanism identity observed by the D03 run.
     pub transport: String,
-    /// Effective permission-value identity, never a path-erasing shape match.
+    /// Effective permission-value identity with only worktree-local path prefixes made portable.
     pub permission_value: String,
     /// Immutable D03 evidence identity for this tested record.
     pub d03_evidence: String,
-    /// Semantic (not textual) complete-state identity for the accepted profile value.
+    /// Semantic state identity with only worktree-local path prefixes made portable.
     pub semantic_state: String,
 }
 
@@ -348,9 +348,9 @@ impl HostSandboxState {
         &self.raw_json
     }
 
-    /// Returns a profile digest that retains effective permission values but excludes cwd identity.
+    /// Returns a profile digest retaining all permissions except equivalent worktree path prefixes.
     fn profile_digest(&self) -> blake3::Hash {
-        blake3::hash(profile_template_value(&self.raw).to_string().as_bytes())
+        blake3::hash(profile_template_value(self).to_string().as_bytes())
     }
 }
 
@@ -3716,18 +3716,60 @@ fn os_bytes(value: &OsString) -> usize {
     }
 }
 
-/// Keeps all semantic profile fields/values while excluding only sandbox cwd identity from a template digest.
-fn profile_template_value(value: &Value) -> Value {
-    let mut template = value.clone();
-    if let Some(object) = template.as_object_mut() {
-        object.insert("sandboxCwd".into(), Value::String("<workspace-cwd>".into()));
+/// Projects a sandbox state into a worktree-portable profile template.
+///
+/// The sandbox cwd must be a supported local absolute path. Its template value becomes the stable
+/// `<workspace-cwd>` marker, as does the prefix of every ordinary filesystem path entry equal to
+/// or below that cwd; each descendant suffix is retained. Sibling and outside paths, special-path
+/// entries, access modes, network policy, unknown fields, and the caller's original value remain
+/// unchanged. `state` has already passed [`HostSandboxState`] validation, so its local cwd is
+/// absolute and free of current- or parent-directory components.
+fn profile_template_value(state: &HostSandboxState) -> Value {
+    let mut template = state.raw.clone();
+    let Some(object) = template.as_object_mut() else {
+        return template;
+    };
+    object.insert("sandboxCwd".into(), Value::String("<workspace-cwd>".into()));
+    if let Some(entries) = object
+        .get_mut("permissionProfile")
+        .and_then(|profile| profile.get_mut("file_system"))
+        .and_then(|file_system| file_system.get_mut("entries"))
+        .and_then(Value::as_array_mut)
+    {
+        for entry in entries {
+            let Some(path) = entry.get_mut("path").and_then(Value::as_object_mut) else {
+                continue;
+            };
+            if path.get("type").and_then(Value::as_str) != Some("path") {
+                continue;
+            }
+            let Some(raw_path) = path.get("path").and_then(Value::as_str).map(str::to_owned) else {
+                continue;
+            };
+            let entry_path = Path::new(&raw_path);
+            let Ok(suffix) = entry_path.strip_prefix(&state.cwd) else {
+                continue;
+            };
+            if !is_normal_absolute(entry_path) {
+                continue;
+            }
+            path.insert(
+                "path".into(),
+                Value::String(
+                    Path::new("<workspace-cwd>")
+                        .join(suffix)
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            );
+        }
     }
     template
 }
 
-/// Hashes the complete semantic host state without relying on JSON whitespace or key order.
+/// Hashes the worktree-portable semantic host state without relying on whitespace or key order.
 fn semantic_state_identity(state: &HostSandboxState) -> String {
-    blake3::hash(canonical_json(&profile_template_value(&state.raw)).as_bytes())
+    blake3::hash(canonical_json(&profile_template_value(state)).as_bytes())
         .to_hex()
         .to_string()
 }

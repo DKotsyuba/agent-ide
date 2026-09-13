@@ -391,6 +391,54 @@ fn real_managed_state(cwd: &str) -> serde_json::Value {
     })
 }
 
+/// Equivalent captured profiles match across workdirs, while an outside path remains significant.
+#[test]
+fn profile_templates_are_portable_only_for_worktree_paths() {
+    let state = |cwd: &str, outside: &str| {
+        HostSandboxState::parse(Some(serde_json::json!({
+            "codexLinuxSandboxExe": null,
+            "permissionProfile": {
+                "file_system": {
+                    "entries": [
+                        {"access":"write","path":{"path":cwd,"type":"path"}},
+                        {"access":"read","path":{"path":format!("{cwd}/.git"),"type":"path"}},
+                        {"access":"read","path":{"path":format!("{cwd}/.agents"),"type":"path"}},
+                        {"access":"read","path":{"path":format!("{cwd}/.codex"),"type":"path"}},
+                        {"access":"read","path":{"path":outside,"type":"path"}},
+                        {"access":"write","path":{"type":"special","value":{"kind":"tmpdir"}}}
+                    ],
+                    "type": "restricted"
+                },
+                "network": "restricted",
+                "type": "managed",
+                "unknown": {"preserved": true}
+            },
+            "sandboxCwd": cwd,
+            "useLegacyLandlock": false
+        })))
+        .unwrap()
+    };
+    let first = state("/private/tmp/one/work", "/opt/shared/toolchain");
+    let second = state("/private/tmp/two/work", "/opt/shared/toolchain");
+    assert_eq!(first.profile_digest(), second.profile_digest());
+    assert_eq!(
+        semantic_state_identity(&first),
+        semantic_state_identity(&second)
+    );
+
+    let outside_changed = state("/private/tmp/two/work", "/opt/other/toolchain");
+    assert_ne!(first.profile_digest(), outside_changed.profile_digest());
+    assert_ne!(
+        semantic_state_identity(&first),
+        semantic_state_identity(&outside_changed)
+    );
+    assert_eq!(first.raw["sandboxCwd"], "/private/tmp/one/work");
+    assert_eq!(
+        first.raw["permissionProfile"]["file_system"]["entries"][1]["path"]["path"],
+        "/private/tmp/one/work/.git"
+    );
+}
+
 /// The recognizer accepts the real default managed entries and refuses every unrecognized shape.
 #[test]
 fn read_all_recognition_is_closed_over_real_entry_shapes() {

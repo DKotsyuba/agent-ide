@@ -12,7 +12,7 @@ roots. Complete delivery accounting and the remaining roadmap acceptance checks 
 
 Tagged releases are built on GitHub Actions using an arm64 macOS runner and published
 with a SHA-256 checksum in GitHub Releases. Install the latest private release with
-`./install.sh`, or select one with `./install.sh 0.1.2`. The installer uses the
+`./install.sh`, or select one with `./install.sh 0.1.3`. The installer uses the
 authenticated GitHub CLI, verifies `SHA256SUMS`, and atomically installs to
 `~/.local/bin` (override with `AGENT_IDE_INSTALL_DIR`). It does not edit MCP or hook
 configuration.
@@ -34,9 +34,11 @@ Placeholder-only host examples are shipped for
 
 `agent-ide doctor --runtime-dir PATH` is observational: it reports effective default configuration and local endpoint/lock/protocol state without creating the path or starting services. Workspace scanning, LSP startup, daemon autostart, and cache retirement without a peer-verified closure/reset fact are unsupported.
 
-Version 0.1.2 adds offline installation helpers without changing the five-tool MCP
-surface: `agent-ide evidence executable`, `agent-ide evidence record`, and
-`agent-ide launcher check`. The bundled `skills/agent-ide` workflow directs coding
+Version 0.1.3 makes captured managed sandbox profiles portable across equivalent
+worktrees without changing raw execution state or the five-tool MCP surface. It also
+includes the offline installation helpers `agent-ide evidence executable`,
+`agent-ide evidence record`, and `agent-ide launcher check`. The bundled
+`skills/agent-ide` workflow directs coding
 agents through start, context, native editing, refreshed context, diff, and stop;
 unavailable IDE support falls back to native host tools.
 

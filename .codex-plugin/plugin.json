@@ -1,6 +1,6 @@
 {
   "name": "agent-ide",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Agent IDE coding-companion skill exposing the bounded ide.start/context/diff/inspect/stop workflow for active-session source edits.",
   "author": {
     "name": "DKotsyuba"

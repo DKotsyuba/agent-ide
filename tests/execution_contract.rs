@@ -1215,9 +1215,9 @@ fn inherited_sandbox_cwd_validates_only_for_a_recognized_read_all_profile_with_a
         "sandboxCwd is never rewritten toward the target worktree"
     );
 
-    // A stale catalog still refuses the same admitted shape.
+    // A catalog whose access mode differs still refuses the otherwise portable profile.
     let (invocation, _) = inherited_invocation(&inherited, true);
-    let (_, foreign) = inherited_invocation(&worktree(), true);
+    let (_, foreign) = inherited_invocation(&worktree(), false);
     assert_eq!(
         ValidatedExecutionRequest::validate(
             invocation,
