@@ -473,17 +473,28 @@ impl Worker<'_> {
                 _ => return Err(FailureCode::ProviderUnavailable),
             }
         };
-        let mut child = match PyrightProtocolChild::spawn(
-            &request,
-            &profile,
-            &worktree,
-            &mut self.providers.registry,
-            view.lease(),
-            Some(active),
-            &job.target.codex.path,
-            self.shared.launcher.limits.output_bytes,
-        ) {
+        let child = {
+            let admission = self.admission.clone();
+            let mut admission = admission
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            PyrightProtocolChild::spawn(
+                &request,
+                &profile,
+                &worktree,
+                &mut self.providers.registry,
+                &mut admission,
+                view.lease(),
+                Some(active),
+                &job.target.codex.path,
+                self.shared.launcher.limits.output_bytes,
+            )
+        };
+        let mut child = match child {
             Ok(child) => child,
+            Err(PyrightProfileError::InvalidProfile) => {
+                return Err(FailureCode::ProviderUnavailable);
+            }
             Err(error) => {
                 let _ = view.release(&mut self.providers.registry);
                 if let PyrightProfileError::Process(error) = error {

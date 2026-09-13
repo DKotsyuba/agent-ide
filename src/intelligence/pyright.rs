@@ -327,12 +327,18 @@ impl PyrightProtocolChild {
         profile: &PyrightProfile,
         worktree: &PyrightWorktree,
         registry: &mut ProviderLeaseRegistry,
+        admission: &mut AdmissionController,
         view: ProviderViewLease,
         active_use: Option<ActiveBindingUse>,
         codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, PyrightProfileError> {
-        profile.verify_script()?;
+        if profile.verify_script().is_err() {
+            registry
+                .cancel_unstarted(admission, view)
+                .map_err(PyrightProfileError::Execution)?;
+            return Err(PyrightProfileError::InvalidProfile);
+        }
         let capability = registry
             .take_spawn_lease(view)
             .map_err(PyrightProfileError::Execution)?;
@@ -381,6 +387,12 @@ impl PyrightProtocolChild {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::{
+        AdmissionLimits, ExecutionProfileCatalog, ExecutionProfileTemplate, HostSandboxState,
+        LocalExecutionPolicy, ProviderLeaseLimits, ValidatedHostInvocation,
+    };
+    use serde_json::json;
+    use std::collections::BTreeSet;
 
     /// Builds a canonical worktree/authority pair for fixed-profile command construction tests.
     fn worktree() -> PyrightWorktree {
@@ -435,6 +447,44 @@ mod tests {
         })
     }
 
+    /// Builds a valid provider request whose command is inert because script verification fails first.
+    fn request(authority: &WorkspaceAuthority) -> ValidatedExecutionRequest {
+        let root = std::env::temp_dir();
+        let sandbox = HostSandboxState::parse(Some(json!({
+            "permissionProfile":{"type":"disabled"},
+            "codexLinuxSandboxExe":null,
+            "sandboxCwd":root.clone(),
+            "useLegacyLandlock":false
+        })))
+        .unwrap();
+        let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+            ExecutionProfileTemplate::from_execution_evidence("pyright-test", 1, &sandbox).unwrap(),
+        ])
+        .unwrap();
+        let command = ControlledCommand::from_validated_peer(
+            CommandKind::Provider,
+            "/usr/bin/true".into(),
+            Vec::new(),
+            root,
+            BTreeMap::new(),
+        )
+        .unwrap();
+        ValidatedExecutionRequest::validate(
+            ValidatedHostInvocation::from_verified_binding("pyright-test", sandbox).unwrap(),
+            authority.clone(),
+            command,
+            &LocalExecutionPolicy::new(
+                BTreeSet::from([PathBuf::from("/usr/bin/true")]),
+                4096,
+                16,
+                true,
+            )
+            .unwrap(),
+            &catalog,
+        )
+        .unwrap()
+    }
+
     /// Admits a profile whose current script and Node fixture bytes equal their accepted digests.
     #[test]
     fn accepted_profile_builds_command() {
@@ -469,19 +519,67 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    /// Rejects a replaced script in the pre-spawn verification that runs before a lease is consumed.
+    /// Rejects a replaced script at the spawn boundary without consuming its view lease.
     #[test]
-    fn replaced_script_after_profile_creation_rejects_pre_spawn_verification() {
+    fn replaced_script_after_profile_creation_rejects_spawn_before_lease_consumption() {
         let directory = temporary_directory();
         let script = executable(&directory, "pyright", b"#!/bin/sh\nexit 0\n");
         let node = executable(&directory, "node", b"#!/bin/sh\nexit 0\n");
         let profile = profile(&script, &node).unwrap();
+        let worktree = worktree();
+        let request = request(worktree.authority());
+        let mut registry = ProviderLeaseRegistry::new(ProviderLeaseLimits {
+            total_views: 1,
+            per_backend_views: 1,
+        })
+        .unwrap();
+        let mut admission = AdmissionController::new(AdmissionLimits {
+            total_running: 1,
+            per_owner_running: 1,
+            per_owner_queued: 1,
+            total_queued: 1,
+            interactive_burst: 1,
+        })
+        .unwrap();
+        let PyrightViewAdmission::Granted(view) = profile.request_view(
+            &worktree,
+            &mut registry,
+            &mut admission,
+            OwnerId::new("pyright-test").unwrap(),
+            AdmissionClass::Interactive,
+            1,
+        ) else {
+            panic!("fixture view")
+        };
         std::fs::write(&script, b"#!/bin/sh\nexit 1\n").unwrap();
 
         assert!(matches!(
-            profile.verify_script(),
+            PyrightProtocolChild::spawn(
+                &request,
+                &profile,
+                &worktree,
+                &mut registry,
+                &mut admission,
+                view.lease(),
+                None,
+                Path::new("/unused"),
+                64,
+            ),
             Err(PyrightProfileError::InvalidProfile)
         ));
+        let PyrightViewAdmission::Granted(retry) = profile.request_view(
+            &worktree,
+            &mut registry,
+            &mut admission,
+            OwnerId::new("pyright-retry").unwrap(),
+            AdmissionClass::Interactive,
+            2,
+        ) else {
+            panic!("failed pre-spawn verification must release provider capacity")
+        };
+        registry
+            .cancel_unstarted(&mut admission, retry.lease())
+            .unwrap();
 
         std::fs::remove_dir_all(directory).unwrap();
     }
