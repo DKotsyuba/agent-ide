@@ -419,10 +419,15 @@ async fn binary_routes_six_methods_to_typed_missing_peer_and_survives_daemon_los
                 }}),
             )
             .await;
-        assert_eq!(response["result"]["isError"], true, "{response}");
+        assert_ne!(response["result"]["isError"], json!(true), "{response}");
+        assert_eq!(response["result"]["content"].as_array().unwrap().len(), 1);
         assert_eq!(
             response["result"]["content"][0]["text"],
-            "Assistance unavailable: host_binding; continue with native tools"
+            "unavailable: host_binding; continue with native tools"
+        );
+        assert_eq!(
+            response["result"]["structuredContent"],
+            json!({"state":"unavailable","reason":"host_binding"})
         );
         assert!(!response.to_string().contains("private-host-channel"));
     }
@@ -1005,6 +1010,54 @@ async fn binary_preserves_sandbox_metadata_and_renders_closed_pending() {
     );
     assert!(!reply.to_string().contains("private-state-marker"));
     assert!(reply.to_string().len() < 64 * 1024);
+    mcp.close().await;
+    drop(listener);
+    std::fs::remove_dir_all(runtime).unwrap();
+}
+
+/// Routes typed unavailable and host-stopped replies through the compact structured MCP envelope.
+#[tokio::test]
+async fn binary_renders_typed_lifecycle_replies_without_transport_errors() {
+    use tokio::net::UnixListener;
+
+    let runtime = runtime();
+    std::fs::create_dir(&runtime).unwrap();
+    let listener = UnixListener::bind(runtime.join("agent-ide.sock")).unwrap();
+    let mut mcp = Mcp::start(&runtime, Some("private-host-channel")).await;
+    let replies = [
+        (
+            host_call("actor", "unavailable", "ide.start"),
+            json!({"state":"unavailable","reason":"host_binding"}),
+            "unavailable: host_binding; continue with native tools",
+        ),
+        (
+            host_call("actor", "stopped", "ide.stop"),
+            json!({"state":"host_stopped"}),
+            "host_stopped: host binding released; no workspace authority was created",
+        ),
+    ];
+    for (call, expected, text) in replies {
+        let peer = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let size = stream.read_u32().await.unwrap();
+            let mut bytes = vec![0; size as usize];
+            stream.read_exact(&mut bytes).await.unwrap();
+            let frame: Value = serde_json::from_slice(&bytes).unwrap();
+            let reply = json!({
+                "version": 2,
+                "request_id": frame["request_id"],
+                "opaque_result_json": expected,
+            })
+            .to_string();
+            stream.write_u32(reply.len() as u32).await.unwrap();
+            stream.write_all(reply.as_bytes()).await.unwrap();
+        };
+        let (response, ()) = tokio::join!(mcp.exchange(call), peer);
+        assert_ne!(response["result"]["isError"], json!(true), "{response}");
+        assert_eq!(response["result"]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(response["result"]["content"][0]["text"], text);
+        assert_eq!(response["result"]["structuredContent"], expected);
+    }
     mcp.close().await;
     drop(listener);
     std::fs::remove_dir_all(runtime).unwrap();
@@ -4064,10 +4117,18 @@ async fn diff_pagination_delivers_every_whole_hunk_once_with_truthful_freshness(
     )
     .unwrap();
     let after_edit = actor
-        .call(&fixture, "ide.inspect", json!({"detail_ref":reopened_ref}))
+        .call(&fixture, "ide.inspect", json!({"detail_ref":&reopened_ref}))
         .await;
     assert_eq!(after_edit["state"], "error", "{after_edit}");
     assert_eq!(after_edit["code"], "source_unavailable", "{after_edit}");
+    let after_edit_retry = actor
+        .call(&fixture, "ide.inspect", json!({"detail_ref":&reopened_ref}))
+        .await;
+    assert_eq!(after_edit_retry["kind"], "diff", "{after_edit_retry}");
+    assert_eq!(
+        after_edit_retry["continuation"], false,
+        "{after_edit_retry}"
+    );
 
     // The production snapshot runner correlates each captured path with its durable observation:
     // a registered path edited without any reconciliation must fail the capture rather than being
@@ -4143,11 +4204,10 @@ async fn diff_oversized_single_hunk_reports_capacity_without_false_continuation(
     daemon.wait().await.unwrap();
 }
 
-/// Drives one real foreground Claude helper launch end to end: `ide.start` returns the exact
-/// helper instruction, a native Bash pre-hook arms it, the fixed helper subcommand runs as a real
-/// process and claims it over the private socket, a matching Bash post-hook settles it, and
-/// `ide.inspect` publishes ordinary results, while Stop consumes an already-ready Edit result
-/// without losing its known replacement outcome.
+/// Drives real foreground Claude helper Start, Diff, Context and Edit launches end to end: each
+/// helper instruction is armed by a native Bash pre-hook, settles through its matching post-hook,
+/// and publishes only through `ide.inspect`, including an escape-heavy Diff that must fit whole;
+/// Stop also consumes an already-ready Edit result without losing its known replacement outcome.
 ///
 /// The accepted `claude_profile` here is the fixture's test-only disabled launcher wiring proof,
 /// not a real host sandbox measurement: it only proves the daemon→hook→helper→daemon correlation
@@ -4239,6 +4299,16 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
     }
 
     let fixture = ProductFixture::new_claude(json!([]));
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "clean claude fixture"]);
+    std::fs::write(fixture.root.join("claude-heavy.txt"), "base\n").unwrap();
+    fixture.git(&["add", "--", "claude-heavy.txt"]);
+    fixture.git(&["commit", "--quiet", "-m", "claude heavy base"]);
+    std::fs::write(
+        fixture.root.join("claude-heavy.txt"),
+        escape_heavy("claude-escape", 400),
+    )
+    .unwrap();
     let mut daemon = fixture.daemon().await;
     let mut first = ProductActor::new(&fixture, "claude-first").await;
 
@@ -4320,6 +4390,15 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
     )
     .await;
     assert_eq!(still_usable, started, "{still_usable}");
+
+    // This hunk is below Claude's raw selection cap but near the duplicated escaped MCP envelope.
+    // Shared fitting may omit later whole hunks, but it must neither slice this hunk nor advertise
+    // a cursor the helper cannot retain after its ticket is consumed.
+    let diff = claude_operation(&mut first, &fixture, "ide.diff", json!({"mode":"head"})).await;
+    assert_eq!(diff["kind"], "diff", "{diff}");
+    assert_eq!(diff["continuation"], false, "{diff}");
+    let diff_text = diff["text"].as_str().unwrap();
+    assert_eq!(diff_text.matches("claude-escape").count(), 400, "{diff}");
 
     let context = claude_operation(
         &mut first,
@@ -4439,7 +4518,16 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
     first
         .claude_lifecycle(&fixture, "PostToolUse", &stale_call)
         .await;
-    assert_eq!(stale_detail["result"]["isError"], true, "{stale_detail}");
+    assert_ne!(
+        stale_detail["result"]["isError"],
+        json!(true),
+        "{stale_detail}"
+    );
+    assert_eq!(
+        stale_detail["result"]["structuredContent"],
+        json!({"state":"unavailable","reason":"host_binding"}),
+        "{stale_detail}"
+    );
     assert!(
         stale_detail["result"]["content"][0]["text"]
             .as_str()

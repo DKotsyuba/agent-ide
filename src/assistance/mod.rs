@@ -6,6 +6,9 @@
 /// Exposes the five bounded MCP tools, finite Application routing, and fail-open feedback state.
 pub mod facade;
 
+/// Projects validated peer replies into compact model text and unchanged structured results.
+pub(crate) mod content;
+
 /// Connects bounded daemon host correlation to closed peer-boundary outcomes.
 pub mod assembly;
 

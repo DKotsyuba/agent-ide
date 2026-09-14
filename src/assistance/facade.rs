@@ -25,14 +25,12 @@ use crate::{
         },
     },
     assistance::{
+        content,
         host_binding::{
             HookEvent, HookLaunch, HookPhase, HostBindingGuard, HostKind, parse_candidate,
             parse_claude_call_id, parse_hook_event, parse_host_kind,
         },
-        reply::{
-            MAX_FEEDBACK_BYTES, MissingPeer, PeerReply, ResultKind, call_tool_result_fits,
-            render_call_tool_result,
-        },
+        reply::{MAX_FEEDBACK_BYTES, PeerReply, ResultKind},
     },
     workspace::authority::{
         AuthorityError, AuthorityRegistry, AuthorityRevoked, AuthorityStamp, StopBindingHandoff,
@@ -376,11 +374,7 @@ pub enum FacadeOutcome {
     Unavailable,
     /// IPC accepted the envelope but no typed peer result was available for safe rendering.
     Incomplete,
-    /// Assistance explicitly identified the first unavailable peer boundary.
-    PeerUnavailable(MissingPeer),
-    /// The exact host binding was revoked without claiming a Workspace operation.
-    HostStopped,
-    /// Pending, typed failure or current owner result accepted from the daemon.
+    /// Typed peer result accepted from the daemon.
     Reply(PeerReply),
 }
 
@@ -450,15 +444,12 @@ impl AssistanceFacade {
             MethodDispatchTransportResult::Unavailable => FacadeOutcome::Unavailable,
             MethodDispatchTransportResult::Dispatched { opaque_result_json } => {
                 match PeerReply::decode(opaque_result_json.as_str()) {
-                    Some(PeerReply::Unavailable { reason }) => {
-                        FacadeOutcome::PeerUnavailable(reason)
-                    }
-                    Some(PeerReply::HostStopped {}) if tool == AssistanceTool::Stop => {
-                        FacadeOutcome::HostStopped
-                    }
-                    Some(reply @ (PeerReply::Pending { .. } | PeerReply::Error { .. })) => {
-                        FacadeOutcome::Reply(reply)
-                    }
+                    Some(
+                        reply @ (PeerReply::Unavailable { .. }
+                        | PeerReply::HostStopped {}
+                        | PeerReply::Pending { .. }
+                        | PeerReply::Error { .. }),
+                    ) => FacadeOutcome::Reply(reply),
                     Some(reply @ PeerReply::Edit { .. })
                         if matches!(tool, AssistanceTool::Edit | AssistanceTool::Inspect) =>
                     {
@@ -905,49 +896,28 @@ impl StdioFacade {
             FacadeOutcome::Incomplete => {
                 "typed Assistance peer result is unavailable; continue with native tools"
             }
-            FacadeOutcome::HostStopped => {
-                return CallToolResult::success(vec![ContentBlock::text(
-                    "Assistance host binding stopped; no Workspace authority was created",
-                )]);
-            }
-            FacadeOutcome::PeerUnavailable(MissingPeer::WorkspaceActivation) => {
-                "Assistance unavailable: workspace_activation; continue with native tools"
-            }
-            FacadeOutcome::PeerUnavailable(MissingPeer::HostBinding) => {
-                "Assistance unavailable: host_binding; continue with native tools"
-            }
         };
         CallToolResult::error(vec![ContentBlock::text(message)])
     }
 }
 
-/// Budgets the complete MCP result by shrinking owner text until it fits the same exact envelope
-/// `worker::snapshots::fit_diff_page` already proved a Diff page fits.
+/// Renders the complete compact MCP result within the same exact envelope that retained Diff page
+/// fitting uses.
 ///
-/// Both callers share [`render_call_tool_result`] and [`call_tool_result_fits`] so a page accepted
-/// during pagination is measured by the identical predicate here and is never re-cut mid-hunk by an
-/// independently computed reserve; only a non-Diff reply too large on arrival (never proven to fit
-/// upstream) ever reaches the shrink loop below.
+/// [`content::render`] shrinks only owner Complete text at UTF-8 boundaries. Diff pages have already
+/// passed [`content::fits`] without shrinking, so the facade never re-cuts an accepted whole hunk.
 ///
 /// `pub(super)` so `worker::Shared::mark_feedback_inline_delivered` can trace the exact same
 /// final carrier a live caller would receive, instead of re-approximating the fitting boundary.
-pub(super) fn render_reply(mut reply: PeerReply) -> CallToolResult {
-    loop {
-        if let Some(rendered) = render_call_tool_result(&reply)
-            && call_tool_result_fits(&rendered)
-        {
-            return rendered;
-        }
-        if !reply.shrink_text() {
-            break;
-        }
-    }
-    CallToolResult::error(vec![ContentBlock::text(
-        "Assistance result exceeds the bounded envelope; continue with native tools",
-    )])
+pub(super) fn render_reply(reply: PeerReply) -> CallToolResult {
+    content::render(reply).unwrap_or_else(|| {
+        CallToolResult::error(vec![ContentBlock::text(
+            "Assistance result exceeds the bounded envelope; continue with native tools",
+        )])
+    })
 }
 
-/// Ensures duplicated and escaped MCP text cannot defeat the actual serialized response budget.
+/// Ensures escaped compact text cannot defeat the actual serialized response budget.
 #[test]
 fn rendered_reply_bounds_the_complete_mcp_result() {
     let rendered = render_reply(PeerReply::Complete {
@@ -955,12 +925,31 @@ fn rendered_reply_bounds_the_complete_mcp_result() {
         text: "\0🦀\"\\".repeat(16000),
         detail_ref: Some("same-binding-detail".into()),
         truncated: false,
+        continuation: false,
     });
-    assert!(call_tool_result_fits(&rendered));
+    assert!(content::call_tool_result_fits(&rendered));
+    assert_eq!(rendered.content.len(), 1);
     let result = rendered.structured_content.unwrap();
     assert_eq!(result["truncated"], true);
     assert_eq!(result["detail_ref"], "same-binding-detail");
     assert!(result["text"].as_str().unwrap().contains('🦀'));
+}
+
+/// Projects typed unavailable and stop lifecycle replies through the shared compact envelope.
+#[test]
+fn typed_lifecycle_replies_preserve_structured_content_without_transport_errors() {
+    for reply in [
+        PeerReply::Unavailable {
+            reason: crate::assistance::reply::MissingPeer::HostBinding,
+        },
+        PeerReply::HostStopped {},
+    ] {
+        let expected = serde_json::to_value(&reply).unwrap();
+        let rendered = render_reply(reply);
+        assert_eq!(rendered.content.len(), 1);
+        assert_eq!(rendered.structured_content, Some(expected));
+        assert_ne!(rendered.is_error, Some(true));
+    }
 }
 
 #[tool_router]

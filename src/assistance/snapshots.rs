@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::{
+    assistance::content,
     execution::{
         CapturedProcessEvidence, ControlledCommand, ControlledTrampoline, LocalExecutionPolicy,
         OwnedChild, ValidatedExecutionRequest, ValidatedHostInvocation, WorkspaceAuthority,
@@ -295,20 +296,22 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// rendered text. `compose` is invoked with a candidate hunk count and must return the selection
 /// for exactly that count under the originally captured byte budget.
 ///
-/// Fitting is measured through [`render_call_tool_result`] and [`call_tool_result_fits`], the same
-/// exact envelope construction and predicate `render_reply` uses to build the complete MCP result
-/// the host actually receives. Using anything narrower here — such as the raw serialized
-/// [`PeerReply`] with an approximate fixed reserve — undercounts the real envelope, because the
-/// MCP result duplicates the reply's JSON into both `content` and `structured_content`; a page
-/// accepted under that narrower measurement could then be silently cut mid-hunk by `render_reply`'s
-/// own shrink loop after the cursor already advanced past it.
+/// Fitting is measured through [`content::fits`], the same compact projection and final serialized
+/// envelope predicate [`content::render`] uses for the complete MCP result the host receives. Using
+/// anything narrower here — such as the raw serialized [`PeerReply`] with an approximate fixed
+/// reserve — could accept a page that the facade then has to cut after its cursor advanced.
 ///
 /// * `mode` — compare mode rendered into the page text.
 /// * `authority_epoch` — current durable epoch rendered as provenance.
 /// * `reference` — same-binding detail handle echoed as `detail_ref`.
 /// * `max_hunks` — largest count to attempt; halved on each retry and clamped to at least one.
+/// * `retain_continuation` — whether this caller will retain the accepted cursor for later
+///   `ide.inspect`; helper results pass `false` because their settled ticket has no page state.
 /// * `compose` — pure selection callback; it must not mutate retained state, because it is called
 ///   repeatedly and only the returned result of the accepted attempt is retained.
+///
+/// The rendered `more_available` marker and typed `continuation` flag are both true only when the
+/// caller retains a cursor for a later `ide.inspect`.
 ///
 /// Returns the accepted selection together with the exact [`PeerReply`] rendered from it; the
 /// caller retains continuation state derived from that same selection.
@@ -320,11 +323,12 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// * [`FailureCode::Capacity`] when even a single whole hunk cannot fit the serialized envelope.
 ///   This is deliberately an explicit finite budget failure: the alternative would be delivering a
 ///   silently cut hunk or claiming an undelivered hunk was delivered.
-pub(super) fn fit_diff_page(
+pub(crate) fn fit_diff_page(
     mode: DiffMode,
     authority_epoch: u64,
     reference: &str,
     max_hunks: usize,
+    retain_continuation: bool,
     compose: impl Fn(usize) -> crate::changes::DiffResult,
 ) -> Result<(crate::changes::DiffResult, PeerReply), FailureCode> {
     let mut max_hunks = max_hunks.max(1);
@@ -340,7 +344,7 @@ pub(super) fn fit_diff_page(
             mode,
             &candidate,
             authority_epoch,
-            candidate.detail_cursor().is_some(),
+            retain_continuation && candidate.detail_cursor().is_some(),
         );
         let reply = PeerReply::Complete {
             kind: ResultKind::Diff,
@@ -349,9 +353,9 @@ pub(super) fn fit_diff_page(
             truncated: candidate.truncated_output()
                 || candidate.overflow_hunks() > 0
                 || candidate.overflow_bytes() > 0,
+            continuation: retain_continuation && candidate.detail_cursor().is_some(),
         };
-        if render_call_tool_result(&reply).is_some_and(|rendered| call_tool_result_fits(&rendered))
-        {
+        if content::fits(&reply) {
             return Ok((candidate, reply));
         }
         if max_hunks == 1 {
@@ -753,6 +757,7 @@ impl Worker<'_> {
             authority.epoch(),
             &reference,
             budget.max_hunks,
+            true,
             |max_hunks| {
                 crate::changes::compose_diff(
                     &scope,

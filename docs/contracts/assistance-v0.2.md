@@ -2,6 +2,8 @@
 
 Revision: EDIT-r1 (proposed). Provider: Assistance. Direct consumers: Application, Changes, and host adapters. Vocabulary: [common](common.md).
 
+Agent-facing rendering follows [AGENT-CONTENT-r1](agent-content-v0.2.md): every validated PeerReply becomes exactly one deterministic compact model text block plus the complete unchanged PeerReply in structuredContent. Only typed `Error` sets `isError`. The facade and retained Diff pagination use the same final serialized CallToolResult measurement; only owner Complete text may shrink, at UTF-8 boundaries, and Diff fitting removes whole hunks instead of cutting text. Rendering is host-independent and neither adds a second response schema nor infers diagnostics absent from the typed PeerReply.
+
 ## Sixth closed MCP method
 
 Assistance owns the sixth and only added MCP method, `ide.edit`, alongside `ide.start`, `ide.context`, `ide.diff`, `ide.inspect`, and `ide.stop`. Its parameters and results are exactly the canonical request/outcomes in [Changes v0.2](changes-v0.2.md); Assistance validates the closed schema, current host binding, active authority, and bounded rendering, then delegates. It neither resolves paths, writes files, settles receipts, nor interprets Application storage rows.

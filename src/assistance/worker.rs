@@ -9,10 +9,7 @@ use super::{
         ActiveBindingUse, BindingRef, HostBindingGuard, ObservedSandboxState, ValidatedInvocation,
     },
     launcher::{AcceptedProviderSettings, LaunchTarget, LauncherConfig},
-    reply::{
-        EditDiagnostics, FailureCode, PeerReply, ResultKind, call_tool_result_fits,
-        render_call_tool_result,
-    },
+    reply::{EditDiagnostics, FailureCode, PeerReply, ResultKind},
 };
 use crate::workspace::observation::SourceObservation;
 use crate::{
@@ -401,7 +398,9 @@ impl Shared {
         ledger.delivered.insert(binding.clone(), identity);
     }
     /// Retains or clears the bounded Diff pagination state for one same-binding detail reference.
-    /// Never touches the serialized reply; only `serve_inspection` may advance or drop this state.
+    /// Clearing a page also disables continuation on its retained Diff reply, so a later inspect
+    /// cannot reuse a continuation after permanent invalidation; only `serve_inspection` may
+    /// advance or drop this state otherwise.
     /// A newly stashed page is marked "fresh" because its text (in `reply`) was already composed
     /// by the caller and not yet handed to any inspector. Refuses to retain a *new* page past the
     /// aggregate retained-evidence ceiling and reports that honestly through its `bool` result;
@@ -434,6 +433,15 @@ impl Shared {
         if let Some(detail) = ledger.details.get_mut(reference) {
             detail.diff_page = page;
             detail.diff_page_fresh = retained;
+            if !retained
+                && let PeerReply::Complete {
+                    kind: ResultKind::Diff,
+                    continuation,
+                    ..
+                } = &mut detail.reply
+            {
+                *continuation = false;
+            }
         }
         retained
     }
@@ -1878,6 +1886,7 @@ impl<'a> Worker<'a> {
                 ),
                 detail_ref: Some(job.reference.clone()),
                 truncated: false,
+                continuation: false,
             },
             Some(authority),
             None,
@@ -2073,6 +2082,7 @@ impl<'a> Worker<'a> {
                 ),
                 detail_ref: Some(job.reference.clone()),
                 truncated: false,
+                continuation: false,
             },
             Some(authority),
             None,
@@ -2250,6 +2260,7 @@ impl<'a> Worker<'a> {
                 ),
                 detail_ref: Some(job.reference.clone()),
                 truncated: *truncated,
+                continuation: false,
             },
             Some(authority),
             Some(observed),
@@ -2301,6 +2312,7 @@ impl<'a> Worker<'a> {
                 text: text.clone(),
                 detail_ref: Some(job.reference.clone()),
                 truncated: *truncated,
+                continuation: false,
             },
             Some(authority),
             None,
@@ -2684,6 +2696,7 @@ impl<'a> Worker<'a> {
                 text,
                 detail_ref: Some(job.reference.clone()),
                 truncated: context.truncated,
+                continuation: false,
             },
             Some(authority),
             Some(observed),
@@ -3059,6 +3072,7 @@ impl<'a> Worker<'a> {
                         .into(),
                 detail_ref: None,
                 truncated: false,
+                continuation: false,
             },
             None,
             None,
@@ -3491,6 +3505,7 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
             authority.epoch(),
             &request.reference,
             page.budget().max_hunks,
+            true,
             |max_hunks| page.expand_with_max_hunks(&expected_scope, max_hunks),
         )
         .map_err(|code| match code {
@@ -4568,6 +4583,7 @@ mod feedback_dedup_tests {
             text: text.into(),
             detail_ref: Some(detail_ref.into()),
             truncated: false,
+            continuation: false,
         }
     }
 

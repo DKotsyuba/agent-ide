@@ -24,6 +24,10 @@ because deferred MCP tools may be omitted there. If discovery is absent, returns
 no matching tools, or a discovered tool fails, continue with the fail-open rule
 below. Do not repeat discovery in a loop.
 
+Each accepted reply carries one compact decision-facing text block. When the host exposes
+`structuredContent`, treat that complete typed result as the source of truth instead of parsing the
+compact text as a second response schema.
+
 ## Workflow
 
 1. `ide.start` once per actor per worktree. Do not call it again for later
