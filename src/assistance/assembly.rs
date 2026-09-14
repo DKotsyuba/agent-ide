@@ -576,6 +576,7 @@ impl ProductDispatcher {
                     AssistanceMethod::Diff => super::facade::AssistanceTool::Diff,
                     AssistanceMethod::Inspect => super::facade::AssistanceTool::Inspect,
                     AssistanceMethod::Stop => super::facade::AssistanceTool::Stop,
+                    AssistanceMethod::Edit => super::facade::AssistanceTool::Edit,
                     AssistanceMethod::HookSubmit => return None,
                 };
                 let call =
@@ -710,6 +711,17 @@ impl ProductDispatcher {
                             )
                             .await
                         }
+                        AssistanceMethod::Edit => PeerReply::Edit {
+                            result: crate::changes::edit::EditResult {
+                                operation_id: call.parameters()["operation_id"]
+                                    .as_str()?
+                                    .to_owned(),
+                                path: call.parameters()["path"].as_str()?.to_owned(),
+                                outcome:
+                                    crate::changes::edit::EditOutcome::UnavailableBeforeDispatch,
+                                source_ref: None,
+                            },
+                        },
                         _ => {
                             let reply = self.mint_claude(
                                 &invocation,

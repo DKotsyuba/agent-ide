@@ -2,7 +2,7 @@
 
 An explicitly activated coding companion for Codex and Claude Code, designed for Linux and macOS. One coding agent owns one Git worktree. A local broker coordinates isolated analysis views, compatible shared language-server backends and bounded feedback.
 
-Status: the binary assembles the five-tool MCP surface, exact Codex hook-to-MCP binding,
+Status: the binary assembles the six-tool MCP surface, exact Codex hook-to-MCP binding,
 explicit Codex/Claude native ingress, bounded hook context output, durable Workspace activation,
 source context, safe Git comparisons and owned provider cleanup. Host-shaped process tests exercise
 Claude foreground-helper activation, Go/Rust Context, Diff and emitted additional context.
@@ -42,7 +42,7 @@ args = ["mcp", "--launcher-template", "/absolute/path/to/launcher.json"]
 The launcher file uses the existing schema and must contain exactly one target. Managed MCP captures
 the host-selected current directory, replaces only that target's candidate and a fresh internal
 attachment, validates the result, and owns its private daemon until stdio closes. Startup failure
-still exposes the same five tools with disconnected native-fallback results. A repository plugin
+still exposes the same six tools with disconnected native-fallback results. A repository plugin
 manifest cannot safely supply the machine-specific template path, so it remains normal host config.
 Legacy `agent-ide mcp --runtime-dir PATH` remains connect-only and compatible with separately
 started `agent-ide daemon --runtime-dir PATH` instances.
@@ -89,7 +89,7 @@ Placeholder-only host examples are shipped for
 `agent-ide doctor --runtime-dir PATH` is observational: it reports effective default configuration and local endpoint/lock/protocol state without creating the path or starting services. Workspace scanning, LSP startup, daemon autostart, and cache retirement without a peer-verified closure/reset fact are unsupported.
 
 Version 0.1.3 makes captured managed sandbox profiles portable across equivalent
-worktrees without changing raw execution state or the five-tool MCP surface. It also
+worktrees without changing raw execution state or the original five v0.1 methods. It also
 includes the offline installation helpers `agent-ide evidence executable`,
 `agent-ide evidence record`, and `agent-ide launcher check`. The bundled
 `skills/agent-ide` workflow directs coding
@@ -111,4 +111,4 @@ Stopping a coder releases its analysis leases and retains its worktree's cache d
 
 Go worktrees split their cache in two. Each worktree keeps a private namespace holding its own `GOCACHE`/`GOMODCACHE`/`GOTMPDIR`, delivered per LSP view rather than as process environment, so a view without one fails closed instead of reading another worktree's build state. Compatible worktrees additionally share one backend-scoped native namespace holding gopls' own on-disk filecache and the listener's temporary directory: gopls binds that filecache once per process, so sharing it is what lets divergent worktrees run on a single physical listener with one forwarder each. Compatibility is one canonical effective-rights identity — provider, settings, toolchain, and the rights the observed sandbox state actually grants; cwd-relative sandbox roots are resolved to absolute rights first, and any policy whose rights cannot be proven equal is never shared. The shared namespace is reference-counted, so it survives a partial stop while any sharing worktree is still live, and both namespaces persist across stop and handoff. gopls manages the contents of its shared native namespace itself and may evict them at any time; that eviction is a cache miss, never a loss of IDE-owned worktree state.
 
-Pyright v0.1.1 supports Codex and Claude Python (`.py` and `.pyi`). Configure its closed `pyright_defaults_v1` provider with accepted absolute `pyright-langserver` and `node` executable objects, and set `toolchain` to the accepted Node identity. The launcher invokes that exact Node executable with the absolute Pyright script and `--stdio`; Claude does so only in its foreground helper, using the same accepted paths, identities, and BLAKE3 digests. The MCP surface remains the current five tools and protocol versions.
+Pyright v0.1.1 supports Codex and Claude Python (`.py` and `.pyi`). Configure its closed `pyright_defaults_v1` provider with accepted absolute `pyright-langserver` and `node` executable objects, and set `toolchain` to the accepted Node identity. The launcher invokes that exact Node executable with the absolute Pyright script and `--stdio`; Claude does so only in its foreground helper, using the same accepted paths, identities, and BLAKE3 digests. The six-tool MCP surface keeps wire v2 for the original five methods and uses wire v3 for `ide.edit`.

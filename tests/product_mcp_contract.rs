@@ -264,6 +264,7 @@ async fn binary_discovery_is_static_and_inactive_calls_are_fail_open() {
         [
             "ide.context",
             "ide.diff",
+            "ide.edit",
             "ide.inspect",
             "ide.start",
             "ide.stop"
@@ -306,7 +307,7 @@ async fn binary_discovery_is_static_and_inactive_calls_are_fail_open() {
     assert!(!runtime.exists());
 }
 
-/// Managed startup failure remains a disconnected static five-tool MCP with bounded fallback calls.
+/// Managed startup failure remains a disconnected static six-tool MCP with bounded fallback calls.
 #[tokio::test]
 async fn managed_startup_failure_serves_exact_static_tools_without_ipc() {
     let candidate = std::env::current_dir().unwrap();
@@ -330,6 +331,7 @@ async fn managed_startup_failure_serves_exact_static_tools_without_ipc() {
         [
             "ide.context",
             "ide.diff",
+            "ide.edit",
             "ide.inspect",
             "ide.start",
             "ide.stop"
@@ -352,9 +354,9 @@ async fn managed_startup_failure_serves_exact_static_tools_without_ipc() {
     mcp.close().await;
 }
 
-/// Proves all five shipping handlers reach the real daemon only after separated launcher and request ingress.
+/// Proves all six shipping handlers reach the real daemon only after separated launcher and request ingress.
 #[tokio::test]
-async fn binary_routes_five_methods_to_typed_missing_peer_and_survives_daemon_loss() {
+async fn binary_routes_six_methods_to_typed_missing_peer_and_survives_daemon_loss() {
     let runtime = runtime();
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
         .args(["daemon", "--runtime-dir"])
@@ -402,6 +404,10 @@ async fn binary_routes_five_methods_to_typed_missing_peer_and_survives_daemon_lo
         ("ide.diff", json!({})),
         ("ide.inspect", json!({"detail_ref":"detail"})),
         ("ide.stop", json!({})),
+        (
+            "ide.edit",
+            json!({"operation_id":"op","path":"src/main.rs","source_ref":"detail","content":"new"}),
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -1642,6 +1648,30 @@ async fn managed_codex_smoke_and_eof_cleanup() {
     let original = settle_managed(&mut mcp, &mut next, actor, &state, original).await;
     assert!(original["text"].as_str().unwrap().contains("worktree"));
 
+    next += 1;
+    let edited = managed_call(
+        &mut mcp,
+        next,
+        actor,
+        "ide.edit",
+        json!({
+            "operation_id":"managed-edit-1",
+            "path":"tracked.txt",
+            "source_ref":original["detail_ref"],
+            "content":"managed-ide-edit\n"
+        }),
+        &state,
+    )
+    .await;
+    let edited = settle_managed(&mut mcp, &mut next, actor, &state, edited).await;
+    assert_eq!(edited["state"], "edit", "{edited}");
+    assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+    assert_eq!(
+        std::fs::read(fixture.root.join("tracked.txt")).unwrap(),
+        b"managed-ide-edit\n"
+    );
+
+    // Preferred edit never disables the native fallback; a native writer remains independently usable.
     std::fs::write(fixture.root.join("tracked.txt"), "managed-native-edit\n").unwrap();
     next += 1;
     let refreshed = managed_call(

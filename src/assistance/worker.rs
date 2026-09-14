@@ -17,6 +17,10 @@ use crate::{
         config::EffectiveConfig,
         store::{MigrationAdmission, OperationId, Store},
     },
+    changes::edit::{
+        EditOutcome as ChangesEditOutcome, EditReceiptStore, EditRequest, EditResult,
+        PrepareAdmission,
+    },
     workspace::{
         authority::{AuthorityStamp, StopBindingHandoff},
         durable::{DurableWorkspace, StartReceipt},
@@ -580,12 +584,21 @@ impl WorkerHandle {
                 let _ = ready.send(Err(FailureCode::SourceUnavailable));
                 return;
             }
+            let edits = EditReceiptStore::new(store);
+            if !matches!(
+                edits.install_schema().await,
+                Ok(MigrationAdmission::Applied { .. } | MigrationAdmission::AlreadyApplied { .. })
+            ) {
+                let _ = ready.send(Err(FailureCode::Internal));
+                return;
+            }
             let _ = ready.send(Ok(()));
             Worker {
                 admission: shared.admission.clone(),
                 shared,
                 workspace,
                 observations,
+                edits,
                 grants: BTreeMap::new(),
                 pending_revocations: std::collections::BTreeSet::new(),
                 registered: BTreeMap::new(),
@@ -1060,6 +1073,8 @@ struct Worker<'a> {
     workspace: DurableWorkspace<'a>,
     /// Workspace-owned persistence for registered source observations.
     observations: WorkspaceStore<'a>,
+    /// Changes-owned durable one-file edit receipts sharing Application's sole Store owner.
+    edits: EditReceiptStore<'a>,
     /// Recoverable committed activation receipts, at most one for each live host binding.
     grants: BTreeMap<BindingRef, StartReceipt>,
     /// Bindings whose provider settlement succeeded but whose durable revoke failed, so their
@@ -1163,6 +1178,9 @@ impl<'a> Worker<'a> {
                     }
                     AssistanceTool::Diff if matches!(job.input, JobInput::Claude(_)) => {
                         self.diff_claude(&mut job).await
+                    }
+                    AssistanceTool::Edit if matches!(job.input, JobInput::Managed) => {
+                        self.edit(&mut job).await
                     }
                     AssistanceTool::Start => self.activate(&mut job).await,
                     AssistanceTool::Context => self.context(&mut job).await,
@@ -2181,6 +2199,201 @@ impl<'a> Worker<'a> {
         ))
     }
 
+    /// Executes one managed-Codex full-content edit through Changes receipts and Workspace permits.
+    ///
+    /// The source reference must name a completed same-binding Context detail whose exact source
+    /// observation still matches `path`. A new durable prepare is the only route to Workspace; an
+    /// exact prepared receipt recovered after ambiguity returns unknown and is never dispatched
+    /// again. Known effects are followed by source observation and best-effort provider diagnostic
+    /// refresh; provider failure never changes a known filesystem outcome.
+    async fn edit(
+        &mut self,
+        job: &mut Job,
+    ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        let request: EditRequest =
+            serde_json::from_value(job.parameters.clone()).map_err(|_| FailureCode::Internal)?;
+        request.validate().map_err(|_| FailureCode::Internal)?;
+        let binding = job.invocation.binding_ref().clone();
+        let prepared = match self.edits.prepare(request.clone()).await {
+            Ok(PrepareAdmission::Prepared(prepared)) => prepared,
+            Ok(
+                PrepareAdmission::Settled(result)
+                | PrepareAdmission::ConflictingDuplicate(result)
+                | PrepareAdmission::OutcomeUnknown(result),
+            ) => {
+                let authority = self.authority(&binding).await.ok();
+                return Ok((PeerReply::Edit { result }, authority, None));
+            }
+            Err(_) => {
+                return Ok((
+                    PeerReply::Edit {
+                        result: EditResult {
+                            operation_id: request.operation_id,
+                            path: request.path,
+                            outcome: ChangesEditOutcome::UnavailableBeforeDispatch,
+                            source_ref: None,
+                        },
+                    },
+                    None,
+                    None,
+                ));
+            }
+        };
+        let source = {
+            let ledger = self
+                .shared
+                .ledger
+                .lock()
+                .map_err(|_| FailureCode::Internal)?;
+            ledger
+                .details
+                .get(&request.source_ref)
+                .filter(|detail| {
+                    detail.binding == binding
+                        && detail.selection.0 == AssistanceTool::Context
+                        && matches!(
+                            detail.reply,
+                            PeerReply::Complete {
+                                kind: ResultKind::Context,
+                                ..
+                            }
+                        )
+                })
+                .and_then(|detail| detail.source.clone())
+        };
+        let Some(source) = source.filter(|source| source.path().to_str() == Some(&request.path))
+        else {
+            return self
+                .settle_edit(
+                    prepared,
+                    &request,
+                    crate::workspace::edit::EditOutcome::StaleSource,
+                    None,
+                    None,
+                )
+                .await;
+        };
+        let authority = self.authority(&binding).await?;
+        let edit_source = match crate::workspace::edit::EditSourceRef::from_observation(&source) {
+            Ok(source) => source,
+            Err(outcome) => {
+                return self
+                    .settle_edit(prepared, &request, outcome, Some(authority), None)
+                    .await;
+            }
+        };
+        let active = self.shared.active(&binding)?;
+        let (permit, target) = match self
+            .workspace
+            .prepare_edit(
+                &authority,
+                &active,
+                request.operation_id.clone(),
+                request.path.clone().into(),
+                edit_source.clone(),
+            )
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(outcome) => {
+                return self
+                    .settle_edit(prepared, &request, outcome, Some(authority), None)
+                    .await;
+            }
+        };
+        let outcome = if *job.cancel.borrow() {
+            crate::workspace::edit::EditOutcome::CancelledNoEffect
+        } else if tokio::time::Instant::now() >= job.deadline {
+            crate::workspace::edit::EditOutcome::DeadlineNoEffect
+        } else {
+            let active = self.shared.active(&binding)?;
+            self.workspace
+                .replace_edit(
+                    &authority,
+                    &active,
+                    permit,
+                    target,
+                    &edit_source,
+                    request.content.as_bytes(),
+                    || true,
+                )
+                .await
+        };
+        let unchanged = matches!(outcome, crate::workspace::edit::EditOutcome::Unchanged(_));
+        let known = matches!(
+            outcome,
+            crate::workspace::edit::EditOutcome::Created(_)
+                | crate::workspace::edit::EditOutcome::Replaced(_)
+                | crate::workspace::edit::EditOutcome::Unchanged(_)
+        );
+        let refreshed = if known {
+            match self
+                .observe(
+                    &binding,
+                    request.path.clone().into(),
+                    job.observed.as_ref().ok_or(FailureCode::SandboxState)?,
+                    &job.target,
+                )
+                .await
+            {
+                Ok((observed, bytes)) => {
+                    let _ = self
+                        .semantic_context(
+                            job,
+                            &observed,
+                            &bytes,
+                            crate::intelligence::context::ContextQuery::File,
+                        )
+                        .await;
+                    Some(observed)
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        let post_reference = refreshed
+            .as_ref()
+            .map(|_| job.reference.clone())
+            .or_else(|| unchanged.then(|| request.source_ref.clone()));
+        let result = EditResult::from_workspace(&request, outcome, |_| post_reference);
+        let result = self
+            .edits
+            .settle(prepared, result)
+            .await
+            .unwrap_or_else(|_| EditResult {
+                operation_id: request.operation_id.clone(),
+                path: request.path.clone(),
+                outcome: ChangesEditOutcome::OutcomeUnknown,
+                source_ref: None,
+            });
+        self.shared.active(&binding)?;
+        Ok((PeerReply::Edit { result }, Some(authority), refreshed))
+    }
+
+    /// Durably settles one typed pre-effect Workspace outcome without dispatching a write.
+    async fn settle_edit(
+        &self,
+        prepared: crate::changes::edit::PreparedEdit,
+        request: &EditRequest,
+        outcome: crate::workspace::edit::EditOutcome,
+        authority: Option<AuthorityStamp>,
+        source: Option<SourceObservation>,
+    ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        let result = EditResult::from_workspace(request, outcome, |_| None);
+        let result = self
+            .edits
+            .settle(prepared, result)
+            .await
+            .unwrap_or_else(|_| EditResult {
+                operation_id: request.operation_id.clone(),
+                path: request.path.clone(),
+                outcome: ChangesEditOutcome::OutcomeUnknown,
+                source_ref: None,
+            });
+        Ok((PeerReply::Edit { result }, authority, source))
+    }
+
     /// Settles one stop by positively closing this binding's providers first and only then durably
     /// revoking its grant, so a failed durable half keeps full retry authority.
     ///
@@ -2773,6 +2986,7 @@ mod stop_retry_tests {
             }),
             workspace,
             observations: WorkspaceStore::new(store),
+            edits: EditReceiptStore::new(store),
             grants: BTreeMap::new(),
             pending_revocations: std::collections::BTreeSet::new(),
             registered: BTreeMap::new(),
@@ -2784,6 +2998,109 @@ mod stop_retry_tests {
             runtime,
             providers: providers::Providers::new(),
         }
+    }
+
+    /// Proves the managed worker loop consumes a completed Context reference and returns exact edit effects.
+    #[tokio::test]
+    async fn managed_context_to_edit_loop_replaces_once_and_conflicts_changed_duplicate() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join("main.rs"), "fn old() {}\n").unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        worker.edits.install_schema().await.unwrap();
+        let (binding, _) = production_start(&mut worker, "edit-actor", "edit-start").await;
+
+        let (invocation, observed) =
+            production_call(&worker, &fixture.root, "edit-actor", "edit-context");
+        let (_cancel_sender, cancel) = watch::channel(false);
+        let mut context_job = Job {
+            input: JobInput::Managed,
+            reference: "context-source".into(),
+            invocation,
+            observed: Some(observed),
+            tool: AssistanceTool::Context,
+            parameters: serde_json::json!({"path":"main.rs"}),
+            target: production_target(&fixture.root),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            cancel,
+            stop_reply: None,
+            native_epoch: 0,
+        };
+        let (context_reply, authority, source) = worker.context(&mut context_job).await.unwrap();
+        worker.shared.ledger.lock().unwrap().details.insert(
+            context_job.reference.clone(),
+            Detail {
+                binding: binding.clone(),
+                reply: context_reply,
+                selection: (AssistanceTool::Context, selection(&context_job.parameters)),
+                authority,
+                source,
+                native_epoch: 0,
+                diff_page: None,
+                diff_page_fresh: false,
+            },
+        );
+
+        let (invocation, observed) =
+            production_call(&worker, &fixture.root, "edit-actor", "edit-call");
+        let (_cancel_sender, cancel) = watch::channel(false);
+        let mut edit_job = Job {
+            input: JobInput::Managed,
+            reference: "edit-result".into(),
+            invocation,
+            observed: Some(observed),
+            tool: AssistanceTool::Edit,
+            parameters: serde_json::json!({
+                "operation_id":"operation-1",
+                "path":"main.rs",
+                "source_ref":"context-source",
+                "content":"fn new() {}\n"
+            }),
+            target: production_target(&fixture.root),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            cancel,
+            stop_reply: None,
+            native_epoch: 0,
+        };
+        let (reply, _, source) = worker.edit(&mut edit_job).await.unwrap();
+        assert!(matches!(
+            reply,
+            PeerReply::Edit {
+                result: EditResult {
+                    outcome: ChangesEditOutcome::Replaced,
+                    source_ref: Some(ref source_ref),
+                    ..
+                }
+            } if source_ref == "edit-result"
+        ));
+        assert_eq!(
+            std::fs::read(fixture.root.join("main.rs")).unwrap(),
+            b"fn new() {}\n"
+        );
+        assert_eq!(
+            source.unwrap().bytes(),
+            Some(&crate::workspace::observation::SourceBytes::from_bytes(
+                b"fn new() {}\n"
+            ))
+        );
+
+        edit_job.parameters["content"] = serde_json::json!("fn conflicting() {}\n");
+        let (reply, _, _) = worker.edit(&mut edit_job).await.unwrap();
+        assert!(matches!(
+            reply,
+            PeerReply::Edit {
+                result: EditResult {
+                    outcome: ChangesEditOutcome::ConflictingDuplicate,
+                    ..
+                }
+            }
+        ));
+        assert_eq!(
+            std::fs::read(fixture.root.join("main.rs")).unwrap(),
+            b"fn new() {}\n"
+        );
     }
 
     #[tokio::test]

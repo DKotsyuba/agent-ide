@@ -129,6 +129,11 @@ pub enum PeerReply {
         /// True when serialized-result budgeting omitted owner text.
         truncated: bool,
     },
+    /// Exact Changes-owned one-file edit result with no source content or diagnostics.
+    Edit {
+        /// Durable closed outcome, operation/path correlation, and optional post-read source ref.
+        result: crate::changes::edit::EditResult,
+    },
 }
 impl std::fmt::Debug for PeerReply {
     /// Omits text and detail handles from diagnostics.
@@ -281,6 +286,18 @@ pub(crate) fn render_call_tool_result(reply: &PeerReply) -> Option<CallToolResul
             ..
         } => "Workspace authority is stopped; files already edited by native host tools remain on disk"
             .to_owned(),
+        PeerReply::Edit { result }
+            if result.outcome == crate::changes::edit::EditOutcome::OutcomeUnknown =>
+        {
+            format!(
+                "Edit outcome is unknown for {}; inspect that target before any later mutation and do not replay this operation",
+                result.path
+            )
+        }
+        PeerReply::Edit { .. } => {
+            "Changes returned a closed single-file edit outcome; native editing remains available"
+                .to_owned()
+        }
         _ => "Assistance returned the current owner result".to_owned(),
     };
     let mut rendered = if matches!(reply, PeerReply::Error { .. }) {

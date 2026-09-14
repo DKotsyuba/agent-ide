@@ -1,4 +1,4 @@
-//! Finite opaque transport values for Assistance hook ingress and current v0.1 method dispatch.
+//! Finite opaque transport values for Assistance hook ingress and closed v0.1/v0.2 method dispatch.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -64,7 +64,7 @@ impl OpaqueJson {
     }
 }
 
-/// Names the only Assistance operations Application may route in v0.1.
+/// Names the closed Assistance operations Application may route through wire v2 or v3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssistanceMethod {
     /// Separate sanitized hook-observation ingress; never a generic event subscription.
@@ -79,17 +79,20 @@ pub enum AssistanceMethod {
     Inspect,
     /// Current v0.1 `ide.stop` method dispatch.
     Stop,
+    /// v0.2 `ide.edit` method dispatch, available only on wire version 3.
+    Edit,
 }
 
 impl AssistanceMethod {
-    /// Parses only the five currently accepted v0.1 method-dispatch tags.
-    pub(crate) fn from_dispatch_tag(value: &str) -> Option<Self> {
+    /// Parses the closed version-specific method tags; v2 never accepts `edit`.
+    pub(crate) fn from_dispatch_tag(value: &str, version: u64) -> Option<Self> {
         match value {
             "start" => Some(Self::Start),
             "context" => Some(Self::Context),
             "diff" => Some(Self::Diff),
             "inspect" => Some(Self::Inspect),
             "stop" => Some(Self::Stop),
+            "edit" if version == 3 => Some(Self::Edit),
             _ => None,
         }
     }
@@ -158,7 +161,7 @@ impl HookSubmit {
     }
 }
 
-/// Holds one finite dispatch request for exactly one current v0.1 Assistance method.
+/// Holds one finite dispatch request for exactly one closed Assistance method.
 #[derive(Clone, PartialEq, Eq)]
 pub struct MethodDispatch {
     request_id: String,
@@ -215,7 +218,7 @@ impl MethodDispatch {
         &self.opaque_attachment
     }
 
-    /// Returns the closed v0.1 method tag selected by the caller.
+    /// Returns the closed method tag selected by the caller.
     pub fn method(&self) -> AssistanceMethod {
         self.method
     }
@@ -231,7 +234,7 @@ impl MethodDispatch {
 pub enum AssistanceDispatch {
     /// One sanitized hook observation submitted without any retained queue or subscription.
     HookSubmit(HookSubmit),
-    /// One of the five closed current v0.1 method dispatches.
+    /// One closed v2/v3 method dispatch; Application still enforces the version-specific set.
     MethodDispatch(MethodDispatch),
 }
 
@@ -240,7 +243,7 @@ pub enum AssistanceDispatch {
 pub enum AssistanceDispatchReply {
     /// Opaque reply associated with one hook submit correlation.
     HookSubmit(OpaqueJson),
-    /// Opaque result associated with one current v0.1 method dispatch.
+    /// Opaque result associated with one current closed method dispatch.
     MethodDispatch(OpaqueJson),
 }
 

@@ -399,6 +399,42 @@ async fn assistance_transport_is_finite_and_hook_submission_never_autostarts() {
         method,
         MethodDispatchTransportResult::Dispatched { .. }
     ));
+    let edit = dispatch_method_if_running(
+        &runtime_dir,
+        MethodDispatch::new(
+            "edit-request",
+            "edit-correlation",
+            "attachment",
+            agent_ide::app::transport::AssistanceMethod::Edit,
+            OpaqueJson::new(
+                r#"{"operation_id":"op","path":"a.rs","source_ref":"source","content":"new"}"#,
+                64 * 1024,
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+        transport_limits(),
+    )
+    .await;
+    assert!(matches!(
+        edit,
+        MethodDispatchTransportResult::Dispatched { .. }
+    ));
+    let v3 = exchange(
+        &runtime_dir,
+        json!({
+            "version":3,
+            "request_id":"v3-request",
+            "correlation_id":"v3-correlation",
+            "opaque_attachment":"attachment",
+            "method":"assistance.method_dispatch",
+            "dispatch_method":"edit",
+            "params_json":{}
+        }),
+    )
+    .await;
+    assert_eq!(v3["version"], 3);
+    assert_eq!(v3["request_id"], "v3-request");
     let mut unknown = UnixStream::connect(runtime_dir.join("agent-ide.sock"))
         .await
         .unwrap();
@@ -419,6 +455,25 @@ async fn assistance_transport_is_finite_and_hook_submission_never_autostarts() {
     unknown.write_all(&unknown_body).await.unwrap();
     let mut reply = [0_u8; 1];
     assert_eq!(unknown.read(&mut reply).await.unwrap(), 0);
+    let mut v2_edit = UnixStream::connect(runtime_dir.join("agent-ide.sock"))
+        .await
+        .unwrap();
+    let body = serde_json::to_vec(&json!({
+        "version":2,
+        "request_id":"v2-edit",
+        "correlation_id":"v2-edit-correlation",
+        "opaque_attachment":"attachment",
+        "method":"assistance.method_dispatch",
+        "dispatch_method":"edit",
+        "params_json":{}
+    }))
+    .unwrap();
+    v2_edit
+        .write_all(&(body.len() as u32).to_be_bytes())
+        .await
+        .unwrap();
+    v2_edit.write_all(&body).await.unwrap();
+    assert_eq!(v2_edit.read(&mut reply).await.unwrap(), 0);
     stop_assistance_daemon(task, runtime_dir).await;
 }
 

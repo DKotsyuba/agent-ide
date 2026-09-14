@@ -194,7 +194,7 @@ pub async fn run_daemon(runtime_dir: RuntimeDir) -> Result<(), AppError> {
     run_daemon_inner(runtime_dir, None, ipc, None).await
 }
 
-/// Starts a private daemon that additionally routes the two finite r2 Assistance transport methods.
+/// Starts a private daemon that routes finite v2 hook/method and v3 method-only Assistance ingress.
 ///
 /// `dispatcher` owns all attachment, host, rendering, and method semantics. Application only
 /// frames, limits, correlates, and times out `assistance.hook_submit` and the closed current-method
@@ -211,7 +211,7 @@ pub async fn run_daemon_with_assistance(
         MAX_ASSISTANCE_JSON_BYTES,
         ipc.connection_deadline,
     )
-    .expect("fixed r2 transport limits are valid");
+    .expect("fixed Assistance transport limits are valid");
     run_daemon_inner(runtime_dir, Some(dispatcher), ipc, Some(limits)).await
 }
 
@@ -377,7 +377,7 @@ pub async fn submit_hook_if_running(
     }
 }
 
-/// Connects to an already-running daemon for one closed current-method dispatch without starting it.
+/// Connects to an already-running daemon for one closed v2/v3 method dispatch without starting it.
 ///
 /// Transport faults return `Unavailable`; Application does not retry, render, or reinterpret the
 /// opaque result. Assistance decides whether that unavailable result must be shown to its caller.
@@ -406,10 +406,16 @@ pub async fn dispatch_method_if_running(
         AssistanceMethod::Diff => "diff",
         AssistanceMethod::Inspect => "inspect",
         AssistanceMethod::Stop => "stop",
+        AssistanceMethod::Edit => "edit",
         AssistanceMethod::HookSubmit => return MethodDispatchTransportResult::Unavailable,
     };
+    let version = if request.method() == AssistanceMethod::Edit {
+        3
+    } else {
+        2
+    };
     let wire = json!({
-        "version": 2,
+        "version": version,
         "request_id": request.request_id(),
         "correlation_id": request.correlation_id(),
         "opaque_attachment": request.opaque_attachment(),
@@ -563,7 +569,7 @@ async fn serve_connection(
     let request: Value = read_frame(&mut stream, MAX_V2_FRAME_BYTES).await?;
     match request.get("version").and_then(Value::as_u64) {
         Some(1) => serve_health(&mut stream, request, generation).await,
-        Some(2) => match (dispatcher, transport_limits) {
+        Some(2 | 3) => match (dispatcher, transport_limits) {
             (Some(dispatcher), Some(limits)) => {
                 serve_assistance_request(&mut stream, request, dispatcher, limits).await
             }
@@ -603,7 +609,7 @@ async fn exchange(mut stream: UnixStream, request: &HealthRequest) -> io::Result
     read_frame(&mut stream, MAX_V1_FRAME_BYTES).await
 }
 
-/// Decodes and forwards exactly one finite v2 Assistance request without inspecting its semantics.
+/// Decodes and forwards exactly one finite v2/v3 Assistance request without inspecting semantics.
 async fn serve_assistance_request(
     stream: &mut UnixStream,
     request: Value,
@@ -613,9 +619,16 @@ async fn serve_assistance_request(
     let object = request
         .as_object()
         .ok_or_else(|| invalid_transport("v2 request is not an object"))?;
+    let version = object
+        .get("version")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
     let method = required_string(object, "method")?;
     match method {
         "assistance.hook_submit" => {
+            if version != 2 {
+                return Err(invalid_transport("hook submit requires wire version 2"));
+            }
             require_exact_keys(
                 object,
                 &[
@@ -677,9 +690,11 @@ async fn serve_assistance_request(
                     "params_json",
                 ],
             )?;
-            let dispatch_method =
-                AssistanceMethod::from_dispatch_tag(required_string(object, "dispatch_method")?)
-                    .ok_or_else(|| invalid_transport("unsupported assistance method"))?;
+            let dispatch_method = AssistanceMethod::from_dispatch_tag(
+                required_string(object, "dispatch_method")?,
+                version,
+            )
+            .ok_or_else(|| invalid_transport("unsupported assistance method"))?;
             let dispatch = MethodDispatch::new(
                 required_string(object, "request_id")?,
                 required_string(object, "correlation_id")?,
@@ -702,14 +717,14 @@ async fn serve_assistance_request(
                     if payload.as_str().len() <= MAX_ASSISTANCE_JSON_BYTES =>
                 {
                     json!({
-                        "version": 2,
+                        "version": version,
                         "request_id": dispatch.request_id(),
                         "opaque_result_json": serde_json::from_str::<Value>(payload.as_str())
                             .map_err(|error| invalid_transport(error.to_string()))?,
                     })
                 }
                 Ok(Ok(_)) | Ok(Err(_)) | Err(_) => json!({
-                    "version": 2,
+                    "version": version,
                     "request_id": dispatch.request_id(),
                     "status": "unavailable",
                 }),
@@ -754,7 +769,12 @@ fn parse_method_dispatch_reply(
     let object = reply
         .as_object()
         .ok_or_else(|| invalid_transport("method reply is not an object"))?;
-    if object.get("version").and_then(Value::as_u64) != Some(2)
+    let expected_version = if request.method() == AssistanceMethod::Edit {
+        3
+    } else {
+        2
+    };
+    if object.get("version").and_then(Value::as_u64) != Some(expected_version)
         || object.get("request_id").and_then(Value::as_str) != Some(request.request_id())
     {
         return Err(invalid_transport("method reply correlation mismatch"));
