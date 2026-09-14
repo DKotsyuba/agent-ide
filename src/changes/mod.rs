@@ -7,6 +7,9 @@ use crate::workspace::git::{
     snapshot::GitSnapshot,
 };
 
+/// Durable request, settlement, recovery and exact-effect semantics for v0.2 single-file edits.
+pub mod edit;
+
 /// Maximum number of hunks selected by default for one bounded composition.
 pub const DEFAULT_MAX_HUNKS: usize = 32;
 /// Maximum number of raw hunk bytes selected by default for one bounded composition.
