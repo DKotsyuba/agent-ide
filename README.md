@@ -12,7 +12,7 @@ roots. Complete delivery accounting and the remaining roadmap acceptance checks 
 
 Tagged releases are built on GitHub Actions using an arm64 macOS runner and published
 with a SHA-256 checksum in GitHub Releases. Install the latest private release with
-`./install.sh`, or select one with `./install.sh 0.1.3`. The installer uses the
+`./install.sh`, or select one with `./install.sh 0.1.4`. The installer uses the
 authenticated GitHub CLI, verifies `SHA256SUMS`, and atomically installs to
 `~/.local/bin` (override with `AGENT_IDE_INSTALL_DIR`). It does not edit MCP or hook
 configuration.
