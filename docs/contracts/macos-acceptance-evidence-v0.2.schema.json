@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-ide.invalid/contracts/macos-acceptance-evidence-v0.2.schema.json",
+  "title": "Agent IDE macOS acceptance evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "revision", "route", "status", "platform", "host", "toolchains", "scenarios", "privacy"],
+  "properties": {
+    "schema": {"const": "agent-ide.macos-acceptance.v1"},
+    "revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "route": {"enum": ["product", "codex", "claude", "agent_run_claude"]},
+    "status": {"$ref": "#/$defs/status"},
+    "platform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "version", "architecture"],
+      "properties": {
+        "os": {"enum": ["macos", "linux", "other"]},
+        "version": {"$ref": "#/$defs/token"},
+        "architecture": {"enum": ["arm64", "x86_64", "other"]}
+      }
+    },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version"],
+      "properties": {"version": {"$ref": "#/$defs/token"}}
+    },
+    "toolchains": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["go", "gopls", "rust", "rust_analyzer", "node", "pyright", "typescript_language_server", "typescript"],
+      "properties": {
+        "go": {"$ref": "#/$defs/token"},
+        "gopls": {"$ref": "#/$defs/token"},
+        "rust": {"$ref": "#/$defs/token"},
+        "rust_analyzer": {"$ref": "#/$defs/token"},
+        "node": {"$ref": "#/$defs/token"},
+        "pyright": {"$ref": "#/$defs/token"},
+        "typescript_language_server": {"$ref": "#/$defs/token"},
+        "typescript": {"$ref": "#/$defs/token"}
+      }
+    },
+    "scenarios": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["edit_diagnostic_loop", "stale_edit_zero_write", "native_fallback", "telemetry_restart_query_export", "compact_content", "python_provider", "typescript_r3", "divergent_worktrees"],
+      "properties": {
+        "edit_diagnostic_loop": {"$ref": "#/$defs/status"},
+        "stale_edit_zero_write": {"$ref": "#/$defs/status"},
+        "native_fallback": {"$ref": "#/$defs/status"},
+        "telemetry_restart_query_export": {"$ref": "#/$defs/status"},
+        "compact_content": {"$ref": "#/$defs/status"},
+        "python_provider": {"$ref": "#/$defs/status"},
+        "typescript_r3": {"$ref": "#/$defs/status"},
+        "divergent_worktrees": {"$ref": "#/$defs/status"}
+      }
+    },
+    "privacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "prompts", "credentials", "commands", "paths", "diagnostic_messages", "private_ids"],
+      "properties": {
+        "source": {"const": false},
+        "prompts": {"const": false},
+        "credentials": {"const": false},
+        "commands": {"const": false},
+        "paths": {"const": false},
+        "diagnostic_messages": {"const": false},
+        "private_ids": {"const": false}
+      }
+    }
+  },
+  "$defs": {
+    "status": {"enum": ["product_pass", "real_pass", "failed", "not_tested"]},
+    "token": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9._+-]+$"}
+  }
+}

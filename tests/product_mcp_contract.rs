@@ -25,6 +25,15 @@ static MANAGED_CODEX_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::con
 /// Child Tokio clocks cannot be paused by this test runtime. This wall-clock ceiling stays
 /// below both a doubled (500 ms) and sixfold (1500 ms) timeout without changing product code.
 const HOOK_EXIT_CEILING: Duration = Duration::from_millis(450);
+/// Maximum retained-result polls in one product fixture operation.
+///
+/// At the capped delay this spans approximately the configured 120-second operation lifetime while
+/// consuming at most 64 of Assistance's 1,024 replay entries for the actor scope.
+const PRODUCT_SETTLE_MAX_POLLS: usize = 64;
+/// First retained-result poll delay, allowing fast operations to settle without a busy loop.
+const PRODUCT_SETTLE_INITIAL_DELAY: Duration = Duration::from_millis(50);
+/// Largest retained-result poll delay; 64 stepped waits cover the product operation lifetime.
+const PRODUCT_SETTLE_MAX_DELAY: Duration = Duration::from_secs(2);
 
 /// Returns a unique missing runtime path; the tested command decides whether to create it.
 fn runtime() -> PathBuf {
@@ -181,6 +190,28 @@ impl Mcp {
     }
 }
 
+/// Verifies one successful MCP tool carrier has a single non-JSON block matching its typed state.
+///
+/// `reply` must be a JSON-RPC tools/call response with `structuredContent`. The assertion performs
+/// no I/O and deliberately compares only the closed state projection: source and diagnostic text
+/// may legitimately occur in the compact block, while the complete typed value remains separate.
+fn assert_compact_envelope(reply: &Value) {
+    let result = reply["result"].as_object().expect("tool result object");
+    let content = result["content"].as_array().expect("content array");
+    assert_eq!(content.len(), 1, "{reply}");
+    let text = content[0]["text"].as_str().expect("sole text block");
+    assert!(serde_json::from_str::<Value>(text).is_err(), "{reply}");
+    let structured = result["structuredContent"]
+        .as_object()
+        .expect("typed structured result");
+    let state = structured["state"].as_str().expect("closed reply state");
+    assert!(text.starts_with(state), "{reply}");
+    assert_eq!(
+        result.get("isError") == Some(&json!(true)),
+        state == "error"
+    );
+}
+
 /// Calls one managed Codex tool using only trusted request metadata for actor and sandbox identity.
 async fn managed_call(
     mcp: &mut Mcp,
@@ -191,6 +222,7 @@ async fn managed_call(
     state: &Value,
 ) -> Value {
     let reply=mcp.exchange(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments,"_meta":{"threadId":actor,"callId":format!("managed-{actor}-{id}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":state}}})).await;
+    assert_compact_envelope(&reply);
     reply["result"]["structuredContent"].clone()
 }
 
@@ -645,8 +677,8 @@ async fn binary_codex_hooks_bind_exact_parallel_actors_and_stop_before_workspace
     // Host stop is honest about its scope, and cannot revoke the other actor.
     hook(&runtime, "PreToolUse", "session_id", "root", "stop").await;
     let stopped = root.exchange(host_call("root", "stop", "ide.stop")).await;
-    assert_eq!(stopped["result"]["isError"], false);
-    boundary(&stopped, "host binding stopped");
+    assert_compact_envelope(&stopped);
+    boundary(&stopped, "host_stopped");
     hook(&runtime, "PostToolUse", "session_id", "root", "stop").await;
     tokio::join!(
         hook(&runtime, "PreToolUse", "session_id", "root", "after-stop"),
@@ -1027,7 +1059,7 @@ async fn binary_active_native_hooks_accept_edits_deletes_renames_and_failed_comm
     hook(&runtime, "PreToolUse", "session_id", "actor", "stop").await;
     boundary(
         &mcp.exchange(host_call("actor", "stop", "ide.stop")).await,
-        "host binding stopped",
+        "host_stopped",
     );
     hook(
         &runtime,
@@ -1379,6 +1411,75 @@ fn accepted_typescript_file(path: &Path) -> Value {
     json!({"path":path,"blake3":blake3::hash(&bytes).to_hex().to_string(),"bytes":bytes.len()})
 }
 
+/// Builds the accepted Pyright provider from exact environment paths and a fixture cache label.
+///
+/// `cache_namespace` is a nonempty synthetic label used only inside the disposable fixture.
+/// Missing or unreadable `AGENT_IDE_PYRIGHT`/`AGENT_IDE_NODE` paths panic because callers are
+/// ignored release tests. The returned value fingerprints both files and stores no source text.
+fn accepted_pyright_provider(cache_namespace: &str) -> Value {
+    assert!(!cache_namespace.is_empty());
+    let pyright = std::env::var("AGENT_IDE_PYRIGHT").unwrap();
+    let node = std::env::var("AGENT_IDE_NODE").unwrap();
+    json!({
+        "executable":accepted_program(&pyright,"pyright 1.1.413"),
+        "settings":"pyright_defaults_v1",
+        "toolchain":"node-fixture",
+        "node":accepted_program(&node,"node-fixture"),
+        "cargo":null,
+        "cargo_version":null,
+        "rustc":null,
+        "rustc_version":null,
+        "trust":"fixture-disabled",
+        "cache_namespace":cache_namespace
+    })
+}
+
+/// Builds the release-pinned TypeScript provider from the three exact acceptance environment paths.
+///
+/// The Node executable, bridge module, and `tsserver.js` must be absolute readable files from the
+/// accepted 24.4.0/6.0.0/5.9.3 bundle. Missing files or environment values panic because callers
+/// are ignored release tests, and the returned JSON contains the bundle-bound Codex evidence hash.
+fn accepted_typescript_provider() -> Value {
+    let node = PathBuf::from(std::env::var("AGENT_IDE_NODE").unwrap());
+    let bridge = PathBuf::from(std::env::var("AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER").unwrap());
+    let tsserver = PathBuf::from(std::env::var("AGENT_IDE_TSSERVER").unwrap());
+    let typescript_root = tsserver.parent().unwrap().parent().unwrap();
+    let bridge_root = bridge.parent().unwrap().parent().unwrap();
+    let mut closure = [
+        bridge_root.join("package.json"),
+        typescript_root.join("lib/_tsserver.js"),
+        typescript_root.join("lib/typescript.js"),
+        typescript_root.join("package.json"),
+    ];
+    closure.sort();
+    let mut provider = json!({
+        "executable":accepted_program(bridge.to_str().unwrap(),"6.0.0"),
+        "settings":"typescript_defaults_v1",
+        "toolchain":"24.4.0",
+        "node":accepted_program(node.to_str().unwrap(),"24.4.0"),
+        "typescript":{
+            "bridge_bytes":std::fs::metadata(&bridge).unwrap().len(),
+            "bridge_version":"6.0.0",
+            "tsserver":accepted_typescript_file(&tsserver),
+            "typescript_version":"5.9.3",
+            "closure":closure.iter().map(|path| accepted_typescript_file(path)).collect::<Vec<_>>(),
+            "codex_macos_evidence":"macos-26.6.2-node-24.4.0-tls-6.0.0-ts-5.9.3-codex-r3-2026-09-14",
+            "claude_macos_evidence":null
+        },
+        "cargo":null,
+        "cargo_version":null,
+        "rustc":null,
+        "rustc_version":null,
+        "trust":"fixture-disabled",
+        "cache_namespace":"fixture-typescript-cache"
+    });
+    let unbound: agent_ide::assistance::launcher::ProviderLaunch =
+        serde_json::from_value(provider.clone()).unwrap();
+    provider["typescript"]["codex_macos_evidence"] =
+        json!(unbound.expected_typescript_codex_macos_evidence().unwrap());
+    provider
+}
+
 /// Returns the operator-verified absolute path of one binary inside the accepted rustup toolchain,
 /// honoring `AGENT_IDE_RUST_TOOLCHAIN_DIR` when the harness points at a non-default rustup home.
 fn toolchain_bin(tool: &str) -> String {
@@ -1503,7 +1604,7 @@ impl ProductActor {
             )
             .await;
         self.claude_lifecycle(fixture, "PostToolUse", &call).await;
-        assert!(!reply["result"]["structuredContent"].is_null(), "{reply}");
+        assert_compact_envelope(&reply);
         reply["result"]["structuredContent"].clone()
     }
     /// Runs the exact foreground helper named by a pending reply and returns its owned handle.
@@ -1581,7 +1682,7 @@ impl ProductActor {
             .claude_lifecycle_output(fixture, "PostToolUse", &inspect_call)
             .await;
         assert!(feedback.status.success() && feedback.stderr.is_empty());
-        assert!(!reply["result"]["structuredContent"].is_null(), "{reply}");
+        assert_compact_envelope(&reply);
         (
             reply["result"]["structuredContent"].clone(),
             feedback.stdout,
@@ -1594,22 +1695,30 @@ impl ProductActor {
         self.lifecycle(fixture, "PreToolUse", &call).await;
         let reply=self.mcp.exchange(json!({"jsonrpc":"2.0","id":self.next,"method":"tools/call","params":{"name":name,"arguments":arguments,"_meta":{"threadId":self.actor,"callId":call,"x-codex-turn-metadata":{},"codex/sandbox-state-meta":self.state}}})).await;
         self.lifecycle(fixture, "PostToolUse", &call).await;
-        assert!(!reply["result"]["structuredContent"].is_null(), "{reply}");
+        assert_compact_envelope(&reply);
         reply["result"]["structuredContent"].clone()
     }
-    /// Retrieves a same-binding result without keeping the original IPC request open through warmup.
+    /// Retrieves a same-binding result with fresh call IDs and bounded replay-safe backoff.
+    ///
+    /// Each inspection uses [`Self::call`], which advances the host correlation before both its
+    /// native hook and MCP request. The capped backoff and 64-attempt ceiling cover the fixture's
+    /// 120-second operation lifetime without approaching the product replay budget.
     async fn settle(&mut self, fixture: &ProductFixture, mut reply: Value) -> Value {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
+        let mut polls = 0;
+        let mut delay = PRODUCT_SETTLE_INITIAL_DELAY;
         while reply["state"] == "pending" {
             assert!(
-                tokio::time::Instant::now() < deadline,
+                tokio::time::Instant::now() < deadline && polls < PRODUCT_SETTLE_MAX_POLLS,
                 "product operation did not settle"
             );
             let reference = reply["detail_ref"].as_str().unwrap().to_owned();
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            tokio::time::sleep(delay).await;
+            polls += 1;
             reply = self
                 .call(fixture, "ide.inspect", json!({"detail_ref":reference}))
                 .await;
+            delay = delay.saturating_mul(2).min(PRODUCT_SETTLE_MAX_DELAY);
         }
         reply
     }
@@ -1842,7 +1951,12 @@ async fn managed_codex_smoke_and_eof_cleanup() {
 
     next += 1;
     let isolated = mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.context","arguments":{"path":"tracked.txt"},"_meta":{"threadId":"managed-stranger","callId":format!("managed-stranger-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":fixture.state()}}})).await;
-    assert_eq!(isolated["result"]["isError"], true, "{isolated}");
+    assert_compact_envelope(&isolated);
+    assert_eq!(
+        isolated["result"]["structuredContent"],
+        json!({"state":"unavailable","reason":"host_binding"}),
+        "{isolated}"
+    );
 
     next += 1;
     let stopped = managed_call(&mut mcp, next, actor, "ide.stop", json!({}), &state).await;
@@ -2058,7 +2172,12 @@ async fn managed_claude_root_child_rendezvous_second_owner_and_eof_cleanup() {
             }}),
         )
         .await;
-    assert_eq!(denied["result"]["isError"], true, "{denied}");
+    assert_compact_envelope(&denied);
+    assert_eq!(
+        denied["result"]["structuredContent"],
+        json!({"state":"unavailable","reason":"host_binding"}),
+        "{denied}"
+    );
 
     let mut next = 10;
     let root_pending = managed_claude_call(
@@ -2260,11 +2379,12 @@ async fn configured_product_unknown_attachments_allocate_no_channel_or_scope_sta
     .await;
     stranger.next += 1;
     let reply=stranger.mcp.exchange(json!({"jsonrpc":"2.0","id":stranger.next,"method":"tools/call","params":{"name":"ide.start","arguments":{"activation_id":"stranger-start"},"_meta":{"threadId":stranger.actor,"callId":"call-1","x-codex-turn-metadata":{},"codex/sandbox-state-meta":stranger.state}}})).await;
-    assert!(
-        reply["result"]["structuredContent"].is_null(),
+    assert_compact_envelope(&reply);
+    assert_eq!(
+        reply["result"]["structuredContent"],
+        json!({"state":"unavailable","reason":"host_binding"}),
         "an unknown attachment must not produce an owner result: {reply}"
     );
-    assert_eq!(reply["result"]["isError"], json!(true), "{reply}");
     // Allocation is checked by capacity: enough distinct stranger actors to fill the bounded
     // binding table are sent, so an ingress that minted a channel and generation for each of them
     // would leave no room for the configured actor below.
@@ -2272,8 +2392,10 @@ async fn configured_product_unknown_attachments_allocate_no_channel_or_scope_sta
         stranger.next += 1;
         let actor = format!("stranger-{index}");
         let reply=stranger.mcp.exchange(json!({"jsonrpc":"2.0","id":stranger.next,"method":"tools/call","params":{"name":"ide.start","arguments":{"activation_id":"stranger-start"},"_meta":{"threadId":actor,"callId":format!("call-{index}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":stranger.state}}})).await;
-        assert!(
-            reply["result"]["structuredContent"].is_null(),
+        assert_compact_envelope(&reply);
+        assert_eq!(
+            reply["result"]["structuredContent"],
+            json!({"state":"unavailable","reason":"host_binding"}),
             "an unknown attachment must not produce an owner result: {reply}"
         );
     }
@@ -2600,7 +2722,16 @@ async fn configured_product_returns_real_go_and_rust_semantic_context() {
                 )
                 .await;
             let response = actor.settle(&fixture, response).await;
-            assert_eq!(response["kind"], "context", "{response}");
+            if response["kind"] != "context" {
+                actor.mcp.close().await;
+                daemon.kill().await.unwrap();
+                let output = daemon.wait_with_output().await.unwrap();
+                panic!(
+                    "{path}: calls={}: {response}; daemon stderr={}",
+                    actor.next,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
             if !response["text"]
                 .as_str()
                 .unwrap()
@@ -2647,21 +2778,7 @@ async fn configured_product_returns_real_go_and_rust_semantic_context() {
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
 async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
-    let pyright = std::env::var("AGENT_IDE_PYRIGHT").unwrap();
-    let node = std::env::var("AGENT_IDE_NODE").unwrap();
-    let node_identity = "node-fixture";
-    let providers = json!([{
-        "executable":accepted_program(&pyright,"pyright 1.1.413"),
-        "settings":"pyright_defaults_v1",
-        "toolchain":node_identity,
-        "node":accepted_program(&node,node_identity),
-        "cargo":null,
-        "cargo_version":null,
-        "rustc":null,
-        "rustc_version":null,
-        "trust":"fixture-disabled",
-        "cache_namespace":"fixture-pyright-cache"
-    }]);
+    let providers = json!([accepted_pyright_provider("fixture-pyright-cache")]);
     let fixture = ProductFixture::new(providers);
     let path = fixture.root.join("main.py");
     std::fs::write(
@@ -2745,6 +2862,240 @@ async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
     daemon.wait().await.unwrap();
 }
 
+/// Exercises the integrated macOS product loop, stale-write fence, restart telemetry, and fallback.
+///
+/// This ignored release gate uses the exact configured Pyright and Node files. It proves a known
+/// diagnostic can be edited to another same-response reported diagnostic and then to current clean,
+/// with every MCP carrier checked by [`assert_compact_envelope`]. It also proves a stale source
+/// reference writes nothing, a later native edit remains usable, and sanitized edit telemetry is
+/// queryable and exportable after a graceful daemon restart. Host CLI identity/containment remains
+/// outside this product-contract test and is recorded by the external acceptance driver.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
+async fn configured_product_acceptance_edit_diagnostics_telemetry_and_fallback() {
+    let providers = json!([accepted_pyright_provider(
+        "fixture-acceptance-pyright-cache"
+    )]);
+    let fixture = ProductFixture::new(providers);
+    let path = fixture.root.join("main.py");
+    let initial = "def value() -> int:\n    return \"initial-private-bad\"\n\ndef caller() -> int:\n    return value()\n";
+    std::fs::write(&path, initial).unwrap();
+    fixture.git(&["add", "--", "main.py"]);
+    fixture.git(&["commit", "--quiet", "-m", "acceptance fixture"]);
+
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "acceptance-product").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"acceptance-start"}),
+        )
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    let context = actor
+        .call(
+            &fixture,
+            "ide.context",
+            json!({"path":"main.py","byte_offset":initial.rfind("value()").unwrap()}),
+        )
+        .await;
+    let context = actor.settle(&fixture, context).await;
+    assert_eq!(context["kind"], "context", "{context}");
+    assert!(
+        context["text"]
+            .as_str()
+            .unwrap()
+            .contains("diagnostic_count: 1"),
+        "{context}"
+    );
+    let stale_ref = context["detail_ref"].as_str().unwrap().to_owned();
+
+    let intervening = "def value() -> int:\n    return \"intervening-private-bad\"\n\ndef caller() -> int:\n    return value()\n";
+    std::fs::write(&path, intervening).unwrap();
+    let stale = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"acceptance-stale",
+                "path":"main.py",
+                "source_ref":stale_ref,
+                "content":"def value() -> int:\n    return 0\n"
+            }),
+        )
+        .await;
+    let stale = actor.settle(&fixture, stale).await;
+    assert_eq!(stale["result"]["outcome"], "stale_source", "{stale}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), intervening);
+
+    let current = actor
+        .call(&fixture, "ide.context", json!({"path":"main.py"}))
+        .await;
+    let current = actor.settle(&fixture, current).await;
+    let reported_source = "def value() -> int:\n    return \"reported-private-bad\"\n\ndef caller() -> int:\n    return value()\n";
+    let reported = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"acceptance-reported",
+                "path":"main.py",
+                "source_ref":current["detail_ref"],
+                "content":reported_source
+            }),
+        )
+        .await;
+    let reported = actor.settle(&fixture, reported).await;
+    assert_eq!(reported["result"]["outcome"], "replaced", "{reported}");
+    assert_eq!(
+        reported["diagnostics"]["state"], "current_reported",
+        "{reported}"
+    );
+    assert!(
+        !reported["diagnostics"]["messages"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{reported}"
+    );
+
+    let fixed = "def value() -> int:\n    return 8\n\ndef caller() -> int:\n    return value()\n";
+    let clean = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"acceptance-clean",
+                "path":"main.py",
+                "source_ref":reported["result"]["source_ref"],
+                "content":fixed
+            }),
+        )
+        .await;
+    let clean = actor.settle(&fixture, clean).await;
+    assert_eq!(clean["result"]["outcome"], "replaced", "{clean}");
+    assert_eq!(clean["diagnostics"]["state"], "current_clean", "{clean}");
+
+    let diff = actor
+        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let diff = actor.settle(&fixture, diff).await;
+    assert_eq!(diff["kind"], "diff", "{diff}");
+    assert!(
+        diff["text"].as_str().unwrap().contains("return 8"),
+        "{diff}"
+    );
+
+    let native = "def value() -> int:\n    return 9\n\ndef caller() -> int:\n    return value()\n";
+    std::fs::write(&path, native).unwrap();
+    actor
+        .lifecycle(&fixture, "PreToolUse", "acceptance-native-edit")
+        .await;
+    actor
+        .lifecycle(&fixture, "PostToolUse", "acceptance-native-edit")
+        .await;
+    let refreshed = actor
+        .call(&fixture, "ide.context", json!({"path":"main.py"}))
+        .await;
+    let refreshed = actor.settle(&fixture, refreshed).await;
+    assert!(
+        refreshed["text"].as_str().unwrap().contains("return 9"),
+        "{refreshed}"
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+
+    let daemon_pid = daemon.id().unwrap() as libc::pid_t;
+    // SAFETY: this test owns the live daemon identified by the Tokio Child handle.
+    assert_eq!(unsafe { libc::kill(daemon_pid, libc::SIGTERM) }, 0);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), daemon.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+
+    let mut restarted = fixture.daemon().await;
+    let mut restarted_actor = ProductActor::new(&fixture, "acceptance-restarted").await;
+    let fresh = restarted_actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"acceptance-restart"}),
+        )
+        .await;
+    let fresh = restarted_actor.settle(&fixture, fresh).await;
+    assert_eq!(fresh["kind"], "activation", "{fresh}");
+    let stopped = restarted_actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    restarted_actor.mcp.close().await;
+    let restarted_pid = restarted.id().unwrap() as libc::pid_t;
+    // SAFETY: this test owns the restarted live daemon identified by its Tokio Child handle.
+    assert_eq!(unsafe { libc::kill(restarted_pid, libc::SIGTERM) }, 0);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), restarted.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+
+    let telemetry = fixture.runtime.join("telemetry.sqlite");
+    let query = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+        .args(["telemetry", "query", "--database"])
+        .arg(&telemetry)
+        .args(["--tag", "tool_completed"])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        query.status.success(),
+        "{}",
+        String::from_utf8_lossy(&query.stderr)
+    );
+    let query: Value = serde_json::from_slice(&query.stdout).unwrap();
+    let rows = query["rows"].as_array().unwrap();
+    assert!(rows.iter().any(|row| {
+        row["event"]["method"] == "edit" && row["event"]["diagnostics"] == "changed"
+    }));
+    assert!(
+        rows.iter().any(|row| {
+            row["event"]["method"] == "edit" && row["event"]["diagnostics"] == "clean"
+        })
+    );
+
+    let export = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+        .args(["telemetry", "export", "--database"])
+        .arg(&telemetry)
+        .args(["--tag", "tool_completed"])
+        .output()
+        .await
+        .unwrap();
+    assert!(export.status.success());
+    let export = String::from_utf8(export.stdout).unwrap();
+    for forbidden in [
+        "main.py",
+        "initial-private-bad",
+        "intervening-private-bad",
+        "reported-private-bad",
+        "operation_id",
+        "source_ref",
+        "prompt",
+        "credential",
+        "command",
+    ] {
+        assert!(
+            !export.contains(forbidden),
+            "telemetry leaked {forbidden}: {export}"
+        );
+    }
+}
+
 /// Exercises real JS, JSX, TS, and TSX through the pinned exclusive TypeScript product profile.
 ///
 /// The ignored release check requires exact launcher-owned Node, bridge, `tsserver.js`, and loaded
@@ -2755,44 +3106,7 @@ async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
 #[tokio::test]
 #[ignore = "requires exact AGENT_IDE_NODE, AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER and AGENT_IDE_TSSERVER environment"]
 async fn configured_product_returns_real_typescript_family_context_and_reaps() {
-    let node = PathBuf::from(std::env::var("AGENT_IDE_NODE").unwrap());
-    let bridge = PathBuf::from(std::env::var("AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER").unwrap());
-    let tsserver = PathBuf::from(std::env::var("AGENT_IDE_TSSERVER").unwrap());
-    let typescript_root = tsserver.parent().unwrap().parent().unwrap();
-    let bridge_root = bridge.parent().unwrap().parent().unwrap();
-    let mut closure = [
-        bridge_root.join("package.json"),
-        typescript_root.join("lib/_tsserver.js"),
-        typescript_root.join("lib/typescript.js"),
-        typescript_root.join("package.json"),
-    ];
-    closure.sort();
-    let mut provider = json!({
-        "executable":accepted_program(bridge.to_str().unwrap(),"6.0.0"),
-        "settings":"typescript_defaults_v1",
-        "toolchain":"24.4.0",
-        "node":accepted_program(node.to_str().unwrap(),"24.4.0"),
-        "typescript":{
-            "bridge_bytes":std::fs::metadata(&bridge).unwrap().len(),
-            "bridge_version":"6.0.0",
-            "tsserver":accepted_typescript_file(&tsserver),
-            "typescript_version":"5.9.3",
-            "closure":closure.iter().map(|path| accepted_typescript_file(path)).collect::<Vec<_>>(),
-            "codex_macos_evidence":"macos-26.6.2-node-24.4.0-tls-6.0.0-ts-5.9.3-codex-r3-2026-09-14",
-            "claude_macos_evidence":null
-        },
-        "cargo":null,
-        "cargo_version":null,
-        "rustc":null,
-        "rustc_version":null,
-        "trust":"fixture-disabled",
-        "cache_namespace":"fixture-typescript-cache"
-    });
-    let unbound: agent_ide::assistance::launcher::ProviderLaunch =
-        serde_json::from_value(provider.clone()).unwrap();
-    provider["typescript"]["codex_macos_evidence"] =
-        json!(unbound.expected_typescript_codex_macos_evidence().unwrap());
-    let providers = json!([provider]);
+    let providers = json!([accepted_typescript_provider()]);
     let fixture = ProductFixture::new(providers);
     std::fs::write(
         fixture.root.join("tsconfig.json"),
