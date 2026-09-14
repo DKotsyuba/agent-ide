@@ -3348,7 +3348,6 @@ impl OwnedProtocolChild {
     /// wait returns direct-child settlement, always with unverified descendant evidence. It must
     /// never be used for normal TypeScript shutdown, whose successful path calls [`Self::reap`]
     /// without requesting a signal.
-    #[allow(dead_code)]
     pub(crate) async fn terminate_typescript_abnormally(
         mut self,
         grace: Duration,

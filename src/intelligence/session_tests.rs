@@ -100,11 +100,21 @@ fn pyright_settings_are_closed_and_allow_omitted_server_info() {
     );
 }
 
-/// Maps Python implementation and interface files to Python while preserving lexical fallback ids.
+/// Maps configured Python and TypeScript-family extensions while preserving lexical fallback ids.
 #[test]
-fn python_file_extensions_use_python_language_id() {
+fn configured_file_extensions_use_exact_language_ids() {
     assert_eq!(language_id(std::path::Path::new("module.py")), "python");
     assert_eq!(language_id(std::path::Path::new("module.pyi")), "python");
+    assert_eq!(language_id(std::path::Path::new("module.js")), "javascript");
+    assert_eq!(
+        language_id(std::path::Path::new("module.jsx")),
+        "javascriptreact"
+    );
+    assert_eq!(language_id(std::path::Path::new("module.ts")), "typescript");
+    assert_eq!(
+        language_id(std::path::Path::new("module.tsx")),
+        "typescriptreact"
+    );
     assert_eq!(language_id(std::path::Path::new("module.txt")), "plaintext");
 }
 
