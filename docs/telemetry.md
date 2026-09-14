@@ -7,3 +7,5 @@ The durable event schema contains only fixed tags and enums plus bounded elapsed
 Rows are ordered by durable sequence. At insertion, the oldest rows are evicted as soon as either the configured row count (at most 100,000) or canonical event payload total (at most 16 MiB) would be exceeded. An event's canonical encoding is at most 2 KiB. Query and export use Application's bounded multi-row read; neither opens SQLite independently or changes retention.
 
 See [the telemetry contract](contracts/telemetry-v0.2.md) for the fixed vocabulary and read/export guarantees.
+
+`agent-ide telemetry query --database <local.sqlite> [--tag <closed-tag>]` emits a deterministic page of no more than 1,000 rows. `agent-ide telemetry export --database <local.sqlite> [--tag <closed-tag>]` writes canonical rows until its 4 MiB budget and reports `truncated` plus the first omitted sequence on stderr. Both commands accept only the four closed tags, use Application's Store API, and never accept SQL.

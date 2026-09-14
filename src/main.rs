@@ -21,6 +21,10 @@ use agent_ide::assistance::{
     launcher::{AcceptedExecutable, LauncherConfig},
 };
 use agent_ide::execution::{D03ProfileEvidence, HostSandboxState, PersistedProfileRecord};
+use agent_ide::{
+    app::store::Store,
+    telemetry::{Filter, Telemetry, TelemetryConfig},
+};
 use rmcp::{serve_server, transport::io::stdio};
 
 /// Selects an explicit mode; MCP writes only protocol messages to stdout and never autostarts.
@@ -183,6 +187,63 @@ async fn main() -> ExitCode {
             }
             Err(error) => fail(error),
         },
+        Ok(Command::TelemetryQuery { database, filter }) => {
+            let page = match telemetry_owner(&database).await {
+                Ok(telemetry) => telemetry
+                    .query(filter, None, 1_000)
+                    .await
+                    .map_err(|_| AppError::InvalidResponse),
+                Err(error) => Err(error),
+            };
+            match page {
+                Ok(page) => {
+                    let rows = page
+                        .rows
+                        .iter()
+                        .map(|row| {
+                            serde_json::json!({
+                                "sequence": row.sequence,
+                                "event": row.event,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "rows": rows,
+                            "next_cursor": page.next_cursor,
+                            "truncated": page.truncated,
+                            "dropped": page.dropped,
+                        })
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(error) => fail(error),
+            }
+        }
+        Ok(Command::TelemetryExport { database, filter }) => {
+            let export = match telemetry_owner(&database).await {
+                Ok(telemetry) => telemetry
+                    .export(filter)
+                    .await
+                    .map_err(|_| AppError::InvalidResponse),
+                Err(error) => Err(error),
+            };
+            match export {
+                Ok(export) => {
+                    if std::io::stdout().write_all(&export.bytes).is_err() {
+                        return ExitCode::FAILURE;
+                    }
+                    eprintln!("truncated={}", export.truncated);
+                    if let Some(sequence) = export.first_omitted_sequence {
+                        eprintln!("first_omitted_sequence={sequence}");
+                    }
+                    eprintln!("dropped={}", export.dropped);
+                    ExitCode::SUCCESS
+                }
+                Err(error) => fail(error),
+            }
+        }
         Err(error) => fail(error),
     }
 }
@@ -306,6 +367,21 @@ fn fail(error: AppError) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// Opens the bounded local telemetry owner used only by deterministic query and export commands.
+///
+/// `database` is an operator-provided existing local SQLite path; no direct SQLite handle escapes
+/// this helper. Application's owner thread performs migration and every following read. Opening or
+/// reading failure reports the existing compact invalid-response class and cannot start a daemon.
+async fn telemetry_owner(database: &Path) -> Result<Telemetry, AppError> {
+    let store = Arc::new(
+        Store::open(database, EffectiveConfig::defaults().store())
+            .map_err(|_| AppError::InvalidResponse)?,
+    );
+    Telemetry::open(store, TelemetryConfig::default())
+        .await
+        .map_err(|_| AppError::InvalidResponse)
+}
+
 /// Holds the explicit runtime directory required by each supported executable mode.
 enum Command {
     /// Serves health and finite Assistance dispatch until interrupted or killed.
@@ -386,6 +462,20 @@ enum Command {
     LauncherCheck {
         /// Launcher configuration file to load and verify.
         path: PathBuf,
+    },
+    /// Prints one deterministic bounded telemetry page from an operator-selected local database.
+    TelemetryQuery {
+        /// Existing local SQLite database owned through Application's Store thread.
+        database: PathBuf,
+        /// Optional fixed event-tag restriction; no caller-supplied SQL or arbitrary tag is accepted.
+        filter: Filter,
+    },
+    /// Writes deterministic bounded canonical telemetry rows from an operator-selected local database.
+    TelemetryExport {
+        /// Existing local SQLite database owned through Application's Store thread.
+        database: PathBuf,
+        /// Optional fixed event-tag restriction; no caller-supplied SQL or arbitrary tag is accepted.
+        filter: Filter,
     },
 }
 
@@ -527,6 +617,22 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
             path: PathBuf::from(path),
         });
     }
+    if let [mode, sub, database_flag, database] = arguments.as_slice()
+        && mode == "telemetry"
+        && matches!(sub.to_str(), Some("query" | "export"))
+        && database_flag == "--database"
+    {
+        return telemetry_command(sub, PathBuf::from(database), Filter::All);
+    }
+    if let [mode, sub, database_flag, database, tag_flag, tag] = arguments.as_slice()
+        && mode == "telemetry"
+        && matches!(sub.to_str(), Some("query" | "export"))
+        && database_flag == "--database"
+        && tag_flag == "--tag"
+    {
+        let filter = telemetry_filter(tag.to_str().ok_or(AppError::InvalidResponse)?)?;
+        return telemetry_command(sub, PathBuf::from(database), filter);
+    }
     let [mode, flag, value] = arguments.as_slice() else {
         return Err(AppError::InvalidResponse);
     };
@@ -557,6 +663,35 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
         Some("mcp") => Ok(Command::Mcp { runtime_dir }),
         Some("codex-hook") => Ok(Command::CodexHook { runtime_dir }),
         Some("claude-hook") => Ok(Command::ClaudeHook { runtime_dir }),
+        _ => Err(AppError::InvalidResponse),
+    }
+}
+
+/// Builds a fixed telemetry CLI command after its exact subcommand and bounded filter were parsed.
+fn telemetry_command(
+    subcommand: &OsString,
+    database: PathBuf,
+    filter: Filter,
+) -> Result<Command, AppError> {
+    match subcommand.to_str() {
+        Some("query") => Ok(Command::TelemetryQuery { database, filter }),
+        Some("export") => Ok(Command::TelemetryExport { database, filter }),
+        _ => Err(AppError::InvalidResponse),
+    }
+}
+
+/// Converts only canonical closed tags into query filters, rejecting arbitrary local SQLite selectors.
+fn telemetry_filter(tag: &str) -> Result<Filter, AppError> {
+    match tag {
+        "tool_completed" | "execution_completed" | "provider_observed" | "native_fallback" => {
+            Ok(Filter::Tag(match tag {
+                "tool_completed" => "tool_completed",
+                "execution_completed" => "execution_completed",
+                "provider_observed" => "provider_observed",
+                "native_fallback" => "native_fallback",
+                _ => unreachable!("closed tag match is exhaustive"),
+            }))
+        }
         _ => Err(AppError::InvalidResponse),
     }
 }

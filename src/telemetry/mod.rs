@@ -13,11 +13,10 @@ use rusqlite::{params, types::Value};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::app::{
-    config::StoreConfig,
-    store::{
-        DomainMigration, DomainName, MigrationDigest, MigrationKey, Store, StoreError, TrustedUpSql,
-    },
+#[cfg(test)]
+use crate::app::config::StoreConfig;
+use crate::app::store::{
+    DomainMigration, DomainName, MigrationDigest, MigrationKey, Store, StoreError, TrustedUpSql,
 };
 
 /// Converts existing Assistance, provider, and Execution facts into closed telemetry events.
