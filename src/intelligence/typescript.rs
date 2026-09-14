@@ -1003,6 +1003,7 @@ fn validate_resolution_shape(path: &Path, contents: &[u8]) -> Result<(), TypeScr
             .and_then(serde_json::Value::as_object)
             .ok_or(TypeScriptProfileError::InvalidResolution)?;
         if options.get("types") != Some(&serde_json::Value::Array(Vec::new()))
+            || !closed_module_resolution(options)
             || ["baseUrl", "paths", "plugins", "rootDirs", "typeRoots"]
                 .iter()
                 .any(|key| options.contains_key(*key))
@@ -1027,6 +1028,23 @@ fn validate_resolution_shape(path: &Path, contents: &[u8]) -> Result<(), TypeScr
         return Err(TypeScriptProfileError::InvalidResolution);
     }
     Ok(())
+}
+
+/// Returns whether compiler options select only the explicit closed TypeScript resolution mode.
+///
+/// `node10` is the pinned TypeScript mode whose ancestor lookup is already closed by the exact
+/// `node_modules` gate. Missing, alternate, or unknown resolution modes are rejected. Node16,
+/// NodeNext, and Preserve module modes are also refused because they select or imply incompatible
+/// package-resolution semantics even when a conflicting resolution option is present.
+fn closed_module_resolution(options: &serde_json::Map<String, serde_json::Value>) -> bool {
+    options
+        .get("moduleResolution")
+        .and_then(serde_json::Value::as_str)
+        == Some("node10")
+        && !options
+            .get("module")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|module| matches!(module, "node16" | "nodenext" | "preserve"))
 }
 
 /// Returns whether an optional config path list can only name lexical descendants of its config.
@@ -1058,7 +1076,7 @@ mod tests {
     use std::{collections::BTreeSet, os::unix::fs::PermissionsExt};
 
     /// Exact closed config bytes accepted by TypeScript resolution fixtures.
-    const CLOSED_CONFIG: &[u8] = br#"{"compilerOptions":{"types":[]}}"#;
+    const CLOSED_CONFIG: &[u8] = br#"{"compilerOptions":{"types":[],"moduleResolution":"node10"}}"#;
 
     /// Distinguishes parallel fixture roots when the platform clock has coarse resolution.
     static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1408,7 +1426,7 @@ mod tests {
 
         std::fs::write(
             fixture.root.join("tsconfig.json"),
-            br#"{"compilerOptions":{"types":[]},"include":["src/**/*.ts"],"files":["src/file.ts"]}"#,
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"node10"},"include":["src/**/*.ts"],"files":["src/file.ts"]}"#,
         )
         .unwrap();
         assert!(
@@ -1420,6 +1438,42 @@ mod tests {
             ProjectResolutionInputsV1::observe(worktree, document, &bundle),
             Err(TypeScriptProfileError::InvalidResolution)
         ));
+    }
+
+    /// Accepts only the explicit node10 resolution mode and module combinations it preserves.
+    #[test]
+    fn project_resolution_accepts_closed_module_resolution() {
+        for config in [
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"node10"}}"#.as_slice(),
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","module":"commonjs"}}"#
+                .as_slice(),
+        ] {
+            assert!(validate_resolution_shape(Path::new("tsconfig.json"), config).is_ok());
+        }
+    }
+
+    /// Refuses implicit, alternate, unknown, and contradictory TypeScript resolution settings.
+    #[test]
+    fn project_resolution_refuses_open_module_resolution() {
+        for config in [
+            br#"{"compilerOptions":{"types":[]}}"#.as_slice(),
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"classic"}}"#.as_slice(),
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"node16"}}"#.as_slice(),
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"nodenext"}}"#.as_slice(),
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"bundler"}}"#.as_slice(),
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"future"}}"#.as_slice(),
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","module":"node16"}}"#
+                .as_slice(),
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","module":"nodenext"}}"#
+                .as_slice(),
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","module":"preserve"}}"#
+                .as_slice(),
+        ] {
+            assert!(matches!(
+                validate_resolution_shape(Path::new("tsconfig.json"), config),
+                Err(TypeScriptProfileError::InvalidResolution)
+            ));
+        }
     }
 
     /// Rechecks every declared bundle member and refuses a changed TypeScript closure file.

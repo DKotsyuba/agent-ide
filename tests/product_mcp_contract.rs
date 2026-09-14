@@ -2564,7 +2564,7 @@ async fn configured_product_returns_real_typescript_family_context_and_reaps() {
     let fixture = ProductFixture::new(providers);
     std::fs::write(
         fixture.root.join("tsconfig.json"),
-        "{\"compilerOptions\":{\"types\":[]}}\n",
+        "{\"compilerOptions\":{\"types\":[],\"moduleResolution\":\"node10\"}}\n",
     )
     .unwrap();
     let cases = [
