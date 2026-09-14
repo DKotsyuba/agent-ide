@@ -1339,13 +1339,14 @@ fn terminal_claude_edit_cleanup_reserves_capacity() {
 /// Nothing here is fabricated: the returned token only exists because
 /// [`super::claude_worker::LaunchLedger`] itself proved mint, recognition, claim, a matching
 /// `Complete` frame and a successful post, exactly as a real foreground helper round trip would.
+/// `binding` is the exact invocation generation that owns the token; the fixture never substitutes
+/// a separate hard-coded generation.
 #[cfg(test)]
-fn settled_claude_edit() -> SettledClaudeOperation {
+fn settled_claude_edit(binding: BindingRef) -> SettledClaudeOperation {
     use super::claude_worker::{
         AcceptedIdentity, ChildSettlement, ClaimOutcome, HelperActor, HelperBudgets,
         HelperEditSource, HelperJob, HelperPayload, HelperResult, LaunchLedger, LaunchRecognition,
     };
-    let binding = BindingRef::fixture("agent", "channel", 1);
     let identity = |path: &str| {
         AcceptedIdentity::new(std::path::PathBuf::from(path), "fixture", &"ab".repeat(32))
             .expect("fixture identity is well formed")
@@ -1390,6 +1391,7 @@ fn settled_claude_edit() -> SettledClaudeOperation {
     };
     let mut ledger = LaunchLedger::new(std::sync::Arc::new(Mutex::new(admission_controller())));
     let actor = HelperActor::new("agent", Some("session")).unwrap();
+    let binding_fingerprint = binding.fingerprint();
     let command = LaunchLedger::helper_command(
         std::path::Path::new("/usr/local/bin/agent-ide"),
         std::path::Path::new("/private/tmp/rt"),
@@ -1414,7 +1416,7 @@ fn settled_claude_edit() -> SettledClaudeOperation {
         LaunchRecognition::Recognized
     );
     let ClaimOutcome::Granted(_) = ledger.claim("detail-1", "channel", 0, |current| {
-        current == &BindingRef::fixture("agent", "channel", 1)
+        current.fingerprint() == binding_fingerprint
     }) else {
         panic!("fixture claim must be granted");
     };
@@ -1444,10 +1446,7 @@ fn settled_claude_edit() -> SettledClaudeOperation {
         .unwrap();
     ledger.settle_post("edit-call", true).unwrap();
     ledger
-        .settled(
-            "detail-1",
-            BindingRef::fixture("agent", "channel", 1).fingerprint(),
-        )
+        .settled("detail-1", binding_fingerprint)
         .expect("every settlement half is present")
 }
 
@@ -1457,7 +1456,9 @@ fn settled_claude_edit() -> SettledClaudeOperation {
 #[cfg(test)]
 #[test]
 fn successful_claude_edit_completion_reuses_terminal_capacity_treatment() {
-    let settled = JobInput::Claude(Box::new(settled_claude_edit()));
+    let settled = JobInput::Claude(Box::new(settled_claude_edit(BindingRef::fixture(
+        "agent", "channel", 1,
+    ))));
     assert!(!retains_detail(AssistanceTool::Edit, &settled));
     assert_eq!(queue_capacity(8, AssistanceTool::Edit, &settled), 72);
 }
@@ -4190,7 +4191,9 @@ mod stop_retry_tests {
         );
         let (_cancel_sender, cancel) = watch::channel(false);
         let mut job = Job {
-            input: JobInput::ClaudeStopEdit(Box::new(settled_claude_edit())),
+            input: JobInput::ClaudeStopEdit(Box::new(settled_claude_edit(
+                invocation.binding_ref().clone(),
+            ))),
             reference: "stop-cleanup".into(),
             invocation,
             observed: None,
@@ -4286,7 +4289,7 @@ mod stop_retry_tests {
                 .complete_claude_edit_for_stop(
                     invocation.clone(),
                     "stop-retry",
-                    settled_claude_edit(),
+                    settled_claude_edit(invocation.binding_ref().clone()),
                 )
                 .await,
             PeerReply::Error {
@@ -4331,6 +4334,67 @@ mod stop_retry_tests {
                 ..
             })
         ));
+    }
+
+    /// Settles a ready Stop Edit through stopping authority and source observation with its exact
+    /// invocation binding, preserving the known replacement and prepared source reference.
+    #[tokio::test]
+    async fn stopped_ready_edit_settles_known_replacement_with_exact_binding() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        Arc::get_mut(&mut worker.shared).unwrap().launcher = production_launcher(&fixture.root);
+        worker.observations.install_schema().await.unwrap();
+        worker.edits.install_schema().await.unwrap();
+        let (binding, _) = production_start(&mut worker, "stop-actor", "stop-start").await;
+        let (invocation, _) = production_call(&worker, &fixture.root, "stop-actor", "stop-call");
+        {
+            let mut guard = worker.shared.bindings.lock().unwrap();
+            guard.begin_stop(invocation.binding_ref()).unwrap();
+        }
+        assert_eq!(binding, *invocation.binding_ref());
+        let request = EditRequest::new("stop-known", "main.rs", "context", "new").unwrap();
+        let PrepareAdmission::Prepared(receipt) =
+            worker.edits.prepare(request.clone()).await.unwrap()
+        else {
+            panic!("fixture request must prepare once");
+        };
+        worker.prepared_edits.insert(
+            (binding.clone(), request.operation_id.clone()),
+            PreparedClaudeEdit {
+                receipt,
+                detail_ref: "prepared-detail".into(),
+            },
+        );
+        let (_cancel_sender, cancel) = watch::channel(false);
+        let mut job = Job {
+            input: JobInput::ClaudeStopEdit(Box::new(settled_claude_edit(binding))),
+            reference: "stop-known-job".into(),
+            invocation,
+            observed: None,
+            tool: AssistanceTool::Edit,
+            parameters: serde_json::to_value(&request).unwrap(),
+            target: production_target(&fixture.root),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            cancel,
+            stop_reply: None,
+            native_epoch: 0,
+        };
+        let (reply, authority, source) = worker.settle_stopped_claude_edit(&mut job).await.unwrap();
+        assert!(matches!(
+            reply,
+            PeerReply::Edit {
+                result: EditResult {
+                    outcome: ChangesEditOutcome::Replaced,
+                    source_ref: Some(ref source_ref),
+                    ..
+                },
+                ..
+            } if source_ref == "prepared-detail"
+        ));
+        assert!(authority.is_some());
+        assert!(source.is_some());
     }
 
     #[tokio::test]

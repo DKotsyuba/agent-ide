@@ -140,8 +140,10 @@ impl ProductDispatcher {
     /// Performs no Git, source, provider or process work: it only records what a later helper
     /// would be permitted to do. Returns a closed `Error` when the target has no accepted strict
     /// Claude operator profile, when this executable or runtime directory could not be resolved,
-    /// or when bounded ticket capacity is full. Absence of a profile is always unavailability and
-    /// never a fallback to unrestricted execution.
+    /// or when bounded ticket capacity is full. Immediately before minting, the exact binding is
+    /// revalidated while the launch ledger lock is held, so Stop linearizes before or after mint
+    /// without allowing a ticket onto a binding already closed to external admission. Absence of
+    /// a profile is always unavailability and never a fallback to unrestricted execution.
     fn mint_claude(
         &self,
         invocation: &ValidatedInvocation,
@@ -278,6 +280,12 @@ impl ProductDispatcher {
             }
         }
         let deadline = monotonic_ms().saturating_add(worker.limits().operation_ms);
+        let Ok(bindings) = self.bindings.lock() else {
+            return error(FailureCode::Internal);
+        };
+        if bindings.check_active(invocation.binding_ref()).is_err() {
+            return error(FailureCode::WorkspaceAuthority);
+        }
         match launches.mint(
             &detail_ref,
             invocation.binding_ref().clone(),
@@ -1197,4 +1205,133 @@ async fn host_shaped_claude_start_never_reaches_workspace_without_sandbox_author
             reason: MissingPeer::WorkspaceActivation
         })
     );
+}
+
+/// Builds a configured Claude dispatcher and one active start invocation for the mint/Stop race.
+#[cfg(test)]
+fn claude_race_fixture() -> (ProductDispatcher, ValidatedInvocation) {
+    use crate::execution::{D03ProfileEvidence, HostSandboxState, PersistedProfileRecord};
+
+    let sandbox = HostSandboxState::parse(Some(json!({
+        "permissionProfile":{"type":"disabled"},
+        "codexLinuxSandboxExe":null,
+        "sandboxCwd":"/private/tmp",
+        "useLegacyLandlock":false
+    })))
+    .unwrap();
+    let record = PersistedProfileRecord::from_execution_evidence(
+        "race-profile",
+        1,
+        D03ProfileEvidence {
+            provider_binary: "race-git".into(),
+            toolchain: "race-toolchain".into(),
+            configuration: "default".into(),
+            trust: "race-local".into(),
+            transport: "direct".into(),
+            d03_evidence: "race-d03".into(),
+        },
+        &sandbox,
+    )
+    .unwrap();
+    let git = "/usr/bin/git";
+    let executable = json!({
+        "path":git,
+        "identity":"race-git",
+        "blake3":blake3::hash(&std::fs::read(git).unwrap()).to_hex().to_string()
+    });
+    let launcher = LauncherConfig::parse(
+        json!({
+            "version":1,
+            "limits":{"queued":8,"details":8,"operation_ms":1000,"output_bytes":4096},
+            "targets":[{
+                "attachment":"race-attachment",
+                "candidate":"/private/tmp/race-worktree",
+                "git":executable,
+                "codex":executable,
+                "providers":[],
+                "profiles":[{
+                    "record":serde_json::from_str::<Value>(&record.to_json()).unwrap(),
+                    "sandbox_state":serde_json::from_str::<Value>(sandbox.sandbox_state_json()).unwrap()
+                }],
+                "allow_disabled_host":true,
+                "claude_profile":{
+                    "enabled":true,
+                    "fail_if_unavailable":true,
+                    "allow_unsandboxed_commands":false,
+                    "no_matching_excluded_commands":true,
+                    "scope_declared":true,
+                    "platform":"mac_os"
+                }
+            }]
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+    let dispatcher = ProductDispatcher::with_launcher(launcher);
+    *dispatcher.runtime_dir.lock().unwrap() = Some(std::path::PathBuf::from("/private/tmp"));
+    let channel = dispatcher.channel("race-attachment").unwrap();
+    let mut bindings = dispatcher.bindings.lock().unwrap();
+    assert!(matches!(
+        bindings.observe_hook(
+            parse_claude_hook_event(
+                json!({
+                    "hook_event_name":"PreToolUse",
+                    "session_id":"race-actor",
+                    "tool_use_id":"race-start"
+                })
+                .to_string()
+                .as_bytes()
+            )
+            .unwrap(),
+            channel.clone()
+        ),
+        BindingStatus::PreObserved
+    ));
+    let BindingStatus::Validated(invocation) =
+        bindings.establish_start_claude("race-start", channel)
+    else {
+        panic!("race fixture binding must validate");
+    };
+    drop(bindings);
+    (dispatcher, invocation)
+}
+
+/// Proves Stop wins the exact concurrent boundary before Claude mint can publish a ticket.
+#[test]
+fn claude_mint_rechecks_binding_after_concurrent_stop_begins() {
+    let (dispatcher, invocation) = claude_race_fixture();
+    let dispatcher = std::sync::Arc::new(dispatcher);
+    let binding = invocation.binding_ref().clone();
+    let (stopping, ready) = std::sync::mpsc::sync_channel(0);
+    let stop_dispatcher = dispatcher.clone();
+    let stop = std::thread::spawn(move || {
+        stop_dispatcher
+            .bindings
+            .lock()
+            .unwrap()
+            .begin_stop(&binding)
+            .unwrap();
+        stopping.send(()).unwrap();
+        stop_dispatcher
+            .launches
+            .lock()
+            .unwrap()
+            .revoke(binding.fingerprint());
+    });
+    ready.recv().unwrap();
+    let reply = dispatcher.mint_claude(
+        &invocation,
+        super::facade::AssistanceTool::Start,
+        &json!({"activation_id":"race-start"}),
+        "race-attachment",
+    );
+    stop.join().unwrap();
+    assert_eq!(
+        reply,
+        PeerReply::Error {
+            code: FailureCode::WorkspaceAuthority
+        }
+    );
+    assert!(dispatcher.launches.lock().unwrap().is_empty());
 }
