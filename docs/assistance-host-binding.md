@@ -47,6 +47,26 @@ starts a daemon, or repairs transport, and its separately started daemon retains
 hook-correlated behavior. Both forms validate the same closed model-argument schemas and write only
 MCP protocol messages to stdout.
 
+`agent-ide mcp --claude-launcher-template ABSOLUTE_PATH` is the explicit self-contained Claude
+entrypoint. It captures only an absolute, normalized `CLAUDE_PROJECT_DIR`, canonicalizes that
+directory once, and derives `/tmp/ai-c-<16 lowercase hex>` directly from the leading 64 bits of the
+BLAKE3 digest of the canonical project-root path bytes. The MCP exclusively creates that directory
+with mode `0700`; an existing path leaves a second MCP disconnected and is never adopted, repaired,
+or removed. The owner binds the template's sole target to the captured project and a fresh random
+attachment, requires that target's existing strict Claude operator profile, writes the bound
+launcher and project-bound attachment record with mode `0600`, then starts and health-checks the
+daemon through the existing legacy Claude route. It serves the unchanged five tools and reaps its
+exact daemon before identity-checked runtime removal on stdio EOF, cancellation, SIGINT, or SIGTERM.
+
+The plugin's `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, and `PermissionDenied` handlers run
+the argument-free `agent-ide claude-hook`. That command independently derives the same path from
+`CLAUDE_PROJECT_DIR`, validates the runtime and bounded attachment file's owner, exact modes, shape,
+and full project digest, then reuses the existing Claude parser and connect-only transport. Missing
+or corrupt state is silent fail-open. Root and child lifecycle identity, permission denial,
+failed-tool settlement, feedback output, and exact foreground-helper recognition are unchanged.
+The installed binary and launcher template remain machine-specific values in normal Claude MCP
+configuration; they are not embedded in the plugin manifest.
+
 For legacy Codex mode, configure native `PreToolUse`, `PostToolUse`, and available `PostToolBatch` commands to invoke
 `agent-ide codex-hook --runtime-dir PATH` for supported native tools as well as this MCP
 server's five `ide.*` tools. The placeholder-only example is

@@ -1,8 +1,9 @@
-//! Command-line entrypoint for the MCP facade, Codex hook, local daemon, and doctor.
+//! Command-line entrypoint for managed and legacy MCP, native hooks, the daemon, and diagnostics.
 
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{ExitCode, Stdio};
@@ -25,6 +26,9 @@ use rmcp::{serve_server, transport::io::stdio};
 /// Selects an explicit mode; MCP writes only protocol messages to stdout and never autostarts.
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Claude's workspace identity is captured before argument parsing or asynchronous setup and is
+    // never accepted from an MCP call, hook payload, or later environment read.
+    let claude_project_dir = std::env::var_os("CLAUDE_PROJECT_DIR");
     match command(std::env::args_os().skip(1)) {
         Ok(Command::Daemon { runtime_dir }) => match RuntimeDir::prepare_for_daemon(runtime_dir) {
             Ok(runtime_dir) => match run_daemon_with_assistance(
@@ -90,10 +94,20 @@ async fn main() -> ExitCode {
                 Err(_) => fail(AppError::InvalidResponse),
             }
         }
-        Ok(Command::ManagedMcp { launcher_template }) => {
-            // Capture exactly once before setup or any async work can change process state.
-            let candidate = std::env::current_dir();
-            run_managed_mcp(launcher_template, candidate).await
+        Ok(Command::ManagedMcp {
+            launcher_template,
+            host,
+        }) => {
+            let candidate = match host {
+                // Codex retains its existing current-directory identity contract.
+                ManagedHost::Codex => std::env::current_dir(),
+                ManagedHost::Claude => canonical_claude_project(claude_project_dir),
+            };
+            run_managed_mcp(launcher_template, candidate, host).await
+        }
+        Ok(Command::ManagedClaudeHook) => {
+            run_managed_claude_hook(claude_project_dir).await;
+            ExitCode::SUCCESS
         }
         Ok(Command::ClaudeWorker {
             runtime_dir,
@@ -298,7 +312,11 @@ enum Command {
     ManagedMcp {
         /// Absolute one-target launcher template rebound to this process and captured candidate.
         launcher_template: PathBuf,
+        /// Host contract selected by the explicit managed MCP flag.
+        host: ManagedHost,
     },
+    /// Submits one managed Claude hook through the project-derived private rendezvous.
+    ManagedClaudeHook,
     /// Submits one bounded native Codex hook and exits successfully on every ingress failure.
     CodexHook {
         /// Existing daemon endpoint directory; never created by the hook command.
@@ -362,6 +380,15 @@ enum Command {
     },
 }
 
+/// Selects the host-specific identity and binding behavior of a self-contained managed MCP.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedHost {
+    /// Existing Codex mode derives its candidate from the startup current directory and binds directly.
+    Codex,
+    /// Claude derives its candidate only from startup-captured `CLAUDE_PROJECT_DIR` and uses hooks.
+    Claude,
+}
+
 /// Matches `pairs` against the exact ordered `--flag value` sequence in `expected`.
 ///
 /// Returns each value as `&str` in `expected`'s order, or `None` for a wrong element count, a
@@ -384,6 +411,9 @@ fn ordered_flags<'a>(pairs: &'a [OsString], expected: &[&str]) -> Option<Vec<&'a
 /// Rejects unknown, missing, and extra CLI arguments before any filesystem or daemon action.
 fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppError> {
     let arguments = arguments.collect::<Vec<_>>();
+    if arguments.as_slice() == [OsString::from("claude-hook")] {
+        return Ok(Command::ManagedClaudeHook);
+    }
     // The helper command has its own fixed longer shape; every other mode keeps the exact
     // three-argument form it already had, so no existing invocation changes meaning.
     if let [
@@ -480,6 +510,13 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
     if mode == "mcp" && flag == "--launcher-template" {
         return Ok(Command::ManagedMcp {
             launcher_template: PathBuf::from(value),
+            host: ManagedHost::Codex,
+        });
+    }
+    if mode == "mcp" && flag == "--claude-launcher-template" {
+        return Ok(Command::ManagedMcp {
+            launcher_template: PathBuf::from(value),
+            host: ManagedHost::Claude,
         });
     }
     if flag != "--runtime-dir" {
@@ -540,6 +577,33 @@ impl ManagedRuntime {
         ))
     }
 
+    /// Exclusively creates the one deterministic Claude runtime directory with exact mode `0700`.
+    ///
+    /// `path` must be the project-derived child of the canonical `/tmp` root. An existing path is
+    /// never opened, repaired, removed, or adopted, so a concurrent second MCP stays disconnected
+    /// and cannot overwrite the first owner's launcher or attachment. The captured device/inode
+    /// identity fences the eventual recursive cleanup exactly as in managed Codex mode.
+    fn create_deterministic(path: PathBuf) -> std::io::Result<Self> {
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700).create(&path)?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o777 != 0o700
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "managed Claude runtime is not private",
+            ));
+        }
+        Ok(Self {
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
     /// Writes the already validated bound launcher bytes once with mode `0600`.
     ///
     /// The returned absolute path is passed only to the exact daemon child. Existing files are
@@ -554,6 +618,22 @@ impl ManagedRuntime {
         file.write_all(bytes)?;
         file.sync_all()?;
         Ok(path)
+    }
+
+    /// Writes one project-bound random Claude attachment record exactly once with mode `0600`.
+    ///
+    /// The first field is the full project identity whose prefix selected this short runtime path;
+    /// the second is the unguessable transport attachment. A hook validates both fields before it
+    /// attempts IPC. Existing files are never followed or overwritten, and no value is rendered.
+    fn write_claude_attachment(&self, project: &Path, attachment: &str) -> std::io::Result<()> {
+        let record = format!("{} {attachment}\n", claude_project_identity(project));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(self.path.join(CLAUDE_ATTACHMENT_FILE))?;
+        file.write_all(record.as_bytes())?;
+        file.sync_all()
     }
 
     /// Removes this runtime tree only while its original private directory identity still matches.
@@ -600,6 +680,139 @@ fn absolute_local_path(path: &Path) -> bool {
             .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
 }
 
+/// Fixed short namespace for deterministic Claude runtimes below the canonical `/tmp` directory.
+const CLAUDE_RUNTIME_PREFIX: &str = "ai-c-";
+/// Fixed owner-only file carrying the full project identity and random transport attachment.
+const CLAUDE_ATTACHMENT_FILE: &str = "attachment";
+/// Exact record length: 64 digest bytes, one separator, 64 attachment bytes, and one newline.
+const CLAUDE_ATTACHMENT_BYTES: u64 = 130;
+
+/// Resolves one startup-captured Claude project value to an absolute canonical directory.
+///
+/// Relative, non-normalized, missing, nonexistent, and non-directory values are rejected without
+/// falling back to the process current directory. The returned path is the sole managed Claude
+/// candidate and the sole input to its deterministic runtime identity.
+fn canonical_claude_project(value: Option<OsString>) -> std::io::Result<PathBuf> {
+    let path = PathBuf::from(value.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "CLAUDE_PROJECT_DIR is unavailable",
+        )
+    })?);
+    if !absolute_local_path(&path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "CLAUDE_PROJECT_DIR is not absolute and normalized",
+        ));
+    }
+    let project = fs::canonicalize(path)?;
+    if !absolute_local_path(&project)
+        || !fs::symlink_metadata(&project).is_ok_and(|metadata| metadata.is_dir())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "CLAUDE_PROJECT_DIR is not a canonical directory",
+        ));
+    }
+    Ok(project)
+}
+
+/// Returns the full BLAKE3 digest of one canonical Claude project root's raw path bytes.
+fn claude_project_identity(project: &Path) -> String {
+    blake3::hash(project.as_os_str().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+/// Derives the one short deterministic private runtime path for a canonical Claude project root.
+///
+/// The full digest remains in the attachment record to reject a theoretical collision in the
+/// sixteen-hex-character pathname prefix. The returned parent is canonical `/tmp`; no caller or
+/// model path can redirect the rendezvous elsewhere.
+fn claude_runtime_path(project: &Path) -> std::io::Result<PathBuf> {
+    let identity = claude_project_identity(project);
+    Ok(fs::canonicalize(Path::new("/tmp"))?
+        .join(format!("{CLAUDE_RUNTIME_PREFIX}{}", &identity[..16])))
+}
+
+/// Returns whether a string is exactly one generated 32-byte lowercase hexadecimal attachment.
+fn valid_random_attachment(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// Reads one project-derived managed Claude rendezvous after strict owner/mode/identity checks.
+///
+/// The directory must be the expected nonsymlink owned by the effective user with exact mode
+/// `0700`. Its fixed attachment file is opened with `O_NOFOLLOW`, must be a regular owner-only
+/// `0600` file of the exact bounded size, and must carry this project's full digest plus one valid
+/// random attachment. Any missing, stale, replaced, or corrupt state is rejected without repair.
+fn read_claude_attachment(project: &Path) -> std::io::Result<(PathBuf, String)> {
+    let runtime = claude_runtime_path(project)?;
+    let metadata = fs::symlink_metadata(&runtime)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o777 != 0o700
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "managed Claude runtime identity is invalid",
+        ));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(runtime.join(CLAUDE_ATTACHMENT_FILE))?;
+    let attachment_metadata = file.metadata()?;
+    if !attachment_metadata.is_file()
+        || attachment_metadata.uid() != unsafe { libc::geteuid() }
+        || attachment_metadata.permissions().mode() & 0o777 != 0o600
+        || attachment_metadata.len() != CLAUDE_ATTACHMENT_BYTES
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "managed Claude attachment identity is invalid",
+        ));
+    }
+    let mut record = String::new();
+    file.take(CLAUDE_ATTACHMENT_BYTES + 1)
+        .read_to_string(&mut record)?;
+    let Some((identity, attachment)) = record
+        .strip_suffix('\n')
+        .and_then(|value| value.split_once(' '))
+    else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "managed Claude attachment is malformed",
+        ));
+    };
+    if identity != claude_project_identity(project) || !valid_random_attachment(attachment) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "managed Claude attachment does not match the project",
+        ));
+    }
+    Ok((runtime, attachment.to_owned()))
+}
+
+/// Submits one argument-free managed Claude hook through its exact project rendezvous.
+///
+/// Missing project identity, runtime, attachment, or daemon state returns silently. Once validated,
+/// the existing bounded Claude parser, 250 ms total deadline, sanitized transport, exact lifecycle
+/// correlation, feedback rendering, and foreground-helper recognition remain unchanged.
+async fn run_managed_claude_hook(project: Option<OsString>) {
+    let Ok(project) = canonical_claude_project(project) else {
+        return;
+    };
+    let Ok((runtime, attachment)) = read_claude_attachment(&project) else {
+        return;
+    };
+    agent_ide::assistance::codex_hook::run(&runtime, Some(attachment), HostKind::Claude).await;
+}
+
 /// Starts, health-checks, serves, and tears down one self-contained managed MCP generation.
 ///
 /// Setup failure still serves the static five tools through a connect-only unavailable facade.
@@ -608,12 +821,22 @@ fn absolute_local_path(path: &Path) -> bool {
 async fn run_managed_mcp(
     launcher_template: PathBuf,
     candidate: std::io::Result<PathBuf>,
+    host: ManagedHost,
 ) -> ExitCode {
-    let Ok(runtime) = ManagedRuntime::create() else {
+    let Ok(candidate) = candidate else {
+        return serve_managed_stdio(StdioFacade::unavailable(), None, None).await;
+    };
+    let runtime = match host {
+        ManagedHost::Codex => ManagedRuntime::create(),
+        ManagedHost::Claude => {
+            claude_runtime_path(&candidate).and_then(ManagedRuntime::create_deterministic)
+        }
+    };
+    let Ok(runtime) = runtime else {
         return serve_managed_stdio(StdioFacade::unavailable(), None, None).await;
     };
     let runtime_path = runtime.path.clone();
-    let started = start_managed_daemon(&runtime, &launcher_template, candidate).await;
+    let started = start_managed_daemon(&runtime, &launcher_template, candidate, host).await;
     match started {
         Ok((attachment, child)) => {
             let Some(facade) = StdioFacade::with_host_attachment(runtime_path, attachment) else {
@@ -638,9 +861,9 @@ async fn run_managed_mcp(
 async fn start_managed_daemon(
     runtime: &ManagedRuntime,
     launcher_template: &Path,
-    candidate: std::io::Result<PathBuf>,
+    candidate: PathBuf,
+    host: ManagedHost,
 ) -> Result<(String, tokio::process::Child), ()> {
-    let candidate = candidate.map_err(|_| ())?;
     if !absolute_local_path(&candidate)
         || !fs::symlink_metadata(&candidate).is_ok_and(|metadata| metadata.is_dir())
         || !absolute_local_path(launcher_template)
@@ -651,19 +874,39 @@ async fn start_managed_daemon(
     let (launcher, bytes) =
         LauncherConfig::bind_one_candidate(launcher_template, &attachment, &candidate)
             .map_err(|_| ())?;
+    if host == ManagedHost::Claude
+        && launcher
+            .target(&attachment)
+            .is_none_or(|target| target.claude_profile.is_none())
+    {
+        return Err(());
+    }
     launcher.verify().map_err(|_| ())?;
     let launcher_path = runtime.write_launcher(&bytes).map_err(|_| ())?;
-    let mut child = tokio::process::Command::new(std::env::current_exe().map_err(|_| ())?)
+    if host == ManagedHost::Claude {
+        runtime
+            .write_claude_attachment(&candidate, &attachment)
+            .map_err(|_| ())?;
+    }
+    let mut command = tokio::process::Command::new(std::env::current_exe().map_err(|_| ())?);
+    command
         .args(["daemon", "--runtime-dir"])
         .arg(&runtime.path)
         .env("AGENT_IDE_LAUNCHER_CONFIG", launcher_path)
-        .env("AGENT_IDE_MANAGED_CODEX_ATTACHMENT", &attachment)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|_| ())?;
+        .kill_on_drop(true);
+    match host {
+        ManagedHost::Codex => {
+            command.env("AGENT_IDE_MANAGED_CODEX_ATTACHMENT", &attachment);
+        }
+        ManagedHost::Claude => {
+            // Claude deliberately uses the existing hook-correlated daemon path.
+            command.env_remove("AGENT_IDE_MANAGED_CODEX_ATTACHMENT");
+        }
+    }
+    let mut child = command.spawn().map_err(|_| ())?;
     if !health_check_owned_daemon(&mut child, &runtime.path).await {
         terminate_owned_daemon(child).await;
         return Err(());
@@ -908,17 +1151,96 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
-    /// Managed MCP uses its distinct absolute launcher-template form while legacy MCP is unchanged.
+    /// Managed host flags and the argument-free Claude hook are distinct from both legacy forms.
     #[test]
     fn managed_and_legacy_mcp_cli_forms_are_distinct() {
         assert!(matches!(
             command(args(&["mcp", "--launcher-template", "/private/tmp/template.json"])),
-            Ok(Command::ManagedMcp { launcher_template })
+            Ok(Command::ManagedMcp {
+                launcher_template,
+                host: ManagedHost::Codex,
+            })
                 if launcher_template == Path::new("/private/tmp/template.json")
+        ));
+        assert!(matches!(
+            command(args(&[
+                "mcp",
+                "--claude-launcher-template",
+                "/private/tmp/template.json"
+            ])),
+            Ok(Command::ManagedMcp {
+                launcher_template,
+                host: ManagedHost::Claude,
+            }) if launcher_template == Path::new("/private/tmp/template.json")
         ));
         assert!(matches!(
             command(args(&["mcp", "--runtime-dir", "/private/tmp/runtime"])),
             Ok(Command::Mcp { runtime_dir }) if runtime_dir == Path::new("/private/tmp/runtime")
         ));
+        assert!(matches!(
+            command(args(&["claude-hook"])),
+            Ok(Command::ManagedClaudeHook)
+        ));
+        assert!(matches!(
+            command(args(&[
+                "claude-hook",
+                "--runtime-dir",
+                "/private/tmp/runtime"
+            ])),
+            Ok(Command::ClaudeHook { runtime_dir })
+                if runtime_dir == Path::new("/private/tmp/runtime")
+        ));
+    }
+
+    /// Claude's shortened rendezvous is stable for one root and different for another root.
+    #[test]
+    fn claude_runtime_path_is_stable_and_candidate_specific() {
+        let first = Path::new("/private/tmp/agent-ide-claude-project-a");
+        let second = Path::new("/private/tmp/agent-ide-claude-project-b");
+        let first_path = claude_runtime_path(first).unwrap();
+        assert_eq!(first_path, claude_runtime_path(first).unwrap());
+        assert_ne!(first_path, claude_runtime_path(second).unwrap());
+        assert_eq!(
+            first_path.parent(),
+            Some(fs::canonicalize(Path::new("/tmp")).unwrap().as_path())
+        );
+        assert!(canonical_claude_project(Some(OsString::from("relative"))).is_err());
+        assert!(canonical_claude_project(Some(OsString::from("/private/tmp/../tmp"))).is_err());
+    }
+
+    /// Exclusive Claude ownership preserves the first attachment and rejects corrupt rendezvous.
+    #[test]
+    fn claude_runtime_second_owner_cannot_overwrite_attachment() {
+        let project = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "agent-ide-claude-owner-{}-{}",
+                std::process::id(),
+                random_hex(4).unwrap()
+            ));
+        fs::create_dir(&project).unwrap();
+        let project = fs::canonicalize(&project).unwrap();
+        let runtime_path = claude_runtime_path(&project).unwrap();
+        let runtime = ManagedRuntime::create_deterministic(runtime_path.clone()).unwrap();
+        let attachment = "a".repeat(64);
+        runtime
+            .write_claude_attachment(&project, &attachment)
+            .unwrap();
+        let original = fs::read(runtime_path.join(CLAUDE_ATTACHMENT_FILE)).unwrap();
+
+        assert!(matches!(
+            ManagedRuntime::create_deterministic(runtime_path.clone()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(
+            fs::read(runtime_path.join(CLAUDE_ATTACHMENT_FILE)).unwrap(),
+            original
+        );
+        assert_eq!(read_claude_attachment(&project).unwrap().1, attachment);
+
+        fs::write(runtime_path.join(CLAUDE_ATTACHMENT_FILE), b"corrupt").unwrap();
+        assert!(read_claude_attachment(&project).is_err());
+        runtime.remove().unwrap();
+        fs::remove_dir(project).unwrap();
     }
 }

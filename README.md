@@ -34,6 +34,30 @@ manifest cannot safely supply the machine-specific template path, so it remains 
 Legacy `agent-ide mcp --runtime-dir PATH` remains connect-only and compatible with separately
 started `agent-ide daemon --runtime-dir PATH` instances.
 
+Claude uses the same standard MCP configuration mechanism, with an explicit managed-Claude flag.
+Keep both absolute, machine-specific paths in the host's normal MCP configuration rather than the
+plugin manifest:
+
+```json
+{
+  "mcpServers": {
+    "agent-ide": {
+      "type": "stdio",
+      "command": "/absolute/path/to/agent-ide",
+      "args": ["mcp", "--claude-launcher-template", "/absolute/path/to/launcher.json"]
+    }
+  }
+}
+```
+
+The Claude plugin contributes the four correlated lifecycle hooks from `hooks/hooks.json`; its
+plugin-local command uses only Claude's standard `CLAUDE_PLUGIN_ROOT` path and delegates to the
+installed `agent-ide claude-hook`. That argument-free mode finds the active project rendezvous
+solely from Claude's absolute `CLAUDE_PROJECT_DIR`. The managed MCP requires the template's one
+target to carry the strict Claude operator profile documented below. It exclusively owns a
+deterministic private runtime for that project, so a second MCP stays disconnected until the owner
+exits and removes it.
+
 The separate launcher environment variable `AGENT_IDE_HOST_ATTACHMENT` enables
 connect-only routing when supported host request metadata is also present. It is an
 opaque transport handle, not authentication or workspace authority. The current daemon

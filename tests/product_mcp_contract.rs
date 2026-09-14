@@ -1,6 +1,7 @@
 //! Executable MCP roundtrips for static discovery, separated ingress, and finite daemon routing.
 
 use std::{
+    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
     sync::atomic::{AtomicUsize, Ordering},
@@ -93,6 +94,36 @@ impl Mcp {
         };
         let response = mcp.exchange(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
             "protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"managed-product-contract","version":"1"}
+        }})).await;
+        assert!(response.get("result").is_some(), "{response}");
+        mcp.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+            .await;
+        mcp
+    }
+
+    /// Starts the shipping self-contained Claude MCP using only its captured project environment.
+    async fn start_managed_claude(template: &Path, project: &Path) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
+        command
+            .env("TOKIO_WORKER_THREADS", "1")
+            .env("CLAUDE_PROJECT_DIR", project)
+            .env_remove("AGENT_IDE_HOST_ATTACHMENT")
+            .env_remove("AGENT_IDE_MANAGED_CODEX_ATTACHMENT")
+            .args(["mcp", "--claude-launcher-template"])
+            .arg(template)
+            .current_dir(project.parent().unwrap())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let mut mcp = Self {
+            input: child.stdin.take().unwrap(),
+            output: BufReader::new(child.stdout.take().unwrap()),
+            child,
+        };
+        let response = mcp.exchange(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"managed-claude-contract","version":"1"}
         }})).await;
         assert!(response.get("result").is_some(), "{response}");
         mcp.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
@@ -471,6 +502,40 @@ fn claude_hook_process(runtime: &Path, attachment: Option<&str>) -> Child {
         command.env("AGENT_IDE_HOST_ATTACHMENT", attachment);
     }
     command.spawn().unwrap()
+}
+
+/// Starts the argument-free managed Claude hook with no caller-selected runtime or attachment.
+fn managed_claude_hook_process(project: Option<&Path>) -> Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
+    command
+        .env("TOKIO_WORKER_THREADS", "1")
+        .env_remove("CLAUDE_PROJECT_DIR")
+        .env_remove("AGENT_IDE_HOST_ATTACHMENT")
+        .args(["claude-hook"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(project) = project {
+        command.env("CLAUDE_PROJECT_DIR", project);
+    }
+    command.spawn().unwrap()
+}
+
+/// Sends one native Claude payload through the managed hook and returns its bounded process output.
+async fn managed_claude_hook(project: Option<&Path>, payload: Value) -> std::process::Output {
+    let mut child = managed_claude_hook_process(project);
+    let mut input = child.stdin.take().unwrap();
+    input
+        .write_all(payload.to_string().as_bytes())
+        .await
+        .unwrap();
+    input.shutdown().await.unwrap();
+    drop(input);
+    tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap()
 }
 
 /// Submits native-shaped hook JSON through the executable and requires silent fail-open completion.
@@ -1410,6 +1475,117 @@ impl ProductActor {
     }
 }
 
+/// Reproduces the public deterministic Claude rendezvous contract for product-edge assertions.
+fn managed_claude_runtime_path(project: &Path) -> PathBuf {
+    let project = std::fs::canonicalize(project).unwrap();
+    let hash = blake3::hash(project.as_os_str().as_bytes());
+    std::fs::canonicalize("/tmp")
+        .unwrap()
+        .join(format!("ai-c-{}", &hash.to_hex().as_str()[..16]))
+}
+
+/// Builds one exact Claude root or child lifecycle event without any transport attachment fields.
+fn managed_claude_event(phase: &str, session: &str, agent: Option<&str>, call: &str) -> Value {
+    let mut event = json!({
+        "hook_event_name": phase,
+        "session_id": session,
+        "tool_use_id": call,
+    });
+    if let Some(agent) = agent {
+        event["agent_id"] = Value::String(agent.to_owned());
+        event["agent_type"] = Value::String("fixture-child".into());
+    }
+    event
+}
+
+/// Runs exact managed Claude Pre→MCP→terminal-hook correlation for one root or child actor.
+async fn managed_claude_call(
+    mcp: &mut Mcp,
+    project: &Path,
+    id: usize,
+    session: &str,
+    agent: Option<&str>,
+    name: &str,
+    arguments: Value,
+) -> Value {
+    let call = format!("managed-claude-{id}");
+    let pre = managed_claude_hook(
+        Some(project),
+        managed_claude_event("PreToolUse", session, agent, &call),
+    )
+    .await;
+    assert!(
+        pre.status.success() && pre.stdout.is_empty() && pre.stderr.is_empty(),
+        "managed pre-hook failed: {}",
+        String::from_utf8_lossy(&pre.stderr)
+    );
+    let reply = mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+                "name":name,"arguments":arguments,"_meta":{"claudecode/toolUseId":call}
+            }}),
+        )
+        .await;
+    let post = managed_claude_hook(
+        Some(project),
+        managed_claude_event("PostToolUse", session, agent, &call),
+    )
+    .await;
+    assert!(post.status.success() && post.stderr.is_empty());
+    assert!(!reply["result"]["structuredContent"].is_null(), "{reply}");
+    reply["result"]["structuredContent"].clone()
+}
+
+/// Executes and settles one pending managed Claude start through the ordinary foreground helper.
+async fn settle_managed_claude_start(
+    mcp: &mut Mcp,
+    project: &Path,
+    next: &mut usize,
+    session: &str,
+    agent: Option<&str>,
+    pending: &Value,
+) -> Value {
+    assert_eq!(pending["state"], "pending", "{pending}");
+    let helper = pending["helper"].as_str().unwrap();
+    let detail_ref = pending["detail_ref"].as_str().unwrap();
+    let launch_call = format!("managed-claude-bash-{next}");
+    let mut pre = managed_claude_event("PreToolUse", session, agent, &launch_call);
+    pre["tool_name"] = Value::String("Bash".into());
+    pre["tool_input"] = json!({"command":helper});
+    let armed = managed_claude_hook(Some(project), pre).await;
+    assert!(armed.status.success() && armed.stdout.is_empty() && armed.stderr.is_empty());
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(90),
+        Command::new("/bin/sh").arg("-c").arg(helper).output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "managed helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut post = managed_claude_event("PostToolUse", session, agent, &launch_call);
+    post["tool_response"] = json!({"success":true});
+    let settled = managed_claude_hook(Some(project), post).await;
+    assert!(settled.status.success() && settled.stdout.is_empty() && settled.stderr.is_empty());
+
+    *next += 1;
+    managed_claude_call(
+        mcp,
+        project,
+        *next,
+        session,
+        agent,
+        "ide.inspect",
+        json!({"detail_ref":detail_ref}),
+    )
+    .await
+}
+
 /// Lists live short managed runtime directories so EOF cleanup can be observed at the product edge.
 fn managed_runtime_paths() -> std::collections::BTreeSet<PathBuf> {
     std::fs::read_dir(std::fs::canonicalize(std::env::temp_dir()).unwrap())
@@ -1508,6 +1684,306 @@ async fn managed_codex_smoke_and_eof_cleanup() {
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     mcp.close().await;
     assert_eq!(managed_runtime_paths(), before);
+}
+
+/// Managed Claude hooks silently ignore absent and corrupt project-derived attachment state.
+#[tokio::test]
+async fn managed_claude_hook_missing_or_corrupt_attachment_is_silent() {
+    let fixture = ProductFixture::new_claude(json!([]));
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    assert!(!runtime.exists());
+    let payload = managed_claude_event("PreToolUse", "root", None, "missing");
+
+    for project in [None, Some(fixture.root.as_path())] {
+        let output = managed_claude_hook(project, payload.clone()).await;
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty() && output.stderr.is_empty());
+    }
+
+    std::fs::create_dir(&runtime).unwrap();
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let missing = managed_claude_hook(Some(&fixture.root), payload.clone()).await;
+    assert!(missing.status.success() && missing.stdout.is_empty() && missing.stderr.is_empty());
+
+    std::fs::write(runtime.join("attachment"), b"corrupt").unwrap();
+    std::fs::set_permissions(
+        runtime.join("attachment"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let corrupt = managed_claude_hook(Some(&fixture.root), payload).await;
+    assert!(corrupt.status.success() && corrupt.stdout.is_empty() && corrupt.stderr.is_empty());
+    std::fs::remove_dir_all(runtime).unwrap();
+}
+
+/// Missing templates and templates without strict Claude evidence stay bounded and disconnected.
+#[tokio::test]
+async fn managed_claude_startup_requires_template_and_strict_profile() {
+    let fixture = ProductFixture::new(json!([]));
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    for template in [
+        fixture.base.join("missing-launcher.json"),
+        fixture.config.clone(),
+    ] {
+        let mut mcp = Mcp::start_managed_claude(&template, &fixture.root).await;
+        let response = mcp
+            .exchange(
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                    "name":"ide.start","arguments":{"activation_id":"unavailable"},
+                    "_meta":{"claudecode/toolUseId":"unavailable"}
+                }}),
+            )
+            .await;
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        assert!(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("continue with native tools")
+        );
+        mcp.close().await;
+        assert!(!runtime.exists());
+    }
+}
+
+/// The standard Claude MCP/hook pair activates root then child and cleans its exact runtime on EOF.
+#[tokio::test]
+async fn managed_claude_root_child_rendezvous_second_owner_and_eof_cleanup() {
+    let fixture = ProductFixture::new_claude(json!([]));
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    assert!(!runtime.exists());
+    let (launcher, _) = agent_ide::assistance::launcher::LauncherConfig::bind_one_candidate(
+        &fixture.config,
+        &"b".repeat(64),
+        &fixture.root,
+    )
+    .unwrap();
+    assert!(
+        launcher
+            .target(&"b".repeat(64))
+            .unwrap()
+            .claude_profile
+            .is_some()
+    );
+    launcher.verify().unwrap();
+    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    assert!(
+        runtime.is_dir(),
+        "expected {runtime:?}; live Claude runtimes: {:?}",
+        std::fs::read_dir(std::fs::canonicalize("/tmp").unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("ai-c-")))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        std::fs::symlink_metadata(&runtime)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    let attachment_path = runtime.join("attachment");
+    assert_eq!(
+        std::fs::symlink_metadata(&attachment_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let first_attachment = std::fs::read(&attachment_path).unwrap();
+
+    let immediate_call = "managed-claude-immediate";
+    let record = String::from_utf8(first_attachment.clone()).unwrap();
+    let attachment = record
+        .strip_suffix('\n')
+        .unwrap()
+        .split_once(' ')
+        .unwrap()
+        .1;
+    let immediate_event =
+        managed_claude_event("PreToolUse", "immediate-root", None, immediate_call);
+    let immediate_event = agent_ide::assistance::host_binding::parse_claude_hook_event(
+        immediate_event.to_string().as_bytes(),
+    )
+    .unwrap();
+    let immediate_host = agent_ide::assistance::facade::TrustedTransport::from_host_ingress(
+        immediate_call,
+        immediate_call,
+        attachment,
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ide::assistance::facade::submit_hook_event(
+            &runtime,
+            &immediate_host,
+            &immediate_event,
+        )
+        .await,
+        agent_ide::assistance::facade::HookIngressOutcome::Submitted
+    );
+    let immediate = mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{
+                "name":"ide.start","arguments":{"activation_id":"immediate"},
+                "_meta":{"claudecode/toolUseId":immediate_call}
+            }}),
+        )
+        .await;
+    assert!(
+        !immediate["result"]["structuredContent"].is_null(),
+        "immediate rendezvous failed: {immediate}"
+    );
+
+    let mut second = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    let disconnected = second
+        .exchange(
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                "name":"ide.start","arguments":{"activation_id":"second-owner"},
+                "_meta":{"claudecode/toolUseId":"second-owner"}
+            }}),
+        )
+        .await;
+    assert_eq!(disconnected["result"]["isError"], true, "{disconnected}");
+    assert_eq!(std::fs::read(&attachment_path).unwrap(), first_attachment);
+    second.close().await;
+    assert!(
+        runtime.is_dir(),
+        "second owner must not remove the first runtime"
+    );
+    assert!(
+        UnixStream::connect(runtime.join("agent-ide.sock"))
+            .await
+            .is_ok(),
+        "second owner must not stop the first daemon"
+    );
+
+    let denied_call = "managed-claude-denied";
+    let denied_pre = managed_claude_hook(
+        Some(&fixture.root),
+        managed_claude_event("PreToolUse", "root-session", None, denied_call),
+    )
+    .await;
+    assert!(
+        denied_pre.status.success() && denied_pre.stdout.is_empty() && denied_pre.stderr.is_empty()
+    );
+    assert!(
+        UnixStream::connect(runtime.join("agent-ide.sock"))
+            .await
+            .is_ok(),
+        "managed hook must leave the owned daemon running"
+    );
+    let denied_terminal = managed_claude_hook(
+        Some(&fixture.root),
+        managed_claude_event("PermissionDenied", "root-session", None, denied_call),
+    )
+    .await;
+    assert!(
+        denied_terminal.status.success()
+            && denied_terminal.stdout.is_empty()
+            && denied_terminal.stderr.is_empty()
+    );
+    let denied = mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+                "name":"ide.start","arguments":{"activation_id":"denied"},
+                "_meta":{"claudecode/toolUseId":denied_call}
+            }}),
+        )
+        .await;
+    assert_eq!(denied["result"]["isError"], true, "{denied}");
+
+    let mut next = 10;
+    let root_pending = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "root-session",
+        None,
+        "ide.start",
+        json!({"activation_id":"root-start"}),
+    )
+    .await;
+    let root_started = settle_managed_claude_start(
+        &mut mcp,
+        &fixture.root,
+        &mut next,
+        "root-session",
+        None,
+        &root_pending,
+    )
+    .await;
+    assert_eq!(root_started["kind"], "activation", "{root_started}");
+
+    next += 1;
+    let failed_pre = managed_claude_hook(
+        Some(&fixture.root),
+        managed_claude_event("PreToolUse", "root-session", None, "native-failure"),
+    )
+    .await;
+    let failed_post = managed_claude_hook(
+        Some(&fixture.root),
+        managed_claude_event("PostToolUseFailure", "root-session", None, "native-failure"),
+    )
+    .await;
+    assert!(failed_pre.status.success() && failed_pre.stderr.is_empty());
+    assert!(failed_post.status.success() && failed_post.stderr.is_empty());
+
+    next += 1;
+    let root_stopped = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "root-session",
+        None,
+        "ide.stop",
+        json!({}),
+    )
+    .await;
+    assert_eq!(root_stopped["kind"], "stop", "{root_stopped}");
+
+    next += 1;
+    let child_pending = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "root-session",
+        Some("child-agent"),
+        "ide.start",
+        json!({"activation_id":"child-start"}),
+    )
+    .await;
+    let child_started = settle_managed_claude_start(
+        &mut mcp,
+        &fixture.root,
+        &mut next,
+        "root-session",
+        Some("child-agent"),
+        &child_pending,
+    )
+    .await;
+    assert_eq!(child_started["kind"], "activation", "{child_started}");
+
+    next += 1;
+    let child_stopped = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "root-session",
+        Some("child-agent"),
+        "ide.stop",
+        json!({}),
+    )
+    .await;
+    assert_eq!(child_stopped["kind"], "stop", "{child_stopped}");
+
+    mcp.close().await;
+    assert!(!runtime.exists());
 }
 
 /// A reused Start with unusable sandbox metadata is refused without disturbing the live binding.
