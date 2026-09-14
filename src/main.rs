@@ -35,9 +35,17 @@ async fn main() -> ExitCode {
     let claude_project_dir = std::env::var_os("CLAUDE_PROJECT_DIR");
     match command(std::env::args_os().skip(1)) {
         Ok(Command::Daemon { runtime_dir }) => match RuntimeDir::prepare_for_daemon(runtime_dir) {
-            Ok(runtime_dir) => match run_daemon_with_assistance(
-                runtime_dir,
-                Arc::new(match std::env::var("AGENT_IDE_LAUNCHER_CONFIG") {
+            Ok(runtime_dir) => {
+                let config = EffectiveConfig::defaults();
+                let telemetry =
+                    match Store::open(&runtime_dir.path().join("telemetry.sqlite"), config.store())
+                    {
+                        Ok(store) => Telemetry::open(Arc::new(store), TelemetryConfig::default())
+                            .await
+                            .ok(),
+                        Err(_) => None,
+                    };
+                let dispatcher = match std::env::var("AGENT_IDE_LAUNCHER_CONFIG") {
                     Ok(path) => match LauncherConfig::read(std::path::Path::new(&path)) {
                         Ok(config)
                             if std::env::var("AGENT_IDE_MANAGED_CODEX_ATTACHMENT")
@@ -51,14 +59,16 @@ async fn main() -> ExitCode {
                     },
                     Err(std::env::VarError::NotPresent) => ProductDispatcher::default(),
                     Err(_) => return fail(AppError::InvalidResponse),
-                }),
-                EffectiveConfig::defaults(),
-            )
-            .await
-            {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(error) => fail(error),
-            },
+                };
+                let dispatcher = match telemetry {
+                    Some(telemetry) => dispatcher.with_telemetry(telemetry),
+                    None => dispatcher,
+                };
+                match run_daemon_with_assistance(runtime_dir, Arc::new(dispatcher), config).await {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => fail(error),
+                }
+            }
             Err(error) => fail(error),
         },
         Ok(Command::CodexHook { runtime_dir }) => {

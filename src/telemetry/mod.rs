@@ -609,7 +609,7 @@ pub(crate) async fn open_test_telemetry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     /// Supplies a representative schema-closed event without any user-controlled content field.
     fn event() -> Event {
@@ -702,6 +702,65 @@ mod tests {
         assert!(export.truncated);
         assert_eq!(export.first_omitted_sequence, Some(1));
         assert!(export.bytes.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Proves a reopened owner reads prior durable rows in sequence order after its writer stops.
+    #[tokio::test]
+    async fn reopen_preserves_durable_sequence_order() {
+        let path = std::env::temp_dir().join(format!(
+            "agent-ide-telemetry-reopen-{}.sqlite",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = Arc::new(Store::open(&path, test_store_config()).unwrap());
+        let telemetry = Telemetry::open(Arc::clone(&store), TelemetryConfig::default())
+            .await
+            .unwrap();
+        telemetry.record(event());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(telemetry);
+        drop(store);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let reopened_store = Arc::new(Store::open(&path, test_store_config()).unwrap());
+        let reopened = Telemetry::open(reopened_store, TelemetryConfig::default())
+            .await
+            .unwrap();
+        let rows = reopened.query(Filter::All, None, 1).await.unwrap().rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sequence, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Proves a disabled or unavailable telemetry owner drops ingress without returning an error.
+    #[tokio::test]
+    async fn disabled_sink_is_fail_open() {
+        let (telemetry, path) = open_test_telemetry(TelemetryConfig {
+            enabled: false,
+            ..TelemetryConfig::default()
+        })
+        .await;
+        telemetry.record(event());
+        let page = telemetry.query(Filter::All, None, 1).await.unwrap();
+        assert!(page.rows.is_empty());
+        assert_eq!(page.dropped, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Proves a full ingress queue drops observations synchronously without delaying the producer.
+    #[tokio::test]
+    async fn full_sink_is_fail_open() {
+        let (telemetry, path) = open_test_telemetry(TelemetryConfig {
+            queue_capacity: 1,
+            ..TelemetryConfig::default()
+        })
+        .await;
+        for _ in 0..8 {
+            telemetry.record(event());
+        }
+        assert!(telemetry.dropped.load(Ordering::Relaxed) >= 7);
         let _ = std::fs::remove_file(path);
     }
 }
