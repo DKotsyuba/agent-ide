@@ -1,6 +1,6 @@
 ---
 name: agent-ide
-description: Use the Agent IDE `ide.*` MCP tools (ide.start, ide.context, ide.diff, ide.inspect, ide.stop) for source implementation, debugging, refactoring, and testing when they are offered. Not for read-only exploration, prose, or when `ide.*` is absent.
+description: Use the Agent IDE `ide.*` MCP tools (ide.start, ide.context, ide.diff, ide.inspect, ide.stop) for source implementation, debugging, refactoring, and testing when they are offered or discoverable. Not for read-only exploration, prose, or when `ide.*` is absent.
 ---
 
 # Agent IDE
@@ -11,6 +11,18 @@ offered and the task implements, debugs, refactors, or writes/fixes source.
 Skip it for read-only exploration, prose, configuration, or when `ide.*` is
 not present — use native host read/write/test tools plus CodeGraph (when
 available) instead.
+
+## Deferred tool discovery
+
+When this skill is required for source work and `ide.*` is not already visible,
+use the host's tool discovery once before declaring Agent IDE unavailable. With
+`ToolSearch`, search for `Agent IDE ide.start ide.context ide.diff ide.inspect
+ide.stop` and load the exact tool references it returns; do not assume whether
+the MCP server name uses a hyphen or underscore. A configured MCP missing from a
+code-mode `ALL_TOOLS` snapshot is not sufficient evidence of unavailability,
+because deferred MCP tools may be omitted there. If discovery is absent, returns
+no matching tools, or a discovered tool fails, continue with the fail-open rule
+below. Do not repeat discovery in a loop.
 
 ## Workflow
 
