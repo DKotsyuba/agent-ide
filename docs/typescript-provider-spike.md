@@ -1,42 +1,44 @@
-# TypeScript provider admission spike
+# TypeScript provider release evidence
 
-Status: blocked by the v0.2 descendant-settlement gate. This is an evidence
-checkpoint, not a provider-support claim.
+Status: `real_pass` for the Codex macOS host cell on 2026-09-14; `not_tested` for
+Claude. This is release evidence for the pinned bundle only. Runtime
+`DescendantEvidence` remains `Unverified`.
 
-## Verified exchange
+## Pinned exchange
 
-The local accepted Node 24.4.0 executed the installed TypeScript Language Server
-6.0.0 bridge in stdio mode. The bridge loaded TypeScript 5.9.3 from the explicitly
-configured `tsserver.path`. Initialization fixed automatic typing acquisition off,
-tsserver syntax mode to `never`, and tracing/logging off. The bridge accepted
-`initialize`, `initialized`, `textDocument/didOpen`, `textDocument/definition`,
-`textDocument/references`, `shutdown`, and `exit`.
+On macOS 26.6.2, the accepted Node 24.4.0 executed TypeScript Language Server
+6.0.0 in stdio mode with TypeScript 5.9.3 selected from the explicit
+`tsserver.path` (`source=user-setting`). Initialization fixed automatic typing
+acquisition off, syntax-server mode to `never`, and tracing and logging off. The
+exchange completed `initialize`, `initialized`, `textDocument/didOpen`,
+`textDocument/definition`, `textDocument/references`, `shutdown`, and `exit`.
 
-A `.ts` document opened as `typescript` returned its declaration and both
-references. The exchange observed `$/typescriptVersion` and a versioned
-`textDocument/publishDiagnostics` notification. The installed bridge source maps
-the closed extension set to the LSP IDs `javascript`, `javascriptreact`,
-`typescript`, and `typescriptreact` for `.js`, `.jsx`, `.ts`, and `.tsx`
-respectively.
+A `.ts` document opened as `typescript` returned one definition, two references,
+and two diagnostics. The bridge emitted `$/typescriptVersion` and
+`textDocument/publishDiagnostics`; its diagnostic notification omitted a document
+version even when the client advertised version support, so the runtime must not
+invent version correlation. The server made one bounded `workspace/configuration`
+request. The installed bridge source maps the closed extension set to the LSP IDs
+`javascript`, `javascriptreact`, `typescript`, and `typescriptreact` for `.js`,
+`.jsx`, `.ts`, and `.tsx` respectively.
 
-## Topology and gate result
+## Normal-shutdown topology
 
-The stdio bridge is a Node direct child and starts `tsserver.js` as its Node
-descendant in the same process group. Its observed arguments included the fixed
-automatic-typing flag and no syntax-server or logging flags. This proves that a
-direct-child-only settlement result is insufficient: the current Execution API
-always returns `DescendantEvidence::Unverified` after a protocol-child reap.
+Before shutdown, the process observations were:
 
-Because v0.2 requires proved direct-child **and descendant** settlement, the
-real assertion fails. The profile therefore remains `resolution_unverified` and
-unavailable. No provider bundle, cache profile, launcher target, Codex path, or
-Claude helper path may be enabled until Execution can provide a bounded,
-positive descendant-settlement proof for this topology.
+| Role | PID | PPID | PGID | Darwin start time |
+|---|---:|---:|---:|---|
+| stdio bridge | 67421 | 67420 | 67421 | Mon Sep 14 13:46:10 2026 |
+| `tsserver.js` | 67422 | 67421 | 67421 | Mon Sep 14 13:46:10 2026 |
 
-## Scope retained for a future retry
+The observed TypeScript-server arguments included
+`--disableAutomaticTypingAcquisition` and contained no syntax-server or logging
+flag. After the successful shutdown response, the client sent `exit`, observed
+protocol EOF, observed bridge exit code zero with no signal, and reaped the direct
+bridge child. The client requested no TERM or KILL. Fresh process queries for both
+captured PID/start-time identities were empty after ordinary shutdown.
 
-The accepted dependency closure to remeasure is the Node executable, the bridge
-package, the TypeScript package, and every bridge-loaded runtime dependency.
-The retry must re-run the real stdio exchange, confirm fixed initialization and
-the four-language-ID table, exercise diagnostics and write refusal, and prove
-that bridge and `tsserver.js` are both settled before admitting the profile.
+These observations establish normal-shutdown conformance for this exact release
+cell. They neither prove arbitrary descendant settlement at runtime nor claim that
+a process group contains every descendant. Claude requires its own real macOS
+foreground-helper record before this bundle may be enabled for Claude.
