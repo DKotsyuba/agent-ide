@@ -12,6 +12,9 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.x"
       - name: Verify tag and runner
         run: |
           test "$(uname -m)" = arm64
@@ -20,7 +23,11 @@ jobs:
           test "$version" = "$manifest_version"
       - name: Build
         run: |
+          npm install --global pyright@1.1.413
+          export AGENT_IDE_PYRIGHT="$(command -v pyright-langserver)"
+          export AGENT_IDE_NODE="$(command -v node)"
           cargo test --locked --lib --bin agent-ide
+          cargo test --locked --test product_mcp_contract configured_product_claude_helper_returns_real_pyright_semantic_context_diff_and_stop -- --ignored --nocapture --test-threads=1
           cargo build --locked --release --bin agent-ide
       - name: Package
         run: |
