@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::{
+    assistance::content,
     execution::{
         CapturedProcessEvidence, ControlledCommand, ControlledTrampoline, LocalExecutionPolicy,
         OwnedChild, ValidatedExecutionRequest, ValidatedHostInvocation, WorkspaceAuthority,
@@ -295,13 +296,10 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// rendered text. `compose` is invoked with a candidate hunk count and must return the selection
 /// for exactly that count under the originally captured byte budget.
 ///
-/// Fitting is measured through [`render_call_tool_result`] and [`call_tool_result_fits`], the same
-/// exact envelope construction and predicate `render_reply` uses to build the complete MCP result
-/// the host actually receives. Using anything narrower here — such as the raw serialized
-/// [`PeerReply`] with an approximate fixed reserve — undercounts the real envelope, because the
-/// MCP result duplicates the reply's JSON into both `content` and `structured_content`; a page
-/// accepted under that narrower measurement could then be silently cut mid-hunk by `render_reply`'s
-/// own shrink loop after the cursor already advanced past it.
+/// Fitting is measured through [`content::fits`], the same compact projection and final serialized
+/// envelope predicate [`content::render`] uses for the complete MCP result the host receives. Using
+/// anything narrower here — such as the raw serialized [`PeerReply`] with an approximate fixed
+/// reserve — could accept a page that the facade then has to cut after its cursor advanced.
 ///
 /// * `mode` — compare mode rendered into the page text.
 /// * `authority_epoch` — current durable epoch rendered as provenance.
@@ -350,8 +348,7 @@ pub(super) fn fit_diff_page(
                 || candidate.overflow_hunks() > 0
                 || candidate.overflow_bytes() > 0,
         };
-        if render_call_tool_result(&reply).is_some_and(|rendered| call_tool_result_fits(&rendered))
-        {
+        if content::fits(&reply) {
             return Ok((candidate, reply));
         }
         if max_hunks == 1 {

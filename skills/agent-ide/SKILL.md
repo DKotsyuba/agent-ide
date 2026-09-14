@@ -12,6 +12,10 @@ Skip it for read-only exploration, prose, configuration, or when `ide.*` is
 not present — use native host read/write/test tools plus CodeGraph (when
 available) instead.
 
+Each accepted reply carries one compact decision-facing text block. When the host exposes
+`structuredContent`, treat that complete typed result as the source of truth instead of parsing the
+compact text as a second response schema.
+
 ## Workflow
 
 1. `ide.start` once per actor per worktree. Do not call it again for later

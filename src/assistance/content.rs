@@ -2,7 +2,7 @@
 
 use rmcp::model::{CallToolResult, ContentBlock};
 
-use super::reply::{MAX_REPLY_BYTES, MCP_RESERVE, PeerReply, ResultKind};
+use super::reply::{FailureCode, MAX_REPLY_BYTES, MCP_RESERVE, MissingPeer, PeerReply, ResultKind};
 use crate::changes::edit::{EditOutcome, EditResult};
 
 /// Renders one validated reply and shrinks only owner text until the final MCP envelope fits.
@@ -53,9 +53,13 @@ fn project(reply: &PeerReply) -> Option<CallToolResult> {
 /// references, and names no host metadata, telemetry, provider errors, or inferred diagnostics.
 fn render_text(reply: &PeerReply) -> String {
     match reply {
-        PeerReply::Unavailable { reason } => {
-            format!("unavailable: {reason:?}; continue with native tools").to_lowercase()
-        }
+        PeerReply::Unavailable { reason } => format!(
+            "unavailable: {}; continue with native tools",
+            match reason {
+                MissingPeer::HostBinding => "host_binding",
+                MissingPeer::WorkspaceActivation => "workspace_activation",
+            }
+        ),
         PeerReply::HookObserved {} => "hook_observed: native pre-hook retained".to_owned(),
         PeerReply::HookSettled {} => "hook_settled: validated invocation settled".to_owned(),
         PeerReply::NativeHookObserved {} => {
@@ -77,9 +81,25 @@ fn render_text(reply: &PeerReply) -> String {
             detail_ref,
             helper: None,
         } => format!("pending: use ide.inspect with detail_ref {detail_ref}"),
-        PeerReply::Error { code } => {
-            format!("error: {code:?}; continue with native tools").to_lowercase()
-        }
+        PeerReply::Error { code } => format!(
+            "error: {}; continue with native tools",
+            match code {
+                FailureCode::LauncherConfiguration => "launcher_configuration",
+                FailureCode::SandboxState => "sandbox_state",
+                FailureCode::ExecutionProfile => "execution_profile",
+                FailureCode::UnsupportedGit => "unsupported_git",
+                FailureCode::WorkspaceActivation => "workspace_activation",
+                FailureCode::WorkspaceAuthority => "workspace_authority",
+                FailureCode::ProviderUnavailable => "provider_unavailable",
+                FailureCode::Cancelled => "cancelled",
+                FailureCode::Deadline => "deadline",
+                FailureCode::Capacity => "capacity",
+                FailureCode::InvalidDetail => "invalid_detail",
+                FailureCode::SourceUnavailable => "source_unavailable",
+                FailureCode::Conflict => "conflict",
+                FailureCode::Internal => "internal",
+            }
+        ),
         PeerReply::Complete {
             kind: ResultKind::Activation,
             text,
@@ -189,17 +209,14 @@ fn render_edit(result: &EditResult) -> String {
 }
 
 /// Returns whether the serialized final MCP carrier stays below the Assistance reply ceiling.
-fn call_tool_result_fits(rendered: &CallToolResult) -> bool {
+pub(crate) fn call_tool_result_fits(rendered: &CallToolResult) -> bool {
     serde_json::to_vec(rendered).is_ok_and(|bytes| bytes.len() <= MAX_REPLY_BYTES - MCP_RESERVE)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        assistance::reply::{FailureCode, MissingPeer},
-        changes::edit::EditReceiptError,
-    };
+    use crate::changes::edit::EditReceiptError;
 
     /// Extracts the sole model-facing text block from a rendered test result.
     fn text_of(rendered: &CallToolResult) -> &str {
@@ -270,6 +287,11 @@ mod tests {
             let rendered = render(reply).unwrap();
             let text = text_of(&rendered);
             assert!(!text.starts_with('{') && !text.contains("\"state\""));
+            for field in ["reason", "code"] {
+                if let Some(value) = expected[field].as_str() {
+                    assert!(text.contains(value));
+                }
+            }
             assert_eq!(rendered.structured_content, Some(expected.clone()));
             assert_eq!(
                 rendered.is_error,

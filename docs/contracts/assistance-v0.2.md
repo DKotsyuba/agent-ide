@@ -2,7 +2,7 @@
 
 Revision: EDIT-r1 (proposed). Provider: Assistance. Direct consumers: Application, Changes, and host adapters. Vocabulary: [common](common.md).
 
-Agent-facing rendering follows [AGENT-CONTENT-r1](agent-content-v0.2.md): one compact model text block and the unchanged typed structured result.
+Agent-facing rendering follows [AGENT-CONTENT-r1](agent-content-v0.2.md): every validated PeerReply becomes exactly one deterministic compact model text block plus the complete unchanged PeerReply in structuredContent. Only typed `Error` sets `isError`. The facade and retained Diff pagination use the same final serialized CallToolResult measurement; only owner Complete text may shrink, at UTF-8 boundaries, and Diff fitting removes whole hunks instead of cutting text. Rendering is host-independent and neither adds a second response schema nor infers diagnostics absent from the typed EditResult.
 
 ## Sixth closed MCP method
 

@@ -9,7 +9,7 @@ use super::{
         ActiveBindingUse, BindingRef, HostBindingGuard, ObservedSandboxState, ValidatedInvocation,
     },
     launcher::{AcceptedProviderSettings, LaunchTarget, LauncherConfig},
-    reply::{FailureCode, PeerReply, ResultKind, call_tool_result_fits, render_call_tool_result},
+    reply::{FailureCode, PeerReply, ResultKind},
 };
 use crate::workspace::observation::SourceObservation;
 use crate::{
