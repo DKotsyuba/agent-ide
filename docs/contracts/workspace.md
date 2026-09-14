@@ -1,7 +1,8 @@
 # Historical Workspace authority and snapshots
 
 > This r3 draft is historical and superseded for v0.1 by
-> [Workspace v0.1 contract](workspace-v0.1.md). It remains here only as prior
+> [Workspace v0.1 contract](workspace-v0.1.md), with the narrow v0.2 edit
+> boundary in [Workspace v0.2](workspace-v0.2.md). It remains here only as prior
 > design material and is not an implementation contract.
 
 Revision: r3. Provider: Workspace. Consumers: Assistance, Intelligence, Changes, Execution, Application. Shared vocabulary: [common](common.md).

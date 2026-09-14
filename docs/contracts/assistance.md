@@ -1,9 +1,8 @@
 # Agent integration, scenario facade and feedback
 
-> Historical pre-SPEC-v2 design record. It is not the current v0.1 contract: the current MCP
-> surface has exactly five tools (`start`, `context`, `diff`, `inspect`, `stop`). Current behavior
-> and remaining host-binding gates are defined in `assistance-v0.1.md` and
-> `../assistance-host-binding.md`.
+> Historical pre-SPEC-v2 design record. The v0.2 sixth-method boundary is
+> [Assistance v0.2](assistance-v0.2.md); host-binding gates remain in
+> [the host-binding contract](../assistance-host-binding.md).
 
 Revision: r3. Provider: Assistance for trusted host attachment and facade/render/delivery; consumers: Workspace and Application, with Codex/Claude as external systems whose support must be tested. Domain inputs are Workspace, Intelligence, Changes and indirect Execution facts. Vocabulary: [common](common.md).
 

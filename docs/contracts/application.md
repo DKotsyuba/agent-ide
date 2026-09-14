@@ -18,6 +18,8 @@ UID equality is only a local-user transport boundary; it is not actor proof or a
 
 The accepted r2 addition exposes exactly `assistance.hook_submit` and `assistance.method_dispatch`; the latter has the closed v0.1 tool enum `start | context | diff | inspect | stop`. Application dispatches one correlated request to Assistance and returns one correlated opaque reply. It has no generic event bus, pub/sub, retained hook queue, host identity, authority, rendering, or method semantics. `submit_hook_if_running` is connect-only and returns bounded `Unavailable` on every transport fault; it never starts/retries a daemon and its caller must fail open.
 
+The proposed v0.2 additions are limited to the mechanics named by [Core IPC](core-ipc.md), [TELEMETRY-r1](telemetry-v0.2.md), and [EDIT-r1](changes-v0.2.md). Application offers a bounded trusted multi-row read to Telemetry and transaction/receipt persistence to Changes; it does not parse telemetry rows, edit requests, paths, source references, or outcomes. The v0.2 configuration additions are restart-only and do not introduce live reload.
+
 Both connect-only clients compute one absolute deadline at call entry. Connecting and the
 subsequent frame exchange consume that same `HookTransportLimits.deadline` budget; a slow
 connection never grants a second full exchange interval. The fake-socket regression uses

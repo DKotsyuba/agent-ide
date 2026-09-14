@@ -90,9 +90,16 @@ surviving backend or proven warm opaque provider index.
 
 Limits are explicit: 1–64 queued operations, 1–128 retained details, 1–300000 ms per
 operation, and 1–1048576 retained bytes per output stream. There are at most 64 distinct
-attachment mappings, three provider languages per target and two accepted Execution profile
+attachment mappings, four provider languages per target and two accepted Execution profile
 classes. Duplicate attachment mappings, unknown fields, invalid limits, relative paths,
 malformed executable digests and mismatched profile evidence are rejected.
+
+The fourth provider is reserved for the immutable `TypeScriptProviderBundleV1` in
+[TYPESCRIPT-r1](contracts/intelligence-v0.2.md). It accepts only an explicit accepted Node,
+bridge, TypeScript closure, and `tsserver.path`; it has no ambient npm/plugin/network discovery.
+The launcher rejects a TypeScript declaration until its real spike evidence accepts the exact
+bundle/profile. This is restart-only configuration and never enables a syntax server or
+automatic typing acquisition.
 
 Configuration contains private attachment and evidence values. Diagnostic formatting
 redacts the configuration; it must never be rendered in model-facing tool results.

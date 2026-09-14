@@ -30,6 +30,12 @@ Only two version-2 methods exist. `assistance.hook_submit` is `{version:2,reques
 
 `submit_hook_if_running` is connect-only: it never prepares a runtime directory, starts or retries a daemon, or retries inline. Every connect, timeout, framing, or dispatch failure is `unavailable` to its caller, which must exit the host hook permissively. There is no subscription, queue fan-out, retained event stream, or other generic bus.
 
+## Wire version 3: closed v0.2 method dispatch
+
+Version 3 preserves the version-2 framing, identity limits, one-request/one-reply lifecycle, and opaque Application treatment. Its only method is `assistance.method_dispatch` with the same envelope and a closed method enum `start | context | diff | inspect | stop | edit`. `edit` parameters and result semantics are owned exclusively by [Assistance v0.2](assistance-v0.2.md) and [Changes v0.2](changes-v0.2.md); Application validates only framing, JSON, field sizes, version, and the closed method tag. It neither logs nor retains the parameters/result as telemetry.
+
+The version-3 reply remains `{version:3,request_id,opaque_result_json}` or `unavailable`/`overflow`. Unknown fields, versions, and method tags are rejected before dispatch. Version 2 remains the v0.1 five-method contract; version 3 is required for the sixth method and is not a generic protocol extension.
+
 ## Verification
 
 Use actual Unix sockets and separate daemon processes. Cover correct reply/correlation, private directory/socket permissions and current peer UID, invalid/oversized/truncated frames, unknown fields/methods, bounded partial-input wait, lock contention, stale-socket recovery, restart generation change and doctor on an absent runtime directory. Version 2 additionally covers inactive-hook non-autostart, one opaque hook reply, a permitted current-method dispatch, and rejection of a closed-enum violation before dispatch. Test wrong-UID rejection as far as the local test privileges permit and state that limit. These checks establish Application mechanics only; they do not establish host binding, sandbox propagation or a working IDE.

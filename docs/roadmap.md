@@ -82,6 +82,22 @@ the previously ordered history-first increment. Work proceeds in this order:
    refusal, native fallback, restart-safe telemetry and two-worktree isolation.
    Linux remains explicit `not_tested` until a real host cell passes.
 
+### v0.2 acceptance evidence matrix (ACCEPTANCE-r1)
+
+This matrix consumes the public [TELEMETRY-r1](contracts/telemetry-v0.2.md),
+[EDIT-r1](contracts/changes-v0.2.md), and [TYPESCRIPT-r1](contracts/intelligence-v0.2.md)
+contracts. It is preparation only: every cell below is `not_tested` until an implementation and
+real run produce public evidence. Public artifacts contain versions, route, scenario outcomes,
+bounded metrics, and explicit truncation only; private supervisor identifiers and transcripts do
+not enter them.
+
+| macOS route | Required real evidence | Status |
+|---|---|---|
+| Direct Codex | `start -> context -> edit -> diagnostic -> fix -> diff -> stop`; stale edit has zero writes; native fallback; restart-safe telemetry query/export; divergent worktrees | `not_tested` |
+| Direct Claude | The same scenario through the claimed foreground helper, including TypeScript only after its spike; stale edit has zero writes; native fallback; restart-safe telemetry; divergent worktrees | `not_tested` |
+| Installed external agent-run-to-Claude | The same end-to-end route, with its external attachment treated as an adapter rather than identity authority; stale edit has zero writes; native fallback; restart-safe telemetry; divergent worktrees | `not_tested` |
+| Linux, all routes | No v0.2 host/provider acceptance claim | `not_tested` |
+
 This increment does not add a remote analytics service, dashboard, arbitrary shell
 execution, multi-file atomicity, semantic rename, test/check orchestration or DAP.
 Local statistics need a bounded query/export surface; visualization can be added

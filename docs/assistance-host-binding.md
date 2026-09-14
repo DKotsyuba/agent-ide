@@ -15,7 +15,7 @@ The Codex parser selects root `session_id` for a parent. A native child supplies
 
 Assistance accepts Application r2's single finite `assistance.hook_submit` request. It carries `request_id`, `correlation_id`, `opaque_attachment`, and `sanitized_observation_json`, with one opaque correlated reply. Application owns framing, daemon generation, private endpoint and connection limits, byte limits, and total deadline. `submit_hook_if_running` neither creates runtime files nor starts, retries, or repairs a daemon; it never interprets actor, attachment, or hook identity. Assistance owns sanitization, attachment/identity semantics, and the caller's permissive no-inline-retry behavior.
 
-The current five MCP methods need one additional finite request/reply operation, `assistance.method_dispatch`. It carries the same request/correlation/opaque-attachment envelope plus one registered method name and bounded JSON parameters, and returns one opaque correlated result. Application routes it without interpreting method or host semantics; Assistance owns the fixed method set, input validation, binding checks, rendering, and fail-open result. These two operations are the complete v0.1 transport need: no generic event bus, topic subscription, or health-to-RPC upgrade is required.
+The v0.1 five MCP methods use one additional finite request/reply operation, `assistance.method_dispatch`. It carries the same request/correlation/opaque-attachment envelope plus one registered method name and bounded JSON parameters, and returns one opaque correlated result. Application routes it without interpreting method or host semantics; Assistance owns the fixed method set, input validation, binding checks, rendering, and fail-open result. Version 3 extends that closed set only with `edit` as defined by [EDIT-r1](contracts/assistance-v0.2.md); it remains no generic event bus, topic subscription, or health-to-RPC upgrade.
 
 ## Proposed binding liveness
 
@@ -55,7 +55,8 @@ with mode `0700`; an existing path leaves a second MCP disconnected and is never
 or removed. The owner binds the template's sole target to the captured project and a fresh random
 attachment, requires that target's existing strict Claude operator profile, writes the bound
 launcher and project-bound attachment record with mode `0600`, then starts and health-checks the
-daemon through the existing legacy Claude route. It serves the unchanged five tools and reaps its
+daemon through the existing legacy Claude route. It serves the v0.1 five tools and, when the
+claimed foreground-helper gate succeeds, the v0.2 `edit` tool; it reaps its
 exact daemon before identity-checked runtime removal on stdio EOF, cancellation, SIGINT, or SIGTERM.
 
 The plugin's `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, and `PermissionDenied` handlers run

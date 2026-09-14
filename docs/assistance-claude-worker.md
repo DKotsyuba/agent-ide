@@ -9,8 +9,9 @@ host's own real sandbox instead of a sandbox the daemon claims to have measured.
 The daemon performs **no Git, source, provider or process effect for a Claude operation**. It
 mints correlation, hands out one closed job, and records settlement.
 
-The five public MCP tools are unchanged: `start`, `context`, `diff`, `inspect`, `stop`. No new
-tool, reply state or launch flag is introduced; the helper handle is the existing
+The v0.1 five public MCP tools are `start`, `context`, `diff`, `inspect`, `stop`. Proposed v0.2
+adds only `edit` under [EDIT-r1](contracts/assistance-v0.2.md); no other new tool, reply state
+or launch flag is introduced; the helper handle is the existing
 `Pending.detail_ref`.
 
 The sections below describe the complete contract. **Implementation status** at the end of this
@@ -120,6 +121,11 @@ its provider before exiting.
   helper carries only the launcher's accepted Pyright script and Node paths, identities, and
   BLAKE3 digests; it reconstructs the profile, verifies the script at the final boundary, and
   retains the inherited-process Node recheck before spawning its one-shot child.
+
+- **TypeScript** remains unavailable to Claude until the real spike required by
+  [TYPESCRIPT-r1](contracts/intelligence-v0.2.md) proves its immutable closure, stdio protocol,
+  diagnostics, topology, and cleanup. Once accepted, it is one claimed foreground-helper
+  provider per worktree operation, never a daemon-borrowed or ambient Node process.
 
 Stop and handoff retain the IDE-owned worktree cache directories; no analysis runs while inactive.
 The daemon derives their private absolute paths from the durable worktree identity/incarnation,
