@@ -22,6 +22,7 @@ use crate::{
         },
         session::{DiagnosticSnapshot, GoEnv, ProviderSettings, SessionOptions, with_session},
     },
+    telemetry::{CacheState, DiagnosticState, Language, Telemetry, adapters},
 };
 use std::path::Path;
 
@@ -504,6 +505,7 @@ impl Worker<'_> {
             }
         };
         let result = {
+            let telemetry = self.telemetry.clone();
             let (input, output) = child.pipes();
             let operation = session_operation(
                 input,
@@ -519,6 +521,8 @@ impl Worker<'_> {
                 },
                 ProviderSettings::Pyright(profile),
                 remaining_options(job),
+                telemetry.as_ref(),
+                Language::Python,
             );
             tokio::pin!(operation);
             tokio::select! {result=&mut operation=>result,_=job.cancel.changed()=>Err(FailureCode::Cancelled)}
@@ -654,6 +658,7 @@ impl Worker<'_> {
             }
         };
         let result = {
+            let telemetry = self.telemetry.clone();
             let (input, output) = child.pipes();
             let operation = session_operation(
                 input,
@@ -669,6 +674,8 @@ impl Worker<'_> {
                 },
                 ProviderSettings::Rust(profile),
                 remaining_options(job),
+                telemetry.as_ref(),
+                Language::Rust,
             );
             tokio::pin!(operation);
             tokio::select! {result=&mut operation=>result,_=job.cancel.changed()=>Err(FailureCode::Cancelled)}
@@ -942,6 +949,7 @@ impl Worker<'_> {
         let backend_generation = backend_state.generation;
         let mut child = view.into_child();
         let result = {
+            let telemetry = self.telemetry.clone();
             let operation = session_operation(
                 &mut child.stdout,
                 &mut child.stdin,
@@ -956,6 +964,8 @@ impl Worker<'_> {
                 },
                 ProviderSettings::GoplsDefaults(go_env),
                 remaining_options(job),
+                telemetry.as_ref(),
+                Language::Go,
             );
             tokio::pin!(operation);
             tokio::select! {result=&mut operation=>result,_=job.cancel.changed()=>Err(FailureCode::Cancelled)}
@@ -1496,10 +1506,12 @@ async fn session_operation<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncW
     generation: ViewGeneration,
     settings: ProviderSettings,
     options: SessionOptions,
+    telemetry: Option<&Telemetry>,
+    language: Language,
 ) -> Result<ProviderContext, FailureCode> {
     let tree = source.worktree().clone();
     let epoch = source.authority_epoch();
-    with_session(
+    let result = with_session(
         input,
         output,
         tree,
@@ -1519,7 +1531,16 @@ async fn session_operation<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncW
         },
     )
     .await
-    .map_err(|_| FailureCode::ProviderUnavailable)
+    .map_err(|_| FailureCode::ProviderUnavailable);
+    if let Some(telemetry) = telemetry {
+        let diagnostics = match &result {
+            Ok(context) if context.diagnostics.diagnostics.is_empty() => DiagnosticState::Clean,
+            Ok(_) => DiagnosticState::Changed,
+            Err(_) => DiagnosticState::Unavailable,
+        };
+        adapters::provider_summary(telemetry, language, CacheState::Unavailable, diagnostics);
+    }
+    result
 }
 
 #[cfg(test)]

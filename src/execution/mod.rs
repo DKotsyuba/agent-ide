@@ -11,7 +11,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde_json::Value;
@@ -2832,6 +2832,8 @@ pub struct CapturedProcessEvidence {
     stderr: CapturedOutput,
     /// Direct-child exit does not prove descendant termination.
     descendants: DescendantEvidence,
+    /// Monotonic interval from successful child spawn through bounded drain completion.
+    elapsed: Duration,
 }
 impl CapturedProcessEvidence {
     /// Validates bounded fixture evidence without minting settlement rights.
@@ -2862,6 +2864,7 @@ impl CapturedProcessEvidence {
             stdout,
             stderr,
             descendants,
+            elapsed: Duration::ZERO,
         })
     }
     /// Returns non-authorizing actual-wait identity for exact scratch/resource lifetime correlation.
@@ -2888,6 +2891,10 @@ impl CapturedProcessEvidence {
     /// Returns conservative descendant evidence.
     pub const fn descendants(&self) -> DescendantEvidence {
         self.descendants
+    }
+    /// Returns the measured owned-child interval, or zero for fixture-only evidence.
+    pub const fn elapsed(&self) -> Duration {
+        self.elapsed
     }
 }
 
@@ -2973,6 +2980,8 @@ pub struct OwnedChild {
     lease: AdmissionLease,
     /// Typed reservation target retained unchanged from launch through direct reap.
     target: SpawnTarget,
+    /// Monotonic instant captured immediately after this owned child successfully spawned.
+    started: Instant,
 }
 
 impl OwnedChild {
@@ -3073,6 +3082,7 @@ impl OwnedChild {
             stderr,
             lease: settlement.lease,
             target: settlement.target,
+            started: Instant::now(),
         })
     }
 
@@ -3150,6 +3160,7 @@ impl OwnedChild {
                 stdout,
                 stderr,
                 descendants: DescendantEvidence::Unverified,
+                elapsed: self.started.elapsed(),
             },
             settlement: DirectChildReap {
                 lease: self.lease,
@@ -4206,6 +4217,7 @@ pub async fn run_inherited_controlled_child(
             stdout,
             stderr,
             descendants: DescendantEvidence::Unverified,
+            elapsed: Duration::ZERO,
         },
         launch_identity: ProcessIdentity(identity),
     })

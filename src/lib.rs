@@ -17,3 +17,6 @@ pub mod intelligence;
 
 /// Composes bounded diff summaries and hunk payload for Changes v0.1.
 pub mod changes;
+
+/// Owns closed, bounded, local-only usage telemetry and its durable query/export surface.
+pub mod telemetry;

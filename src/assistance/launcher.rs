@@ -543,6 +543,14 @@ impl LauncherConfig {
     pub fn target(&self, attachment: &str) -> Option<&LaunchTarget> {
         self.targets.get(attachment)
     }
+
+    /// Iterates the configured private attachments for runtime-bound fallback authentication.
+    ///
+    /// Values remain borrowed from this immutable launcher generation and must never be persisted,
+    /// logged, or rendered by the consumer.
+    pub(crate) fn attachments(&self) -> impl Iterator<Item = &str> {
+        self.targets.keys().map(String::as_str)
+    }
 }
 
 /// Accepts bounded nonempty identity strings without control bytes.

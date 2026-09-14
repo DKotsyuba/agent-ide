@@ -11,6 +11,10 @@ use super::{
     launcher::{AcceptedProviderSettings, LaunchTarget, LauncherConfig},
     reply::{EditDiagnostics, FailureCode, PeerReply, ResultKind},
 };
+use crate::telemetry::{
+    AdmissionState, CancellationState, DescendantSettlement, OutputSizeClass, Telemetry,
+    TelemetryConfig, adapters,
+};
 use crate::workspace::observation::SourceObservation;
 use crate::{
     app::{
@@ -508,6 +512,10 @@ pub struct WorkerHandle {
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Cooperative stop flag for the bounded startup fingerprint reader.
     startup_cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Optional local-only sink cloned into the sole worker at daemon startup.
+    telemetry: Arc<Mutex<Option<Telemetry>>>,
+    /// Fixed-byte native fallback receiver drained before the telemetry writer stops.
+    fallback_ingress: Arc<Mutex<Option<super::codex_hook::NativeFallbackIngress>>>,
 }
 impl std::fmt::Debug for WorkerHandle {
     /// Omits all host, target, profile and result contents.
@@ -581,9 +589,26 @@ impl WorkerHandle {
             receiver: Mutex::new(Some(receiver)),
             task: Mutex::new(None),
             startup_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            telemetry: Arc::new(Mutex::new(None)),
+            fallback_ingress: Arc::new(Mutex::new(None)),
         }
     }
-    /// Opens exactly one durable Workspace owner and observation schema for this daemon boot.
+
+    /// Returns the daemon's sole telemetry owner after startup, if its local schema was available.
+    ///
+    /// The returned clone shares the Worker's Application Store owner. It is absent before startup
+    /// or when telemetry initialization failed, neither of which changes dispatch behaviour.
+    pub fn telemetry(&self) -> Option<Telemetry> {
+        self.telemetry.lock().ok()?.clone()
+    }
+    /// Opens one session-local Workspace owner plus an independently locked telemetry sink.
+    ///
+    /// `runtime` is this daemon's private directory and owns all Workspace/Changes authority state.
+    /// An absolute `AGENT_IDE_TELEMETRY_DATABASE` may select durable capture independently; lock
+    /// contention disables only telemetry. Startup fails only when the session-local store or its
+    /// authority schemas cannot open, and creates the worker task exactly once. When telemetry is
+    /// available, fallback ingress accepts only datagrams authenticated by a configured launcher
+    /// attachment for this exact runtime.
     pub async fn start(&self, runtime: &Path) -> Result<(), FailureCode> {
         let receiver = self
             .receiver
@@ -592,6 +617,8 @@ impl WorkerHandle {
             .take()
             .ok_or(FailureCode::Internal)?;
         let shared = self.shared.clone();
+        let telemetry_owner = self.telemetry.clone();
+        let fallback_owner = self.fallback_ingress.clone();
         let runtime = runtime.to_path_buf();
         let (ready, wait) = oneshot::channel();
         let cancel = self.startup_cancel.clone();
@@ -608,8 +635,12 @@ impl WorkerHandle {
                 return;
             }
 
+            let database = std::env::var_os("AGENT_IDE_STATE_DATABASE")
+                .map(std::path::PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .unwrap_or_else(|| runtime.join("state.sqlite"));
             let store = match Store::open_with_backup_root(
-                &runtime.join("state.sqlite"),
+                &database,
                 &runtime.join("backups"),
                 EffectiveConfig::defaults().store(),
             ) {
@@ -619,9 +650,20 @@ impl WorkerHandle {
                     return;
                 }
             };
-            // ponytail: one process-lifetime Store leak per daemon boot; replace with Arc ownership
-            // only if in-process daemon restart becomes a supported lifecycle.
-            let store: &'static Store = Box::leak(Box::new(store));
+            // ponytail: one process-lifetime Store Arc leak per daemon boot; replace with explicit
+            // task-owned shutdown once in-process daemon restart becomes a supported lifecycle.
+            let store: &'static Arc<Store> = Box::leak(Box::new(Arc::new(store)));
+            let telemetry_database = std::env::var_os("AGENT_IDE_TELEMETRY_DATABASE")
+                .map(std::path::PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .unwrap_or_else(|| runtime.join("telemetry.sqlite"));
+            let telemetry = if telemetry_database == database {
+                None
+            } else {
+                Telemetry::open_database(&telemetry_database, TelemetryConfig::default())
+                    .await
+                    .ok()
+            };
             let workspace = match DurableWorkspace::open(store).await {
                 Ok(owner) => owner,
                 Err(_) => {
@@ -645,6 +687,19 @@ impl WorkerHandle {
                 let _ = ready.send(Err(FailureCode::Internal));
                 return;
             }
+            if let Ok(mut configured) = telemetry_owner.lock() {
+                *configured = telemetry.clone();
+            }
+            if let Some(telemetry) = telemetry.clone()
+                && let Ok(ingress) = super::codex_hook::NativeFallbackIngress::bind(
+                    &runtime,
+                    telemetry,
+                    shared.launcher.attachments(),
+                )
+                && let Ok(mut configured) = fallback_owner.lock()
+            {
+                *configured = Some(ingress);
+            }
             let _ = ready.send(Ok(()));
             Worker {
                 admission: shared.admission.clone(),
@@ -662,6 +717,7 @@ impl WorkerHandle {
                 uncertain_snapshots: Vec::new(),
                 runtime,
                 providers: providers::Providers::new(),
+                telemetry,
             }
             .run(receiver)
             .await;
@@ -691,7 +747,7 @@ impl WorkerHandle {
         let Some(mut task) = task else {
             return Ok(());
         };
-        match tokio::time::timeout(Duration::from_secs(39), &mut task).await {
+        let result = match tokio::time::timeout(Duration::from_secs(39), &mut task).await {
             Ok(Ok(())) => self
                 .shared
                 .shutdown_failure
@@ -705,7 +761,20 @@ impl WorkerHandle {
                 let _ = task.await;
                 Err(FailureCode::Deadline)
             }
+        };
+        let fallback = self
+            .fallback_ingress
+            .lock()
+            .map_err(|_| FailureCode::Internal)?
+            .take();
+        if let Some(fallback) = fallback {
+            fallback.shutdown().await;
         }
+        let telemetry = self.telemetry();
+        if let Some(telemetry) = telemetry {
+            telemetry.shutdown().await;
+        }
+        result
     }
     /// Enqueues or resolves the exact query, returning pending without waiting for provider warmup.
     pub async fn submit(
@@ -1519,6 +1588,8 @@ struct Worker<'a> {
     runtime: std::path::PathBuf,
     /// Exact provider/backend/view ownership and generations.
     providers: providers::Providers,
+    /// Optional closed telemetry sink shared by Assistance producer boundaries.
+    telemetry: Option<Telemetry>,
 }
 
 /// Couples a durable Changes preparation with its already-reserved result detail.
@@ -1533,6 +1604,46 @@ struct PreparedClaudeEdit {
     detail_ref: String,
 }
 impl<'a> Worker<'a> {
+    /// Records one already-settled owned-child completion using closed output and lifecycle facts.
+    ///
+    /// `output_bytes` is the saturated sum of existing bounded captures and never contains their
+    /// bytes. `truncated` and `cancelled` are existing process facts; the event is dropped when no
+    /// sink is attached and cannot affect admission release or the caller's result.
+    pub(super) fn record_execution(
+        &self,
+        elapsed: Duration,
+        output_bytes: usize,
+        truncated: bool,
+        cancelled: bool,
+    ) {
+        let Some(telemetry) = &self.telemetry else {
+            return;
+        };
+        let output = if truncated {
+            OutputSizeClass::Truncated
+        } else if output_bytes == 0 {
+            OutputSizeClass::Empty
+        } else if output_bytes <= 4 * 1024 {
+            OutputSizeClass::Small
+        } else if output_bytes <= 64 * 1024 {
+            OutputSizeClass::Medium
+        } else {
+            OutputSizeClass::Large
+        };
+        adapters::execution_summary(
+            telemetry,
+            elapsed,
+            output,
+            AdmissionState::Admitted,
+            if cancelled {
+                CancellationState::Requested
+            } else {
+                CancellationState::NotRequested
+            },
+            DescendantSettlement::Unverified,
+        );
+    }
+
     /// Processes one slow operation at a time; inspections run on an independently scheduled task
     /// (see `inspection_loop`) so a non-yielding poll of the current operation cannot starve
     /// `ide.inspect`. Shutdown first cancels the current operation, allowing its Rust or forwarder
@@ -1757,6 +1868,17 @@ impl<'a> Worker<'a> {
             self.admission()
                 .release_reaped(completed.settlement)
                 .map_err(|_| FailureCode::Internal)?;
+            self.record_execution(
+                completed.evidence.elapsed(),
+                completed
+                    .evidence
+                    .stdout()
+                    .bytes
+                    .len()
+                    .saturating_add(completed.evidence.stderr().bytes.len()),
+                completed.evidence.stdout().truncated || completed.evidence.stderr().truncated,
+                completed.evidence.cancellation().is_some(),
+            );
             if interrupted {
                 return Err(if *job.cancel.borrow() {
                     FailureCode::Cancelled
@@ -3981,6 +4103,7 @@ mod stop_retry_tests {
             uncertain_snapshots: Vec::new(),
             runtime,
             providers: providers::Providers::new(),
+            telemetry: None,
         }
     }
 
@@ -4298,6 +4421,8 @@ mod stop_retry_tests {
             receiver: Mutex::new(Some(receiver)),
             task: Mutex::new(Some(tokio::spawn(std::future::pending()))),
             startup_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            telemetry: Arc::new(Mutex::new(None)),
+            fallback_ingress: Arc::new(Mutex::new(None)),
         };
         assert!(matches!(
             handle

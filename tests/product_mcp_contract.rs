@@ -17,6 +17,8 @@ use tokio::{
 
 /// Distinguishes temporary endpoints across concurrently running scenarios in this process.
 static NEXT_RUNTIME: AtomicUsize = AtomicUsize::new(0);
+/// Serializes tests that assert global managed-Codex runtime-directory counts.
+static MANAGED_CODEX_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Allows 200 ms for subprocess startup/scheduling beyond the 250 ms hook contract.
 ///
@@ -866,6 +868,78 @@ async fn binary_codex_hook_hung_daemon_deadline_sends_only_selected_fields() {
     std::fs::remove_dir_all(runtime).unwrap();
 }
 
+/// Proves CLI query follows its returned cursor and read-only query/export report unknown drops.
+#[tokio::test]
+async fn telemetry_cli_continues_after_first_page_and_never_invents_drops() {
+    let database = runtime().with_extension("sqlite");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE telemetry_events (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                tag TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                logical_bytes INTEGER NOT NULL CHECK(logical_bytes > 0)
+            );",
+        )
+        .unwrap();
+    let payload = br#"{"tag":"native_fallback","reason":"hook_unavailable"}"#;
+    let transaction = connection.unchecked_transaction().unwrap();
+    for _ in 0..1_001 {
+        transaction
+            .execute(
+                "INSERT INTO telemetry_events(tag,payload,logical_bytes) VALUES(?1,?2,?3)",
+                rusqlite::params!["native_fallback", payload, payload.len()],
+            )
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+    drop(connection);
+
+    let first = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+        .args(["telemetry", "query", "--database"])
+        .arg(&database)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["rows"].as_array().unwrap().len(), 1_000);
+    assert_eq!(first["next_cursor"], 1_000);
+    assert_eq!(first["dropped"], Value::Null);
+
+    let second = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+        .args(["telemetry", "query", "--database"])
+        .arg(&database)
+        .args(["--cursor", "1000"])
+        .output()
+        .await
+        .unwrap();
+    assert!(second.status.success());
+    let second: Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(second["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(second["rows"][0]["sequence"], 1_001);
+
+    let export = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+        .args(["telemetry", "export", "--database"])
+        .arg(&database)
+        .output()
+        .await
+        .unwrap();
+    assert!(export.status.success());
+    assert_eq!(export.stdout.split(|byte| *byte == b'\n').count(), 1_002);
+    assert!(
+        String::from_utf8(export.stderr)
+            .unwrap()
+            .contains("dropped=null")
+    );
+    std::fs::remove_file(database).unwrap();
+}
+
 /// Reads the closed post-hook acknowledgement through real IPC without exposing it in the hook process.
 async fn post_ack(runtime: &Path, actor: &str, call: &str) -> Value {
     use agent_ide::app::{
@@ -1663,6 +1737,7 @@ fn managed_runtime_paths() -> std::collections::BTreeSet<PathBuf> {
 /// Proves managed Codex needs no hooks, observes native edits, isolates actors, and cleans on EOF.
 #[tokio::test]
 async fn managed_codex_smoke_and_eof_cleanup() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
     let fixture = ProductFixture::new(json!([]));
     let before = managed_runtime_paths();
     let mut mcp = Mcp::start_managed(&fixture.config, &fixture.root).await;
@@ -1768,6 +1843,79 @@ async fn managed_codex_smoke_and_eof_cleanup() {
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     mcp.close().await;
     assert_eq!(managed_runtime_paths(), before);
+}
+
+/// Proves two managed sessions share only telemetry ownership, not Workspace boot authority.
+#[tokio::test]
+async fn parallel_managed_daemons_do_not_fence_each_others_workspace() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let fixture = ProductFixture::new(json!([]));
+    let mut first = Mcp::start_managed(&fixture.config, &fixture.root).await;
+    let mut second = Mcp::start_managed(&fixture.config, &fixture.root).await;
+    let state = fixture.state();
+    let mut first_id = 2;
+    let mut second_id = 2;
+
+    let first_started = managed_call(
+        &mut first,
+        first_id,
+        "parallel-first",
+        "ide.start",
+        json!({"activation_id":"first-session"}),
+        &state,
+    )
+    .await;
+    let first_started = settle_managed(
+        &mut first,
+        &mut first_id,
+        "parallel-first",
+        &state,
+        first_started,
+    )
+    .await;
+    assert_eq!(first_started["kind"], "activation", "{first_started}");
+
+    let second_started = managed_call(
+        &mut second,
+        second_id,
+        "parallel-second",
+        "ide.start",
+        json!({"activation_id":"second-session"}),
+        &state,
+    )
+    .await;
+    let second_started = settle_managed(
+        &mut second,
+        &mut second_id,
+        "parallel-second",
+        &state,
+        second_started,
+    )
+    .await;
+    assert_eq!(second_started["kind"], "activation", "{second_started}");
+
+    first_id += 1;
+    let still_live = managed_call(
+        &mut first,
+        first_id,
+        "parallel-first",
+        "ide.context",
+        json!({"path":"src/lib.rs"}),
+        &state,
+    )
+    .await;
+    let still_live = settle_managed(
+        &mut first,
+        &mut first_id,
+        "parallel-first",
+        &state,
+        still_live,
+    )
+    .await;
+    assert_eq!(still_live["kind"], "context", "{still_live}");
+
+    first.close().await;
+    second.close().await;
 }
 
 /// Managed Claude hooks silently ignore absent and corrupt project-derived attachment state.

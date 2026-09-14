@@ -21,6 +21,7 @@ use crate::app::transport::{
     AssistanceDispatch, AssistanceDispatchReply, AssistanceDispatchUnavailable,
     AssistanceDispatcher, AssistanceMethod,
 };
+use crate::telemetry::{CacheState, DiagnosticState, adapters};
 use serde_json::{Value, json};
 use std::{
     future::Future,
@@ -1018,12 +1019,46 @@ impl AssistanceDispatcher for ProductDispatcher {
         >,
     > {
         Box::pin(async move {
+            let started = std::time::Instant::now();
             let result = self
                 .handle(&request)
                 .await
                 .unwrap_or(PeerReply::Unavailable {
                     reason: MissingPeer::HostBinding,
                 });
+            if let Some(telemetry) = self.worker.as_ref().and_then(WorkerHandle::telemetry) {
+                match &request {
+                    AssistanceDispatch::HookSubmit(_) => {
+                        // Hook payloads are intentionally never accepted by telemetry adapters.
+                    }
+                    AssistanceDispatch::MethodDispatch(method) => {
+                        let tool = match method.method() {
+                            AssistanceMethod::Start => Some(super::facade::AssistanceTool::Start),
+                            AssistanceMethod::Context => {
+                                Some(super::facade::AssistanceTool::Context)
+                            }
+                            AssistanceMethod::Diff => Some(super::facade::AssistanceTool::Diff),
+                            AssistanceMethod::Inspect => {
+                                Some(super::facade::AssistanceTool::Inspect)
+                            }
+                            AssistanceMethod::Stop => Some(super::facade::AssistanceTool::Stop),
+                            AssistanceMethod::Edit => Some(super::facade::AssistanceTool::Edit),
+                            AssistanceMethod::HookSubmit => None,
+                        };
+                        if let Some(tool) = tool {
+                            adapters::tool_reply(
+                                &telemetry,
+                                tool,
+                                &result,
+                                started.elapsed(),
+                                None,
+                                CacheState::NotApplicable,
+                                DiagnosticState::NotApplicable,
+                            );
+                        }
+                    }
+                }
+            }
             let reply = result.encode().ok_or(AssistanceDispatchUnavailable)?;
             Ok(match request {
                 AssistanceDispatch::HookSubmit(_) => AssistanceDispatchReply::HookSubmit(reply),

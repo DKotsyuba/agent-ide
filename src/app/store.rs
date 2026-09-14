@@ -10,7 +10,8 @@ use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::thread;
 
 use rusqlite::{
-    Connection, ErrorCode, MAIN_DB, OptionalExtension, Transaction, TransactionBehavior, params,
+    Connection, ErrorCode, MAIN_DB, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+    params,
 };
 use tokio::sync::oneshot;
 
@@ -201,6 +202,15 @@ pub enum StoreOutcome {
     OutcomeUnknown,
 }
 
+/// Reports whether one accepted receipt-free transaction was observed to commit before its caller deadline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UntrackedOutcome<T> {
+    /// The transaction committed and produced the enclosed domain value.
+    Committed(T),
+    /// The caller deadline elapsed after queue admission, so the transaction may still commit later.
+    OutcomeUnknown,
+}
+
 impl StoreOutcome {
     /// Decodes one stable mechanics receipt string, treating unexpected data as unknown.
     fn parse(value: &str) -> Self {
@@ -317,7 +327,16 @@ impl Store {
     /// interrupted `Queued`/`Started` receipts to `OutcomeUnknown`. It creates only Application
     /// operation and migration ledgers, never a domain table or external-work inference.
     pub fn open(database_path: &Path, config: StoreConfig) -> Result<Self, StoreError> {
-        Self::open_inner(database_path, None, config)
+        Self::open_inner(database_path, None, config, false)
+    }
+
+    /// Opens an existing database on a dedicated read-only owner without creating ledgers or files.
+    ///
+    /// This variant is for fixed trusted export/query paths only. SQLite refuses every write,
+    /// including WAL or migration setup, so a missing, locked, or non-readable database returns
+    /// the existing infrastructure failure rather than being created or repaired.
+    pub fn open_read_only(database_path: &Path, config: StoreConfig) -> Result<Self, StoreError> {
+        Self::open_inner(database_path, None, config, true)
     }
 
     /// Opens a Store that may create durable SQLite backups before nonfresh migration upgrades.
@@ -332,7 +351,7 @@ impl Store {
         config: StoreConfig,
     ) -> Result<Self, StoreError> {
         let backup_root = prepare_backup_root(backup_root)?;
-        Self::open_inner(database_path, Some(backup_root), config)
+        Self::open_inner(database_path, Some(backup_root), config, false)
     }
 
     /// Starts the owner thread after all public Store construction variants have validated inputs.
@@ -340,6 +359,7 @@ impl Store {
         database_path: &Path,
         backup_root: Option<PathBuf>,
         config: StoreConfig,
+        read_only: bool,
     ) -> Result<Self, StoreError> {
         validate_store_config(config)?;
         let (sender, receiver) = mpsc::sync_channel(config.queue_capacity);
@@ -347,7 +367,16 @@ impl Store {
         let database_path = database_path.to_path_buf();
         thread::Builder::new()
             .name("agent-ide-sqlite".to_owned())
-            .spawn(move || owner_thread(database_path, backup_root, config, receiver, ready_sender))
+            .spawn(move || {
+                owner_thread(
+                    database_path,
+                    backup_root,
+                    config,
+                    read_only,
+                    receiver,
+                    ready_sender,
+                )
+            })
             .map_err(|error| StoreError::Infrastructure(error.to_string()))?;
         ready_receiver
             .recv()
@@ -463,6 +492,105 @@ impl Store {
             reply,
         });
         match self.sender.try_send(StoreMessage::Read { job }) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => return Err(StoreError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => return Err(StoreError::Unavailable),
+        }
+        match tokio::time::timeout(self.config.request_deadline, receive).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) | Err(_) => Err(StoreError::Unavailable),
+        }
+    }
+
+    /// Executes one trusted, receipt-free SQLite transaction on the owner thread.
+    ///
+    /// This is reserved for local append-only domains whose writes have no external effect and
+    /// therefore need neither an operation receipt nor replay authority. `sql` receives the live
+    /// transaction, must not manage a top-level transaction itself, and returns its typed value
+    /// only after commit. Queue saturation, owner loss, SQLite failure, or a caller deadline
+    /// return an error and do not alter the caller's domain behaviour. An accepted caller timeout
+    /// returns [`UntrackedOutcome::OutcomeUnknown`] because queued work may still commit later.
+    pub async fn execute_untracked<T, F>(&self, sql: F) -> Result<UntrackedOutcome<T>, StoreError>
+    where
+        T: Send + 'static,
+        F: for<'transaction> FnOnce(&Transaction<'transaction>) -> rusqlite::Result<T>
+            + Send
+            + 'static,
+    {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        let job = Box::new(TypedJob {
+            sql,
+            reply: reply_sender,
+        });
+        match self.sender.try_send(StoreMessage::ExecuteUntracked { job }) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => return Err(StoreError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => return Err(StoreError::Unavailable),
+        }
+        match tokio::time::timeout(self.config.request_deadline, reply_receiver).await {
+            Ok(Ok(result)) => result.map(UntrackedOutcome::Committed),
+            Ok(Err(_)) | Err(_) => Ok(UntrackedOutcome::OutcomeUnknown),
+        }
+    }
+
+    /// Executes one receipt-free transaction and waits for its actual owner-thread settlement.
+    ///
+    /// This variant is reserved for background drains that have already accepted local work and
+    /// must not finish shutdown while a commit remains outcome-unknown. Queue refusal is returned
+    /// immediately; after admission the call waits until commit, rollback, or owner loss, without
+    /// changing the bounded deadline of [`Self::execute_untracked`]. `sql` receives the live
+    /// Application transaction, must not manage a top-level transaction, and yields its value only
+    /// after commit.
+    pub(crate) async fn execute_untracked_settled<T, F>(&self, sql: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: for<'transaction> FnOnce(&Transaction<'transaction>) -> rusqlite::Result<T>
+            + Send
+            + 'static,
+    {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        let job = Box::new(TypedJob {
+            sql,
+            reply: reply_sender,
+        });
+        match self.sender.try_send(StoreMessage::ExecuteUntracked { job }) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => return Err(StoreError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => return Err(StoreError::Unavailable),
+        }
+        reply_receiver.await.map_err(|_| StoreError::Unavailable)?
+    }
+
+    /// Reads at most `limit` rows of trusted static read-only SQL on the existing owner thread.
+    ///
+    /// `limit` must be in `1..=1001`; the extra row lets a domain prove page continuation while
+    /// exposing no unbounded SQLite cursor. SQL is fixed by the trusted domain owner and must be a
+    /// read-only `SELECT`; Application binds only the supplied values and never interprets rows.
+    /// Queue, decode, timeout, and owner failures return an error without allocating a receipt.
+    pub async fn read_many<T, F>(
+        &self,
+        sql: &'static str,
+        parameters: Vec<rusqlite::types::Value>,
+        limit: usize,
+        decode: F,
+    ) -> Result<Vec<T>, StoreError>
+    where
+        T: Send + 'static,
+        F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T> + Send + 'static,
+    {
+        const MAX_TRUSTED_MULTI_ROWS: usize = 1_001;
+        if limit == 0 || limit > MAX_TRUSTED_MULTI_ROWS {
+            return Err(StoreError::InvalidConfig);
+        }
+        let (reply, receive) = oneshot::channel();
+        let job = Box::new(TypedReadMany {
+            sql,
+            parameters,
+            limit,
+            decode,
+            reply,
+        });
+        match self.sender.try_send(StoreMessage::ReadMany { job }) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => return Err(StoreError::QueueFull),
             Err(TrySendError::Disconnected(_)) => return Err(StoreError::Unavailable),
@@ -625,6 +753,12 @@ trait StoreRead: Send {
     fn run(self: Box<Self>, connection: &Connection);
 }
 
+/// Erases a bounded trusted multi-row SELECT while retaining its typed decoder on the owner thread.
+trait StoreReadMany: Send {
+    /// Executes the static read-only query and returns no more than its prevalidated row ceiling.
+    fn run(self: Box<Self>, connection: &Connection);
+}
+
 /// Owns one static query, bound values, row decoder, and typed reply channel.
 struct TypedRead<T, F> {
     /// Trusted SELECT statement, never model-supplied SQL.
@@ -667,12 +801,71 @@ where
     }
 }
 
+/// Owns one bounded static query and its stateful row decoder for a trusted domain page.
+struct TypedReadMany<T, F> {
+    /// Trusted static SELECT statement, never model-supplied SQL.
+    sql: &'static str,
+    /// Owned SQLite bind values.
+    parameters: Vec<rusqlite::types::Value>,
+    /// Hard maximum decoded rows, validated before owner-thread submission.
+    limit: usize,
+    /// Converts each returned row into a domain value in durable sequence order.
+    decode: F,
+    /// Delivers the bounded page without a durable mechanics receipt.
+    reply: oneshot::Sender<Result<Vec<T>, StoreError>>,
+}
+
+impl<T, F> StoreReadMany for TypedReadMany<T, F>
+where
+    T: Send + 'static,
+    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T> + Send + 'static,
+{
+    /// Refuses non-SELECT or SQLite-write statements and limits decoding before returning a page.
+    fn run(self: Box<Self>, connection: &Connection) {
+        let Self {
+            sql,
+            parameters,
+            limit,
+            mut decode,
+            reply,
+        } = *self;
+        let result = (|| {
+            if !sql.trim_start().starts_with("SELECT ") {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            let mut statement = connection.prepare(sql)?;
+            if !statement.readonly() {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            let mut rows = statement.query(rusqlite::params_from_iter(parameters))?;
+            let mut values = Vec::with_capacity(limit);
+            while values.len() < limit {
+                let Some(row) = rows.next()? else { break };
+                values.push(decode(row)?);
+            }
+            Ok(values)
+        })()
+        .map_err(infrastructure);
+        let _ = reply.send(result);
+    }
+}
+
 /// Carries one bounded owner-thread execution or read-only mechanics lookup.
 enum StoreMessage {
     /// Reads a domain row without admitting a mutating operation or allocating a receipt.
     Read {
         /// Single-row static SELECT and typed response.
         job: Box<dyn StoreRead>,
+    },
+    /// Reads a fixed bounded domain page without interpreting its row semantics.
+    ReadMany {
+        /// Static SELECT, capped decoder, and typed reply channel.
+        job: Box<dyn StoreReadMany>,
+    },
+    /// Runs a receipt-free local-only transaction for a trusted append-only domain.
+    ExecuteUntracked {
+        /// Typed closure whose result is delivered only after transaction commit.
+        job: Box<dyn StoreJob>,
     },
     /// Attempts exactly one operation receipt admission and transaction execution.
     Execute {
@@ -711,10 +904,11 @@ fn owner_thread(
     database_path: std::path::PathBuf,
     backup_root: Option<PathBuf>,
     config: StoreConfig,
+    read_only: bool,
     receiver: mpsc::Receiver<StoreMessage>,
     ready_sender: SyncSender<Result<(), StoreError>>,
 ) {
-    let mut connection = match open_connection(&database_path, config) {
+    let mut connection = match open_connection(&database_path, config, read_only) {
         Ok(connection) => {
             let _ = ready_sender.send(Ok(()));
             connection
@@ -727,6 +921,10 @@ fn owner_thread(
     while let Ok(message) = receiver.recv() {
         match message {
             StoreMessage::Read { job } => job.run(&connection),
+            StoreMessage::ReadMany { job } => job.run(&connection),
+            StoreMessage::ExecuteUntracked { job } => {
+                execute_untracked_one(&mut connection, job);
+            }
             StoreMessage::Execute { operation, job } => {
                 execute_one(&mut connection, config, operation, job);
             }
@@ -748,11 +946,23 @@ fn owner_thread(
 }
 
 /// Opens bundled SQLite and initializes bounded, durable Application operation and migration ledgers.
-fn open_connection(database_path: &Path, config: StoreConfig) -> Result<Connection, StoreError> {
-    let connection = Connection::open(database_path).map_err(infrastructure)?;
+fn open_connection(
+    database_path: &Path,
+    config: StoreConfig,
+    read_only: bool,
+) -> Result<Connection, StoreError> {
+    let connection = if read_only {
+        Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+    } else {
+        Connection::open(database_path)
+    }
+    .map_err(infrastructure)?;
     connection
         .busy_timeout(config.busy_timeout)
         .map_err(infrastructure)?;
+    if read_only {
+        return Ok(connection);
+    }
     connection
         .execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -1108,6 +1318,31 @@ fn execute_one(
         Ok(()) => completion.finish(Ok(StoreOutcome::Committed)),
         Err(_) => completion.finish(Err(StoreError::OutcomeUnknown { operation })),
     }
+}
+
+/// Commits one trusted local-only transaction without creating an operation receipt or retry right.
+fn execute_untracked_one(connection: &mut Connection, job: Box<dyn StoreJob>) {
+    let transaction = match begin_transaction(connection) {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            job.fail(error);
+            return;
+        }
+    };
+    let completion = match job.run(&transaction) {
+        JobRun::Failure(completion) => {
+            let result = transaction.rollback().map_err(infrastructure);
+            completion.finish(result.and(Err(StoreError::RolledBack)));
+            return;
+        }
+        JobRun::Success(completion) => completion,
+    };
+    completion.finish(
+        transaction
+            .commit()
+            .map_err(infrastructure)
+            .map(|_| StoreOutcome::Committed),
+    );
 }
 
 /// Begins the owner-controlled immediate transaction without leaking a mutable borrow on failure.

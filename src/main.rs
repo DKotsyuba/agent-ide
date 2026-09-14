@@ -21,6 +21,10 @@ use agent_ide::assistance::{
     launcher::{AcceptedExecutable, LauncherConfig},
 };
 use agent_ide::execution::{D03ProfileEvidence, HostSandboxState, PersistedProfileRecord};
+use agent_ide::{
+    app::store::Store,
+    telemetry::{Filter, Telemetry, TelemetryConfig},
+};
 use rmcp::{serve_server, transport::io::stdio};
 
 /// Selects an explicit mode; MCP writes only protocol messages to stdout and never autostarts.
@@ -31,9 +35,9 @@ async fn main() -> ExitCode {
     let claude_project_dir = std::env::var_os("CLAUDE_PROJECT_DIR");
     match command(std::env::args_os().skip(1)) {
         Ok(Command::Daemon { runtime_dir }) => match RuntimeDir::prepare_for_daemon(runtime_dir) {
-            Ok(runtime_dir) => match run_daemon_with_assistance(
-                runtime_dir,
-                Arc::new(match std::env::var("AGENT_IDE_LAUNCHER_CONFIG") {
+            Ok(runtime_dir) => {
+                let config = EffectiveConfig::defaults();
+                let dispatcher = match std::env::var("AGENT_IDE_LAUNCHER_CONFIG") {
                     Ok(path) => match LauncherConfig::read(std::path::Path::new(&path)) {
                         Ok(config)
                             if std::env::var("AGENT_IDE_MANAGED_CODEX_ATTACHMENT")
@@ -47,14 +51,12 @@ async fn main() -> ExitCode {
                     },
                     Err(std::env::VarError::NotPresent) => ProductDispatcher::default(),
                     Err(_) => return fail(AppError::InvalidResponse),
-                }),
-                EffectiveConfig::defaults(),
-            )
-            .await
-            {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(error) => fail(error),
-            },
+                };
+                match run_daemon_with_assistance(runtime_dir, Arc::new(dispatcher), config).await {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => fail(error),
+                }
+            }
             Err(error) => fail(error),
         },
         Ok(Command::CodexHook { runtime_dir }) => {
@@ -183,6 +185,70 @@ async fn main() -> ExitCode {
             }
             Err(error) => fail(error),
         },
+        Ok(Command::TelemetryQuery {
+            database,
+            filter,
+            cursor,
+        }) => {
+            let page = match telemetry_owner(&database).await {
+                Ok(telemetry) => telemetry
+                    .query(filter, cursor, 1_000)
+                    .await
+                    .map_err(|_| AppError::InvalidResponse),
+                Err(error) => Err(error),
+            };
+            match page {
+                Ok(page) => {
+                    let rows = page
+                        .rows
+                        .iter()
+                        .map(|row| {
+                            serde_json::json!({
+                                "sequence": row.sequence,
+                                "event": row.event,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "rows": rows,
+                            "next_cursor": page.next_cursor,
+                            "truncated": page.truncated,
+                            "dropped": page.dropped,
+                        })
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(error) => fail(error),
+            }
+        }
+        Ok(Command::TelemetryExport { database, filter }) => {
+            let export = match telemetry_owner(&database).await {
+                Ok(telemetry) => telemetry
+                    .export(filter)
+                    .await
+                    .map_err(|_| AppError::InvalidResponse),
+                Err(error) => Err(error),
+            };
+            match export {
+                Ok(export) => {
+                    if std::io::stdout().write_all(&export.bytes).is_err() {
+                        return ExitCode::FAILURE;
+                    }
+                    eprintln!("truncated={}", export.truncated);
+                    if let Some(sequence) = export.first_omitted_sequence {
+                        eprintln!("first_omitted_sequence={sequence}");
+                    }
+                    match export.dropped {
+                        Some(dropped) => eprintln!("dropped={dropped}"),
+                        None => eprintln!("dropped=null"),
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(error) => fail(error),
+            }
+        }
         Err(error) => fail(error),
     }
 }
@@ -306,6 +372,24 @@ fn fail(error: AppError) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// Opens the bounded local telemetry owner used only by deterministic query and export commands.
+///
+/// `database` is an operator-provided existing local SQLite path; no direct SQLite handle escapes
+/// this helper. Its read-only Application owner never creates ledgers, runs migrations, or changes
+/// retention. Opening or reading failure reports the existing compact invalid-response class.
+async fn telemetry_owner(database: &Path) -> Result<Telemetry, AppError> {
+    if !database.is_file() {
+        return Err(AppError::InvalidResponse);
+    }
+    let store = Arc::new(
+        Store::open_read_only(database, EffectiveConfig::defaults().store())
+            .map_err(|_| AppError::InvalidResponse)?,
+    );
+    Telemetry::open_read_only(store, TelemetryConfig::default())
+        .await
+        .map_err(|_| AppError::InvalidResponse)
+}
+
 /// Holds the explicit runtime directory required by each supported executable mode.
 enum Command {
     /// Serves health and finite Assistance dispatch until interrupted or killed.
@@ -386,6 +470,22 @@ enum Command {
     LauncherCheck {
         /// Launcher configuration file to load and verify.
         path: PathBuf,
+    },
+    /// Prints one deterministic bounded telemetry page from an operator-selected local database.
+    TelemetryQuery {
+        /// Existing local SQLite database owned through Application's Store thread.
+        database: PathBuf,
+        /// Optional fixed event-tag restriction; no caller-supplied SQL or arbitrary tag is accepted.
+        filter: Filter,
+        /// Exclusive durable sequence returned as `next_cursor` by a prior query page.
+        cursor: Option<u64>,
+    },
+    /// Writes deterministic bounded canonical telemetry rows from an operator-selected local database.
+    TelemetryExport {
+        /// Existing local SQLite database owned through Application's Store thread.
+        database: PathBuf,
+        /// Optional fixed event-tag restriction; no caller-supplied SQL or arbitrary tag is accepted.
+        filter: Filter,
     },
 }
 
@@ -527,6 +627,57 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
             path: PathBuf::from(path),
         });
     }
+    if let [mode, sub, database_flag, database] = arguments.as_slice()
+        && mode == "telemetry"
+        && matches!(sub.to_str(), Some("query" | "export"))
+        && database_flag == "--database"
+    {
+        return telemetry_command(sub, PathBuf::from(database), Filter::All, None);
+    }
+    if let [mode, sub, database_flag, database, tag_flag, tag] = arguments.as_slice()
+        && mode == "telemetry"
+        && matches!(sub.to_str(), Some("query" | "export"))
+        && database_flag == "--database"
+        && tag_flag == "--tag"
+    {
+        let filter = telemetry_filter(tag.to_str().ok_or(AppError::InvalidResponse)?)?;
+        return telemetry_command(sub, PathBuf::from(database), filter, None);
+    }
+    if let [mode, sub, database_flag, database, cursor_flag, cursor] = arguments.as_slice()
+        && mode == "telemetry"
+        && sub == "query"
+        && database_flag == "--database"
+        && cursor_flag == "--cursor"
+    {
+        let cursor = cursor
+            .to_str()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or(AppError::InvalidResponse)?;
+        return telemetry_command(sub, PathBuf::from(database), Filter::All, Some(cursor));
+    }
+    if let [
+        mode,
+        sub,
+        database_flag,
+        database,
+        tag_flag,
+        tag,
+        cursor_flag,
+        cursor,
+    ] = arguments.as_slice()
+        && mode == "telemetry"
+        && sub == "query"
+        && database_flag == "--database"
+        && tag_flag == "--tag"
+        && cursor_flag == "--cursor"
+    {
+        let filter = telemetry_filter(tag.to_str().ok_or(AppError::InvalidResponse)?)?;
+        let cursor = cursor
+            .to_str()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or(AppError::InvalidResponse)?;
+        return telemetry_command(sub, PathBuf::from(database), filter, Some(cursor));
+    }
     let [mode, flag, value] = arguments.as_slice() else {
         return Err(AppError::InvalidResponse);
     };
@@ -557,6 +708,43 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
         Some("mcp") => Ok(Command::Mcp { runtime_dir }),
         Some("codex-hook") => Ok(Command::CodexHook { runtime_dir }),
         Some("claude-hook") => Ok(Command::ClaudeHook { runtime_dir }),
+        _ => Err(AppError::InvalidResponse),
+    }
+}
+
+/// Builds a fixed telemetry CLI command from a trusted subcommand, database, closed filter, and cursor.
+///
+/// `cursor` is the exclusive durable sequence returned by a prior query and is rejected for export.
+/// Unknown subcommands return [`AppError::InvalidResponse`] without filesystem access.
+fn telemetry_command(
+    subcommand: &OsString,
+    database: PathBuf,
+    filter: Filter,
+    cursor: Option<u64>,
+) -> Result<Command, AppError> {
+    match subcommand.to_str() {
+        Some("query") => Ok(Command::TelemetryQuery {
+            database,
+            filter,
+            cursor,
+        }),
+        Some("export") if cursor.is_none() => Ok(Command::TelemetryExport { database, filter }),
+        _ => Err(AppError::InvalidResponse),
+    }
+}
+
+/// Converts only canonical closed tags into query filters, rejecting arbitrary local SQLite selectors.
+fn telemetry_filter(tag: &str) -> Result<Filter, AppError> {
+    match tag {
+        "tool_completed" | "execution_completed" | "provider_observed" | "native_fallback" => {
+            Ok(Filter::Tag(match tag {
+                "tool_completed" => "tool_completed",
+                "execution_completed" => "execution_completed",
+                "provider_observed" => "provider_observed",
+                "native_fallback" => "native_fallback",
+                _ => unreachable!("closed tag match is exhaustive"),
+            }))
+        }
         _ => Err(AppError::InvalidResponse),
     }
 }
@@ -752,6 +940,81 @@ fn claude_project_identity(project: &Path) -> String {
         .to_string()
 }
 
+/// Creates or validates one owner-only persistent directory without following a final symlink.
+///
+/// Missing paths are created with mode `0700`; an existing non-directory, symlink, foreign owner,
+/// nonprivate mode, or I/O failure is returned without repairing or removing the path.
+fn prepare_private_persistent_directory(path: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata)
+            if !metadata.file_type().is_symlink()
+                && metadata.is_dir()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.permissions().mode() & 0o777 == 0o700 =>
+        {
+            Ok(())
+        }
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "telemetry state directory is not private",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700).create(path)?;
+            prepare_private_persistent_directory(path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Derives one candidate database below an explicitly supplied private Application state root.
+///
+/// The application, telemetry, and digest directories are created or validated as `0700`. The
+/// returned database path is not opened here; unsafe or unavailable directory state returns I/O.
+fn managed_telemetry_database_in(
+    application_state: &Path,
+    candidate: &Path,
+) -> std::io::Result<PathBuf> {
+    prepare_private_persistent_directory(application_state)?;
+    let telemetry = application_state.join("telemetry");
+    prepare_private_persistent_directory(&telemetry)?;
+    let candidate_state = telemetry.join(
+        blake3::hash(candidate.as_os_str().as_bytes())
+            .to_hex()
+            .as_str(),
+    );
+    prepare_private_persistent_directory(&candidate_state)?;
+    Ok(candidate_state.join("state.sqlite"))
+}
+
+/// Derives the persistent telemetry-only Store path for one canonical managed worktree.
+///
+/// State lives below the effective user's real home in private `0700` directories. The candidate
+/// component is an opaque digest of the already-validated path, so fresh runtime generations reuse
+/// prior events while runtime cleanup cannot delete them. Unsafe or symlinked state is rejected,
+/// and Workspace/Changes authority remains in each daemon's private runtime.
+fn managed_telemetry_database(candidate: &Path) -> std::io::Result<PathBuf> {
+    let home =
+        PathBuf::from(std::env::var_os("HOME").ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is unavailable")
+        })?);
+    if !absolute_local_path(&home) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "HOME is not absolute and normalized",
+        ));
+    }
+    let home = fs::canonicalize(home)?;
+    let metadata = fs::symlink_metadata(&home)?;
+    if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "HOME is not owned by this user",
+        ));
+    }
+    managed_telemetry_database_in(&home.join(".agent-ide"), candidate)
+}
+
 /// Derives the one short deterministic private runtime path for a canonical Claude project root.
 ///
 /// The full digest remains in the attachment record to reject a theoretical collision in the
@@ -885,7 +1148,8 @@ async fn run_managed_mcp(
 ///
 /// The candidate must be the one captured by the parent and remain an absolute local directory.
 /// Git identity is deliberately discovered later by the existing worker activation path. Launcher
-/// executables and profiles are validated through [`LauncherConfig`] before the child starts.
+/// executables and profiles are validated through [`LauncherConfig`] before the child starts. The
+/// child receives only the candidate-stable telemetry path; its authority Store stays runtime-local.
 async fn start_managed_daemon(
     runtime: &ManagedRuntime,
     launcher_template: &Path,
@@ -899,6 +1163,7 @@ async fn start_managed_daemon(
         return Err(());
     }
     let attachment = random_hex(32).map_err(|_| ())?;
+    let telemetry_database = managed_telemetry_database(&candidate).map_err(|_| ())?;
     let (launcher, bytes) =
         LauncherConfig::bind_one_candidate(launcher_template, &attachment, &candidate)
             .map_err(|_| ())?;
@@ -921,6 +1186,8 @@ async fn start_managed_daemon(
         .args(["daemon", "--runtime-dir"])
         .arg(&runtime.path)
         .env("AGENT_IDE_LAUNCHER_CONFIG", launcher_path)
+        .env("AGENT_IDE_TELEMETRY_DATABASE", telemetry_database)
+        .env_remove("AGENT_IDE_STATE_DATABASE")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1179,6 +1446,43 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    /// Telemetry query accepts its returned exclusive cursor with or without a closed tag filter.
+    #[test]
+    fn telemetry_query_cli_accepts_continuation_cursor() {
+        assert!(matches!(
+            command(args(&[
+                "telemetry",
+                "query",
+                "--database",
+                "/private/tmp/telemetry.sqlite",
+                "--cursor",
+                "42"
+            ])),
+            Ok(Command::TelemetryQuery {
+                cursor: Some(42),
+                filter: Filter::All,
+                ..
+            })
+        ));
+        assert!(matches!(
+            command(args(&[
+                "telemetry",
+                "query",
+                "--database",
+                "/private/tmp/telemetry.sqlite",
+                "--tag",
+                "native_fallback",
+                "--cursor",
+                "42"
+            ])),
+            Ok(Command::TelemetryQuery {
+                cursor: Some(42),
+                filter: Filter::Tag("native_fallback"),
+                ..
+            })
+        ));
+    }
+
     /// Managed host flags and the argument-free Claude hook are distinct from both legacy forms.
     #[test]
     fn managed_and_legacy_mcp_cli_forms_are_distinct() {
@@ -1296,5 +1600,70 @@ mod tests {
         assert!(read_claude_attachment(&project).is_err());
         runtime.remove().unwrap();
         fs::remove_dir(project).unwrap();
+    }
+
+    /// Proves a managed runtime cleanup cannot remove its candidate-stable local Store path.
+    #[test]
+    fn managed_telemetry_database_is_stable_outside_a_runtime_generation() {
+        let candidate = fs::canonicalize(std::env::temp_dir()).unwrap();
+        let state_parent = std::env::temp_dir().join(format!(
+            "agent-ide-managed-state-{}-{}",
+            std::process::id(),
+            random_hex(4).unwrap()
+        ));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&state_parent)
+            .unwrap();
+        let state = state_parent.join("app");
+        let database = managed_telemetry_database_in(&state, &candidate).unwrap();
+        let runtime = ManagedRuntime::create().unwrap();
+        assert_ne!(database.parent(), Some(runtime.path.as_path()));
+        assert_eq!(
+            database,
+            managed_telemetry_database_in(&state, &candidate).unwrap()
+        );
+        for directory in [
+            state.clone(),
+            state.join("telemetry"),
+            database.parent().unwrap().to_path_buf(),
+        ] {
+            let metadata = fs::symlink_metadata(directory).unwrap();
+            assert!(metadata.is_dir());
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        }
+        runtime.remove().unwrap();
+        fs::remove_dir_all(state_parent).unwrap();
+    }
+
+    /// Rejects preplaced symlink and nonprivate persistent telemetry directories without repair.
+    #[test]
+    fn managed_telemetry_database_rejects_unsafe_state_directories() {
+        let parent = std::env::temp_dir().join(format!(
+            "agent-ide-unsafe-state-{}-{}",
+            std::process::id(),
+            random_hex(4).unwrap()
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
+        let state = parent.join("state");
+        fs::DirBuilder::new().mode(0o755).create(&state).unwrap();
+        assert!(managed_telemetry_database_in(&state, &parent).is_err());
+        fs::remove_dir(&state).unwrap();
+        std::os::unix::fs::symlink(&parent, &state).unwrap();
+        assert!(managed_telemetry_database_in(&state, &parent).is_err());
+        fs::remove_file(&state).unwrap();
+        fs::remove_dir(parent).unwrap();
+    }
+
+    /// Proves a telemetry query refuses a missing database without creating a SQLite file.
+    #[tokio::test]
+    async fn telemetry_query_does_not_create_a_missing_database() {
+        let database = std::env::temp_dir().join(format!(
+            "agent-ide-telemetry-read-only-{}-{}.sqlite",
+            std::process::id(),
+            random_hex(4).unwrap()
+        ));
+        assert!(telemetry_owner(&database).await.is_err());
+        assert!(!database.exists());
     }
 }
