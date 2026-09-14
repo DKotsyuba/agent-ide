@@ -375,6 +375,10 @@ pub struct HelperBudgets {
     /// Maximum direct child processes the helper may spawn and must itself reap.
     pub processes: u32,
     /// Total helper lifetime, measured from claim.
+    ///
+    /// [`LaunchLedger::claim`] clamps this to the issuing ticket's own remaining time before its
+    /// absolute `deadline_ms`, so a helper that starts working after a delayed foreground launch
+    /// never computes a fresh full-length deadline that outlives the ticket the daemon will expire.
     pub deadline_ms: u64,
 }
 
@@ -1009,6 +1013,25 @@ impl LaunchTicket {
         )
     }
 
+    /// Returns whether this ticket's claimed work already carries full positive settlement proof:
+    /// the final frame together with a matching successful post and exactly settled children.
+    ///
+    /// This mirrors the exact guard [`LaunchLedger::delivery`] uses to report [`Delivery::Ready`].
+    /// [`LaunchLedger::expire`] consults it so a ticket that reached this proof before its deadline
+    /// is never downgraded to `Uncertain` merely because nobody retrieved it first — that downgrade
+    /// would discard a known outcome for `outcome_unknown` even though the physical work is already
+    /// proven.
+    fn positively_settled(&self) -> bool {
+        matches!(
+            &self.state,
+            TicketState::Claimed(ClaimedWork {
+                frame: Some(frame),
+                post: Some(true),
+                ..
+            }) if frame.children.settled()
+        )
+    }
+
     /// Suppresses this ticket's authority, returning whether it must be retained.
     ///
     /// Work that provably never ran (`Minted`, `Launched`) is normally retired and returns `false`.
@@ -1469,7 +1492,16 @@ impl LaunchLedger {
             post: None,
             lease: true,
         });
-        ClaimOutcome::Granted(Box::new(ticket.job.clone()))
+        // The configured budget was fixed at mint time, before the model's own delay running the
+        // foreground command. Clamping it to the ticket's actual remaining time here — the only
+        // point that shares the mint-time clock with `deadline_ms` — is what keeps the helper's own
+        // diagnostic wait from outliving this exact issued ticket instead of a fresh full window.
+        let mut job = ticket.job.clone();
+        job.budgets.deadline_ms = job
+            .budgets
+            .deadline_ms
+            .min(ticket.deadline_ms.saturating_sub(now_ms));
+        ClaimOutcome::Granted(Box::new(job))
     }
 
     /// Releases the bounded lease exactly once, and only on positive settlement proof.
@@ -1714,11 +1746,14 @@ impl LaunchLedger {
     /// An unclaimed non-Edit ticket is dropped: nothing ran. An unclaimed Edit is retained as
     /// `ExpiredNoEffect` so retrieval durably settles `deadline_no_effect`. A claimed ticket that
     /// never settled becomes `TicketState::Uncertain`; claimed Edit retrieval reports
-    /// `outcome_unknown`, and its admission stays quarantined instead of being silently reused.
+    /// `outcome_unknown`, and its admission stays quarantined instead of being silently reused. A
+    /// claimed ticket whose final frame and matching successful post already arrived before the
+    /// sweep is left untouched, so the deadline crossing this same sweep enforces can never itself
+    /// erase evidence that already proved the operation's outcome.
     pub fn expire(&mut self, now_ms: u64) {
         let leases = &mut self.leases;
         self.tickets.retain(|reference, ticket| {
-            if now_ms < ticket.deadline_ms {
+            if now_ms < ticket.deadline_ms || ticket.positively_settled() {
                 return true;
             }
             ticket.quarantine(reference, leases)
@@ -2292,6 +2327,114 @@ mod tests {
         assert!(matches!(
             ledger.delivery(&reference),
             Delivery::OutcomeUnknown(job) if job.operation == HelperOperation::Edit
+        ));
+    }
+
+    /// A claim clamps the granted job's budget to the ticket's own remaining time.
+    ///
+    /// The fixture ticket carries a 1000ms absolute deadline and a 30_000ms configured budget. A
+    /// delayed foreground launch that only claims at 700ms leaves 300ms actually remaining; the
+    /// helper must receive that shrunk figure, never the full configured window, or its own
+    /// diagnostic wait could outlive the ticket the daemon will expire.
+    #[test]
+    fn delayed_claim_clamps_the_granted_budget_to_the_tickets_remaining_time() {
+        let (mut ledger, reference, actor) = ledger();
+        let command = LaunchLedger::helper_command(
+            std::path::Path::new("/usr/local/bin/agent-ide"),
+            std::path::Path::new("/private/tmp/rt"),
+            "attach",
+            "detail-1",
+        );
+        assert_eq!(
+            ledger.recognize(&command, false, "call", &actor, 700),
+            LaunchRecognition::Recognized
+        );
+        let ClaimOutcome::Granted(granted) = ledger.claim(&reference, "channel", 700, live) else {
+            panic!("a live claim before the ticket's own deadline must be granted");
+        };
+        assert_eq!(
+            job().budgets.deadline_ms,
+            30_000,
+            "fixture budget is unclamped"
+        );
+        assert_eq!(granted.budgets.deadline_ms, 300);
+    }
+
+    /// A ready frame that arrives before the deadline survives the same sweep that expires it.
+    ///
+    /// Both settlement halves and exact child accounting already prove the operation's outcome;
+    /// nothing about crossing the deadline afterward makes that proof less true.
+    #[test]
+    fn ready_frame_crossing_its_deadline_survives_the_expiry_sweep() {
+        let (mut ledger, reference) = claimed();
+        assert_eq!(ledger.settle_frame(completed(1, 1)), Ok(()));
+        assert_eq!(ledger.settle_post("call", true), Ok(()));
+        ledger.expire(1000);
+        assert!(matches!(
+            ledger.delivery(&reference),
+            Delivery::Ready(frame) if frame.children.settled()
+        ));
+        assert_eq!(
+            ledger.len(),
+            1,
+            "a proven ticket is not removed by expiry alone"
+        );
+    }
+
+    /// A ready Edit frame crossing its deadline reports its known outcome, not `outcome_unknown`.
+    ///
+    /// This is the Edit-specific case the daemon must get right: the same expiry sweep that types
+    /// unsettled claimed Edit work as `outcome_unknown` must not apply that same downgrade to Edit
+    /// work whose frame and post already proved a concrete outcome.
+    #[test]
+    fn ready_edit_frame_crossing_its_deadline_reports_the_known_outcome() {
+        let (mut ledger, reference, actor) = edit_ledger();
+        let command = LaunchLedger::helper_command(
+            std::path::Path::new("/usr/local/bin/agent-ide"),
+            std::path::Path::new("/private/tmp/rt"),
+            "attach",
+            "detail-1",
+        );
+        assert_eq!(
+            ledger.recognize(&command, false, "edit-call", &actor, 0),
+            LaunchRecognition::Recognized
+        );
+        assert!(matches!(
+            ledger.claim(&reference, "channel", 0, live),
+            ClaimOutcome::Granted(_)
+        ));
+        assert_eq!(
+            ledger.settle_frame(HelperResult {
+                protocol: HELPER_PROTOCOL,
+                detail_ref: reference.clone(),
+                outcome: HelperOutcome::Complete {
+                    text: "replaced".into(),
+                },
+                children: ChildSettlement {
+                    spawned: 1,
+                    reaped: 1,
+                },
+                discovery: Vec::new(),
+                payload: Some(HelperPayload::Edit {
+                    outcome: crate::changes::edit::EditOutcome::Replaced,
+                    source: Some(HelperSource {
+                        path: "main.rs".into(),
+                        present: true,
+                        digest: Some(*blake3::hash(b"new").as_bytes()),
+                        length: 3,
+                    }),
+                    diagnostics: crate::assistance::reply::EditDiagnostics::Unknown {},
+                }),
+            }),
+            Ok(())
+        );
+        assert_eq!(ledger.settle_post("edit-call", true), Ok(()));
+        ledger.expire(1000);
+        assert!(matches!(
+            ledger.delivery(&reference),
+            Delivery::Ready(frame)
+                if frame.children.settled()
+                    && matches!(frame.outcome, HelperOutcome::Complete { .. })
         ));
     }
 

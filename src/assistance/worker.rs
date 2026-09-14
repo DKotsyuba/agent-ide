@@ -1200,24 +1200,36 @@ impl WorkerHandle {
     }
 }
 
+/// Returns whether one job settles an already-prepared Claude edit rather than creating new,
+/// later-retrievable result state.
+///
+/// Both a terminal receipt cleanup and a positively settled Claude Edit completion release
+/// existing lifecycle state — a prepared Changes receipt and a claimed ticket/lease — and answer
+/// their waiting caller directly. Neither publishes a reference any later `ide.inspect` could ever
+/// name: a successful Edit's `PeerReply::Edit` carries no pagination cursor, unlike Claude
+/// Start/Context/Diff, whose completion reference is retrieved again for retry or Diff paging.
+fn is_claude_edit_settlement(input: &JobInput) -> bool {
+    matches!(input, JobInput::ClaudeEditTerminal(_))
+        || matches!(input, JobInput::Claude(settled) if settled.operation() == HelperOperation::Edit)
+}
+
 /// Returns whether an operation needs a retained result detail after it completes.
 ///
-/// Stop and Claude terminal receipt cleanup return directly to their waiting caller. The latter
-/// settles only an existing prepared edit and deliberately bypasses ordinary detail capacity so a
-/// mint failure, expiry, or stop cannot strand receipt/ticket cleanup behind live result details.
+/// Stop and Claude edit settlement (terminal or successful) return directly to their waiting
+/// caller. The latter deliberately bypasses ordinary detail capacity so a mint failure, expiry, or
+/// stop cannot strand receipt/ticket cleanup behind live result details — and, for a successful
+/// completion, so saturated capacity can never turn a write the foreground helper already
+/// performed into a bare `Capacity` error instead of its settled receipt.
 fn retains_detail(tool: AssistanceTool, input: &JobInput) -> bool {
-    tool != AssistanceTool::Stop && !matches!(input, JobInput::ClaudeEditTerminal(_))
+    tool != AssistanceTool::Stop && !is_claude_edit_settlement(input)
 }
 
 /// Returns the finite queue ceiling, reserving bounded cleanup headroom for terminal work.
 ///
-/// Regular work may use only `ordinary`; stop and Claude terminal edit settlement may use the
-/// fixed reserve because they release existing lifecycle state rather than creating new details.
+/// Regular work may use only `ordinary`; stop and Claude edit settlement may use the fixed reserve
+/// because they release existing lifecycle state rather than creating new details.
 fn queue_capacity(ordinary: usize, tool: AssistanceTool, input: &JobInput) -> usize {
-    ordinary
-        + usize::from(
-            tool == AssistanceTool::Stop || matches!(input, JobInput::ClaudeEditTerminal(_)),
-        ) * 64
+    ordinary + usize::from(tool == AssistanceTool::Stop || is_claude_edit_settlement(input)) * 64
 }
 
 /// Proves terminal Claude receipt settlement remains admissible after ordinary detail saturation.
@@ -1230,6 +1242,134 @@ fn terminal_claude_edit_cleanup_reserves_capacity() {
         AssistanceTool::Edit,
         &JobInput::ClaudeEditPrepare
     ));
+}
+
+/// Builds one real, positively settled Claude Edit operation through the full ticket lifecycle.
+///
+/// Nothing here is fabricated: the returned token only exists because
+/// [`super::claude_worker::LaunchLedger`] itself proved mint, recognition, claim, a matching
+/// `Complete` frame and a successful post, exactly as a real foreground helper round trip would.
+#[cfg(test)]
+fn settled_claude_edit() -> SettledClaudeOperation {
+    use super::claude_worker::{
+        AcceptedIdentity, ChildSettlement, ClaimOutcome, HelperActor, HelperBudgets,
+        HelperEditSource, HelperJob, HelperPayload, HelperResult, LaunchLedger, LaunchRecognition,
+    };
+    let binding = BindingRef::fixture("agent", "channel", 1);
+    let identity = |path: &str| {
+        AcceptedIdentity::new(std::path::PathBuf::from(path), "fixture", &"ab".repeat(32))
+            .expect("fixture identity is well formed")
+    };
+    let job = HelperJob {
+        protocol: super::claude_worker::HELPER_PROTOCOL,
+        operation: HelperOperation::Edit,
+        candidate: std::path::PathBuf::from("/private/tmp/work"),
+        git: std::path::PathBuf::from("/usr/bin/git"),
+        canonical_root: Some(std::path::PathBuf::from("/private/tmp/work")),
+        scope: Some(HelperScope {
+            worktree_id: "worktree".into(),
+            incarnation: 1,
+            root: std::path::PathBuf::from("/private/tmp/work"),
+            repository_root: std::path::PathBuf::from("/private/tmp/work"),
+            git_common_dir: std::path::PathBuf::from(".git"),
+            native_root_identity: [1; 32],
+            authority_epoch: 1,
+        }),
+        baseline: None,
+        provider: None,
+        edit_source: Some(HelperEditSource {
+            path: "main.rs".into(),
+            present: true,
+            digest: Some(*blake3::hash(b"old").as_bytes()),
+            length: 3,
+            sequence: 1,
+            source_revision: "revision".into(),
+            observation_ref: "context".into(),
+        }),
+        parameters: serde_json::json!({
+            "operation_id": "saturated-success",
+            "path": "main.rs",
+            "source_ref": "context",
+            "content": "new"
+        }),
+        budgets: HelperBudgets {
+            output_bytes: 4096,
+            processes: 2,
+            deadline_ms: 30_000,
+        },
+    };
+    let mut ledger = LaunchLedger::new(std::sync::Arc::new(Mutex::new(admission_controller())));
+    let actor = HelperActor::new("agent", Some("session")).unwrap();
+    let command = LaunchLedger::helper_command(
+        std::path::Path::new("/usr/local/bin/agent-ide"),
+        std::path::Path::new("/private/tmp/rt"),
+        "attach",
+        "detail-1",
+    );
+    ledger
+        .mint(
+            "detail-1",
+            binding,
+            actor.clone(),
+            "channel",
+            command.clone(),
+            job,
+            1_000,
+            identity("/usr/local/bin/agent-ide"),
+            vec![identity("/usr/bin/git")],
+        )
+        .unwrap();
+    assert_eq!(
+        ledger.recognize(&command, false, "edit-call", &actor, 0),
+        LaunchRecognition::Recognized
+    );
+    let ClaimOutcome::Granted(_) = ledger.claim("detail-1", "channel", 0, |current| {
+        current == &BindingRef::fixture("agent", "channel", 1)
+    }) else {
+        panic!("fixture claim must be granted");
+    };
+    ledger
+        .settle_frame(HelperResult {
+            protocol: super::claude_worker::HELPER_PROTOCOL,
+            detail_ref: "detail-1".into(),
+            outcome: HelperOutcome::Complete {
+                text: "replaced".into(),
+            },
+            children: ChildSettlement {
+                spawned: 1,
+                reaped: 1,
+            },
+            discovery: Vec::new(),
+            payload: Some(HelperPayload::Edit {
+                outcome: ChangesEditOutcome::Replaced,
+                source: Some(super::claude_worker::HelperSource {
+                    path: "main.rs".into(),
+                    present: true,
+                    digest: Some(*blake3::hash(b"new").as_bytes()),
+                    length: 3,
+                }),
+                diagnostics: EditDiagnostics::Unknown {},
+            }),
+        })
+        .unwrap();
+    ledger.settle_post("edit-call", true).unwrap();
+    ledger
+        .settled(
+            "detail-1",
+            BindingRef::fixture("agent", "channel", 1).fingerprint(),
+        )
+        .expect("every settlement half is present")
+}
+
+/// A successful Claude Edit completion bypasses ordinary detail and queue capacity exactly like
+/// terminal receipt cleanup does, so saturated capacity can never turn a write the foreground
+/// helper already performed into a bare `Capacity` error instead of its settled receipt.
+#[cfg(test)]
+#[test]
+fn successful_claude_edit_completion_reuses_terminal_capacity_treatment() {
+    let settled = JobInput::Claude(Box::new(settled_claude_edit()));
+    assert!(!retains_detail(AssistanceTool::Edit, &settled));
+    assert_eq!(queue_capacity(8, AssistanceTool::Edit, &settled), 72);
 }
 
 /// Bounds the in-memory pending-revocation set so an unbounded stream of failed durable revokes
