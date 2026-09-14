@@ -767,6 +767,57 @@ enum CaptureCheckpoint {
 }
 
 impl DurableWorkspace<'_> {
+    /// Resolves one descriptor-held edit target only after a fresh durable authority check.
+    ///
+    /// `operation_id` and `path` are bounded by the Workspace edit contract. The returned permit
+    /// can be consumed exactly once, and the target retains its parent/original descriptors across
+    /// queueing. Any authority failure is reported as stale source with no filesystem write.
+    pub async fn prepare_edit(
+        &self,
+        authority: &AuthorityStamp,
+        active: &ActiveBindingUse,
+        operation_id: impl Into<String>,
+        path: PathBuf,
+        source_ref: super::edit::EditSourceRef,
+    ) -> Result<(super::edit::EditPermit, super::edit::CurrentEditTarget), super::edit::EditOutcome>
+    {
+        self.authorize(authority, active)
+            .await
+            .map_err(|_| super::edit::EditOutcome::StaleSource)?;
+        let permit = super::edit::EditPermit::new(operation_id, path.clone())?;
+        let target = super::edit::CurrentEditTarget::resolve(authority, &path, source_ref)?;
+        Ok((permit, target))
+    }
+
+    /// Rechecks durable authority immediately before consuming one prepared edit permit.
+    ///
+    /// `continue_before_effect` is called after authority validation and descriptor resolution but
+    /// before any target write. Returning false yields `cancelled_no_effect`. Once a rename may have
+    /// happened, errors remain `outcome_unknown` and this method never retries the write.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn replace_edit(
+        &self,
+        authority: &AuthorityStamp,
+        active: &ActiveBindingUse,
+        permit: super::edit::EditPermit,
+        target: super::edit::CurrentEditTarget,
+        source_ref: &super::edit::EditSourceRef,
+        content: &[u8],
+        continue_before_effect: impl FnOnce() -> bool,
+    ) -> super::edit::EditOutcome {
+        if self.authorize(authority, active).await.is_err() {
+            return super::edit::EditOutcome::StaleSource;
+        }
+        super::edit::replace_if_current(
+            permit,
+            target,
+            source_ref,
+            content,
+            || true,
+            continue_before_effect,
+        )
+    }
+
     /// Captures bounded Git evidence and explicitly registered native source bytes under current authority.
     /// The stored window is always Unverified/Partial: separate Git evidence and native reads are not
     /// one atomic snapshot. Symlinks, unavailable files, truncation, and file ceilings remain explicit

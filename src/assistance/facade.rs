@@ -1,6 +1,6 @@
 //! Bounded MCP discovery, finite Application routing, and fail-open Assistance feedback.
 //!
-//! This module has no peer-domain implementation of its own. It validates the five logical tool
+//! This module has no peer-domain implementation of its own. It validates the six logical tool
 //! inputs, carries trusted host transport context, and honestly reports an unavailable or
 //! incomplete result until Workspace, Intelligence, and Changes return their typed facts.
 
@@ -49,7 +49,7 @@ const MAX_BYTE_OFFSET: u64 = crate::workspace::observation::MAX_SOURCE_BYTES as 
 const MAX_ACTIVATION_ID_BYTES: usize = 128;
 const MAX_HOOK_BYTES: usize = 64 * 1024;
 
-/// Names the only logical MCP methods exposed by Assistance v0.1.
+/// Names the only logical MCP methods exposed by Assistance through v0.2.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum AssistanceTool {
     /// Creates or retries one bounded Workspace activation operation.
@@ -62,6 +62,8 @@ pub enum AssistanceTool {
     Inspect,
     /// Stops the host binding and the expected Workspace authority generation.
     Stop,
+    /// Applies one full-content, stale-safe edit through Changes and Workspace.
+    Edit,
 }
 
 impl AssistanceTool {
@@ -73,6 +75,7 @@ impl AssistanceTool {
             Self::Diff => "ide.diff",
             Self::Inspect => "ide.inspect",
             Self::Stop => "ide.stop",
+            Self::Edit => "ide.edit",
         }
     }
 
@@ -84,6 +87,7 @@ impl AssistanceTool {
             Self::Diff => AssistanceMethod::Diff,
             Self::Inspect => AssistanceMethod::Inspect,
             Self::Stop => AssistanceMethod::Stop,
+            Self::Edit => AssistanceMethod::Edit,
         }
     }
 }
@@ -99,8 +103,8 @@ pub struct ToolSchema {
     pub input_schema: Value,
 }
 
-/// Returns exactly the five current Assistance schemas regardless of daemon availability.
-pub fn tool_schemas() -> [ToolSchema; 5] {
+/// Returns exactly the six current Assistance schemas regardless of daemon availability.
+pub fn tool_schemas() -> [ToolSchema; 6] {
     [
         schema(
             AssistanceTool::Start,
@@ -142,6 +146,19 @@ pub fn tool_schemas() -> [ToolSchema; 5] {
             json!({
                 "type": "object", "additionalProperties": false,
                 "properties": {}
+            }),
+        ),
+        schema(
+            AssistanceTool::Edit,
+            json!({
+                "type": "object", "additionalProperties": false,
+                "required": ["operation_id", "path", "source_ref", "content"],
+                "properties": {
+                    "operation_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES},
+                    "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES},
+                    "content": {"type": "string", "maxLength": crate::workspace::edit::MAX_EDIT_CONTENT_BYTES}
+                }
             }),
         ),
     ]
@@ -193,9 +210,14 @@ pub fn validate_call(
     tool: AssistanceTool,
     mut parameters: Value,
 ) -> Result<ValidatedCall, ParameterError> {
+    let parameter_limit = if tool == AssistanceTool::Edit {
+        crate::changes::edit::MAX_EDIT_ARGUMENT_BYTES
+    } else {
+        MAX_PARAMETER_BYTES
+    };
     if serde_json::to_vec(&parameters)
         .ok()
-        .is_none_or(|value| value.len() > MAX_PARAMETER_BYTES)
+        .is_none_or(|value| value.len() > parameter_limit)
     {
         return Err(ParameterError::InvalidObject);
     }
@@ -208,6 +230,7 @@ pub fn validate_call(
         AssistanceTool::Diff => &["mode", "detail_ref"][..],
         AssistanceTool::Inspect => &["detail_ref"][..],
         AssistanceTool::Stop => &[][..],
+        AssistanceTool::Edit => &["operation_id", "path", "source_ref", "content"][..],
     };
     if object
         .keys()
@@ -248,6 +271,19 @@ pub fn validate_call(
             required_string(object, "detail_ref", MAX_DETAIL_REF_BYTES)?;
         }
         AssistanceTool::Stop => {}
+        AssistanceTool::Edit => {
+            let request = crate::changes::edit::EditRequest::new(
+                required_string(object, "operation_id", 128)?,
+                required_string(object, "path", MAX_RELATIVE_PATH_BYTES)?,
+                required_string(object, "source_ref", MAX_DETAIL_REF_BYTES)?,
+                object
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .ok_or(ParameterError::InvalidField)?,
+            )
+            .map_err(|_| ParameterError::InvalidField)?;
+            parameters = serde_json::to_value(request).map_err(|_| ParameterError::InvalidField)?;
+        }
     }
     if tool == AssistanceTool::Diff {
         parameters
@@ -421,6 +457,11 @@ impl AssistanceFacade {
                         FacadeOutcome::HostStopped
                     }
                     Some(reply @ (PeerReply::Pending { .. } | PeerReply::Error { .. })) => {
+                        FacadeOutcome::Reply(reply)
+                    }
+                    Some(reply @ PeerReply::Edit { .. })
+                        if matches!(tool, AssistanceTool::Edit | AssistanceTool::Inspect) =>
+                    {
                         FacadeOutcome::Reply(reply)
                     }
                     Some(reply @ PeerReply::Complete { kind, .. })
@@ -757,7 +798,7 @@ impl FeedbackLedger {
     }
 }
 
-/// Hosts the static five-tool rmcp surface even when no trusted host attachment exists.
+/// Hosts the static six-tool rmcp surface even when no trusted host attachment exists.
 #[derive(Clone)]
 pub struct StdioFacade {
     /// Connect-only Application endpoint and finite deadline.
@@ -778,7 +819,7 @@ impl StdioFacade {
         }
     }
 
-    /// Creates a disconnected five-tool facade for managed startup failure.
+    /// Creates a disconnected six-tool facade for managed startup failure.
     ///
     /// Discovery remains static and calls validate normally before returning unavailable. The
     /// facade contains neither a host attachment nor an IPC path, so it cannot disclose request
@@ -974,6 +1015,16 @@ impl StdioFacade {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         self.call(AssistanceTool::Stop, parameters, context).await
+    }
+
+    /// Applies one bounded full-content edit only through the active host-bound product route.
+    #[tool(name = "ide.edit", input_schema = tool_schemas()[5].input_schema.as_object().expect("tool schema is an object").clone())]
+    async fn edit(
+        &self,
+        Parameters(parameters): Parameters<Value>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.call(AssistanceTool::Edit, parameters, context).await
     }
 }
 

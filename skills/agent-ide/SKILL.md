@@ -1,12 +1,12 @@
 ---
 name: agent-ide
-description: Use the Agent IDE `ide.*` MCP tools (ide.start, ide.context, ide.diff, ide.inspect, ide.stop) for source implementation, debugging, refactoring, and testing when they are offered or discoverable. Not for read-only exploration, prose, or when `ide.*` is absent.
+description: Use Agent IDE `ide.*` tools, including `ide.edit` when offered, for source implementation, debugging, refactoring, and testing. Native host editing remains a supported fallback.
 ---
 
 # Agent IDE
 
-Agent IDE exposes exactly five bounded MCP tools: `ide.start`, `ide.context`,
-`ide.diff`, `ide.inspect`, `ide.stop`. Use this workflow whenever they are
+Agent IDE exposes five lifecycle tools: `ide.start`, `ide.context`, `ide.diff`,
+`ide.inspect`, `ide.stop`, plus `ide.edit` when the active product surface offers it. Use this workflow whenever they are
 offered and the task implements, debugs, refactors, or writes/fixes source.
 Skip it for read-only exploration, prose, configuration, or when `ide.*` is
 not present — use native host read/write/test tools plus CodeGraph (when
@@ -31,11 +31,18 @@ below. Do not repeat discovery in a loop.
 2. `ide.context` before each relevant edit, using a workspace-relative path.
    Include `byte_offset` when definitions or references are needed; omitting it
    requests complete lexical source context only.
-3. Edit with the native host writer — the model's own file-edit tool (Claude's
-   editor, Codex `apply_patch`, etc.). Agent IDE has no `ide.edit`; the native
-   writer is the only source-mutation path this release supports.
-4. `ide.context` again after the edit, to confirm the change landed and refresh
-   diagnostics against the new bytes.
+3. Prefer `ide.edit` for a supported bounded full-content edit when it is offered
+   and its Context contract is satisfied. Native host editing — the model's own
+   file-edit tool (Claude's editor, Codex `apply_patch`, etc.) — remains available
+   whenever `ide.edit` is inactive, unavailable, unsupported, declined, or uncertain.
+4. After a known `ide.edit` outcome (`created`, `replaced`, `unchanged`), follow
+   its closed diagnostic state: `current_reported` → `ide.edit` with the
+   returned `source_ref`; `current_clean` → `ide.diff`; `unknown` diagnostics
+   → `ide.context`. A pending diagnostic still requires `ide.inspect` with its
+   returned `detail_ref`. An `outcome_unknown` *result* is a different unknown
+   from `unknown` *diagnostics*: the edit's own effect, not just its
+   diagnostics, is unproven, so inspect the named path with native host tools
+   instead — never call `ide.context` to replay it, and never blind-retry.
 5. `ide.diff` before finishing the task, to review the accumulated change.
 6. `ide.inspect` with the returned `detail_ref` whenever a reply is `Pending`
    or reports truncated content. Do not repeat the same call instead.
@@ -67,6 +74,5 @@ search; never block source work waiting for `ide.*` to become available.
 
 ## Boundaries
 
-This skill covers exactly the five current tools listed above. Do not assume
-`ide.edit`, `ide.check`, or `ide.finish` exist — none of them ship in this
-release.
+Do not assume `ide.check` or `ide.finish` exist. Discover whether `ide.edit` is
+offered for this session; its absence never blocks the truthful native fallback.

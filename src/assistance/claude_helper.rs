@@ -16,7 +16,7 @@ use super::claude_worker::{
     HelperResult, HelperSource, LaunchLedger, MAX_HELPER_FRAME_BYTES, MAX_RESULT_TEXT_BYTES,
 };
 use super::host_binding::BindingRef;
-use super::reply::FailureCode;
+use super::reply::{EditDiagnostics, FailureCode};
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
@@ -40,6 +40,8 @@ pub const HELPER_SOCKET: &str = "claude-helper.sock";
 const SESSION_DEADLINE: Duration = Duration::from_secs(120);
 /// Bounds a single frame read before any decoding occurs.
 const MAX_FRAME: u32 = MAX_HELPER_FRAME_BYTES as u32;
+/// Leaves room to reap diagnostics and report a known edit result before its ticket expires.
+const EDIT_SETTLEMENT_RESERVE: Duration = Duration::from_secs(2);
 
 /// One helper's request to claim the operation bound to a handle it was launched for.
 ///
@@ -408,7 +410,7 @@ async fn perform_discovery(
                 HelperQuery::WorktreeListPorcelainZ,
             ),
         ],
-        HelperOperation::Context | HelperOperation::Diff => {
+        HelperOperation::Context | HelperOperation::Diff | HelperOperation::Edit => {
             &[(GitDiscoveryQuery::ShowTopLevel, HelperQuery::ShowTopLevel)]
         }
     };
@@ -516,6 +518,25 @@ async fn perform(
         tokio::time::Instant::now() + Duration::from_millis(job.budgets.deadline_ms.min(300_000));
     let (discovery_outcome, mut children, discovery) = perform_discovery(job, deadline).await;
     if let HelperOutcome::Failed { code } = discovery_outcome {
+        if job.operation == HelperOperation::Edit && children.settled() {
+            let outcome = match code {
+                FailureCode::Deadline => crate::changes::edit::EditOutcome::DeadlineNoEffect,
+                FailureCode::Cancelled => crate::changes::edit::EditOutcome::CancelledNoEffect,
+                _ => crate::changes::edit::EditOutcome::UnavailableBeforeDispatch,
+            };
+            return (
+                HelperOutcome::Complete {
+                    text: format!("edit outcome: {}", outcome.as_str()),
+                },
+                children,
+                discovery,
+                Some(HelperPayload::Edit {
+                    outcome,
+                    source: None,
+                    diagnostics: EditDiagnostics::Unknown {},
+                }),
+            );
+        }
         return failed(code, children.spawned, children.reaped, discovery);
     }
     if job.operation == HelperOperation::Start {
@@ -599,6 +620,16 @@ async fn perform(
             )
             .await
         }
+        HelperOperation::Edit => {
+            edit(
+                job,
+                deadline,
+                worktree,
+                &mut children.spawned,
+                &mut children.reaped,
+            )
+            .await
+        }
         HelperOperation::Start => (
             HelperOutcome::Failed {
                 code: FailureCode::Internal,
@@ -607,6 +638,161 @@ async fn perform(
         ),
     };
     (outcome, children, discovery, payload)
+}
+
+/// Applies one claimed full-content edit and refreshes configured diagnostics after known success.
+///
+/// The helper uses only daemon-selected inherited scope and expected source facts. Deadline is
+/// checked immediately before the descriptor operation. Provider refresh is best-effort after an
+/// exact Workspace post-read, contributes only matching diagnostic evidence to the helper frame,
+/// and cannot change a known filesystem result.
+async fn edit(
+    job: &HelperJob,
+    deadline: tokio::time::Instant,
+    worktree: crate::workspace::authority::WorktreeRef,
+    spawned: &mut u32,
+    reaped: &mut u32,
+) -> (HelperOutcome, Option<HelperPayload>) {
+    use crate::workspace::observation::{
+        ObservationRef, ObservedState, SourceBytes, SourceCoverage, SourceObservation,
+        SourceRevision,
+    };
+    let Some(scope) = job.scope.as_ref() else {
+        return failed_edit(crate::changes::edit::EditOutcome::UnavailableBeforeDispatch);
+    };
+    let Some(expected) = job.edit_source.as_ref() else {
+        return failed_edit(crate::changes::edit::EditOutcome::UnavailableBeforeDispatch);
+    };
+    let Ok(request) =
+        serde_json::from_value::<crate::changes::edit::EditRequest>(job.parameters.clone())
+    else {
+        return failed_edit(crate::changes::edit::EditOutcome::UnavailableBeforeDispatch);
+    };
+    if request.validate().is_err() || request.path != expected.path {
+        return failed_edit(crate::changes::edit::EditOutcome::UnavailableBeforeDispatch);
+    }
+    if tokio::time::Instant::now() >= deadline {
+        return failed_edit(crate::changes::edit::EditOutcome::DeadlineNoEffect);
+    }
+    let expected_bytes = match (expected.present, expected.digest) {
+        (true, Some(digest)) => match SourceBytes::from_reported(digest, expected.length) {
+            Ok(bytes) => Some(bytes),
+            Err(_) => return failed_edit(crate::changes::edit::EditOutcome::UnsafeTarget),
+        },
+        (false, None) if expected.length == 0 => None,
+        _ => return failed_edit(crate::changes::edit::EditOutcome::UnsafeTarget),
+    };
+    let workspace = crate::workspace::edit::replace_inherited_if_current(
+        &worktree,
+        scope.authority_epoch,
+        &request.operation_id,
+        std::path::Path::new(&request.path),
+        expected_bytes,
+        request.content.as_bytes(),
+        || tokio::time::Instant::now() < deadline,
+    );
+    let (outcome, post) = match workspace {
+        crate::workspace::edit::EditOutcome::Created(read) => {
+            (crate::changes::edit::EditOutcome::Created, Some(read))
+        }
+        crate::workspace::edit::EditOutcome::Replaced(read) => {
+            (crate::changes::edit::EditOutcome::Replaced, Some(read))
+        }
+        crate::workspace::edit::EditOutcome::Unchanged(read) => {
+            (crate::changes::edit::EditOutcome::Unchanged, Some(read))
+        }
+        crate::workspace::edit::EditOutcome::StaleSource => {
+            (crate::changes::edit::EditOutcome::StaleSource, None)
+        }
+        crate::workspace::edit::EditOutcome::UnsafeTarget => {
+            (crate::changes::edit::EditOutcome::UnsafeTarget, None)
+        }
+        crate::workspace::edit::EditOutcome::CancelledNoEffect => {
+            (crate::changes::edit::EditOutcome::DeadlineNoEffect, None)
+        }
+        crate::workspace::edit::EditOutcome::DeadlineNoEffect => {
+            (crate::changes::edit::EditOutcome::DeadlineNoEffect, None)
+        }
+        crate::workspace::edit::EditOutcome::CapacityNoEffect => {
+            (crate::changes::edit::EditOutcome::CapacityNoEffect, None)
+        }
+        crate::workspace::edit::EditOutcome::OutcomeUnknown { .. } => {
+            (crate::changes::edit::EditOutcome::OutcomeUnknown, None)
+        }
+    };
+    let mut diagnostics = EditDiagnostics::Unknown {};
+    if let Some(read) = &post {
+        let observation = SourceObservation::new(
+            worktree,
+            scope.authority_epoch,
+            expected.sequence.saturating_add(1),
+            ObservationRef::new("claude-helper-edit").expect("fixed observation reference"),
+            read.path().to_path_buf(),
+            Some(read.bytes().clone()),
+            SourceRevision::new(blake3::hash(read.contents()).to_hex().to_string())
+                .expect("digest revision is bounded"),
+            SourceCoverage::Complete,
+            ObservedState::Present,
+        );
+        if let (Ok(observation), Some(diagnostic_deadline)) =
+            (observation, edit_diagnostic_deadline(deadline))
+        {
+            if let Ok(Some((context, Some(snapshot)))) = provider_context(
+                job,
+                diagnostic_deadline,
+                &observation,
+                read.contents(),
+                crate::intelligence::context::ContextQuery::File,
+                spawned,
+                reaped,
+            )
+            .await
+            {
+                diagnostics = EditDiagnostics::from_snapshot(&context, &snapshot);
+            }
+        }
+    }
+    let source = post.map(|read| HelperSource {
+        path: request.path,
+        present: true,
+        digest: Some(*read.bytes().digest()),
+        length: read.bytes().length(),
+    });
+    (
+        HelperOutcome::Complete {
+            text: format!("edit outcome: {}", outcome.as_str()),
+        },
+        Some(HelperPayload::Edit {
+            outcome,
+            source,
+            diagnostics,
+        }),
+    )
+}
+
+/// Returns the latest deadline a best-effort edit diagnostic refresh may consume.
+///
+/// `None` leaves the completed Workspace effect intact and publishes `unknown` diagnostics so
+/// the helper can settle its receipt and ticket before their shared operation deadline.
+fn edit_diagnostic_deadline(deadline: tokio::time::Instant) -> Option<tokio::time::Instant> {
+    let diagnostic_deadline = deadline.checked_sub(EDIT_SETTLEMENT_RESERVE)?;
+    (diagnostic_deadline > tokio::time::Instant::now()).then_some(diagnostic_deadline)
+}
+
+/// Builds a settled edit payload for a known pre-effect or unavailable helper outcome.
+fn failed_edit(
+    outcome: crate::changes::edit::EditOutcome,
+) -> (HelperOutcome, Option<HelperPayload>) {
+    (
+        HelperOutcome::Complete {
+            text: format!("edit outcome: {}", outcome.as_str()),
+        },
+        Some(HelperPayload::Edit {
+            outcome,
+            source: None,
+            diagnostics: EditDiagnostics::Unknown {},
+        }),
+    )
 }
 
 /// Returns one closed failure while preserving actual child settlement counts and discovery bytes.
@@ -966,8 +1152,8 @@ async fn context(
     (HelperOutcome::Complete { text }, Some(payload))
 }
 
-/// Runs one accepted provider over exact helper-observed bytes, awaits matching Pyright diagnostics
-/// under the helper's inherited deadline, then reaps it before returning.
+/// Runs one accepted provider over exact helper-observed bytes, awaits matching diagnostics under
+/// the helper's inherited deadline, then reaps it before returning.
 async fn provider_context(
     job: &HelperJob,
     deadline: tokio::time::Instant,
@@ -1151,9 +1337,7 @@ async fn provider_context(
         },
         |mut session| async move {
             let context = session.context(source, bytes, query).await?;
-            if matches!(session.settings(), ProviderSettings::Pyright(_)) {
-                session.wait_for_matching_diagnostics().await;
-            }
+            session.wait_for_matching_diagnostics().await;
             let diagnostics = session.diagnostics();
             session.shutdown().await?;
             Ok((context, Some(diagnostics)))
@@ -1466,6 +1650,7 @@ mod tests {
             scope: None,
             baseline: None,
             provider: None,
+            edit_source: None,
             parameters: serde_json::json!({"activation_id": "activate"}),
             budgets: HelperBudgets {
                 output_bytes: 4096,

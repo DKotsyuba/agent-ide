@@ -1,4 +1,4 @@
-//! Contract checks for the bounded five-tool Assistance facade and fail-open feedback core.
+//! Contract checks for the bounded six-tool Assistance facade and fail-open feedback core.
 
 use std::{fs, path::PathBuf};
 
@@ -49,15 +49,16 @@ fn pre_hook() -> agent_ide::assistance::host_binding::HookEvent {
 }
 
 #[test]
-fn discovery_is_static_and_contains_exactly_five_current_methods() {
+fn discovery_is_static_and_contains_exactly_six_current_methods() {
     let schemas = tool_schemas();
-    assert_eq!(schemas.len(), 5);
+    assert_eq!(schemas.len(), 6);
     assert!(schemas.iter().map(|schema| schema.name).eq([
         "ide.start",
         "ide.context",
         "ide.diff",
         "ide.inspect",
-        "ide.stop"
+        "ide.stop",
+        "ide.edit"
     ]));
     assert!(
         schemas
@@ -262,4 +263,31 @@ fn context_paths_offsets_and_diff_modes_are_closed() {
     for mode in [json!("HEAD~1"), json!("arbitrary"), json!(null)] {
         assert!(validate_call(AssistanceTool::Diff, json!({"mode":mode})).is_err());
     }
+}
+
+/// Keeps the edit schema exact and enforces its independent full-content and argument limits.
+#[test]
+fn edit_arguments_are_closed_and_bounded() {
+    let valid = json!({
+        "operation_id":"edit-1",
+        "path":"src/main.rs",
+        "source_ref":"context-1",
+        "content":"fn main() {}\n"
+    });
+    assert!(validate_call(AssistanceTool::Edit, valid.clone()).is_ok());
+    let mut extra = valid.clone();
+    extra["patch"] = json!("@@");
+    assert!(validate_call(AssistanceTool::Edit, extra).is_err());
+    for field in ["operation_id", "path", "source_ref", "content"] {
+        let mut missing = valid.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        assert!(validate_call(AssistanceTool::Edit, missing).is_err());
+    }
+    assert!(
+        validate_call(
+            AssistanceTool::Edit,
+            json!({"operation_id":"edit-2","path":"src/main.rs","source_ref":"context-1","content":"x".repeat(48 * 1024 + 1)})
+        )
+        .is_err()
+    );
 }

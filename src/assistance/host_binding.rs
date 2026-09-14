@@ -466,13 +466,21 @@ impl ObservedSandboxState {
 ///
 /// One guard belongs to one host connection scope. It never silently reactivates a stopped
 /// binding: only `establish_start` creates a generation, while ordinary calls use
-/// `validate_active`. Rejected and completed call evidence is partitioned by channel and scope,
-/// bounded without eviction, and survives ordinary stop/start within this guard.
+/// `validate_active`. Claude Stop may close a generation to all external admission while retaining
+/// cleanup-only consumes until its already-ready Edit receipts settle. Rejected and completed call
+/// evidence is partitioned by channel and scope, bounded without eviction, and survives ordinary
+/// stop/start within this guard.
 #[derive(Debug, Default)]
 pub struct HostBindingGuard {
+    /// Valid pre-hooks awaiting their exact MCP invocation on the same private channel.
     pre_observed: BTreeSet<(CandidateInvocation, ChannelSessionRef)>,
+    /// Validated calls awaiting a terminal native post, bound to their admitted generation.
     settling: BTreeMap<(CandidateInvocation, ChannelSessionRef), BindingRef>,
+    /// Current generation for each host, actor and channel scope.
     bindings: BTreeMap<(HostKind, String, ChannelSessionRef), BindingRef>,
+    /// Bindings closed to external admission but retained for exact stop-time cleanup consumes.
+    stopping: BTreeSet<BindingRef>,
+    /// Last issued nonzero generation; exhaustion refuses a new binding instead of wrapping.
     next_generation: u64,
     /// Coalesced native lifecycle hints, at most one per active binding and no raw tool data.
     native_hints: BTreeSet<BindingRef>,
@@ -591,6 +599,11 @@ impl HostBindingGuard {
         }
         let binding_key = (candidate.host, candidate.actor_id.clone(), channel.clone());
         let (binding, created_binding) = if let Some(existing) = self.bindings.get(&binding_key) {
+            if self.stopping.contains(existing) {
+                self.record_replay(&invocation, ReplayDisposition::Rejected)
+                    .expect("the checked replay scope has capacity");
+                return BindingStatus::Unavailable(BindingUnavailable::InactiveBinding);
+            }
             (existing.clone(), false)
         } else {
             if self.bindings.len() >= MAX_BINDINGS {
@@ -655,6 +668,11 @@ impl HostBindingGuard {
             }
             return BindingStatus::Unavailable(BindingUnavailable::InactiveBinding);
         };
+        if self.stopping.contains(&binding) {
+            self.record_replay(&invocation, ReplayDisposition::Rejected)
+                .expect("the checked replay scope has capacity");
+            return BindingStatus::Unavailable(BindingUnavailable::InactiveBinding);
+        }
         self.settling.insert(invocation, binding.clone());
         BindingStatus::Validated(validated(candidate, binding, false))
     }
@@ -956,7 +974,7 @@ impl HostBindingGuard {
             binding.actor_id.clone(),
             binding.channel.clone(),
         );
-        (self.bindings.get(&key) == Some(binding))
+        (self.bindings.get(&key) == Some(binding) && !self.stopping.contains(binding))
             .then_some(())
             .ok_or(BindingUnavailable::InactiveBinding)
     }
@@ -971,6 +989,44 @@ impl HostBindingGuard {
     ) -> Result<ActiveBindingUse, BindingUnavailable> {
         self.check_active(binding)?;
         Ok(ActiveBindingUse(binding.clone()))
+    }
+
+    /// Closes external admission while retaining only exact cleanup authority for this generation.
+    ///
+    /// After this transition, ordinary validation, helper claims and active consumes fail. The
+    /// caller may use [`Self::consume_stopping`] solely to settle already-ready Edit evidence before
+    /// [`Self::stop_binding`] removes the generation permanently. Repeated or stale transitions are
+    /// rejected and no new generation is created.
+    pub fn begin_stop(&mut self, binding: &BindingRef) -> Result<(), BindingUnavailable> {
+        let key = (
+            binding.host,
+            binding.actor_id.clone(),
+            binding.channel.clone(),
+        );
+        if self.bindings.get(&key) != Some(binding) || !self.stopping.insert(binding.clone()) {
+            return Err(BindingUnavailable::InactiveBinding);
+        }
+        self.native_hints.remove(binding);
+        Ok(())
+    }
+
+    /// Consumes cleanup-only liveness for the exact generation already closed by `begin_stop`.
+    ///
+    /// This cannot admit a helper claim or an ordinary Workspace operation because those routes
+    /// use [`Self::consume_active`], which rejects stopping bindings. The returned transient value
+    /// is valid only for settlement of ready tickets captured by that Stop invocation.
+    pub(crate) fn consume_stopping(
+        &mut self,
+        binding: &BindingRef,
+    ) -> Result<ActiveBindingUse, BindingUnavailable> {
+        let key = (
+            binding.host,
+            binding.actor_id.clone(),
+            binding.channel.clone(),
+        );
+        (self.bindings.get(&key) == Some(binding) && self.stopping.contains(binding))
+            .then(|| ActiveBindingUse(binding.clone()))
+            .ok_or(BindingUnavailable::InactiveBinding)
     }
 
     /// Removes only one just-established generation after its own admission refused it.
@@ -994,6 +1050,7 @@ impl HostBindingGuard {
             return Err(BindingUnavailable::InactiveBinding);
         }
         self.bindings.remove(&key);
+        self.stopping.remove(binding);
         self.native_hints.remove(binding);
         self.settling.retain(|_, owner| owner != binding);
         Ok(())
@@ -1010,6 +1067,7 @@ impl HostBindingGuard {
             return Err(BindingUnavailable::InactiveBinding);
         }
         self.bindings.remove(&key);
+        self.stopping.remove(binding);
         self.native_hints.remove(binding);
         let pending: Vec<_> = self
             .pre_observed
@@ -1040,6 +1098,7 @@ impl HostBindingGuard {
     pub fn stop(&mut self) {
         self.pre_observed.clear();
         self.bindings.clear();
+        self.stopping.clear();
         self.native_hints.clear();
     }
 }
@@ -1589,6 +1648,47 @@ mod tests {
             guard.observe_hook(codex_hook("PreToolUse", "actor", "start"), channel),
             BindingStatus::Unavailable(BindingUnavailable::Replay)
         ));
+    }
+
+    /// Claude Stop closes a concurrently pre-observed Edit while retaining exact cleanup access.
+    #[test]
+    fn claude_stop_closes_concurrent_edit_admission_before_cleanup() {
+        let mut guard = HostBindingGuard::default();
+        let channel = channel("claude-stop-channel");
+        assert!(matches!(
+            guard.observe_hook(claude_pre("actor", None, "start"), channel.clone()),
+            BindingStatus::PreObserved
+        ));
+        let BindingStatus::Validated(started) =
+            guard.establish_start_claude("start", channel.clone())
+        else {
+            panic!("Claude start must validate");
+        };
+        for call in ["edit", "stop"] {
+            assert!(matches!(
+                guard.observe_hook(claude_pre("actor", None, call), channel.clone()),
+                BindingStatus::PreObserved
+            ));
+        }
+        let BindingStatus::Validated(stop) = guard.validate_active_claude("stop", channel.clone())
+        else {
+            panic!("Claude stop must validate");
+        };
+        guard.begin_stop(stop.binding_ref()).unwrap();
+        assert!(matches!(
+            guard.validate_active_claude("edit", channel),
+            BindingStatus::Unavailable(BindingUnavailable::InactiveBinding)
+        ));
+        assert!(guard.consume_active(started.binding_ref()).is_err());
+        assert_eq!(
+            guard
+                .consume_stopping(started.binding_ref())
+                .unwrap()
+                .binding_ref(),
+            started.binding_ref()
+        );
+        guard.stop_binding(started.binding_ref()).unwrap();
+        assert!(guard.consume_stopping(started.binding_ref()).is_err());
     }
 
     /// Rejects mixed and partial host-shaped metadata instead of selecting a convenient parser.

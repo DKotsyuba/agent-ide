@@ -128,6 +128,8 @@ pub enum HelperOperation {
     Context,
     /// Composed comparison evidence for the current Workspace scope.
     Diff,
+    /// One full-content descriptor-safe edit performed only inside the claimed foreground helper.
+    Edit,
 }
 
 /// Names the per-operation exclusive language profile a helper may run.
@@ -373,6 +375,10 @@ pub struct HelperBudgets {
     /// Maximum direct child processes the helper may spawn and must itself reap.
     pub processes: u32,
     /// Total helper lifetime, measured from claim.
+    ///
+    /// [`LaunchLedger::claim`] clamps this to the issuing ticket's own remaining time before its
+    /// absolute `deadline_ms`, so a helper that starts working after a delayed foreground launch
+    /// never computes a fresh full-length deadline that outlives the ticket the daemon will expire.
     pub deadline_ms: u64,
 }
 
@@ -410,6 +416,8 @@ pub struct HelperJob {
     pub baseline: Option<HelperBaseline>,
     /// Per-operation exclusive provider; absent when the operation needs no analyzer.
     pub provider: Option<HelperProvider>,
+    /// Daemon-selected exact pre-edit source facts, present only for Edit.
+    pub edit_source: Option<HelperEditSource>,
     /// Already validated closed method parameters carrying no target, profile or authority data.
     pub parameters: Value,
     /// Finite byte, process and deadline ceilings for this operation.
@@ -443,14 +451,16 @@ impl HelperJob {
                 if self.canonical_root.is_none()
                     && self.scope.is_none()
                     && self.baseline.is_none()
-                    && self.provider.is_none() =>
+                    && self.provider.is_none()
+                    && self.edit_source.is_none() =>
             {
                 Ok(())
             }
             HelperOperation::Context
                 if self.scope.as_ref().is_some_and(|scope| {
                     scope.validate().is_ok() && self.canonical_root.as_ref() == Some(&scope.root)
-                }) && self.baseline.is_none() =>
+                }) && self.baseline.is_none()
+                    && self.edit_source.is_none() =>
             {
                 Ok(())
             }
@@ -461,7 +471,23 @@ impl HelperJob {
                     .baseline
                     .as_ref()
                     .is_some_and(|baseline| baseline.validate().is_ok())
-                    && self.provider.is_none() =>
+                    && self.provider.is_none()
+                    && self.edit_source.is_none() =>
+            {
+                Ok(())
+            }
+            HelperOperation::Edit
+                if self.scope.as_ref().is_some_and(|scope| {
+                    scope.validate().is_ok() && self.canonical_root.as_ref() == Some(&scope.root)
+                }) && self.baseline.is_none()
+                    && self.edit_source.as_ref().is_some_and(|source| {
+                        source.validate().is_ok()
+                            && self.parameters["path"].as_str() == Some(source.path.as_str())
+                    })
+                    && serde_json::from_value::<crate::changes::edit::EditRequest>(
+                        self.parameters.clone(),
+                    )
+                    .is_ok_and(|request| request.validate().is_ok()) =>
             {
                 Ok(())
             }
@@ -607,6 +633,44 @@ pub struct HelperSource {
     pub length: u64,
 }
 
+/// Daemon-selected completed-context facts a helper must match before an Edit effect.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HelperEditSource {
+    /// Exact relative UTF-8 path bound to the source reference.
+    pub path: String,
+    /// Whether the completed context observed a regular file rather than an eligible absence.
+    pub present: bool,
+    /// Exact digest of present pre-edit bytes, absent only for a missing target.
+    pub digest: Option<[u8; 32]>,
+    /// Exact present byte length, or zero for a missing target.
+    pub length: u64,
+    /// Durable Workspace observation ordering value.
+    pub sequence: u64,
+    /// Nonempty bounded Workspace source revision.
+    pub source_revision: String,
+    /// Opaque completed-context observation reference.
+    pub observation_ref: String,
+}
+
+impl HelperEditSource {
+    /// Rejects incomplete, oversized or internally inconsistent source facts before helper launch.
+    pub fn validate(&self) -> Result<(), FailureCode> {
+        (!self.path.is_empty()
+            && self.path.len() <= 1024
+            && self.present == self.digest.is_some()
+            && self.length <= crate::workspace::observation::MAX_SOURCE_BYTES as u64
+            && (self.present || self.length == 0)
+            && self.sequence > 0
+            && !self.source_revision.is_empty()
+            && self.source_revision.len() <= 128
+            && !self.observation_ref.is_empty()
+            && self.observation_ref.len() <= 128)
+            .then_some(())
+            .ok_or(FailureCode::SourceUnavailable)
+    }
+}
+
 /// Adds operation-specific evidence to a completed helper result.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -638,6 +702,19 @@ pub enum HelperPayload {
         /// Whether bounded hunk selection omitted material.
         truncated: bool,
     },
+    /// Typed single-file edit outcome plus exact post-read source facts for known success.
+    Edit {
+        /// Closed Changes outcome derived from the helper's Workspace result.
+        outcome: crate::changes::edit::EditOutcome,
+        /// Exact post-read digest/length for success, absent for no-effect or unknown outcomes.
+        source: Option<HelperSource>,
+        /// Assistance-only diagnostic evidence derived from the exact helper post-read generation.
+        ///
+        /// Helpers cannot retain inspectable detail, so they never carry `Pending`; older frames
+        /// decode conservatively as unknown rather than inventing clean state.
+        #[serde(default)]
+        diagnostics: super::reply::EditDiagnostics,
+    },
 }
 
 impl HelperPayload {
@@ -647,6 +724,7 @@ impl HelperPayload {
             Self::Start { .. } => HelperOperation::Start,
             Self::Context { .. } => HelperOperation::Context,
             Self::Diff { .. } => HelperOperation::Diff,
+            Self::Edit { .. } => HelperOperation::Edit,
         }
     }
 }
@@ -737,6 +815,31 @@ impl HelperResult {
                 || feedback.as_ref().is_some_and(|text| text.len() > 4096))
         {
             return Err(FailureCode::Capacity);
+        }
+        if let Some(HelperPayload::Edit {
+            outcome,
+            source,
+            diagnostics,
+        }) = &self.payload
+        {
+            let success = outcome.has_post_source();
+            if success != source.is_some()
+                || source.as_ref().is_some_and(|source| {
+                    source.path.is_empty()
+                        || source.path.len() > 1024
+                        || !source.present
+                        || source.digest.is_none()
+                        || source.length > crate::workspace::observation::MAX_SOURCE_BYTES as u64
+                })
+            {
+                return Err(FailureCode::Capacity);
+            }
+            if !diagnostics.valid()
+                || matches!(diagnostics, super::reply::EditDiagnostics::Pending { .. })
+                || (!success && !matches!(diagnostics, super::reply::EditDiagnostics::Unknown {}))
+            {
+                return Err(FailureCode::Capacity);
+            }
         }
         Ok(())
     }
@@ -831,6 +934,8 @@ enum TicketState {
     /// never be released on proof. Suppression is a property of [`LaunchLedger::delivery`] and
     /// [`LaunchLedger::settled`], not of destroying the identity.
     Uncertain(ClaimedWork),
+    /// Edit ticket expired before claim, proving the prepared request had zero target effects.
+    ExpiredNoEffect,
 }
 
 /// The correlated state one claimed helper operation accumulates, in either arrival order.
@@ -908,21 +1013,50 @@ impl LaunchTicket {
         )
     }
 
+    /// Returns whether this ticket's claimed work already carries full positive settlement proof:
+    /// the final frame together with a matching successful post and exactly settled children.
+    ///
+    /// This mirrors the exact guard [`LaunchLedger::delivery`] uses to report [`Delivery::Ready`].
+    /// [`LaunchLedger::expire`] consults it so a ticket that reached this proof before its deadline
+    /// is never downgraded to `Uncertain` merely because nobody retrieved it first — that downgrade
+    /// would discard a known outcome for `outcome_unknown` even though the physical work is already
+    /// proven.
+    fn positively_settled(&self) -> bool {
+        matches!(
+            &self.state,
+            TicketState::Claimed(ClaimedWork {
+                frame: Some(frame),
+                post: Some(true),
+                ..
+            }) if frame.children.settled()
+        )
+    }
+
     /// Suppresses this ticket's authority, returning whether it must be retained.
     ///
-    /// Work that provably never ran (`Minted`, `Launched`) is retired and returns `false`: nothing
-    /// physical exists, so dropping it has no effect and cannot be misread as cleanup evidence.
-    /// Claimed work is retained with its correlation intact and returns `true`.
+    /// Work that provably never ran (`Minted`, `Launched`) is normally retired and returns `false`.
+    /// Edit is retained as `ExpiredNoEffect` so its already-prepared Changes receipt can settle
+    /// durably rather than becoming replayable. Claimed work retains its correlation and returns
+    /// `true`.
     ///
     /// Quarantining also releases the bounded lease when the retained work *already* carries
     /// positive settlement proof. Nothing will ever consume that evidence now, so continuing to
     /// hold its capacity would strand a slot on work that is provably finished. Work without such
     /// proof keeps its lease, which is the honest outcome for cleanup that was never observed.
     fn quarantine(&mut self, detail_ref: &str, leases: &mut LeasePool) -> bool {
+        if matches!(
+            self.state,
+            TicketState::Minted | TicketState::Launched { .. }
+        ) && self.job.operation == HelperOperation::Edit
+        {
+            self.state = TicketState::ExpiredNoEffect;
+            return true;
+        }
         let retained = match &self.state {
             TicketState::Minted | TicketState::Launched { .. } => None,
             TicketState::Claimed(work) => Some(Some(work.clone())),
             TicketState::Uncertain(_) => Some(None),
+            TicketState::ExpiredNoEffect => Some(None),
         };
         match retained {
             None => false,
@@ -994,8 +1128,9 @@ impl AcceptedIdentity {
 /// This token is the only thing that may carry helper evidence into the Worker authority path. It
 /// is produced solely by [`LaunchLedger::settled`], which requires, all at once: exact ticket and
 /// binding ownership; the final frame correlated to that exact handle; a matching successful post;
-/// a `Complete` outcome with exactly settled child accounting; verified helper and child executable
-/// identities; and a still-retained admission lease. It deliberately implements neither
+/// a `Complete` outcome with exactly settled child accounting; and verified helper and child
+/// executable identities. Its admission lease may already have been released after positive proof.
+/// It deliberately implements neither
 /// `Deserialize` nor `Default`, and its fields are private with no public constructor, so no amount
 /// of arbitrary `HelperResult` JSON can mint one.
 ///
@@ -1167,6 +1302,10 @@ pub enum Delivery {
     Waiting,
     /// Settlement failed, expired or the launch was denied; the outcome is honest and finite.
     Failed(FailureCode),
+    /// An Edit ticket expired before claim, proving its prepared request had no target effect.
+    DeadlineNoEffect(Box<HelperJob>),
+    /// A claimed Edit lost settlement after an effect became possible.
+    OutcomeUnknown(Box<HelperJob>),
 }
 
 /// Holds the bounded set of outstanding Claude helper tickets for one daemon boot.
@@ -1354,7 +1493,16 @@ impl LaunchLedger {
             post: None,
             lease: true,
         });
-        ClaimOutcome::Granted(Box::new(ticket.job.clone()))
+        // The configured budget was fixed at mint time, before the model's own delay running the
+        // foreground command. Clamping it to the ticket's actual remaining time here — the only
+        // point that shares the mint-time clock with `deadline_ms` — is what keeps the helper's own
+        // diagnostic wait from outliving this exact issued ticket instead of a fresh full window.
+        let mut job = ticket.job.clone();
+        job.budgets.deadline_ms = job
+            .budgets
+            .deadline_ms
+            .min(ticket.deadline_ms.saturating_sub(now_ms));
+        ClaimOutcome::Granted(Box::new(job))
     }
 
     /// Releases the bounded lease exactly once, and only on positive settlement proof.
@@ -1364,9 +1512,9 @@ impl LaunchLedger {
     /// cleanup stays lost instead of being silently reclaimed.
     ///
     /// Callers decide *when* to ask. Quarantined work releases as soon as cleanup proves settled,
-    /// because nothing further will ever consume it. Live claimed work retains its lease through
-    /// settlement so [`Self::settled`] can require it, and releases only when the daemon has
-    /// consumed the resulting token through [`Self::release_settled`].
+    /// because nothing further will ever consume it. Live claimed work retains its lease until the
+    /// daemon consumes its proof or an absolute-deadline sweep releases capacity while retaining
+    /// the known result; [`Self::settled`] validates that proof directly.
     fn release_settled_lease(work: &mut ClaimedWork, detail_ref: &str, leases: &mut LeasePool) {
         if work.lease
             && work.post == Some(true)
@@ -1423,23 +1571,53 @@ impl LaunchLedger {
 
     /// Releases the lease of one live claimed operation whose settled token the daemon consumed.
     ///
-    /// Requires the same positive proof as any other release, plus ownership by `binding`. Returns
-    /// whether a lease was actually released; a second call for the same handle returns `false`, so
-    /// capacity can never be double-credited. Quarantined work is untouched here: it released on
-    /// cleanup proof and has no token to consume.
+    /// Requires the same positive proof as any other release, plus ownership by `binding`. On
+    /// release it retires the fully consumed ticket, freeing both its admission slot and bounded
+    /// ticket capacity. Quarantined work is untouched here: it released on cleanup proof and has
+    /// no token to consume.
     pub fn release_settled(&mut self, detail_ref: &str, binding: [u8; 32]) -> bool {
-        let Some(ticket) = self.tickets.get_mut(detail_ref) else {
-            return false;
+        let released = {
+            let Some(ticket) = self.tickets.get_mut(detail_ref) else {
+                return false;
+            };
+            if ticket.binding.fingerprint() != binding {
+                return false;
+            }
+            let TicketState::Claimed(work) = &mut ticket.state else {
+                return false;
+            };
+            if work.post != Some(true)
+                || !work
+                    .frame
+                    .as_ref()
+                    .is_some_and(|frame| frame.children.settled())
+            {
+                return false;
+            }
+            work.lease = false;
+            true
         };
-        if ticket.binding.fingerprint() != binding {
-            return false;
+        if released {
+            self.leases.release(detail_ref);
+            self.tickets.remove(detail_ref);
         }
-        let TicketState::Claimed(work) = &mut ticket.state else {
-            return false;
-        };
-        let before = self.leases.len();
-        Self::release_settled_lease(work, detail_ref, &mut self.leases);
-        before != self.leases.len()
+        released
+    }
+
+    /// Retires a delivered pre-claim Edit terminal result, freeing its ticket-capacity entry.
+    ///
+    /// Only `ExpiredNoEffect` has proof that no helper was claimed and therefore no physical work
+    /// needs later correlation. Claimed uncertainty remains retained for cleanup-only evidence.
+    pub fn retire_no_effect_edit(&mut self, detail_ref: &str, binding: [u8; 32]) -> bool {
+        let removable = self.tickets.get(detail_ref).is_some_and(|ticket| {
+            ticket.binding.fingerprint() == binding
+                && ticket.job.operation == HelperOperation::Edit
+                && ticket.state == TicketState::ExpiredNoEffect
+        });
+        removable
+            .then(|| self.tickets.remove(detail_ref))
+            .flatten()
+            .is_some()
     }
 
     /// Records the matching `Bash` post-hook for one claimed ticket.
@@ -1487,8 +1665,10 @@ impl LaunchLedger {
     /// supplied binding generation; the ticket is still `Claimed` rather than quarantined; the
     /// retained frame names this exact handle; the outcome is `Complete` with exactly settled child
     /// accounting; the matching post arrived and succeeded; the helper and child executable
-    /// identities are present and well formed; and the admission lease is still retained. Because
-    /// the token has no public constructor and no `Deserialize`, this is the only way one exists.
+    /// identities are present and well formed. The lease may already have been released by an
+    /// absolute-deadline sweep, which preserves known evidence for later retrieval while avoiding
+    /// permanent admission loss. Because the token has no public constructor and no `Deserialize`,
+    /// this is the only way one exists.
     ///
     /// Reads only ledger state: no Git, source, provider or process effect.
     pub fn settled(&self, detail_ref: &str, binding: [u8; 32]) -> Option<SettledClaudeOperation> {
@@ -1499,7 +1679,7 @@ impl LaunchLedger {
         let TicketState::Claimed(work) = &ticket.state else {
             return None;
         };
-        if !work.lease || work.post != Some(true) {
+        if work.post != Some(true) {
             return None;
         }
         let frame = work.frame.as_ref()?;
@@ -1530,6 +1710,9 @@ impl LaunchLedger {
         match &ticket.state {
             // Quarantine is unconditional and permanent: a late cleanup frame or post may still be
             // recorded against retained identity, but it can never produce a visible result.
+            TicketState::Uncertain(_) if ticket.job.operation == HelperOperation::Edit => {
+                Delivery::OutcomeUnknown(Box::new(ticket.job.clone()))
+            }
             TicketState::Uncertain(_) => Delivery::Failed(FailureCode::Deadline),
             // Delivery re-checks settlement rather than trusting that the frame was validated on
             // the way in: a completed result requires exact settled child accounting *and* the
@@ -1546,22 +1729,39 @@ impl LaunchLedger {
             }) => Delivery::Failed(FailureCode::Deadline),
             TicketState::Claimed(ClaimedWork {
                 post: Some(false), ..
+            }) if ticket.job.operation == HelperOperation::Edit => {
+                Delivery::OutcomeUnknown(Box::new(ticket.job.clone()))
+            }
+            TicketState::Claimed(ClaimedWork {
+                post: Some(false), ..
             }) => Delivery::Failed(FailureCode::Cancelled),
             TicketState::Claimed(_) => Delivery::Waiting,
             TicketState::Minted | TicketState::Launched { .. } => Delivery::Waiting,
+            TicketState::ExpiredNoEffect => {
+                Delivery::DeadlineNoEffect(Box::new(ticket.job.clone()))
+            }
         }
     }
 
     /// Expires overdue tickets, distinguishing a launch that never happened from claimed work.
     ///
-    /// An unclaimed ticket is dropped with no effect at all: nothing ran, so nothing must be
-    /// cleaned up or reported. A claimed ticket that never settled becomes
-    /// `TicketState::Uncertain` and is retained, so its admission stays quarantined instead of
-    /// being silently reused.
+    /// An unclaimed non-Edit ticket is dropped: nothing ran. An unclaimed Edit is retained as
+    /// `ExpiredNoEffect` so retrieval durably settles `deadline_no_effect`. A claimed ticket that
+    /// never settled becomes `TicketState::Uncertain`; claimed Edit retrieval reports
+    /// `outcome_unknown`, and its admission stays quarantined instead of being silently reused. A
+    /// claimed ticket whose final frame and matching successful post already arrived before the
+    /// sweep retains its proven result but releases its bounded lease, so an uninspected success
+    /// cannot occupy shared execution capacity forever.
     pub fn expire(&mut self, now_ms: u64) {
         let leases = &mut self.leases;
         self.tickets.retain(|reference, ticket| {
             if now_ms < ticket.deadline_ms {
+                return true;
+            }
+            if ticket.positively_settled() {
+                if let TicketState::Claimed(work) = &mut ticket.state {
+                    LaunchLedger::release_settled_lease(work, reference, leases);
+                }
                 return true;
             }
             ticket.quarantine(reference, leases)
@@ -1570,10 +1770,11 @@ impl LaunchLedger {
 
     /// Retires unclaimed work and quarantines claimed work for one revoked binding generation.
     ///
-    /// Stop revokes durable authority first; a ticket for a revoked generation can no longer be
-    /// claimed, so a late helper is rejected rather than being allowed to run against stale
-    /// authority. Only work that provably never ran is retired: a `Minted` or `Launched` ticket had
-    /// no claim, so nothing physical exists to settle and dropping it has no effect.
+    /// Stop closes binding admission before calling this method; a ticket for that generation can
+    /// no longer be claimed, so a late helper is rejected rather than being allowed to run against
+    /// stale authority. The caller first extracts ready Edits for known receipt settlement. Only
+    /// remaining work that provably never ran is retired: a `Minted` or `Launched` ticket had no
+    /// claim, so nothing physical exists to settle and dropping it has no effect.
     ///
     /// Claimed work is *not* deleted, and its claimed identity is *not* discarded. A claimed,
     /// disconnected, expired or unsettled ticket keeps its `tool_use_id`, frame slot and lease and
@@ -1582,14 +1783,39 @@ impl LaunchLedger {
     /// was the previous defect: it made the documented late cleanup impossible to correlate and
     /// left the bounded lease unreleasable. Authority never returns, because [`Self::claim`] admits
     /// `Launched` alone and both [`Self::delivery`] and [`Self::settled`] refuse quarantined work.
-    pub fn revoke(&mut self, binding: [u8; 32]) {
+    /// Returned Edit terminals let the Worker settle already-prepared receipts as no-effect or
+    /// unknown even after the binding itself has been stopped.
+    pub fn revoke(
+        &mut self,
+        binding: [u8; 32],
+    ) -> Vec<(String, HelperJob, crate::changes::edit::EditOutcome)> {
         let leases = &mut self.leases;
+        let mut terminals = Vec::new();
         self.tickets.retain(|reference, ticket| {
             if ticket.binding.fingerprint() != binding {
                 return true;
             }
+            let terminal = match ticket.state {
+                TicketState::Minted
+                | TicketState::Launched { .. }
+                | TicketState::ExpiredNoEffect
+                    if ticket.job.operation == HelperOperation::Edit =>
+                {
+                    Some(crate::changes::edit::EditOutcome::DeadlineNoEffect)
+                }
+                TicketState::Claimed(_) | TicketState::Uncertain(_)
+                    if ticket.job.operation == HelperOperation::Edit =>
+                {
+                    Some(crate::changes::edit::EditOutcome::OutcomeUnknown)
+                }
+                _ => None,
+            };
+            if let Some(outcome) = terminal {
+                terminals.push((reference.clone(), ticket.job.clone(), outcome));
+            }
             ticket.quarantine(reference, leases)
         });
+        terminals
     }
 
     /// Returns whether one handle exists and belongs to the supplied binding generation.
@@ -1600,6 +1826,24 @@ impl LaunchLedger {
         self.tickets
             .get(detail_ref)
             .is_some_and(|ticket| ticket.binding.fingerprint() == binding)
+    }
+
+    /// Returns ready Edit handles still owned by `binding` for stop-time receipt settlement.
+    ///
+    /// The caller has already closed binding admission, removing every claim path. These handles
+    /// are already claimed and positively proven, so completing their prepared receipts is cleanup
+    /// only and cannot start new helper work. The caller extracts them and revokes all remaining
+    /// tickets under the same ledger lock, preventing a late settlement from falling between steps.
+    pub fn ready_edit_references(&self, binding: [u8; 32]) -> Vec<String> {
+        self.tickets
+            .iter()
+            .filter(|(_, ticket)| {
+                ticket.binding.fingerprint() == binding
+                    && ticket.job.operation == HelperOperation::Edit
+                    && ticket.positively_settled()
+            })
+            .map(|(reference, _)| reference.clone())
+            .collect()
     }
 
     /// Returns the number of outstanding tickets for bounded-capacity assertions.
@@ -1673,6 +1917,7 @@ mod tests {
                 trust: "fixture".into(),
                 cache_namespace: "/private/tmp/ns-1".into(),
             }),
+            edit_source: None,
             parameters: serde_json::json!({"query": "x"}),
             budgets: HelperBudgets {
                 output_bytes: 4096,
@@ -1680,6 +1925,36 @@ mod tests {
                 deadline_ms: 30_000,
             },
         }
+    }
+
+    /// Builds one valid daemon-selected Edit job over the fixture scope and expected source bytes.
+    fn edit_job() -> HelperJob {
+        let mut job = job();
+        job.operation = HelperOperation::Edit;
+        job.provider = None;
+        job.edit_source = Some(HelperEditSource {
+            path: "main.rs".into(),
+            present: true,
+            digest: Some(*blake3::hash(b"old").as_bytes()),
+            length: 3,
+            sequence: 1,
+            source_revision: "revision".into(),
+            observation_ref: "context".into(),
+        });
+        job.parameters = serde_json::json!({
+            "operation_id":"edit-operation",
+            "path":"main.rs",
+            "source_ref":"context",
+            "content":"new"
+        });
+        job
+    }
+
+    /// Mints an Edit ticket in the same closed ledger used by lifecycle settlement tests.
+    fn edit_ledger() -> (LaunchLedger, String, HelperActor) {
+        let (mut ledger, reference, actor) = ledger();
+        ledger.tickets.get_mut(&reference).unwrap().job = edit_job();
+        (ledger, reference, actor)
     }
 
     /// Mints one ticket on a fixed binding/actor/channel with the fixed helper command.
@@ -2045,6 +2320,211 @@ mod tests {
         );
     }
 
+    /// Edit expiry is typed: unclaimed proves no effect, while claimed can only be unknown.
+    #[test]
+    fn edit_expiry_distinguishes_unclaimed_no_effect_from_claimed_unknown() {
+        let (mut ledger, reference, _) = edit_ledger();
+        ledger.expire(1000);
+        assert!(matches!(
+            ledger.delivery(&reference),
+            Delivery::DeadlineNoEffect(job) if job.operation == HelperOperation::Edit
+        ));
+        assert!(ledger.retire_no_effect_edit(&reference, binding_fixture().fingerprint()));
+        assert!(
+            ledger.is_empty(),
+            "delivered no-effect edits free ticket capacity"
+        );
+
+        let (mut ledger, reference, actor) = edit_ledger();
+        let command = LaunchLedger::helper_command(
+            std::path::Path::new("/usr/local/bin/agent-ide"),
+            std::path::Path::new("/private/tmp/rt"),
+            "attach",
+            "detail-1",
+        );
+        assert_eq!(
+            ledger.recognize(&command, false, "edit-call", &actor, 0),
+            LaunchRecognition::Recognized
+        );
+        assert!(matches!(
+            ledger.claim(&reference, "channel", 0, live),
+            ClaimOutcome::Granted(_)
+        ));
+        ledger.expire(1000);
+        assert!(matches!(
+            ledger.delivery(&reference),
+            Delivery::OutcomeUnknown(job) if job.operation == HelperOperation::Edit
+        ));
+    }
+
+    /// A claim clamps the granted job's budget to the ticket's own remaining time.
+    ///
+    /// The fixture ticket carries a 1000ms absolute deadline and a 30_000ms configured budget. A
+    /// delayed foreground launch that only claims at 700ms leaves 300ms actually remaining; the
+    /// helper must receive that shrunk figure, never the full configured window, or its own
+    /// diagnostic wait could outlive the ticket the daemon will expire.
+    #[test]
+    fn delayed_claim_clamps_the_granted_budget_to_the_tickets_remaining_time() {
+        let (mut ledger, reference, actor) = ledger();
+        let command = LaunchLedger::helper_command(
+            std::path::Path::new("/usr/local/bin/agent-ide"),
+            std::path::Path::new("/private/tmp/rt"),
+            "attach",
+            "detail-1",
+        );
+        assert_eq!(
+            ledger.recognize(&command, false, "call", &actor, 700),
+            LaunchRecognition::Recognized
+        );
+        let ClaimOutcome::Granted(granted) = ledger.claim(&reference, "channel", 700, live) else {
+            panic!("a live claim before the ticket's own deadline must be granted");
+        };
+        assert_eq!(
+            job().budgets.deadline_ms,
+            30_000,
+            "fixture budget is unclamped"
+        );
+        assert_eq!(granted.budgets.deadline_ms, 300);
+    }
+
+    /// A ready frame that arrives before the deadline survives the same sweep that expires it.
+    ///
+    /// Both settlement halves and exact child accounting already prove the operation's outcome;
+    /// nothing about crossing the deadline afterward makes that proof less true.
+    #[test]
+    fn ready_frame_crossing_its_deadline_survives_the_expiry_sweep() {
+        let (mut ledger, reference) = claimed();
+        assert_eq!(ledger.settle_frame(completed(1, 1)), Ok(()));
+        assert_eq!(ledger.settle_post("call", true), Ok(()));
+        ledger.expire(1000);
+        assert!(matches!(
+            ledger.delivery(&reference),
+            Delivery::Ready(frame) if frame.children.settled()
+        ));
+        assert_eq!(
+            ledger.len(),
+            1,
+            "a proven result remains retrievable after its lease is released"
+        );
+        assert_eq!(
+            ledger.active_claims(),
+            0,
+            "known work cannot pin capacity forever"
+        );
+        assert!(
+            ledger
+                .settled(&reference, binding_fixture().fingerprint())
+                .is_some(),
+            "lease release preserves the known result for bounded later consumption"
+        );
+    }
+
+    /// A ready Edit frame crossing its deadline reports its known outcome, not `outcome_unknown`.
+    ///
+    /// This is the Edit-specific case the daemon must get right: the same expiry sweep that types
+    /// unsettled claimed Edit work as `outcome_unknown` must not apply that same downgrade to Edit
+    /// work whose frame and post already proved a concrete outcome.
+    #[test]
+    fn ready_edit_frame_crossing_its_deadline_reports_the_known_outcome() {
+        let (mut ledger, reference, actor) = edit_ledger();
+        let command = LaunchLedger::helper_command(
+            std::path::Path::new("/usr/local/bin/agent-ide"),
+            std::path::Path::new("/private/tmp/rt"),
+            "attach",
+            "detail-1",
+        );
+        assert_eq!(
+            ledger.recognize(&command, false, "edit-call", &actor, 0),
+            LaunchRecognition::Recognized
+        );
+        assert!(matches!(
+            ledger.claim(&reference, "channel", 0, live),
+            ClaimOutcome::Granted(_)
+        ));
+        assert_eq!(
+            ledger.settle_frame(HelperResult {
+                protocol: HELPER_PROTOCOL,
+                detail_ref: reference.clone(),
+                outcome: HelperOutcome::Complete {
+                    text: "replaced".into(),
+                },
+                children: ChildSettlement {
+                    spawned: 1,
+                    reaped: 1,
+                },
+                discovery: Vec::new(),
+                payload: Some(HelperPayload::Edit {
+                    outcome: crate::changes::edit::EditOutcome::Replaced,
+                    source: Some(HelperSource {
+                        path: "main.rs".into(),
+                        present: true,
+                        digest: Some(*blake3::hash(b"new").as_bytes()),
+                        length: 3,
+                    }),
+                    diagnostics: crate::assistance::reply::EditDiagnostics::Unknown {},
+                }),
+            }),
+            Ok(())
+        );
+        assert_eq!(ledger.settle_post("edit-call", true), Ok(()));
+        ledger.expire(1000);
+        assert!(matches!(
+            ledger.delivery(&reference),
+            Delivery::Ready(frame)
+                if frame.children.settled()
+                    && matches!(frame.outcome, HelperOutcome::Complete { .. })
+        ));
+    }
+
+    /// Stop extracts a fully proven Edit before revocation and releases its ticket and lease.
+    #[test]
+    fn stop_drains_ready_edit_without_ticket_or_lease_capacity_loss() {
+        let (mut ledger, reference, actor) = edit_ledger();
+        let command = LaunchLedger::helper_command(
+            std::path::Path::new("/usr/local/bin/agent-ide"),
+            std::path::Path::new("/private/tmp/rt"),
+            "attach",
+            "detail-1",
+        );
+        assert_eq!(
+            ledger.recognize(&command, false, "edit-call", &actor, 0),
+            LaunchRecognition::Recognized
+        );
+        assert!(matches!(
+            ledger.claim(&reference, "channel", 0, live),
+            ClaimOutcome::Granted(_)
+        ));
+        assert_eq!(ledger.settle_frame(completed_edit()), Ok(()));
+        assert_eq!(ledger.settle_post("edit-call", true), Ok(()));
+        assert_eq!(
+            ledger.ready_edit_references(binding_fixture().fingerprint()),
+            vec![reference.clone()]
+        );
+        assert!(matches!(ledger.delivery(&reference), Delivery::Ready(_)));
+        let settled = ledger
+            .settled(&reference, binding_fixture().fingerprint())
+            .expect("Stop captures the known result before revocation");
+        assert!(ledger.release_settled(&reference, binding_fixture().fingerprint()));
+        assert_eq!(
+            settled.result().payload.as_ref().unwrap().operation(),
+            HelperOperation::Edit
+        );
+        assert!(ledger.revoke(binding_fixture().fingerprint()).is_empty());
+        assert_eq!(ledger.active_claims(), 0);
+        assert!(ledger.is_empty());
+    }
+
+    /// Proves a daemon-consumed successful helper releases both its shared lease and ticket slot.
+    #[test]
+    fn consumed_settlement_releases_ticket_capacity() {
+        let (mut ledger, reference) = claimed();
+        assert_eq!(ledger.settle_frame(completed(1, 1)), Ok(()));
+        assert_eq!(ledger.settle_post("call", true), Ok(()));
+        assert!(ledger.release_settled(&reference, binding_fixture().fingerprint()));
+        assert_eq!(ledger.active_claims(), 0);
+        assert!(ledger.is_empty());
+    }
+
     /// Both settlement halves are required, and either arrival order reaches the same result.
     #[test]
     fn result_is_visible_only_after_frame_and_successful_post_in_either_order() {
@@ -2194,6 +2674,32 @@ mod tests {
             children: ChildSettlement { spawned, reaped },
             discovery: Vec::new(),
             payload: Some(context_payload()),
+        }
+    }
+
+    /// Returns one valid successful Edit frame for a ticket named `detail-1`.
+    fn completed_edit() -> HelperResult {
+        HelperResult {
+            protocol: HELPER_PROTOCOL,
+            detail_ref: "detail-1".into(),
+            outcome: HelperOutcome::Complete {
+                text: "replaced".into(),
+            },
+            children: ChildSettlement {
+                spawned: 1,
+                reaped: 1,
+            },
+            discovery: Vec::new(),
+            payload: Some(HelperPayload::Edit {
+                outcome: crate::changes::edit::EditOutcome::Replaced,
+                source: Some(HelperSource {
+                    path: "main.rs".into(),
+                    present: true,
+                    digest: Some(*blake3::hash(b"new").as_bytes()),
+                    length: 3,
+                }),
+                diagnostics: crate::assistance::reply::EditDiagnostics::Unknown {},
+            }),
         }
     }
 
@@ -2457,6 +2963,20 @@ mod tests {
             ledger.claim(&reference, "channel", 0, live),
             ClaimOutcome::Rejected(FailureCode::InvalidDetail)
         );
+    }
+
+    /// Proves stop emits a durable no-effect terminal for an unclaimed prepared Edit ticket.
+    #[test]
+    fn revocation_emits_and_releases_unclaimed_edit_terminal() {
+        let (mut ledger, reference, _) = edit_ledger();
+        let terminals = ledger.revoke(binding_fixture().fingerprint());
+        assert!(matches!(
+            terminals.as_slice(),
+            [(_, job, crate::changes::edit::EditOutcome::DeadlineNoEffect)]
+                if job.operation == HelperOperation::Edit
+        ));
+        assert!(ledger.retire_no_effect_edit(&reference, binding_fixture().fingerprint()));
+        assert!(ledger.is_empty());
     }
 
     /// Ticket admission is bounded and duplicate handles are refused rather than overwritten.

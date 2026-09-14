@@ -310,9 +310,9 @@ fn fail(error: AppError) -> ExitCode {
 enum Command {
     /// Serves health and finite Assistance dispatch until interrupted or killed.
     Daemon { runtime_dir: PathBuf },
-    /// Serves the static five-tool MCP surface on stdio without creating local runtime state.
+    /// Serves the static six-tool MCP surface on stdio without creating local runtime state.
     Mcp { runtime_dir: PathBuf },
-    /// Owns one private daemon and serves the same static five-tool surface until stdio ends.
+    /// Owns one private daemon and serves the same static six-tool surface until stdio ends.
     ManagedMcp {
         /// Absolute one-target launcher template rebound to this process and captured candidate.
         launcher_template: PathBuf,
@@ -843,7 +843,7 @@ async fn run_managed_claude_hook(project: Option<OsString>) {
 
 /// Starts, health-checks, serves, and tears down one self-contained managed MCP generation.
 ///
-/// Setup failure still serves the static five tools through a connect-only unavailable facade.
+/// Setup failure still serves the static six tools through a connect-only unavailable facade.
 /// Successful setup binds one captured local candidate to one random attachment, starts exactly
 /// one daemon child, and tears it down on stdio EOF, MCP cancellation, SIGINT, or SIGTERM.
 async fn run_managed_mcp(

@@ -28,3 +28,6 @@ pub mod reply;
 
 /// Runs one bounded daemon-owned job/detail worker with durable authority gates.
 pub mod worker;
+
+/// Replaceable nonblocking sink for privacy-safe edit and native-fallback facts.
+pub mod telemetry;

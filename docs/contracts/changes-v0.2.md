@@ -4,7 +4,7 @@ Revision: EDIT-r1 (proposed; extends [Changes v0.1](changes-v0.1.md)). Provider:
 
 ## Canonical request and durable settlement
 
-The entire `ide.edit` request is exactly `operation_id`, relative UTF-8 `path`, same-binding completed-context `source_ref`, and full UTF-8 `content`. There are no optional fields, patch syntax, rename, multi-file journal, shell, `check`, or `finish` operation. Content is at most 48 KiB and the canonical serialized edit arguments are at most 56 KiB; enclosing MCP/IPC limits remain independent and may refuse an otherwise valid request.
+The entire `ide.edit` request is exactly `operation_id`, relative UTF-8 `path`, same-binding `source_ref`, and full UTF-8 `content`. `source_ref` names either a completed `ide.context` or a prior successful `ide.edit` (`created`, `replaced`, or `unchanged`) for the exact same path within this binding; either chains the identical post-read source binding, so a successful edit needs no context round trip before the next one. There are no optional fields, patch syntax, rename, multi-file journal, shell, `check`, or `finish` operation. Content is at most 48 KiB and the canonical serialized edit arguments are at most 56 KiB; enclosing MCP/IPC limits remain independent and may refuse an otherwise valid request.
 
 Changes owns the `Prepared` and settled durable one-file receipt, duplicate/recovery semantics, orchestration, and public effects result. A receipt stores the canonical request fingerprint, target path, prepared/settled state, and exact settled outcome. It first prepares durably, obtains Workspace's one-use permit, and settles the receipt only from Workspace's typed result. Application provides transaction/receipt mechanics only; it does not decide edit semantics or filesystem effects.
 

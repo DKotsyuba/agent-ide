@@ -322,7 +322,7 @@ pub struct ProviderCapabilities {
     pub server_info: Option<lsp::ServerInfo>,
 }
 
-/// Bounded diagnostic evidence; push-only results always retain unknown readiness.
+/// Bounded diagnostic evidence correlated to the latest synchronized provider document.
 #[derive(Clone, Debug)]
 pub struct DiagnosticSnapshot {
     /// Exact synchronized source binding, absent for unversioned provider pushes.
@@ -331,9 +331,9 @@ pub struct DiagnosticSnapshot {
     pub generation: ViewGeneration,
     /// Provider's published document version; absent means uncorrelated push.
     pub document_version: Option<i32>,
-    /// Provisional for matching pushes, unknown for absence/invalidation; never clean by inference.
+    /// Provisional for matching pushes, unknown for absence/invalidation; silence never implies clean.
     pub freshness: Freshness,
-    /// No pull/barrier proof is implemented, so this remains `Unknown`.
+    /// `Clean` or `Reported` only after a matching versioned provider notification.
     pub readiness: DiagnosticReadiness,
     /// At most 128 diagnostics from one accepted provider push.
     pub diagnostics: Vec<lsp::Diagnostic>,
@@ -638,7 +638,7 @@ impl Session {
         &self.settings
     }
 
-    /// Returns only the latest exact Rust status barrier; gopls and diagnostic cleanliness remain unknown.
+    /// Returns only the latest exact Rust status barrier; it is separate from document diagnostics.
     pub fn provider_readiness(&self) -> ProviderReadiness {
         *self.state.lock().expect("session lock").readiness.borrow()
     }
@@ -653,8 +653,8 @@ impl Session {
         self.state.lock().expect("session lock").diagnostics.clone()
     }
 
-    /// Waits under the current request deadline for the current Pyright document's first versioned
-    /// diagnostic push. A timeout deliberately leaves diagnostic evidence unknown and does not
+    /// Waits under the current request deadline for the current document's first versioned
+    /// diagnostic result. A timeout deliberately leaves diagnostic evidence unknown and does not
     /// affect already-computed semantic context.
     pub(crate) async fn wait_for_matching_diagnostics(&self) {
         let _ = wait_for_matching_diagnostics(&self.state, self.exchange_deadline()).await;
@@ -978,10 +978,10 @@ impl Session {
     }
 }
 
-/// Waits for the current document's exact versioned diagnostic snapshot without treating a push as
-/// clean readiness. The revision subscription is installed before the snapshot check, so accepted
-/// callback updates cannot be lost between checking state and waiting; deadline or stale pushes
-/// return `false` without changing session state.
+/// Waits for the current document's exact versioned diagnostic snapshot without treating silence
+/// as clean readiness. The revision subscription is installed before the snapshot check, so
+/// accepted callback updates cannot be lost between checking state and waiting; deadline or stale
+/// pushes return `false` without changing session state.
 async fn wait_for_matching_diagnostics(state: &Arc<Mutex<State>>, deadline: Instant) -> bool {
     let (source, version, mut revisions) = {
         let state = state.lock().expect("session lock");
@@ -1105,9 +1105,19 @@ fn client_router(state: Arc<Mutex<State>>) -> Router<Arc<Mutex<State>>> {
         }
         let binding = params.version.map(|_| document.source.clone());
         let document_version = document.version;
+        let readiness = if params.version == Some(document_version) {
+            if params.diagnostics.is_empty() {
+                DiagnosticReadiness::Clean
+            } else {
+                DiagnosticReadiness::Reported
+            }
+        } else {
+            DiagnosticReadiness::Unknown
+        };
         state.diagnostics.source = binding;
         state.diagnostics.document_version = params.version;
         state.diagnostics.freshness = Freshness::Provisional;
+        state.diagnostics.readiness = readiness;
         state.diagnostics.truncated = params.diagnostics.len() > MAX_CONTEXT_ITEMS;
         state.diagnostics.diagnostics = params
             .diagnostics

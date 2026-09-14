@@ -264,6 +264,7 @@ async fn binary_discovery_is_static_and_inactive_calls_are_fail_open() {
         [
             "ide.context",
             "ide.diff",
+            "ide.edit",
             "ide.inspect",
             "ide.start",
             "ide.stop"
@@ -306,7 +307,7 @@ async fn binary_discovery_is_static_and_inactive_calls_are_fail_open() {
     assert!(!runtime.exists());
 }
 
-/// Managed startup failure remains a disconnected static five-tool MCP with bounded fallback calls.
+/// Managed startup failure remains a disconnected static six-tool MCP with bounded fallback calls.
 #[tokio::test]
 async fn managed_startup_failure_serves_exact_static_tools_without_ipc() {
     let candidate = std::env::current_dir().unwrap();
@@ -330,6 +331,7 @@ async fn managed_startup_failure_serves_exact_static_tools_without_ipc() {
         [
             "ide.context",
             "ide.diff",
+            "ide.edit",
             "ide.inspect",
             "ide.start",
             "ide.stop"
@@ -352,9 +354,9 @@ async fn managed_startup_failure_serves_exact_static_tools_without_ipc() {
     mcp.close().await;
 }
 
-/// Proves all five shipping handlers reach the real daemon only after separated launcher and request ingress.
+/// Proves all six shipping handlers reach the real daemon only after separated launcher and request ingress.
 #[tokio::test]
-async fn binary_routes_five_methods_to_typed_missing_peer_and_survives_daemon_loss() {
+async fn binary_routes_six_methods_to_typed_missing_peer_and_survives_daemon_loss() {
     let runtime = runtime();
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
         .args(["daemon", "--runtime-dir"])
@@ -402,6 +404,10 @@ async fn binary_routes_five_methods_to_typed_missing_peer_and_survives_daemon_lo
         ("ide.diff", json!({})),
         ("ide.inspect", json!({"detail_ref":"detail"})),
         ("ide.stop", json!({})),
+        (
+            "ide.edit",
+            json!({"operation_id":"op","path":"src/main.rs","source_ref":"detail","content":"new"}),
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -1642,6 +1648,30 @@ async fn managed_codex_smoke_and_eof_cleanup() {
     let original = settle_managed(&mut mcp, &mut next, actor, &state, original).await;
     assert!(original["text"].as_str().unwrap().contains("worktree"));
 
+    next += 1;
+    let edited = managed_call(
+        &mut mcp,
+        next,
+        actor,
+        "ide.edit",
+        json!({
+            "operation_id":"managed-edit-1",
+            "path":"tracked.txt",
+            "source_ref":original["detail_ref"],
+            "content":"managed-ide-edit\n"
+        }),
+        &state,
+    )
+    .await;
+    let edited = settle_managed(&mut mcp, &mut next, actor, &state, edited).await;
+    assert_eq!(edited["state"], "edit", "{edited}");
+    assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+    assert_eq!(
+        std::fs::read(fixture.root.join("tracked.txt")).unwrap(),
+        b"managed-ide-edit\n"
+    );
+
+    // Preferred edit never disables the native fallback; a native writer remains independently usable.
     std::fs::write(fixture.root.join("tracked.txt"), "managed-native-edit\n").unwrap();
     next += 1;
     let refreshed = managed_call(
@@ -4116,7 +4146,8 @@ async fn diff_oversized_single_hunk_reports_capacity_without_false_continuation(
 /// Drives one real foreground Claude helper launch end to end: `ide.start` returns the exact
 /// helper instruction, a native Bash pre-hook arms it, the fixed helper subcommand runs as a real
 /// process and claims it over the private socket, a matching Bash post-hook settles it, and
-/// `ide.inspect` is the only route that ever publishes a durable Workspace row from that evidence.
+/// `ide.inspect` publishes ordinary results, while Stop consumes an already-ready Edit result
+/// without losing its known replacement outcome.
 ///
 /// The accepted `claude_profile` here is the fixture's test-only disabled launcher wiring proof,
 /// not a real host sandbox measurement: it only proves the daemon→hook→helper→daemon correlation
@@ -4124,11 +4155,14 @@ async fn diff_oversized_single_hunk_reports_capacity_without_false_continuation(
 /// helper.
 #[tokio::test]
 async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor_then_stops() {
-    /// Runs one complete Claude `ide.start` round trip: mint, arm, real helper process, settle.
-    async fn claude_start(actor: &mut ProductActor, fixture: &ProductFixture) -> Value {
-        let pending = actor
-            .call_claude(fixture, "ide.start", json!({"activation_id":"start"}))
-            .await;
+    /// Runs one complete Claude helper round trip: mint, arm, real process, post, and inspect.
+    async fn claude_operation(
+        actor: &mut ProductActor,
+        fixture: &ProductFixture,
+        name: &str,
+        arguments: Value,
+    ) -> Value {
+        let pending = actor.call_claude(fixture, name, arguments).await;
         assert_eq!(pending["state"], "pending", "{pending}");
         let detail_ref = pending["detail_ref"].as_str().unwrap().to_owned();
         let helper = pending["helper"].as_str().unwrap().to_owned();
@@ -4208,7 +4242,13 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
     let mut daemon = fixture.daemon().await;
     let mut first = ProductActor::new(&fixture, "claude-first").await;
 
-    let started = claude_start(&mut first, &fixture).await;
+    let started = claude_operation(
+        &mut first,
+        &fixture,
+        "ide.start",
+        json!({"activation_id":"start"}),
+    )
+    .await;
     assert_eq!(started["kind"], "activation", "{started}");
     let detail_ref = started["detail_ref"].as_str().unwrap().to_owned();
     let database = rusqlite::Connection::open(fixture.runtime.join("state.sqlite")).unwrap();
@@ -4225,7 +4265,13 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
 
     // Re-running the exact same activation end to end is idempotent: the already-durable
     // Workspace publishes the identical retained evidence rather than a second row.
-    let reread = claude_start(&mut first, &fixture).await;
+    let reread = claude_operation(
+        &mut first,
+        &fixture,
+        "ide.start",
+        json!({"activation_id":"start"}),
+    )
+    .await;
     assert_eq!(reread, started, "{reread}");
     assert_eq!(
         database
@@ -4246,7 +4292,13 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
         fixture.state(),
     )
     .await;
-    let conflicted = claude_start(&mut second, &fixture).await;
+    let conflicted = claude_operation(
+        &mut second,
+        &fixture,
+        "ide.start",
+        json!({"activation_id":"start"}),
+    )
+    .await;
     assert_eq!(conflicted["state"], "error", "{conflicted}");
     assert_eq!(conflicted["code"], "conflict", "{conflicted}");
     assert!(
@@ -4260,11 +4312,110 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
         "the refused actor must not replace the first durable owner"
     );
 
-    let still_usable = claude_start(&mut first, &fixture).await;
+    let still_usable = claude_operation(
+        &mut first,
+        &fixture,
+        "ide.start",
+        json!({"activation_id":"start"}),
+    )
+    .await;
     assert_eq!(still_usable, started, "{still_usable}");
+
+    let context = claude_operation(
+        &mut first,
+        &fixture,
+        "ide.context",
+        json!({"path":"tracked.txt"}),
+    )
+    .await;
+    assert_eq!(context["kind"], "context", "{context}");
+    let source_ref = context["detail_ref"].as_str().unwrap().to_owned();
+    let edited = claude_operation(
+        &mut first,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"claude-edit-1",
+            "path":"tracked.txt",
+            "source_ref":source_ref,
+            "content":"claude-helper-edit\n"
+        }),
+    )
+    .await;
+    assert_eq!(edited["state"], "edit", "{edited}");
+    assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+    let edited_source_ref = edited["result"]["source_ref"]
+        .as_str()
+        .expect("a successful Claude Edit must retain its post-read detail")
+        .to_owned();
+    assert_eq!(
+        std::fs::read(fixture.root.join("tracked.txt")).unwrap(),
+        b"claude-helper-edit\n"
+    );
+    // The returned Edit source reference is the already-reserved prepare detail, even while
+    // ordinary detail capacity is saturated; a second real Claude helper can consume it directly.
+    let chained = claude_operation(
+        &mut first,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"claude-edit-2",
+            "path":"tracked.txt",
+            "source_ref":edited_source_ref,
+            "content":"claude-helper-chain\n"
+        }),
+    )
+    .await;
+    assert_eq!(chained["result"]["outcome"], "replaced", "{chained}");
+    assert_eq!(
+        std::fs::read(fixture.root.join("tracked.txt")).unwrap(),
+        b"claude-helper-chain\n"
+    );
+    std::fs::write(fixture.root.join("tracked.txt"), "claude-native-fallback\n").unwrap();
+    assert_eq!(
+        std::fs::read(fixture.root.join("tracked.txt")).unwrap(),
+        b"claude-native-fallback\n"
+    );
+
+    let stop_context = claude_operation(
+        &mut first,
+        &fixture,
+        "ide.context",
+        json!({"path":"tracked.txt"}),
+    )
+    .await;
+    let stop_source_ref = stop_context["detail_ref"].as_str().unwrap().to_owned();
+    let ready = first
+        .call_claude(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"claude-stop-ready",
+                "path":"tracked.txt",
+                "source_ref":stop_source_ref,
+                "content":"claude-stop-ready\n"
+            }),
+        )
+        .await;
+    first.launch_claude_pending(&fixture, &ready).await;
+    assert_eq!(
+        std::fs::read(fixture.root.join("tracked.txt")).unwrap(),
+        b"claude-stop-ready\n"
+    );
 
     let stopped = first.call_claude(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
+    let (edit_state, edit_outcome): (String, String) = database
+        .query_row(
+            "SELECT state,outcome FROM changes_edit_receipts WHERE operation_id='claude-stop-ready'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (edit_state.as_str(), edit_outcome.as_str()),
+        ("settled", "replaced")
+    );
     assert!(
         !database
             .query_row(
