@@ -2,6 +2,8 @@
 
 Revision: EDIT-r1 (proposed). Provider: Assistance. Direct consumers: Application, Changes, and host adapters. Vocabulary: [common](common.md).
 
+Agent-facing rendering follows [AGENT-CONTENT-r1](agent-content-v0.2.md): one compact model text block and the unchanged typed structured result.
+
 ## Sixth closed MCP method
 
 Assistance owns the sixth and only added MCP method, `ide.edit`, alongside `ide.start`, `ide.context`, `ide.diff`, `ide.inspect`, and `ide.stop`. Its parameters and results are exactly the canonical request/outcomes in [Changes v0.2](changes-v0.2.md); Assistance validates the closed schema, current host binding, active authority, and bounded rendering, then delegates. It neither resolves paths, writes files, settles receipts, nor interprets Application storage rows.
