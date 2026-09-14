@@ -127,6 +127,13 @@ pub enum PeerReply {
         detail_ref: Option<String>,
         /// True when serialized-result budgeting omitted owner text.
         truncated: bool,
+        /// True only when the referenced result retains another consumable page for `ide.inspect`.
+        ///
+        /// A detail reference alone is not a continuation: retained Context and helper-composed
+        /// Diff results may be inspectable but cannot yield new evidence. Missing from an older
+        /// envelope decodes as `false`, preserving the safe non-looping default.
+        #[serde(default)]
+        continuation: bool,
     },
     /// Exact Changes-owned one-file edit result with no source content or diagnostics.
     Edit {
@@ -214,6 +221,7 @@ fn envelopes_are_closed_and_fit_serialized_budget() {
         text: "\0🦀\"\\".repeat(16000),
         detail_ref: Some("detail-1".into()),
         truncated: false,
+        continuation: false,
     };
     let encoded = reply.encode().unwrap();
     assert!(encoded.as_str().len() < MAX_REPLY_BYTES);

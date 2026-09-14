@@ -16,7 +16,7 @@ use super::claude_worker::{
     HelperResult, HelperSource, LaunchLedger, MAX_HELPER_FRAME_BYTES, MAX_RESULT_TEXT_BYTES,
 };
 use super::host_binding::BindingRef;
-use super::reply::FailureCode;
+use super::reply::{FailureCode, PeerReply};
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
@@ -361,7 +361,7 @@ async fn execute(
         Ok(ClaimReply::Granted(job)) => *job,
         _ => return "refused",
     };
-    let (outcome, children, discovery, payload) = perform(&job).await;
+    let (outcome, children, discovery, payload) = perform(&job, &detail_ref).await;
     let settled = children.settled();
     let result = HelperResult {
         protocol: HELPER_PROTOCOL,
@@ -503,9 +503,13 @@ async fn perform_discovery(
     )
 }
 
-/// Executes the operation-specific work after the fixed discovery boundary succeeds.
+/// Executes operation-specific work after discovery using the claimed detail reference for fitting.
+///
+/// `detail_ref` is the exact ticket handle carried by the enclosing helper result. It is used only
+/// to measure the final Diff envelope; it never grants authority or becomes a continuation.
 async fn perform(
     job: &HelperJob,
+    detail_ref: &str,
 ) -> (
     HelperOutcome,
     ChildSettlement,
@@ -610,6 +614,7 @@ async fn perform(
         HelperOperation::Diff => {
             diff(
                 job,
+                detail_ref,
                 deadline,
                 worktree,
                 &mut children.spawned,
@@ -1358,8 +1363,12 @@ fn fit_result_text(mut text: String) -> (String, bool) {
 }
 
 /// Produces one bounded current Git comparison inside the inherited sandbox.
+///
+/// `detail_ref` is included only in the shared final-envelope fit. Claude helper Diff pages retain
+/// no cursor, so an incomplete page never advertises this handle as a continuation.
 async fn diff(
     job: &HelperJob,
+    detail_ref: &str,
     deadline: tokio::time::Instant,
     worktree: crate::workspace::authority::WorktreeRef,
     spawned: &mut u32,
@@ -1467,38 +1476,38 @@ async fn diff(
         );
     }
     let comparison = evidence.comparison().clone();
-    let mut max_hunks = 32;
-    loop {
-        let result = crate::changes::compose_diff(
-            &scope,
-            &comparison,
-            evidence.clone(),
-            crate::changes::DiffSelectionBudget::bounded(max_hunks, 24 * 1024),
-        );
-        let text = crate::assistance::worker::snapshots::render_diff_text(
-            mode,
-            &result,
-            helper_scope.authority_epoch,
-            false,
-        );
-        if text.len() <= MAX_RESULT_TEXT_BYTES {
-            let truncated = result.truncated_output()
-                || result.overflow_hunks() > 0
-                || result.overflow_bytes() > 0;
-            return (
-                HelperOutcome::Complete { text },
-                Some(HelperPayload::Diff { truncated }),
-            );
-        }
-        if max_hunks == 1 {
-            return (
-                HelperOutcome::Failed {
-                    code: FailureCode::Capacity,
-                },
-                None,
-            );
-        }
-        max_hunks = (max_hunks / 2).max(1);
+    let fitted = crate::assistance::worker::snapshots::fit_diff_page(
+        mode,
+        helper_scope.authority_epoch,
+        detail_ref,
+        32,
+        false,
+        |max_hunks| {
+            crate::changes::compose_diff(
+                &scope,
+                &comparison,
+                evidence.clone(),
+                crate::changes::DiffSelectionBudget::bounded(max_hunks, 24 * 1024),
+            )
+        },
+    );
+    match fitted {
+        Ok((
+            result,
+            PeerReply::Complete {
+                text, truncated, ..
+            },
+        )) => (
+            HelperOutcome::Complete { text },
+            Some(HelperPayload::Diff {
+                truncated: truncated
+                    || result.truncated_output()
+                    || result.overflow_hunks() > 0
+                    || result.overflow_bytes() > 0,
+            }),
+        ),
+        Ok(_) => unreachable!("shared diff fitter always returns a complete reply"),
+        Err(code) => (HelperOutcome::Failed { code }, None),
     }
 }
 

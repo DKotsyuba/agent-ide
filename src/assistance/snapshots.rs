@@ -305,6 +305,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// * `authority_epoch` — current durable epoch rendered as provenance.
 /// * `reference` — same-binding detail handle echoed as `detail_ref`.
 /// * `max_hunks` — largest count to attempt; halved on each retry and clamped to at least one.
+/// * `retain_continuation` — whether this caller will retain the accepted cursor for later
+///   `ide.inspect`; helper results pass `false` because their settled ticket has no page state.
 /// * `compose` — pure selection callback; it must not mutate retained state, because it is called
 ///   repeatedly and only the returned result of the accepted attempt is retained.
 ///
@@ -318,11 +320,12 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// * [`FailureCode::Capacity`] when even a single whole hunk cannot fit the serialized envelope.
 ///   This is deliberately an explicit finite budget failure: the alternative would be delivering a
 ///   silently cut hunk or claiming an undelivered hunk was delivered.
-pub(super) fn fit_diff_page(
+pub(crate) fn fit_diff_page(
     mode: DiffMode,
     authority_epoch: u64,
     reference: &str,
     max_hunks: usize,
+    retain_continuation: bool,
     compose: impl Fn(usize) -> crate::changes::DiffResult,
 ) -> Result<(crate::changes::DiffResult, PeerReply), FailureCode> {
     let mut max_hunks = max_hunks.max(1);
@@ -347,6 +350,7 @@ pub(super) fn fit_diff_page(
             truncated: candidate.truncated_output()
                 || candidate.overflow_hunks() > 0
                 || candidate.overflow_bytes() > 0,
+            continuation: retain_continuation && candidate.detail_cursor().is_some(),
         };
         if content::fits(&reply) {
             return Ok((candidate, reply));
@@ -750,6 +754,7 @@ impl Worker<'_> {
             authority.epoch(),
             &reference,
             budget.max_hunks,
+            true,
             |max_hunks| {
                 crate::changes::compose_diff(
                     &scope,

@@ -110,6 +110,7 @@ fn render_text(reply: &PeerReply) -> String {
             text,
             detail_ref: Some(detail_ref),
             truncated: true,
+            continuation: true,
         } => format!(
             "complete context: {text}\nOutput is truncated; use ide.inspect with detail_ref \
              {detail_ref} before editing"
@@ -120,8 +121,8 @@ fn render_text(reply: &PeerReply) -> String {
             truncated: true,
             ..
         } => format!(
-            "complete context: {text}\nOutput is truncated without a detail reference; continue \
-             with native tools"
+            "complete context: {text}\nOutput is incomplete; use ide.edit when available, \
+             otherwise use the native editor"
         ),
         PeerReply::Complete {
             kind: ResultKind::Context,
@@ -136,6 +137,7 @@ fn render_text(reply: &PeerReply) -> String {
             text,
             detail_ref: Some(detail_ref),
             truncated: true,
+            continuation: true,
         } => format!(
             "complete diff: {text}\nOutput is truncated; use ide.inspect with detail_ref \
              {detail_ref}"
@@ -146,8 +148,8 @@ fn render_text(reply: &PeerReply) -> String {
             truncated: true,
             ..
         } => format!(
-            "complete diff: {text}\nOutput is truncated without a detail reference; continue \
-             with native tools"
+            "complete diff: {text}\nOutput is incomplete; stop or review the available hunks \
+             safely with native tools"
         ),
         PeerReply::Complete {
             kind: ResultKind::Diff,
@@ -183,8 +185,8 @@ fn render_edit(result: &EditResult) -> String {
             result.path
         ),
         EditOutcome::ConflictingDuplicate => format!(
-            "edit: {outcome}; path {}. No write occurred; use native tools to inspect the target \
-             before a new operation",
+            "edit: {outcome}; path {}. No write occurred; use ide.context to inspect the target \
+             before a new operation_id",
             result.path
         ),
         EditOutcome::UnsafeTarget => format!(
@@ -262,24 +264,28 @@ mod tests {
                 text: "active".into(),
                 detail_ref: None,
                 truncated: false,
+                continuation: false,
             },
             PeerReply::Complete {
                 kind: ResultKind::Context,
                 text: "context evidence".into(),
                 detail_ref: None,
                 truncated: false,
+                continuation: false,
             },
             PeerReply::Complete {
                 kind: ResultKind::Diff,
                 text: "diff evidence".into(),
                 detail_ref: None,
                 truncated: false,
+                continuation: false,
             },
             PeerReply::Complete {
                 kind: ResultKind::Stop,
                 text: "stopped".into(),
                 detail_ref: None,
                 truncated: false,
+                continuation: false,
             },
         ];
         for reply in replies {
@@ -339,7 +345,10 @@ mod tests {
             let text = text_of(&rendered);
             assert!(text.starts_with(&format!("edit: {}", outcome.as_str())));
             assert!(text.contains("src/lib.rs"));
-            assert!(!text.contains("private-operation-id") && !text.contains("operation_id"));
+            assert!(!text.contains("private-operation-id"));
+            if outcome != EditOutcome::ConflictingDuplicate {
+                assert!(!text.contains("operation_id"));
+            }
             assert_eq!(rendered.structured_content, Some(expected));
             assert_eq!(rendered.is_error, None);
             if outcome == EditOutcome::OutcomeUnknown {
@@ -356,13 +365,63 @@ mod tests {
             text: "bounded owner evidence".into(),
             detail_ref: Some("private-live-detail".into()),
             truncated: true,
+            continuation: false,
         })
         .unwrap();
         let text = text_of(&rendered);
-        assert!(text.contains("private-live-detail") && text.contains("bounded owner evidence"));
+        assert!(text.contains("bounded owner evidence"));
+        assert!(!text.contains("private-live-detail"));
         for excluded in ["\"state\"", "\"kind\"", "structured_content", "is_error"] {
             assert!(!text.contains(excluded));
         }
+    }
+
+    /// Recommends inspection only for a typed retained continuation, never merely for a handle.
+    #[test]
+    fn incomplete_results_do_not_infer_continuation_from_detail_reference() {
+        let context = render(PeerReply::Complete {
+            kind: ResultKind::Context,
+            text: "partial context".into(),
+            detail_ref: Some("context-detail".into()),
+            truncated: true,
+            continuation: false,
+        })
+        .unwrap();
+        let diff = render(PeerReply::Complete {
+            kind: ResultKind::Diff,
+            text: "partial diff".into(),
+            detail_ref: Some("diff-detail".into()),
+            truncated: true,
+            continuation: false,
+        })
+        .unwrap();
+        let paged = render(PeerReply::Complete {
+            kind: ResultKind::Diff,
+            text: "paged diff".into(),
+            detail_ref: Some("page-detail".into()),
+            truncated: true,
+            continuation: true,
+        })
+        .unwrap();
+        assert!(
+            text_of(&context).contains("incomplete") && !text_of(&context).contains("ide.inspect")
+        );
+        assert!(
+            text_of(&diff).contains("stop or review") && !text_of(&diff).contains("ide.inspect")
+        );
+        assert!(text_of(&paged).contains("ide.inspect with detail_ref page-detail"));
+    }
+
+    /// Sends duplicate-edit recovery through the IDE context path with a fresh operation identity.
+    #[test]
+    fn conflicting_duplicate_requests_context_and_a_new_operation_id() {
+        let rendered = render(PeerReply::Edit {
+            result: edit_result(EditOutcome::ConflictingDuplicate).unwrap(),
+        })
+        .unwrap();
+        let text = text_of(&rendered);
+        assert!(text.contains("use ide.context") && text.contains("new operation_id"));
+        assert!(!text.contains("native tools"));
     }
 
     /// Shrinks only complete owner text on UTF-8 boundaries and measures the final MCP bytes.
@@ -373,6 +432,7 @@ mod tests {
             text: "\0🦀\"\\".repeat(16_000),
             detail_ref: Some("same-binding-detail".into()),
             truncated: false,
+            continuation: false,
         })
         .unwrap();
         assert!(call_tool_result_fits(&rendered));

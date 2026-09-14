@@ -1609,6 +1609,7 @@ impl<'a> Worker<'a> {
                 ),
                 detail_ref: Some(job.reference.clone()),
                 truncated: false,
+                continuation: false,
             },
             Some(authority),
             None,
@@ -1804,6 +1805,7 @@ impl<'a> Worker<'a> {
                 ),
                 detail_ref: Some(job.reference.clone()),
                 truncated: false,
+                continuation: false,
             },
             Some(authority),
             None,
@@ -1964,6 +1966,7 @@ impl<'a> Worker<'a> {
                 ),
                 detail_ref: Some(job.reference.clone()),
                 truncated: *truncated,
+                continuation: false,
             },
             Some(authority),
             Some(observed),
@@ -2015,6 +2018,7 @@ impl<'a> Worker<'a> {
                 text: text.clone(),
                 detail_ref: Some(job.reference.clone()),
                 truncated: *truncated,
+                continuation: false,
             },
             Some(authority),
             None,
@@ -2379,6 +2383,7 @@ impl<'a> Worker<'a> {
                 text,
                 detail_ref: Some(job.reference.clone()),
                 truncated: context.truncated,
+                continuation: false,
             },
             Some(authority),
             Some(observed),
@@ -2711,6 +2716,7 @@ impl<'a> Worker<'a> {
                         .into(),
                 detail_ref: None,
                 truncated: false,
+                continuation: false,
             },
             None,
             None,
@@ -3074,6 +3080,7 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
             authority.epoch(),
             &request.reference,
             page.budget().max_hunks,
+            true,
             |max_hunks| page.expand_with_max_hunks(&expected_scope, max_hunks),
         )
         .map_err(|code| match code {
@@ -3755,6 +3762,7 @@ mod feedback_dedup_tests {
             text: text.into(),
             detail_ref: Some(detail_ref.into()),
             truncated: false,
+            continuation: false,
         }
     }
 

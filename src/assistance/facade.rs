@@ -30,7 +30,7 @@ use crate::{
             HookEvent, HookLaunch, HookPhase, HostBindingGuard, HostKind, parse_candidate,
             parse_claude_call_id, parse_hook_event, parse_host_kind,
         },
-        reply::{MAX_FEEDBACK_BYTES, MissingPeer, PeerReply, ResultKind},
+        reply::{MAX_FEEDBACK_BYTES, PeerReply, ResultKind},
     },
     workspace::authority::{
         AuthorityError, AuthorityRegistry, AuthorityRevoked, AuthorityStamp, StopBindingHandoff,
@@ -374,11 +374,7 @@ pub enum FacadeOutcome {
     Unavailable,
     /// IPC accepted the envelope but no typed peer result was available for safe rendering.
     Incomplete,
-    /// Assistance explicitly identified the first unavailable peer boundary.
-    PeerUnavailable(MissingPeer),
-    /// The exact host binding was revoked without claiming a Workspace operation.
-    HostStopped,
-    /// Pending, typed failure or current owner result accepted from the daemon.
+    /// Typed peer result accepted from the daemon.
     Reply(PeerReply),
 }
 
@@ -448,15 +444,12 @@ impl AssistanceFacade {
             MethodDispatchTransportResult::Unavailable => FacadeOutcome::Unavailable,
             MethodDispatchTransportResult::Dispatched { opaque_result_json } => {
                 match PeerReply::decode(opaque_result_json.as_str()) {
-                    Some(PeerReply::Unavailable { reason }) => {
-                        FacadeOutcome::PeerUnavailable(reason)
-                    }
-                    Some(PeerReply::HostStopped {}) if tool == AssistanceTool::Stop => {
-                        FacadeOutcome::HostStopped
-                    }
-                    Some(reply @ (PeerReply::Pending { .. } | PeerReply::Error { .. })) => {
-                        FacadeOutcome::Reply(reply)
-                    }
+                    Some(
+                        reply @ (PeerReply::Unavailable { .. }
+                        | PeerReply::HostStopped {}
+                        | PeerReply::Pending { .. }
+                        | PeerReply::Error { .. }),
+                    ) => FacadeOutcome::Reply(reply),
                     Some(reply @ PeerReply::Edit { .. })
                         if matches!(tool, AssistanceTool::Edit | AssistanceTool::Inspect) =>
                     {
@@ -903,17 +896,6 @@ impl StdioFacade {
             FacadeOutcome::Incomplete => {
                 "typed Assistance peer result is unavailable; continue with native tools"
             }
-            FacadeOutcome::HostStopped => {
-                return CallToolResult::success(vec![ContentBlock::text(
-                    "Assistance host binding stopped; no Workspace authority was created",
-                )]);
-            }
-            FacadeOutcome::PeerUnavailable(MissingPeer::WorkspaceActivation) => {
-                "Assistance unavailable: workspace_activation; continue with native tools"
-            }
-            FacadeOutcome::PeerUnavailable(MissingPeer::HostBinding) => {
-                "Assistance unavailable: host_binding; continue with native tools"
-            }
         };
         CallToolResult::error(vec![ContentBlock::text(message)])
     }
@@ -943,6 +925,7 @@ fn rendered_reply_bounds_the_complete_mcp_result() {
         text: "\0🦀\"\\".repeat(16000),
         detail_ref: Some("same-binding-detail".into()),
         truncated: false,
+        continuation: false,
     });
     assert!(content::call_tool_result_fits(&rendered));
     assert_eq!(rendered.content.len(), 1);
@@ -950,6 +933,23 @@ fn rendered_reply_bounds_the_complete_mcp_result() {
     assert_eq!(result["truncated"], true);
     assert_eq!(result["detail_ref"], "same-binding-detail");
     assert!(result["text"].as_str().unwrap().contains('🦀'));
+}
+
+/// Projects typed unavailable and stop lifecycle replies through the shared compact envelope.
+#[test]
+fn typed_lifecycle_replies_preserve_structured_content_without_transport_errors() {
+    for reply in [
+        PeerReply::Unavailable {
+            reason: crate::assistance::reply::MissingPeer::HostBinding,
+        },
+        PeerReply::HostStopped {},
+    ] {
+        let expected = serde_json::to_value(&reply).unwrap();
+        let rendered = render_reply(reply);
+        assert_eq!(rendered.content.len(), 1);
+        assert_eq!(rendered.structured_content, Some(expected));
+        assert_ne!(rendered.is_error, Some(true));
+    }
 }
 
 #[tool_router]
