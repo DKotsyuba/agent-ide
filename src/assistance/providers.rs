@@ -1718,9 +1718,10 @@ fn remaining_options(job: &Job) -> SessionOptions {
 }
 
 /// Runs the accepted settings handshake and one exact-source query, waits only until the inherited
-/// deadline for matching diagnostics, snapshots that Session's bounded evidence, then performs
-/// graceful protocol shutdown. Transport or protocol failures return `ProviderUnavailable`; the
-/// caller still owns and must reap the protocol child.
+/// deadline for Pyright's matching versioned diagnostics, snapshots bounded evidence, then performs
+/// graceful protocol shutdown. Other profiles preserve their immediate snapshot rather than
+/// waiting for a diagnostic fact their accepted protocol does not guarantee. Transport or protocol
+/// failures return `ProviderUnavailable`; the caller still owns and must reap the protocol child.
 #[allow(clippy::too_many_arguments)]
 async fn session_operation<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin>(
     input: R,
@@ -1746,7 +1747,9 @@ async fn session_operation<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncW
         options,
         |mut session| async move {
             let context = session.context(&source, &bytes, query).await?;
-            session.wait_for_matching_diagnostics().await;
+            if matches!(session.settings(), ProviderSettings::Pyright(_)) {
+                session.wait_for_matching_diagnostics().await;
+            }
             let diagnostics = session.diagnostics();
             session.shutdown().await?;
             Ok(ProviderContext {

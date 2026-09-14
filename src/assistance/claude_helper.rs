@@ -1157,8 +1157,9 @@ async fn context(
     (HelperOutcome::Complete { text }, Some(payload))
 }
 
-/// Runs one accepted provider over exact helper-observed bytes, awaits matching diagnostics under
-/// the inherited deadline, reaps it, and rechecks TypeScript resolution before returning.
+/// Runs one accepted provider over exact helper-observed bytes and reaps it before returning.
+/// Pyright awaits matching versioned diagnostics under the inherited deadline; Go, Rust, and
+/// TypeScript retain their immediate snapshot, and TypeScript also rechecks its closed resolution.
 async fn provider_context(
     job: &HelperJob,
     deadline: tokio::time::Instant,
@@ -1376,7 +1377,9 @@ async fn provider_context(
         },
         |mut session| async move {
             let context = session.context(source, bytes, query).await?;
-            session.wait_for_matching_diagnostics().await;
+            if matches!(session.settings(), ProviderSettings::Pyright(_)) {
+                session.wait_for_matching_diagnostics().await;
+            }
             let diagnostics = session.diagnostics();
             session.shutdown().await?;
             Ok((context, Some(diagnostics)))

@@ -23,7 +23,9 @@ use crate::{
 /// `elapsed` is the already measured local dispatch interval and is saturated to `u32` whole
 /// milliseconds. `language`, `cache`, and `diagnostics` must be pre-sanitized closed summaries;
 /// callers must use `None`/`NotApplicable` when no existing fact is available. The call never
-/// changes the reply, waits for durable storage, or exposes a submission result.
+/// changes the reply, waits for durable storage, or exposes a submission result. A settled edit
+/// retrieved through `ide.inspect` remains attributed to `edit`, because the typed result owns the
+/// completed operation while the earlier pending Edit call already records its incomplete poll.
 pub fn tool_reply(
     telemetry: &Telemetry,
     tool: AssistanceTool,
@@ -33,6 +35,11 @@ pub fn tool_reply(
     cache: CacheState,
     diagnostics: DiagnosticState,
 ) {
+    let method = if matches!(reply, PeerReply::Edit { .. }) {
+        ToolMethod::Edit
+    } else {
+        tool_method(tool)
+    };
     let diagnostics = match reply {
         PeerReply::Edit {
             diagnostics: EditDiagnostics::CurrentClean {},
@@ -49,7 +56,7 @@ pub fn tool_reply(
         _ => diagnostics,
     };
     telemetry.record(Event::ToolCompleted {
-        method: tool_method(tool),
+        method,
         outcome: reply_outcome(reply),
         duration_ms: elapsed.as_millis().try_into().unwrap_or(u32::MAX),
         language,
