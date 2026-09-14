@@ -5,15 +5,18 @@
 //! ingress and persistence are counted locally and never affect the observed coding operation.
 
 use std::{
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     os::fd::AsRawFd,
-    os::unix::fs::OpenOptionsExt,
-    path::Path,
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    path::{Component, Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
+
+#[cfg(test)]
+use std::os::unix::fs::DirBuilderExt;
 
 use rusqlite::{params, types::Value};
 use serde::{Deserialize, Serialize};
@@ -21,9 +24,11 @@ use tokio::sync::mpsc;
 
 #[cfg(test)]
 use crate::app::config::StoreConfig;
+#[cfg(test)]
+use crate::app::store::UntrackedOutcome;
 use crate::app::store::{
     DomainMigration, DomainName, MigrationAdmission, MigrationDigest, MigrationKey, Store,
-    StoreError, TrustedUpSql, UntrackedOutcome,
+    StoreError, TrustedUpSql,
 };
 
 /// Converts existing Assistance, provider, and Execution facts into closed telemetry events.
@@ -376,7 +381,10 @@ struct TelemetryOwnership {
 }
 
 impl TelemetryOwnership {
-    /// Acquires the sibling lock file without waiting; contention returns the fail-open busy class.
+    /// Acquires the validated sibling lock file without following links or waiting.
+    ///
+    /// The database parent must already be an owner-only real directory. A pre-existing lock must
+    /// be a regular owner-only file; contention returns the fail-open busy class.
     fn acquire(database: &Path) -> Result<Self, TelemetryError> {
         let mut lock_path = database.as_os_str().to_os_string();
         lock_path.push(".lock");
@@ -386,8 +394,10 @@ impl TelemetryOwnership {
             .write(true)
             .truncate(false)
             .mode(0o600)
-            .open(lock_path)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&lock_path)
             .map_err(|_| TelemetryError::Store)?;
+        validate_private_file(&file.metadata().map_err(|_| TelemetryError::Store)?)?;
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if result == 0 {
             Ok(Self { _file: file })
@@ -396,6 +406,84 @@ impl TelemetryOwnership {
         } else {
             Err(TelemetryError::Store)
         }
+    }
+}
+
+/// Rejects a path that is not absolute and lexically normalized without parent traversal.
+fn absolute_local_path(path: &Path) -> bool {
+    path.is_absolute()
+        && path
+            .components()
+            .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+}
+
+/// Validates one persistent telemetry directory as a real owner-only directory.
+fn validate_private_directory(path: &Path) -> Result<(), TelemetryError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| TelemetryError::Store)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o777 != 0o700
+    {
+        Err(TelemetryError::Store)
+    } else {
+        Ok(())
+    }
+}
+
+/// Validates owner-only regular-file metadata for a database, journal, WAL, shared memory, or lock.
+fn validate_private_file(metadata: &fs::Metadata) -> Result<(), TelemetryError> {
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        Err(TelemetryError::Store)
+    } else {
+        Ok(())
+    }
+}
+
+/// Returns a SQLite companion path by appending its fixed suffix to the database pathname.
+fn sqlite_companion(database: &Path, suffix: &str) -> PathBuf {
+    let mut path = database.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+/// Rejects an existing SQLite state path unless it is a nonsymlink owner-only regular file.
+fn validate_private_file_if_present(path: &Path) -> Result<(), TelemetryError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(TelemetryError::Store),
+        Ok(metadata) => validate_private_file(&metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(TelemetryError::Store),
+    }
+}
+
+/// Creates or validates the database and every SQLite companion path inside its private directory.
+fn prepare_private_database(database: &Path) -> Result<(), TelemetryError> {
+    if !absolute_local_path(database) {
+        return Err(TelemetryError::Store);
+    }
+    validate_private_directory(database.parent().ok_or(TelemetryError::Store)?)?;
+    for suffix in ["-journal", "-wal", "-shm"] {
+        validate_private_file_if_present(&sqlite_companion(database, suffix))?;
+    }
+    match fs::symlink_metadata(database) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(TelemetryError::Store),
+        Ok(metadata) => validate_private_file(&metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let file = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(database)
+                .map_err(|_| TelemetryError::Store)?;
+            validate_private_file(&file.metadata().map_err(|_| TelemetryError::Store)?)
+        }
+        Err(_) => Err(TelemetryError::Store),
     }
 }
 
@@ -425,7 +513,8 @@ pub struct Telemetry {
     shutdown: Option<tokio::sync::watch::Sender<bool>>,
     /// Shared single-use join handle for the background writer.
     writer: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    /// Exclusive stable-database ownership, absent for caller-supplied and read-only stores.
+    /// Exclusive stable ownership shared with the writer until every admitted transaction settles.
+    /// Absent for caller-supplied and read-only stores.
     _ownership: Option<Arc<TelemetryOwnership>>,
 }
 
@@ -441,22 +530,29 @@ impl Telemetry {
 
     /// Acquires one stable database writer without waiting, then migrates and starts telemetry.
     ///
-    /// The sibling advisory lock is retained for this owner's lifetime. A competing process gets
-    /// [`TelemetryError::Busy`] before SQLite is opened, so it can disable telemetry without
-    /// disturbing the current writer or any session-local Workspace authority.
+    /// `database` must be an absolute normalized child of an existing owner-only `0700` directory.
+    /// The database, SQLite companions, backup directory, and sibling advisory lock are created or
+    /// validated as nonsymlink owner-only state. Unsafe state returns [`TelemetryError::Store`].
+    /// The lock is retained through writer settlement; a competing process gets
+    /// [`TelemetryError::Busy`] before SQLite is opened and can disable telemetry without
+    /// disturbing the writer or any session-local Workspace authority.
     pub async fn open_database(
         database: &Path,
         config: TelemetryConfig,
     ) -> Result<Self, TelemetryError> {
+        prepare_private_database(database)?;
         let ownership = Arc::new(TelemetryOwnership::acquire(database)?);
-        let mut backup_root = database.as_os_str().to_os_string();
-        backup_root.push(".backups");
+        let backup_root = database
+            .parent()
+            .ok_or(TelemetryError::Store)?
+            .join("backups");
         let store = Store::open_with_backup_root(
             database,
-            Path::new(&backup_root),
+            &backup_root,
             crate::app::config::EffectiveConfig::defaults().store(),
         )
         .map_err(map_store)?;
+        prepare_private_database(database)?;
         Self::open_inner(Arc::new(store), config, Some(ownership)).await
     }
 
@@ -482,13 +578,15 @@ impl Telemetry {
                 _ownership: ownership,
             });
         }
-        let mut retention = Some(load_retention(&store).await?);
+        let mut retention = load_retention(&store).await?;
         let (sender, mut receiver) = mpsc::channel(config.queue_capacity);
         let (shutdown, mut shutdown_receiver) = tokio::sync::watch::channel(false);
         let writer_store = Arc::clone(&store);
         let writer_config = config;
         let writer_dropped = Arc::clone(&dropped);
+        let writer_ownership = ownership.clone();
         let writer = tokio::spawn(async move {
+            let _ownership = writer_ownership;
             loop {
                 tokio::select! {
                     biased;
@@ -712,24 +810,16 @@ async fn load_retention(store: &Store) -> Result<RetentionState, TelemetryError>
         .ok_or(TelemetryError::Store)
 }
 
-/// Persists one queued event and updates drop accounting only for outcomes known not to commit.
+/// Persists one queued event and returns only after its Store transaction actually settles.
 async fn write_event(
     store: &Store,
     config: TelemetryConfig,
     event: Event,
-    retention: &mut Option<RetentionState>,
+    retention: &mut RetentionState,
     dropped: &AtomicU64,
 ) {
-    if retention.is_none() {
-        *retention = load_retention(store).await.ok();
-    }
-    let Some(current) = *retention else {
-        dropped.fetch_add(1, Ordering::Relaxed);
-        return;
-    };
-    match persist(store, config, event, current).await {
-        Ok(UntrackedOutcome::Committed(next)) => *retention = Some(next),
-        Ok(UntrackedOutcome::OutcomeUnknown) => *retention = None,
+    match persist(store, config, event, *retention).await {
+        Ok(next) => *retention = next,
         Err(_) => {
             dropped.fetch_add(1, Ordering::Relaxed);
         }
@@ -742,7 +832,7 @@ async fn persist(
     config: TelemetryConfig,
     event: Event,
     retained: RetentionState,
-) -> Result<UntrackedOutcome<RetentionState>, TelemetryError> {
+) -> Result<RetentionState, TelemetryError> {
     let payload = event.encode()?;
     let tag = event.tag();
     let logical_bytes = i64::try_from(payload.len()).map_err(|_| TelemetryError::InvalidEvent)?;
@@ -750,7 +840,7 @@ async fn persist(
     let max_bytes =
         i64::try_from(config.max_logical_bytes).map_err(|_| TelemetryError::InvalidConfig)?;
     store
-        .execute_untracked(move |transaction| {
+        .execute_untracked_settled(move |transaction| {
             transaction.execute(
                 "INSERT INTO telemetry_events (tag, payload, logical_bytes) VALUES (?1, ?2, ?3)",
                 params![tag, payload, logical_bytes],
@@ -870,6 +960,23 @@ pub(crate) async fn open_test_telemetry(
 mod tests {
     use super::*;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    /// Creates a unique owner-only directory and returns its reserved telemetry database path.
+    fn private_database(prefix: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            NEXT_TEST_DATABASE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700).create(&directory).unwrap();
+        directory.join("state.sqlite")
+    }
+
+    /// Removes one test database's complete private state directory after all owners are dropped.
+    fn remove_private_database(database: &Path) {
+        let _ = fs::remove_dir_all(database.parent().unwrap());
+    }
 
     /// Supplies a representative schema-closed event without any user-controlled content field.
     fn event() -> Event {
@@ -1010,31 +1117,34 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// Proves a competing stable owner fails open before SQLite while the first owner stays usable.
+    /// Keeps ownership through a contended background settlement so no second writer overlaps it.
     #[tokio::test]
-    async fn stable_database_has_one_nonblocking_writer_owner() {
-        let path = std::env::temp_dir().join(format!(
-            "agent-ide-telemetry-owner-{}-{}.sqlite",
-            std::process::id(),
-            NEXT_TEST_DATABASE.fetch_add(1, Ordering::Relaxed)
-        ));
+    async fn stable_database_ownership_outlives_the_last_ingress_handle() {
+        let path = private_database("agent-ide-telemetry-owner");
         let first = Telemetry::open_database(&path, TelemetryConfig::default())
             .await
             .unwrap();
+        let blocker = rusqlite::Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        first.record(event());
+        tokio::task::yield_now().await;
+        drop(first);
         assert!(matches!(
             Telemetry::open_database(&path, TelemetryConfig::default()).await,
             Err(TelemetryError::Busy)
         ));
-        first.record(event());
-        first.shutdown().await;
-        assert_eq!(
-            first.query(Filter::All, None, 1).await.unwrap().rows.len(),
-            1
-        );
-        drop(first);
-        let reopened = Telemetry::open_database(&path, TelemetryConfig::default())
-            .await
-            .unwrap();
+        drop(blocker);
+        let reopened = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match Telemetry::open_database(&path, TelemetryConfig::default()).await {
+                    Ok(owner) => break owner,
+                    Err(TelemetryError::Busy) => tokio::task::yield_now().await,
+                    Err(error) => panic!("unexpected telemetry reopen failure: {error:?}"),
+                }
+            }
+        })
+        .await
+        .expect("settled writer releases ownership");
         assert_eq!(
             reopened
                 .query(Filter::All, None, 1)
@@ -1046,11 +1156,51 @@ mod tests {
         );
         reopened.shutdown().await;
         drop(reopened);
-        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
-        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(format!("{}.lock", path.display()));
-        let _ = std::fs::remove_dir_all(format!("{}.backups", path.display()));
+        remove_private_database(&path);
+    }
+
+    /// Rejects preplaced database symlinks and world-readable state, then creates private files.
+    #[tokio::test]
+    async fn stable_database_requires_private_nonsymlink_state() {
+        let path = private_database("agent-ide-telemetry-private");
+        let target = path.parent().unwrap().join("target.sqlite");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(matches!(
+            Telemetry::open_database(&path, TelemetryConfig::default()).await,
+            Err(TelemetryError::Store)
+        ));
+        assert!(!target.exists());
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, []).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            Telemetry::open_database(&path, TelemetryConfig::default()).await,
+            Err(TelemetryError::Store)
+        ));
+        fs::remove_file(&path).unwrap();
+        let telemetry = Telemetry::open_database(&path, TelemetryConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let lock = sqlite_companion(&path, ".lock");
+        assert_eq!(
+            fs::metadata(lock).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(path.parent().unwrap().join("backups"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        telemetry.shutdown().await;
+        drop(telemetry);
+        remove_private_database(&path);
     }
 
     /// Proves incompatible migration admission is not mistaken for an initialized telemetry schema.
@@ -1141,9 +1291,9 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// Proves accepted writer timeout is not counted dropped when its queued insert later commits.
+    /// Proves immediate shutdown waits through contention for the final accepted Store settlement.
     #[tokio::test]
-    async fn accepted_timeout_can_commit_without_false_drop_accounting() {
+    async fn immediate_shutdown_settles_the_final_accepted_event_under_contention() {
         let path = std::env::temp_dir().join(format!(
             "agent-ide-telemetry-timeout-{}-{}.sqlite",
             std::process::id(),
@@ -1167,15 +1317,14 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
         telemetry.record(event());
+        telemetry.shutdown().await;
         assert!(matches!(
             blocker.await.unwrap().unwrap(),
             UntrackedOutcome::OutcomeUnknown
         ));
-        tokio::time::sleep(Duration::from_millis(250)).await;
         let page = telemetry.query(Filter::All, None, 1).await.unwrap();
         assert_eq!(page.rows.len(), 1);
         assert_eq!(page.dropped, Some(0));
-        telemetry.shutdown().await;
         let _ = std::fs::remove_file(path);
     }
 

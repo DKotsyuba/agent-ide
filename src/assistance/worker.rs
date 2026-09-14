@@ -549,7 +549,9 @@ impl WorkerHandle {
     /// `runtime` is this daemon's private directory and owns all Workspace/Changes authority state.
     /// An absolute `AGENT_IDE_TELEMETRY_DATABASE` may select durable capture independently; lock
     /// contention disables only telemetry. Startup fails only when the session-local store or its
-    /// authority schemas cannot open, and creates the worker task exactly once.
+    /// authority schemas cannot open, and creates the worker task exactly once. When telemetry is
+    /// available, fallback ingress accepts only datagrams authenticated by a configured launcher
+    /// attachment for this exact runtime.
     pub async fn start(&self, runtime: &Path) -> Result<(), FailureCode> {
         let receiver = self
             .receiver
@@ -624,8 +626,11 @@ impl WorkerHandle {
                 *configured = telemetry.clone();
             }
             if let Some(telemetry) = telemetry.clone()
-                && let Ok(ingress) =
-                    super::codex_hook::NativeFallbackIngress::bind(&runtime, telemetry)
+                && let Ok(ingress) = super::codex_hook::NativeFallbackIngress::bind(
+                    &runtime,
+                    telemetry,
+                    shared.launcher.attachments(),
+                )
                 && let Ok(mut configured) = fallback_owner.lock()
             {
                 *configured = Some(ingress);

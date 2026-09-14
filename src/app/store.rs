@@ -533,6 +533,34 @@ impl Store {
         }
     }
 
+    /// Executes one receipt-free transaction and waits for its actual owner-thread settlement.
+    ///
+    /// This variant is reserved for background drains that have already accepted local work and
+    /// must not finish shutdown while a commit remains outcome-unknown. Queue refusal is returned
+    /// immediately; after admission the call waits until commit, rollback, or owner loss, without
+    /// changing the bounded deadline of [`Self::execute_untracked`]. `sql` receives the live
+    /// Application transaction, must not manage a top-level transaction, and yields its value only
+    /// after commit.
+    pub(crate) async fn execute_untracked_settled<T, F>(&self, sql: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: for<'transaction> FnOnce(&Transaction<'transaction>) -> rusqlite::Result<T>
+            + Send
+            + 'static,
+    {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        let job = Box::new(TypedJob {
+            sql,
+            reply: reply_sender,
+        });
+        match self.sender.try_send(StoreMessage::ExecuteUntracked { job }) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => return Err(StoreError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => return Err(StoreError::Unavailable),
+        }
+        reply_receiver.await.map_err(|_| StoreError::Unavailable)?
+    }
+
     /// Reads at most `limit` rows of trusted static read-only SQL on the existing owner thread.
     ///
     /// `limit` must be in `1..=1001`; the extra row lets a domain prove page continuation while

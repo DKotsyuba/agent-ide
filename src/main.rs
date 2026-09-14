@@ -940,16 +940,79 @@ fn claude_project_identity(project: &Path) -> String {
         .to_string()
 }
 
+/// Creates or validates one owner-only persistent directory without following a final symlink.
+///
+/// Missing paths are created with mode `0700`; an existing non-directory, symlink, foreign owner,
+/// nonprivate mode, or I/O failure is returned without repairing or removing the path.
+fn prepare_private_persistent_directory(path: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata)
+            if !metadata.file_type().is_symlink()
+                && metadata.is_dir()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.permissions().mode() & 0o777 == 0o700 =>
+        {
+            Ok(())
+        }
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "telemetry state directory is not private",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700).create(path)?;
+            prepare_private_persistent_directory(path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Derives one candidate database below an explicitly supplied private Application state root.
+///
+/// The application, telemetry, and digest directories are created or validated as `0700`. The
+/// returned database path is not opened here; unsafe or unavailable directory state returns I/O.
+fn managed_telemetry_database_in(
+    application_state: &Path,
+    candidate: &Path,
+) -> std::io::Result<PathBuf> {
+    prepare_private_persistent_directory(application_state)?;
+    let telemetry = application_state.join("telemetry");
+    prepare_private_persistent_directory(&telemetry)?;
+    let candidate_state = telemetry.join(
+        blake3::hash(candidate.as_os_str().as_bytes())
+            .to_hex()
+            .as_str(),
+    );
+    prepare_private_persistent_directory(&candidate_state)?;
+    Ok(candidate_state.join("state.sqlite"))
+}
+
 /// Derives the persistent telemetry-only Store path for one canonical managed worktree.
 ///
-/// The name is an opaque digest of the already-validated candidate, so a fresh managed runtime
-/// generation reuses prior events while runtime socket cleanup cannot delete it. Workspace and
-/// Changes authority are deliberately excluded and remain in each managed daemon's private runtime.
+/// State lives below the effective user's real home in private `0700` directories. The candidate
+/// component is an opaque digest of the already-validated path, so fresh runtime generations reuse
+/// prior events while runtime cleanup cannot delete them. Unsafe or symlinked state is rejected,
+/// and Workspace/Changes authority remains in each daemon's private runtime.
 fn managed_telemetry_database(candidate: &Path) -> std::io::Result<PathBuf> {
-    Ok(fs::canonicalize(std::env::temp_dir())?.join(format!(
-        "agent-ide-state-{}.sqlite",
-        blake3::hash(candidate.as_os_str().as_bytes()).to_hex()
-    )))
+    let home =
+        PathBuf::from(std::env::var_os("HOME").ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is unavailable")
+        })?);
+    if !absolute_local_path(&home) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "HOME is not absolute and normalized",
+        ));
+    }
+    let home = fs::canonicalize(home)?;
+    let metadata = fs::symlink_metadata(&home)?;
+    if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "HOME is not owned by this user",
+        ));
+    }
+    managed_telemetry_database_in(&home.join(".agent-ide"), candidate)
 }
 
 /// Derives the one short deterministic private runtime path for a canonical Claude project root.
@@ -1543,11 +1606,53 @@ mod tests {
     #[test]
     fn managed_telemetry_database_is_stable_outside_a_runtime_generation() {
         let candidate = fs::canonicalize(std::env::temp_dir()).unwrap();
-        let database = managed_telemetry_database(&candidate).unwrap();
+        let state_parent = std::env::temp_dir().join(format!(
+            "agent-ide-managed-state-{}-{}",
+            std::process::id(),
+            random_hex(4).unwrap()
+        ));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&state_parent)
+            .unwrap();
+        let state = state_parent.join("app");
+        let database = managed_telemetry_database_in(&state, &candidate).unwrap();
         let runtime = ManagedRuntime::create().unwrap();
         assert_ne!(database.parent(), Some(runtime.path.as_path()));
-        assert_eq!(database, managed_telemetry_database(&candidate).unwrap());
+        assert_eq!(
+            database,
+            managed_telemetry_database_in(&state, &candidate).unwrap()
+        );
+        for directory in [
+            state.clone(),
+            state.join("telemetry"),
+            database.parent().unwrap().to_path_buf(),
+        ] {
+            let metadata = fs::symlink_metadata(directory).unwrap();
+            assert!(metadata.is_dir());
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        }
         runtime.remove().unwrap();
+        fs::remove_dir_all(state_parent).unwrap();
+    }
+
+    /// Rejects preplaced symlink and nonprivate persistent telemetry directories without repair.
+    #[test]
+    fn managed_telemetry_database_rejects_unsafe_state_directories() {
+        let parent = std::env::temp_dir().join(format!(
+            "agent-ide-unsafe-state-{}-{}",
+            std::process::id(),
+            random_hex(4).unwrap()
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
+        let state = parent.join("state");
+        fs::DirBuilder::new().mode(0o755).create(&state).unwrap();
+        assert!(managed_telemetry_database_in(&state, &parent).is_err());
+        fs::remove_dir(&state).unwrap();
+        std::os::unix::fs::symlink(&parent, &state).unwrap();
+        assert!(managed_telemetry_database_in(&state, &parent).is_err());
+        fs::remove_file(&state).unwrap();
+        fs::remove_dir(parent).unwrap();
     }
 
     /// Proves a telemetry query refuses a missing database without creating a SQLite file.

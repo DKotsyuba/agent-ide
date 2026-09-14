@@ -7,6 +7,10 @@ use super::{
 use crate::telemetry::{Telemetry, adapters};
 use std::{
     io::Read,
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{FileTypeExt, MetadataExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -19,10 +23,12 @@ use std::{
 const MAX_INPUT_BYTES: u64 = 64 * 1024;
 /// Bounds stdin, parsing, connect and reply together, including a silent or stuck host pipe.
 const TOTAL_DEADLINE: Duration = Duration::from_millis(250);
-/// Private fixed-message datagram endpoint owned by the daemon inside its runtime directory.
+/// Private authenticated-datagram endpoint owned by the daemon inside its runtime directory.
 const FALLBACK_SOCKET: &str = "telemetry-fallback.sock";
-/// Entire privacy-safe wire vocabulary for one native fallback observation.
-const FALLBACK_MARKER: [u8; 1] = [1];
+/// Closed event marker prefixed to one runtime-and-attachment authenticator.
+const FALLBACK_MARKER: u8 = 1;
+/// Exact authenticated datagram length: one marker byte plus one BLAKE3 authenticator.
+const FALLBACK_MESSAGE_BYTES: usize = 33;
 /// Bounds the final kernel-datagram drain after hook ingress is closed for shutdown.
 const FALLBACK_DRAIN_DEADLINE: Duration = Duration::from_millis(10);
 
@@ -30,6 +36,10 @@ const FALLBACK_DRAIN_DEADLINE: Duration = Duration::from_millis(10);
 pub(crate) struct NativeFallbackIngress {
     /// Runtime-local socket removed only after the receiver task has stopped.
     path: PathBuf,
+    /// Device identity captured from the bound socket pathname.
+    device: u64,
+    /// Inode identity captured from the bound socket pathname.
+    inode: u64,
     /// Single-use stop signal that asks the receiver to drain already delivered datagrams.
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     /// Receiver task joined before the telemetry writer itself is drained.
@@ -37,22 +47,47 @@ pub(crate) struct NativeFallbackIngress {
 }
 
 impl NativeFallbackIngress {
-    /// Binds the daemon-private socket and starts accepting only the one-byte closed marker.
-    pub(crate) fn bind(runtime_dir: &Path, telemetry: Telemetry) -> std::io::Result<Self> {
+    /// Binds the daemon-private socket and accepts only exact authenticated fallback messages.
+    ///
+    /// `attachments` are the immutable configured launcher credentials for this runtime. They are
+    /// reduced to one-way runtime-bound authenticators in memory and are never written by ingress.
+    /// A stale path is retired only when it is already an owner-only Unix socket.
+    pub(crate) fn bind<'a>(
+        runtime_dir: &Path,
+        telemetry: Telemetry,
+        attachments: impl IntoIterator<Item = &'a str>,
+    ) -> std::io::Result<Self> {
         let path = runtime_dir.join(FALLBACK_SOCKET);
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
+        retire_fallback_socket(&path)?;
+        let authenticators: Vec<_> = attachments
+            .into_iter()
+            .map(|attachment| fallback_message(runtime_dir, attachment))
+            .collect();
         let socket = tokio::net::UnixDatagram::bind(&path)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_socket()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o777 != 0o600
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "unsafe telemetry fallback socket",
+            ));
+        }
+        let device = metadata.dev();
+        let inode = metadata.ino();
         let (shutdown, mut stopping) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            let mut marker = [0_u8; 1];
+            let mut message = [0_u8; FALLBACK_MESSAGE_BYTES + 1];
             loop {
                 tokio::select! {
-                    received = socket.recv(&mut marker) => match received {
-                        Ok(1) if marker == FALLBACK_MARKER => record_fallback(&telemetry),
+                    received = socket.recv(&mut message) => match received {
+                        Ok(FALLBACK_MESSAGE_BYTES)
+                            if authenticators.iter().any(|expected| message[..FALLBACK_MESSAGE_BYTES] == *expected) =>
+                        {
+                            record_fallback(&telemetry)
+                        }
                         Ok(_) => {}
                         Err(_) => break,
                     },
@@ -65,9 +100,13 @@ impl NativeFallbackIngress {
                             }
                             match tokio::time::timeout(
                                 remaining,
-                                socket.recv(&mut marker),
+                                socket.recv(&mut message),
                             ).await {
-                                Ok(Ok(1)) if marker == FALLBACK_MARKER => record_fallback(&telemetry),
+                                Ok(Ok(FALLBACK_MESSAGE_BYTES))
+                                    if authenticators.iter().any(|expected| message[..FALLBACK_MESSAGE_BYTES] == *expected) =>
+                                {
+                                    record_fallback(&telemetry)
+                                }
                                 Ok(Ok(_)) => {}
                                 Ok(Err(_)) | Err(_) => break,
                             }
@@ -79,6 +118,8 @@ impl NativeFallbackIngress {
         });
         Ok(Self {
             path,
+            device,
+            inode,
             shutdown: Some(shutdown),
             task: Some(task),
         })
@@ -92,7 +133,7 @@ impl NativeFallbackIngress {
         if let Some(task) = self.task.take() {
             let _ = task.await;
         }
-        let _ = std::fs::remove_file(&self.path);
+        remove_owned_socket(&self.path, self.device, self.inode);
     }
 }
 
@@ -102,8 +143,51 @@ impl Drop for NativeFallbackIngress {
         if let Some(task) = self.task.take() {
             task.abort();
         }
-        let _ = std::fs::remove_file(&self.path);
+        remove_owned_socket(&self.path, self.device, self.inode);
     }
+}
+
+/// Removes an old fallback path only when it is an owner-only Unix socket, never a link or file.
+fn retire_fallback_socket(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata)
+            if metadata.file_type().is_socket()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.permissions().mode() & 0o077 == 0 =>
+        {
+            std::fs::remove_file(path)
+        }
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "unsafe telemetry fallback socket path",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Removes the fallback socket only while its captured device and inode still identify the path.
+fn remove_owned_socket(path: &Path, device: u64, inode: u64) {
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.file_type().is_socket() && metadata.dev() == device && metadata.ino() == inode
+    }) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Builds the exact fixed-shape marker authenticated to one runtime and launcher attachment.
+fn fallback_message(runtime_dir: &Path, attachment: &str) -> [u8; FALLBACK_MESSAGE_BYTES] {
+    let key = blake3::derive_key(
+        "agent-ide telemetry fallback attachment authentication v1",
+        attachment.as_bytes(),
+    );
+    let mut hash = blake3::Hasher::new_keyed(&key);
+    hash.update(runtime_dir.as_os_str().as_bytes());
+    hash.update(&[FALLBACK_MARKER]);
+    let mut message = [0_u8; FALLBACK_MESSAGE_BYTES];
+    message[0] = FALLBACK_MARKER;
+    message[1..].copy_from_slice(hash.finalize().as_bytes());
+    message
 }
 
 /// Records the sole fixed native fallback event without accepting any hook content.
@@ -111,14 +195,17 @@ fn record_fallback(telemetry: &Telemetry) {
     adapters::hook_result(telemetry, &HookIngressOutcome::Unavailable);
 }
 
-/// Sends one nonblocking fixed-byte marker without opening SQLite and reports kernel acceptance.
-fn report_native_fallback(runtime_dir: &Path) -> bool {
+/// Sends one nonblocking authenticated marker without opening SQLite and reports kernel acceptance.
+fn report_native_fallback(runtime_dir: &Path, attachment: &str) -> bool {
     let Ok(socket) = std::os::unix::net::UnixDatagram::unbound() else {
         return false;
     };
     socket.set_nonblocking(true).is_ok()
         && socket
-            .send_to(&FALLBACK_MARKER, runtime_dir.join(FALLBACK_SOCKET))
+            .send_to(
+                &fallback_message(runtime_dir, attachment),
+                runtime_dir.join(FALLBACK_SOCKET),
+            )
             .is_ok()
 }
 
@@ -127,10 +214,11 @@ fn report_native_fallback(runtime_dir: &Path) -> bool {
 /// Missing/invalid launcher attachment, malformed input, absent daemon and deadline expiry all
 /// return normally. The detached reader cannot delay process exit if stdin remains open. This
 /// function never creates hook-specific daemon state, retries, autostarts, or changes native tool
-/// permission. After valid parsing, an unavailable/deadline result sends only a best-effort fixed
-/// byte to the daemon's private socket. This ingress never opens SQLite, contends with its writer,
-/// or creates a database.
+/// permission. After valid parsing, an unavailable/deadline result sends only a best-effort
+/// fixed-shape marker authenticated to this runtime and attachment. This ingress never opens
+/// SQLite, contends with its writer, persists the credential, or creates a database.
 pub async fn run(runtime_dir: &Path, attachment: Option<String>, host_kind: HostKind) {
+    let fallback_attachment = attachment.clone();
     let valid_boundary = Arc::new(AtomicBool::new(false));
     let valid_for_hook = Arc::clone(&valid_boundary);
     let hook = tokio::time::timeout(TOTAL_DEADLINE, async {
@@ -165,7 +253,9 @@ pub async fn run(runtime_dir: &Path, attachment: Option<String>, host_kind: Host
     if matches!(hook, Some((_, HookIngressOutcome::Unavailable)))
         || (hook.is_none() && valid_boundary.load(Ordering::Acquire))
     {
-        let _ = report_native_fallback(runtime_dir);
+        if let Some(attachment) = fallback_attachment.as_deref() {
+            let _ = report_native_fallback(runtime_dir, attachment);
+        }
     }
     if let Some((event, HookIngressOutcome::Feedback(text))) = hook
         && let Some(output) = render_hook_context(&event, &text)
@@ -196,7 +286,9 @@ mod tests {
     async fn valid_hook_transport_respects_the_deadline_while_sqlite_is_locked() {
         let runtime = runtime("aiht");
         let _ = std::fs::remove_dir_all(&runtime);
-        std::fs::create_dir(&runtime).unwrap();
+        let mut builder = std::fs::DirBuilder::new();
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&runtime).unwrap();
         let listener = tokio::net::UnixListener::bind(runtime.join("agent-ide.sock")).unwrap();
         let database = runtime.join("state.sqlite");
         let lock = rusqlite::Connection::open(&database).unwrap();
@@ -221,21 +313,39 @@ mod tests {
         let _ = std::fs::remove_dir(runtime);
     }
 
-    /// Proves the fixed-byte ingress survives a SQLite lock and graceful shutdown drains its event.
+    /// Accepts only exact configured-attachment datagrams and drains the valid one at shutdown.
     #[tokio::test]
-    async fn native_fallback_marker_is_nonblocking_and_durable_at_shutdown() {
+    async fn native_fallback_rejects_invalid_attachment_and_oversized_datagrams() {
         let runtime = runtime("aihf");
-        std::fs::create_dir(&runtime).unwrap();
+        let mut builder = std::fs::DirBuilder::new();
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&runtime).unwrap();
         let database = runtime.join("telemetry.sqlite");
         let telemetry =
             Telemetry::open_database(&database, crate::telemetry::TelemetryConfig::default())
                 .await
                 .unwrap();
-        let ingress = NativeFallbackIngress::bind(&runtime, telemetry.clone()).unwrap();
+        let socket_path = runtime.join(FALLBACK_SOCKET);
+        let decoy = runtime.join("decoy");
+        std::os::unix::fs::symlink(&decoy, &socket_path).unwrap();
+        assert!(NativeFallbackIngress::bind(&runtime, telemetry.clone(), ["configured"]).is_err());
+        assert!(!decoy.exists());
+        std::fs::remove_file(&socket_path).unwrap();
+        let ingress =
+            NativeFallbackIngress::bind(&runtime, telemetry.clone(), ["configured"]).unwrap();
         let lock = rusqlite::Connection::open(&database).unwrap();
         lock.execute_batch("BEGIN IMMEDIATE;").unwrap();
         let started = std::time::Instant::now();
-        assert!(report_native_fallback(&runtime));
+        assert!(report_native_fallback(&runtime, "unconfigured"));
+        let sender = std::os::unix::net::UnixDatagram::unbound().unwrap();
+        sender.set_nonblocking(true).unwrap();
+        let mut oversized = fallback_message(&runtime, "configured").to_vec();
+        oversized.push(0);
+        assert_eq!(
+            sender.send_to(&oversized, &socket_path).unwrap(),
+            oversized.len()
+        );
+        assert!(report_native_fallback(&runtime, "configured"));
         assert!(started.elapsed() < TOTAL_DEADLINE);
         drop(lock);
         ingress.shutdown().await;
