@@ -16,8 +16,9 @@ available) instead.
 
 1. `ide.start` once per actor per worktree. Do not call it again for later
    edits in the same worktree.
-2. `ide.context` before each relevant edit, to see current source and
-   diagnostics before changing it.
+2. `ide.context` before each relevant edit, using a workspace-relative path.
+   Include `byte_offset` when definitions or references are needed; omitting it
+   requests complete lexical source context only.
 3. Edit with the native host writer — the model's own file-edit tool (Claude's
    editor, Codex `apply_patch`, etc.). Agent IDE has no `ide.edit`; the native
    writer is the only source-mutation path this release supports.
