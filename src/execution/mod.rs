@@ -3341,8 +3341,8 @@ impl OwnedProtocolChild {
     /// Performs the fixed abnormal TypeScript cleanup sequence while retaining direct-child ownership.
     ///
     /// This crate-private path requires positive `grace` and `deadline` values of at most 60
-    /// seconds. It closes protocol pipes, requests group TERM, waits the complete grace without
-    /// polling or reaping the child, then requests group KILL and a direct-child kill before the
+    /// seconds. It requests group TERM, waits the complete grace without polling or reaping the
+    /// child, then requests group KILL and a direct-child kill before the
     /// sole direct wait. Signal failures do not skip later cleanup steps; only a successful bounded
     /// wait returns direct-child settlement, always with unverified descendant evidence. It must
     /// never be used for normal TypeScript shutdown, whose successful path calls [`Self::reap`]
