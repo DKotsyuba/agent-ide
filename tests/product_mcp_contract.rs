@@ -28,11 +28,11 @@ const HOOK_EXIT_CEILING: Duration = Duration::from_millis(450);
 /// Maximum retained-result polls in one product fixture operation.
 ///
 /// At the capped delay this spans approximately the configured 120-second operation lifetime while
-/// consuming at most 64 of Assistance's 1,024 replay entries for the actor scope.
-const PRODUCT_SETTLE_MAX_POLLS: usize = 64;
-/// First retained-result poll delay, allowing fast operations to settle without a busy loop.
-const PRODUCT_SETTLE_INITIAL_DELAY: Duration = Duration::from_millis(50);
-/// Largest retained-result poll delay; 64 stepped waits cover the product operation lifetime.
+/// consuming at most 61 of Assistance's 1,024 replay entries for the actor scope.
+const PRODUCT_SETTLE_MAX_POLLS: usize = 61;
+/// First retained-result poll delay, leaving the daemon's short hook budget free during startup.
+const PRODUCT_SETTLE_INITIAL_DELAY: Duration = Duration::from_millis(750);
+/// Largest retained-result poll delay; 61 stepped waits cover the product operation lifetime.
 const PRODUCT_SETTLE_MAX_DELAY: Duration = Duration::from_secs(2);
 
 /// Returns a unique missing runtime path; the tested command decides whether to create it.
@@ -1701,7 +1701,7 @@ impl ProductActor {
     /// Retrieves a same-binding result with fresh call IDs and bounded replay-safe backoff.
     ///
     /// Each inspection uses [`Self::call`], which advances the host correlation before both its
-    /// native hook and MCP request. The capped backoff and 64-attempt ceiling cover the fixture's
+    /// native hook and MCP request. The capped backoff and 61-attempt ceiling cover the fixture's
     /// 120-second operation lifetime without approaching the product replay budget.
     async fn settle(&mut self, fixture: &ProductFixture, mut reply: Value) -> Value {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(150);

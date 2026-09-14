@@ -161,13 +161,13 @@ verify_toolchains() {
 # Tests inherit only caller-selected exact tool paths. Each command is fixed, serial, and locked;
 # a first failure returns nonzero without converting partial coverage into a passing evidence row.
 run_product_gates() {
-    verify_toolchains || return 1
     cargo test --locked --test product_mcp_contract configured_product_returns_real_go_and_rust_semantic_context -- --ignored --nocapture --test-threads=1 || return 1
     cargo test --locked --test product_mcp_contract configured_product_isolates_go_across_two_divergent_worktree_actors -- --ignored --nocapture --test-threads=1 || return 1
     cargo test --locked --test product_mcp_contract configured_product_returns_real_typescript_family_context_and_reaps -- --ignored --nocapture --test-threads=1 || return 1
     cargo test --locked --test product_mcp_contract configured_product_returns_real_pyright_semantic_context_and_reaps -- --ignored --nocapture --test-threads=1 || return 1
     cargo test --locked --test product_mcp_contract configured_product_acceptance_edit_diagnostics_telemetry_and_fallback -- --ignored --nocapture --test-threads=1 || return 1
-    cargo test --locked --test product_mcp_contract configured_product_claude_helper_returns_real_pyright_semantic_context_diff_and_stop -- --ignored --nocapture --test-threads=1
+    cargo test --locked --test product_mcp_contract configured_product_claude_helper_returns_real_pyright_semantic_context_diff_and_stop -- --ignored --nocapture --test-threads=1 || return 1
+    verify_toolchains
 }
 
 # Executes one explicitly supplied real-host driver against the two isolated fixture worktrees.
@@ -176,7 +176,6 @@ run_product_gates() {
 # receives no arguments or run identifier. Success requires the exact fixed public result document;
 # arbitrary output, missing scenarios, reordered fields, and private metadata are rejected.
 run_external_driver() {
-    verify_toolchains || return 1
     require_file driver "$ACCEPTANCE_DRIVER" executable || return 1
     ACCEPTANCE_RESULT="$ACCEPTANCE_TMP/host-result"
     AGENT_IDE_ACCEPTANCE_ROUTE="$ACCEPTANCE_ROUTE" \
@@ -194,8 +193,9 @@ compact_content=real_pass
 python_provider=real_pass
 typescript_r3=real_pass
 divergent_worktrees=real_pass'
-    [ "$(sed -n '1,10p' "$ACCEPTANCE_RESULT")" = "$ACCEPTANCE_EXPECTED" ]
-    [ "$(wc -l <"$ACCEPTANCE_RESULT" | tr -d ' ')" -le 9 ]
+    [ "$(sed -n '1,10p' "$ACCEPTANCE_RESULT")" = "$ACCEPTANCE_EXPECTED" ] || return 1
+    [ "$(wc -l <"$ACCEPTANCE_RESULT" | tr -d ' ')" -le 9 ] || return 1
+    verify_toolchains
 }
 
 # Writes one closed JSON evidence object without paths, diagnostics, commands, or private IDs.
