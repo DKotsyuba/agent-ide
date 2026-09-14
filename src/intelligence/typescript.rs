@@ -212,7 +212,10 @@ impl ProjectResolutionInputsV1 {
     /// required because inferred projects are unsupported. A configuration must explicitly set
     /// `compilerOptions.types` to `[]` and `compilerOptions.moduleResolution` to `node10`; a
     /// JavaScript or JSX document additionally requires `compilerOptions.allowJs` to be exactly
-    /// `true`. Any `include` or `files` key is refused because glob membership is not observed.
+    /// `true`. Any `include`, `files`, or `exclude` key is refused because glob membership is not
+    /// observed. `compilerOptions.outDir` and `declarationDir` are also refused because output
+    /// membership is not observed. The optional `checkJs` and `noImplicitAny` options are closed
+    /// to the exact boolean value `true` when present.
     /// Workspace reads only those exact names without following symlinks or listing directories,
     /// and refuses an ancestor `node_modules` entry before tsserver can resolve an unobserved bare
     /// dependency. Missing declarations, changed bytes, unsupported composite project shapes, and
@@ -986,8 +989,10 @@ fn ancestor_has_node_modules(document: &Path) -> Result<bool, TypeScriptProfileE
 ///
 /// `language_id` is the fixed ID for the opened document. JavaScript-family documents require the
 /// observed config to opt into JavaScript with boolean `allowJs: true`; TypeScript-family documents
-/// do not require that option. Config `include` and `files` keys are always refused because their
-/// glob membership is not part of the observed evidence.
+/// do not require that option. Config `include`, `files`, and `exclude` keys are always refused
+/// because their glob membership is not part of the observed evidence. Output-directory options
+/// are refused because output membership is not observed. The optional diagnostic switches
+/// `checkJs` and `noImplicitAny` accept only `true` when present.
 fn validate_resolution_shape(
     path: &Path,
     contents: &[u8],
@@ -1019,10 +1024,23 @@ fn validate_resolution_shape(
             || !closed_module_resolution(options)
             || (matches!(language_id, "javascript" | "javascriptreact")
                 && options.get("allowJs") != Some(&serde_json::Value::Bool(true)))
-            || ["baseUrl", "paths", "plugins", "rootDirs", "typeRoots"]
-                .iter()
-                .any(|key| options.contains_key(*key))
-            || ["include", "files"]
+            || [
+                "baseUrl",
+                "paths",
+                "plugins",
+                "rootDirs",
+                "typeRoots",
+                "outDir",
+                "declarationDir",
+            ]
+            .iter()
+            .any(|key| options.contains_key(*key))
+            || ["checkJs", "noImplicitAny"].iter().any(|key| {
+                options
+                    .get(*key)
+                    .is_some_and(|value| value != &serde_json::Value::Bool(true))
+            })
+            || ["include", "files", "exclude"]
                 .iter()
                 .any(|key| object.contains_key(*key))
         {
@@ -1495,7 +1513,8 @@ mod tests {
         }
     }
 
-    /// Requires exact JavaScript opt-in only for JavaScript-family documents and rejects glob keys.
+    /// Requires exact JavaScript opt-in only for JavaScript-family documents and rejects open
+    /// membership/output settings.
     #[test]
     fn project_resolution_requires_javascript_opt_in_without_glob_membership() {
         assert!(
@@ -1526,6 +1545,16 @@ mod tests {
             br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","allowJs":true},"include":[]}"#
                 .as_slice(),
             br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","allowJs":true},"files":[]}"#
+                .as_slice(),
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","allowJs":true},"exclude":[]}"#
+                .as_slice(),
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","allowJs":true,"outDir":"dist"}}"#
+                .as_slice(),
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","allowJs":true,"declarationDir":"types"}}"#
+                .as_slice(),
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","allowJs":true,"checkJs":false}}"#
+                .as_slice(),
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","allowJs":true,"noImplicitAny":false}}"#
                 .as_slice(),
         ] {
             assert!(matches!(

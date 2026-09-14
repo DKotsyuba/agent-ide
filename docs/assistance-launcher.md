@@ -113,6 +113,15 @@ Claude shape, but Claude selection stays unavailable until its independent compi
 exists. This is restart-only configuration and never enables a syntax server or automatic typing
 acquisition.
 
+For a configured TypeScript-family document, the observed ancestor `tsconfig.json` or `jsconfig.json`
+must explicitly set `compilerOptions.types` to `[]` and `compilerOptions.moduleResolution` to
+`node10`. JavaScript and JSX documents additionally require `compilerOptions.allowJs` to be `true`;
+the closed diagnostic options `checkJs` and `noImplicitAny`, when present, must also be `true`.
+Top-level `include`, `files`, and `exclude`, compiler output options `outDir` and `declarationDir`,
+and dependency graphs (`extends`, `references`, package dependencies/workspaces, or ancestor
+`node_modules`) are unsupported and rejected. Glob, output-path, and dependency membership is never
+inferred or scanned.
+
 Configuration contains private attachment and evidence values. Diagnostic formatting
 redacts the configuration; it must never be rendered in model-facing tool results.
 
