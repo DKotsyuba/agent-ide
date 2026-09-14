@@ -11,6 +11,9 @@ use super::{
     launcher::{AcceptedProviderSettings, LaunchTarget, LauncherConfig},
     reply::{FailureCode, PeerReply, ResultKind, call_tool_result_fits, render_call_tool_result},
 };
+use crate::telemetry::{
+    AdmissionState, CancellationState, DescendantSettlement, OutputSizeClass, Telemetry, adapters,
+};
 use crate::workspace::observation::SourceObservation;
 use crate::{
     app::{
@@ -472,6 +475,8 @@ pub struct WorkerHandle {
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Cooperative stop flag for the bounded startup fingerprint reader.
     startup_cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Optional local-only sink cloned into the sole worker at daemon startup.
+    telemetry: Option<Telemetry>,
 }
 impl std::fmt::Debug for WorkerHandle {
     /// Omits all host, target, profile and result contents.
@@ -524,7 +529,16 @@ impl WorkerHandle {
             receiver: Mutex::new(Some(receiver)),
             task: Mutex::new(None),
             startup_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            telemetry: None,
         }
+    }
+
+    /// Attaches a local telemetry owner before startup without changing worker authority or limits.
+    ///
+    /// The owner is cloned into the single worker task when it starts. A later unavailable sink
+    /// only drops observations; it cannot change job admission, execution, or replies.
+    pub fn with_telemetry(&mut self, telemetry: Telemetry) {
+        self.telemetry = Some(telemetry);
     }
     /// Opens exactly one durable Workspace owner and observation schema for this daemon boot.
     pub async fn start(&self, runtime: &Path) -> Result<(), FailureCode> {
@@ -535,6 +549,7 @@ impl WorkerHandle {
             .take()
             .ok_or(FailureCode::Internal)?;
         let shared = self.shared.clone();
+        let telemetry = self.telemetry.clone();
         let runtime = runtime.to_path_buf();
         let (ready, wait) = oneshot::channel();
         let cancel = self.startup_cancel.clone();
@@ -595,6 +610,7 @@ impl WorkerHandle {
                 uncertain_snapshots: Vec::new(),
                 runtime,
                 providers: providers::Providers::new(),
+                telemetry,
             }
             .run(receiver)
             .await;
@@ -1091,8 +1107,50 @@ struct Worker<'a> {
     runtime: std::path::PathBuf,
     /// Exact provider/backend/view ownership and generations.
     providers: providers::Providers,
+    /// Optional closed telemetry sink shared by Assistance producer boundaries.
+    telemetry: Option<Telemetry>,
 }
 impl<'a> Worker<'a> {
+    /// Records one already-settled owned-child completion using closed output and lifecycle facts.
+    ///
+    /// `output_bytes` is the saturated sum of existing bounded captures and never contains their
+    /// bytes. `truncated` and `cancelled` are existing process facts; the event is dropped when no
+    /// sink is attached and cannot affect admission release or the caller's result.
+    pub(super) fn record_execution(
+        &self,
+        elapsed: Duration,
+        output_bytes: usize,
+        truncated: bool,
+        cancelled: bool,
+    ) {
+        let Some(telemetry) = &self.telemetry else {
+            return;
+        };
+        let output = if truncated {
+            OutputSizeClass::Truncated
+        } else if output_bytes == 0 {
+            OutputSizeClass::Empty
+        } else if output_bytes <= 4 * 1024 {
+            OutputSizeClass::Small
+        } else if output_bytes <= 64 * 1024 {
+            OutputSizeClass::Medium
+        } else {
+            OutputSizeClass::Large
+        };
+        adapters::execution_summary(
+            telemetry,
+            elapsed,
+            output,
+            AdmissionState::Admitted,
+            if cancelled {
+                CancellationState::Requested
+            } else {
+                CancellationState::NotRequested
+            },
+            DescendantSettlement::Unverified,
+        );
+    }
+
     /// Processes one slow operation at a time; inspections run on an independently scheduled task
     /// (see `inspection_loop`) so a non-yielding poll of the current operation cannot starve
     /// `ide.inspect`. Shutdown first cancels the current operation, allowing its Rust or forwarder
@@ -1276,6 +1334,17 @@ impl<'a> Worker<'a> {
             self.admission()
                 .release_reaped(completed.settlement)
                 .map_err(|_| FailureCode::Internal)?;
+            self.record_execution(
+                completed.evidence.elapsed(),
+                completed
+                    .evidence
+                    .stdout()
+                    .bytes
+                    .len()
+                    .saturating_add(completed.evidence.stderr().bytes.len()),
+                completed.evidence.stdout().truncated || completed.evidence.stderr().truncated,
+                completed.evidence.cancellation().is_some(),
+            );
             if interrupted {
                 return Err(if *job.cancel.borrow() {
                     FailureCode::Cancelled
@@ -2783,6 +2852,7 @@ mod stop_retry_tests {
             uncertain_snapshots: Vec::new(),
             runtime,
             providers: providers::Providers::new(),
+            telemetry: None,
         }
     }
 

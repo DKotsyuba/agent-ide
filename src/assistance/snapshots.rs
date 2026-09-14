@@ -158,6 +158,17 @@ impl ProductSnapshotRunner<'_, '_> {
             .admission()
             .release_reaped(completed.settlement)
             .map_err(|_| FailureCode::Internal)?;
+        self.worker.record_execution(
+            completed.evidence.elapsed(),
+            completed
+                .evidence
+                .stdout()
+                .bytes
+                .len()
+                .saturating_add(completed.evidence.stderr().bytes.len()),
+            completed.evidence.stdout().truncated || completed.evidence.stderr().truncated,
+            completed.evidence.cancellation().is_some(),
+        );
         intent
             .acknowledge_reap(&completed.evidence)
             .map_err(|_| FailureCode::Internal)?;
@@ -560,6 +571,17 @@ impl Worker<'_> {
             self.admission()
                 .release_reaped(completed.settlement)
                 .map_err(|_| FailureCode::Internal)?;
+            self.record_execution(
+                completed.evidence.elapsed(),
+                completed
+                    .evidence
+                    .stdout()
+                    .bytes
+                    .len()
+                    .saturating_add(completed.evidence.stderr().bytes.len()),
+                completed.evidence.stdout().truncated || completed.evidence.stderr().truncated,
+                completed.evidence.cancellation().is_some(),
+            );
             if interrupted {
                 return Err(if *job.cancel.borrow() {
                     FailureCode::Cancelled

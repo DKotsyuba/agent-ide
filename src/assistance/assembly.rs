@@ -114,6 +114,9 @@ impl ProductDispatcher {
     /// The supplied owner is used only after a closed reply exists. If its bounded ingress or
     /// durable writer is unavailable, the reply remains unchanged and telemetry drops that event.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        if let Some(worker) = &mut self.worker {
+            worker.with_telemetry(telemetry.clone());
+        }
         self.telemetry = Some(telemetry);
         self
     }

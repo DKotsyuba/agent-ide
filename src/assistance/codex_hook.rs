@@ -4,7 +4,11 @@ use super::{
     facade::{HookIngressOutcome, TrustedTransport, render_hook_context, submit_hook_event},
     host_binding::{HostKind, parse_claude_hook_event, parse_hook_event},
 };
-use std::{io::Read, path::Path, time::Duration};
+use crate::{
+    app::{config::EffectiveConfig, store::Store},
+    telemetry::{Telemetry, TelemetryConfig, adapters},
+};
+use std::{io::Read, path::Path, sync::Arc, time::Duration};
 
 /// Caps raw host input before parsing; discarded fields are never sent to the daemon.
 const MAX_INPUT_BYTES: u64 = 64 * 1024;
@@ -15,9 +19,12 @@ const TOTAL_DEADLINE: Duration = Duration::from_millis(250);
 ///
 /// Missing/invalid launcher attachment, malformed input, absent daemon and deadline expiry all
 /// return normally. The detached reader cannot delay process exit if stdin remains open. This
-/// function never creates runtime state, retries, autostarts, or changes native tool permission.
+/// function never creates hook-specific daemon state, retries, autostarts, or changes native tool
+/// permission. It may asynchronously record an unavailable outcome in an existing local telemetry
+/// database, which never changes the hook result or creates a database.
 pub async fn run(runtime_dir: &Path, attachment: Option<String>, host_kind: HostKind) {
-    let _ = tokio::time::timeout(TOTAL_DEADLINE, async {
+    let telemetry = open_hook_telemetry(runtime_dir);
+    let hook = tokio::time::timeout(TOTAL_DEADLINE, async {
         let attachment = attachment?;
         TrustedTransport::from_host_ingress("hook", "hook", attachment.clone())?;
         let (sender, receiver) = tokio::sync::oneshot::channel();
@@ -39,13 +46,50 @@ pub async fn run(runtime_dir: &Path, attachment: Option<String>, host_kind: Host
         .ok()?;
         let correlation = event.optional_call_id().unwrap_or("post-tool-batch");
         let host = TrustedTransport::from_host_ingress(correlation, correlation, attachment)?;
-        if let HookIngressOutcome::Feedback(text) =
-            submit_hook_event(runtime_dir, &host, &event).await
-            && let Some(output) = render_hook_context(&event, &text)
-        {
-            println!("{output}");
-        }
-        Some(())
+        let outcome = submit_hook_event(runtime_dir, &host, &event).await;
+        Some((event, outcome))
     })
-    .await;
+    .await
+    .ok()
+    .flatten();
+    let outcome = hook
+        .as_ref()
+        .map(|(_, outcome)| outcome)
+        .unwrap_or(&HookIngressOutcome::Unavailable);
+    if telemetry.is_finished() {
+        if let Ok(Some(telemetry)) = telemetry.await {
+            adapters::hook_result(&telemetry, outcome);
+        }
+    } else {
+        telemetry.abort();
+    }
+    if let Some((event, HookIngressOutcome::Feedback(text))) = hook
+        && let Some(output) = render_hook_context(&event, &text)
+    {
+        println!("{output}");
+    }
+}
+
+/// Opens an existing optional hook-local telemetry owner concurrently with native ingress.
+///
+/// The task is never awaited unless it already completed inside the hook's existing deadline, so
+/// SQLite opening, migration, or telemetry failure cannot delay stdin handling, transport, native
+/// fallback, or feedback output. An absent database is never created by a hook. The runtime
+/// directory comes from the trusted launcher rather than a hook payload; no hook field reaches the
+/// database path or the telemetry event.
+fn open_hook_telemetry(runtime_dir: &Path) -> tokio::task::JoinHandle<Option<Telemetry>> {
+    let database = runtime_dir.join("telemetry.sqlite");
+    if !database.is_file() {
+        return tokio::spawn(async { None });
+    }
+    tokio::spawn(async move {
+        let store = tokio::task::spawn_blocking(move || {
+            Store::open(&database, EffectiveConfig::defaults().store()).ok()
+        })
+        .await
+        .ok()??;
+        Telemetry::open(Arc::new(store), TelemetryConfig::default())
+            .await
+            .ok()
+    })
 }
