@@ -383,7 +383,9 @@ impl Shared {
         ledger.delivered.insert(binding.clone(), identity);
     }
     /// Retains or clears the bounded Diff pagination state for one same-binding detail reference.
-    /// Never touches the serialized reply; only `serve_inspection` may advance or drop this state.
+    /// Clearing a page also disables continuation on its retained Diff reply, so a later inspect
+    /// cannot reuse a continuation after permanent invalidation; only `serve_inspection` may
+    /// advance or drop this state otherwise.
     /// A newly stashed page is marked "fresh" because its text (in `reply`) was already composed
     /// by the caller and not yet handed to any inspector. Refuses to retain a *new* page past the
     /// aggregate retained-evidence ceiling and reports that honestly through its `bool` result;
@@ -416,6 +418,15 @@ impl Shared {
         if let Some(detail) = ledger.details.get_mut(reference) {
             detail.diff_page = page;
             detail.diff_page_fresh = retained;
+            if !retained
+                && let PeerReply::Complete {
+                    kind: ResultKind::Diff,
+                    continuation,
+                    ..
+                } = &mut detail.reply
+            {
+                *continuation = false;
+            }
         }
         retained
     }

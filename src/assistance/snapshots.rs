@@ -310,6 +310,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// * `compose` — pure selection callback; it must not mutate retained state, because it is called
 ///   repeatedly and only the returned result of the accepted attempt is retained.
 ///
+/// The rendered `more_available` marker and typed `continuation` flag are both true only when the
+/// caller retains a cursor for a later `ide.inspect`.
+///
 /// Returns the accepted selection together with the exact [`PeerReply`] rendered from it; the
 /// caller retains continuation state derived from that same selection.
 ///
@@ -341,7 +344,7 @@ pub(crate) fn fit_diff_page(
             mode,
             &candidate,
             authority_epoch,
-            candidate.detail_cursor().is_some(),
+            retain_continuation && candidate.detail_cursor().is_some(),
         );
         let reply = PeerReply::Complete {
             kind: ResultKind::Diff,

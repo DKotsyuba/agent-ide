@@ -4117,10 +4117,18 @@ async fn diff_pagination_delivers_every_whole_hunk_once_with_truthful_freshness(
     )
     .unwrap();
     let after_edit = actor
-        .call(&fixture, "ide.inspect", json!({"detail_ref":reopened_ref}))
+        .call(&fixture, "ide.inspect", json!({"detail_ref":&reopened_ref}))
         .await;
     assert_eq!(after_edit["state"], "error", "{after_edit}");
     assert_eq!(after_edit["code"], "source_unavailable", "{after_edit}");
+    let after_edit_retry = actor
+        .call(&fixture, "ide.inspect", json!({"detail_ref":&reopened_ref}))
+        .await;
+    assert_eq!(after_edit_retry["kind"], "diff", "{after_edit_retry}");
+    assert_eq!(
+        after_edit_retry["continuation"], false,
+        "{after_edit_retry}"
+    );
 
     // The production snapshot runner correlates each captured path with its durable observation:
     // a registered path edited without any reconciliation must fail the capture rather than being
