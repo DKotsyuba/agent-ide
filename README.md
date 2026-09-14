@@ -119,7 +119,8 @@ TypeScript Language Server 6.0.0 bridge, TypeScript 5.9.3 `tsserver.js`, complet
 the bundle-bound compiled Codex evidence ID, and an ancestor `tsconfig.json` or `jsconfig.json` as
 documented in the [launcher contract](docs/assistance-launcher.md). That config must set
 `compilerOptions.types` to `[]` and `moduleResolution` to `node10`; JS/JSX also require
-`allowJs: true`. `include`, `files`, `exclude`, `outDir`, `declarationDir`, and dependency graphs
-are unsupported, so membership is not inferred. Each operation is exclusive and one-shot; normal
+`allowJs: true`. The top-level `files` array must contain the current document exactly once as a
+bounded normalized relative path; `include`, `exclude`, `outDir`, `declarationDir`, and dependency
+graphs are unsupported. Each operation is exclusive and one-shot; normal
 success requires graceful shutdown, protocol EOF, zero bridge exit, and direct-child reap without
 TERM/KILL. Claude TypeScript remains unavailable pending its separate real macOS acceptance record.

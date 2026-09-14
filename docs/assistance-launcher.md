@@ -117,9 +117,13 @@ For a configured TypeScript-family document, the observed ancestor `tsconfig.jso
 must explicitly set `compilerOptions.types` to `[]` and `compilerOptions.moduleResolution` to
 `node10`. JavaScript and JSX documents additionally require `compilerOptions.allowJs` to be `true`;
 the closed diagnostic options `checkJs` and `noImplicitAny`, when present, must also be `true`.
-Top-level `include`, `files`, and `exclude`, compiler output options `outDir` and `declarationDir`,
-and dependency graphs (`extends`, `references`, package dependencies/workspaces, or ancestor
-`node_modules`) are unsupported and rejected. Glob, output-path, and dependency membership is never
+The top-level `files` array is required, bounded by the existing 16-entry resolution limit, and
+must list the current document exactly once relative to the config directory. Every entry must be a
+normalized relative UTF-8 path without glob metacharacters, absolute paths, dot/parent components,
+or backslashes; duplicates are rejected. Top-level `include` and `exclude`, compiler output options
+`outDir` and `declarationDir`, and dependency graphs (`extends`, `references`, package
+dependencies/workspaces, or ancestor `node_modules`) are unsupported and rejected. Membership is
+taken only from this exact observed array; no glob, output-path, or dependency membership is
 inferred or scanned.
 
 Configuration contains private attachment and evidence values. Diagnostic formatting

@@ -49,8 +49,9 @@ foreground-helper record before this bundle may be enabled for Claude.
 
 The prior r2 evidence is superseded by this r3 record. The r3 closure requires an observed
 configured project: JavaScript and JSX documents require `compilerOptions.allowJs=true`, while
-TypeScript and TSX documents do not invent that requirement; any `include` or `files` key is
-refused because glob membership is not observed.
+TypeScript and TSX documents do not invent that requirement. The top-level `files` array lists all
+four fixture documents exactly, so configured membership is observed directly; `include` and
+`exclude` remain refused.
 
 The shipping MCP and daemon then loaded the same accepted bundle through the fourth
 `typescript_defaults_v1` launcher profile. Real `.js`, `.jsx`, `.ts`, and `.tsx`

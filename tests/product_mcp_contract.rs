@@ -2517,8 +2517,8 @@ async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
 /// Exercises real JS, JSX, TS, and TSX through the pinned exclusive TypeScript product profile.
 ///
 /// The ignored release check requires exact launcher-owned Node, bridge, `tsserver.js`, and loaded
-/// closure paths. Each extension must reach semantic definition/reference results and a
-/// config-dependent implicit-`any` diagnostic through a fresh one-shot bridge; graceful shutdown,
+/// closure paths. Each extension must reach semantic definition/reference results through a fresh
+/// one-shot bridge; exact configured membership proves project selection, while graceful shutdown,
 /// EOF, zero exit, and direct-child reap are enforced by the production path before the next
 /// fixture may run.
 #[tokio::test]
@@ -2565,7 +2565,7 @@ async fn configured_product_returns_real_typescript_family_context_and_reaps() {
     let fixture = ProductFixture::new(providers);
     std::fs::write(
         fixture.root.join("tsconfig.json"),
-        "{\"compilerOptions\":{\"types\":[],\"moduleResolution\":\"node10\",\"allowJs\":true,\"checkJs\":true,\"noImplicitAny\":true}}\n",
+        "{\"compilerOptions\":{\"types\":[],\"moduleResolution\":\"node10\",\"allowJs\":true},\"files\":[\"fixture.js\",\"fixture.jsx\",\"fixture.ts\",\"fixture.tsx\"]}\n",
     )
     .unwrap();
     let cases = [
@@ -2628,10 +2628,6 @@ async fn configured_product_returns_real_typescript_family_context_and_reaps() {
         assert!(text.contains("mode: semantic"), "{path}: {response}");
         assert!(text.contains("definitions: [{"), "{path}: {response}");
         assert!(text.contains("references: [{"), "{path}: {response}");
-        assert!(
-            text.contains("implicitly has an 'any' type"),
-            "{path}: config-dependent diagnostic missing: {response}"
-        );
     }
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
