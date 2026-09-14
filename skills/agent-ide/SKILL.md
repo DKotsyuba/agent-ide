@@ -23,8 +23,10 @@ available) instead.
    and its Context contract is satisfied. Native host editing — the model's own
    file-edit tool (Claude's editor, Codex `apply_patch`, etc.) — remains available
    whenever `ide.edit` is inactive, unavailable, unsupported, declined, or uncertain.
-4. `ide.context` again after the edit, to confirm the change landed and refresh
-   diagnostics against the new bytes.
+4. After `ide.edit`, follow its closed diagnostic state: `current_reported` →
+   `ide.edit` with the returned `source_ref`; `current_clean` → `ide.diff`;
+   `unknown` → `ide.context`. A pending diagnostic still requires `ide.inspect`
+   with its returned `detail_ref`.
 5. `ide.diff` before finishing the task, to review the accumulated change.
 6. `ide.inspect` with the returned `detail_ref` whenever a reply is `Pending`
    or reports truncated content. Do not repeat the same call instead.

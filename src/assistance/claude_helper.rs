@@ -40,6 +40,8 @@ pub const HELPER_SOCKET: &str = "claude-helper.sock";
 const SESSION_DEADLINE: Duration = Duration::from_secs(120);
 /// Bounds a single frame read before any decoding occurs.
 const MAX_FRAME: u32 = MAX_HELPER_FRAME_BYTES as u32;
+/// Leaves room to reap diagnostics and report a known edit result before its ticket expires.
+const EDIT_SETTLEMENT_RESERVE: Duration = Duration::from_secs(2);
 
 /// One helper's request to claim the operation bound to a handle it was launched for.
 ///
@@ -732,10 +734,12 @@ async fn edit(
             SourceCoverage::Complete,
             ObservedState::Present,
         );
-        if let Ok(observation) = observation {
+        if let (Ok(observation), Some(diagnostic_deadline)) =
+            (observation, edit_diagnostic_deadline(deadline))
+        {
             if let Ok(Some((context, Some(snapshot)))) = provider_context(
                 job,
-                deadline,
+                diagnostic_deadline,
                 &observation,
                 read.contents(),
                 crate::intelligence::context::ContextQuery::File,
@@ -764,6 +768,15 @@ async fn edit(
             diagnostics,
         }),
     )
+}
+
+/// Returns the latest deadline a best-effort edit diagnostic refresh may consume.
+///
+/// `None` leaves the completed Workspace effect intact and publishes `unknown` diagnostics so
+/// the helper can settle its receipt and ticket before their shared operation deadline.
+fn edit_diagnostic_deadline(deadline: tokio::time::Instant) -> Option<tokio::time::Instant> {
+    let diagnostic_deadline = deadline.checked_sub(EDIT_SETTLEMENT_RESERVE)?;
+    (diagnostic_deadline > tokio::time::Instant::now()).then_some(diagnostic_deadline)
 }
 
 /// Builds a settled edit payload for a known pre-effect or unavailable helper outcome.
