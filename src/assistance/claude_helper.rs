@@ -966,7 +966,8 @@ async fn context(
     (HelperOutcome::Complete { text }, Some(payload))
 }
 
-/// Runs one accepted provider over exact helper-observed bytes, then reaps it before returning.
+/// Runs one accepted provider over exact helper-observed bytes, awaits matching Pyright diagnostics
+/// under the helper's inherited deadline, then reaps it before returning.
 async fn provider_context(
     job: &HelperJob,
     deadline: tokio::time::Instant,
@@ -1150,6 +1151,9 @@ async fn provider_context(
         },
         |mut session| async move {
             let context = session.context(source, bytes, query).await?;
+            if matches!(session.settings(), ProviderSettings::Pyright(_)) {
+                session.wait_for_matching_diagnostics().await;
+            }
             let diagnostics = session.diagnostics();
             session.shutdown().await?;
             Ok((context, Some(diagnostics)))

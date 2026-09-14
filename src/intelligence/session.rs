@@ -653,15 +653,11 @@ impl Session {
         self.state.lock().expect("session lock").diagnostics.clone()
     }
 
-    /// Waits at most two seconds, and never beyond the current request deadline, for the current
-    /// Pyright document's first versioned diagnostic push. A timeout deliberately leaves diagnostic
-    /// evidence unknown and does not affect already-computed semantic context.
+    /// Waits under the current request deadline for the current Pyright document's first versioned
+    /// diagnostic push. A timeout deliberately leaves diagnostic evidence unknown and does not
+    /// affect already-computed semantic context.
     pub(crate) async fn wait_for_matching_diagnostics(&self) {
-        let deadline = std::cmp::min(
-            self.exchange_deadline(),
-            Instant::now() + Duration::from_secs(2),
-        );
-        let _ = wait_for_matching_diagnostics(&self.state, deadline).await;
+        let _ = wait_for_matching_diagnostics(&self.state, self.exchange_deadline()).await;
     }
 
     /// Synchronizes exact observation bytes, then requests advertised definition/reference methods.
