@@ -478,6 +478,8 @@ pub struct WorkerHandle {
     startup_cancel: Arc<std::sync::atomic::AtomicBool>,
     /// Optional local-only sink cloned into the sole worker at daemon startup.
     telemetry: Arc<Mutex<Option<Telemetry>>>,
+    /// Fixed-byte native fallback receiver drained before the telemetry writer stops.
+    fallback_ingress: Arc<Mutex<Option<super::codex_hook::NativeFallbackIngress>>>,
 }
 impl std::fmt::Debug for WorkerHandle {
     /// Omits all host, target, profile and result contents.
@@ -531,6 +533,7 @@ impl WorkerHandle {
             task: Mutex::new(None),
             startup_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             telemetry: Arc::new(Mutex::new(None)),
+            fallback_ingress: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -541,7 +544,12 @@ impl WorkerHandle {
     pub fn telemetry(&self) -> Option<Telemetry> {
         self.telemetry.lock().ok()?.clone()
     }
-    /// Opens exactly one durable Workspace owner and observation schema for this daemon boot.
+    /// Opens one session-local Workspace owner plus an independently locked telemetry sink.
+    ///
+    /// `runtime` is this daemon's private directory and owns all Workspace/Changes authority state.
+    /// An absolute `AGENT_IDE_TELEMETRY_DATABASE` may select durable capture independently; lock
+    /// contention disables only telemetry. Startup fails only when the session-local store or its
+    /// authority schemas cannot open, and creates the worker task exactly once.
     pub async fn start(&self, runtime: &Path) -> Result<(), FailureCode> {
         let receiver = self
             .receiver
@@ -551,6 +559,7 @@ impl WorkerHandle {
             .ok_or(FailureCode::Internal)?;
         let shared = self.shared.clone();
         let telemetry_owner = self.telemetry.clone();
+        let fallback_owner = self.fallback_ingress.clone();
         let runtime = runtime.to_path_buf();
         let (ready, wait) = oneshot::channel();
         let cancel = self.startup_cancel.clone();
@@ -585,9 +594,17 @@ impl WorkerHandle {
             // ponytail: one process-lifetime Store Arc leak per daemon boot; replace with explicit
             // task-owned shutdown once in-process daemon restart becomes a supported lifecycle.
             let store: &'static Arc<Store> = Box::leak(Box::new(Arc::new(store)));
-            let telemetry = Telemetry::open(Arc::clone(store), TelemetryConfig::default())
-                .await
-                .ok();
+            let telemetry_database = std::env::var_os("AGENT_IDE_TELEMETRY_DATABASE")
+                .map(std::path::PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .unwrap_or_else(|| runtime.join("telemetry.sqlite"));
+            let telemetry = if telemetry_database == database {
+                None
+            } else {
+                Telemetry::open_database(&telemetry_database, TelemetryConfig::default())
+                    .await
+                    .ok()
+            };
             let workspace = match DurableWorkspace::open(store).await {
                 Ok(owner) => owner,
                 Err(_) => {
@@ -605,6 +622,13 @@ impl WorkerHandle {
             }
             if let Ok(mut configured) = telemetry_owner.lock() {
                 *configured = telemetry.clone();
+            }
+            if let Some(telemetry) = telemetry.clone()
+                && let Ok(ingress) =
+                    super::codex_hook::NativeFallbackIngress::bind(&runtime, telemetry)
+                && let Ok(mut configured) = fallback_owner.lock()
+            {
+                *configured = Some(ingress);
             }
             let _ = ready.send(Ok(()));
             Worker {
@@ -651,7 +675,7 @@ impl WorkerHandle {
         let Some(mut task) = task else {
             return Ok(());
         };
-        match tokio::time::timeout(Duration::from_secs(39), &mut task).await {
+        let result = match tokio::time::timeout(Duration::from_secs(39), &mut task).await {
             Ok(Ok(())) => self
                 .shared
                 .shutdown_failure
@@ -665,7 +689,20 @@ impl WorkerHandle {
                 let _ = task.await;
                 Err(FailureCode::Deadline)
             }
+        };
+        let fallback = self
+            .fallback_ingress
+            .lock()
+            .map_err(|_| FailureCode::Internal)?
+            .take();
+        if let Some(fallback) = fallback {
+            fallback.shutdown().await;
         }
+        let telemetry = self.telemetry();
+        if let Some(telemetry) = telemetry {
+            telemetry.shutdown().await;
+        }
+        result
     }
     /// Enqueues or resolves the exact query, returning pending without waiting for provider warmup.
     pub async fn submit(

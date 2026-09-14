@@ -123,6 +123,9 @@ fn reply_outcome(reply: &PeerReply) -> ToolOutcome {
         PeerReply::Error {
             code: FailureCode::InvalidDetail,
         } => ToolOutcome::Invalid,
+        PeerReply::Error {
+            code: FailureCode::Deadline,
+        } => ToolOutcome::Incomplete,
         PeerReply::Error { .. } => ToolOutcome::Failed,
         PeerReply::Feedback { .. } => ToolOutcome::Completed,
     }
@@ -149,6 +152,12 @@ mod tests {
                 code: FailureCode::ProviderUnavailable,
             }),
             ToolOutcome::Failed
+        );
+        assert_eq!(
+            reply_outcome(&PeerReply::Error {
+                code: FailureCode::Deadline,
+            }),
+            ToolOutcome::Incomplete
         );
     }
 

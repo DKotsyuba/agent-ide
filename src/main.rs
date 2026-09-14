@@ -185,10 +185,14 @@ async fn main() -> ExitCode {
             }
             Err(error) => fail(error),
         },
-        Ok(Command::TelemetryQuery { database, filter }) => {
+        Ok(Command::TelemetryQuery {
+            database,
+            filter,
+            cursor,
+        }) => {
             let page = match telemetry_owner(&database).await {
                 Ok(telemetry) => telemetry
-                    .query(filter, None, 1_000)
+                    .query(filter, cursor, 1_000)
                     .await
                     .map_err(|_| AppError::InvalidResponse),
                 Err(error) => Err(error),
@@ -236,7 +240,10 @@ async fn main() -> ExitCode {
                     if let Some(sequence) = export.first_omitted_sequence {
                         eprintln!("first_omitted_sequence={sequence}");
                     }
-                    eprintln!("dropped={}", export.dropped);
+                    match export.dropped {
+                        Some(dropped) => eprintln!("dropped={dropped}"),
+                        None => eprintln!("dropped=null"),
+                    }
                     ExitCode::SUCCESS
                 }
                 Err(error) => fail(error),
@@ -470,6 +477,8 @@ enum Command {
         database: PathBuf,
         /// Optional fixed event-tag restriction; no caller-supplied SQL or arbitrary tag is accepted.
         filter: Filter,
+        /// Exclusive durable sequence returned as `next_cursor` by a prior query page.
+        cursor: Option<u64>,
     },
     /// Writes deterministic bounded canonical telemetry rows from an operator-selected local database.
     TelemetryExport {
@@ -623,7 +632,7 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
         && matches!(sub.to_str(), Some("query" | "export"))
         && database_flag == "--database"
     {
-        return telemetry_command(sub, PathBuf::from(database), Filter::All);
+        return telemetry_command(sub, PathBuf::from(database), Filter::All, None);
     }
     if let [mode, sub, database_flag, database, tag_flag, tag] = arguments.as_slice()
         && mode == "telemetry"
@@ -632,7 +641,42 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
         && tag_flag == "--tag"
     {
         let filter = telemetry_filter(tag.to_str().ok_or(AppError::InvalidResponse)?)?;
-        return telemetry_command(sub, PathBuf::from(database), filter);
+        return telemetry_command(sub, PathBuf::from(database), filter, None);
+    }
+    if let [mode, sub, database_flag, database, cursor_flag, cursor] = arguments.as_slice()
+        && mode == "telemetry"
+        && sub == "query"
+        && database_flag == "--database"
+        && cursor_flag == "--cursor"
+    {
+        let cursor = cursor
+            .to_str()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or(AppError::InvalidResponse)?;
+        return telemetry_command(sub, PathBuf::from(database), Filter::All, Some(cursor));
+    }
+    if let [
+        mode,
+        sub,
+        database_flag,
+        database,
+        tag_flag,
+        tag,
+        cursor_flag,
+        cursor,
+    ] = arguments.as_slice()
+        && mode == "telemetry"
+        && sub == "query"
+        && database_flag == "--database"
+        && tag_flag == "--tag"
+        && cursor_flag == "--cursor"
+    {
+        let filter = telemetry_filter(tag.to_str().ok_or(AppError::InvalidResponse)?)?;
+        let cursor = cursor
+            .to_str()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or(AppError::InvalidResponse)?;
+        return telemetry_command(sub, PathBuf::from(database), filter, Some(cursor));
     }
     let [mode, flag, value] = arguments.as_slice() else {
         return Err(AppError::InvalidResponse);
@@ -668,15 +712,23 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
     }
 }
 
-/// Builds a fixed telemetry CLI command after its exact subcommand and bounded filter were parsed.
+/// Builds a fixed telemetry CLI command from a trusted subcommand, database, closed filter, and cursor.
+///
+/// `cursor` is the exclusive durable sequence returned by a prior query and is rejected for export.
+/// Unknown subcommands return [`AppError::InvalidResponse`] without filesystem access.
 fn telemetry_command(
     subcommand: &OsString,
     database: PathBuf,
     filter: Filter,
+    cursor: Option<u64>,
 ) -> Result<Command, AppError> {
     match subcommand.to_str() {
-        Some("query") => Ok(Command::TelemetryQuery { database, filter }),
-        Some("export") => Ok(Command::TelemetryExport { database, filter }),
+        Some("query") => Ok(Command::TelemetryQuery {
+            database,
+            filter,
+            cursor,
+        }),
+        Some("export") if cursor.is_none() => Ok(Command::TelemetryExport { database, filter }),
         _ => Err(AppError::InvalidResponse),
     }
 }
@@ -888,11 +940,12 @@ fn claude_project_identity(project: &Path) -> String {
         .to_string()
 }
 
-/// Derives the persistent local Store path for one canonical managed worktree.
+/// Derives the persistent telemetry-only Store path for one canonical managed worktree.
 ///
 /// The name is an opaque digest of the already-validated candidate, so a fresh managed runtime
-/// generation reuses its prior local state while runtime socket cleanup cannot delete it.
-fn managed_state_database(candidate: &Path) -> std::io::Result<PathBuf> {
+/// generation reuses prior events while runtime socket cleanup cannot delete it. Workspace and
+/// Changes authority are deliberately excluded and remain in each managed daemon's private runtime.
+fn managed_telemetry_database(candidate: &Path) -> std::io::Result<PathBuf> {
     Ok(fs::canonicalize(std::env::temp_dir())?.join(format!(
         "agent-ide-state-{}.sqlite",
         blake3::hash(candidate.as_os_str().as_bytes()).to_hex()
@@ -1032,7 +1085,8 @@ async fn run_managed_mcp(
 ///
 /// The candidate must be the one captured by the parent and remain an absolute local directory.
 /// Git identity is deliberately discovered later by the existing worker activation path. Launcher
-/// executables and profiles are validated through [`LauncherConfig`] before the child starts.
+/// executables and profiles are validated through [`LauncherConfig`] before the child starts. The
+/// child receives only the candidate-stable telemetry path; its authority Store stays runtime-local.
 async fn start_managed_daemon(
     runtime: &ManagedRuntime,
     launcher_template: &Path,
@@ -1046,7 +1100,7 @@ async fn start_managed_daemon(
         return Err(());
     }
     let attachment = random_hex(32).map_err(|_| ())?;
-    let state_database = managed_state_database(&candidate).map_err(|_| ())?;
+    let telemetry_database = managed_telemetry_database(&candidate).map_err(|_| ())?;
     let (launcher, bytes) =
         LauncherConfig::bind_one_candidate(launcher_template, &attachment, &candidate)
             .map_err(|_| ())?;
@@ -1069,7 +1123,8 @@ async fn start_managed_daemon(
         .args(["daemon", "--runtime-dir"])
         .arg(&runtime.path)
         .env("AGENT_IDE_LAUNCHER_CONFIG", launcher_path)
-        .env("AGENT_IDE_STATE_DATABASE", state_database)
+        .env("AGENT_IDE_TELEMETRY_DATABASE", telemetry_database)
+        .env_remove("AGENT_IDE_STATE_DATABASE")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1328,6 +1383,43 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    /// Telemetry query accepts its returned exclusive cursor with or without a closed tag filter.
+    #[test]
+    fn telemetry_query_cli_accepts_continuation_cursor() {
+        assert!(matches!(
+            command(args(&[
+                "telemetry",
+                "query",
+                "--database",
+                "/private/tmp/telemetry.sqlite",
+                "--cursor",
+                "42"
+            ])),
+            Ok(Command::TelemetryQuery {
+                cursor: Some(42),
+                filter: Filter::All,
+                ..
+            })
+        ));
+        assert!(matches!(
+            command(args(&[
+                "telemetry",
+                "query",
+                "--database",
+                "/private/tmp/telemetry.sqlite",
+                "--tag",
+                "native_fallback",
+                "--cursor",
+                "42"
+            ])),
+            Ok(Command::TelemetryQuery {
+                cursor: Some(42),
+                filter: Filter::Tag("native_fallback"),
+                ..
+            })
+        ));
+    }
+
     /// Managed host flags and the argument-free Claude hook are distinct from both legacy forms.
     #[test]
     fn managed_and_legacy_mcp_cli_forms_are_distinct() {
@@ -1449,12 +1541,12 @@ mod tests {
 
     /// Proves a managed runtime cleanup cannot remove its candidate-stable local Store path.
     #[test]
-    fn managed_state_database_is_stable_outside_a_runtime_generation() {
+    fn managed_telemetry_database_is_stable_outside_a_runtime_generation() {
         let candidate = fs::canonicalize(std::env::temp_dir()).unwrap();
-        let database = managed_state_database(&candidate).unwrap();
+        let database = managed_telemetry_database(&candidate).unwrap();
         let runtime = ManagedRuntime::create().unwrap();
         assert_ne!(database.parent(), Some(runtime.path.as_path()));
-        assert_eq!(database, managed_state_database(&candidate).unwrap());
+        assert_eq!(database, managed_telemetry_database(&candidate).unwrap());
         runtime.remove().unwrap();
     }
 

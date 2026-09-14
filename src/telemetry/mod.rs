@@ -4,9 +4,15 @@
 //! JSON, path, command, source, prompt, credential, output, or diagnostic-message field. Failed
 //! ingress and persistence are counted locally and never affect the observed coding operation.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    fs::{File, OpenOptions},
+    os::fd::AsRawFd,
+    os::unix::fs::OpenOptionsExt,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 use rusqlite::{params, types::Value};
@@ -16,7 +22,8 @@ use tokio::sync::mpsc;
 #[cfg(test)]
 use crate::app::config::StoreConfig;
 use crate::app::store::{
-    DomainMigration, DomainName, MigrationDigest, MigrationKey, Store, StoreError, TrustedUpSql,
+    DomainMigration, DomainName, MigrationAdmission, MigrationDigest, MigrationKey, Store,
+    StoreError, TrustedUpSql, UntrackedOutcome,
 };
 
 /// Converts existing Assistance, provider, and Execution facts into closed telemetry events.
@@ -308,6 +315,14 @@ pub enum TelemetryError {
     OversizedEvent,
     /// Application durable storage was unavailable or rejected the bounded request.
     Store,
+    /// Another process already owns the stable telemetry database.
+    Busy,
+    /// The telemetry migration key already names a different immutable schema.
+    MigrationIncompatible,
+    /// A nonfresh telemetry migration could not obtain its required durable backup.
+    MigrationBackupUnavailable,
+    /// Telemetry migration commit or caller delivery could not be determined safely.
+    MigrationOutcomeUnknown,
 }
 
 /// Describes a durable telemetry row in increasing allocated sequence order.
@@ -337,8 +352,8 @@ pub struct QueryPage {
     pub next_cursor: Option<u64>,
     /// True when a matching row remained beyond this page's limit.
     pub truncated: bool,
-    /// Events this owner has observed as dropped since startup because ingress or persistence was unavailable.
-    pub dropped: u64,
+    /// Events this writer observed as dropped, or `None` when a read-only owner cannot know.
+    pub dropped: Option<u64>,
 }
 
 /// Returns canonical newline-delimited UTF-8 export bytes and an explicit first omitted sequence.
@@ -350,8 +365,47 @@ pub struct Export {
     pub truncated: bool,
     /// Durable sequence of the first matching row omitted by the byte cap.
     pub first_omitted_sequence: Option<u64>,
-    /// Events this owner has observed as dropped since startup because ingress or persistence was unavailable.
-    pub dropped: u64,
+    /// Events this writer observed as dropped, or `None` when a read-only owner cannot know.
+    pub dropped: Option<u64>,
+}
+
+/// Retains the telemetry database's exclusive advisory lock for one writer lifetime.
+struct TelemetryOwnership {
+    /// Open lock-file descriptor whose process lock excludes another stable writer.
+    _file: File,
+}
+
+impl TelemetryOwnership {
+    /// Acquires the sibling lock file without waiting; contention returns the fail-open busy class.
+    fn acquire(database: &Path) -> Result<Self, TelemetryError> {
+        let mut lock_path = database.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(lock_path)
+            .map_err(|_| TelemetryError::Store)?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            Ok(Self { _file: file })
+        } else if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+            Err(TelemetryError::Busy)
+        } else {
+            Err(TelemetryError::Store)
+        }
+    }
+}
+
+/// Tracks retained aggregates in memory so ordinary inserts never scan the full event table.
+#[derive(Clone, Copy)]
+struct RetentionState {
+    /// Number of rows committed by this exclusive owner.
+    rows: i64,
+    /// Sum of committed canonical payload bytes.
+    logical_bytes: i64,
 }
 
 /// Provides fail-open nonblocking ingress plus durable query and export for one restart-only owner.
@@ -363,8 +417,16 @@ pub struct Telemetry {
     store: Arc<Store>,
     /// Immutable limits established at construction and never live-reloaded.
     config: TelemetryConfig,
-    /// Counts locally dropped events without recording their content or reason.
-    dropped: Arc<AtomicU64>,
+    /// Counts locally dropped events, or is absent for a read-only owner with unknown history.
+    dropped: Option<Arc<AtomicU64>>,
+    /// Prevents new ingress once graceful writer drain begins.
+    closing: Arc<AtomicBool>,
+    /// Signals the background writer to close ingress and drain every already queued event.
+    shutdown: Option<tokio::sync::watch::Sender<bool>>,
+    /// Shared single-use join handle for the background writer.
+    writer: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Exclusive stable-database ownership, absent for caller-supplied and read-only stores.
+    _ownership: Option<Arc<TelemetryOwnership>>,
 }
 
 impl Telemetry {
@@ -374,25 +436,87 @@ impl Telemetry {
     /// Once returned, [`Self::record`] never waits for SQLite, retries an event, changes a caller's
     /// result, or exposes an ingestion error.
     pub async fn open(store: Arc<Store>, config: TelemetryConfig) -> Result<Self, TelemetryError> {
+        Self::open_inner(store, config, None).await
+    }
+
+    /// Acquires one stable database writer without waiting, then migrates and starts telemetry.
+    ///
+    /// The sibling advisory lock is retained for this owner's lifetime. A competing process gets
+    /// [`TelemetryError::Busy`] before SQLite is opened, so it can disable telemetry without
+    /// disturbing the current writer or any session-local Workspace authority.
+    pub async fn open_database(
+        database: &Path,
+        config: TelemetryConfig,
+    ) -> Result<Self, TelemetryError> {
+        let ownership = Arc::new(TelemetryOwnership::acquire(database)?);
+        let mut backup_root = database.as_os_str().to_os_string();
+        backup_root.push(".backups");
+        let store = Store::open_with_backup_root(
+            database,
+            Path::new(&backup_root),
+            crate::app::config::EffectiveConfig::defaults().store(),
+        )
+        .map_err(map_store)?;
+        Self::open_inner(Arc::new(store), config, Some(ownership)).await
+    }
+
+    /// Starts a writer over one already-open store and optional stable ownership guard.
+    async fn open_inner(
+        store: Arc<Store>,
+        config: TelemetryConfig,
+        ownership: Option<Arc<TelemetryOwnership>>,
+    ) -> Result<Self, TelemetryError> {
         let config = config.validate()?;
         migrate(&store).await?;
         let dropped = Arc::new(AtomicU64::new(0));
+        let closing = Arc::new(AtomicBool::new(false));
         if !config.enabled {
             return Ok(Self {
                 sender: None,
                 store,
                 config,
-                dropped,
+                dropped: Some(dropped),
+                closing,
+                shutdown: None,
+                writer: Arc::new(tokio::sync::Mutex::new(None)),
+                _ownership: ownership,
             });
         }
+        let mut retention = Some(load_retention(&store).await?);
         let (sender, mut receiver) = mpsc::channel(config.queue_capacity);
+        let (shutdown, mut shutdown_receiver) = tokio::sync::watch::channel(false);
         let writer_store = Arc::clone(&store);
         let writer_config = config;
         let writer_dropped = Arc::clone(&dropped);
-        tokio::spawn(async move {
-            while let Some(event) = receiver.recv().await {
-                if persist(&writer_store, writer_config, event).await.is_err() {
-                    writer_dropped.fetch_add(1, Ordering::Relaxed);
+        let writer = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    changed = shutdown_receiver.changed() => {
+                        if changed.is_err() || *shutdown_receiver.borrow() {
+                            receiver.close();
+                            while let Some(event) = receiver.recv().await {
+                                write_event(
+                                    &writer_store,
+                                    writer_config,
+                                    event,
+                                    &mut retention,
+                                    &writer_dropped,
+                                ).await;
+                            }
+                            break;
+                        }
+                    }
+                    event = receiver.recv() => match event {
+                        Some(event) => write_event(
+                            &writer_store,
+                            writer_config,
+                            event,
+                            &mut retention,
+                            &writer_dropped,
+                        ).await,
+                        None => break,
+                    }
                 }
             }
         });
@@ -400,14 +524,18 @@ impl Telemetry {
             sender: Some(sender),
             store,
             config,
-            dropped,
+            dropped: Some(dropped),
+            closing,
+            shutdown: Some(shutdown),
+            writer: Arc::new(tokio::sync::Mutex::new(Some(writer))),
+            _ownership: ownership,
         })
     }
 
     /// Opens an existing telemetry schema for query/export without migration, a writer, or mutation.
     ///
-    /// `store` must be Application's read-only owner. The returned disabled ingress deliberately
-    /// counts any attempted record as dropped, while reads remain limited by the supplied config.
+    /// `store` must be Application's read-only owner. The returned disabled ingress discards any
+    /// attempted record and reports drop history as unknown, while reads use `config` budgets.
     pub async fn open_read_only(
         store: Arc<Store>,
         config: TelemetryConfig,
@@ -416,7 +544,11 @@ impl Telemetry {
             sender: None,
             store,
             config: config.validate()?,
-            dropped: Arc::new(AtomicU64::new(0)),
+            dropped: None,
+            closing: Arc::new(AtomicBool::new(false)),
+            shutdown: None,
+            writer: Arc::new(tokio::sync::Mutex::new(None)),
+            _ownership: None,
         })
     }
 
@@ -426,16 +558,37 @@ impl Telemetry {
     /// native fallback outcome, or returns an error. Invalid and oversized events are dropped just
     /// like a full queue or unavailable durable sink.
     pub fn record(&self, event: Event) {
+        let Some(dropped) = &self.dropped else {
+            return;
+        };
+        if self.closing.load(Ordering::Acquire) {
+            dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         if event.encode().is_err() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            dropped.fetch_add(1, Ordering::Relaxed);
             return;
         }
         let Some(sender) = &self.sender else {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            dropped.fetch_add(1, Ordering::Relaxed);
             return;
         };
         if sender.try_send(event).is_err() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Stops new ingress, drains every accepted event, and waits for its final durable settlement.
+    ///
+    /// Clones share one join handle, so repeated shutdown calls are harmless. Read-only and
+    /// disabled owners return immediately.
+    pub async fn shutdown(&self) {
+        self.closing.store(true, Ordering::Release);
+        if let Some(shutdown) = &self.shutdown {
+            let _ = shutdown.send(true);
+        }
+        if let Some(writer) = self.writer.lock().await.take() {
+            let _ = writer.await;
         }
     }
 
@@ -464,7 +617,10 @@ impl Telemetry {
             rows,
             next_cursor,
             truncated,
-            dropped: self.dropped.load(Ordering::Relaxed),
+            dropped: self
+                .dropped
+                .as_ref()
+                .map(|dropped| dropped.load(Ordering::Relaxed)),
         })
     }
 
@@ -483,7 +639,10 @@ impl Telemetry {
                     bytes,
                     truncated: false,
                     first_omitted_sequence: None,
-                    dropped: self.dropped.load(Ordering::Relaxed),
+                    dropped: self
+                        .dropped
+                        .as_ref()
+                        .map(|dropped| dropped.load(Ordering::Relaxed)),
                 });
             }
             for row in &rows {
@@ -494,7 +653,10 @@ impl Telemetry {
                         bytes,
                         truncated: true,
                         first_omitted_sequence: Some(row.sequence),
-                        dropped: self.dropped.load(Ordering::Relaxed),
+                        dropped: self
+                            .dropped
+                            .as_ref()
+                            .map(|dropped| dropped.load(Ordering::Relaxed)),
                     });
                 }
                 bytes.extend_from_slice(&line);
@@ -505,7 +667,10 @@ impl Telemetry {
                     bytes,
                     truncated: false,
                     first_omitted_sequence: None,
-                    dropped: self.dropped.load(Ordering::Relaxed),
+                    dropped: self
+                        .dropped
+                        .as_ref()
+                        .map(|dropped| dropped.load(Ordering::Relaxed)),
                 });
             }
         }
@@ -521,37 +686,111 @@ async fn migrate(store: &Store) -> Result<(), TelemetryError> {
         expected_digest: MigrationDigest::from_sql(&sql),
         up_sql: sql,
     };
-    store.admit_migration(migration).await.map_err(map_store)?;
-    Ok(())
+    match store.admit_migration(migration).await.map_err(map_store)? {
+        MigrationAdmission::Applied { .. } | MigrationAdmission::AlreadyApplied { .. } => Ok(()),
+        MigrationAdmission::Incompatible { .. } => Err(TelemetryError::MigrationIncompatible),
+        MigrationAdmission::BackupUnavailable => Err(TelemetryError::MigrationBackupUnavailable),
+        MigrationAdmission::OutcomeUnknown { .. } => Err(TelemetryError::MigrationOutcomeUnknown),
+    }
 }
 
-/// Persists one event and evicts oldest durable rows until both independent ceilings hold.
+/// Reads retained aggregates once when an exclusive telemetry writer starts.
+async fn load_retention(store: &Store) -> Result<RetentionState, TelemetryError> {
+    store
+        .read_one(
+            "SELECT COUNT(*), COALESCE(SUM(logical_bytes), 0) FROM telemetry_events",
+            Vec::new(),
+            |row| {
+                Ok(RetentionState {
+                    rows: row.get(0)?,
+                    logical_bytes: row.get(1)?,
+                })
+            },
+        )
+        .await
+        .map_err(map_store)?
+        .ok_or(TelemetryError::Store)
+}
+
+/// Persists one queued event and updates drop accounting only for outcomes known not to commit.
+async fn write_event(
+    store: &Store,
+    config: TelemetryConfig,
+    event: Event,
+    retention: &mut Option<RetentionState>,
+    dropped: &AtomicU64,
+) {
+    if retention.is_none() {
+        *retention = load_retention(store).await.ok();
+    }
+    let Some(current) = *retention else {
+        dropped.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    match persist(store, config, event, current).await {
+        Ok(UntrackedOutcome::Committed(next)) => *retention = Some(next),
+        Ok(UntrackedOutcome::OutcomeUnknown) => *retention = None,
+        Err(_) => {
+            dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Persists one event and evicts only the oldest rows needed for both ceilings to hold.
 async fn persist(
     store: &Store,
     config: TelemetryConfig,
     event: Event,
-) -> Result<(), TelemetryError> {
+    retained: RetentionState,
+) -> Result<UntrackedOutcome<RetentionState>, TelemetryError> {
     let payload = event.encode()?;
     let tag = event.tag();
     let logical_bytes = i64::try_from(payload.len()).map_err(|_| TelemetryError::InvalidEvent)?;
     let max_rows = i64::try_from(config.max_rows).map_err(|_| TelemetryError::InvalidConfig)?;
     let max_bytes =
         i64::try_from(config.max_logical_bytes).map_err(|_| TelemetryError::InvalidConfig)?;
-    store.execute_untracked(move |transaction| {
-        transaction.execute(
-            "INSERT INTO telemetry_events (tag, payload, logical_bytes) VALUES (?1, ?2, ?3)",
-            params![tag, payload, logical_bytes],
-        )?;
-        while transaction.query_row("SELECT COUNT(*) FROM telemetry_events", [], |row| row.get::<_, i64>(0))? > max_rows
-            || transaction.query_row("SELECT COALESCE(SUM(logical_bytes), 0) FROM telemetry_events", [], |row| row.get::<_, i64>(0))? > max_bytes
-        {
+    store
+        .execute_untracked(move |transaction| {
             transaction.execute(
-                "DELETE FROM telemetry_events WHERE sequence = (SELECT MIN(sequence) FROM telemetry_events)",
-                [],
+                "INSERT INTO telemetry_events (tag, payload, logical_bytes) VALUES (?1, ?2, ?3)",
+                params![tag, payload, logical_bytes],
             )?;
-        }
-        Ok(())
-    }).await.map_err(map_store)
+            let mut next = RetentionState {
+                rows: retained
+                    .rows
+                    .checked_add(1)
+                    .ok_or(rusqlite::Error::InvalidQuery)?,
+                logical_bytes: retained
+                    .logical_bytes
+                    .checked_add(logical_bytes)
+                    .ok_or(rusqlite::Error::InvalidQuery)?,
+            };
+            let mut cutoff = None;
+            if next.rows > max_rows || next.logical_bytes > max_bytes {
+                let mut statement = transaction.prepare(
+                    "SELECT sequence, logical_bytes FROM telemetry_events ORDER BY sequence ASC",
+                )?;
+                let mut rows = statement.query([])?;
+                while next.rows > max_rows || next.logical_bytes > max_bytes {
+                    let row = rows.next()?.ok_or(rusqlite::Error::InvalidQuery)?;
+                    cutoff = Some(row.get::<_, i64>(0)?);
+                    next.rows -= 1;
+                    next.logical_bytes = next
+                        .logical_bytes
+                        .checked_sub(row.get::<_, i64>(1)?)
+                        .ok_or(rusqlite::Error::InvalidQuery)?;
+                }
+            }
+            if let Some(cutoff) = cutoff {
+                transaction.execute(
+                    "DELETE FROM telemetry_events WHERE sequence <= ?1",
+                    params![cutoff],
+                )?;
+            }
+            Ok(next)
+        })
+        .await
+        .map_err(map_store)
 }
 
 /// Reads and validates one bounded durable page through Application's trusted multi-row API.
@@ -590,6 +829,10 @@ fn map_store(_: StoreError) -> TelemetryError {
     TelemetryError::Store
 }
 
+/// Distinguishes temporary telemetry databases created by concurrent focused tests.
+#[cfg(test)]
+static NEXT_TEST_DATABASE: AtomicU64 = AtomicU64::new(0);
+
 /// Returns Application defaults so focused tests can open a standalone local telemetry store.
 #[cfg(test)]
 fn test_store_config() -> StoreConfig {
@@ -608,7 +851,6 @@ pub(crate) async fn open_test_telemetry(
 ) -> (Telemetry, std::path::PathBuf) {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    static NEXT_TEST_DATABASE: AtomicU64 = AtomicU64::new(0);
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("the system clock is after the Unix epoch in tests")
@@ -752,6 +994,191 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// Proves an immediate graceful stop commits the final accepted event before returning.
+    #[tokio::test]
+    async fn shutdown_drains_the_final_queued_event() {
+        let (telemetry, path) = open_test_telemetry(TelemetryConfig::default()).await;
+        telemetry.record(event());
+        telemetry.shutdown().await;
+        let store = Arc::new(Store::open_read_only(&path, test_store_config()).unwrap());
+        let reader = Telemetry::open_read_only(store, TelemetryConfig::default())
+            .await
+            .unwrap();
+        let page = reader.query(Filter::All, None, 1).await.unwrap();
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.dropped, None);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Proves a competing stable owner fails open before SQLite while the first owner stays usable.
+    #[tokio::test]
+    async fn stable_database_has_one_nonblocking_writer_owner() {
+        let path = std::env::temp_dir().join(format!(
+            "agent-ide-telemetry-owner-{}-{}.sqlite",
+            std::process::id(),
+            NEXT_TEST_DATABASE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let first = Telemetry::open_database(&path, TelemetryConfig::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            Telemetry::open_database(&path, TelemetryConfig::default()).await,
+            Err(TelemetryError::Busy)
+        ));
+        first.record(event());
+        first.shutdown().await;
+        assert_eq!(
+            first.query(Filter::All, None, 1).await.unwrap().rows.len(),
+            1
+        );
+        drop(first);
+        let reopened = Telemetry::open_database(&path, TelemetryConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .query(Filter::All, None, 1)
+                .await
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+        reopened.shutdown().await;
+        drop(reopened);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+        let _ = std::fs::remove_dir_all(format!("{}.backups", path.display()));
+    }
+
+    /// Proves incompatible migration admission is not mistaken for an initialized telemetry schema.
+    #[tokio::test]
+    async fn incompatible_migration_is_propagated() {
+        let path = std::env::temp_dir().join(format!(
+            "agent-ide-telemetry-migration-{}-{}.sqlite",
+            std::process::id(),
+            NEXT_TEST_DATABASE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = Arc::new(Store::open(&path, test_store_config()).unwrap());
+        let sql = TrustedUpSql::new("CREATE TABLE incompatible(value INTEGER);").unwrap();
+        assert!(matches!(
+            store
+                .admit_migration(DomainMigration {
+                    domain: DomainName::new("telemetry").unwrap(),
+                    key: MigrationKey::new("telemetry-v0-2-r1").unwrap(),
+                    expected_digest: MigrationDigest::from_sql(&sql),
+                    up_sql: sql,
+                })
+                .await
+                .unwrap(),
+            MigrationAdmission::Applied { .. }
+        ));
+        assert!(matches!(
+            Telemetry::open(store, TelemetryConfig::default()).await,
+            Err(TelemetryError::MigrationIncompatible)
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Proves a nonfresh database without an approved backup root cannot masquerade as migrated.
+    #[tokio::test]
+    async fn backup_unavailable_migration_is_propagated() {
+        let path = std::env::temp_dir().join(format!(
+            "agent-ide-telemetry-backup-{}-{}.sqlite",
+            std::process::id(),
+            NEXT_TEST_DATABASE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = Arc::new(Store::open(&path, test_store_config()).unwrap());
+        assert!(matches!(
+            store
+                .execute_untracked(|transaction| {
+                    transaction.execute_batch("CREATE TABLE prior_domain(value INTEGER);")
+                })
+                .await
+                .unwrap(),
+            UntrackedOutcome::Committed(())
+        ));
+        assert!(matches!(
+            Telemetry::open(store, TelemetryConfig::default()).await,
+            Err(TelemetryError::MigrationBackupUnavailable)
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Proves accepted migration timeout remains unknown instead of authorizing a telemetry owner.
+    #[tokio::test]
+    async fn outcome_unknown_migration_is_propagated() {
+        let path = std::env::temp_dir().join(format!(
+            "agent-ide-telemetry-unknown-{}-{}.sqlite",
+            std::process::id(),
+            NEXT_TEST_DATABASE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let config = StoreConfig {
+            request_deadline: Duration::from_millis(10),
+            ..test_store_config()
+        };
+        let store = Arc::new(Store::open(&path, config).unwrap());
+        let blocker_store = Arc::clone(&store);
+        let blocker = tokio::spawn(async move {
+            blocker_store
+                .execute_untracked(|_| {
+                    std::thread::sleep(Duration::from_millis(100));
+                    Ok(())
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(
+            Telemetry::open(store, TelemetryConfig::default()).await,
+            Err(TelemetryError::MigrationOutcomeUnknown)
+        ));
+        assert!(matches!(
+            blocker.await.unwrap().unwrap(),
+            UntrackedOutcome::OutcomeUnknown
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Proves accepted writer timeout is not counted dropped when its queued insert later commits.
+    #[tokio::test]
+    async fn accepted_timeout_can_commit_without_false_drop_accounting() {
+        let path = std::env::temp_dir().join(format!(
+            "agent-ide-telemetry-timeout-{}-{}.sqlite",
+            std::process::id(),
+            NEXT_TEST_DATABASE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let config = StoreConfig {
+            request_deadline: Duration::from_millis(10),
+            ..test_store_config()
+        };
+        let store = Arc::new(Store::open(&path, config).unwrap());
+        let telemetry = Telemetry::open(Arc::clone(&store), TelemetryConfig::default())
+            .await
+            .unwrap();
+        let blocker = tokio::spawn(async move {
+            store
+                .execute_untracked(|_| {
+                    std::thread::sleep(Duration::from_millis(100));
+                    Ok(())
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        telemetry.record(event());
+        assert!(matches!(
+            blocker.await.unwrap().unwrap(),
+            UntrackedOutcome::OutcomeUnknown
+        ));
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let page = telemetry.query(Filter::All, None, 1).await.unwrap();
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.dropped, Some(0));
+        telemetry.shutdown().await;
+        let _ = std::fs::remove_file(path);
+    }
+
     /// Proves a disabled or unavailable telemetry owner drops ingress without returning an error.
     #[tokio::test]
     async fn disabled_sink_is_fail_open() {
@@ -763,7 +1190,7 @@ mod tests {
         telemetry.record(event());
         let page = telemetry.query(Filter::All, None, 1).await.unwrap();
         assert!(page.rows.is_empty());
-        assert_eq!(page.dropped, 1);
+        assert_eq!(page.dropped, Some(1));
         let _ = std::fs::remove_file(path);
     }
 
@@ -778,7 +1205,7 @@ mod tests {
         for _ in 0..8 {
             telemetry.record(event());
         }
-        assert!(telemetry.dropped.load(Ordering::Relaxed) >= 7);
+        assert!(telemetry.dropped.as_ref().unwrap().load(Ordering::Relaxed) >= 7);
         let _ = std::fs::remove_file(path);
     }
 }

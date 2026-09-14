@@ -202,6 +202,15 @@ pub enum StoreOutcome {
     OutcomeUnknown,
 }
 
+/// Reports whether one accepted receipt-free transaction was observed to commit before its caller deadline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UntrackedOutcome<T> {
+    /// The transaction committed and produced the enclosed domain value.
+    Committed(T),
+    /// The caller deadline elapsed after queue admission, so the transaction may still commit later.
+    OutcomeUnknown,
+}
+
 impl StoreOutcome {
     /// Decodes one stable mechanics receipt string, treating unexpected data as unknown.
     fn parse(value: &str) -> Self {
@@ -499,8 +508,9 @@ impl Store {
     /// therefore need neither an operation receipt nor replay authority. `sql` receives the live
     /// transaction, must not manage a top-level transaction itself, and returns its typed value
     /// only after commit. Queue saturation, owner loss, SQLite failure, or a caller deadline
-    /// return an error and do not alter the caller's domain behaviour.
-    pub async fn execute_untracked<T, F>(&self, sql: F) -> Result<T, StoreError>
+    /// return an error and do not alter the caller's domain behaviour. An accepted caller timeout
+    /// returns [`UntrackedOutcome::OutcomeUnknown`] because queued work may still commit later.
+    pub async fn execute_untracked<T, F>(&self, sql: F) -> Result<UntrackedOutcome<T>, StoreError>
     where
         T: Send + 'static,
         F: for<'transaction> FnOnce(&Transaction<'transaction>) -> rusqlite::Result<T>
@@ -518,8 +528,8 @@ impl Store {
             Err(TrySendError::Disconnected(_)) => return Err(StoreError::Unavailable),
         }
         match tokio::time::timeout(self.config.request_deadline, reply_receiver).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) | Err(_) => Err(StoreError::Unavailable),
+            Ok(Ok(result)) => result.map(UntrackedOutcome::Committed),
+            Ok(Err(_)) | Err(_) => Ok(UntrackedOutcome::OutcomeUnknown),
         }
     }
 
