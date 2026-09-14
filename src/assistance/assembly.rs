@@ -178,6 +178,7 @@ impl ProductDispatcher {
             super::facade::AssistanceTool::Start => HelperOperation::Start,
             super::facade::AssistanceTool::Context => HelperOperation::Context,
             super::facade::AssistanceTool::Diff => HelperOperation::Diff,
+            super::facade::AssistanceTool::Edit => HelperOperation::Edit,
             _ => return error(FailureCode::Internal),
         };
         let Ok(mut launches) = self.launches.lock() else {
@@ -198,7 +199,7 @@ impl ProductDispatcher {
                 None => return error(FailureCode::WorkspaceAuthority),
             },
         };
-        let provider = if operation == HelperOperation::Context {
+        let provider = if matches!(operation, HelperOperation::Context | HelperOperation::Edit) {
             let required = match parameters["path"]
                 .as_str()
                 .and_then(|path| path.rsplit('.').next())
@@ -217,6 +218,20 @@ impl ProductDispatcher {
         } else {
             None
         };
+        let edit_source = if operation == HelperOperation::Edit {
+            let (Some(reference), Some(path)) = (
+                parameters.get("source_ref").and_then(Value::as_str),
+                parameters.get("path").and_then(Value::as_str),
+            ) else {
+                return error(FailureCode::SourceUnavailable);
+            };
+            match worker.claude_edit_source(invocation.binding_ref(), reference, path) {
+                Some(source) => Some(source),
+                None => return error(FailureCode::SourceUnavailable),
+            }
+        } else {
+            None
+        };
         let job = HelperJob {
             protocol: super::claude_worker::HELPER_PROTOCOL,
             operation,
@@ -227,6 +242,7 @@ impl ProductDispatcher {
             baseline: (operation == HelperOperation::Diff)
                 .then(|| state.as_ref().expect("Diff state exists").baseline.clone()),
             provider,
+            edit_source,
             parameters: parameters.clone(),
             budgets: HelperBudgets {
                 output_bytes: worker.limits().output_bytes,
@@ -234,6 +250,7 @@ impl ProductDispatcher {
                     HelperOperation::Start => 6,
                     HelperOperation::Context => 2,
                     HelperOperation::Diff => 64,
+                    HelperOperation::Edit => 2,
                 },
                 deadline_ms: worker.limits().operation_ms,
             },
@@ -284,7 +301,8 @@ impl ProductDispatcher {
     ///
     /// Only the exact owning binding generation can retrieve a handle. A still-unsettled operation
     /// answers `Pending` without re-issuing the command, and every failed, expired, denied or
-    /// uncertain outcome becomes a closed typed error rather than a fabricated success.
+    /// uncertain outcome becomes a closed typed error, or for Edit its required typed no-effect /
+    /// unknown Changes result, rather than a fabricated success.
     async fn retrieve_claude(
         &self,
         invocation: &ValidatedInvocation,
@@ -333,7 +351,7 @@ impl ProductDispatcher {
                         .await;
                     // The bounded lease is released only once the daemon has actually consumed the
                     // settled evidence, and only on the same positive proof that minted it.
-                    if matches!(reply, PeerReply::Complete { .. })
+                    if matches!(reply, PeerReply::Complete { .. } | PeerReply::Edit { .. })
                         && let Ok(mut launches) = self.launches.lock()
                     {
                         launches.release_settled(detail_ref, owner);
@@ -347,6 +365,36 @@ impl ProductDispatcher {
                 helper: None,
             },
             Delivery::Failed(code) => PeerReply::Error { code },
+            Delivery::DeadlineNoEffect(job) => {
+                let Some(worker) = &self.worker else {
+                    return PeerReply::Unavailable {
+                        reason: MissingPeer::WorkspaceActivation,
+                    };
+                };
+                worker
+                    .complete_claude_edit_terminal(
+                        invocation.clone(),
+                        job.parameters.clone(),
+                        attachment,
+                        crate::changes::edit::EditOutcome::DeadlineNoEffect,
+                    )
+                    .await
+            }
+            Delivery::OutcomeUnknown(job) => {
+                let Some(worker) = &self.worker else {
+                    return PeerReply::Unavailable {
+                        reason: MissingPeer::WorkspaceActivation,
+                    };
+                };
+                worker
+                    .complete_claude_edit_terminal(
+                        invocation.clone(),
+                        job.parameters.clone(),
+                        attachment,
+                        crate::changes::edit::EditOutcome::OutcomeUnknown,
+                    )
+                    .await
+            }
         }
     }
 
@@ -451,8 +499,9 @@ impl ProductDispatcher {
     /// Retires overdue helper tickets at every ingress, without a timer task.
     ///
     /// Sweeping on ingress keeps deadline handling finite while the daemon is doing work anyway.
-    /// A ticket whose launch was denied or never happened disappears with no effect, because
-    /// nothing ran; a claimed ticket that never settled becomes uncertain and stays quarantined.
+    /// A non-Edit ticket whose launch never happened disappears. Prepared Edit tickets instead
+    /// retain typed `deadline_no_effect` for retrieval; claimed unsettled Edit stays quarantined
+    /// and retrieves as `outcome_unknown`.
     fn sweep_launches(&self) {
         if let Ok(mut launches) = self.launches.lock() {
             launches.expire(monotonic_ms());
@@ -711,17 +760,40 @@ impl ProductDispatcher {
                             )
                             .await
                         }
-                        AssistanceMethod::Edit => PeerReply::Edit {
-                            result: crate::changes::edit::EditResult {
-                                operation_id: call.parameters()["operation_id"]
-                                    .as_str()?
-                                    .to_owned(),
-                                path: call.parameters()["path"].as_str()?.to_owned(),
-                                outcome:
-                                    crate::changes::edit::EditOutcome::UnavailableBeforeDispatch,
-                                source_ref: None,
-                            },
-                        },
+                        AssistanceMethod::Edit => {
+                            let prepared = worker
+                                .prepare_claude_edit(
+                                    invocation.clone(),
+                                    call.parameters().clone(),
+                                    method.opaque_attachment(),
+                                )
+                                .await;
+                            if matches!(prepared, PeerReply::HookObserved {}) {
+                                let minted = self.mint_claude(
+                                    &invocation,
+                                    tool,
+                                    call.parameters(),
+                                    method.opaque_attachment(),
+                                );
+                                if matches!(
+                                    minted,
+                                    PeerReply::Error { .. } | PeerReply::Unavailable { .. }
+                                ) {
+                                    worker
+                                        .complete_claude_edit_terminal(
+                                            invocation.clone(),
+                                            call.parameters().clone(),
+                                            method.opaque_attachment(),
+                                            crate::changes::edit::EditOutcome::UnavailableBeforeDispatch,
+                                        )
+                                        .await
+                                } else {
+                                    minted
+                                }
+                            } else {
+                                prepared
+                            }
+                        }
                         _ => {
                             let reply = self.mint_claude(
                                 &invocation,

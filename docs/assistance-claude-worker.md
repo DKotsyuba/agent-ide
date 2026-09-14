@@ -6,8 +6,9 @@ daemon may borrow. A Claude operation therefore does not run inside the daemon. 
 short **foreground `Bash` helper** that the model launches itself, so the helper inherits the
 host's own real sandbox instead of a sandbox the daemon claims to have measured.
 
-The daemon performs **no Git, source, provider or process effect for a Claude operation**. It
-mints correlation, hands out one closed job, and records settlement.
+The daemon performs **no Git, source-file, provider or process effect for a Claude operation**. For
+Edit it first prepares the Changes receipt durably, then mints correlation, hands out one closed
+job, and records settlement. SQLite receipt/source-observation writes remain daemon-owned.
 
 The v0.1 five public MCP tools are `start`, `context`, `diff`, `inspect`, `stop`. Proposed v0.2
 adds only `edit` under [EDIT-r1](contracts/assistance-v0.2.md); no other new tool, reply state
@@ -43,12 +44,15 @@ the contract for shipped behaviour.
    claims the bound operation exactly once. It receives a closed daemon-selected job: target and root, accepted
    programs and settings, the known worktree/canonical authority, the selected operation and its
    already validated parameters, finite byte/process/deadline budgets, and the cache scope. Model
-   input never selects an executable, shell fragment, scope or permission.
+   input never selects an executable, shell fragment, scope or permission. Edit additionally
+   carries the daemon-selected completed-context digest, length, sequence and revision so the
+   helper can reject stale bytes without trusting a path reopened by the daemon.
 
    Each length-prefixed helper frame is capped at 256 KiB before allocation or JSON decoding. Raw
    discovery/baseline streams remain capped at 8 KiB each and rendered owner text at 32 KiB.
 
-4. **Work.** All Git discovery, baseline capture, source reads and language-server traffic for a
+4. **Work.** All Git discovery, baseline capture, source reads, descriptor-safe single-file writes
+   and language-server traffic for a
    Claude operation happen inside that helper, under the sandbox it inherited from `Bash`. The
    daemon reads no source at any point, including during `inspect` freshness checks and feedback
    emission. Reading trusted operator configuration and accepted binaries is management, not a
@@ -79,9 +83,10 @@ A claim is refused, with no job released and therefore no effect of any kind, wh
 | A second or replayed claim of the same handle | `invalid_detail` |
 | Deadline already expired | `deadline` |
 
-Expiry distinguishes two honest cases. An **unclaimed** ticket vanishes with no effect: nothing
-ran, so nothing needs cleanup or reporting. A **claimed** ticket that never settled becomes
-uncertain and is retained, keeping its admission quarantined rather than silently reusable.
+Expiry distinguishes two honest cases. An **unclaimed Edit** settles `deadline_no_effect`: no job
+was released and the prepared receipt is never left replayable. Other unclaimed tickets vanish.
+A **claimed Edit** that loses settlement reports `outcome_unknown(operation_id,path)`; claimed work
+is retained with admission quarantined rather than silently reusable.
 
 ## Result visibility and settlement order
 
@@ -167,7 +172,7 @@ that started but could not be settled, so unreaped children are reported rather 
 Wired and covered by local checks:
 
 - optional strict `claude_profile` on a launcher target, rejected at load when declared weakened;
-- Claude `start`/`context`/`diff` minting a single-use ticket and returning `Pending` with the
+- Claude `start`/`context`/`diff` plus durably prepared `edit` minting a single-use ticket and returning `Pending` with the
   complete, untruncatable helper command in the summary the model reads;
 - Claude `Bash` pre-hook selection of the command and background flag, exact-byte recognition with
   actor enforcement, and silent handling with no permission decision or updated input;
@@ -180,7 +185,8 @@ Wired and covered by local checks:
 - canonical durable Workspace activation plus a partial/unverified stored baseline built from six
   real settled Git children, with unknown baseline coverage preserved on invalid capture;
 - helper-owned bounded source reads, one-shot exclusive Go and Rust provider sessions, durable
-  source metadata, composed Workspace/Changes Diff, and one provisional diagnostic delta delivered
+  source metadata, descriptor-safe one-file Edit with exact post-read settlement, composed
+  Workspace/Changes Diff, and one provisional diagnostic delta delivered
   through an ordinary later native hook;
 - rights-aware durable worktree cache directory retention across Stop/handoff, without a warm native
   backend or opaque-index reuse claim. Claude Go remains per-operation exclusive; the compatible

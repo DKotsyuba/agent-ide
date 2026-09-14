@@ -5,7 +5,7 @@ An explicitly activated coding companion for Codex and Claude Code, designed for
 Status: the binary assembles the six-tool MCP surface, exact Codex hook-to-MCP binding,
 explicit Codex/Claude native ingress, bounded hook context output, durable Workspace activation,
 source context, safe Git comparisons and owned provider cleanup. Host-shaped process tests exercise
-Claude foreground-helper activation, Go/Rust Context, Diff and emitted additional context.
+Claude foreground-helper activation, stale-safe Edit, Go/Rust Context, Diff and emitted additional context.
 Live macOS checks cover Claude Go/Rust and parallel native actors with sequential handoff,
 plus Codex Go context/edit/diff/stop and parent/native-child isolation across distinct worktree
 roots. Complete delivery accounting and the remaining roadmap acceptance checks are still open.

@@ -128,6 +128,8 @@ pub enum HelperOperation {
     Context,
     /// Composed comparison evidence for the current Workspace scope.
     Diff,
+    /// One full-content descriptor-safe edit performed only inside the claimed foreground helper.
+    Edit,
 }
 
 /// Names the per-operation exclusive language profile a helper may run.
@@ -410,6 +412,8 @@ pub struct HelperJob {
     pub baseline: Option<HelperBaseline>,
     /// Per-operation exclusive provider; absent when the operation needs no analyzer.
     pub provider: Option<HelperProvider>,
+    /// Daemon-selected exact pre-edit source facts, present only for Edit.
+    pub edit_source: Option<HelperEditSource>,
     /// Already validated closed method parameters carrying no target, profile or authority data.
     pub parameters: Value,
     /// Finite byte, process and deadline ceilings for this operation.
@@ -443,14 +447,16 @@ impl HelperJob {
                 if self.canonical_root.is_none()
                     && self.scope.is_none()
                     && self.baseline.is_none()
-                    && self.provider.is_none() =>
+                    && self.provider.is_none()
+                    && self.edit_source.is_none() =>
             {
                 Ok(())
             }
             HelperOperation::Context
                 if self.scope.as_ref().is_some_and(|scope| {
                     scope.validate().is_ok() && self.canonical_root.as_ref() == Some(&scope.root)
-                }) && self.baseline.is_none() =>
+                }) && self.baseline.is_none()
+                    && self.edit_source.is_none() =>
             {
                 Ok(())
             }
@@ -461,7 +467,23 @@ impl HelperJob {
                     .baseline
                     .as_ref()
                     .is_some_and(|baseline| baseline.validate().is_ok())
-                    && self.provider.is_none() =>
+                    && self.provider.is_none()
+                    && self.edit_source.is_none() =>
+            {
+                Ok(())
+            }
+            HelperOperation::Edit
+                if self.scope.as_ref().is_some_and(|scope| {
+                    scope.validate().is_ok() && self.canonical_root.as_ref() == Some(&scope.root)
+                }) && self.baseline.is_none()
+                    && self.edit_source.as_ref().is_some_and(|source| {
+                        source.validate().is_ok()
+                            && self.parameters["path"].as_str() == Some(source.path.as_str())
+                    })
+                    && serde_json::from_value::<crate::changes::edit::EditRequest>(
+                        self.parameters.clone(),
+                    )
+                    .is_ok_and(|request| request.validate().is_ok()) =>
             {
                 Ok(())
             }
@@ -607,6 +629,44 @@ pub struct HelperSource {
     pub length: u64,
 }
 
+/// Daemon-selected completed-context facts a helper must match before an Edit effect.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HelperEditSource {
+    /// Exact relative UTF-8 path bound to the source reference.
+    pub path: String,
+    /// Whether the completed context observed a regular file rather than an eligible absence.
+    pub present: bool,
+    /// Exact digest of present pre-edit bytes, absent only for a missing target.
+    pub digest: Option<[u8; 32]>,
+    /// Exact present byte length, or zero for a missing target.
+    pub length: u64,
+    /// Durable Workspace observation ordering value.
+    pub sequence: u64,
+    /// Nonempty bounded Workspace source revision.
+    pub source_revision: String,
+    /// Opaque completed-context observation reference.
+    pub observation_ref: String,
+}
+
+impl HelperEditSource {
+    /// Rejects incomplete, oversized or internally inconsistent source facts before helper launch.
+    pub fn validate(&self) -> Result<(), FailureCode> {
+        (!self.path.is_empty()
+            && self.path.len() <= 1024
+            && self.present == self.digest.is_some()
+            && self.length <= crate::workspace::observation::MAX_SOURCE_BYTES as u64
+            && (self.present || self.length == 0)
+            && self.sequence > 0
+            && !self.source_revision.is_empty()
+            && self.source_revision.len() <= 128
+            && !self.observation_ref.is_empty()
+            && self.observation_ref.len() <= 128)
+            .then_some(())
+            .ok_or(FailureCode::SourceUnavailable)
+    }
+}
+
 /// Adds operation-specific evidence to a completed helper result.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -638,6 +698,13 @@ pub enum HelperPayload {
         /// Whether bounded hunk selection omitted material.
         truncated: bool,
     },
+    /// Typed single-file edit outcome plus exact post-read source facts for known success.
+    Edit {
+        /// Closed Changes outcome derived from the helper's Workspace result.
+        outcome: crate::changes::edit::EditOutcome,
+        /// Exact post-read digest/length for success, absent for no-effect or unknown outcomes.
+        source: Option<HelperSource>,
+    },
 }
 
 impl HelperPayload {
@@ -647,6 +714,7 @@ impl HelperPayload {
             Self::Start { .. } => HelperOperation::Start,
             Self::Context { .. } => HelperOperation::Context,
             Self::Diff { .. } => HelperOperation::Diff,
+            Self::Edit { .. } => HelperOperation::Edit,
         }
     }
 }
@@ -737,6 +805,20 @@ impl HelperResult {
                 || feedback.as_ref().is_some_and(|text| text.len() > 4096))
         {
             return Err(FailureCode::Capacity);
+        }
+        if let Some(HelperPayload::Edit { outcome, source }) = &self.payload {
+            let success = outcome.has_post_source();
+            if success != source.is_some()
+                || source.as_ref().is_some_and(|source| {
+                    source.path.is_empty()
+                        || source.path.len() > 1024
+                        || !source.present
+                        || source.digest.is_none()
+                        || source.length > crate::workspace::observation::MAX_SOURCE_BYTES as u64
+                })
+            {
+                return Err(FailureCode::Capacity);
+            }
         }
         Ok(())
     }
@@ -831,6 +913,8 @@ enum TicketState {
     /// never be released on proof. Suppression is a property of [`LaunchLedger::delivery`] and
     /// [`LaunchLedger::settled`], not of destroying the identity.
     Uncertain(ClaimedWork),
+    /// Edit ticket expired before claim, proving the prepared request had zero target effects.
+    ExpiredNoEffect,
 }
 
 /// The correlated state one claimed helper operation accumulates, in either arrival order.
@@ -910,19 +994,29 @@ impl LaunchTicket {
 
     /// Suppresses this ticket's authority, returning whether it must be retained.
     ///
-    /// Work that provably never ran (`Minted`, `Launched`) is retired and returns `false`: nothing
-    /// physical exists, so dropping it has no effect and cannot be misread as cleanup evidence.
-    /// Claimed work is retained with its correlation intact and returns `true`.
+    /// Work that provably never ran (`Minted`, `Launched`) is normally retired and returns `false`.
+    /// Edit is retained as `ExpiredNoEffect` so its already-prepared Changes receipt can settle
+    /// durably rather than becoming replayable. Claimed work retains its correlation and returns
+    /// `true`.
     ///
     /// Quarantining also releases the bounded lease when the retained work *already* carries
     /// positive settlement proof. Nothing will ever consume that evidence now, so continuing to
     /// hold its capacity would strand a slot on work that is provably finished. Work without such
     /// proof keeps its lease, which is the honest outcome for cleanup that was never observed.
     fn quarantine(&mut self, detail_ref: &str, leases: &mut LeasePool) -> bool {
+        if matches!(
+            self.state,
+            TicketState::Minted | TicketState::Launched { .. }
+        ) && self.job.operation == HelperOperation::Edit
+        {
+            self.state = TicketState::ExpiredNoEffect;
+            return true;
+        }
         let retained = match &self.state {
             TicketState::Minted | TicketState::Launched { .. } => None,
             TicketState::Claimed(work) => Some(Some(work.clone())),
             TicketState::Uncertain(_) => Some(None),
+            TicketState::ExpiredNoEffect => Some(None),
         };
         match retained {
             None => false,
@@ -1167,6 +1261,10 @@ pub enum Delivery {
     Waiting,
     /// Settlement failed, expired or the launch was denied; the outcome is honest and finite.
     Failed(FailureCode),
+    /// An Edit ticket expired before claim, proving its prepared request had no target effect.
+    DeadlineNoEffect(Box<HelperJob>),
+    /// A claimed Edit lost settlement after an effect became possible.
+    OutcomeUnknown(Box<HelperJob>),
 }
 
 /// Holds the bounded set of outstanding Claude helper tickets for one daemon boot.
@@ -1530,6 +1628,9 @@ impl LaunchLedger {
         match &ticket.state {
             // Quarantine is unconditional and permanent: a late cleanup frame or post may still be
             // recorded against retained identity, but it can never produce a visible result.
+            TicketState::Uncertain(_) if ticket.job.operation == HelperOperation::Edit => {
+                Delivery::OutcomeUnknown(Box::new(ticket.job.clone()))
+            }
             TicketState::Uncertain(_) => Delivery::Failed(FailureCode::Deadline),
             // Delivery re-checks settlement rather than trusting that the frame was validated on
             // the way in: a completed result requires exact settled child accounting *and* the
@@ -1546,18 +1647,26 @@ impl LaunchLedger {
             }) => Delivery::Failed(FailureCode::Deadline),
             TicketState::Claimed(ClaimedWork {
                 post: Some(false), ..
+            }) if ticket.job.operation == HelperOperation::Edit => {
+                Delivery::OutcomeUnknown(Box::new(ticket.job.clone()))
+            }
+            TicketState::Claimed(ClaimedWork {
+                post: Some(false), ..
             }) => Delivery::Failed(FailureCode::Cancelled),
             TicketState::Claimed(_) => Delivery::Waiting,
             TicketState::Minted | TicketState::Launched { .. } => Delivery::Waiting,
+            TicketState::ExpiredNoEffect => {
+                Delivery::DeadlineNoEffect(Box::new(ticket.job.clone()))
+            }
         }
     }
 
     /// Expires overdue tickets, distinguishing a launch that never happened from claimed work.
     ///
-    /// An unclaimed ticket is dropped with no effect at all: nothing ran, so nothing must be
-    /// cleaned up or reported. A claimed ticket that never settled becomes
-    /// `TicketState::Uncertain` and is retained, so its admission stays quarantined instead of
-    /// being silently reused.
+    /// An unclaimed non-Edit ticket is dropped: nothing ran. An unclaimed Edit is retained as
+    /// `ExpiredNoEffect` so retrieval durably settles `deadline_no_effect`. A claimed ticket that
+    /// never settled becomes `TicketState::Uncertain`; claimed Edit retrieval reports
+    /// `outcome_unknown`, and its admission stays quarantined instead of being silently reused.
     pub fn expire(&mut self, now_ms: u64) {
         let leases = &mut self.leases;
         self.tickets.retain(|reference, ticket| {
@@ -1673,6 +1782,7 @@ mod tests {
                 trust: "fixture".into(),
                 cache_namespace: "/private/tmp/ns-1".into(),
             }),
+            edit_source: None,
             parameters: serde_json::json!({"query": "x"}),
             budgets: HelperBudgets {
                 output_bytes: 4096,
@@ -1680,6 +1790,36 @@ mod tests {
                 deadline_ms: 30_000,
             },
         }
+    }
+
+    /// Builds one valid daemon-selected Edit job over the fixture scope and expected source bytes.
+    fn edit_job() -> HelperJob {
+        let mut job = job();
+        job.operation = HelperOperation::Edit;
+        job.provider = None;
+        job.edit_source = Some(HelperEditSource {
+            path: "main.rs".into(),
+            present: true,
+            digest: Some(*blake3::hash(b"old").as_bytes()),
+            length: 3,
+            sequence: 1,
+            source_revision: "revision".into(),
+            observation_ref: "context".into(),
+        });
+        job.parameters = serde_json::json!({
+            "operation_id":"edit-operation",
+            "path":"main.rs",
+            "source_ref":"context",
+            "content":"new"
+        });
+        job
+    }
+
+    /// Mints an Edit ticket in the same closed ledger used by lifecycle settlement tests.
+    fn edit_ledger() -> (LaunchLedger, String, HelperActor) {
+        let (mut ledger, reference, actor) = ledger();
+        ledger.tickets.get_mut(&reference).unwrap().job = edit_job();
+        (ledger, reference, actor)
     }
 
     /// Mints one ticket on a fixed binding/actor/channel with the fixed helper command.
@@ -2043,6 +2183,38 @@ mod tests {
             ledger.delivery(&reference),
             Delivery::Failed(FailureCode::Deadline)
         );
+    }
+
+    /// Edit expiry is typed: unclaimed proves no effect, while claimed can only be unknown.
+    #[test]
+    fn edit_expiry_distinguishes_unclaimed_no_effect_from_claimed_unknown() {
+        let (mut ledger, reference, _) = edit_ledger();
+        ledger.expire(1000);
+        assert!(matches!(
+            ledger.delivery(&reference),
+            Delivery::DeadlineNoEffect(job) if job.operation == HelperOperation::Edit
+        ));
+
+        let (mut ledger, reference, actor) = edit_ledger();
+        let command = LaunchLedger::helper_command(
+            std::path::Path::new("/usr/local/bin/agent-ide"),
+            std::path::Path::new("/private/tmp/rt"),
+            "attach",
+            "detail-1",
+        );
+        assert_eq!(
+            ledger.recognize(&command, false, "edit-call", &actor, 0),
+            LaunchRecognition::Recognized
+        );
+        assert!(matches!(
+            ledger.claim(&reference, "channel", 0, live),
+            ClaimOutcome::Granted(_)
+        ));
+        ledger.expire(1000);
+        assert!(matches!(
+            ledger.delivery(&reference),
+            Delivery::OutcomeUnknown(job) if job.operation == HelperOperation::Edit
+        ));
     }
 
     /// Both settlement halves are required, and either arrival order reaches the same result.

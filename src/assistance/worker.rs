@@ -52,6 +52,10 @@ enum JobInput {
     Managed,
     /// Positively settled Claude helper evidence, already proven correlated, owned and settled.
     Claude(Box<SettledClaudeOperation>),
+    /// Daemon-only Changes preparation required before an Edit helper ticket may be minted.
+    ClaudeEditPrepare,
+    /// Daemon-ledger proof that an Edit expired pre-claim or became uncertain post-claim.
+    ClaudeEditTerminal(ChangesEditOutcome),
 }
 
 /// A bounded asynchronous operation whose identity never includes the transient MCP call ID.
@@ -278,6 +282,8 @@ struct Shared {
     /// the whole point: ordinary worker work and Claude helper children contend for exactly the
     /// same configured global budget, and no second counter can widen it.
     admission: Arc<Mutex<crate::execution::AdmissionController>>,
+    /// Replaceable fail-open sink receiving only sanitized typed telemetry facts.
+    telemetry: Arc<dyn super::telemetry::EditTelemetry>,
 }
 impl Shared {
     /// Acquires a new transient binding use at one exact admission/return boundary.
@@ -512,6 +518,26 @@ impl WorkerHandle {
         nonce: [u8; 32],
         admission: Arc<Mutex<crate::execution::AdmissionController>>,
     ) -> Self {
+        Self::new_with_telemetry(
+            bindings,
+            launcher,
+            nonce,
+            admission,
+            Arc::new(super::telemetry::NoopEditTelemetry),
+        )
+    }
+
+    /// Creates finite channels with a replaceable fail-open telemetry sink.
+    ///
+    /// The sink receives only typed sanitized facts and must return immediately. It cannot affect
+    /// admission, authority, edit settlement, native fallback, or any returned result.
+    pub fn new_with_telemetry(
+        bindings: Arc<Mutex<HostBindingGuard>>,
+        launcher: LauncherConfig,
+        nonce: [u8; 32],
+        admission: Arc<Mutex<crate::execution::AdmissionController>>,
+        telemetry: Arc<dyn super::telemetry::EditTelemetry>,
+    ) -> Self {
         let (inspect, receiver) = mpsc::channel(launcher.limits.queued);
         Self {
             shared: Arc::new(Shared {
@@ -523,6 +549,7 @@ impl WorkerHandle {
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
                 shutdown_failure: Mutex::new(None),
                 admission,
+                telemetry,
             }),
             inspect,
             receiver: Mutex::new(Some(receiver)),
@@ -599,6 +626,7 @@ impl WorkerHandle {
                 workspace,
                 observations,
                 edits,
+                prepared_edits: BTreeMap::new(),
                 grants: BTreeMap::new(),
                 pending_revocations: std::collections::BTreeSet::new(),
                 registered: BTreeMap::new(),
@@ -743,8 +771,9 @@ impl WorkerHandle {
     /// job on the existing queue; Start mints authority/baseline, Context records source metadata,
     /// and Diff publishes only helper-composed current evidence.
     ///
-    /// Start delivery is idempotent by the existing `(binding, activation_id)` ledger. Context and
-    /// Diff consume one settled helper token each and still require current durable authority.
+    /// Start delivery is idempotent by the existing `(binding, activation_id)` ledger. Context,
+    /// Diff and Edit consume one settled helper token each and still require current authority;
+    /// Edit additionally requires its already-retained durable Changes prepare token.
     pub async fn complete_claude(
         &self,
         invocation: ValidatedInvocation,
@@ -757,6 +786,7 @@ impl WorkerHandle {
             HelperOperation::Start => AssistanceTool::Start,
             HelperOperation::Context => AssistanceTool::Context,
             HelperOperation::Diff => AssistanceTool::Diff,
+            HelperOperation::Edit => AssistanceTool::Edit,
         };
         // Repeated inspection of an already completed activation is retrieval, never a second
         // activation: answer from the retained detail rather than re-entering the queue.
@@ -793,6 +823,111 @@ impl WorkerHandle {
                 code: FailureCode::Deadline,
             },
         }
+    }
+
+    /// Durably prepares one Claude edit before the foreground-helper ticket is exposed.
+    ///
+    /// `HookObserved` is an internal readiness signal consumed only by the assembly layer. Any
+    /// duplicate, unavailable or closed edit result is returned directly and no helper is minted.
+    pub async fn prepare_claude_edit(
+        &self,
+        invocation: ValidatedInvocation,
+        parameters: Value,
+        attachment: &str,
+    ) -> PeerReply {
+        let (send, wait) = oneshot::channel();
+        if let Err(code) = self.enqueue(
+            invocation,
+            None,
+            AssistanceTool::Edit,
+            parameters,
+            attachment,
+            Some(send),
+            JobInput::ClaudeEditPrepare,
+        ) {
+            return PeerReply::Error { code };
+        }
+        match tokio::time::timeout(
+            Duration::from_millis(self.shared.launcher.limits.operation_ms),
+            wait,
+        )
+        .await
+        {
+            Ok(Ok(reply)) => reply,
+            _ => PeerReply::Error {
+                code: FailureCode::Deadline,
+            },
+        }
+    }
+
+    /// Settles an edit from daemon-owned helper lifecycle proof without accepting helper JSON.
+    pub async fn complete_claude_edit_terminal(
+        &self,
+        invocation: ValidatedInvocation,
+        parameters: Value,
+        attachment: &str,
+        outcome: ChangesEditOutcome,
+    ) -> PeerReply {
+        let (send, wait) = oneshot::channel();
+        if let Err(code) = self.enqueue(
+            invocation,
+            None,
+            AssistanceTool::Edit,
+            parameters,
+            attachment,
+            Some(send),
+            JobInput::ClaudeEditTerminal(outcome),
+        ) {
+            return PeerReply::Error { code };
+        }
+        match tokio::time::timeout(
+            Duration::from_millis(self.shared.launcher.limits.operation_ms),
+            wait,
+        )
+        .await
+        {
+            Ok(Ok(reply)) => reply,
+            _ => PeerReply::Error {
+                code: FailureCode::Deadline,
+            },
+        }
+    }
+
+    /// Returns daemon-selected exact Context facts for one same-binding Claude edit ticket.
+    pub fn claude_edit_source(
+        &self,
+        binding: &BindingRef,
+        reference: &str,
+        path: &str,
+    ) -> Option<super::claude_worker::HelperEditSource> {
+        self.shared.active(binding).ok()?;
+        let ledger = self.shared.ledger.lock().ok()?;
+        let detail = ledger.details.get(reference)?;
+        if detail.binding != *binding
+            || detail.selection.0 != AssistanceTool::Context
+            || !matches!(
+                detail.reply,
+                PeerReply::Complete {
+                    kind: ResultKind::Context,
+                    ..
+                }
+            )
+        {
+            return None;
+        }
+        let source = detail.source.as_ref()?;
+        if source.path().to_str() != Some(path) {
+            return None;
+        }
+        Some(super::claude_worker::HelperEditSource {
+            path: path.to_owned(),
+            present: source.bytes().is_some(),
+            digest: source.bytes().map(|bytes| *bytes.digest()),
+            length: source.bytes().map_or(0, |bytes| bytes.length()),
+            sequence: source.sequence(),
+            source_revision: source.source_revision().as_str().to_owned(),
+            observation_ref: source.reference().as_str().to_owned(),
+        })
     }
 
     /// Returns the retained result of an already completed start for this binding and activation.
@@ -885,6 +1020,11 @@ impl WorkerHandle {
             *epoch = epoch.saturating_add(1);
         }
         self.shared.notify.notify_one();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.shared
+                .telemetry
+                .native_fallback(super::telemetry::NativeFallbackReason::NativeSelected);
+        }));
     }
 
     /// Coalesces managed-Codex registered-path reconciliation at a trusted read boundary.
@@ -1075,6 +1215,8 @@ struct Worker<'a> {
     observations: WorkspaceStore<'a>,
     /// Changes-owned durable one-file edit receipts sharing Application's sole Store owner.
     edits: EditReceiptStore<'a>,
+    /// Newly prepared Claude requests awaiting exact helper or no-effect expiry settlement.
+    prepared_edits: BTreeMap<(BindingRef, String), crate::changes::edit::PreparedEdit>,
     /// Recoverable committed activation receipts, at most one for each live host binding.
     grants: BTreeMap<BindingRef, StartReceipt>,
     /// Bindings whose provider settlement succeeded but whose durable revoke failed, so their
@@ -1182,6 +1324,17 @@ impl<'a> Worker<'a> {
                     AssistanceTool::Edit if matches!(job.input, JobInput::Managed) => {
                         self.edit(&mut job).await
                     }
+                    AssistanceTool::Edit if matches!(job.input, JobInput::ClaudeEditPrepare) => {
+                        self.prepare_claude_edit_job(&mut job).await
+                    }
+                    AssistanceTool::Edit if matches!(job.input, JobInput::Claude(_)) => {
+                        self.edit_claude(&mut job).await
+                    }
+                    AssistanceTool::Edit
+                        if matches!(job.input, JobInput::ClaudeEditTerminal(_)) =>
+                    {
+                        self.settle_claude_edit_terminal(&mut job).await
+                    }
                     AssistanceTool::Start => self.activate(&mut job).await,
                     AssistanceTool::Context => self.context(&mut job).await,
                     AssistanceTool::Diff => self.diff(&mut job).await,
@@ -1193,6 +1346,30 @@ impl<'a> Worker<'a> {
             Ok(result) => result,
             Err(code) => (PeerReply::Error { code }, None, None),
         };
+        if let PeerReply::Edit { result } = &reply {
+            let lifetime = Duration::from_millis(self.shared.launcher.limits.operation_ms);
+            let started = job.deadline.checked_sub(lifetime).unwrap_or(job.deadline);
+            let duration_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
+            let diagnostics = if result.outcome.has_post_source() && source.is_some() {
+                super::telemetry::EditDiagnosticState::Refreshed
+            } else if result.outcome.has_post_source()
+                || result.outcome == ChangesEditOutcome::OutcomeUnknown
+            {
+                super::telemetry::EditDiagnosticState::Unknown
+            } else {
+                super::telemetry::EditDiagnosticState::NotApplicable
+            };
+            let bytes = serde_json::to_vec(result).map_or(0, |value| value.len());
+            let fact = super::telemetry::EditTelemetryFact {
+                outcome: result.outcome,
+                duration_ms,
+                diagnostics,
+                output_size: super::telemetry::output_size(bytes),
+            };
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.shared.telemetry.edit_completed(fact);
+            }));
+        }
         self.shared.complete(
             &job.reference,
             reply.clone(),
@@ -2492,6 +2669,224 @@ impl<'a> Worker<'a> {
             None,
         ))
     }
+
+    /// Durably prepares a Claude edit and retains its one-use Changes token before helper minting.
+    async fn prepare_claude_edit_job(
+        &mut self,
+        job: &mut Job,
+    ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        let request: EditRequest =
+            serde_json::from_value(job.parameters.clone()).map_err(|_| FailureCode::Internal)?;
+        request.validate().map_err(|_| FailureCode::Internal)?;
+        let binding = job.invocation.binding_ref().clone();
+        let prepared = match self.edits.prepare(request.clone()).await {
+            Ok(PrepareAdmission::Prepared(prepared)) => prepared,
+            Ok(
+                PrepareAdmission::Settled(result)
+                | PrepareAdmission::ConflictingDuplicate(result)
+                | PrepareAdmission::OutcomeUnknown(result),
+            ) => return Ok((PeerReply::Edit { result }, None, None)),
+            Err(_) => {
+                return Ok((
+                    PeerReply::Edit {
+                        result: EditResult {
+                            operation_id: request.operation_id,
+                            path: request.path,
+                            outcome: ChangesEditOutcome::UnavailableBeforeDispatch,
+                            source_ref: None,
+                        },
+                    },
+                    None,
+                    None,
+                ));
+            }
+        };
+        let source = {
+            let ledger = self
+                .shared
+                .ledger
+                .lock()
+                .map_err(|_| FailureCode::Internal)?;
+            ledger
+                .details
+                .get(&request.source_ref)
+                .filter(|detail| {
+                    detail.binding == binding
+                        && detail.selection.0 == AssistanceTool::Context
+                        && matches!(
+                            detail.reply,
+                            PeerReply::Complete {
+                                kind: ResultKind::Context,
+                                ..
+                            }
+                        )
+                })
+                .and_then(|detail| detail.source.clone())
+                .filter(|source| source.path().to_str() == Some(request.path.as_str()))
+        };
+        let Some(source) = source else {
+            return self
+                .settle_edit(
+                    prepared,
+                    &request,
+                    crate::workspace::edit::EditOutcome::StaleSource,
+                    None,
+                    None,
+                )
+                .await;
+        };
+        let authority = match self.authority(&binding).await {
+            Ok(authority) => authority,
+            Err(_) => {
+                return self
+                    .settle_edit(
+                        prepared,
+                        &request,
+                        crate::workspace::edit::EditOutcome::CancelledNoEffect,
+                        None,
+                        Some(source),
+                    )
+                    .await;
+            }
+        };
+        if self.prepared_edits.len() >= self.shared.launcher.limits.details {
+            return self
+                .settle_edit(
+                    prepared,
+                    &request,
+                    crate::workspace::edit::EditOutcome::CapacityNoEffect,
+                    Some(authority),
+                    Some(source),
+                )
+                .await;
+        }
+        self.prepared_edits
+            .insert((binding, request.operation_id), prepared);
+        Ok((PeerReply::HookObserved {}, Some(authority), Some(source)))
+    }
+
+    /// Settles one exact claimed-helper Edit result against its pre-helper Changes token.
+    async fn edit_claude(
+        &mut self,
+        job: &mut Job,
+    ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        let binding = job.invocation.binding_ref().clone();
+        let JobInput::Claude(settled) = &job.input else {
+            return Err(FailureCode::Internal);
+        };
+        if settled.operation() != HelperOperation::Edit
+            || settled.binding().fingerprint() != binding.fingerprint()
+            || !matches!(settled.result().outcome, HelperOutcome::Complete { .. })
+        {
+            return Err(FailureCode::WorkspaceAuthority);
+        }
+        let request: EditRequest =
+            serde_json::from_value(job.parameters.clone()).map_err(|_| FailureCode::Internal)?;
+        let prepared = self
+            .prepared_edits
+            .remove(&(binding.clone(), request.operation_id.clone()))
+            .ok_or(FailureCode::Internal)?;
+        let Some(super::claude_worker::HelperPayload::Edit {
+            mut outcome,
+            source,
+        }) = settled.result().payload.clone()
+        else {
+            return Err(FailureCode::Internal);
+        };
+        if source
+            .as_ref()
+            .is_some_and(|source| source.path != request.path)
+        {
+            outcome = ChangesEditOutcome::OutcomeUnknown;
+        }
+        let mut observed = None;
+        if outcome.has_post_source() {
+            observed = match source.as_ref() {
+                Some(source) => self.record_claude_source(&binding, source).await.ok(),
+                None => None,
+            };
+            if observed.is_none() {
+                outcome = ChangesEditOutcome::OutcomeUnknown;
+            }
+        }
+        let source_ref = outcome.has_post_source().then(|| job.reference.clone());
+        let result = EditResult::new(
+            request.operation_id.clone(),
+            request.path.clone(),
+            outcome,
+            source_ref,
+        )
+        .map_err(|_| FailureCode::Internal)?;
+        let result = self
+            .edits
+            .settle(prepared, result)
+            .await
+            .unwrap_or_else(|_| EditResult {
+                operation_id: request.operation_id,
+                path: request.path,
+                outcome: ChangesEditOutcome::OutcomeUnknown,
+                source_ref: None,
+            });
+        let authority = self.authority(&binding).await.ok();
+        Ok((PeerReply::Edit { result }, authority, observed))
+    }
+
+    /// Settles daemon-proven pre-claim no-effect or post-claim unknown helper lifecycle state.
+    async fn settle_claude_edit_terminal(
+        &mut self,
+        job: &mut Job,
+    ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        let JobInput::ClaudeEditTerminal(outcome) = &job.input else {
+            return Err(FailureCode::Internal);
+        };
+        let outcome = *outcome;
+        if !matches!(
+            outcome,
+            ChangesEditOutcome::DeadlineNoEffect
+                | ChangesEditOutcome::OutcomeUnknown
+                | ChangesEditOutcome::UnavailableBeforeDispatch
+        ) {
+            return Err(FailureCode::Internal);
+        }
+        let request: EditRequest =
+            serde_json::from_value(job.parameters.clone()).map_err(|_| FailureCode::Internal)?;
+        let binding = job.invocation.binding_ref().clone();
+        let prepared = match self
+            .prepared_edits
+            .remove(&(binding.clone(), request.operation_id.clone()))
+        {
+            Some(prepared) => prepared,
+            None => match self.edits.prepare(request.clone()).await {
+                Ok(PrepareAdmission::Settled(result)) => {
+                    return Ok((
+                        PeerReply::Edit { result },
+                        self.authority(&binding).await.ok(),
+                        None,
+                    ));
+                }
+                _ => return Err(FailureCode::Internal),
+            },
+        };
+        let result = EditResult::new(
+            request.operation_id.clone(),
+            request.path.clone(),
+            outcome,
+            None,
+        )
+        .map_err(|_| FailureCode::Internal)?;
+        let result = self
+            .edits
+            .settle(prepared, result)
+            .await
+            .unwrap_or_else(|_| EditResult {
+                operation_id: request.operation_id,
+                path: request.path,
+                outcome: ChangesEditOutcome::OutcomeUnknown,
+                source_ref: None,
+            });
+        let authority = self.authority(&binding).await.ok();
+        Ok((PeerReply::Edit { result }, authority, None))
+    }
 }
 
 /// Aborts the independently scheduled inspection task if the owning worker task exits or panics,
@@ -2983,10 +3378,12 @@ mod stop_retry_tests {
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
                 shutdown_failure: Mutex::new(None),
                 admission: Arc::new(Mutex::new(admission_controller())),
+                telemetry: Arc::new(crate::assistance::telemetry::NoopEditTelemetry),
             }),
             workspace,
             observations: WorkspaceStore::new(store),
             edits: EditReceiptStore::new(store),
+            prepared_edits: BTreeMap::new(),
             grants: BTreeMap::new(),
             pending_revocations: std::collections::BTreeSet::new(),
             registered: BTreeMap::new(),

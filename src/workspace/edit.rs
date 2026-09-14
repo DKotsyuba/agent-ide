@@ -153,14 +153,47 @@ impl CurrentEditTarget {
         path: &Path,
         source_ref: EditSourceRef,
     ) -> Result<Self, EditOutcome> {
-        if source_ref.worktree() != authority.worktree()
-            || source_ref.authority_epoch() != authority.epoch()
+        Self::resolve_scope(authority.worktree(), authority.epoch(), path, source_ref)
+    }
+
+    /// Resolves a daemon-selected expected state inside a verified inherited foreground helper.
+    ///
+    /// `worktree` must carry Workspace's descriptor-derived root identity and `authority_epoch`
+    /// must come from the daemon's active helper scope. This method mints no durable authority; it
+    /// only applies the same descriptor, metadata and exact-byte checks used by [`Self::resolve`].
+    pub(crate) fn resolve_inherited(
+        worktree: &WorktreeRef,
+        authority_epoch: u64,
+        path: &Path,
+        expected: Option<SourceBytes>,
+    ) -> Result<Self, EditOutcome> {
+        let source_ref = EditSourceRef {
+            worktree: worktree.clone(),
+            authority_epoch,
+            sequence: 1,
+            observation_ref: "inherited-helper".into(),
+            source_revision: "inherited-helper".into(),
+            path: path.to_path_buf(),
+            bytes: expected,
+        };
+        Self::resolve_scope(worktree, authority_epoch, path, source_ref)
+    }
+
+    /// Applies shared scope/reference validation before the descriptor-safe final-component walk.
+    fn resolve_scope(
+        worktree: &WorktreeRef,
+        authority_epoch: u64,
+        path: &Path,
+        source_ref: EditSourceRef,
+    ) -> Result<Self, EditOutcome> {
+        if source_ref.worktree() != worktree
+            || source_ref.authority_epoch() != authority_epoch
             || source_ref.path() != path
             || !valid_edit_path(path)
         {
             return Err(EditOutcome::StaleSource);
         }
-        let (parent, name) = open_parent(authority.worktree(), path)?;
+        let (parent, name) = open_parent(worktree, path)?;
         match open_final(parent.as_raw_fd(), &name) {
             Ok(mut file) => {
                 let metadata = safe_metadata(&file)?;
@@ -204,6 +237,41 @@ impl CurrentEditTarget {
     pub fn metadata(&self) -> Option<&EditMetadata> {
         self.metadata.as_ref()
     }
+}
+
+/// Performs one helper-owned edit using only daemon-selected inherited scope and expected bytes.
+///
+/// This is not an alternate authority source: callers can construct the inherited `WorktreeRef`
+/// only from the daemon's current helper job, and descriptor-derived root identity is rechecked.
+/// The one-use permit, confinement, metadata preservation, stale checks and post-read are identical
+/// to the managed path. `continue_before_effect` false returns cancellation with zero target writes.
+pub(crate) fn replace_inherited_if_current(
+    worktree: &WorktreeRef,
+    authority_epoch: u64,
+    operation_id: &str,
+    path: &Path,
+    expected: Option<SourceBytes>,
+    content: &[u8],
+    continue_before_effect: impl FnOnce() -> bool,
+) -> EditOutcome {
+    let source_ref =
+        match CurrentEditTarget::resolve_inherited(worktree, authority_epoch, path, expected) {
+            Ok(target) => target,
+            Err(outcome) => return outcome,
+        };
+    let expected = source_ref.source_ref.clone();
+    let permit = match EditPermit::new(operation_id, path.to_path_buf()) {
+        Ok(permit) => permit,
+        Err(outcome) => return outcome,
+    };
+    replace_if_current(
+        permit,
+        source_ref,
+        &expected,
+        content,
+        || true,
+        continue_before_effect,
+    )
 }
 
 /// A one-use Workspace capability tied to an operation and target path.

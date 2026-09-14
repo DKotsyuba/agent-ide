@@ -4154,11 +4154,14 @@ async fn diff_oversized_single_hunk_reports_capacity_without_false_continuation(
 /// helper.
 #[tokio::test]
 async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor_then_stops() {
-    /// Runs one complete Claude `ide.start` round trip: mint, arm, real helper process, settle.
-    async fn claude_start(actor: &mut ProductActor, fixture: &ProductFixture) -> Value {
-        let pending = actor
-            .call_claude(fixture, "ide.start", json!({"activation_id":"start"}))
-            .await;
+    /// Runs one complete Claude helper round trip: mint, arm, real process, post, and inspect.
+    async fn claude_operation(
+        actor: &mut ProductActor,
+        fixture: &ProductFixture,
+        name: &str,
+        arguments: Value,
+    ) -> Value {
+        let pending = actor.call_claude(fixture, name, arguments).await;
         assert_eq!(pending["state"], "pending", "{pending}");
         let detail_ref = pending["detail_ref"].as_str().unwrap().to_owned();
         let helper = pending["helper"].as_str().unwrap().to_owned();
@@ -4238,7 +4241,13 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
     let mut daemon = fixture.daemon().await;
     let mut first = ProductActor::new(&fixture, "claude-first").await;
 
-    let started = claude_start(&mut first, &fixture).await;
+    let started = claude_operation(
+        &mut first,
+        &fixture,
+        "ide.start",
+        json!({"activation_id":"start"}),
+    )
+    .await;
     assert_eq!(started["kind"], "activation", "{started}");
     let detail_ref = started["detail_ref"].as_str().unwrap().to_owned();
     let database = rusqlite::Connection::open(fixture.runtime.join("state.sqlite")).unwrap();
@@ -4255,7 +4264,13 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
 
     // Re-running the exact same activation end to end is idempotent: the already-durable
     // Workspace publishes the identical retained evidence rather than a second row.
-    let reread = claude_start(&mut first, &fixture).await;
+    let reread = claude_operation(
+        &mut first,
+        &fixture,
+        "ide.start",
+        json!({"activation_id":"start"}),
+    )
+    .await;
     assert_eq!(reread, started, "{reread}");
     assert_eq!(
         database
@@ -4276,7 +4291,13 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
         fixture.state(),
     )
     .await;
-    let conflicted = claude_start(&mut second, &fixture).await;
+    let conflicted = claude_operation(
+        &mut second,
+        &fixture,
+        "ide.start",
+        json!({"activation_id":"start"}),
+    )
+    .await;
     assert_eq!(conflicted["state"], "error", "{conflicted}");
     assert_eq!(conflicted["code"], "conflict", "{conflicted}");
     assert!(
@@ -4290,8 +4311,47 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
         "the refused actor must not replace the first durable owner"
     );
 
-    let still_usable = claude_start(&mut first, &fixture).await;
+    let still_usable = claude_operation(
+        &mut first,
+        &fixture,
+        "ide.start",
+        json!({"activation_id":"start"}),
+    )
+    .await;
     assert_eq!(still_usable, started, "{still_usable}");
+
+    let context = claude_operation(
+        &mut first,
+        &fixture,
+        "ide.context",
+        json!({"path":"tracked.txt"}),
+    )
+    .await;
+    assert_eq!(context["kind"], "context", "{context}");
+    let source_ref = context["detail_ref"].as_str().unwrap().to_owned();
+    let edited = claude_operation(
+        &mut first,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"claude-edit-1",
+            "path":"tracked.txt",
+            "source_ref":source_ref,
+            "content":"claude-helper-edit\n"
+        }),
+    )
+    .await;
+    assert_eq!(edited["state"], "edit", "{edited}");
+    assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+    assert_eq!(
+        std::fs::read(fixture.root.join("tracked.txt")).unwrap(),
+        b"claude-helper-edit\n"
+    );
+    std::fs::write(fixture.root.join("tracked.txt"), "claude-native-fallback\n").unwrap();
+    assert_eq!(
+        std::fs::read(fixture.root.join("tracked.txt")).unwrap(),
+        b"claude-native-fallback\n"
+    );
 
     let stopped = first.call_claude(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
