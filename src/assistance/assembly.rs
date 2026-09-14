@@ -684,7 +684,11 @@ impl ProductDispatcher {
                         // Claude never advertises or returns `codex/sandbox-state-meta`. Instead
                         // of inventing sandbox authority it was never given, this operation runs
                         // in a foreground helper that inherits the host's own real sandbox.
-                        bindings.consume_active(invocation.binding_ref()).ok()?;
+                        if method.method() == AssistanceMethod::Stop {
+                            bindings.begin_stop(invocation.binding_ref()).ok()?;
+                        } else {
+                            bindings.consume_active(invocation.binding_ref()).ok()?;
+                        }
                         (invocation, None)
                     } else {
                         let active = bindings.consume_active(invocation.binding_ref()).ok()?;
@@ -726,6 +730,12 @@ impl ProductDispatcher {
                     }
                 };
                 let Some(worker) = &self.worker else {
+                    if host == HostKind::Claude
+                        && method.method() == AssistanceMethod::Stop
+                        && let Ok(mut bindings) = self.bindings.lock()
+                    {
+                        let _ = bindings.stop_binding(invocation.binding_ref());
+                    }
                     return Some(if method.method() == AssistanceMethod::Stop {
                         PeerReply::HostStopped {}
                     } else {
@@ -737,32 +747,49 @@ impl ProductDispatcher {
                 if host == HostKind::Claude {
                     let established = method.method() == AssistanceMethod::Start;
                     return Some(match method.method() {
-                        // Revoke tickets before stopping durable authority so a helper that has
-                        // not yet claimed can never claim afterwards. A fully proven Edit remains
-                        // available only long enough to settle its already-prepared receipt.
+                        // External admission is already closed under the binding lock. Settle ready
+                        // Edits through the exact stopping generation, then revoke every remaining
+                        // ticket before stopping durable Workspace authority.
                         AssistanceMethod::Stop => {
                             let owner = invocation.binding_ref().fingerprint();
-                            let (terminals, ready_edits) = self
-                                .launches
-                                .lock()
-                                .map(|mut launches| {
-                                    let terminals = launches.revoke(owner);
-                                    let ready_edits = launches.ready_edit_references(owner);
-                                    (terminals, ready_edits)
-                                })
-                                .unwrap_or_default();
-                            for detail_ref in ready_edits {
-                                let _ = self
-                                    .retrieve_claude(
-                                        &invocation,
-                                        &detail_ref,
+                            let mut settlement_error = None;
+                            let (ready_edits, terminals) = match self.launches.lock() {
+                                Ok(mut launches) => {
+                                    let mut ready = Vec::new();
+                                    for detail_ref in launches.ready_edit_references(owner) {
+                                        if let Some(settled) = launches.settled(&detail_ref, owner)
+                                            && launches.release_settled(&detail_ref, owner)
+                                        {
+                                            ready.push(settled);
+                                        } else {
+                                            settlement_error = Some(PeerReply::Error {
+                                                code: FailureCode::Internal,
+                                            });
+                                        }
+                                    }
+                                    (ready, launches.revoke(owner))
+                                }
+                                Err(_) => {
+                                    settlement_error = Some(PeerReply::Error {
+                                        code: FailureCode::Internal,
+                                    });
+                                    (Vec::new(), Vec::new())
+                                }
+                            };
+                            for settled in ready_edits {
+                                let completion = worker
+                                    .complete_claude_edit_for_stop(
+                                        invocation.clone(),
                                         method.opaque_attachment(),
+                                        settled,
                                     )
                                     .await;
+                                if !matches!(&completion, PeerReply::Edit { .. })
+                                    && settlement_error.is_none()
+                                {
+                                    settlement_error = Some(completion);
+                                }
                             }
-                            let reply = worker
-                                .stop(invocation.clone(), method.opaque_attachment())
-                                .await;
                             for (detail_ref, job, outcome) in terminals {
                                 let terminal = worker
                                     .complete_claude_edit_terminal(
@@ -772,21 +799,24 @@ impl ProductDispatcher {
                                         outcome,
                                     )
                                     .await;
-                                if matches!(terminal, PeerReply::Edit { .. })
-                                    && outcome
-                                        == crate::changes::edit::EditOutcome::DeadlineNoEffect
+                                if !matches!(&terminal, PeerReply::Edit { .. })
+                                    && settlement_error.is_none()
+                                {
+                                    settlement_error = Some(terminal);
+                                }
+                                if outcome == crate::changes::edit::EditOutcome::DeadlineNoEffect
                                     && let Ok(mut launches) = self.launches.lock()
                                 {
                                     launches.retire_no_effect_edit(&detail_ref, owner);
                                 }
                             }
-                            // Claude's binding remains live only through the bounded ready-edit
-                            // receipt settlement above; stopping it now keeps that settlement
-                            // authoritative without opening a later helper-claim window.
+                            let reply = worker
+                                .stop(invocation.clone(), method.opaque_attachment())
+                                .await;
                             if let Ok(mut bindings) = self.bindings.lock() {
                                 let _ = bindings.stop_binding(invocation.binding_ref());
                             }
-                            reply
+                            settlement_error.unwrap_or(reply)
                         }
                         // Context/Diff preserve the shared facade's optional detail retrieval:
                         // the handle names already-settled work and never starts another helper.

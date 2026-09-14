@@ -1128,8 +1128,9 @@ impl AcceptedIdentity {
 /// This token is the only thing that may carry helper evidence into the Worker authority path. It
 /// is produced solely by [`LaunchLedger::settled`], which requires, all at once: exact ticket and
 /// binding ownership; the final frame correlated to that exact handle; a matching successful post;
-/// a `Complete` outcome with exactly settled child accounting; verified helper and child executable
-/// identities; and a still-retained admission lease. It deliberately implements neither
+/// a `Complete` outcome with exactly settled child accounting; and verified helper and child
+/// executable identities. Its admission lease may already have been released after positive proof.
+/// It deliberately implements neither
 /// `Deserialize` nor `Default`, and its fields are private with no public constructor, so no amount
 /// of arbitrary `HelperResult` JSON can mint one.
 ///
@@ -1769,10 +1770,11 @@ impl LaunchLedger {
 
     /// Retires unclaimed work and quarantines claimed work for one revoked binding generation.
     ///
-    /// Stop revokes durable authority first; a ticket for a revoked generation can no longer be
-    /// claimed, so a late helper is rejected rather than being allowed to run against stale
-    /// authority. Only work that provably never ran is retired: a `Minted` or `Launched` ticket had
-    /// no claim, so nothing physical exists to settle and dropping it has no effect.
+    /// Stop closes binding admission before calling this method; a ticket for that generation can
+    /// no longer be claimed, so a late helper is rejected rather than being allowed to run against
+    /// stale authority. The caller first extracts ready Edits for known receipt settlement. Only
+    /// remaining work that provably never ran is retired: a `Minted` or `Launched` ticket had no
+    /// claim, so nothing physical exists to settle and dropping it has no effect.
     ///
     /// Claimed work is *not* deleted, and its claimed identity is *not* discarded. A claimed,
     /// disconnected, expired or unsettled ticket keeps its `tool_use_id`, frame slot and lease and
@@ -1791,11 +1793,6 @@ impl LaunchLedger {
         let mut terminals = Vec::new();
         self.tickets.retain(|reference, ticket| {
             if ticket.binding.fingerprint() != binding {
-                return true;
-            }
-            if ticket.positively_settled() {
-                // Stop blocks every future claim but preserves fully proven work long enough for
-                // the dispatcher to settle its prepared receipt before durable authority ends.
                 return true;
             }
             let terminal = match ticket.state {
@@ -1833,9 +1830,10 @@ impl LaunchLedger {
 
     /// Returns ready Edit handles still owned by `binding` for stop-time receipt settlement.
     ///
-    /// The caller revokes the ledger first, removing unclaimed launch authority. These handles
+    /// The caller has already closed binding admission, removing every claim path. These handles
     /// are already claimed and positively proven, so completing their prepared receipts is cleanup
-    /// only and cannot start new helper work.
+    /// only and cannot start new helper work. The caller extracts them and revokes all remaining
+    /// tickets under the same ledger lock, preventing a late settlement from falling between steps.
     pub fn ready_edit_references(&self, binding: [u8; 32]) -> Vec<String> {
         self.tickets
             .iter()
@@ -2478,9 +2476,9 @@ mod tests {
         ));
     }
 
-    /// Stop preserves a fully proven Edit long enough to settle its prepared receipt.
+    /// Stop extracts a fully proven Edit before revocation and releases its ticket and lease.
     #[test]
-    fn revocation_keeps_a_ready_edit_known_for_stop_time_settlement() {
+    fn stop_drains_ready_edit_without_ticket_or_lease_capacity_loss() {
         let (mut ledger, reference, actor) = edit_ledger();
         let command = LaunchLedger::helper_command(
             std::path::Path::new("/usr/local/bin/agent-ide"),
@@ -2498,14 +2496,22 @@ mod tests {
         ));
         assert_eq!(ledger.settle_frame(completed_edit()), Ok(()));
         assert_eq!(ledger.settle_post("edit-call", true), Ok(()));
-        assert!(ledger.revoke(binding_fixture().fingerprint()).is_empty());
         assert_eq!(
             ledger.ready_edit_references(binding_fixture().fingerprint()),
             vec![reference.clone()]
         );
         assert!(matches!(ledger.delivery(&reference), Delivery::Ready(_)));
+        let settled = ledger
+            .settled(&reference, binding_fixture().fingerprint())
+            .expect("Stop captures the known result before revocation");
         assert!(ledger.release_settled(&reference, binding_fixture().fingerprint()));
+        assert_eq!(
+            settled.result().payload.as_ref().unwrap().operation(),
+            HelperOperation::Edit
+        );
+        assert!(ledger.revoke(binding_fixture().fingerprint()).is_empty());
         assert_eq!(ledger.active_claims(), 0);
+        assert!(ledger.is_empty());
     }
 
     /// Proves a daemon-consumed successful helper releases both its shared lease and ticket slot.

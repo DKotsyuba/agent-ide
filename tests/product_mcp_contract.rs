@@ -4146,7 +4146,8 @@ async fn diff_oversized_single_hunk_reports_capacity_without_false_continuation(
 /// Drives one real foreground Claude helper launch end to end: `ide.start` returns the exact
 /// helper instruction, a native Bash pre-hook arms it, the fixed helper subcommand runs as a real
 /// process and claims it over the private socket, a matching Bash post-hook settles it, and
-/// `ide.inspect` is the only route that ever publishes a durable Workspace row from that evidence.
+/// `ide.inspect` publishes ordinary results, while Stop consumes an already-ready Edit result
+/// without losing its known replacement outcome.
 ///
 /// The accepted `claude_profile` here is the fixture's test-only disabled launcher wiring proof,
 /// not a real host sandbox measurement: it only proves the daemon→hook→helper→daemon correlation
@@ -4376,8 +4377,45 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
         b"claude-native-fallback\n"
     );
 
+    let stop_context = claude_operation(
+        &mut first,
+        &fixture,
+        "ide.context",
+        json!({"path":"tracked.txt"}),
+    )
+    .await;
+    let stop_source_ref = stop_context["detail_ref"].as_str().unwrap().to_owned();
+    let ready = first
+        .call_claude(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"claude-stop-ready",
+                "path":"tracked.txt",
+                "source_ref":stop_source_ref,
+                "content":"claude-stop-ready\n"
+            }),
+        )
+        .await;
+    first.launch_claude_pending(&fixture, &ready).await;
+    assert_eq!(
+        std::fs::read(fixture.root.join("tracked.txt")).unwrap(),
+        b"claude-stop-ready\n"
+    );
+
     let stopped = first.call_claude(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
+    let (edit_state, edit_outcome): (String, String) = database
+        .query_row(
+            "SELECT state,outcome FROM changes_edit_receipts WHERE operation_id='claude-stop-ready'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (edit_state.as_str(), edit_outcome.as_str()),
+        ("settled", "replaced")
+    );
     assert!(
         !database
             .query_row(

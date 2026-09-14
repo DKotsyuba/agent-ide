@@ -104,9 +104,13 @@ read. Helper-observed source and diagnostic freshness remain provisional rather 
 unobserved out-of-band changes as current. A later ordinary native Pre/Post pair may consume that
 delta once; delivery advances the binding epoch but does not pretend the daemon re-read source.
 
-`stop` is daemon-owned and never launches a helper. It revokes and cancels tickets first; any
-already-running helper may report late cleanup evidence, but cannot revive authority. Stop success
-still requires the daemon's actual provider/revocation settlement.
+`stop` is daemon-owned and never launches a helper. It first closes the binding to external calls
+and helper claims. Ready Edit proof captured for that exact generation may still settle its
+already-prepared receipt through a cleanup-only path; a failed or timed-out known settlement has a
+finite `outcome_unknown` fallback and cannot retain ticket, receipt or admission capacity. Stop
+then revokes remaining tickets and durable Workspace authority. An already-running unsettled helper
+may report late cleanup evidence, but cannot revive authority. Stop success still requires the
+daemon's actual provider/revocation settlement.
 
 ## Supported profiles
 
