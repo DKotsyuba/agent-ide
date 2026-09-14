@@ -2508,6 +2508,117 @@ async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
     daemon.wait().await.unwrap();
 }
 
+/// Exercises the accepted exclusive Pyright process through Claude's foreground-helper route.
+///
+/// The test proves that the helper reconstructs the same launcher-bound Pyright profile as Codex:
+/// semantic definitions and references, the exact current diagnostic, a native-edit refresh, the
+/// tracked diff, and Stop all complete without daemon-side provider execution.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
+async fn configured_product_claude_helper_returns_real_pyright_semantic_context_diff_and_stop() {
+    let pyright = std::env::var("AGENT_IDE_PYRIGHT").unwrap();
+    let node = std::env::var("AGENT_IDE_NODE").unwrap();
+    let node_identity = "node-fixture";
+    let providers = json!([{
+        "executable":accepted_program(&pyright,"pyright 1.1.413"),
+        "settings":"pyright_defaults_v1",
+        "toolchain":node_identity,
+        "node":accepted_program(&node,node_identity),
+        "cargo":null,
+        "cargo_version":null,
+        "rustc":null,
+        "rustc_version":null,
+        "trust":"fixture-disabled",
+        "cache_namespace":"fixture-claude-pyright-cache"
+    }]);
+    let fixture = ProductFixture::new_claude(providers);
+    let path = fixture.root.join("main.py");
+    std::fs::write(
+        &path,
+        "def value() -> int:\n    return \"bad\"\n\ndef caller() -> int:\n    return value()\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "main.py"]);
+    fixture.git(&["commit", "--quiet", "-m", "claude python fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "claude-pyright").await;
+
+    let pending = actor
+        .call_claude(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"pyright-start"}),
+        )
+        .await;
+    let (started, feedback) = actor.complete_claude_pending(&fixture, &pending).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    assert!(feedback.is_empty());
+
+    let source = std::fs::read_to_string(&path).unwrap();
+    let pending = actor
+        .call_claude(
+            &fixture,
+            "ide.context",
+            json!({"path":"main.py","byte_offset":source.rfind("value()").unwrap()}),
+        )
+        .await;
+    let (context, _) = actor.complete_claude_pending(&fixture, &pending).await;
+    let text = context["text"].as_str().unwrap();
+    assert_eq!(context["kind"], "context", "{context}");
+    assert!(text.contains("mode: semantic"), "{context}");
+    assert!(text.contains("definitions: [{"), "{context}");
+    assert!(text.contains("references: [{"), "{context}");
+    assert!(text.contains("diagnostic_count: 1"), "{context}");
+    assert!(
+        text.contains("Type \\\"Literal['bad']\\\" is not assignable to return type \\\"int\\\""),
+        "{context}"
+    );
+
+    std::fs::write(
+        &path,
+        "def value() -> int:\n    return 8\n\ndef caller() -> int:\n    return value()\n",
+    )
+    .unwrap();
+    actor
+        .claude_lifecycle(&fixture, "PreToolUse", "native-python-edit")
+        .await;
+    actor
+        .claude_lifecycle(&fixture, "PostToolUse", "native-python-edit")
+        .await;
+    let fixed = std::fs::read_to_string(&path).unwrap();
+    let pending = actor
+        .call_claude(
+            &fixture,
+            "ide.context",
+            json!({"path":"main.py","byte_offset":fixed.rfind("value()").unwrap()}),
+        )
+        .await;
+    let (refreshed, _) = actor.complete_claude_pending(&fixture, &pending).await;
+    let refreshed_text = refreshed["text"].as_str().unwrap();
+    assert!(refreshed_text.contains("return 8"), "{refreshed}");
+    assert!(
+        !refreshed_text.contains("return \\\"bad\\\"")
+            && !refreshed_text.contains("Literal['bad']"),
+        "stale Pyright diagnostic survived native edit: {refreshed}"
+    );
+
+    let pending = actor
+        .call_claude(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let (diff, feedback) = actor.complete_claude_pending(&fixture, &pending).await;
+    assert_eq!(diff["kind"], "diff", "{diff}");
+    assert!(
+        diff["text"].as_str().unwrap().contains("return 8"),
+        "{diff}"
+    );
+    assert!(feedback.is_empty());
+    let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Proves CARGO/RUSTC threading actually lets rust-analyzer load the Cargo workspace under
 /// `env_clear`: a detached single file cannot resolve a symbol defined only in a path-dependency
 /// crate, so a passing cross-crate definition is real evidence of loaded workspace semantics, not

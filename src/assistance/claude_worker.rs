@@ -29,7 +29,7 @@ use std::{
 /// Maximum complete serialized helper frame in either direction, before JSON decoding.
 pub const MAX_HELPER_FRAME_BYTES: usize = 256 * 1024;
 /// Only this closed helper wire revision is accepted in either direction.
-pub const HELPER_PROTOCOL: u32 = 2;
+pub const HELPER_PROTOCOL: u32 = 3;
 /// Bounds concurrently outstanding launch tickets within one daemon boot.
 pub const MAX_TICKETS: usize = 64;
 /// Maximum accepted length of one exact expected helper command.
@@ -142,6 +142,46 @@ pub enum HelperLanguage {
     Go,
     /// rust-analyzer with cache priming and proc-macro expansion both disabled.
     Rust,
+    /// Pyright over one helper-private, worktree-isolated stdio child.
+    Python,
+}
+
+/// Carries the complete launcher-accepted Pyright and Node identities for one helper child.
+///
+/// Both paths and byte digests come directly from the restart-loaded launcher configuration. The
+/// helper never discovers either program from project files or its inherited environment; it only
+/// reconstructs the existing fixed Pyright profile and rechecks these identities before spawning.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HelperPyrightProfile {
+    /// Absolute accepted `pyright-langserver` script path.
+    pub script: PathBuf,
+    /// Nonempty launcher-accepted Pyright script identity.
+    pub script_identity: String,
+    /// Complete hexadecimal BLAKE3 digest of the accepted script bytes.
+    pub script_blake3: String,
+    /// Absolute accepted Node program that alone may execute `script`.
+    pub node: PathBuf,
+    /// Nonempty launcher-accepted Node identity.
+    pub node_identity: String,
+    /// Complete hexadecimal BLAKE3 digest of the accepted Node bytes.
+    pub node_blake3: String,
+}
+
+impl HelperPyrightProfile {
+    /// Rejects non-absolute paths, blank identities, and malformed accepted byte digests.
+    pub fn validate(&self) -> Result<(), FailureCode> {
+        let digest =
+            |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+        (self.script.is_absolute()
+            && !self.script_identity.is_empty()
+            && digest(&self.script_blake3)
+            && self.node.is_absolute()
+            && !self.node_identity.is_empty()
+            && digest(&self.node_blake3))
+        .then_some(())
+        .ok_or(FailureCode::ExecutionProfile)
+    }
 }
 
 /// Carries the effective Rust analyzer settings a Claude helper is permitted to run under.
@@ -192,6 +232,8 @@ pub struct HelperProvider {
     pub language: HelperLanguage,
     /// Effective Rust settings; present only for [`HelperLanguage::Rust`].
     pub rust_settings: Option<RustEffectiveSettings>,
+    /// Fixed launcher-accepted Pyright/Node identity; present only for [`HelperLanguage::Python`].
+    pub pyright: Option<HelperPyrightProfile>,
     /// Accepted Go executable path or Rust toolchain selector.
     pub toolchain: String,
     /// Accepted Cargo executable for Rust; absent for Go.
@@ -223,20 +265,32 @@ impl HelperProvider {
         match (
             self.language,
             self.rust_settings.as_ref(),
+            self.pyright.as_ref(),
             self.cargo.as_ref(),
             self.cargo_version.as_ref(),
             self.rustc.as_ref(),
             self.rustc_version.as_ref(),
         ) {
-            (HelperLanguage::Rust, Some(settings), Some(cargo), Some(_), Some(rustc), Some(_))
-                if cargo.is_absolute() && rustc.is_absolute() =>
-            {
-                settings.validate()
-            }
-            (HelperLanguage::Go, None, None, None, None, None)
+            (
+                HelperLanguage::Rust,
+                Some(settings),
+                None,
+                Some(cargo),
+                Some(_),
+                Some(rustc),
+                Some(_),
+            ) if cargo.is_absolute() && rustc.is_absolute() => settings.validate(),
+            (HelperLanguage::Go, None, None, None, None, None, None)
                 if PathBuf::from(&self.toolchain).is_absolute() =>
             {
                 Ok(())
+            }
+            (HelperLanguage::Python, None, Some(pyright), None, None, None, None)
+                if self.executable == pyright.script
+                    && self.version == pyright.script_identity
+                    && self.toolchain == pyright.node_identity =>
+            {
+                pyright.validate()
             }
             _ => Err(FailureCode::ExecutionProfile),
         }
@@ -1610,6 +1664,7 @@ mod tests {
                     cache_priming: false,
                     proc_macro: false,
                 }),
+                pyright: None,
                 toolchain: "fixture".into(),
                 cargo: Some(PathBuf::from("/usr/bin/true")),
                 cargo_version: Some("cargo fixture".into()),
@@ -1825,6 +1880,39 @@ mod tests {
         job.provider.as_mut().unwrap().rustc = None;
         job.provider.as_mut().unwrap().rustc_version = None;
         assert_eq!(job.validate(), Ok(()));
+    }
+
+    /// Python helper frames require matching launcher-selected script and Node identities.
+    #[test]
+    fn python_profile_requires_complete_agreeing_launcher_identities() {
+        let mut job = job();
+        let provider = job.provider.as_mut().unwrap();
+        provider.executable = PathBuf::from("/private/tmp/pyright-langserver");
+        provider.version = "pyright fixture".into();
+        provider.language = HelperLanguage::Python;
+        provider.rust_settings = None;
+        provider.toolchain = "node fixture".into();
+        provider.cargo = None;
+        provider.cargo_version = None;
+        provider.rustc = None;
+        provider.rustc_version = None;
+        provider.pyright = Some(HelperPyrightProfile {
+            script: provider.executable.clone(),
+            script_identity: provider.version.clone(),
+            script_blake3: "ab".repeat(32),
+            node: PathBuf::from("/private/tmp/node"),
+            node_identity: provider.toolchain.clone(),
+            node_blake3: "cd".repeat(32),
+        });
+        assert_eq!(job.validate(), Ok(()));
+        job.provider
+            .as_mut()
+            .unwrap()
+            .pyright
+            .as_mut()
+            .unwrap()
+            .node = PathBuf::from("node");
+        assert_eq!(job.validate(), Err(FailureCode::ExecutionProfile));
     }
 
     /// A bare copied handle without a recognized native launch never releases a job.

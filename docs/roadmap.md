@@ -8,7 +8,7 @@ A coding actor explicitly activates assistance for its own Git worktree. The ini
 
 Activation is actor-specific. Native subagents do not inherit it. The host adapter must prove the relation between the actor, MCP invocation, and hook/delivery channel; model arguments, working directory, timing, parent IDs, and peer user identity alone are insufficient proof. A failed or unavailable IDE must leave native tools and turn completion usable. Hooks have independently enforced deadlines and never wait for compiler warmup.
 
-The real provider loop covers shared Go/gopls, a bounded exclusive Rust profile, and a bounded exclusive Pyright profile for Codex Python (`.py` and `.pyi`) on macOS. Pyright is always one worktree-isolated stdio child with fixed configuration; Claude Python stays unsupported and lexical. Intelligence chooses the provider topology; Execution admits and supervises physical processes and forwarders. Unsupported sharing stays explicitly unsupported. A shared daemon must not gain authority beyond the host's verified execution profile. Where enforcement is unproven, affected execution is unavailable.
+The real provider loop covers shared Go/gopls, a bounded exclusive Rust profile, and a bounded exclusive Pyright profile for Codex and Claude Python (`.py` and `.pyi`) on macOS. Pyright is always one worktree-isolated stdio child with fixed configuration; Claude runs it only in a foreground helper under the helper's existing strict sandbox contract. Intelligence chooses the provider topology; Execution admits and supervises physical processes and forwarders. Unsupported sharing stays explicitly unsupported. A shared daemon must not gain authority beyond the host's verified execution profile. Where enforcement is unproven, affected execution is unavailable.
 
 ### Responsibilities
 
@@ -44,7 +44,7 @@ The target platforms are Linux and macOS. Current v0.1 acceptance runs real Code
 | macOS, Codex CLI, Python/Pyright 1.1.413 | `real_pass` for the bounded product/provider contract |
 | macOS 26.6.2, Claude Code 2.1.267, Go/gopls 0.23.0 | `real_pass`: foreground helper, native-edit diagnostic, Diff, Stop and parallel actor isolation |
 | macOS 26.6.2, Claude Code 2.1.267, Rust/rust-analyzer 1.98.1 | `real_pass`: foreground helper semantic context, native-edit diagnostic, Diff and Stop |
-| macOS, Claude Code, Python/Pyright | `unsupported`; lexical fallback only |
+| macOS, Claude Code, Python/Pyright | `product_covered`; real host containment remains separately verified |
 | Linux, both hosts/providers | `not_tested`; outside the current Mac-only release gate |
 
 Checks cover isolation between divergent worktrees, stale source/provider results, inactive hooks, stop and handoff, daemon/provider crashes, cancellation, bounded queues/output, and preservation of native tool/turn behavior. Productivity evaluation includes correctness, full model-visible context, cold/warm/handoff time, and the complete process tree's resource use. Fewer tool calls alone do not establish improvement.
@@ -75,8 +75,8 @@ the previously ordered history-first increment. Work proceeds in this order:
 3. Add JavaScript/TypeScript/Node.js provider profiles through the same bounded
    context/diagnostic/edit/diff/stop scenario. Node/TypeScript project resolution
    is part of the supported profile; an installed binary alone does not establish
-   support. Python is delivered in v0.1.1 for Codex/macOS; Claude Python remains
-   lexical and unsupported.
+   support. Python is delivered for Codex and Claude/macOS through their existing bounded
+   provider paths.
 4. Accept the increment only after real Codex and Claude macOS scenarios cover
    `start -> context -> edit -> diagnostic -> fix -> diff -> stop`, stale-edit
    refusal, native fallback, restart-safe telemetry and two-worktree isolation.

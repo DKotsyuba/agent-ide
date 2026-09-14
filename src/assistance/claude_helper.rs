@@ -987,6 +987,7 @@ async fn provider_context(
         intelligence::{
             freshness::ViewGeneration,
             gopls::GoplsProfile,
+            pyright::{PyrightProfile, PyrightProfileIdentity, PyrightWorktree},
             rust::{RustProfile, RustProfileIdentity, RustWorktree},
             session::{GoEnv, ProviderSettings, SessionOptions, with_session},
         },
@@ -1005,7 +1006,7 @@ async fn provider_context(
     )
     .map_err(|_| FailureCode::WorkspaceAuthority)?;
     let cache = Path::new(&provider.cache_namespace);
-    let (command, settings) = match provider.language {
+    let (command, settings, pyright_profile) = match provider.language {
         HelperLanguage::Go => {
             let env = GoEnv::prepare(
                 cache.join("go-build"),
@@ -1028,6 +1029,7 @@ async fn provider_context(
                     .standalone_command(&authority)
                     .map_err(|_| FailureCode::ExecutionProfile)?,
                 ProviderSettings::GoplsDefaults(env),
+                None,
             )
         }
         HelperLanguage::Rust => {
@@ -1064,9 +1066,42 @@ async fn provider_context(
                     .command(&worktree)
                     .map_err(|_| FailureCode::ExecutionProfile)?,
                 ProviderSettings::Rust(profile),
+                None,
+            )
+        }
+        HelperLanguage::Python => {
+            let identity = provider
+                .pyright
+                .as_ref()
+                .ok_or(FailureCode::ExecutionProfile)?;
+            let profile = PyrightProfile::new(PyrightProfileIdentity {
+                binary: identity.script.clone(),
+                accepted_script_digest: blake3::Hash::from_hex(&identity.script_blake3)
+                    .map_err(|_| FailureCode::ExecutionProfile)?,
+                version: identity.script_identity.clone(),
+                node: identity.node.clone(),
+                accepted_node_digest: blake3::Hash::from_hex(&identity.node_blake3)
+                    .map_err(|_| FailureCode::ExecutionProfile)?,
+                node_identity: identity.node_identity.clone(),
+                trust: provider.trust.clone(),
+                cache_namespace: provider.cache_namespace.clone(),
+            })
+            .map_err(|_| FailureCode::ExecutionProfile)?;
+            let worktree = PyrightWorktree::new(source.worktree().clone(), authority)
+                .map_err(|_| FailureCode::WorkspaceAuthority)?;
+            let command = profile
+                .command(&worktree)
+                .map_err(|_| FailureCode::ExecutionProfile)?;
+            (
+                command,
+                ProviderSettings::Pyright(profile.clone()),
+                Some(profile),
             )
         }
     };
+    if pyright_profile.is_some_and(|profile| profile.verify_script().is_err()) {
+        return Err(FailureCode::ProviderUnavailable);
+    }
     let mut process = command
         .inherited_process()
         .map_err(|_| FailureCode::ExecutionProfile)?;

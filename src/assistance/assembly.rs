@@ -5,7 +5,8 @@ pub use super::reply::{MissingPeer, PeerReply};
 use super::{
     claude_worker::{
         AcceptedIdentity, ClaudeOperatorProfile, HelperActor, HelperBudgets, HelperJob,
-        HelperLanguage, HelperOperation, HelperProvider, LaunchLedger, RustEffectiveSettings,
+        HelperLanguage, HelperOperation, HelperProvider, HelperPyrightProfile, LaunchLedger,
+        RustEffectiveSettings,
     },
     host_binding::{
         BindingStatus, HostBindingGuard, HostKind, ValidatedInvocation, parse_candidate,
@@ -204,6 +205,7 @@ impl ProductDispatcher {
             {
                 Some("go") => Some(AcceptedProviderSettings::GoplsDefaults),
                 Some("rs") => Some(AcceptedProviderSettings::RustCachePrimingDisabledV1),
+                Some("py") | Some("pyi") => Some(AcceptedProviderSettings::PyrightDefaultsV1),
                 _ => None,
             };
             required.and_then(|settings| {
@@ -394,7 +396,7 @@ impl ProductDispatcher {
     /// Git-only work. Rust is always pinned to disabled cache priming and disabled proc-macro
     /// expansion. Shared multi-worktree gopls is deliberately not offered here: a foreground
     /// helper cannot retain a safe shared listener, so Go runs on a helper-private view only.
-    /// Pyright is deliberately unavailable to Claude helpers and therefore remains lexical.
+    /// Pyright likewise remains one helper-private, worktree-isolated stdio child.
     fn helper_provider(
         target: &LaunchTarget,
         settings: AcceptedProviderSettings,
@@ -404,22 +406,38 @@ impl ProductDispatcher {
             .providers
             .iter()
             .find(|provider| provider.settings == settings)?;
-        let (language, rust_settings) = match provider.settings {
-            AcceptedProviderSettings::GoplsDefaults => (HelperLanguage::Go, None),
+        let (language, rust_settings, pyright) = match provider.settings {
+            AcceptedProviderSettings::GoplsDefaults => (HelperLanguage::Go, None, None),
             AcceptedProviderSettings::RustCachePrimingDisabledV1 => (
                 HelperLanguage::Rust,
                 Some(RustEffectiveSettings {
                     cache_priming: false,
                     proc_macro: false,
                 }),
+                None,
             ),
-            AcceptedProviderSettings::PyrightDefaultsV1 => return None,
+            AcceptedProviderSettings::PyrightDefaultsV1 => {
+                let node = provider.node.as_ref()?;
+                (
+                    HelperLanguage::Python,
+                    None,
+                    Some(HelperPyrightProfile {
+                        script: provider.executable.path.clone(),
+                        script_identity: provider.executable.identity.clone(),
+                        script_blake3: provider.executable.blake3.clone(),
+                        node: node.path.clone(),
+                        node_identity: node.identity.clone(),
+                        node_blake3: node.blake3.clone(),
+                    }),
+                )
+            }
         };
         Some(HelperProvider {
             executable: provider.executable.path.clone(),
             version: provider.executable.identity.clone(),
             language,
             rust_settings,
+            pyright,
             toolchain: provider.toolchain.clone(),
             cargo: provider.cargo.as_ref().map(|program| program.path.clone()),
             cargo_version: provider.cargo_version.clone(),

@@ -104,7 +104,7 @@ still requires the daemon's actual provider/revocation settlement.
 
 ## Supported profiles
 
-A Claude operation is **per-operation exclusive**: Go or Rust, never both, and each helper reaps
+A Claude operation is **per-operation exclusive**: Go, Rust, or Pyright, never more than one, and each helper reaps
 its provider before exiting.
 
 - **Rust** runs with both `cachePriming` and `procMacro` disabled. This is a Claude-specific
@@ -116,6 +116,10 @@ its provider before exiting.
   unavailable for Claude**, because a foreground helper lifecycle cannot retain a safe shared
   listener across operations. That matrix cell remains covered by the existing Codex shared
   listener, which is unchanged.
+- **Python** runs the same fixed Pyright defaults profile as Codex for `.py` and `.pyi`. The
+  helper carries only the launcher's accepted Pyright script and Node paths, identities, and
+  BLAKE3 digests; it reconstructs the profile, verifies the script at the final boundary, and
+  retains the inherited-process Node recheck before spawning its one-shot child.
 
 Stop and handoff retain the IDE-owned worktree cache directories; no analysis runs while inactive.
 The daemon derives their private absolute paths from the durable worktree identity/incarnation,

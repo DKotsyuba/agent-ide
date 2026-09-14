@@ -12,7 +12,7 @@ roots. Complete delivery accounting and the remaining roadmap acceptance checks 
 
 Tagged releases are built on GitHub Actions using an arm64 macOS runner and published
 with a SHA-256 checksum in GitHub Releases. Install the latest private release with
-`./install.sh`, or select one with `./install.sh 0.1.5`. The installer uses the
+`./install.sh`, or select one with `./install.sh 0.1.6`. The installer uses the
 authenticated GitHub CLI, verifies `SHA256SUMS`, and atomically installs to
 `~/.local/bin` (override with `AGENT_IDE_INSTALL_DIR`). It does not edit MCP or hook
 configuration.
@@ -111,4 +111,4 @@ Stopping a coder releases its analysis leases and retains its worktree's cache d
 
 Go worktrees split their cache in two. Each worktree keeps a private namespace holding its own `GOCACHE`/`GOMODCACHE`/`GOTMPDIR`, delivered per LSP view rather than as process environment, so a view without one fails closed instead of reading another worktree's build state. Compatible worktrees additionally share one backend-scoped native namespace holding gopls' own on-disk filecache and the listener's temporary directory: gopls binds that filecache once per process, so sharing it is what lets divergent worktrees run on a single physical listener with one forwarder each. Compatibility is one canonical effective-rights identity — provider, settings, toolchain, and the rights the observed sandbox state actually grants; cwd-relative sandbox roots are resolved to absolute rights first, and any policy whose rights cannot be proven equal is never shared. The shared namespace is reference-counted, so it survives a partial stop while any sharing worktree is still live, and both namespaces persist across stop and handoff. gopls manages the contents of its shared native namespace itself and may evict them at any time; that eviction is a cache miss, never a loss of IDE-owned worktree state.
 
-Pyright v0.1.1 is Codex-only. Configure its closed `pyright_defaults_v1` provider with accepted absolute `pyright-langserver` and `node` executable objects, and set `toolchain` to the accepted Node identity. The launcher invokes that exact Node executable with the absolute Pyright script and `--stdio`. Claude has no Pyright provider and falls back lexically for Python. The MCP surface remains the current five tools and protocol versions.
+Pyright v0.1.1 supports Codex and Claude Python (`.py` and `.pyi`). Configure its closed `pyright_defaults_v1` provider with accepted absolute `pyright-langserver` and `node` executable objects, and set `toolchain` to the accepted Node identity. The launcher invokes that exact Node executable with the absolute Pyright script and `--stdio`; Claude does so only in its foreground helper, using the same accepted paths, identities, and BLAKE3 digests. The MCP surface remains the current five tools and protocol versions.

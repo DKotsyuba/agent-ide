@@ -71,12 +71,14 @@ Go executable as `toolchain` and absent/null `cargo_version` and `rustc_version`
 `rust_cache_priming_disabled_v1` requires a nonempty rustup toolchain selector plus accepted
 nonempty `cargo_version` and `rustc_version` identities. Arbitrary settings objects and
 duplicate language/settings entries are rejected.
-`pyright_defaults_v1` is Codex-only and requires `node` as an accepted executable object whose
+`pyright_defaults_v1` supports Codex and Claude foreground helpers and requires `node` as an accepted executable object whose
 identity exactly matches `toolchain`, with all Rust executable/version fields absent/null. The
 configured Node program runs the accepted absolute `pyright-langserver` script directly; only
 Node's parent directory and the private temporary directory are retained in its environment.
-Claude has no Pyright provider and uses lexical Python fallback. This
-does not change the five MCP tools or their current protocol versions.
+Claude reconstructs the fixed profile from only these launcher-accepted script and Node paths,
+identities, and BLAKE3 digests, then rechecks the script before the inherited-process Node
+recheck at spawn. This does not change the five MCP tools; helper protocol revision 3 fences
+mixed binaries.
 `cache_namespace` is a bounded compatibility label, not a filesystem path or
 authority grant. Assistance combines it with the verified durable worktree and
 accepted provider identities to retain a private directory, then supplies only
