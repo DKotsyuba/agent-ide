@@ -1,6 +1,7 @@
 //! Exploit regressions for linear provider admission and exact direct-child settlement.
 
 use super::*;
+use tokio::io::AsyncBufReadExt;
 
 /// Creates one exact disabled-host command accepted by a test-only local execution profile.
 fn request(kind: CommandKind, program: &str, args: &[&str]) -> ValidatedExecutionRequest {
@@ -173,6 +174,99 @@ async fn raw_provider_spawns_require_typed_registry_capabilities() {
         admission.settle_never_started(settlement).unwrap();
     }
     assert_eq!(admission.running_count(), 0);
+}
+
+/// Normal TypeScript-style protocol settlement reaps successfully without requesting any signal.
+#[tokio::test]
+async fn normal_protocol_reap_sends_no_signal_and_keeps_descendants_unverified() {
+    let (mut admission, mut registry) = controllers();
+    let provider = request(CommandKind::Provider, "/usr/bin/true", &[]);
+    let view = view(&mut registry, &mut admission, &provider);
+    let child = OwnedProtocolChild::spawn_from_provider_lease(
+        &provider,
+        registry.take_spawn_lease(view).unwrap(),
+        None,
+        Path::new("/unused"),
+        64,
+    )
+    .unwrap();
+    let BackendRelease::ReapOwned(capability) = registry.release(view).unwrap() else {
+        panic!("exclusive provider must require direct-child reap")
+    };
+
+    let completed = child.reap(Duration::from_secs(2)).await.unwrap();
+
+    assert!(completed.status.success());
+    assert_eq!(completed.cancellation, None);
+    assert_eq!(completed.descendants, DescendantEvidence::Unverified);
+    registry
+        .complete_reap(&mut admission, capability, completed.proof)
+        .unwrap();
+    assert_eq!(admission.running_count(), 0);
+}
+
+/// Abnormal TypeScript cleanup preserves the TERM grace before group/direct KILL and direct reap.
+#[cfg(unix)]
+#[tokio::test]
+async fn abnormal_typescript_cleanup_waits_full_grace_before_kill_and_reap() {
+    let (mut admission, mut registry) = controllers();
+    let provider = request(
+        CommandKind::Provider,
+        "/bin/sh",
+        &[
+            "-c",
+            "trap 'exit 0' TERM; /bin/sh -c 'trap \"\" TERM; while :; do sleep 1; done' & printf '%s\\n' \"$!\"; while :; do sleep 1; done",
+        ],
+    );
+    let view = view(&mut registry, &mut admission, &provider);
+    let mut child = OwnedProtocolChild::spawn_from_provider_lease(
+        &provider,
+        registry.take_spawn_lease(view).unwrap(),
+        None,
+        Path::new("/unused"),
+        64,
+    )
+    .unwrap();
+    let mut descendant = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::io::BufReader::new(&mut child.stdout).read_line(&mut descendant),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let descendant: libc::pid_t = descendant.trim().parse().unwrap();
+    let BackendRelease::ReapOwned(capability) = registry.release(view).unwrap() else {
+        panic!("exclusive provider must require direct-child reap")
+    };
+    let grace = Duration::from_millis(100);
+    let started = tokio::time::Instant::now();
+
+    let completed = child
+        .terminate_typescript_abnormally(grace, Duration::from_secs(2))
+        .await
+        .unwrap();
+
+    assert!(started.elapsed() >= grace);
+    assert_eq!(
+        completed.cancellation,
+        Some(CancellationEvidence {
+            term_requested: true,
+            kill_requested: true,
+        })
+    );
+    assert_eq!(completed.descendants, DescendantEvidence::Unverified);
+    registry
+        .complete_reap(&mut admission, capability, completed.proof)
+        .unwrap();
+    assert_eq!(admission.running_count(), 0);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while unsafe { libc::kill(descendant, 0) } == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fixture descendant should be absent after group KILL");
 }
 
 /// Released logical views invalidate already-issued listener and forwarder launch capabilities.
