@@ -20,6 +20,9 @@ use crate::app::{
     },
 };
 
+/// Converts existing Assistance, provider, and Execution facts into closed telemetry events.
+pub mod adapters;
+
 /// Largest accepted canonical encoded event in bytes.
 pub const MAX_EVENT_BYTES: usize = 2 * 1024;
 /// Hard upper bound for retained durable telemetry rows.
@@ -195,6 +198,15 @@ pub enum Event {
         /// Existing conservative descendant settlement observation.
         descendants: DescendantSettlement,
     },
+    /// Records an existing provider state summary without provider identity, cache key, or message.
+    ProviderObserved {
+        /// Closed provider language class.
+        language: Language,
+        /// Existing provider cache summary.
+        cache: CacheState,
+        /// Existing provider diagnostic summary.
+        diagnostics: DiagnosticState,
+    },
     /// Records a native fallback observation without changing native fallback behaviour.
     NativeFallback {
         /// Closed unavailable boundary that selected the native path.
@@ -222,6 +234,7 @@ impl Event {
         match self {
             Self::ToolCompleted { .. } => "tool_completed",
             Self::ExecutionCompleted { .. } => "execution_completed",
+            Self::ProviderObserved { .. } => "provider_observed",
             Self::NativeFallback { .. } => "native_fallback",
         }
     }
@@ -571,28 +584,33 @@ fn test_store_config() -> StoreConfig {
     }
 }
 
+/// Opens a fresh temporary telemetry owner for module-local contract tests only.
+#[cfg(test)]
+pub(crate) async fn open_test_telemetry(
+    config: TelemetryConfig,
+) -> (Telemetry, std::path::PathBuf) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEST_DATABASE: AtomicU64 = AtomicU64::new(0);
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the system clock is after the Unix epoch in tests")
+        .as_nanos();
+    let ordinal = NEXT_TEST_DATABASE.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("agent-ide-telemetry-{nonce}-{ordinal}.sqlite"));
+    let store = Arc::new(Store::open(&path, test_store_config()).expect("test store opens"));
+    (
+        Telemetry::open(store, config)
+            .await
+            .expect("test telemetry opens"),
+        path,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-    /// Creates a uniquely named temporary SQLite path without retaining a user path in telemetry data.
-    fn database_path() -> std::path::PathBuf {
-        static NEXT_TEST_DATABASE: AtomicU64 = AtomicU64::new(0);
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let ordinal = NEXT_TEST_DATABASE.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("agent-ide-telemetry-{nonce}-{ordinal}.sqlite"))
-    }
-
-    /// Opens a test owner using a fresh local SQLite database.
-    async fn test_telemetry(config: TelemetryConfig) -> (Telemetry, std::path::PathBuf) {
-        let path = database_path();
-        let store = Arc::new(Store::open(&path, test_store_config()).unwrap());
-        (Telemetry::open(store, config).await.unwrap(), path)
-    }
+    use std::time::Duration;
 
     /// Supplies a representative schema-closed event without any user-controlled content field.
     fn event() -> Event {
@@ -617,7 +635,7 @@ mod tests {
     /// Proves smallest configured row ceiling evicts the oldest durable rows in sequence order.
     #[tokio::test]
     async fn retention_evicts_oldest_at_the_first_row_ceiling() {
-        let (telemetry, path) = test_telemetry(TelemetryConfig {
+        let (telemetry, path) = open_test_telemetry(TelemetryConfig {
             max_rows: 2,
             ..TelemetryConfig::default()
         })
@@ -636,7 +654,7 @@ mod tests {
     #[tokio::test]
     async fn retention_evicts_oldest_at_the_logical_byte_ceiling() {
         let one_event_bytes = event().encode().unwrap().len();
-        let (telemetry, path) = test_telemetry(TelemetryConfig {
+        let (telemetry, path) = open_test_telemetry(TelemetryConfig {
             max_logical_bytes: one_event_bytes * 2,
             ..TelemetryConfig::default()
         })
@@ -654,7 +672,7 @@ mod tests {
     /// Proves page continuation is sequence ordered and tells callers where the next page begins.
     #[tokio::test]
     async fn query_exposes_contiguous_sequence_cursor() {
-        let (telemetry, path) = test_telemetry(TelemetryConfig::default()).await;
+        let (telemetry, path) = open_test_telemetry(TelemetryConfig::default()).await;
         telemetry.record(event());
         telemetry.record(Event::NativeFallback {
             reason: FallbackReason::HookUnavailable,
@@ -674,7 +692,7 @@ mod tests {
     /// Proves a deliberately small export ceiling reports its first omitted sequence rather than sampling.
     #[tokio::test]
     async fn export_reports_explicit_byte_truncation() {
-        let (telemetry, path) = test_telemetry(TelemetryConfig {
+        let (telemetry, path) = open_test_telemetry(TelemetryConfig {
             export_budget: 1,
             ..TelemetryConfig::default()
         })
