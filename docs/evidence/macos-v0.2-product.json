@@ -1,0 +1,11 @@
+{
+  "schema": "agent-ide.macos-acceptance.v1",
+  "revision": "d88af079ac1e0c06d411208f513a1bfefeddf4b1",
+  "route": "product",
+  "status": "product_pass",
+  "platform": {"os": "macos", "version": "26.6.2", "architecture": "arm64"},
+  "host": {"version": "product-contract"},
+  "toolchains": {"go": "1.25.0", "gopls": "0.23.0", "rust": "1.98.1", "rust_analyzer": "1.98.1", "node": "24.4.0", "pyright": "1.1.413", "typescript_language_server": "6.0.0", "typescript": "5.9.3"},
+  "scenarios": {"edit_diagnostic_loop": "product_pass", "stale_edit_zero_write": "product_pass", "native_fallback": "product_pass", "telemetry_restart_query_export": "product_pass", "compact_content": "product_pass", "python_provider": "product_pass", "typescript_r3": "product_pass", "divergent_worktrees": "product_pass"},
+  "privacy": {"source": false, "prompts": false, "credentials": false, "commands": false, "paths": false, "diagnostic_messages": false, "private_ids": false}
+}

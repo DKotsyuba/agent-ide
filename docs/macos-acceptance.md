@@ -65,3 +65,21 @@ or private run identifier. `product_pass` records a shipping product/provider ga
 Non-macOS execution emits `not_tested` evidence and does not create worktrees or claim support.
 Linux therefore remains explicitly `not_tested` until a separate real Linux acceptance contract is
 implemented.
+
+## v0.2 candidate results
+
+The candidate at revision `d88af079ac1e0c06d411208f513a1bfefeddf4b1` was exercised on macOS
+26.6.2 arm64. Its locked [product gate](evidence/macos-v0.2-product.json) passed with the documented
+toolchain versions. The real-host matrix remains closed: a partially successful route is not a
+`real_pass`, and the runner marks every scenario `failed` when its strict driver withholds the exact
+complete result document.
+
+| Route | Public evidence | Result |
+|---|---|---|
+| Direct Codex CLI 0.154.0 | [JSON](evidence/macos-v0.2-direct-codex.json) | `failed`: real Pyright edit/stale/native behavior and TypeScript semantic Context ran, but a required final inspection failed; no complete host claim |
+| Direct Claude Code 2.1.267 | [JSON](evidence/macos-v0.2-direct-claude.json) | `not_tested`: external authentication blocker was exactly `Not logged in · Please run /login` |
+| Installed agent-run 0.11.8 to Claude Code 2.1.267 | [JSON](evidence/macos-v0.2-agent-run-claude.json) | `failed`: both divergent worktrees completed the real Pyright/helper path, including stale zero-write and native fallback; Diff inspection exhausted detail capacity and TypeScript remained lexical-only, so the complete cell did not pass |
+
+The installed agent-run route is separate evidence and is not relabeled as direct Claude. Private
+driver prompts, local paths, credentials, transcripts, and host/run identifiers were retained only
+in disposable operator state and do not appear in these artifacts.

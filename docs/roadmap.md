@@ -94,9 +94,9 @@ not enter them.
 
 | macOS route | Required real evidence | Status |
 |---|---|---|
-| Direct Codex | `start -> context -> edit -> diagnostic -> fix -> diff -> stop`; stale edit has zero writes; native fallback; restart-safe telemetry query/export; divergent worktrees | TypeScript Context/normal-shutdown subset `real_pass`; complete cell `not_tested` |
-| Direct Claude | The same scenario through the claimed foreground helper, including TypeScript only after its spike; stale edit has zero writes; native fallback; restart-safe telemetry; divergent worktrees | `not_tested` |
-| Installed external agent-run-to-Claude | The same end-to-end route, with its external attachment treated as an adapter rather than identity authority; stale edit has zero writes; native fallback; restart-safe telemetry; divergent worktrees | `not_tested` |
+| Direct Codex | `start -> context -> edit -> diagnostic -> fix -> diff -> stop`; stale edit has zero writes; native fallback; restart-safe telemetry query/export; divergent worktrees | `failed` on macOS 26.6.2 with Codex CLI 0.154.0: Pyright edit/stale/native behavior and TypeScript semantic Context ran, but a required final inspection failed; no complete claim |
+| Direct Claude | The same scenario through the claimed foreground helper, including TypeScript only after its spike; stale edit has zero writes; native fallback; restart-safe telemetry; divergent worktrees | `not_tested` with Claude Code 2.1.267: external blocker was exactly `Not logged in · Please run /login` |
+| Installed external agent-run-to-Claude | The same end-to-end route, with its external attachment treated as an adapter rather than identity authority; stale edit has zero writes; native fallback; restart-safe telemetry; divergent worktrees | `failed` on agent-run 0.11.8 to Claude Code 2.1.267: both divergent Pyright/helper paths ran, but Diff inspection reached capacity and TypeScript remained lexical-only |
 | Linux, all routes | No v0.2 host/provider acceptance claim | `not_tested` |
 
 This increment does not add a remote analytics service, dashboard, arbitrary shell

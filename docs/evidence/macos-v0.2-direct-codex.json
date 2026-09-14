@@ -1,0 +1,11 @@
+{
+  "schema": "agent-ide.macos-acceptance.v1",
+  "revision": "d88af079ac1e0c06d411208f513a1bfefeddf4b1",
+  "route": "codex",
+  "status": "failed",
+  "platform": {"os": "macos", "version": "26.6.2", "architecture": "arm64"},
+  "host": {"version": "codex-cli-0.154.0"},
+  "toolchains": {"go": "not_tested", "gopls": "not_tested", "rust": "not_tested", "rust_analyzer": "not_tested", "node": "not_tested", "pyright": "not_tested", "typescript_language_server": "not_tested", "typescript": "not_tested"},
+  "scenarios": {"edit_diagnostic_loop": "failed", "stale_edit_zero_write": "failed", "native_fallback": "failed", "telemetry_restart_query_export": "failed", "compact_content": "failed", "python_provider": "failed", "typescript_r3": "failed", "divergent_worktrees": "failed"},
+  "privacy": {"source": false, "prompts": false, "credentials": false, "commands": false, "paths": false, "diagnostic_messages": false, "private_ids": false}
+}
