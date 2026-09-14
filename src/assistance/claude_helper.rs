@@ -966,8 +966,8 @@ async fn context(
     (HelperOutcome::Complete { text }, Some(payload))
 }
 
-/// Runs one accepted provider over exact helper-observed bytes, awaits matching Pyright diagnostics
-/// under the helper's inherited deadline, then reaps it before returning.
+/// Runs one accepted provider over exact helper-observed bytes, awaits matching Pyright diagnostics,
+/// reaps it, and rechecks a future TypeScript operation's resolution snapshot before returning.
 async fn provider_context(
     job: &HelperJob,
     deadline: tokio::time::Instant,
@@ -1008,7 +1008,7 @@ async fn provider_context(
     )
     .map_err(|_| FailureCode::WorkspaceAuthority)?;
     let cache = Path::new(&provider.cache_namespace);
-    let (command, settings, pyright_profile) = match provider.language {
+    let (command, settings, pyright_profile, typescript_profile) = match provider.language {
         HelperLanguage::Go => {
             let env = GoEnv::prepare(
                 cache.join("go-build"),
@@ -1031,6 +1031,7 @@ async fn provider_context(
                     .standalone_command(&authority)
                     .map_err(|_| FailureCode::ExecutionProfile)?,
                 ProviderSettings::GoplsDefaults(env),
+                None,
                 None,
             )
         }
@@ -1069,6 +1070,7 @@ async fn provider_context(
                     .map_err(|_| FailureCode::ExecutionProfile)?,
                 ProviderSettings::Rust(profile),
                 None,
+                None,
             )
         }
         HelperLanguage::Python => {
@@ -1098,6 +1100,7 @@ async fn provider_context(
                 command,
                 ProviderSettings::Pyright(profile.clone()),
                 Some(profile),
+                None,
             )
         }
         HelperLanguage::TypeScript => {
@@ -1106,13 +1109,12 @@ async fn provider_context(
                 .as_ref()
                 .ok_or(FailureCode::ExecutionProfile)?;
             let bundle = identity.bundle()?;
-            let resolution = ProjectResolutionInputsV1::new(
+            let resolution = ProjectResolutionInputsV1::observe(
                 source.worktree().clone(),
                 source.worktree().worktree_path().join(source.path()),
                 &bundle,
-                vec![],
             )
-            .map_err(|_| FailureCode::ProviderUnavailable)?;
+            .map_err(|_| FailureCode::ResolutionUnverified)?;
             let profile = TypeScriptProfile::new(
                 bundle,
                 resolution,
@@ -1126,8 +1128,9 @@ async fn provider_context(
                 profile
                     .command(&worktree)
                     .map_err(|_| FailureCode::ExecutionProfile)?,
-                ProviderSettings::TypeScript(profile),
+                ProviderSettings::TypeScript(profile.clone()),
                 None,
+                Some(profile),
             )
         }
     };
@@ -1216,6 +1219,12 @@ async fn provider_context(
     match status {
         Ok(status) => {
             *reaped += 1;
+            if typescript_profile
+                .as_ref()
+                .is_some_and(|profile| profile.verify_resolution().is_err())
+            {
+                return Err(FailureCode::ResolutionUnverified);
+            }
             if !status.success() || operation.is_err() {
                 return Err(FailureCode::ProviderUnavailable);
             }

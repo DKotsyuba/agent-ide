@@ -83,9 +83,13 @@ mixed binaries.
 `typescript` object containing `bridge_bytes`, the exact bridge and TypeScript versions, an
 accepted `tsserver` file (`path`, `blake3`, and `bytes`), a sorted nonempty `closure` of files in
 that same shape, and separate host evidence fields. The compiled Codex release cell accepts only
-`macos-26.6.2-node-24.4.0-tls-6.0.0-ts-5.9.3-codex-r2-2026-09-14`; the Claude evidence field must
-remain null until a separate real Claude macOS record ships. Every member is remeasured at startup
-and immediately before its one-shot child starts.
+`macos-26.6.2-node-24.4.0-tls-6.0.0-ts-5.9.3-codex-r2-2026-09-14:<bundle-digest>`: the suffix is
+derived from the exact declared Node, bridge, `tsserver.js`, and closure paths, digests, lengths,
+and identities, so copying the record to another bundle is rejected. The three public versions
+must also be exactly 24.4.0, 6.0.0, and 5.9.3, and the compiled record fixes the accepted Node,
+bridge, `tsserver.js`, and complete closure byte identities rather than trusting those labels alone.
+The Claude evidence field must remain null until a separate real Claude macOS record ships. Every
+member is remeasured at startup and immediately before its one-shot child starts.
 `cache_namespace` is a bounded compatibility label, not a filesystem path or
 authority grant. Assistance combines it with the verified durable worktree and
 accepted provider identities to retain a private directory, then supplies only
@@ -104,7 +108,7 @@ malformed executable digests and mismatched profile evidence are rejected.
 The fourth provider is the immutable `TypeScriptProviderBundleV1` in
 [TYPESCRIPT-r2](contracts/intelligence-v0.2.md). It accepts only an explicit accepted Node,
 bridge, TypeScript closure, and `tsserver.path`; it has no ambient npm/plugin/network discovery.
-Codex requires its exact compiled release record. The launcher and helper frame support the closed
+Codex requires its exact bundle-bound compiled release record. The launcher and helper frame support the closed
 Claude shape, but Claude selection stays unavailable until its independent compiled release record
 exists. This is restart-only configuration and never enables a syntax server or automatic typing
 acquisition.

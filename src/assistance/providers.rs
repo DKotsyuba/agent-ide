@@ -23,8 +23,8 @@ use crate::{
         session::{DiagnosticSnapshot, GoEnv, ProviderSettings, SessionOptions, with_session},
         typescript::{
             ProjectResolutionInputsV1, TypeScriptProfile, TypeScriptProfileError,
-            TypeScriptProfiles, TypeScriptProtocolChild, TypeScriptViewAdmission,
-            TypeScriptWorktree,
+            TypeScriptProfiles, TypeScriptProtocolChild, TypeScriptShutdownFailure,
+            TypeScriptViewAdmission, TypeScriptWorktree,
         },
     },
 };
@@ -442,13 +442,12 @@ impl Worker<'_> {
         let bundle = launch
             .typescript_bundle()
             .map_err(|_| FailureCode::ExecutionProfile)?;
-        let resolution = ProjectResolutionInputsV1::new(
+        let resolution = ProjectResolutionInputsV1::observe(
             authority.worktree().clone(),
             authority.worktree().worktree_path().join(source.path()),
             &bundle,
-            vec![],
         )
-        .map_err(|_| FailureCode::ProviderUnavailable)?;
+        .map_err(|_| FailureCode::ResolutionUnverified)?;
         let profile = TypeScriptProfile::new(
             bundle,
             resolution,
@@ -461,9 +460,10 @@ impl Worker<'_> {
             execution_authority(&authority)?,
         )
         .map_err(|_| FailureCode::WorkspaceAuthority)?;
-        let command = profile
-            .command(&worktree)
-            .map_err(|_| FailureCode::ExecutionProfile)?;
+        let command = profile.command(&worktree).map_err(|error| match error {
+            TypeScriptProfileError::InvalidResolution => FailureCode::ResolutionUnverified,
+            _ => FailureCode::ExecutionProfile,
+        })?;
         let node = launch.node.as_ref().ok_or(FailureCode::ExecutionProfile)?;
         let request = self
             .execution_request(job, &authority, command, node)
@@ -514,12 +514,25 @@ impl Worker<'_> {
         };
         let mut child = match child {
             Ok(child) => child,
-            Err(TypeScriptProfileError::InvalidBundle) => {
-                self.providers.typescript.quarantine(&view);
-                return Err(FailureCode::ProviderUnavailable);
+            Err(
+                error @ (TypeScriptProfileError::InvalidBundle
+                | TypeScriptProfileError::InvalidResolution),
+            ) => {
+                self.providers
+                    .typescript
+                    .quarantine_after(&view, TypeScriptShutdownFailure::Operation);
+                return Err(
+                    if matches!(error, TypeScriptProfileError::InvalidResolution) {
+                        FailureCode::ResolutionUnverified
+                    } else {
+                        FailureCode::ProviderUnavailable
+                    },
+                );
             }
             Err(error) => {
-                self.providers.typescript.quarantine(&view);
+                self.providers
+                    .typescript
+                    .quarantine_after(&view, TypeScriptShutdownFailure::Operation);
                 let _ = self
                     .providers
                     .typescript
@@ -544,7 +557,7 @@ impl Worker<'_> {
                     toolchain: 1,
                     view: view.generation(),
                 },
-                ProviderSettings::TypeScript(profile),
+                ProviderSettings::TypeScript(profile.clone()),
                 remaining_options(job),
             );
             tokio::pin!(operation);
@@ -554,13 +567,17 @@ impl Worker<'_> {
             match child.wait_for_exit(Duration::from_millis(500)).await {
                 Ok(waited) => {
                     if !waited.success() {
-                        self.providers.typescript.quarantine(&view);
+                        self.providers
+                            .typescript
+                            .quarantine_after(&view, TypeScriptShutdownFailure::NonzeroExit);
                         outcome = Err(FailureCode::ProviderUnavailable);
                     }
                     child.finish_reap(waited, Duration::from_millis(500)).await
                 }
                 Err(_) => {
-                    self.providers.typescript.quarantine(&view);
+                    self.providers
+                        .typescript
+                        .quarantine_after(&view, TypeScriptShutdownFailure::WaitTimeout);
                     outcome = Err(FailureCode::Deadline);
                     child
                         .terminate_abnormally(
@@ -571,7 +588,9 @@ impl Worker<'_> {
                 }
             }
         } else {
-            self.providers.typescript.quarantine(&view);
+            self.providers
+                .typescript
+                .quarantine_after(&view, TypeScriptShutdownFailure::Operation);
             child
                 .terminate_abnormally(Duration::from_millis(100), Duration::from_millis(500))
                 .await
@@ -583,6 +602,12 @@ impl Worker<'_> {
                 return Err(FailureCode::Deadline);
             }
         };
+        if profile.verify_resolution().is_err() {
+            self.providers
+                .typescript
+                .quarantine_after(&view, TypeScriptShutdownFailure::Operation);
+            outcome = Err(FailureCode::ResolutionUnverified);
+        }
         let capability = self
             .providers
             .typescript

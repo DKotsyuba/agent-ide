@@ -19,6 +19,9 @@ pub const MAX_SOURCE_PATH_BYTES: usize = 4096;
 /// The largest source byte payload accepted by the v0.1 source reader.
 pub const MAX_SOURCE_BYTES: usize = 1024 * 1024;
 
+/// Largest one-file identity observation admitted for bounded project resolution.
+pub const MAX_RESOLUTION_INPUT_BYTES: usize = 8 * 1024 * 1024;
+
 /// States whether an observation captures the complete requested source scope.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourceCoverage {
@@ -341,6 +344,44 @@ pub struct SourceRead {
     git_mode: u32,
 }
 
+/// Carries exact bytes and identity for one explicitly named project-resolution input.
+///
+/// Workspace creates this value through the same descriptor-rooted, no-follow path walk used for
+/// source observations. It is intentionally not durable source state: callers consume the bytes
+/// only to validate a closed project shape, then retain `path`, `digest`, and `length` as their own
+/// typed resolution evidence. Each read is capped at 8 MiB and performs no directory scan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionInputRead {
+    /// Exact validated relative Unix pathname supplied to the reader.
+    path: PathBuf,
+    /// Complete file bytes retained only for immediate project-shape validation.
+    contents: Vec<u8>,
+    /// BLAKE3 digest of `contents`.
+    digest: blake3::Hash,
+}
+
+impl ResolutionInputRead {
+    /// Returns the exact validated relative path without decoding or canonicalizing it.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the complete bounded bytes for immediate closed-shape validation.
+    pub fn contents(&self) -> &[u8] {
+        &self.contents
+    }
+
+    /// Returns the BLAKE3 digest of the complete returned bytes.
+    pub const fn digest(&self) -> blake3::Hash {
+        self.digest
+    }
+
+    /// Returns the complete byte length, always at most 8 MiB.
+    pub fn length(&self) -> u64 {
+        self.contents.len() as u64
+    }
+}
+
 impl SourceRead {
     /// Returns descriptor-derived Git mode (100644 or 100755), using the owner executable bit; byte identity is separate.
     pub const fn git_mode(&self) -> u32 {
@@ -426,6 +467,38 @@ pub fn read_authorized_source(
         } else {
             0o100644
         },
+    })
+}
+
+/// Reads one exact project-resolution input beneath an authorized worktree without scanning.
+///
+/// `path` receives the same raw relative-path and no-symlink enforcement as
+/// [`read_authorized_source`]. `max_bytes` is the remaining aggregate caller budget and must be at
+/// most 8 MiB; the reader consumes at most one byte beyond it before returning
+/// [`ObservationError::TooLarge`]. Missing paths remain explicit `Missing` results, and changed
+/// durable roots fail before descendant bytes are exposed. The returned bytes are not persisted or
+/// registered as source and confer no authority.
+pub fn read_authorized_resolution_input(
+    worktree: &WorktreeRef,
+    path: &Path,
+    max_bytes: usize,
+) -> Result<ResolutionInputRead, ObservationError> {
+    if max_bytes > MAX_RESOLUTION_INPUT_BYTES {
+        return Err(ObservationError::InvalidLimits);
+    }
+    let (mut file, _) = open_authorized_regular_file(worktree, path, MAX_SOURCE_PATH_BYTES)?;
+    let mut contents = Vec::with_capacity(max_bytes.min(8192));
+    file.by_ref()
+        .take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut contents)
+        .map_err(classify_io)?;
+    if contents.len() > max_bytes {
+        return Err(ObservationError::TooLarge);
+    }
+    Ok(ResolutionInputRead {
+        path: path.to_path_buf(),
+        digest: blake3::hash(&contents),
+        contents,
     })
 }
 

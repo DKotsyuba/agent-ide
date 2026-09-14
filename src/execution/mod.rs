@@ -3608,8 +3608,8 @@ impl BorrowedEndpoint {
 
 /// Constructs a direct or sandbox-wrapped command entirely from validated typed inputs.
 ///
-/// Managed Codex wrappers receive only the executable's own directory as `PATH` so an env-based
-/// Node launcher can start without inheriting arbitrary parent environment entries.
+/// Managed Codex wrappers receive their own directory plus only explicitly configured search roots
+/// as `PATH`; an absolute provider program never contributes its directory implicitly.
 ///
 /// `trampoline` is `Some` only for a managed request whose authoritative worktree differs from the
 /// host's own `sandboxCwd` (see [`ValidatedExecutionRequest::validate`]). The sandbox argv and its
@@ -3662,9 +3662,6 @@ fn build_command(
                 ))
             })?;
         let mut search = vec![parent.to_path_buf()];
-        if let Some(program_parent) = command.program.parent().filter(|path| path.is_absolute()) {
-            search.push(program_parent.to_path_buf());
-        }
         if let Some(configured) = command.env.get(&OsString::from("PATH")) {
             search.extend(std::env::split_paths(configured));
         }

@@ -2535,7 +2535,7 @@ async fn configured_product_returns_real_typescript_family_context_and_reaps() {
         typescript_root.join("package.json"),
     ];
     closure.sort();
-    let providers = json!([{
+    let mut provider = json!({
         "executable":accepted_program(bridge.to_str().unwrap(),"6.0.0"),
         "settings":"typescript_defaults_v1",
         "toolchain":"24.4.0",
@@ -2555,8 +2555,14 @@ async fn configured_product_returns_real_typescript_family_context_and_reaps() {
         "rustc_version":null,
         "trust":"fixture-disabled",
         "cache_namespace":"fixture-typescript-cache"
-    }]);
+    });
+    let unbound: agent_ide::assistance::launcher::ProviderLaunch =
+        serde_json::from_value(provider.clone()).unwrap();
+    provider["typescript"]["codex_macos_evidence"] =
+        json!(unbound.expected_typescript_codex_macos_evidence().unwrap());
+    let providers = json!([provider]);
     let fixture = ProductFixture::new(providers);
+    std::fs::write(fixture.root.join("tsconfig.json"), "{}\n").unwrap();
     let cases = [
         (
             "fixture.js",
@@ -2589,6 +2595,7 @@ async fn configured_product_returns_real_typescript_family_context_and_reaps() {
         "fixture.jsx",
         "fixture.ts",
         "fixture.tsx",
+        "tsconfig.json",
     ]);
     fixture.git(&["commit", "--quiet", "-m", "TypeScript fixtures"]);
     let mut daemon = fixture.daemon().await;

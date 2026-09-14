@@ -116,7 +116,8 @@ Pyright v0.1.1 supports Codex and Claude Python (`.py` and `.pyi`). Configure it
 The v0.2 TypeScript increment supports Codex semantic Context for `.js`, `.jsx`, `.ts`, and `.tsx`
 on its accepted macOS release cell. Configure `typescript_defaults_v1` with the exact Node 24.4.0,
 TypeScript Language Server 6.0.0 bridge, TypeScript 5.9.3 `tsserver.js`, complete closure identities,
-and the compiled Codex evidence ID documented in the
-[launcher contract](docs/assistance-launcher.md). Each operation is exclusive and one-shot; normal
+the bundle-bound compiled Codex evidence ID, and an ancestor `tsconfig.json` or `jsconfig.json` as
+documented in the [launcher contract](docs/assistance-launcher.md). Each operation is exclusive and
+one-shot; normal
 success requires graceful shutdown, protocol EOF, zero bridge exit, and direct-child reap without
 TERM/KILL. Claude TypeScript remains unavailable pending its separate real macOS acceptance record.

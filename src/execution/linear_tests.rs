@@ -346,7 +346,7 @@ async fn dropped_registry_cannot_authorize_an_outstanding_capability() {
     );
 }
 
-/// Managed launch supplies wrapper, provider, and configured tool search roots without ambient PATH.
+/// Managed launch supplies only its wrapper and explicitly configured search roots.
 #[test]
 fn managed_provider_search_path_is_explicit_and_complete() {
     let sandbox = HostSandboxState::parse(Some(serde_json::json!({
@@ -371,9 +371,30 @@ fn managed_provider_search_path_is_explicit_and_complete() {
         .unwrap();
     assert_eq!(
         std::env::split_paths(path).collect::<Vec<_>>(),
-        ["/opt/codex/bin", "/usr/bin", "/toolchain/bin"]
+        ["/opt/codex/bin", "/toolchain/bin"]
             .map(PathBuf::from)
             .to_vec()
+    );
+
+    let command = ControlledCommand::from_validated_peer(
+        CommandKind::Provider,
+        PathBuf::from("/usr/bin/true"),
+        Vec::new(),
+        PathBuf::from("/private/tmp"),
+        BTreeMap::new(),
+    )
+    .unwrap();
+    let process =
+        build_command(&command, &sandbox, Path::new("/opt/codex/bin/codex"), None).unwrap();
+    let path = process
+        .as_std()
+        .get_envs()
+        .find_map(|(name, value)| (name == "PATH").then_some(value.unwrap()))
+        .unwrap();
+    assert_eq!(
+        std::env::split_paths(path).collect::<Vec<_>>(),
+        [PathBuf::from("/opt/codex/bin")],
+        "an absolute provider does not expose its own directory implicitly"
     );
 }
 
