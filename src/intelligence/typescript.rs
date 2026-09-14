@@ -2,7 +2,8 @@
 //!
 //! The profile admits one immutable Node/bridge/TypeScript closure for one worktree incarnation.
 //! It probes only fixed ancestor metadata names through Workspace and never lists directories or
-//! discovers packages, plugins, configuration names, or executables from ambient state.
+//! discovers packages, plugins, configuration names, executables, or ancestor dependency trees
+//! from ambient state.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -208,9 +209,12 @@ impl ProjectResolutionInputsV1 {
     /// `files` may contain at most 16 strictly sorted, unique normal relative paths whose basenames
     /// are one of the supported TypeScript/JavaScript project or package inputs. Their declared
     /// sizes may total at most 8 MiB, and at least one `tsconfig.json` or `jsconfig.json` is
-    /// required because inferred projects are unsupported. Workspace reads only those exact names
-    /// without following symlinks or listing directories. Missing declarations, changed bytes,
-    /// unsupported composite project shapes, and any bound mismatch return
+    /// required because inferred projects are unsupported. A configuration must explicitly set
+    /// `compilerOptions.types` to `[]`, and its optional `include`/`files` entries must be normal
+    /// relative paths below that configuration. Workspace reads only those exact names without
+    /// following symlinks or listing directories, and refuses an ancestor `node_modules` entry
+    /// before tsserver can resolve an unobserved bare dependency. Missing declarations, changed
+    /// bytes, unsupported composite project shapes, and any bound mismatch return
     /// [`TypeScriptProfileError::InvalidResolution`].
     pub fn new(
         worktree: WorktreeRef,
@@ -246,9 +250,11 @@ impl ProjectResolutionInputsV1 {
     ///
     /// This is the shared Codex/future-Claude construction path. It derives only the six supported
     /// exact basenames at the document directory and each ancestor through the worktree root; it
-    /// never lists a directory or consults ambient package state. At most 16 present files and 8
-    /// MiB total are accepted. Malformed JSON or a config/package shape that can redirect tsserver
-    /// to undeclared config, plugin, workspace, dependency, or path inputs fails closed as
+    /// never lists a directory or scans packages. It also checks the exact `node_modules` name at
+    /// each document ancestor through the filesystem root, rejecting any entry that could support
+    /// bare-module resolution. At most 16 present files and 8 MiB total are accepted. Malformed
+    /// JSON or a config/package shape that can redirect tsserver to undeclared config, plugin,
+    /// workspace, dependency, or path inputs fails closed as
     /// [`TypeScriptProfileError::InvalidResolution`].
     pub fn observe(
         worktree: WorktreeRef,
@@ -589,6 +595,28 @@ impl TypeScriptProfiles {
         self.quarantine(view);
     }
 
+    /// Quarantines a view when its actual direct-child wait proves a nonzero bridge exit.
+    ///
+    /// Returns `true` exactly for the failure branch so the provider can map that observed exit to
+    /// its public unavailable result while retaining the same owner-lifetime profile fence.
+    pub(crate) fn quarantine_after_unsuccessful_wait(
+        &mut self,
+        view: &TypeScriptView,
+        waited: &WaitedProtocolChild,
+    ) -> bool {
+        if waited.success() {
+            false
+        } else {
+            self.quarantine_after(view, TypeScriptShutdownFailure::NonzeroExit);
+            true
+        }
+    }
+
+    /// Quarantines a view after its actual direct-child wait exceeded the graceful deadline.
+    pub(crate) fn quarantine_after_wait_timeout(&mut self, view: &TypeScriptView) {
+        self.quarantine_after(view, TypeScriptShutdownFailure::WaitTimeout);
+    }
+
     /// Releases one exclusive view and returns the capability required for direct-child settlement.
     pub fn release(
         &mut self,
@@ -894,6 +922,9 @@ fn observe_resolution_files(
     worktree: &WorktreeRef,
     document: &Path,
 ) -> Result<Vec<ProjectResolutionFileV1>, TypeScriptProfileError> {
+    if ancestor_has_node_modules(&worktree.worktree_path().join(document))? {
+        return Err(TypeScriptProfileError::InvalidResolution);
+    }
     let parent = document
         .parent()
         .ok_or(TypeScriptProfileError::InvalidResolution)?;
@@ -928,6 +959,25 @@ fn observe_resolution_files(
     Ok(files)
 }
 
+/// Returns whether an exact ancestor `node_modules` entry could admit bare-module resolution.
+///
+/// The check examines only that fixed name, not package contents or directory listings. Any entry,
+/// including a symlink or an unreadable object, is unsafe because tsserver could follow or inspect
+/// it; an I/O failure also rejects the profile rather than claiming the ambient chain is closed.
+fn ancestor_has_node_modules(document: &Path) -> Result<bool, TypeScriptProfileError> {
+    let parent = document
+        .parent()
+        .ok_or(TypeScriptProfileError::InvalidResolution)?;
+    for directory in parent.ancestors() {
+        match std::fs::symlink_metadata(directory.join("node_modules")) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(TypeScriptProfileError::InvalidResolution),
+        }
+    }
+    Ok(false)
+}
+
 /// Rejects project metadata that can redirect tsserver beyond the exact observed ancestor inputs.
 fn validate_resolution_shape(path: &Path, contents: &[u8]) -> Result<(), TypeScriptProfileError> {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -948,23 +998,19 @@ fn validate_resolution_shape(path: &Path, contents: &[u8]) -> Result<(), TypeScr
         {
             return Err(TypeScriptProfileError::InvalidResolution);
         }
-        if let Some(options) = object.get("compilerOptions") {
-            let options = options
-                .as_object()
-                .ok_or(TypeScriptProfileError::InvalidResolution)?;
-            if [
-                "baseUrl",
-                "paths",
-                "plugins",
-                "rootDirs",
-                "typeRoots",
-                "types",
-            ]
-            .iter()
-            .any(|key| options.contains_key(*key))
-            {
-                return Err(TypeScriptProfileError::InvalidResolution);
-            }
+        let options = object
+            .get("compilerOptions")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(TypeScriptProfileError::InvalidResolution)?;
+        if options.get("types") != Some(&serde_json::Value::Array(Vec::new()))
+            || ["baseUrl", "paths", "plugins", "rootDirs", "typeRoots"]
+                .iter()
+                .any(|key| options.contains_key(*key))
+            || ["include", "files"]
+                .iter()
+                .any(|key| !confined_config_entries(object, key))
+        {
+            return Err(TypeScriptProfileError::InvalidResolution);
         }
     } else if name == "package.json"
         && [
@@ -983,11 +1029,36 @@ fn validate_resolution_shape(path: &Path, contents: &[u8]) -> Result<(), TypeScr
     Ok(())
 }
 
+/// Returns whether an optional config path list can only name lexical descendants of its config.
+///
+/// TypeScript resolves `include` and `files` strings relative to the config's directory. Empty
+/// arrays are closed; nonempty arrays must contain only nonempty normal Unix-relative paths, so
+/// absolute names, traversal, dot components, and alternate separator escapes are refused before
+/// the server starts.
+fn confined_config_entries(object: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
+    object.get(key).is_none_or(|value| {
+        value.as_array().is_some_and(|entries| {
+            entries.iter().all(|entry| {
+                entry
+                    .as_str()
+                    .is_some_and(|path| !path.contains('\\') && normal_relative(Path::new(path)))
+            })
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::{AdmissionLimits, ProviderLeaseLimits};
-    use std::os::unix::fs::PermissionsExt;
+    use crate::execution::{
+        AdmissionLimits, ExecutionProfileCatalog, ExecutionProfileTemplate, HostSandboxState,
+        LocalExecutionPolicy, ProviderLeaseLimits, ValidatedExecutionRequest,
+        ValidatedHostInvocation,
+    };
+    use std::{collections::BTreeSet, os::unix::fs::PermissionsExt};
+
+    /// Exact closed config bytes accepted by TypeScript resolution fixtures.
+    const CLOSED_CONFIG: &[u8] = br#"{"compilerOptions":{"types":[]}}"#;
 
     /// Distinguishes parallel fixture roots when the platform clock has coarse resolution.
     static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -996,6 +1067,8 @@ mod tests {
     struct Fixture {
         /// Unique test-owned root containing every bundle and cache fixture.
         root: PathBuf,
+        /// Parent retained so tests can model ambient ancestors above the worktree safely.
+        cleanup_root: PathBuf,
     }
 
     impl Fixture {
@@ -1013,7 +1086,12 @@ mod tests {
                     NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 ));
             std::fs::create_dir(&path).unwrap();
-            Self { root: path }
+            let root = path.join("worktree");
+            std::fs::create_dir(&root).unwrap();
+            Self {
+                root,
+                cleanup_root: path,
+            }
         }
 
         /// Writes one file and returns its accepted path, length, and digest identity.
@@ -1032,7 +1110,12 @@ mod tests {
 
         /// Builds the accepted immutable bundle fixture with one explicit closure member.
         fn bundle(&self) -> TypeScriptProviderBundleV1 {
-            let node = self.file("node", b"#!/bin/sh\nexit 0\n", true);
+            self.bundle_with_node_script(b"#!/bin/sh\nexit 0\n")
+        }
+
+        /// Builds the accepted immutable bundle fixture with a test-controlled direct-child script.
+        fn bundle_with_node_script(&self, node_script: &[u8]) -> TypeScriptProviderBundleV1 {
+            let node = self.file("node", node_script, true);
             let bridge = self.file("bridge.mjs", b"bridge", false);
             let tsserver = self.file("tsserver.js", b"tsserver", false);
             let closure = self.file("typescript.js", b"typescript", false);
@@ -1070,17 +1153,26 @@ mod tests {
 
         /// Builds one valid exact profile for the requested TypeScript-family extension.
         fn profile(&self, extension: &str) -> (TypeScriptProfile, TypeScriptWorktree) {
-            let bundle = self.bundle();
+            self.profile_with_node_script(extension, b"#!/bin/sh\nexit 0\n")
+        }
+
+        /// Builds a closed profile whose accepted Node executable runs `node_script` directly.
+        fn profile_with_node_script(
+            &self,
+            extension: &str,
+            node_script: &[u8],
+        ) -> (TypeScriptProfile, TypeScriptWorktree) {
+            let bundle = self.bundle_with_node_script(node_script);
             let (worktree, authority) = self.worktree();
-            std::fs::write(self.root.join("tsconfig.json"), b"{}").unwrap();
+            std::fs::write(self.root.join("tsconfig.json"), CLOSED_CONFIG).unwrap();
             let resolution = ProjectResolutionInputsV1::new(
                 worktree.clone(),
                 self.root.join(format!("fixture.{extension}")),
                 &bundle,
                 vec![ProjectResolutionFileV1 {
                     path: PathBuf::from("tsconfig.json"),
-                    blake3: blake3::hash(b"{}"),
-                    bytes: 2,
+                    blake3: blake3::hash(CLOSED_CONFIG),
+                    bytes: CLOSED_CONFIG.len() as u64,
                 }],
             )
             .unwrap();
@@ -1092,10 +1184,39 @@ mod tests {
         }
     }
 
+    /// Builds one execution request for a fixture's already accepted TypeScript command.
+    fn fixture_request(
+        profile: &TypeScriptProfile,
+        worktree: &TypeScriptWorktree,
+        program: PathBuf,
+    ) -> ValidatedExecutionRequest {
+        let sandbox = HostSandboxState::parse(Some(serde_json::json!({
+            "permissionProfile":{"type":"disabled"},
+            "codexLinuxSandboxExe":null,
+            "sandboxCwd":worktree.authority().root(),
+            "useLegacyLandlock":false
+        })))
+        .unwrap();
+        let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+            ExecutionProfileTemplate::from_execution_evidence("typescript-test", 1, &sandbox)
+                .unwrap(),
+        ])
+        .unwrap();
+        let policy = LocalExecutionPolicy::new(BTreeSet::from([program]), 4096, 16, true).unwrap();
+        ValidatedExecutionRequest::validate(
+            ValidatedHostInvocation::from_verified_binding("typescript-test", sandbox).unwrap(),
+            worktree.authority().clone(),
+            profile.command(worktree).unwrap(),
+            &policy,
+            &catalog,
+        )
+        .unwrap()
+    }
+
     impl Drop for Fixture {
         /// Removes only this test-owned directory after no child can retain its files.
         fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.root).unwrap();
+            std::fs::remove_dir_all(&self.cleanup_root).unwrap();
         }
     }
 
@@ -1111,15 +1232,15 @@ mod tests {
             let fixture = Fixture::new();
             let bundle = fixture.bundle();
             let (worktree, _) = fixture.worktree();
-            std::fs::write(fixture.root.join("tsconfig.json"), b"{}").unwrap();
+            std::fs::write(fixture.root.join("tsconfig.json"), CLOSED_CONFIG).unwrap();
             let resolution = ProjectResolutionInputsV1::new(
                 worktree,
                 fixture.root.join(format!("src/file.{extension}")),
                 &bundle,
                 vec![ProjectResolutionFileV1 {
                     path: PathBuf::from("tsconfig.json"),
-                    blake3: blake3::hash(b"{}"),
-                    bytes: 2,
+                    blake3: blake3::hash(CLOSED_CONFIG),
+                    bytes: CLOSED_CONFIG.len() as u64,
                 }],
             )
             .unwrap();
@@ -1199,7 +1320,7 @@ mod tests {
         let (worktree, _) = fixture.worktree();
         let document = fixture.root.join("src/file.ts");
         std::fs::create_dir(fixture.root.join("src")).unwrap();
-        std::fs::write(fixture.root.join("tsconfig.json"), b"{}").unwrap();
+        std::fs::write(fixture.root.join("tsconfig.json"), CLOSED_CONFIG).unwrap();
         let resolution =
             ProjectResolutionInputsV1::observe(worktree.clone(), document.clone(), &bundle)
                 .unwrap();
@@ -1210,7 +1331,7 @@ mod tests {
         assert_eq!(resolution.identity, repeated.identity);
 
         for (name, bytes) in [
-            ("jsconfig.json", b"{}".as_slice()),
+            ("jsconfig.json", CLOSED_CONFIG),
             ("package-lock.json", b"{}".as_slice()),
             ("package.json", b"{}".as_slice()),
             ("pnpm-lock.yaml", b"lock".as_slice()),
@@ -1237,7 +1358,7 @@ mod tests {
 
         std::fs::write(
             fixture.root.join("tsconfig.json"),
-            br#"{"compilerOptions":{}}"#,
+            br#"{"compilerOptions":{"types":["ambient"]}}"#,
         )
         .unwrap();
         assert!(matches!(
@@ -1250,12 +1371,51 @@ mod tests {
             ProjectResolutionInputsV1::observe(worktree.clone(), document.clone(), &bundle),
             Err(TypeScriptProfileError::InvalidResolution)
         ));
-        std::fs::write(fixture.root.join("tsconfig.json"), b"{}").unwrap();
+        std::fs::write(fixture.root.join("tsconfig.json"), CLOSED_CONFIG).unwrap();
         std::fs::write(
             fixture.root.join("package.json"),
             br#"{"dependencies":{"outside":"1"}}"#,
         )
         .unwrap();
+        assert!(matches!(
+            ProjectResolutionInputsV1::observe(worktree, document, &bundle),
+            Err(TypeScriptProfileError::InvalidResolution)
+        ));
+    }
+
+    /// Rejects ambient type discovery, escaping config entries, and ancestor dependency directories.
+    #[test]
+    fn project_resolution_rejects_ambient_type_and_dependency_reads() {
+        let fixture = Fixture::new();
+        let bundle = fixture.bundle();
+        let (worktree, _) = fixture.worktree();
+        let document = fixture.root.join("src/file.ts");
+        std::fs::create_dir(fixture.root.join("src")).unwrap();
+
+        for config in [
+            br#"{}"#.as_slice(),
+            br#"{"compilerOptions":{"types":["ambient"]}}"#.as_slice(),
+            br#"{"compilerOptions":{"types":[]},"include":["../outside"]}"#.as_slice(),
+            br#"{"compilerOptions":{"types":[]},"files":["/outside.ts"]}"#.as_slice(),
+            br#"{"compilerOptions":{"types":[]},"include":["src\\outside"]}"#.as_slice(),
+        ] {
+            std::fs::write(fixture.root.join("tsconfig.json"), config).unwrap();
+            assert!(matches!(
+                ProjectResolutionInputsV1::observe(worktree.clone(), document.clone(), &bundle),
+                Err(TypeScriptProfileError::InvalidResolution)
+            ));
+        }
+
+        std::fs::write(
+            fixture.root.join("tsconfig.json"),
+            br#"{"compilerOptions":{"types":[]},"include":["src/**/*.ts"],"files":["src/file.ts"]}"#,
+        )
+        .unwrap();
+        assert!(
+            ProjectResolutionInputsV1::observe(worktree.clone(), document.clone(), &bundle).is_ok()
+        );
+
+        std::fs::create_dir(fixture.cleanup_root.join("node_modules")).unwrap();
         assert!(matches!(
             ProjectResolutionInputsV1::observe(worktree, document, &bundle),
             Err(TypeScriptProfileError::InvalidResolution)
@@ -1298,11 +1458,12 @@ mod tests {
         );
     }
 
-    /// An exclusive second view is refused and nonzero exit quarantines the exact profile.
-    #[test]
-    fn exact_profile_quarantine_lasts_for_owner_lifetime() {
+    /// A real nonzero TypeScript bridge wait quarantines only its exact profile after reap.
+    #[tokio::test]
+    async fn nonzero_bridge_wait_quarantines_the_exact_profile() {
         let fixture = Fixture::new();
-        let (profile, worktree) = fixture.profile("ts");
+        let (profile, worktree) = fixture.profile_with_node_script("ts", b"#!/bin/sh\nexit 1\n");
+        let request = fixture_request(&profile, &worktree, fixture.root.join("node"));
         let mut profiles = TypeScriptProfiles::default();
         let mut registry = ProviderLeaseRegistry::new(ProviderLeaseLimits {
             total_views: 2,
@@ -1327,22 +1488,31 @@ mod tests {
         ) else {
             panic!("first exact profile must be admitted")
         };
-        assert!(matches!(
-            profiles.request(
-                &profile,
-                &worktree,
-                &mut registry,
-                &mut admission,
-                OwnerId::new("second-typescript").unwrap(),
-                AdmissionClass::Interactive,
-            ),
-            TypeScriptViewAdmission::Unavailable(TypeScriptProfileError::Execution(
-                ProviderLeaseError::ExclusiveInUse
-            ))
-        ));
-        profiles.quarantine_after(&view, TypeScriptShutdownFailure::NonzeroExit);
+        let mut child = TypeScriptProtocolChild::spawn(
+            &request,
+            &profile,
+            &worktree,
+            &mut registry,
+            &mut admission,
+            view.lease(),
+            None,
+            Path::new("/unused"),
+            64,
+        )
+        .unwrap();
+        let waited = child.wait_for_exit(Duration::from_secs(1)).await.unwrap();
+        assert!(
+            !waited.success(),
+            "the fixture bridge must take the !success branch"
+        );
+        assert!(profiles.quarantine_after_unsuccessful_wait(&view, &waited));
+        let reaped = child
+            .finish_reap(waited, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let capability = profiles.release(view, &mut registry).unwrap();
         registry
-            .cancel_unstarted(&mut admission, view.lease())
+            .complete_reap(&mut admission, capability, reaped.proof)
             .unwrap();
         assert!(matches!(
             profiles.request(
@@ -1357,11 +1527,12 @@ mod tests {
         ));
     }
 
-    /// A graceful-wait timeout has the same owner-lifetime quarantine effect as nonzero exit.
-    #[test]
-    fn wait_timeout_quarantines_the_exact_profile() {
+    /// A real hanging TypeScript bridge wait timeout quarantines only its exact profile after kill.
+    #[tokio::test]
+    async fn hanging_bridge_wait_timeout_quarantines_the_exact_profile() {
         let fixture = Fixture::new();
-        let (profile, worktree) = fixture.profile("ts");
+        let (profile, worktree) = fixture.profile_with_node_script("ts", b"#!/bin/sh\nsleep 10\n");
+        let request = fixture_request(&profile, &worktree, fixture.root.join("node"));
         let mut profiles = TypeScriptProfiles::default();
         let mut registry = ProviderLeaseRegistry::new(ProviderLeaseLimits {
             total_views: 1,
@@ -1386,9 +1557,33 @@ mod tests {
         ) else {
             panic!("initial exact profile must be admitted")
         };
-        profiles.quarantine_after(&view, TypeScriptShutdownFailure::WaitTimeout);
+        let mut child = TypeScriptProtocolChild::spawn(
+            &request,
+            &profile,
+            &worktree,
+            &mut registry,
+            &mut admission,
+            view.lease(),
+            None,
+            Path::new("/unused"),
+            64,
+        )
+        .unwrap();
+        assert!(
+            child
+                .wait_for_exit(Duration::from_millis(10))
+                .await
+                .is_err(),
+            "the fixture bridge must take the wait-timeout branch"
+        );
+        profiles.quarantine_after_wait_timeout(&view);
+        let reaped = child
+            .terminate_abnormally(Duration::from_millis(10), Duration::from_secs(1))
+            .await
+            .unwrap();
+        let capability = profiles.release(view, &mut registry).unwrap();
         registry
-            .cancel_unstarted(&mut admission, view.lease())
+            .complete_reap(&mut admission, capability, reaped.proof)
             .unwrap();
         assert!(matches!(
             profiles.request(

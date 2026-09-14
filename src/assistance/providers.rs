@@ -566,10 +566,11 @@ impl Worker<'_> {
         let reaped = if outcome.is_ok() {
             match child.wait_for_exit(Duration::from_millis(500)).await {
                 Ok(waited) => {
-                    if !waited.success() {
-                        self.providers
-                            .typescript
-                            .quarantine_after(&view, TypeScriptShutdownFailure::NonzeroExit);
+                    if self
+                        .providers
+                        .typescript
+                        .quarantine_after_unsuccessful_wait(&view, &waited)
+                    {
                         outcome = Err(FailureCode::ProviderUnavailable);
                     }
                     child.finish_reap(waited, Duration::from_millis(500)).await
@@ -577,7 +578,7 @@ impl Worker<'_> {
                 Err(_) => {
                     self.providers
                         .typescript
-                        .quarantine_after(&view, TypeScriptShutdownFailure::WaitTimeout);
+                        .quarantine_after_wait_timeout(&view);
                     outcome = Err(FailureCode::Deadline);
                     child
                         .terminate_abnormally(

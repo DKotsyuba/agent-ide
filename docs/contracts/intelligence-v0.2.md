@@ -8,7 +8,7 @@ The fourth closed provider is TypeScript. It starts `typescript-language-server 
 
 The profile is exclusive per worktree. It admits only `.js`, `.jsx`, `.ts`, and `.tsx` after a real spike verifies the exact LSP language IDs used for each extension; until then the profile is `resolution_unverified`. It has no shared backend, multi-root reuse, or inferred project discovery.
 
-`ProjectResolutionInputsV1` is a bounded, canonical set of Workspace-observed project-resolution inputs (root identity, supported config/package lock identities, accepted bundle identity, and document language ID). Workspace probes only the six exact supported basenames on the document's ancestor chain, without directory listing, and the profile requires at least one `tsconfig.json` or `jsconfig.json` while retaining at most 16 present files and 8 MiB. The same typed constructor is used by Codex and the gated future Claude path. If a required input is absent, unsupported, oversized, reordered, or changes before spawn or during the session, Intelligence returns `resolution_unverified` rather than guessing resolution. Configs that redirect resolution through extends, project references, plugins, workspaces, dependency package graphs, or compiler path/type roots are unsupported. The type authorizes no process.
+`ProjectResolutionInputsV1` is a bounded, canonical set of Workspace-observed project-resolution inputs (root identity, supported config/package lock identities, accepted bundle identity, and document language ID). Workspace probes only the six exact supported basenames on the document's ancestor chain, without directory listing, and the profile requires at least one `tsconfig.json` or `jsconfig.json` while retaining at most 16 present files and 8 MiB. Every accepted config explicitly sets `compilerOptions.types` to `[]`; optional `include`/`files` entries are only normal relative paths below the config root. Workspace also checks only the exact `node_modules` name on each document ancestor through the filesystem root and rejects any entry, so bare imports cannot open an ambient dependency graph. The same typed constructor is used by Codex and the gated future Claude path. If a required input is absent, unsupported, oversized, reordered, or changes before spawn or during the session, Intelligence returns `resolution_unverified` rather than guessing resolution. Configs that redirect resolution through extends, project references, plugins, workspaces, dependency package graphs, or compiler path/type roots are unsupported. The type authorizes no process.
 
 ## Spike and outcomes
 
@@ -20,7 +20,7 @@ Any shutdown rejection or timeout, missing EOF, nonzero bridge exit, cancellatio
 
 Success: a `.tsx` completed context with verified bundle and bounded resolution inputs receives a same-worktree exclusive provider view and generation-matched diagnostics.
 
-Error: a `.ts` request whose accepted `tsserver.path` changes before spawn returns `resolution_unverified`; no server starts. A server request to apply edits is rejected under the existing Intelligence write prohibition.
+Error: a `.ts` request whose project-resolution input changes before spawn returns `resolution_unverified`; no server starts. A changed accepted bundle member, including `tsserver.path`, returns `execution_profile` (or `provider_unavailable` after admission) rather than a resolution error. A server request to apply edits is rejected under the existing Intelligence write prohibition.
 
 ## Gates
 

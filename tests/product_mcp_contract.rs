@@ -2562,7 +2562,11 @@ async fn configured_product_returns_real_typescript_family_context_and_reaps() {
         json!(unbound.expected_typescript_codex_macos_evidence().unwrap());
     let providers = json!([provider]);
     let fixture = ProductFixture::new(providers);
-    std::fs::write(fixture.root.join("tsconfig.json"), "{}\n").unwrap();
+    std::fs::write(
+        fixture.root.join("tsconfig.json"),
+        "{\"compilerOptions\":{\"types\":[]}}\n",
+    )
+    .unwrap();
     let cases = [
         (
             "fixture.js",
