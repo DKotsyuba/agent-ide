@@ -645,7 +645,7 @@ async fn real_rust_production_session_uses_exact_profile_and_barrier() {
         assert!(matches!(session.settings(),ProviderSettings::Rust(profile) if profile.configuration()=="cache-priming-and-proc-macro-disabled-v1"));
         let context=session.context(&observed,text.as_bytes(),ContextQuery::Symbol{byte_offset:text.rfind("answer").unwrap()}).await?;
         assert_eq!(context.mode,ContextMode::Semantic,"{context:?}");assert!(!context.definitions.unwrap().is_empty());
-        assert_eq!(session.diagnostics().readiness,DiagnosticReadiness::Unknown);
+        assert_eq!(session.diagnostics().readiness,DiagnosticReadiness::Clean);
         session.shutdown().await?;
         assert!(session.context(&observed,text.as_bytes(),ContextQuery::File).await.is_err());
         Ok(())
