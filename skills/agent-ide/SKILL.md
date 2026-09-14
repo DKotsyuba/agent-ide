@@ -37,6 +37,11 @@ command yourself with the Bash tool in the foreground
 appending to it. Call `ide.inspect` only after that command has completed —
 never before, and never construct the helper command yourself.
 
+If that exact helper reports `unavailable` under Claude's strict macOS sandbox, report the exact
+`/private/tmp/ai-c-…/claude-helper.sock` path derived from its `--runtime-dir` argument. The operator
+must add that one path to `sandbox.network.allowUnixSockets` in project-local settings before a new
+Claude session; never suggest `allowAllUnixSockets`.
+
 ## Independence and fallback
 
 Each child or subagent activates `ide.*` independently: a parent's

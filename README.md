@@ -58,6 +58,11 @@ target to carry the strict Claude operator profile documented below. It exclusiv
 deterministic private runtime for that project, so a second MCP stays disconnected until the owner
 exits and removes it.
 
+With Claude sandboxing enabled on macOS, `sandbox.network.allowUnixSockets` must contain the exact
+`/private/tmp/ai-c-<project-digest>/claude-helper.sock` path shown inside the pending helper command.
+Current Claude Code does not expand a wildcard for this socket allowlist. Add that exact path to the
+project's local settings before the next session; do not enable `allowAllUnixSockets` for Agent IDE.
+
 The separate launcher environment variable `AGENT_IDE_HOST_ATTACHMENT` enables
 connect-only routing when supported host request metadata is also present. It is an
 opaque transport handle, not authentication or workspace authority. The current daemon
