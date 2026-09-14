@@ -18,7 +18,7 @@ use crate::{
         AdmissionClass, AdmissionController, BackendReapCapability, BackendRelease, CommandKind,
         ControlledCommand, OwnedProtocolChild, OwnerId, ProcessError, ProviderLeaseAdmission,
         ProviderLeaseError, ProviderLeaseRegistry, ProviderViewLease, QueueTicket,
-        ReapedProtocolProcess, ValidatedExecutionRequest, WorkspaceAuthority,
+        ReapedProtocolProcess, ValidatedExecutionRequest, WaitedProtocolChild, WorkspaceAuthority,
     },
     workspace::authority::WorktreeRef,
 };
@@ -626,10 +626,10 @@ impl TypeScriptProtocolChild {
     }
 
     /// Waits without consuming or signalling so a timeout can enter ordered abnormal cleanup.
-    pub async fn wait_for_exit(
+    pub(crate) async fn wait_for_exit(
         &mut self,
         deadline: Duration,
-    ) -> Result<std::process::ExitStatus, TypeScriptProfileError> {
+    ) -> Result<WaitedProtocolChild, TypeScriptProfileError> {
         self.child
             .wait_for_exit(deadline)
             .await
@@ -637,13 +637,13 @@ impl TypeScriptProtocolChild {
     }
 
     /// Converts an already waited direct bridge child into its sole Execution reap proof.
-    pub async fn finish_reap(
+    pub(crate) async fn finish_reap(
         self,
-        status: std::process::ExitStatus,
+        waited: WaitedProtocolChild,
         deadline: Duration,
     ) -> Result<ReapedProtocolProcess, TypeScriptProfileError> {
         self.child
-            .finish_reap(status, deadline)
+            .finish_reap(waited, deadline)
             .await
             .map_err(TypeScriptProfileError::Process)
     }

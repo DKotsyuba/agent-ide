@@ -3175,6 +3175,21 @@ pub struct ReapedProtocolProcess {
     pub proof: DirectChildReap,
 }
 
+/// Opaque identity-bound result of waiting one protocol child without consuming its owner.
+pub(crate) struct WaitedProtocolChild {
+    /// Exit status returned by the direct wait.
+    status: ExitStatus,
+    /// Exact launch identity of the child that produced `status`.
+    identity: ProcessIdentityData,
+}
+
+impl WaitedProtocolChild {
+    /// Returns whether the waited direct child reported successful exit.
+    pub(crate) fn success(&self) -> bool {
+        self.status.success()
+    }
+}
+
 /// Gives Intelligence sole ownership of a protocol child's stdin/stdout while Execution drains stderr.
 ///
 /// Dropping the handle or consuming reap future requests owned group/direct kill and aborts stderr;
@@ -3340,7 +3355,11 @@ impl OwnedProtocolChild {
         let (status, evidence) =
             terminate_typescript_child_abnormally(&mut self.process.child, grace, deadline).await?;
         self.process.cancellation = Some(evidence);
-        self.finish_reap(status, deadline).await
+        let waited = WaitedProtocolChild {
+            status,
+            identity: self.process.identity,
+        };
+        self.finish_reap(waited, deadline).await
     }
 
     /// Waits for the direct bridge child without consuming ownership or requesting a signal.
@@ -3349,23 +3368,33 @@ impl OwnedProtocolChild {
     pub(crate) async fn wait_for_exit(
         &mut self,
         deadline: Duration,
-    ) -> Result<ExitStatus, ProcessError> {
+    ) -> Result<WaitedProtocolChild, ProcessError> {
         validate_reap_deadline(deadline)?;
-        timeout(deadline, self.process.child.wait())
+        let status = timeout(deadline, self.process.child.wait())
             .await
             .map_err(|_| ProcessError::ReapTimedOut)?
-            .map_err(ProcessError::Io)
+            .map_err(ProcessError::Io)?;
+        Ok(WaitedProtocolChild {
+            status,
+            identity: self.process.identity,
+        })
     }
 
     /// Consumes an already reaped direct child into its sole accounting proof and stderr evidence.
     pub(crate) async fn finish_reap(
         self,
-        status: ExitStatus,
+        waited: WaitedProtocolChild,
         deadline: Duration,
     ) -> Result<ReapedProtocolProcess, ProcessError> {
+        if waited.identity != self.process.identity {
+            return Err(ProcessError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "protocol wait identity does not match owned child",
+            )));
+        }
         let stderr = collect_drain(self.stderr, deadline).await;
         Ok(ReapedProtocolProcess {
-            status,
+            status: waited.status,
             cancellation: self.process.cancellation,
             stderr,
             descendants: DescendantEvidence::Unverified,

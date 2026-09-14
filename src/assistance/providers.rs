@@ -552,12 +552,12 @@ impl Worker<'_> {
         };
         let reaped = if outcome.is_ok() {
             match child.wait_for_exit(Duration::from_millis(500)).await {
-                Ok(status) => {
-                    if !status.success() {
+                Ok(waited) => {
+                    if !waited.success() {
                         self.providers.typescript.quarantine(&view);
                         outcome = Err(FailureCode::ProviderUnavailable);
                     }
-                    child.finish_reap(status, Duration::from_millis(500)).await
+                    child.finish_reap(waited, Duration::from_millis(500)).await
                 }
                 Err(_) => {
                     self.providers.typescript.quarantine(&view);
