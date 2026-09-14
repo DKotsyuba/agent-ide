@@ -1205,9 +1205,8 @@ impl WorkerHandle {
 ///
 /// Both a terminal receipt cleanup and a positively settled Claude Edit completion release
 /// existing lifecycle state — a prepared Changes receipt and a claimed ticket/lease — and answer
-/// their waiting caller directly. Neither publishes a reference any later `ide.inspect` could ever
-/// name: a successful Edit's `PeerReply::Edit` carries no pagination cursor, unlike Claude
-/// Start/Context/Diff, whose completion reference is retrieved again for retry or Diff paging.
+/// their waiting caller directly. They bypass new-detail admission, but settle the already-retained
+/// prepare detail: a successful Edit returns that same detail as its post-read source reference.
 fn is_claude_edit_settlement(input: &JobInput) -> bool {
     matches!(input, JobInput::ClaudeEditTerminal(_))
         || matches!(input, JobInput::Claude(settled) if settled.operation() == HelperOperation::Edit)
@@ -1388,7 +1387,7 @@ struct Worker<'a> {
     /// Changes-owned durable one-file edit receipts sharing Application's sole Store owner.
     edits: EditReceiptStore<'a>,
     /// Newly prepared Claude requests awaiting exact helper or no-effect expiry settlement.
-    prepared_edits: BTreeMap<(BindingRef, String), crate::changes::edit::PreparedEdit>,
+    prepared_edits: BTreeMap<(BindingRef, String), PreparedClaudeEdit>,
     /// Recoverable committed activation receipts, at most one for each live host binding.
     grants: BTreeMap<BindingRef, StartReceipt>,
     /// Bindings whose provider settlement succeeded but whose durable revoke failed, so their
@@ -1420,6 +1419,18 @@ struct Worker<'a> {
     runtime: std::path::PathBuf,
     /// Exact provider/backend/view ownership and generations.
     providers: providers::Providers,
+}
+
+/// Couples a durable Changes preparation with its already-reserved result detail.
+///
+/// Claude creates this record before exposing a helper ticket. The helper's later terminal result
+/// must update this exact detail: it is both the bounded capacity reservation and, on a successful
+/// replacement, the same-binding post-read source reference returned for the next Edit.
+struct PreparedClaudeEdit {
+    /// One-use durable receipt token returned by Changes preparation.
+    receipt: crate::changes::edit::PreparedEdit,
+    /// Retained detail allocated by the prepare job before helper minting.
+    detail_ref: String,
 }
 impl<'a> Worker<'a> {
     /// Processes one slow operation at a time; inspections run on an independently scheduled task
@@ -3009,8 +3020,13 @@ impl<'a> Worker<'a> {
                 )
                 .await;
         }
-        self.prepared_edits
-            .insert((binding, request.operation_id), prepared);
+        self.prepared_edits.insert(
+            (binding, request.operation_id),
+            PreparedClaudeEdit {
+                receipt: prepared,
+                detail_ref: job.reference.clone(),
+            },
+        );
         Ok((PeerReply::HookObserved {}, Some(authority), Some(source)))
     }
 
@@ -3035,6 +3051,11 @@ impl<'a> Worker<'a> {
             .prepared_edits
             .remove(&(binding.clone(), request.operation_id.clone()))
             .ok_or(FailureCode::Internal)?;
+        // Completion was admitted through reserved cleanup capacity and has no new retained
+        // detail. Reuse the prepare detail, whose capacity was reserved before helper launch, so
+        // the returned source reference always names its exact post-read observation.
+        job.reference = prepared.detail_ref;
+        let prepared = prepared.receipt;
         let Some(super::claude_worker::HelperPayload::Edit {
             mut outcome,
             source,
@@ -3136,6 +3157,9 @@ impl<'a> Worker<'a> {
                 _ => return Err(FailureCode::Internal),
             },
         };
+        // Terminal cleanup also completes the retained prepare detail rather than leaving its
+        // original internal readiness reply visible after its one-use receipt has closed.
+        job.reference = prepared.detail_ref;
         let result = EditResult::new(
             request.operation_id.clone(),
             request.path.clone(),
@@ -3145,7 +3169,7 @@ impl<'a> Worker<'a> {
         .map_err(|_| FailureCode::Internal)?;
         let result = self
             .edits
-            .settle(prepared, result)
+            .settle(prepared.receipt, result)
             .await
             .unwrap_or_else(|_| EditResult {
                 operation_id: request.operation_id,

@@ -677,7 +677,7 @@ impl ProductDispatcher {
                     let BindingStatus::Validated(invocation) = status else {
                         return None;
                     };
-                    if method.method() == AssistanceMethod::Stop {
+                    if method.method() == AssistanceMethod::Stop && host != HostKind::Claude {
                         bindings.stop_binding(invocation.binding_ref()).ok()?;
                         (invocation, None)
                     } else if host == HostKind::Claude {
@@ -737,15 +737,29 @@ impl ProductDispatcher {
                 if host == HostKind::Claude {
                     let established = method.method() == AssistanceMethod::Start;
                     return Some(match method.method() {
-                        // Stop revokes the ledger first, so a helper that has not yet claimed can
-                        // never claim afterwards, then reuses the ordinary revocation path.
+                        // Revoke tickets before stopping durable authority so a helper that has
+                        // not yet claimed can never claim afterwards. A fully proven Edit remains
+                        // available only long enough to settle its already-prepared receipt.
                         AssistanceMethod::Stop => {
                             let owner = invocation.binding_ref().fingerprint();
-                            let terminals = self
+                            let (terminals, ready_edits) = self
                                 .launches
                                 .lock()
-                                .map(|mut launches| launches.revoke(owner))
+                                .map(|mut launches| {
+                                    let terminals = launches.revoke(owner);
+                                    let ready_edits = launches.ready_edit_references(owner);
+                                    (terminals, ready_edits)
+                                })
                                 .unwrap_or_default();
+                            for detail_ref in ready_edits {
+                                let _ = self
+                                    .retrieve_claude(
+                                        &invocation,
+                                        &detail_ref,
+                                        method.opaque_attachment(),
+                                    )
+                                    .await;
+                            }
                             let reply = worker
                                 .stop(invocation.clone(), method.opaque_attachment())
                                 .await;
@@ -765,6 +779,12 @@ impl ProductDispatcher {
                                 {
                                     launches.retire_no_effect_edit(&detail_ref, owner);
                                 }
+                            }
+                            // Claude's binding remains live only through the bounded ready-edit
+                            // receipt settlement above; stopping it now keeps that settlement
+                            // authoritative without opening a later helper-claim window.
+                            if let Ok(mut bindings) = self.bindings.lock() {
+                                let _ = bindings.stop_binding(invocation.binding_ref());
                             }
                             reply
                         }

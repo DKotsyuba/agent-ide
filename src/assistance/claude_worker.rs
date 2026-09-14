@@ -1511,9 +1511,9 @@ impl LaunchLedger {
     /// cleanup stays lost instead of being silently reclaimed.
     ///
     /// Callers decide *when* to ask. Quarantined work releases as soon as cleanup proves settled,
-    /// because nothing further will ever consume it. Live claimed work retains its lease through
-    /// settlement so [`Self::settled`] can require it, and releases only when the daemon has
-    /// consumed the resulting token through [`Self::release_settled`].
+    /// because nothing further will ever consume it. Live claimed work retains its lease until the
+    /// daemon consumes its proof or an absolute-deadline sweep releases capacity while retaining
+    /// the known result; [`Self::settled`] validates that proof directly.
     fn release_settled_lease(work: &mut ClaimedWork, detail_ref: &str, leases: &mut LeasePool) {
         if work.lease
             && work.post == Some(true)
@@ -1585,8 +1585,7 @@ impl LaunchLedger {
             let TicketState::Claimed(work) = &mut ticket.state else {
                 return false;
             };
-            if !work.lease
-                || work.post != Some(true)
+            if work.post != Some(true)
                 || !work
                     .frame
                     .as_ref()
@@ -1665,8 +1664,10 @@ impl LaunchLedger {
     /// supplied binding generation; the ticket is still `Claimed` rather than quarantined; the
     /// retained frame names this exact handle; the outcome is `Complete` with exactly settled child
     /// accounting; the matching post arrived and succeeded; the helper and child executable
-    /// identities are present and well formed; and the admission lease is still retained. Because
-    /// the token has no public constructor and no `Deserialize`, this is the only way one exists.
+    /// identities are present and well formed. The lease may already have been released by an
+    /// absolute-deadline sweep, which preserves known evidence for later retrieval while avoiding
+    /// permanent admission loss. Because the token has no public constructor and no `Deserialize`,
+    /// this is the only way one exists.
     ///
     /// Reads only ledger state: no Git, source, provider or process effect.
     pub fn settled(&self, detail_ref: &str, binding: [u8; 32]) -> Option<SettledClaudeOperation> {
@@ -1677,7 +1678,7 @@ impl LaunchLedger {
         let TicketState::Claimed(work) = &ticket.state else {
             return None;
         };
-        if !work.lease || work.post != Some(true) {
+        if work.post != Some(true) {
             return None;
         }
         let frame = work.frame.as_ref()?;
@@ -1748,12 +1749,18 @@ impl LaunchLedger {
     /// never settled becomes `TicketState::Uncertain`; claimed Edit retrieval reports
     /// `outcome_unknown`, and its admission stays quarantined instead of being silently reused. A
     /// claimed ticket whose final frame and matching successful post already arrived before the
-    /// sweep is left untouched, so the deadline crossing this same sweep enforces can never itself
-    /// erase evidence that already proved the operation's outcome.
+    /// sweep retains its proven result but releases its bounded lease, so an uninspected success
+    /// cannot occupy shared execution capacity forever.
     pub fn expire(&mut self, now_ms: u64) {
         let leases = &mut self.leases;
         self.tickets.retain(|reference, ticket| {
-            if now_ms < ticket.deadline_ms || ticket.positively_settled() {
+            if now_ms < ticket.deadline_ms {
+                return true;
+            }
+            if ticket.positively_settled() {
+                if let TicketState::Claimed(work) = &mut ticket.state {
+                    LaunchLedger::release_settled_lease(work, reference, leases);
+                }
                 return true;
             }
             ticket.quarantine(reference, leases)
@@ -1784,6 +1791,11 @@ impl LaunchLedger {
         let mut terminals = Vec::new();
         self.tickets.retain(|reference, ticket| {
             if ticket.binding.fingerprint() != binding {
+                return true;
+            }
+            if ticket.positively_settled() {
+                // Stop blocks every future claim but preserves fully proven work long enough for
+                // the dispatcher to settle its prepared receipt before durable authority ends.
                 return true;
             }
             let terminal = match ticket.state {
@@ -1817,6 +1829,23 @@ impl LaunchLedger {
         self.tickets
             .get(detail_ref)
             .is_some_and(|ticket| ticket.binding.fingerprint() == binding)
+    }
+
+    /// Returns ready Edit handles still owned by `binding` for stop-time receipt settlement.
+    ///
+    /// The caller revokes the ledger first, removing unclaimed launch authority. These handles
+    /// are already claimed and positively proven, so completing their prepared receipts is cleanup
+    /// only and cannot start new helper work.
+    pub fn ready_edit_references(&self, binding: [u8; 32]) -> Vec<String> {
+        self.tickets
+            .iter()
+            .filter(|(_, ticket)| {
+                ticket.binding.fingerprint() == binding
+                    && ticket.job.operation == HelperOperation::Edit
+                    && ticket.positively_settled()
+            })
+            .map(|(reference, _)| reference.clone())
+            .collect()
     }
 
     /// Returns the number of outstanding tickets for bounded-capacity assertions.
@@ -2377,7 +2406,18 @@ mod tests {
         assert_eq!(
             ledger.len(),
             1,
-            "a proven ticket is not removed by expiry alone"
+            "a proven result remains retrievable after its lease is released"
+        );
+        assert_eq!(
+            ledger.active_claims(),
+            0,
+            "known work cannot pin capacity forever"
+        );
+        assert!(
+            ledger
+                .settled(&reference, binding_fixture().fingerprint())
+                .is_some(),
+            "lease release preserves the known result for bounded later consumption"
         );
     }
 
@@ -2436,6 +2476,36 @@ mod tests {
                 if frame.children.settled()
                     && matches!(frame.outcome, HelperOutcome::Complete { .. })
         ));
+    }
+
+    /// Stop preserves a fully proven Edit long enough to settle its prepared receipt.
+    #[test]
+    fn revocation_keeps_a_ready_edit_known_for_stop_time_settlement() {
+        let (mut ledger, reference, actor) = edit_ledger();
+        let command = LaunchLedger::helper_command(
+            std::path::Path::new("/usr/local/bin/agent-ide"),
+            std::path::Path::new("/private/tmp/rt"),
+            "attach",
+            "detail-1",
+        );
+        assert_eq!(
+            ledger.recognize(&command, false, "edit-call", &actor, 0),
+            LaunchRecognition::Recognized
+        );
+        assert!(matches!(
+            ledger.claim(&reference, "channel", 0, live),
+            ClaimOutcome::Granted(_)
+        ));
+        assert_eq!(ledger.settle_frame(completed_edit()), Ok(()));
+        assert_eq!(ledger.settle_post("edit-call", true), Ok(()));
+        assert!(ledger.revoke(binding_fixture().fingerprint()).is_empty());
+        assert_eq!(
+            ledger.ready_edit_references(binding_fixture().fingerprint()),
+            vec![reference.clone()]
+        );
+        assert!(matches!(ledger.delivery(&reference), Delivery::Ready(_)));
+        assert!(ledger.release_settled(&reference, binding_fixture().fingerprint()));
+        assert_eq!(ledger.active_claims(), 0);
     }
 
     /// Proves a daemon-consumed successful helper releases both its shared lease and ticket slot.
@@ -2598,6 +2668,32 @@ mod tests {
             children: ChildSettlement { spawned, reaped },
             discovery: Vec::new(),
             payload: Some(context_payload()),
+        }
+    }
+
+    /// Returns one valid successful Edit frame for a ticket named `detail-1`.
+    fn completed_edit() -> HelperResult {
+        HelperResult {
+            protocol: HELPER_PROTOCOL,
+            detail_ref: "detail-1".into(),
+            outcome: HelperOutcome::Complete {
+                text: "replaced".into(),
+            },
+            children: ChildSettlement {
+                spawned: 1,
+                reaped: 1,
+            },
+            discovery: Vec::new(),
+            payload: Some(HelperPayload::Edit {
+                outcome: crate::changes::edit::EditOutcome::Replaced,
+                source: Some(HelperSource {
+                    path: "main.rs".into(),
+                    present: true,
+                    digest: Some(*blake3::hash(b"new").as_bytes()),
+                    length: 3,
+                }),
+                diagnostics: crate::assistance::reply::EditDiagnostics::Unknown {},
+            }),
         }
     }
 

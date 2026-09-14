@@ -4343,9 +4343,32 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
     .await;
     assert_eq!(edited["state"], "edit", "{edited}");
     assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+    let edited_source_ref = edited["result"]["source_ref"]
+        .as_str()
+        .expect("a successful Claude Edit must retain its post-read detail")
+        .to_owned();
     assert_eq!(
         std::fs::read(fixture.root.join("tracked.txt")).unwrap(),
         b"claude-helper-edit\n"
+    );
+    // The returned Edit source reference is the already-reserved prepare detail, even while
+    // ordinary detail capacity is saturated; a second real Claude helper can consume it directly.
+    let chained = claude_operation(
+        &mut first,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"claude-edit-2",
+            "path":"tracked.txt",
+            "source_ref":edited_source_ref,
+            "content":"claude-helper-chain\n"
+        }),
+    )
+    .await;
+    assert_eq!(chained["result"]["outcome"], "replaced", "{chained}");
+    assert_eq!(
+        std::fs::read(fixture.root.join("tracked.txt")).unwrap(),
+        b"claude-helper-chain\n"
     );
     std::fs::write(fixture.root.join("tracked.txt"), "claude-native-fallback\n").unwrap();
     assert_eq!(
