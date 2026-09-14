@@ -79,7 +79,8 @@ impl Mcp {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
         command
             .env("TOKIO_WORKER_THREADS", "1")
-            .args(["mcp", "--launcher-template"])
+            .env_remove("CLAUDE_PROJECT_DIR")
+            .args(["mcp", "--auto-launcher-template"])
             .arg(template)
             .current_dir(candidate)
             .stdin(Stdio::piped())
@@ -109,7 +110,7 @@ impl Mcp {
             .env("CLAUDE_PROJECT_DIR", project)
             .env_remove("AGENT_IDE_HOST_ATTACHMENT")
             .env_remove("AGENT_IDE_MANAGED_CODEX_ATTACHMENT")
-            .args(["mcp", "--claude-launcher-template"])
+            .args(["mcp", "--auto-launcher-template"])
             .arg(template)
             .current_dir(project.parent().unwrap())
             .stdin(Stdio::piped())

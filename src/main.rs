@@ -105,6 +105,10 @@ async fn main() -> ExitCode {
             };
             run_managed_mcp(launcher_template, candidate, host).await
         }
+        Ok(Command::AutoManagedMcp { launcher_template }) => {
+            let (host, candidate) = auto_managed_candidate(claude_project_dir);
+            run_managed_mcp(launcher_template, candidate, host).await
+        }
         Ok(Command::ManagedClaudeHook) => {
             run_managed_claude_hook(claude_project_dir).await;
             ExitCode::SUCCESS
@@ -315,6 +319,11 @@ enum Command {
         /// Host contract selected by the explicit managed MCP flag.
         host: ManagedHost,
     },
+    /// Selects one existing managed host contract from the startup environment.
+    AutoManagedMcp {
+        /// Absolute one-target launcher template used by either selected managed host.
+        launcher_template: PathBuf,
+    },
     /// Submits one managed Claude hook through the project-derived private rendezvous.
     ManagedClaudeHook,
     /// Submits one bounded native Codex hook and exits successfully on every ingress failure.
@@ -387,6 +396,20 @@ enum ManagedHost {
     Codex,
     /// Claude derives its candidate only from startup-captured `CLAUDE_PROJECT_DIR` and uses hooks.
     Claude,
+}
+
+/// Selects the existing managed host and captures its candidate without fallback between hosts.
+///
+/// A present `claude_project_dir` always selects Claude, including when canonical validation
+/// fails; the returned error then drives the existing Claude fail-open MCP path. An absent value
+/// selects Codex and returns the process current directory, preserving its existing error behavior.
+fn auto_managed_candidate(
+    claude_project_dir: Option<OsString>,
+) -> (ManagedHost, std::io::Result<PathBuf>) {
+    match claude_project_dir {
+        Some(project) => (ManagedHost::Claude, canonical_claude_project(Some(project))),
+        None => (ManagedHost::Codex, std::env::current_dir()),
+    }
 }
 
 /// Matches `pairs` against the exact ordered `--flag value` sequence in `expected`.
@@ -507,6 +530,11 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
     let [mode, flag, value] = arguments.as_slice() else {
         return Err(AppError::InvalidResponse);
     };
+    if mode == "mcp" && flag == "--auto-launcher-template" {
+        return Ok(Command::AutoManagedMcp {
+            launcher_template: PathBuf::from(value),
+        });
+    }
     if mode == "mcp" && flag == "--launcher-template" {
         return Ok(Command::ManagedMcp {
             launcher_template: PathBuf::from(value),
@@ -1155,6 +1183,15 @@ mod tests {
     #[test]
     fn managed_and_legacy_mcp_cli_forms_are_distinct() {
         assert!(matches!(
+            command(args(&[
+                "mcp",
+                "--auto-launcher-template",
+                "/private/tmp/template.json"
+            ])),
+            Ok(Command::AutoManagedMcp { launcher_template })
+                if launcher_template == Path::new("/private/tmp/template.json")
+        ));
+        assert!(matches!(
             command(args(&["mcp", "--launcher-template", "/private/tmp/template.json"])),
             Ok(Command::ManagedMcp {
                 launcher_template,
@@ -1190,6 +1227,23 @@ mod tests {
             Ok(Command::ClaudeHook { runtime_dir })
                 if runtime_dir == Path::new("/private/tmp/runtime")
         ));
+    }
+
+    /// Auto host selection uses only Claude project-variable presence and never cross-falls back.
+    #[test]
+    fn auto_managed_candidate_preserves_invalid_claude_selection() {
+        let (codex, candidate) = auto_managed_candidate(None);
+        assert_eq!(codex, ManagedHost::Codex);
+        assert!(candidate.is_ok());
+
+        let project = fs::canonicalize(std::env::temp_dir()).unwrap();
+        let (claude, candidate) = auto_managed_candidate(Some(project.clone().into_os_string()));
+        assert_eq!(claude, ManagedHost::Claude);
+        assert_eq!(candidate.unwrap(), project);
+
+        let (invalid_claude, candidate) = auto_managed_candidate(Some(OsString::from("relative")));
+        assert_eq!(invalid_claude, ManagedHost::Claude);
+        assert!(candidate.is_err());
     }
 
     /// Claude's shortened rendezvous is stable for one root and different for another root.

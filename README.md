@@ -12,10 +12,23 @@ roots. Complete delivery accounting and the remaining roadmap acceptance checks 
 
 Tagged releases are built on GitHub Actions using an arm64 macOS runner and published
 with a SHA-256 checksum in GitHub Releases. Install the latest private release with
-`./install.sh`, or select one with `./install.sh 0.1.4`. The installer uses the
+`./install.sh`, or select one with `./install.sh 0.1.5`. The installer uses the
 authenticated GitHub CLI, verifies `SHA256SUMS`, and atomically installs to
 `~/.local/bin` (override with `AGENT_IDE_INSTALL_DIR`). It does not edit MCP or hook
 configuration.
+
+Runtime-neutral orchestrators can register one command for both hosts:
+
+```toml
+[mcp.agent_ide]
+transport = "stdio"
+command = "/absolute/path/to/agent-ide"
+args = ["mcp", "--auto-launcher-template", "/absolute/path/to/launcher.json"]
+```
+
+Auto mode selects Claude whenever `CLAUDE_PROJECT_DIR` is present, including invalid values that
+must fail open as Claude rather than fall through to Codex. When the variable is absent, it reuses
+the existing Codex managed path. The explicit host flags below remain supported.
 
 Build locally with `cargo build --locked --bin agent-ide`. The standard Codex setup is one
 machine-local entry in `~/.codex/config.toml` (replace both absolute paths):
