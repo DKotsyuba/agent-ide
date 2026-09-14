@@ -14,3 +14,6 @@ pub mod store;
 
 /// Canonical physical worktree identity, durable authority receipts, and bounded baseline captures.
 pub mod durable;
+
+/// Descriptor-held, one-use mutation boundary for the v0.2 single-file edit operation.
+pub mod edit;
