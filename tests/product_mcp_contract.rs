@@ -1373,6 +1373,12 @@ fn accepted_program(path: &str, identity: &str) -> Value {
     json!({"path":path,"identity":identity,"blake3":blake3::hash(&std::fs::read(path).unwrap()).to_hex().to_string()})
 }
 
+/// Supplies an exact path, length, and content fingerprint for a non-executable bundle member.
+fn accepted_typescript_file(path: &Path) -> Value {
+    let bytes = std::fs::read(path).unwrap();
+    json!({"path":path,"blake3":blake3::hash(&bytes).to_hex().to_string(),"bytes":bytes.len()})
+}
+
 /// Returns the operator-verified absolute path of one binary inside the accepted rustup toolchain,
 /// honoring `AGENT_IDE_RUST_TOOLCHAIN_DIR` when the harness points at a non-default rustup home.
 fn toolchain_bin(tool: &str) -> String {
@@ -2733,6 +2739,128 @@ async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
     assert_eq!(diff["kind"], "diff", "{diff}");
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     let stopped = actor.settle(&fixture, stopped).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Exercises real JS, JSX, TS, and TSX through the pinned exclusive TypeScript product profile.
+///
+/// The ignored release check requires exact launcher-owned Node, bridge, `tsserver.js`, and loaded
+/// closure paths. Each extension must reach semantic definition/reference results through a fresh
+/// one-shot bridge; exact configured membership proves project selection, while graceful shutdown,
+/// EOF, zero exit, and direct-child reap are enforced by the production path before the next
+/// fixture may run.
+#[tokio::test]
+#[ignore = "requires exact AGENT_IDE_NODE, AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER and AGENT_IDE_TSSERVER environment"]
+async fn configured_product_returns_real_typescript_family_context_and_reaps() {
+    let node = PathBuf::from(std::env::var("AGENT_IDE_NODE").unwrap());
+    let bridge = PathBuf::from(std::env::var("AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER").unwrap());
+    let tsserver = PathBuf::from(std::env::var("AGENT_IDE_TSSERVER").unwrap());
+    let typescript_root = tsserver.parent().unwrap().parent().unwrap();
+    let bridge_root = bridge.parent().unwrap().parent().unwrap();
+    let mut closure = [
+        bridge_root.join("package.json"),
+        typescript_root.join("lib/_tsserver.js"),
+        typescript_root.join("lib/typescript.js"),
+        typescript_root.join("package.json"),
+    ];
+    closure.sort();
+    let mut provider = json!({
+        "executable":accepted_program(bridge.to_str().unwrap(),"6.0.0"),
+        "settings":"typescript_defaults_v1",
+        "toolchain":"24.4.0",
+        "node":accepted_program(node.to_str().unwrap(),"24.4.0"),
+        "typescript":{
+            "bridge_bytes":std::fs::metadata(&bridge).unwrap().len(),
+            "bridge_version":"6.0.0",
+            "tsserver":accepted_typescript_file(&tsserver),
+            "typescript_version":"5.9.3",
+            "closure":closure.iter().map(|path| accepted_typescript_file(path)).collect::<Vec<_>>(),
+            "codex_macos_evidence":"macos-26.6.2-node-24.4.0-tls-6.0.0-ts-5.9.3-codex-r3-2026-09-14",
+            "claude_macos_evidence":null
+        },
+        "cargo":null,
+        "cargo_version":null,
+        "rustc":null,
+        "rustc_version":null,
+        "trust":"fixture-disabled",
+        "cache_namespace":"fixture-typescript-cache"
+    });
+    let unbound: agent_ide::assistance::launcher::ProviderLaunch =
+        serde_json::from_value(provider.clone()).unwrap();
+    provider["typescript"]["codex_macos_evidence"] =
+        json!(unbound.expected_typescript_codex_macos_evidence().unwrap());
+    let providers = json!([provider]);
+    let fixture = ProductFixture::new(providers);
+    std::fs::write(
+        fixture.root.join("tsconfig.json"),
+        "{\"compilerOptions\":{\"types\":[],\"moduleResolution\":\"node10\",\"allowJs\":true},\"files\":[\"fixture.js\",\"fixture.jsx\",\"fixture.ts\",\"fixture.tsx\"]}\n",
+    )
+    .unwrap();
+    let cases = [
+        (
+            "fixture.js",
+            "export function identity(input) { return input; }\nexport const value = 42;\nexport const use = value;\n",
+            "value;",
+        ),
+        (
+            "fixture.jsx",
+            "export function identity(input) { return input; }\nexport function Component() { return <div />; }\nexport const view = <Component />;\n",
+            "Component />",
+        ),
+        (
+            "fixture.ts",
+            "export function identity(input) { return input; }\nexport const value: number = 42;\nexport const use: number = value;\n",
+            "value;",
+        ),
+        (
+            "fixture.tsx",
+            "export function identity(input) { return input; }\nexport function Component(): JSX.Element { return <div />; }\nexport const view = <Component />;\n",
+            "Component />",
+        ),
+    ];
+    for (path, source, _) in cases {
+        std::fs::write(fixture.root.join(path), source).unwrap();
+    }
+    fixture.git(&[
+        "add",
+        "--",
+        "fixture.js",
+        "fixture.jsx",
+        "fixture.ts",
+        "fixture.tsx",
+        "tsconfig.json",
+    ]);
+    fixture.git(&["commit", "--quiet", "-m", "TypeScript fixtures"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "typescript-root").await;
+    let start = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"typescript-start"}),
+        )
+        .await;
+    let start = actor.settle(&fixture, start).await;
+    assert_eq!(start["kind"], "activation", "{start}");
+    for (path, source, occurrence) in cases {
+        let response = actor
+            .call(
+                &fixture,
+                "ide.context",
+                json!({"path":path,"byte_offset":source.rfind(occurrence).unwrap()}),
+            )
+            .await;
+        let response = actor.settle(&fixture, response).await;
+        assert_eq!(response["kind"], "context", "{path}: {response}");
+        let text = response["text"].as_str().unwrap();
+        assert!(text.contains("mode: semantic"), "{path}: {response}");
+        assert!(text.contains("definitions: [{"), "{path}: {response}");
+        assert!(text.contains("references: [{"), "{path}: {response}");
+    }
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     actor.mcp.close().await;
     daemon.kill().await.unwrap();

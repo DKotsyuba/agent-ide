@@ -5,8 +5,8 @@ pub use super::reply::{MissingPeer, PeerReply};
 use super::{
     claude_worker::{
         AcceptedIdentity, ClaudeOperatorProfile, HelperActor, HelperBudgets, HelperJob,
-        HelperLanguage, HelperOperation, HelperProvider, HelperPyrightProfile, LaunchLedger,
-        RustEffectiveSettings,
+        HelperLanguage, HelperOperation, HelperProvider, HelperPyrightProfile,
+        HelperTypeScriptFileV1, HelperTypeScriptProfileV1, LaunchLedger, RustEffectiveSettings,
     },
     host_binding::{
         BindingStatus, HostBindingGuard, HostKind, ValidatedInvocation, parse_candidate,
@@ -210,6 +210,9 @@ impl ProductDispatcher {
                 Some("go") => Some(AcceptedProviderSettings::GoplsDefaults),
                 Some("rs") => Some(AcceptedProviderSettings::RustCachePrimingDisabledV1),
                 Some("py") | Some("pyi") => Some(AcceptedProviderSettings::PyrightDefaultsV1),
+                Some("js") | Some("jsx") | Some("ts") | Some("tsx") => {
+                    Some(AcceptedProviderSettings::TypeScriptDefaultsV1)
+                }
                 _ => None,
             };
             required.and_then(|settings| {
@@ -469,14 +472,15 @@ impl ProductDispatcher {
             .providers
             .iter()
             .find(|provider| provider.settings == settings)?;
-        let (language, rust_settings, pyright) = match provider.settings {
-            AcceptedProviderSettings::GoplsDefaults => (HelperLanguage::Go, None, None),
+        let (language, rust_settings, pyright, typescript) = match provider.settings {
+            AcceptedProviderSettings::GoplsDefaults => (HelperLanguage::Go, None, None, None),
             AcceptedProviderSettings::RustCachePrimingDisabledV1 => (
                 HelperLanguage::Rust,
                 Some(RustEffectiveSettings {
                     cache_priming: false,
                     proc_macro: false,
                 }),
+                None,
                 None,
             ),
             AcceptedProviderSettings::PyrightDefaultsV1 => {
@@ -492,6 +496,39 @@ impl ProductDispatcher {
                         node_identity: node.identity.clone(),
                         node_blake3: node.blake3.clone(),
                     }),
+                    None,
+                )
+            }
+            AcceptedProviderSettings::TypeScriptDefaultsV1 => {
+                if !provider.typescript_claude_accepted() {
+                    return None;
+                }
+                let node = provider.node.as_ref()?;
+                let bundle = provider.typescript.as_ref()?;
+                let file =
+                    |value: &super::launcher::AcceptedTypeScriptFileV1| HelperTypeScriptFileV1 {
+                        path: value.path.clone(),
+                        blake3: value.blake3.clone(),
+                        bytes: value.bytes,
+                    };
+                (
+                    HelperLanguage::TypeScript,
+                    None,
+                    None,
+                    Some(HelperTypeScriptProfileV1 {
+                        node: node.path.clone(),
+                        node_version: node.identity.clone(),
+                        node_blake3: node.blake3.clone(),
+                        bridge: HelperTypeScriptFileV1 {
+                            path: provider.executable.path.clone(),
+                            blake3: provider.executable.blake3.clone(),
+                            bytes: bundle.bridge_bytes,
+                        },
+                        bridge_version: bundle.bridge_version.clone(),
+                        tsserver: file(&bundle.tsserver),
+                        typescript_version: bundle.typescript_version.clone(),
+                        closure: bundle.closure.iter().map(file).collect(),
+                    }),
                 )
             }
         };
@@ -501,6 +538,7 @@ impl ProductDispatcher {
             language,
             rust_settings,
             pyright,
+            typescript,
             toolchain: provider.toolchain.clone(),
             cargo: provider.cargo.as_ref().map(|program| program.path.clone()),
             cargo_version: provider.cargo_version.clone(),

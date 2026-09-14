@@ -9,6 +9,9 @@ pub mod rust;
 /// Defines the exclusive Pyright v0.1.1 profile and its owned stdio lifecycle.
 pub mod pyright;
 
+/// Defines the exclusive release-pinned TypeScript profile and normal/abnormal stdio lifecycle.
+pub mod typescript;
+
 /// Validates bounded framing before production sessions decode provider messages.
 #[allow(dead_code)]
 pub(crate) mod wire;

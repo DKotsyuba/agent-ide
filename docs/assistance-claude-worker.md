@@ -131,10 +131,10 @@ its provider before exiting.
   BLAKE3 digests; it reconstructs the profile, verifies the script at the final boundary, and
   retains the inherited-process Node recheck before spawning its one-shot child.
 
-- **TypeScript** remains unavailable to Claude until the real spike required by
-  [TYPESCRIPT-r1](contracts/intelligence-v0.2.md) proves its immutable closure, stdio protocol,
-  diagnostics, topology, and cleanup. Once accepted, it is one claimed foreground-helper
-  provider per worktree operation, never a daemon-borrowed or ambient Node process.
+The helper wire retains a typed TypeScript profile shape for a future independently accepted
+Claude cell, using the same `ProjectResolutionInputsV1` observation path as Codex. It is not a
+supported Claude provider today: selection is unconditionally unavailable until a real Claude
+macOS record exists, and no fixture or Codex record enables it.
 
 Stop and handoff retain the IDE-owned worktree cache directories; no analysis runs while inactive.
 The daemon derives their private absolute paths from the durable worktree identity/incarnation,
@@ -195,6 +195,9 @@ Wired and covered by local checks:
 - rights-aware durable worktree cache directory retention across Stop/handoff, without a warm native
   backend or opaque-index reuse claim. Claude Go remains per-operation exclusive; the compatible
   two-worktree shared-gopls guarantee belongs only to the managed Codex matrix.
+- the fourth closed TypeScript launcher/helper frame and one-shot helper execution path. Selection
+  remains unavailable because the separate real Claude macOS acceptance record is not yet present;
+  the accepted Codex record cannot enable it.
 
 Live checks with Claude Code 2.1.267 on macOS 26.6.2 exercised Go and Rust semantic
 context, diagnostic changes after native edits, actual Git diff and Stop. Parallel native

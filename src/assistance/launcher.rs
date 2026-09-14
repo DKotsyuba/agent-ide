@@ -15,6 +15,51 @@ use std::{
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
 /// Maximum executable bytes hashed during a pre-spawn identity check.
 const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
+/// Compiled Codex release record prefix for the exact TypeScript r3 macOS bundle cell.
+const TYPESCRIPT_CODEX_MACOS_EVIDENCE_V1: &str =
+    "macos-26.6.2-node-24.4.0-tls-6.0.0-ts-5.9.3-codex-r3-2026-09-14";
+/// Exact Node release admitted by the compiled Codex TypeScript record.
+const TYPESCRIPT_NODE_VERSION_V1: &str = "24.4.0";
+/// BLAKE3 identity of the accepted macOS Node 24.4.0 executable bytes.
+const TYPESCRIPT_NODE_BLAKE3_V1: &str =
+    "f3d5f7b7c7296b22889c5ca6a62fbfebc6f263190cefec97255d98a286e92ce9";
+/// Exact TypeScript Language Server release admitted by the compiled Codex record.
+const TYPESCRIPT_BRIDGE_VERSION_V1: &str = "6.0.0";
+/// BLAKE3 identity of the accepted TypeScript Language Server 6.0.0 bridge bytes.
+const TYPESCRIPT_BRIDGE_BLAKE3_V1: &str =
+    "541877f06eff230f60b5ca90332d2db54128d0dd8b88bd7fdc987976e22a8c9b";
+/// Exact accepted TypeScript Language Server bridge byte length.
+const TYPESCRIPT_BRIDGE_BYTES_V1: u64 = 917_064;
+/// Exact TypeScript release admitted by the compiled Codex record.
+const TYPESCRIPT_VERSION_V1: &str = "5.9.3";
+/// BLAKE3 identity of the accepted TypeScript 5.9.3 `tsserver.js` bytes.
+const TYPESCRIPT_TSSERVER_BLAKE3_V1: &str =
+    "fd205df6b7930ede592846b8aeabc046f75a76f8f4eaf74a2b6dba9b3bd6a1a8";
+/// Exact accepted TypeScript 5.9.3 `tsserver.js` byte length.
+const TYPESCRIPT_TSSERVER_BYTES_V1: u64 = 272;
+/// Ordered basename, BLAKE3 digest, and length of the accepted loaded runtime closure.
+const TYPESCRIPT_CLOSURE_V1: [(&str, &str, u64); 4] = [
+    (
+        "_tsserver.js",
+        "2f5f9a981943299237ca1a8f566aff95814508abf919027c4f5bb82dc9c5762f",
+        27_888,
+    ),
+    (
+        "typescript.js",
+        "90519822fe3575779770b1e3a921528d30777e2be3c97cb68457caf2c22393e9",
+        9_112_572,
+    ),
+    (
+        "package.json",
+        "822486c3f526033cfa7e628d2725e1ee968850b281194496ef733dd6b1d9096d",
+        3_620,
+    ),
+    (
+        "package.json",
+        "d93faca38a6da90246cddcb64eaf2ec7537a1dd3973f74034fd33e6c667ceca7",
+        2_542,
+    ),
+];
 
 /// Fixed launcher failure categories; no paths, attachments or accepted evidence are rendered.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -133,6 +178,94 @@ pub enum AcceptedProviderSettings {
     RustCachePrimingDisabledV1,
     /// Accepted Pyright defaults over one exclusive, worktree-isolated stdio child.
     PyrightDefaultsV1,
+    /// Accepted release-pinned TypeScript bundle over one exclusive stdio bridge child.
+    #[serde(rename = "typescript_defaults_v1")]
+    TypeScriptDefaultsV1,
+}
+
+/// One restart-configured regular file in the immutable TypeScript runtime closure.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptedTypeScriptFileV1 {
+    /// Absolute normalized file path selected only by trusted launcher configuration.
+    pub path: PathBuf,
+    /// Complete hexadecimal BLAKE3 digest of the accepted bytes.
+    pub blake3: String,
+    /// Exact accepted byte length, bounded and rechecked with the digest.
+    pub bytes: u64,
+}
+
+impl AcceptedTypeScriptFileV1 {
+    /// Rejects malformed paths, digests, and files above the TypeScript bundle member ceiling.
+    fn validate(&self) -> Result<(), LauncherError> {
+        if !absolute(&self.path)
+            || self.blake3.len() != 64
+            || !self.blake3.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || self.bytes > 64 * 1024 * 1024
+        {
+            return Err(LauncherError::Rejected);
+        }
+        Ok(())
+    }
+
+    /// Converts the validated launcher identity into Intelligence's immutable bundle member.
+    fn bundle_file(
+        &self,
+    ) -> Result<crate::intelligence::typescript::TypeScriptBundleFileV1, LauncherError> {
+        Ok(crate::intelligence::typescript::TypeScriptBundleFileV1 {
+            path: self.path.clone(),
+            blake3: blake3::Hash::from_hex(&self.blake3).map_err(|_| LauncherError::Rejected)?,
+            bytes: self.bytes,
+        })
+    }
+}
+
+/// Closed TypeScript-specific portion of one fourth launcher provider declaration.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptedTypeScriptBundleV1 {
+    /// Exact byte length of `ProviderLaunch::executable`, the bridge entry module.
+    pub bridge_bytes: u64,
+    /// Exact accepted TypeScript Language Server release identity.
+    pub bridge_version: String,
+    /// Explicit accepted `tsserver.js` entry module.
+    pub tsserver: AcceptedTypeScriptFileV1,
+    /// Exact accepted TypeScript release identity.
+    pub typescript_version: String,
+    /// Strictly sorted complete loaded runtime closure excluding bridge and `tsserver.js`.
+    pub closure: Vec<AcceptedTypeScriptFileV1>,
+    /// Exact compiled Codex macOS release record required to enable this provider for Codex.
+    pub codex_macos_evidence: String,
+    /// Optional separate Claude macOS record; no value is accepted until that cell passes.
+    pub claude_macos_evidence: Option<String>,
+}
+
+impl AcceptedTypeScriptBundleV1 {
+    /// Validates the bounded closed declaration without granting either host execution authority.
+    fn validate(&self) -> Result<(), LauncherError> {
+        if self.bridge_bytes > 64 * 1024 * 1024
+            || !identifier(&self.bridge_version)
+            || !identifier(&self.typescript_version)
+            || self.closure.is_empty()
+            || self.closure.len() > 64
+            || !identifier(&self.codex_macos_evidence)
+            || self.claude_macos_evidence.is_some()
+        {
+            return Err(LauncherError::Rejected);
+        }
+        self.tsserver.validate()?;
+        let mut previous: Option<&Path> = None;
+        for file in &self.closure {
+            file.validate()?;
+            if previous.is_some_and(|path| path >= file.path.as_path())
+                || file.path == self.tsserver.path
+            {
+                return Err(LauncherError::Rejected);
+            }
+            previous = Some(&file.path);
+        }
+        Ok(())
+    }
 }
 
 /// Trusted provider identity; populated only by the restart-loaded launcher file.
@@ -148,6 +281,8 @@ pub struct ProviderLaunch {
     /// Absolute operator-declared Node executable for Pyright; absent for Go and Rust. Its measured
     /// identity must match `toolchain`, and it is the only program permitted to start Pyright.
     pub node: Option<AcceptedExecutable>,
+    /// Immutable TypeScript closure and host-specific release records; present only for TypeScript.
+    pub typescript: Option<AcceptedTypeScriptBundleV1>,
     /// Absolute operator-declared `cargo` executable for Rust; absent for gopls. Never chosen by
     /// model or project input; its measured identity must match `cargo_version`.
     pub cargo: Option<AcceptedExecutable>,
@@ -162,6 +297,135 @@ pub struct ProviderLaunch {
     pub trust: String,
     /// Persistent compatible cache namespace, retained after stopping a view.
     pub cache_namespace: String,
+}
+
+impl ProviderLaunch {
+    /// Derives the only Codex macOS record accepted for this exact declared TypeScript bundle.
+    ///
+    /// The public release prefix is accepted only with Node 24.4.0, TypeScript Language Server
+    /// 6.0.0, TypeScript 5.9.3, the compiled accepted Node/bridge/tsserver/closure byte identities,
+    /// an exact `tsserver.js` basename, and a BLAKE3 suffix over every declared path, digest, byte
+    /// length, and identity. Returns `None` for any other provider kind, release, malformed bundle,
+    /// or absent Node. This performs no filesystem read and grants no execution authority; startup
+    /// and pre-spawn remeasurement remain separate mandatory checks.
+    pub fn expected_typescript_codex_macos_evidence(&self) -> Option<String> {
+        let node = self.node.as_ref()?;
+        let bundle = self.typescript.as_ref()?;
+        if self.settings != AcceptedProviderSettings::TypeScriptDefaultsV1
+            || node.validate().is_err()
+            || self.executable.validate().is_err()
+            || bundle.validate().is_err()
+            || self.toolchain != TYPESCRIPT_NODE_VERSION_V1
+            || node.identity != TYPESCRIPT_NODE_VERSION_V1
+            || !node.blake3.eq_ignore_ascii_case(TYPESCRIPT_NODE_BLAKE3_V1)
+            || self.executable.identity != TYPESCRIPT_BRIDGE_VERSION_V1
+            || !self
+                .executable
+                .blake3
+                .eq_ignore_ascii_case(TYPESCRIPT_BRIDGE_BLAKE3_V1)
+            || bundle.bridge_bytes != TYPESCRIPT_BRIDGE_BYTES_V1
+            || bundle.bridge_version != TYPESCRIPT_BRIDGE_VERSION_V1
+            || bundle.typescript_version != TYPESCRIPT_VERSION_V1
+            || !bundle
+                .tsserver
+                .blake3
+                .eq_ignore_ascii_case(TYPESCRIPT_TSSERVER_BLAKE3_V1)
+            || bundle.tsserver.bytes != TYPESCRIPT_TSSERVER_BYTES_V1
+            || bundle
+                .tsserver
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                != Some("tsserver.js")
+            || bundle.closure.len() != TYPESCRIPT_CLOSURE_V1.len()
+            || bundle.closure.iter().zip(TYPESCRIPT_CLOSURE_V1).any(
+                |(file, (name, digest, bytes))| {
+                    file.path.file_name().and_then(|value| value.to_str()) != Some(name)
+                        || !file.blake3.eq_ignore_ascii_case(digest)
+                        || file.bytes != bytes
+                },
+            )
+        {
+            return None;
+        }
+        let mut hash = blake3::Hasher::new();
+        evidence_frame(&mut hash, b"typescript-codex-macos-bundle-v1");
+        for value in [
+            self.toolchain.as_bytes(),
+            node.path.as_os_str().as_encoded_bytes(),
+            node.identity.as_bytes(),
+            node.blake3.as_bytes(),
+            self.executable.path.as_os_str().as_encoded_bytes(),
+            self.executable.identity.as_bytes(),
+            self.executable.blake3.as_bytes(),
+            bundle.bridge_version.as_bytes(),
+            bundle.tsserver.path.as_os_str().as_encoded_bytes(),
+            bundle.tsserver.blake3.as_bytes(),
+            bundle.typescript_version.as_bytes(),
+        ] {
+            evidence_frame(&mut hash, value);
+        }
+        evidence_frame(&mut hash, &bundle.bridge_bytes.to_le_bytes());
+        evidence_frame(&mut hash, &bundle.tsserver.bytes.to_le_bytes());
+        for file in &bundle.closure {
+            evidence_frame(&mut hash, file.path.as_os_str().as_encoded_bytes());
+            evidence_frame(&mut hash, file.blake3.as_bytes());
+            evidence_frame(&mut hash, &file.bytes.to_le_bytes());
+        }
+        Some(format!(
+            "{TYPESCRIPT_CODEX_MACOS_EVIDENCE_V1}:{}",
+            hash.finalize().to_hex()
+        ))
+    }
+
+    /// Reconstructs the exact immutable TypeScript bundle from this validated launcher provider.
+    pub fn typescript_bundle(
+        &self,
+    ) -> Result<crate::intelligence::typescript::TypeScriptProviderBundleV1, LauncherError> {
+        let configured = self.typescript.as_ref().ok_or(LauncherError::Rejected)?;
+        let node = self.node.as_ref().ok_or(LauncherError::Rejected)?;
+        crate::intelligence::typescript::TypeScriptProviderBundleV1::new(
+            crate::intelligence::typescript::TypeScriptProviderBundleV1Identity {
+                node: node.path.clone(),
+                node_blake3: blake3::Hash::from_hex(&node.blake3)
+                    .map_err(|_| LauncherError::Rejected)?,
+                node_version: node.identity.clone(),
+                bridge: crate::intelligence::typescript::TypeScriptBundleFileV1 {
+                    path: self.executable.path.clone(),
+                    blake3: blake3::Hash::from_hex(&self.executable.blake3)
+                        .map_err(|_| LauncherError::Rejected)?,
+                    bytes: configured.bridge_bytes,
+                },
+                bridge_version: configured.bridge_version.clone(),
+                tsserver: configured.tsserver.bundle_file()?,
+                typescript_version: configured.typescript_version.clone(),
+                closure: configured
+                    .closure
+                    .iter()
+                    .map(AcceptedTypeScriptFileV1::bundle_file)
+                    .collect::<Result<Vec<_>, _>>()?,
+            },
+        )
+        .map_err(|_| LauncherError::ExecutableChanged)
+    }
+
+    /// Returns whether the compiled Codex release record accepts this exact provider declaration.
+    pub fn typescript_codex_accepted(&self) -> bool {
+        self.expected_typescript_codex_macos_evidence()
+            .is_some_and(|expected| {
+                self.typescript
+                    .as_ref()
+                    .is_some_and(|bundle| bundle.codex_macos_evidence == expected)
+            })
+    }
+
+    /// Returns whether a separately compiled Claude release record accepts this exact declaration.
+    ///
+    /// No Claude TypeScript record is accepted in this release; the wired helper path therefore
+    /// remains unavailable instead of inheriting the Codex record.
+    pub const fn typescript_claude_accepted(&self) -> bool {
+        false
+    }
 }
 
 /// Finite worker limits supplied once at daemon launch.
@@ -370,7 +634,7 @@ impl LauncherConfig {
                 || !absolute(&target.candidate)
                 || target.profiles.is_empty()
                 || target.profiles.len() > 2
-                || target.providers.len() > 3
+                || target.providers.len() > 4
             {
                 return Err(LauncherError::Rejected);
             }
@@ -399,6 +663,7 @@ impl LauncherConfig {
                     AcceptedProviderSettings::GoplsDefaults
                         if !absolute(Path::new(&provider.toolchain))
                             || provider.node.is_some()
+                            || provider.typescript.is_some()
                             || provider.cargo.is_some()
                             || provider.cargo_version.is_some()
                             || provider.rustc.is_some()
@@ -409,7 +674,8 @@ impl LauncherConfig {
                     AcceptedProviderSettings::PyrightDefaultsV1
                         if !provider.node.as_ref().is_some_and(|node| {
                             node.validate().is_ok() && provider.toolchain == node.identity
-                        }) || provider.cargo.is_some()
+                        }) || provider.typescript.is_some()
+                            || provider.cargo.is_some()
                             || provider.cargo_version.is_some()
                             || provider.rustc.is_some()
                             || provider.rustc_version.is_some() =>
@@ -418,6 +684,7 @@ impl LauncherConfig {
                     }
                     AcceptedProviderSettings::RustCachePrimingDisabledV1
                         if provider.node.is_some()
+                            || provider.typescript.is_some()
                             || !provider.cargo_version.as_deref().is_some_and(identifier)
                             || !provider.rustc_version.as_deref().is_some_and(identifier)
                             || !provider.cargo.as_ref().is_some_and(|cargo| {
@@ -434,6 +701,20 @@ impl LauncherConfig {
                                 && Some(rustc.identity.as_str())
                                     == provider.rustc_version.as_deref()
                         }) =>
+                    {
+                        return Err(LauncherError::Rejected);
+                    }
+                    AcceptedProviderSettings::TypeScriptDefaultsV1
+                        if !provider.node.as_ref().is_some_and(|node| {
+                            node.validate().is_ok() && provider.toolchain == node.identity
+                        }) || !provider.typescript.as_ref().is_some_and(|bundle| {
+                            bundle.validate().is_ok()
+                                && provider.executable.identity == bundle.bridge_version
+                        }) || !provider.typescript_codex_accepted()
+                            || provider.cargo.is_some()
+                            || provider.cargo_version.is_some()
+                            || provider.rustc.is_some()
+                            || provider.rustc_version.is_some() =>
                     {
                         return Err(LauncherError::Rejected);
                     }
@@ -529,6 +810,17 @@ impl LauncherConfig {
         for program in programs.values() {
             program.verify_cancellable(cancel)?;
         }
+        for provider in self
+            .targets
+            .values()
+            .flat_map(|target| target.providers.iter())
+            .filter(|provider| provider.settings == AcceptedProviderSettings::TypeScriptDefaultsV1)
+        {
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(LauncherError::Cancelled);
+            }
+            provider.typescript_bundle()?;
+        }
         Ok(())
     }
     /// Verifies every configured executable's current bytes without starting a daemon or worker.
@@ -556,6 +848,12 @@ impl LauncherConfig {
 /// Accepts bounded nonempty identity strings without control bytes.
 fn identifier(value: &str) -> bool {
     !value.is_empty() && value.len() <= 4096 && !value.chars().any(char::is_control)
+}
+
+/// Appends one unambiguous raw field to the declared TypeScript evidence digest.
+fn evidence_frame(hash: &mut blake3::Hasher, value: &[u8]) {
+    hash.update(&(value.len() as u64).to_le_bytes());
+    hash.update(value);
 }
 /// Rejects relative or lexically non-normal launcher paths without deriving them from cwd.
 fn absolute(path: &Path) -> bool {
@@ -635,10 +933,60 @@ fn launcher_mapping_is_closed_bounded_and_restart_only() {
     python_target["providers"] = json!([
         provider("pyright_defaults_v1"),
         json!({"executable":executable,"settings":"gopls_defaults","toolchain":"/usr/bin/true","cargo":null,"cargo_version":null,"rustc":null,"rustc_version":null,"trust":"accepted-local","cache_namespace":"go-cache"}),
-        json!({"executable":executable,"settings":"rust_cache_priming_disabled_v1","toolchain":"rust-test","cargo":executable,"cargo_version":"accepted-git","rustc":executable,"rustc_version":"accepted-git","trust":"accepted-local","cache_namespace":"rust-cache"})
+        json!({"executable":executable,"settings":"rust_cache_priming_disabled_v1","toolchain":"rust-test","cargo":executable,"cargo_version":"accepted-git","rustc":executable,"rustc_version":"accepted-git","trust":"accepted-local","cache_namespace":"rust-cache"}),
+        json!({"executable":{"path":"/private/tmp/bridge.mjs","identity":"6.0.0","blake3":TYPESCRIPT_BRIDGE_BLAKE3_V1},"settings":"typescript_defaults_v1","toolchain":"24.4.0","node":{"path":"/private/tmp/node","identity":"24.4.0","blake3":TYPESCRIPT_NODE_BLAKE3_V1},"typescript":{"bridge_bytes":TYPESCRIPT_BRIDGE_BYTES_V1,"bridge_version":"6.0.0","tsserver":{"path":"/private/tmp/tsserver.js","blake3":TYPESCRIPT_TSSERVER_BLAKE3_V1,"bytes":TYPESCRIPT_TSSERVER_BYTES_V1},"typescript_version":"5.9.3","closure":[{"path":"/private/tmp/a/_tsserver.js","blake3":TYPESCRIPT_CLOSURE_V1[0].1,"bytes":TYPESCRIPT_CLOSURE_V1[0].2},{"path":"/private/tmp/a/typescript.js","blake3":TYPESCRIPT_CLOSURE_V1[1].1,"bytes":TYPESCRIPT_CLOSURE_V1[1].2},{"path":"/private/tmp/b/package.json","blake3":TYPESCRIPT_CLOSURE_V1[2].1,"bytes":TYPESCRIPT_CLOSURE_V1[2].2},{"path":"/private/tmp/c/package.json","blake3":TYPESCRIPT_CLOSURE_V1[3].1,"bytes":TYPESCRIPT_CLOSURE_V1[3].2}],"codex_macos_evidence":TYPESCRIPT_CODEX_MACOS_EVIDENCE_V1,"claude_macos_evidence":null},"cargo":null,"cargo_version":null,"rustc":null,"rustc_version":null,"trust":"accepted-local","cache_namespace":"typescript-cache"})
     ]);
-    let python_config = json!({"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[python_target.clone()]});
+    let mut python_config = json!({"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[python_target.clone()]});
+    let unbound: ProviderLaunch =
+        serde_json::from_value(python_config["targets"][0]["providers"][3].clone()).unwrap();
+    python_config["targets"][0]["providers"][3]["typescript"]["codex_macos_evidence"] =
+        json!(unbound.expected_typescript_codex_macos_evidence().unwrap());
     assert!(LauncherConfig::parse(python_config.to_string().as_bytes()).is_ok());
+    let loaded = LauncherConfig::parse(python_config.to_string().as_bytes()).unwrap();
+    let typescript = &loaded.target("private-attachment").unwrap().providers[3];
+    assert!(typescript.typescript_codex_accepted());
+    assert!(!typescript.typescript_claude_accepted());
+    let mut invented_claude = python_config.clone();
+    invented_claude["targets"][0]["providers"][3]["typescript"]["claude_macos_evidence"] =
+        json!("invented");
+    assert!(LauncherConfig::parse(invented_claude.to_string().as_bytes()).is_err());
+    for field in [
+        "toolchain",
+        "node.identity",
+        "executable.identity",
+        "executable.blake3",
+        "typescript.typescript_version",
+        "typescript.tsserver.blake3",
+        "typescript.closure.blake3",
+        "typescript.closure.path",
+    ] {
+        let mut copied = python_config.clone();
+        let provider = &mut copied["targets"][0]["providers"][3];
+        match field {
+            "toolchain" => provider["toolchain"] = json!("24.4.1"),
+            "node.identity" => provider["node"]["identity"] = json!("24.4.1"),
+            "executable.identity" => provider["executable"]["identity"] = json!("6.0.1"),
+            "executable.blake3" => provider["executable"]["blake3"] = json!("e".repeat(64)),
+            "typescript.typescript_version" => {
+                provider["typescript"]["typescript_version"] = json!("5.9.4")
+            }
+            "typescript.tsserver.blake3" => {
+                provider["typescript"]["tsserver"]["blake3"] = json!("f".repeat(64))
+            }
+            "typescript.closure.blake3" => {
+                provider["typescript"]["closure"][0]["blake3"] = json!("d".repeat(64))
+            }
+            "typescript.closure.path" => {
+                provider["typescript"]["closure"][0]["path"] =
+                    json!("/private/tmp/a/a/_tsserver.js")
+            }
+            _ => unreachable!("closed copied-evidence mutation"),
+        }
+        assert!(
+            LauncherConfig::parse(copied.to_string().as_bytes()).is_err(),
+            "copied evidence accepted changed {field}"
+        );
+    }
     let mut relative_node = python_config.clone();
     relative_node["targets"][0]["providers"][0]["toolchain"] = json!("node");
     assert!(LauncherConfig::parse(relative_node.to_string().as_bytes()).is_err());

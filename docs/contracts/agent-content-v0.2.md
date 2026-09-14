@@ -21,7 +21,7 @@ Pending work preserves an exact helper command when present, requires foreground
 
 Edit presents the closed outcome, public path and only the references needed for a safe next action. outcome_unknown requires inspecting the target and forbids replay. When an accepted Edit result carries post-edit diagnostics, current reported diagnostics may point to another ide.edit with its usable source_ref, current clean diagnostics point to ide.diff, and unknown or pending diagnostics point to ide.context or to ide.inspect only when a real detail_ref exists. The renderer never infers clean diagnostics from silence.
 
-Typed Error sets isError. Unavailable, pending, lifecycle, feedback and edit-result states do not become transport errors; each accepted typed reply has one compact content block and unchanged structuredContent. Native fallback is named only when IDE work is unavailable, unsupported, declined or uncertain.
+Typed Error sets isError. `resolution_unverified` names the supported configured-project requirement and a later Context retry without claiming that a native tool can substitute for closed TypeScript resolution. Unavailable, pending, lifecycle, feedback and edit-result states do not become transport errors; each accepted typed reply has one compact content block and unchanged structuredContent. Native fallback is named only when IDE work is unavailable, unsupported, declined or uncertain.
 
 ## Bounds and privacy
 

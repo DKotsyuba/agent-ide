@@ -151,6 +151,8 @@ pub enum ProviderSettings {
     Rust(RustProfile),
     /// The fixed Pyright configuration for one exclusive Python stdio session.
     Pyright(crate::intelligence::pyright::PyrightProfile),
+    /// Release-pinned TypeScript initialization for one exclusive JS/JSX/TS/TSX session.
+    TypeScript(crate::intelligence::typescript::TypeScriptProfile),
 }
 impl ProviderSettings {
     /// Returns the fixed initialize/configuration payload; no dynamic settings or model keys are accepted.
@@ -168,6 +170,7 @@ impl ProviderSettings {
                 "procMacro":{"enable":!profile.proc_macros_disabled()}
             }),
             Self::Pyright(_) => serde_json::json!({}),
+            Self::TypeScript(profile) => profile.initialization_options(),
         }
     }
 
@@ -180,6 +183,9 @@ impl ProviderSettings {
                     && info.version.as_deref() == Some(profile.initialize_version())
             }),
             Self::Pyright(_) => info.is_none_or(|info| info.name == "pyright"),
+            Self::TypeScript(_) => {
+                info.is_none_or(|info| info.name == "typescript-language-server")
+            }
         };
         if valid {
             Ok(())
@@ -654,7 +660,8 @@ impl Session {
     }
 
     /// Waits under the current request deadline for the current document's first versioned
-    /// diagnostic result. A timeout deliberately leaves diagnostic evidence unknown and does not
+    /// diagnostic result. TypeScript may omit a document version and therefore remain unknown; a
+    /// timeout also leaves diagnostic evidence unknown and does not
     /// affect already-computed semantic context.
     pub(crate) async fn wait_for_matching_diagnostics(&self) {
         let _ = wait_for_matching_diagnostics(&self.state, self.exchange_deadline()).await;
@@ -1021,6 +1028,10 @@ fn language_id(path: &std::path::Path) -> &'static str {
         Some("go") => "go",
         Some("rs") => "rust",
         Some("py") | Some("pyi") => "python",
+        Some("js") => "javascript",
+        Some("jsx") => "javascriptreact",
+        Some("ts") => "typescript",
+        Some("tsx") => "typescriptreact",
         _ => "plaintext",
     }
 }

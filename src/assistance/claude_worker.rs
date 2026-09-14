@@ -146,6 +146,90 @@ pub enum HelperLanguage {
     Rust,
     /// Pyright over one helper-private, worktree-isolated stdio child.
     Python,
+    /// Release-pinned TypeScript Language Server for JS, JSX, TS, or TSX.
+    #[serde(rename = "typescript")]
+    TypeScript,
+}
+
+/// One accepted regular-file identity in a Claude helper's TypeScript bundle frame.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HelperTypeScriptFileV1 {
+    /// Absolute normalized file path selected by the daemon from trusted launcher configuration.
+    pub path: PathBuf,
+    /// Complete hexadecimal BLAKE3 digest of the accepted bytes.
+    pub blake3: String,
+    /// Exact accepted byte length.
+    pub bytes: u64,
+}
+
+impl HelperTypeScriptFileV1 {
+    /// Converts one validated wire identity into Intelligence's immutable bundle member.
+    fn bundle_file(
+        &self,
+    ) -> Result<crate::intelligence::typescript::TypeScriptBundleFileV1, FailureCode> {
+        if !self.path.is_absolute() || self.bytes > 64 * 1024 * 1024 {
+            return Err(FailureCode::ExecutionProfile);
+        }
+        Ok(crate::intelligence::typescript::TypeScriptBundleFileV1 {
+            path: self.path.clone(),
+            blake3: blake3::Hash::from_hex(&self.blake3)
+                .map_err(|_| FailureCode::ExecutionProfile)?,
+            bytes: self.bytes,
+        })
+    }
+}
+
+/// Complete daemon-selected TypeScript bundle identity carried to one foreground helper.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HelperTypeScriptProfileV1 {
+    /// Absolute accepted Node executable used as the only launched program.
+    pub node: PathBuf,
+    /// Accepted Node release identity.
+    pub node_version: String,
+    /// Complete BLAKE3 digest of the accepted Node executable.
+    pub node_blake3: String,
+    /// Accepted bridge entry module.
+    pub bridge: HelperTypeScriptFileV1,
+    /// Accepted TypeScript Language Server release identity.
+    pub bridge_version: String,
+    /// Explicit accepted `tsserver.js` entry module.
+    pub tsserver: HelperTypeScriptFileV1,
+    /// Accepted TypeScript release identity.
+    pub typescript_version: String,
+    /// Strictly sorted complete loaded closure excluding bridge and `tsserver.js`.
+    pub closure: Vec<HelperTypeScriptFileV1>,
+}
+
+impl HelperTypeScriptProfileV1 {
+    /// Reconstructs and validates the immutable bundle before the helper creates a command.
+    pub fn bundle(
+        &self,
+    ) -> Result<crate::intelligence::typescript::TypeScriptProviderBundleV1, FailureCode> {
+        let identity = crate::intelligence::typescript::TypeScriptProviderBundleV1Identity {
+            node: self.node.clone(),
+            node_blake3: blake3::Hash::from_hex(&self.node_blake3)
+                .map_err(|_| FailureCode::ExecutionProfile)?,
+            node_version: self.node_version.clone(),
+            bridge: self.bridge.bundle_file()?,
+            bridge_version: self.bridge_version.clone(),
+            tsserver: self.tsserver.bundle_file()?,
+            typescript_version: self.typescript_version.clone(),
+            closure: self
+                .closure
+                .iter()
+                .map(HelperTypeScriptFileV1::bundle_file)
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        crate::intelligence::typescript::TypeScriptProviderBundleV1::new(identity)
+            .map_err(|_| FailureCode::ExecutionProfile)
+    }
+
+    /// Rejects malformed or changed bundle identities at the helper frame boundary.
+    pub fn validate(&self) -> Result<(), FailureCode> {
+        self.bundle().map(|_| ())
+    }
 }
 
 /// Carries the complete launcher-accepted Pyright and Node identities for one helper child.
@@ -236,6 +320,8 @@ pub struct HelperProvider {
     pub rust_settings: Option<RustEffectiveSettings>,
     /// Fixed launcher-accepted Pyright/Node identity; present only for [`HelperLanguage::Python`].
     pub pyright: Option<HelperPyrightProfile>,
+    /// Release-pinned TypeScript bundle; present only for [`HelperLanguage::TypeScript`].
+    pub typescript: Option<HelperTypeScriptProfileV1>,
     /// Accepted Go executable path or Rust toolchain selector.
     pub toolchain: String,
     /// Accepted Cargo executable for Rust; absent for Go.
@@ -268,6 +354,7 @@ impl HelperProvider {
             self.language,
             self.rust_settings.as_ref(),
             self.pyright.as_ref(),
+            self.typescript.as_ref(),
             self.cargo.as_ref(),
             self.cargo_version.as_ref(),
             self.rustc.as_ref(),
@@ -277,22 +364,30 @@ impl HelperProvider {
                 HelperLanguage::Rust,
                 Some(settings),
                 None,
+                None,
                 Some(cargo),
                 Some(_),
                 Some(rustc),
                 Some(_),
             ) if cargo.is_absolute() && rustc.is_absolute() => settings.validate(),
-            (HelperLanguage::Go, None, None, None, None, None, None)
+            (HelperLanguage::Go, None, None, None, None, None, None, None)
                 if PathBuf::from(&self.toolchain).is_absolute() =>
             {
                 Ok(())
             }
-            (HelperLanguage::Python, None, Some(pyright), None, None, None, None)
+            (HelperLanguage::Python, None, Some(pyright), None, None, None, None, None)
                 if self.executable == pyright.script
                     && self.version == pyright.script_identity
                     && self.toolchain == pyright.node_identity =>
             {
                 pyright.validate()
+            }
+            (HelperLanguage::TypeScript, None, None, Some(typescript), None, None, None, None)
+                if self.executable == typescript.bridge.path
+                    && self.version == typescript.bridge_version
+                    && self.toolchain == typescript.node_version =>
+            {
+                typescript.validate()
             }
             _ => Err(FailureCode::ExecutionProfile),
         }
@@ -1909,6 +2004,7 @@ mod tests {
                     proc_macro: false,
                 }),
                 pyright: None,
+                typescript: None,
                 toolchain: "fixture".into(),
                 cargo: Some(PathBuf::from("/usr/bin/true")),
                 cargo_version: Some("cargo fixture".into()),

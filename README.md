@@ -113,3 +113,15 @@ Stopping a coder releases its analysis leases and retains its worktree's cache d
 Go worktrees split their cache in two. Each worktree keeps a private namespace holding its own `GOCACHE`/`GOMODCACHE`/`GOTMPDIR`, delivered per LSP view rather than as process environment, so a view without one fails closed instead of reading another worktree's build state. Compatible worktrees additionally share one backend-scoped native namespace holding gopls' own on-disk filecache and the listener's temporary directory: gopls binds that filecache once per process, so sharing it is what lets divergent worktrees run on a single physical listener with one forwarder each. Compatibility is one canonical effective-rights identity — provider, settings, toolchain, and the rights the observed sandbox state actually grants; cwd-relative sandbox roots are resolved to absolute rights first, and any policy whose rights cannot be proven equal is never shared. The shared namespace is reference-counted, so it survives a partial stop while any sharing worktree is still live, and both namespaces persist across stop and handoff. gopls manages the contents of its shared native namespace itself and may evict them at any time; that eviction is a cache miss, never a loss of IDE-owned worktree state.
 
 Pyright v0.1.1 supports Codex and Claude Python (`.py` and `.pyi`). Configure its closed `pyright_defaults_v1` provider with accepted absolute `pyright-langserver` and `node` executable objects, and set `toolchain` to the accepted Node identity. The launcher invokes that exact Node executable with the absolute Pyright script and `--stdio`; Claude does so only in its foreground helper, using the same accepted paths, identities, and BLAKE3 digests. The six-tool MCP surface keeps wire v2 for the original five methods and uses wire v3 for `ide.edit`.
+
+The v0.2 TypeScript increment supports Codex semantic Context for `.js`, `.jsx`, `.ts`, and `.tsx`
+on its accepted macOS release cell. Configure `typescript_defaults_v1` with the exact Node 24.4.0,
+TypeScript Language Server 6.0.0 bridge, TypeScript 5.9.3 `tsserver.js`, complete closure identities,
+the bundle-bound compiled Codex evidence ID, and an ancestor `tsconfig.json` or `jsconfig.json` as
+documented in the [launcher contract](docs/assistance-launcher.md). That config must set
+`compilerOptions.types` to `[]` and `moduleResolution` to `node10`; JS/JSX also require
+`allowJs: true`. The top-level `files` array must contain the current document exactly once as a
+bounded normalized relative path; `include`, `exclude`, `outDir`, `declarationDir`, and dependency
+graphs are unsupported. Each operation is exclusive and one-shot; normal
+success requires graceful shutdown, protocol EOF, zero bridge exit, and direct-child reap without
+TERM/KILL. Claude TypeScript remains unavailable pending its separate real macOS acceptance record.

@@ -79,6 +79,17 @@ Claude reconstructs the fixed profile from only these launcher-accepted script a
 identities, and BLAKE3 digests, then rechecks the script before the inherited-process Node
 recheck at spawn. This does not change the five MCP tools; helper protocol revision 3 fences
 mixed binaries.
+`typescript_defaults_v1` requires accepted `node` and bridge executable objects plus a
+`typescript` object containing `bridge_bytes`, the exact bridge and TypeScript versions, an
+accepted `tsserver` file (`path`, `blake3`, and `bytes`), a sorted nonempty `closure` of files in
+that same shape, and separate host evidence fields. The compiled Codex release cell accepts only
+`macos-26.6.2-node-24.4.0-tls-6.0.0-ts-5.9.3-codex-r3-2026-09-14:<bundle-digest>`: the suffix is
+derived from the exact declared Node, bridge, `tsserver.js`, and closure paths, digests, lengths,
+and identities, so copying the record to another bundle is rejected. The three public versions
+must also be exactly 24.4.0, 6.0.0, and 5.9.3, and the compiled record fixes the accepted Node,
+bridge, `tsserver.js`, and complete closure byte identities rather than trusting those labels alone.
+The Claude evidence field must remain null until a separate real Claude macOS record ships. Every
+member is remeasured at startup and immediately before its one-shot child starts.
 `cache_namespace` is a bounded compatibility label, not a filesystem path or
 authority grant. Assistance combines it with the verified durable worktree and
 accepted provider identities to retain a private directory, then supplies only
@@ -94,12 +105,26 @@ attachment mappings, four provider languages per target and two accepted Executi
 classes. Duplicate attachment mappings, unknown fields, invalid limits, relative paths,
 malformed executable digests and mismatched profile evidence are rejected.
 
-The fourth provider is reserved for the immutable `TypeScriptProviderBundleV1` in
-[TYPESCRIPT-r1](contracts/intelligence-v0.2.md). It accepts only an explicit accepted Node,
+The fourth provider is the immutable `TypeScriptProviderBundleV1` in
+[TYPESCRIPT-r3](contracts/intelligence-v0.2.md). It accepts only an explicit accepted Node,
 bridge, TypeScript closure, and `tsserver.path`; it has no ambient npm/plugin/network discovery.
-The launcher rejects a TypeScript declaration until its real spike evidence accepts the exact
-bundle/profile. This is restart-only configuration and never enables a syntax server or
-automatic typing acquisition.
+Codex requires its exact bundle-bound compiled release record. The launcher and helper frame support the closed
+Claude shape, but Claude selection stays unavailable until its independent compiled release record
+exists. This is restart-only configuration and never enables a syntax server or automatic typing
+acquisition.
+
+For a configured TypeScript-family document, the observed ancestor `tsconfig.json` or `jsconfig.json`
+must explicitly set `compilerOptions.types` to `[]` and `compilerOptions.moduleResolution` to
+`node10`. JavaScript and JSX documents additionally require `compilerOptions.allowJs` to be `true`;
+the closed diagnostic options `checkJs` and `noImplicitAny`, when present, must also be `true`.
+The top-level `files` array is required, bounded by the existing 16-entry resolution limit, and
+must list the current document exactly once relative to the config directory. Every entry must be a
+normalized relative UTF-8 path without glob metacharacters, absolute paths, dot/parent components,
+or backslashes; duplicates are rejected. Top-level `include` and `exclude`, compiler output options
+`outDir` and `declarationDir`, and dependency graphs (`extends`, `references`, package
+dependencies/workspaces, or ancestor `node_modules`) are unsupported and rejected. Membership is
+taken only from this exact observed array; no glob, output-path, or dependency membership is
+inferred or scanned.
 
 Configuration contains private attachment and evidence values. Diagnostic formatting
 redacts the configuration; it must never be rendered in model-facing tool results.

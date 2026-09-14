@@ -42,6 +42,7 @@ The target platforms are Linux and macOS. Current v0.1 acceptance runs real Code
 | macOS 26.6.2, Codex CLI 0.154.0, Go/gopls 0.23.0 | `real_pass`: parent plus parallel native children in divergent worktrees, scoped diagnostic, peer survival and fresh sequential handoff |
 | macOS 26.6.2, Codex CLI 0.154.0, Rust/rust-analyzer 1.98.1 | `real_pass` for the managed product/provider contract; live model CLI cell `not_tested` |
 | macOS, Codex CLI, Python/Pyright 1.1.413 | `real_pass` for the bounded product/provider contract |
+| macOS 26.6.2, Codex, Node 24.4.0 / TypeScript Language Server 6.0.0 / TypeScript 5.9.3 | `real_pass`: real JS, JSX, TS and TSX semantic Context plus release-pinned normal shutdown |
 | macOS 26.6.2, Claude Code 2.1.267, Go/gopls 0.23.0 | `real_pass`: foreground helper, native-edit diagnostic, Diff, Stop and parallel actor isolation |
 | macOS 26.6.2, Claude Code 2.1.267, Rust/rust-analyzer 1.98.1 | `real_pass`: foreground helper semantic context, native-edit diagnostic, Diff and Stop |
 | macOS, Claude Code, Python/Pyright | `product_covered`; real host containment remains separately verified |
@@ -85,7 +86,7 @@ the previously ordered history-first increment. Work proceeds in this order:
 ### v0.2 acceptance evidence matrix (ACCEPTANCE-r1)
 
 This matrix consumes the public [TELEMETRY-r1](contracts/telemetry-v0.2.md),
-[EDIT-r1](contracts/changes-v0.2.md), and [TYPESCRIPT-r1](contracts/intelligence-v0.2.md)
+[EDIT-r1](contracts/changes-v0.2.md), and [TYPESCRIPT-r3](contracts/intelligence-v0.2.md)
 contracts. It is preparation only: every cell below is `not_tested` until an implementation and
 real run produce public evidence. Public artifacts contain versions, route, scenario outcomes,
 bounded metrics, and explicit truncation only; private supervisor identifiers and transcripts do
@@ -93,7 +94,7 @@ not enter them.
 
 | macOS route | Required real evidence | Status |
 |---|---|---|
-| Direct Codex | `start -> context -> edit -> diagnostic -> fix -> diff -> stop`; stale edit has zero writes; native fallback; restart-safe telemetry query/export; divergent worktrees | `not_tested` |
+| Direct Codex | `start -> context -> edit -> diagnostic -> fix -> diff -> stop`; stale edit has zero writes; native fallback; restart-safe telemetry query/export; divergent worktrees | TypeScript Context/normal-shutdown subset `real_pass`; complete cell `not_tested` |
 | Direct Claude | The same scenario through the claimed foreground helper, including TypeScript only after its spike; stale edit has zero writes; native fallback; restart-safe telemetry; divergent worktrees | `not_tested` |
 | Installed external agent-run-to-Claude | The same end-to-end route, with its external attachment treated as an adapter rather than identity authority; stale edit has zero writes; native fallback; restart-safe telemetry; divergent worktrees | `not_tested` |
 | Linux, all routes | No v0.2 host/provider acceptance claim | `not_tested` |

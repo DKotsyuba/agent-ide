@@ -83,6 +83,9 @@ fn render_text(reply: &PeerReply) -> String {
             detail_ref,
             helper: None,
         } => format!("pending: use ide.inspect with detail_ref {detail_ref}"),
+        PeerReply::Error {
+            code: FailureCode::ResolutionUnverified,
+        } => "error: resolution_unverified; establish a supported configured project with exact document membership, then retry ide.context".to_owned(),
         PeerReply::Error { code } => format!(
             "error: {}; continue with native tools",
             match code {
@@ -93,6 +96,7 @@ fn render_text(reply: &PeerReply) -> String {
                 FailureCode::WorkspaceActivation => "workspace_activation",
                 FailureCode::WorkspaceAuthority => "workspace_authority",
                 FailureCode::ProviderUnavailable => "provider_unavailable",
+                FailureCode::ResolutionUnverified => unreachable!("handled above"),
                 FailureCode::Cancelled => "cancelled",
                 FailureCode::Deadline => "deadline",
                 FailureCode::Capacity => "capacity",
@@ -366,6 +370,21 @@ mod tests {
         let text = text_of(&rendered);
         assert!(text.contains(helper) && text.contains(detail_ref));
         assert!(text.find(helper).unwrap() < text.find("ide.inspect").unwrap());
+    }
+
+    /// Keeps unresolved TypeScript configuration actionable without claiming a native substitute.
+    #[test]
+    fn resolution_unverified_is_closed_without_native_path_overclaim() {
+        let reply = PeerReply::Error {
+            code: FailureCode::ResolutionUnverified,
+        };
+        let expected = serde_json::to_value(&reply).unwrap();
+        let rendered = render(reply).unwrap();
+        let text = text_of(&rendered);
+        assert!(text.contains("resolution_unverified") && text.contains("ide.context"));
+        assert!(!text.contains("native"));
+        assert_eq!(rendered.structured_content, Some(expected));
+        assert_eq!(rendered.is_error, Some(true));
     }
 
     /// Covers every closed edit outcome without exposing irrelevant operation correlation.
