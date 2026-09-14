@@ -625,6 +625,29 @@ impl TypeScriptProtocolChild {
             .map_err(TypeScriptProfileError::Process)
     }
 
+    /// Waits without consuming or signalling so a timeout can enter ordered abnormal cleanup.
+    pub async fn wait_for_exit(
+        &mut self,
+        deadline: Duration,
+    ) -> Result<std::process::ExitStatus, TypeScriptProfileError> {
+        self.child
+            .wait_for_exit(deadline)
+            .await
+            .map_err(TypeScriptProfileError::Process)
+    }
+
+    /// Converts an already waited direct bridge child into its sole Execution reap proof.
+    pub async fn finish_reap(
+        self,
+        status: std::process::ExitStatus,
+        deadline: Duration,
+    ) -> Result<ReapedProtocolProcess, TypeScriptProfileError> {
+        self.child
+            .finish_reap(status, deadline)
+            .await
+            .map_err(TypeScriptProfileError::Process)
+    }
+
     /// Runs the fixed group TERM/grace/group-and-direct KILL/direct-reap abnormal sequence.
     pub async fn terminate_abnormally(
         self,

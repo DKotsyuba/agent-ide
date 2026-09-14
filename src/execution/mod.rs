@@ -3298,25 +3298,9 @@ impl OwnedProtocolChild {
 
     /// Returns ordinary direct-child reap evidence under a positive deadline of at most 60 seconds.
     pub async fn reap(self, deadline: Duration) -> Result<ReapedProtocolProcess, ProcessError> {
-        validate_reap_deadline(deadline)?;
         let mut this = self;
-        drop(this.stdin);
-        let status = timeout(deadline, this.process.child.wait())
-            .await
-            .map_err(|_| ProcessError::ReapTimedOut)??;
-        drop(this.stdout);
-        let stderr = collect_drain(this.stderr, deadline).await;
-        Ok(ReapedProtocolProcess {
-            status,
-            cancellation: this.process.cancellation,
-            stderr,
-            descendants: DescendantEvidence::Unverified,
-            proof: DirectChildReap {
-                lease: this.lease,
-                target: this.target,
-                identity: this.process.identity,
-            },
-        })
+        let status = this.wait_for_exit(deadline).await?;
+        this.finish_reap(status, deadline).await
     }
 
     /// Borrows bounded cancellation while keeping ownership available for a supervised reaper handoff.
@@ -3353,37 +3337,36 @@ impl OwnedProtocolChild {
         grace: Duration,
         deadline: Duration,
     ) -> Result<ReapedProtocolProcess, ProcessError> {
+        let (status, evidence) =
+            terminate_typescript_child_abnormally(&mut self.process.child, grace, deadline).await?;
+        self.process.cancellation = Some(evidence);
+        self.finish_reap(status, deadline).await
+    }
+
+    /// Waits for the direct bridge child without consuming ownership or requesting a signal.
+    ///
+    /// A timeout leaves this handle available for the ordered abnormal TypeScript cleanup path.
+    pub(crate) async fn wait_for_exit(
+        &mut self,
+        deadline: Duration,
+    ) -> Result<ExitStatus, ProcessError> {
         validate_reap_deadline(deadline)?;
-        if grace.is_zero() || grace > Duration::from_secs(60) {
-            return Err(ProcessError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid TypeScript cleanup grace",
-            )));
-        }
-        drop(self.stdin);
-        drop(self.stdout);
-        let pid = self
-            .process
-            .child
-            .id()
-            .ok_or_else(|| io::Error::other("owned TypeScript child has no live PID"))?;
-        let mut evidence = CancellationEvidence {
-            term_requested: signal_group(pid, libc::SIGTERM).is_ok(),
-            kill_requested: false,
-        };
-        self.process.cancellation = Some(evidence);
-        tokio::time::sleep(grace).await;
-        let group_kill = signal_group(pid, libc::SIGKILL).is_ok();
-        let direct_kill = self.process.child.start_kill().is_ok();
-        evidence.kill_requested = group_kill || direct_kill;
-        self.process.cancellation = Some(evidence);
-        let status = timeout(deadline, self.process.child.wait())
+        timeout(deadline, self.process.child.wait())
             .await
-            .map_err(|_| ProcessError::ReapTimedOut)??;
+            .map_err(|_| ProcessError::ReapTimedOut)?
+            .map_err(ProcessError::Io)
+    }
+
+    /// Consumes an already reaped direct child into its sole accounting proof and stderr evidence.
+    pub(crate) async fn finish_reap(
+        self,
+        status: ExitStatus,
+        deadline: Duration,
+    ) -> Result<ReapedProtocolProcess, ProcessError> {
         let stderr = collect_drain(self.stderr, deadline).await;
         Ok(ReapedProtocolProcess {
             status,
-            cancellation: Some(evidence),
+            cancellation: self.process.cancellation,
             stderr,
             descendants: DescendantEvidence::Unverified,
             proof: DirectChildReap {
@@ -3393,6 +3376,41 @@ impl OwnedProtocolChild {
             },
         })
     }
+}
+
+/// Applies the one fixed abnormal TypeScript signal order to an unreaped direct child.
+///
+/// The caller retains the child handle. Positive `grace` and `deadline` values may not exceed 60
+/// seconds. This function requests group TERM, sleeps the complete grace without polling or
+/// reaping, requests group KILL and direct-child kill, then performs the sole direct wait. It never
+/// signals after that wait and makes no descendant-settlement or process-group-containment claim.
+pub(crate) async fn terminate_typescript_child_abnormally(
+    child: &mut Child,
+    grace: Duration,
+    deadline: Duration,
+) -> Result<(ExitStatus, CancellationEvidence), ProcessError> {
+    validate_reap_deadline(deadline)?;
+    if grace.is_zero() || grace > Duration::from_secs(60) {
+        return Err(ProcessError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid TypeScript cleanup grace",
+        )));
+    }
+    let pid = child
+        .id()
+        .ok_or_else(|| io::Error::other("owned TypeScript child has no live PID"))?;
+    let mut evidence = CancellationEvidence {
+        term_requested: signal_group(pid, libc::SIGTERM).is_ok(),
+        kill_requested: false,
+    };
+    tokio::time::sleep(grace).await;
+    let group_kill = signal_group(pid, libc::SIGKILL).is_ok();
+    let direct_kill = child.start_kill().is_ok();
+    evidence.kill_requested = group_kill || direct_kill;
+    let status = timeout(deadline, child.wait())
+        .await
+        .map_err(|_| ProcessError::ReapTimedOut)??;
+    Ok((status, evidence))
 }
 
 /// Refuses using direct-job admission to launch an Intelligence provider process.

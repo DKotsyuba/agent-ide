@@ -187,6 +187,9 @@ Wired and covered by local checks:
 - rights-aware durable worktree cache directory retention across Stop/handoff, without a warm native
   backend or opaque-index reuse claim. Claude Go remains per-operation exclusive; the compatible
   two-worktree shared-gopls guarantee belongs only to the managed Codex matrix.
+- the fourth closed TypeScript launcher/helper frame and one-shot helper execution path. Selection
+  remains unavailable because the separate real Claude macOS acceptance record is not yet present;
+  the accepted Codex record cannot enable it.
 
 Live checks with Claude Code 2.1.267 on macOS 26.6.2 exercised Go and Rust semantic
 context, diagnostic changes after native edits, actual Git diff and Stop. Parallel native

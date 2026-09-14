@@ -991,6 +991,7 @@ async fn provider_context(
             pyright::{PyrightProfile, PyrightProfileIdentity, PyrightWorktree},
             rust::{RustProfile, RustProfileIdentity, RustWorktree},
             session::{GoEnv, ProviderSettings, SessionOptions, with_session},
+            typescript::{ProjectResolutionInputsV1, TypeScriptProfile, TypeScriptWorktree},
         },
     };
     let Some(provider) = job.provider.as_ref() else {
@@ -1099,6 +1100,36 @@ async fn provider_context(
                 Some(profile),
             )
         }
+        HelperLanguage::TypeScript => {
+            let identity = provider
+                .typescript
+                .as_ref()
+                .ok_or(FailureCode::ExecutionProfile)?;
+            let bundle = identity.bundle()?;
+            let resolution = ProjectResolutionInputsV1::new(
+                source.worktree().clone(),
+                source.worktree().worktree_path().join(source.path()),
+                &bundle,
+                vec![],
+            )
+            .map_err(|_| FailureCode::ProviderUnavailable)?;
+            let profile = TypeScriptProfile::new(
+                bundle,
+                resolution,
+                provider.trust.clone(),
+                Path::new(&provider.cache_namespace).to_path_buf(),
+            )
+            .map_err(|_| FailureCode::ExecutionProfile)?;
+            let worktree = TypeScriptWorktree::new(source.worktree().clone(), authority)
+                .map_err(|_| FailureCode::WorkspaceAuthority)?;
+            (
+                profile
+                    .command(&worktree)
+                    .map_err(|_| FailureCode::ExecutionProfile)?,
+                ProviderSettings::TypeScript(profile),
+                None,
+            )
+        }
     };
     if pyright_profile.is_some_and(|profile| profile.verify_script().is_err()) {
         return Err(FailureCode::ProviderUnavailable);
@@ -1160,19 +1191,41 @@ async fn provider_context(
         },
     )
     .await;
-    drop(input);
-    drop(output);
-    let status = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    let typescript = provider.language == HelperLanguage::TypeScript;
+    let status = if typescript && operation.is_err() {
+        crate::execution::terminate_typescript_child_abnormally(
+            &mut child,
+            Duration::from_millis(100),
+            Duration::from_secs(2),
+        )
+        .await
+        .map(|(status, _)| status)
+    } else {
+        match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+            Ok(status) => status.map_err(crate::execution::ProcessError::Io),
+            Err(_) if typescript => crate::execution::terminate_typescript_child_abnormally(
+                &mut child,
+                Duration::from_millis(100),
+                Duration::from_secs(2),
+            )
+            .await
+            .map(|(status, _)| status),
+            Err(_) => Err(crate::execution::ProcessError::ReapTimedOut),
+        }
+    };
     match status {
-        Ok(Ok(status)) if status.success() => *reaped += 1,
-        _ => {
-            let settled = child.kill().await.is_ok() && child.wait().await.is_ok();
-            *reaped += u32::from(settled);
-            return Err(if settled {
-                FailureCode::ProviderUnavailable
-            } else {
-                FailureCode::Deadline
-            });
+        Ok(status) => {
+            *reaped += 1;
+            if !status.success() || operation.is_err() {
+                return Err(FailureCode::ProviderUnavailable);
+            }
+        }
+        Err(_) => {
+            if !typescript {
+                let settled = child.kill().await.is_ok() && child.wait().await.is_ok();
+                *reaped += u32::from(settled);
+            }
+            return Err(FailureCode::Deadline);
         }
     }
     operation

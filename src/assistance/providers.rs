@@ -21,6 +21,11 @@ use crate::{
             RustViewAdmission, RustViews, RustWorktree,
         },
         session::{DiagnosticSnapshot, GoEnv, ProviderSettings, SessionOptions, with_session},
+        typescript::{
+            ProjectResolutionInputsV1, TypeScriptProfile, TypeScriptProfileError,
+            TypeScriptProfiles, TypeScriptProtocolChild, TypeScriptViewAdmission,
+            TypeScriptWorktree,
+        },
     },
 };
 use std::path::Path;
@@ -114,6 +119,8 @@ pub(super) struct Providers {
     socket_generation: BTreeMap<String, u64>,
     /// Exclusive Rust generation and source bookkeeping.
     rust: RustViews,
+    /// Exclusive TypeScript generations and owner-lifetime exact-profile quarantine.
+    typescript: TypeScriptProfiles,
     /// Strictly increasing protocol/backend generation within this boot.
     generation: u64,
     /// Worktree/provider cache owners retained independently from actor bindings.
@@ -140,6 +147,7 @@ impl Providers {
             go_views: BTreeMap::new(),
             socket_generation: BTreeMap::new(),
             rust: RustViews::default(),
+            typescript: TypeScriptProfiles::default(),
             generation: 0,
             caches: BTreeMap::new(),
             binding_caches: BTreeMap::new(),
@@ -251,6 +259,7 @@ impl Worker<'_> {
                         &["cargo", "target", "tmp"][..]
                     }
                     AcceptedProviderSettings::PyrightDefaultsV1 => &["tmp"][..],
+                    AcceptedProviderSettings::TypeScriptDefaultsV1 => &["tmp"][..],
                 },
                 shared: false,
             });
@@ -380,6 +389,9 @@ impl Worker<'_> {
             Some("go") => AcceptedProviderSettings::GoplsDefaults,
             Some("rs") => AcceptedProviderSettings::RustCachePrimingDisabledV1,
             Some("py") | Some("pyi") => AcceptedProviderSettings::PyrightDefaultsV1,
+            Some("js") | Some("jsx") | Some("ts") | Some("tsx") => {
+                AcceptedProviderSettings::TypeScriptDefaultsV1
+            }
             _ => return Ok(None),
         };
         let Some(profile) = job
@@ -404,7 +416,188 @@ impl Worker<'_> {
                 .pyright_context(job, &profile, source, bytes, query)
                 .await
                 .map(Some),
+            AcceptedProviderSettings::TypeScriptDefaultsV1 => self
+                .typescript_context(job, &profile, source, bytes, query)
+                .await
+                .map(Some),
         }
+    }
+
+    /// Runs one release-pinned exclusive TypeScript session with strict normal/abnormal settlement.
+    async fn typescript_context(
+        &mut self,
+        job: &mut Job,
+        launch: &ProviderLaunch,
+        source: &SourceObservation,
+        bytes: &[u8],
+        query: ContextQuery,
+    ) -> Result<ProviderContext, FailureCode> {
+        if !launch.typescript_codex_accepted() {
+            return Err(FailureCode::ExecutionProfile);
+        }
+        let binding = job.invocation.binding_ref().clone();
+        let authority = self.authority(&binding).await?;
+        let cache_namespace =
+            self.provider_cache_namespace(&binding, &authority, launch, &launch.trust)?;
+        let bundle = launch
+            .typescript_bundle()
+            .map_err(|_| FailureCode::ExecutionProfile)?;
+        let resolution = ProjectResolutionInputsV1::new(
+            authority.worktree().clone(),
+            authority.worktree().worktree_path().join(source.path()),
+            &bundle,
+            vec![],
+        )
+        .map_err(|_| FailureCode::ProviderUnavailable)?;
+        let profile = TypeScriptProfile::new(
+            bundle,
+            resolution,
+            launch.trust.clone(),
+            Path::new(&cache_namespace).to_path_buf(),
+        )
+        .map_err(|_| FailureCode::ExecutionProfile)?;
+        let worktree = TypeScriptWorktree::new(
+            authority.worktree().clone(),
+            execution_authority(&authority)?,
+        )
+        .map_err(|_| FailureCode::WorkspaceAuthority)?;
+        let command = profile
+            .command(&worktree)
+            .map_err(|_| FailureCode::ExecutionProfile)?;
+        let node = launch.node.as_ref().ok_or(FailureCode::ExecutionProfile)?;
+        let request = self
+            .execution_request(job, &authority, command, node)
+            .await?;
+        let active = self.shared.active(&binding)?;
+        let view = {
+            let admission = self.admission.clone();
+            let mut admission = admission
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match self.providers.typescript.request(
+                &profile,
+                &worktree,
+                &mut self.providers.registry,
+                &mut admission,
+                owner(&binding)?,
+                AdmissionClass::Interactive,
+            ) {
+                TypeScriptViewAdmission::Granted(view) => view,
+                TypeScriptViewAdmission::Queued(ticket) => {
+                    self.providers
+                        .registry
+                        .cancel_pending(&mut admission, ticket);
+                    return Err(FailureCode::Capacity);
+                }
+                TypeScriptViewAdmission::Unavailable(TypeScriptProfileError::Quarantined) => {
+                    return Err(FailureCode::ProviderUnavailable);
+                }
+                _ => return Err(FailureCode::ProviderUnavailable),
+            }
+        };
+        let child = {
+            let admission = self.admission.clone();
+            let mut admission = admission
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            TypeScriptProtocolChild::spawn(
+                &request,
+                &profile,
+                &worktree,
+                &mut self.providers.registry,
+                &mut admission,
+                view.lease(),
+                Some(active),
+                &job.target.codex.path,
+                self.shared.launcher.limits.output_bytes,
+            )
+        };
+        let mut child = match child {
+            Ok(child) => child,
+            Err(TypeScriptProfileError::InvalidBundle) => {
+                self.providers.typescript.quarantine(&view);
+                return Err(FailureCode::ProviderUnavailable);
+            }
+            Err(error) => {
+                self.providers.typescript.quarantine(&view);
+                let _ = self
+                    .providers
+                    .typescript
+                    .release(view, &mut self.providers.registry);
+                if let TypeScriptProfileError::Process(error) = error {
+                    self.provider_spawn_failure(error, &binding);
+                }
+                return Err(FailureCode::ProviderUnavailable);
+            }
+        };
+        let mut outcome = {
+            let (input, output) = child.pipes();
+            let operation = session_operation(
+                input,
+                output,
+                source.clone(),
+                bytes.to_vec(),
+                query,
+                ViewGeneration {
+                    backend: view.generation(),
+                    configuration: 1,
+                    toolchain: 1,
+                    view: view.generation(),
+                },
+                ProviderSettings::TypeScript(profile),
+                remaining_options(job),
+            );
+            tokio::pin!(operation);
+            tokio::select! {result=&mut operation=>result,_=job.cancel.changed()=>Err(FailureCode::Cancelled)}
+        };
+        let reaped = if outcome.is_ok() {
+            match child.wait_for_exit(Duration::from_millis(500)).await {
+                Ok(status) => {
+                    if !status.success() {
+                        self.providers.typescript.quarantine(&view);
+                        outcome = Err(FailureCode::ProviderUnavailable);
+                    }
+                    child.finish_reap(status, Duration::from_millis(500)).await
+                }
+                Err(_) => {
+                    self.providers.typescript.quarantine(&view);
+                    outcome = Err(FailureCode::Deadline);
+                    child
+                        .terminate_abnormally(
+                            Duration::from_millis(100),
+                            Duration::from_millis(500),
+                        )
+                        .await
+                }
+            }
+        } else {
+            self.providers.typescript.quarantine(&view);
+            child
+                .terminate_abnormally(Duration::from_millis(100), Duration::from_millis(500))
+                .await
+        };
+        let reaped = match reaped {
+            Ok(reaped) => reaped,
+            Err(_) => {
+                self.uncertain.insert(binding);
+                return Err(FailureCode::Deadline);
+            }
+        };
+        let capability = self
+            .providers
+            .typescript
+            .release(view, &mut self.providers.registry)
+            .map_err(|_| FailureCode::Internal)?;
+        let admission = self.admission.clone();
+        let mut admission = admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.providers
+            .registry
+            .complete_reap(&mut admission, capability, reaped.proof)
+            .map_err(|_| FailureCode::Internal)?;
+        self.shared.active(&binding)?;
+        outcome
     }
 
     /// Starts one exclusive accepted Pyright session and settles it only after direct-child reap.
@@ -1292,6 +1485,7 @@ fn provider_cache_settings(settings: AcceptedProviderSettings) -> &'static str {
         AcceptedProviderSettings::GoplsDefaults => "gopls-defaults-v1",
         AcceptedProviderSettings::RustCachePrimingDisabledV1 => "rust-cache-priming-disabled-v1",
         AcceptedProviderSettings::PyrightDefaultsV1 => "pyright-defaults-v1",
+        AcceptedProviderSettings::TypeScriptDefaultsV1 => "typescript-defaults-v1",
     }
 }
 
@@ -1309,6 +1503,7 @@ fn effective_configuration(
         }
         AcceptedProviderSettings::RustCachePrimingDisabledV1 => "cache-priming-disabled-v1",
         AcceptedProviderSettings::PyrightDefaultsV1 => "pyright-defaults-v1",
+        AcceptedProviderSettings::TypeScriptDefaultsV1 => "typescript-defaults-v1",
     }
 }
 
@@ -1340,6 +1535,7 @@ fn effective_trust(launch: &ProviderLaunch, rights: &str) -> String {
         AcceptedProviderSettings::GoplsDefaults => format!("{}|{}", launch.trust, rights),
         AcceptedProviderSettings::RustCachePrimingDisabledV1 => launch.trust.clone(),
         AcceptedProviderSettings::PyrightDefaultsV1 => launch.trust.clone(),
+        AcceptedProviderSettings::TypeScriptDefaultsV1 => launch.trust.clone(),
     }
 }
 
@@ -1512,7 +1708,7 @@ async fn session_operation<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncW
                 session.wait_for_matching_diagnostics().await;
             }
             let diagnostics = session.diagnostics();
-            let _ = session.shutdown().await;
+            session.shutdown().await?;
             Ok(ProviderContext {
                 context,
                 diagnostics,
