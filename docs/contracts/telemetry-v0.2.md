@@ -4,7 +4,7 @@ Revision: TELEMETRY-r1 (proposed; no implementation claim). Provider: Telemetry.
 
 ## Closed local event boundary
 
-Telemetry records a closed, privacy-safe set of typed local events for the six public MCP methods and native fallback observations. An event contains only its schema tag, outcome/fallback reason, bounded duration, provider/language/profile revision, cache/diagnostic state, bounded output-size class, and existing measured resource facts. Measured facts are values already produced by Execution or the provider (for example elapsed time, peak resident bytes, or child CPU time); Telemetry neither samples processes nor invents measurements.
+Telemetry records a closed, privacy-safe set of typed local events for the six public MCP methods and native fallback observations. An event contains only its schema tag, outcome/fallback reason, bounded duration, provider/language/profile revision, cache/diagnostic state, bounded output-size class, and existing measured resource facts. Measured facts are limited to values current Execution or provider paths already produce: elapsed duration, bounded output byte counts and truncation, admission and cancellation state, and descendant-settlement categories. Telemetry neither samples processes nor invents measurements.
 
 An event never contains source or other content, paths, prompts, credentials, arguments, commands, stdout, stderr, diagnostic messages, free-form error text, private attachments, or identifiers that can encode those values. Unknown tags, fields, or enum values are rejected before ingestion. Callers supply typed values, never JSON blobs. Telemetry does not infer semantics from Application rows.
 

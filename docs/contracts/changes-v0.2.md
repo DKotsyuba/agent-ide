@@ -1,6 +1,6 @@
 # Changes v0.2 edit contract
 
-Revision: EDIT-r1 (proposed; extends [Changes v0.1](changes-v0.1.md)). Provider: Changes. Direct consumers: Assistance and Workspace. Vocabulary: [common](common.md).
+Revision: EDIT-r1 (proposed; extends [Changes v0.1](changes-v0.1.md)). Provider: Changes. Direct consumer: Assistance. Changes consumes the Workspace mutation boundary and Application persistence mechanics. Vocabulary: [common](common.md).
 
 ## Canonical request and durable settlement
 
