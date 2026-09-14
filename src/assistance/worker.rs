@@ -835,6 +835,8 @@ impl WorkerHandle {
         parameters: Value,
         attachment: &str,
     ) -> PeerReply {
+        let cleanup_invocation = invocation.clone();
+        let cleanup_parameters = parameters.clone();
         let (send, wait) = oneshot::channel();
         if let Err(code) = self.enqueue(
             invocation,
@@ -854,9 +856,17 @@ impl WorkerHandle {
         .await
         {
             Ok(Ok(reply)) => reply,
-            _ => PeerReply::Error {
-                code: FailureCode::Deadline,
-            },
+            _ => {
+                // The prepare job remains ordered before this terminal job, so a timed-out caller
+                // cannot strand a durable prepared receipt or consume Claude ticket capacity.
+                self.complete_claude_edit_terminal(
+                    cleanup_invocation,
+                    cleanup_parameters,
+                    attachment,
+                    ChangesEditOutcome::DeadlineNoEffect,
+                )
+                .await
+            }
         }
     }
 
@@ -1302,6 +1312,10 @@ impl<'a> Worker<'a> {
             .unwrap_or(0);
         let result = if job.tool == AssistanceTool::Stop {
             self.revoke(&binding, &job.reference).await
+        } else if matches!(job.input, JobInput::ClaudeEditTerminal(_)) {
+            // A terminal receipt cleanup is safe after stop: it dispatches no helper or target
+            // write and must not be blocked by the binding cancellation that triggered cleanup.
+            self.settle_claude_edit_terminal(&mut job).await
         } else if *job.cancel.borrow() || self.shared.active(&binding).is_err() {
             Err(FailureCode::Cancelled)
         } else if tokio::time::Instant::now() >= job.deadline {
@@ -1329,11 +1343,6 @@ impl<'a> Worker<'a> {
                     }
                     AssistanceTool::Edit if matches!(job.input, JobInput::Claude(_)) => {
                         self.edit_claude(&mut job).await
-                    }
-                    AssistanceTool::Edit
-                        if matches!(job.input, JobInput::ClaudeEditTerminal(_)) =>
-                    {
-                        self.settle_claude_edit_terminal(&mut job).await
                     }
                     AssistanceTool::Start => self.activate(&mut job).await,
                     AssistanceTool::Context => self.context(&mut job).await,
@@ -2416,28 +2425,30 @@ impl<'a> Worker<'a> {
                 ));
             }
         };
-        let source = {
-            let ledger = self
-                .shared
-                .ledger
-                .lock()
-                .map_err(|_| FailureCode::Internal)?;
+        let source = self.shared.ledger.lock().ok().and_then(|ledger| {
             ledger
                 .details
                 .get(&request.source_ref)
                 .filter(|detail| {
                     detail.binding == binding
-                        && detail.selection.0 == AssistanceTool::Context
                         && matches!(
-                            detail.reply,
+                            detail.selection.0,
+                            AssistanceTool::Context | AssistanceTool::Edit
+                        )
+                        && match &detail.reply {
                             PeerReply::Complete {
                                 kind: ResultKind::Context,
                                 ..
+                            } => true,
+                            PeerReply::Edit { result } => {
+                                result.source_ref.as_deref() == Some(request.source_ref.as_str())
+                                    && result.outcome.has_post_source()
                             }
-                        )
+                            _ => false,
+                        }
                 })
                 .and_then(|detail| detail.source.clone())
-        };
+        });
         let Some(source) = source.filter(|source| source.path().to_str() == Some(&request.path))
         else {
             return self
@@ -2450,7 +2461,20 @@ impl<'a> Worker<'a> {
                 )
                 .await;
         };
-        let authority = self.authority(&binding).await?;
+        let authority = match self.authority(&binding).await {
+            Ok(authority) => authority,
+            Err(_) => {
+                return self
+                    .settle_edit(
+                        prepared,
+                        &request,
+                        crate::workspace::edit::EditOutcome::CancelledNoEffect,
+                        None,
+                        None,
+                    )
+                    .await;
+            }
+        };
         let edit_source = match crate::workspace::edit::EditSourceRef::from_observation(&source) {
             Ok(source) => source,
             Err(outcome) => {
@@ -2459,7 +2483,20 @@ impl<'a> Worker<'a> {
                     .await;
             }
         };
-        let active = self.shared.active(&binding)?;
+        let active = match self.shared.active(&binding) {
+            Ok(active) => active,
+            Err(_) => {
+                return self
+                    .settle_edit(
+                        prepared,
+                        &request,
+                        crate::workspace::edit::EditOutcome::CancelledNoEffect,
+                        Some(authority),
+                        None,
+                    )
+                    .await;
+            }
+        };
         let (permit, target) = match self
             .workspace
             .prepare_edit(
@@ -2483,18 +2520,22 @@ impl<'a> Worker<'a> {
         } else if tokio::time::Instant::now() >= job.deadline {
             crate::workspace::edit::EditOutcome::DeadlineNoEffect
         } else {
-            let active = self.shared.active(&binding)?;
-            self.workspace
-                .replace_edit(
-                    &authority,
-                    &active,
-                    permit,
-                    target,
-                    &edit_source,
-                    request.content.as_bytes(),
-                    || true,
-                )
-                .await
+            match self.shared.active(&binding) {
+                Ok(active) => {
+                    self.workspace
+                        .replace_edit(
+                            &authority,
+                            &active,
+                            permit,
+                            target,
+                            &edit_source,
+                            request.content.as_bytes(),
+                            || !*job.cancel.borrow() && tokio::time::Instant::now() < job.deadline,
+                        )
+                        .await
+                }
+                Err(_) => crate::workspace::edit::EditOutcome::CancelledNoEffect,
+            }
         };
         let unchanged = matches!(outcome, crate::workspace::edit::EditOutcome::Unchanged(_));
         let known = matches!(
@@ -2503,12 +2544,12 @@ impl<'a> Worker<'a> {
                 | crate::workspace::edit::EditOutcome::Replaced(_)
                 | crate::workspace::edit::EditOutcome::Unchanged(_)
         );
-        let refreshed = if known {
+        let refreshed = if known && job.observed.is_some() {
             match self
                 .observe(
                     &binding,
                     request.path.clone().into(),
-                    job.observed.as_ref().ok_or(FailureCode::SandboxState)?,
+                    job.observed.as_ref().expect("checked present"),
                     &job.target,
                 )
                 .await
@@ -2534,17 +2575,7 @@ impl<'a> Worker<'a> {
             .map(|_| job.reference.clone())
             .or_else(|| unchanged.then(|| request.source_ref.clone()));
         let result = EditResult::from_workspace(&request, outcome, |_| post_reference);
-        let result = self
-            .edits
-            .settle(prepared, result)
-            .await
-            .unwrap_or_else(|_| EditResult {
-                operation_id: request.operation_id.clone(),
-                path: request.path.clone(),
-                outcome: ChangesEditOutcome::OutcomeUnknown,
-                source_ref: None,
-            });
-        self.shared.active(&binding)?;
+        let result = self.settle_prepared_edit(prepared, &request, result).await;
         Ok((PeerReply::Edit { result }, Some(authority), refreshed))
     }
 
@@ -2558,17 +2589,33 @@ impl<'a> Worker<'a> {
         source: Option<SourceObservation>,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
         let result = EditResult::from_workspace(request, outcome, |_| None);
-        let result = self
-            .edits
-            .settle(prepared, result)
-            .await
-            .unwrap_or_else(|_| EditResult {
-                operation_id: request.operation_id.clone(),
-                path: request.path.clone(),
-                outcome: ChangesEditOutcome::OutcomeUnknown,
-                source_ref: None,
-            });
+        let result = self.settle_prepared_edit(prepared, request, result).await;
         Ok((PeerReply::Edit { result }, authority, source))
+    }
+
+    /// Settles a consumed receipt and reconciles ambiguity without discarding an already durable result.
+    async fn settle_prepared_edit(
+        &self,
+        prepared: crate::changes::edit::PreparedEdit,
+        request: &EditRequest,
+        result: EditResult,
+    ) -> EditResult {
+        match self.edits.settle(prepared, result).await {
+            Ok(result) => result,
+            Err(_) => match self.edits.prepare(request.clone()).await {
+                Ok(
+                    PrepareAdmission::Settled(result)
+                    | PrepareAdmission::ConflictingDuplicate(result)
+                    | PrepareAdmission::OutcomeUnknown(result),
+                ) => result,
+                _ => EditResult {
+                    operation_id: request.operation_id.clone(),
+                    path: request.path.clone(),
+                    outcome: ChangesEditOutcome::OutcomeUnknown,
+                    source_ref: None,
+                },
+            },
+        }
     }
 
     /// Settles one stop by positively closing this binding's providers first and only then durably
@@ -3461,7 +3508,7 @@ mod stop_retry_tests {
             stop_reply: None,
             native_epoch: 0,
         };
-        let (reply, _, source) = worker.edit(&mut edit_job).await.unwrap();
+        let (reply, authority, source) = worker.edit(&mut edit_job).await.unwrap();
         assert!(matches!(
             reply,
             PeerReply::Edit {
@@ -3477,10 +3524,47 @@ mod stop_retry_tests {
             b"fn new() {}\n"
         );
         assert_eq!(
-            source.unwrap().bytes(),
+            source.as_ref().unwrap().bytes(),
             Some(&crate::workspace::observation::SourceBytes::from_bytes(
                 b"fn new() {}\n"
             ))
+        );
+
+        // A successful Edit is itself a usable post-read source detail for the next Edit.
+        worker.shared.ledger.lock().unwrap().details.insert(
+            edit_job.reference.clone(),
+            Detail {
+                binding: binding.clone(),
+                reply: reply.clone(),
+                selection: (AssistanceTool::Edit, selection(&edit_job.parameters)),
+                authority,
+                source,
+                native_epoch: 0,
+                diff_page: None,
+                diff_page_fresh: false,
+            },
+        );
+        edit_job.reference = "edit-result-2".into();
+        edit_job.parameters = serde_json::json!({
+            "operation_id":"operation-2",
+            "path":"main.rs",
+            "source_ref":"edit-result",
+            "content":"fn newest() {}\n"
+        });
+        let (reply, _, _) = worker.edit(&mut edit_job).await.unwrap();
+        assert!(matches!(
+            reply,
+            PeerReply::Edit {
+                result: EditResult {
+                    outcome: ChangesEditOutcome::Replaced,
+                    source_ref: Some(ref source_ref),
+                    ..
+                }
+            } if source_ref == "edit-result-2"
+        ));
+        assert_eq!(
+            std::fs::read(fixture.root.join("main.rs")).unwrap(),
+            b"fn newest() {}\n"
         );
 
         edit_job.parameters["content"] = serde_json::json!("fn conflicting() {}\n");
@@ -3496,7 +3580,7 @@ mod stop_retry_tests {
         ));
         assert_eq!(
             std::fs::read(fixture.root.join("main.rs")).unwrap(),
-            b"fn new() {}\n"
+            b"fn newest() {}\n"
         );
     }
 

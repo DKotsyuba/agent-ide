@@ -363,20 +363,42 @@ pub enum EditOutcome {
 /// `unsafe_target`; any failure after rename is `outcome_unknown(operation_id, path)`.
 pub fn replace_if_current(
     permit: EditPermit,
+    target: CurrentEditTarget,
+    source_ref: &EditSourceRef,
+    content: &[u8],
+    still_authorized: impl FnOnce() -> bool,
+    continue_before_effect: impl FnOnce() -> bool,
+) -> EditOutcome {
+    replace_if_current_with_checkpoint(
+        permit,
+        target,
+        source_ref,
+        content,
+        still_authorized,
+        continue_before_effect,
+        || {},
+    )
+}
+
+/// Applies one replacement and runs `after_prepare` only after private temporary bytes are durable.
+///
+/// Production uses [`replace_if_current`]'s no-op checkpoint. The test-only observable checkpoint
+/// proves a native edit during preparation is rejected by the final identity check. Cancellation is
+/// checked immediately before installation, so private preparation cannot overwrite a target.
+fn replace_if_current_with_checkpoint(
+    permit: EditPermit,
     mut target: CurrentEditTarget,
     source_ref: &EditSourceRef,
     content: &[u8],
     still_authorized: impl FnOnce() -> bool,
     continue_before_effect: impl FnOnce() -> bool,
+    after_prepare: impl FnOnce(),
 ) -> EditOutcome {
     if permit.path != target.path || source_ref != &target.source_ref || !still_authorized() {
         return EditOutcome::StaleSource;
     }
     if content.len() > MAX_EDIT_CONTENT_BYTES || std::str::from_utf8(content).is_err() {
         return EditOutcome::UnsafeTarget;
-    }
-    if !continue_before_effect() {
-        return EditOutcome::CancelledNoEffect;
     }
     if recheck_target(&mut target).is_err() {
         return EditOutcome::StaleSource;
@@ -389,7 +411,7 @@ pub fn replace_if_current(
         return post_read(&target).map_or(EditOutcome::StaleSource, EditOutcome::Unchanged);
     }
     let created = target.file.is_none();
-    match write_replacement(&target, content) {
+    match write_replacement(&mut target, content, continue_before_effect, after_prepare) {
         Ok(()) => match post_read(&target) {
             Ok(read) if created => EditOutcome::Created(read),
             Ok(read) => EditOutcome::Replaced(read),
@@ -399,6 +421,8 @@ pub fn replace_if_current(
             },
         },
         Err(WriteFailure::BeforeEffect) => EditOutcome::UnsafeTarget,
+        Err(WriteFailure::StaleSource) => EditOutcome::StaleSource,
+        Err(WriteFailure::CancelledNoEffect) => EditOutcome::CancelledNoEffect,
         Err(WriteFailure::AfterPossibleEffect) => EditOutcome::OutcomeUnknown {
             operation_id: permit.operation_id,
             path: target.path,
@@ -675,12 +699,21 @@ fn descriptor_equals(file: &mut File, content: &[u8]) -> bool {
 enum WriteFailure {
     /// The target name was not affected.
     BeforeEffect,
+    /// The target changed after private preparation but before confined installation.
+    StaleSource,
+    /// Cancellation was observed after private preparation but before any target effect.
+    CancelledNoEffect,
     /// Rename may have taken effect and exact completion was lost.
     AfterPossibleEffect,
 }
 
 /// Writes, syncs and metadata-prepares one private temp, then renames it through the retained parent.
-fn write_replacement(target: &CurrentEditTarget, content: &[u8]) -> Result<(), WriteFailure> {
+fn write_replacement(
+    target: &mut CurrentEditTarget,
+    content: &[u8],
+    continue_before_effect: impl FnOnce() -> bool,
+    after_prepare: impl FnOnce(),
+) -> Result<(), WriteFailure> {
     let mut nonce = [0u8; 16];
     File::open("/dev/urandom")
         .and_then(|mut random| random.read_exact(&mut nonce))
@@ -726,6 +759,17 @@ fn write_replacement(target: &CurrentEditTarget, content: &[u8]) -> Result<(), W
     if before.is_err() {
         unlink_temp(target.parent.as_raw_fd(), &temp);
         return Err(WriteFailure::BeforeEffect);
+    }
+    // Private bytes are durable but not installed. This is the last safe point to reject a
+    // native write that raced preparation, immediately before the confined replacement.
+    after_prepare();
+    if !continue_before_effect() {
+        unlink_temp(target.parent.as_raw_fd(), &temp);
+        return Err(WriteFailure::CancelledNoEffect);
+    }
+    if recheck_target(target).is_err() {
+        unlink_temp(target.parent.as_raw_fd(), &temp);
+        return Err(WriteFailure::StaleSource);
     }
     let final_name = nul_name(&target.name);
     // SAFETY: both names are live/NUL-terminated and share the retained parent descriptor.
@@ -972,6 +1016,31 @@ mod tests {
             Err(EditOutcome::UnsafeTarget)
         ));
         assert_eq!(fs::read(root.join("moved.rs")).expect("read"), b"native");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Proves a native write after temporary fsync but before installation is never overwritten.
+    #[test]
+    fn final_recheck_rejects_native_write_during_private_preparation() {
+        let root = temporary("final-recheck");
+        let path = PathBuf::from("a.rs");
+        fs::write(root.join(&path), "old").expect("seed");
+        let authority = authority(&root);
+        let source = source_ref(&authority, &path, Some(b"old"));
+        let target = CurrentEditTarget::resolve(&authority, &path, source.clone()).expect("target");
+        assert_eq!(
+            replace_if_current_with_checkpoint(
+                EditPermit::new("race-after-fsync", path.clone()).expect("permit"),
+                target,
+                &source,
+                b"model",
+                || true,
+                || true,
+                || fs::write(root.join(&path), "native").expect("native write"),
+            ),
+            EditOutcome::StaleSource
+        );
+        assert_eq!(fs::read(root.join(&path)).expect("read"), b"native");
         fs::remove_dir_all(root).expect("cleanup");
     }
 }

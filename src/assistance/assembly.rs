@@ -371,14 +371,20 @@ impl ProductDispatcher {
                         reason: MissingPeer::WorkspaceActivation,
                     };
                 };
-                worker
+                let reply = worker
                     .complete_claude_edit_terminal(
                         invocation.clone(),
                         job.parameters.clone(),
                         attachment,
                         crate::changes::edit::EditOutcome::DeadlineNoEffect,
                     )
-                    .await
+                    .await;
+                if matches!(reply, PeerReply::Edit { .. })
+                    && let Ok(mut launches) = self.launches.lock()
+                {
+                    launches.retire_no_effect_edit(detail_ref, owner);
+                }
+                reply
             }
             Delivery::OutcomeUnknown(job) => {
                 let Some(worker) = &self.worker else {
@@ -734,10 +740,33 @@ impl ProductDispatcher {
                         // Stop revokes the ledger first, so a helper that has not yet claimed can
                         // never claim afterwards, then reuses the ordinary revocation path.
                         AssistanceMethod::Stop => {
-                            if let Ok(mut launches) = self.launches.lock() {
-                                launches.revoke(invocation.binding_ref().fingerprint());
+                            let owner = invocation.binding_ref().fingerprint();
+                            let terminals = self
+                                .launches
+                                .lock()
+                                .map(|mut launches| launches.revoke(owner))
+                                .unwrap_or_default();
+                            let reply = worker
+                                .stop(invocation.clone(), method.opaque_attachment())
+                                .await;
+                            for (detail_ref, job, outcome) in terminals {
+                                let terminal = worker
+                                    .complete_claude_edit_terminal(
+                                        invocation.clone(),
+                                        job.parameters,
+                                        method.opaque_attachment(),
+                                        outcome,
+                                    )
+                                    .await;
+                                if matches!(terminal, PeerReply::Edit { .. })
+                                    && outcome
+                                        == crate::changes::edit::EditOutcome::DeadlineNoEffect
+                                    && let Ok(mut launches) = self.launches.lock()
+                                {
+                                    launches.retire_no_effect_edit(&detail_ref, owner);
+                                }
                             }
-                            worker.stop(invocation, method.opaque_attachment()).await
+                            reply
                         }
                         // Context/Diff preserve the shared facade's optional detail retrieval:
                         // the handle names already-settled work and never starts another helper.

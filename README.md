@@ -92,9 +92,10 @@ Version 0.1.3 makes captured managed sandbox profiles portable across equivalent
 worktrees without changing raw execution state or the original five v0.1 methods. It also
 includes the offline installation helpers `agent-ide evidence executable`,
 `agent-ide evidence record`, and `agent-ide launcher check`. The bundled
-`skills/agent-ide` workflow directs coding
-agents through start, context, native editing, refreshed context, diff, and stop;
-unavailable IDE support falls back to native host tools.
+`skills/agent-ide` workflow directs coding agents through start, context, the
+supported `ide.edit` path when offered, refreshed context, diff, and stop.
+Native host editing remains available when `ide.edit` is inactive, unavailable,
+unsupported, declined, or uncertain.
 
 - [Current delivery roadmap](docs/roadmap.md)
 
