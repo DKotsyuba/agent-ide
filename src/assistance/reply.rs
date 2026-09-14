@@ -14,7 +14,7 @@ pub const MAX_FEEDBACK_BYTES: usize = 4 * 1024;
 /// exact command would not fit is refused rather than answered with an unusable partial command.
 pub const MAX_HELPER_INSTRUCTION_BYTES: usize = 8 * 1024;
 /// Leaves room for fixed MCP content and protocol wrapper fields.
-const MCP_RESERVE: usize = 1024;
+pub(crate) const MCP_RESERVE: usize = 1024;
 
 /// First missing peer without implying workspace authority was granted.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
