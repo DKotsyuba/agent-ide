@@ -3039,9 +3039,11 @@ impl<'a> Worker<'a> {
         let result = self
             .settle_prepared_edit(prepared, &request, expected.clone())
             .await;
-        let diagnostics = (result == expected && result.outcome.has_post_source())
-            .then_some(diagnostics)
-            .unwrap_or(EditDiagnostics::Unknown {});
+        let diagnostics = if result == expected && result.outcome.has_post_source() {
+            diagnostics
+        } else {
+            EditDiagnostics::Unknown {}
+        };
         let source = (result.outcome.has_post_source())
             .then_some(refreshed)
             .flatten();
@@ -3369,7 +3371,7 @@ impl<'a> Worker<'a> {
             .edits
             .settle(prepared.receipt, expected.clone())
             .await
-            .unwrap_or_else(|_| EditResult {
+            .unwrap_or(EditResult {
                 operation_id: request.operation_id,
                 path: request.path,
                 outcome: ChangesEditOutcome::OutcomeUnknown,
@@ -3381,9 +3383,11 @@ impl<'a> Worker<'a> {
             self.authority(&binding).await.ok()
         };
         let diagnostics =
-            (result == expected && result.outcome.has_post_source() && observed.is_some())
-                .then_some(diagnostics)
-                .unwrap_or(EditDiagnostics::Unknown {});
+            if result == expected && result.outcome.has_post_source() && observed.is_some() {
+                diagnostics
+            } else {
+                EditDiagnostics::Unknown {}
+            };
         let observed = result
             .outcome
             .has_post_source()
@@ -3471,7 +3475,7 @@ impl<'a> Worker<'a> {
             .edits
             .settle(prepared.receipt, result)
             .await
-            .unwrap_or_else(|_| EditResult {
+            .unwrap_or(EditResult {
                 operation_id: request.operation_id,
                 path: request.path,
                 outcome: ChangesEditOutcome::OutcomeUnknown,

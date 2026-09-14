@@ -564,10 +564,10 @@ fn unknown(request: &EditRequest) -> EditResult {
 
 /// Namespaces Application mechanics operations while retaining only a fixed-size request hash.
 fn mechanics_operation(kind: &str, operation_id: &str) -> Result<OperationId, StoreError> {
-    Ok(OperationId::new(format!(
+    OperationId::new(format!(
         "changes-edit-{kind}-{}",
         blake3::hash(operation_id.as_bytes()).to_hex()
-    ))?)
+    ))
 }
 
 /// Validates the contract's portable relative UTF-8 path without normalizing it.
@@ -651,7 +651,6 @@ mod tests {
                 .expect("settle"),
             settled
         );
-        drop(receipts);
         drop(store);
 
         let reopened = Store::open(&path, config()).expect("reopen");
@@ -669,7 +668,6 @@ mod tests {
             PrepareAdmission::ConflictingDuplicate(result)
                 if result.outcome == EditOutcome::ConflictingDuplicate
         ));
-        drop(receipts);
         drop(reopened);
         let _ = fs::remove_file(path);
     }
@@ -688,7 +686,6 @@ mod tests {
                 .expect("prepare"),
             PrepareAdmission::Prepared(_)
         ));
-        drop(receipts);
         drop(store);
         let reopened = Store::open(&path, config()).expect("reopen");
         let receipts = EditReceiptStore::new(&reopened);
@@ -699,7 +696,6 @@ mod tests {
                 if result.outcome == EditOutcome::OutcomeUnknown
                     && result.effects().is_none()
         ));
-        drop(receipts);
         drop(reopened);
         let _ = fs::remove_file(path);
     }

@@ -250,12 +250,10 @@ pub async fn run(runtime_dir: &Path, attachment: Option<String>, host_kind: Host
     .await
     .ok()
     .flatten();
-    if matches!(hook, Some((_, HookIngressOutcome::Unavailable)))
-        || (hook.is_none() && valid_boundary.load(Ordering::Acquire))
-    {
-        if let Some(attachment) = fallback_attachment.as_deref() {
-            let _ = report_native_fallback(runtime_dir, attachment);
-        }
+    let unavailable = matches!(hook, Some((_, HookIngressOutcome::Unavailable)))
+        || (hook.is_none() && valid_boundary.load(Ordering::Acquire));
+    if unavailable && let Some(attachment) = fallback_attachment.as_deref() {
+        let _ = report_native_fallback(runtime_dir, attachment);
     }
     if let Some((event, HookIngressOutcome::Feedback(text))) = hook
         && let Some(output) = render_hook_context(&event, &text)

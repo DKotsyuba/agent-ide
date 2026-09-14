@@ -504,9 +504,15 @@ fn safe_metadata(file: &File) -> Result<EditMetadata, EditOutcome> {
     })
 }
 
+/// Ordered descriptor xattr name/value bytes preserved across one safe replacement.
+///
+/// Names exclude their terminating NUL; values retain their complete opaque bytes. An empty vector
+/// means the descriptor has no extended attributes, not that observation was unavailable.
+type ExtendedMetadata = Vec<(Vec<u8>, Vec<u8>)>;
+
 /// Reads all descriptor xattrs so replacement can preserve them or refuse before rename.
 #[cfg(target_os = "macos")]
-fn extended_metadata(file: &File) -> Result<Vec<(Vec<u8>, Vec<u8>)>, EditOutcome> {
+fn extended_metadata(file: &File) -> Result<ExtendedMetadata, EditOutcome> {
     // SAFETY: null buffer with zero size asks only for the required list length.
     let result = unsafe { libc::flistxattr(file.as_raw_fd(), std::ptr::null_mut(), 0, 0) };
     if result < 0 {
@@ -525,7 +531,7 @@ fn extended_metadata(file: &File) -> Result<Vec<(Vec<u8>, Vec<u8>)>, EditOutcome
 
 /// Reads all descriptor xattrs so replacement can preserve them or refuse before rename.
 #[cfg(not(target_os = "macos"))]
-fn extended_metadata(file: &File) -> Result<Vec<(Vec<u8>, Vec<u8>)>, EditOutcome> {
+fn extended_metadata(file: &File) -> Result<ExtendedMetadata, EditOutcome> {
     // SAFETY: null buffer with zero size asks only for the required list length.
     let result = unsafe { libc::flistxattr(file.as_raw_fd(), std::ptr::null_mut(), 0) };
     if result < 0 {
@@ -543,7 +549,7 @@ fn extended_metadata(file: &File) -> Result<Vec<(Vec<u8>, Vec<u8>)>, EditOutcome
 }
 
 /// Reads every NUL-separated xattr value from one already-open descriptor.
-fn read_extended_values(file: &File, names: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, EditOutcome> {
+fn read_extended_values(file: &File, names: &[u8]) -> Result<ExtendedMetadata, EditOutcome> {
     let mut values = Vec::new();
     for name in names
         .split(|byte| *byte == 0)

@@ -994,7 +994,7 @@ impl HostBindingGuard {
     /// Closes external admission while retaining only exact cleanup authority for this generation.
     ///
     /// After this transition, ordinary validation, helper claims and active consumes fail. The
-    /// caller may use [`Self::consume_stopping`] solely to settle already-ready Edit evidence before
+    /// caller may use `consume_stopping` solely to settle already-ready Edit evidence before
     /// [`Self::stop_binding`] removes the generation permanently. Repeated or stale transitions are
     /// rejected and no new generation is created.
     pub fn begin_stop(&mut self, binding: &BindingRef) -> Result<(), BindingUnavailable> {

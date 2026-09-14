@@ -741,8 +741,7 @@ async fn edit(
         );
         if let (Ok(observation), Some(diagnostic_deadline)) =
             (observation, edit_diagnostic_deadline(deadline))
-        {
-            if let Ok(Some((context, Some(snapshot)))) = provider_context(
+            && let Ok(Some((context, Some(snapshot)))) = provider_context(
                 job,
                 diagnostic_deadline,
                 &observation,
@@ -752,9 +751,8 @@ async fn edit(
                 reaped,
             )
             .await
-            {
-                diagnostics = EditDiagnostics::from_snapshot(&context, &snapshot);
-            }
+        {
+            diagnostics = EditDiagnostics::from_snapshot(&context, &snapshot);
         }
     }
     let source = post.map(|read| HelperSource {
