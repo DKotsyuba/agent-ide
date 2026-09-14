@@ -42,3 +42,13 @@ These observations establish normal-shutdown conformance for this exact release
 cell. They neither prove arbitrary descendant settlement at runtime nor claim that
 a process group contains every descendant. Claude requires its own real macOS
 foreground-helper record before this bundle may be enabled for Claude.
+
+## Shipping product fixture
+
+The shipping MCP and daemon then loaded the same accepted bundle through the fourth
+`typescript_defaults_v1` launcher profile. Real `.js`, `.jsx`, `.ts`, and `.tsx`
+files each returned semantic definitions and references through separate exclusive
+one-shot sessions. Every operation completed the strict graceful session result
+before the direct bridge child was released. This covers the TypeScript Context and
+normal-shutdown subset only; it does not complete the broader v0.2 edit, telemetry,
+fallback, or multi-worktree acceptance matrix.
