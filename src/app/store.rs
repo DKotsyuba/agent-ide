@@ -10,7 +10,8 @@ use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::thread;
 
 use rusqlite::{
-    Connection, ErrorCode, MAIN_DB, OptionalExtension, Transaction, TransactionBehavior, params,
+    Connection, ErrorCode, MAIN_DB, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+    params,
 };
 use tokio::sync::oneshot;
 
@@ -317,7 +318,16 @@ impl Store {
     /// interrupted `Queued`/`Started` receipts to `OutcomeUnknown`. It creates only Application
     /// operation and migration ledgers, never a domain table or external-work inference.
     pub fn open(database_path: &Path, config: StoreConfig) -> Result<Self, StoreError> {
-        Self::open_inner(database_path, None, config)
+        Self::open_inner(database_path, None, config, false)
+    }
+
+    /// Opens an existing database on a dedicated read-only owner without creating ledgers or files.
+    ///
+    /// This variant is for fixed trusted export/query paths only. SQLite refuses every write,
+    /// including WAL or migration setup, so a missing, locked, or non-readable database returns
+    /// the existing infrastructure failure rather than being created or repaired.
+    pub fn open_read_only(database_path: &Path, config: StoreConfig) -> Result<Self, StoreError> {
+        Self::open_inner(database_path, None, config, true)
     }
 
     /// Opens a Store that may create durable SQLite backups before nonfresh migration upgrades.
@@ -332,7 +342,7 @@ impl Store {
         config: StoreConfig,
     ) -> Result<Self, StoreError> {
         let backup_root = prepare_backup_root(backup_root)?;
-        Self::open_inner(database_path, Some(backup_root), config)
+        Self::open_inner(database_path, Some(backup_root), config, false)
     }
 
     /// Starts the owner thread after all public Store construction variants have validated inputs.
@@ -340,6 +350,7 @@ impl Store {
         database_path: &Path,
         backup_root: Option<PathBuf>,
         config: StoreConfig,
+        read_only: bool,
     ) -> Result<Self, StoreError> {
         validate_store_config(config)?;
         let (sender, receiver) = mpsc::sync_channel(config.queue_capacity);
@@ -347,7 +358,16 @@ impl Store {
         let database_path = database_path.to_path_buf();
         thread::Builder::new()
             .name("agent-ide-sqlite".to_owned())
-            .spawn(move || owner_thread(database_path, backup_root, config, receiver, ready_sender))
+            .spawn(move || {
+                owner_thread(
+                    database_path,
+                    backup_root,
+                    config,
+                    read_only,
+                    receiver,
+                    ready_sender,
+                )
+            })
             .map_err(|error| StoreError::Infrastructure(error.to_string()))?;
         ready_receiver
             .recv()
@@ -846,10 +866,11 @@ fn owner_thread(
     database_path: std::path::PathBuf,
     backup_root: Option<PathBuf>,
     config: StoreConfig,
+    read_only: bool,
     receiver: mpsc::Receiver<StoreMessage>,
     ready_sender: SyncSender<Result<(), StoreError>>,
 ) {
-    let mut connection = match open_connection(&database_path, config) {
+    let mut connection = match open_connection(&database_path, config, read_only) {
         Ok(connection) => {
             let _ = ready_sender.send(Ok(()));
             connection
@@ -887,11 +908,23 @@ fn owner_thread(
 }
 
 /// Opens bundled SQLite and initializes bounded, durable Application operation and migration ledgers.
-fn open_connection(database_path: &Path, config: StoreConfig) -> Result<Connection, StoreError> {
-    let connection = Connection::open(database_path).map_err(infrastructure)?;
+fn open_connection(
+    database_path: &Path,
+    config: StoreConfig,
+    read_only: bool,
+) -> Result<Connection, StoreError> {
+    let connection = if read_only {
+        Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+    } else {
+        Connection::open(database_path)
+    }
+    .map_err(infrastructure)?;
     connection
         .busy_timeout(config.busy_timeout)
         .map_err(infrastructure)?;
+    if read_only {
+        return Ok(connection);
+    }
     connection
         .execute_batch(
             "PRAGMA journal_mode = WAL;

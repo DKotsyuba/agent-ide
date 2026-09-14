@@ -21,7 +21,7 @@ use crate::app::transport::{
     AssistanceDispatch, AssistanceDispatchReply, AssistanceDispatchUnavailable,
     AssistanceDispatcher, AssistanceMethod,
 };
-use crate::telemetry::{CacheState, DiagnosticState, Telemetry, adapters};
+use crate::telemetry::{CacheState, DiagnosticState, adapters};
 use serde_json::{Value, json};
 use std::{
     future::Future,
@@ -58,8 +58,6 @@ pub struct ProductDispatcher {
     admission: Arc<Mutex<crate::execution::AdmissionController>>,
     /// Enables direct trusted Codex metadata binding only for an owned managed-MCP daemon.
     managed_codex: bool,
-    /// Optional local-only sink; absent owners preserve every pre-telemetry dispatch behaviour.
-    telemetry: Option<Telemetry>,
 }
 
 /// Returns a monotonic millisecond reading for ticket deadlines.
@@ -104,23 +102,10 @@ impl Default for ProductDispatcher {
             runtime_dir: Arc::new(Mutex::new(None)),
             endpoint: Mutex::new(None),
             managed_codex: false,
-            telemetry: None,
         }
     }
 }
 impl ProductDispatcher {
-    /// Attaches one already-open local telemetry owner without changing dispatch authority or limits.
-    ///
-    /// The supplied owner is used only after a closed reply exists. If its bounded ingress or
-    /// durable writer is unavailable, the reply remains unchanged and telemetry drops that event.
-    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
-        if let Some(worker) = &mut self.worker {
-            worker.with_telemetry(telemetry.clone());
-        }
-        self.telemetry = Some(telemetry);
-        self
-    }
-
     /// Installs one immutable trusted map; peer startup waits for Application's exclusive daemon lock.
     pub fn with_launcher(launcher: LauncherConfig) -> Self {
         let mut dispatcher = Self::default();
@@ -870,7 +855,7 @@ impl AssistanceDispatcher for ProductDispatcher {
                 .unwrap_or(PeerReply::Unavailable {
                     reason: MissingPeer::HostBinding,
                 });
-            if let Some(telemetry) = &self.telemetry {
+            if let Some(telemetry) = self.worker.as_ref().and_then(WorkerHandle::telemetry) {
                 match &request {
                     AssistanceDispatch::HookSubmit(_) => {
                         // Hook payloads are intentionally never accepted by telemetry adapters.
@@ -890,7 +875,7 @@ impl AssistanceDispatcher for ProductDispatcher {
                         };
                         if let Some(tool) = tool {
                             adapters::tool_reply(
-                                telemetry,
+                                &telemetry,
                                 tool,
                                 &result,
                                 started.elapsed(),

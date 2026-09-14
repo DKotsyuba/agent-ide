@@ -37,14 +37,6 @@ async fn main() -> ExitCode {
         Ok(Command::Daemon { runtime_dir }) => match RuntimeDir::prepare_for_daemon(runtime_dir) {
             Ok(runtime_dir) => {
                 let config = EffectiveConfig::defaults();
-                let telemetry =
-                    match Store::open(&runtime_dir.path().join("telemetry.sqlite"), config.store())
-                    {
-                        Ok(store) => Telemetry::open(Arc::new(store), TelemetryConfig::default())
-                            .await
-                            .ok(),
-                        Err(_) => None,
-                    };
                 let dispatcher = match std::env::var("AGENT_IDE_LAUNCHER_CONFIG") {
                     Ok(path) => match LauncherConfig::read(std::path::Path::new(&path)) {
                         Ok(config)
@@ -59,10 +51,6 @@ async fn main() -> ExitCode {
                     },
                     Err(std::env::VarError::NotPresent) => ProductDispatcher::default(),
                     Err(_) => return fail(AppError::InvalidResponse),
-                };
-                let dispatcher = match telemetry {
-                    Some(telemetry) => dispatcher.with_telemetry(telemetry),
-                    None => dispatcher,
                 };
                 match run_daemon_with_assistance(runtime_dir, Arc::new(dispatcher), config).await {
                     Ok(()) => ExitCode::SUCCESS,
@@ -380,14 +368,17 @@ fn fail(error: AppError) -> ExitCode {
 /// Opens the bounded local telemetry owner used only by deterministic query and export commands.
 ///
 /// `database` is an operator-provided existing local SQLite path; no direct SQLite handle escapes
-/// this helper. Application's owner thread performs migration and every following read. Opening or
-/// reading failure reports the existing compact invalid-response class and cannot start a daemon.
+/// this helper. Its read-only Application owner never creates ledgers, runs migrations, or changes
+/// retention. Opening or reading failure reports the existing compact invalid-response class.
 async fn telemetry_owner(database: &Path) -> Result<Telemetry, AppError> {
+    if !database.is_file() {
+        return Err(AppError::InvalidResponse);
+    }
     let store = Arc::new(
-        Store::open(database, EffectiveConfig::defaults().store())
+        Store::open_read_only(database, EffectiveConfig::defaults().store())
             .map_err(|_| AppError::InvalidResponse)?,
     );
-    Telemetry::open(store, TelemetryConfig::default())
+    Telemetry::open_read_only(store, TelemetryConfig::default())
         .await
         .map_err(|_| AppError::InvalidResponse)
 }
@@ -897,6 +888,17 @@ fn claude_project_identity(project: &Path) -> String {
         .to_string()
 }
 
+/// Derives the persistent local Store path for one canonical managed worktree.
+///
+/// The name is an opaque digest of the already-validated candidate, so a fresh managed runtime
+/// generation reuses its prior local state while runtime socket cleanup cannot delete it.
+fn managed_state_database(candidate: &Path) -> std::io::Result<PathBuf> {
+    Ok(fs::canonicalize(std::env::temp_dir())?.join(format!(
+        "agent-ide-state-{}.sqlite",
+        blake3::hash(candidate.as_os_str().as_bytes()).to_hex()
+    )))
+}
+
 /// Derives the one short deterministic private runtime path for a canonical Claude project root.
 ///
 /// The full digest remains in the attachment record to reject a theoretical collision in the
@@ -1044,6 +1046,7 @@ async fn start_managed_daemon(
         return Err(());
     }
     let attachment = random_hex(32).map_err(|_| ())?;
+    let state_database = managed_state_database(&candidate).map_err(|_| ())?;
     let (launcher, bytes) =
         LauncherConfig::bind_one_candidate(launcher_template, &attachment, &candidate)
             .map_err(|_| ())?;
@@ -1066,6 +1069,7 @@ async fn start_managed_daemon(
         .args(["daemon", "--runtime-dir"])
         .arg(&runtime.path)
         .env("AGENT_IDE_LAUNCHER_CONFIG", launcher_path)
+        .env("AGENT_IDE_STATE_DATABASE", state_database)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1441,5 +1445,28 @@ mod tests {
         assert!(read_claude_attachment(&project).is_err());
         runtime.remove().unwrap();
         fs::remove_dir(project).unwrap();
+    }
+
+    /// Proves a managed runtime cleanup cannot remove its candidate-stable local Store path.
+    #[test]
+    fn managed_state_database_is_stable_outside_a_runtime_generation() {
+        let candidate = fs::canonicalize(std::env::temp_dir()).unwrap();
+        let database = managed_state_database(&candidate).unwrap();
+        let runtime = ManagedRuntime::create().unwrap();
+        assert_ne!(database.parent(), Some(runtime.path.as_path()));
+        assert_eq!(database, managed_state_database(&candidate).unwrap());
+        runtime.remove().unwrap();
+    }
+
+    /// Proves a telemetry query refuses a missing database without creating a SQLite file.
+    #[tokio::test]
+    async fn telemetry_query_does_not_create_a_missing_database() {
+        let database = std::env::temp_dir().join(format!(
+            "agent-ide-telemetry-read-only-{}-{}.sqlite",
+            std::process::id(),
+            random_hex(4).unwrap()
+        ));
+        assert!(telemetry_owner(&database).await.is_err());
+        assert!(!database.exists());
     }
 }

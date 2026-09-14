@@ -12,7 +12,8 @@ use super::{
     reply::{FailureCode, PeerReply, ResultKind, call_tool_result_fits, render_call_tool_result},
 };
 use crate::telemetry::{
-    AdmissionState, CancellationState, DescendantSettlement, OutputSizeClass, Telemetry, adapters,
+    AdmissionState, CancellationState, DescendantSettlement, OutputSizeClass, Telemetry,
+    TelemetryConfig, adapters,
 };
 use crate::workspace::observation::SourceObservation;
 use crate::{
@@ -476,7 +477,7 @@ pub struct WorkerHandle {
     /// Cooperative stop flag for the bounded startup fingerprint reader.
     startup_cancel: Arc<std::sync::atomic::AtomicBool>,
     /// Optional local-only sink cloned into the sole worker at daemon startup.
-    telemetry: Option<Telemetry>,
+    telemetry: Arc<Mutex<Option<Telemetry>>>,
 }
 impl std::fmt::Debug for WorkerHandle {
     /// Omits all host, target, profile and result contents.
@@ -529,16 +530,16 @@ impl WorkerHandle {
             receiver: Mutex::new(Some(receiver)),
             task: Mutex::new(None),
             startup_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            telemetry: None,
+            telemetry: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Attaches a local telemetry owner before startup without changing worker authority or limits.
+    /// Returns the daemon's sole telemetry owner after startup, if its local schema was available.
     ///
-    /// The owner is cloned into the single worker task when it starts. A later unavailable sink
-    /// only drops observations; it cannot change job admission, execution, or replies.
-    pub fn with_telemetry(&mut self, telemetry: Telemetry) {
-        self.telemetry = Some(telemetry);
+    /// The returned clone shares the Worker's Application Store owner. It is absent before startup
+    /// or when telemetry initialization failed, neither of which changes dispatch behaviour.
+    pub fn telemetry(&self) -> Option<Telemetry> {
+        self.telemetry.lock().ok()?.clone()
     }
     /// Opens exactly one durable Workspace owner and observation schema for this daemon boot.
     pub async fn start(&self, runtime: &Path) -> Result<(), FailureCode> {
@@ -549,7 +550,7 @@ impl WorkerHandle {
             .take()
             .ok_or(FailureCode::Internal)?;
         let shared = self.shared.clone();
-        let telemetry = self.telemetry.clone();
+        let telemetry_owner = self.telemetry.clone();
         let runtime = runtime.to_path_buf();
         let (ready, wait) = oneshot::channel();
         let cancel = self.startup_cancel.clone();
@@ -566,8 +567,12 @@ impl WorkerHandle {
                 return;
             }
 
+            let database = std::env::var_os("AGENT_IDE_STATE_DATABASE")
+                .map(std::path::PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .unwrap_or_else(|| runtime.join("state.sqlite"));
             let store = match Store::open_with_backup_root(
-                &runtime.join("state.sqlite"),
+                &database,
                 &runtime.join("backups"),
                 EffectiveConfig::defaults().store(),
             ) {
@@ -577,9 +582,12 @@ impl WorkerHandle {
                     return;
                 }
             };
-            // ponytail: one process-lifetime Store leak per daemon boot; replace with Arc ownership
-            // only if in-process daemon restart becomes a supported lifecycle.
-            let store: &'static Store = Box::leak(Box::new(store));
+            // ponytail: one process-lifetime Store Arc leak per daemon boot; replace with explicit
+            // task-owned shutdown once in-process daemon restart becomes a supported lifecycle.
+            let store: &'static Arc<Store> = Box::leak(Box::new(Arc::new(store)));
+            let telemetry = Telemetry::open(Arc::clone(store), TelemetryConfig::default())
+                .await
+                .ok();
             let workspace = match DurableWorkspace::open(store).await {
                 Ok(owner) => owner,
                 Err(_) => {
@@ -594,6 +602,9 @@ impl WorkerHandle {
             ) {
                 let _ = ready.send(Err(FailureCode::SourceUnavailable));
                 return;
+            }
+            if let Ok(mut configured) = telemetry_owner.lock() {
+                *configured = telemetry.clone();
             }
             let _ = ready.send(Ok(()));
             Worker {

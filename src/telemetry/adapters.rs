@@ -120,7 +120,10 @@ fn reply_outcome(reply: &PeerReply) -> ToolOutcome {
         PeerReply::Error {
             code: FailureCode::Cancelled,
         } => ToolOutcome::Cancelled,
-        PeerReply::Error { .. } => ToolOutcome::Invalid,
+        PeerReply::Error {
+            code: FailureCode::InvalidDetail,
+        } => ToolOutcome::Invalid,
+        PeerReply::Error { .. } => ToolOutcome::Failed,
         PeerReply::Feedback { .. } => ToolOutcome::Completed,
     }
 }
@@ -140,6 +143,12 @@ mod tests {
                 reason: MissingPeer::HostBinding,
             }),
             ToolOutcome::Unavailable
+        );
+        assert_eq!(
+            reply_outcome(&PeerReply::Error {
+                code: FailureCode::ProviderUnavailable,
+            }),
+            ToolOutcome::Failed
         );
     }
 

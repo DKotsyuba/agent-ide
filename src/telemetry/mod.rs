@@ -69,6 +69,8 @@ pub enum ToolOutcome {
     Invalid,
     /// A required local boundary was unavailable.
     Unavailable,
+    /// The peer completed with a meaningful closed failure that was not invalid input or cancellation.
+    Failed,
     /// The result was incomplete or pending at the bounded observation point.
     Incomplete,
     /// The operation was explicitly stopped or cancelled.
@@ -331,11 +333,11 @@ pub enum Filter {
 pub struct QueryPage {
     /// Sequence-ordered matching rows, never longer than the requested bounded limit.
     pub rows: Vec<TelemetryRow>,
-    /// First sequence after this page when another matching row exists.
+    /// Exclusive cursor for the next page: the final sequence returned here when another matching row exists.
     pub next_cursor: Option<u64>,
     /// True when a matching row remained beyond this page's limit.
     pub truncated: bool,
-    /// Events dropped by this owner since startup because ingress or persistence was unavailable.
+    /// Events this owner has observed as dropped since startup because ingress or persistence was unavailable.
     pub dropped: u64,
 }
 
@@ -348,7 +350,7 @@ pub struct Export {
     pub truncated: bool,
     /// Durable sequence of the first matching row omitted by the byte cap.
     pub first_omitted_sequence: Option<u64>,
-    /// Events dropped by this owner since startup because ingress or persistence was unavailable.
+    /// Events this owner has observed as dropped since startup because ingress or persistence was unavailable.
     pub dropped: u64,
 }
 
@@ -399,6 +401,22 @@ impl Telemetry {
             store,
             config,
             dropped,
+        })
+    }
+
+    /// Opens an existing telemetry schema for query/export without migration, a writer, or mutation.
+    ///
+    /// `store` must be Application's read-only owner. The returned disabled ingress deliberately
+    /// counts any attempted record as dropped, while reads remain limited by the supplied config.
+    pub async fn open_read_only(
+        store: Arc<Store>,
+        config: TelemetryConfig,
+    ) -> Result<Self, TelemetryError> {
+        Ok(Self {
+            sender: None,
+            store,
+            config: config.validate()?,
+            dropped: Arc::new(AtomicU64::new(0)),
         })
     }
 

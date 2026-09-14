@@ -1539,7 +1539,7 @@ async fn session_operation<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncW
             Ok(_) => DiagnosticState::Changed,
             Err(_) => DiagnosticState::Unavailable,
         };
-        adapters::provider_summary(telemetry, language, CacheState::Hit, diagnostics);
+        adapters::provider_summary(telemetry, language, CacheState::Unavailable, diagnostics);
     }
     result
 }
