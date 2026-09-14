@@ -1,6 +1,6 @@
 # Intelligence v0.2 TypeScript contract
 
-Revision: TYPESCRIPT-r1 (proposed; extends [Intelligence v0.1](intelligence-v0.1.md)). Provider: Intelligence. Direct consumers: Execution, Workspace, Assistance, and the launcher configuration. Vocabulary: [common](common.md).
+Revision: TYPESCRIPT-r1 (admission blocked; extends [Intelligence v0.1](intelligence-v0.1.md)). Provider: Intelligence. Direct consumers: Execution, Workspace, Assistance, and the launcher configuration. Vocabulary: [common](common.md).
 
 ## Closed provider profile
 
@@ -20,4 +20,4 @@ Error: a `.ts` request whose accepted `tsserver.path` changes before spawn retur
 
 ## Gates
 
-A substitute gate proves bundle closure comparison, fixed settings, extension/language-ID table closure, resolution bounds, and exclusive admission. The real macOS spike proves actual stdio exchange, required notifications/requests, diagnostics, no syntax server/logs/automatic typing acquisition, process topology, and direct-child plus descendant cleanup. Until every named real assertion passes, TypeScript—including Claude support—is unavailable.
+A substitute gate proves bundle closure comparison, fixed settings, extension/language-ID table closure, resolution bounds, and exclusive admission. The real macOS spike proves actual stdio exchange, required notifications/requests, diagnostics, no syntax server/logs/automatic typing acquisition, process topology, and direct-child plus descendant cleanup. Until every named real assertion passes, TypeScript—including Claude support—is unavailable. The current real-spike checkpoint is recorded in [the provider evidence](../typescript-provider-spike.md): the bridge creates a TypeScript-server descendant, while Execution can only report direct-child reap with `DescendantEvidence::Unverified`. That cannot satisfy this revision's descendant-settlement gate, so no TypeScript launcher, Codex, or Claude provider implementation is admitted.
