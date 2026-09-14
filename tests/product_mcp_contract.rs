@@ -2546,7 +2546,7 @@ async fn configured_product_returns_real_typescript_family_context_and_reaps() {
             "tsserver":accepted_typescript_file(&tsserver),
             "typescript_version":"5.9.3",
             "closure":closure.iter().map(|path| accepted_typescript_file(path)).collect::<Vec<_>>(),
-            "codex_macos_evidence":"macos-26.6.2-node-24.4.0-tls-6.0.0-ts-5.9.3-codex-r2-2026-09-14",
+            "codex_macos_evidence":"macos-26.6.2-node-24.4.0-tls-6.0.0-ts-5.9.3-codex-r3-2026-09-14",
             "claude_macos_evidence":null
         },
         "cargo":null,
@@ -2564,7 +2564,7 @@ async fn configured_product_returns_real_typescript_family_context_and_reaps() {
     let fixture = ProductFixture::new(providers);
     std::fs::write(
         fixture.root.join("tsconfig.json"),
-        "{\"compilerOptions\":{\"types\":[],\"moduleResolution\":\"node10\"}}\n",
+        "{\"compilerOptions\":{\"types\":[],\"moduleResolution\":\"node10\",\"allowJs\":true}}\n",
     )
     .unwrap();
     let cases = [

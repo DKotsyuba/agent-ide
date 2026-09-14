@@ -47,10 +47,15 @@ foreground-helper record before this bundle may be enabled for Claude.
 
 ## Shipping product fixture
 
+The prior r2 evidence is superseded by this r3 record. The r3 closure requires an observed
+configured project: JavaScript and JSX documents require `compilerOptions.allowJs=true`, while
+TypeScript and TSX documents do not invent that requirement; any `include` or `files` key is
+refused because glob membership is not observed.
+
 The shipping MCP and daemon then loaded the same accepted bundle through the fourth
 `typescript_defaults_v1` launcher profile. Real `.js`, `.jsx`, `.ts`, and `.tsx`
-files under one exact empty `tsconfig.json` each returned semantic definitions and references
-through separate exclusive one-shot sessions. Every operation completed the strict graceful session result
-before the direct bridge child was released. This covers the TypeScript Context and
-normal-shutdown subset only; it does not complete the broader v0.2 edit, telemetry,
-fallback, or multi-worktree acceptance matrix.
+files under one exact `tsconfig.json` containing `types=[]`, `moduleResolution=node10`, and
+`allowJs=true` each returned semantic definitions and references through separate exclusive
+one-shot sessions. Every operation completed the strict graceful session result before the direct
+bridge child was released. This covers the TypeScript Context and normal-shutdown subset only; it
+does not complete the broader v0.2 edit, telemetry, fallback, or multi-worktree acceptance matrix.

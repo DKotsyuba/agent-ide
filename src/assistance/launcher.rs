@@ -15,9 +15,9 @@ use std::{
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
 /// Maximum executable bytes hashed during a pre-spawn identity check.
 const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
-/// Compiled Codex release record prefix for the exact TypeScript r2 macOS bundle cell.
+/// Compiled Codex release record prefix for the exact TypeScript r3 macOS bundle cell.
 const TYPESCRIPT_CODEX_MACOS_EVIDENCE_V1: &str =
-    "macos-26.6.2-node-24.4.0-tls-6.0.0-ts-5.9.3-codex-r2-2026-09-14";
+    "macos-26.6.2-node-24.4.0-tls-6.0.0-ts-5.9.3-codex-r3-2026-09-14";
 /// Exact Node release admitted by the compiled Codex TypeScript record.
 const TYPESCRIPT_NODE_VERSION_V1: &str = "24.4.0";
 /// BLAKE3 identity of the accepted macOS Node 24.4.0 executable bytes.

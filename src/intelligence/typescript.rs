@@ -210,11 +210,13 @@ impl ProjectResolutionInputsV1 {
     /// are one of the supported TypeScript/JavaScript project or package inputs. Their declared
     /// sizes may total at most 8 MiB, and at least one `tsconfig.json` or `jsconfig.json` is
     /// required because inferred projects are unsupported. A configuration must explicitly set
-    /// `compilerOptions.types` to `[]`, and its optional `include`/`files` entries must be normal
-    /// relative paths below that configuration. Workspace reads only those exact names without
-    /// following symlinks or listing directories, and refuses an ancestor `node_modules` entry
-    /// before tsserver can resolve an unobserved bare dependency. Missing declarations, changed
-    /// bytes, unsupported composite project shapes, and any bound mismatch return
+    /// `compilerOptions.types` to `[]` and `compilerOptions.moduleResolution` to `node10`; a
+    /// JavaScript or JSX document additionally requires `compilerOptions.allowJs` to be exactly
+    /// `true`. Any `include` or `files` key is refused because glob membership is not observed.
+    /// Workspace reads only those exact names without following symlinks or listing directories,
+    /// and refuses an ancestor `node_modules` entry before tsserver can resolve an unobserved bare
+    /// dependency. Missing declarations, changed bytes, unsupported composite project shapes, and
+    /// any bound mismatch return
     /// [`TypeScriptProfileError::InvalidResolution`].
     pub fn new(
         worktree: WorktreeRef,
@@ -925,6 +927,8 @@ fn observe_resolution_files(
     if ancestor_has_node_modules(&worktree.worktree_path().join(document))? {
         return Err(TypeScriptProfileError::InvalidResolution);
     }
+    let language_id =
+        typescript_language_id(document).ok_or(TypeScriptProfileError::InvalidResolution)?;
     let parent = document
         .parent()
         .ok_or(TypeScriptProfileError::InvalidResolution)?;
@@ -942,7 +946,7 @@ fn observe_resolution_files(
             Err(ObservationError::Missing) => continue,
             Err(_) => return Err(TypeScriptProfileError::InvalidResolution),
         };
-        validate_resolution_shape(observed.path(), observed.contents())?;
+        validate_resolution_shape(observed.path(), observed.contents(), language_id)?;
         remaining = remaining
             .checked_sub(observed.length() as usize)
             .ok_or(TypeScriptProfileError::InvalidResolution)?;
@@ -979,7 +983,16 @@ fn ancestor_has_node_modules(document: &Path) -> Result<bool, TypeScriptProfileE
 }
 
 /// Rejects project metadata that can redirect tsserver beyond the exact observed ancestor inputs.
-fn validate_resolution_shape(path: &Path, contents: &[u8]) -> Result<(), TypeScriptProfileError> {
+///
+/// `language_id` is the fixed ID for the opened document. JavaScript-family documents require the
+/// observed config to opt into JavaScript with boolean `allowJs: true`; TypeScript-family documents
+/// do not require that option. Config `include` and `files` keys are always refused because their
+/// glob membership is not part of the observed evidence.
+fn validate_resolution_shape(
+    path: &Path,
+    contents: &[u8],
+    language_id: &str,
+) -> Result<(), TypeScriptProfileError> {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return Err(TypeScriptProfileError::InvalidResolution);
     };
@@ -1004,12 +1017,14 @@ fn validate_resolution_shape(path: &Path, contents: &[u8]) -> Result<(), TypeScr
             .ok_or(TypeScriptProfileError::InvalidResolution)?;
         if options.get("types") != Some(&serde_json::Value::Array(Vec::new()))
             || !closed_module_resolution(options)
+            || (matches!(language_id, "javascript" | "javascriptreact")
+                && options.get("allowJs") != Some(&serde_json::Value::Bool(true)))
             || ["baseUrl", "paths", "plugins", "rootDirs", "typeRoots"]
                 .iter()
                 .any(|key| options.contains_key(*key))
             || ["include", "files"]
                 .iter()
-                .any(|key| !confined_config_entries(object, key))
+                .any(|key| object.contains_key(*key))
         {
             return Err(TypeScriptProfileError::InvalidResolution);
         }
@@ -1044,25 +1059,11 @@ fn closed_module_resolution(options: &serde_json::Map<String, serde_json::Value>
         && !options
             .get("module")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|module| matches!(module, "node16" | "nodenext" | "preserve"))
-}
-
-/// Returns whether an optional config path list can only name lexical descendants of its config.
-///
-/// TypeScript resolves `include` and `files` strings relative to the config's directory. Empty
-/// arrays are closed; nonempty arrays must contain only nonempty normal Unix-relative paths, so
-/// absolute names, traversal, dot components, and alternate separator escapes are refused before
-/// the server starts.
-fn confined_config_entries(object: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
-    object.get(key).is_none_or(|value| {
-        value.as_array().is_some_and(|entries| {
-            entries.iter().all(|entry| {
-                entry
-                    .as_str()
-                    .is_some_and(|path| !path.contains('\\') && normal_relative(Path::new(path)))
+            .is_some_and(|module| {
+                ["node16", "nodenext", "preserve"]
+                    .iter()
+                    .any(|forbidden| module.eq_ignore_ascii_case(forbidden))
             })
-        })
-    })
 }
 
 #[cfg(test)]
@@ -1077,6 +1078,9 @@ mod tests {
 
     /// Exact closed config bytes accepted by TypeScript resolution fixtures.
     const CLOSED_CONFIG: &[u8] = br#"{"compilerOptions":{"types":[],"moduleResolution":"node10"}}"#;
+    /// Exact closed config bytes accepted for JavaScript-family resolution fixtures.
+    const JAVASCRIPT_CONFIG: &[u8] =
+        br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","allowJs":true}}"#;
 
     /// Distinguishes parallel fixture roots when the platform clock has coarse resolution.
     static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1250,15 +1254,20 @@ mod tests {
             let fixture = Fixture::new();
             let bundle = fixture.bundle();
             let (worktree, _) = fixture.worktree();
-            std::fs::write(fixture.root.join("tsconfig.json"), CLOSED_CONFIG).unwrap();
+            let config = if matches!(extension, "js" | "jsx") {
+                JAVASCRIPT_CONFIG
+            } else {
+                CLOSED_CONFIG
+            };
+            std::fs::write(fixture.root.join("tsconfig.json"), config).unwrap();
             let resolution = ProjectResolutionInputsV1::new(
                 worktree,
                 fixture.root.join(format!("src/file.{extension}")),
                 &bundle,
                 vec![ProjectResolutionFileV1 {
                     path: PathBuf::from("tsconfig.json"),
-                    blake3: blake3::hash(CLOSED_CONFIG),
-                    bytes: CLOSED_CONFIG.len() as u64,
+                    blake3: blake3::hash(config),
+                    bytes: config.len() as u64,
                 }],
             )
             .unwrap();
@@ -1429,10 +1438,12 @@ mod tests {
             br#"{"compilerOptions":{"types":[],"moduleResolution":"node10"},"include":["src/**/*.ts"],"files":["src/file.ts"]}"#,
         )
         .unwrap();
-        assert!(
-            ProjectResolutionInputsV1::observe(worktree.clone(), document.clone(), &bundle).is_ok()
-        );
+        assert!(matches!(
+            ProjectResolutionInputsV1::observe(worktree.clone(), document.clone(), &bundle),
+            Err(TypeScriptProfileError::InvalidResolution)
+        ));
 
+        std::fs::write(fixture.root.join("tsconfig.json"), CLOSED_CONFIG).unwrap();
         std::fs::create_dir(fixture.cleanup_root.join("node_modules")).unwrap();
         assert!(matches!(
             ProjectResolutionInputsV1::observe(worktree, document, &bundle),
@@ -1448,7 +1459,9 @@ mod tests {
             br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","module":"commonjs"}}"#
                 .as_slice(),
         ] {
-            assert!(validate_resolution_shape(Path::new("tsconfig.json"), config).is_ok());
+            assert!(
+                validate_resolution_shape(Path::new("tsconfig.json"), config, "typescript").is_ok()
+            );
         }
     }
 
@@ -1468,9 +1481,55 @@ mod tests {
                 .as_slice(),
             br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","module":"preserve"}}"#
                 .as_slice(),
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","module":"Node16"}}"#
+                .as_slice(),
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","module":"NODENEXT"}}"#
+                .as_slice(),
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","module":"PRESERVE"}}"#
+                .as_slice(),
         ] {
             assert!(matches!(
-                validate_resolution_shape(Path::new("tsconfig.json"), config),
+                validate_resolution_shape(Path::new("tsconfig.json"), config, "typescript"),
+                Err(TypeScriptProfileError::InvalidResolution)
+            ));
+        }
+    }
+
+    /// Requires exact JavaScript opt-in only for JavaScript-family documents and rejects glob keys.
+    #[test]
+    fn project_resolution_requires_javascript_opt_in_without_glob_membership() {
+        assert!(
+            validate_resolution_shape(Path::new("tsconfig.json"), CLOSED_CONFIG, "typescript")
+                .is_ok()
+        );
+        for config in [
+            CLOSED_CONFIG,
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","allowJs":false}}"#
+                .as_slice(),
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","allowJs":"true"}}"#
+                .as_slice(),
+        ] {
+            assert!(matches!(
+                validate_resolution_shape(Path::new("tsconfig.json"), config, "javascript"),
+                Err(TypeScriptProfileError::InvalidResolution)
+            ));
+        }
+        assert!(
+            validate_resolution_shape(
+                Path::new("tsconfig.json"),
+                JAVASCRIPT_CONFIG,
+                "javascriptreact"
+            )
+            .is_ok()
+        );
+        for config in [
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","allowJs":true},"include":[]}"#
+                .as_slice(),
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","allowJs":true},"files":[]}"#
+                .as_slice(),
+        ] {
+            assert!(matches!(
+                validate_resolution_shape(Path::new("tsconfig.json"), config, "javascript"),
                 Err(TypeScriptProfileError::InvalidResolution)
             ));
         }

@@ -83,7 +83,7 @@ mixed binaries.
 `typescript` object containing `bridge_bytes`, the exact bridge and TypeScript versions, an
 accepted `tsserver` file (`path`, `blake3`, and `bytes`), a sorted nonempty `closure` of files in
 that same shape, and separate host evidence fields. The compiled Codex release cell accepts only
-`macos-26.6.2-node-24.4.0-tls-6.0.0-ts-5.9.3-codex-r2-2026-09-14:<bundle-digest>`: the suffix is
+`macos-26.6.2-node-24.4.0-tls-6.0.0-ts-5.9.3-codex-r3-2026-09-14:<bundle-digest>`: the suffix is
 derived from the exact declared Node, bridge, `tsserver.js`, and closure paths, digests, lengths,
 and identities, so copying the record to another bundle is rejected. The three public versions
 must also be exactly 24.4.0, 6.0.0, and 5.9.3, and the compiled record fixes the accepted Node,
@@ -106,7 +106,7 @@ classes. Duplicate attachment mappings, unknown fields, invalid limits, relative
 malformed executable digests and mismatched profile evidence are rejected.
 
 The fourth provider is the immutable `TypeScriptProviderBundleV1` in
-[TYPESCRIPT-r2](contracts/intelligence-v0.2.md). It accepts only an explicit accepted Node,
+[TYPESCRIPT-r3](contracts/intelligence-v0.2.md). It accepts only an explicit accepted Node,
 bridge, TypeScript closure, and `tsserver.path`; it has no ambient npm/plugin/network discovery.
 Codex requires its exact bundle-bound compiled release record. The launcher and helper frame support the closed
 Claude shape, but Claude selection stays unavailable until its independent compiled release record

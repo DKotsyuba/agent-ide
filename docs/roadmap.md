@@ -86,7 +86,7 @@ the previously ordered history-first increment. Work proceeds in this order:
 ### v0.2 acceptance evidence matrix (ACCEPTANCE-r1)
 
 This matrix consumes the public [TELEMETRY-r1](contracts/telemetry-v0.2.md),
-[EDIT-r1](contracts/changes-v0.2.md), and [TYPESCRIPT-r2](contracts/intelligence-v0.2.md)
+[EDIT-r1](contracts/changes-v0.2.md), and [TYPESCRIPT-r3](contracts/intelligence-v0.2.md)
 contracts. It is preparation only: every cell below is `not_tested` until an implementation and
 real run produce public evidence. Public artifacts contain versions, route, scenario outcomes,
 bounded metrics, and explicit truncation only; private supervisor identifiers and transcripts do
