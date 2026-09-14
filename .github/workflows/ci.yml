@@ -13,6 +13,9 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
       - name: Verify runner
         run: test "$(uname -m)" = arm64
       - name: Prepare toolchains
