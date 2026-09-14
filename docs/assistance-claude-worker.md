@@ -105,7 +105,7 @@ still requires the daemon's actual provider/revocation settlement.
 
 ## Supported profiles
 
-A Claude operation is **per-operation exclusive**: Go, Rust, or Pyright, never more than one, and each helper reaps
+A Claude operation is **per-operation exclusive**: Go, Rust, Pyright, or TypeScript, never more than one, and each helper reaps
 its provider before exiting.
 
 - **Rust** runs with both `cachePriming` and `procMacro` disabled. This is a Claude-specific
@@ -122,10 +122,12 @@ its provider before exiting.
   BLAKE3 digests; it reconstructs the profile, verifies the script at the final boundary, and
   retains the inherited-process Node recheck before spawning its one-shot child.
 
-- **TypeScript** remains unavailable to Claude until the real spike required by
-  [TYPESCRIPT-r1](contracts/intelligence-v0.2.md) proves its immutable closure, stdio protocol,
-  diagnostics, topology, and cleanup. Once accepted, it is one claimed foreground-helper
-  provider per worktree operation, never a daemon-borrowed or ambient Node process.
+- **TypeScript** follows [TYPESCRIPT-r2](contracts/intelligence-v0.2.md) as one claimed
+  foreground-helper provider per worktree operation, never a daemon-borrowed or ambient Node
+  process. Claude remains unavailable until its own real macOS acceptance record passes for the
+  exact immutable bundle. Success requires graceful protocol shutdown, EOF, successful bridge
+  exit, and direct-child reap without `TERM` or `KILL`; any abnormal outcome quarantines that
+  profile for the helper owner lifetime and cannot be reported as a successful helper result.
 
 Stop and handoff retain the IDE-owned worktree cache directories; no analysis runs while inactive.
 The daemon derives their private absolute paths from the durable worktree identity/incarnation,

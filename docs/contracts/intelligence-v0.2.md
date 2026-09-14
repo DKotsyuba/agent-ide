@@ -1,6 +1,6 @@
 # Intelligence v0.2 TypeScript contract
 
-Revision: TYPESCRIPT-r1 (admission blocked; extends [Intelligence v0.1](intelligence-v0.1.md)). Provider: Intelligence. Direct consumers: Execution, Workspace, Assistance, and the launcher configuration. Vocabulary: [common](common.md).
+Revision: TYPESCRIPT-r2 (accepted; extends [Intelligence v0.1](intelligence-v0.1.md)). Provider: Intelligence. Direct consumers: Execution, Workspace, Assistance, and the launcher configuration. Vocabulary: [common](common.md).
 
 ## Closed provider profile
 
@@ -12,7 +12,11 @@ The profile is exclusive per worktree. It admits only `.js`, `.jsx`, `.ts`, and 
 
 ## Spike and outcomes
 
-The real spike is the admission gate for Claude support and must prove the full immutable dependency closure, server requests and notifications, diagnostics, process topology, and descendant cleanup under the selected execution profile. It records only public versions, profile identity, and outcomes; it does not publish source, paths, prompts, commands, or private supervisor data.
+TypeScript support is a release-pinned normal-shutdown conformance claim for one exact immutable `TypeScriptProviderBundleV1`, not per-invocation proof that arbitrary descendants settled. Runtime `DescendantEvidence` remains `Unverified`. Codex and Claude require separate real macOS acceptance records for the same bundle and profile; neither host's record admits the other.
+
+The real acceptance spike must prove the full immutable dependency closure, server requests and notifications, diagnostics, and observed bridge/TypeScript-server topology under the selected execution profile. A successful operation requires the LSP `shutdown` request to succeed, `exit` to be sent, protocol EOF to be observed, the bridge to exit successfully within the deadline, and its direct child to be reaped. This normal-success path sends no `TERM` or `KILL`. The record captures bridge and TypeScript-server PID plus Darwin start time before shutdown and confirms both identities are absent afterward. These observations are release evidence for the pinned bundle, not runtime descendant evidence or a claim that a process group contains arbitrary descendants. Records contain only public versions, profile identity, and outcomes; they do not publish source, paths, prompts, commands, or private supervisor data.
+
+Any shutdown rejection or timeout, missing EOF, nonzero bridge exit, cancellation, forced signal, direct-child reap timeout, or lost helper returns `unavailable` or `deadline` and quarantines the exact TypeScript profile for the owner lifetime. No later operation owned by that daemon or helper may reuse the quarantined profile.
 
 Success: a `.tsx` completed context with verified bundle and bounded resolution inputs receives a same-worktree exclusive provider view and generation-matched diagnostics.
 
@@ -20,4 +24,4 @@ Error: a `.ts` request whose accepted `tsserver.path` changes before spawn retur
 
 ## Gates
 
-A substitute gate proves bundle closure comparison, fixed settings, extension/language-ID table closure, resolution bounds, and exclusive admission. The real macOS spike proves actual stdio exchange, required notifications/requests, diagnostics, no syntax server/logs/automatic typing acquisition, process topology, and direct-child plus descendant cleanup. Until every named real assertion passes, TypeScript—including Claude support—is unavailable. The current real-spike checkpoint is recorded in [the provider evidence](../typescript-provider-spike.md): the bridge creates a TypeScript-server descendant, while Execution can only report direct-child reap with `DescendantEvidence::Unverified`. That cannot satisfy this revision's descendant-settlement gate, so no TypeScript launcher, Codex, or Claude provider implementation is admitted.
+A substitute gate proves bundle closure comparison, fixed settings, extension/language-ID table closure, resolution bounds, exclusive admission, normal-success criteria, owner-lifetime quarantine, and abnormal-cleanup ordering. Separate real Codex and Claude macOS spikes prove the actual stdio exchange, required notifications/requests, diagnostics, no syntax server/logs/automatic typing acquisition, and pinned-bundle topology observations. TypeScript remains unavailable for a host until every named substitute assertion and that host's real acceptance record pass.
