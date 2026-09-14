@@ -68,18 +68,33 @@ implemented.
 
 ## v0.2 candidate results
 
-The candidate at revision `d88af079ac1e0c06d411208f513a1bfefeddf4b1` was exercised on macOS
-26.6.2 arm64. Its locked [product gate](evidence/macos-v0.2-product.json) passed with the documented
-toolchain versions. The real-host matrix remains closed: a partially successful route is not a
-`real_pass`, and the runner marks every scenario `failed` when its strict driver withholds the exact
-complete result document.
+The product candidate at revision `d88af079ac1e0c06d411208f513a1bfefeddf4b1` was exercised on
+macOS 26.6.2 arm64. Its locked [product gate](evidence/macos-v0.2-product.json) passed with the
+documented toolchain versions. Direct Claude was rerun at revision
+`0806f50bcde8d68b5404576c5d9e69879bcd14f1`; the intervening revision changed only this acceptance
+documentation and evidence, not the tested product. The real-host matrix remains closed: a
+partially successful route is not a `real_pass`, and the runner marks every scenario `failed` when
+its strict driver withholds the exact complete result document.
 
 | Route | Public evidence | Result |
 |---|---|---|
-| Direct Codex CLI 0.154.0 | [JSON](evidence/macos-v0.2-direct-codex.json) | `failed`: real Pyright edit/stale/native behavior and TypeScript semantic Context ran, but a required final inspection failed; no complete host claim |
-| Direct Claude Code 2.1.267 | [JSON](evidence/macos-v0.2-direct-claude.json) | `not_tested`: external authentication blocker was exactly `Not logged in · Please run /login` |
-| Installed agent-run 0.11.8 to Claude Code 2.1.267 | [JSON](evidence/macos-v0.2-agent-run-claude.json) | `failed`: both divergent worktrees completed the real Pyright/helper path, including stale zero-write and native fallback; Diff inspection exhausted detail capacity and TypeScript remained lexical-only, so the complete cell did not pass |
+| Direct Codex CLI 0.154.0 | [JSON](evidence/macos-v0.2-direct-codex.json) | `failed`: real Pyright edit/stale/native behavior and TypeScript semantic Context ran; the first Diff inspection completed, then a further driver inspection failed without preserving its closed code, so no complete host claim exists |
+| Direct Claude Code 2.1.267 | [JSON](evidence/macos-v0.2-direct-claude.json) | `failed`: authenticated helper-backed Pyright activity ran in both worktrees; a focused registered-source Diff returned `workspace_authority`, and TypeScript remained lexical because no Claude TypeScript record is accepted |
+| Installed agent-run 0.11.8 to Claude Code 2.1.267 | [JSON](evidence/macos-v0.2-agent-run-claude.json) | `failed`: both divergent worktrees completed the real Pyright/helper path, including stale zero-write and native fallback; Diff inspection returned `capacity`, and TypeScript remained lexical because the tested Claude launcher had no accepted provider, so the complete cell did not pass |
 
 The installed agent-run route is separate evidence and is not relabeled as direct Claude. Private
 driver prompts, local paths, credentials, transcripts, and host/run identifiers were retained only
 in disposable operator state and do not appear in these artifacts.
+
+The earlier direct-Claude login result was false: the host inherited a per-run synthetic `HOME`, so
+Claude resolved an empty isolated profile instead of the operator's normal authorized profile.
+Changing outer sandbox permissions did not change that result; restoring the normal login home did,
+with the existing OAuth read in place and no credential copied or emitted. Direct Claude then reached
+the candidate MCP and foreground-helper route. This environment correction changes the row from
+`not_tested` to a real `failed` result; it does not turn the incomplete cell into `real_pass`.
+
+The remaining failures do not justify a product change in this task. The locked Claude helper gate
+passes real Pyright Context and Diff, while the live direct-Claude Diff failure is
+`workspace_authority`. The agent-run Diff failure is the distinct closed `capacity` result. Claude
+TypeScript is intentionally unavailable until an independently compiled macOS acceptance record is
+implemented, so enabling it here would bypass the release boundary rather than correct the driver.
