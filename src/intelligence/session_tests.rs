@@ -208,6 +208,10 @@ async fn matching_diagnostics_notification_wakes_waiter() {
         ControlFlow::Continue(())
     ));
     assert!(waiting.await.unwrap());
+    assert_eq!(
+        state.lock().unwrap().diagnostics.readiness,
+        DiagnosticReadiness::Clean
+    );
 }
 
 /// Confirms stale versioned notifications do not wake the waiter and deadline preserves unknown evidence.
@@ -228,8 +232,9 @@ async fn stale_diagnostics_notification_does_not_wake_waiter() {
     );
 }
 
-/// Proves versioned/unversioned pushes cannot claim clean, late versions cannot replace current evidence,
-/// invalidation discards evidence, applyEdit is rejected, and prompts have no affirmative default.
+/// Proves only a matching versioned empty result can claim clean, late versions cannot replace it,
+/// unversioned evidence remains unknown, invalidation discards evidence, applyEdit is rejected,
+/// and prompts have no affirmative default.
 #[tokio::test]
 async fn callbacks_and_diagnostics_fail_closed() {
     use tower_service::Service;
@@ -243,7 +248,14 @@ async fn callbacks_and_diagnostics_fail_closed() {
             ControlFlow::Continue(())
         ));
         let snapshot = &state.lock().unwrap().diagnostics;
-        assert_eq!(snapshot.readiness, DiagnosticReadiness::Unknown);
+        assert_eq!(
+            snapshot.readiness,
+            if version.is_none() {
+                DiagnosticReadiness::Unknown
+            } else {
+                DiagnosticReadiness::Clean
+            }
+        );
         assert_eq!(snapshot.freshness, Freshness::Provisional);
         if version.is_none() {
             assert!(snapshot.source.is_none());

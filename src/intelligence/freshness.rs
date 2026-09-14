@@ -30,11 +30,11 @@ pub enum Freshness {
 /// States whether a diagnostic collection can claim that a document is clean.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DiagnosticReadiness {
-    /// A completed, current provider pull explicitly reported an empty diagnostic set.
+    /// A matching, versioned provider diagnostic result explicitly reported an empty set.
     Clean,
-    /// The provider reported at least one current diagnostic.
+    /// A matching, versioned provider diagnostic result reported at least one diagnostic.
     Reported,
-    /// No completed diagnostic pull exists; absence is never interpreted as clean.
+    /// No matching, versioned diagnostic result exists; absence is never interpreted as clean.
     Unknown,
 }
 

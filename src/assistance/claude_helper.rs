@@ -16,7 +16,7 @@ use super::claude_worker::{
     HelperResult, HelperSource, LaunchLedger, MAX_HELPER_FRAME_BYTES, MAX_RESULT_TEXT_BYTES,
 };
 use super::host_binding::BindingRef;
-use super::reply::FailureCode;
+use super::reply::{EditDiagnostics, FailureCode};
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
@@ -531,6 +531,7 @@ async fn perform(
                 Some(HelperPayload::Edit {
                     outcome,
                     source: None,
+                    diagnostics: EditDiagnostics::Unknown {},
                 }),
             );
         }
@@ -641,7 +642,8 @@ async fn perform(
 ///
 /// The helper uses only daemon-selected inherited scope and expected source facts. Deadline is
 /// checked immediately before the descriptor operation. Provider refresh is best-effort after an
-/// exact Workspace post-read and cannot change a known filesystem result.
+/// exact Workspace post-read, contributes only matching diagnostic evidence to the helper frame,
+/// and cannot change a known filesystem result.
 async fn edit(
     job: &HelperJob,
     deadline: tokio::time::Instant,
@@ -716,6 +718,7 @@ async fn edit(
             (crate::changes::edit::EditOutcome::OutcomeUnknown, None)
         }
     };
+    let mut diagnostics = EditDiagnostics::Unknown {};
     if let Some(read) = &post {
         let observation = SourceObservation::new(
             worktree,
@@ -730,7 +733,7 @@ async fn edit(
             ObservedState::Present,
         );
         if let Ok(observation) = observation {
-            let _ = provider_context(
+            if let Ok(Some((context, Some(snapshot)))) = provider_context(
                 job,
                 deadline,
                 &observation,
@@ -739,7 +742,10 @@ async fn edit(
                 spawned,
                 reaped,
             )
-            .await;
+            .await
+            {
+                diagnostics = EditDiagnostics::from_snapshot(&context, &snapshot);
+            }
         }
     }
     let source = post.map(|read| HelperSource {
@@ -752,7 +758,11 @@ async fn edit(
         HelperOutcome::Complete {
             text: format!("edit outcome: {}", outcome.as_str()),
         },
-        Some(HelperPayload::Edit { outcome, source }),
+        Some(HelperPayload::Edit {
+            outcome,
+            source,
+            diagnostics,
+        }),
     )
 }
 
@@ -767,6 +777,7 @@ fn failed_edit(
         Some(HelperPayload::Edit {
             outcome,
             source: None,
+            diagnostics: EditDiagnostics::Unknown {},
         }),
     )
 }
@@ -1128,8 +1139,8 @@ async fn context(
     (HelperOutcome::Complete { text }, Some(payload))
 }
 
-/// Runs one accepted provider over exact helper-observed bytes, awaits matching Pyright diagnostics
-/// under the helper's inherited deadline, then reaps it before returning.
+/// Runs one accepted provider over exact helper-observed bytes, awaits matching diagnostics under
+/// the helper's inherited deadline, then reaps it before returning.
 async fn provider_context(
     job: &HelperJob,
     deadline: tokio::time::Instant,
@@ -1313,9 +1324,7 @@ async fn provider_context(
         },
         |mut session| async move {
             let context = session.context(source, bytes, query).await?;
-            if matches!(session.settings(), ProviderSettings::Pyright(_)) {
-                session.wait_for_matching_diagnostics().await;
-            }
+            session.wait_for_matching_diagnostics().await;
             let diagnostics = session.diagnostics();
             session.shutdown().await?;
             Ok((context, Some(diagnostics)))

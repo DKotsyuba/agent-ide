@@ -9,7 +9,10 @@ use super::{
         ActiveBindingUse, BindingRef, HostBindingGuard, ObservedSandboxState, ValidatedInvocation,
     },
     launcher::{AcceptedProviderSettings, LaunchTarget, LauncherConfig},
-    reply::{FailureCode, PeerReply, ResultKind, call_tool_result_fits, render_call_tool_result},
+    reply::{
+        EditDiagnostics, FailureCode, PeerReply, ResultKind, call_tool_result_fits,
+        render_call_tool_result,
+    },
 };
 use crate::workspace::observation::SourceObservation;
 use crate::{
@@ -1355,7 +1358,7 @@ impl<'a> Worker<'a> {
             Ok(result) => result,
             Err(code) => (PeerReply::Error { code }, None, None),
         };
-        if let PeerReply::Edit { result } = &reply {
+        if let PeerReply::Edit { result, .. } = &reply {
             let lifetime = Duration::from_millis(self.shared.launcher.limits.operation_ms);
             let started = job.deadline.checked_sub(lifetime).unwrap_or(job.deadline);
             let duration_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
@@ -2390,8 +2393,9 @@ impl<'a> Worker<'a> {
     /// The source reference must name a completed same-binding Context detail whose exact source
     /// observation still matches `path`. A new durable prepare is the only route to Workspace; an
     /// exact prepared receipt recovered after ambiguity returns unknown and is never dispatched
-    /// again. Known effects are followed by source observation and best-effort provider diagnostic
-    /// refresh; provider failure never changes a known filesystem outcome.
+    /// again. Known effects are followed by source observation and a deadline-bounded provider
+    /// diagnostic refresh attached to the same reply only when it matches that post-read source;
+    /// provider failure never changes a known filesystem outcome or implies cleanliness.
     async fn edit(
         &mut self,
         job: &mut Job,
@@ -2408,7 +2412,14 @@ impl<'a> Worker<'a> {
                 | PrepareAdmission::OutcomeUnknown(result),
             ) => {
                 let authority = self.authority(&binding).await.ok();
-                return Ok((PeerReply::Edit { result }, authority, None));
+                return Ok((
+                    PeerReply::Edit {
+                        result,
+                        diagnostics: EditDiagnostics::Unknown {},
+                    },
+                    authority,
+                    None,
+                ));
             }
             Err(_) => {
                 return Ok((
@@ -2419,6 +2430,7 @@ impl<'a> Worker<'a> {
                             outcome: ChangesEditOutcome::UnavailableBeforeDispatch,
                             source_ref: None,
                         },
+                        diagnostics: EditDiagnostics::Unknown {},
                     },
                     None,
                     None,
@@ -2440,7 +2452,7 @@ impl<'a> Worker<'a> {
                                 kind: ResultKind::Context,
                                 ..
                             } => true,
-                            PeerReply::Edit { result } => {
+                            PeerReply::Edit { result, .. } => {
                                 result.source_ref.as_deref() == Some(request.source_ref.as_str())
                                     && result.outcome.has_post_source()
                             }
@@ -2544,7 +2556,7 @@ impl<'a> Worker<'a> {
                 | crate::workspace::edit::EditOutcome::Replaced(_)
                 | crate::workspace::edit::EditOutcome::Unchanged(_)
         );
-        let refreshed = if known && job.observed.is_some() {
+        let (refreshed, diagnostics) = if known && job.observed.is_some() {
             match self
                 .observe(
                     &binding,
@@ -2555,28 +2567,49 @@ impl<'a> Worker<'a> {
                 .await
             {
                 Ok((observed, bytes)) => {
-                    let _ = self
+                    let diagnostics = match self
                         .semantic_context(
                             job,
                             &observed,
                             &bytes,
                             crate::intelligence::context::ContextQuery::File,
                         )
-                        .await;
-                    Some(observed)
+                        .await
+                    {
+                        Ok(Some(provider)) => {
+                            EditDiagnostics::from_snapshot(&provider.context, &provider.diagnostics)
+                        }
+                        Ok(None) | Err(_) => EditDiagnostics::Unknown {},
+                    };
+                    (Some(observed), diagnostics)
                 }
-                Err(_) => None,
+                Err(_) => (None, EditDiagnostics::Unknown {}),
             }
         } else {
-            None
+            (None, EditDiagnostics::Unknown {})
         };
         let post_reference = refreshed
             .as_ref()
             .map(|_| job.reference.clone())
             .or_else(|| unchanged.then(|| request.source_ref.clone()));
-        let result = EditResult::from_workspace(&request, outcome, |_| post_reference);
-        let result = self.settle_prepared_edit(prepared, &request, result).await;
-        Ok((PeerReply::Edit { result }, Some(authority), refreshed))
+        let expected = EditResult::from_workspace(&request, outcome, |_| post_reference);
+        let result = self
+            .settle_prepared_edit(prepared, &request, expected.clone())
+            .await;
+        let diagnostics = (result == expected && result.outcome.has_post_source())
+            .then_some(diagnostics)
+            .unwrap_or(EditDiagnostics::Unknown {});
+        let source = (result.outcome.has_post_source())
+            .then_some(refreshed)
+            .flatten();
+        Ok((
+            PeerReply::Edit {
+                result,
+                diagnostics,
+            },
+            Some(authority),
+            source,
+        ))
     }
 
     /// Durably settles one typed pre-effect Workspace outcome without dispatching a write.
@@ -2590,7 +2623,14 @@ impl<'a> Worker<'a> {
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
         let result = EditResult::from_workspace(request, outcome, |_| None);
         let result = self.settle_prepared_edit(prepared, request, result).await;
-        Ok((PeerReply::Edit { result }, authority, source))
+        Ok((
+            PeerReply::Edit {
+                result,
+                diagnostics: EditDiagnostics::Unknown {},
+            },
+            authority,
+            source,
+        ))
     }
 
     /// Settles a consumed receipt and reconciles ambiguity without discarding an already durable result.
@@ -2732,7 +2772,16 @@ impl<'a> Worker<'a> {
                 PrepareAdmission::Settled(result)
                 | PrepareAdmission::ConflictingDuplicate(result)
                 | PrepareAdmission::OutcomeUnknown(result),
-            ) => return Ok((PeerReply::Edit { result }, None, None)),
+            ) => {
+                return Ok((
+                    PeerReply::Edit {
+                        result,
+                        diagnostics: EditDiagnostics::Unknown {},
+                    },
+                    None,
+                    None,
+                ));
+            }
             Err(_) => {
                 return Ok((
                     PeerReply::Edit {
@@ -2742,6 +2791,7 @@ impl<'a> Worker<'a> {
                             outcome: ChangesEditOutcome::UnavailableBeforeDispatch,
                             source_ref: None,
                         },
+                        diagnostics: EditDiagnostics::Unknown {},
                     },
                     None,
                     None,
@@ -2836,6 +2886,7 @@ impl<'a> Worker<'a> {
         let Some(super::claude_worker::HelperPayload::Edit {
             mut outcome,
             source,
+            diagnostics,
         }) = settled.result().payload.clone()
         else {
             return Err(FailureCode::Internal);
@@ -2857,7 +2908,7 @@ impl<'a> Worker<'a> {
             }
         }
         let source_ref = outcome.has_post_source().then(|| job.reference.clone());
-        let result = EditResult::new(
+        let expected = EditResult::new(
             request.operation_id.clone(),
             request.path.clone(),
             outcome,
@@ -2866,7 +2917,7 @@ impl<'a> Worker<'a> {
         .map_err(|_| FailureCode::Internal)?;
         let result = self
             .edits
-            .settle(prepared, result)
+            .settle(prepared, expected.clone())
             .await
             .unwrap_or_else(|_| EditResult {
                 operation_id: request.operation_id,
@@ -2875,7 +2926,23 @@ impl<'a> Worker<'a> {
                 source_ref: None,
             });
         let authority = self.authority(&binding).await.ok();
-        Ok((PeerReply::Edit { result }, authority, observed))
+        let diagnostics =
+            (result == expected && result.outcome.has_post_source() && observed.is_some())
+                .then_some(diagnostics)
+                .unwrap_or(EditDiagnostics::Unknown {});
+        let observed = result
+            .outcome
+            .has_post_source()
+            .then_some(observed)
+            .flatten();
+        Ok((
+            PeerReply::Edit {
+                result,
+                diagnostics,
+            },
+            authority,
+            observed,
+        ))
     }
 
     /// Settles daemon-proven pre-claim no-effect or post-claim unknown helper lifecycle state.
@@ -2906,7 +2973,10 @@ impl<'a> Worker<'a> {
             None => match self.edits.prepare(request.clone()).await {
                 Ok(PrepareAdmission::Settled(result)) => {
                     return Ok((
-                        PeerReply::Edit { result },
+                        PeerReply::Edit {
+                            result,
+                            diagnostics: EditDiagnostics::Unknown {},
+                        },
                         self.authority(&binding).await.ok(),
                         None,
                     ));
@@ -2932,7 +3002,14 @@ impl<'a> Worker<'a> {
                 source_ref: None,
             });
         let authority = self.authority(&binding).await.ok();
-        Ok((PeerReply::Edit { result }, authority, None))
+        Ok((
+            PeerReply::Edit {
+                result,
+                diagnostics: EditDiagnostics::Unknown {},
+            },
+            authority,
+            None,
+        ))
     }
 }
 
@@ -3516,7 +3593,8 @@ mod stop_retry_tests {
                     outcome: ChangesEditOutcome::Replaced,
                     source_ref: Some(ref source_ref),
                     ..
-                }
+                },
+                ..
             } if source_ref == "edit-result"
         ));
         assert_eq!(
@@ -3559,7 +3637,8 @@ mod stop_retry_tests {
                     outcome: ChangesEditOutcome::Replaced,
                     source_ref: Some(ref source_ref),
                     ..
-                }
+                },
+                ..
             } if source_ref == "edit-result-2"
         ));
         assert_eq!(
@@ -3575,7 +3654,8 @@ mod stop_retry_tests {
                 result: EditResult {
                     outcome: ChangesEditOutcome::ConflictingDuplicate,
                     ..
-                }
+                },
+                ..
             }
         ));
         assert_eq!(

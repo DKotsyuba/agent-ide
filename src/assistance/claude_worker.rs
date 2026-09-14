@@ -704,6 +704,12 @@ pub enum HelperPayload {
         outcome: crate::changes::edit::EditOutcome,
         /// Exact post-read digest/length for success, absent for no-effect or unknown outcomes.
         source: Option<HelperSource>,
+        /// Assistance-only diagnostic evidence derived from the exact helper post-read generation.
+        ///
+        /// Helpers cannot retain inspectable detail, so they never carry `Pending`; older frames
+        /// decode conservatively as unknown rather than inventing clean state.
+        #[serde(default)]
+        diagnostics: super::reply::EditDiagnostics,
     },
 }
 
@@ -806,7 +812,12 @@ impl HelperResult {
         {
             return Err(FailureCode::Capacity);
         }
-        if let Some(HelperPayload::Edit { outcome, source }) = &self.payload {
+        if let Some(HelperPayload::Edit {
+            outcome,
+            source,
+            diagnostics,
+        }) = &self.payload
+        {
             let success = outcome.has_post_source();
             if success != source.is_some()
                 || source.as_ref().is_some_and(|source| {
@@ -816,6 +827,12 @@ impl HelperResult {
                         || source.digest.is_none()
                         || source.length > crate::workspace::observation::MAX_SOURCE_BYTES as u64
                 })
+            {
+                return Err(FailureCode::Capacity);
+            }
+            if !diagnostics.valid()
+                || matches!(diagnostics, super::reply::EditDiagnostics::Pending { .. })
+                || (!success && !matches!(diagnostics, super::reply::EditDiagnostics::Unknown {}))
             {
                 return Err(FailureCode::Capacity);
             }

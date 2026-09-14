@@ -77,6 +77,124 @@ pub enum ResultKind {
     Stop,
 }
 
+/// Closed diagnostic evidence attached to one successful Assistance edit reply.
+///
+/// The projection is deliberately owned by Assistance rather than Changes: its facts are bounded
+/// provider observations for the exact post-read source generation, not durable filesystem receipt
+/// state. `Unknown` never implies that a provider found no diagnostics, and `Pending` is valid
+/// only when the named detail can actually be inspected by the same binding.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EditDiagnostics {
+    /// A matching, versioned provider result explicitly reported no diagnostics for the post-edit
+    /// source generation.
+    CurrentClean {},
+    /// A matching, versioned provider result reported bounded diagnostics for the post-edit source
+    /// generation.
+    CurrentReported {
+        /// At most eight provider messages, each limited to 256 UTF-8 bytes.
+        messages: Vec<String>,
+        /// Bounded explanation of the exact-generation diagnostic delta.
+        delta: String,
+        /// True when the provider or reply ceiling omitted one or more diagnostic messages.
+        truncated: bool,
+    },
+    /// No matching-generation diagnostic result was established before the bounded edit deadline.
+    Unknown {},
+    /// Matching-generation diagnostic work remains inspectable through this same-binding detail.
+    Pending {
+        /// Opaque same-binding detail reference that is retained and consumable by `ide.inspect`.
+        detail_ref: String,
+    },
+}
+
+impl EditDiagnostics {
+    /// Converts one correlated provider snapshot into post-edit evidence without treating silence
+    /// as cleanliness.
+    ///
+    /// Only a current semantic context, a matching source/generation/version diagnostic snapshot,
+    /// and explicit `Clean` or `Reported` readiness produce current evidence. All unavailable,
+    /// timeout, stale, lexical, unversioned, and unready snapshots stay `Unknown`.
+    pub(crate) fn from_snapshot(
+        context: &crate::intelligence::context::ContextResult,
+        diagnostics: &crate::intelligence::session::DiagnosticSnapshot,
+    ) -> Self {
+        use crate::intelligence::freshness::{DiagnosticReadiness, Freshness};
+
+        let exact = context.freshness == Freshness::Current
+            && diagnostics.freshness == Freshness::Provisional
+            && diagnostics.source.as_ref() == Some(&context.source)
+            && Some(diagnostics.generation) == context.generation
+            && diagnostics.document_version == context.document_version
+            && diagnostics
+                .document_version
+                .is_some_and(|version| version > 0);
+        if !exact {
+            return Self::Unknown {};
+        }
+        match diagnostics.readiness {
+            DiagnosticReadiness::Clean if diagnostics.diagnostics.is_empty() => {
+                Self::CurrentClean {}
+            }
+            DiagnosticReadiness::Reported if !diagnostics.diagnostics.is_empty() => {
+                let messages = diagnostics
+                    .diagnostics
+                    .iter()
+                    .take(8)
+                    .map(|diagnostic| bounded_utf8_prefix(&diagnostic.message, 256))
+                    .collect::<Vec<String>>();
+                Self::CurrentReported {
+                    delta: format!(
+                        "Provider reported {} diagnostics for the exact post-edit source generation.",
+                        diagnostics.diagnostics.len()
+                    ),
+                    truncated: diagnostics.truncated
+                        || diagnostics.diagnostics.len() > messages.len(),
+                    messages,
+                }
+            }
+            _ => Self::Unknown {},
+        }
+    }
+
+    /// Returns whether this closed projection has bounded, self-consistent model-visible fields.
+    pub(super) fn valid(&self) -> bool {
+        match self {
+            Self::CurrentClean {} | Self::Unknown {} => true,
+            Self::CurrentReported {
+                messages, delta, ..
+            } => {
+                !messages.is_empty()
+                    && messages.len() <= 8
+                    && messages.iter().all(|message| message.len() <= 256)
+                    && !delta.is_empty()
+                    && delta.len() <= MAX_FEEDBACK_BYTES
+            }
+            Self::Pending { detail_ref } => {
+                !detail_ref.is_empty()
+                    && detail_ref.len() <= 128
+                    && !detail_ref.chars().any(char::is_control)
+            }
+        }
+    }
+}
+
+/// Returns the largest UTF-8 prefix of `value` that fits `limit` bytes.
+fn bounded_utf8_prefix(value: &str, limit: usize) -> String {
+    let mut end = value.len().min(limit);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
+impl Default for EditDiagnostics {
+    /// Decodes absent backward-compatible diagnostic fields as unknown, never as clean.
+    fn default() -> Self {
+        Self::Unknown {}
+    }
+}
+
 /// Closed result shape; decoding rejects unknown states, fields and invalid detail references.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
@@ -129,10 +247,13 @@ pub enum PeerReply {
         /// True when serialized-result budgeting omitted owner text.
         truncated: bool,
     },
-    /// Exact Changes-owned one-file edit result with no source content or diagnostics.
+    /// Exact Changes-owned one-file result plus Assistance-only post-edit diagnostic evidence.
     Edit {
         /// Durable closed outcome, operation/path correlation, and optional post-read source ref.
         result: crate::changes::edit::EditResult,
+        /// Closed diagnostic projection for the exact post-read source generation.
+        #[serde(default)]
+        diagnostics: EditDiagnostics,
     },
 }
 impl std::fmt::Debug for PeerReply {
@@ -188,6 +309,9 @@ impl PeerReply {
     }
     /// Checks reference syntax; ownership and current liveness remain worker admission gates.
     fn valid_reference(&self) -> bool {
+        if matches!(self, Self::Edit { diagnostics, .. } if !diagnostics.valid()) {
+            return false;
+        }
         if matches!(self, Self::Feedback { text } if text.is_empty() || text.len() > MAX_FEEDBACK_BYTES)
         {
             return false;
@@ -286,7 +410,7 @@ pub(crate) fn render_call_tool_result(reply: &PeerReply) -> Option<CallToolResul
             ..
         } => "Workspace authority is stopped; files already edited by native host tools remain on disk"
             .to_owned(),
-        PeerReply::Edit { result }
+        PeerReply::Edit { result, .. }
             if result.outcome == crate::changes::edit::EditOutcome::OutcomeUnknown =>
         {
             format!(
@@ -294,9 +418,29 @@ pub(crate) fn render_call_tool_result(reply: &PeerReply) -> Option<CallToolResul
                 result.path
             )
         }
+        PeerReply::Edit {
+            result,
+            diagnostics: EditDiagnostics::CurrentReported { .. },
+        } if result.outcome.has_post_source() => {
+            "Current diagnostics were reported for this edit; call ide.edit with the returned source_ref to fix them".to_owned()
+        }
+        PeerReply::Edit {
+            result,
+            diagnostics: EditDiagnostics::CurrentClean {},
+        } if result.outcome.has_post_source() => {
+            "The edited source is currently clean; call ide.diff to review the change".to_owned()
+        }
+        PeerReply::Edit {
+            result,
+            diagnostics: EditDiagnostics::Pending { detail_ref },
+        } if result.outcome.has_post_source() => {
+            format!("Post-edit diagnostics are pending; use ide.inspect with detail_ref {detail_ref}")
+        }
+        PeerReply::Edit { result, .. } if result.outcome.has_post_source() => {
+            "Post-edit diagnostics are unknown; call ide.context to refresh them".to_owned()
+        }
         PeerReply::Edit { .. } => {
-            "Changes returned a closed single-file edit outcome; native editing remains available"
-                .to_owned()
+            "Changes returned a closed single-file edit outcome; native editing remains available".to_owned()
         }
         _ => "Assistance returned the current owner result".to_owned(),
     };
@@ -403,4 +547,78 @@ fn summary_names_the_next_step_tool_for_each_reply_shape() {
         truncated: false,
     });
     assert!(stop.contains("remain on disk"));
+}
+
+/// Builds one successful edit reply with a usable post-read reference for response-contract checks.
+#[cfg(test)]
+fn successful_edit_reply(diagnostics: EditDiagnostics) -> PeerReply {
+    PeerReply::Edit {
+        result: crate::changes::edit::EditResult::new(
+            "edit-1".into(),
+            "main.rs".into(),
+            crate::changes::edit::EditOutcome::Replaced,
+            Some("post-edit-1".into()),
+        )
+        .expect("fixed successful edit result"),
+        diagnostics,
+    }
+}
+
+/// Proves Codex can chain a reported-error edit to a clean edit without a context round trip, and
+/// that the clean reply directs diff review without leaking the earlier diagnostic.
+#[test]
+fn codex_edit_returns_current_errors_or_clean_with_the_next_action() {
+    let reported = successful_edit_reply(EditDiagnostics::CurrentReported {
+        messages: vec!["cannot find value `x`".into()],
+        delta: "Provider reported 1 diagnostic for the exact post-edit source generation.".into(),
+        truncated: false,
+    });
+    let rendered = render_call_tool_result(&reported).expect("bounded reply");
+    let ContentBlock::Text(summary) = &rendered.content[0] else {
+        panic!("summary is text");
+    };
+    assert!(summary.text.contains("ide.edit") && summary.text.contains("source_ref"));
+    let value = serde_json::to_value(&reported).expect("closed typed reply");
+    assert_eq!(value["diagnostics"]["state"], "current_reported");
+    assert_eq!(value["result"]["source_ref"], "post-edit-1");
+
+    let clean = successful_edit_reply(EditDiagnostics::CurrentClean {});
+    let rendered = render_call_tool_result(&clean).expect("bounded reply");
+    let ContentBlock::Text(summary) = &rendered.content[0] else {
+        panic!("summary is text");
+    };
+    assert!(summary.text.contains("ide.diff"));
+    assert!(
+        !serde_json::to_string(&clean)
+            .expect("closed typed reply")
+            .contains("cannot find value")
+    );
+}
+
+/// Proves Claude provider failures and deadlines are unknown rather than stale errors or inferred
+/// clean state, and only a retained pending reference directs inspection.
+#[test]
+fn claude_edit_timeout_or_unavailable_diagnostics_are_unknown_without_stale_leakage() {
+    let unknown = successful_edit_reply(EditDiagnostics::Unknown {});
+    let rendered = render_call_tool_result(&unknown).expect("bounded reply");
+    let ContentBlock::Text(summary) = &rendered.content[0] else {
+        panic!("summary is text");
+    };
+    assert!(summary.text.contains("ide.context"));
+    let value = serde_json::to_value(&unknown).expect("closed typed reply");
+    assert_eq!(value["diagnostics"], serde_json::json!({"state":"unknown"}));
+    assert!(!value.to_string().contains("cannot find value"));
+
+    let pending = successful_edit_reply(EditDiagnostics::Pending {
+        detail_ref: "diagnostic-detail-1".into(),
+    });
+    let rendered = render_call_tool_result(&pending).expect("bounded reply");
+    let ContentBlock::Text(summary) = &rendered.content[0] else {
+        panic!("summary is text");
+    };
+    assert!(summary.text.contains("ide.inspect") && summary.text.contains("diagnostic-detail-1"));
+    assert!(PeerReply::decode(
+        r#"{"state":"edit","result":{"operation_id":"edit-1","path":"main.rs","outcome":"replaced","source_ref":"post-edit-1"},"diagnostics":{"state":"pending","detail_ref":""}}"#
+    )
+    .is_none());
 }
