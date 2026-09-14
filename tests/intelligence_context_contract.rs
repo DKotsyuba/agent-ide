@@ -297,7 +297,7 @@ async fn real_gopls_production_context_tracks_exact_observed_bytes() {
             .expect("real gopls must publish the missing-name diagnostic");
             let diagnostics = session.diagnostics();
             assert_eq!(diagnostics.freshness, Freshness::Provisional);
-            assert_eq!(diagnostics.readiness, DiagnosticReadiness::Unknown);
+            assert_eq!(diagnostics.readiness, DiagnosticReadiness::Reported);
             assert!(
                 diagnostics
                     .diagnostics

@@ -801,7 +801,9 @@ impl Session {
 
     /// Sends didOpen, full-document didChange, or close/open while retaining one exact document.
     /// Missing observations close the document and return `None`; present sources return their
-    /// monotonic version. Requires advertised synchronization; source versions never reset.
+    /// monotonic version. Every identity change clears diagnostic rows and resets readiness to
+    /// unknown until a matching versioned notification arrives. Requires advertised
+    /// synchronization; source versions never reset.
     fn synchronize(
         &mut self,
         observation: &SourceObservation,
@@ -840,6 +842,7 @@ impl Session {
             state.diagnostics.source = None;
             state.diagnostics.document_version = None;
             state.diagnostics.freshness = Freshness::Unknown;
+            state.diagnostics.readiness = DiagnosticReadiness::Unknown;
             state.diagnostics.diagnostics.clear();
             state.diagnostics.truncated = false;
             return Ok(None);
@@ -915,6 +918,7 @@ impl Session {
         state.diagnostics.source = None;
         state.diagnostics.document_version = None;
         state.diagnostics.freshness = Freshness::Unknown;
+        state.diagnostics.readiness = DiagnosticReadiness::Unknown;
         state.diagnostics.diagnostics.clear();
         state.diagnostics.truncated = false;
         Ok(Some(version))
