@@ -55,13 +55,20 @@ fn toolchain_bin(tool: &str) -> PathBuf {
     PathBuf::from(root).join("bin").join(tool)
 }
 
+/// Returns the operator-verified rust-analyzer path, with the local accepted binary as fallback.
+fn analyzer_bin() -> PathBuf {
+    std::env::var("AGENT_IDE_RUST_ANALYZER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/Users/pluto/.local/bin/rust-analyzer"))
+}
+
 /// Builds the complete fixed Rust compatibility identity used by every exclusive request.
 /// `cache_namespace` must be a verified absolute directory, never a bare relative label, so
 /// `command`'s derived `CARGO_HOME`/`CARGO_TARGET_DIR`/`TMPDIR` resolve without depending on the
 /// spawned process's working directory.
 fn profile(cache_namespace: &Path) -> RustProfile {
     RustProfile::new(RustProfileIdentity {
-        binary: PathBuf::from("/Users/pluto/.local/bin/rust-analyzer"),
+        binary: analyzer_bin(),
         rust_analyzer_version: format!("rust-analyzer {ANALYZER_VERSION}"),
         cargo: toolchain_bin("cargo"),
         cargo_version: "cargo 1.98.1".into(),
@@ -411,10 +418,7 @@ fn exclusive_rust_requests_are_distinct_and_source_results_are_generation_scoped
 /// Runs two divergent real rust-analyzer projects serially under one heavy-process slot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_rust_analyzer_is_exclusive_across_divergent_worktrees() {
-    let analyzer = PathBuf::from(
-        std::env::var("AGENT_IDE_RUST_ANALYZER")
-            .expect("AGENT_IDE_RUST_ANALYZER must name the verified rust-analyzer binary"),
-    );
+    let analyzer = analyzer_bin();
     let (first_root, first_uri, first_cache_namespace) = project("first", "u32", "42");
     let (second_root, second_uri, second_cache_namespace) =
         project("second", "String", "String::new()");

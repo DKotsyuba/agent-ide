@@ -16,11 +16,12 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.25.x"
+          cache: false
       - name: Verify runner
         run: test "$(uname -m)" = arm64
       - name: Prepare toolchains
         run: |
-          rustup component add rustfmt clippy rust-analyzer
+          rustup component add rustfmt clippy rust-analyzer rust-src
           go install golang.org/x/tools/gopls@v0.23.0
           echo "AGENT_IDE_GOPLS=$(go env GOPATH)/bin/gopls" >> "$GITHUB_ENV"
           echo "AGENT_IDE_GO=$(command -v go)" >> "$GITHUB_ENV"
