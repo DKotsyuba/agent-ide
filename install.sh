@@ -29,10 +29,15 @@ trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
 gh release download "$tag" --repo "$repo" --pattern "$asset" --pattern SHA256SUMS --dir "$tmp_dir"
 (cd "$tmp_dir" && shasum -a 256 -c SHA256SUMS)
 tar -xzf "$tmp_dir/$asset" -C "$tmp_dir"
+bundle="$tmp_dir/agent-ide-$tag"
+[ -d "$bundle" ] && [ -x "$bundle/agent-ide" ] || {
+  echo "release archive is missing the $tag bundle" >&2
+  exit 1
+}
 
 mkdir -p "$install_dir"
 tmp_binary="$install_dir/.agent-ide.$$"
-cp "$tmp_dir/agent-ide" "$tmp_binary"
+cp "$bundle/agent-ide" "$tmp_binary"
 chmod 755 "$tmp_binary"
 mv -f "$tmp_binary" "$install_dir/agent-ide"
 echo "installed $tag to $install_dir/agent-ide"
