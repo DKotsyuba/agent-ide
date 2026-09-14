@@ -1382,13 +1382,16 @@ fn is_claude_edit_settlement(input: &JobInput) -> bool {
 
 /// Returns whether an operation needs a retained result detail after it completes.
 ///
-/// Stop and Claude edit settlement (terminal or successful) return directly to their waiting
-/// caller. The latter deliberately bypasses ordinary detail capacity so a mint failure, expiry, or
-/// stop cannot strand receipt/ticket cleanup behind live result details — and, for a successful
-/// completion, so saturated capacity can never turn a write the foreground helper already
-/// performed into a bare `Capacity` error instead of its settled receipt.
+/// Stop, Claude Diff, and Claude edit settlement (terminal or successful) return directly to their
+/// waiting caller. A helper-composed Diff has no continuation and therefore no usable retained
+/// detail. Edit settlement deliberately bypasses ordinary detail capacity so a mint failure,
+/// expiry, or stop cannot strand receipt/ticket cleanup behind live result details — and, for a
+/// successful completion, so saturated capacity can never turn a write the foreground helper
+/// already performed into a bare `Capacity` error instead of its settled receipt.
 fn retains_detail(tool: AssistanceTool, input: &JobInput) -> bool {
-    tool != AssistanceTool::Stop && !is_claude_edit_settlement(input)
+    tool != AssistanceTool::Stop
+        && !matches!(input, JobInput::Claude(settled) if settled.operation() == HelperOperation::Diff)
+        && !is_claude_edit_settlement(input)
 }
 
 /// Returns the finite queue ceiling, reserving bounded cleanup headroom for terminal work.
@@ -1774,6 +1777,15 @@ impl<'a> Worker<'a> {
             source,
             job.native_epoch,
         );
+        if matches!(&job.input, JobInput::Claude(_))
+            && matches!(reply, PeerReply::Error { .. })
+            && let Ok(mut ledger) = self.shared.ledger.lock()
+        {
+            ledger.details.remove(&job.reference);
+            ledger
+                .starts
+                .retain(|_, reference| reference != &job.reference);
+        }
         if let Some(sender) = job.stop_reply.take() {
             // The oneshot send is the actual submission boundary for this synchronous-wait path
             // (Claude Start/Context/Diff/Stop): it only succeeds while the caller's own `wait`
@@ -2432,7 +2444,7 @@ impl<'a> Worker<'a> {
             PeerReply::Complete {
                 kind: ResultKind::Diff,
                 text: text.clone(),
-                detail_ref: Some(job.reference.clone()),
+                detail_ref: None,
                 truncated: *truncated,
                 continuation: false,
             },

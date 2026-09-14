@@ -18,6 +18,9 @@ const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
 /// Compiled Codex release record prefix for the exact TypeScript r3 macOS bundle cell.
 const TYPESCRIPT_CODEX_MACOS_EVIDENCE_V1: &str =
     "macos-26.6.2-node-24.4.0-tls-6.0.0-ts-5.9.3-codex-r3-2026-09-14";
+/// Compiled Claude release record prefix for the same exact TypeScript r3 macOS bundle cell.
+const TYPESCRIPT_CLAUDE_MACOS_EVIDENCE_V1: &str =
+    "macos-26.6.2-node-24.4.0-tls-6.0.0-ts-5.9.3-claude-r3-2026-09-14";
 /// Exact Node release admitted by the compiled Codex TypeScript record.
 const TYPESCRIPT_NODE_VERSION_V1: &str = "24.4.0";
 /// BLAKE3 identity of the accepted macOS Node 24.4.0 executable bytes.
@@ -236,7 +239,7 @@ pub struct AcceptedTypeScriptBundleV1 {
     pub closure: Vec<AcceptedTypeScriptFileV1>,
     /// Exact compiled Codex macOS release record required to enable this provider for Codex.
     pub codex_macos_evidence: String,
-    /// Optional separate Claude macOS record; no value is accepted until that cell passes.
+    /// Optional separate Claude macOS record; `None` keeps the provider unavailable to Claude.
     pub claude_macos_evidence: Option<String>,
 }
 
@@ -249,7 +252,10 @@ impl AcceptedTypeScriptBundleV1 {
             || self.closure.is_empty()
             || self.closure.len() > 64
             || !identifier(&self.codex_macos_evidence)
-            || self.claude_macos_evidence.is_some()
+            || self
+                .claude_macos_evidence
+                .as_deref()
+                .is_some_and(|evidence| !identifier(evidence))
         {
             return Err(LauncherError::Rejected);
         }
@@ -419,12 +425,27 @@ impl ProviderLaunch {
             })
     }
 
-    /// Returns whether a separately compiled Claude release record accepts this exact declaration.
+    /// Derives the Claude record for the same exact bundle already bound by the Codex digest.
     ///
-    /// No Claude TypeScript record is accepted in this release; the wired helper path therefore
-    /// remains unavailable instead of inheriting the Codex record.
-    pub const fn typescript_claude_accepted(&self) -> bool {
-        false
+    /// The distinct prefix names the independently exercised Claude host cell. Reusing the exact
+    /// bundle suffix keeps both records bound to identical declared paths, bytes, and releases;
+    /// malformed or non-Codex-accepted declarations return `None` without filesystem I/O.
+    pub fn expected_typescript_claude_macos_evidence(&self) -> Option<String> {
+        let codex = self.expected_typescript_codex_macos_evidence()?;
+        let (_, bundle_digest) = codex.rsplit_once(':')?;
+        Some(format!(
+            "{TYPESCRIPT_CLAUDE_MACOS_EVIDENCE_V1}:{bundle_digest}"
+        ))
+    }
+
+    /// Returns whether the independent Claude release record accepts this exact declaration.
+    pub fn typescript_claude_accepted(&self) -> bool {
+        self.expected_typescript_claude_macos_evidence()
+            .is_some_and(|expected| {
+                self.typescript.as_ref().is_some_and(|bundle| {
+                    bundle.claude_macos_evidence.as_deref() == Some(expected.as_str())
+                })
+            })
     }
 }
 
@@ -711,6 +732,10 @@ impl LauncherConfig {
                             bundle.validate().is_ok()
                                 && provider.executable.identity == bundle.bridge_version
                         }) || !provider.typescript_codex_accepted()
+                            || provider.typescript.as_ref().is_some_and(|bundle| {
+                                bundle.claude_macos_evidence.is_some()
+                                    && !provider.typescript_claude_accepted()
+                            })
                             || provider.cargo.is_some()
                             || provider.cargo_version.is_some()
                             || provider.rustc.is_some()
@@ -946,6 +971,13 @@ fn launcher_mapping_is_closed_bounded_and_restart_only() {
     let typescript = &loaded.target("private-attachment").unwrap().providers[3];
     assert!(typescript.typescript_codex_accepted());
     assert!(!typescript.typescript_claude_accepted());
+    let accepted_claude = typescript
+        .expected_typescript_claude_macos_evidence()
+        .unwrap();
+    python_config["targets"][0]["providers"][3]["typescript"]["claude_macos_evidence"] =
+        json!(accepted_claude);
+    let loaded = LauncherConfig::parse(python_config.to_string().as_bytes()).unwrap();
+    assert!(loaded.target("private-attachment").unwrap().providers[3].typescript_claude_accepted());
     let mut invented_claude = python_config.clone();
     invented_claude["targets"][0]["providers"][3]["typescript"]["claude_macos_evidence"] =
         json!("invented");

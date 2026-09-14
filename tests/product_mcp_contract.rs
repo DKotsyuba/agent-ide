@@ -1438,7 +1438,7 @@ fn accepted_pyright_provider(cache_namespace: &str) -> Value {
 ///
 /// The Node executable, bridge module, and `tsserver.js` must be absolute readable files from the
 /// accepted 24.4.0/6.0.0/5.9.3 bundle. Missing files or environment values panic because callers
-/// are ignored release tests, and the returned JSON contains the bundle-bound Codex evidence hash.
+/// are ignored release tests, and the returned JSON contains both bundle-bound host evidence hashes.
 fn accepted_typescript_provider() -> Value {
     let node = PathBuf::from(std::env::var("AGENT_IDE_NODE").unwrap());
     let bridge = PathBuf::from(std::env::var("AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER").unwrap());
@@ -1477,6 +1477,8 @@ fn accepted_typescript_provider() -> Value {
         serde_json::from_value(provider.clone()).unwrap();
     provider["typescript"]["codex_macos_evidence"] =
         json!(unbound.expected_typescript_codex_macos_evidence().unwrap());
+    provider["typescript"]["claude_macos_evidence"] =
+        json!(unbound.expected_typescript_claude_macos_evidence().unwrap());
     provider
 }
 
@@ -1890,6 +1892,18 @@ async fn managed_codex_smoke_and_eof_cleanup() {
     .await;
     let original = settle_managed(&mut mcp, &mut next, actor, &state, original).await;
     assert!(original["text"].as_str().unwrap().contains("worktree"));
+    let original_ref = original["detail_ref"].as_str().unwrap().to_owned();
+    next += 1;
+    let retrieved = managed_call(
+        &mut mcp,
+        next,
+        actor,
+        "ide.context",
+        json!({"path":"tracked.txt","detail_ref":original_ref}),
+        &state,
+    )
+    .await;
+    assert_eq!(retrieved, original, "{retrieved}");
 
     next += 1;
     let edited = managed_call(
@@ -1944,6 +1958,18 @@ async fn managed_codex_smoke_and_eof_cleanup() {
             .unwrap()
             .contains("managed-native-edit")
     );
+    let diff_ref = diff["detail_ref"].as_str().unwrap().to_owned();
+    next += 1;
+    let retrieved = managed_call(
+        &mut mcp,
+        next,
+        actor,
+        "ide.diff",
+        json!({"mode":"head","detail_ref":diff_ref}),
+        &state,
+    )
+    .await;
+    assert_eq!(retrieved, diff, "{retrieved}");
 
     next += 1;
     let forged = mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.context","arguments":{"path":"tracked.txt","actor_id":"forged","sandbox":state},"_meta":{"threadId":actor,"callId":format!("managed-{actor}-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":fixture.state()}}})).await;
@@ -3175,6 +3201,57 @@ async fn configured_product_returns_real_typescript_family_context_and_reaps() {
         assert!(text.contains("references: [{"), "{path}: {response}");
     }
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Exercises the release-pinned TypeScript provider through Claude's foreground helper path.
+///
+/// The ignored release check requires the exact accepted Node, bridge, `tsserver.js`, and closure
+/// environment paths. A helper-private `.ts` session must return semantic definition/reference
+/// evidence and complete its graceful shutdown before the helper reports all children reaped.
+#[tokio::test]
+#[ignore = "requires exact AGENT_IDE_NODE, AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER and AGENT_IDE_TSSERVER environment"]
+async fn configured_product_claude_helper_returns_real_typescript_semantic_context_and_reaps() {
+    let fixture = ProductFixture::new_claude(json!([accepted_typescript_provider()]));
+    let source = "export const value: number = 42;\nexport const use: number = value;\n";
+    std::fs::write(fixture.root.join("fixture.ts"), source).unwrap();
+    std::fs::write(
+        fixture.root.join("tsconfig.json"),
+        "{\"compilerOptions\":{\"types\":[],\"moduleResolution\":\"node10\"},\"files\":[\"fixture.ts\"]}\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "fixture.ts", "tsconfig.json"]);
+    fixture.git(&["commit", "--quiet", "-m", "TypeScript Claude fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "claude-typescript").await;
+    let started = actor
+        .call_claude(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"typescript-start"}),
+        )
+        .await;
+    let (started, _) = actor.complete_claude_pending(&fixture, &started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    let context = actor
+        .call_claude(
+            &fixture,
+            "ide.context",
+            json!({"path":"fixture.ts","byte_offset":source.rfind("value;").unwrap()}),
+        )
+        .await;
+    let (context, _) = actor.complete_claude_pending(&fixture, &context).await;
+    assert_eq!(context["kind"], "context", "{context}");
+    let text = context["text"].as_str().unwrap();
+    assert!(text.contains("mode: semantic"), "{context}");
+    assert!(text.contains("definitions: [{"), "{context}");
+    assert!(text.contains("references: [{"), "{context}");
+
+    let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
@@ -5126,6 +5203,70 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
         "{stale_detail}"
     );
 
+    first.mcp.close().await;
+    second.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Keeps a two-detail Claude worker usable across helper Diff finalization and repeated failures.
+///
+/// One retained activation occupies the first slot. A second actor's settled-but-conflicting Start
+/// is inspected repeatedly; each identical failure must retire its unusable worker detail. Repeated
+/// helper-composed Diffs retain no continuation detail, leaving the second slot available for a
+/// source-producing Context that a later Edit could consume.
+#[tokio::test]
+async fn claude_diff_and_failed_reinspection_do_not_exhaust_detail_capacity() {
+    let fixture = ProductFixture::new_claude(json!([]));
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+    config["limits"]["details"] = json!(2);
+    std::fs::write(&fixture.config, config.to_string()).unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut first = ProductActor::new(&fixture, "claude-capacity-first").await;
+    let started = first
+        .call_claude(&fixture, "ide.start", json!({"activation_id":"first"}))
+        .await;
+    let (started, _) = first.complete_claude_pending(&fixture, &started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    let mut second = ProductActor::new_at(
+        &fixture,
+        "claude-capacity-second",
+        "private-host-channel",
+        "session_id",
+        fixture.state(),
+    )
+    .await;
+    let conflicting = second
+        .call_claude(&fixture, "ide.start", json!({"activation_id":"second"}))
+        .await;
+    let detail_ref = second.launch_claude_pending(&fixture, &conflicting).await;
+    for _ in 0..3 {
+        let conflict = second
+            .call_claude(&fixture, "ide.inspect", json!({"detail_ref":detail_ref}))
+            .await;
+        assert_eq!(conflict["code"], "conflict", "{conflict}");
+    }
+
+    for _ in 0..3 {
+        let diff = first
+            .call_claude(&fixture, "ide.diff", json!({"mode":"head"}))
+            .await;
+        let (diff, _) = first.complete_claude_pending(&fixture, &diff).await;
+        assert_eq!(diff["kind"], "diff", "{diff}");
+        assert!(diff["detail_ref"].is_null(), "{diff}");
+        assert_eq!(diff["continuation"], false, "{diff}");
+    }
+
+    let context = first
+        .call_claude(&fixture, "ide.context", json!({"path":"tracked.txt"}))
+        .await;
+    let (context, _) = first.complete_claude_pending(&fixture, &context).await;
+    assert_eq!(context["kind"], "context", "{context}");
+    assert!(context["detail_ref"].is_string(), "{context}");
+    let stopped = first.call_claude(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
     first.mcp.close().await;
     second.mcp.close().await;
     daemon.kill().await.unwrap();

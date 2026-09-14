@@ -1,7 +1,7 @@
 # TypeScript provider release evidence
 
-Status: `real_pass` for the Codex macOS host cell on 2026-09-14; `not_tested` for
-Claude. This is release evidence for the pinned bundle only. Runtime
+Status: `real_pass` for the separate Codex and Claude macOS host cells on 2026-09-14.
+This is release evidence for the pinned bundle only. Runtime
 `DescendantEvidence` remains `Unverified`.
 
 ## Pinned exchange
@@ -39,11 +39,22 @@ bridge child. The client requested no TERM or KILL. Fresh process queries for bo
 captured PID/start-time identities were empty after ordinary shutdown.
 
 These observations establish normal-shutdown conformance for this exact release
-cell. The configured Codex record appends the stable digest of the exact accepted
+cell. The configured host records append the stable digest of the exact accepted
 Node/bridge/`tsserver.js`/closure declaration; changing any declared identity rejects a copied
-record. They neither prove arbitrary descendant settlement at runtime nor claim that
-a process group contains every descendant. Claude requires its own real macOS
-foreground-helper record before this bundle may be enabled for Claude.
+record, and the distinct Codex and Claude prefixes cannot substitute for each other. They neither
+prove arbitrary descendant settlement at runtime nor claim that a process group contains every
+descendant.
+
+## Claude foreground-host spike
+
+Claude Code 2.1.267 ran the same pinned stdio bridge in a foreground Bash operation under its
+normal strict macOS sandbox and normal authenticated profile. The exchange returned a semantic
+definition, two references, and a nonempty diagnostic publication, then completed `shutdown`,
+`exit`, EOF, and bridge exit zero. An observer outside the sandbox captured the bridge and direct
+`tsserver.js` PID plus Darwin start-time identities before shutdown and confirmed both exact
+identities absent afterward. The observer did not widen the sandbox or grant process-table access
+inside it. The production helper gate separately reconstructed the bundle from the accepted Claude
+launcher frame, returned semantic TypeScript Context, and reported every direct child reaped.
 
 ## Shipping product fixture
 
@@ -58,5 +69,7 @@ The shipping MCP and daemon then loaded the same accepted bundle through the fou
 files under one exact `tsconfig.json` containing `types=[]`, `moduleResolution=node10`, and
 `allowJs=true` each returned semantic definitions and references through separate exclusive
 one-shot sessions. Every operation completed the strict graceful session result before the direct
-bridge child was released. This covers the TypeScript Context and normal-shutdown subset only; it
-does not complete the broader v0.2 edit, telemetry, fallback, or multi-worktree acceptance matrix.
+bridge child was released. A separate `.ts` fixture completed the same semantic Context and
+normal-shutdown path inside the Claude foreground helper. This covers the TypeScript Context and
+normal-shutdown subset only; it does not complete the broader v0.2 edit, telemetry, fallback, or
+multi-worktree acceptance matrix.

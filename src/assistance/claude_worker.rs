@@ -164,11 +164,23 @@ pub struct HelperTypeScriptFileV1 {
 }
 
 impl HelperTypeScriptFileV1 {
-    /// Converts one validated wire identity into Intelligence's immutable bundle member.
+    /// Converts one structurally valid wire identity into Intelligence's immutable bundle member.
+    ///
+    /// This performs no file I/O: launcher startup already measured the accepted bytes, and the
+    /// helper reconstructs the complete bundle immediately before spawn to remeasure them. A
+    /// relative, non-normal path, malformed digest, or oversized declared file is rejected here.
     fn bundle_file(
         &self,
     ) -> Result<crate::intelligence::typescript::TypeScriptBundleFileV1, FailureCode> {
-        if !self.path.is_absolute() || self.bytes > 64 * 1024 * 1024 {
+        if !self.path.is_absolute()
+            || !self.path.components().all(|component| {
+                matches!(
+                    component,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                )
+            })
+            || self.bytes > 64 * 1024 * 1024
+        {
             return Err(FailureCode::ExecutionProfile);
         }
         Ok(crate::intelligence::typescript::TypeScriptBundleFileV1 {
@@ -226,9 +238,47 @@ impl HelperTypeScriptProfileV1 {
             .map_err(|_| FailureCode::ExecutionProfile)
     }
 
-    /// Rejects malformed or changed bundle identities at the helper frame boundary.
+    /// Rejects malformed bundle identities at the daemon/helper frame boundary without file I/O.
+    ///
+    /// Startup has already measured the launcher-owned bundle. The receiving helper calls
+    /// [`Self::bundle`] immediately before constructing its one-shot command, which performs the
+    /// required second byte measurement; avoiding it here keeps ticket minting within MCP ingress.
     pub fn validate(&self) -> Result<(), FailureCode> {
-        self.bundle().map(|_| ())
+        let identity = |value: &str| {
+            !value.is_empty()
+                && value.len() <= MAX_IDENTIFIER_BYTES
+                && !value.chars().any(char::is_control)
+        };
+        if !self.node.is_absolute()
+            || !self.node.components().all(|component| {
+                matches!(
+                    component,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                )
+            })
+            || blake3::Hash::from_hex(&self.node_blake3).is_err()
+            || !identity(&self.node_version)
+            || !identity(&self.bridge_version)
+            || !identity(&self.typescript_version)
+            || self.bridge.bundle_file().is_err()
+            || self.tsserver.bundle_file().is_err()
+            || self.closure.is_empty()
+            || self.closure.len() > 64
+        {
+            return Err(FailureCode::ExecutionProfile);
+        }
+        let mut previous: Option<&std::path::Path> = None;
+        for file in &self.closure {
+            if file.bundle_file().is_err()
+                || previous.is_some_and(|path| path >= file.path.as_path())
+                || file.path == self.bridge.path
+                || file.path == self.tsserver.path
+            {
+                return Err(FailureCode::ExecutionProfile);
+            }
+            previous = Some(&file.path);
+        }
+        Ok(())
     }
 }
 

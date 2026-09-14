@@ -43,6 +43,7 @@ The target platforms are Linux and macOS. Current v0.1 acceptance runs real Code
 | macOS 26.6.2, Codex CLI 0.154.0, Rust/rust-analyzer 1.98.1 | `real_pass` for the managed product/provider contract; live model CLI cell `not_tested` |
 | macOS, Codex CLI, Python/Pyright 1.1.413 | `real_pass` for the bounded product/provider contract |
 | macOS 26.6.2, Codex, Node 24.4.0 / TypeScript Language Server 6.0.0 / TypeScript 5.9.3 | `real_pass`: real JS, JSX, TS and TSX semantic Context plus release-pinned normal shutdown |
+| macOS 26.6.2, Claude Code 2.1.267, Node 24.4.0 / TypeScript Language Server 6.0.0 / TypeScript 5.9.3 | `real_pass`: strict foreground-host semantic/diagnostic spike plus release-pinned normal shutdown and product helper Context |
 | macOS 26.6.2, Claude Code 2.1.267, Go/gopls 0.23.0 | `real_pass`: foreground helper, native-edit diagnostic, Diff, Stop and parallel actor isolation |
 | macOS 26.6.2, Claude Code 2.1.267, Rust/rust-analyzer 1.98.1 | `real_pass`: foreground helper semantic context, native-edit diagnostic, Diff and Stop |
 | macOS, Claude Code, Python/Pyright | `product_covered`; real host containment remains separately verified |

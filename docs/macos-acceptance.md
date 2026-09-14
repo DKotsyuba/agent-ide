@@ -7,7 +7,9 @@ in each, runs the selected cell, and removes only those runner-owned worktrees a
 The default `product` route runs the locked real-provider product gates for Go/gopls, Rust,
 Python/Pyright, Node/TypeScript r3, the edit/diagnostic/fix/diff/stop loop, stale-edit zero-write,
 native fallback, compact MCP projection, telemetry restart/query/export, the Claude foreground
-helper, and divergent-worktree isolation. Supply all of these absolute environment paths:
+helper for Pyright and TypeScript, and divergent-worktree isolation. Every toolchain path and
+version check returns explicitly inside the route guard, so a later successful check cannot mask
+an earlier failure. Supply all of these absolute environment paths:
 
 - `AGENT_IDE_GO` and `AGENT_IDE_GOPLS` for Go 1.25.x and gopls 0.23.0;
 - `AGENT_IDE_RUST_ANALYZER`, `AGENT_IDE_RUST_TOOLCHAIN`, and

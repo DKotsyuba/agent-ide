@@ -103,6 +103,10 @@ same-generation retrieval only. Retrieval launches no second helper and performs
 read. Helper-observed source and diagnostic freshness remain provisional rather than presenting
 unobserved out-of-band changes as current. A later ordinary native Pre/Post pair may consume that
 delta once; delivery advances the binding epoch but does not pretend the daemon re-read source.
+A completed helper Diff has no continuation and is returned directly without retaining an unusable
+second daemon detail. A failed helper finalization retires its transient daemon detail (including a
+failed Start mapping), so repeated inspection returns the same bounded failure without consuming
+the global detail ceiling.
 
 `stop` is daemon-owned and never launches a helper. It first closes the binding to external calls
 and helper claims. Ready Edit proof captured for that exact generation may still settle its
@@ -130,11 +134,11 @@ its provider before exiting.
   helper carries only the launcher's accepted Pyright script and Node paths, identities, and
   BLAKE3 digests; it reconstructs the profile, verifies the script at the final boundary, and
   retains the inherited-process Node recheck before spawning its one-shot child.
-
-The helper wire retains a typed TypeScript profile shape for a future independently accepted
-Claude cell, using the same `ProjectResolutionInputsV1` observation path as Codex. It is not a
-supported Claude provider today: selection is unconditionally unavailable until a real Claude
-macOS record exists, and no fixture or Codex record enables it.
+- **TypeScript** uses the same closed `ProjectResolutionInputsV1` and immutable bundle as Codex for
+  `.js`, `.jsx`, `.ts`, and `.tsx`, but only when its separate bundle-bound Claude macOS record is
+  present. Ticket validation is structural and nonblocking; startup and the receiving helper's
+  immediate pre-spawn reconstruction perform the required byte measurements. A missing, copied,
+  or mismatched Claude record leaves selection unavailable.
 
 Stop and handoff retain the IDE-owned worktree cache directories; no analysis runs while inactive.
 The daemon derives their private absolute paths from the durable worktree identity/incarnation,
@@ -195,9 +199,9 @@ Wired and covered by local checks:
 - rights-aware durable worktree cache directory retention across Stop/handoff, without a warm native
   backend or opaque-index reuse claim. Claude Go remains per-operation exclusive; the compatible
   two-worktree shared-gopls guarantee belongs only to the managed Codex matrix.
-- the fourth closed TypeScript launcher/helper frame and one-shot helper execution path. Selection
-  remains unavailable because the separate real Claude macOS acceptance record is not yet present;
-  the accepted Codex record cannot enable it.
+- the fourth closed TypeScript launcher/helper frame, independently bound Claude macOS record, and
+  one-shot semantic helper execution with normal child shutdown. The accepted Codex record alone
+  still cannot enable Claude selection.
 
 Live checks with Claude Code 2.1.267 on macOS 26.6.2 exercised Go and Rust semantic
 context, diagnostic changes after native edits, actual Git diff and Stop. Parallel native

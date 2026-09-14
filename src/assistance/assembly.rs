@@ -954,9 +954,12 @@ impl ProductDispatcher {
                     // Managed Codex has no native hook stream. Treat every read boundary as a
                     // possible native edit and reuse the worker's registered-path reconciliation
                     // and stale-detail fencing instead of adding a watcher or trusting tool args.
+                    // A Context/Diff call carrying a detail reference is retrieval of its existing
+                    // capture, not a new read boundary, so it must not invalidate itself first.
                     worker.managed_read_boundary(
                         invocation.binding_ref().clone(),
-                        method.method() != AssistanceMethod::Inspect,
+                        method.method() != AssistanceMethod::Inspect
+                            && call.parameters().get("detail_ref").is_none(),
                     );
                 }
                 Some(match method.method() {

@@ -126,26 +126,26 @@ verify_toolchains() {
     : "${AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER:?AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER is required}"
     : "${AGENT_IDE_TSSERVER:?AGENT_IDE_TSSERVER is required}"
 
-    require_file AGENT_IDE_GO "$AGENT_IDE_GO" executable
-    require_file AGENT_IDE_GOPLS "$AGENT_IDE_GOPLS" executable
-    require_file AGENT_IDE_RUST_ANALYZER "$AGENT_IDE_RUST_ANALYZER" executable
-    require_directory AGENT_IDE_RUST_TOOLCHAIN_DIR "$AGENT_IDE_RUST_TOOLCHAIN_DIR"
-    require_file AGENT_IDE_NODE "$AGENT_IDE_NODE" executable
-    require_file AGENT_IDE_PYRIGHT "$AGENT_IDE_PYRIGHT" executable
-    require_file AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER "$AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER" executable
-    require_file AGENT_IDE_TSSERVER "$AGENT_IDE_TSSERVER" readable
-    require_file rustc "$AGENT_IDE_RUST_TOOLCHAIN_DIR/bin/rustc" executable
-    require_file cargo "$AGENT_IDE_RUST_TOOLCHAIN_DIR/bin/cargo" executable
+    require_file AGENT_IDE_GO "$AGENT_IDE_GO" executable || return 1
+    require_file AGENT_IDE_GOPLS "$AGENT_IDE_GOPLS" executable || return 1
+    require_file AGENT_IDE_RUST_ANALYZER "$AGENT_IDE_RUST_ANALYZER" executable || return 1
+    require_directory AGENT_IDE_RUST_TOOLCHAIN_DIR "$AGENT_IDE_RUST_TOOLCHAIN_DIR" || return 1
+    require_file AGENT_IDE_NODE "$AGENT_IDE_NODE" executable || return 1
+    require_file AGENT_IDE_PYRIGHT "$AGENT_IDE_PYRIGHT" executable || return 1
+    require_file AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER "$AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER" executable || return 1
+    require_file AGENT_IDE_TSSERVER "$AGENT_IDE_TSSERVER" readable || return 1
+    require_file rustc "$AGENT_IDE_RUST_TOOLCHAIN_DIR/bin/rustc" executable || return 1
+    require_file cargo "$AGENT_IDE_RUST_TOOLCHAIN_DIR/bin/cargo" executable || return 1
 
     case "$("$AGENT_IDE_GO" version)" in *' go1.25.'*' darwin/arm64') ;; *) return 1 ;; esac
     case "$("$AGENT_IDE_GOPLS" version)" in *'gopls v0.23.0'*) ;; *) return 1 ;; esac
     case "$("$AGENT_IDE_RUST_ANALYZER" --version)" in 'rust-analyzer 1.98.1 '*) ;; *) return 1 ;; esac
     case "$("$AGENT_IDE_RUST_TOOLCHAIN_DIR/bin/rustc" --version)" in 'rustc 1.98.1 '*) ;; *) return 1 ;; esac
-    [ "$("$AGENT_IDE_NODE" --version)" = v24.4.0 ]
-    [ "$("$AGENT_IDE_NODE" "$AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER" --version)" = 6.0.0 ]
+    [ "$("$AGENT_IDE_NODE" --version)" = v24.4.0 ] || return 1
+    [ "$("$AGENT_IDE_NODE" "$AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER" --version)" = 6.0.0 ] || return 1
     ACCEPTANCE_PYRIGHT_CLI=$(dirname "$AGENT_IDE_PYRIGHT")/pyright
-    require_file pyright "$ACCEPTANCE_PYRIGHT_CLI" executable
-    [ "$("$ACCEPTANCE_PYRIGHT_CLI" --version)" = 'pyright 1.1.413' ]
+    require_file pyright "$ACCEPTANCE_PYRIGHT_CLI" executable || return 1
+    [ "$("$ACCEPTANCE_PYRIGHT_CLI" --version)" = 'pyright 1.1.413' ] || return 1
     ACCEPTANCE_GO_VERSION=1.25.0
     ACCEPTANCE_GOPLS_VERSION=0.23.0
     ACCEPTANCE_RUST_VERSION=1.98.1
@@ -167,7 +167,8 @@ run_product_gates() {
     cargo test --locked --test product_mcp_contract configured_product_returns_real_pyright_semantic_context_and_reaps -- --ignored --nocapture --test-threads=1 || return 1
     cargo test --locked --test product_mcp_contract configured_product_acceptance_edit_diagnostics_telemetry_and_fallback -- --ignored --nocapture --test-threads=1 || return 1
     cargo test --locked --test product_mcp_contract configured_product_claude_helper_returns_real_pyright_semantic_context_diff_and_stop -- --ignored --nocapture --test-threads=1 || return 1
-    verify_toolchains
+    cargo test --locked --test product_mcp_contract configured_product_claude_helper_returns_real_typescript_semantic_context_and_reaps -- --ignored --nocapture --test-threads=1 || return 1
+    verify_toolchains || return 1
 }
 
 # Executes one explicitly supplied real-host driver against the two isolated fixture worktrees.
@@ -195,7 +196,7 @@ typescript_r3=real_pass
 divergent_worktrees=real_pass'
     [ "$(sed -n '1,10p' "$ACCEPTANCE_RESULT")" = "$ACCEPTANCE_EXPECTED" ] || return 1
     [ "$(wc -l <"$ACCEPTANCE_RESULT" | tr -d ' ')" -le 9 ] || return 1
-    verify_toolchains
+    verify_toolchains || return 1
 }
 
 # Writes one closed JSON evidence object without paths, diagnostics, commands, or private IDs.

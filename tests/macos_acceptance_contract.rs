@@ -68,6 +68,7 @@ fn runner_covers_all_cells_without_embedding_private_run_identifiers() {
         "configured_product_returns_real_go_and_rust_semantic_context",
         "configured_product_isolates_go_across_two_divergent_worktree_actors",
         "configured_product_claude_helper_returns_real_pyright_semantic_context_diff_and_stop",
+        "configured_product_claude_helper_returns_real_typescript_semantic_context_and_reaps",
     ] {
         assert!(runner.contains(gate));
     }
@@ -77,4 +78,31 @@ fn runner_covers_all_cells_without_embedding_private_run_identifiers() {
     for forbidden in ["run_id", "session_id", "thread_id", "transcript"] {
         assert!(!runner.contains(forbidden));
     }
+}
+
+/// Ensures every fallible toolchain check propagates failure from route-guarded shell functions.
+#[test]
+fn toolchain_checks_return_explicitly_inside_guarded_routes() {
+    let runner = include_str!("../scripts/macos-acceptance.sh");
+    let verify = runner
+        .split("verify_toolchains() {")
+        .nth(1)
+        .unwrap()
+        .split("\n}")
+        .next()
+        .unwrap();
+    let checks = verify
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            line.starts_with("require_file ")
+                || line.starts_with("require_directory ")
+                || line.starts_with("[ \"$(")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(checks.len(), 14, "{checks:?}");
+    assert!(
+        checks.iter().all(|line| line.ends_with("|| return 1")),
+        "{checks:?}"
+    );
 }

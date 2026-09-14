@@ -122,10 +122,11 @@ and exact call ID remain finite transport request/correlation values. All matchi
 In managed Codex mode, `ide.start` creates its binding directly from trusted MCP
 `_meta.threadId`, `_meta.callId`, and advertised/returned `codex/sandbox-state-meta` on the fresh
 process-private attachment. Tool arguments cannot supply actor, candidate, or sandbox state.
-Context and Diff request the existing registered-path reconciliation before capture; Inspect applies
-the same current-byte/stale-detail fencing and queues reconciliation for the next capture, so native
-edits need no Codex hook or watcher. Actors remain isolated by attachment, actor, and binding
-generation. Claude and legacy Codex do not use this direct path.
+New Context and Diff captures request the existing registered-path reconciliation before capture;
+the same methods carrying `detail_ref` are retrieval and do not invalidate that retained detail.
+Inspect applies the same current-byte/stale-detail fencing and queues reconciliation for the next
+capture, so native edits need no Codex hook or watcher. Actors remain isolated by attachment,
+actor, and binding generation. Claude and legacy Codex do not use this direct path.
 
 In legacy mode, only an exact pre-hook followed by `ide.start` creates an actor/channel binding. Later
 ordinary methods require their own matching pre-hook and that binding's current liveness.
