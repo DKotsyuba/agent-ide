@@ -1,0 +1,46 @@
+; Standalone probe profile, NOT copied from any existing repo sandbox-exec generator
+; (none was found in src/execution -- see docs/evidence/v03-service-sandbox-probe.md Q1).
+; Placeholders __ALLOWED_ROOT__ / __CACHE_ROOT__ are substituted by run-profile.sh.
+; Extra placeholder __EXTRA_READ__ / __EXTRA_WRITE__ let cargo/pyright tests add roots
+; discovered empirically (see profile-cargo.sb.tmpl).
+(version 1)
+(deny default)
+(deny network*)
+
+(allow process-fork)
+(allow process-exec)
+(allow signal (target self))
+(allow mach-lookup)
+
+; macOS 27 (26A428): /bin/echo and other basic binaries abort (SIGABRT) at process
+; bootstrap unless these two are allowed unfiltered -- confirmed via
+; `log show --predicate 'eventMessage contains "Sandbox"'` showing
+; "deny(1) sysctl-read security.mac.lockdown_mode_state/kern.bootargs" and
+; "deny(1) file-read-data /" for the plain child, even though it never touches
+; those paths on purpose. Without this the process crashes, not "permission denied".
+(allow sysctl-read)
+(allow file-read-data (literal "/"))
+(allow file-read-metadata (subpath "/"))
+
+; allowed project root: read + write
+(allow file-read* file-write* (subpath "__ALLOWED_ROOT__"))
+
+; private cache dir: read + write
+(allow file-read* file-write* (subpath "__CACHE_ROOT__"))
+
+; minimal system paths needed to exec dynamic binaries / shells
+(allow file-read*
+  (subpath "/usr/lib")
+  (subpath "/usr/bin")
+  (subpath "/usr/libexec")
+  (subpath "/bin")
+  (subpath "/System/Library")
+  (subpath "/private/var/db/timezone")
+  (literal "/dev/null")
+  (literal "/dev/urandom")
+  (literal "/dev/dtracehelper")
+  (literal "/etc")
+  (literal "/private/etc/localtime"))
+
+(allow file-read-data file-ioctl (literal "/dev/null") (literal "/dev/tty"))
+(allow file-write-data (literal "/dev/null") (literal "/dev/tty"))

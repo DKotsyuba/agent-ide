@@ -1,0 +1,41 @@
+; Cargo-specific probe profile: base profile plus toolchain/registry read roots and a
+; target write root, discovered empirically by iterating `cargo check --offline` failures
+; under the base profile (see docs/evidence/v03-service-sandbox-probe.md Q1).
+(version 1)
+(deny default)
+(deny network*)
+
+(allow process-fork)
+(allow process-exec)
+(allow signal (target self))
+(allow mach-lookup)
+
+(allow sysctl-read)
+(allow file-read-data (literal "/"))
+(allow file-read-metadata (subpath "/"))
+
+(allow file-read* file-write* (subpath "__ALLOWED_ROOT__"))
+(allow file-read* file-write* (subpath "__CACHE_ROOT__"))
+
+(allow file-read*
+  (subpath "/usr/lib")
+  (subpath "/usr/bin")
+  (subpath "/usr/libexec")
+  (subpath "/bin")
+  (subpath "/System/Library")
+  (subpath "/private/var/db/timezone")
+  (subpath "/private/etc")
+  (literal "/dev/null")
+  (literal "/dev/urandom")
+  (literal "/dev/dtracehelper")
+  (literal "/etc")
+  (literal "/private/etc/localtime"))
+
+(allow file-read-data file-ioctl (literal "/dev/null") (literal "/dev/tty"))
+(allow file-write-data (literal "/dev/null") (literal "/dev/tty"))
+
+; toolchain + registry: read-only
+(allow file-read* (subpath "__RUSTUP_HOME__"))
+(allow file-read* (subpath "__CARGO_HOME__"))
+; cargo still wants to write lock files / small state inside CARGO_HOME even offline
+(allow file-write* (subpath "__CARGO_HOME__/registry"))

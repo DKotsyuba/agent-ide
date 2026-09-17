@@ -1,0 +1,13 @@
+{
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "excludedCommands": [],
+    "network": {
+      "allowUnixSockets": [
+        "/private/tmp/aiv3-probe/s.sock"
+      ]
+    }
+  }
+}
