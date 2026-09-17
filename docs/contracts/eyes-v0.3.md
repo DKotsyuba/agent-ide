@@ -108,7 +108,21 @@ Every project check process is started through one spawn path:
   killed (SIGTERM, 2 s, SIGKILL) and reaped. No pattern-based kill of processes the daemon did not
   start.
 - Environment is rebuilt from an allowlist (PATH to toolchain bins, HOME, TMPDIR to the private
-  temp dir, CARGO_TARGET_DIR, CARGO_NET_OFFLINE=true); ambient credentials are not passed.
+  temp dir, CARGO_TARGET_DIR, CARGO_NET_OFFLINE=true, plus Rust's linker-bypass variables below);
+  ambient credentials are not passed.
+- Rust linker bypass (T06B): `/usr/bin/cc`, which every native build script's link step reaches by
+  default, is Apple's `xcrun` shim — it writes an `xcrun_db` cache into the real Darwin user temp
+  directory via `confstr(_CS_DARWIN_USER_TEMP_DIR)` (ignoring `TMPDIR`) and dyld-loads Xcode
+  frameworks outside `Contents/Developer`, both denied by this profile, so every build script fails
+  linking with exit status 71 even though compilation itself succeeds. When a toolchain `clang` is
+  found under the resolved Apple developer directory (`<dir>/Toolchains/XcodeDefault.xctoolchain/
+  usr/bin/clang` for Xcode, `<dir>/usr/bin/clang` for the Command Line Tools), the check environment
+  points the link step straight at it instead: `CC=<clang>`, `CXX=<clang>++` when that sibling
+  exists, `SDKROOT=<dir>/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk` (Xcode) or
+  `<dir>/SDKs/MacOSX.sdk` (Command Line Tools) when it exists, and either
+  `CARGO_TARGET_<TRIPLE>_LINKER=<clang>` when the toolchain directory's own name (for example
+  `1.98.1-aarch64-apple-darwin`) yields a target triple, or `RUSTFLAGS=-Clinker=<clang>` otherwise.
+  No clang found: the environment is unchanged and the build fails exactly as it would unconfined.
 
 Error example: a build script tries to read `~/.ssh/id_ed25519` or open a TCP connection; the
 access is denied by the OS profile; the check reports whatever cargo reports.
@@ -152,10 +166,12 @@ pub struct ProblemSnapshot { pub language: Language, pub state: CheckState,
 - `Ready` requires the final `build-finished` message. If any compilation unit failed so dependent
   units produced no result, state is `Partial`. Missing `build-finished` → `Unavailable(Fatal)`.
 - `build-finished.success: false` with zero deduplicated errors (T05B: a build failure with no
-  diagnostic to show, for example a build-script failure such as `blake3`'s `cc` invocation
-  failing) is also `Unavailable(Fatal)`, never `Ready`: counts are never fabricated for a run that
-  did not actually compile the workspace. The snapshot's `detail` carries the first `error:` line
-  of cargo's stderr (trimmed to 160 bytes) when one is present.
+  diagnostic to show, for example a build-script link failure — T06B: `cc` exiting nonzero has no
+  primary span, so it is never counted) is also `Unavailable(Fatal)`, never `Ready`: counts are
+  never fabricated for a run that did not actually compile the workspace. The snapshot's `detail`
+  prefers the `message.message` of the first `error`-level `compiler-message`, even without a
+  primary span (T06B), over cargo's own summary; only when no such message exists does the first
+  `error:` line of cargo's stderr stand in (both trimmed to 160 bytes).
 - `CARGO_TARGET_DIR` is the check's private cache dir for that worktree.
 - Missing `cargo` in `toolchain_dir` → `Unavailable(ToolMissing)`.
 

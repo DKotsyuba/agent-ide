@@ -75,10 +75,24 @@ fn rust_checker(root: &Path, runner: FakeRunner) -> RustChecker {
 }
 
 /// Creates and returns `<root>/developer`, a deterministic stand-in for the Apple developer
-/// directory (EYES-r2 §3, T05B).
+/// directory (EYES-r2 §3, T05B). It contains no toolchain layout, so it never yields a linker
+/// bypass environment (T06B).
 fn rust_developer_dir(root: &Path) -> PathBuf {
     let dir = root.join("developer");
     fs::create_dir_all(&dir).expect("developer dir creates");
+    dir
+}
+
+/// Creates and returns `<root>/xcode-developer`, a deterministic stand-in for an Xcode developer
+/// directory carrying a toolchain `clang`, sibling `clang++`, and the macOS platform SDK (T06B).
+fn rust_xcode_developer_dir(root: &Path) -> PathBuf {
+    let dir = root.join("xcode-developer");
+    let bin_dir = dir.join("Toolchains/XcodeDefault.xctoolchain/usr/bin");
+    fs::create_dir_all(&bin_dir).expect("xcode clang bin dir creates");
+    fs::write(bin_dir.join("clang"), b"placeholder").expect("clang stub writes");
+    fs::write(bin_dir.join("clang++"), b"placeholder").expect("clang++ stub writes");
+    let sdk_dir = dir.join("Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk");
+    fs::create_dir_all(&sdk_dir).expect("sdk dir creates");
     dir
 }
 
@@ -425,6 +439,31 @@ fn rust_parser_failed_build_detail_is_truncated_to_160_bytes() {
     assert!(stderr.starts_with(&detail));
 }
 
+/// Proves a failed-build-with-no-errors stream whose only diagnostic is a spanless rustc `error`
+/// message (T06B: a linker failure such as `cc` exiting nonzero has no primary span, so it is
+/// never counted by [`parse_cargo_messages`]) reports that message as the snapshot detail in
+/// preference to cargo's own stderr summary line.
+#[test]
+fn rust_parser_prefers_spanless_compiler_error_message_over_stderr() {
+    let stream = concat!(
+        r#"{"reason":"compiler-message","package_id":"pastey 0.2.3","message":{"level":"error","message":"linking with `cc` failed: exit status: 71","spans":[]}}"#,
+        "\n",
+        r#"{"reason":"build-finished","success":false}"#,
+    );
+    let stderr = b"error: could not compile `pastey` (build script)\n";
+    let snapshot = parse_cargo_messages(stream.as_bytes(), stderr, 3, 42);
+    assert_eq!(
+        snapshot.state,
+        CheckState::Unavailable(UnavailableReason::Fatal)
+    );
+    assert_eq!(snapshot.errors, 0);
+    assert!(snapshot.problems.is_empty());
+    assert_eq!(
+        snapshot.detail.as_deref(),
+        Some("linking with `cc` failed: exit status: 71")
+    );
+}
+
 /// Proves a stream without the terminal `build-finished` event is `Unavailable(Fatal)` with
 /// zero counts.
 #[test]
@@ -631,6 +670,75 @@ fn rust_cargo_check_spec_ignores_nonexistent_developer_dir_override() {
         !spec.read_roots.contains(&bogus_developer_dir),
         "{:?}",
         spec.read_roots
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Proves the confined spec sets the linker-bypass environment (T06B) when the developer
+/// directory carries an Xcode toolchain clang: `CARGO_TARGET_<TRIPLE>_LINKER` derived from the
+/// toolchain directory name, `CC`, `CXX` and `SDKROOT` all point at the resolved Xcode paths, so
+/// a build script's link step never reaches the `/usr/bin/cc` `xcrun` shim.
+#[test]
+fn rust_cargo_check_spec_sets_linker_env_when_xcode_clang_present() {
+    let root = rust_scratch("linker-env-xcode");
+    let request = rust_request(&root, true);
+    let developer_dir = rust_xcode_developer_dir(&root);
+    let toolchain_dir = root.join("toolchains").join("1.98.1-aarch64-apple-darwin");
+    fs::create_dir_all(toolchain_dir.join("bin")).expect("toolchain bin dir creates");
+    fs::write(toolchain_dir.join("bin").join("cargo"), b"placeholder").expect("cargo stub writes");
+    let checker = RustChecker::new(
+        Arc::new(FakeRunner::default()),
+        toolchain_dir,
+        None,
+        Duration::from_secs(300),
+        Some(developer_dir.clone()),
+    );
+    let spec = checker.cargo_check_spec(&request);
+    let clang = developer_dir.join("Toolchains/XcodeDefault.xctoolchain/usr/bin/clang");
+    let clangxx = developer_dir.join("Toolchains/XcodeDefault.xctoolchain/usr/bin/clang++");
+    let sdk = developer_dir.join("Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk");
+    let env: std::collections::HashMap<_, _> = spec.env.into_iter().collect();
+    assert_eq!(
+        env.get("CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER"),
+        Some(&clang.to_string_lossy().into_owned())
+    );
+    assert_eq!(env.get("CC"), Some(&clang.to_string_lossy().into_owned()));
+    assert_eq!(
+        env.get("CXX"),
+        Some(&clangxx.to_string_lossy().into_owned())
+    );
+    assert_eq!(
+        env.get("SDKROOT"),
+        Some(&sdk.to_string_lossy().into_owned())
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Proves the confined spec falls back to `RUSTFLAGS=-Clinker=<clang>` (T06B) when a clang is
+/// found but the toolchain directory's own name carries no recognizable target triple.
+#[test]
+fn rust_cargo_check_spec_falls_back_to_rustflags_when_triple_unknown() {
+    let root = rust_scratch("linker-env-unknown-triple");
+    let request = rust_request(&root, true);
+    let developer_dir = rust_xcode_developer_dir(&root);
+    let checker = RustChecker::new(
+        Arc::new(FakeRunner::default()),
+        rust_toolchain(&root, true),
+        None,
+        Duration::from_secs(300),
+        Some(developer_dir.clone()),
+    );
+    let spec = checker.cargo_check_spec(&request);
+    let clang = developer_dir.join("Toolchains/XcodeDefault.xctoolchain/usr/bin/clang");
+    let env: std::collections::HashMap<_, _> = spec.env.into_iter().collect();
+    assert_eq!(
+        env.get("RUSTFLAGS"),
+        Some(&format!("-Clinker={}", clang.display()))
+    );
+    assert!(
+        !env.keys().any(|key| key.ends_with("_LINKER")),
+        "{:?}",
+        env.keys().collect::<Vec<_>>()
     );
     let _ = fs::remove_dir_all(&root);
 }

@@ -51,6 +51,10 @@ pub struct RustChecker {
     /// Apple developer directory read roots resolved once at construction (see
     /// [`resolve_developer_roots`]); `/usr/bin/cc` is an `xcrun` shim and cannot run without them.
     developer_roots: Vec<PathBuf>,
+    /// Linker-bypass environment (`CARGO_TARGET_<TRIPLE>_LINKER`/`RUSTFLAGS`, `CC`, `CXX`,
+    /// `SDKROOT`) resolved once at construction (see [`resolve_linker_env`]); empty when no
+    /// toolchain clang could be found, leaving `/usr/bin/cc` (the `xcrun` shim) as the linker.
+    linker_env: Vec<(String, String)>,
 }
 
 impl RustChecker {
@@ -65,7 +69,9 @@ impl RustChecker {
     /// falling back to `/Applications/Xcode.app/Contents/Developer` then
     /// `/Library/Developer/CommandLineTools`, plus `/private/var/db/xcode_select_link` and
     /// `/Library/Developer/CommandLineTools` when they exist, on the read roots this checker
-    /// resolves once at construction.
+    /// resolves once at construction. The same resolved primary developer directory feeds the
+    /// linker-bypass environment (T06B), so a build script's linker step bypasses the `xcrun`
+    /// shim whenever a toolchain clang is found under it.
     pub fn new(
         runner: Arc<dyn ConfinedRunner>,
         toolchain_dir: PathBuf,
@@ -73,12 +79,15 @@ impl RustChecker {
         timeout: Duration,
         developer_dir: Option<PathBuf>,
     ) -> Self {
+        let primary_developer_dir = resolve_primary_developer_dir(developer_dir);
+        let linker_env = resolve_linker_env(primary_developer_dir.as_deref(), &toolchain_dir);
         Self {
             runner,
             toolchain_dir,
             cargo_home,
             timeout,
-            developer_roots: resolve_developer_roots(developer_dir),
+            developer_roots: resolve_developer_roots(primary_developer_dir),
+            linker_env,
         }
     }
 
@@ -90,11 +99,14 @@ impl RustChecker {
     /// outdated lockfile cannot be written and cargo's refusal maps to
     /// [`UnavailableReason::EnvMissing`] in [`RustChecker::check`]. The environment is
     /// rebuilt from the allowlist: `PATH` limited to toolchain bins plus the system dirs,
-    /// `HOME`, `TMPDIR`/`CARGO_TARGET_DIR` under the private cache, and `CARGO_NET_OFFLINE=true`.
-    /// Read roots cover the worktree, the toolchain, the cargo home, the derived rustup home,
-    /// `/private/etc` and this checker's resolved Apple developer directory roots (build scripts
-    /// such as `blake3`'s invoke `/usr/bin/cc`, an `xcrun` shim that needs the Apple developer
-    /// directory to run at all); the private cache is the only write root; each output stream is
+    /// `HOME`, `TMPDIR`/`CARGO_TARGET_DIR` under the private cache, `CARGO_NET_OFFLINE=true`, and
+    /// this checker's resolved linker-bypass environment (T06B): compiling still needs read
+    /// access to the Apple developer directory for headers and libraries, but the link step of a
+    /// build script (for example `blake3`'s) is pointed straight at the toolchain `clang` instead
+    /// of `/usr/bin/cc`, because that `cc` is an `xcrun` shim that fails under this Seatbelt
+    /// profile. Read roots cover the worktree, the toolchain, the
+    /// cargo home, the derived rustup home, `/private/etc` and this checker's resolved Apple
+    /// developer directory roots; the private cache is the only write root; each output stream is
     /// capped at `MAX_OUTPUT_BYTES`. The construction is pure with respect to the process
     /// environment: its only inputs are the checker configuration and `request`.
     pub fn cargo_check_spec(&self, request: &CheckRequest) -> RunSpec {
@@ -117,7 +129,7 @@ impl RustChecker {
             program: self.toolchain_dir.join("bin").join("cargo"),
             args,
             cwd: request.worktree.clone(),
-            env: vec![
+            env: [
                 (
                     "PATH".to_owned(),
                     format!("{}/bin:/usr/bin:/bin", self.toolchain_dir.display()),
@@ -136,7 +148,10 @@ impl RustChecker {
                         .into_owned(),
                 ),
                 ("CARGO_NET_OFFLINE".to_owned(), "true".to_owned()),
-            ],
+            ]
+            .into_iter()
+            .chain(self.linker_env.iter().cloned())
+            .collect(),
             read_roots: [
                 request.worktree.clone(),
                 self.toolchain_dir.clone(),
@@ -195,6 +210,17 @@ fn derived_rustup_home(toolchain_dir: &Path, home: &Path) -> PathBuf {
     home.join(".rustup")
 }
 
+/// Resolves the primary Apple developer directory: `override_dir` when it names an existing
+/// directory, else the result of [`xcode_select_developer_dir`].
+///
+/// Split out from [`resolve_developer_roots`] so both the read-root list and [`resolve_linker_env`]
+/// derive their toolchain layout from the exact same primary directory.
+fn resolve_primary_developer_dir(override_dir: Option<PathBuf>) -> Option<PathBuf> {
+    override_dir
+        .filter(|dir| dir.is_dir())
+        .or_else(xcode_select_developer_dir)
+}
+
 /// Resolves the Apple developer directory read roots for the confined cargo run.
 ///
 /// A build script that compiles native code (for example `blake3`'s) runs `/usr/bin/cc`, which
@@ -202,20 +228,16 @@ fn derived_rustup_home(toolchain_dir: &Path, home: &Path) -> PathBuf {
 /// fails immediately, before producing any `compiler-message`, which [`parse_cargo_messages`]
 /// would otherwise have no choice but to treat as a build failure with no diagnostics.
 ///
-/// `override_dir` is the operator-declared `project_checks.rust.developer_dir`; when it names an
-/// existing directory it is the sole primary root and no `xcode-select` query runs. Otherwise the
-/// primary root comes from [`xcode_select_developer_dir`]. Beyond the primary root,
-/// `/private/var/db/xcode_select_link` and `/Library/Developer/CommandLineTools` are always
-/// appended when they exist (deduplicated against the primary root), because `/usr/bin/cc`
-/// resolves through that symlink database independently of which developer directory
-/// `xcode-select` currently reports. Only roots that exist on this filesystem are ever returned,
-/// so a machine with neither Xcode nor the Command Line Tools installed adds no read root at all
-/// (a build script that needs a C compiler still fails, just as it would unconfined).
-fn resolve_developer_roots(override_dir: Option<PathBuf>) -> Vec<PathBuf> {
+/// `primary` is the directory resolved by [`resolve_primary_developer_dir`]; when present it is
+/// the first root. Beyond it, `/private/var/db/xcode_select_link` and
+/// `/Library/Developer/CommandLineTools` are always appended when they exist (deduplicated
+/// against the primary root), because `/usr/bin/cc` resolves through that symlink database
+/// independently of which developer directory `xcode-select` currently reports. Only roots that
+/// exist on this filesystem are ever returned, so a machine with neither Xcode nor the Command
+/// Line Tools installed adds no read root at all (a build script that needs a C compiler still
+/// fails, just as it would unconfined).
+fn resolve_developer_roots(primary: Option<PathBuf>) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    let primary = override_dir
-        .filter(|dir| dir.is_dir())
-        .or_else(xcode_select_developer_dir);
     if let Some(primary) = primary {
         roots.push(primary);
     }
@@ -228,6 +250,102 @@ fn resolve_developer_roots(override_dir: Option<PathBuf>) -> Vec<PathBuf> {
         }
     }
     roots
+}
+
+/// Resolves the linker-bypass environment for the confined cargo run: `CC`, optionally `CXX`,
+/// optionally `SDKROOT`, and either `CARGO_TARGET_<TRIPLE>_LINKER` or `RUSTFLAGS`.
+///
+/// `/usr/bin/cc` is Apple's `xcrun` shim: it writes an `xcrun_db` cache into the real Darwin user
+/// temp directory (via `confstr(_CS_DARWIN_USER_TEMP_DIR)`, ignoring `TMPDIR`) and dyld-loads
+/// Xcode frameworks outside `Contents/Developer`, both forbidden by the Seatbelt profile, so every
+/// build-script link step fails with exit status 71 even though compilation itself succeeds. This
+/// resolves the toolchain's own `clang` under `developer_dir` and points cargo/cc at it directly,
+/// skipping the shim entirely.
+///
+/// `developer_dir` is the primary directory from [`resolve_primary_developer_dir`]; `None` (no
+/// Xcode or Command Line Tools resolved at all) leaves the environment untouched, and the T05B
+/// fatal-detail path reports the resulting failure. Otherwise [`resolve_clang`] locates the
+/// toolchain `clang`; when none is found the environment is also left untouched — clang missing
+/// entirely is reported the same way an unconfined build would fail. When clang is found: `CC` is
+/// always set; `CXX` is set only when a sibling `clang++` exists; `SDKROOT` is set only when
+/// [`resolve_sdk`] finds the platform SDK under `developer_dir`; and the linker variable is
+/// `CARGO_TARGET_<TRIPLE>_LINKER` when [`derive_target_env_var`] can read a target triple out of
+/// `toolchain_dir`'s own name, else `RUSTFLAGS=-Clinker=<clang>`.
+fn resolve_linker_env(developer_dir: Option<&Path>, toolchain_dir: &Path) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    let Some(developer_dir) = developer_dir else {
+        return env;
+    };
+    let Some(clang) = resolve_clang(developer_dir) else {
+        return env;
+    };
+    let clang_path = clang.to_string_lossy().into_owned();
+    match derive_target_env_var(toolchain_dir) {
+        Some(target) => env.push((format!("CARGO_TARGET_{target}_LINKER"), clang_path.clone())),
+        None => env.push(("RUSTFLAGS".to_owned(), format!("-Clinker={clang_path}"))),
+    }
+    env.push(("CC".to_owned(), clang_path));
+    if let Some(clangxx) = sibling_clangxx(&clang) {
+        env.push(("CXX".to_owned(), clangxx.to_string_lossy().into_owned()));
+    }
+    if let Some(sdk) = resolve_sdk(developer_dir) {
+        env.push(("SDKROOT".to_owned(), sdk.to_string_lossy().into_owned()));
+    }
+    env
+}
+
+/// Locates the toolchain `clang` under an Apple developer directory.
+///
+/// Tries the Xcode layout (`<dir>/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang`) first, then
+/// the Command Line Tools layout (`<dir>/usr/bin/clang`); returns the first that exists as a file.
+fn resolve_clang(developer_dir: &Path) -> Option<PathBuf> {
+    let xcode_clang = developer_dir.join("Toolchains/XcodeDefault.xctoolchain/usr/bin/clang");
+    if xcode_clang.is_file() {
+        return Some(xcode_clang);
+    }
+    let clt_clang = developer_dir.join("usr/bin/clang");
+    clt_clang.is_file().then_some(clt_clang)
+}
+
+/// Locates the macOS platform SDK under an Apple developer directory.
+///
+/// Tries the Xcode layout (`<dir>/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk`) first,
+/// then the Command Line Tools layout (`<dir>/SDKs/MacOSX.sdk`); returns the first that exists as
+/// a directory.
+fn resolve_sdk(developer_dir: &Path) -> Option<PathBuf> {
+    let xcode_sdk = developer_dir.join("Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk");
+    if xcode_sdk.is_dir() {
+        return Some(xcode_sdk);
+    }
+    let clt_sdk = developer_dir.join("SDKs/MacOSX.sdk");
+    clt_sdk.is_dir().then_some(clt_sdk)
+}
+
+/// Returns `clang`'s sibling `clang++` when it exists as a file, else `None`.
+fn sibling_clangxx(clang: &Path) -> Option<PathBuf> {
+    let name = clang.file_name()?.to_str()?;
+    let candidate = clang.with_file_name(format!("{name}++"));
+    candidate.is_file().then_some(candidate)
+}
+
+/// Derives a `CARGO_TARGET_<TRIPLE>_LINKER` suffix from a toolchain directory's own name.
+///
+/// Rustup toolchain directory names embed the target triple after the channel/version, for
+/// example `1.98.1-aarch64-apple-darwin`, `stable-x86_64-apple-darwin` or
+/// `nightly-2026-08-14-aarch64-apple-darwin`. This splits the name on `-` and looks for the
+/// `apple-darwin` pair (the only vendor/OS this checker targets); the element immediately before
+/// it is the architecture. Returns `None` when the name carries no such pair (for example a
+/// standalone toolchain directory not named after its triple), so the caller falls back to
+/// `RUSTFLAGS` instead of guessing a target triple.
+fn derive_target_env_var(toolchain_dir: &Path) -> Option<String> {
+    let name = toolchain_dir.file_name()?.to_str()?;
+    let parts: Vec<&str> = name.split('-').collect();
+    for index in 1..parts.len().saturating_sub(1) {
+        if parts[index] == "apple" && parts[index + 1] == "darwin" {
+            return Some(format!("{}_apple_darwin", parts[index - 1]).to_uppercase());
+        }
+    }
+    None
 }
 
 /// Runs `/usr/bin/xcode-select -p` and returns its trimmed stdout as an existing directory.
@@ -377,10 +495,13 @@ fn lockfile_write_failure(stderr: &[u8]) -> bool {
 /// State heuristic (EYES-r2 §4): a missing terminal `build-finished` event means cargo never
 /// completed the run, which is [`UnavailableReason::Fatal`]. A terminal `build-finished.success:
 /// false` with zero deduplicated errors — a build failure with no diagnostics to show, for
-/// example a build-script failure such as `blake3`'s invoking a `cc` it cannot read — is also
-/// [`UnavailableReason::Fatal`], carrying the first `error:` line of `stderr` (trimmed to 160
-/// bytes) as [`ProblemSnapshot::detail`] when one is present; counts must never be fabricated as
-/// `Ready` for a build that did not actually compile the workspace. Otherwise the snapshot is
+/// example a build-script link failure (T06B: `cc` exiting with a nonzero status has no primary
+/// span, so it is never counted as a diagnostic) — is also [`UnavailableReason::Fatal`],
+/// carrying [`ProblemSnapshot::detail`] when one is available: the `message.message` of the first
+/// `compiler-message` at `error` level, even without a primary span, takes priority over cargo's
+/// own stderr summary; only when no such message exists does the first `error:` line of `stderr`
+/// stand in (both trimmed to 160 bytes). Counts must never be fabricated as `Ready` for a build
+/// that did not actually compile the workspace. Otherwise the snapshot is
 /// [`CheckState::Partial`] exactly when `build-finished.success` is `false`, at least one
 /// deduplicated error exists, and at least one package that produced `compiler-message` events
 /// produced no `compiler-artifact`. With `--keep-going` that set is the failed package plus any
@@ -398,6 +519,7 @@ pub fn parse_cargo_messages(
     let mut message_packages: HashSet<String> = HashSet::new();
     let mut artifact_packages: HashSet<String> = HashSet::new();
     let mut build_finished: Option<bool> = None;
+    let mut first_error_message: Option<String> = None;
 
     for line in stdout.split(|&byte| byte == b'\n') {
         if line.iter().all(|byte| byte.is_ascii_whitespace()) {
@@ -411,10 +533,13 @@ pub fn parse_cargo_messages(
                 if let Some(package_id) = event.package_id.clone() {
                     message_packages.insert(package_id);
                 }
-                if let Some(message) = event.message
-                    && let Some(problem) = diagnostic_problem(&message)
-                {
-                    problems.push(problem);
+                if let Some(message) = event.message {
+                    if first_error_message.is_none() && message.level == "error" {
+                        first_error_message = Some(message.message.clone());
+                    }
+                    if let Some(problem) = diagnostic_problem(&message) {
+                        problems.push(problem);
+                    }
                 }
             }
             "compiler-artifact" => {
@@ -442,11 +567,14 @@ pub fn parse_cargo_messages(
         duration_ms,
     );
     if !success && base.errors == 0 {
+        let detail = first_error_message
+            .map(|message| truncate_bytes(&message, 160))
+            .or_else(|| first_error_line(stderr));
         return ProblemSnapshot::unavailable_with_detail(
             Language::Rust,
             UnavailableReason::Fatal,
             input_generation,
-            first_error_line(stderr),
+            detail,
         );
     }
     let state = if !success
@@ -464,11 +592,13 @@ pub fn parse_cargo_messages(
 
 /// Extracts the first `error:`-prefixed line of cargo stderr, trimmed to at most 160 bytes.
 ///
-/// Used only to explain an [`UnavailableReason::Fatal`] snapshot produced by a failed build with
-/// no error-level diagnostics: cargo's own summary line (for example `error: failed to run custom
-/// build command for \`blake3 v1.5.0\``) is the most actionable cause available without running
-/// an unbounded, untrusted stderr stream through the feed. Returns `None` when no line starts
-/// with `error:` after trimming, so a build failure with no such line simply carries no detail.
+/// Fallback source of [`ProblemSnapshot::detail`] for an [`UnavailableReason::Fatal`] snapshot
+/// produced by a failed build with no error-level `compiler-message` at all (so
+/// [`parse_cargo_messages`] has no rustc-authored text to prefer): cargo's own summary line (for
+/// example `error: failed to run custom build command for \`blake3 v1.5.0\``) is the most
+/// actionable cause available without running an unbounded, untrusted stderr stream through the
+/// feed. Returns `None` when no line starts with `error:` after trimming, so a build failure with
+/// no such line simply carries no detail.
 fn first_error_line(stderr: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(stderr);
     let line = text
@@ -593,4 +723,46 @@ struct RustcSpan {
     /// First column of the span; `0` when rustc reported none.
     #[serde(default)]
     column_start: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Proves a versioned rustup toolchain name (`<version>-<triple>`) yields the matching
+    /// `CARGO_TARGET_<TRIPLE>_LINKER` suffix.
+    #[test]
+    fn derive_target_env_var_handles_versioned_toolchain_name() {
+        assert_eq!(
+            derive_target_env_var(Path::new("1.98.1-aarch64-apple-darwin")),
+            Some("AARCH64_APPLE_DARWIN".to_owned())
+        );
+    }
+
+    /// Proves a channel rustup toolchain name (`<channel>-<triple>`) with an underscore in the
+    /// architecture yields the matching suffix.
+    #[test]
+    fn derive_target_env_var_handles_channel_toolchain_name() {
+        assert_eq!(
+            derive_target_env_var(Path::new("stable-x86_64-apple-darwin")),
+            Some("X86_64_APPLE_DARWIN".to_owned())
+        );
+    }
+
+    /// Proves a dated nightly rustup toolchain name (`nightly-<date>-<triple>`) yields the
+    /// matching suffix, ignoring the embedded date's own hyphens.
+    #[test]
+    fn derive_target_env_var_handles_dated_nightly_toolchain_name() {
+        assert_eq!(
+            derive_target_env_var(Path::new("nightly-2026-08-14-aarch64-apple-darwin")),
+            Some("AARCH64_APPLE_DARWIN".to_owned())
+        );
+    }
+
+    /// Proves a toolchain directory name with no `apple-darwin` pair derives no target env var,
+    /// so [`resolve_linker_env`] falls back to `RUSTFLAGS`.
+    #[test]
+    fn derive_target_env_var_returns_none_for_unrecognized_name() {
+        assert_eq!(derive_target_env_var(Path::new("tc")), None);
+    }
 }

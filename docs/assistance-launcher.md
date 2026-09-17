@@ -168,6 +168,10 @@ read-only access to the admitted worktree, reads limited to the declared toolcha
 system paths, and write access only to the check's private cache directory and private temporary
 directory. The environment is rebuilt from an allowlist (toolchain binaries, `HOME`, the private
 temp directory, `CARGO_TARGET_DIR`, `CARGO_NET_OFFLINE=true`); ambient credentials are not passed.
+For Rust, T06B adds `CC`/`CXX`/`SDKROOT` plus `CARGO_TARGET_<TRIPLE>_LINKER` (or `RUSTFLAGS`)
+pointing at the resolved developer directory's own `clang`, bypassing the `/usr/bin/cc` `xcrun`
+shim that a build script's link step cannot run under this profile; see EYES-r2 §3 for the exact
+resolution.
 Each check owns one process group, killed whole on cancel, timeout (`check_timeout_s`), or daemon
 shutdown; no pattern-based kill touches processes the daemon did not start.
 
