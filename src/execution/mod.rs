@@ -4402,5 +4402,7 @@ pub async fn run_inherited_child(
     }
 }
 
+pub mod seatbelt;
+
 #[cfg(test)]
 mod linear_tests;
