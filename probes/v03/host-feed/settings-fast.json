@@ -1,0 +1,6 @@
+{
+  "hooks": {
+    "PostToolUse": [{"matcher": "", "hooks": [{"type": "command", "command": "/Users/pluto/projects/agent-ide-worktrees/v03-probe-host-feed/probes/v03/host-feed/hook-post-fast.sh", "timeout": 10}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "/Users/pluto/projects/agent-ide-worktrees/v03-probe-host-feed/probes/v03/host-feed/hook-prompt.sh", "timeout": 10}]}]
+  }
+}

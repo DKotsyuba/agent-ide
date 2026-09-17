@@ -1,0 +1,5 @@
+{
+  "hooks": {
+    "PostToolUse": [{"matcher": "", "hooks": [{"type": "command", "command": "/Users/pluto/projects/agent-ide-worktrees/v03-probe-host-feed/probes/v03/host-feed/hook-post-slow.sh", "timeout": 1}]}]
+  }
+}
