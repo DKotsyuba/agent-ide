@@ -6,6 +6,9 @@ pub mod app;
 /// Validates and tracks trusted host invocations and their active bindings.
 pub mod assistance;
 
+/// Owns confined background project checks and the shared problem snapshot types.
+pub mod checks;
+
 /// Admits and owns bounded local processes under supported host profiles.
 pub mod execution;
 
