@@ -1,0 +1,7 @@
+[package]
+name = "probe-b"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+probe-a = { path = "../a" }
