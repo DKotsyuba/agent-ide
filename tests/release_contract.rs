@@ -1,5 +1,12 @@
 //! Static release contracts for versions, quality gates, evidence, packaging, and host wiring.
 
+use std::{
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
 use serde_json::Value;
 
 /// Keeps the Rust package and both plugin manifests on the exact v0.2 release version.
@@ -128,4 +135,125 @@ fn claude_marketplace_installs_the_root_plugin() {
     assert_eq!(claude["plugins"][0]["name"], "agent-ide");
     assert_eq!(claude["plugins"][0]["source"], "./");
     assert_eq!(claude["plugins"][0]["version"], "0.2.0");
+}
+
+/// Distinguishes temporary install prefixes across scenarios inside one test-process run.
+static NEXT_INSTALL_PREFIX: AtomicUsize = AtomicUsize::new(0);
+
+/// Returns a fresh, unique absolute temp path for one disposable `--prefix`; nothing is created
+/// here, and the real `$HOME/.local` is never a candidate.
+fn unique_install_prefix(label: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "agent-ide-install-local-contract-{label}-{}-{}",
+        std::process::id(),
+        NEXT_INSTALL_PREFIX.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// Runs `scripts/install-local.sh --no-build --prefix prefix` and panics with the captured
+/// stdout/stderr when it exits non-zero.
+fn run_install_local(script: &Path, prefix: &Path) {
+    let output = Command::new(script)
+        .arg("--no-build")
+        .arg("--prefix")
+        .arg(prefix)
+        .output()
+        .expect("scripts/install-local.sh must execute");
+    assert!(
+        output.status.success(),
+        "install-local.sh failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Asserts the installed layout under `prefix` for `version`: the mode-0755 binary, the plugin
+/// bundle's four copied directories plus its two contract files, the baked absolute-path hook
+/// naming that exact binary, and the `current` symlink pointing at `version`.
+fn assert_install_layout(prefix: &Path, installed_bin: &Path, version: &str) {
+    assert!(installed_bin.is_file(), "missing installed binary");
+    let bin_mode = std::fs::metadata(installed_bin)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(bin_mode, 0o755, "installed binary must be mode 0755");
+
+    let version_dir = prefix.join("share/agent-ide/plugin").join(version);
+    for part in [".claude-plugin", ".codex-plugin", "hooks", "skills"] {
+        assert!(
+            version_dir.join(part).is_dir(),
+            "missing installed bundle part: {part}"
+        );
+    }
+    assert!(version_dir.join("hooks/hooks.json").is_file());
+    assert!(version_dir.join("skills/agent-ide/SKILL.md").is_file());
+
+    let hook_path = version_dir.join("hooks/claude-hook.sh");
+    let hook_contents = std::fs::read_to_string(&hook_path).unwrap();
+    let expected_exec = format!("exec \"{}\" claude-hook", installed_bin.display());
+    assert!(
+        hook_contents.contains(&expected_exec),
+        "generated hook is missing the baked absolute exec line: {hook_contents}"
+    );
+    let hook_mode = std::fs::metadata(&hook_path).unwrap().permissions().mode();
+    assert_ne!(hook_mode & 0o111, 0, "generated hook must be executable");
+
+    let current_link = prefix.join("share/agent-ide/plugin/current");
+    let target = std::fs::read_link(&current_link).unwrap();
+    assert_eq!(target, PathBuf::from(version));
+}
+
+/// Shells out to `scripts/install-local.sh` against disposable temp prefixes, proving the
+/// installed layout, the baked hook, the `current` symlink, an idempotent same-version re-run,
+/// and backup-file creation ahead of replacing an existing binary — never the real `$HOME/.local`.
+/// Skips cleanly when this workspace has no locally built release binary, since the script's own
+/// `cargo build` step is exercised separately and this test only shells out with `--no-build`.
+#[test]
+fn install_local_installs_into_a_disposable_prefix() {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let release_bin = repo_root.join("target/release/agent-ide");
+    if !release_bin.is_file() {
+        eprintln!(
+            "skipping install_local_installs_into_a_disposable_prefix: no {} \
+             (run `cargo build --locked --release` first)",
+            release_bin.display()
+        );
+        return;
+    }
+    let script = repo_root.join("scripts/install-local.sh");
+    let version = env!("CARGO_PKG_VERSION");
+
+    let prefix = unique_install_prefix("layout");
+    let installed_bin = prefix.join("bin/agent-ide");
+    run_install_local(&script, &prefix);
+    assert_install_layout(&prefix, &installed_bin, version);
+
+    // Re-running for the same version must replace the version directory and binary cleanly.
+    run_install_local(&script, &prefix);
+    assert_install_layout(&prefix, &installed_bin, version);
+    let _ = std::fs::remove_dir_all(&prefix);
+
+    let backup_prefix = unique_install_prefix("backup");
+    let bin_dir = backup_prefix.join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let fake_binary = bin_dir.join("agent-ide");
+    std::fs::write(&fake_binary, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&fake_binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    run_install_local(&script, &backup_prefix);
+    let backups = std::fs::read_dir(&bin_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("agent-ide.bak-"))
+        })
+        .count();
+    assert_eq!(
+        backups, 1,
+        "expected exactly one backup file after reinstall"
+    );
+    let _ = std::fs::remove_dir_all(&backup_prefix);
 }
