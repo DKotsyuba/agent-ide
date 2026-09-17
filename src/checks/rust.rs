@@ -253,21 +253,26 @@ fn resolve_developer_roots(primary: Option<PathBuf>) -> Vec<PathBuf> {
 }
 
 /// Resolves the linker-bypass environment for the confined cargo run: `CC`, optionally `CXX`,
-/// optionally `SDKROOT`, and either `CARGO_TARGET_<TRIPLE>_LINKER` or `RUSTFLAGS`.
+/// optionally `AR`, optionally `RANLIB`, optionally `SDKROOT`, and either
+/// `CARGO_TARGET_<TRIPLE>_LINKER` or `RUSTFLAGS`.
 ///
 /// `/usr/bin/cc` is Apple's `xcrun` shim: it writes an `xcrun_db` cache into the real Darwin user
 /// temp directory (via `confstr(_CS_DARWIN_USER_TEMP_DIR)`, ignoring `TMPDIR`) and dyld-loads
 /// Xcode frameworks outside `Contents/Developer`, both forbidden by the Seatbelt profile, so every
 /// build-script link step fails with exit status 71 even though compilation itself succeeds. This
 /// resolves the toolchain's own `clang` under `developer_dir` and points cargo/cc at it directly,
-/// skipping the shim entirely.
+/// skipping the shim entirely. `/usr/bin/ar` is the same kind of shim, used by the `cc` crate to
+/// archive object files into a static library (for example `blake3`'s `libblake3_neon.a`), so it
+/// fails the same way; the toolchain's own `ar` (and `ranlib`, which the `cc` crate also invokes
+/// as a separate step) sit next to `clang` and bypass it the same way.
 ///
 /// `developer_dir` is the primary directory from [`resolve_primary_developer_dir`]; `None` (no
 /// Xcode or Command Line Tools resolved at all) leaves the environment untouched, and the T05B
 /// fatal-detail path reports the resulting failure. Otherwise [`resolve_clang`] locates the
 /// toolchain `clang`; when none is found the environment is also left untouched — clang missing
 /// entirely is reported the same way an unconfined build would fail. When clang is found: `CC` is
-/// always set; `CXX` is set only when a sibling `clang++` exists; `SDKROOT` is set only when
+/// always set; `CXX` is set only when a sibling `clang++` exists; `AR` and `RANLIB` are set only
+/// when the corresponding sibling binaries exist next to `clang`; `SDKROOT` is set only when
 /// [`resolve_sdk`] finds the platform SDK under `developer_dir`; and the linker variable is
 /// `CARGO_TARGET_<TRIPLE>_LINKER` when [`derive_target_env_var`] can read a target triple out of
 /// `toolchain_dir`'s own name, else `RUSTFLAGS=-Clinker=<clang>`.
@@ -287,6 +292,12 @@ fn resolve_linker_env(developer_dir: Option<&Path>, toolchain_dir: &Path) -> Vec
     env.push(("CC".to_owned(), clang_path));
     if let Some(clangxx) = sibling_clangxx(&clang) {
         env.push(("CXX".to_owned(), clangxx.to_string_lossy().into_owned()));
+    }
+    if let Some(ar) = sibling_tool(&clang, "ar") {
+        env.push(("AR".to_owned(), ar.to_string_lossy().into_owned()));
+    }
+    if let Some(ranlib) = sibling_tool(&clang, "ranlib") {
+        env.push(("RANLIB".to_owned(), ranlib.to_string_lossy().into_owned()));
     }
     if let Some(sdk) = resolve_sdk(developer_dir) {
         env.push(("SDKROOT".to_owned(), sdk.to_string_lossy().into_owned()));
@@ -325,6 +336,13 @@ fn resolve_sdk(developer_dir: &Path) -> Option<PathBuf> {
 fn sibling_clangxx(clang: &Path) -> Option<PathBuf> {
     let name = clang.file_name()?.to_str()?;
     let candidate = clang.with_file_name(format!("{name}++"));
+    candidate.is_file().then_some(candidate)
+}
+
+/// Returns `clang`'s sibling `<tool>` (in the same `usr/bin` directory) when it exists as a file,
+/// else `None`.
+fn sibling_tool(clang: &Path, tool: &str) -> Option<PathBuf> {
+    let candidate = clang.with_file_name(tool);
     candidate.is_file().then_some(candidate)
 }
 

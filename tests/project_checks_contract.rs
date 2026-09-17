@@ -91,6 +91,8 @@ fn rust_xcode_developer_dir(root: &Path) -> PathBuf {
     fs::create_dir_all(&bin_dir).expect("xcode clang bin dir creates");
     fs::write(bin_dir.join("clang"), b"placeholder").expect("clang stub writes");
     fs::write(bin_dir.join("clang++"), b"placeholder").expect("clang++ stub writes");
+    fs::write(bin_dir.join("ar"), b"placeholder").expect("ar stub writes");
+    fs::write(bin_dir.join("ranlib"), b"placeholder").expect("ranlib stub writes");
     let sdk_dir = dir.join("Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk");
     fs::create_dir_all(&sdk_dir).expect("sdk dir creates");
     dir
@@ -696,6 +698,8 @@ fn rust_cargo_check_spec_sets_linker_env_when_xcode_clang_present() {
     let spec = checker.cargo_check_spec(&request);
     let clang = developer_dir.join("Toolchains/XcodeDefault.xctoolchain/usr/bin/clang");
     let clangxx = developer_dir.join("Toolchains/XcodeDefault.xctoolchain/usr/bin/clang++");
+    let ar = developer_dir.join("Toolchains/XcodeDefault.xctoolchain/usr/bin/ar");
+    let ranlib = developer_dir.join("Toolchains/XcodeDefault.xctoolchain/usr/bin/ranlib");
     let sdk = developer_dir.join("Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk");
     let env: std::collections::HashMap<_, _> = spec.env.into_iter().collect();
     assert_eq!(
@@ -706,6 +710,11 @@ fn rust_cargo_check_spec_sets_linker_env_when_xcode_clang_present() {
     assert_eq!(
         env.get("CXX"),
         Some(&clangxx.to_string_lossy().into_owned())
+    );
+    assert_eq!(env.get("AR"), Some(&ar.to_string_lossy().into_owned()));
+    assert_eq!(
+        env.get("RANLIB"),
+        Some(&ranlib.to_string_lossy().into_owned())
     );
     assert_eq!(
         env.get("SDKROOT"),

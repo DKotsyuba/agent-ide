@@ -114,11 +114,14 @@ Every project check process is started through one spawn path:
   default, is Apple's `xcrun` shim — it writes an `xcrun_db` cache into the real Darwin user temp
   directory via `confstr(_CS_DARWIN_USER_TEMP_DIR)` (ignoring `TMPDIR`) and dyld-loads Xcode
   frameworks outside `Contents/Developer`, both denied by this profile, so every build script fails
-  linking with exit status 71 even though compilation itself succeeds. When a toolchain `clang` is
+  linking with exit status 71 even though compilation itself succeeds. `/usr/bin/ar`, which the `cc`
+  crate reaches to archive compiled C sources into a static library (for example `blake3`'s
+  `libblake3_neon.a`), is the same kind of shim and fails the same way. When a toolchain `clang` is
   found under the resolved Apple developer directory (`<dir>/Toolchains/XcodeDefault.xctoolchain/
   usr/bin/clang` for Xcode, `<dir>/usr/bin/clang` for the Command Line Tools), the check environment
   points the link step straight at it instead: `CC=<clang>`, `CXX=<clang>++` when that sibling
-  exists, `SDKROOT=<dir>/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk` (Xcode) or
+  exists, `AR=<clang dir>/ar` and `RANLIB=<clang dir>/ranlib` when those siblings exist,
+  `SDKROOT=<dir>/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk` (Xcode) or
   `<dir>/SDKs/MacOSX.sdk` (Command Line Tools) when it exists, and either
   `CARGO_TARGET_<TRIPLE>_LINKER=<clang>` when the toolchain directory's own name (for example
   `1.98.1-aarch64-apple-darwin`) yields a target triple, or `RUSTFLAGS=-Clinker=<clang>` otherwise.
