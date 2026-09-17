@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::BoxFuture;
+use crate::execution::seatbelt::{SeatbeltPolicy, run_confined};
 
 /// One confined process invocation requested by a checker.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,6 +55,40 @@ pub struct RunOutput {
 pub trait ConfinedRunner: Send + Sync {
     /// Runs one specification to completion; dropping the returned future cancels the process.
     fn run(&self, spec: RunSpec) -> BoxFuture<'_, io::Result<RunOutput>>;
+}
+
+/// Production runner: executes every specification under the generated Seatbelt profile of
+/// [`run_confined`], so a project check reads only its declared roots, writes only its private
+/// cache, has no network, and is killed as a whole process group on timeout or cancellation.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SeatbeltRunner;
+
+impl ConfinedRunner for SeatbeltRunner {
+    fn run(&self, spec: RunSpec) -> BoxFuture<'_, io::Result<RunOutput>> {
+        Box::pin(async move {
+            let policy = SeatbeltPolicy {
+                read_roots: spec.read_roots,
+                write_roots: spec.write_roots,
+            };
+            let output = run_confined(
+                &spec.program,
+                &spec.args,
+                &spec.cwd,
+                &spec.env,
+                &policy,
+                spec.timeout,
+                spec.max_output_bytes,
+            )
+            .await?;
+            Ok(RunOutput {
+                status: output.status,
+                stdout: output.stdout,
+                stderr: output.stderr,
+                timed_out: output.timed_out,
+                truncated: output.truncated,
+            })
+        })
+    }
 }
 
 /// Test substitute that replays scripted outputs in order and records every specification.
@@ -145,5 +180,49 @@ mod tests {
         let exhausted = runner.run(spec.clone()).await.unwrap_err();
         assert_eq!(exhausted.kind(), io::ErrorKind::NotFound);
         assert_eq!(runner.specs(), vec![spec.clone(), spec.clone(), spec]);
+    }
+
+    /// Proves the production adapter maps a specification onto a real confined run and that the
+    /// declared roots, not the caller's environment, decide what the child may read.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_runner_runs_a_confined_child_and_denies_outside_reads() {
+        let root = std::env::temp_dir().join(format!("aiv3-runner-{}", std::process::id()));
+        let inside = root.join("inside");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(inside.join("ok.txt"), "hello\n").unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret\n").unwrap();
+        let spec = |target: PathBuf| RunSpec {
+            program: PathBuf::from("/bin/cat"),
+            args: vec![target.into_os_string()],
+            cwd: inside.clone(),
+            env: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
+            read_roots: vec![inside.clone()],
+            write_roots: vec![],
+            timeout: Duration::from_secs(10),
+            max_output_bytes: 4096,
+        };
+        let allowed = SeatbeltRunner
+            .run(spec(inside.join("ok.txt")))
+            .await
+            .unwrap();
+        // A caller already confined by Seatbelt (for example an agent's own sandboxed shell)
+        // cannot apply a nested profile; that is an environment limit, not an adapter defect.
+        if allowed.stderr.windows(13).any(|w| w == b"sandbox_apply") {
+            eprintln!("skipping: nested sandbox-exec is not permitted in this environment");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        assert_eq!(allowed.status, Some(0), "{allowed:?}");
+        assert_eq!(allowed.stdout, b"hello\n");
+        let denied = SeatbeltRunner
+            .run(spec(outside.join("secret.txt")))
+            .await
+            .unwrap();
+        assert_ne!(denied.status, Some(0), "{denied:?}");
+        assert!(denied.stdout.is_empty(), "{denied:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
