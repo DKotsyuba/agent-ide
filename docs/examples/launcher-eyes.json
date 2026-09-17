@@ -1,0 +1,12 @@
+{
+  "allowed_roots": ["/Users/you/projects"],
+  "project_checks": {
+    "rust": {
+      "toolchain_dir": "/Users/you/.rustup/toolchains/stable-aarch64-apple-darwin"
+    },
+    "python": {
+      "node": "/opt/homebrew/bin/node",
+      "pyright_cli": "/Users/you/.local/pyright/pack/pyright/langserver.index.js"
+    }
+  }
+}

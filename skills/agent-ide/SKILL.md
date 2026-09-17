@@ -53,6 +53,16 @@ compact text as a second response schema.
 7. `ide.stop` at handoff to another actor, or when the task ends, to release
    this binding's activation.
 
+## Project problem feed
+
+The `<agent-ide>` block reports project-wide Rust/Python error and warning counts for this
+worktree and appears in hook context only when those items change; no block means unchanged, not
+finished. When counts rise after your edit, call `ide.context` with `{"kind": "problems"}`
+(optionally `"language": "rust" | "python"` and `"offset"`) to read the bounded problem list
+before continuing. Fixed texts such as `environment not found`, `outside allowed roots`, or
+`checks disabled` mean the feed has no counts for that language — never treat them as a clean
+result.
+
 ## Pending replies and the Claude foreground helper
 
 A `Pending` reply may carry an exact `helper` command. On Claude, run that

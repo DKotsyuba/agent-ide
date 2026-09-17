@@ -40,3 +40,16 @@ flowchart LR
 ```
 
 These are runtime relationships, not a serial implementation schedule. Application composes the components. Workspace owns lifecycle identity; persistent analysis cache follows that worktree lifecycle independently of actor/session changes. A failed assistance component cannot veto native agent work.
+
+## v0.3 MVP: project problem feed
+
+[EYES-r2](contracts/eyes-v0.3.md) extends the composed application with a shared per-repository
+check service. `src/checks/` owns confined background `cargo check` and pyright runs for admitted
+Rust and Python worktrees and one bounded problem snapshot per `(worktree, language)`; Assistance
+renders the compact `<agent-ide>` block through Claude post hooks and answers `ide.context` with
+`{"kind":"problems"}`; Application hosts the per-repository rendezvous (`/private/tmp/ai-r-…`,
+hook key cache `/private/tmp/ai-k-…`) and the persistent check caches under
+`$HOME/.agent-ide/checks`. Admission is restart-only launcher configuration (`allowed_roots`,
+`project_checks`); every failure is fail-open and never vetoes native agent work. The MVP targets
+macOS and Claude; phase 2 adds warm LSP, a launchd per-user service, subagent attach, TypeScript
+checks, the Codex active block, and Go checks last.

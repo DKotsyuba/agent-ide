@@ -74,9 +74,15 @@ deterministic private runtime for that project, so a second MCP stays disconnect
 exits and removes it.
 
 With Claude sandboxing enabled on macOS, `sandbox.network.allowUnixSockets` must contain the exact
-`/private/tmp/ai-c-<project-digest>/claude-helper.sock` path shown inside the pending helper command.
-Current Claude Code does not expand a wildcard for this socket allowlist. Add that exact path to the
-project's local settings before the next session; do not enable `allowAllUnixSockets` for Agent IDE.
+`/private/tmp/ai-r-<hash>/claude-helper.sock` path. Since v0.3 the runtime directory is keyed by the
+repository rather than one project digest: `<hash>` is the first 16 hex digits of the BLAKE3 digest
+of the canonical git common directory (`git -C <project> rev-parse --path-format=absolute
+--git-common-dir`, symlinks resolved), or of the canonical project directory outside a repository,
+so one allowlist entry serves every worktree of one repository. The pending helper command shows the
+exact runtime directory in its `--runtime-dir` argument whenever a helper reports `unavailable`.
+Current Claude Code does not expand a wildcard for this socket allowlist; add that exact path to the
+project's local settings before the next session, and do not enable `allowAllUnixSockets` for
+Agent IDE.
 
 The separate launcher environment variable `AGENT_IDE_HOST_ATTACHMENT` enables
 connect-only routing when supported host request metadata is also present. It is an
@@ -87,6 +93,30 @@ Without that configuration, methods report the missing Workspace boundary.
 See [product MCP boundary](docs/assistance-host-binding.md#product-mcp-boundary) for its limits.
 Placeholder-only host examples are shipped for
 [Codex](docs/examples/codex-hooks.toml) and [Claude Code](docs/examples/claude-settings.json).
+
+The v0.3 project problem feed adds confined background checks for Rust (`cargo check --offline
+--locked`) and Python (pyright) on macOS, a compact `<agent-ide>` error/warning block on Claude
+`PostToolUse` hooks, and `ide.context` with `{"kind":"problems"}`. Enable it only through the
+trusted launcher configuration (`AGENT_IDE_LAUNCHER_CONFIG`): declare normalized absolute
+`allowed_roots` plus a `project_checks` section naming the Rust toolchain and the Node/Pyright
+pair, as in the shipped fragment
+[docs/examples/launcher-eyes.json](docs/examples/launcher-eyes.json). Missing fields, empty
+roots, or an undeclared language keep the feed disabled and v0.2 behaviour unchanged. Each check
+runs under `sandbox-exec` with no network, a read-only worktree, reads limited to the declared
+toolchains, and one private cache under
+`$HOME/.agent-ide/checks/<repository>/<worktree>/<language>`; the environment is rebuilt from an
+allowlist (`CARGO_NET_OFFLINE=true`, private `CARGO_TARGET_DIR` and temp). Runs are debounced,
+bounded by `check_timeout_s`, and their process groups are killed on cancel or timeout. See the
+[EYES-r2 contract](docs/contracts/eyes-v0.3.md) and the
+[launcher configuration](docs/assistance-launcher.md).
+
+Checks run in one shared per-repository daemon under `/private/tmp/ai-r-<hash>`, keyed by the
+canonical git common directory, so every worktree of one repository shares one daemon; later MCP
+servers adopt it and MCP exit never stops it. The MCP leaves the repository key for its hook in
+`/private/tmp/ai-k-<hash>`, so hooks never run `git`. With zero open sessions and no running
+check the daemon stops after `idle_timeout_s` (default 300 seconds) and removes only its runtime
+directory; caches survive. Everything is fail-open: a missing service, toolchain, or feed never
+blocks native tools or turn completion.
 
 `agent-ide doctor --runtime-dir PATH` is observational: it reports effective default configuration and local endpoint/lock/protocol state without creating the path or starting services. Workspace scanning, LSP startup, daemon autostart, and cache retirement without a peer-verified closure/reset fact are unsupported.
 
