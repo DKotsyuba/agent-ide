@@ -23,6 +23,9 @@ pub mod claude_worker;
 /// Exposes the bounded fail-open native Codex and Claude hook command modes.
 pub mod codex_hook;
 
+/// Defines the confined project-problem source seam and the compact problems page text.
+pub mod problems;
+
 /// Loads bounded restart-only trusted target and executable/profile configuration.
 pub mod launcher;
 

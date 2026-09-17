@@ -265,6 +265,97 @@ fn context_paths_offsets_and_diff_modes_are_closed() {
     }
 }
 
+/// Accepts the bounded problems arguments without a path and keeps every v0.2 context rejection
+/// exact: absent kind still requires `path`, problem-feed fields stay rejected there, and any
+/// other kind value falls back to v0.2 behaviour (EYES-r1 §7).
+#[test]
+fn context_problems_arguments_are_bounded_and_v02_behaviour_is_unchanged() {
+    assert!(validate_call(AssistanceTool::Context, json!({"kind":"problems"})).is_ok());
+    assert!(
+        validate_call(
+            AssistanceTool::Context,
+            json!({"kind":"problems","language":"rust"})
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_call(
+            AssistanceTool::Context,
+            json!({"kind":"problems","language":"python","offset":20,"detail_ref":"d"})
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_call(
+            AssistanceTool::Context,
+            json!({"kind":"problems","path":"src/main.rs","offset":0})
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_call(
+            AssistanceTool::Context,
+            json!({"kind":"problems","offset":u32::MAX})
+        )
+        .is_ok()
+    );
+    for invalid in [
+        json!({"kind":"problems","language":"go"}),
+        json!({"kind":"problems","language":null}),
+        json!({"kind":"problems","offset":-1}),
+        json!({"kind":"problems","offset":1.5}),
+        json!({"kind":"problems","offset":u64::from(u32::MAX) + 1}),
+        json!({"kind":null}),
+        json!({"kind":"problems","path":"../escape"}),
+        json!({"kind":"problems","path":"a//b"}),
+    ] {
+        assert!(
+            validate_call(AssistanceTool::Context, invalid.clone()).is_err(),
+            "{invalid}"
+        );
+    }
+    // Any other kind value keeps v0.2 behaviour: path required, problem fields rejected.
+    assert!(validate_call(AssistanceTool::Context, json!({"kind":"everything"})).is_err());
+    assert!(
+        validate_call(
+            AssistanceTool::Context,
+            json!({"kind":"everything","path":"src/main.rs"})
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_call(
+            AssistanceTool::Context,
+            json!({"kind":"everything","path":"src/main.rs","offset":1})
+        )
+        .is_err()
+    );
+    assert!(
+        validate_call(
+            AssistanceTool::Context,
+            json!({"path":"src/main.rs","language":"rust"})
+        )
+        .is_err()
+    );
+    assert!(
+        validate_call(
+            AssistanceTool::Context,
+            json!({"path":"src/main.rs","offset":0})
+        )
+        .is_err()
+    );
+    // The v0.2 shape itself is unchanged.
+    assert!(validate_call(AssistanceTool::Context, json!({"path":"src/main.rs"})).is_ok());
+    assert!(
+        validate_call(
+            AssistanceTool::Context,
+            json!({"path":"src/main.rs","byte_offset":0})
+        )
+        .is_ok()
+    );
+    assert!(validate_call(AssistanceTool::Context, json!({"query":"old schema"})).is_err());
+}
+
 /// Keeps the edit schema exact and enforces its independent full-content and argument limits.
 #[test]
 fn edit_arguments_are_closed_and_bounded() {
