@@ -42,8 +42,8 @@ fn rust_scratch(tag: &str) -> PathBuf {
 
 /// Builds a check request over `<root>/wt` with input generation 42.
 ///
-/// `with_lockfile` writes an empty `<worktree>/Cargo.lock`, which decides the `--locked`
-/// argument of the built spec.
+/// `with_lockfile` writes an empty `<worktree>/Cargo.lock`; the built spec passes `--locked`
+/// either way.
 fn rust_request(root: &Path, with_lockfile: bool) -> CheckRequest {
     let worktree = root.join("wt");
     fs::create_dir_all(&worktree).expect("worktree creates");
@@ -161,9 +161,9 @@ fn rust_cargo_check_spec_matches_confined_contract() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// Proves `--locked` is appended only when the worktree carries `Cargo.lock`.
+/// Proves `--locked` is passed even when the worktree carries no `Cargo.lock` (EYES-r2 §4).
 #[test]
-fn rust_cargo_check_spec_omits_locked_without_lockfile() {
+fn rust_cargo_check_spec_passes_locked_without_lockfile() {
     let root = rust_scratch("spec-unlocked");
     let request = rust_request(&root, false);
     let checker = rust_checker(&root, FakeRunner::default());
@@ -182,6 +182,7 @@ fn rust_cargo_check_spec_omits_locked_without_lockfile() {
             "--message-format=json",
             "--offline",
             "--keep-going",
+            "--locked",
         ]
     );
     let _ = fs::remove_dir_all(&root);
