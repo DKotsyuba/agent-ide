@@ -8,6 +8,7 @@
 
 pub mod python;
 pub mod runner;
+pub mod rust;
 
 use std::collections::HashSet;
 use std::future::Future;
