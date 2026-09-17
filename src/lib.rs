@@ -9,6 +9,9 @@ pub mod assistance;
 /// Owns confined background project checks and the shared problem snapshot types.
 pub mod checks;
 
+/// Renders the bounded `<agent-ide>` problem block with per-actor dedup (EYES-r1 §6).
+pub mod feed;
+
 /// Admits and owns bounded local processes under supported host profiles.
 pub mod execution;
 
