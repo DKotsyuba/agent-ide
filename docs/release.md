@@ -67,6 +67,41 @@ marketplace source to the matching tag, run `claude plugin marketplace update ag
 `claude plugin update agent-ide@agent-ide`, then run `/reload-plugins` or start a new session.
 Recheck `claude mcp get agent-ide` and `AGENT_IDE_BIN` before using the updated plugin.
 
+## Local install from source
+
+`scripts/install-local.sh [--prefix DIR] [--dry-run] [--no-build]` builds this checkout and
+installs it into a user prefix (default `$HOME/.local`) so agent-run runtimes, crew hooks, and
+Claude skills catalogs can depend on a stable installed path instead of the checkout itself. The
+checkout remains the development working copy; nothing about it changes.
+
+What is installed where:
+
+- `<prefix>/bin/agent-ide` — the release binary, built with `cargo build --locked --release`
+  (skip with `--no-build` when `target/release/agent-ide` is already current) and copied in
+  atomically: staged as `agent-ide.tmp-<pid>`, then `mv`'d over the existing name so running
+  processes keep their already-open old inode.
+- `<prefix>/share/agent-ide/plugin/<version>/` — a plugin bundle containing `.claude-plugin/`,
+  `.codex-plugin/`, `hooks/`, and `skills/` copied from the checkout. Its `hooks/claude-hook.sh`
+  is regenerated to `exec` the installed binary's absolute path directly, so the installed copy
+  no longer needs `AGENT_IDE_BIN`; the checkout's own strict `hooks/claude-hook.sh` is untouched.
+  Re-running the installer for the same version replaces that version directory (staged, then
+  swapped in).
+- `<prefix>/share/agent-ide/plugin/current` — a symlink to the just-installed version directory,
+  swapped atomically (staged as `current.tmp-<pid>`, then `mv -f`).
+
+The script validates the installed bundle (`hooks/hooks.json` and `skills/agent-ide/SKILL.md`
+present, the generated hook executable) and runs `agent-ide launcher check` against
+`$HOME/.config/agent-ide/launcher.json` when that file exists; a launcher check failure is
+reported as a warning, not a stop. It never edits `~/.claude/settings.json`,
+`~/.agent-run/config.toml`, `crew.toml`, or any skills catalog — it only prints the exact lines an
+operator should apply there, pointed at `<prefix>/share/agent-ide/plugin/current`. `--dry-run`
+prints every action it would take without writing anything.
+
+To roll back: restore the binary from its `<prefix>/bin/agent-ide.bak-<old-version-or-timestamp>`
+backup (written before the new binary replaces the old one, named from the old binary's own
+`--version` output when it prints one, else a UTC timestamp), and point `current` back at the
+previous `<prefix>/share/agent-ide/plugin/<old-version>/` directory.
+
 ## Publication gate
 
 The release workflow repeats formatting, locked workspace tests, Clippy, rustdoc, the complete
