@@ -12,33 +12,57 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.0"
+          cache: false
       - uses: actions/setup-node@v4
         with:
-          node-version: "24.x"
+          node-version: "24.4.0"
       - name: Verify tag and runner
         run: |
           test "$(uname -m)" = arm64
           version="${GITHUB_REF_NAME#v}"
           manifest_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "agent-ide") | .version')"
           test "$version" = "$manifest_version"
-      - name: Build
+          test "$version" = "$(jq -r .version .codex-plugin/plugin.json)"
+          test "$version" = "$(jq -r .version .claude-plugin/plugin.json)"
+          test "$version" = "$(jq -r .plugins[0].version .claude-plugin/marketplace.json)"
+      - name: Prepare accepted toolchains
         run: |
-          npm install --global pyright@1.1.413
-          export AGENT_IDE_PYRIGHT="$(command -v pyright-langserver)"
-          export AGENT_IDE_NODE="$(command -v node)"
-          cargo test --locked --lib --bin agent-ide
-          cargo test --locked --test product_mcp_contract configured_product_claude_helper_returns_real_pyright_semantic_context_diff_and_stop -- --ignored --nocapture --test-threads=1
-          cargo build --locked --release --bin agent-ide
+          rustup component add rustfmt clippy rust-analyzer rust-src
+          go install golang.org/x/tools/gopls@v0.23.0
+          npm install --global pyright@1.1.413 typescript-language-server@6.0.0 typescript@5.9.3
+          npm_root="$(npm root --global)"
+          echo "AGENT_IDE_GOPLS=$(go env GOPATH)/bin/gopls" >> "$GITHUB_ENV"
+          echo "AGENT_IDE_GO=$(command -v go)" >> "$GITHUB_ENV"
+          echo "AGENT_IDE_RUST_ANALYZER=$(rustup which rust-analyzer)" >> "$GITHUB_ENV"
+          echo "AGENT_IDE_RUST_TOOLCHAIN=$(rustup show active-toolchain | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "AGENT_IDE_RUST_TOOLCHAIN_DIR=$(rustc --print sysroot)" >> "$GITHUB_ENV"
+          echo "AGENT_IDE_NODE=$(command -v node)" >> "$GITHUB_ENV"
+          echo "AGENT_IDE_PYRIGHT=$(command -v pyright-langserver)" >> "$GITHUB_ENV"
+          echo "AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER=$npm_root/typescript-language-server/lib/cli.mjs" >> "$GITHUB_ENV"
+          echo "AGENT_IDE_TSSERVER=$npm_root/typescript/lib/tsserver.js" >> "$GITHUB_ENV"
+      - name: Run complete quality gates
+        run: |
+          cargo fmt --check
+          cargo test --locked --workspace -- --test-threads=1
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
+      - name: Run candidate product acceptance
+        run: scripts/macos-acceptance.sh --route product --evidence "$RUNNER_TEMP/product-evidence.json"
+      - name: Validate accepted candidate host evidence
+        run: scripts/validate-release-evidence.sh "$GITHUB_SHA"
+      - name: Build release executable
+        run: cargo build --locked --release --bin agent-ide
       - name: Package
         run: |
-          asset="agent-ide-${GITHUB_REF_NAME}-aarch64-apple-darwin.tar.gz"
-          mkdir -p package
-          cp target/release/agent-ide package/agent-ide
-          chmod 755 package/agent-ide
-          touch -t 197001010000 package/agent-ide
-          COPYFILE_DISABLE=1 tar -cf - -C package agent-ide | gzip -n > "$asset"
-          shasum -a 256 "$asset" > SHA256SUMS
+          asset="$(scripts/package-release.sh target/release/agent-ide "$GITHUB_REF_NAME" .)"
           echo "ASSET=$asset" >> "$GITHUB_ENV"
+      - name: Smoke packaged executable
+        run: scripts/release-smoke.sh "$ASSET"
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

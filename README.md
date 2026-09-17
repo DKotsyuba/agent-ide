@@ -1,6 +1,6 @@
 # Agent IDE
 
-An explicitly activated coding companion for Codex and Claude Code, designed for Linux and macOS. One coding agent owns one Git worktree. A local broker coordinates isolated analysis views, compatible shared language-server backends and bounded feedback.
+An explicitly activated coding companion for Codex and Claude Code on macOS arm64. One coding agent owns one Git worktree. A local broker coordinates isolated analysis views, compatible shared language-server backends and bounded feedback. Linux remains explicitly `not_tested` and no Linux release artifact is published.
 
 Status: the binary assembles the six-tool MCP surface, exact Codex hook-to-MCP binding,
 explicit Codex/Claude native ingress, bounded hook context output, durable Workspace activation,
@@ -12,10 +12,11 @@ roots. Complete delivery accounting and the remaining roadmap acceptance checks 
 
 Tagged releases are built on GitHub Actions using an arm64 macOS runner and published
 with a SHA-256 checksum in GitHub Releases. Install the latest private release with
-`./install.sh`, or select one with `./install.sh 0.1.6`. The installer uses the
+`./install.sh`, or pin v0.2.0 with `./install.sh 0.2.0`. The installer uses the
 authenticated GitHub CLI, verifies `SHA256SUMS`, and atomically installs to
 `~/.local/bin` (override with `AGENT_IDE_INSTALL_DIR`). It does not edit MCP or hook
-configuration.
+configuration. The release archive also contains the Codex and Claude plugin manifests,
+marketplace catalogs, skill, and hooks. See the [release installation and update guide](docs/release.md).
 
 Runtime-neutral orchestrators can register one command for both hosts:
 
@@ -64,8 +65,9 @@ plugin manifest:
 ```
 
 The Claude plugin contributes the four correlated lifecycle hooks from `hooks/hooks.json`; its
-plugin-local command uses only Claude's standard `CLAUDE_PLUGIN_ROOT` path and delegates to the
-installed `agent-ide claude-hook`. That argument-free mode finds the active project rendezvous
+plugin-local command requires `AGENT_IDE_BIN` to be the same absolute executable configured for
+MCP and delegates to that exact installed binary's `claude-hook`. It never searches `PATH`, so a
+binary update cannot split MCP and hook versions. That argument-free mode finds the active project rendezvous
 solely from Claude's absolute `CLAUDE_PROJECT_DIR`. The managed MCP requires the template's one
 target to carry the strict Claude operator profile documented below. It exclusively owns a
 deterministic private runtime for that project, so a second MCP stays disconnected until the owner
