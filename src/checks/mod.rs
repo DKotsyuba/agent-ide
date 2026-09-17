@@ -7,6 +7,7 @@
 //! [`ProblemSnapshot::problems`] list is capped; messages are untrusted checker output.
 
 pub mod runner;
+pub mod rust;
 
 use std::collections::HashSet;
 use std::future::Future;
