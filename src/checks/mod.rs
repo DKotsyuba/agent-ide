@@ -15,6 +15,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+/// Debounced scheduler that drives [`Checker`] runs per `(worktree, language)`, per EYES-r1 §5.
+pub mod scheduler;
+
 /// Maximum number of problems retained in one [`ProblemSnapshot`].
 ///
 /// `errors`/`warnings` keep counting the full deduplicated result beyond this cap; the cap only
