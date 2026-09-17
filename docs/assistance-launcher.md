@@ -159,9 +159,12 @@ never believes a partially strict configuration was accepted. `linux` is accepte
 never satisfies validation; see `assistance-claude-worker.md`.
 
 On macOS, `scope_declared` also requires Claude's sandbox configuration to allow the exact
-`/private/tmp/ai-c-<project-digest>/claude-helper.sock` path through
-`sandbox.network.allowUnixSockets`. The pending helper command exposes the exact runtime directory
-without disclosing the attachment. Current Claude Code does not expand a wildcard in this allowlist,
-so the operator must add the exact path to project-local settings before the next session.
+`/private/tmp/ai-r-<repository-key-digest>/claude-helper.sock` path through
+`sandbox.network.allowUnixSockets`. Per EYES-r1 §2, this path is now keyed by the repository (its
+canonical git common directory, or the project root itself outside a git repository), so it is
+shared by every worktree of one repository rather than distinct per worktree. The pending helper
+command exposes the exact runtime directory without disclosing the attachment. Current Claude Code
+does not expand a wildcard in this allowlist, so the operator must add the exact path to
+project-local settings before the next session.
 `allowAllUnixSockets` is outside this strict profile because it grants access to unrelated host
 sockets.
