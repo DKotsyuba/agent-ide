@@ -143,6 +143,26 @@ fn config_project_check_defaults_apply_when_optional_fields_absent() {
     assert!(checks.python().is_none());
 }
 
+/// The shipped `docs/examples/launcher-eyes.json` fragment parses when merged into an otherwise
+/// valid base configuration, and exposes both configured languages.
+#[test]
+fn config_example_parses() {
+    let example: Value =
+        serde_json::from_str(include_str!("../docs/examples/launcher-eyes.json")).unwrap();
+    let mut config = v02_config();
+    for (field, value) in example.as_object().unwrap() {
+        config[field.as_str()] = value.clone();
+    }
+    let loaded = LauncherConfig::parse(config.to_string().as_bytes()).unwrap();
+    assert_eq!(
+        loaded.allowed_roots(),
+        std::slice::from_ref(&PathBuf::from("/Users/you/projects"))
+    );
+    let checks = loaded.project_checks().unwrap();
+    assert!(checks.rust().is_some());
+    assert!(checks.python().is_some());
+}
+
 /// Each out-of-range project-check timing is rejected with the launcher configuration error.
 #[test]
 fn config_rejects_out_of_range_project_check_values() {

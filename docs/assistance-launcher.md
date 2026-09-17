@@ -133,6 +133,68 @@ inferred or scanned.
 Configuration contains private attachment and evidence values. Diagnostic formatting
 redacts the configuration; it must never be rendered in model-facing tool results.
 
+## Confined project checks (EYES-r2)
+
+Two optional top-level fields extend the configuration for the v0.3 project problem feed. They
+follow the same rules as every other field: restart-only, validated at load, and the whole
+configuration is rejected on any malformed value.
+
+- `allowed_roots`: 0..=16 absolute, normalized directory roots (no `..`, no trailing `/`); the
+  product default is an empty list. A worktree is admitted when its canonical path is equal to or
+  below a canonicalized root; otherwise every language state is `outside allowed roots`.
+- `project_checks`: optional timing and language declarations. Presence together with a nonempty
+  `allowed_roots` enables the feed; absence, or empty roots, keeps v0.2 behaviour unchanged.
+  - `debounce_ms` 100..=10000 (default 1500), `idle_timeout_s` 30..=3600 (default 300),
+    `check_timeout_s` 10..=900 (default 300).
+  - `rust`: `toolchain_dir` (required, absolute, normalized), the rustup toolchain that runs
+    `cargo check --workspace --all-targets --message-format=json --offline --locked`. EYES-r2 also
+    defines the optional `rust.cargo_home` override, which defaults to `$HOME/.cargo` (the rustup
+    home is derived from `toolchain_dir`, never configured); the shipped example fragment
+    [docs/examples/launcher-eyes.json](examples/launcher-eyes.json) omits the field while the
+    schema on the current base accepts only `toolchain_dir` and rejects unknown fields.
+  - `python`: `node` and `pyright_cli` (both required, absolute, normalized), the accepted Node
+    executable and the Pyright CLI entry module it runs. The project's own interpreter is located
+    inside the worktree; a missing environment reports `environment not found` rather than the
+    flood of unresolved imports it would produce.
+  - A language subsection absent means that language is never checked and never appears in the
+    `<agent-ide>` block.
+
+Every check process runs confined through one `sandbox-exec` profile: default-deny, no network,
+read-only access to the admitted worktree, reads limited to the declared toolchain directories and
+system paths, and write access only to the check's private cache directory and private temporary
+directory. The environment is rebuilt from an allowlist (toolchain binaries, `HOME`, the private
+temp directory, `CARGO_TARGET_DIR`, `CARGO_NET_OFFLINE=true`); ambient credentials are not passed.
+Each check owns one process group, killed whole on cancel, timeout (`check_timeout_s`), or daemon
+shutdown; no pattern-based kill touches processes the daemon did not start.
+
+Check caches live outside every runtime directory, under
+`$HOME/.agent-ide/checks/<16 hex blake3(repository key)>/<16 hex blake3(canonical worktree)>/<language>`
+(mode `0700`), so they survive daemon idle stops and crashes; at daemon start, cache directories
+whose recorded worktree no longer exists are removed. A new worktree's Rust cache is cloned
+copy-on-write from the most recently completed sibling worktree of the same repository when
+possible.
+
+Lifecycle: the first MCP server that finds no live daemon spawns one shared per-repository daemon
+(runtime directory `/private/tmp/ai-r-<16 hex of the rendezvous key digest>`); later MCP servers of
+the same repository adopt it after validation, and an MCP exit never stops it. The hook path reads
+the repository key from the MCP-cached hint `/private/tmp/ai-k-<16 hex of the worktree path
+digest>` and never runs `git` itself. With zero open leases and no running check the daemon stops
+after `idle_timeout_s`, closes its socket, and removes its runtime directory; the caches remain.
+
+Scheduling: triggers are a successful `ide.start`, Claude post hooks for `Edit`, `Write`,
+`MultiEdit`, `NotebookEdit`, and `Bash`, and a completed `ide.edit`. Per `(worktree, language)`,
+runs are debounced by `debounce_ms`, at most one runs at a time, and at most two run concurrently
+across the daemon.
+
+Results: one bounded snapshot per `(worktree, language)` carries state, error/warning counts, and
+a bounded problem list. The compact `<agent-ide>` block (at most 256 bytes, counts and fixed state
+text only, never paths or messages) is emitted to the owning Claude actor only when its items
+change; unavailable states render fixed text (`checks disabled`, `outside allowed roots`,
+`tool not found`, `environment not found`, `check failed`, `check timed out`). `ide.context` with
+`{"kind":"problems","language"?,"offset"?}` returns counts and up to 20 problems per call with
+`next_offset`. One `ProjectCheckCompleted` telemetry event (bucketed counts, no paths or messages)
+extends the TELEMETRY-r1 event scope.
+
 ## Optional strict Claude operator profile
 
 A target may declare `claude_profile`. Omit it, or set it to `null`, for a Codex-only target: the

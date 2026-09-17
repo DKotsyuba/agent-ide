@@ -53,6 +53,21 @@ Checks cover isolation between divergent worktrees, stale source/provider result
 
 Caches follow the worktree across stop and sequential handoff. Actor termination does not delete a valid worktree cache; verified worktree closure/reset retires its owned namespace. Hot memory and durable cache are distinct. The scope of this retention guarantee for opaque provider-internal indexes still needs an explicit decision; no provider profile may silently weaken the current strict requirement.
 
+## v0.3 MVP: project problem feed
+
+The current increment is the [EYES-r2](contracts/eyes-v0.3.md) MVP: a shared per-repository daemon
+runs confined background `cargo check` and pyright checks for admitted Rust and Python worktrees on
+macOS and feeds the active Claude actor a compact `<agent-ide>` problem-count block plus an
+`ide.context` `{"kind":"problems"}` reader. Done in the MVP: restart-only launcher admission
+(`allowed_roots`, `project_checks`), lease-based shared daemon lifecycle with idle stop, sandboxed
+read-only check execution with private per-repository caches under `$HOME/.agent-ide/checks`, the
+Claude rendezvous (`/private/tmp/ai-r-…`) and its hook key cache (`/private/tmp/ai-k-…`),
+delta-only block emission, problems retrieval, and one bucketed `ProjectCheckCompleted` telemetry
+event. Codex keeps the v0.2 path without the active block; Linux stays `not_tested`.
+
+Deferred to phase 2, in this order: warm LSP checks, launchd registration, a per-user service,
+subagent attach, TypeScript checks, the Codex active block, and Go checks last.
+
 ## Later increments
 
 These are roadmap boundaries, not authorization to scaffold their APIs now.
@@ -108,7 +123,7 @@ after the collected events show that it is useful.
 | Version | Added result |
 |---|---|
 | v0.2 | Local usage telemetry; preferred single-file `ide.edit` with native fallback; JavaScript/TypeScript/Node.js profiles |
-| v0.3 | Explicit known checks, evidence and local finish; `ide.check` and `ide.finish` |
+| v0.3 | Project problem feed MVP (EYES-r2); the previously listed explicit checks/finish scope (`ide.check`, `ide.finish`) moves beyond the MVP |
 | v0.4 | ChangeSet, Git/source context and history; Scope WorkBundle and CodeBinding |
 | v0.5 | Computed CriterionAssessment, Task Context Compiler and contract-aware impact |
 | v0.6 | Evaluator registry, cost-aware verification planner and approved automatic checks |
