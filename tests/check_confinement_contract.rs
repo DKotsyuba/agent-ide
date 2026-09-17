@@ -1,0 +1,281 @@
+//! Launcher configuration and worktree root admission contract checks for confined project checks.
+
+use agent_ide::assistance::launcher::{LauncherConfig, RootAdmissionError, admit_worktree};
+use agent_ide::execution::{D03ProfileEvidence, HostSandboxState, PersistedProfileRecord};
+use serde_json::{Value, json};
+use std::path::PathBuf;
+use std::time::Duration;
+
+/// Creates a fresh empty scratch root under the system temporary directory.
+///
+/// Any leftover directory from an earlier run of the same binary is removed first, so symlink
+/// and admission fixtures never observe stale content. Tests run single-threaded by contract,
+/// and each test removes its own scratch root before returning.
+fn scratch(name: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "agent-ide-roots-config-{}-{name}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    root
+}
+
+/// Builds the disabled-host sandbox state JSON of one trusted launcher target.
+fn disabled_state() -> Value {
+    let state = HostSandboxState::parse(Some(json!({
+        "permissionProfile": {"type": "disabled"},
+        "codexLinuxSandboxExe": null,
+        "sandboxCwd": "/private/tmp",
+        "useLegacyLandlock": false
+    })))
+    .unwrap();
+    serde_json::from_str(state.sandbox_state_json()).unwrap()
+}
+
+/// Builds the accepted Execution profile record JSON for one trusted disabled-host target.
+fn accepted_record() -> Value {
+    let state = HostSandboxState::parse(Some(json!({
+        "permissionProfile": {"type": "disabled"},
+        "codexLinuxSandboxExe": null,
+        "sandboxCwd": "/private/tmp",
+        "useLegacyLandlock": false
+    })))
+    .unwrap();
+    let record = PersistedProfileRecord::from_execution_evidence(
+        "accepted-disabled",
+        1,
+        D03ProfileEvidence {
+            provider_binary: "accepted-git".into(),
+            toolchain: "toolchain".into(),
+            configuration: "default".into(),
+            trust: "accepted-local".into(),
+            transport: "direct".into(),
+            d03_evidence: "accepted-d03".into(),
+        },
+        &state,
+    )
+    .unwrap();
+    serde_json::from_str(&record.to_json()).unwrap()
+}
+
+/// Builds a valid v0.2 launcher configuration with exactly one trusted target and no v0.3 fields.
+fn v02_config() -> Value {
+    let executable = json!({
+        "path": "/private/tmp/accepted-program",
+        "identity": "accepted-git",
+        "blake3": "0".repeat(64)
+    });
+    let target = json!({
+        "attachment": "private-attachment",
+        "candidate": "/private/tmp/worktree",
+        "git": executable.clone(),
+        "codex": executable,
+        "providers": [],
+        "profiles": [{"record": accepted_record(), "sandbox_state": disabled_state()}],
+        "allow_disabled_host": true
+    });
+    json!({
+        "version": 1,
+        "limits": {"queued": 4, "details": 8, "operation_ms": 1000, "output_bytes": 4096},
+        "targets": [target]
+    })
+}
+
+/// A v0.2 configuration without the new fields parses unchanged and reports project checks off.
+#[test]
+fn config_v02_configuration_parses_without_new_fields() {
+    let loaded = LauncherConfig::parse(v02_config().to_string().as_bytes()).unwrap();
+    assert!(loaded.allowed_roots().is_empty());
+    assert!(loaded.project_checks().is_none());
+    assert_eq!(
+        loaded.target("private-attachment").unwrap().candidate,
+        PathBuf::from("/private/tmp/worktree")
+    );
+    assert!(!format!("{loaded:?}").contains("private-attachment"));
+}
+
+/// A complete v0.3 configuration parses and exposes allowed roots and typed check timings.
+#[test]
+fn config_full_v03_configuration_parses_and_exposes_accessors() {
+    let root = scratch("full");
+    let mut config = v02_config();
+    config["allowed_roots"] = json!([root.to_string_lossy()]);
+    config["project_checks"] = json!({
+        "debounce_ms": 100,
+        "idle_timeout_s": 30,
+        "check_timeout_s": 900,
+        "rust": {"toolchain_dir": "/private/tmp/toolchain"},
+        "python": {"node": "/private/tmp/node", "pyright_cli": "/private/tmp/pyright"}
+    });
+    let loaded = LauncherConfig::parse(config.to_string().as_bytes()).unwrap();
+    assert_eq!(loaded.allowed_roots(), std::slice::from_ref(&root));
+    let checks = loaded.project_checks().unwrap();
+    assert_eq!(checks.debounce(), Duration::from_millis(100));
+    assert_eq!(checks.idle_timeout(), Duration::from_secs(30));
+    assert_eq!(checks.check_timeout(), Duration::from_secs(900));
+    assert_eq!(
+        checks.rust().unwrap().toolchain_dir(),
+        std::path::Path::new("/private/tmp/toolchain")
+    );
+    let python = checks.python().unwrap();
+    assert_eq!(python.node(), std::path::Path::new("/private/tmp/node"));
+    assert_eq!(
+        python.pyright_cli(),
+        std::path::Path::new("/private/tmp/pyright")
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Absent project-check timing and language fields fall back to the contract defaults.
+#[test]
+fn config_project_check_defaults_apply_when_optional_fields_absent() {
+    let mut config = v02_config();
+    config["allowed_roots"] = json!(["/private/tmp/worktree"]);
+    config["project_checks"] = json!({});
+    let loaded = LauncherConfig::parse(config.to_string().as_bytes()).unwrap();
+    let checks = loaded.project_checks().unwrap();
+    assert_eq!(checks.debounce(), Duration::from_millis(1500));
+    assert_eq!(checks.idle_timeout(), Duration::from_secs(300));
+    assert_eq!(checks.check_timeout(), Duration::from_secs(300));
+    // A language subsection absent means that language is never checked.
+    assert!(checks.rust().is_none());
+    assert!(checks.python().is_none());
+}
+
+/// Each out-of-range project-check timing is rejected with the launcher configuration error.
+#[test]
+fn config_rejects_out_of_range_project_check_values() {
+    for (field, values) in [
+        ("debounce_ms", [99, 10_001]),
+        ("idle_timeout_s", [29, 3601]),
+        ("check_timeout_s", [9, 901]),
+    ] {
+        for value in values {
+            let mut config = v02_config();
+            config["allowed_roots"] = json!(["/private/tmp/worktree"]);
+            config["project_checks"] = json!({});
+            config["project_checks"][field] = json!(value);
+            assert!(
+                LauncherConfig::parse(config.to_string().as_bytes()).is_err(),
+                "{field}={value} must be rejected"
+            );
+        }
+    }
+}
+
+/// Relative, escaping, trailing-slash, and oversized allowed-root declarations are rejected
+/// at parse time, as are relative project-check tool paths.
+#[test]
+fn config_rejects_malformed_allowed_roots_and_paths() {
+    let mut config = v02_config();
+    for roots in [
+        json!(["relative/path"]),
+        json!(["/private/tmp/../worktree"]),
+        json!(["/private/tmp/worktree/"]),
+        // The filesystem root itself carries a trailing separator and stays undeclarable.
+        json!(["/"]),
+        json!(
+            (0..17)
+                .map(|index| format!("/private/tmp/r{index}"))
+                .collect::<Vec<_>>()
+        ),
+    ] {
+        config["allowed_roots"] = roots;
+        assert!(
+            LauncherConfig::parse(config.to_string().as_bytes()).is_err(),
+            "allowed_roots={:?} must be rejected",
+            config["allowed_roots"]
+        );
+    }
+    config["allowed_roots"] = json!(["/private/tmp/worktree"]);
+    for checks in [
+        json!({"rust": {"toolchain_dir": "relative/toolchain"}}),
+        json!({"python": {"node": "/abs/node", "pyright_cli": "relative/cli"}}),
+        json!({"unknown_field": 1}),
+    ] {
+        config["project_checks"] = checks;
+        assert!(
+            LauncherConfig::parse(config.to_string().as_bytes()).is_err(),
+            "project_checks={:?} must be rejected",
+            config["project_checks"]
+        );
+    }
+}
+
+/// Worktrees equal to or below one allowed root are admitted and returned in canonical form.
+#[test]
+fn config_admission_accepts_equal_and_nested_worktrees() {
+    let root = scratch("admit");
+    let nested = root.join("repo");
+    std::fs::create_dir_all(&nested).unwrap();
+    let roots = vec![root.clone()];
+    assert_eq!(
+        admit_worktree(&roots, &nested).unwrap(),
+        std::fs::canonicalize(&nested).unwrap()
+    );
+    assert_eq!(
+        admit_worktree(&roots, &root).unwrap(),
+        std::fs::canonicalize(&root).unwrap()
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A worktree outside every allowed root is rejected without returning a path.
+#[test]
+fn config_admission_rejects_outside_worktrees() {
+    let root = scratch("outside-root");
+    let other = scratch("outside-other");
+    assert_eq!(
+        admit_worktree(std::slice::from_ref(&root), &other),
+        Err(RootAdmissionError::OutsideRoots)
+    );
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(other).unwrap();
+}
+
+/// A sibling path sharing only a string prefix with a root is not admitted.
+#[test]
+fn config_admission_rejects_prefix_trap_siblings() {
+    let parent = scratch("prefix-trap");
+    let root = parent.join("b");
+    let sibling = parent.join("bc");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&sibling).unwrap();
+    assert_eq!(
+        admit_worktree(&[root], &sibling),
+        Err(RootAdmissionError::OutsideRoots)
+    );
+    std::fs::remove_dir_all(parent).unwrap();
+}
+
+/// A symlink inside a root whose target resolves outside every root is rejected.
+#[test]
+fn config_admission_rejects_symlink_escape() {
+    let root = scratch("symlink-root");
+    let outside = scratch("symlink-outside");
+    let link = root.join("escape");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    assert_eq!(
+        admit_worktree(std::slice::from_ref(&root), &link),
+        Err(RootAdmissionError::OutsideRoots)
+    );
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(outside).unwrap();
+}
+
+/// Admission fails closed with no roots or unresolvable paths instead of admitting anything.
+#[test]
+fn config_admission_fails_closed_without_roots_or_unresolvable_paths() {
+    let root = scratch("fail-closed");
+    assert_eq!(admit_worktree(&[], &root), Err(RootAdmissionError::NoRoots));
+    assert_eq!(
+        admit_worktree(&[root.join("missing-root")], &root),
+        Err(RootAdmissionError::Unresolvable)
+    );
+    assert_eq!(
+        admit_worktree(std::slice::from_ref(&root), &root.join("missing-worktree")),
+        Err(RootAdmissionError::Unresolvable)
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}

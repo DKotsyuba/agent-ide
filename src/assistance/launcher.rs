@@ -9,10 +9,13 @@ use std::{
     fs::File,
     io::Read,
     path::{Component, Path, PathBuf},
+    time::Duration,
 };
 
 /// Maximum complete launcher file; limits memory before JSON decoding.
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
+/// Maximum absolute allowed roots; bounds the operator declaration and admission work.
+const MAX_ALLOWED_ROOTS: usize = 16;
 /// Maximum executable bytes hashed during a pre-spawn identity check.
 const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
 /// Compiled Codex release record prefix for the exact TypeScript r3 macOS bundle cell.
@@ -476,6 +479,129 @@ impl ProductLimits {
     }
 }
 
+/// Contract default milliseconds between a worktree change and a check start.
+const fn default_debounce_ms() -> u64 {
+    1500
+}
+/// Contract default seconds of zero leases and no running check before the daemon stops.
+const fn default_idle_timeout_s() -> u64 {
+    300
+}
+/// Contract default total wall-clock ceiling of one check run.
+const fn default_check_timeout_s() -> u64 {
+    300
+}
+
+/// Accepted Rust toolchain declaration for confined background project checks.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectRustChecksConfig {
+    /// Absolute normalized rustup toolchain directory used to run confined Rust checks.
+    toolchain_dir: PathBuf,
+}
+impl ProjectRustChecksConfig {
+    /// Returns the declared absolute toolchain directory; never resolved from model or project input.
+    pub fn toolchain_dir(&self) -> &Path {
+        &self.toolchain_dir
+    }
+    /// Rejects a relative or lexically non-normal toolchain directory at parse time.
+    fn validate(&self) -> Result<(), LauncherError> {
+        if !absolute(&self.toolchain_dir) {
+            return Err(LauncherError::Rejected);
+        }
+        Ok(())
+    }
+}
+
+/// Accepted Python toolchain declaration for confined background project checks.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectPythonChecksConfig {
+    /// Absolute normalized Node executable; the only program allowed to start confined Pyright.
+    node: PathBuf,
+    /// Absolute normalized Pyright CLI entry module executed by `node`.
+    pyright_cli: PathBuf,
+}
+impl ProjectPythonChecksConfig {
+    /// Returns the declared absolute Node executable path.
+    pub fn node(&self) -> &Path {
+        &self.node
+    }
+    /// Returns the declared absolute Pyright CLI entry module path.
+    pub fn pyright_cli(&self) -> &Path {
+        &self.pyright_cli
+    }
+    /// Rejects a relative or lexically non-normal tool path at parse time.
+    fn validate(&self) -> Result<(), LauncherError> {
+        if !absolute(&self.node) || !absolute(&self.pyright_cli) {
+            return Err(LauncherError::Rejected);
+        }
+        Ok(())
+    }
+}
+
+/// Optional timing and language declarations for confined background project checks.
+///
+/// Presence enables project checks only together with a nonempty [`LauncherConfig::allowed_roots`];
+/// an absent language subsection means that language is never checked and never appears in a feed.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectChecksConfig {
+    /// Minimum milliseconds between an observed worktree change and a check start, 100..=10000.
+    #[serde(default = "default_debounce_ms")]
+    debounce_ms: u64,
+    /// Seconds of zero leases and no running check before the shared daemon stops, 30..=3600.
+    #[serde(default = "default_idle_timeout_s")]
+    idle_timeout_s: u64,
+    /// Total wall-clock ceiling of one check run including its tool startup, 10..=900.
+    #[serde(default = "default_check_timeout_s")]
+    check_timeout_s: u64,
+    /// Rust check toolchain declaration; `None` keeps Rust unchecked.
+    #[serde(default)]
+    rust: Option<ProjectRustChecksConfig>,
+    /// Python check toolchain declaration; `None` keeps Python unchecked.
+    #[serde(default)]
+    python: Option<ProjectPythonChecksConfig>,
+}
+impl ProjectChecksConfig {
+    /// Returns the debounce window between a change and the check it triggers.
+    pub fn debounce(&self) -> Duration {
+        Duration::from_millis(self.debounce_ms)
+    }
+    /// Returns the shared daemon idle timeout with zero leases and no running check.
+    pub fn idle_timeout(&self) -> Duration {
+        Duration::from_secs(self.idle_timeout_s)
+    }
+    /// Returns the total wall-clock ceiling of one check run.
+    pub fn check_timeout(&self) -> Duration {
+        Duration::from_secs(self.check_timeout_s)
+    }
+    /// Returns the Rust declaration; `None` means Rust is never checked.
+    pub fn rust(&self) -> Option<&ProjectRustChecksConfig> {
+        self.rust.as_ref()
+    }
+    /// Returns the Python declaration; `None` means Python is never checked.
+    pub fn python(&self) -> Option<&ProjectPythonChecksConfig> {
+        self.python.as_ref()
+    }
+    /// Checks the contract timing ranges and every declared path before any check can run.
+    fn validate(&self) -> Result<(), LauncherError> {
+        if !(100..=10_000).contains(&self.debounce_ms)
+            || !(30..=3600).contains(&self.idle_timeout_s)
+            || !(10..=900).contains(&self.check_timeout_s)
+        {
+            return Err(LauncherError::Rejected);
+        }
+        if let Some(rust) = &self.rust {
+            rust.validate()?;
+        }
+        if let Some(python) = &self.python {
+            python.validate()?;
+        }
+        Ok(())
+    }
+}
+
 /// Trusted raw Execution evidence loaded from the launcher, never from an invocation or stored reply.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -529,6 +655,12 @@ struct RawConfig {
     limits: ProductLimits,
     /// Bounded attachment mappings, with at most 64 distinct targets.
     targets: Vec<RawTarget>,
+    /// Absolute normalized directory roots inside which confined project checks may run.
+    #[serde(default)]
+    allowed_roots: Vec<PathBuf>,
+    /// Confined background project-check declarations; absent disables project checks.
+    #[serde(default)]
+    project_checks: Option<ProjectChecksConfig>,
 }
 
 /// One validated trusted target; metadata alone never creates one of these values.
@@ -566,6 +698,10 @@ pub struct LauncherConfig {
     targets: BTreeMap<String, LaunchTarget>,
     /// Shared validated bounds for the daemon's single worker.
     pub limits: ProductLimits,
+    /// Absolute normalized roots admitted for confined project checks; empty disables them.
+    allowed_roots: Vec<PathBuf>,
+    /// Validated project-check declarations; `None` disables project checks.
+    project_checks: Option<ProjectChecksConfig>,
 }
 impl std::fmt::Debug for LauncherConfig {
     /// Emits no attachment, path, accepted profile or executable identity.
@@ -645,6 +781,14 @@ impl LauncherConfig {
         }
         let raw: RawConfig = serde_json::from_slice(bytes).map_err(|_| LauncherError::Invalid)?;
         raw.limits.validate()?;
+        if raw.allowed_roots.len() > MAX_ALLOWED_ROOTS
+            || raw.allowed_roots.iter().any(|root| !allowed_root(root))
+        {
+            return Err(LauncherError::Rejected);
+        }
+        if let Some(checks) = &raw.project_checks {
+            checks.validate()?;
+        }
         if raw.version != 1 || raw.targets.len() > 64 {
             return Err(LauncherError::Rejected);
         }
@@ -792,6 +936,8 @@ impl LauncherConfig {
         Ok(Self {
             targets,
             limits: raw.limits,
+            allowed_roots: raw.allowed_roots,
+            project_checks: raw.project_checks,
         })
     }
     /// Verifies each immutable configured executable once before the worker becomes visible.
@@ -861,6 +1007,19 @@ impl LauncherConfig {
         self.targets.get(attachment)
     }
 
+    /// Returns the configured absolute allowed roots; an empty slice disables project checks.
+    ///
+    /// Values are the operator's declared lexical forms; canonicalization against the live
+    /// filesystem happens only in [`admit_worktree`], never at parse time.
+    pub fn allowed_roots(&self) -> &[PathBuf] {
+        &self.allowed_roots
+    }
+
+    /// Returns the validated project-check declarations; `None` disables project checks.
+    pub fn project_checks(&self) -> Option<&ProjectChecksConfig> {
+        self.project_checks.as_ref()
+    }
+
     /// Iterates the configured private attachments for runtime-bound fallback authentication.
     ///
     /// Values remain borrowed from this immutable launcher generation and must never be persisted,
@@ -868,6 +1027,50 @@ impl LauncherConfig {
     pub(crate) fn attachments(&self) -> impl Iterator<Item = &str> {
         self.targets.keys().map(String::as_str)
     }
+}
+
+/// Fixed worktree admission failure categories for confined project checks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootAdmissionError {
+    /// No allowed root is configured, so project checks are disabled.
+    NoRoots,
+    /// The worktree's canonical path is not equal to or below any canonical allowed root.
+    ///
+    /// This also covers a symlink inside a root whose target resolves outside every root.
+    OutsideRoots,
+    /// The worktree or a configured root cannot be canonicalized on the current filesystem.
+    ///
+    /// An unresolvable root fails closed instead of being skipped, so a broken operator
+    /// declaration never widens admission.
+    Unresolvable,
+}
+
+/// Admits one worktree for confined project checks when it resolves under one allowed root.
+///
+/// The worktree and every root are resolved with `std::fs::canonicalize`, so admission compares
+/// real filesystem locations: a symlinked worktree spelling is compared in its target location,
+/// and a symlink inside a root that points outside is rejected. Containment is component-wise,
+/// not a string prefix: `/a/bc` is not below `/a/b`. Returns the canonical worktree path on
+/// success; admission performs no write and grants no execution authority by itself.
+pub fn admit_worktree(
+    allowed_roots: &[PathBuf],
+    worktree: &Path,
+) -> Result<PathBuf, RootAdmissionError> {
+    if allowed_roots.is_empty() {
+        return Err(RootAdmissionError::NoRoots);
+    }
+    let canonical_worktree =
+        std::fs::canonicalize(worktree).map_err(|_| RootAdmissionError::Unresolvable)?;
+    for root in allowed_roots {
+        let canonical_root =
+            std::fs::canonicalize(root).map_err(|_| RootAdmissionError::Unresolvable)?;
+        // `Path::starts_with` compares whole components, so a longer sibling sharing the root's
+        // string prefix is never contained.
+        if canonical_worktree.starts_with(&canonical_root) {
+            return Ok(canonical_worktree);
+        }
+    }
+    Err(RootAdmissionError::OutsideRoots)
 }
 
 /// Accepts bounded nonempty identity strings without control bytes.
@@ -886,6 +1089,15 @@ fn absolute(path: &Path) -> bool {
         && path
             .components()
             .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
+}
+
+/// Accepts only absolute normalized allowed roots: no `..`, and no trailing separator.
+///
+/// The lexical `..` check reuses [`absolute`]; the separator check reads the raw path bytes
+/// because `Path::components` silently normalizes a trailing slash away. The filesystem root
+/// itself is therefore never an allowed root, which keeps whole-filesystem admission undeclarable.
+fn allowed_root(path: &Path) -> bool {
+    absolute(path) && !path.as_os_str().as_encoded_bytes().ends_with(b"/")
 }
 
 /// Validates trusted mapping/evidence/limits and refuses ambiguous mappings or unknown settings.
