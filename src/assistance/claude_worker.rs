@@ -6,9 +6,10 @@
 //!
 //! * the daemon mints a `LaunchTicket` bound to one action-scoped `detail_ref` and returns the
 //!   exact helper command in the ordinary bounded reply text;
-//! * the ordinary `Bash` `PreToolUse` hook recognizes that command by comparing it against the
-//!   daemon-stored expected bytes (`LaunchLedger::recognize`) and stays silent, so the host's
-//!   own permission and sandbox evaluation of the unchanged command is what actually decides;
+//! * the ordinary `Bash` `PreToolUse` hook recognizes that command by comparing it, byte-exact or
+//!   as the same POSIX words under equivalent quoting, against the daemon-stored expected command
+//!   (`LaunchLedger::recognize`) and stays silent, so the host's own permission and sandbox
+//!   evaluation of the unchanged command is what actually decides;
 //! * the helper claims the bound operation exactly once over the private socket
 //!   (`LaunchLedger::claim`) and receives one closed daemon-selected `HelperJob`.
 //!
@@ -43,12 +44,91 @@ const MAX_DISCOVERY_STREAM_BYTES: usize = 8 * 1024;
 /// Fixed helper subcommand; the model never selects an executable, argument or shell fragment.
 const HELPER_SUBCOMMAND: &str = "claude-worker";
 
-/// Quotes one daemon-selected UTF-8 argument as a single POSIX shell word.
+/// Renders one daemon-selected UTF-8 argument as a POSIX shell word.
 ///
-/// Single quotes are closed, emitted through a quoted backslash escape, then reopened. The caller
-/// measures the expanded command afterward, so escaping cannot bypass the command byte ceiling.
+/// A nonempty value made up only of characters that never require shell quoting (`[A-Za-z0-9]`
+/// and `_./:=@%+,-`) is emitted bare; every other value is single-quoted, with single quotes
+/// closed, emitted through a quoted backslash escape, then reopened. The caller measures the
+/// expanded command afterward, so escaping cannot bypass the command byte ceiling.
 fn shell_word(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+    let is_bare = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_./:=@%+,-".contains(c));
+    if is_bare {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+/// Splits one raw observed shell command into POSIX argv words, conservatively.
+///
+/// Accepts unquoted bare words separated by spaces or tabs, single-quoted strings (no escapes
+/// recognized inside), and double-quoted strings where only `\"` and `\\` are valid escapes.
+/// Returns `None` — never an approximate parse — on an unterminated quote, on `$` or a backtick
+/// inside double quotes, or on any of the shell metacharacters
+/// `; & | < > ( ) $ \` \n * ? [ ] { } ~ # !` or a backslash appearing outside quotes. This is
+/// intentionally narrower than a real shell grammar: anything it cannot parse with full
+/// confidence is rejected rather than guessed at.
+fn helper_words(command: &str) -> Option<Vec<String>> {
+    const REJECTED_OUTSIDE_QUOTES: &[char] = &[
+        ';', '&', '|', '<', '>', '(', ')', '$', '`', '\n', '*', '?', '[', ']', '{', '}', '~', '#',
+        '!', '\\',
+    ];
+    fn is_separator(c: char) -> bool {
+        c == ' ' || c == '\t'
+    }
+    let mut words = Vec::new();
+    let mut chars = command.chars().peekable();
+    loop {
+        while matches!(chars.peek(), Some(&c) if is_separator(c)) {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+        let mut word = String::new();
+        loop {
+            match chars.peek().copied() {
+                None => break,
+                Some(c) if is_separator(c) => break,
+                Some('\'') => {
+                    chars.next();
+                    loop {
+                        match chars.next() {
+                            Some('\'') => break,
+                            Some(c) => word.push(c),
+                            None => return None,
+                        }
+                    }
+                }
+                Some('"') => {
+                    chars.next();
+                    loop {
+                        match chars.next() {
+                            Some('"') => break,
+                            Some('\\') => match chars.next() {
+                                Some('"') => word.push('"'),
+                                Some('\\') => word.push('\\'),
+                                _ => return None,
+                            },
+                            Some('$') | Some('`') => return None,
+                            Some(c) => word.push(c),
+                            None => return None,
+                        }
+                    }
+                }
+                Some(c) if REJECTED_OUTSIDE_QUOTES.contains(&c) => return None,
+                Some(c) => {
+                    word.push(c);
+                    chars.next();
+                }
+            }
+        }
+        words.push(word);
+    }
+    Some(words)
 }
 
 /// Declares the operator-managed strict Claude configuration this profile is accepted under.
@@ -1484,9 +1564,12 @@ impl LaunchLedger {
 
     /// Renders the exact fixed foreground helper command for one handle.
     ///
-    /// The shape is fixed and fully daemon-chosen. Each value is one POSIX-quoted word; the full
-    /// expanded command is then bounded by [`Self::mint`], stored as expected bytes, and returned
-    /// verbatim. Recognition later compares bytes rather than parsing arbitrary shell syntax.
+    /// The shape is fixed and fully daemon-chosen. Each value is one POSIX shell word, rendered
+    /// bare where that never requires quoting and single-quoted otherwise (see `shell_word`);
+    /// the full expanded command is then bounded by [`Self::mint`], stored as the ticket's
+    /// expected command, and returned verbatim. Recognition later accepts this exact command by
+    /// bytes, or any other command that splits into the same POSIX words (see `helper_words`),
+    /// so an equivalently requoted reproduction of the same argv still matches.
     pub fn helper_command(
         binary: &std::path::Path,
         runtime_dir: &std::path::Path,
@@ -1554,10 +1637,13 @@ impl LaunchLedger {
 
     /// Recognizes an ordinary foreground `Bash` pre-hook as the launch of one live ticket.
     ///
-    /// Recognition requires byte-exact equality with the stored expected command and
-    /// `run_in_background == false`. A background launch, a modified command, a superset command
-    /// line or any other tool payload is [`LaunchRecognition::Ignored`] and discarded.
-    /// Recognition is not authorization: it only records that the native launch happened.
+    /// Recognition accepts either byte-exact equality with the stored expected command, or the
+    /// observed command splitting into the exact same POSIX words as the stored command under
+    /// `helper_words`'s conservative parser — so a shell-equivalent requoting of the identical
+    /// argv still matches. `run_in_background == false` is still required. A background launch, a
+    /// compound command, an added or missing argument, a shell expansion or any other tool
+    /// payload is [`LaunchRecognition::Ignored`] and discarded. Recognition is not authorization:
+    /// it only records that the native launch happened.
     pub fn recognize(
         &mut self,
         command: &str,
@@ -1569,11 +1655,16 @@ impl LaunchLedger {
         if run_in_background || tool_use_id.is_empty() {
             return LaunchRecognition::Ignored;
         }
+        let observed_words = helper_words(command);
         // Actor equality is enforced here, at the trusted native pre-hook, because this is where
         // the host itself states who ran the command. A helper process cannot be asked for its own
         // actor identity: it would only be repeating a value it was handed.
         let Some(ticket) = self.tickets.values_mut().find(|ticket| {
-            ticket.command.as_bytes() == command.as_bytes() && &ticket.actor == actor
+            (ticket.command.as_bytes() == command.as_bytes()
+                || observed_words
+                    .as_deref()
+                    .is_some_and(|words| helper_words(&ticket.command).as_deref() == Some(words)))
+                && &ticket.actor == actor
         }) else {
             return LaunchRecognition::Ignored;
         };
@@ -2142,6 +2233,37 @@ mod tests {
         (ledger, "detail-1".into(), actor)
     }
 
+    /// Mints a ticket on the same fixed binding/actor/channel, but with a caller-chosen expected
+    /// command, so recognition-matching tests can exercise commands `helper_command` itself would
+    /// not currently emit (for example, an old-style always-quoted command).
+    fn ledger_with_command(command: &str) -> (LaunchLedger, String, HelperActor) {
+        let mut ledger = LaunchLedger::new(Arc::new(Mutex::new(
+            crate::execution::AdmissionController::new(crate::execution::AdmissionLimits {
+                total_running: CLAIM_CEILING,
+                per_owner_running: CLAIM_CEILING,
+                per_owner_queued: 1,
+                total_queued: 2,
+                interactive_burst: 8,
+            })
+            .expect("fixture limits"),
+        )));
+        let actor = HelperActor::new("agent", Some("session")).unwrap();
+        ledger
+            .mint(
+                "detail-1",
+                binding_fixture(),
+                actor.clone(),
+                "channel",
+                command.to_owned(),
+                job(),
+                1000,
+                identity("/usr/local/bin/agent-ide"),
+                vec![identity("/usr/bin/git")],
+            )
+            .unwrap();
+        (ledger, "detail-1".into(), actor)
+    }
+
     /// Ordinary daemon work and a Claude helper claim contend for exactly one configured budget.
     ///
     /// This is the distinguishing test for the shared-admission contract. With a ledger-private
@@ -2379,6 +2501,116 @@ mod tests {
         assert_eq!(
             ledger.recognize(&exact, false, "call-2", &actor, 0),
             LaunchRecognition::Ignored
+        );
+    }
+
+    /// An old-style always-quoted expected command still recognizes a fully unquoted reproduction
+    /// of the same argv.
+    #[test]
+    fn unquoted_reproduction_of_a_quoted_command_is_recognized() {
+        let quoted = "'/usr/local/bin/agent-ide' claude-worker --runtime-dir '/private/tmp/rt' \
+                       --attachment 'attach' --detail-ref 'detail-1'";
+        let (mut ledger, _, actor) = ledger_with_command(quoted);
+        let unquoted = "/usr/local/bin/agent-ide claude-worker --runtime-dir /private/tmp/rt --attachment attach --detail-ref detail-1";
+        assert_eq!(
+            ledger.recognize(unquoted, false, "call", &actor, 0),
+            LaunchRecognition::Recognized
+        );
+    }
+
+    /// An old-style always-quoted expected command still recognizes a reproduction where every
+    /// word is double-quoted instead of single-quoted.
+    #[test]
+    fn double_quoted_reproduction_of_every_word_is_recognized() {
+        let quoted = "'/usr/local/bin/agent-ide' claude-worker --runtime-dir '/private/tmp/rt' \
+                       --attachment 'attach' --detail-ref 'detail-1'";
+        let (mut ledger, _, actor) = ledger_with_command(quoted);
+        let double_quoted = "\"/usr/local/bin/agent-ide\" \"claude-worker\" --runtime-dir \"/private/tmp/rt\" --attachment \"attach\" --detail-ref \"detail-1\"";
+        assert_eq!(
+            ledger.recognize(double_quoted, false, "call", &actor, 0),
+            LaunchRecognition::Recognized
+        );
+    }
+
+    /// `helper_command` single-quotes a value containing a space, and both the emitted quoted
+    /// form and an equivalent double-quoted reproduction are recognized.
+    #[test]
+    fn a_space_containing_value_is_single_quoted_and_both_quotings_are_recognized() {
+        let command = LaunchLedger::helper_command(
+            std::path::Path::new("/usr/local/bin/agent-ide"),
+            std::path::Path::new("/private/tmp/rt with space"),
+            "attach",
+            "detail-1",
+        );
+        assert!(
+            command.contains("'/private/tmp/rt with space'"),
+            "a space forces single-quoting: {command}"
+        );
+
+        let (mut first_ledger, _, first_actor) = ledger_with_command(&command);
+        assert_eq!(
+            first_ledger.recognize(&command, false, "call", &first_actor, 0),
+            LaunchRecognition::Recognized
+        );
+
+        let double_quoted = command.replace(
+            "'/private/tmp/rt with space'",
+            "\"/private/tmp/rt with space\"",
+        );
+        let (mut other_ledger, _, other_actor) = ledger_with_command(&command);
+        assert_eq!(
+            other_ledger.recognize(&double_quoted, false, "call", &other_actor, 0),
+            LaunchRecognition::Recognized
+        );
+    }
+
+    /// A compound command, an added or removed argument, and a shell expansion are all ignored
+    /// even though they share a prefix or most words with the exact expected command.
+    #[test]
+    fn shell_equivalent_variations_that_change_the_argv_are_ignored() {
+        let (mut ledger, _, actor) = ledger();
+        let exact = LaunchLedger::helper_command(
+            std::path::Path::new("/usr/local/bin/agent-ide"),
+            std::path::Path::new("/private/tmp/rt"),
+            "attach",
+            "detail-1",
+        );
+        assert_eq!(
+            ledger.recognize(&format!("{exact}; echo x"), false, "call", &actor, 0),
+            LaunchRecognition::Ignored
+        );
+        assert_eq!(
+            ledger.recognize(&format!("{exact} --extra"), false, "call", &actor, 0),
+            LaunchRecognition::Ignored
+        );
+        let missing_argument = exact.rsplit_once(' ').expect("multi-word command").0;
+        assert_eq!(
+            ledger.recognize(missing_argument, false, "call", &actor, 0),
+            LaunchRecognition::Ignored
+        );
+        let expanded = exact.replace("detail-1", "$HOME");
+        assert_eq!(
+            ledger.recognize(&expanded, false, "call", &actor, 0),
+            LaunchRecognition::Ignored
+        );
+        assert_eq!(
+            ledger.recognize(&exact, true, "call", &actor, 0),
+            LaunchRecognition::Ignored
+        );
+    }
+
+    /// A plain-path helper command contains no shell quote characters.
+    #[test]
+    fn helper_command_for_plain_paths_is_unquoted() {
+        let command = LaunchLedger::helper_command(
+            std::path::Path::new("/usr/local/bin/agent-ide"),
+            std::path::Path::new("/private/tmp/rt"),
+            "attach",
+            "detail-1",
+        );
+        assert!(
+            !command.contains('\'') && !command.contains('"'),
+            "plain paths must not be quoted: {command}"
         );
     }
 
