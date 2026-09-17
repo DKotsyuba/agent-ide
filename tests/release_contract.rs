@@ -13,8 +13,9 @@ use serde_json::Value;
 #[test]
 fn release_versions_are_synchronized() {
     assert!(include_str!("../Cargo.toml").contains("version = \"0.3.0-alpha.1\""));
-    assert!(include_str!("../Cargo.lock")
-        .contains("name = \"agent-ide\"\nversion = \"0.3.0-alpha.1\""));
+    assert!(
+        include_str!("../Cargo.lock").contains("name = \"agent-ide\"\nversion = \"0.3.0-alpha.1\"")
+    );
     for manifest in [
         include_str!("../.codex-plugin/plugin.json"),
         include_str!("../.claude-plugin/plugin.json"),
