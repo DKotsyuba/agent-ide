@@ -1,0 +1,7 @@
+[project]
+name = "fixture"
+version = "0.0.0"
+
+[tool.pyright]
+venvPath = "env"
+venv = "myenv"

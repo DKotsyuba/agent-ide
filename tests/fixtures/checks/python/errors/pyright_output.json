@@ -1,0 +1,77 @@
+{
+    "version": "1.1.413",
+    "generalDiagnostics": [
+        {
+            "file": "{{FIXTURE_DIR}}/src/pkg/b.py",
+            "severity": "warning",
+            "message": "Import \"os\" is not accessed",
+            "range": {
+                "start": {
+                    "line": 2,
+                    "character": 7
+                },
+                "end": {
+                    "line": 2,
+                    "character": 9
+                }
+            },
+            "rule": "reportUnusedImport"
+        },
+        {
+            "file": "{{FIXTURE_DIR}}/src/pkg/b.py",
+            "severity": "error",
+            "message": "Import \"definitely_not_installed_thirdparty\" could not be resolved",
+            "range": {
+                "start": {
+                    "line": 4,
+                    "character": 7
+                },
+                "end": {
+                    "line": 4,
+                    "character": 42
+                }
+            },
+            "rule": "reportMissingImports"
+        },
+        {
+            "file": "{{FIXTURE_DIR}}/src/pkg/b.py",
+            "severity": "warning",
+            "message": "Import \"definitely_not_installed_thirdparty\" is not accessed",
+            "range": {
+                "start": {
+                    "line": 4,
+                    "character": 7
+                },
+                "end": {
+                    "line": 4,
+                    "character": 42
+                }
+            },
+            "rule": "reportUnusedImport"
+        },
+        {
+            "file": "{{FIXTURE_DIR}}/src/pkg/c.py",
+            "severity": "error",
+            "message": "Expected 2 positional arguments",
+            "range": {
+                "start": {
+                    "line": 4,
+                    "character": 18
+                },
+                "end": {
+                    "line": 4,
+                    "character": 19
+                }
+            },
+            "rule": "reportCallIssue"
+        }
+    ],
+    "summary": {
+        "filesAnalyzed": 4,
+        "errorCount": 2,
+        "warningCount": 2,
+        "informationCount": 0,
+        "timeInSec": 0.179
+    }
+}
+

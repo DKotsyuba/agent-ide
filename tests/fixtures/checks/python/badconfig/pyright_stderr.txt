@@ -1,0 +1,1 @@
+Config file "/Users/pluto/projects/agent-ide-worktrees/v03-python-check/tests/fixtures/checks/python/badconfig/pyrightconfig.json" could not be parsed. Verify that format is correct.
