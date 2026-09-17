@@ -165,7 +165,7 @@ fn config_rejects_out_of_range_project_check_values() {
 }
 
 /// Relative, escaping, trailing-slash, and oversized allowed-root declarations are rejected
-/// at parse time, as are relative project-check tool paths.
+/// at parse time, as are relative or `..`-escaping project-check tool paths.
 #[test]
 fn config_rejects_malformed_allowed_roots_and_paths() {
     let mut config = v02_config();
@@ -191,7 +191,9 @@ fn config_rejects_malformed_allowed_roots_and_paths() {
     config["allowed_roots"] = json!(["/private/tmp/worktree"]);
     for checks in [
         json!({"rust": {"toolchain_dir": "relative/toolchain"}}),
+        json!({"rust": {"toolchain_dir": "/private/tmp/../toolchain"}}),
         json!({"python": {"node": "/abs/node", "pyright_cli": "relative/cli"}}),
+        json!({"python": {"node": "/private/tmp/../node", "pyright_cli": "/abs/cli"}}),
         json!({"unknown_field": 1}),
     ] {
         config["project_checks"] = checks;
@@ -200,6 +202,40 @@ fn config_rejects_malformed_allowed_roots_and_paths() {
             "project_checks={:?} must be rejected",
             config["project_checks"]
         );
+    }
+}
+
+/// Exactly the maximum of 16 allowed roots parses successfully; one more is rejected (covered
+/// above by the 17-root case in [`config_rejects_malformed_allowed_roots_and_paths`]).
+#[test]
+fn config_accepts_exactly_sixteen_allowed_roots() {
+    let mut config = v02_config();
+    let roots: Vec<String> = (0..16)
+        .map(|index| format!("/private/tmp/r{index}"))
+        .collect();
+    config["allowed_roots"] = json!(roots);
+    let loaded = LauncherConfig::parse(config.to_string().as_bytes()).unwrap();
+    assert_eq!(loaded.allowed_roots().len(), 16);
+}
+
+/// Each project-check timing field is accepted at both ends of its contract range.
+#[test]
+fn config_accepts_boundary_project_check_values() {
+    let mut config = v02_config();
+    config["allowed_roots"] = json!(["/private/tmp/worktree"]);
+    for (field, min, max) in [
+        ("debounce_ms", 100u64, 10_000u64),
+        ("idle_timeout_s", 30u64, 3600u64),
+        ("check_timeout_s", 10u64, 900u64),
+    ] {
+        for value in [min, max] {
+            config["project_checks"] = json!({});
+            config["project_checks"][field] = json!(value);
+            assert!(
+                LauncherConfig::parse(config.to_string().as_bytes()).is_ok(),
+                "{field}={value} must be accepted"
+            );
+        }
     }
 }
 
@@ -264,18 +300,51 @@ fn config_admission_rejects_symlink_escape() {
     std::fs::remove_dir_all(outside).unwrap();
 }
 
-/// Admission fails closed with no roots or unresolvable paths instead of admitting anything.
+/// Admission fails closed with no configured roots or an unresolvable worktree.
 #[test]
-fn config_admission_fails_closed_without_roots_or_unresolvable_paths() {
+fn config_admission_fails_closed_without_roots_or_unresolvable_worktree() {
     let root = scratch("fail-closed");
     assert_eq!(admit_worktree(&[], &root), Err(RootAdmissionError::NoRoots));
     assert_eq!(
-        admit_worktree(&[root.join("missing-root")], &root),
-        Err(RootAdmissionError::Unresolvable)
-    );
-    assert_eq!(
         admit_worktree(std::slice::from_ref(&root), &root.join("missing-worktree")),
         Err(RootAdmissionError::Unresolvable)
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A root that fails to canonicalize is skipped, not treated as an admission failure, regardless
+/// of where it sits in the list; a resolvable root elsewhere still admits the worktree.
+#[test]
+fn config_admission_skips_unresolvable_roots_regardless_of_order() {
+    let missing = scratch("skip-missing");
+    let missing_root = missing.join("missing-root");
+    std::fs::remove_dir_all(&missing).unwrap();
+    let valid_root = scratch("skip-valid");
+    let worktree = valid_root.join("repo");
+    std::fs::create_dir_all(&worktree).unwrap();
+    let canonical = std::fs::canonicalize(&worktree).unwrap();
+
+    assert_eq!(
+        admit_worktree(&[missing_root.clone(), valid_root.clone()], &worktree),
+        Ok(canonical.clone())
+    );
+    assert_eq!(
+        admit_worktree(&[valid_root.clone(), missing_root.clone()], &worktree),
+        Ok(canonical)
+    );
+    std::fs::remove_dir_all(valid_root).unwrap();
+}
+
+/// When every configured root is unresolvable, a resolvable worktree elsewhere is rejected as
+/// outside the (empty, once unresolvable roots are skipped) set of admitted roots, not as
+/// `Unresolvable`.
+#[test]
+fn config_admission_rejects_outside_roots_when_only_root_is_unresolvable() {
+    let root = scratch("only-root-unresolvable");
+    let missing_root = root.join("missing-root");
+    assert_eq!(
+        admit_worktree(&[missing_root], &root),
+        Err(RootAdmissionError::OutsideRoots)
     );
     std::fs::remove_dir_all(root).unwrap();
 }
