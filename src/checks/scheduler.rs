@@ -1,15 +1,16 @@
 //! Debounced project check scheduler for EYES-r1 §5, updated for the EYES-r2 §5 cooldown and
 //! failure/cache-layout refinements.
 //!
-//! [`Scheduler`] owns, per `(worktree, language)`, a debounce timer, at most one running
+//! [`Scheduler`](crate::checks::scheduler::Scheduler) owns, per `(worktree, language)`, a debounce timer, at most one running
 //! [`Checker`] invocation, and the latest completed [`ProblemSnapshot`]. It never blocks a
-//! caller: [`Scheduler::trigger`] only restarts a timer, and [`Scheduler::latest`] only reads
+//! caller: [`Scheduler::trigger`](crate::checks::scheduler::Scheduler::trigger) only restarts a timer, and
+//! [`Scheduler::latest`](crate::checks::scheduler::Scheduler::latest) only reads
 //! the last stored result. A new worktree's first Rust check is preceded by a best-effort
 //! copy-on-write clone of a sibling worktree's `target/` directory. Between completions, a run
 //! is further throttled by a cooldown of `max(debounce, previous run duration)`, and a
 //! transient `Fatal`/`Timeout` completion never overwrites an existing `Ready`/`Partial` result.
 //! Cache directories live under a caller-supplied `cache_root` (for example
-//! `$HOME/.agent-ide/checks`) and record enough to let [`sweep_stale_caches`] reclaim caches for
+//! `$HOME/.agent-ide/checks`) and record enough to let [`sweep_stale_caches`](crate::checks::scheduler::sweep_stale_caches) reclaim caches for
 //! worktrees that no longer exist.
 
 use std::collections::HashMap;
@@ -703,7 +704,7 @@ fn hash16(bytes: &[u8]) -> String {
 /// (EYES-r2 §5 follow-up), for a daemon to call periodically outside any live [`Scheduler`].
 ///
 /// Walks `<cache_root>/<repository hash>/<worktree hash>/`, reading each worktree-level
-/// directory's [`WORKTREE_MARKER_FILE_NAME`] to recover the worktree path it was created for; a
+/// directory's `WORKTREE_MARKER_FILE_NAME` to recover the worktree path it was created for; a
 /// directory whose recorded worktree path no longer exists is removed entirely, and a
 /// repository-level directory left with no worktree subdirectories is removed too. A
 /// worktree-level directory with no marker file (never written by this scheduler, or from an

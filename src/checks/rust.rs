@@ -82,7 +82,7 @@ impl RustChecker {
     /// `HOME`, `TMPDIR`/`CARGO_TARGET_DIR` under the private cache, and `CARGO_NET_OFFLINE=true`.
     /// Read roots cover the worktree, the toolchain, the cargo home, the derived rustup home and
     /// `/private/etc`; the private cache is the only write root; each output stream is capped at
-    /// [`MAX_OUTPUT_BYTES`]. The construction is pure with respect to the process environment:
+    /// `MAX_OUTPUT_BYTES`. The construction is pure with respect to the process environment:
     /// its only inputs are the checker configuration and `request`.
     pub fn cargo_check_spec(&self, request: &CheckRequest) -> RunSpec {
         let home = real_home();

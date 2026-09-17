@@ -1,6 +1,6 @@
 //! Project problem feed for `ide.context` with `kind: "problems"` (EYES-r1 §7, EYES-r2).
 //!
-//! This module defines the confined [`ProblemSource`] seam the daemon answers the problems kind
+//! This module defines the confined [`ProblemSource`](crate::assistance::problems::ProblemSource) seam the daemon answers the problems kind
 //! from, plus the deterministic compact page text. The source never runs a check; it only
 //! reports the latest completed snapshots for one authorized worktree, and every rendered
 //! textual field is treated as untrusted checker output: single line, control characters
