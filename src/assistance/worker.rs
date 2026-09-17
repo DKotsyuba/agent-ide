@@ -9,6 +9,7 @@ use super::{
         ActiveBindingUse, BindingRef, HostBindingGuard, ObservedSandboxState, ValidatedInvocation,
     },
     launcher::{AcceptedProviderSettings, LaunchTarget, LauncherConfig},
+    problems::{ProblemSource, parse_language, problems_text},
     reply::{EditDiagnostics, FailureCode, PeerReply, ResultKind},
 };
 use crate::telemetry::{
@@ -295,6 +296,12 @@ struct Shared {
     admission: Arc<Mutex<crate::execution::AdmissionController>>,
     /// Replaceable fail-open sink receiving only sanitized typed telemetry facts.
     telemetry: Arc<dyn super::telemetry::EditTelemetry>,
+    /// Optional project-problem snapshot source behind the `ide.context` problems kind.
+    ///
+    /// Absent (the default) renders the honest `checks disabled` outcome. It is installed
+    /// before startup through [`WorkerHandle::with_problem_source`] and only reports typed
+    /// snapshots for the authorized worktree; it never runs a check or touches authority.
+    problem_source: Option<Arc<dyn ProblemSource>>,
 }
 impl Shared {
     /// Acquires a new transient binding use at one exact admission/return boundary.
@@ -584,6 +591,7 @@ impl WorkerHandle {
                 shutdown_failure: Mutex::new(None),
                 admission,
                 telemetry,
+                problem_source: None,
             }),
             inspect,
             receiver: Mutex::new(Some(receiver)),
@@ -591,6 +599,51 @@ impl WorkerHandle {
             startup_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             telemetry: Arc::new(Mutex::new(None)),
             fallback_ingress: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Attaches the project-problem snapshot source used by the `ide.context` problems kind.
+    ///
+    /// Must be called before [`WorkerHandle::start`]: the spawned worker task clones the shared
+    /// state, so the source can only be installed while this handle still owns it exclusively.
+    /// Without a source the problems kind reports the honest `checks disabled` outcome.
+    pub fn with_problem_source(mut self, problem_source: Arc<dyn ProblemSource>) -> Self {
+        Arc::get_mut(&mut self.shared)
+            .expect("problem source must be attached before worker startup")
+            .problem_source = Some(problem_source);
+        self
+    }
+
+    /// Answers a `kind: "problems"` context request from the daemon's in-memory problem source.
+    ///
+    /// EYES-r2: the request runs as a bounded managed job inside the worker task — never as a
+    /// Claude foreground helper — because only the worker owns the durable authority and its
+    /// authorized worktree. The caller waits on the job's bounded oneshot exactly like Stop; a
+    /// lost wait still leaves the finished result retrievable through the retained detail
+    /// reference until the ledger evicts it.
+    pub async fn context_problems(
+        &self,
+        invocation: ValidatedInvocation,
+        parameters: Value,
+        attachment: &str,
+    ) -> PeerReply {
+        let (send, wait) = oneshot::channel();
+        if let Err(code) = self.enqueue(
+            invocation,
+            None,
+            AssistanceTool::Context,
+            parameters,
+            attachment,
+            Some(send),
+            JobInput::Managed,
+        ) {
+            return PeerReply::Error { code };
+        }
+        match tokio::time::timeout(Duration::from_millis(800), wait).await {
+            Ok(Ok(reply)) => reply,
+            _ => PeerReply::Error {
+                code: FailureCode::Deadline,
+            },
         }
     }
 
@@ -2663,6 +2716,9 @@ impl<'a> Worker<'a> {
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
         use crate::intelligence::context::{ContextMode, ContextQuery, lexical_context};
         let binding = job.invocation.binding_ref().clone();
+        if job.parameters.get("kind").and_then(Value::as_str) == Some("problems") {
+            return self.context_problems_job(job, &binding).await;
+        }
         let path = job.parameters["path"]
             .as_str()
             .ok_or(FailureCode::SourceUnavailable)?
@@ -2834,6 +2890,52 @@ impl<'a> Worker<'a> {
             },
             Some(authority),
             Some(observed),
+        ))
+    }
+
+    /// Returns the project problem feed for `kind: "problems"` from the configured snapshot source.
+    ///
+    /// The worktree is the fresh durable authority's worktree — the same active-binding/authority
+    /// lookup every other context use requires — and no source file is read and no observation is
+    /// recorded. Without an attached source, or when the requested language is not configured,
+    /// the reply is the honest single line `checks disabled`.
+    async fn context_problems_job(
+        &mut self,
+        job: &mut Job,
+        binding: &BindingRef,
+    ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        if tokio::time::Instant::now() >= job.deadline {
+            return Err(FailureCode::Deadline);
+        }
+        let authority = self.authority(binding).await?;
+        let text = match self.shared.problem_source.as_ref() {
+            Some(source) => {
+                let snapshots = source.latest(authority.worktree().worktree_path());
+                let language = job
+                    .parameters
+                    .get("language")
+                    .and_then(Value::as_str)
+                    .and_then(parse_language);
+                let offset = job
+                    .parameters
+                    .get("offset")
+                    .and_then(Value::as_u64)
+                    .map_or(0, |offset| u32::try_from(offset).unwrap_or(u32::MAX));
+                problems_text(&snapshots, language, offset)
+            }
+            None => "checks disabled".to_owned(),
+        };
+        self.shared.active(binding)?;
+        Ok((
+            PeerReply::Complete {
+                kind: ResultKind::Context,
+                text,
+                detail_ref: Some(job.reference.clone()),
+                truncated: false,
+                continuation: false,
+            },
+            Some(authority),
+            None,
         ))
     }
 
@@ -3903,6 +4005,7 @@ mod stop_retry_tests {
             BindingStatus, parse_candidate, parse_channel_session, parse_claude_hook_event,
             parse_hook_event, parse_observed_sandbox_state,
         },
+        checks::{CheckState, Language, Problem, ProblemSnapshot, Severity},
         execution::{D03ProfileEvidence, HostSandboxState, PersistedProfileRecord},
         intelligence::freshness::{CacheIdentity, CacheLifecycle},
     };
@@ -4104,6 +4207,7 @@ mod stop_retry_tests {
                 shutdown_failure: Mutex::new(None),
                 admission: Arc::new(Mutex::new(admission_controller())),
                 telemetry: Arc::new(crate::assistance::telemetry::NoopEditTelemetry),
+                problem_source: None,
             }),
             workspace,
             observations: WorkspaceStore::new(store),
@@ -4656,6 +4760,141 @@ mod stop_retry_tests {
         assert!(settled.is_ok());
         assert!(!worker.grants.contains_key(&new_binding));
         assert!(worker.pending_revocations.is_empty());
+    }
+
+    /// A recorded fake problem source used only by the problems-kind tests below; it never runs
+    /// a check and only reports cloned fixed snapshots for whichever worktree it is asked about.
+    struct RecordedProblems {
+        /// Snapshots returned on every query, cloned per call.
+        snapshots: Vec<ProblemSnapshot>,
+        /// Recorded query worktrees in call order.
+        queried: Mutex<Vec<std::path::PathBuf>>,
+    }
+
+    impl RecordedProblems {
+        /// Builds a substitute returning the same snapshots for every worktree.
+        fn new(snapshots: Vec<ProblemSnapshot>) -> Self {
+            Self {
+                snapshots,
+                queried: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Returns the recorded query worktrees in call order.
+        fn queried(&self) -> Vec<std::path::PathBuf> {
+            self.queried.lock().unwrap().clone()
+        }
+    }
+
+    impl ProblemSource for RecordedProblems {
+        fn latest(&self, worktree: &std::path::Path) -> Vec<ProblemSnapshot> {
+            self.queried.lock().unwrap().push(worktree.to_path_buf());
+            self.snapshots.clone()
+        }
+    }
+
+    /// Runs one problems-kind context job through the real production context entry point.
+    async fn run_problems_context(
+        worker: &mut Worker<'_>,
+        actor: &str,
+        id: &str,
+        observed: Option<ObservedSandboxState>,
+        parameters: serde_json::Value,
+    ) -> PeerReply {
+        let (invocation, _) = production_call(worker, &worker.runtime, actor, id);
+        let (_cancel_sender, cancel) = watch::channel(false);
+        let mut job = Job {
+            input: JobInput::Managed,
+            reference: format!("problems-{id}"),
+            invocation,
+            observed,
+            tool: AssistanceTool::Context,
+            parameters,
+            target: production_target(&worker.runtime),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            cancel,
+            stop_reply: None,
+            native_epoch: 0,
+        };
+        let (reply, _, source) = worker.context(&mut job).await.unwrap();
+        assert!(matches!(
+            reply,
+            PeerReply::Complete {
+                kind: ResultKind::Context,
+                ..
+            }
+        ));
+        // The problems kind reads no source file, so it never records an observation.
+        assert!(source.is_none());
+        reply
+    }
+
+    /// Proves the problems kind answers from the attached in-memory source against the authorized
+    /// worktree — without any sandbox observation, which Claude never has — and reports the honest
+    /// single disabled line when no source is attached. No helper, provider or source file is
+    /// involved on either path.
+    #[tokio::test]
+    async fn context_problems_answers_from_source_and_reports_disabled_without_one() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        production_start(&mut worker, "problems-actor", "problems-start").await;
+
+        // Without an attached source the reply is the honest single disabled line.
+        let reply = run_problems_context(
+            &mut worker,
+            "problems-actor",
+            "problems-disabled",
+            None,
+            serde_json::json!({"kind":"problems"}),
+        )
+        .await;
+        let PeerReply::Complete { text, .. } = &reply else {
+            panic!("problems context must complete: {reply:?}")
+        };
+        assert_eq!(text, "checks disabled");
+
+        // With an attached source the page renders from the authorized worktree's snapshots.
+        let snapshot = ProblemSnapshot::from_problems(
+            Language::Rust,
+            CheckState::Ready,
+            vec![Problem::new(
+                "src/main.rs".to_owned(),
+                10,
+                5,
+                Severity::Error,
+                Some("E0308".to_owned()),
+                "mismatched types\u{7}!".to_owned(),
+            )],
+            1,
+            5,
+        );
+        let fake = Arc::new(RecordedProblems::new(vec![snapshot]));
+        Arc::get_mut(&mut worker.shared)
+            .expect("fixture worker owns its shared state exclusively")
+            .problem_source = Some(fake.clone());
+        let reply = run_problems_context(
+            &mut worker,
+            "problems-actor",
+            "problems-page",
+            None,
+            serde_json::json!({"kind":"problems","language":"rust","offset":0}),
+        )
+        .await;
+        let PeerReply::Complete { text, .. } = &reply else {
+            panic!("problems context must complete: {reply:?}")
+        };
+        assert!(
+            text.contains("rust: ready; errors: 1; warnings: 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("src/main.rs:10:5 error [E0308] mismatched types!"),
+            "{text}"
+        );
+        assert_eq!(fake.queried(), vec![fixture.root.clone()]);
     }
 }
 

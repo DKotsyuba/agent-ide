@@ -73,6 +73,18 @@ pub(crate) fn monotonic_ms() -> u64 {
         .try_into()
         .unwrap_or(u64::MAX)
 }
+/// Reports whether one validated context call names the in-memory `kind: "problems"` feed.
+///
+/// EYES-r2: such calls are answered entirely from the daemon's in-memory problem source for the
+/// caller's bound worktree. On Claude they must short-circuit before foreground-helper routing,
+/// and on managed Codex they skip native read-boundary reconciliation. A call carrying a detail
+/// reference is retrieval of an already-settled result and keeps its existing route.
+fn is_problems_context(method: AssistanceMethod, parameters: &Value) -> bool {
+    method == AssistanceMethod::Context
+        && parameters.get("detail_ref").is_none()
+        && parameters.get("kind").and_then(Value::as_str) == Some("problems")
+}
+
 impl std::fmt::Debug for ProductDispatcher {
     /// Omits private channel nonces, host identities and all worker state.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -900,6 +912,19 @@ impl ProductDispatcher {
                             )
                             .await
                         }
+                        // EYES-r2: the problems kind is answered from the daemon's in-memory
+                        // problem source and never mints or dispatches a foreground helper.
+                        AssistanceMethod::Context
+                            if is_problems_context(method.method(), call.parameters()) =>
+                        {
+                            worker
+                                .context_problems(
+                                    invocation,
+                                    call.parameters().clone(),
+                                    method.opaque_attachment(),
+                                )
+                                .await
+                        }
                         AssistanceMethod::Edit => {
                             let prepared = worker
                                 .prepare_claude_edit(
@@ -964,6 +989,7 @@ impl ProductDispatcher {
                             | AssistanceMethod::Diff
                             | AssistanceMethod::Inspect
                     )
+                    && !is_problems_context(method.method(), call.parameters())
                 {
                     // Managed Codex has no native hook stream. Treat every read boundary as a
                     // possible native edit and reuse the worker's registered-path reconciliation
@@ -988,6 +1014,17 @@ impl ProductDispatcher {
                                 observed?,
                                 method.opaque_attachment(),
                                 None,
+                            )
+                            .await
+                    }
+                    AssistanceMethod::Context
+                        if is_problems_context(method.method(), call.parameters()) =>
+                    {
+                        worker
+                            .context_problems(
+                                invocation,
+                                call.parameters().clone(),
+                                method.opaque_attachment(),
                             )
                             .await
                     }
@@ -1423,5 +1460,71 @@ fn claude_mint_rechecks_binding_after_concurrent_stop_begins() {
             code: FailureCode::WorkspaceAuthority
         }
     );
+    assert!(dispatcher.launches.lock().unwrap().is_empty());
+}
+
+/// EYES-r2: a `kind: "problems"` context call on the Claude path never mints a foreground-helper
+/// ticket. It must route into the worker's in-memory problem-source path — with no started
+/// worker task that path fails at enqueue (`internal`), while the removed short-circuit would
+/// have fallen through to helper minting and returned `workspace_authority` instead.
+#[tokio::test]
+async fn claude_problems_context_short_circuits_before_helper_mint() {
+    let (dispatcher, _invocation) = claude_race_fixture();
+    // Every ordinary Claude MCP call is armed by its own trusted native pre-hook, so the
+    // problems call registers a fresh pre-observation for its own call identity on the exact
+    // same channel as the still-active start binding.
+    let call_id = "problems-call-1";
+    let channel = dispatcher.channel("race-attachment").unwrap();
+    {
+        let mut bindings = dispatcher.bindings.lock().unwrap();
+        assert!(matches!(
+            bindings.observe_hook(
+                parse_claude_hook_event(
+                    json!({
+                        "hook_event_name":"PreToolUse",
+                        "session_id":"race-actor",
+                        "tool_use_id":call_id
+                    })
+                    .to_string()
+                    .as_bytes()
+                )
+                .unwrap(),
+                channel.clone()
+            ),
+            BindingStatus::PreObserved
+        ));
+    }
+    let request = crate::app::transport::MethodDispatch::new(
+        "problems-request".to_owned(),
+        call_id.to_owned(),
+        "race-attachment".to_owned(),
+        AssistanceMethod::Context,
+        crate::app::transport::OpaqueJson::from_value(
+            &json!({
+                "parameters":{"kind":"problems"},
+                "host_meta":{"claudecode/toolUseId": call_id}
+            }),
+            64 * 1024,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let reply = dispatcher
+        .handle(&AssistanceDispatch::MethodDispatch(request))
+        .await
+        .expect("problems dispatch must produce a typed reply");
+    assert_eq!(
+        reply,
+        PeerReply::Error {
+            code: FailureCode::Internal
+        }
+    );
+    assert!(!matches!(
+        reply,
+        PeerReply::Pending {
+            helper: Some(_),
+            ..
+        }
+    ));
     assert!(dispatcher.launches.lock().unwrap().is_empty());
 }

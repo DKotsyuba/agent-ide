@@ -42,6 +42,8 @@ const MAX_TEXT_BYTES: usize = 512;
 const MAX_DETAIL_REF_BYTES: usize = 128;
 /// Maximum UTF-8 relative source path accepted from a model request.
 const MAX_RELATIVE_PATH_BYTES: usize = 1024;
+/// Maximum problems-page offset accepted from a model request (u32 range).
+const MAX_PROBLEM_OFFSET: u64 = u32::MAX as u64;
 /// Byte offsets cannot exceed Workspace's bounded source payload.
 const MAX_BYTE_OFFSET: u64 = crate::workspace::observation::MAX_SOURCE_BYTES as u64;
 const MAX_ACTIVATION_ID_BYTES: usize = 128;
@@ -116,11 +118,17 @@ pub fn tool_schemas() -> [ToolSchema; 6] {
             AssistanceTool::Context,
             json!({
                 "type": "object", "additionalProperties": false,
-                "required": ["path"],
+                "allOf": [{
+                    "if": {"properties": {"kind": {"const": "problems"}}, "required": ["kind"]},
+                    "else": {"required": ["path"]}
+                }],
                 "properties": {
                     "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES},
                     "byte_offset": {"type": "integer", "minimum": 0, "maximum": MAX_BYTE_OFFSET},
-                    "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES}
+                    "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES},
+                    "kind": {"type": "string", "enum": ["problems"]},
+                    "language": {"type": "string", "enum": ["rust", "python"]},
+                    "offset": {"type": "integer", "minimum": 0, "maximum": MAX_PROBLEM_OFFSET}
                 }
             }),
         ),
@@ -224,7 +232,14 @@ pub fn validate_call(
         .ok_or(ParameterError::InvalidObject)?;
     let allowed = match tool {
         AssistanceTool::Start => &["activation_id"][..],
-        AssistanceTool::Context => &["path", "byte_offset", "detail_ref"][..],
+        AssistanceTool::Context => &[
+            "path",
+            "byte_offset",
+            "detail_ref",
+            "kind",
+            "language",
+            "offset",
+        ][..],
         AssistanceTool::Diff => &["mode", "detail_ref"][..],
         AssistanceTool::Inspect => &["detail_ref"][..],
         AssistanceTool::Stop => &[][..],
@@ -241,11 +256,43 @@ pub fn validate_call(
             required_string(object, "activation_id", MAX_ACTIVATION_ID_BYTES)?;
         }
         AssistanceTool::Context => {
-            let path = required_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
-            if path.as_bytes().contains(&0)
-                || path.split('/').any(|part| matches!(part, "" | "." | ".."))
-            {
-                return Err(ParameterError::InvalidField);
+            let problems = match object.get("kind") {
+                None => false,
+                Some(kind) => match kind.as_str() {
+                    Some("problems") => true,
+                    // Any other kind value keeps the exact v0.2 context behaviour (EYES-r1 §7).
+                    Some(_) => false,
+                    None => return Err(ParameterError::InvalidField),
+                },
+            };
+            if problems {
+                if object
+                    .get("language")
+                    .is_some_and(|value| !matches!(value.as_str(), Some("rust" | "python")))
+                {
+                    return Err(ParameterError::InvalidField);
+                }
+                if object.get("offset").is_some_and(|value| {
+                    value
+                        .as_u64()
+                        .is_none_or(|offset| offset > MAX_PROBLEM_OFFSET)
+                }) {
+                    return Err(ParameterError::InvalidField);
+                }
+            } else {
+                // The problem-feed fields are meaningless without `kind: "problems"`; v0.2 keeps
+                // its exact closed field set, so a request naming them there is rejected.
+                if object.contains_key("language") || object.contains_key("offset") {
+                    return Err(ParameterError::InvalidField);
+                }
+            }
+            if !problems || object.contains_key("path") {
+                let path = required_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
+                if path.as_bytes().contains(&0)
+                    || path.split('/').any(|part| matches!(part, "" | "." | ".."))
+                {
+                    return Err(ParameterError::InvalidField);
+                }
             }
             if object
                 .get("byte_offset")
