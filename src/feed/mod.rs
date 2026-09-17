@@ -94,8 +94,10 @@ impl FeedState {
     /// count that changed versus the last delivered counts of the same language (a language's
     /// first numeric delivery has no deltas), the items join into the tagged block, and oversized
     /// blocks shrink in order: deltas are dropped, then unavailable phrases shorten to
-    /// `unavailable`, then trailing items drop — [`MAX_BLOCK_BYTES`] is never exceeded. The result
-    /// records as delivered for `key`, which also marks `key` most recently used.
+    /// `unavailable`, then trailing items drop, and finally — only if one remaining item still
+    /// exceeds the cap — that item's text is hard-truncated on a UTF-8 boundary, so
+    /// [`MAX_BLOCK_BYTES`] is never exceeded. The result records as delivered for `key`, which
+    /// also marks `key` most recently used.
     pub fn next_block(&mut self, key: &FeedKey, snapshots: &[ProblemSnapshot]) -> Option<String> {
         let items = build_items(snapshots);
         if items.is_empty() {
@@ -138,8 +140,22 @@ impl FeedState {
                     rendered.pop();
                     block = wrap_block(&rendered);
                 }
+                // The ladder above only drops whole items; a single remaining item can still
+                // exceed the cap (an implausibly large count still renders a bounded number of
+                // digits, but nothing upstream stops this from growing). Hard-truncate its text
+                // on a UTF-8 boundary so the emitted block can never exceed the byte cap.
+                if block.len() > MAX_BLOCK_BYTES {
+                    let overhead = wrap_block(&[String::new()]).len();
+                    let budget = MAX_BLOCK_BYTES.saturating_sub(overhead);
+                    rendered[0] = truncate_to_byte_len(&rendered[0], budget);
+                    block = wrap_block(&rendered);
+                }
             }
         }
+        debug_assert!(
+            block.len() <= MAX_BLOCK_BYTES,
+            "rendered block must never exceed MAX_BLOCK_BYTES"
+        );
         let counts: Vec<(Language, u32, u32)> = items
             .iter()
             .filter_map(|item| match &item.state {
@@ -290,9 +306,25 @@ fn wrap_block(rendered: &[String]) -> String {
     )
 }
 
+/// Truncates `text` to at most `max_bytes` UTF-8 bytes, cutting only on a whole character.
+///
+/// A byte offset that would split a multi-byte character is walked back to the nearest earlier
+/// boundary, so the result is always valid UTF-8 and never longer than `max_bytes` bytes.
+fn truncate_to_byte_len(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checks::{Problem, Severity};
 
     /// Builds a ready snapshot with fixed counts for compact arrangements.
     fn ready(language: Language, errors: u32, warnings: u32) -> ProblemSnapshot {
@@ -574,5 +606,79 @@ mod tests {
         );
         // Forgetting an unknown key is a no-op.
         state.forget(&key("unknown"));
+    }
+
+    /// Two languages present simultaneously with distinct starting counts: only python's count
+    /// changes, proving each item's delta is matched by its own language rather than by position
+    /// (a `last_counts` mixup would misattribute rust's unchanged counts to python or vice versa).
+    #[test]
+    fn per_language_last_counts_are_not_mixed_up_across_languages() {
+        let mut state = FeedState::default();
+        let hook = key("hook");
+        let first = [ready(Language::Rust, 1, 0), ready(Language::Python, 5, 0)];
+        assert!(state.next_block(&hook, &first).is_some());
+        let second = [ready(Language::Rust, 1, 0), ready(Language::Python, 10, 0)];
+        let block = state
+            .next_block(&hook, &second)
+            .expect("changed python count emits");
+        assert_eq!(
+            block,
+            "<agent-ide>\nrust: 1 error, 0 warnings | python: 10 errors (+5), 0 warnings\n</agent-ide>"
+        );
+    }
+
+    /// The truncation helper cuts on a UTF-8 character boundary and never exceeds the requested
+    /// byte budget.
+    ///
+    /// No reachable `next_block` input can grow a single item's rendered counts text past
+    /// `MAX_BLOCK_BYTES` (see `worst_case_block_with_max_counts_and_deltas_stays_within_cap`), so
+    /// the ladder's final hard-truncate step is exercised directly here instead.
+    #[test]
+    fn truncate_to_byte_len_cuts_only_on_a_char_boundary() {
+        assert_eq!(truncate_to_byte_len("short", 10), "short");
+        assert_eq!(truncate_to_byte_len("abcdef", 3), "abc");
+        // Each 'é' is 2 bytes; a budget landing mid-character drops the whole character rather
+        // than splitting it, so the result stays valid UTF-8.
+        let truncated = truncate_to_byte_len("éé", 3);
+        assert_eq!(truncated, "é");
+        assert!(truncated.len() <= 3);
+    }
+
+    /// The block never contains raw path, message or code text from the underlying problems:
+    /// only fixed phrases and numeric counts derived from the snapshot feed it.
+    #[test]
+    fn block_never_leaks_problem_path_message_or_code_text() {
+        let mut state = FeedState::default();
+        let problems = vec![Problem::new(
+            "very/secret/path.rs".to_owned(),
+            1,
+            1,
+            Severity::Error,
+            Some("SECRET_CODE".to_owned()),
+            "super secret message".to_owned(),
+        )];
+        let snapshot =
+            ProblemSnapshot::from_problems(Language::Rust, CheckState::Ready, problems, 1, 5);
+        let block = state
+            .next_block(&key("hook"), &[snapshot])
+            .expect("ready snapshot emits");
+        assert!(!block.contains("very/secret/path.rs"), "{block}");
+        assert!(!block.contains("SECRET_CODE"), "{block}");
+        assert!(!block.contains("super secret message"), "{block}");
+    }
+
+    /// Several snapshots of the same language in one call: the last one in the slice wins.
+    #[test]
+    fn several_snapshots_of_the_same_language_the_last_one_wins() {
+        let mut state = FeedState::default();
+        let snapshots = [
+            ready(Language::Rust, 1, 0),
+            ready(Language::Rust, 9, 9),
+            unavailable(Language::Rust, UnavailableReason::ToolMissing),
+        ];
+        let block = state
+            .next_block(&key("hook"), &snapshots)
+            .expect("last snapshot state emits");
+        assert_eq!(block, "<agent-ide>\nrust: tool not found\n</agent-ide>");
     }
 }
