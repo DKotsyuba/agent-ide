@@ -215,6 +215,9 @@ pub struct HookEvent {
     launch: Option<HookLaunch>,
     /// Whether a post reported explicit failure; `false` for every non-post event.
     failed: bool,
+    /// Native tool name retained only for Claude `PostToolUse`/`PostToolUseFailure`; the name
+    /// alone selects project-check triggers (EYES-r2 §5) and never carries tool input or output.
+    tool_name: Option<String>,
 }
 
 impl HookEvent {
@@ -260,6 +263,14 @@ impl HookEvent {
     /// rather than by this flag.
     pub fn failed(&self) -> bool {
         self.failed
+    }
+
+    /// Returns the native tool name of a Claude post or post-failure event.
+    ///
+    /// Absent for Codex, for pre, permission-denied and batch phases, and whenever the host sent
+    /// no valid bounded name.
+    pub fn tool_name(&self) -> Option<&str> {
+        self.tool_name.as_deref()
     }
 
     /// Returns the selected shell launch when this was a Claude `Bash` pre-hook.
@@ -1203,15 +1214,18 @@ pub fn parse_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnavailable>
         agent_type: None,
         launch: None,
         failed: false,
+        tool_name: None,
     })
 }
 
 /// Parses Claude Code's documented hook identity without treating permission mode as a sandbox.
 ///
 /// `session_id` is always retained. A subagent is identified by its exact optional `agent_id`,
-/// while a parent is identified by `session_id`; `agent_type` is descriptive only. Tool input,
-/// output, permission mode, paths, source, and unknown fields are discarded. `PostToolBatch`
-/// deliberately has no fabricated call identity.
+/// while a parent is identified by `session_id`; `agent_type` is descriptive only. `tool_name` is
+/// retained only for `PostToolUse`/`PostToolUseFailure` and only when it is a valid bounded
+/// identifier; an invalid name is dropped rather than rejecting the event. Tool input, output,
+/// permission mode, paths, source, and unknown fields are discarded. `PostToolBatch` deliberately
+/// has no fabricated call identity.
 pub fn parse_claude_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnavailable> {
     if payload.len() > MAX_HOOK_METADATA_BYTES {
         return Err(BindingUnavailable::InvalidMetadata);
@@ -1243,6 +1257,13 @@ pub fn parse_claude_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnava
     // A launch observation is selected only from a `Bash` pre-hook, and only its two shell
     // fields. Every other tool's arguments are discarded here, so nothing about an unrelated
     // tool call is ever retained or relayed to the daemon.
+    let tool_name = match phase {
+        HookPhase::Post | HookPhase::PostFailure => payload
+            .tool_name
+            .clone()
+            .and_then(|name| checked_identifier(name, "tool_name").ok()),
+        _ => None,
+    };
     let launch = match (phase, payload.tool_name.as_deref(), payload.tool_input) {
         (HookPhase::Pre, Some(CLAUDE_SHELL_TOOL), Some(input)) => input
             .command
@@ -1270,6 +1291,7 @@ pub fn parse_claude_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnava
         agent_type,
         launch,
         failed,
+        tool_name,
     })
 }
 
@@ -1299,7 +1321,7 @@ struct ClaudeHookPayload {
     agent_type: Option<String>,
     /// Exact native tool identity; optional only for `PostToolBatch`.
     tool_use_id: Option<String>,
-    /// Native tool name, used only to decide whether a shell launch may be selected at all.
+    /// Native tool name; selects a shell launch on pre-hooks and is retained on post phases.
     tool_name: Option<String>,
     /// Native tool arguments; only a shell launch's two selected fields survive parsing.
     #[serde(default, deserialize_with = "selected_fields")]

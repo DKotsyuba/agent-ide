@@ -38,16 +38,22 @@ async fn main() -> ExitCode {
         Ok(Command::Daemon { runtime_dir }) => match RuntimeDir::prepare_for_daemon(runtime_dir) {
             Ok(runtime_dir) => {
                 let config = EffectiveConfig::defaults();
+                let mut idle_timeout = agent_ide::app::lease::DEFAULT_IDLE_TIMEOUT;
                 let dispatcher = match std::env::var("AGENT_IDE_LAUNCHER_CONFIG") {
                     Ok(path) => match LauncherConfig::read(std::path::Path::new(&path)) {
-                        Ok(config)
+                        Ok(config) => {
+                            if let Some(checks) = config.project_checks() {
+                                idle_timeout = checks.idle_timeout();
+                            }
                             if std::env::var("AGENT_IDE_MANAGED_CODEX_ATTACHMENT")
                                 .ok()
-                                .is_some_and(|attachment| config.target(&attachment).is_some()) =>
-                        {
-                            ProductDispatcher::with_managed_codex_launcher(config)
+                                .is_some_and(|attachment| config.target(&attachment).is_some())
+                            {
+                                ProductDispatcher::with_managed_codex_launcher(config)
+                            } else {
+                                ProductDispatcher::with_launcher(config)
+                            }
                         }
-                        Ok(config) => ProductDispatcher::with_launcher(config),
                         Err(_) => return fail(AppError::InvalidResponse),
                     },
                     Err(std::env::VarError::NotPresent) => ProductDispatcher::default(),
@@ -57,7 +63,7 @@ async fn main() -> ExitCode {
                     runtime_dir,
                     Arc::new(dispatcher),
                     config,
-                    agent_ide::app::lease::DEFAULT_IDLE_TIMEOUT,
+                    idle_timeout,
                 )
                 .await
                 {
@@ -744,15 +750,18 @@ fn telemetry_command(
 /// Converts only canonical closed tags into query filters, rejecting arbitrary local SQLite selectors.
 fn telemetry_filter(tag: &str) -> Result<Filter, AppError> {
     match tag {
-        "tool_completed" | "execution_completed" | "provider_observed" | "native_fallback" => {
-            Ok(Filter::Tag(match tag {
-                "tool_completed" => "tool_completed",
-                "execution_completed" => "execution_completed",
-                "provider_observed" => "provider_observed",
-                "native_fallback" => "native_fallback",
-                _ => unreachable!("closed tag match is exhaustive"),
-            }))
-        }
+        "tool_completed"
+        | "execution_completed"
+        | "provider_observed"
+        | "native_fallback"
+        | "project_check_completed" => Ok(Filter::Tag(match tag {
+            "tool_completed" => "tool_completed",
+            "execution_completed" => "execution_completed",
+            "provider_observed" => "provider_observed",
+            "native_fallback" => "native_fallback",
+            "project_check_completed" => "project_check_completed",
+            _ => unreachable!("closed tag match is exhaustive"),
+        })),
         _ => Err(AppError::InvalidResponse),
     }
 }

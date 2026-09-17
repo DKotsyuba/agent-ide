@@ -9,7 +9,7 @@ use super::{
         ActiveBindingUse, BindingRef, HostBindingGuard, ObservedSandboxState, ValidatedInvocation,
     },
     launcher::{AcceptedProviderSettings, LaunchTarget, LauncherConfig},
-    problems::{ProblemSource, parse_language, problems_text},
+    problems::{ProblemSource, ProjectProblemFeed, parse_language, problems_text},
     reply::{EditDiagnostics, FailureCode, PeerReply, ResultKind},
 };
 use crate::telemetry::{
@@ -302,6 +302,11 @@ struct Shared {
     /// before startup through [`WorkerHandle::with_problem_source`] and only reports typed
     /// snapshots for the authorized worktree; it never runs a check or touches authority.
     problem_source: Option<Arc<dyn ProblemSource>>,
+    /// Optional project problem feed receiving start/edit triggers and forgetting stopped bindings.
+    ///
+    /// Installed through [`WorkerHandle::with_project_feed`], which also makes it the
+    /// [`Shared::problem_source`]. Absent when project checks are not configured.
+    project_feed: Option<Arc<ProjectProblemFeed>>,
 }
 impl Shared {
     /// Acquires a new transient binding use at one exact admission/return boundary.
@@ -592,6 +597,7 @@ impl WorkerHandle {
                 admission,
                 telemetry,
                 problem_source: None,
+                project_feed: None,
             }),
             inspect,
             receiver: Mutex::new(Some(receiver)),
@@ -612,6 +618,33 @@ impl WorkerHandle {
             .expect("problem source must be attached before worker startup")
             .problem_source = Some(problem_source);
         self
+    }
+
+    /// Attaches the daemon's project problem feed as both trigger sink and problem source.
+    ///
+    /// Must be called before [`WorkerHandle::start`], like [`WorkerHandle::with_problem_source`].
+    /// Successful `ide.start` activations and `ide.edit` results that wrote the file then schedule
+    /// checks, and `ide.stop` forgets the binding's feed state.
+    pub fn with_project_feed(mut self, feed: Arc<ProjectProblemFeed>) -> Self {
+        let shared = Arc::get_mut(&mut self.shared)
+            .expect("project feed must be attached before worker startup");
+        shared.problem_source = Some(feed.clone());
+        shared.project_feed = Some(feed);
+        self
+    }
+
+    /// Returns the attached project problem feed, if project checks are configured.
+    pub fn project_feed(&self) -> Option<&Arc<ProjectProblemFeed>> {
+        self.shared.project_feed.as_ref()
+    }
+
+    /// Returns the shared slot that holds the telemetry owner once startup has opened it.
+    ///
+    /// Lets callbacks created before startup (for example project check completion) record
+    /// telemetry later without holding a worker reference; the slot stays empty when telemetry
+    /// is unavailable.
+    pub fn telemetry_slot(&self) -> Arc<Mutex<Option<Telemetry>>> {
+        self.telemetry.clone()
     }
 
     /// Answers a `kind: "problems"` context request from the daemon's in-memory problem source.
@@ -903,6 +936,9 @@ impl WorkerHandle {
             ledger.native_epoch.remove(&binding);
             ledger.feedback.remove(&binding);
             ledger.delivered.remove(&binding);
+        }
+        if let Some(feed) = &self.shared.project_feed {
+            feed.forget(&binding.fingerprint());
         }
         self.shared.notify.notify_one();
         let (send, wait) = oneshot::channel();
@@ -1799,6 +1835,25 @@ impl<'a> Worker<'a> {
             Ok(result) => result,
             Err(code) => (PeerReply::Error { code }, None, None),
         };
+        if let Some(feed) = &self.shared.project_feed {
+            match (&reply, &authority) {
+                (
+                    PeerReply::Complete {
+                        kind: ResultKind::Activation,
+                        ..
+                    },
+                    Some(authority),
+                ) if job.tool == AssistanceTool::Start => feed.activated(
+                    binding.fingerprint(),
+                    authority.worktree().worktree_path(),
+                    authority.worktree().git_common_dir(),
+                ),
+                (PeerReply::Edit { result, .. }, _) if result.outcome.has_post_source() => {
+                    feed.changed(&binding.fingerprint());
+                }
+                _ => {}
+            }
+        }
         if let PeerReply::Edit { result, .. } = &reply {
             let lifetime = Duration::from_millis(self.shared.launcher.limits.operation_ms);
             let started = job.deadline.checked_sub(lifetime).unwrap_or(job.deadline);
@@ -4208,6 +4263,7 @@ mod stop_retry_tests {
                 admission: Arc::new(Mutex::new(admission_controller())),
                 telemetry: Arc::new(crate::assistance::telemetry::NoopEditTelemetry),
                 problem_source: None,
+                project_feed: None,
             }),
             workspace,
             observations: WorkspaceStore::new(store),

@@ -258,9 +258,11 @@ async fn run_daemon_inner(
     }
     let mut connections = tokio::task::JoinSet::new();
     let mut owned_socket = None;
-    // `is_busy` is fixed `false` until a future task threads real project-check status through
-    // (EYES-r2 §2); the daemon is therefore idle-eligible whenever no lease connection is open.
-    let lease = lease::LeaseController::new(idle_timeout, || false);
+    // A pending or running project check keeps a lease-free daemon from idling out (EYES-r2 §2).
+    let busy = dispatcher.clone();
+    let lease = lease::LeaseController::new(idle_timeout, move || {
+        busy.as_ref().is_some_and(|dispatcher| dispatcher.is_busy())
+    });
     let idle_expired = lease.idle_expired();
     tokio::pin!(idle_expired);
     let serving = async {

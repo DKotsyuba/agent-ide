@@ -870,7 +870,8 @@ async fn binary_codex_hook_hung_daemon_deadline_sends_only_selected_fields() {
         assert_eq!(
             frame["sanitized_observation_json"],
             json!({"host":"codex","phase":"pre","actor_id":"child","call_id":"hung",
-                "session_id":null,"agent_type":null,"launch_command":null,"launch_background":null,"failed":false})
+                "session_id":null,"agent_type":null,"launch_command":null,"launch_background":null,"failed":false,
+                "tool_name":null})
         );
         let wire = String::from_utf8(bytes).unwrap();
         for private in [
@@ -1356,7 +1357,16 @@ impl ProductFixture {
     }
     /// Starts one configured shipping daemon and waits only for its real private endpoint.
     async fn daemon(&self) -> Child {
-        let mut daemon = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+        self.daemon_with_home(None).await
+    }
+    /// Starts the configured daemon, optionally with `HOME` redirected into the fixture so its
+    /// project check caches never touch the real home directory.
+    async fn daemon_with_home(&self, home: Option<&Path>) -> Child {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
+        if let Some(home) = home {
+            command.env("HOME", home);
+        }
+        let mut daemon = command
             .args(["daemon", "--runtime-dir"])
             .arg(&self.runtime)
             .env("AGENT_IDE_LAUNCHER_CONFIG", &self.config)
@@ -1608,6 +1618,36 @@ impl ProductActor {
         self.claude_lifecycle(fixture, "PostToolUse", &call).await;
         assert_compact_envelope(&reply);
         reply["result"]["structuredContent"].clone()
+    }
+    /// Runs one native Claude tool's Pre/Post hooks and returns the post hook's stdout.
+    ///
+    /// `tool` is the native tool name relayed on both phases; the pre-hook must stay silent.
+    async fn claude_native_post(&mut self, fixture: &ProductFixture, tool: &str) -> String {
+        self.next += 1;
+        let call = format!("native-{}", self.next);
+        let mut post = String::new();
+        for phase in ["PreToolUse", "PostToolUse"] {
+            let mut child = claude_hook_process(&fixture.runtime, Some(self.attachment));
+            let payload = json!({"hook_event_name":phase,self.actor_field:self.actor,
+                "tool_use_id":call,"tool_name":tool,"tool_input":{"file_path":"src/lib.rs"}});
+            let mut input = child.stdin.take().unwrap();
+            input
+                .write_all(payload.to_string().as_bytes())
+                .await
+                .unwrap();
+            input.shutdown().await.unwrap();
+            drop(input);
+            let output = tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(output.status.success() && output.stderr.is_empty());
+            post = String::from_utf8(output.stdout).unwrap();
+            if phase == "PreToolUse" {
+                assert!(post.is_empty(), "{post}");
+            }
+        }
+        post
     }
     /// Runs the exact foreground helper named by a pending reply and returns its owned handle.
     async fn launch_claude_pending(&self, fixture: &ProductFixture, pending: &Value) -> String {
@@ -5560,6 +5600,210 @@ async fn configured_product_claude_helper_returns_context_diff_and_feedback() {
         after_stop, retained,
         "Stop retains compatible cache directories"
     );
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Enables project checks with a fake Rust toolchain whose `cargo` replays a fixed JSON stream.
+///
+/// The fake `cargo` runs under the real Seatbelt runner and reports one error per line of the
+/// worktree's untracked `problems.count` value, so tests change counts without a real compiler.
+/// `allowed_root` is the configured admission root. Returns the redirected daemon `HOME`.
+fn enable_fake_rust_checks(fixture: &ProductFixture, allowed_root: &Path) -> PathBuf {
+    let home = fixture.base.join("home");
+    let toolchain = home.join(".rustup/toolchains/fake");
+    std::fs::create_dir_all(toolchain.join("bin")).unwrap();
+    std::fs::create_dir_all(home.join(".cargo")).unwrap();
+    let cargo = toolchain.join("bin/cargo");
+    std::fs::write(
+        &cargo,
+        r#"#!/bin/sh
+n=$(/bin/cat problems.count 2>/dev/null || echo 0)
+i=0
+while [ "$i" -lt "$n" ]; do
+  i=$((i+1))
+  printf '{"reason":"compiler-message","package_id":"fixture","message":{"level":"error","message":"fake %s","code":null,"spans":[{"file_name":"src/lib.rs","is_primary":true,"line_start":%s,"column_start":1}]}}\n' "$i" "$i"
+done
+printf '{"reason":"compiler-artifact","package_id":"fixture"}\n'
+printf '{"reason":"build-finished","success":true}\n'
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+    config["allowed_roots"] = json!([allowed_root]);
+    config["project_checks"] = json!({"debounce_ms":100,"rust":{"toolchain_dir":toolchain}});
+    std::fs::write(&fixture.config, config.to_string()).unwrap();
+    home
+}
+
+/// Activates a Claude actor through the real foreground helper and returns it.
+async fn eyes_claude_actor(fixture: &ProductFixture, actor: &'static str) -> ProductActor {
+    let mut actor = ProductActor::new(fixture, actor).await;
+    let started = actor
+        .call_claude(fixture, "ide.start", json!({"activation_id":"eyes"}))
+        .await;
+    let (started, feedback) = actor.complete_claude_pending(fixture, &started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    assert!(feedback.is_empty());
+    actor
+}
+
+/// Polls native `Read` post-hooks until one carries a model context, returning its text.
+async fn await_eyes_block(actor: &mut ProductActor, fixture: &ProductFixture) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let output = actor.claude_native_post(fixture, "Read").await;
+        if !output.is_empty() {
+            let rendered: Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(
+                rendered["hookSpecificOutput"]["hookEventName"], "PostToolUse",
+                "{rendered}"
+            );
+            return rendered["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no problem block was delivered"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Reads the `ide.context` problems page for an active Claude actor.
+async fn eyes_problems(actor: &mut ProductActor, fixture: &ProductFixture) -> String {
+    let reply = actor
+        .call_claude(fixture, "ide.context", json!({"kind":"problems"}))
+        .await;
+    assert_eq!(reply["kind"], "context", "{reply}");
+    reply["text"].as_str().unwrap().to_owned()
+}
+
+/// Start schedules a confined check whose first result reaches the next native post-hook once;
+/// unchanged state stays silent, a native edit reruns the check and the block carries the delta,
+/// and `ide.context kind=problems` reports the same counts (EYES-r1 §5–§7).
+#[tokio::test]
+async fn eyes_claude_post_hook_delivers_problem_block_and_delta() {
+    let fixture = ProductFixture::new_claude(json!([]));
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    std::fs::write(fixture.root.join("problems.count"), "2").unwrap();
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = eyes_claude_actor(&fixture, "claude-eyes").await;
+
+    let first = await_eyes_block(&mut actor, &fixture).await;
+    assert_eq!(
+        first,
+        "<agent-ide>\nrust: 2 errors, 0 warnings\n</agent-ide>"
+    );
+    assert!(
+        actor.claude_native_post(&fixture, "Read").await.is_empty(),
+        "unchanged problem state must not be re-emitted"
+    );
+    assert!(
+        eyes_problems(&mut actor, &fixture)
+            .await
+            .starts_with("rust: ready; errors: 2; warnings: 0")
+    );
+
+    std::fs::write(fixture.root.join("problems.count"), "5").unwrap();
+    let _ = actor.claude_native_post(&fixture, "Edit").await;
+    let changed = await_eyes_block(&mut actor, &fixture).await;
+    assert_eq!(
+        changed,
+        "<agent-ide>\nrust: 5 errors (+3), 0 warnings\n</agent-ide>"
+    );
+    assert!(
+        eyes_problems(&mut actor, &fixture)
+            .await
+            .starts_with("rust: ready; errors: 5; warnings: 0")
+    );
+    // Each completed check records one bucketed telemetry event without paths or messages.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let query = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+            .args(["telemetry", "query", "--database"])
+            .arg(fixture.runtime.join("telemetry.sqlite"))
+            .args(["--tag", "project_check_completed"])
+            .output()
+            .await
+            .unwrap();
+        let rows = String::from_utf8_lossy(&query.stdout).into_owned();
+        if query.status.success()
+            && rows.contains(r#""errors_bucket":"1-9""#)
+            && rows.contains(r#""state":"ready""#)
+        {
+            assert!(
+                !rows.contains("src/lib.rs") && !rows.contains("fake"),
+                "{rows}"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "missing project check telemetry: {rows}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+    assert!(home.join(".agent-ide/checks").is_dir());
+}
+
+/// A worktree outside every allowed root schedules no check and reports `outside allowed roots`.
+#[tokio::test]
+async fn eyes_outside_roots_reports_unavailable_without_checking() {
+    let fixture = ProductFixture::new_claude(json!([]));
+    let elsewhere = fixture.base.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let home = enable_fake_rust_checks(&fixture, &elsewhere);
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = eyes_claude_actor(&fixture, "claude-eyes-outside").await;
+
+    let block = await_eyes_block(&mut actor, &fixture).await;
+    assert_eq!(
+        block,
+        "<agent-ide>\nrust: outside allowed roots\n</agent-ide>"
+    );
+    assert_eq!(
+        eyes_problems(&mut actor, &fixture).await,
+        "rust: unavailable:outside_roots"
+    );
+    assert!(
+        !home
+            .join(".agent-ide/checks")
+            .read_dir()
+            .is_ok_and(|mut entries| entries.next().is_some()),
+        "no check cache may be created for an outside worktree"
+    );
+
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Without `project_checks`, native post-hooks stay silent and the problems kind is disabled.
+#[tokio::test]
+async fn eyes_absent_configuration_keeps_v02_hook_replies() {
+    let fixture = ProductFixture::new_claude(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = eyes_claude_actor(&fixture, "claude-eyes-absent").await;
+
+    for tool in ["Edit", "Read"] {
+        assert!(actor.claude_native_post(&fixture, tool).await.is_empty());
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(actor.claude_native_post(&fixture, "Read").await.is_empty());
+    assert_eq!(eyes_problems(&mut actor, &fixture).await, "checks disabled");
+
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();

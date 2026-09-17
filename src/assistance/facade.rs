@@ -580,6 +580,8 @@ pub async fn submit_hook_event(
         // Explicit post failure only; a post that carried no marker relays false, which means
         // "no failure was reported", not "success was proven".
         "failed": event.failed(),
+        // Claude post phases only: the bare native tool name that selects project-check triggers.
+        "tool_name": event.tool_name(),
     });
     let Some(observation) = OpaqueJson::from_value(&observation, MAX_HOOK_BYTES) else {
         return HookIngressOutcome::Unavailable;

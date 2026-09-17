@@ -9,11 +9,12 @@ use super::{
         HelperTypeScriptFileV1, HelperTypeScriptProfileV1, LaunchLedger, RustEffectiveSettings,
     },
     host_binding::{
-        BindingStatus, HostBindingGuard, HostKind, ValidatedInvocation, parse_candidate,
+        BindingStatus, HookPhase, HostBindingGuard, HostKind, ValidatedInvocation, parse_candidate,
         parse_channel_session, parse_claude_call_id, parse_claude_hook_event, parse_hook_event,
         parse_host_kind, parse_observed_sandbox_state,
     },
     launcher::{AcceptedProviderSettings, LaunchTarget, LauncherConfig},
+    problems::{CHECK_TRIGGER_TOOLS, ProjectProblemFeed},
     reply::FailureCode,
     worker::WorkerHandle,
 };
@@ -119,15 +120,32 @@ impl Default for ProductDispatcher {
 }
 impl ProductDispatcher {
     /// Installs one immutable trusted map; peer startup waits for Application's exclusive daemon lock.
+    ///
+    /// When the launcher enables project checks (EYES-r1 §1), the worker also receives one
+    /// [`ProjectProblemFeed`] whose completed checks are recorded as telemetry once the worker's
+    /// telemetry owner has started; otherwise the worker is unchanged from v0.2.
     pub fn with_launcher(launcher: LauncherConfig) -> Self {
         let mut dispatcher = Self::default();
         if let Some(scope) = dispatcher.scope {
-            dispatcher.worker = Some(WorkerHandle::new(
+            let worker = WorkerHandle::new(
                 dispatcher.bindings.clone(),
-                launcher,
+                launcher.clone(),
                 scope,
                 dispatcher.admission.clone(),
-            ));
+            );
+            let telemetry = worker.telemetry_slot();
+            let feed = ProjectProblemFeed::from_launcher(
+                &launcher,
+                Arc::new(move |snapshot: &crate::checks::ProblemSnapshot| {
+                    if let Some(telemetry) = telemetry.lock().ok().and_then(|slot| slot.clone()) {
+                        adapters::project_check(&telemetry, snapshot);
+                    }
+                }),
+            );
+            dispatcher.worker = Some(match feed {
+                Some(feed) => worker.with_project_feed(Arc::new(feed)),
+                None => worker,
+            });
         }
         dispatcher
     }
@@ -601,7 +619,9 @@ impl ProductDispatcher {
                 let observation: Value =
                     serde_json::from_str(hook.sanitized_observation_json().as_str()).ok()?;
                 let object = observation.as_object()?;
-                if object.len() != 9 {
+                // `tool_name` is the one optional relayed field, so hooks from a release that
+                // predates it still correlate against this daemon.
+                if object.len() != 9 + usize::from(object.contains_key("tool_name")) {
                     return None;
                 }
                 let phase = match object.get("phase")?.as_str()? {
@@ -618,7 +638,7 @@ impl ProductDispatcher {
                             .to_string().as_bytes(),
                     ),
                     "claude" => parse_claude_hook_event(
-                        json!({"hook_event_name":phase,"session_id":object.get("session_id")?,"agent_id":(object.get("actor_id")? != object.get("session_id")?).then_some(object.get("actor_id")?),"agent_type":object.get("agent_type")?,"tool_use_id":object.get("call_id")?})
+                        json!({"hook_event_name":phase,"session_id":object.get("session_id")?,"agent_id":(object.get("actor_id")? != object.get("session_id")?).then_some(object.get("actor_id")?),"agent_type":object.get("agent_type")?,"tool_use_id":object.get("call_id")?,"tool_name":object.get("tool_name")})
                             .to_string().as_bytes(),
                     ),
                     _ => return None,
@@ -661,6 +681,14 @@ impl ProductDispatcher {
                 }
                 let call_id = event.optional_call_id().map(str::to_owned);
                 let failed = event.failed();
+                // EYES-r2 §5/§6: only Claude post phases receive the problem block, and only the
+                // named native writers additionally trigger a project check.
+                let claude_post = event.host() == HostKind::Claude
+                    && matches!(event.phase(), HookPhase::Post | HookPhase::PostFailure);
+                let triggers_check = claude_post
+                    && event
+                        .tool_name()
+                        .is_some_and(|name| CHECK_TRIGGER_TOOLS.contains(&name));
                 let status = self.bindings.lock().ok()?.observe_hook(event, channel);
                 match status {
                     BindingStatus::PreObserved => Some(PeerReply::HookObserved {}),
@@ -681,7 +709,29 @@ impl ProductDispatcher {
                         }
                         if let Some(worker) = &self.worker {
                             worker.native_hint(binding.clone());
-                            if let Some(text) = worker.take_current_feedback(binding).await {
+                            let fingerprint = binding.fingerprint();
+                            let feed = worker.project_feed().filter(|_| claude_post);
+                            if triggers_check && let Some(feed) = feed {
+                                feed.changed(&fingerprint);
+                            }
+                            let feedback = worker.take_current_feedback(binding).await;
+                            // The block is taken from in-memory snapshots only. It is skipped, and
+                            // stays due for a later hook, whenever it could not fit beside the
+                            // feedback inside one bounded hook context.
+                            let block = feed
+                                .filter(|_| {
+                                    feedback.as_ref().map_or(0, |text| text.len() + 1)
+                                        + crate::feed::MAX_BLOCK_BYTES
+                                        <= super::reply::MAX_FEEDBACK_BYTES
+                                })
+                                .and_then(|feed| feed.next_block(&fingerprint));
+                            let text = match (block, feedback) {
+                                (Some(block), Some(feedback)) => {
+                                    Some(format!("{block}\n{feedback}"))
+                                }
+                                (block, feedback) => block.or(feedback),
+                            };
+                            if let Some(text) = text {
                                 return Some(PeerReply::Feedback { text });
                             }
                         }
@@ -1091,13 +1141,26 @@ impl AssistanceDispatcher for ProductDispatcher {
                 endpoint.take();
             }
             match &self.worker {
-                Some(worker) => worker
-                    .shutdown()
-                    .await
-                    .map_err(|_| AssistanceDispatchUnavailable),
+                Some(worker) => {
+                    // Checks are cancelled first so no confined process outlives the worker.
+                    if let Some(feed) = worker.project_feed() {
+                        feed.shutdown().await;
+                    }
+                    worker
+                        .shutdown()
+                        .await
+                        .map_err(|_| AssistanceDispatchUnavailable)
+                }
                 None => Ok(()),
             }
         })
+    }
+    /// Reports a pending or running project check, which keeps the idle daemon alive.
+    fn is_busy(&self) -> bool {
+        self.worker
+            .as_ref()
+            .and_then(WorkerHandle::project_feed)
+            .is_some_and(|feed| feed.is_busy())
     }
     /// Returns bounded closed outcomes; slow jobs become pending while short inspections stay finite.
     fn dispatch(

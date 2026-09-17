@@ -51,8 +51,8 @@ pub struct LeaseController(Arc<Inner>);
 impl LeaseController {
     /// Starts idle (zero open leases, countdown already running) from the moment of construction.
     ///
-    /// `is_busy` reports whether daemon-owned work is in flight; a daemon with no such work supplies
-    /// a fixed `|| false`, matching EYES-r2 §2 until a future task wires real check status through.
+    /// `is_busy` reports whether daemon-owned work (a pending or running project check) is in
+    /// flight; a daemon with no such work supplies a fixed `|| false`.
     pub fn new(idle_timeout: Duration, is_busy: impl Fn() -> bool + Send + Sync + 'static) -> Self {
         Self(Arc::new(Inner {
             open: AtomicUsize::new(0),
@@ -65,8 +65,8 @@ impl LeaseController {
     }
 
     /// Registers a hook run exactly once, in registration order, when this daemon shuts down for any
-    /// reason (orderly idle expiry, SIGINT/SIGTERM, or a serving failure). Intended for a future
-    /// check scheduler to cancel its own outstanding work (EYES-r2 §2).
+    /// reason (orderly idle expiry, SIGINT/SIGTERM, or a serving failure), after the dispatcher's
+    /// own asynchronous shutdown (which already cancels project checks) has completed.
     pub fn on_shutdown(&self, hook: impl FnOnce() + Send + 'static) {
         self.0.hooks.lock().unwrap().push(Box::new(hook));
     }
@@ -101,7 +101,7 @@ impl LeaseController {
     /// one continuous idle timeout; never resolves while any lease is open or the daemon is busy.
     ///
     /// While no lease is open but the daemon is busy, the busy predicate is re-polled every
-    /// [`BUSY_POLL_INTERVAL`], because nothing else signals the end of daemon-owned work.
+    /// `BUSY_POLL_INTERVAL` (one second), because nothing else signals the end of daemon-owned work.
     pub async fn idle_expired(&self) {
         loop {
             let changed = self.0.changed.notified();
