@@ -111,8 +111,9 @@ impl std::error::Error for SeatbeltProfileError {}
 /// self-signalling, and mach lookups, carries the macOS 27 bootstrap allowances, read-only
 /// access to the fixed system paths, read-only access to every `SeatbeltPolicy::read_roots`
 /// entry, and read-write access to every `SeatbeltPolicy::write_roots` entry. Root paths are
-/// escaped into safe SBPL string literals; a root that cannot be represented safely fails the
-/// whole render rather than weakening the profile.
+/// canonicalized when they exist (Seatbelt evaluates canonical paths) and escaped into safe SBPL
+/// string literals; a root that cannot be represented safely fails the whole render rather than
+/// weakening the profile.
 ///
 /// # Errors
 ///
@@ -150,7 +151,11 @@ fn append_roots(
         "\n; caller-provided {role} roots\n(allow {operation}"
     ));
     for root in roots {
-        profile.push_str(&format!(" (subpath \"{}\")", sbpl_path(root)?));
+        // Seatbelt matches `subpath` filters against canonical paths, so a root spelled through
+        // a symlink (`/var/folders/...`, `/tmp/...`) would silently deny everything beneath it.
+        // A root that cannot be canonicalized (not yet created) is rendered as given.
+        let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        profile.push_str(&format!(" (subpath \"{}\")", sbpl_path(&canonical)?));
     }
     profile.push_str(")\n");
     Ok(())
@@ -455,4 +460,42 @@ fn write_profile(profile: &str) -> io::Result<PathBuf> {
         .open(&path)?;
     file.write_all(profile.as_bytes())?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Proves a root spelled through a symlink is rendered canonically: Seatbelt evaluates the
+    /// canonical path, so `/var/...` roots would otherwise deny every read beneath them.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn render_profile_canonicalizes_symlinked_roots() {
+        let policy = SeatbeltPolicy {
+            read_roots: vec![PathBuf::from("/var/tmp")],
+            write_roots: vec![PathBuf::from("/tmp")],
+        };
+        let profile = render_profile(&policy).unwrap();
+        assert!(
+            profile.contains("(subpath \"/private/var/tmp\")"),
+            "{profile}"
+        );
+        assert!(profile.contains("(subpath \"/private/tmp\")"), "{profile}");
+        assert!(!profile.contains("(subpath \"/var/tmp\")"), "{profile}");
+    }
+
+    /// Proves a root that does not exist yet is rendered as given instead of failing the render.
+    #[test]
+    fn render_profile_keeps_missing_roots_verbatim() {
+        let missing = std::env::temp_dir().join(format!("aiv3-missing-{}", std::process::id()));
+        let policy = SeatbeltPolicy {
+            read_roots: vec![missing.clone()],
+            write_roots: vec![],
+        };
+        let profile = render_profile(&policy).unwrap();
+        assert!(
+            profile.contains(&format!("(subpath \"{}\")", missing.display())),
+            "{profile}"
+        );
+    }
 }
