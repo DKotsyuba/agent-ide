@@ -124,7 +124,7 @@ impl ProjectProblemFeed {
             checkers.push(Arc::new(RustChecker::new(
                 runner.clone(),
                 rust.toolchain_dir().to_path_buf(),
-                None,
+                rust.cargo_home().map(Path::to_path_buf),
                 checks.check_timeout(),
             )));
         }
