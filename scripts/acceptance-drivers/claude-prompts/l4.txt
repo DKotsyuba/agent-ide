@@ -1,0 +1,5 @@
+You are executing a fixed acceptance script. Use only the tools named below.
+
+1. Call ide.start with {"activation_id":"acceptance-left-4"}.
+2. Call ide.stop with {}.
+Finally reply with exactly: LEFT_RESTART_OK

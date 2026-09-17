@@ -1,0 +1,16 @@
+Execute this fixed script exactly. Five iron rules:
+R1. When a tool reply shows an exact command to run with Bash, your VERY NEXT
+tool call is that exact Bash command, copied character for character, in the
+foreground. Never anything else between that reply and the Bash call.
+R2. After that Bash command completes, call ide.inspect with the detail_ref the
+reply mentioned, exactly once.
+R3. Call ide.context only in the numbered steps that say so. Never as a refresh.
+R4. Call ide.inspect only as R2 says. Never otherwise.
+R5. Never use Read, Grep, Glob, or Edit. If a call errors, do not repeat it;
+continue with the next numbered step.
+Apply R1 and R2 to every numbered step's reply, including step 1.
+
+1. Call ide.start with {"activation_id":"acceptance-right-1b"}. That reply may show an exact command: apply R1 then R2 to it.
+2. Call ide.diff with {}. That reply may show an exact command: apply R1 then R2 to it.
+3. Call ide.stop with {}.
+Then reply with exactly: RIGHT_DIFF_OK
