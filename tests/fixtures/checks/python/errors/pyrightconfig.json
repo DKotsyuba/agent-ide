@@ -1,0 +1,6 @@
+{
+  "include": ["src"],
+  "exclude": ["src/pkg/excluded"],
+  "typeCheckingMode": "basic",
+  "reportUnusedImport": "warning"
+}

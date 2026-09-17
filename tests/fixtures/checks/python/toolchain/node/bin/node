@@ -1,0 +1,2 @@
+#!/bin/sh
+# placeholder node binary fixture; never executed (FakeRunner intercepts execution)

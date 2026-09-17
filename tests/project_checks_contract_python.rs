@@ -1,0 +1,419 @@
+//! Contract tests for [`agent_ide::checks::python::PythonChecker`] (T098, EYES-r2 §4 "Python").
+//!
+//! Every test name is prefixed `python_` per the module task's naming convention. Fixtures live
+//! under `tests/fixtures/checks/python/`; the `errors`/`clean`/`badconfig` JSON fixtures were
+//! recorded from a real pinned-pyright run against the sibling fixture source and are replayed
+//! here through [`FakeRunner`], never re-invoking pyright. The real-runner (non-fake) end-to-end
+//! test is out of scope for this task; it is added at integration (T102).
+
+use std::ffi::OsString;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use agent_ide::checks::python::{PythonChecker, parse_pyright_output, resolve_interpreter};
+use agent_ide::checks::runner::{ConfinedRunner, FakeRunner, RunOutput};
+use agent_ide::checks::{CheckRequest, CheckState, Checker, Severity, UnavailableReason};
+
+/// Returns the absolute path of one fixture under `tests/fixtures/checks/python/`.
+fn fixture(relative: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/checks/python")
+        .join(relative)
+}
+
+/// Creates a fresh, empty temporary directory unique to this process and call, for tests that
+/// need a worktree or cache directory the fixture tree does not provide.
+fn unique_temp_dir(label: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "agent-ide-python-check-{}-{}-{}",
+        std::process::id(),
+        label,
+        n
+    ));
+    fs::create_dir_all(&dir).expect("unique temp dir created");
+    dir
+}
+
+/// Returns the committed placeholder `(node, pyright_cli)` pair used by checker-level tests.
+///
+/// Neither file is ever executed: [`FakeRunner`] intercepts every run before a process is
+/// spawned. Their layout (`.../bin/node`, `.../lib/node_modules/pyright/index.js`) mirrors a real
+/// npm-installed toolchain closely enough for `read_roots` assertions to be meaningful.
+fn toolchain_paths() -> (PathBuf, PathBuf) {
+    (
+        fixture("toolchain/node/bin/node"),
+        fixture("toolchain/pyright/lib/node_modules/pyright/index.js"),
+    )
+}
+
+// -- parse_pyright_output ----------------------------------------------------------------------
+
+#[test]
+fn python_parses_clean_project_json_as_ready_with_zero_counts() {
+    let stdout = fs::read(fixture("clean/pyright_output.json")).expect("clean fixture readable");
+    let snapshot = parse_pyright_output(Some(0), &stdout, 5, 42);
+    assert_eq!(snapshot.state, CheckState::Ready);
+    assert_eq!(snapshot.errors, 0);
+    assert_eq!(snapshot.warnings, 0);
+    assert!(snapshot.problems.is_empty());
+    assert_eq!(snapshot.input_generation, 5);
+    assert_eq!(snapshot.duration_ms, 42);
+}
+
+#[test]
+fn python_parses_errors_and_warnings_including_never_opened_file() {
+    let dir = fixture("errors");
+    let template =
+        fs::read_to_string(dir.join("pyright_output.json")).expect("errors fixture readable");
+    let stdout = template.replace("{{FIXTURE_DIR}}", &dir.display().to_string());
+    let snapshot = parse_pyright_output(Some(1), stdout.as_bytes(), 7, 179);
+    assert_eq!(snapshot.state, CheckState::Ready);
+    assert_eq!(snapshot.errors, 2);
+    assert_eq!(snapshot.warnings, 2);
+    assert!(!snapshot.truncated);
+    // c.py is never "opened" in an editor; the project-wide CLI run must still report it.
+    assert!(snapshot.problems.iter().any(|problem| {
+        problem.path.ends_with("src/pkg/c.py")
+            && problem.severity == Severity::Error
+            && problem.code.as_deref() == Some("reportCallIssue")
+    }));
+    let b_problems: Vec<_> = snapshot
+        .problems
+        .iter()
+        .filter(|problem| problem.path.ends_with("src/pkg/b.py"))
+        .collect();
+    assert_eq!(b_problems.len(), 3);
+}
+
+#[test]
+fn python_bad_config_exit_3_is_fatal_regardless_of_json() {
+    let stdout =
+        fs::read(fixture("badconfig/pyright_output.json")).expect("badconfig fixture readable");
+    let snapshot = parse_pyright_output(Some(3), &stdout, 1, 1);
+    assert_eq!(
+        snapshot.state,
+        CheckState::Unavailable(UnavailableReason::Fatal)
+    );
+    assert_eq!(snapshot.errors, 0);
+    assert_eq!(snapshot.warnings, 0);
+}
+
+#[test]
+fn python_unparseable_stdout_is_fatal() {
+    let snapshot = parse_pyright_output(Some(0), b"not json", 1, 1);
+    assert_eq!(
+        snapshot.state,
+        CheckState::Unavailable(UnavailableReason::Fatal)
+    );
+}
+
+#[test]
+fn python_signal_killed_exit_is_fatal() {
+    let snapshot = parse_pyright_output(None, b"{}", 1, 1);
+    assert_eq!(
+        snapshot.state,
+        CheckState::Unavailable(UnavailableReason::Fatal)
+    );
+}
+
+#[test]
+fn python_exit_code_two_is_fatal() {
+    let snapshot = parse_pyright_output(Some(2), b"{}", 1, 1);
+    assert_eq!(
+        snapshot.state,
+        CheckState::Unavailable(UnavailableReason::Fatal)
+    );
+}
+
+#[test]
+fn python_files_analyzed_zero_is_env_missing() {
+    let json = br#"{"generalDiagnostics": [], "summary": {"errorCount": 0, "warningCount": 0, "filesAnalyzed": 0}}"#;
+    let snapshot = parse_pyright_output(Some(0), json, 1, 1);
+    assert_eq!(
+        snapshot.state,
+        CheckState::Unavailable(UnavailableReason::EnvMissing)
+    );
+}
+
+#[test]
+fn python_count_mismatch_against_summary_is_fatal() {
+    let json = br#"{"generalDiagnostics": [], "summary": {"errorCount": 1, "warningCount": 0, "filesAnalyzed": 3}}"#;
+    let snapshot = parse_pyright_output(Some(0), json, 1, 1);
+    assert_eq!(
+        snapshot.state,
+        CheckState::Unavailable(UnavailableReason::Fatal)
+    );
+}
+
+// -- resolve_interpreter ------------------------------------------------------------------------
+
+#[test]
+fn python_resolve_interpreter_from_pyrightconfig_json() {
+    let worktree = fixture("interpreter_pyrightconfig");
+    let resolved =
+        resolve_interpreter(&worktree).expect("interpreter resolved from pyrightconfig.json");
+    assert_eq!(resolved, worktree.join("env/myenv/bin/python"));
+}
+
+#[test]
+fn python_resolve_interpreter_from_pyproject_toml() {
+    let worktree = fixture("interpreter_pyproject");
+    let resolved = resolve_interpreter(&worktree)
+        .expect("interpreter resolved from pyproject.toml [tool.pyright]");
+    assert_eq!(resolved, worktree.join("env/myenv/bin/python"));
+}
+
+#[test]
+fn python_resolve_interpreter_default_venv() {
+    let worktree = fixture("interpreter_venv");
+    let resolved = resolve_interpreter(&worktree).expect("interpreter resolved from default .venv");
+    assert_eq!(resolved, worktree.join(".venv/bin/python"));
+}
+
+#[test]
+fn python_resolve_interpreter_none_when_nothing_present() {
+    let worktree = unique_temp_dir("resolve-none");
+    assert_eq!(resolve_interpreter(&worktree), None);
+    let _ = fs::remove_dir_all(&worktree);
+}
+
+// -- PythonChecker::check / pyright_spec -------------------------------------------------------
+
+#[tokio::test]
+async fn python_checker_missing_tool_is_unavailable_tool_missing() {
+    let runner: Arc<dyn ConfinedRunner> = Arc::new(FakeRunner::new(Vec::new()));
+    let checker = PythonChecker::new(
+        runner,
+        PathBuf::from("/nonexistent/node"),
+        PathBuf::from("/nonexistent/pyright"),
+        Duration::from_secs(60),
+    );
+    let request = CheckRequest {
+        worktree: fixture("interpreter_venv"),
+        cache_dir: unique_temp_dir("tool-missing"),
+        input_generation: 1,
+    };
+    let snapshot = checker.check(request).await;
+    assert_eq!(
+        snapshot.state,
+        CheckState::Unavailable(UnavailableReason::ToolMissing)
+    );
+}
+
+#[tokio::test]
+async fn python_checker_missing_interpreter_is_unavailable_env_missing() {
+    let (node, pyright_cli) = toolchain_paths();
+    let runner: Arc<dyn ConfinedRunner> = Arc::new(FakeRunner::new(Vec::new()));
+    let checker = PythonChecker::new(runner, node, pyright_cli, Duration::from_secs(60));
+    let worktree = unique_temp_dir("env-missing-worktree");
+    let request = CheckRequest {
+        worktree: worktree.clone(),
+        cache_dir: unique_temp_dir("env-missing-cache"),
+        input_generation: 3,
+    };
+    let snapshot = checker.check(request).await;
+    assert_eq!(
+        snapshot.state,
+        CheckState::Unavailable(UnavailableReason::EnvMissing)
+    );
+    let _ = fs::remove_dir_all(&worktree);
+}
+
+#[tokio::test]
+async fn python_checker_runner_error_is_unavailable_fatal() {
+    let (node, pyright_cli) = toolchain_paths();
+    let runner: Arc<dyn ConfinedRunner> = Arc::new(FakeRunner::new(vec![Err(
+        std::io::Error::other("spawn failed"),
+    )]));
+    let checker = PythonChecker::new(runner, node, pyright_cli, Duration::from_secs(60));
+    let request = CheckRequest {
+        worktree: fixture("interpreter_venv"),
+        cache_dir: unique_temp_dir("runner-error"),
+        input_generation: 4,
+    };
+    let snapshot = checker.check(request).await;
+    assert_eq!(
+        snapshot.state,
+        CheckState::Unavailable(UnavailableReason::Fatal)
+    );
+}
+
+#[tokio::test]
+async fn python_checker_timed_out_run_is_unavailable_timeout() {
+    let (node, pyright_cli) = toolchain_paths();
+    let runner: Arc<dyn ConfinedRunner> = Arc::new(FakeRunner::new(vec![Ok(RunOutput {
+        timed_out: true,
+        ..RunOutput::default()
+    })]));
+    let checker = PythonChecker::new(runner, node, pyright_cli, Duration::from_secs(60));
+    let request = CheckRequest {
+        worktree: fixture("interpreter_venv"),
+        cache_dir: unique_temp_dir("timeout"),
+        input_generation: 5,
+    };
+    let snapshot = checker.check(request).await;
+    assert_eq!(
+        snapshot.state,
+        CheckState::Unavailable(UnavailableReason::Timeout)
+    );
+}
+
+#[tokio::test]
+async fn python_checker_ready_snapshot_counts_from_real_fixture_json_with_relative_paths() {
+    let (node, pyright_cli) = toolchain_paths();
+    let dir = fixture("errors");
+    let template = fs::read_to_string(dir.join("pyright_output.json")).expect("errors fixture");
+    let stdout = template.replace("{{FIXTURE_DIR}}", &dir.display().to_string());
+    let runner: Arc<dyn ConfinedRunner> = Arc::new(FakeRunner::with_stdout(1, stdout.as_bytes()));
+    let checker = PythonChecker::new(runner, node, pyright_cli, Duration::from_secs(60));
+    let request = CheckRequest {
+        worktree: dir.clone(),
+        cache_dir: unique_temp_dir("ready-counts"),
+        input_generation: 9,
+    };
+    let snapshot = checker.check(request).await;
+    assert_eq!(snapshot.state, CheckState::Ready);
+    assert_eq!(snapshot.errors, 2);
+    assert_eq!(snapshot.warnings, 2);
+    assert!(
+        snapshot
+            .problems
+            .iter()
+            .all(|problem| !Path::new(&problem.path).is_absolute()),
+        "paths must be rewritten relative to the worktree: {:?}",
+        snapshot.problems
+    );
+    assert!(
+        snapshot
+            .problems
+            .iter()
+            .any(|problem| problem.path == "src/pkg/c.py")
+    );
+}
+
+#[tokio::test]
+async fn python_checker_builds_exact_run_spec_for_default_venv_interpreter() {
+    let (node, pyright_cli) = toolchain_paths();
+    let ready_json =
+        br#"{"generalDiagnostics": [], "summary": {"errorCount": 0, "warningCount": 0, "filesAnalyzed": 1}}"#;
+    let fake = Arc::new(FakeRunner::with_stdout(0, ready_json));
+    let runner: Arc<dyn ConfinedRunner> = fake.clone();
+    let checker = PythonChecker::new(
+        runner,
+        node.clone(),
+        pyright_cli.clone(),
+        Duration::from_secs(120),
+    );
+    let worktree = fixture("interpreter_venv");
+    let cache_dir = unique_temp_dir("run-spec");
+    let request = CheckRequest {
+        worktree: worktree.clone(),
+        cache_dir: cache_dir.clone(),
+        input_generation: 2,
+    };
+
+    let snapshot = checker.check(request).await;
+    assert_eq!(snapshot.state, CheckState::Ready);
+
+    let specs = fake.specs();
+    assert_eq!(specs.len(), 1);
+    let spec = &specs[0];
+
+    let interpreter = worktree.join(".venv/bin/python");
+    let canonical_interpreter =
+        fs::canonicalize(&interpreter).expect("fixture interpreter canonicalizes");
+
+    assert_eq!(spec.program, node);
+    assert_eq!(
+        spec.args,
+        vec![
+            pyright_cli.clone().into_os_string(),
+            OsString::from("--outputjson"),
+            OsString::from("--project"),
+            worktree.clone().into_os_string(),
+            OsString::from("--pythonpath"),
+            canonical_interpreter.clone().into_os_string(),
+        ]
+    );
+    assert_eq!(spec.cwd, worktree);
+
+    let node_bin_dir = node.parent().expect("node has a parent bin dir");
+    assert_eq!(
+        spec.env,
+        vec![
+            (
+                "PATH".to_string(),
+                format!("{}:/usr/bin:/bin", node_bin_dir.display())
+            ),
+            (
+                "HOME".to_string(),
+                std::env::var("HOME").unwrap_or_default()
+            ),
+            (
+                "TMPDIR".to_string(),
+                cache_dir.join("tmp").display().to_string()
+            ),
+        ]
+    );
+
+    let expected_read_roots = vec![
+        worktree.clone(),
+        node_bin_dir
+            .parent()
+            .expect("node bin dir has a parent")
+            .to_path_buf(),
+        pyright_cli
+            .parent()
+            .expect("pyright cli has a parent")
+            .to_path_buf(),
+        interpreter
+            .parent()
+            .and_then(Path::parent)
+            .expect("interpreter venv root")
+            .to_path_buf(),
+        canonical_interpreter
+            .parent()
+            .and_then(Path::parent)
+            .expect("interpreter base prefix")
+            .to_path_buf(),
+        PathBuf::from("/private/etc"),
+    ];
+    assert_eq!(spec.read_roots, expected_read_roots);
+    assert_eq!(spec.write_roots, vec![cache_dir.clone()]);
+    assert_eq!(spec.timeout, Duration::from_secs(120));
+    assert_eq!(spec.max_output_bytes, 64 * 1024 * 1024);
+
+    assert!(
+        cache_dir.join("tmp").is_dir(),
+        "check() must create <cache_dir>/tmp before running"
+    );
+}
+
+#[tokio::test]
+async fn python_checker_uses_pyrightconfig_json_as_project_when_present() {
+    let (node, pyright_cli) = toolchain_paths();
+    let dir = fixture("errors");
+    let template = fs::read_to_string(dir.join("pyright_output.json")).expect("errors fixture");
+    let stdout = template.replace("{{FIXTURE_DIR}}", &dir.display().to_string());
+    let fake = Arc::new(FakeRunner::with_stdout(1, stdout.as_bytes()));
+    let runner: Arc<dyn ConfinedRunner> = fake.clone();
+    let checker = PythonChecker::new(runner, node, pyright_cli.clone(), Duration::from_secs(60));
+    let cache_dir = unique_temp_dir("project-arg");
+    let request = CheckRequest {
+        worktree: dir.clone(),
+        cache_dir: cache_dir.clone(),
+        input_generation: 1,
+    };
+    let interpreter = fixture("interpreter_venv/.venv/bin/python");
+    let spec = checker.pyright_spec(&request, &interpreter);
+    assert_eq!(spec.args[2], OsString::from("--project"));
+    assert_eq!(
+        spec.args[3],
+        dir.join("pyrightconfig.json").into_os_string()
+    );
+}

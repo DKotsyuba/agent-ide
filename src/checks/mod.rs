@@ -6,6 +6,7 @@
 //! from it. Counts always describe the full deduplicated result even when the retained
 //! [`ProblemSnapshot::problems`] list is capped; messages are untrusted checker output.
 
+pub mod python;
 pub mod runner;
 
 use std::collections::HashSet;
