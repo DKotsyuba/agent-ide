@@ -12,9 +12,11 @@ use crate::{
         reply::{EditDiagnostics, FailureCode, MissingPeer, PeerReply},
     },
     changes::edit::EditOutcome,
+    checks::{self, CheckState, ProblemSnapshot, UnavailableReason},
     telemetry::{
-        AdmissionState, CacheState, CancellationState, DescendantSettlement, DiagnosticState,
-        Event, FallbackReason, Language, OutputSizeClass, Telemetry, ToolMethod, ToolOutcome,
+        AdmissionState, CacheState, CancellationState, CountBucket, DescendantSettlement,
+        DiagnosticState, Event, FallbackReason, Language, OutputSizeClass, ProjectCheckState,
+        Telemetry, ToolMethod, ToolOutcome,
     },
 };
 
@@ -114,6 +116,37 @@ pub fn execution_summary(
         admission,
         cancellation,
         descendants,
+    });
+}
+
+/// Records one completed project check from its snapshot's language, state, duration and counts.
+///
+/// Problem paths, messages and codes are never read; counts are bucketed and the duration is
+/// saturated to whole `u32` milliseconds. Recording is synchronous, bounded and fail-open.
+pub fn project_check(telemetry: &Telemetry, snapshot: &ProblemSnapshot) {
+    telemetry.record(Event::ProjectCheckCompleted {
+        language: match snapshot.language {
+            checks::Language::Rust => Language::Rust,
+            checks::Language::Python => Language::Python,
+        },
+        state: match snapshot.state {
+            CheckState::Ready => ProjectCheckState::Ready,
+            CheckState::Partial => ProjectCheckState::Partial,
+            CheckState::Checking => ProjectCheckState::Checking,
+            CheckState::Unavailable(UnavailableReason::Disabled) => ProjectCheckState::Disabled,
+            CheckState::Unavailable(UnavailableReason::OutsideRoots) => {
+                ProjectCheckState::OutsideRoots
+            }
+            CheckState::Unavailable(UnavailableReason::ToolMissing) => {
+                ProjectCheckState::ToolMissing
+            }
+            CheckState::Unavailable(UnavailableReason::EnvMissing) => ProjectCheckState::EnvMissing,
+            CheckState::Unavailable(UnavailableReason::Fatal) => ProjectCheckState::Fatal,
+            CheckState::Unavailable(UnavailableReason::Timeout) => ProjectCheckState::Timeout,
+        },
+        duration_ms: snapshot.duration_ms.try_into().unwrap_or(u32::MAX),
+        errors_bucket: CountBucket::of(snapshot.errors),
+        warnings_bucket: CountBucket::of(snapshot.warnings),
     });
 }
 

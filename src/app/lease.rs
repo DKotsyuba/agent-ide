@@ -19,14 +19,19 @@ pub const LEASE_POOL_CAPACITY: usize = 32;
 /// Idle-shutdown timeout used when no operator configuration overrides it (EYES-r2 §1 default).
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Re-evaluation interval of the busy predicate while no lease is open.
+///
+/// The predicate has no change signal of its own, so a busy daemon polls it at this interval to
+/// notice that its last check finished and the idle countdown may begin.
+const BUSY_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Shared state behind every [`LeaseController`] clone and every outstanding [`LeaseGuard`].
 struct Inner {
     /// Count of currently admitted, still-open lease connections.
     open: AtomicUsize,
     /// Duration the daemon must stay idle (zero leases, not busy) before it shuts down.
     idle_timeout: Duration,
-    /// Reports whether daemon-owned work is in flight; always `false` until a future task supplies
-    /// the real project-check signal (EYES-r2 §2).
+    /// Reports whether daemon-owned work (a pending or running project check) is in flight.
     is_busy: Box<dyn Fn() -> bool + Send + Sync>,
     /// The instant the daemon most recently became idle (zero leases), or `None` while ineligible.
     became_idle_at: Mutex<Option<Instant>>,
@@ -46,8 +51,8 @@ pub struct LeaseController(Arc<Inner>);
 impl LeaseController {
     /// Starts idle (zero open leases, countdown already running) from the moment of construction.
     ///
-    /// `is_busy` reports whether daemon-owned work is in flight; a daemon with no such work supplies
-    /// a fixed `|| false`, matching EYES-r2 §2 until a future task wires real check status through.
+    /// `is_busy` reports whether daemon-owned work (a pending or running project check) is in
+    /// flight; a daemon with no such work supplies a fixed `|| false`.
     pub fn new(idle_timeout: Duration, is_busy: impl Fn() -> bool + Send + Sync + 'static) -> Self {
         Self(Arc::new(Inner {
             open: AtomicUsize::new(0),
@@ -60,8 +65,8 @@ impl LeaseController {
     }
 
     /// Registers a hook run exactly once, in registration order, when this daemon shuts down for any
-    /// reason (orderly idle expiry, SIGINT/SIGTERM, or a serving failure). Intended for a future
-    /// check scheduler to cancel its own outstanding work (EYES-r2 §2).
+    /// reason (orderly idle expiry, SIGINT/SIGTERM, or a serving failure), after the dispatcher's
+    /// own asynchronous shutdown (which already cancels project checks) has completed.
     pub fn on_shutdown(&self, hook: impl FnOnce() + Send + 'static) {
         self.0.hooks.lock().unwrap().push(Box::new(hook));
     }
@@ -94,6 +99,9 @@ impl LeaseController {
 
     /// Resolves once the lease count has been zero, and the daemon has reported itself not busy, for
     /// one continuous idle timeout; never resolves while any lease is open or the daemon is busy.
+    ///
+    /// While no lease is open but the daemon is busy, the busy predicate is re-polled every
+    /// `BUSY_POLL_INTERVAL` (one second), because nothing else signals the end of daemon-owned work.
     pub async fn idle_expired(&self) {
         loop {
             let changed = self.0.changed.notified();
@@ -106,6 +114,12 @@ impl LeaseController {
                                 return;
                             }
                         }
+                        () = &mut changed => {}
+                    }
+                }
+                None if self.0.open.load(Ordering::SeqCst) == 0 => {
+                    tokio::select! {
+                        () = tokio::time::sleep(BUSY_POLL_INTERVAL) => {}
                         () = &mut changed => {}
                     }
                 }
@@ -124,8 +138,16 @@ impl LeaseController {
 
     /// Returns the instant the idle countdown completes, or `None` while zero-lease-and-idle does
     /// not currently hold.
+    ///
+    /// Observing the daemon busy with zero leases restarts the countdown from now, so the idle
+    /// timeout is measured from the end of the last daemon-owned work rather than from the last
+    /// lease release (EYES-r2 §2).
     fn current_deadline(&self) -> Option<Instant> {
-        if self.0.open.load(Ordering::SeqCst) != 0 || (self.0.is_busy)() {
+        if self.0.open.load(Ordering::SeqCst) != 0 {
+            return None;
+        }
+        if (self.0.is_busy)() {
+            *self.0.became_idle_at.lock().unwrap() = Some(Instant::now());
             return None;
         }
         self.0
@@ -214,6 +236,32 @@ mod tests {
         assert!(
             lease.try_admit().is_some(),
             "releasing one lease must free exactly one admission slot"
+        );
+    }
+
+    /// Busy daemon-owned work suppresses expiry, and the countdown restarts once the work ends.
+    #[tokio::test(start_paused = true)]
+    async fn busy_work_defers_expiry_until_a_full_timeout_after_it_ends() {
+        let busy = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let lease = LeaseController::new(Duration::from_millis(50), {
+            let busy = Arc::clone(&busy);
+            move || busy.load(Ordering::SeqCst)
+        });
+        let expiry = tokio::spawn({
+            let lease = lease.clone();
+            async move { lease.idle_expired().await }
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!expiry.is_finished(), "busy work must suppress idle expiry");
+        busy.store(false, Ordering::SeqCst);
+        let ended = Instant::now();
+        tokio::time::timeout(BUSY_POLL_INTERVAL * 2, expiry)
+            .await
+            .expect("idle expiry must follow once busy work ends")
+            .unwrap();
+        assert!(
+            ended.elapsed() >= Duration::from_millis(50),
+            "the countdown must restart when busy work ends"
         );
     }
 

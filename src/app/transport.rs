@@ -318,6 +318,13 @@ pub trait AssistanceDispatcher: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
+    /// Reports whether daemon-owned background work (a pending or running project check) is in
+    /// flight, which defers idle shutdown (EYES-r2 §2). Must return promptly without blocking.
+    /// Default dispatchers own no background work.
+    fn is_busy(&self) -> bool {
+        false
+    }
+
     /// Starts one finite Assistance operation and resolves its opaque result within the caller budget.
     fn dispatch(
         &self,

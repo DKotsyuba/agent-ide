@@ -285,6 +285,32 @@ fn claude_parent_and_two_subagents_remain_explicit_and_isolated() {
     }
 }
 
+/// Retains the native tool name for Claude post phases only, never for pre-hooks or Codex.
+#[test]
+fn claude_post_phases_retain_only_the_tool_name() {
+    for phase in ["PostToolUse", "PostToolUseFailure"] {
+        let event = parse_claude_hook_event(
+            json!({"hook_event_name":phase,"session_id":"session","tool_use_id":"call",
+                "tool_name":"Edit","tool_input":{"file_path":"/secret"},"tool_response":"secret"})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(event.tool_name(), Some("Edit"));
+        assert!(!format!("{event:?}").contains("secret"));
+    }
+    let pre = parse_claude_hook_event(
+        br#"{"hook_event_name":"PreToolUse","session_id":"session","tool_use_id":"call","tool_name":"Edit"}"#,
+    )
+    .unwrap();
+    assert_eq!(pre.tool_name(), None);
+    let codex = parse_hook_event(
+        br#"{"hook_event_name":"PostToolUse","session_id":"session","tool_use_id":"call","tool_name":"Edit"}"#,
+    )
+    .unwrap();
+    assert_eq!(codex.tool_name(), None);
+}
+
 /// Accepts a host-declared batch boundary without fabricating a tool or session-derived call ID.
 #[test]
 fn batch_hook_has_no_synthetic_call_identity() {

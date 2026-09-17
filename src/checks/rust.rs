@@ -74,34 +74,32 @@ impl RustChecker {
     /// Builds the exact confined cargo invocation for `request`.
     ///
     /// Program is `<toolchain_dir>/bin/cargo` with `check --workspace --all-targets
-    /// --message-format=json --offline --keep-going` in the worktree, plus `--locked` exactly
-    /// when `<worktree>/Cargo.lock` exists (the lockfile must exist to be enforceable; without
-    /// it cargo would re-resolve the dependency graph on every check). The environment is
+    /// --message-format=json --offline --keep-going --locked` in the worktree. `--locked` is
+    /// always passed (EYES-r2 §4): the worktree is read-only for the check, so a missing or
+    /// outdated lockfile cannot be written and cargo's refusal maps to
+    /// [`UnavailableReason::EnvMissing`] in [`RustChecker::check`]. The environment is
     /// rebuilt from the allowlist: `PATH` limited to toolchain bins plus the system dirs,
     /// `HOME`, `TMPDIR`/`CARGO_TARGET_DIR` under the private cache, and `CARGO_NET_OFFLINE=true`.
     /// Read roots cover the worktree, the toolchain, the cargo home, the derived rustup home and
     /// `/private/etc`; the private cache is the only write root; each output stream is capped at
     /// [`MAX_OUTPUT_BYTES`]. The construction is pure with respect to the process environment:
-    /// its only inputs are the checker configuration and `request` (including the on-disk
-    /// `Cargo.lock` presence in the request's worktree).
+    /// its only inputs are the checker configuration and `request`.
     pub fn cargo_check_spec(&self, request: &CheckRequest) -> RunSpec {
         let home = real_home();
         let cargo_home = self.effective_cargo_home(&home);
         let rustup_home = derived_rustup_home(&self.toolchain_dir, &home);
-        let mut args: Vec<OsString> = vec![
+        let args: Vec<OsString> = vec![
             "check",
             "--workspace",
             "--all-targets",
             "--message-format=json",
             "--offline",
             "--keep-going",
+            "--locked",
         ]
         .into_iter()
         .map(OsString::from)
         .collect();
-        if request.worktree.join("Cargo.lock").is_file() {
-            args.push(OsString::from("--locked"));
-        }
         RunSpec {
             program: self.toolchain_dir.join("bin").join("cargo"),
             args,

@@ -68,7 +68,16 @@ struct Inner {
     cache_root: PathBuf,
     /// Mutable scheduling state, locked only for the duration of a synchronous read or write.
     state: Mutex<State>,
+    /// Optional observer called once with every snapshot a [`Checker`] run completes with.
+    on_complete: Option<CompletionHook>,
 }
+
+/// Observer of completed check runs, installed through [`Scheduler::with_completion_hook`].
+///
+/// Called synchronously on the scheduler task right after a run completes and before the
+/// snapshot is stored, never while scheduler state is locked. It must return promptly and must
+/// not call back into the scheduler.
+pub type CompletionHook = Arc<dyn Fn(&ProblemSnapshot) + Send + Sync>;
 
 /// Mutable scheduler state, guarded by [`Inner::state`].
 ///
@@ -163,8 +172,24 @@ impl Scheduler {
                 semaphore: Arc::new(Semaphore::new(max_concurrent.max(1))),
                 cache_root,
                 state: Mutex::new(State::default()),
+                on_complete: None,
             }),
         }
+    }
+
+    /// Installs `hook`, called with every snapshot a check run completes with (for example to
+    /// record telemetry), including completions later discarded by the storage guards.
+    ///
+    /// Must be called on the freshly built scheduler before it is cloned or triggered.
+    ///
+    /// # Panics
+    ///
+    /// Panics when another clone of this scheduler already exists.
+    pub fn with_completion_hook(mut self, hook: CompletionHook) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("completion hook must be installed before the scheduler is shared")
+            .on_complete = Some(hook);
+        self
     }
 
     /// Records a trigger for `worktree` and restarts the debounce timer for every configured
@@ -343,7 +368,8 @@ impl Inner {
     /// Each iteration first waits out any pending EYES-r2 cooldown (see
     /// [`Inner::cooldown_remaining`]), then prepares the cache directory (cloning Rust's
     /// `target/` on the worktree's first Rust check when possible), acquires the shared
-    /// concurrency permit, dispatches the configured [`Checker`], stores the resulting snapshot
+    /// concurrency permit, dispatches the configured [`Checker`], reports the completion to the
+    /// optional [`CompletionHook`], stores the resulting snapshot
     /// (subject to the generation and Fatal/Timeout guards in [`Inner::store_snapshot`]),
     /// records this completion's timing for the next iteration's cooldown, and records Rust
     /// cache completion for sibling worktrees. If the pair was marked dirty while this run was
@@ -393,6 +419,9 @@ impl Inner {
             let snapshot = checker.check(request).await;
             let duration = started.elapsed();
             drop(permit);
+            if let Some(hook) = &inner.on_complete {
+                hook(&snapshot);
+            }
             inner.store_snapshot(&worktree, snapshot);
             inner.record_completion(&worktree, language, duration);
             if language == Language::Rust {

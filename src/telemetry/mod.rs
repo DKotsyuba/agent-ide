@@ -227,6 +227,72 @@ pub enum Event {
         /// Closed unavailable boundary that selected the native path.
         reason: FallbackReason,
     },
+    /// Records one completed confined project check with bucketed counts only (EYES-r1 §8).
+    ProjectCheckCompleted {
+        /// Checked language; only `rust` and `python` occur.
+        language: Language,
+        /// Closed state of the completed snapshot.
+        state: ProjectCheckState,
+        /// Checker-measured run duration, saturated to whole milliseconds.
+        duration_ms: u32,
+        /// Bucketed deduplicated error count.
+        errors_bucket: CountBucket,
+        /// Bucketed deduplicated warning count.
+        warnings_bucket: CountBucket,
+    },
+}
+
+/// Classifies a completed project check's state without any path, message, or reason text.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectCheckState {
+    /// Complete result for the configured scope.
+    Ready,
+    /// Result present with incomplete coverage.
+    Partial,
+    /// No result was available yet.
+    Checking,
+    /// Project checks were disabled.
+    Disabled,
+    /// The worktree was outside every allowed root.
+    OutsideRoots,
+    /// The configured tool was missing.
+    ToolMissing,
+    /// The project environment was missing.
+    EnvMissing,
+    /// The check failed unrecoverably.
+    Fatal,
+    /// The check exceeded its timeout.
+    Timeout,
+}
+
+/// Buckets one problem count so telemetry never retains an exact project-specific number.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum CountBucket {
+    /// Exactly zero.
+    #[serde(rename = "0")]
+    Zero,
+    /// One through nine.
+    #[serde(rename = "1-9")]
+    Units,
+    /// Ten through ninety-nine.
+    #[serde(rename = "10-99")]
+    Tens,
+    /// One hundred or more.
+    #[serde(rename = "100+")]
+    Hundreds,
+}
+
+impl CountBucket {
+    /// Returns the bucket containing `count`.
+    pub const fn of(count: u32) -> Self {
+        match count {
+            0 => Self::Zero,
+            1..=9 => Self::Units,
+            10..=99 => Self::Tens,
+            _ => Self::Hundreds,
+        }
+    }
 }
 
 /// Names a closed provider language profile without carrying a file path, source, or command.
@@ -251,6 +317,7 @@ impl Event {
             Self::ExecutionCompleted { .. } => "execution_completed",
             Self::ProviderObserved { .. } => "provider_observed",
             Self::NativeFallback { .. } => "native_fallback",
+            Self::ProjectCheckCompleted { .. } => "project_check_completed",
         }
     }
 
@@ -998,6 +1065,32 @@ mod tests {
         assert!(serde_json::from_str::<Event>(r#"{"tag":"tool_completed","method":"context","outcome":"completed","duration_ms":1,"language":null,"cache":"hit","diagnostics":"clean","path":"secret"}"#).is_err());
         let encoded = event().encode().unwrap();
         assert!(!String::from_utf8(encoded).unwrap().contains("path"));
+    }
+
+    /// Proves the project check event encodes the EYES-r1 §8 bucket labels under its closed tag.
+    #[test]
+    fn project_check_event_encodes_closed_buckets() {
+        let event = Event::ProjectCheckCompleted {
+            language: Language::Python,
+            state: ProjectCheckState::OutsideRoots,
+            duration_ms: 7,
+            errors_bucket: CountBucket::of(100),
+            warnings_bucket: CountBucket::of(9),
+        };
+        assert_eq!(event.tag(), "project_check_completed");
+        assert_eq!(
+            String::from_utf8(event.encode().unwrap()).unwrap(),
+            r#"{"tag":"project_check_completed","language":"python","state":"outside_roots","duration_ms":7,"errors_bucket":"100+","warnings_bucket":"1-9"}"#
+        );
+        for (count, bucket) in [
+            (0, CountBucket::Zero),
+            (1, CountBucket::Units),
+            (10, CountBucket::Tens),
+            (99, CountBucket::Tens),
+            (u32::MAX, CountBucket::Hundreds),
+        ] {
+            assert_eq!(CountBucket::of(count), bucket);
+        }
     }
 
     /// Proves smallest configured row ceiling evicts the oldest durable rows in sequence order.

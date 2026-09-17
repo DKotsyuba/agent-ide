@@ -5,10 +5,31 @@
 //! reports the latest completed snapshots for one authorized worktree, and every rendered
 //! textual field is treated as untrusted checker output: single line, control characters
 //! stripped, never interpreted as markdown or HTML.
+//!
+//! [`ProjectProblemFeed`](crate::assistance::problems::ProjectProblemFeed) is the daemon-owned
+//! wiring behind that seam: it admits bound worktrees against the allowed roots, forwards
+//! triggers to the check [`Scheduler`](crate::checks::scheduler::Scheduler), and renders the
+//! per-binding `<agent-ide>` block from in-memory state only.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use crate::checks::{CheckState, Language, Problem, ProblemSnapshot, Severity, UnavailableReason};
+use super::launcher::{LauncherConfig, admit_worktree};
+use crate::checks::python::PythonChecker;
+use crate::checks::runner::{ConfinedRunner, SeatbeltRunner};
+use crate::checks::rust::RustChecker;
+use crate::checks::scheduler::{CompletionHook, Scheduler, sweep_stale_caches};
+use crate::checks::{
+    CheckState, Checker, Language, Problem, ProblemSnapshot, Severity, UnavailableReason,
+};
+use crate::feed::{FeedKey, FeedState, MAX_FEED_KEYS};
+
+/// Checks run concurrently across the daemon (EYES-r1 §5).
+const MAX_CONCURRENT_CHECKS: usize = 2;
+
+/// Native Claude tools whose completed post-hook triggers a project check (EYES-r2 §5).
+pub const CHECK_TRIGGER_TOOLS: [&str; 5] = ["Edit", "Write", "MultiEdit", "NotebookEdit", "Bash"];
 
 /// Maximum problems rendered on one `ide.context` problems page.
 pub const PROBLEMS_PAGE_SIZE: u32 = 20;
@@ -26,6 +47,255 @@ pub trait ProblemSource: Send + Sync {
     /// snapshots for a different worktree. An empty result means no language is configured,
     /// which the renderer reports as `checks disabled`.
     fn latest(&self, worktree: &Path) -> Vec<ProblemSnapshot>;
+}
+
+/// Worktree bound to one activated actor binding, as recorded at `ide.start`.
+struct BoundWorktree {
+    /// Canonical worktree path Workspace resolved for the binding.
+    worktree: PathBuf,
+    /// Canonical git common dir of the worktree's repository, the scheduler repository key.
+    repository_key: String,
+    /// Whether the worktree was admitted under an allowed root; `false` renders `outside_roots`.
+    admitted: bool,
+}
+
+/// Mutable feed wiring state, locked only for synchronous in-memory reads and writes.
+#[derive(Default)]
+struct FeedWiring {
+    /// Bound worktrees keyed by binding fingerprint; at most [`MAX_FEED_KEYS`] entries.
+    bindings: HashMap<[u8; 32], BoundWorktree>,
+    /// Delivered-block state per `(binding, worktree)`.
+    feed: FeedState,
+}
+
+/// Daemon-owned project problem feed: trigger routing, admission, and block delivery state.
+///
+/// One instance exists per daemon when project checks are configured. Every method is
+/// synchronous and non-blocking except [`ProjectProblemFeed::shutdown`]; none waits for a check,
+/// so hook and IPC paths can consult it inside their existing deadlines. Bindings are identified
+/// by their opaque fingerprint and must be forgotten on `ide.stop`.
+pub struct ProjectProblemFeed {
+    /// Debounced check scheduler that owns every check run and completed snapshot.
+    scheduler: Scheduler,
+    /// Operator-declared allowed roots used for worktree admission.
+    allowed_roots: Vec<PathBuf>,
+    /// Configured languages in feed order; the scheduler runs exactly these.
+    languages: Vec<Language>,
+    /// Binding and delivery state.
+    state: Mutex<FeedWiring>,
+}
+
+impl ProjectProblemFeed {
+    /// Builds the feed around an already configured `scheduler`.
+    ///
+    /// `allowed_roots` must be nonempty for any worktree to be admitted; `languages` lists the
+    /// languages `scheduler` has checkers for and is sorted into feed order here.
+    pub fn new(
+        scheduler: Scheduler,
+        allowed_roots: Vec<PathBuf>,
+        mut languages: Vec<Language>,
+    ) -> Self {
+        languages.sort();
+        languages.dedup();
+        Self {
+            scheduler,
+            allowed_roots,
+            languages,
+            state: Mutex::new(FeedWiring::default()),
+        }
+    }
+
+    /// Builds the production feed from the launcher configuration, or `None` when disabled.
+    ///
+    /// Project checks are enabled only with nonempty `allowed_roots`, a `project_checks` section
+    /// and at least one configured language (EYES-r1 §1); otherwise `None` leaves v0.2 behaviour
+    /// unchanged. Checkers run through the Seatbelt runner with the configured timeout, the
+    /// scheduler uses the configured debounce and the cache root `$HOME/.agent-ide/checks`
+    /// (created `0700` best-effort), and stale caches of removed worktrees are swept first.
+    /// `on_complete` observes every completed check run. Returns `None` when `HOME` is unset.
+    pub fn from_launcher(launcher: &LauncherConfig, on_complete: CompletionHook) -> Option<Self> {
+        let checks = launcher.project_checks()?;
+        if launcher.allowed_roots().is_empty() {
+            return None;
+        }
+        let runner: Arc<dyn ConfinedRunner> = Arc::new(SeatbeltRunner);
+        let mut checkers: Vec<Arc<dyn Checker>> = Vec::new();
+        if let Some(rust) = checks.rust() {
+            checkers.push(Arc::new(RustChecker::new(
+                runner.clone(),
+                rust.toolchain_dir().to_path_buf(),
+                None,
+                checks.check_timeout(),
+            )));
+        }
+        if let Some(python) = checks.python() {
+            checkers.push(Arc::new(PythonChecker::new(
+                runner.clone(),
+                python.node().to_path_buf(),
+                python.pyright_cli().to_path_buf(),
+                checks.check_timeout(),
+            )));
+        }
+        if checkers.is_empty() {
+            return None;
+        }
+        let cache_root = PathBuf::from(std::env::var_os("HOME")?)
+            .join(".agent-ide")
+            .join("checks");
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let _ = std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&cache_root);
+        }
+        sweep_stale_caches(&cache_root);
+        let languages = checkers.iter().map(|checker| checker.language()).collect();
+        let scheduler = Scheduler::new(
+            checkers,
+            checks.debounce(),
+            MAX_CONCURRENT_CHECKS,
+            cache_root,
+        )
+        .with_completion_hook(on_complete);
+        Some(Self::new(
+            scheduler,
+            launcher.allowed_roots().to_vec(),
+            languages,
+        ))
+    }
+
+    /// Records a successful `ide.start` for `binding` and schedules the initial warm check.
+    ///
+    /// `worktree` is Workspace's canonical worktree path and `repository_key` its canonical git
+    /// common dir. A worktree outside every allowed root is recorded as not admitted — its
+    /// snapshots then report `outside_roots` — and no check is scheduled. Replaces any previous
+    /// record for the same binding; when the bound set is full an arbitrary other binding is
+    /// evicted first.
+    pub fn activated(&self, binding: [u8; 32], worktree: &Path, repository_key: &Path) {
+        let admitted = admit_worktree(&self.allowed_roots, worktree).is_ok();
+        let repository_key = repository_key.to_string_lossy().into_owned();
+        if admitted {
+            self.scheduler.trigger(&repository_key, worktree);
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.bindings.len() >= MAX_FEED_KEYS
+            && !state.bindings.contains_key(&binding)
+            && let Some(evicted) = state.bindings.keys().next().copied()
+        {
+            state.bindings.remove(&evicted);
+        }
+        state.bindings.insert(
+            binding,
+            BoundWorktree {
+                worktree: worktree.to_path_buf(),
+                repository_key,
+                admitted,
+            },
+        );
+    }
+
+    /// Schedules a check for `binding`'s admitted worktree after a native edit or `ide.edit`.
+    ///
+    /// An unknown binding or a worktree outside the allowed roots schedules nothing.
+    pub fn changed(&self, binding: &[u8; 32]) {
+        let target = self.state.lock().ok().and_then(|state| {
+            let bound = state.bindings.get(binding)?;
+            bound
+                .admitted
+                .then(|| (bound.repository_key.clone(), bound.worktree.clone()))
+        });
+        if let Some((repository_key, worktree)) = target {
+            self.scheduler.trigger(&repository_key, &worktree);
+        }
+    }
+
+    /// Returns the `<agent-ide>` block due for `binding`, marking it delivered, or `None`.
+    ///
+    /// Reads only in-memory snapshots and never waits for a running check. `None` means the
+    /// binding is unknown, no language has a completed result yet, or the item set equals the
+    /// last block delivered to this binding for its worktree (EYES-r1 §6).
+    pub fn next_block(&self, binding: &[u8; 32]) -> Option<String> {
+        let mut guard = self.state.lock().ok()?;
+        let state = &mut *guard;
+        let bound = state.bindings.get(binding)?;
+        let key = FeedKey {
+            binding: hex(binding),
+            worktree: bound.worktree.clone(),
+        };
+        let snapshots = self.snapshots(&bound.worktree, bound.admitted);
+        state.feed.next_block(&key, &snapshots)
+    }
+
+    /// Drops `binding`'s worktree record and delivery state; called on `ide.stop`.
+    pub fn forget(&self, binding: &[u8; 32]) {
+        if let Ok(mut state) = self.state.lock()
+            && let Some(bound) = state.bindings.remove(binding)
+        {
+            state.feed.forget(&FeedKey {
+                binding: hex(binding),
+                worktree: bound.worktree,
+            });
+        }
+    }
+
+    /// Reports whether any check is pending or running, for the daemon idle controller.
+    pub fn is_busy(&self) -> bool {
+        self.scheduler.is_busy()
+    }
+
+    /// Cancels every pending and running check; triggers afterwards are ignored.
+    pub async fn shutdown(&self) {
+        self.scheduler.shutdown().await;
+    }
+
+    /// Returns one snapshot per configured language for `worktree`, in feed order.
+    ///
+    /// Not-admitted worktrees report `unavailable(outside_roots)`; a configured language without
+    /// a completed result reports `checking`.
+    fn snapshots(&self, worktree: &Path, admitted: bool) -> Vec<ProblemSnapshot> {
+        if !admitted {
+            return self
+                .languages
+                .iter()
+                .map(|language| {
+                    ProblemSnapshot::unavailable(*language, UnavailableReason::OutsideRoots, 0)
+                })
+                .collect();
+        }
+        let completed = self.scheduler.latest(worktree);
+        self.languages
+            .iter()
+            .map(|language| {
+                completed
+                    .iter()
+                    .find(|snapshot| snapshot.language == *language)
+                    .cloned()
+                    .unwrap_or_else(|| ProblemSnapshot::checking(*language, 0))
+            })
+            .collect()
+    }
+}
+
+impl ProblemSource for ProjectProblemFeed {
+    /// Answers from the scheduler's completed snapshots, reporting `outside_roots` when a binding
+    /// recorded `worktree` as not admitted and `checking` for languages without a result.
+    fn latest(&self, worktree: &Path) -> Vec<ProblemSnapshot> {
+        let admitted = self.state.lock().map_or(true, |state| {
+            !state
+                .bindings
+                .values()
+                .any(|bound| bound.worktree == worktree && !bound.admitted)
+        });
+        self.snapshots(worktree, admitted)
+    }
+}
+
+/// Renders a binding fingerprint as lowercase hex, the stable [`FeedKey::binding`] form.
+fn hex(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Parses one closed `language` parameter value into its snapshot language.
