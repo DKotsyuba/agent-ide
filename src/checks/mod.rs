@@ -164,6 +164,12 @@ pub struct ProblemSnapshot {
     pub input_generation: u64,
     /// Wall-clock duration of the completed check in milliseconds; `0` before any run.
     pub duration_ms: u64,
+    /// Optional bounded explanation of an `Unavailable` cause (for example the first `error:`
+    /// line of a failed build's stderr); untrusted checker text, rendered only by the
+    /// `ide.context` problems page, never by the `<agent-ide>` block. `None` for every other
+    /// state and for an `Unavailable` snapshot with no cheaply available explanation.
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 impl ProblemSnapshot {
@@ -219,6 +225,7 @@ impl ProblemSnapshot {
             truncated,
             input_generation,
             duration_ms,
+            detail: None,
         }
     }
 
@@ -227,6 +234,21 @@ impl ProblemSnapshot {
         language: Language,
         reason: UnavailableReason,
         input_generation: u64,
+    ) -> Self {
+        Self::unavailable_with_detail(language, reason, input_generation, None)
+    }
+
+    /// Builds the zero-count snapshot for a language that cannot produce any result, carrying an
+    /// optional bounded explanation of the cause.
+    ///
+    /// `detail` is untrusted checker text (for example the first `error:` line of a failed
+    /// build's stderr); callers that have no cheap explanation should use
+    /// [`ProblemSnapshot::unavailable`] instead of passing `None` here explicitly.
+    pub fn unavailable_with_detail(
+        language: Language,
+        reason: UnavailableReason,
+        input_generation: u64,
+        detail: Option<String>,
     ) -> Self {
         Self {
             language,
@@ -237,6 +259,7 @@ impl ProblemSnapshot {
             truncated: false,
             input_generation,
             duration_ms: 0,
+            detail,
         }
     }
 
@@ -251,6 +274,7 @@ impl ProblemSnapshot {
             truncated: false,
             input_generation,
             duration_ms: 0,
+            detail: None,
         }
     }
 }

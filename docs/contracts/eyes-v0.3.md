@@ -29,7 +29,8 @@ top-level fields:
     "debounce_ms": 1500,
     "idle_timeout_s": 300,
     "check_timeout_s": 300,
-    "rust": { "toolchain_dir": "/abs/.rustup/toolchains/<name>", "cargo_home": "/abs/.cargo" },
+    "rust": { "toolchain_dir": "/abs/.rustup/toolchains/<name>", "cargo_home": "/abs/.cargo",
+              "developer_dir": "/abs/Xcode.app/Contents/Developer" },
     "python": { "node": "/abs/node", "pyright_cli": "/abs/pyright" }
   }
 }
@@ -46,6 +47,13 @@ top-level fields:
 - A language subsection absent: that language is not checked and never appears in the block.
 - `rust.cargo_home` is optional and defaults to `$HOME/.cargo`; the parent of `toolchain_dir`'s
   `toolchains` directory (normally `$HOME/.rustup`) is derived, not configured.
+- `rust.developer_dir` is optional (T05B) and overrides the Apple developer directory read root a
+  native build script's `cc`/`xcrun` invocation needs; absent, it is resolved once per checker from
+  `/usr/bin/xcode-select -p`, falling back to `/Applications/Xcode.app/Contents/Developer` then
+  `/Library/Developer/CommandLineTools`. `/private/var/db/xcode_select_link` and
+  `/Library/Developer/CommandLineTools` are always added as extra read roots when they exist,
+  because `/usr/bin/cc` resolves through that symlink database independently of the reported
+  developer directory. Only existing paths are ever added.
 - Check caches live outside any runtime directory, under
   `$HOME/.agent-ide/checks/<16 hex blake3(repository key)>/<16 hex blake3(canonical worktree)>/<language>`
   (0700), so they survive daemon idle stops and crashes. At daemon start, cache directories whose
@@ -91,9 +99,11 @@ Every project check process is started through one spawn path:
   process fork/exec, `sysctl-read`, `file-read-data (literal "/")`, `file-read-metadata (subpath
   "/")` (required on macOS 27, otherwise children abort with SIGABRT), read of system paths,
   **read-only** of the admitted worktree root, read of the configured toolchain directories
-  (Rust: `toolchain_dir`, `cargo_home`, the derived rustup home; Python: the node install root,
-  the pyright package root, the venv root and the canonical base interpreter prefix) and
-  `/private/etc`, read+write of the check's private cache directory and a private temp directory.
+  (Rust: `toolchain_dir`, `cargo_home`, the derived rustup home, the resolved or configured Apple
+  developer directory and its `xcode_select_link`/`CommandLineTools` companions (T05B); Python:
+  the node install root, the pyright package root, the venv root and the canonical base
+  interpreter prefix) and `/private/etc`, read+write of the check's private cache directory and a
+  private temp directory.
 - Own process group; on cancel, timeout (`check_timeout_s`) or daemon shutdown the whole group is
   killed (SIGTERM, 2 s, SIGKILL) and reaped. No pattern-based kill of processes the daemon did not
   start.
@@ -121,7 +131,9 @@ pub struct ProblemSnapshot { pub language: Language, pub state: CheckState,
                              pub errors: u32, pub warnings: u32,
                              pub problems: Vec<Problem> /* <= 500, sorted: errors first, path, line */,
                              pub truncated: bool, pub input_generation: u64,
-                             pub duration_ms: u64 }
+                             pub duration_ms: u64,
+                             pub detail: Option<String> /* T05B: bounded cause, e.g. a build
+                                                            failure's first `error:` line */ }
 ```
 
 `errors`/`warnings` count all deduplicated problems even when `problems` is truncated.
@@ -139,6 +151,11 @@ pub struct ProblemSnapshot { pub language: Language, pub state: CheckState,
   `--all-targets` repeats a diagnostic for lib and lib-test units.
 - `Ready` requires the final `build-finished` message. If any compilation unit failed so dependent
   units produced no result, state is `Partial`. Missing `build-finished` → `Unavailable(Fatal)`.
+- `build-finished.success: false` with zero deduplicated errors (T05B: a build failure with no
+  diagnostic to show, for example a build-script failure such as `blake3`'s `cc` invocation
+  failing) is also `Unavailable(Fatal)`, never `Ready`: counts are never fabricated for a run that
+  did not actually compile the workspace. The snapshot's `detail` carries the first `error:` line
+  of cargo's stderr (trimmed to 160 bytes) when one is present.
 - `CARGO_TARGET_DIR` is the check's private cache dir for that worktree.
 - Missing `cargo` in `toolchain_dir` → `Unavailable(ToolMissing)`.
 
@@ -210,9 +227,13 @@ Parameters: `{"kind": "problems", "language": "rust" | "python" (optional), "off
 `path` is not required for this kind; any other `kind` value or absent `kind` keeps v0.2 behaviour.
 Reply: per language the state, counts, and up to 20 problems from `offset`, each
 `path:line:column severity [code] message`, plus `next_offset` when more exist. Messages are
-untrusted text. No new tool and no new `AssistanceMethod`. The problems kind is answered from the
-daemon's in-memory snapshots for the caller's bound worktree on every host; it is never dispatched
-to the Claude foreground helper and needs no provider.
+untrusted text. An `unavailable:<reason>` state line carrying a [`ProblemSnapshot::detail`] (T05B)
+appends it in parentheses, for example `rust: unavailable:fatal (error: failed to run custom
+build command for \`blake3 v1.5.0\`)`; a snapshot with no detail renders exactly as before. This
+detail is never included in the `<agent-ide>` block (§6), which stays within its 256-byte cap. No
+new tool and no new `AssistanceMethod`. The problems kind is answered from the daemon's in-memory
+snapshots for the caller's bound worktree on every host; it is never dispatched to the Claude
+foreground helper and needs no provider.
 
 ## 8. Telemetry
 

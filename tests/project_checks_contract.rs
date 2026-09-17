@@ -61,7 +61,8 @@ fn rust_request(root: &Path, with_lockfile: bool) -> CheckRequest {
 ///
 /// The toolchain directory sits at `<root>/toolchains/tc` with a placeholder `bin/cargo`, so
 /// the derived rustup home is `<root>`; no real process ever runs because `FakeRunner` replays
-/// scripted outputs.
+/// scripted outputs. The developer directory is overridden to a scratch directory so spec
+/// assertions never depend on whether this machine has Xcode or the Command Line Tools installed.
 fn rust_checker(root: &Path, runner: FakeRunner) -> RustChecker {
     let toolchain_dir = rust_toolchain(root, true);
     RustChecker::new(
@@ -69,7 +70,29 @@ fn rust_checker(root: &Path, runner: FakeRunner) -> RustChecker {
         toolchain_dir,
         None,
         Duration::from_secs(300),
+        Some(rust_developer_dir(root)),
     )
+}
+
+/// Creates and returns `<root>/developer`, a deterministic stand-in for the Apple developer
+/// directory (EYES-r2 §3, T05B).
+fn rust_developer_dir(root: &Path) -> PathBuf {
+    let dir = root.join("developer");
+    fs::create_dir_all(&dir).expect("developer dir creates");
+    dir
+}
+
+/// Returns the fixed extra Apple developer read roots (`/private/var/db/xcode_select_link`,
+/// `/Library/Developer/CommandLineTools`) that are only present when they exist on this real
+/// filesystem, mirroring [`RustChecker::cargo_check_spec`]'s own existence check.
+fn existing_literal_developer_roots() -> Vec<PathBuf> {
+    [
+        PathBuf::from("/private/var/db/xcode_select_link"),
+        PathBuf::from("/Library/Developer/CommandLineTools"),
+    ]
+    .into_iter()
+    .filter(|path| path.exists())
+    .collect()
 }
 
 /// Creates the toolchain directory `<root>/toolchains/tc`, with a placeholder `bin/cargo` file
@@ -145,16 +168,16 @@ fn rust_cargo_check_spec_matches_confined_contract() {
             ("CARGO_NET_OFFLINE".to_owned(), "true".to_owned()),
         ]
     );
-    assert_eq!(
-        spec.read_roots,
-        vec![
-            request.worktree.clone(),
-            toolchain.clone(),
-            rust_home().join(".cargo"),
-            root.clone(),
-            PathBuf::from("/private/etc"),
-        ]
-    );
+    let mut expected_read_roots = vec![
+        request.worktree.clone(),
+        toolchain.clone(),
+        rust_home().join(".cargo"),
+        root.clone(),
+        PathBuf::from("/private/etc"),
+        rust_developer_dir(&root),
+    ];
+    expected_read_roots.extend(existing_literal_developer_roots());
+    assert_eq!(spec.read_roots, expected_read_roots);
     assert_eq!(spec.write_roots, vec![root.join("cache")]);
     assert_eq!(spec.timeout, Duration::from_secs(300));
     assert_eq!(spec.max_output_bytes, 64 * 1024 * 1024);
@@ -202,6 +225,7 @@ fn rust_cargo_check_spec_honors_explicit_cargo_home() {
         toolchain_dir.clone(),
         Some(cargo_home.clone()),
         Duration::from_secs(300),
+        Some(rust_developer_dir(&root)),
     );
     let spec = checker.cargo_check_spec(&request);
     assert_eq!(spec.read_roots[2], cargo_home);
@@ -221,18 +245,19 @@ fn rust_cargo_check_spec_falls_back_to_home_rustup() {
         toolchain_dir.clone(),
         None,
         Duration::from_secs(300),
+        Some(rust_developer_dir(&root)),
     );
     let spec = checker.cargo_check_spec(&request);
-    assert_eq!(
-        spec.read_roots,
-        vec![
-            request.worktree.clone(),
-            toolchain_dir.clone(),
-            rust_home().join(".cargo"),
-            rust_home().join(".rustup"),
-            PathBuf::from("/private/etc"),
-        ]
-    );
+    let mut expected_read_roots = vec![
+        request.worktree.clone(),
+        toolchain_dir.clone(),
+        rust_home().join(".cargo"),
+        rust_home().join(".rustup"),
+        PathBuf::from("/private/etc"),
+        rust_developer_dir(&root),
+    ];
+    expected_read_roots.extend(existing_literal_developer_roots());
+    assert_eq!(spec.read_roots, expected_read_roots);
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -257,6 +282,7 @@ async fn rust_check_reports_tool_missing_without_cargo_binary() {
         rust_toolchain(&root, false),
         None,
         Duration::from_secs(300),
+        Some(rust_developer_dir(&root)),
     );
     let snapshot = checker.check(request).await;
     assert_eq!(
@@ -332,7 +358,7 @@ async fn rust_check_clean_stream_is_ready_with_deduped_warning() {
 /// duration through verbatim.
 #[test]
 fn rust_parser_failure_stream_maps_partial_with_dedup() {
-    let snapshot = parse_cargo_messages(FAILURE_STREAM.as_bytes(), 7, 1234);
+    let snapshot = parse_cargo_messages(FAILURE_STREAM.as_bytes(), &[], 7, 1234);
     assert_eq!(snapshot.state, CheckState::Partial);
     assert_eq!(snapshot.errors, 1);
     assert_eq!(snapshot.warnings, 1);
@@ -344,18 +370,66 @@ fn rust_parser_failure_stream_maps_partial_with_dedup() {
 /// collapsed.
 #[test]
 fn rust_parser_clean_stream_maps_ready() {
-    let snapshot = parse_cargo_messages(CLEAN_STREAM.as_bytes(), 8, 20);
+    let snapshot = parse_cargo_messages(CLEAN_STREAM.as_bytes(), &[], 8, 20);
     assert_eq!(snapshot.state, CheckState::Ready);
     assert_eq!(snapshot.errors, 0);
     assert_eq!(snapshot.warnings, 1);
     assert_eq!(snapshot.problems.len(), 1);
 }
 
+/// Proves a `build-finished.success: false` stream with zero error-level diagnostics is
+/// `Unavailable(Fatal)`, never fabricated as `Ready` (T05B): a build-script failure such as
+/// `blake3`'s produces exactly this shape, and the first `error:` line of stderr becomes the
+/// snapshot's detail.
+#[test]
+fn rust_parser_failed_build_with_no_errors_is_fatal_with_stderr_detail() {
+    let stream = br#"{"reason":"build-finished","success":false}"#;
+    let stderr = b"Compiling blake3 v1.5.0\nerror: failed to run custom build command for `blake3 v1.5.0`\n\nCaused by:\n  process didn't exit successfully\n";
+    let snapshot = parse_cargo_messages(stream, stderr, 11, 99);
+    assert_eq!(
+        snapshot.state,
+        CheckState::Unavailable(UnavailableReason::Fatal)
+    );
+    assert_eq!(snapshot.errors, 0);
+    assert_eq!(snapshot.warnings, 0);
+    assert!(snapshot.problems.is_empty());
+    assert_eq!(snapshot.duration_ms, 0);
+    assert_eq!(
+        snapshot.detail.as_deref(),
+        Some("error: failed to run custom build command for `blake3 v1.5.0`")
+    );
+}
+
+/// Proves the same failed-build-with-no-errors shape without any `error:` line in stderr still
+/// reports `Unavailable(Fatal)`, with no detail rather than a guessed one.
+#[test]
+fn rust_parser_failed_build_with_no_errors_and_no_stderr_has_no_detail() {
+    let stream = br#"{"reason":"build-finished","success":false}"#;
+    let snapshot = parse_cargo_messages(stream, b"", 11, 99);
+    assert_eq!(
+        snapshot.state,
+        CheckState::Unavailable(UnavailableReason::Fatal)
+    );
+    assert_eq!(snapshot.detail, None);
+}
+
+/// Proves a stderr `error:` line longer than 160 bytes is truncated on a UTF-8 boundary.
+#[test]
+fn rust_parser_failed_build_detail_is_truncated_to_160_bytes() {
+    let stream = br#"{"reason":"build-finished","success":false}"#;
+    let long_suffix = "x".repeat(200);
+    let stderr = format!("error: {long_suffix}\n");
+    let snapshot = parse_cargo_messages(stream, stderr.as_bytes(), 1, 1);
+    let detail = snapshot.detail.expect("detail present");
+    assert!(detail.len() <= 160, "{}", detail.len());
+    assert!(stderr.starts_with(&detail));
+}
+
 /// Proves a stream without the terminal `build-finished` event is `Unavailable(Fatal)` with
 /// zero counts.
 #[test]
 fn rust_parser_stream_without_build_finished_is_fatal() {
-    let snapshot = parse_cargo_messages(TRUNCATED_STREAM.as_bytes(), 9, 55);
+    let snapshot = parse_cargo_messages(TRUNCATED_STREAM.as_bytes(), &[], 9, 55);
     assert_eq!(
         snapshot.state,
         CheckState::Unavailable(UnavailableReason::Fatal)
@@ -482,4 +556,81 @@ async fn rust_check_lockfile_stderr_is_env_missing() {
     let snapshot = control_checker.check(control_request).await;
     assert_eq!(snapshot.state, CheckState::Partial);
     let _ = fs::remove_dir_all(&control_root);
+}
+
+/// Proves a completed run whose build failed with no error-level diagnostics is
+/// `Unavailable(Fatal)` end to end (T05B), never fabricated as `Ready`, and carries the first
+/// `error:` line of stderr as the snapshot detail.
+#[tokio::test]
+async fn rust_check_failed_build_with_no_errors_is_fatal_not_ready() {
+    let root = rust_scratch("build-failed-no-errors");
+    let request = rust_request(&root, true);
+    let checker = rust_checker(
+        &root,
+        FakeRunner::new(vec![Ok(RunOutput {
+            status: Some(101),
+            stdout: br#"{"reason":"build-finished","success":false}"#.to_vec(),
+            stderr: b"error: failed to run custom build command for `blake3 v1.5.0`\n".to_vec(),
+            ..RunOutput::default()
+        })]),
+    );
+    let snapshot = checker.check(request).await;
+    assert_eq!(
+        snapshot.state,
+        CheckState::Unavailable(UnavailableReason::Fatal)
+    );
+    assert_eq!(snapshot.errors, 0);
+    assert_eq!(snapshot.warnings, 0);
+    assert_eq!(
+        snapshot.detail.as_deref(),
+        Some("error: failed to run custom build command for `blake3 v1.5.0`")
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Proves the confined spec's read roots include the configured developer directory override
+/// (T05B, EYES-r2 §3), so a build script's `cc` invocation can resolve through it.
+#[test]
+fn rust_cargo_check_spec_includes_configured_developer_dir() {
+    let root = rust_scratch("developer-dir-configured");
+    let request = rust_request(&root, true);
+    let developer_dir = root.join("custom-xcode");
+    fs::create_dir_all(&developer_dir).expect("developer dir creates");
+    let checker = RustChecker::new(
+        Arc::new(FakeRunner::default()),
+        rust_toolchain(&root, true),
+        None,
+        Duration::from_secs(300),
+        Some(developer_dir.clone()),
+    );
+    let spec = checker.cargo_check_spec(&request);
+    assert!(
+        spec.read_roots.contains(&developer_dir),
+        "{:?}",
+        spec.read_roots
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Proves a `developer_dir` override that does not exist on disk is not trusted verbatim: the
+/// checker falls back to its own resolution instead of admitting a nonexistent read root.
+#[test]
+fn rust_cargo_check_spec_ignores_nonexistent_developer_dir_override() {
+    let root = rust_scratch("developer-dir-missing-override");
+    let request = rust_request(&root, true);
+    let bogus_developer_dir = root.join("does-not-exist");
+    let checker = RustChecker::new(
+        Arc::new(FakeRunner::default()),
+        rust_toolchain(&root, true),
+        None,
+        Duration::from_secs(300),
+        Some(bogus_developer_dir.clone()),
+    );
+    let spec = checker.cargo_check_spec(&request);
+    assert!(
+        !spec.read_roots.contains(&bogus_developer_dir),
+        "{:?}",
+        spec.read_roots
+    );
+    let _ = fs::remove_dir_all(&root);
 }

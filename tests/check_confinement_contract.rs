@@ -167,6 +167,46 @@ fn config_rejects_relative_rust_cargo_home() {
     }
 }
 
+/// An explicit `rust.developer_dir` parses into the accessor, and an absent one stays `None`
+/// (T05B: optional, defaulting to the `xcode-select -p` resolution).
+#[test]
+fn config_rust_developer_dir_parses_when_present_and_stays_none_when_absent() {
+    let mut config = v02_config();
+    config["allowed_roots"] = json!(["/private/tmp/worktree"]);
+    config["project_checks"] = json!({
+        "rust": {"toolchain_dir": "/private/tmp/toolchain", "developer_dir": "/private/tmp/xcode"}
+    });
+    let loaded = LauncherConfig::parse(config.to_string().as_bytes()).unwrap();
+    let rust = loaded.project_checks().unwrap().rust().unwrap();
+    assert_eq!(
+        rust.developer_dir(),
+        Some(std::path::Path::new("/private/tmp/xcode"))
+    );
+
+    config["project_checks"] = json!({"rust": {"toolchain_dir": "/private/tmp/toolchain"}});
+    let loaded = LauncherConfig::parse(config.to_string().as_bytes()).unwrap();
+    let rust = loaded.project_checks().unwrap().rust().unwrap();
+    assert_eq!(rust.developer_dir(), None);
+}
+
+/// Relative or `..`-escaping `rust.developer_dir` declarations are rejected at parse time.
+#[test]
+fn config_rejects_relative_rust_developer_dir() {
+    let mut config = v02_config();
+    config["allowed_roots"] = json!(["/private/tmp/worktree"]);
+    for rust in [
+        json!({"toolchain_dir": "/private/tmp/toolchain", "developer_dir": "relative/xcode"}),
+        json!({"toolchain_dir": "/private/tmp/toolchain", "developer_dir": "/private/tmp/../xcode"}),
+    ] {
+        config["project_checks"] = json!({"rust": rust});
+        assert!(
+            LauncherConfig::parse(config.to_string().as_bytes()).is_err(),
+            "rust={:?} must be rejected",
+            config["project_checks"]
+        );
+    }
+}
+
 /// Absent project-check timing and language fields fall back to the contract defaults.
 #[test]
 fn config_project_check_defaults_apply_when_optional_fields_absent() {

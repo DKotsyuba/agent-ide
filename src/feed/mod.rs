@@ -337,6 +337,7 @@ mod tests {
             truncated: false,
             input_generation: 1,
             duration_ms: 1,
+            detail: None,
         }
     }
 

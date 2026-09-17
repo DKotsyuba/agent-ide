@@ -501,6 +501,10 @@ pub struct ProjectRustChecksConfig {
     /// Optional absolute normalized cargo home; `None` falls back to the default `$HOME/.cargo`.
     #[serde(default)]
     cargo_home: Option<PathBuf>,
+    /// Optional absolute normalized Apple developer directory override; `None` resolves it from
+    /// `/usr/bin/xcode-select -p` with the fixed fallbacks (T05B, EYES-r2 §3).
+    #[serde(default)]
+    developer_dir: Option<PathBuf>,
 }
 impl ProjectRustChecksConfig {
     /// Returns the declared absolute toolchain directory; never resolved from model or project input.
@@ -511,13 +515,24 @@ impl ProjectRustChecksConfig {
     pub fn cargo_home(&self) -> Option<&Path> {
         self.cargo_home.as_deref()
     }
-    /// Rejects a relative or lexically non-normal toolchain directory or cargo home at parse time.
+    /// Returns the declared absolute Apple developer directory override, or `None` to resolve it
+    /// from `/usr/bin/xcode-select -p` (T05B).
+    pub fn developer_dir(&self) -> Option<&Path> {
+        self.developer_dir.as_deref()
+    }
+    /// Rejects a relative or lexically non-normal toolchain directory, cargo home or developer
+    /// directory at parse time.
     fn validate(&self) -> Result<(), LauncherError> {
         if !absolute(&self.toolchain_dir) {
             return Err(LauncherError::Rejected);
         }
         if let Some(cargo_home) = &self.cargo_home
             && !absolute(cargo_home)
+        {
+            return Err(LauncherError::Rejected);
+        }
+        if let Some(developer_dir) = &self.developer_dir
+            && !absolute(developer_dir)
         {
             return Err(LauncherError::Rejected);
         }

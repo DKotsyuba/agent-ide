@@ -48,6 +48,9 @@ pub struct RustChecker {
     cargo_home: Option<PathBuf>,
     /// Wall-clock limit handed to the runner for each cargo run.
     timeout: Duration,
+    /// Apple developer directory read roots resolved once at construction (see
+    /// [`resolve_developer_roots`]); `/usr/bin/cc` is an `xcrun` shim and cannot run without them.
+    developer_roots: Vec<PathBuf>,
 }
 
 impl RustChecker {
@@ -57,17 +60,25 @@ impl RustChecker {
     /// missing, [`RustChecker::check`] reports [`UnavailableReason::ToolMissing`]. `cargo_home`
     /// overrides the cargo home read root; `None` means `$HOME/.cargo`. `timeout` bounds each
     /// cargo run; expiry yields [`UnavailableReason::Timeout`] (the runner kills the group).
+    /// `developer_dir` is the operator-declared `project_checks.rust.developer_dir` override; when
+    /// absent (or the override does not exist) it is resolved from `/usr/bin/xcode-select -p`,
+    /// falling back to `/Applications/Xcode.app/Contents/Developer` then
+    /// `/Library/Developer/CommandLineTools`, plus `/private/var/db/xcode_select_link` and
+    /// `/Library/Developer/CommandLineTools` when they exist, on the read roots this checker
+    /// resolves once at construction.
     pub fn new(
         runner: Arc<dyn ConfinedRunner>,
         toolchain_dir: PathBuf,
         cargo_home: Option<PathBuf>,
         timeout: Duration,
+        developer_dir: Option<PathBuf>,
     ) -> Self {
         Self {
             runner,
             toolchain_dir,
             cargo_home,
             timeout,
+            developer_roots: resolve_developer_roots(developer_dir),
         }
     }
 
@@ -80,10 +91,12 @@ impl RustChecker {
     /// [`UnavailableReason::EnvMissing`] in [`RustChecker::check`]. The environment is
     /// rebuilt from the allowlist: `PATH` limited to toolchain bins plus the system dirs,
     /// `HOME`, `TMPDIR`/`CARGO_TARGET_DIR` under the private cache, and `CARGO_NET_OFFLINE=true`.
-    /// Read roots cover the worktree, the toolchain, the cargo home, the derived rustup home and
-    /// `/private/etc`; the private cache is the only write root; each output stream is capped at
-    /// `MAX_OUTPUT_BYTES`. The construction is pure with respect to the process environment:
-    /// its only inputs are the checker configuration and `request`.
+    /// Read roots cover the worktree, the toolchain, the cargo home, the derived rustup home,
+    /// `/private/etc` and this checker's resolved Apple developer directory roots (build scripts
+    /// such as `blake3`'s invoke `/usr/bin/cc`, an `xcrun` shim that needs the Apple developer
+    /// directory to run at all); the private cache is the only write root; each output stream is
+    /// capped at `MAX_OUTPUT_BYTES`. The construction is pure with respect to the process
+    /// environment: its only inputs are the checker configuration and `request`.
     pub fn cargo_check_spec(&self, request: &CheckRequest) -> RunSpec {
         let home = real_home();
         let cargo_home = self.effective_cargo_home(&home);
@@ -124,13 +137,16 @@ impl RustChecker {
                 ),
                 ("CARGO_NET_OFFLINE".to_owned(), "true".to_owned()),
             ],
-            read_roots: vec![
+            read_roots: [
                 request.worktree.clone(),
                 self.toolchain_dir.clone(),
                 cargo_home,
                 rustup_home,
                 PathBuf::from(ETC_READ_ROOT),
-            ],
+            ]
+            .into_iter()
+            .chain(self.developer_roots.iter().cloned())
+            .collect(),
             write_roots: vec![request.cache_dir.clone()],
             timeout: self.timeout,
             max_output_bytes: MAX_OUTPUT_BYTES,
@@ -177,6 +193,65 @@ fn derived_rustup_home(toolchain_dir: &Path, home: &Path) -> PathBuf {
         current = parent;
     }
     home.join(".rustup")
+}
+
+/// Resolves the Apple developer directory read roots for the confined cargo run.
+///
+/// A build script that compiles native code (for example `blake3`'s) runs `/usr/bin/cc`, which
+/// is an `xcrun` shim: without read access to the active Xcode/Command Line Tools installation it
+/// fails immediately, before producing any `compiler-message`, which [`parse_cargo_messages`]
+/// would otherwise have no choice but to treat as a build failure with no diagnostics.
+///
+/// `override_dir` is the operator-declared `project_checks.rust.developer_dir`; when it names an
+/// existing directory it is the sole primary root and no `xcode-select` query runs. Otherwise the
+/// primary root comes from [`xcode_select_developer_dir`]. Beyond the primary root,
+/// `/private/var/db/xcode_select_link` and `/Library/Developer/CommandLineTools` are always
+/// appended when they exist (deduplicated against the primary root), because `/usr/bin/cc`
+/// resolves through that symlink database independently of which developer directory
+/// `xcode-select` currently reports. Only roots that exist on this filesystem are ever returned,
+/// so a machine with neither Xcode nor the Command Line Tools installed adds no read root at all
+/// (a build script that needs a C compiler still fails, just as it would unconfined).
+fn resolve_developer_roots(override_dir: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let primary = override_dir
+        .filter(|dir| dir.is_dir())
+        .or_else(xcode_select_developer_dir);
+    if let Some(primary) = primary {
+        roots.push(primary);
+    }
+    for candidate in [
+        PathBuf::from("/private/var/db/xcode_select_link"),
+        PathBuf::from("/Library/Developer/CommandLineTools"),
+    ] {
+        if candidate.exists() && !roots.contains(&candidate) {
+            roots.push(candidate);
+        }
+    }
+    roots
+}
+
+/// Runs `/usr/bin/xcode-select -p` and returns its trimmed stdout as an existing directory.
+///
+/// Falls back in order to `/Applications/Xcode.app/Contents/Developer` then
+/// `/Library/Developer/CommandLineTools` when the query fails, exits non-zero, prints non-UTF-8
+/// or non-existent output; returns `None` when neither fallback exists either.
+fn xcode_select_developer_dir() -> Option<PathBuf> {
+    std::process::Command::new("/usr/bin/xcode-select")
+        .arg("-p")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|stdout| PathBuf::from(stdout.trim()))
+        .filter(|path| path.is_dir())
+        .or_else(|| existing_dir("/Applications/Xcode.app/Contents/Developer"))
+        .or_else(|| existing_dir("/Library/Developer/CommandLineTools"))
+}
+
+/// Returns `path` as a [`PathBuf`] when it names an existing directory, otherwise `None`.
+fn existing_dir(path: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(path);
+    path.is_dir().then_some(path)
 }
 
 impl Checker for RustChecker {
@@ -265,7 +340,12 @@ fn map_run_output(request: &CheckRequest, output: &RunOutput, duration_ms: u64) 
             request.input_generation,
         );
     }
-    parse_cargo_messages(&output.stdout, request.input_generation, duration_ms)
+    parse_cargo_messages(
+        &output.stdout,
+        &output.stderr,
+        request.input_generation,
+        duration_ms,
+    )
 }
 
 /// Reports whether cargo stderr says the lockfile could not be updated or written.
@@ -295,16 +375,22 @@ fn lockfile_write_failure(stderr: &[u8]) -> bool {
 /// lib-test unit, and the repetition collapses there.
 ///
 /// State heuristic (EYES-r2 §4): a missing terminal `build-finished` event means cargo never
-/// completed the run, which is [`UnavailableReason::Fatal`]. Otherwise the snapshot is
+/// completed the run, which is [`UnavailableReason::Fatal`]. A terminal `build-finished.success:
+/// false` with zero deduplicated errors — a build failure with no diagnostics to show, for
+/// example a build-script failure such as `blake3`'s invoking a `cc` it cannot read — is also
+/// [`UnavailableReason::Fatal`], carrying the first `error:` line of `stderr` (trimmed to 160
+/// bytes) as [`ProblemSnapshot::detail`] when one is present; counts must never be fabricated as
+/// `Ready` for a build that did not actually compile the workspace. Otherwise the snapshot is
 /// [`CheckState::Partial`] exactly when `build-finished.success` is `false`, at least one
 /// deduplicated error exists, and at least one package that produced `compiler-message` events
 /// produced no `compiler-artifact`. With `--keep-going` that set is the failed package plus any
 /// dependents cargo skipped; because skipped dependents never appear in the stream at all, the
-/// failed package's own missing artifact is the observable marker of skipped coverage. A
-/// successful build, or a failed build without error-level diagnostics (for example a
-/// build-script failure), is [`CheckState::Ready`].
+/// failed package's own missing artifact is the observable marker of skipped coverage. Every
+/// other outcome — a successful build, or a failed build whose errors are all covered by that
+/// `Partial` rule — is [`CheckState::Ready`].
 pub fn parse_cargo_messages(
-    stream: &[u8],
+    stdout: &[u8],
+    stderr: &[u8],
     input_generation: u64,
     duration_ms: u64,
 ) -> ProblemSnapshot {
@@ -313,7 +399,7 @@ pub fn parse_cargo_messages(
     let mut artifact_packages: HashSet<String> = HashSet::new();
     let mut build_finished: Option<bool> = None;
 
-    for line in stream.split(|&byte| byte == b'\n') {
+    for line in stdout.split(|&byte| byte == b'\n') {
         if line.iter().all(|byte| byte.is_ascii_whitespace()) {
             continue;
         }
@@ -355,6 +441,14 @@ pub fn parse_cargo_messages(
         input_generation,
         duration_ms,
     );
+    if !success && base.errors == 0 {
+        return ProblemSnapshot::unavailable_with_detail(
+            Language::Rust,
+            UnavailableReason::Fatal,
+            input_generation,
+            first_error_line(stderr),
+        );
+    }
     let state = if !success
         && base.errors > 0
         && message_packages
@@ -366,6 +460,34 @@ pub fn parse_cargo_messages(
         CheckState::Ready
     };
     ProblemSnapshot { state, ..base }
+}
+
+/// Extracts the first `error:`-prefixed line of cargo stderr, trimmed to at most 160 bytes.
+///
+/// Used only to explain an [`UnavailableReason::Fatal`] snapshot produced by a failed build with
+/// no error-level diagnostics: cargo's own summary line (for example `error: failed to run custom
+/// build command for \`blake3 v1.5.0\``) is the most actionable cause available without running
+/// an unbounded, untrusted stderr stream through the feed. Returns `None` when no line starts
+/// with `error:` after trimming, so a build failure with no such line simply carries no detail.
+fn first_error_line(stderr: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stderr);
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("error:"))?;
+    Some(truncate_bytes(line, 160))
+}
+
+/// Truncates `value` to at most `max_bytes` UTF-8 bytes, cutting only on a whole character.
+fn truncate_bytes(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
 }
 
 /// Converts one rustc diagnostic to a [`Problem`], or `None` when it must not be counted.

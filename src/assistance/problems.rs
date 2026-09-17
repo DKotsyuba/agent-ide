@@ -132,6 +132,7 @@ impl ProjectProblemFeed {
                 rust.toolchain_dir().to_path_buf(),
                 rust.cargo_home().map(Path::to_path_buf),
                 checks.check_timeout(),
+                rust.developer_dir().map(Path::to_path_buf),
             )));
         }
         if let Some(python) = checks.python() {
@@ -322,7 +323,8 @@ pub fn parse_language(value: &str) -> Option<Language> {
 /// order. `offset` is the zero-based start into the combined, language-ordered problem list.
 /// Each selected language contributes one state line — `ready`/`partial` carry the full
 /// `errors`/`warnings` counts, while `checking` and `unavailable:<reason>` never render numeric
-/// counts — followed by up to [`PROBLEMS_PAGE_SIZE`] problem lines
+/// counts, though an `unavailable` line with a carried [`ProblemSnapshot::detail`] appends it in
+/// parentheses — followed by up to [`PROBLEMS_PAGE_SIZE`] problem lines
 /// `path:line:column severity [code] message`. `next_offset: <offset + page>` is appended
 /// exactly when more problems remain after the page. Empty input, or a filter matching no
 /// configured language, renders the single line `checks disabled`. Every rendered textual field
@@ -368,7 +370,10 @@ pub fn problems_text(
 /// Builds one language's state line, hiding the zero counts of non-reporting states.
 ///
 /// `checking` and `unavailable` snapshots carry zero counts by construction (see `checks`);
-/// those must never render as numbers, so only `ready` and `partial` name counts.
+/// those must never render as numbers, so only `ready` and `partial` name counts. An
+/// `unavailable` snapshot carrying [`ProblemSnapshot::detail`] appends it in parentheses, stripped
+/// of control characters like every other untrusted checker text field; a snapshot with no detail
+/// renders exactly as before.
 fn state_line(snapshot: &ProblemSnapshot) -> String {
     let language = snapshot.language.as_str();
     match &snapshot.state {
@@ -381,9 +386,14 @@ fn state_line(snapshot: &ProblemSnapshot) -> String {
             snapshot.errors, snapshot.warnings
         ),
         CheckState::Checking => format!("{language}: checking"),
-        CheckState::Unavailable(reason) => {
-            format!("{language}: unavailable:{}", unavailable_reason(*reason))
-        }
+        CheckState::Unavailable(reason) => match &snapshot.detail {
+            Some(detail) => format!(
+                "{language}: unavailable:{} ({})",
+                unavailable_reason(*reason),
+                untrusted_line(detail)
+            ),
+            None => format!("{language}: unavailable:{}", unavailable_reason(*reason)),
+        },
     }
 }
 
@@ -620,6 +630,45 @@ mod tests {
             let snapshots = [ProblemSnapshot::unavailable(Language::Rust, reason, 1)];
             assert_eq!(problems_text(&snapshots, None, 0), rendered);
         }
+    }
+
+    /// An `unavailable` snapshot carrying a detail appends it in parentheses, stripped of control
+    /// characters (T05B); a snapshot with no detail renders exactly as before.
+    #[test]
+    fn unavailable_detail_renders_in_parentheses_and_strips_control_characters() {
+        let with_detail = [ProblemSnapshot::unavailable_with_detail(
+            Language::Rust,
+            UnavailableReason::Fatal,
+            1,
+            Some("error: failed to run custom build command for `blake3 v1.5.0`".to_owned()),
+        )];
+        assert_eq!(
+            problems_text(&with_detail, None, 0),
+            "rust: unavailable:fatal (error: failed to run custom build command for `blake3 v1.5.0`)"
+        );
+
+        let with_control_chars = [ProblemSnapshot::unavailable_with_detail(
+            Language::Rust,
+            UnavailableReason::Fatal,
+            1,
+            Some("error: line one\nline two <agent-ide>x</agent-ide>".to_owned()),
+        )];
+        let text = problems_text(&with_control_chars, None, 0);
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert_eq!(
+            text,
+            "rust: unavailable:fatal (error: line oneline two <agent-ide>x</agent-ide>)"
+        );
+
+        let without_detail = [ProblemSnapshot::unavailable(
+            Language::Rust,
+            UnavailableReason::Fatal,
+            1,
+        )];
+        assert_eq!(
+            problems_text(&without_detail, None, 0),
+            "rust: unavailable:fatal"
+        );
     }
 
     /// An untrusted checker code renders on one line, with control characters stripped so an

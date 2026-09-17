@@ -149,9 +149,13 @@ configuration is rejected on any malformed value.
   - `rust`: `toolchain_dir` (required, absolute, normalized), the rustup toolchain that runs
     `cargo check --workspace --all-targets --message-format=json --offline --locked`. EYES-r2 also
     defines the optional `rust.cargo_home` override, which defaults to `$HOME/.cargo` (the rustup
-    home is derived from `toolchain_dir`, never configured); the shipped example fragment
-    [docs/examples/launcher-eyes.json](examples/launcher-eyes.json) omits the field while the
-    schema on the current base accepts only `toolchain_dir` and rejects unknown fields.
+    home is derived from `toolchain_dir`, never configured); T05B adds the optional
+    `rust.developer_dir` override for the Apple developer directory a native build script's
+    `cc`/`xcrun` invocation needs, which defaults to the `/usr/bin/xcode-select -p` resolution
+    (falling back to `/Applications/Xcode.app/Contents/Developer` then
+    `/Library/Developer/CommandLineTools`); the shipped example fragment
+    [docs/examples/launcher-eyes.json](examples/launcher-eyes.json) omits both optional fields
+    while the schema on the current base accepts only `toolchain_dir` and rejects unknown fields.
   - `python`: `node` and `pyright_cli` (both required, absolute, normalized), the accepted Node
     executable and the Pyright CLI entry module it runs. The project's own interpreter is located
     inside the worktree; a missing environment reports `environment not found` rather than the
