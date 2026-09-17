@@ -1528,3 +1528,137 @@ async fn claude_problems_context_short_circuits_before_helper_mint() {
     ));
     assert!(dispatcher.launches.lock().unwrap().is_empty());
 }
+
+/// Builds a managed-Codex dispatcher with one established start binding for the read-boundary
+/// short-circuit test, mirroring [`claude_race_fixture`] for the Codex host contract.
+#[cfg(test)]
+fn codex_problems_fixture() -> (ProductDispatcher, super::host_binding::BindingRef, String) {
+    use crate::execution::{D03ProfileEvidence, HostSandboxState, PersistedProfileRecord};
+
+    let sandbox = HostSandboxState::parse(Some(json!({
+        "permissionProfile":{"type":"disabled"},
+        "codexLinuxSandboxExe":null,
+        "sandboxCwd":"/private/tmp",
+        "useLegacyLandlock":false
+    })))
+    .unwrap();
+    let record = PersistedProfileRecord::from_execution_evidence(
+        "codex-profile",
+        1,
+        D03ProfileEvidence {
+            provider_binary: "codex-git".into(),
+            toolchain: "codex-toolchain".into(),
+            configuration: "default".into(),
+            trust: "codex-local".into(),
+            transport: "direct".into(),
+            d03_evidence: "codex-d03".into(),
+        },
+        &sandbox,
+    )
+    .unwrap();
+    let git = "/usr/bin/git";
+    let executable = json!({
+        "path":git,
+        "identity":"codex-git",
+        "blake3":blake3::hash(&std::fs::read(git).unwrap()).to_hex().to_string()
+    });
+    let launcher = LauncherConfig::parse(
+        json!({
+            "version":1,
+            "limits":{"queued":8,"details":8,"operation_ms":1000,"output_bytes":4096},
+            "targets":[{
+                "attachment":"codex-attachment",
+                "candidate":"/private/tmp/codex-worktree",
+                "git":executable,
+                "codex":executable,
+                "providers":[],
+                "profiles":[{
+                    "record":serde_json::from_str::<Value>(&record.to_json()).unwrap(),
+                    "sandbox_state":serde_json::from_str::<Value>(sandbox.sandbox_state_json()).unwrap()
+                }],
+                "allow_disabled_host":true
+            }]
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+    let dispatcher = ProductDispatcher::with_managed_codex_launcher(launcher);
+    *dispatcher.runtime_dir.lock().unwrap() = Some(std::path::PathBuf::from("/private/tmp"));
+    let channel = dispatcher.channel("codex-attachment").unwrap();
+    let actor_id = "codex-actor".to_owned();
+    let meta = json!({
+        "threadId": actor_id,
+        "callId": "codex-start",
+        "x-codex-turn-metadata": {}
+    });
+    let candidate = parse_candidate(meta.as_object().unwrap()).unwrap();
+    let BindingStatus::Validated(invocation) = dispatcher
+        .bindings
+        .lock()
+        .unwrap()
+        .establish_managed_codex_start(candidate, channel)
+    else {
+        panic!("codex fixture binding must establish");
+    };
+    let binding = invocation.binding_ref().clone();
+    (dispatcher, binding, actor_id)
+}
+
+/// EYES-r2: a `kind: "problems"` context call on the managed-Codex path never runs native
+/// read-boundary reconciliation. It must route directly into the worker's in-memory problem
+/// source — with no started worker task that path fails at enqueue (`internal`) — while the
+/// removed short-circuit would have first requested reconciliation via
+/// [`super::worker::WorkerHandle::managed_read_boundary`], which coalesces into a native change
+/// hint this test can observe directly on the binding guard.
+#[tokio::test]
+async fn managed_codex_problems_context_short_circuits_before_read_boundary_reconciliation() {
+    let (dispatcher, binding, actor_id) = codex_problems_fixture();
+    let call_id = "codex-problems-call-1";
+    let request = crate::app::transport::MethodDispatch::new(
+        "codex-problems-request".to_owned(),
+        call_id.to_owned(),
+        "codex-attachment".to_owned(),
+        AssistanceMethod::Context,
+        crate::app::transport::OpaqueJson::from_value(
+            &json!({
+                "parameters": {"kind":"problems"},
+                "host_meta": {
+                    "threadId": actor_id,
+                    "callId": call_id,
+                    "x-codex-turn-metadata": {},
+                    "codex/sandbox-state-meta": {
+                        "permissionProfile":{"type":"disabled"},
+                        "codexLinuxSandboxExe":null,
+                        "sandboxCwd":"/private/tmp",
+                        "useLegacyLandlock":false
+                    }
+                }
+            }),
+            64 * 1024,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let reply = dispatcher
+        .handle(&AssistanceDispatch::MethodDispatch(request))
+        .await
+        .expect("codex problems dispatch must produce a typed reply");
+    assert_eq!(
+        reply,
+        PeerReply::Error {
+            code: FailureCode::Internal
+        }
+    );
+    // The removed short-circuit would have called `managed_read_boundary`, which coalesces a
+    // registered-path reconciliation request into this exact native-hint slot.
+    assert_eq!(
+        dispatcher
+            .bindings
+            .lock()
+            .unwrap()
+            .take_native_change_hint(&binding),
+        Ok(false),
+        "problems short-circuit must skip managed-Codex read-boundary reconciliation"
+    );
+}
