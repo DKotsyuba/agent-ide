@@ -1669,8 +1669,8 @@ impl crate::workspace::git::snapshot::SnapshotRunner for HelperSnapshotRunner {
 mod tests {
     use super::*;
     use crate::assistance::claude_worker::{
-        AcceptedIdentity, Delivery, HELPER_PROTOCOL, HelperActor, HelperBudgets, HelperOperation,
-        LaunchRecognition,
+        AcceptedIdentity, Delivery, HELPER_PROTOCOL, HelperActor, HelperBaseline, HelperBudgets,
+        HelperJob, HelperOperation, HelperScope, LaunchRecognition,
     };
     use crate::assistance::host_binding::BindingRef;
     use crate::assistance::reply::FailureCode;
@@ -1767,6 +1767,126 @@ mod tests {
     }
 
     /// A launched helper claims once, runs real Git children, reaps them, and settles its frame.
+    /// Proves the daemon-minted Diff budget covers the snapshot's bounded per-path walk.
+    ///
+    /// A real repository with more tracked paths than the old per-operation process ceiling
+    /// used to exhaust the helper's child budget mid-walk and fail every Claude Diff closed as
+    /// `capacity` without any write. This regression runs the real helper Diff over a worktree
+    /// with more than sixty-four tracked paths using exactly the minted production ceilings, and
+    /// additionally shows the previous small budget fails on the same repository, so the budget
+    /// and the snapshot bound can never silently diverge again.
+    #[tokio::test]
+    async fn diff_helper_completes_the_bounded_snapshot_walk_of_a_real_repository() {
+        let candidate = worktree();
+        for index in 0..80 {
+            std::fs::write(
+                candidate.join(format!("file-{index:03}.txt")),
+                format!("tracked content {index}\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(candidate.join("changed.txt"), "before\n").unwrap();
+        let status = std::process::Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(&candidate)
+            .args([
+                "-c",
+                "user.name=helper",
+                "-c",
+                "user.email=helper@invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(["add", "--", "."])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = std::process::Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(&candidate)
+            .args([
+                "-c",
+                "user.name=helper",
+                "-c",
+                "user.email=helper@invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(["commit", "--quiet", "-m", "many tracked paths"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(candidate.join("changed.txt"), "after\n").unwrap();
+        let root_identity = crate::workspace::observation::native_directory_identity(
+            &std::fs::File::open(&candidate).unwrap(),
+        )
+        .expect("fixture worktree has a native root identity");
+        let diff_job = |processes: u32, output_bytes: usize| HelperJob {
+            protocol: HELPER_PROTOCOL,
+            operation: HelperOperation::Diff,
+            candidate: candidate.clone(),
+            git: PathBuf::from("/usr/bin/git"),
+            canonical_root: Some(candidate.clone()),
+            scope: Some(HelperScope {
+                worktree_id: "worktree".into(),
+                incarnation: 1,
+                root: candidate.clone(),
+                repository_root: candidate.clone(),
+                git_common_dir: PathBuf::from(".git"),
+                native_root_identity: root_identity,
+                authority_epoch: 1,
+            }),
+            baseline: Some(HelperBaseline {
+                reference: "baseline".into(),
+                captured: false,
+                digest: None,
+            }),
+            provider: None,
+            edit_source: None,
+            parameters: serde_json::json!({"mode":"head"}),
+            budgets: HelperBudgets {
+                output_bytes,
+                processes,
+                deadline_ms: 120_000,
+            },
+        };
+        // The previously minted ceiling cannot finish the walk of this repository and fails
+        // closed partway through its child budget instead of delivering any diff.
+        let (outcome, small, _, _) = perform(&diff_job(64, 64 * 1024), "detail").await;
+        assert!(
+            matches!(
+                outcome,
+                HelperOutcome::Failed {
+                    code: FailureCode::Capacity
+                } | HelperOutcome::Failed {
+                    code: FailureCode::SourceUnavailable
+                }
+            ),
+            "the small legacy budget must fail closed, saw {outcome:?}"
+        );
+        assert!(
+            small.spawned > 8,
+            "legacy budget consumed {}",
+            small.spawned
+        );
+        // The minted production ceilings complete the same walk and deliver a real diff.
+        let (outcome, children, _, payload) = perform(
+            &diff_job(
+                1024,
+                crate::workspace::git::snapshot::MAX_SNAPSHOT_BLOB_BYTES,
+            ),
+            "detail",
+        )
+        .await;
+        let HelperOutcome::Complete { text } = outcome else {
+            panic!("the bounded snapshot walk completes, saw {outcome:?}")
+        };
+        assert!(children.settled() && children.spawned > 64);
+        assert!(text.contains("changed.txt"), "diff text: {text}");
+        assert!(matches!(payload, Some(HelperPayload::Diff { .. })));
+        let _ = std::fs::remove_dir_all(&candidate);
+    }
+
     #[tokio::test]
     async fn launched_helper_runs_real_git_discovery_and_settles_its_children() {
         let candidate = worktree();

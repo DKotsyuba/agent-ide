@@ -251,11 +251,25 @@ impl ProductDispatcher {
             edit_source,
             parameters: parameters.clone(),
             budgets: HelperBudgets {
-                output_bytes: worker.limits().output_bytes,
+                // A Diff helper walks every tracked path of the snapshot scope, and each distinct
+                // blob costs one captured read child plus one verification child. The snapshot
+                // itself is bounded by MAX_SNAPSHOT_PATHS and MAX_SNAPSHOT_BLOB_BYTES, so the
+                // Diff ceilings below cover that whole bounded walk (a small fixed margin for the
+                // metadata queries) instead of the per-operation default, which real repositories
+                // with more than a few dozen tracked files would otherwise exceed and fail closed
+                // as `capacity` without any write.
+                output_bytes: if operation == HelperOperation::Diff {
+                    worker
+                        .limits()
+                        .output_bytes
+                        .max(crate::workspace::git::snapshot::MAX_SNAPSHOT_BLOB_BYTES)
+                } else {
+                    worker.limits().output_bytes
+                },
                 processes: match operation {
                     HelperOperation::Start => 6,
                     HelperOperation::Context => 2,
-                    HelperOperation::Diff => 64,
+                    HelperOperation::Diff => 1024,
                     HelperOperation::Edit => 2,
                 },
                 deadline_ms: worker.limits().operation_ms,

@@ -609,7 +609,7 @@ pub(super) fn open_root_directory(path: &Path) -> Result<File, ObservationError>
 
 /// Fingerprints the opened directory's device, inode and creation timestamp, never its pathname.
 /// A filesystem without creation-time evidence fails closed rather than trusting reusable inode numbers.
-pub(super) fn native_directory_identity(directory: &File) -> Result<[u8; 32], ObservationError> {
+pub(crate) fn native_directory_identity(directory: &File) -> Result<[u8; 32], ObservationError> {
     let metadata = directory
         .metadata()
         .map_err(|_| ObservationError::RootUnavailable)?;

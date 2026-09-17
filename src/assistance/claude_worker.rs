@@ -529,9 +529,13 @@ pub struct HelperBudgets {
 
 impl HelperBudgets {
     /// Rejects zero or unbounded budgets so no helper can run without a finite ceiling.
+    ///
+    /// The process ceiling admits the Diff helper's bounded snapshot walk, whose per-path blob
+    /// read and verification children scale with the snapshot's own `MAX_SNAPSHOT_PATHS` bound,
+    /// while every operation keeps a finite, launcher-independent maximum.
     pub fn validate(&self) -> Result<(), FailureCode> {
         let bounded = (1..=1024 * 1024).contains(&self.output_bytes)
-            && (1..=64).contains(&self.processes)
+            && (1..=1024).contains(&self.processes)
             && (1..=300_000).contains(&self.deadline_ms);
         bounded.then_some(()).ok_or(FailureCode::ExecutionProfile)
     }
