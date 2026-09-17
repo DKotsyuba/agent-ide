@@ -1,9 +1,9 @@
 //! Long-lived client lease admission and idle-timeout daemon shutdown (EYES-r2 §2).
 //!
 //! Every managed MCP server that shares one repository's daemon holds one `ClientLease`
-//! connection open for its whole lifetime. [`LeaseController`] counts those open connections,
+//! connection open for its whole lifetime. [`LeaseController`](crate::app::lease::LeaseController) counts those open connections,
 //! independently of the transport's hook/assistance `max_connections` capacity, and drives the
-//! daemon's [`LeaseController::idle_expired`] shutdown signal once no lease has been open, and no
+//! daemon's [`LeaseController::idle_expired`](crate::app::lease::LeaseController::idle_expired) shutdown signal once no lease has been open, and no
 //! daemon-owned work has been in flight, for the configured idle timeout.
 
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -498,15 +498,27 @@ const fn default_check_timeout_s() -> u64 {
 pub struct ProjectRustChecksConfig {
     /// Absolute normalized rustup toolchain directory used to run confined Rust checks.
     toolchain_dir: PathBuf,
+    /// Optional absolute normalized cargo home; `None` falls back to the default `$HOME/.cargo`.
+    #[serde(default)]
+    cargo_home: Option<PathBuf>,
 }
 impl ProjectRustChecksConfig {
     /// Returns the declared absolute toolchain directory; never resolved from model or project input.
     pub fn toolchain_dir(&self) -> &Path {
         &self.toolchain_dir
     }
-    /// Rejects a relative or lexically non-normal toolchain directory at parse time.
+    /// Returns the declared absolute cargo home, or `None` for the default `$HOME/.cargo` (EYES-r2 §1).
+    pub fn cargo_home(&self) -> Option<&Path> {
+        self.cargo_home.as_deref()
+    }
+    /// Rejects a relative or lexically non-normal toolchain directory or cargo home at parse time.
     fn validate(&self) -> Result<(), LauncherError> {
         if !absolute(&self.toolchain_dir) {
+            return Err(LauncherError::Rejected);
+        }
+        if let Some(cargo_home) = &self.cargo_home
+            && !absolute(cargo_home)
+        {
             return Err(LauncherError::Rejected);
         }
         Ok(())

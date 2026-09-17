@@ -1,10 +1,10 @@
-//! Shared project problem snapshot types and the confined [`Checker`] contract for EYES-r1 §4.
+//! Shared project problem snapshot types and the confined [`Checker`](crate::checks::Checker) contract for EYES-r1 §4.
 //!
 //! Every parallel v0.3 project-check task builds against these types: checkers produce one
-//! [`ProblemSnapshot`] per run, the scheduler stores the latest completed snapshot per
+//! [`ProblemSnapshot`](crate::checks::ProblemSnapshot) per run, the scheduler stores the latest completed snapshot per
 //! `(worktree, language)`, and the `<agent-ide>` block and `ide.context` problems kind render
 //! from it. Counts always describe the full deduplicated result even when the retained
-//! [`ProblemSnapshot::problems`] list is capped; messages are untrusted checker output.
+//! [`ProblemSnapshot::problems`](crate::checks::ProblemSnapshot::problems) list is capped; messages are untrusted checker output.
 
 pub mod python;
 pub mod runner;

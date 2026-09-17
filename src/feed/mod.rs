@@ -1,8 +1,8 @@
 //! Renders the bounded `<agent-ide>` problem block and tracks per-actor delivery state (EYES-r1 §6).
 //!
-//! The feed turns the latest completed [`ProblemSnapshot`]s of an actor's worktree into one compact
-//! block: fixed language order, no paths, messages or codes, at most [`MAX_BLOCK_BYTES`] bytes
-//! including tags. [`FeedState`] remembers the last block delivered per (actor binding, worktree)
+//! The feed turns the latest completed [`ProblemSnapshot`](crate::checks::ProblemSnapshot)s of an actor's worktree into one compact
+//! block: fixed language order, no paths, messages or codes, at most [`MAX_BLOCK_BYTES`](crate::feed::MAX_BLOCK_BYTES) bytes
+//! including tags. [`FeedState`](crate::feed::FeedState) remembers the last block delivered per (actor binding, worktree)
 //! so identical state is never re-emitted and changed counts render as `(+N)`/`(-N)` deltas. The
 //! state is bounded and purely in-memory; hook and IPC wiring live elsewhere.
 

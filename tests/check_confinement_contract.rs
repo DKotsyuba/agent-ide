@@ -127,6 +127,46 @@ fn config_full_v03_configuration_parses_and_exposes_accessors() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// An explicit `rust.cargo_home` parses into the accessor, and an absent one stays `None`
+/// (EYES-r2 §1: optional, defaulting to `$HOME/.cargo`).
+#[test]
+fn config_rust_cargo_home_parses_when_present_and_stays_none_when_absent() {
+    let mut config = v02_config();
+    config["allowed_roots"] = json!(["/private/tmp/worktree"]);
+    config["project_checks"] = json!({
+        "rust": {"toolchain_dir": "/private/tmp/toolchain", "cargo_home": "/private/tmp/cargo"}
+    });
+    let loaded = LauncherConfig::parse(config.to_string().as_bytes()).unwrap();
+    let rust = loaded.project_checks().unwrap().rust().unwrap();
+    assert_eq!(
+        rust.cargo_home(),
+        Some(std::path::Path::new("/private/tmp/cargo"))
+    );
+
+    config["project_checks"] = json!({"rust": {"toolchain_dir": "/private/tmp/toolchain"}});
+    let loaded = LauncherConfig::parse(config.to_string().as_bytes()).unwrap();
+    let rust = loaded.project_checks().unwrap().rust().unwrap();
+    assert_eq!(rust.cargo_home(), None);
+}
+
+/// Relative or `..`-escaping `rust.cargo_home` declarations are rejected at parse time.
+#[test]
+fn config_rejects_relative_rust_cargo_home() {
+    let mut config = v02_config();
+    config["allowed_roots"] = json!(["/private/tmp/worktree"]);
+    for rust in [
+        json!({"toolchain_dir": "/private/tmp/toolchain", "cargo_home": "relative/cargo"}),
+        json!({"toolchain_dir": "/private/tmp/toolchain", "cargo_home": "/private/tmp/../cargo"}),
+    ] {
+        config["project_checks"] = json!({"rust": rust});
+        assert!(
+            LauncherConfig::parse(config.to_string().as_bytes()).is_err(),
+            "rust={:?} must be rejected",
+            config["project_checks"]
+        );
+    }
+}
+
 /// Absent project-check timing and language fields fall back to the contract defaults.
 #[test]
 fn config_project_check_defaults_apply_when_optional_fields_absent() {
