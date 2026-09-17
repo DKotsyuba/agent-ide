@@ -26,6 +26,7 @@ use agent_ide::{
     telemetry::{Filter, Telemetry, TelemetryConfig},
 };
 use rmcp::{serve_server, transport::io::stdio};
+use tokio::net::UnixStream;
 
 /// Selects an explicit mode; MCP writes only protocol messages to stdout and never autostarts.
 #[tokio::main]
@@ -52,7 +53,14 @@ async fn main() -> ExitCode {
                     Err(std::env::VarError::NotPresent) => ProductDispatcher::default(),
                     Err(_) => return fail(AppError::InvalidResponse),
                 };
-                match run_daemon_with_assistance(runtime_dir, Arc::new(dispatcher), config).await {
+                match run_daemon_with_assistance(
+                    runtime_dir,
+                    Arc::new(dispatcher),
+                    config,
+                    agent_ide::app::lease::DEFAULT_IDLE_TIMEOUT,
+                )
+                .await
+                {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(error) => fail(error),
                 }
@@ -1319,10 +1327,10 @@ async fn run_managed_codex_mcp(
     candidate: std::io::Result<PathBuf>,
 ) -> ExitCode {
     let Ok(candidate) = candidate else {
-        return serve_managed_stdio(StdioFacade::unavailable(), None, None).await;
+        return serve_managed_stdio(StdioFacade::unavailable(), None, None, None).await;
     };
     let Ok(runtime) = ManagedRuntime::create() else {
-        return serve_managed_stdio(StdioFacade::unavailable(), None, None).await;
+        return serve_managed_stdio(StdioFacade::unavailable(), None, None, None).await;
     };
     let runtime_path = runtime.path.clone();
     let started = start_managed_daemon(
@@ -1338,13 +1346,13 @@ async fn run_managed_codex_mcp(
             let Some(facade) = StdioFacade::with_host_attachment(runtime_path, attachment) else {
                 terminate_owned_daemon(child).await;
                 let _ = runtime.remove();
-                return serve_managed_stdio(StdioFacade::unavailable(), None, None).await;
+                return serve_managed_stdio(StdioFacade::unavailable(), None, None, None).await;
             };
-            serve_managed_stdio(facade, Some(child), Some(runtime)).await
+            serve_managed_stdio(facade, Some(child), Some(runtime), None).await
         }
         Err(_) => {
             let _ = runtime.remove();
-            serve_managed_stdio(StdioFacade::unavailable(), None, None).await
+            serve_managed_stdio(StdioFacade::unavailable(), None, None, None).await
         }
     }
 }
@@ -1360,29 +1368,42 @@ async fn run_managed_claude_mcp(
     candidate: std::io::Result<PathBuf>,
 ) -> ExitCode {
     let Ok(candidate) = candidate else {
-        return serve_managed_stdio(StdioFacade::unavailable(), None, None).await;
+        return serve_managed_stdio(StdioFacade::unavailable(), None, None, None).await;
     };
     if !absolute_local_path(&candidate)
         || !fs::symlink_metadata(&candidate).is_ok_and(|metadata| metadata.is_dir())
     {
-        return serve_managed_stdio(StdioFacade::unavailable(), None, None).await;
+        return serve_managed_stdio(StdioFacade::unavailable(), None, None, None).await;
     }
     let key = claude_rendezvous_key(&candidate).await;
     // The MCP server can afford this one bounded `git` probe at its own startup; the hook cannot,
     // so it is left this cache instead of ever resolving the key itself (EYES-r2 §3).
     write_claude_key_cache(&candidate, &key);
     let Ok(path) = claude_runtime_path(&key) else {
-        return serve_managed_stdio(StdioFacade::unavailable(), None, None).await;
+        return serve_managed_stdio(StdioFacade::unavailable(), None, None, None).await;
     };
     match rendezvous_with_claude_daemon(&path, &key, &launcher_template, &candidate).await {
         Some((runtime_path, attachment)) => {
+            // Per EYES-r2 §2, this generation never owns the shared daemon's lifetime, so it holds
+            // one `ClientLease` connection open for its own entire lifetime instead: the daemon's
+            // idle-shutdown countdown only ever runs while zero managed Claude MCPs are attached.
+            let lease = open_client_lease(&runtime_path).await;
             match StdioFacade::with_host_attachment(runtime_path, attachment) {
-                Some(facade) => serve_managed_stdio(facade, None, None).await,
-                None => serve_managed_stdio(StdioFacade::unavailable(), None, None).await,
+                Some(facade) => serve_managed_stdio(facade, None, None, lease).await,
+                None => serve_managed_stdio(StdioFacade::unavailable(), None, None, lease).await,
             }
         }
-        None => serve_managed_stdio(StdioFacade::unavailable(), None, None).await,
+        None => serve_managed_stdio(StdioFacade::unavailable(), None, None, None).await,
     }
+}
+
+/// Opens and acknowledges one long-lived `ClientLease` connection to the daemon at `runtime`.
+///
+/// Fails open: any connect, framing, or correlation fault yields `None`, and the managed MCP still
+/// serves normally without ever holding up an idle daemon's shutdown (EYES-r2 §2). The caller must
+/// hold the returned stream for its own entire process lifetime.
+async fn open_client_lease(runtime: &Path) -> Option<UnixStream> {
+    agent_ide::app::open_client_lease(runtime, "managed-claude-mcp").await
 }
 
 /// Adopts a currently live daemon, or spawns one and adopts the eventual winner of a start race.
@@ -1637,10 +1658,15 @@ async fn health_check_owned_daemon(child: &mut tokio::process::Child, runtime: &
 }
 
 /// Serves one static MCP facade and always cleans up an optional owned daemon/runtime generation.
+///
+/// `lease` is an optional held-open `ClientLease` connection (Claude only); it is dropped once
+/// serving ends, whatever the reason, which is the client-side EOF that releases the daemon's lease
+/// count (EYES-r2 §2).
 async fn serve_managed_stdio(
     facade: StdioFacade,
     child: Option<tokio::process::Child>,
     runtime: Option<ManagedRuntime>,
+    lease: Option<UnixStream>,
 ) -> ExitCode {
     let served = match serve_server(facade, stdio()).await {
         Ok(service) => {
@@ -1651,6 +1677,7 @@ async fn serve_managed_stdio(
         }
         Err(_) => false,
     };
+    drop(lease);
     if let Some(child) = child {
         terminate_owned_daemon(child).await;
     }

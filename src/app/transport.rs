@@ -4,9 +4,57 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const MAX_OPAQUE_ID_BYTES: usize = 128;
+
+/// Wire version reserved exclusively for the long-lived `ClientLease` connection (EYES-r2 §2).
+///
+/// Distinct from the v1 health, v2 hook/method, and v3 edit versions so a lease request is
+/// identified from the same top-level `version` field before any Assistance dispatch is attempted.
+pub const CLIENT_LEASE_WIRE_VERSION: u8 = 4;
+
+/// Represents the complete `ClientLease` request and rejects all undeclared wire fields.
+///
+/// Sent once, on its own connection, by a peer that intends to hold that connection open for its
+/// entire lifetime; the daemon acks it and then counts the connection as one open lease until EOF.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientLeaseRequest {
+    /// Must equal [`CLIENT_LEASE_WIRE_VERSION`].
+    pub version: u8,
+    /// Bounded non-empty caller-chosen identifier echoed in the ack.
+    pub request_id: String,
+    /// Must equal the fixed literal `"assistance.client_lease"`.
+    pub method: String,
+}
+
+impl ClientLeaseRequest {
+    /// Builds the fixed lease request for a caller-chosen bounded request identifier.
+    pub fn new(request_id: impl Into<String>) -> Self {
+        Self {
+            version: CLIENT_LEASE_WIRE_VERSION,
+            request_id: request_id.into(),
+            method: "assistance.client_lease".to_owned(),
+        }
+    }
+}
+
+/// Represents the complete `ClientLease` acknowledgement correlated to one accepted request.
+///
+/// Written exactly once, immediately after the daemon admits the lease; no further replies follow
+/// on this connection, which the daemon then holds open until the peer's own EOF.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientLeaseAck {
+    /// Always [`CLIENT_LEASE_WIRE_VERSION`].
+    pub version: u8,
+    /// Echoes the request's `request_id`.
+    pub request_id: String,
+    /// Always the fixed literal `"ok"`; admission failure closes the connection without a reply.
+    pub status: String,
+}
 
 /// Limits one finite Assistance transport call without creating a generic event channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
