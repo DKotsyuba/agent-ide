@@ -49,15 +49,20 @@ MCP protocol messages to stdout.
 
 `agent-ide mcp --claude-launcher-template ABSOLUTE_PATH` is the explicit self-contained Claude
 entrypoint. It captures only an absolute, normalized `CLAUDE_PROJECT_DIR`, canonicalizes that
-directory once, and derives `/tmp/ai-c-<16 lowercase hex>` directly from the leading 64 bits of the
-BLAKE3 digest of the canonical project-root path bytes. The MCP exclusively creates that directory
-with mode `0700`; an existing path leaves a second MCP disconnected and is never adopted, repaired,
-or removed. The owner binds the template's sole target to the captured project and a fresh random
-attachment, requires that target's existing strict Claude operator profile, writes the bound
-launcher and project-bound attachment record with mode `0600`, then starts and health-checks the
-daemon through the existing legacy Claude route. It serves the v0.1 five tools and, when the
-claimed foreground-helper gate succeeds, the v0.2 `edit` tool; it reaps its
-exact daemon before identity-checked runtime removal on stdio EOF, cancellation, SIGINT, or SIGTERM.
+directory once, and derives `/private/tmp/ai-r-<16 lowercase hex>` directly from the leading 64 bits
+of the BLAKE3 digest of the repository's canonical git common directory (or the canonical project
+root itself outside a git repository), so every worktree of one repository shares one rendezvous.
+Per EYES-r1 §2/EYES-r2, the MCP creates that directory only when no live lock holder answers it; an
+existing directory whose lock is held and whose health endpoint answers is instead explicitly
+validated (owner, mode `0700`, non-symlink, device/inode re-checked from an open file descriptor)
+and adopted, never repaired or removed. The owner binds the template's sole target to the captured
+project and a fresh random attachment, requires that target's existing strict Claude operator
+profile, writes the bound launcher and project-bound attachment record with mode `0600`, then
+starts and health-checks the daemon through the existing legacy Claude route. It serves the v0.1
+five tools and, when the claimed foreground-helper gate succeeds, the v0.2 `edit` tool. Per
+EYES-r1 §2, this MCP never owns that daemon's lifetime: stdio EOF, cancellation, SIGINT, or SIGTERM
+end this one MCP process only, leaving an adopted or spawned daemon running for the next MCP of the
+same repository to find.
 
 The plugin's `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, and `PermissionDenied` handlers run
 the argument-free `agent-ide claude-hook`. That command independently derives the same path from

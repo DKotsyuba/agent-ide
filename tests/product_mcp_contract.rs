@@ -1727,12 +1727,61 @@ impl ProductActor {
 }
 
 /// Reproduces the public deterministic Claude rendezvous contract for product-edge assertions.
+///
+/// The key is `project`'s canonical git common directory (every fixture is its own real Git
+/// repository), independently rediscovered through the real `git` binary rather than assumed, so
+/// this stays a black-box reproduction of the product formula instead of a peek at its internals.
 fn managed_claude_runtime_path(project: &Path) -> PathBuf {
     let project = std::fs::canonicalize(project).unwrap();
-    let hash = blake3::hash(project.as_os_str().as_bytes());
-    std::fs::canonicalize("/tmp")
+    let output = std::process::Command::new("/usr/bin/git")
+        .arg("-C")
+        .arg(&project)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .unwrap();
+    let key = if output.status.success() {
+        std::fs::canonicalize(String::from_utf8(output.stdout).unwrap().trim_end())
+            .unwrap_or_else(|_| project.clone())
+    } else {
+        project
+    };
+    let hash = blake3::hash(key.as_os_str().as_bytes());
+    std::fs::canonicalize("/private/tmp")
         .unwrap()
-        .join(format!("ai-c-{}", &hash.to_hex().as_str()[..16]))
+        .join(format!("ai-r-{}", &hash.to_hex().as_str()[..16]))
+}
+
+/// Sends SIGTERM to the exact process holding a shared Claude daemon's runtime lock, if any.
+///
+/// A shared daemon deliberately outlives every MCP process's own EOF (EYES-r1 §2), so a test that
+/// causes one to be spawned must reap it explicitly instead of leaving it running past the test
+/// binary's own exit. `lsof` is asked for the specific lock file's current holder only; this never
+/// pattern-kills by process name or command line.
+/// Guarantees a shared daemon a test caused to be spawned is reaped even if an assertion later in
+/// the same test panics, so a failing test cannot leak a long-lived orphan process.
+struct SharedClaudeDaemonGuard(PathBuf);
+
+impl Drop for SharedClaudeDaemonGuard {
+    fn drop(&mut self) {
+        terminate_shared_claude_daemon(&self.0);
+    }
+}
+
+fn terminate_shared_claude_daemon(runtime: &Path) {
+    let Ok(output) = std::process::Command::new("/usr/sbin/lsof")
+        .arg("-t")
+        .arg(runtime.join("agent-ide.lock"))
+        .output()
+    else {
+        return;
+    };
+    for pid in String::from_utf8_lossy(&output.stdout).split_whitespace() {
+        if let Ok(pid) = pid.parse::<libc::pid_t>() {
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+        }
+    }
 }
 
 /// Builds one exact Claude root or child lifecycle event without any transport attachment fields.
@@ -2120,15 +2169,21 @@ async fn managed_claude_startup_requires_template_and_strict_profile() {
                 .contains("continue with native tools")
         );
         mcp.close().await;
-        assert!(!runtime.exists());
+        // The shared rendezvous directory this MCP created is never removed on exit, even when no
+        // daemon ever started inside it; a later MCP simply reuses it through the same idempotent
+        // ensure-or-adopt path.
+        assert!(runtime.is_dir());
     }
 }
 
-/// The standard Claude MCP/hook pair activates root then child and cleans its exact runtime on EOF.
+/// The standard Claude MCP/hook pair activates root then child; a second MCP for the same
+/// repository adopts the same shared daemon instead of starting its own, and the daemon outlives
+/// every MCP process's own EOF (EYES-r1 §2).
 #[tokio::test]
-async fn managed_claude_root_child_rendezvous_second_owner_and_eof_cleanup() {
+async fn managed_claude_root_child_rendezvous_shared_daemon_survives_eof() {
     let fixture = ProductFixture::new_claude(json!([]));
     let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
     assert!(!runtime.exists());
     // Claude validates the helper binary before every minted operation. Warm the test artifact so
     // this contract measures rendezvous behavior rather than cold debug-binary filesystem I/O.
@@ -2154,8 +2209,12 @@ async fn managed_claude_root_child_rendezvous_second_owner_and_eof_cleanup() {
     );
     let first_attachment = std::fs::read(&attachment_path).unwrap();
 
+    // The second MCP adopts the exact daemon the first one spawned, so its attachment file is
+    // read, never rewritten; the daemon itself still processes the call (unlike the old rejected
+    // second-owner contract), but this call carries no prior hook binding for its tool-use id, so
+    // it gets the same unavailable "host_binding" outcome as any other unbound call.
     let mut second = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
-    let disconnected = second
+    let unbound = second
         .exchange(
             json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
                 "name":"ide.start","arguments":{"activation_id":"second-owner"},
@@ -2163,12 +2222,17 @@ async fn managed_claude_root_child_rendezvous_second_owner_and_eof_cleanup() {
             }}),
         )
         .await;
-    assert_eq!(disconnected["result"]["isError"], true, "{disconnected}");
+    assert_compact_envelope(&unbound);
+    assert_eq!(
+        unbound["result"]["structuredContent"],
+        json!({"state":"unavailable","reason":"host_binding"}),
+        "{unbound}"
+    );
     assert_eq!(std::fs::read(&attachment_path).unwrap(), first_attachment);
     second.close().await;
     assert!(
         runtime.is_dir(),
-        "second owner must not remove the first runtime"
+        "an adopting second owner must not remove the shared runtime"
     );
 
     let denied_call = "managed-claude-denied";
@@ -2290,7 +2354,59 @@ async fn managed_claude_root_child_rendezvous_second_owner_and_eof_cleanup() {
     assert_eq!(child_stopped["kind"], "stop", "{child_stopped}");
 
     mcp.close().await;
-    assert!(!runtime.exists());
+    assert!(
+        runtime.is_dir(),
+        "the shared daemon must outlive its spawning MCP's own EOF"
+    );
+}
+
+/// The hook resolves its rendezvous key from its own cache, never by probing `git` itself
+/// (EYES-r2 §3): once that cache is warm, a hook call still correlates correctly even after the
+/// candidate's `.git` directory is moved away, which a live re-probe would instead treat as a
+/// non-git candidate and resolve to a completely different (and unreachable) rendezvous. Reaching
+/// the daemon's own unrelated `unsupported_git` outcome (rather than the "host_binding" outcome an
+/// uncorrelated call gets) proves the Pre/PostToolUse hooks still bound to the exact right daemon.
+#[tokio::test]
+async fn managed_claude_hook_relies_on_its_cached_key_not_a_live_git_probe() {
+    let fixture = ProductFixture::new_claude(json!([]));
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    assert!(runtime.is_dir());
+
+    std::fs::rename(
+        fixture.root.join(".git"),
+        fixture.base.join("git-moved-away-after-cache-warm"),
+    )
+    .unwrap();
+
+    let mut next = 1;
+    let pending = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "cache-session",
+        None,
+        "ide.start",
+        json!({"activation_id":"cache-start"}),
+    )
+    .await;
+    let started = settle_managed_claude_start(
+        &mut mcp,
+        &fixture.root,
+        &mut next,
+        "cache-session",
+        None,
+        &pending,
+    )
+    .await;
+    assert_eq!(
+        started,
+        json!({"state":"error","code":"unsupported_git"}),
+        "{started}"
+    );
+
+    mcp.close().await;
 }
 
 /// A reused Start with unusable sandbox metadata is refused without disturbing the live binding.

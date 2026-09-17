@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_ide::app::{
-    AppError, DoctorReport, DoctorStatus, RuntimeDir, config::EffectiveConfig, doctor_report,
-    run_daemon_with_assistance,
+    AppError, DoctorLockState, DoctorReport, DoctorStatus, RuntimeDir, config::EffectiveConfig,
+    doctor_report, run_daemon_with_assistance,
 };
 use agent_ide::assistance::{
     assembly::ProductDispatcher,
@@ -749,10 +749,13 @@ fn telemetry_filter(tag: &str) -> Result<Filter, AppError> {
     }
 }
 
-/// Owns the identity of one freshly created managed runtime tree.
+/// Owns the identity of one managed runtime tree this process created, adopted, or is ensuring.
 ///
-/// The recorded device and inode fence cleanup against pathname replacement. The directory is
-/// private to this MCP process and must be removed only after its exact daemon child is reaped.
+/// The recorded device and inode fence cleanup against pathname replacement. For Codex, the
+/// directory remains private to this one MCP process and is removed only after its exact daemon
+/// child is reaped. For Claude, the directory is shared by every worktree of one repository and is
+/// never removed by an MCP process; only its own generation-specific launcher/attachment files may
+/// be cleared, and only before a confirmed-dead generation is replaced.
 struct ManagedRuntime {
     /// Short absolute directory used by the owned daemon's Unix socket and private state.
     path: PathBuf,
@@ -793,12 +796,14 @@ impl ManagedRuntime {
         ))
     }
 
-    /// Exclusively creates the one deterministic Claude runtime directory with exact mode `0700`.
+    /// Exclusively creates the one deterministic shared Claude runtime directory with mode `0700`.
     ///
-    /// `path` must be the project-derived child of the canonical `/tmp` root. An existing path is
-    /// never opened, repaired, removed, or adopted, so a concurrent second MCP stays disconnected
-    /// and cannot overwrite the first owner's launcher or attachment. The captured device/inode
-    /// identity fences the eventual recursive cleanup exactly as in managed Codex mode.
+    /// `path` must be the rendezvous-key-derived child of the canonical `/private/tmp` root. An
+    /// existing path is never opened, repaired, or removed here, so a fresh generation can never
+    /// silently reuse or overwrite a live daemon's directory identity; [`Self::ensure_deterministic`]
+    /// is the idempotent entry point a second worktree's MCP uses to join an existing rendezvous. The
+    /// captured device/inode identity fences the eventual recursive cleanup exactly as in managed
+    /// Codex mode.
     fn create_deterministic(path: PathBuf) -> std::io::Result<Self> {
         let mut builder = fs::DirBuilder::new();
         builder.mode(0o700).create(&path)?;
@@ -836,13 +841,13 @@ impl ManagedRuntime {
         Ok(path)
     }
 
-    /// Writes one project-bound random Claude attachment record exactly once with mode `0600`.
+    /// Writes one rendezvous-key-bound random Claude attachment record exactly once with mode `0600`.
     ///
-    /// The first field is the full project identity whose prefix selected this short runtime path;
-    /// the second is the unguessable transport attachment. A hook validates both fields before it
-    /// attempts IPC. Existing files are never followed or overwritten, and no value is rendered.
-    fn write_claude_attachment(&self, project: &Path, attachment: &str) -> std::io::Result<()> {
-        let record = format!("{} {attachment}\n", claude_project_identity(project));
+    /// The first field is the full rendezvous-key identity whose prefix selected this short runtime
+    /// path; the second is the unguessable transport attachment. A hook validates both fields before
+    /// it attempts IPC. Existing files are never followed or overwritten, and no value is rendered.
+    fn write_claude_attachment(&self, key: &Path, attachment: &str) -> std::io::Result<()> {
+        let record = format!("{} {attachment}\n", claude_rendezvous_identity(key));
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -850,6 +855,65 @@ impl ManagedRuntime {
             .open(self.path.join(CLAUDE_ATTACHMENT_FILE))?;
         file.write_all(record.as_bytes())?;
         file.sync_all()
+    }
+
+    /// Idempotently ensures the one shared deterministic rendezvous directory at `path` exists.
+    ///
+    /// A fresh directory is created exclusively, exactly as [`Self::create_deterministic`]. When the
+    /// directory already exists (another worktree's MCP created it first, or a prior generation left
+    /// it behind), it is instead validated in place: it must be the expected nonsymlink, owner-only,
+    /// mode `0700` real directory, and its current device/inode identity is captured for this
+    /// process's own fencing. Any other existing-path state is rejected without repair.
+    fn ensure_deterministic(path: PathBuf) -> std::io::Result<Self> {
+        match Self::create_deterministic(path.clone()) {
+            Ok(runtime) => Ok(runtime),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Self::open_existing(path)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Explicitly validates and fences an already-existing shared runtime directory before this
+    /// process ever trusts it for adoption.
+    ///
+    /// Per EYES-r2, adopting a directory this process did not itself just create requires its own
+    /// explicit check, not a reuse of the freshly-created path's implicit trust: `path` must be a
+    /// real, non-symlink, owner-only (mode `0700`) directory owned by the effective user. It is
+    /// opened directly with `O_NOFOLLOW`/`O_DIRECTORY`, refusing a symlink at the final component,
+    /// and its identity is captured from the *open file descriptor* (immune to a path swap between
+    /// stat calls), then compared against an independent path-based stat taken first: any mismatch
+    /// between the two means the path was replaced concurrently and is rejected rather than trusted.
+    fn open_existing(path: PathBuf) -> std::io::Result<Self> {
+        let initial = fs::symlink_metadata(&path)?;
+        if initial.file_type().is_symlink() || !initial.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "shared managed Claude runtime is not a private directory",
+            ));
+        }
+        let handle = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(&path)?;
+        let opened = handle.metadata()?;
+        if opened.file_type().is_symlink()
+            || !opened.is_dir()
+            || opened.uid() != unsafe { libc::geteuid() }
+            || opened.permissions().mode() & 0o777 != 0o700
+            || opened.dev() != initial.dev()
+            || opened.ino() != initial.ino()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "shared managed Claude runtime identity is not stable and private",
+            ));
+        }
+        Ok(Self {
+            path,
+            device: opened.dev(),
+            inode: opened.ino(),
+        })
     }
 
     /// Removes this runtime tree only while its original private directory identity still matches.
@@ -896,8 +960,10 @@ fn absolute_local_path(path: &Path) -> bool {
             .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
 }
 
-/// Fixed short namespace for deterministic Claude runtimes below the canonical `/tmp` directory.
-const CLAUDE_RUNTIME_PREFIX: &str = "ai-c-";
+/// Fixed short namespace for deterministic shared per-repository Claude runtimes below `/private/tmp`.
+const CLAUDE_RUNTIME_PREFIX: &str = "ai-r-";
+/// Bounded deadline for the local `git` rendezvous-key probe; a real repository answers instantly.
+const GIT_COMMON_DIR_TIMEOUT: Duration = Duration::from_secs(2);
 /// Fixed owner-only file carrying the full project identity and random transport attachment.
 const CLAUDE_ATTACHMENT_FILE: &str = "attachment";
 /// Exact record length: 64 digest bytes, one separator, 64 attachment bytes, and one newline.
@@ -933,11 +999,127 @@ fn canonical_claude_project(value: Option<OsString>) -> std::io::Result<PathBuf>
     Ok(project)
 }
 
-/// Returns the full BLAKE3 digest of one canonical Claude project root's raw path bytes.
-fn claude_project_identity(project: &Path) -> String {
-    blake3::hash(project.as_os_str().as_bytes())
+/// Returns the full BLAKE3 digest of one canonical rendezvous key's raw path bytes.
+fn claude_rendezvous_identity(key: &Path) -> String {
+    blake3::hash(key.as_os_str().as_bytes())
         .to_hex()
         .to_string()
+}
+
+/// Resolves the repository-wide rendezvous key shared by every worktree of one Claude candidate.
+///
+/// Shells out to the fixed `/usr/bin/git -C <candidate> rev-parse --path-format=absolute
+/// --git-common-dir` under [`GIT_COMMON_DIR_TIMEOUT`] so distinct worktrees of one repository
+/// resolve to the same canonical git common directory. A spawn failure, timeout, nonzero exit,
+/// non-absolute output, or a value that fails to canonicalize is treated as "not a git repository"
+/// and falls back to `candidate` itself; managed startup is never blocked or failed by this probe.
+async fn claude_rendezvous_key(candidate: &Path) -> PathBuf {
+    match git_common_dir(candidate).await {
+        Some(common_dir) => fs::canonicalize(&common_dir).unwrap_or_else(|_| candidate.to_owned()),
+        None => candidate.to_owned(),
+    }
+}
+
+/// Runs one bounded `git rev-parse --git-common-dir` probe and returns its absolute output path.
+///
+/// Never removes, creates, or writes anything; a killed, failed, or malformed probe returns `None`.
+async fn git_common_dir(candidate: &Path) -> Option<PathBuf> {
+    let mut command = tokio::process::Command::new("/usr/bin/git");
+    command
+        .arg("-C")
+        .arg(candidate)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let child = command.spawn().ok()?;
+    let output = tokio::time::timeout(GIT_COMMON_DIR_TIMEOUT, child.wait_with_output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = std::str::from_utf8(&output.stdout).ok()?;
+    let path = PathBuf::from(text.trim_end_matches('\n'));
+    absolute_local_path(&path).then_some(path)
+}
+
+/// Fixed short namespace for one candidate's non-authoritative cached rendezvous key.
+const CLAUDE_KEY_CACHE_PREFIX: &str = "ai-k-";
+/// Fixed owner-only file name holding one candidate's cached rendezvous key bytes.
+const CLAUDE_KEY_CACHE_FILE: &str = "key";
+
+/// Derives the deterministic per-candidate path of [`claude_rendezvous_key`]'s hot-path cache.
+///
+/// Keyed by the raw candidate path itself (never the resolved key), so it never requires `git` to
+/// locate: every worktree has its own distinct, purely local cache slot.
+fn claude_key_cache_path(candidate: &Path) -> std::io::Result<PathBuf> {
+    let identity = blake3::hash(candidate.as_os_str().as_bytes())
+        .to_hex()
+        .to_string();
+    Ok(fs::canonicalize(Path::new("/private/tmp"))?
+        .join(format!("{CLAUDE_KEY_CACHE_PREFIX}{}", &identity[..16])))
+}
+
+/// Best-effort caches `key` for `candidate`'s hot path; per EYES-r2, only the MCP server calls this.
+///
+/// Per EYES-r2 §3, the hook must never spawn `git` on its bounded deadline, so the MCP server (which
+/// can afford one bounded `git` probe at its own startup) leaves this hint for it. This is purely a
+/// hint: it carries no secret and grants no authority by itself, since [`read_claude_attachment`]
+/// independently re-validates any key read back from here against the runtime directory's own
+/// identity before anything is trusted. Failure is silent and never blocks managed startup.
+fn write_claude_key_cache(candidate: &Path, key: &Path) {
+    let Ok(cache) = claude_key_cache_path(candidate) else {
+        return;
+    };
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    if builder.create(&cache).is_err() && !cache.is_dir() {
+        return;
+    }
+    let _ = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(cache.join(CLAUDE_KEY_CACHE_FILE))
+        .and_then(|mut file| file.write_all(key.as_os_str().as_bytes()));
+}
+
+/// Reads one candidate's cached rendezvous key without ever invoking `git`.
+///
+/// The cache directory and file must be the expected private (`0700`/`0600`), non-symlink,
+/// owner-only state; anything else, including a missing cache, returns `None` rather than
+/// repairing or removing it. This is only ever a hint for [`run_managed_claude_hook`]: the returned
+/// key still passes through the exact same strict [`read_claude_attachment`] validation as one
+/// resolved live, so a stale or hostile cache only ever fails safely.
+fn read_claude_key_cache(candidate: &Path) -> Option<PathBuf> {
+    let cache = claude_key_cache_path(candidate).ok()?;
+    let directory_metadata = fs::symlink_metadata(&cache).ok()?;
+    if directory_metadata.file_type().is_symlink()
+        || !directory_metadata.is_dir()
+        || directory_metadata.uid() != unsafe { libc::geteuid() }
+        || directory_metadata.permissions().mode() & 0o777 != 0o700
+    {
+        return None;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(cache.join(CLAUDE_KEY_CACHE_FILE))
+        .ok()?;
+    let file_metadata = file.metadata().ok()?;
+    if !file_metadata.is_file()
+        || file_metadata.uid() != unsafe { libc::geteuid() }
+        || file_metadata.permissions().mode() & 0o777 != 0o600
+    {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(4096).read_to_end(&mut bytes).ok()?;
+    let key = PathBuf::from(std::ffi::OsStr::from_bytes(&bytes));
+    absolute_local_path(&key).then_some(key)
 }
 
 /// Creates or validates one owner-only persistent directory without following a final symlink.
@@ -1015,14 +1197,16 @@ fn managed_telemetry_database(candidate: &Path) -> std::io::Result<PathBuf> {
     managed_telemetry_database_in(&home.join(".agent-ide"), candidate)
 }
 
-/// Derives the one short deterministic private runtime path for a canonical Claude project root.
+/// Derives the one short deterministic private runtime path shared by every worktree of one key.
 ///
-/// The full digest remains in the attachment record to reject a theoretical collision in the
-/// sixteen-hex-character pathname prefix. The returned parent is canonical `/tmp`; no caller or
-/// model path can redirect the rendezvous elsewhere.
-fn claude_runtime_path(project: &Path) -> std::io::Result<PathBuf> {
-    let identity = claude_project_identity(project);
-    Ok(fs::canonicalize(Path::new("/tmp"))?
+/// `key` is the rendezvous key resolved by [`claude_rendezvous_key`] (a repository's canonical git
+/// common directory, or the canonical candidate itself outside a git repository). The full digest
+/// remains in the attachment record to reject a theoretical collision in the sixteen-hex-character
+/// pathname prefix. The returned parent is canonical `/private/tmp`; no caller or model path can
+/// redirect the rendezvous elsewhere.
+fn claude_runtime_path(key: &Path) -> std::io::Result<PathBuf> {
+    let identity = claude_rendezvous_identity(key);
+    Ok(fs::canonicalize(Path::new("/private/tmp"))?
         .join(format!("{CLAUDE_RUNTIME_PREFIX}{}", &identity[..16])))
 }
 
@@ -1034,14 +1218,14 @@ fn valid_random_attachment(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-/// Reads one project-derived managed Claude rendezvous after strict owner/mode/identity checks.
+/// Reads one key-derived managed Claude rendezvous after strict owner/mode/identity checks.
 ///
 /// The directory must be the expected nonsymlink owned by the effective user with exact mode
 /// `0700`. Its fixed attachment file is opened with `O_NOFOLLOW`, must be a regular owner-only
-/// `0600` file of the exact bounded size, and must carry this project's full digest plus one valid
-/// random attachment. Any missing, stale, replaced, or corrupt state is rejected without repair.
-fn read_claude_attachment(project: &Path) -> std::io::Result<(PathBuf, String)> {
-    let runtime = claude_runtime_path(project)?;
+/// `0600` file of the exact bounded size, and must carry this rendezvous key's full digest plus one
+/// valid random attachment. Any missing, stale, replaced, or corrupt state is rejected without repair.
+fn read_claude_attachment(key: &Path) -> std::io::Result<(PathBuf, String)> {
+    let runtime = claude_runtime_path(key)?;
     let metadata = fs::symlink_metadata(&runtime)?;
     if metadata.file_type().is_symlink()
         || !metadata.is_dir()
@@ -1080,54 +1264,75 @@ fn read_claude_attachment(project: &Path) -> std::io::Result<(PathBuf, String)> 
             "managed Claude attachment is malformed",
         ));
     };
-    if identity != claude_project_identity(project) || !valid_random_attachment(attachment) {
+    if identity != claude_rendezvous_identity(key) || !valid_random_attachment(attachment) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "managed Claude attachment does not match the project",
+            "managed Claude attachment does not match the rendezvous key",
         ));
     }
     Ok((runtime, attachment.to_owned()))
 }
 
-/// Submits one argument-free managed Claude hook through its exact project rendezvous.
+/// Submits one argument-free managed Claude hook through its shared repository rendezvous.
 ///
-/// Missing project identity, runtime, attachment, or daemon state returns silently. Once validated,
-/// the existing bounded Claude parser, 250 ms total deadline, sanitized transport, exact lifecycle
-/// correlation, feedback rendering, and foreground-helper recognition remain unchanged.
+/// Missing project identity, cached key, runtime, attachment, or daemon state returns silently.
+/// Per EYES-r2 §3, this never spawns `git` itself and so never risks the existing bounded 250 ms
+/// total deadline on that account: the rendezvous key is only ever read from
+/// [`read_claude_key_cache`], a hint the owning MCP server left behind at its own startup. Once
+/// validated, the existing bounded Claude parser, sanitized transport, exact lifecycle correlation,
+/// feedback rendering, and foreground-helper recognition remain unchanged.
 async fn run_managed_claude_hook(project: Option<OsString>) {
     let Ok(project) = canonical_claude_project(project) else {
         return;
     };
-    let Ok((runtime, attachment)) = read_claude_attachment(&project) else {
+    let Some(key) = read_claude_key_cache(&project) else {
+        return;
+    };
+    let Ok((runtime, attachment)) = read_claude_attachment(&key) else {
         return;
     };
     agent_ide::assistance::codex_hook::run(&runtime, Some(attachment), HostKind::Claude).await;
 }
 
-/// Starts, health-checks, serves, and tears down one self-contained managed MCP generation.
+/// Dispatches one self-contained managed MCP generation to its host-specific lifecycle contract.
 ///
-/// Setup failure still serves the static six tools through a connect-only unavailable facade.
-/// Successful setup binds one captured local candidate to one random attachment, starts exactly
-/// one daemon child, and tears it down on stdio EOF, MCP cancellation, SIGINT, or SIGTERM.
+/// Setup failure always still serves the static six tools through a connect-only unavailable
+/// facade, for either host.
 async fn run_managed_mcp(
     launcher_template: PathBuf,
     candidate: std::io::Result<PathBuf>,
     host: ManagedHost,
 ) -> ExitCode {
+    match host {
+        ManagedHost::Codex => run_managed_codex_mcp(launcher_template, candidate).await,
+        ManagedHost::Claude => run_managed_claude_mcp(launcher_template, candidate).await,
+    }
+}
+
+/// Starts, health-checks, serves, and tears down one exclusively owned managed Codex generation.
+///
+/// Codex retains its pre-existing single-owner contract unchanged: one random private runtime is
+/// created per MCP process, one daemon child is started and owned by it, and both are torn down on
+/// stdio EOF, MCP cancellation, SIGINT, or SIGTERM.
+async fn run_managed_codex_mcp(
+    launcher_template: PathBuf,
+    candidate: std::io::Result<PathBuf>,
+) -> ExitCode {
     let Ok(candidate) = candidate else {
         return serve_managed_stdio(StdioFacade::unavailable(), None, None).await;
     };
-    let runtime = match host {
-        ManagedHost::Codex => ManagedRuntime::create(),
-        ManagedHost::Claude => {
-            claude_runtime_path(&candidate).and_then(ManagedRuntime::create_deterministic)
-        }
-    };
-    let Ok(runtime) = runtime else {
+    let Ok(runtime) = ManagedRuntime::create() else {
         return serve_managed_stdio(StdioFacade::unavailable(), None, None).await;
     };
     let runtime_path = runtime.path.clone();
-    let started = start_managed_daemon(&runtime, &launcher_template, candidate, host).await;
+    let started = start_managed_daemon(
+        &runtime,
+        &launcher_template,
+        &candidate,
+        &candidate,
+        ManagedHost::Codex,
+    )
+    .await;
     match started {
         Ok((attachment, child)) => {
             let Some(facade) = StdioFacade::with_host_attachment(runtime_path, attachment) else {
@@ -1137,11 +1342,172 @@ async fn run_managed_mcp(
             };
             serve_managed_stdio(facade, Some(child), Some(runtime)).await
         }
-        Err(()) => {
+        Err(_) => {
             let _ = runtime.remove();
             serve_managed_stdio(StdioFacade::unavailable(), None, None).await
         }
     }
+}
+
+/// Finds or starts the one daemon shared by every worktree of `candidate`'s repository, and serves.
+///
+/// Per EYES-r1 §2, the runtime directory is keyed by the repository (its canonical git common
+/// directory, or `candidate` itself outside a git repository), not by this one MCP process. This
+/// generation never owns the resulting daemon's lifetime: on stdio EOF, MCP cancellation, SIGINT,
+/// or SIGTERM it exits without terminating or removing an adopted or spawned daemon.
+async fn run_managed_claude_mcp(
+    launcher_template: PathBuf,
+    candidate: std::io::Result<PathBuf>,
+) -> ExitCode {
+    let Ok(candidate) = candidate else {
+        return serve_managed_stdio(StdioFacade::unavailable(), None, None).await;
+    };
+    if !absolute_local_path(&candidate)
+        || !fs::symlink_metadata(&candidate).is_ok_and(|metadata| metadata.is_dir())
+    {
+        return serve_managed_stdio(StdioFacade::unavailable(), None, None).await;
+    }
+    let key = claude_rendezvous_key(&candidate).await;
+    // The MCP server can afford this one bounded `git` probe at its own startup; the hook cannot,
+    // so it is left this cache instead of ever resolving the key itself (EYES-r2 §3).
+    write_claude_key_cache(&candidate, &key);
+    let Ok(path) = claude_runtime_path(&key) else {
+        return serve_managed_stdio(StdioFacade::unavailable(), None, None).await;
+    };
+    match rendezvous_with_claude_daemon(&path, &key, &launcher_template, &candidate).await {
+        Some((runtime_path, attachment)) => {
+            match StdioFacade::with_host_attachment(runtime_path, attachment) {
+                Some(facade) => serve_managed_stdio(facade, None, None).await,
+                None => serve_managed_stdio(StdioFacade::unavailable(), None, None).await,
+            }
+        }
+        None => serve_managed_stdio(StdioFacade::unavailable(), None, None).await,
+    }
+}
+
+/// Adopts a currently live daemon, or spawns one and adopts the eventual winner of a start race.
+///
+/// Never returns ownership of a child process or the runtime directory to the caller: whichever
+/// generation actually serves the daemon manages its own lifetime independently of this MCP.
+async fn rendezvous_with_claude_daemon(
+    path: &Path,
+    key: &Path,
+    launcher_template: &Path,
+    candidate: &Path,
+) -> Option<(PathBuf, String)> {
+    if let Some(attachment) = adopt_claude_daemon(path, key).await {
+        return Some((path.to_owned(), attachment));
+    }
+    let runtime = ManagedRuntime::ensure_deterministic(path.to_owned()).ok()?;
+    if let Some(attachment) = spawn_claude_daemon(&runtime, key, launcher_template, candidate).await
+    {
+        return Some((path.to_owned(), attachment));
+    }
+    // Lost the start race to a concurrent MCP, or startup failed for another reason; make one more
+    // adoption attempt before reporting this generation unavailable.
+    adopt_claude_daemon(path, key)
+        .await
+        .map(|attachment| (path.to_owned(), attachment))
+}
+
+/// Adopts an existing daemon only after its directory identity, lock, and health all check out.
+///
+/// Per EYES-r2, a directory this process did not itself just create is never adopted on doctor
+/// output alone: [`ManagedRuntime::open_existing`] first requires it to be a real, non-symlink,
+/// owner-only (mode `0700`) directory owned by the effective user, with its device/inode identity
+/// re-validated from an open file descriptor. Only then is the exact "lock held and socket answers"
+/// test from EYES-r1 §2 applied; a merely present but unhealthy runtime directory (a crashed
+/// daemon's leftovers) is never adopted.
+async fn adopt_claude_daemon(path: &Path, key: &Path) -> Option<String> {
+    ManagedRuntime::open_existing(path.to_owned()).ok()?;
+    let report = doctor_report(path).await.ok()?;
+    if report.lock != DoctorLockState::Held
+        || !matches!(report.status, DoctorStatus::Healthy { .. })
+    {
+        return None;
+    }
+    read_claude_attachment(key)
+        .ok()
+        .map(|(_, attachment)| attachment)
+}
+
+/// Spawns one detached daemon generation, or safely joins a concurrent MCP's in-flight spawn.
+///
+/// Only ever called after [`adopt_claude_daemon`] found nothing live. A [`StartDaemonError::WriteRace`]
+/// means a concurrent MCP already owns this generation's launcher/attachment write slot, so its
+/// files are never touched on a guess: this waits for it to answer healthy and adopts it. Only once
+/// that wait times out (a crashed generation nobody is completing) are the leftover files cleared
+/// for exactly one clean retry. A `WriteRace` on that retry, or any other failure, clears this
+/// attempt's own files again so a later caller is not blocked by it.
+async fn spawn_claude_daemon(
+    runtime: &ManagedRuntime,
+    key: &Path,
+    launcher_template: &Path,
+    candidate: &Path,
+) -> Option<String> {
+    match start_managed_daemon(
+        runtime,
+        launcher_template,
+        key,
+        candidate,
+        ManagedHost::Claude,
+    )
+    .await
+    {
+        Ok((attachment, child)) => {
+            // Detached: the daemon now owns its own lifetime independently of this MCP process, so
+            // its handle is dropped without killing it (kill-on-drop was disabled for this spawn).
+            drop(child);
+            Some(attachment)
+        }
+        Err(StartDaemonError::WriteRace) => {
+            if wait_for_external_health(&runtime.path).await {
+                return adopt_claude_daemon(&runtime.path, key).await;
+            }
+            clear_claude_generation(runtime);
+            match start_managed_daemon(
+                runtime,
+                launcher_template,
+                key,
+                candidate,
+                ManagedHost::Claude,
+            )
+            .await
+            {
+                Ok((attachment, child)) => {
+                    drop(child);
+                    Some(attachment)
+                }
+                Err(_) => {
+                    clear_claude_generation(runtime);
+                    None
+                }
+            }
+        }
+        Err(StartDaemonError::Other) => {
+            clear_claude_generation(runtime);
+            None
+        }
+    }
+}
+
+/// Best-effort removal of one shared Claude runtime's generation-specific launcher/attachment files.
+///
+/// Never removes the shared rendezvous directory itself, and never fails the caller: a missing file
+/// is already clean, and any other removal error is silently accepted, since a live daemon's own
+/// files (if this race was lost) are recreated identically by nothing else touching this directory.
+fn clear_claude_generation(runtime: &ManagedRuntime) {
+    let _ = fs::remove_file(runtime.path.join("launcher.json"));
+    let _ = fs::remove_file(runtime.path.join(CLAUDE_ATTACHMENT_FILE));
+}
+
+/// Distinguishes a benign concurrent write race from every other managed-daemon startup failure.
+enum StartDaemonError {
+    /// Another process already holds this rendezvous's launcher or attachment write slot; its files
+    /// must never be assumed stale without first waiting to see whether it becomes healthy.
+    WriteRace,
+    /// Any other validation, spawn, or health-check failure.
+    Other,
 }
 
 /// Validates the managed inputs and returns the exact healthy daemon child and private attachment.
@@ -1150,38 +1516,55 @@ async fn run_managed_mcp(
 /// Git identity is deliberately discovered later by the existing worker activation path. Launcher
 /// executables and profiles are validated through [`LauncherConfig`] before the child starts. The
 /// child receives only the candidate-stable telemetry path; its authority Store stays runtime-local.
+/// `identity` is the value bound into the Claude attachment record (the resolved rendezvous key);
+/// it is ignored for Codex, which keeps its pre-existing candidate-only identity. A Claude daemon is
+/// additionally spawned detached in its own process group with kill-on-drop disabled, so it outlives
+/// this MCP process; a Codex daemon keeps its pre-existing MCP-owned lifetime.
 async fn start_managed_daemon(
     runtime: &ManagedRuntime,
     launcher_template: &Path,
-    candidate: PathBuf,
+    identity: &Path,
+    candidate: &Path,
     host: ManagedHost,
-) -> Result<(String, tokio::process::Child), ()> {
-    if !absolute_local_path(&candidate)
-        || !fs::symlink_metadata(&candidate).is_ok_and(|metadata| metadata.is_dir())
+) -> Result<(String, tokio::process::Child), StartDaemonError> {
+    if !absolute_local_path(candidate)
+        || !fs::symlink_metadata(candidate).is_ok_and(|metadata| metadata.is_dir())
         || !absolute_local_path(launcher_template)
     {
-        return Err(());
+        return Err(StartDaemonError::Other);
     }
-    let attachment = random_hex(32).map_err(|_| ())?;
-    let telemetry_database = managed_telemetry_database(&candidate).map_err(|_| ())?;
+    let attachment = random_hex(32).map_err(|_| StartDaemonError::Other)?;
+    let telemetry_database =
+        managed_telemetry_database(candidate).map_err(|_| StartDaemonError::Other)?;
     let (launcher, bytes) =
-        LauncherConfig::bind_one_candidate(launcher_template, &attachment, &candidate)
-            .map_err(|_| ())?;
+        LauncherConfig::bind_one_candidate(launcher_template, &attachment, candidate)
+            .map_err(|_| StartDaemonError::Other)?;
     if host == ManagedHost::Claude
         && launcher
             .target(&attachment)
             .is_none_or(|target| target.claude_profile.is_none())
     {
-        return Err(());
+        return Err(StartDaemonError::Other);
     }
-    launcher.verify().map_err(|_| ())?;
-    let launcher_path = runtime.write_launcher(&bytes).map_err(|_| ())?;
+    launcher.verify().map_err(|_| StartDaemonError::Other)?;
+    let launcher_path = match runtime.write_launcher(&bytes) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(StartDaemonError::WriteRace);
+        }
+        Err(_) => return Err(StartDaemonError::Other),
+    };
     if host == ManagedHost::Claude {
-        runtime
-            .write_claude_attachment(&candidate, &attachment)
-            .map_err(|_| ())?;
+        match runtime.write_claude_attachment(identity, &attachment) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(StartDaemonError::WriteRace);
+            }
+            Err(_) => return Err(StartDaemonError::Other),
+        }
     }
-    let mut command = tokio::process::Command::new(std::env::current_exe().map_err(|_| ())?);
+    let mut command =
+        tokio::process::Command::new(std::env::current_exe().map_err(|_| StartDaemonError::Other)?);
     command
         .args(["daemon", "--runtime-dir"])
         .arg(&runtime.path)
@@ -1197,16 +1580,40 @@ async fn start_managed_daemon(
             command.env("AGENT_IDE_MANAGED_CODEX_ATTACHMENT", &attachment);
         }
         ManagedHost::Claude => {
-            // Claude deliberately uses the existing hook-correlated daemon path.
+            // Claude deliberately uses the existing hook-correlated daemon path. The daemon is
+            // shared by every worktree of this repository, so it must outlive this one MCP process:
+            // it runs detached, in its own process group, and is never killed by dropping the handle.
             command.env_remove("AGENT_IDE_MANAGED_CODEX_ATTACHMENT");
+            command.kill_on_drop(false);
+            command.process_group(0);
         }
     }
-    let mut child = command.spawn().map_err(|_| ())?;
+    let mut child = command.spawn().map_err(|_| StartDaemonError::Other)?;
     if !health_check_owned_daemon(&mut child, &runtime.path).await {
         terminate_owned_daemon(child).await;
-        return Err(());
+        return Err(StartDaemonError::Other);
     }
     Ok((attachment, child))
+}
+
+/// Waits a bounded interval for an external daemon (not owned by this process) to answer healthy.
+///
+/// Used only to decide whether a concurrent MCP's in-flight spawn for the same shared rendezvous
+/// completed, before ever treating its files as a stale, crashed generation's leftovers.
+async fn wait_for_external_health(runtime: &Path) -> bool {
+    tokio::time::timeout(Duration::from_secs(7), async {
+        loop {
+            if doctor_report(runtime)
+                .await
+                .is_ok_and(|report| matches!(report.status, DoctorStatus::Healthy { .. }))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok()
 }
 
 /// Waits a bounded interval for the exact child to answer the existing side-effect-free health RPC.
