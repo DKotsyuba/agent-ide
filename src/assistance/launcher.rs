@@ -1038,10 +1038,11 @@ pub enum RootAdmissionError {
     ///
     /// This also covers a symlink inside a root whose target resolves outside every root.
     OutsideRoots,
-    /// The worktree or a configured root cannot be canonicalized on the current filesystem.
+    /// The worktree itself cannot be canonicalized on the current filesystem.
     ///
-    /// An unresolvable root fails closed instead of being skipped, so a broken operator
-    /// declaration never widens admission.
+    /// A configured root that fails to canonicalize is skipped instead of aborting admission, so
+    /// one broken operator declaration never hides a different, valid root; this variant is
+    /// returned only when the worktree cannot be resolved at all.
     Unresolvable,
 }
 
@@ -1050,8 +1051,12 @@ pub enum RootAdmissionError {
 /// The worktree and every root are resolved with `std::fs::canonicalize`, so admission compares
 /// real filesystem locations: a symlinked worktree spelling is compared in its target location,
 /// and a symlink inside a root that points outside is rejected. Containment is component-wise,
-/// not a string prefix: `/a/bc` is not below `/a/b`. Returns the canonical worktree path on
-/// success; admission performs no write and grants no execution authority by itself.
+/// not a string prefix: `/a/bc` is not below `/a/b`. A configured root that fails to canonicalize
+/// is skipped and the remaining roots are still tried, so admission never depends on the order of
+/// `allowed_roots`; it is [`RootAdmissionError::OutsideRoots`], not `Unresolvable`, once every
+/// root has been tried and none both resolves and contains the worktree. Returns the canonical
+/// worktree path on success; admission performs no write and grants no execution authority by
+/// itself.
 pub fn admit_worktree(
     allowed_roots: &[PathBuf],
     worktree: &Path,
@@ -1062,8 +1067,11 @@ pub fn admit_worktree(
     let canonical_worktree =
         std::fs::canonicalize(worktree).map_err(|_| RootAdmissionError::Unresolvable)?;
     for root in allowed_roots {
-        let canonical_root =
-            std::fs::canonicalize(root).map_err(|_| RootAdmissionError::Unresolvable)?;
+        let Ok(canonical_root) = std::fs::canonicalize(root) else {
+            // A root that cannot be resolved is treated as non-matching rather than aborting
+            // admission, so one broken declaration never hides a different, valid root.
+            continue;
+        };
         // `Path::starts_with` compares whole components, so a longer sibling sharing the root's
         // string prefix is never contained.
         if canonical_worktree.starts_with(&canonical_root) {

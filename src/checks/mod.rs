@@ -405,6 +405,48 @@ mod tests {
         assert!(!snapshot.truncated);
     }
 
+    /// Builds one problem with an explicit `code` for tests that must exercise it as a dedup key.
+    fn problem_with_code(
+        path: &str,
+        line: u32,
+        column: u32,
+        severity: Severity,
+        code: Option<&str>,
+        message: &str,
+    ) -> Problem {
+        Problem::new(
+            path.to_string(),
+            line,
+            column,
+            severity,
+            code.map(str::to_string),
+            message.to_string(),
+        )
+    }
+
+    #[test]
+    fn from_problems_dedup_key_includes_code() {
+        // Same location and message, different `code`: both survive as distinct problems.
+        let differing_code = vec![
+            problem_with_code("src/lib.rs", 1, 1, Severity::Error, Some("E0308"), "boom"),
+            problem_with_code("src/lib.rs", 1, 1, Severity::Error, Some("E0309"), "boom"),
+        ];
+        let snapshot =
+            ProblemSnapshot::from_problems(Language::Rust, CheckState::Ready, differing_code, 1, 1);
+        assert_eq!(snapshot.problems.len(), 2);
+        assert_eq!(snapshot.errors, 2);
+
+        // Same location, message, and `code`: the duplicate merges into one problem.
+        let same_code = vec![
+            problem_with_code("src/lib.rs", 1, 1, Severity::Error, Some("E0308"), "boom"),
+            problem_with_code("src/lib.rs", 1, 1, Severity::Error, Some("E0308"), "boom"),
+        ];
+        let snapshot =
+            ProblemSnapshot::from_problems(Language::Rust, CheckState::Ready, same_code, 1, 1);
+        assert_eq!(snapshot.problems.len(), 1);
+        assert_eq!(snapshot.errors, 1);
+    }
+
     #[test]
     fn from_problems_sorts_errors_first_then_path_line_column() {
         let problems = vec![
@@ -458,6 +500,29 @@ mod tests {
         assert_eq!(snapshot.problems[300].line, 1);
         assert_eq!(snapshot.problems[499].path, "w.rs");
         assert_eq!(snapshot.problems[499].line, 200);
+    }
+
+    #[test]
+    fn from_problems_truncation_boundary_at_max_problems() {
+        // Exactly MAX_PROBLEMS unique problems: nothing is dropped.
+        let exact: Vec<Problem> = (0..MAX_PROBLEMS as u32)
+            .map(|line| problem("e.rs", line, 1, Severity::Error, "e"))
+            .collect();
+        let snapshot =
+            ProblemSnapshot::from_problems(Language::Rust, CheckState::Ready, exact, 1, 1);
+        assert_eq!(snapshot.errors, MAX_PROBLEMS as u32);
+        assert_eq!(snapshot.problems.len(), MAX_PROBLEMS);
+        assert!(!snapshot.truncated);
+
+        // One more unique problem: it is dropped from the retained list, but counts stay complete.
+        let over: Vec<Problem> = (0..=MAX_PROBLEMS as u32)
+            .map(|line| problem("e.rs", line, 1, Severity::Error, "e"))
+            .collect();
+        let snapshot =
+            ProblemSnapshot::from_problems(Language::Rust, CheckState::Ready, over, 1, 1);
+        assert_eq!(snapshot.errors, MAX_PROBLEMS as u32 + 1);
+        assert_eq!(snapshot.problems.len(), MAX_PROBLEMS);
+        assert!(snapshot.truncated);
     }
 
     #[test]
