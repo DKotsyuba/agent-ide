@@ -129,6 +129,19 @@ async fn main() -> ExitCode {
             run_managed_claude_hook(claude_project_dir).await;
             ExitCode::SUCCESS
         }
+        Ok(Command::ClaudeRendezvous { project_dir }) => {
+            match claude_rendezvous_paths(&project_dir).await {
+                Ok((runtime_dir, helper_socket)) => {
+                    println!("runtime_dir={}", runtime_dir.display());
+                    println!("helper_socket={}", helper_socket.display());
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("agent-ide: {error}");
+                    ExitCode::from(2)
+                }
+            }
+        }
         Ok(Command::ClaudeWorker {
             runtime_dir,
             attachment,
@@ -501,6 +514,14 @@ enum Command {
         /// Optional fixed event-tag restriction; no caller-supplied SQL or arbitrary tag is accepted.
         filter: Filter,
     },
+    /// Prints one project's repository-wide Claude rendezvous runtime directory and helper socket.
+    ///
+    /// Pure shared-derivation reporting for operators; creates no runtime state and never starts a
+    /// daemon. Any resolution failure, including a missing project directory, exits with code 2.
+    ClaudeRendezvous {
+        /// Existing project directory (relative paths are canonicalized) whose rendezvous is reported.
+        project_dir: PathBuf,
+    },
 }
 
 /// Selects the host-specific identity and binding behavior of a self-contained managed MCP.
@@ -550,6 +571,14 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
     let arguments = arguments.collect::<Vec<_>>();
     if arguments.as_slice() == [OsString::from("claude-hook")] {
         return Ok(Command::ManagedClaudeHook);
+    }
+    // `claude-rendezvous` takes one bare project directory and only prints derived paths.
+    if let [mode, project_dir] = arguments.as_slice()
+        && mode == "claude-rendezvous"
+    {
+        return Ok(Command::ClaudeRendezvous {
+            project_dir: PathBuf::from(project_dir),
+        });
     }
     // The helper command has its own fixed longer shape; every other mode keeps the exact
     // three-argument form it already had, so no existing invocation changes meaning.
@@ -1225,6 +1254,29 @@ fn claude_runtime_path(key: &Path) -> std::io::Result<PathBuf> {
     let identity = claude_rendezvous_identity(key);
     Ok(fs::canonicalize(Path::new("/private/tmp"))?
         .join(format!("{CLAUDE_RUNTIME_PREFIX}{}", &identity[..16])))
+}
+
+/// Resolves the two operator-reported Claude rendezvous paths for one existing project directory.
+///
+/// The derivation is exactly the shared one used by the managed Claude MCP server and hook: the
+/// repository-wide rendezvous key of [`claude_rendezvous_key`] (EYES-r2 §2) fed through
+/// [`claude_runtime_path`], with the helper socket name appended, so the reported paths match the
+/// allowlist entry a Claude session in the same repository resolves. `project_dir` may be
+/// relative and is canonicalized first; nothing is created, read, or removed under the reported
+/// paths. Returns an error when the directory is missing or not a directory, or when
+/// `/private/tmp` cannot be resolved; the caller reports any error with exit code 2.
+async fn claude_rendezvous_paths(project_dir: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
+    if !fs::symlink_metadata(project_dir).is_ok_and(|metadata| metadata.is_dir()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("project directory {} does not exist", project_dir.display()),
+        ));
+    }
+    let candidate = fs::canonicalize(project_dir)?;
+    let key = claude_rendezvous_key(&candidate).await;
+    let runtime = claude_runtime_path(&key)?;
+    let socket = runtime.join(agent_ide::assistance::claude_helper::HELPER_SOCKET);
+    Ok((runtime, socket))
 }
 
 /// Returns whether a string is exactly one generated 32-byte lowercase hexadecimal attachment.
@@ -2108,5 +2160,76 @@ mod tests {
         ));
         assert!(telemetry_owner(&database).await.is_err());
         assert!(!database.exists());
+    }
+
+    /// A repository and its linked worktree resolve one shared rendezvous and helper socket path.
+    #[tokio::test]
+    async fn claude_rendezvous_paths_share_one_runtime_between_worktrees() {
+        let parent = std::env::temp_dir().join(format!(
+            "agent-ide-rendezvous-cli-{}-{}",
+            std::process::id(),
+            random_hex(4).unwrap()
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
+        let repo = parent.join("repo");
+        let worktree = parent.join("linked");
+        fs::create_dir(&repo).unwrap();
+        let git = |arguments: &[&str]| {
+            let status = std::process::Command::new("/usr/bin/git")
+                .args(arguments)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {arguments:?} failed");
+        };
+        git(&["init", "-q", &repo.to_string_lossy()]);
+        git(&[
+            "-C",
+            &repo.to_string_lossy(),
+            "-c",
+            "user.name=Rendezvous Fixture",
+            "-c",
+            "user.email=rendezvous@fixture.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "rendezvous fixture",
+        ]);
+        git(&[
+            "-C",
+            &repo.to_string_lossy(),
+            "worktree",
+            "add",
+            "-q",
+            &worktree.to_string_lossy(),
+        ]);
+
+        let (repo_runtime, repo_socket) = claude_rendezvous_paths(&repo).await.unwrap();
+        let (worktree_runtime, worktree_socket) = claude_rendezvous_paths(&worktree).await.unwrap();
+        assert_eq!(repo_runtime, worktree_runtime);
+        assert_eq!(worktree_socket, repo_socket);
+        assert_eq!(
+            repo_socket,
+            repo_runtime.join(agent_ide::assistance::claude_helper::HELPER_SOCKET)
+        );
+        // The shortened suffix is the shared key digest's sixteen-hex-character prefix, not any
+        // candidate-specific path digest.
+        let key = claude_rendezvous_key(&fs::canonicalize(&repo).unwrap()).await;
+        let expected = fs::canonicalize(Path::new("/private/tmp"))
+            .unwrap()
+            .join(format!(
+                "{CLAUDE_RUNTIME_PREFIX}{}",
+                &claude_rendezvous_identity(&key)[..16]
+            ));
+        assert_eq!(repo_runtime, expected);
+        assert!(
+            claude_rendezvous_paths(&parent.join("absent"))
+                .await
+                .is_err()
+        );
+
+        fs::remove_dir_all(parent).unwrap();
     }
 }

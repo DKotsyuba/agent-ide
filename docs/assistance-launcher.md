@@ -230,3 +230,8 @@ does not expand a wildcard in this allowlist, so the operator must add the exact
 project-local settings before the next session.
 `allowAllUnixSockets` is outside this strict profile because it grants access to unrelated host
 sockets.
+
+To compute both exact paths for a repository in advance, run
+`agent-ide claude-rendezvous /absolute/path/to/project`: it prints the shared `runtime_dir=` and
+`helper_socket=` paths using the same derivation as the managed MCP server and hook, and creates
+no runtime state.

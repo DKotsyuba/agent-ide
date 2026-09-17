@@ -82,7 +82,8 @@ so one allowlist entry serves every worktree of one repository. The pending help
 exact runtime directory in its `--runtime-dir` argument whenever a helper reports `unavailable`.
 Current Claude Code does not expand a wildcard for this socket allowlist; add that exact path to the
 project's local settings before the next session, and do not enable `allowAllUnixSockets` for
-Agent IDE.
+Agent IDE. `agent-ide claude-rendezvous /absolute/path/to/project` prints the exact
+`runtime_dir=` and `helper_socket=` paths for a repository without creating any runtime state.
 
 The separate launcher environment variable `AGENT_IDE_HOST_ATTACHMENT` enables
 connect-only routing when supported host request metadata is also present. It is an
