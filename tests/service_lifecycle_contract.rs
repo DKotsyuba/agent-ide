@@ -1,19 +1,32 @@
-//! Executable EYES-r1 §2 rendezvous/spawn/adopt lifecycle contract for the shared managed Claude
-//! daemon: repository-keyed sharing across worktrees, start-race convergence to one lock holder,
-//! and daemon persistence across an owning MCP process's own stdio EOF.
+//! Executable EYES-r2 §2 rendezvous/spawn/adopt/lease/idle lifecycle contract for the shared managed
+//! Claude daemon: repository-keyed sharing across worktrees, start-race convergence to one lock
+//! holder, daemon persistence across an owning MCP process's own stdio EOF, and client-lease-driven
+//! idle shutdown.
 
 use std::{
+    future::Future,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
+    pin::Pin,
     process::Stdio,
+    sync::Arc,
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
 
-use agent_ide::app::{DoctorLockState, DoctorStatus, doctor_report};
+use agent_ide::app::{
+    self, DoctorLockState, DoctorStatus, RuntimeDir,
+    config::EffectiveConfig,
+    doctor_report,
+    transport::{
+        AssistanceDispatch, AssistanceDispatchReply, AssistanceDispatchUnavailable,
+        AssistanceDispatcher,
+    },
+};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::UnixStream,
     process::{Child, ChildStdin, ChildStdout, Command},
 };
 
@@ -451,8 +464,10 @@ async fn daemon_survives_mcp_eof_and_is_adopted_by_a_later_mcp() {
     };
 
     first.close().await;
-    // No lease/idle timeout exists yet (T093); the daemon must still be exactly the one already
-    // running, unaffected by its spawning MCP's own process exit.
+    // The production idle timeout is 300s (EYES-r2 §1 default), far longer than this assertion
+    // window, so the daemon must still be exactly the one already running here, unaffected by its
+    // spawning MCP's own process exit; T093's lease/idle mechanism is covered under a short test
+    // timeout by the dedicated lease/idle scenarios below.
     let after_eof = doctor_report(&runtime).await.unwrap();
     assert_eq!(after_eof.lock, DoctorLockState::Held);
     match after_eof.status {
@@ -482,4 +497,156 @@ async fn daemon_survives_mcp_eof_and_is_adopted_by_a_later_mcp() {
     assert!(runtime.is_dir());
 
     let _ = std::fs::remove_dir_all(candidate);
+}
+
+/// Accepts every dispatch as unavailable; the lease/idle scenarios below never exercise Assistance
+/// semantics, only the Application-layer lease count and idle-timeout shutdown path.
+struct NoopDispatcher;
+
+impl AssistanceDispatcher for NoopDispatcher {
+    fn dispatch(
+        &self,
+        _request: AssistanceDispatch,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<AssistanceDispatchReply, AssistanceDispatchUnavailable>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async { Err(AssistanceDispatchUnavailable) })
+    }
+}
+
+/// Starts the real in-process Assistance daemon with an explicit short `idle_timeout`, and returns
+/// its runtime directory and the task that resolves once the daemon's own run loop returns.
+///
+/// The real managed-MCP startup path always uses the EYES-r2 §1 production default (300s), so the
+/// short deadlines these scenarios need can only come from this daemon-runner parameter directly.
+async fn start_lease_test_daemon(idle_timeout: Duration) -> (PathBuf, tokio::task::JoinHandle<()>) {
+    // A short, uncanonicalized prefix, unlike `unique_path`: a Unix socket path must fit
+    // `sockaddr_un.sun_path` (104 bytes on macOS), which `unique_path`'s longer fixture prefix
+    // combined with a canonicalized `TMPDIR` can already exceed before the socket name is appended.
+    let runtime_dir = std::env::temp_dir().join(format!(
+        "ai-lt-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let prepared = RuntimeDir::prepare_for_daemon(&runtime_dir).unwrap();
+    let task = tokio::spawn(async move {
+        app::run_daemon_with_assistance(
+            prepared,
+            Arc::new(NoopDispatcher),
+            EffectiveConfig::defaults(),
+            idle_timeout,
+        )
+        .await
+        .unwrap();
+    });
+    let socket = runtime_dir.join("agent-ide.sock");
+    for _ in 0..200 {
+        if UnixStream::connect(&socket).await.is_ok() {
+            return (runtime_dir, task);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("lease test daemon did not bind its private socket");
+}
+
+/// A daemon that starts with zero open leases shuts itself down after its configured idle timeout,
+/// through the same orderly path as SIGTERM, and removes its own runtime directory (EYES-r2 §2).
+#[tokio::test]
+async fn daemon_shuts_down_after_idle_timeout_with_zero_leases() {
+    let (runtime, task) = start_lease_test_daemon(Duration::from_millis(300)).await;
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("a daemon with no lease must shut itself down after its idle timeout")
+        .unwrap();
+    assert!(
+        !runtime.exists(),
+        "orderly idle shutdown must remove its own runtime directory"
+    );
+}
+
+/// An open `ClientLease` connection suppresses idle shutdown for as long as it stays open; its own
+/// EOF releases the lease and lets the idle countdown run to completion.
+#[tokio::test]
+async fn open_lease_suppresses_idle_shutdown_until_released() {
+    let (runtime, task) = start_lease_test_daemon(Duration::from_millis(400)).await;
+    let lease = app::open_client_lease(&runtime, "lease-a")
+        .await
+        .expect("daemon must admit a well-formed lease request");
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(
+        doctor_report(&runtime)
+            .await
+            .is_ok_and(|report| matches!(report.status, DoctorStatus::Healthy { .. })),
+        "an open lease must keep the daemon alive past its idle timeout"
+    );
+
+    drop(lease);
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("idle expiry must stop the daemon within a bounded deadline")
+        .unwrap();
+    assert!(!runtime.exists());
+}
+
+/// A lease opened while the idle countdown is already running cancels that countdown; the daemon
+/// only idles out once this later lease also releases.
+#[tokio::test]
+async fn a_lease_opened_during_the_countdown_cancels_shutdown() {
+    let (runtime, task) = start_lease_test_daemon(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let lease = app::open_client_lease(&runtime, "late-lease")
+        .await
+        .expect("daemon must still be alive to admit a lease mid-countdown");
+
+    // Past the ORIGINAL 500ms deadline (300ms elapsed + 400ms more); still alive proves the lease
+    // cancelled that countdown rather than merely outliving a shorter one.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        doctor_report(&runtime)
+            .await
+            .is_ok_and(|report| matches!(report.status, DoctorStatus::Healthy { .. })),
+        "a lease opened mid-countdown must cancel the pending idle shutdown"
+    );
+
+    drop(lease);
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("idle expiry must fire once the later lease also releases")
+        .unwrap();
+    assert!(!runtime.exists());
+}
+
+/// Simulates two managed Claude MCP processes sharing one daemon, each holding its own `ClientLease`
+/// open for its process lifetime (EYES-r2 §2): the daemon must survive the first exiting alone, and
+/// only starts (and completes) its idle countdown once the second's lease also releases.
+#[tokio::test]
+async fn daemon_survives_first_of_two_mcp_leases_exiting_and_idles_after_the_second() {
+    let (runtime, task) = start_lease_test_daemon(Duration::from_millis(400)).await;
+    let lease_a = app::open_client_lease(&runtime, "mcp-a")
+        .await
+        .expect("first simulated MCP's lease must be admitted");
+    let lease_b = app::open_client_lease(&runtime, "mcp-b")
+        .await
+        .expect("second simulated MCP's lease must be admitted");
+
+    drop(lease_a);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(
+        doctor_report(&runtime)
+            .await
+            .is_ok_and(|report| matches!(report.status, DoctorStatus::Healthy { .. })),
+        "the daemon must survive the first of two leases releasing while the second stays open"
+    );
+
+    drop(lease_b);
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("idle expiry must fire once the second, and last, lease also releases")
+        .unwrap();
+    assert!(!runtime.exists());
 }

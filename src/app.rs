@@ -4,6 +4,8 @@
 pub mod cache;
 /// Immutable restart-only limits and their provenance for Application infrastructure.
 pub mod config;
+/// Long-lived client lease admission and idle-timeout daemon shutdown.
+pub mod lease;
 /// Dedicated SQLite owner-thread mechanics and durable operation receipts for domain SQL.
 pub mod store;
 /// Finite opaque Assistance hook and current-method transport values.
@@ -191,7 +193,7 @@ impl RuntimeDir {
 /// for a setup/listener failure; SIGKILL cannot run cleanup.
 pub async fn run_daemon(runtime_dir: RuntimeDir) -> Result<(), AppError> {
     let ipc = config::EffectiveConfig::defaults().ipc();
-    run_daemon_inner(runtime_dir, None, ipc, None).await
+    run_daemon_inner(runtime_dir, None, ipc, None, lease::DEFAULT_IDLE_TIMEOUT).await
 }
 
 /// Starts a private daemon that routes finite v2 hook/method and v3 method-only Assistance ingress.
@@ -200,10 +202,15 @@ pub async fn run_daemon(runtime_dir: RuntimeDir) -> Result<(), AppError> {
 /// frames, limits, correlates, and times out `assistance.hook_submit` and the closed current-method
 /// dispatch set. Health remains available with its unchanged version-one contract. SIGINT/SIGTERM
 /// stops ingress and awaits the dispatcher's bounded owned-resource cleanup before return.
+///
+/// `idle_timeout` bounds how long this daemon stays alive with zero open `ClientLease` connections
+/// before it shuts down through the same orderly path as SIGINT/SIGTERM (EYES-r2 §2); callers that
+/// do not yet source it from configuration should pass [`lease::DEFAULT_IDLE_TIMEOUT`].
 pub async fn run_daemon_with_assistance(
     runtime_dir: RuntimeDir,
     dispatcher: Arc<dyn AssistanceDispatcher>,
     config: config::EffectiveConfig,
+    idle_timeout: Duration,
 ) -> Result<(), AppError> {
     let ipc = config.ipc();
     let limits = HookTransportLimits::new(
@@ -212,7 +219,14 @@ pub async fn run_daemon_with_assistance(
         ipc.connection_deadline,
     )
     .expect("fixed Assistance transport limits are valid");
-    run_daemon_inner(runtime_dir, Some(dispatcher), ipc, Some(limits)).await
+    run_daemon_inner(
+        runtime_dir,
+        Some(dispatcher),
+        ipc,
+        Some(limits),
+        idle_timeout,
+    )
+    .await
 }
 
 /// Binds one daemon endpoint until SIGINT/SIGTERM, then drains transport and bounded peer cleanup.
@@ -225,8 +239,12 @@ async fn run_daemon_inner(
     dispatcher: Option<Arc<dyn AssistanceDispatcher>>,
     ipc: config::IpcConfig,
     transport_limits: Option<HookTransportLimits>,
+    idle_timeout: Duration,
 ) -> Result<(), AppError> {
     let _lock = DaemonLock::acquire(runtime_dir.lock_path())?;
+    let runtime_identity = fs::symlink_metadata(runtime_dir.path())
+        .ok()
+        .map(|metadata| (metadata.dev(), metadata.ino()));
     let termination = termination_signal()?;
     tokio::pin!(termination);
     if let Some(dispatcher) = &dispatcher {
@@ -240,6 +258,11 @@ async fn run_daemon_inner(
     }
     let mut connections = tokio::task::JoinSet::new();
     let mut owned_socket = None;
+    // `is_busy` is fixed `false` until a future task threads real project-check status through
+    // (EYES-r2 §2); the daemon is therefore idle-eligible whenever no lease connection is open.
+    let lease = lease::LeaseController::new(idle_timeout, || false);
+    let idle_expired = lease.idle_expired();
+    tokio::pin!(idle_expired);
     let serving = async {
         let socket_path = runtime_dir.socket_path();
         retire_stale_socket(&socket_path, ipc.connection_deadline).await?;
@@ -253,20 +276,23 @@ async fn run_daemon_inner(
             let accepted = tokio::select! {
                 accepted = listener.accept() => accepted,
                 _ = &mut termination => break,
+                _ = &mut idle_expired => break,
                 _ = connections.join_next(), if !connections.is_empty() => continue,
             };
             let (stream, _) = accepted?;
-            let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
-                drop(stream);
-                continue;
-            };
             let generation = generation.clone();
             let dispatcher = dispatcher.clone();
+            let permits = Arc::clone(&permits);
+            let lease = lease.clone();
             connections.spawn(async move {
-                let _permit = permit;
-                let _ = tokio::time::timeout(
+                serve_accepted_connection(
+                    stream,
+                    generation,
+                    dispatcher,
+                    transport_limits,
                     ipc.connection_deadline,
-                    serve_connection(stream, generation, dispatcher, transport_limits),
+                    permits,
+                    lease,
                 )
                 .await;
             });
@@ -274,9 +300,30 @@ async fn run_daemon_inner(
         Ok(())
     }
     .await;
-    let result = finish_daemon(serving, &mut connections, dispatcher.as_ref()).await;
+    let result = finish_daemon(serving, &mut connections, dispatcher.as_ref(), &lease).await;
+    if result.is_ok()
+        && owned_socket.is_some()
+        && let Some(identity) = runtime_identity
+    {
+        remove_owned_runtime_directory(runtime_dir.path(), identity);
+    }
     drop((owned_socket, _lock));
     result
+}
+
+/// Removes `path` only if it is still the exact directory identity captured when this daemon
+/// acquired its lock; a directory a concurrent process already replaced is left untouched.
+///
+/// Per EYES-r2 §2, the shared daemon is never owned by any one MCP process, so its own orderly
+/// shutdown (idle expiry or SIGINT/SIGTERM) is the only place left to remove its runtime directory,
+/// matching what the existing managed-runtime cleanup does for a singly owned runtime.
+fn remove_owned_runtime_directory(path: &Path, identity: (u64, u64)) {
+    if let Ok(metadata) = fs::symlink_metadata(path)
+        && !metadata.file_type().is_symlink()
+        && (metadata.dev(), metadata.ino()) == identity
+    {
+        let _ = fs::remove_dir_all(path);
+    }
 }
 
 /// Bounds dispatcher initialization; a timeout or initialize error may still leave owned provider
@@ -298,12 +345,14 @@ async fn initialize_dispatcher(
 }
 
 /// Aborts and joins every accepted connection task (cancellation, not a graceful drain of in-flight
-/// requests) and shuts down an initialized dispatcher before returning serving state. Cleanup is
-/// attempted in full; an earlier setup or accept error remains the returned error.
+/// requests), shuts down an initialized dispatcher, and runs every registered lease shutdown hook
+/// before returning serving state. Cleanup is attempted in full; an earlier setup or accept error
+/// remains the returned error.
 async fn finish_daemon(
     serving: Result<(), AppError>,
     connections: &mut tokio::task::JoinSet<()>,
     dispatcher: Option<&Arc<dyn AssistanceDispatcher>>,
+    lease: &lease::LeaseController,
 ) -> Result<(), AppError> {
     connections.abort_all();
     while connections.join_next().await.is_some() {}
@@ -311,6 +360,7 @@ async fn finish_daemon(
         Some(dispatcher) => shutdown_dispatcher(dispatcher).await,
         None => Ok(()),
     };
+    lease.run_shutdown_hooks().await;
     serving.and(shutdown)
 }
 
@@ -556,27 +606,117 @@ fn inspect_lock(path: &Path) -> DoctorLockState {
     }
 }
 
-/// Validates one accepted peer and routes either unchanged health or one finite Assistance request.
-async fn serve_connection(
+/// Identifies one accepted peer and routes it to health, Assistance dispatch, or a long-lived lease.
+///
+/// Identifying the request, and any bounded reply, share one `connection_deadline` budget, exactly
+/// like every other accepted connection. Only an admitted lease's ensuing hold-open phase escapes
+/// that budget, run by [`hold_lease_until_eof`] after this function returns, because that phase is
+/// deliberately unbounded until the peer's own EOF (EYES-r2 §2). A lease request is admitted from
+/// its own bounded pool ([`lease::LeaseController::try_admit`]) and never acquires `permits`, the
+/// separate hook/assistance `max_connections` semaphore.
+async fn serve_accepted_connection(
     mut stream: UnixStream,
     generation: String,
     dispatcher: Option<Arc<dyn AssistanceDispatcher>>,
     transport_limits: Option<HookTransportLimits>,
-) -> io::Result<()> {
-    if peer_uid(stream.as_raw_fd())? != effective_uid() {
-        return Ok(());
-    }
-    let request: Value = read_frame(&mut stream, MAX_V2_FRAME_BYTES).await?;
-    match request.get("version").and_then(Value::as_u64) {
-        Some(1) => serve_health(&mut stream, request, generation).await,
-        Some(2 | 3) => match (dispatcher, transport_limits) {
-            (Some(dispatcher), Some(limits)) => {
-                serve_assistance_request(&mut stream, request, dispatcher, limits).await
+    connection_deadline: Duration,
+    permits: Arc<Semaphore>,
+    lease: lease::LeaseController,
+) {
+    let identified = tokio::time::timeout(connection_deadline, async {
+        if peer_uid(stream.as_raw_fd())? != effective_uid() {
+            return Ok(None);
+        }
+        let request: Value = read_frame(&mut stream, MAX_V2_FRAME_BYTES).await?;
+        match request.get("version").and_then(Value::as_u64) {
+            Some(1) => {
+                serve_health(&mut stream, request, generation).await?;
+                Ok(None)
             }
-            _ => Ok(()),
-        },
-        _ => Ok(()),
+            Some(2 | 3) => {
+                if let (Some(dispatcher), Some(limits)) = (dispatcher, transport_limits)
+                    && let Ok(_permit) = permits.try_acquire_owned()
+                {
+                    serve_assistance_request(&mut stream, request, dispatcher, limits).await?;
+                }
+                Ok(None)
+            }
+            Some(version) if version == u64::from(transport::CLIENT_LEASE_WIRE_VERSION) => {
+                serve_client_lease_handshake(&mut stream, request, &lease).await
+            }
+            _ => Ok(None),
+        }
+    })
+    .await;
+    if let Ok(Ok(Some(guard))) = identified {
+        hold_lease_until_eof(stream).await;
+        drop(guard);
     }
+}
+
+/// Reads and discards bytes until EOF or error on one admitted lease connection.
+///
+/// Deliberately unbounded (no timeout): per EYES-r2 §2, an admitted lease is exempt from
+/// `connection_deadline` for exactly this hold-open phase, since the peer keeps it open for its own
+/// entire lifetime and only its EOF should release the lease.
+async fn hold_lease_until_eof(mut stream: UnixStream) {
+    let mut discard = [0_u8; 256];
+    while matches!(stream.read(&mut discard).await, Ok(read) if read > 0) {}
+}
+
+/// Validates one `ClientLease` request, admits it from the bounded lease pool, and acks it.
+///
+/// Returns `Ok(None)` for a malformed request or a refused admission alike, so the connection is
+/// simply dropped exactly like every other rejected frame; the peer never learns which occurred.
+async fn serve_client_lease_handshake(
+    stream: &mut UnixStream,
+    request: Value,
+    lease: &lease::LeaseController,
+) -> io::Result<Option<lease::LeaseGuard>> {
+    let Ok(request) = serde_json::from_value::<transport::ClientLeaseRequest>(request) else {
+        return Ok(None);
+    };
+    if request.version != transport::CLIENT_LEASE_WIRE_VERSION
+        || request.request_id.is_empty()
+        || request.request_id.len() > MAX_REQUEST_ID_BYTES
+        || request.method != "assistance.client_lease"
+    {
+        return Ok(None);
+    }
+    let Some(guard) = lease.try_admit() else {
+        return Ok(None);
+    };
+    let ack = transport::ClientLeaseAck {
+        version: transport::CLIENT_LEASE_WIRE_VERSION,
+        request_id: request.request_id,
+        status: "ok".to_owned(),
+    };
+    write_frame(stream, &ack, MAX_V1_FRAME_BYTES).await?;
+    Ok(Some(guard))
+}
+
+/// Opens and acknowledges one long-lived `ClientLease` connection to a live daemon at `runtime_dir`.
+///
+/// Returns `None` for any connect, framing, or correlation fault; the caller must fail open exactly
+/// like [`submit_hook_if_running`] and must not retry inline or use this as actor proof. The caller
+/// must hold the returned stream for its own entire lifetime and drop it only on its own exit: that
+/// drop is the client-side EOF that releases the daemon's lease count (EYES-r2 §2).
+pub async fn open_client_lease(
+    runtime_dir: &Path,
+    request_id: impl Into<String>,
+) -> Option<UnixStream> {
+    let mut stream = UnixStream::connect(runtime_dir.join(SOCKET_NAME))
+        .await
+        .ok()?;
+    let request = transport::ClientLeaseRequest::new(request_id);
+    write_frame(&mut stream, &request, MAX_V1_FRAME_BYTES)
+        .await
+        .ok()?;
+    let ack: transport::ClientLeaseAck = read_frame(&mut stream, MAX_V1_FRAME_BYTES).await.ok()?;
+    (ack.version == transport::CLIENT_LEASE_WIRE_VERSION
+        && ack.status == "ok"
+        && ack.request_id == request.request_id)
+        .then_some(stream)
 }
 
 /// Validates the unchanged v1 health request and emits only its existing correlated health reply.
@@ -1125,10 +1265,12 @@ mod tests {
         });
         tokio::task::yield_now().await;
 
+        let lease = lease::LeaseController::new(Duration::from_secs(300), || false);
         let error = finish_daemon(
             Err(AppError::Io(io::Error::from_raw_os_error(libc::EMFILE))),
             &mut connections,
             Some(&dispatcher),
+            &lease,
         )
         .await
         .unwrap_err();

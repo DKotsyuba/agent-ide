@@ -101,6 +101,7 @@ async fn start_assistance_daemon(runtime_dir: &Path) -> tokio::task::JoinHandle<
             daemon_runtime,
             Arc::new(TestDispatcher),
             EffectiveConfig::defaults(),
+            agent_ide::app::lease::DEFAULT_IDLE_TIMEOUT,
         )
         .await
         .unwrap();
