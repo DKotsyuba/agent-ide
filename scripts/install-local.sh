@@ -131,10 +131,9 @@ fi
 act rm -rf "$version_dir"
 act mv -f "$staged_version_dir" "$version_dir"
 
-tmp_link="$plugin_root/current.tmp-$$"
-act rm -f "$tmp_link"
-act ln -s "$version" "$tmp_link"
-act mv -f "$tmp_link" "$current_link"
+# `ln -sfh` replaces the symlink itself; `mv` onto a symlink that points at a directory would
+# move the new link *into* that directory and leave `current` unchanged (A02B).
+act ln -sfh "$version" "$current_link"
 
 if [ "$dry_run" -eq 0 ]; then
     launcher_config="$HOME/.config/agent-ide/launcher.json"
