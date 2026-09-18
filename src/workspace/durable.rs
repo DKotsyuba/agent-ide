@@ -926,7 +926,7 @@ impl DurableWorkspace<'_> {
                 Err(error) => {
                     let tag: &[u8] = match error {
                         super::observation::ObservationError::Missing => b"missing",
-                        super::observation::ObservationError::TooLarge => b"too_large",
+                        super::observation::ObservationError::TooLarge { .. } => b"too_large",
                         super::observation::ObservationError::SymlinkEscape => b"symlink",
                         super::observation::ObservationError::NotRegularFile => b"not_regular",
                         super::observation::ObservationError::RootIdentityChanged

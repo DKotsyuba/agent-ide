@@ -16,7 +16,7 @@ use super::claude_worker::{
     HelperResult, HelperSource, LaunchLedger, MAX_HELPER_FRAME_BYTES, MAX_RESULT_TEXT_BYTES,
 };
 use super::host_binding::BindingRef;
-use super::reply::{EditDiagnostics, FailureCode, PeerReply};
+use super::reply::{EditDiagnostics, FailureCode};
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
@@ -363,7 +363,7 @@ async fn execute(
         Ok(ClaimReply::Granted(job)) => *job,
         _ => return "refused",
     };
-    let (outcome, children, discovery, payload) = perform(&job, &detail_ref).await;
+    let (outcome, children, discovery, payload) = perform(&job).await;
     let settled = children.settled();
     let result = HelperResult {
         protocol: HELPER_PROTOCOL,
@@ -505,13 +505,9 @@ async fn perform_discovery(
     )
 }
 
-/// Executes operation-specific work after discovery using the claimed detail reference for fitting.
-///
-/// `detail_ref` is the exact ticket handle carried by the enclosing helper result. It is used only
-/// to measure the final Diff envelope; it never grants authority or becomes a continuation.
+/// Executes operation-specific work after discovery.
 async fn perform(
     job: &HelperJob,
-    detail_ref: &str,
 ) -> (
     HelperOutcome,
     ChildSettlement,
@@ -617,7 +613,6 @@ async fn perform(
         HelperOperation::Diff => {
             diff(
                 job,
-                detail_ref,
                 deadline,
                 worktree,
                 &mut children.spawned,
@@ -905,8 +900,8 @@ async fn context(
             freshness::Freshness,
         },
         workspace::observation::{
-            ObservationRef, ObservedState, SourceBytes, SourceCoverage, SourceObservation,
-            SourceReadLimits, SourceRevision, read_authorized_source,
+            MAX_SOURCE_BYTES, ObservationRef, ObservedState, SourceBytes, SourceCoverage,
+            SourceObservation, SourceReadLimits, SourceRevision, read_authorized_source,
         },
     };
     let Some(scope) = job.scope.as_ref() else {
@@ -926,10 +921,13 @@ async fn context(
         );
     };
     let relative = PathBuf::from(path);
+    // The source read ceiling is the v0.1 reader's own bound, not the helper's discovery-command
+    // output budget: `job.budgets.output_bytes` sizes bounded Git process captures and is far
+    // smaller than a source file may legitimately be.
     let read = read_authorized_source(
         &worktree,
         &relative,
-        match SourceReadLimits::new(1024, job.budgets.output_bytes) {
+        match SourceReadLimits::new(1024, MAX_SOURCE_BYTES) {
             Ok(limits) => limits,
             Err(_) => {
                 return (
@@ -950,6 +948,17 @@ async fn context(
         }
         Err(crate::workspace::observation::ObservationError::Missing) => {
             (Vec::new(), None, ObservedState::Missing, "missing".into())
+        }
+        Err(crate::workspace::observation::ObservationError::TooLarge { size }) => {
+            return (
+                HelperOutcome::Failed {
+                    code: FailureCode::SourceTooLarge {
+                        size,
+                        ceiling: MAX_SOURCE_BYTES as u64,
+                    },
+                },
+                None,
+            );
         }
         Err(_) => {
             return (
@@ -1447,13 +1456,25 @@ fn fit_result_text(mut text: String) -> (String, bool) {
     (text, true)
 }
 
+/// Largest number of hunks selected for one Claude foreground-helper Diff capture (T13B).
+///
+/// The daemon has no execution path of its own for Claude, so unlike the managed path's
+/// re-derivable `DiffPageState`, this single capture must be generous enough for a realistic
+/// diff: the daemon pages the composed text exactly as it already does for a large Context
+/// result, never by re-running Git.
+const CLAUDE_DIFF_MAX_HUNKS: usize = 512;
+/// Largest raw selected-hunk byte budget for one Claude foreground-helper Diff capture (T13B).
+const CLAUDE_DIFF_MAX_BYTES: usize = 192 * 1024;
+
 /// Produces one bounded current Git comparison inside the inherited sandbox.
 ///
-/// `detail_ref` is included only in the shared final-envelope fit. Claude helper Diff pages retain
-/// no cursor, so an incomplete page never advertises this handle as a continuation.
+/// The complete composed diff (up to `CLAUDE_DIFF_MAX_HUNKS`/`CLAUDE_DIFF_MAX_BYTES`) is captured
+/// in this one helper run; the daemon retains its rendered text and pages through it on later
+/// `ide.inspect` calls the same way it pages a large Context result (T13B). Genuine overflow past
+/// this capture's own budget is reported explicitly through `omitted_hunks`/`omitted_bytes` in the
+/// rendered text and the `truncated` payload field, never silently dropped.
 async fn diff(
     job: &HelperJob,
-    detail_ref: &str,
     deadline: tokio::time::Instant,
     worktree: crate::workspace::authority::WorktreeRef,
     spawned: &mut u32,
@@ -1561,39 +1582,38 @@ async fn diff(
         );
     }
     let comparison = evidence.comparison().clone();
-    let fitted = crate::assistance::worker::snapshots::fit_diff_page(
-        mode,
-        helper_scope.authority_epoch,
-        detail_ref,
-        32,
-        false,
-        |max_hunks| {
-            crate::changes::compose_diff(
-                &scope,
-                &comparison,
-                evidence.clone(),
-                crate::changes::DiffSelectionBudget::bounded(max_hunks, 24 * 1024),
-            )
-        },
+    let result = crate::changes::compose_diff(
+        &scope,
+        &comparison,
+        evidence,
+        crate::changes::DiffSelectionBudget::bounded(CLAUDE_DIFF_MAX_HUNKS, CLAUDE_DIFF_MAX_BYTES),
     );
-    match fitted {
-        Ok((
-            result,
-            PeerReply::Complete {
-                text, truncated, ..
+    if matches!(
+        result.state(),
+        crate::changes::DiffResultState::Unavailable | crate::changes::DiffResultState::Failed
+    ) {
+        return (
+            HelperOutcome::Failed {
+                code: FailureCode::SourceUnavailable,
             },
-        )) => (
-            HelperOutcome::Complete { text },
-            Some(HelperPayload::Diff {
-                truncated: truncated
-                    || result.truncated_output()
-                    || result.overflow_hunks() > 0
-                    || result.overflow_bytes() > 0,
-            }),
-        ),
-        Ok(_) => unreachable!("shared diff fitter always returns a complete reply"),
-        Err(code) => (HelperOutcome::Failed { code }, None),
+            None,
+        );
     }
+    let overflowed = result.overflow_hunks() > 0 || result.overflow_bytes() > 0;
+    let rendered = crate::assistance::worker::snapshots::render_diff_text(
+        mode,
+        &result,
+        helper_scope.authority_epoch,
+        overflowed,
+    );
+    let truncated = result.truncated_output() || overflowed;
+    let (text, clipped) = fit_result_text(rendered);
+    (
+        HelperOutcome::Complete { text },
+        Some(HelperPayload::Diff {
+            truncated: truncated || clipped,
+        }),
+    )
 }
 
 /// Executes Workspace snapshot intents sequentially under the one already-held helper admission.
@@ -1852,7 +1872,7 @@ mod tests {
         };
         // The previously minted ceiling cannot finish the walk of this repository and fails
         // closed partway through its child budget instead of delivering any diff.
-        let (outcome, small, _, _) = perform(&diff_job(64, 64 * 1024), "detail").await;
+        let (outcome, small, _, _) = perform(&diff_job(64, 64 * 1024)).await;
         assert!(
             matches!(
                 outcome,
@@ -1870,13 +1890,10 @@ mod tests {
             small.spawned
         );
         // The minted production ceilings complete the same walk and deliver a real diff.
-        let (outcome, children, _, payload) = perform(
-            &diff_job(
-                1024,
-                crate::workspace::git::snapshot::MAX_SNAPSHOT_BLOB_BYTES,
-            ),
-            "detail",
-        )
+        let (outcome, children, _, payload) = perform(&diff_job(
+            1024,
+            crate::workspace::git::snapshot::MAX_SNAPSHOT_BLOB_BYTES,
+        ))
         .await;
         let HelperOutcome::Complete { text } = outcome else {
             panic!("the bounded snapshot walk completes, saw {outcome:?}")
@@ -1884,6 +1901,192 @@ mod tests {
         assert!(children.settled() && children.spawned > 64);
         assert!(text.contains("changed.txt"), "diff text: {text}");
         assert!(matches!(payload, Some(HelperPayload::Diff { .. })));
+        let _ = std::fs::remove_dir_all(&candidate);
+    }
+
+    /// A single hunk larger than the Claude Diff capture's own `CLAUDE_DIFF_MAX_BYTES` ceiling is
+    /// reported through explicit nonzero `omitted_hunks`/`omitted_bytes` and a `truncated` payload,
+    /// never silently dropped or corrupted into a partial hunk (T13B).
+    #[tokio::test]
+    async fn diff_helper_reports_explicit_overflow_above_its_own_capture_ceiling() {
+        let candidate = worktree();
+        std::fs::write(candidate.join("oversized.txt"), "base\n").unwrap();
+        let status = std::process::Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(&candidate)
+            .args(["add", "--", "."])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = std::process::Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(&candidate)
+            .args([
+                "-c",
+                "user.name=helper",
+                "-c",
+                "user.email=helper@invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(["commit", "--quiet", "-m", "oversized base"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        // One hunk whose raw patch bytes alone exceed `CLAUDE_DIFF_MAX_BYTES`, so it can never fit
+        // this or any later Claude Diff capture.
+        std::fs::write(
+            candidate.join("oversized.txt"),
+            format!("oversized-marker\n{}\n", "z".repeat(CLAUDE_DIFF_MAX_BYTES)),
+        )
+        .unwrap();
+        let root_identity = crate::workspace::observation::native_directory_identity(
+            &std::fs::File::open(&candidate).unwrap(),
+        )
+        .expect("fixture worktree has a native root identity");
+        let job = HelperJob {
+            protocol: HELPER_PROTOCOL,
+            operation: HelperOperation::Diff,
+            candidate: candidate.clone(),
+            git: PathBuf::from("/usr/bin/git"),
+            canonical_root: Some(candidate.clone()),
+            scope: Some(HelperScope {
+                worktree_id: "worktree".into(),
+                incarnation: 1,
+                root: candidate.clone(),
+                repository_root: candidate.clone(),
+                git_common_dir: PathBuf::from(".git"),
+                native_root_identity: root_identity,
+                authority_epoch: 1,
+            }),
+            baseline: Some(HelperBaseline {
+                reference: "baseline".into(),
+                captured: false,
+                digest: None,
+            }),
+            provider: None,
+            edit_source: None,
+            parameters: serde_json::json!({"mode":"head"}),
+            budgets: HelperBudgets {
+                output_bytes: crate::workspace::git::snapshot::MAX_SNAPSHOT_BLOB_BYTES,
+                processes: 64,
+                deadline_ms: 30_000,
+            },
+        };
+        let (outcome, _children, _discovery, payload) = perform(&job).await;
+        let HelperOutcome::Complete { text } = outcome else {
+            panic!("overflow is reported through the payload, not a closed failure: {outcome:?}")
+        };
+        assert!(
+            !text.contains("oversized-marker"),
+            "an oversized hunk must never be delivered even partially: {text}"
+        );
+        assert_eq!(page_field(&text, "omitted_hunks"), "1", "{text}");
+        assert_ne!(page_field(&text, "omitted_bytes"), "0", "{text}");
+        let Some(HelperPayload::Diff { truncated }) = payload else {
+            panic!("Diff must return its payload")
+        };
+        assert!(truncated, "an omitted hunk must be reported as truncated");
+        let _ = std::fs::remove_dir_all(&candidate);
+    }
+
+    /// Returns one newline- or semicolon-delimited `key: value` field from a Diff page's bounded
+    /// text, mirroring `product_mcp_contract`'s own helper of the same purpose.
+    fn page_field(text: &str, key: &str) -> String {
+        text.split(['\n', ';'])
+            .map(str::trim)
+            .find_map(|line| line.strip_prefix(&format!("{key}: ")))
+            .unwrap_or_else(|| panic!("missing {key} in page text:\n{text}"))
+            .to_owned()
+    }
+
+    /// Builds one Context job over a real worktree, with a small `output_bytes` discovery budget
+    /// that must never bound the source read itself (T13B).
+    fn context_job(candidate: &Path, path: &str) -> HelperJob {
+        let root_identity = crate::workspace::observation::native_directory_identity(
+            &std::fs::File::open(candidate).unwrap(),
+        )
+        .expect("fixture worktree has a native root identity");
+        HelperJob {
+            protocol: HELPER_PROTOCOL,
+            operation: HelperOperation::Context,
+            candidate: candidate.to_path_buf(),
+            git: PathBuf::from("/usr/bin/git"),
+            canonical_root: Some(candidate.to_path_buf()),
+            scope: Some(HelperScope {
+                worktree_id: "worktree".into(),
+                incarnation: 1,
+                root: candidate.to_path_buf(),
+                repository_root: candidate.to_path_buf(),
+                git_common_dir: PathBuf::from(".git"),
+                native_root_identity: root_identity,
+                authority_epoch: 1,
+            }),
+            baseline: None,
+            provider: None,
+            edit_source: None,
+            parameters: serde_json::json!({"path": path}),
+            budgets: HelperBudgets {
+                // Deliberately tiny: this is the discovery/output-capture budget, never the
+                // ceiling the source read itself uses.
+                output_bytes: 4096,
+                processes: 2,
+                deadline_ms: 30_000,
+            },
+        }
+    }
+
+    /// A source file well over the helper's tiny `output_bytes` discovery budget, but under the
+    /// v0.1 source reader's `MAX_SOURCE_BYTES` ceiling, is still read completely rather than
+    /// failing closed as `source_unavailable` (T13B).
+    #[tokio::test]
+    async fn context_helper_reads_a_source_larger_than_the_output_budget() {
+        let candidate = worktree();
+        // 114000 bytes: matches the reported live-stability failure size, comfortably over the
+        // 4096-byte `output_bytes` budget and Intelligence's 64 KiB `MAX_CONTEXT_BYTES` render
+        // cap, but well under the 1 MiB `MAX_SOURCE_BYTES` read ceiling.
+        let content = "x".repeat(114_000);
+        std::fs::write(candidate.join("large.txt"), &content).unwrap();
+        let (outcome, _children, _discovery, payload) =
+            perform(&context_job(&candidate, "large.txt")).await;
+        let HelperOutcome::Complete { text } = outcome else {
+            panic!("a source under MAX_SOURCE_BYTES must read completely, saw {outcome:?}")
+        };
+        assert!(text.contains('x'), "context text: {text}");
+        let Some(HelperPayload::Context {
+            source, truncated, ..
+        }) = payload
+        else {
+            panic!("Context must return its payload")
+        };
+        assert_eq!(source.length, content.len() as u64);
+        assert!(
+            truncated,
+            "Intelligence's own 64 KiB render cap still truncates the exposed text"
+        );
+        let _ = std::fs::remove_dir_all(&candidate);
+    }
+
+    /// A source file over the v0.1 reader's `MAX_SOURCE_BYTES` ceiling reports the exact size and
+    /// ceiling through `FailureCode::SourceTooLarge`, never the generic `source_unavailable`
+    /// (T13B).
+    #[tokio::test]
+    async fn context_helper_reports_source_too_large_above_the_ceiling() {
+        let candidate = worktree();
+        let size = crate::workspace::observation::MAX_SOURCE_BYTES + 1;
+        std::fs::write(candidate.join("huge.txt"), vec![b'y'; size]).unwrap();
+        let (outcome, _children, _discovery, payload) =
+            perform(&context_job(&candidate, "huge.txt")).await;
+        assert_eq!(
+            outcome,
+            HelperOutcome::Failed {
+                code: FailureCode::SourceTooLarge {
+                    size: size as u64,
+                    ceiling: crate::workspace::observation::MAX_SOURCE_BYTES as u64,
+                }
+            }
+        );
+        assert!(payload.is_none());
         let _ = std::fs::remove_dir_all(&candidate);
     }
 

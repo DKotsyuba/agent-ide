@@ -450,7 +450,7 @@ impl SnapshotSource {
         ) {
             Ok(read) => Some(read),
             Err(ObservationError::Missing) => None,
-            Err(ObservationError::TooLarge) => return Err(GitError::EvidenceTooLarge),
+            Err(ObservationError::TooLarge { .. }) => return Err(GitError::EvidenceTooLarge),
             Err(ObservationError::RootIdentityChanged) => return Err(GitError::UnstableSnapshot),
             Err(ObservationError::NotRegularFile | ObservationError::SymlinkEscape) => {
                 return Err(GitError::UnsupportedSnapshot);

@@ -127,23 +127,29 @@ struct Detail {
     context_page_fresh: bool,
 }
 
-/// Retained bounded state needed to resume one Context detail cursor from `ide.inspect` (T09B).
+/// Retained bounded state needed to resume one Context or Claude-Diff detail cursor from
+/// `ide.inspect` (T09B, extended to Diff by T13B).
 ///
 /// Unlike [`snapshots::DiffPageState`], no Git re-selection is needed: the complete text was
-/// already composed once by the job (managed read or settled Claude helper evidence), so later
-/// pages are pure byte slices of it. Never serialized into a `PeerReply`.
+/// already composed once by the job (managed read, settled Claude Context evidence, or a settled
+/// Claude Diff capture), so later pages are pure byte slices of it. Never serialized into a
+/// `PeerReply`.
 #[derive(Clone)]
 struct ContextPageState {
-    /// Complete composed text for this Context result (fixed header plus full observed source);
+    /// Complete composed text for this result (fixed header plus full observed source or diff);
     /// every page is a line-bounded UTF-8 slice of this buffer, so pages always join byte-exactly.
     text: String,
     /// Exact byte offset into `text` already handed to a caller.
     delivered: usize,
-    /// `true` when the upstream capture itself already lost bytes (Workspace's own source cap or
-    /// the Claude helper's output budget), independent of this pagination. Carried onto the final
-    /// page's `truncated` field once every captured byte has been paged out, so completing
-    /// pagination is never confused with having recovered bytes that were never captured.
+    /// `true` when the upstream capture itself already lost bytes (Workspace's own source cap, a
+    /// Diff selection budget's own overflow, or the Claude helper's output budget), independent of
+    /// this pagination. Carried onto the final page's `truncated` field once every captured byte
+    /// has been paged out, so completing pagination is never confused with having recovered bytes
+    /// that were never captured.
     source_truncated: bool,
+    /// Result kind rendered onto every page cut from `text`, so a Claude-captured Diff resumes as
+    /// `ResultKind::Diff` and never masquerades as a Context result.
+    kind: ResultKind,
 }
 
 /// Retains one versioned provider delta until a later native post-hook rechecks its exact source.
@@ -491,11 +497,11 @@ impl Shared {
         }
         retained
     }
-    /// Retains or clears the bounded Context pagination state for one same-binding detail
-    /// reference (T09B). Mirrors `set_diff_page`'s fresh-page and continuation-clearing semantics,
-    /// minus its aggregate byte ceiling: a Context page's text is already bounded by the source or
-    /// Claude helper capture limits, so the existing `limits.details` count ledger alone is enough
-    /// to bound retained memory here.
+    /// Retains or clears the bounded Context (or Claude-captured Diff, T13B) pagination state for
+    /// one same-binding detail reference (T09B). Mirrors `set_diff_page`'s fresh-page and
+    /// continuation-clearing semantics, minus its aggregate byte ceiling: this page's text is
+    /// already bounded by the source, Diff selection, or Claude helper capture limits, so the
+    /// existing `limits.details` count ledger alone is enough to bound retained memory here.
     fn set_context_page(&self, reference: &str, page: Option<ContextPageState>) {
         let Ok(mut ledger) = self.ledger.lock() else {
             return;
@@ -506,7 +512,7 @@ impl Shared {
             detail.context_page_fresh = retained;
             if !retained
                 && let PeerReply::Complete {
-                    kind: ResultKind::Context,
+                    kind: ResultKind::Context | ResultKind::Diff,
                     continuation,
                     ..
                 } = &mut detail.reply
@@ -1536,16 +1542,15 @@ fn is_claude_edit_settlement(input: &JobInput) -> bool {
 
 /// Returns whether an operation needs a retained result detail after it completes.
 ///
-/// Stop, Claude Diff, and Claude edit settlement (terminal or successful) return directly to their
-/// waiting caller. A helper-composed Diff has no continuation and therefore no usable retained
-/// detail. Edit settlement deliberately bypasses ordinary detail capacity so a mint failure,
+/// Stop and Claude edit settlement (terminal or successful) return directly to their waiting
+/// caller. Edit settlement deliberately bypasses ordinary detail capacity so a mint failure,
 /// expiry, or stop cannot strand receipt/ticket cleanup behind live result details — and, for a
 /// successful completion, so saturated capacity can never turn a write the foreground helper
-/// already performed into a bare `Capacity` error instead of its settled receipt.
+/// already performed into a bare `Capacity` error instead of its settled receipt. A helper-composed
+/// Diff retains a detail exactly like Context (T13B): its captured text may span several
+/// `ide.inspect` pages, so it needs the same addressable, capacity-bounded slot.
 fn retains_detail(tool: AssistanceTool, input: &JobInput) -> bool {
-    tool != AssistanceTool::Stop
-        && !matches!(input, JobInput::Claude(settled) if settled.operation() == HelperOperation::Diff)
-        && !is_claude_edit_settlement(input)
+    tool != AssistanceTool::Stop && !is_claude_edit_settlement(input)
 }
 
 /// Returns the finite queue ceiling, reserving bounded cleanup headroom for terminal work.
@@ -2562,11 +2567,13 @@ impl<'a> Worker<'a> {
             authority.epoch(),
             text
         );
-        let (delivered, reply) = fit_context_page(&full_text, &job.reference, *truncated)?;
+        let (delivered, reply) =
+            fit_context_page(&full_text, &job.reference, *truncated, ResultKind::Context)?;
         let context_page = (delivered < full_text.len()).then_some(ContextPageState {
             text: full_text,
             delivered,
             source_truncated: *truncated,
+            kind: ResultKind::Context,
         });
         self.shared.set_context_page(&job.reference, context_page);
         Ok((reply, Some(authority), Some(observed)))
@@ -2611,17 +2618,20 @@ impl<'a> Worker<'a> {
             return Err(FailureCode::WorkspaceAuthority);
         }
         self.shared.active(&binding)?;
-        Ok((
-            PeerReply::Complete {
-                kind: ResultKind::Diff,
-                text: text.clone(),
-                detail_ref: None,
-                truncated: *truncated,
-                continuation: false,
-            },
-            Some(authority),
-            None,
-        ))
+        // Mirrors `context_claude` (T09B): the helper already composed the complete bounded Diff
+        // text in one capture, so later `ide.inspect` calls page through it byte-exactly instead of
+        // re-running Git, which the daemon cannot do for Claude at all (T13B).
+        let full_text = text.clone();
+        let (delivered, reply) =
+            fit_context_page(&full_text, &job.reference, *truncated, ResultKind::Diff)?;
+        let context_page = (delivered < full_text.len()).then_some(ContextPageState {
+            text: full_text,
+            delivered,
+            source_truncated: *truncated,
+            kind: ResultKind::Diff,
+        });
+        self.shared.set_context_page(&job.reference, context_page);
+        Ok((reply, Some(authority), None))
     }
 
     /// Locks the daemon's single admission controller for one synchronous accounting call.
@@ -2715,18 +2725,20 @@ impl<'a> Worker<'a> {
     ) -> Result<(SourceObservation, Vec<u8>), FailureCode> {
         use crate::workspace::{
             observation::{
-                ObservationError, ObservationRef, SourceCoverage, SourceReadLimits, SourceRevision,
-                read_authorized_source,
+                MAX_SOURCE_BYTES, ObservationError, ObservationRef, SourceCoverage,
+                SourceReadLimits, SourceRevision, read_authorized_source,
             },
             store::{ObservationAdmission, ObservationDraft},
         };
         let authority = self.authority(binding).await?;
         validate_read_scope(&self.shared, binding, observed_scope, target, &authority)?;
+        // The source read ceiling is the v0.1 reader's own bound, not the launcher's discovery and
+        // check-process output budget: `limits.output_bytes` sizes bounded command captures and is
+        // far smaller than a source file may legitimately be.
         let read = read_authorized_source(
             authority.worktree(),
             &path,
-            SourceReadLimits::new(1024, self.shared.launcher.limits.output_bytes)
-                .map_err(|_| FailureCode::Internal)?,
+            SourceReadLimits::new(1024, MAX_SOURCE_BYTES).map_err(|_| FailureCode::Internal)?,
         );
         self.source_sequence = self
             .source_sequence
@@ -2772,6 +2784,12 @@ impl<'a> Worker<'a> {
                 .map_err(|_| FailureCode::SourceUnavailable)?,
                 Vec::new(),
             ),
+            Err(ObservationError::TooLarge { size }) => {
+                return Err(FailureCode::SourceTooLarge {
+                    size,
+                    ceiling: MAX_SOURCE_BYTES as u64,
+                });
+            }
             Err(_) => return Err(FailureCode::SourceUnavailable),
         };
         let active = self.shared.active(binding)?;
@@ -2998,11 +3016,17 @@ impl<'a> Worker<'a> {
                 ledger.feedback.remove(&binding);
             }
         }
-        let (delivered, reply) = fit_context_page(&text, &job.reference, context.truncated)?;
+        let (delivered, reply) = fit_context_page(
+            &text,
+            &job.reference,
+            context.truncated,
+            ResultKind::Context,
+        )?;
         let context_page = (delivered < text.len()).then_some(ContextPageState {
             text,
             delivered,
             source_truncated: context.truncated,
+            kind: ResultKind::Context,
         });
         self.shared.set_context_page(&job.reference, context_page);
         Ok((reply, Some(authority), Some(observed)))
@@ -3917,19 +3941,23 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 }
                 return Ok::<_, FailureCode>(reply);
             }
-            // Staleness is already fully covered above (source bytes and native epoch), unlike
-            // Diff there is no separate working-tree re-check to perform: `source` is always
-            // retained for a Context detail, so the generic `source_matches` check already ran.
+            // Staleness is already fully covered above (source bytes and native epoch). A
+            // Context detail always retains `source`, so the generic `source_matches` check
+            // already ran; a Claude-captured Diff page is a frozen text snapshot with no `source`
+            // and no re-derivable Git cursor (unlike the managed `diff_page` branch above), so
+            // later pages of it need no further working-tree re-check either — exactly like Context.
             let (advanced, next) = fit_context_page(
                 &page.text[page.delivered..],
                 &request.reference,
                 page.source_truncated,
+                page.kind,
             )?;
             let delivered = page.delivered + advanced;
             let next_page = (delivered < page.text.len()).then_some(ContextPageState {
                 text: page.text,
                 delivered,
                 source_truncated: page.source_truncated,
+                kind: page.kind,
             });
             if let Ok(mut ledger) = shared.ledger.lock()
                 && let Some(detail) = ledger.details.get_mut(&request.reference)
@@ -4107,7 +4135,8 @@ fn diagnostics_reserve_known_edit_settlement_time() {
 
 /// Splits the next line-bounded, byte-exact UTF-8 chunk off `remaining` that provably fits the
 /// bounded reply envelope, returning how many bytes of `remaining` it consumed alongside the
-/// rendered [`PeerReply`] (T09B).
+/// rendered [`PeerReply`] (T09B). `kind` is stamped onto the rendered reply unchanged, so the same
+/// fitter serves both a Context result and a Claude-captured Diff result (T13B).
 ///
 /// Mirrors `snapshots::fit_diff_page`'s fitting discipline: the same [`content::fits`] predicate
 /// that gates the real final MCP envelope decides acceptance, so a chunk is never handed out only
@@ -4126,6 +4155,7 @@ fn fit_context_page(
     remaining: &str,
     reference: &str,
     source_truncated: bool,
+    kind: ResultKind,
 ) -> Result<(usize, PeerReply), FailureCode> {
     let mut len = remaining.len();
     loop {
@@ -4141,7 +4171,7 @@ fn fit_context_page(
         };
         let continuation = snapped < remaining.len();
         let reply = PeerReply::Complete {
-            kind: ResultKind::Context,
+            kind,
             text: remaining[..snapped].to_owned(),
             detail_ref: Some(reference.to_owned()),
             truncated: continuation || source_truncated,
@@ -5278,6 +5308,166 @@ mod stop_retry_tests {
         assert!(
             collected.ends_with(&content),
             "concatenated chunks must end with the exact source bytes"
+        );
+    }
+
+    /// A source file far larger than the launcher's tiny `output_bytes` discovery/output-capture
+    /// budget still reads completely (up to Intelligence's own bounded render cap) instead of
+    /// failing closed as `source_unavailable`: the read ceiling is `MAX_SOURCE_BYTES`, never the
+    /// unrelated `output_bytes` budget (T13B).
+    #[tokio::test]
+    async fn managed_context_reads_a_source_larger_than_the_output_budget() {
+        let fixture = Fixture::new();
+        // 114000 bytes: matches the reported live-stability failure size, well over both the
+        // fixture's default 1024-byte `output_bytes` and Intelligence's 64 KiB `MAX_CONTEXT_BYTES`
+        // render cap, but comfortably under the 1 MiB `MAX_SOURCE_BYTES` read ceiling.
+        let content = "x".repeat(114_000);
+        std::fs::write(fixture.root.join("main.rs"), &content).unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        // The fixture default (1024 bytes) is deliberately left unchanged here: it must never
+        // bound the source read itself.
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (binding, _) = production_start(&mut worker, "large-actor", "large-start").await;
+        let (invocation, observed) =
+            production_call(&worker, &fixture.root, "large-actor", "large-call");
+        let (mut job, _cancel_sender) = context_job(&fixture.root, invocation, observed.clone());
+        worker.shared.ledger.lock().unwrap().details.insert(
+            job.reference.clone(),
+            Detail {
+                binding: binding.clone(),
+                reply: PeerReply::Pending {
+                    detail_ref: job.reference.clone(),
+                    helper: None,
+                },
+                selection: (AssistanceTool::Context, selection(&job.parameters)),
+                authority: None,
+                source: None,
+                native_epoch: 0,
+                diff_page: None,
+                diff_page_fresh: false,
+                context_page: None,
+                context_page_fresh: false,
+            },
+        );
+        let (first_reply, authority, source) = worker.context(&mut job).await.unwrap();
+        worker
+            .shared
+            .complete(&job.reference, first_reply.clone(), authority, source, 0);
+        let PeerReply::Complete {
+            text: first_text,
+            truncated: true,
+            continuation: true,
+            ..
+        } = &first_reply
+        else {
+            panic!(
+                "a file over MAX_CONTEXT_BYTES must overflow one reply envelope: {first_reply:?}"
+            );
+        };
+        let mut collected = first_text.clone();
+        let mut pages = 1;
+        loop {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            serve_inspection(
+                &worker.workspace,
+                &worker.shared,
+                Inspection {
+                    binding: binding.clone(),
+                    reference: job.reference.clone(),
+                    observed: Some(observed.clone()),
+                    target: production_target(&fixture.root),
+                    expected: None,
+                    reply: reply_tx,
+                },
+            )
+            .await;
+            let reply = reply_rx.await.unwrap();
+            let PeerReply::Complete {
+                text,
+                truncated,
+                continuation,
+                ..
+            } = &reply
+            else {
+                panic!("continuation must stay a Context Complete reply: {reply:?}")
+            };
+            pages += 1;
+            assert!(
+                pages < 50,
+                "continuation must terminate in a bounded page count"
+            );
+            collected.push_str(text);
+            if *continuation {
+                assert!(*truncated, "a page with more to come must report truncated");
+            } else {
+                // Intelligence's own 64 KiB render cap genuinely omitted the file's tail, so the
+                // final page must still honestly report it, unlike a fully recovered file.
+                assert!(
+                    *truncated,
+                    "content beyond MAX_CONTEXT_BYTES was never captured, so this must stay truncated"
+                );
+                break;
+            }
+        }
+        assert!(pages >= 2, "the fixture file must force multiple pages");
+        // `collected` is the fixed rendered header followed by the exact bounded source text; the
+        // file is homogeneous ASCII with no newlines, so the exact MAX_CONTEXT_BYTES-bounded
+        // prefix of the source is simply the tail of the concatenated pages.
+        assert!(
+            collected.ends_with(&content[..crate::intelligence::context::MAX_CONTEXT_BYTES]),
+            "the exposed text must end with the exact MAX_CONTEXT_BYTES-bounded prefix of the source"
+        );
+        assert!(
+            !collected.ends_with(&content[..crate::intelligence::context::MAX_CONTEXT_BYTES + 1]),
+            "no more than MAX_CONTEXT_BYTES of the source may have been exposed"
+        );
+    }
+
+    /// A source file over the v0.1 reader's `MAX_SOURCE_BYTES` ceiling reports the exact size and
+    /// ceiling through `FailureCode::SourceTooLarge`, never the generic `source_unavailable`, on
+    /// the managed path (T13B).
+    #[tokio::test]
+    async fn managed_context_reports_source_too_large_above_the_ceiling() {
+        let fixture = Fixture::new();
+        let size = crate::workspace::observation::MAX_SOURCE_BYTES + 1;
+        std::fs::write(fixture.root.join("main.rs"), vec![b'y'; size]).unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (binding, _) = production_start(&mut worker, "huge-actor", "huge-start").await;
+        let (invocation, observed) =
+            production_call(&worker, &fixture.root, "huge-actor", "huge-call");
+        let (mut job, _cancel_sender) = context_job(&fixture.root, invocation, observed);
+        worker.shared.ledger.lock().unwrap().details.insert(
+            job.reference.clone(),
+            Detail {
+                binding,
+                reply: PeerReply::Pending {
+                    detail_ref: job.reference.clone(),
+                    helper: None,
+                },
+                selection: (AssistanceTool::Context, selection(&job.parameters)),
+                authority: None,
+                source: None,
+                native_epoch: 0,
+                diff_page: None,
+                diff_page_fresh: false,
+                context_page: None,
+                context_page_fresh: false,
+            },
+        );
+        let Err(code) = worker.context(&mut job).await else {
+            panic!("a source over MAX_SOURCE_BYTES must never be observed")
+        };
+        assert_eq!(
+            code,
+            FailureCode::SourceTooLarge {
+                size: size as u64,
+                ceiling: crate::workspace::observation::MAX_SOURCE_BYTES as u64,
+            }
         );
     }
 

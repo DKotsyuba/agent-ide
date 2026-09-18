@@ -5116,6 +5116,180 @@ async fn diff_oversized_single_hunk_reports_capacity_without_false_continuation(
     daemon.wait().await.unwrap();
 }
 
+/// A real Claude foreground helper reads a source file well over the reported live-stability
+/// failure size in one capture, and the daemon pages the composed text across repeated
+/// `ide.inspect` calls until the whole bounded (`MAX_CONTEXT_BYTES`-capped) text has been
+/// delivered — never the generic `source_unavailable` (T13B).
+#[tokio::test]
+async fn claude_context_pagination_delivers_a_source_larger_than_the_output_budget() {
+    let fixture = ProductFixture::new_claude(json!([]));
+    // 114000 bytes: matches the reported live-stability failure size, well over the fixture's
+    // small default `output_bytes` and over Intelligence's 64 KiB `MAX_CONTEXT_BYTES` render cap.
+    let content = "x".repeat(114_000);
+    std::fs::write(fixture.root.join("claude-large.txt"), &content).unwrap();
+    fixture.git(&["add", "--", "claude-large.txt"]);
+    fixture.git(&["commit", "--quiet", "-m", "claude large source"]);
+
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "claude-large-context").await;
+    let started = actor
+        .call_claude(&fixture, "ide.start", json!({"activation_id":"start"}))
+        .await;
+    let (started, _) = actor.complete_claude_pending(&fixture, &started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    let first_call = actor
+        .call_claude(&fixture, "ide.context", json!({"path":"claude-large.txt"}))
+        .await;
+    let (page1, _) = actor.complete_claude_pending(&fixture, &first_call).await;
+    assert_eq!(page1["kind"], "context", "{page1}");
+    assert_eq!(page1["truncated"], true, "{page1}");
+    assert_eq!(page1["continuation"], true, "{page1}");
+    let reference = page1["detail_ref"]
+        .as_str()
+        .expect("a multi-page Context result must carry a detail_ref")
+        .to_owned();
+
+    let mut collected = page1["text"].as_str().unwrap().to_owned();
+    let mut continuation = true;
+    let mut pages = 1;
+    while continuation {
+        pages += 1;
+        assert!(pages < 12, "pagination did not terminate");
+        let next = actor
+            .call_claude(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
+            .await;
+        assert_eq!(next["kind"], "context", "{next}");
+        assert_eq!(
+            next["detail_ref"].as_str().unwrap(),
+            reference,
+            "every page must echo the same detail_ref"
+        );
+        continuation = next["continuation"].as_bool().unwrap();
+        assert_eq!(
+            next["truncated"],
+            json!(true),
+            "content beyond MAX_CONTEXT_BYTES was never captured, so every page stays truncated: {next}"
+        );
+        collected.push_str(next["text"].as_str().unwrap());
+    }
+    assert!(pages >= 2, "the fixture file must force multiple pages");
+    assert!(
+        collected.ends_with(&content[..64 * 1024]),
+        "the exposed text must end with the exact MAX_CONTEXT_BYTES-bounded prefix of the source"
+    );
+
+    let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A real Claude foreground helper captures a diff too large for one MCP reply in the single
+/// helper round trip, and the daemon pages the composed text across repeated `ide.inspect` calls
+/// the same way it already pages a large Context result, until every hunk has been delivered
+/// (T13B).
+#[tokio::test]
+async fn claude_diff_pagination_delivers_every_hunk_across_repeated_inspect() {
+    let fixture = ProductFixture::new_claude(json!([]));
+    for index in 0..12 {
+        std::fs::write(
+            fixture.root.join(format!("claude-many-{index:02}.txt")),
+            format!("base-{index:02}\n"),
+        )
+        .unwrap();
+    }
+    std::fs::write(fixture.root.join("claude-many-big.txt"), "base-big\n").unwrap();
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "claude many"]);
+    for index in 0..12 {
+        std::fs::write(
+            fixture.root.join(format!("claude-many-{index:02}.txt")),
+            escape_heavy(&format!("claude-hunkmark-{index:02}"), 128),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        fixture.root.join("claude-many-big.txt"),
+        plain_ascii("claude-hunkmark-big", 600),
+    )
+    .unwrap();
+
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "claude-pagination").await;
+    let started = actor
+        .call_claude(&fixture, "ide.start", json!({"activation_id":"start"}))
+        .await;
+    let (started, _) = actor.complete_claude_pending(&fixture, &started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    let first_call = actor
+        .call_claude(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let (page1, _) = actor.complete_claude_pending(&fixture, &first_call).await;
+    assert_eq!(page1["kind"], "diff", "{page1}");
+    let page1_text = page1["text"].as_str().unwrap().to_owned();
+    let reference = page1["detail_ref"]
+        .as_str()
+        .expect("a multi-page Diff must carry a detail_ref")
+        .to_owned();
+    assert_eq!(page1["truncated"], true, "{page1}");
+    assert_eq!(page1["continuation"], true, "{page1}");
+    // No hunk ever overflowed this single capture: every marker is somewhere in the composed
+    // evidence, so nothing here is a hard ceiling failure, only a reply too large for one page.
+    assert_eq!(
+        page_field(&page1_text, "omitted_hunks"),
+        "0",
+        "{page1_text}"
+    );
+    assert_eq!(
+        page_field(&page1_text, "omitted_bytes"),
+        "0",
+        "{page1_text}"
+    );
+
+    let mut collected = page1_text;
+    let mut continuation = page1["continuation"].as_bool().unwrap();
+    let mut pages = 1;
+    while continuation {
+        pages += 1;
+        assert!(pages < 12, "pagination did not terminate");
+        let next = actor
+            .call_claude(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
+            .await;
+        assert_eq!(next["kind"], "diff", "{next}");
+        assert_eq!(
+            next["detail_ref"].as_str().unwrap(),
+            reference,
+            "every page must echo the same detail_ref"
+        );
+        continuation = next["continuation"].as_bool().unwrap();
+        assert_eq!(
+            next["truncated"],
+            json!(continuation),
+            "truncated must agree with continuation on every page: {next}"
+        );
+        collected.push_str(next["text"].as_str().unwrap());
+    }
+    assert!(pages >= 2, "the fixture diff must force multiple pages");
+    for marker in (0..12)
+        .map(|index| format!("claude-hunkmark-{index:02}"))
+        .chain(["claude-hunkmark-big".to_owned()])
+    {
+        assert!(
+            collected.contains(&marker),
+            "{marker} missing from the concatenated pages"
+        );
+    }
+
+    let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Drives real foreground Claude helper Start, Diff, Context and Edit launches end to end: each
 /// helper instruction is armed by a native Bash pre-hook, settles through its matching post-hook,
 /// and publishes only through `ide.inspect`, including an escape-heavy Diff that must fit whole;
@@ -5454,18 +5628,20 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
     daemon.wait().await.unwrap();
 }
 
-/// Keeps a two-detail Claude worker usable across helper Diff finalization and repeated failures.
+/// Keeps a bounded Claude worker usable across repeated helper Diff finalization, repeated
+/// re-inspection of one already-delivered Diff, and repeated failures.
 ///
 /// One retained activation occupies the first slot. A second actor's settled-but-conflicting Start
-/// is inspected repeatedly; each identical failure must retire its unusable worker detail. Repeated
-/// helper-composed Diffs retain no continuation detail, leaving the second slot available for a
-/// source-producing Context that a later Edit could consume.
+/// is inspected repeatedly; each identical failure must retire its unusable worker detail. A
+/// helper-composed Diff now retains a detail exactly like Context (T13B), so it can be paged and
+/// re-inspected; the capacity here is sized for the activation, each of the three Diffs, and the
+/// trailing source-producing Context.
 #[tokio::test]
 async fn claude_diff_and_failed_reinspection_do_not_exhaust_detail_capacity() {
     let fixture = ProductFixture::new_claude(json!([]));
     let mut config: Value =
         serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
-    config["limits"]["details"] = json!(2);
+    config["limits"]["details"] = json!(5);
     std::fs::write(&fixture.config, config.to_string()).unwrap();
     let mut daemon = fixture.daemon().await;
     let mut first = ProductActor::new(&fixture, "claude-capacity-first").await;
@@ -5494,15 +5670,28 @@ async fn claude_diff_and_failed_reinspection_do_not_exhaust_detail_capacity() {
         assert_eq!(conflict["code"], "conflict", "{conflict}");
     }
 
+    let mut diff_detail_ref = None;
     for _ in 0..3 {
         let diff = first
             .call_claude(&fixture, "ide.diff", json!({"mode":"head"}))
             .await;
         let (diff, _) = first.complete_claude_pending(&fixture, &diff).await;
         assert_eq!(diff["kind"], "diff", "{diff}");
-        assert!(diff["detail_ref"].is_null(), "{diff}");
+        assert!(diff["detail_ref"].is_string(), "{diff}");
         assert_eq!(diff["continuation"], false, "{diff}");
+        diff_detail_ref = Some(diff["detail_ref"].as_str().unwrap().to_owned());
     }
+
+    // A completed Diff detail is genuinely retained: a same-binding re-inspection reaches the exact
+    // same unchanged result rather than `invalid_detail` (T13B).
+    let reinspected = first
+        .call_claude(
+            &fixture,
+            "ide.inspect",
+            json!({"detail_ref":diff_detail_ref.unwrap()}),
+        )
+        .await;
+    assert_eq!(reinspected["kind"], "diff", "{reinspected}");
 
     let context = first
         .call_claude(&fixture, "ide.context", json!({"path":"tracked.txt"}))
