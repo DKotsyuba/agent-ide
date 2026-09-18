@@ -282,6 +282,15 @@ async fn main() -> ExitCode {
                 Err(error) => fail(error),
             }
         }
+        Ok(Command::Errors {
+            repo,
+            since_minutes,
+            limit,
+            summary,
+        }) => match errors_command(repo, since_minutes, limit, summary).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(error),
+        },
         Err(error) => fail(error),
     }
 }
@@ -528,6 +537,19 @@ enum Command {
         /// Existing project directory (relative paths are canonicalized) whose rendezvous is reported.
         project_dir: PathBuf,
     },
+    /// Prints recent local error-log events for one repository, or their grouped summary (T107).
+    ///
+    /// Reads only `~/.agent-ide/logs/<repository-key>/events.jsonl[.1]`; works with no daemon running.
+    Errors {
+        /// Repository directory whose rendezvous key selects the log; defaults to the current directory.
+        repo: Option<PathBuf>,
+        /// Only events at most this many minutes old.
+        since_minutes: Option<u64>,
+        /// Bounds the number of printed or summarized events; defaults to 200.
+        limit: usize,
+        /// Prints grouped `(method, outcome, reason)` counts instead of individual lines.
+        summary: bool,
+    },
 }
 
 /// Selects the host-specific identity and binding behavior of a self-contained managed MCP.
@@ -675,6 +697,12 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
             path: PathBuf::from(path),
         });
     }
+    // `errors` accepts its flags in any order, unlike every other mode above.
+    if let [mode, rest @ ..] = arguments.as_slice()
+        && mode == "errors"
+    {
+        return parse_errors_command(rest);
+    }
     // `launcher check` takes a bare configuration path; no `--runtime-dir` is involved.
     if let [mode, sub, path] = arguments.as_slice()
         && mode == "launcher"
@@ -788,6 +816,99 @@ fn telemetry_command(
         Some("export") if cursor.is_none() => Ok(Command::TelemetryExport { database, filter }),
         _ => Err(AppError::InvalidResponse),
     }
+}
+
+/// Reads and prints `~/.agent-ide/logs/<repository-key>/events.jsonl[.1]` for one repository.
+///
+/// Works without a running daemon: it only reads files, using the exact same repository-key
+/// derivation the daemon used to name its log directory. `repo` defaults to the current directory.
+async fn errors_command(
+    repo: Option<PathBuf>,
+    since_minutes: Option<u64>,
+    limit: usize,
+    summary: bool,
+) -> Result<(), AppError> {
+    let repo = match repo {
+        Some(repo) => repo,
+        None => std::env::current_dir().map_err(|_| AppError::InvalidResponse)?,
+    };
+    let candidate = fs::canonicalize(&repo).map_err(|_| AppError::InvalidResponse)?;
+    let key = &claude_rendezvous_identity(&claude_rendezvous_key(&candidate).await)[..16];
+    let home = PathBuf::from(std::env::var_os("HOME").ok_or(AppError::InvalidResponse)?);
+    let dir = home.join(".agent-ide").join("logs").join(key);
+    let mut events = agent_ide::errorlog::read_events(&dir);
+    if let Some(since_minutes) = since_minutes {
+        let cutoff = rfc3339_cutoff(since_minutes);
+        events.retain(|event| event.timestamp >= cutoff);
+    }
+    if summary {
+        for (method, outcome, reason, count) in agent_ide::errorlog::summarize(&events) {
+            println!("{count} {method} {outcome} {reason}");
+        }
+        return Ok(());
+    }
+    let start = events.len().saturating_sub(limit);
+    for event in &events[start..] {
+        println!("{}", agent_ide::errorlog::format_line(event));
+    }
+    Ok(())
+}
+
+/// Renders `now - since_minutes` as the same RFC 3339 UTC form error-log timestamps use, so a
+/// plain string comparison against recorded events is exact without parsing them back.
+fn rfc3339_cutoff(since_minutes: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let cutoff = now.saturating_sub(since_minutes.saturating_mul(60));
+    agent_ide::errorlog::format_rfc3339(cutoff)
+}
+
+/// Parses `errors`' optional, any-order `--repo`/`--since`/`--limit`/`--summary` flags.
+fn parse_errors_command(rest: &[OsString]) -> Result<Command, AppError> {
+    let mut repo = None;
+    let mut since_minutes = None;
+    let mut limit = 200usize;
+    let mut summary = false;
+    let mut index = 0;
+    while index < rest.len() {
+        let flag = rest[index].to_str().ok_or(AppError::InvalidResponse)?;
+        match flag {
+            "--summary" if !summary => {
+                summary = true;
+                index += 1;
+            }
+            "--repo" | "--since" | "--limit" => {
+                let value = rest.get(index + 1).ok_or(AppError::InvalidResponse)?;
+                let value = value.to_str().ok_or(AppError::InvalidResponse)?;
+                match flag {
+                    "--repo" if repo.is_none() => repo = Some(PathBuf::from(value)),
+                    "--since" if since_minutes.is_none() => {
+                        since_minutes = Some(
+                            value
+                                .parse::<u64>()
+                                .map_err(|_| AppError::InvalidResponse)?,
+                        );
+                    }
+                    "--limit" => {
+                        limit = value
+                            .parse::<usize>()
+                            .map_err(|_| AppError::InvalidResponse)?;
+                    }
+                    _ => return Err(AppError::InvalidResponse),
+                }
+                index += 2;
+            }
+            _ => return Err(AppError::InvalidResponse),
+        }
+    }
+    Ok(Command::Errors {
+        repo,
+        since_minutes,
+        limit,
+        summary,
+    })
 }
 
 /// Converts only canonical closed tags into query filters, rejecting arbitrary local SQLite selectors.
