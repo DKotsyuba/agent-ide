@@ -27,6 +27,7 @@ use agent_ide::{
 };
 use rmcp::{serve_server, transport::io::stdio};
 use tokio::net::UnixStream;
+use tokio::sync::Mutex;
 
 /// Selects an explicit mode; MCP writes only protocol messages to stdout and never autostarts.
 #[tokio::main]
@@ -1448,12 +1449,22 @@ async fn run_managed_claude_mcp(
             // Per EYES-r2 §2, this generation never owns the shared daemon's lifetime, so it holds
             // one `ClientLease` connection open for its own entire lifetime instead: the daemon's
             // idle-shutdown countdown only ever runs while zero managed Claude MCPs are attached.
-            let lease = open_client_lease(&runtime_path).await;
-            let reestablish = claude_reestablish_hook(path, key, launcher_template, candidate);
+            // `claude_reestablish_hook` replaces this handle with a fresh lease against the
+            // re-established daemon, so the same guarantee holds across a reconnect.
+            let lease = Arc::new(Mutex::new(open_client_lease(&runtime_path).await));
+            let reestablish = claude_reestablish_hook(
+                path,
+                key,
+                launcher_template,
+                candidate,
+                Arc::clone(&lease),
+            );
             match StdioFacade::with_reestablishing_attachment(runtime_path, attachment, reestablish)
             {
-                Some(facade) => serve_managed_stdio(facade, None, None, lease).await,
-                None => serve_managed_stdio(StdioFacade::unavailable(), None, None, lease).await,
+                Some(facade) => serve_managed_stdio(facade, None, None, Some(lease)).await,
+                None => {
+                    serve_managed_stdio(StdioFacade::unavailable(), None, None, Some(lease)).await
+                }
             }
         }
         None => serve_managed_stdio(StdioFacade::unavailable(), None, None, None).await,
@@ -1465,20 +1476,29 @@ async fn run_managed_claude_mcp(
 /// Repeats the exact [`rendezvous_with_claude_daemon`] path used at startup, so a daemon that
 /// exited (idle timeout, `SIGTERM`, a crash, or a binary upgrade) is relaunched or re-adopted under
 /// the same runtime-dir lock, and several MCP clients racing to relaunch it still end up with one
-/// daemon (EYES-r2 §2).
+/// daemon (EYES-r2 §2). On success, also opens a fresh `ClientLease` against the re-established
+/// daemon and stores it in `lease`, replacing (and thereby dropping) the dead one: otherwise the new
+/// daemon generation would see zero leases from this still-live MCP and idle out from under it.
 fn claude_reestablish_hook(
     path: PathBuf,
     key: PathBuf,
     launcher_template: PathBuf,
     candidate: PathBuf,
+    lease: Arc<Mutex<Option<UnixStream>>>,
 ) -> ReestablishFn {
     Arc::new(move || {
         let path = path.clone();
         let key = key.clone();
         let launcher_template = launcher_template.clone();
         let candidate = candidate.clone();
+        let lease = Arc::clone(&lease);
         Box::pin(async move {
-            rendezvous_with_claude_daemon(&path, &key, &launcher_template, &candidate).await
+            let result =
+                rendezvous_with_claude_daemon(&path, &key, &launcher_template, &candidate).await;
+            if let Some((runtime_path, _)) = &result {
+                *lease.lock().await = open_client_lease(runtime_path).await;
+            }
+            result
         })
     })
 }
@@ -1745,14 +1765,14 @@ async fn health_check_owned_daemon(child: &mut tokio::process::Child, runtime: &
 
 /// Serves one static MCP facade and always cleans up an optional owned daemon/runtime generation.
 ///
-/// `lease` is an optional held-open `ClientLease` connection (Claude only); it is dropped once
-/// serving ends, whatever the reason, which is the client-side EOF that releases the daemon's lease
-/// count (EYES-r2 §2).
+/// `lease` is an optional held-open `ClientLease` connection (Claude only), refreshed in place by
+/// [`claude_reestablish_hook`] on every reconnect; it is dropped once serving ends, whatever the
+/// reason, which is the client-side EOF that releases the daemon's lease count (EYES-r2 §2).
 async fn serve_managed_stdio(
     facade: StdioFacade,
     child: Option<tokio::process::Child>,
     runtime: Option<ManagedRuntime>,
-    lease: Option<UnixStream>,
+    lease: Option<Arc<Mutex<Option<UnixStream>>>>,
 ) -> ExitCode {
     let served = match serve_server(facade, stdio()).await {
         Ok(service) => {

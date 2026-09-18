@@ -91,10 +91,13 @@ with the existing launcher configuration error.
   binary upgrade — while this MCP process kept running), the server re-runs the exact same
   rendezvous it started with (adopt-or-spawn under the runtime-dir lock, so several MCP servers
   racing to relaunch still end up with one daemon), stores the refreshed pair for itself and every
-  later call, and retries that one call once. No retry loop and no background polling: a rendezvous
-  failure, or a retry that is still unavailable, surfaces the normal unavailable outcome for that
-  call. A pending peer-side binding from the dead daemon is gone; the next `ide.start` establishes a
-  fresh one.
+  later call, and retries that one call once. On a successful rendezvous it also opens a fresh
+  `ClientLease` against the re-established daemon and replaces its own held-open one, so the new
+  generation still counts this MCP's lease and its idle countdown keeps only ever running while zero
+  managed Claude MCPs are attached, exactly as at startup. No retry loop and no background polling: a
+  rendezvous failure, or a retry that is still unavailable, surfaces the normal unavailable outcome
+  for that call, and this MCP's lease stays on the dead connection until it is dropped. A pending
+  peer-side binding from the dead daemon is gone; the next `ide.start` establishes a fresh one.
 
 Success example: agents A and B in two worktrees of one repository call `ide.start`; one daemon
 serves both; A exits; B keeps working; B exits; the daemon stops 300 s later.

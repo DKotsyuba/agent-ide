@@ -166,6 +166,17 @@ fn lock_holder_count(runtime: &Path) -> usize {
 /// [`agent_ide::assistance::claude_worker::ClaudeOperatorProfile::validate`] contract so the daemon
 /// reaches its health-checkable serving state; it never exercises real Codex/D03 certification.
 fn write_launcher_template(candidate: &Path) -> PathBuf {
+    write_launcher_template_with_idle_timeout_s(candidate, None)
+}
+
+/// Identical to [`write_launcher_template`], plus an explicit `idle_timeout_s` override.
+///
+/// The real managed-MCP startup path only ever reads this from the launcher's `project_checks`
+/// (EYES-r2 §1); `None` here omits that section entirely, keeping the contract default (300s).
+fn write_launcher_template_with_idle_timeout_s(
+    candidate: &Path,
+    idle_timeout_s: Option<u64>,
+) -> PathBuf {
     use agent_ide::execution::{D03ProfileEvidence, HostSandboxState, PersistedProfileRecord};
     let sandbox_state = json!({
         "permissionProfile": {"type": "disabled"},
@@ -188,7 +199,7 @@ fn write_launcher_template(candidate: &Path) -> PathBuf {
         &state,
     )
     .unwrap();
-    let config = json!({
+    let mut config = json!({
         "version": 1,
         "limits": {"queued": 16, "details": 64, "operation_ms": 120000, "output_bytes": 1048576},
         "targets": [{
@@ -212,6 +223,9 @@ fn write_launcher_template(candidate: &Path) -> PathBuf {
             }
         }]
     });
+    if let Some(idle_timeout_s) = idle_timeout_s {
+        config["project_checks"] = json!({"idle_timeout_s": idle_timeout_s});
+    }
     let path = unique_path("launcher-config").with_extension("json");
     std::fs::write(&path, config.to_string()).unwrap();
     path
@@ -571,6 +585,66 @@ async fn mcp_client_re_establishes_a_lost_shared_daemon_and_serves_the_next_call
         lock_holder_count(&runtime),
         1,
         "the repository must still end up with exactly one live daemon"
+    );
+
+    mcp.close().await;
+    assert!(runtime.is_dir());
+
+    let _ = std::fs::remove_dir_all(candidate);
+}
+
+/// After re-establishing a lost shared daemon, the MCP process's own `ClientLease` connection is
+/// also reopened against the new generation (T08B follow-up): with the MCP still alive and
+/// completely silent for longer than the configured idle timeout, the re-established daemon must
+/// still be running, not idled out from under it because this live MCP held a dead lease.
+#[tokio::test]
+async fn mcp_client_reopens_its_lease_after_re_establishing_a_lost_shared_daemon() {
+    const IDLE_TIMEOUT_S: u64 = 30;
+    let candidate = init_repo();
+    let runtime = expected_runtime_path(&candidate);
+    let _guard = DaemonGuard(runtime.clone());
+    let template = write_launcher_template_with_idle_timeout_s(&candidate, Some(IDLE_TIMEOUT_S));
+
+    let mut mcp = Mcp::start(&template, &candidate).await;
+    wait_for_healthy_locked_daemon(&runtime).await;
+    let generation_before = match doctor_report(&runtime).await.unwrap().status {
+        DoctorStatus::Healthy { daemon_generation } => daemon_generation,
+        DoctorStatus::Unavailable => panic!("daemon must be healthy before the reconnect scenario"),
+    };
+
+    // Stands in for idle shutdown, a crash, or a binary upgrade while the MCP process keeps running.
+    terminate_shared_daemon(&runtime);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if !runtime.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the terminated daemon must remove its own runtime directory");
+
+    assert_reached_live_daemon(&call_ide_start(&mut mcp, 2, "reconnect").await);
+
+    wait_for_healthy_locked_daemon(&runtime).await;
+    let generation_after = match doctor_report(&runtime).await.unwrap().status {
+        DoctorStatus::Healthy { daemon_generation } => daemon_generation,
+        DoctorStatus::Unavailable => panic!("the re-established daemon must be healthy"),
+    };
+    assert_ne!(
+        generation_after, generation_before,
+        "this scenario requires a fresh generation, not the terminated one"
+    );
+
+    // The MCP process makes no further calls from here on; only a reopened lease can suppress the
+    // idle countdown a re-established daemon otherwise starts with zero leases.
+    tokio::time::sleep(Duration::from_secs(IDLE_TIMEOUT_S + 5)).await;
+    assert!(
+        doctor_report(&runtime)
+            .await
+            .is_ok_and(|report| matches!(report.status, DoctorStatus::Healthy { .. })),
+        "the re-established daemon must still be running: its lease must have been reopened"
     );
 
     mcp.close().await;
