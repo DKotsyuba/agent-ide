@@ -337,7 +337,7 @@ async fn python_checker_builds_exact_run_spec_for_default_venv_interpreter() {
             OsString::from("--project"),
             worktree.clone().into_os_string(),
             OsString::from("--pythonpath"),
-            canonical_interpreter.clone().into_os_string(),
+            interpreter.clone().into_os_string(),
         ]
     );
     assert_eq!(spec.cwd, worktree);
@@ -416,4 +416,75 @@ async fn python_checker_uses_pyrightconfig_json_as_project_when_present() {
         spec.args[3],
         dir.join("pyrightconfig.json").into_os_string()
     );
+}
+
+/// A uv-managed venv's `bin/python` is a symlink to a base Python installation elsewhere; T11B
+/// requires `--pythonpath` to receive that symlink path unresolved (so Python's own venv
+/// detection via `pyvenv.cfg` next to it applies), while `read_roots` still cover both the venv
+/// root and the base installation's prefix (needed because pyright execs the interpreter, which
+/// under Seatbelt follows the symlink to the real binary and its stdlib).
+#[tokio::test]
+async fn python_checker_pythonpath_is_the_venv_symlink_not_its_canonical_base() {
+    let (node, pyright_cli) = toolchain_paths();
+    let ready_json =
+        br#"{"generalDiagnostics": [], "summary": {"errorCount": 0, "warningCount": 0, "filesAnalyzed": 1}}"#;
+    let fake = Arc::new(FakeRunner::with_stdout(0, ready_json));
+    let runner: Arc<dyn ConfinedRunner> = fake.clone();
+    let checker = PythonChecker::new(runner, node, pyright_cli, Duration::from_secs(60));
+
+    let base_root = unique_temp_dir("uv-base");
+    let base_bin = base_root.join("bin");
+    fs::create_dir_all(&base_bin).expect("base bin dir created");
+    let base_python = base_bin.join("python3.14");
+    fs::write(&base_python, b"#!/bin/sh\n").expect("base interpreter written");
+
+    let worktree = unique_temp_dir("uv-worktree");
+    let venv_bin = worktree.join(".venv").join("bin");
+    fs::create_dir_all(&venv_bin).expect("venv bin dir created");
+    let venv_python = venv_bin.join("python");
+    std::os::unix::fs::symlink(&base_python, &venv_python).expect("venv symlink created");
+
+    let cache_dir = unique_temp_dir("uv-cache");
+    let request = CheckRequest {
+        worktree: worktree.clone(),
+        cache_dir: cache_dir.clone(),
+        input_generation: 1,
+    };
+    let interpreter = resolve_interpreter(&worktree).expect("uv venv interpreter resolved");
+    assert_eq!(interpreter, venv_python);
+
+    let spec = checker.pyright_spec(&request, &interpreter);
+
+    let pythonpath_index = spec
+        .args
+        .iter()
+        .position(|arg| arg == "--pythonpath")
+        .expect("--pythonpath present")
+        + 1;
+    assert_eq!(
+        spec.args[pythonpath_index],
+        venv_python.clone().into_os_string()
+    );
+
+    let venv_root = worktree.join(".venv");
+    let base_prefix = fs::canonicalize(&base_python)
+        .expect("base interpreter canonicalizes")
+        .parent()
+        .and_then(Path::parent)
+        .expect("base interpreter has an installation prefix")
+        .to_path_buf();
+    assert!(
+        spec.read_roots.contains(&venv_root),
+        "read_roots must contain the venv root: {:?}",
+        spec.read_roots
+    );
+    assert!(
+        spec.read_roots.contains(&base_prefix),
+        "read_roots must contain the base installation prefix: {:?}",
+        spec.read_roots
+    );
+
+    let _ = fs::remove_dir_all(&base_root);
+    let _ = fs::remove_dir_all(&worktree);
+    let _ = fs::remove_dir_all(&cache_dir);
 }
