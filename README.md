@@ -121,6 +121,8 @@ blocks native tools or turn completion.
 
 `agent-ide doctor --runtime-dir PATH` is observational: it reports effective default configuration and local endpoint/lock/protocol state without creating the path or starting services. Workspace scanning, LSP startup, daemon autostart, and cache retirement without a peer-verified closure/reset fact are unsupported.
 
+`agent-ide -v`, `-V`, `--version`, and `version` print `agent-ide <version>` and exit 0 without starting or contacting a daemon.
+
 Version 0.1.3 makes captured managed sandbox profiles portable across equivalent
 worktrees without changing raw execution state or the original five v0.1 methods. It also
 includes the offline installation helpers `agent-ide evidence executable`,

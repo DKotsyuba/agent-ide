@@ -23,6 +23,25 @@ fn release_versions_are_synchronized() {
     }
 }
 
+/// Every version spelling prints the exact version line and exits 0 before any other mode runs.
+#[test]
+fn version_flag_prints_the_package_version_and_exits_zero() {
+    let expected = format!("agent-ide {}\n", env!("CARGO_PKG_VERSION"));
+    for spelling in ["-v", "-V", "--version", "version"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+            .arg(spelling)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{spelling} did not exit 0");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            expected,
+            "{spelling} printed an unexpected line"
+        );
+        assert!(output.stderr.is_empty(), "{spelling} wrote to stderr");
+    }
+}
+
 /// Requires every relevant CI, product-acceptance, evidence, package, and artifact-smoke gate
 /// to precede the only GitHub Release publication command without a continue-on-error escape.
 #[test]

@@ -32,10 +32,15 @@ use tokio::sync::Mutex;
 /// Selects an explicit mode; MCP writes only protocol messages to stdout and never autostarts.
 #[tokio::main]
 async fn main() -> ExitCode {
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if is_version_request(&arguments) {
+        println!("agent-ide {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     // Claude's workspace identity is captured before argument parsing or asynchronous setup and is
     // never accepted from an MCP call, hook payload, or later environment read.
     let claude_project_dir = std::env::var_os("CLAUDE_PROJECT_DIR");
-    match command(std::env::args_os().skip(1)) {
+    match command(arguments.into_iter()) {
         Ok(Command::Daemon { runtime_dir }) => match RuntimeDir::prepare_for_daemon(runtime_dir) {
             Ok(runtime_dir) => {
                 let config = EffectiveConfig::defaults();
@@ -565,6 +570,14 @@ fn ordered_flags<'a>(pairs: &'a [OsString], expected: &[&str]) -> Option<Vec<&'a
                 .flatten()
         })
         .collect()
+}
+
+/// Matches the exact one-argument version spellings, handled before any other mode.
+fn is_version_request(arguments: &[OsString]) -> bool {
+    matches!(
+        arguments,
+        [only] if matches!(only.to_str(), Some("-v" | "-V" | "--version" | "version"))
+    )
 }
 
 /// Rejects unknown, missing, and extra CLI arguments before any filesystem or daemon action.

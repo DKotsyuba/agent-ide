@@ -102,6 +102,9 @@ backup (written before the new binary replaces the old one, named from the old b
 `--version` output when it prints one, else a UTC timestamp), and point `current` back at the
 previous `<prefix>/share/agent-ide/plugin/<old-version>/` directory.
 
+`agent-ide -v`, `-V`, `--version`, and `version` all print `agent-ide <version>` and exit 0
+without touching the daemon, runtime dir, config, or network.
+
 ## Publication gate
 
 The release workflow repeats formatting, locked workspace tests, Clippy, rustdoc, the complete
