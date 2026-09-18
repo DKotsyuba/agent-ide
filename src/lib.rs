@@ -26,3 +26,6 @@ pub mod changes;
 
 /// Owns closed, bounded, local-only usage telemetry and its durable query/export surface.
 pub mod telemetry;
+
+/// Owns the append-only, bounded, closed-reason-code error log (T107).
+pub mod errorlog;

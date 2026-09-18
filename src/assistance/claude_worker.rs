@@ -1684,6 +1684,50 @@ impl LaunchLedger {
         LaunchRecognition::Recognized
     }
 
+    /// Classifies why an ignored `Bash` pre-hook did not recognize a live launch, for the error
+    /// log only (T107); never mutates the ledger and is never consulted by [`Self::recognize`].
+    ///
+    /// Returns `None` for a command that does not even superficially look like a foreground helper
+    /// launch (does not contain the fixed helper subcommand word), so an ordinary `Bash` call never
+    /// produces log noise. The command text itself is never returned or logged, only the closed
+    /// class.
+    pub fn diagnose_ignored(
+        &self,
+        command: &str,
+        run_in_background: bool,
+        tool_use_id: &str,
+        actor: &HelperActor,
+        now_ms: u64,
+    ) -> Option<crate::errorlog::ReasonCode> {
+        use crate::errorlog::ReasonCode;
+        if !command.contains(HELPER_SUBCOMMAND) {
+            return None;
+        }
+        if run_in_background || tool_use_id.is_empty() {
+            return Some(ReasonCode::NoTicket);
+        }
+        let observed_words = helper_words(command);
+        let matched = self.tickets.values().find(|ticket| {
+            ticket.command.as_bytes() == command.as_bytes()
+                || observed_words
+                    .as_deref()
+                    .is_some_and(|words| helper_words(&ticket.command).as_deref() == Some(words))
+        });
+        let Some(ticket) = matched else {
+            return Some(ReasonCode::NoTicket);
+        };
+        if &ticket.actor != actor {
+            return Some(ReasonCode::ActorMismatch);
+        }
+        if now_ms >= ticket.deadline_ms {
+            return Some(ReasonCode::Expired);
+        }
+        if ticket.state != TicketState::Minted {
+            return Some(ReasonCode::NotMinted);
+        }
+        None
+    }
+
     /// Atomically claims one recognized ticket exactly once and releases its closed job.
     ///
     /// Rejected: a handle whose native launch was never recognized (a bare copied reference, or a

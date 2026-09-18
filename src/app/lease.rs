@@ -94,6 +94,11 @@ impl LeaseController {
         }
         *self.0.became_idle_at.lock().unwrap() = None;
         self.0.changed.notify_waiters();
+        crate::errorlog::record(
+            crate::errorlog::Method::Daemon,
+            crate::errorlog::Outcome::LeaseOpened,
+            crate::errorlog::Fields::default(),
+        );
         Some(LeaseGuard(Arc::clone(&self.0)))
     }
 
@@ -168,6 +173,11 @@ impl Drop for LeaseGuard {
             *self.0.became_idle_at.lock().unwrap() = Some(Instant::now());
         }
         self.0.changed.notify_waiters();
+        crate::errorlog::record(
+            crate::errorlog::Method::Daemon,
+            crate::errorlog::Outcome::LeaseClosed,
+            crate::errorlog::Fields::default(),
+        );
     }
 }
 

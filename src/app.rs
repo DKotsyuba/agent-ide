@@ -241,6 +241,7 @@ async fn run_daemon_inner(
     transport_limits: Option<HookTransportLimits>,
     idle_timeout: Duration,
 ) -> Result<(), AppError> {
+    crate::errorlog::init(runtime_dir.path());
     let _lock = DaemonLock::acquire(runtime_dir.lock_path())?;
     let runtime_identity = fs::symlink_metadata(runtime_dir.path())
         .ok()
@@ -265,6 +266,7 @@ async fn run_daemon_inner(
     });
     let idle_expired = lease.idle_expired();
     tokio::pin!(idle_expired);
+    let mut idle_exit = false;
     let serving = async {
         let socket_path = runtime_dir.socket_path();
         retire_stale_socket(&socket_path, ipc.connection_deadline).await?;
@@ -273,12 +275,17 @@ async fn run_daemon_inner(
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
         let generation = new_generation()?;
         let permits = Arc::new(Semaphore::new(ipc.max_connections));
+        crate::errorlog::record(
+            crate::errorlog::Method::Daemon,
+            crate::errorlog::Outcome::Started,
+            crate::errorlog::Fields::default(),
+        );
 
         loop {
             let accepted = tokio::select! {
                 accepted = listener.accept() => accepted,
                 _ = &mut termination => break,
-                _ = &mut idle_expired => break,
+                _ = &mut idle_expired => { idle_exit = true; break; }
                 _ = connections.join_next(), if !connections.is_empty() => continue,
             };
             let (stream, _) = accepted?;
@@ -303,6 +310,17 @@ async fn run_daemon_inner(
     }
     .await;
     let result = finish_daemon(serving, &mut connections, dispatcher.as_ref(), &lease).await;
+    crate::errorlog::record(
+        crate::errorlog::Method::Daemon,
+        if result.is_err() {
+            crate::errorlog::Outcome::Failed
+        } else if idle_exit {
+            crate::errorlog::Outcome::IdleExit
+        } else {
+            crate::errorlog::Outcome::Stopped
+        },
+        crate::errorlog::Fields::default(),
+    );
     if result.is_ok()
         && owned_socket.is_some()
         && let Some(identity) = runtime_identity

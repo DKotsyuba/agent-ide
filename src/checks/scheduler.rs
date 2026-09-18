@@ -670,18 +670,14 @@ impl Inner {
             .await
         {
             Ok(output) if output.status.success() => RustCacheClone::Cloned,
-            Ok(output) => {
-                eprintln!(
-                    "agent-ide: scheduler clonefile of {} failed: {}",
-                    source_target.display(),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                RustCacheClone::Failed
-            }
-            Err(error) => {
-                eprintln!(
-                    "agent-ide: scheduler could not run /bin/cp for {}: {error}",
-                    source_target.display()
+            Ok(_) | Err(_) => {
+                crate::errorlog::record(
+                    crate::errorlog::Method::Check,
+                    crate::errorlog::Outcome::Failed,
+                    crate::errorlog::Fields {
+                        reason: Some(crate::errorlog::ReasonCode::SchedulerCacheCloneFailed),
+                        ..Default::default()
+                    },
                 );
                 RustCacheClone::Failed
             }

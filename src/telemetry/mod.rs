@@ -85,10 +85,14 @@ pub enum ToolOutcome {
     Unavailable,
     /// The peer completed with a meaningful closed failure that was not invalid input or cancellation.
     Failed,
-    /// The result was incomplete or pending at the bounded observation point.
+    /// The result was incomplete or timed out at the bounded observation point.
     Incomplete,
     /// The operation was explicitly stopped or cancelled.
     Cancelled,
+    /// The peer answered `pending`: a Claude foreground-helper round trip is required. Distinct
+    /// from [`ToolOutcome::Incomplete`] because a normal pending/helper/inspect round trip is not
+    /// itself a failure (T107).
+    Pending,
 }
 
 /// Classifies whether a provider cache was used without identifying a cache location or key.
@@ -199,6 +203,10 @@ pub enum Event {
         cache: CacheState,
         /// Existing provider diagnostic summary.
         diagnostics: DiagnosticState,
+        /// Closed reason code for a non-completed, non-pending outcome (T107). `#[serde(default)]`
+        /// keeps durable rows recorded before this field existed readable as `None`.
+        #[serde(default)]
+        reason: Option<crate::errorlog::ReasonCode>,
     },
     /// Records an existing Execution completion using only already-measured bounded facts.
     ExecutionCompleted {
@@ -1058,6 +1066,7 @@ mod tests {
             language: Some(Language::Rust),
             cache: CacheState::Hit,
             diagnostics: DiagnosticState::Clean,
+            reason: None,
         }
     }
 
