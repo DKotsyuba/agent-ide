@@ -263,6 +263,8 @@ pub enum ReasonCode {
     InvalidDetail,
     /// [`FailureCode::SourceUnavailable`].
     SourceUnavailable,
+    /// [`FailureCode::SourceTooLarge`]: the source exceeds the read ceiling (T13B).
+    SourceTooLarge,
     /// [`FailureCode::Conflict`].
     Conflict,
     /// [`FailureCode::Internal`].
@@ -343,6 +345,7 @@ impl ReasonCode {
             Self::Capacity => "capacity",
             Self::InvalidDetail => "invalid_detail",
             Self::SourceUnavailable => "source_unavailable",
+            Self::SourceTooLarge => "source_too_large",
             Self::Conflict => "conflict",
             Self::Internal => "internal",
             Self::ChecksDisabled => "checks_disabled",
@@ -406,6 +409,7 @@ impl From<FailureCode> for ReasonCode {
             FailureCode::Capacity => Self::Capacity,
             FailureCode::InvalidDetail => Self::InvalidDetail,
             FailureCode::SourceUnavailable => Self::SourceUnavailable,
+            FailureCode::SourceTooLarge { .. } => Self::SourceTooLarge,
             FailureCode::Conflict => Self::Conflict,
             FailureCode::Internal => Self::Internal,
         }
