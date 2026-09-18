@@ -85,6 +85,9 @@ Each child or subagent activates `ide.*` independently: a parent's
 `unavailable`. When `ide.*` is inactive, unsupported, or its reply is not
 usable, fall back immediately to native host tools and CodeGraph or native
 search; never block source work waiting for `ide.*` to become available.
+When an `unavailable` reply's `retry` field reads `daemon restarted; repeat
+this call once`, repeat that exact same call once before falling back to
+native tools.
 
 ## Boundaries
 

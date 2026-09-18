@@ -34,7 +34,7 @@ use crate::{
             HookEvent, HookLaunch, HookPhase, HostBindingGuard, HostKind, parse_candidate,
             parse_claude_call_id, parse_hook_event, parse_host_kind,
         },
-        reply::{MAX_FEEDBACK_BYTES, PeerReply, ResultKind},
+        reply::{MAX_FEEDBACK_BYTES, MissingPeer, PeerReply, ResultKind},
     },
     workspace::authority::{
         AuthorityError, AuthorityRegistry, AuthorityRevoked, AuthorityStamp, StopBindingHandoff,
@@ -1033,40 +1033,46 @@ impl StdioFacade {
     /// rendezvous this facade started with, stores the refreshed pair for itself and every later
     /// call, and retries this one call exactly once more. There is no retry loop: a still-unavailable
     /// retry, or a failed rendezvous, returns the original outcome.
+    ///
+    /// The returned flag is true only when that retried dispatch actually ran (T08B): the new
+    /// daemon has no pre-hook observation for the call whose hook fired before it existed, so this
+    /// retried call's own outcome needs a retry hint even though the daemon itself is back.
     async fn dispatch_with_reconnect(
         &self,
         tool: AssistanceTool,
         parameters: Value,
         context: &RequestContext<RoleServer>,
-    ) -> FacadeOutcome {
+    ) -> (FacadeOutcome, bool) {
         let Some((runtime_dir, attachment)) = self.current_connection().await else {
-            return FacadeOutcome::Unavailable;
+            return (FacadeOutcome::Unavailable, false);
         };
         let Some(host) = self.build_host(&attachment, context) else {
-            return FacadeOutcome::Unavailable;
+            return (FacadeOutcome::Unavailable, false);
         };
         let outcome = self
             .facade
             .dispatch_at(&runtime_dir, &host, tool, parameters.clone())
             .await;
         let Some(reconnect) = &self.reconnect else {
-            return outcome;
+            return (outcome, false);
         };
         if !matches!(outcome, FacadeOutcome::Unavailable) {
-            return outcome;
+            return (outcome, false);
         }
         let Some((runtime_dir, attachment)) = (reconnect.reestablish)().await else {
-            return outcome;
+            return (outcome, false);
         };
         reconnect
             .store(runtime_dir.clone(), attachment.clone())
             .await;
         let Some(host) = self.build_host(&attachment, context) else {
-            return outcome;
+            return (outcome, false);
         };
-        self.facade
+        let retried = self
+            .facade
             .dispatch_at(&runtime_dir, &host, tool, parameters)
-            .await
+            .await;
+        (retried, true)
     }
 
     /// Validates model parameters before using separately supplied host metadata for finite IPC.
@@ -1079,14 +1085,17 @@ impl StdioFacade {
         parameters: Value,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        let outcome = match validate_call(tool, parameters.clone()) {
+        let (outcome, reconnected) = match validate_call(tool, parameters.clone()) {
             Ok(_) => {
                 self.dispatch_with_reconnect(tool, parameters, &context)
                     .await
             }
-            Err(_) => FacadeOutcome::InvalidParameters,
+            Err(_) => (FacadeOutcome::InvalidParameters, false),
         };
         let message = match outcome {
+            FacadeOutcome::Reply(reply) if reconnected => {
+                return render_reply_after_reconnect(reply);
+            }
             FacadeOutcome::Reply(reply) => return render_reply(reply),
             FacadeOutcome::InvalidParameters => {
                 "invalid bounded parameters; inspect the tool schema"
@@ -1116,6 +1125,43 @@ pub(super) fn render_reply(reply: PeerReply) -> CallToolResult {
             "Assistance result exceeds the bounded envelope; continue with native tools",
         )])
     })
+}
+
+/// Stable text for [`render_reply_after_reconnect`]'s added `retry` field (T08B).
+const RECONNECT_RETRY_HINT: &str = "daemon restarted; repeat this call once";
+
+/// Renders exactly like [`render_reply`], except a host-binding-unavailable reply also tells the
+/// agent to repeat the call once (T08B).
+///
+/// After [`StdioFacade::dispatch_with_reconnect`] re-establishes a lost shared daemon mid call,
+/// that first retried dispatch has no pre-hook observation for the call whose hook fired before
+/// the new daemon existed ([`crate::assistance::host_binding::BindingUnavailable::MissingPre`]),
+/// so it reports the same host-binding-unavailable outcome an agent would otherwise see with no
+/// daemon at all. An agent may not retry on its own and would stay without the IDE, so this keeps
+/// the existing machine fields and adds a short stable `retry` hint instead. Every other reply
+/// following a reconnect (including a still-unavailable transport outcome, which never reaches
+/// this function) renders unchanged.
+fn render_reply_after_reconnect(reply: PeerReply) -> CallToolResult {
+    let is_host_binding_unavailable = matches!(
+        reply,
+        PeerReply::Unavailable {
+            reason: MissingPeer::HostBinding
+        }
+    );
+    let mut rendered = render_reply(reply);
+    if !is_host_binding_unavailable {
+        return rendered;
+    }
+    if let Some(Value::Object(fields)) = rendered.structured_content.as_mut() {
+        fields.insert(
+            "retry".to_owned(),
+            Value::String(RECONNECT_RETRY_HINT.to_owned()),
+        );
+    }
+    if let Some(ContentBlock::Text(text)) = rendered.content.first_mut() {
+        text.text = format!("{}; retry: {RECONNECT_RETRY_HINT}", text.text);
+    }
+    rendered
 }
 
 /// Ensures escaped compact text cannot defeat the actual serialized response budget.

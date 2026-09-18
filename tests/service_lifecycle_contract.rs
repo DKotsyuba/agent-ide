@@ -535,6 +535,26 @@ fn assert_reached_live_daemon(response: &Value) {
     );
 }
 
+/// Asserts the same typed no-prior-hook outcome as [`assert_reached_live_daemon`], plus the T08B
+/// retry hint: this call's own dispatch is the one that re-established the shared daemon, so the
+/// freshly re-established daemon has no pre-hook observation for it either, and an agent reading
+/// only the plain host-binding-unavailable outcome would have no way to know a repeat could
+/// succeed.
+fn assert_reached_live_daemon_after_reconnect(response: &Value) {
+    assert_ne!(response["result"]["isError"], json!(true), "{response}");
+    assert_eq!(
+        response["result"]["structuredContent"],
+        json!({"state":"unavailable","reason":"host_binding","retry":"daemon restarted; repeat this call once"}),
+        "{response}"
+    );
+    assert!(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("retry: daemon restarted; repeat this call once")),
+        "{response}"
+    );
+}
+
 /// After the shared daemon an MCP client is using exits (here, the test's own `SIGTERM`, standing
 /// in for idle shutdown, a crash, or a binary upgrade), the client re-establishes it on the next
 /// call instead of failing every later call, and the repository still ends up with exactly one
@@ -569,8 +589,10 @@ async fn mcp_client_re_establishes_a_lost_shared_daemon_and_serves_the_next_call
     .await
     .expect("the terminated daemon must remove its own runtime directory");
 
-    // The very next call must reach a live daemon again, not repeat the stale unavailable error.
-    assert_reached_live_daemon(&call_ide_start(&mut mcp, 3, "after").await);
+    // The very next call must reach a live daemon again, not repeat the stale unavailable error,
+    // and its own outcome must carry the T08B retry hint because it is the retried dispatch that
+    // re-established the daemon.
+    assert_reached_live_daemon_after_reconnect(&call_ide_start(&mut mcp, 3, "after").await);
 
     wait_for_healthy_locked_daemon(&runtime).await;
     let generation_after = match doctor_report(&runtime).await.unwrap().status {
@@ -625,7 +647,10 @@ async fn mcp_client_reopens_its_lease_after_re_establishing_a_lost_shared_daemon
     .await
     .expect("the terminated daemon must remove its own runtime directory");
 
-    assert_reached_live_daemon(&call_ide_start(&mut mcp, 2, "reconnect").await);
+    // This is the first call made on this connection, and the daemon it was minted against is
+    // already gone, so this dispatch is itself the one that re-establishes it and must carry the
+    // T08B retry hint.
+    assert_reached_live_daemon_after_reconnect(&call_ide_start(&mut mcp, 2, "reconnect").await);
 
     wait_for_healthy_locked_daemon(&runtime).await;
     let generation_after = match doctor_report(&runtime).await.unwrap().status {

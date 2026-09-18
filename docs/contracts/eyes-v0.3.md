@@ -98,6 +98,13 @@ with the existing launcher configuration error.
   rendezvous failure, or a retry that is still unavailable, surfaces the normal unavailable outcome
   for that call, and this MCP's lease stays on the dead connection until it is dropped. A pending
   peer-side binding from the dead daemon is gone; the next `ide.start` establishes a fresh one.
+- Retry hint (T08B): the retried dispatch above reaches the freshly re-established daemon, which has
+  no pre-hook observation for the call whose own hook fired before that daemon existed, so it reports
+  the ordinary `{"state":"unavailable","reason":"host_binding"}` outcome even though the daemon itself
+  is back. Only for that specific retried dispatch, the reply adds a stable
+  `"retry":"daemon restarted; repeat this call once"` field (structured content and text) telling the
+  agent to repeat the same call once; every other reply, including a still-unavailable retry, is
+  unchanged.
 
 Success example: agents A and B in two worktrees of one repository call `ide.start`; one daemon
 serves both; A exits; B keeps working; B exits; the daemon stops 300 s later.
