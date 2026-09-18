@@ -24,9 +24,12 @@ because deferred MCP tools may be omitted there. If discovery is absent, returns
 no matching tools, or a discovered tool fails, continue with the fail-open rule
 below. Do not repeat discovery in a loop.
 
-Each accepted reply carries one compact decision-facing text block. When the host exposes
-`structuredContent`, treat that complete typed result as the source of truth instead of parsing the
-compact text as a second response schema.
+Each accepted reply carries one compact decision-facing text block that alone states every fact
+needed for the next action — state, `detail_ref`, `helper`, `continuation`, `retry`, Edit outcome
+and `source_ref`. On Claude, that text is the only carrier: Claude hands `structuredContent`
+straight to its model instead of `content`, so the managed Claude MCP never sends it. On a host
+that does expose `structuredContent`, treat that complete typed result as the source of truth
+instead of parsing the compact text as a second response schema.
 
 ## Workflow
 
@@ -89,7 +92,7 @@ Each child or subagent activates `ide.*` independently: a parent's
 `unavailable`. When `ide.*` is inactive, unsupported, or its reply is not
 usable, fall back immediately to native host tools and CodeGraph or native
 search; never block source work waiting for `ide.*` to become available.
-When an `unavailable` reply's `retry` field reads `daemon restarted; repeat
+When an `unavailable` reply carries the retry fact `daemon restarted; repeat
 this call once`, repeat that exact same call once before falling back to
 native tools.
 

@@ -526,11 +526,20 @@ async fn call_ide_start(mcp: &mut Mcp, id: u64, activation_id: &str) -> Value {
 
 /// Asserts one `ide.start` reply reached a live daemon and got its typed no-prior-hook outcome,
 /// rather than the transport-level "daemon is unavailable" fallback text this contract targets.
+///
+/// The Claude host this fixture drives never receives `structuredContent` (T14B): it hands that
+/// field straight to its model in place of `content`, defeating the compact renderer, so the
+/// managed Claude MCP omits it entirely and this asserts against the compact `content` text instead.
 fn assert_reached_live_daemon(response: &Value) {
     assert_ne!(response["result"]["isError"], json!(true), "{response}");
-    assert_eq!(
-        response["result"]["structuredContent"],
-        json!({"state":"unavailable","reason":"host_binding"}),
+    assert!(
+        response["result"].get("structuredContent").is_none(),
+        "{response}"
+    );
+    assert!(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("unavailable: host_binding")),
         "{response}"
     );
 }
@@ -542,15 +551,15 @@ fn assert_reached_live_daemon(response: &Value) {
 /// succeed.
 fn assert_reached_live_daemon_after_reconnect(response: &Value) {
     assert_ne!(response["result"]["isError"], json!(true), "{response}");
-    assert_eq!(
-        response["result"]["structuredContent"],
-        json!({"state":"unavailable","reason":"host_binding","retry":"daemon restarted; repeat this call once"}),
+    assert!(
+        response["result"].get("structuredContent").is_none(),
         "{response}"
     );
     assert!(
         response["result"]["content"][0]["text"]
             .as_str()
-            .is_some_and(|text| text.contains("retry: daemon restarted; repeat this call once")),
+            .is_some_and(|text| text.starts_with("unavailable: host_binding")
+                && text.contains("retry: daemon restarted; repeat this call once")),
         "{response}"
     );
 }

@@ -1092,11 +1092,20 @@ impl StdioFacade {
             }
             Err(_) => (FacadeOutcome::InvalidParameters, false),
         };
+        // The Claude host hands `structuredContent` straight to its model in place of `content`,
+        // defeating the compact renderer (T14B); its calls therefore never receive that duplicate
+        // JSON copy. `parse_host_kind` reads the same trusted per-call `_meta` shape `build_host`
+        // already establishes host identity from, so this holds for every managed Claude MCP mode
+        // regardless of how the process itself was launched.
+        let envelope = match parse_host_kind(&context.meta) {
+            Ok(HostKind::Claude) => content::Envelope::TextOnly,
+            _ => content::Envelope::WithStructured,
+        };
         let message = match outcome {
             FacadeOutcome::Reply(reply) if reconnected => {
-                return render_reply_after_reconnect(reply);
+                return render_reply_after_reconnect(reply, envelope);
             }
-            FacadeOutcome::Reply(reply) => return render_reply(reply),
+            FacadeOutcome::Reply(reply) => return render_reply(reply, envelope),
             FacadeOutcome::InvalidParameters => {
                 "invalid bounded parameters; inspect the tool schema"
             }
@@ -1117,10 +1126,16 @@ impl StdioFacade {
 /// [`content::render`] shrinks only owner Complete text at UTF-8 boundaries. Diff pages have already
 /// passed [`content::fits`] without shrinking, so the facade never re-cuts an accepted whole hunk.
 ///
-/// `pub(super)` so `worker::Shared::mark_feedback_inline_delivered` can trace the exact same
-/// final carrier a live caller would receive, instead of re-approximating the fitting boundary.
-pub(super) fn render_reply(reply: PeerReply) -> CallToolResult {
-    content::render(reply).unwrap_or_else(|| {
+/// `envelope` selects whether the final carrier also duplicates the typed reply as
+/// `structuredContent` (T14B): the Claude host hands that field straight to its model in place of
+/// `content`, defeating the compact renderer, so its calls render with [`content::Envelope::TextOnly`].
+/// Every other caller — Codex, and `worker::Shared::mark_feedback_inline_delivered` tracing the
+/// exact final carrier a live caller would receive — keeps [`content::Envelope::WithStructured`].
+///
+/// `pub(super)` so `worker::Shared::mark_feedback_inline_delivered` can call it directly instead of
+/// re-approximating the fitting boundary.
+pub(super) fn render_reply(reply: PeerReply, envelope: content::Envelope) -> CallToolResult {
+    content::render(reply, envelope).unwrap_or_else(|| {
         CallToolResult::error(vec![ContentBlock::text(
             "Assistance result exceeds the bounded envelope; continue with native tools",
         )])
@@ -1141,14 +1156,14 @@ const RECONNECT_RETRY_HINT: &str = "daemon restarted; repeat this call once";
 /// the existing machine fields and adds a short stable `retry` hint instead. Every other reply
 /// following a reconnect (including a still-unavailable transport outcome, which never reaches
 /// this function) renders unchanged.
-fn render_reply_after_reconnect(reply: PeerReply) -> CallToolResult {
+fn render_reply_after_reconnect(reply: PeerReply, envelope: content::Envelope) -> CallToolResult {
     let is_host_binding_unavailable = matches!(
         reply,
         PeerReply::Unavailable {
             reason: MissingPeer::HostBinding
         }
     );
-    let mut rendered = render_reply(reply);
+    let mut rendered = render_reply(reply, envelope);
     if !is_host_binding_unavailable {
         return rendered;
     }
@@ -1167,13 +1182,16 @@ fn render_reply_after_reconnect(reply: PeerReply) -> CallToolResult {
 /// Ensures escaped compact text cannot defeat the actual serialized response budget.
 #[test]
 fn rendered_reply_bounds_the_complete_mcp_result() {
-    let rendered = render_reply(PeerReply::Complete {
-        kind: ResultKind::Context,
-        text: "\0🦀\"\\".repeat(16000),
-        detail_ref: Some("same-binding-detail".into()),
-        truncated: false,
-        continuation: false,
-    });
+    let rendered = render_reply(
+        PeerReply::Complete {
+            kind: ResultKind::Context,
+            text: "\0🦀\"\\".repeat(16000),
+            detail_ref: Some("same-binding-detail".into()),
+            truncated: false,
+            continuation: false,
+        },
+        content::Envelope::WithStructured,
+    );
     assert!(content::call_tool_result_fits(&rendered));
     assert_eq!(rendered.content.len(), 1);
     let result = rendered.structured_content.unwrap();
@@ -1192,11 +1210,56 @@ fn typed_lifecycle_replies_preserve_structured_content_without_transport_errors(
         PeerReply::HostStopped {},
     ] {
         let expected = serde_json::to_value(&reply).unwrap();
-        let rendered = render_reply(reply);
+        let rendered = render_reply(reply, content::Envelope::WithStructured);
         assert_eq!(rendered.content.len(), 1);
         assert_eq!(rendered.structured_content, Some(expected));
         assert_ne!(rendered.is_error, Some(true));
     }
+}
+
+/// The Claude host reads `structuredContent` straight into its model in place of `content`,
+/// defeating the compact renderer; `render_reply` with [`content::Envelope::TextOnly`] must
+/// therefore never populate it, for every reply state Claude can receive (T14B).
+#[test]
+fn claude_envelope_never_carries_structured_content() {
+    for reply in [
+        PeerReply::Unavailable {
+            reason: crate::assistance::reply::MissingPeer::HostBinding,
+        },
+        PeerReply::HostStopped {},
+        PeerReply::Pending {
+            detail_ref: "detail-queued".into(),
+            helper: Some("agent-ide claude-helper --claim detail-queued".into()),
+        },
+        PeerReply::Complete {
+            kind: ResultKind::Activation,
+            text: "durable capture true".into(),
+            detail_ref: None,
+            truncated: false,
+            continuation: false,
+        },
+    ] {
+        let rendered = render_reply(reply, content::Envelope::TextOnly);
+        assert_eq!(rendered.content.len(), 1);
+        assert_eq!(rendered.structured_content, None);
+    }
+}
+
+/// The T08B reconnect retry hint reaches the Claude host through `content` alone, since
+/// [`content::Envelope::TextOnly`] never populates `structuredContent` for it to be inserted into.
+#[test]
+fn claude_envelope_reconnect_retry_hint_survives_in_content_text() {
+    let rendered = render_reply_after_reconnect(
+        PeerReply::Unavailable {
+            reason: crate::assistance::reply::MissingPeer::HostBinding,
+        },
+        content::Envelope::TextOnly,
+    );
+    assert_eq!(rendered.structured_content, None);
+    let ContentBlock::Text(text) = &rendered.content[0] else {
+        panic!("sole content block must be text");
+    };
+    assert!(text.text.contains(RECONNECT_RETRY_HINT), "{}", text.text);
 }
 
 #[tool_router]
