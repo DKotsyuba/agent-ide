@@ -104,6 +104,19 @@ Every project check process is started through one spawn path:
   the node install root, the pyright package root, the venv root and the canonical base
   interpreter prefix) and `/private/etc`, read+write of the check's private cache directory and a
   private temp directory.
+- Rust ancestor manifest reads (T07B): before resolving a workspace, cargo walks every ancestor
+  of the worktree looking for a `[workspace]` root, reading each ancestor's `Cargo.toml` and
+  `.cargo/config.toml`/`.cargo/config` even when that ancestor is not a workspace root — the
+  owner's live case is a worktree nested inside another checkout, for example a Claude Desktop
+  worktree at `<repo>/.claude/worktrees/<name>`. The profile therefore admits read of exactly
+  those files (never the ancestor directories) for every ancestor of the canonical worktree path
+  up to `/`; a bare ancestor `Cargo.toml` that does not list the worktree as a workspace member
+  leaves cargo treating the worktree as its own workspace root, same as if the ancestor did not
+  exist, while an ancestor `[workspace]` that also omits the worktree is a genuine project
+  misconfiguration cargo rejects outright — both surface through the run's own stdout/stderr, not
+  through profile denial. Without this, the walk fails with `Operation not permitted` before
+  cargo produces a single JSON event, reported as `Unavailable(Fatal)` with cargo's own
+  `error: failed searching for potential workspace` as the snapshot detail (§4).
 - Own process group; on cancel, timeout (`check_timeout_s`) or daemon shutdown the whole group is
   killed (SIGTERM, 2 s, SIGKILL) and reaped. No pattern-based kill of processes the daemon did not
   start.
@@ -167,7 +180,10 @@ pub struct ProblemSnapshot { pub language: Language, pub state: CheckState,
 - Deduplicate by `(level, code, primary span file_name:line_start:column_start, message)`:
   `--all-targets` repeats a diagnostic for lib and lib-test units.
 - `Ready` requires the final `build-finished` message. If any compilation unit failed so dependent
-  units produced no result, state is `Partial`. Missing `build-finished` → `Unavailable(Fatal)`.
+  units produced no result, state is `Partial`. Missing `build-finished` → `Unavailable(Fatal)`,
+  carrying the first `error:`-prefixed line of stderr as `detail` (T07B) when one exists — cargo
+  dying before any JSON event (for example the ancestor-workspace-search failure in §3) never
+  produces a `compiler-message` to draw a detail from otherwise.
 - `build-finished.success: false` with zero deduplicated errors (T05B: a build failure with no
   diagnostic to show, for example a build-script link failure — T06B: `cc` exiting nonzero has no
   primary span, so it is never counted) is also `Unavailable(Fatal)`, never `Ready`: counts are

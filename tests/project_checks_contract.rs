@@ -277,6 +277,87 @@ fn rust_cargo_check_spec_falls_back_to_home_rustup() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// Proves a worktree nested inside another Cargo project (T07B: the owner's Claude Desktop
+/// worktrees under `/Users/pluto/projects/agent-ide/.claude/worktrees/<name>`) gets read roots
+/// for the exact ancestor `Cargo.toml` and `.cargo/config.toml` files cargo's workspace search
+/// walks up to and reads, so the confined run does not die with "failed searching for potential
+/// workspace"; the ancestor directories themselves are never added as roots, and an ancestor with
+/// neither file (the scratch root, two levels up) adds nothing.
+#[test]
+fn rust_cargo_check_spec_adds_ancestor_manifest_files_for_nested_worktree() {
+    let root = rust_scratch("ancestor-manifests");
+    let parent_project = root.join("parent-project");
+    fs::create_dir_all(parent_project.join(".cargo")).expect("parent .cargo dir creates");
+    fs::write(
+        parent_project.join("Cargo.toml"),
+        b"[package]\nname = \"parent\"\n",
+    )
+    .expect("parent manifest writes");
+    fs::write(
+        parent_project.join(".cargo").join("config.toml"),
+        b"[build]\n",
+    )
+    .expect("parent cargo config writes");
+    let worktree = parent_project
+        .join(".claude")
+        .join("worktrees")
+        .join("nested-wt");
+    fs::create_dir_all(&worktree).expect("nested worktree creates");
+    let request = CheckRequest {
+        worktree: worktree.clone(),
+        cache_dir: root.join("cache"),
+        input_generation: 42,
+    };
+    let checker = rust_checker(&root, FakeRunner::default());
+    let spec = checker.cargo_check_spec(&request);
+    let canonical_parent = fs::canonicalize(&parent_project).expect("parent canonicalizes");
+    assert!(
+        spec.read_roots
+            .contains(&canonical_parent.join("Cargo.toml")),
+        "{:?}",
+        spec.read_roots
+    );
+    assert!(
+        spec.read_roots
+            .contains(&canonical_parent.join(".cargo").join("config.toml")),
+        "{:?}",
+        spec.read_roots
+    );
+    assert!(
+        !spec.read_roots.contains(&canonical_parent),
+        "ancestor directory itself must not be a root: {:?}",
+        spec.read_roots
+    );
+    let canonical_root = fs::canonicalize(&root).expect("root canonicalizes");
+    assert!(
+        !spec.read_roots.contains(&canonical_root.join("Cargo.toml")),
+        "an ancestor with no manifest must not add one: {:?}",
+        spec.read_roots
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Proves a worktree with no ancestor `Cargo.toml`/cargo config anywhere above it (the common
+/// case: a standalone checkout, as in every other spec test) adds no extra read roots at all.
+#[test]
+fn rust_cargo_check_spec_without_ancestor_manifests_adds_nothing() {
+    let root = rust_scratch("ancestor-manifests-none");
+    let request = rust_request(&root, true);
+    let checker = rust_checker(&root, FakeRunner::default());
+    let spec = checker.cargo_check_spec(&request);
+    let mut expected_read_roots = vec![
+        request.worktree.clone(),
+        root.join("toolchains").join("tc"),
+        rust_home().join(".cargo"),
+        root.clone(),
+        PathBuf::from("/private/etc"),
+        rust_developer_dir(&root),
+    ];
+    expected_read_roots.extend(existing_literal_developer_roots());
+    assert_eq!(spec.read_roots, expected_read_roots);
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// Proves the checker reports the Rust language.
 #[test]
 fn rust_checker_reports_rust_language() {
@@ -467,7 +548,7 @@ fn rust_parser_prefers_spanless_compiler_error_message_over_stderr() {
 }
 
 /// Proves a stream without the terminal `build-finished` event is `Unavailable(Fatal)` with
-/// zero counts.
+/// zero counts and no detail when stderr carries no `error:` line.
 #[test]
 fn rust_parser_stream_without_build_finished_is_fatal() {
     let snapshot = parse_cargo_messages(TRUNCATED_STREAM.as_bytes(), &[], 9, 55);
@@ -480,6 +561,26 @@ fn rust_parser_stream_without_build_finished_is_fatal() {
     assert!(snapshot.problems.is_empty());
     // The sanctioned zero-count constructor pins duration to 0, like every unavailable outcome.
     assert_eq!(snapshot.duration_ms, 0);
+    assert_eq!(snapshot.detail, None);
+}
+
+/// Proves a stream without the terminal `build-finished` event carries the first `error:` line
+/// of stderr as its detail (T07B): cargo dying before it can even resolve a workspace — for
+/// example the ancestor-manifest read failure this task fixes — never emits a JSON event at all,
+/// so this is the only place such a failure can surface a cause.
+#[test]
+fn rust_parser_stream_without_build_finished_carries_stderr_detail() {
+    let stderr =
+        b"error: failed searching for potential workspace\nCaused by:\n  Operation not permitted (os error 1)\n";
+    let snapshot = parse_cargo_messages(TRUNCATED_STREAM.as_bytes(), stderr, 9, 55);
+    assert_eq!(
+        snapshot.state,
+        CheckState::Unavailable(UnavailableReason::Fatal)
+    );
+    assert_eq!(
+        snapshot.detail.as_deref(),
+        Some("error: failed searching for potential workspace")
+    );
 }
 
 /// Proves a runner-level failure maps to `Unavailable(Fatal)`.

@@ -161,6 +161,7 @@ impl RustChecker {
             ]
             .into_iter()
             .chain(self.developer_roots.iter().cloned())
+            .chain(ancestor_manifest_roots(&request.worktree))
             .collect(),
             write_roots: vec![request.cache_dir.clone()],
             timeout: self.timeout,
@@ -177,6 +178,44 @@ impl RustChecker {
             .clone()
             .unwrap_or_else(|| home.join(".cargo"))
     }
+}
+
+/// Resolves the ancestor manifest and cargo-config files a confined `cargo check` needs to read
+/// when the worktree is nested inside another Cargo project (T07B).
+///
+/// Cargo walks every ancestor of the current directory looking for a workspace root, reading
+/// each ancestor's `Cargo.toml` (and `.cargo/config.toml`/`.cargo/config`, which also affect
+/// workspace discovery) even when that ancestor turns out not to be a workspace root at all —
+/// for example the parent checkout at `/Users/pluto/projects/agent-ide/Cargo.toml` when the
+/// checked worktree is `/Users/pluto/projects/agent-ide/.claude/worktrees/<name>`. Without read
+/// access to those files the walk itself fails with `Operation not permitted` before cargo ever
+/// resolves a workspace, regardless of whether the ancestor is a plain package (an implicit
+/// single-package workspace, which does not claim the nested worktree as a member — cargo then
+/// treats the worktree as its own workspace root, same as if the parent didn't exist) or an
+/// explicit `[workspace]` that also doesn't list the worktree (which cargo rejects with "current
+/// package believes it's in a workspace when it's not", a genuine project misconfiguration this
+/// checker must surface, not hide, via the [`UnavailableReason::Fatal`] detail on a missing
+/// `build-finished` event).
+///
+/// Only the ancestors of `worktree` are walked, not `worktree` itself (already covered by the
+/// worktree's own read root), starting from the canonical path (Seatbelt matches canonical
+/// paths) up to the filesystem root. Only files that exist are returned; ancestor directories
+/// themselves are never added as roots, keeping the added read access limited to the exact
+/// manifest and config files cargo consults.
+fn ancestor_manifest_roots(worktree: &Path) -> Vec<PathBuf> {
+    let canonical = std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+    let mut ancestors = canonical.ancestors();
+    ancestors.next();
+    let mut roots = Vec::new();
+    for ancestor in ancestors {
+        for relative in ["Cargo.toml", ".cargo/config.toml", ".cargo/config"] {
+            let candidate = ancestor.join(relative);
+            if candidate.is_file() {
+                roots.push(candidate);
+            }
+        }
+    }
+    roots
 }
 
 /// Returns the real user home directory.
@@ -511,7 +550,10 @@ fn lockfile_write_failure(stderr: &[u8]) -> bool {
 /// lib-test unit, and the repetition collapses there.
 ///
 /// State heuristic (EYES-r2 §4): a missing terminal `build-finished` event means cargo never
-/// completed the run, which is [`UnavailableReason::Fatal`]. A terminal `build-finished.success:
+/// completed the run, which is [`UnavailableReason::Fatal`], carrying the first `error:` line of
+/// `stderr` (T07B) as its [`ProblemSnapshot::detail`] when one exists — for example cargo's own
+/// `error: failed searching for potential workspace` when an ancestor manifest it needed to read
+/// was outside the confined read roots. A terminal `build-finished.success:
 /// false` with zero deduplicated errors — a build failure with no diagnostics to show, for
 /// example a build-script link failure (T06B: `cc` exiting with a nonzero status has no primary
 /// span, so it is never counted as a diagnostic) — is also [`UnavailableReason::Fatal`],
@@ -571,10 +613,11 @@ pub fn parse_cargo_messages(
     }
 
     let Some(success) = build_finished else {
-        return ProblemSnapshot::unavailable(
+        return ProblemSnapshot::unavailable_with_detail(
             Language::Rust,
             UnavailableReason::Fatal,
             input_generation,
+            first_error_line(stderr),
         );
     };
     let base = ProblemSnapshot::from_problems(
