@@ -444,6 +444,7 @@ fn unavailable_reason(reason: UnavailableReason) -> &'static str {
         UnavailableReason::OutsideRoots => "outside_roots",
         UnavailableReason::ToolMissing => "tool_missing",
         UnavailableReason::EnvMissing => "env_missing",
+        UnavailableReason::NoFiles => "no_files",
         UnavailableReason::Fatal => "fatal",
         UnavailableReason::Timeout => "timeout",
     }
@@ -638,6 +639,7 @@ mod tests {
                 UnavailableReason::EnvMissing,
                 "rust: unavailable:env_missing",
             ),
+            (UnavailableReason::NoFiles, "rust: unavailable:no_files"),
             (UnavailableReason::Fatal, "rust: unavailable:fatal"),
             (UnavailableReason::Timeout, "rust: unavailable:timeout"),
         ] {
@@ -713,6 +715,27 @@ mod tests {
         assert_eq!(
             problems_text(&without_detail, None, 0),
             "rust: unavailable:fatal"
+        );
+    }
+
+    /// A pyright run that analyzed zero files (T12B) renders `unavailable:no_files` with a detail
+    /// pointing at the project's `include`/`exclude` configuration, distinct from `env_missing`.
+    #[test]
+    fn python_no_files_analyzed_renders_with_include_exclude_detail() {
+        let snapshots = [ProblemSnapshot::unavailable_with_detail(
+            Language::Python,
+            UnavailableReason::NoFiles,
+            1,
+            Some(
+                "pyright analyzed 0 files; check \"include\"/\"exclude\" in pyrightconfig.json \
+                 or [tool.pyright]"
+                    .to_owned(),
+            ),
+        )];
+        assert_eq!(
+            problems_text(&snapshots, None, 0),
+            "python: unavailable:no_files (pyright analyzed 0 files; check \"include\"/\"exclude\" \
+             in pyrightconfig.json or [tool.pyright])"
         );
     }
 

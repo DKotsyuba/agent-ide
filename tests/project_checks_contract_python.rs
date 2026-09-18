@@ -131,12 +131,19 @@ fn python_exit_code_two_is_fatal() {
 }
 
 #[test]
-fn python_files_analyzed_zero_is_env_missing() {
+fn python_files_analyzed_zero_is_no_files() {
     let json = br#"{"generalDiagnostics": [], "summary": {"errorCount": 0, "warningCount": 0, "filesAnalyzed": 0}}"#;
     let snapshot = parse_pyright_output(Some(0), json, 1, 1);
     assert_eq!(
         snapshot.state,
-        CheckState::Unavailable(UnavailableReason::EnvMissing)
+        CheckState::Unavailable(UnavailableReason::NoFiles)
+    );
+    assert_eq!(
+        snapshot.detail.as_deref(),
+        Some(
+            "pyright analyzed 0 files; check \"include\"/\"exclude\" in pyrightconfig.json or \
+             [tool.pyright]"
+        )
     );
 }
 

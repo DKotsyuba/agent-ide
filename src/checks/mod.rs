@@ -113,6 +113,11 @@ pub enum UnavailableReason {
     ToolMissing,
     /// The required project environment (for example the Python interpreter) was not found.
     EnvMissing,
+    /// The check tool ran against a resolved environment but analyzed zero files (for example
+    /// pyright with a malformed `include`/`exclude` in `pyrightconfig.json`); distinct from
+    /// [`UnavailableReason::EnvMissing`], which means the environment itself could not be
+    /// resolved. Carries the same durable-condition replacement semantics as `EnvMissing` (T12B).
+    NoFiles,
     /// The check ran and failed unrecoverably (crash, unparseable output, missing completion marker).
     Fatal,
     /// The check exceeded its configured timeout and its process group was killed.

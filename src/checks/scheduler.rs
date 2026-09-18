@@ -467,7 +467,8 @@ impl Inner {
     /// `Fatal`/`Timeout` failure (EYES-r2 §5) that would overwrite an existing usable
     /// `Ready`/`Partial` result. Every other `Unavailable` reason still replaces the stored
     /// result, since those describe a durable condition (disabled, outside roots, tool/env
-    /// missing) rather than one bad run.
+    /// missing, or T12B's `NoFiles`, a project misconfiguration that stays true run after run)
+    /// rather than one bad run.
     fn store_snapshot(&self, worktree: &Path, snapshot: ProblemSnapshot) {
         let mut state = self.lock_state();
         let Some(lang) = state

@@ -141,6 +141,7 @@ pub fn project_check(telemetry: &Telemetry, snapshot: &ProblemSnapshot) {
                 ProjectCheckState::ToolMissing
             }
             CheckState::Unavailable(UnavailableReason::EnvMissing) => ProjectCheckState::EnvMissing,
+            CheckState::Unavailable(UnavailableReason::NoFiles) => ProjectCheckState::NoFiles,
             CheckState::Unavailable(UnavailableReason::Fatal) => ProjectCheckState::Fatal,
             CheckState::Unavailable(UnavailableReason::Timeout) => ProjectCheckState::Timeout,
         },

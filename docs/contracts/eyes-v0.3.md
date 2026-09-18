@@ -189,7 +189,7 @@ resolved (§4 Python).
 
 ```rust
 pub enum Language { Rust, Python }
-pub enum UnavailableReason { Disabled, OutsideRoots, ToolMissing, EnvMissing, Fatal, Timeout }
+pub enum UnavailableReason { Disabled, OutsideRoots, ToolMissing, EnvMissing, NoFiles, Fatal, Timeout }
 pub enum CheckState {
     Ready,          // complete result for the configured scope
     Partial,        // result present but coverage incomplete
@@ -240,7 +240,11 @@ pub struct ProblemSnapshot { pub language: Language, pub state: CheckState,
 
 - Exit 0 or 1 with parseable JSON: counts from `generalDiagnostics` severities `error`/`warning`;
   must equal `summary.errorCount`/`summary.warningCount`; `summary.filesAnalyzed == 0` →
-  `Unavailable(EnvMissing)`. Exit ≥ 2 or unparseable output → `Unavailable(Fatal)`.
+  `Unavailable(NoFiles)` (T12B), carrying the fixed `detail` `pyright analyzed 0 files; check
+  "include"/"exclude" in pyrightconfig.json or [tool.pyright]` — pyright ran against a resolved
+  environment but had nothing to analyze (for example a malformed `include` glob), which is a
+  project-configuration problem, not a missing interpreter; `EnvMissing` stays reserved for that
+  (§4 Language presence). Exit ≥ 2 or unparseable output → `Unavailable(Fatal)`.
 - Environment: use the project's own interpreter. Order: `<venvPath>/<venv>/bin/python` from
   `pyrightconfig.json` or `[tool.pyright]` in `pyproject.toml`; else `<worktree>/.venv/bin/python`.
   The interpreter file must exist; the resolved path *as found inside the venv* (symlinks not
@@ -278,7 +282,10 @@ pub struct ProblemSnapshot { pub language: Language, pub state: CheckState,
 - The latest completed snapshot per `(worktree, language)` is kept in memory; a running check never
   replaces it until it completes. A completed `Unavailable(Fatal)` or `Unavailable(Timeout)` never
   replaces an existing `Ready`/`Partial` snapshot (the previous counts stay visible); other
-  unavailable reasons replace it.
+  unavailable reasons replace it, including `NoFiles` (T12B): a project misconfiguration that
+  makes pyright analyze zero files is a durable condition, not one bad run, so it must surface
+  even if it appears only after an earlier `Ready`/`Partial` result — the same replacement
+  semantics as `EnvMissing`.
 
 ## 6. The `<agent-ide>` block
 
@@ -295,8 +302,9 @@ rust: 3 errors (+2), 5 warnings | python: environment not found
 - Item forms: `<lang>: <E> errors, <W> warnings`; append ` (partial)` for `Partial`; the delta
   `(+N)`/`(-N)` after a count appears only when that count changed since the last block delivered
   to this actor for this worktree. `Unavailable` renders fixed text: `checks disabled`,
-  `outside allowed roots`, `tool not found`, `environment not found`, `check failed`,
-  `check timed out`. A language still `Checking` without any completed snapshot is omitted, and
+  `outside allowed roots`, `tool not found`, `environment not found`, `no files analyzed` (T12B),
+  `check failed`, `check timed out`. A language still `Checking` without any completed snapshot is
+  omitted, and
   (T10B) so is a language absent from the worktree (`Unavailable(Disabled)`, §4) — it never
   renders `checks disabled` or any other phrase, it is simply not mentioned. A pure-Python
   worktree therefore renders `<agent-ide>\npython: 2 errors, 0 warnings\n</agent-ide>` with no
@@ -327,7 +335,9 @@ Reply: per language the state, counts, and up to 20 problems from `offset`, each
 `path:line:column severity [code] message`, plus `next_offset` when more exist. Messages are
 untrusted text. An `unavailable:<reason>` state line carrying a [`ProblemSnapshot::detail`] (T05B)
 appends it in parentheses, for example `rust: unavailable:fatal (error: failed to run custom
-build command for \`blake3 v1.5.0\`)`; a snapshot with no detail renders exactly as before. This
+build command for \`blake3 v1.5.0\`)` or (T12B) `python: unavailable:no_files (pyright analyzed 0
+files; check "include"/"exclude" in pyrightconfig.json or [tool.pyright])`; a snapshot with no
+detail renders exactly as before. This
 detail is never included in the `<agent-ide>` block (§6), which stays within its 256-byte cap. No
 new tool and no new `AssistanceMethod`. The problems kind is answered from the daemon's in-memory
 snapshots for the caller's bound worktree on every host; it is never dispatched to the Claude

@@ -300,6 +300,7 @@ fn unavailable_text(reason: UnavailableReason) -> &'static str {
         UnavailableReason::OutsideRoots => "outside allowed roots",
         UnavailableReason::ToolMissing => "tool not found",
         UnavailableReason::EnvMissing => "environment not found",
+        UnavailableReason::NoFiles => "no files analyzed",
         UnavailableReason::Fatal => "check failed",
         UnavailableReason::Timeout => "check timed out",
     }
@@ -462,6 +463,7 @@ mod tests {
             (UnavailableReason::OutsideRoots, "outside allowed roots"),
             (UnavailableReason::ToolMissing, "tool not found"),
             (UnavailableReason::EnvMissing, "environment not found"),
+            (UnavailableReason::NoFiles, "no files analyzed"),
             (UnavailableReason::Fatal, "check failed"),
             (UnavailableReason::Timeout, "check timed out"),
         ];

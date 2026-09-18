@@ -29,6 +29,10 @@ const PYRIGHT_CONFIG_FILE: &str = "pyrightconfig.json";
 /// resolution source.
 const PYPROJECT_FILE: &str = "pyproject.toml";
 
+/// Detail attached to an [`UnavailableReason::NoFiles`] snapshot (T12B), naming the project
+/// configuration a fix should start from.
+const NO_FILES_DETAIL: &str = "pyright analyzed 0 files; check \"include\"/\"exclude\" in pyrightconfig.json or [tool.pyright]";
+
 /// Per-stream capture limit passed to the [`ConfinedRunner`] for every pyright run.
 ///
 /// Pyright's JSON report grows with the number of reported diagnostics; 64 MiB comfortably
@@ -441,8 +445,10 @@ struct PyrightSummary {
 /// one). `stdout` is the captured `--outputjson` report. Only exit `0` or `1` with a parseable
 /// report are accepted; any other exit code, or a report `serde_json` cannot parse, produces
 /// [`UnavailableReason::Fatal`] without inspecting `stdout` further. A parsed report whose
-/// `summary.filesAnalyzed` is `0` produces [`UnavailableReason::EnvMissing`] (pyright ran but had
-/// nothing to analyze, the same symptom a missing interpreter environment produces). A parsed
+/// `summary.filesAnalyzed` is `0` produces [`UnavailableReason::NoFiles`] with a `detail`
+/// pointing at the project's `include`/`exclude` configuration: pyright ran against a resolved
+/// environment but had nothing to analyze, which is a project-configuration problem, not a
+/// missing interpreter ([`UnavailableReason::EnvMissing`] stays reserved for that). A parsed
 /// report whose raw error/warning tally does not equal `summary.errorCount`/`warningCount`
 /// produces [`UnavailableReason::Fatal`], since a report that disagrees with its own summary is
 /// not safe to trust. Otherwise returns a `Ready` snapshot built by [`ProblemSnapshot::from_problems`]
@@ -470,10 +476,11 @@ pub fn parse_pyright_output(
         );
     };
     if report.summary.files_analyzed == 0 {
-        return ProblemSnapshot::unavailable(
+        return ProblemSnapshot::unavailable_with_detail(
             Language::Python,
-            UnavailableReason::EnvMissing,
+            UnavailableReason::NoFiles,
             input_generation,
+            Some(NO_FILES_DETAIL.to_owned()),
         );
     }
 

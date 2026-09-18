@@ -260,6 +260,8 @@ pub enum ProjectCheckState {
     ToolMissing,
     /// The project environment was missing.
     EnvMissing,
+    /// The check tool ran but analyzed zero files.
+    NoFiles,
     /// The check failed unrecoverably.
     Fatal,
     /// The check exceeded its timeout.
