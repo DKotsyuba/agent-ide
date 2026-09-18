@@ -77,14 +77,29 @@ impl PythonChecker {
     /// Builds the [`RunSpec`] for one pyright run against `request`, using the already-resolved
     /// `interpreter` (as returned by [`resolve_interpreter`], not yet canonicalized).
     ///
-    /// Canonicalizes `interpreter` internally (falling back to the given path if canonicalization
-    /// fails, which only happens if the file was removed between resolution and this call): the
-    /// canonical path is what `--pythonpath` receives and what its installation prefix is derived
-    /// from, while `interpreter`'s own parent-of-parent (the venv root, e.g. a `.venv` directory)
-    /// is added to `read_roots` unresolved, because pyright reads the venv's own layout (for
-    /// example `pyvenv.cfg` and `site-packages`) independently of where its `python` symlink
-    /// ultimately points. This function performs no process execution and no writes; it is
-    /// deterministic for a fixed filesystem state, which is what its unit tests rely on.
+    /// `interpreter` itself — not its canonical form — is what `--pythonpath` receives: a
+    /// uv-managed (or otherwise symlinked) venv's `bin/python` is a symlink to a base
+    /// installation's interpreter, and Python's own venv detection keys off `pyvenv.cfg` sitting
+    /// next to the symlink it was *invoked as* (`sys._base_executable`/`sys.prefix` resolution),
+    /// not next to whatever that symlink resolves to. Passing the canonical (resolved) path here
+    /// would make pyright run the base interpreter as if it had no venv, so it would never see
+    /// the venv's `site-packages`. `interpreter` still takes precedence over any `venvPath`/`venv`
+    /// pyright would otherwise read from `pyrightconfig.json`/`pyproject.toml` itself: pyright
+    /// gives an explicit `--pythonpath` priority over its own config-driven venv resolution, so
+    /// the two sources cannot disagree here.
+    ///
+    /// `interpreter` is canonicalized only to derive `read_roots` (falling back to the given path
+    /// if canonicalization fails, which only happens if the file was removed between resolution
+    /// and this call): the canonical path's installation prefix (its parent-of-parent) is added
+    /// so the confinement profile covers the real interpreter binary and its standard library —
+    /// pyright starts `interpreter` to enumerate its own search paths, and under Seatbelt that
+    /// exec follows the symlink to a location outside the venv — including the directory
+    /// `pyvenv.cfg`'s `home` key names (the base prefix's own `bin`, already inside that prefix).
+    /// `interpreter`'s own parent-of-parent (the venv root, e.g. a `.venv` directory) is added to
+    /// `read_roots` unresolved, because pyright reads the venv's own layout (for example
+    /// `pyvenv.cfg` and `site-packages`) independently of where its `python` symlink ultimately
+    /// points. This function performs no process execution and no writes; it is deterministic for
+    /// a fixed filesystem state, which is what its unit tests rely on.
     pub fn pyright_spec(&self, request: &CheckRequest, interpreter: &Path) -> RunSpec {
         let canonical_interpreter =
             fs::canonicalize(interpreter).unwrap_or_else(|_| interpreter.to_path_buf());
@@ -116,7 +131,7 @@ impl PythonChecker {
                 OsString::from("--project"),
                 project.into_os_string(),
                 OsString::from("--pythonpath"),
-                canonical_interpreter.into_os_string(),
+                interpreter.as_os_str().to_os_string(),
             ],
             cwd: request.worktree.clone(),
             env: vec![

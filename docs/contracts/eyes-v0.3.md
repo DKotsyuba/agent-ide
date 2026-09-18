@@ -243,10 +243,17 @@ pub struct ProblemSnapshot { pub language: Language, pub state: CheckState,
   `Unavailable(EnvMissing)`. Exit ≥ 2 or unparseable output → `Unavailable(Fatal)`.
 - Environment: use the project's own interpreter. Order: `<venvPath>/<venv>/bin/python` from
   `pyrightconfig.json` or `[tool.pyright]` in `pyproject.toml`; else `<worktree>/.venv/bin/python`.
-  The interpreter file must exist; its canonical path (symlinks resolved) is passed as
-  `--pythonpath`, and the canonical interpreter's installation prefix is added to the check's read
-  set. None found → `Unavailable(EnvMissing)` (never report the flood of unresolved-import errors a
-  missing environment produces).
+  The interpreter file must exist; the resolved path *as found inside the venv* (symlinks not
+  resolved) is passed as `--pythonpath`, so Python's own venv detection (`pyvenv.cfg` sitting next
+  to that path) still applies — a uv-managed venv's `bin/python` is a symlink to a base
+  installation, and passing its canonical target instead would run pyright against the base
+  interpreter with no venv `site-packages` visible. `--pythonpath` takes precedence over any
+  `venvPath`/`venv` pyright would otherwise read from the same config files, so the two sources
+  never disagree. The interpreter's canonical target's installation prefix (its parent-of-parent)
+  is added to the check's read set alongside the (unresolved) venv root, since pyright starts the
+  interpreter to enumerate its search paths and, under Seatbelt, that exec follows the symlink to
+  the base installation's binary and standard library. None found → `Unavailable(EnvMissing)`
+  (never report the flood of unresolved-import errors a missing environment produces).
 - Project source is never executed. Pyright does start the interpreter to enumerate search paths,
   so interpreter start-up hooks (`sitecustomize`, `.pth`) run under the same confinement.
 
