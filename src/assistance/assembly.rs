@@ -78,7 +78,7 @@ pub(crate) fn monotonic_ms() -> u64 {
 /// Logs the specific closed [`BindingUnavailable`](super::host_binding::BindingUnavailable) reason
 /// a host/MCP correlation was refused for (T107), right before it is collapsed into the coarse
 /// `MissingPeer::HostBinding` reply every peer actually sees. `correlation_id` is the opaque
-/// `tool_use_id`/`call_id` the model already holds, logged only as an activation-id detail.
+/// `tool_use_id`/`call_id` the model already holds.
 fn log_binding_unavailable(
     tool: super::facade::AssistanceTool,
     host: HostKind,
@@ -96,11 +96,12 @@ fn log_binding_unavailable(
     errorlog::record(
         method,
         errorlog::Outcome::Unavailable,
-        Some(reason.into()),
-        None,
-        Some(host),
-        None,
-        Some(correlation_id),
+        errorlog::Fields {
+            reason: Some(reason.into()),
+            host: Some(host),
+            correlation: Some(correlation_id),
+            ..Default::default()
+        },
     );
 }
 
@@ -764,11 +765,11 @@ impl ProductDispatcher {
                         errorlog::record(
                             errorlog::Method::Hook,
                             errorlog::Outcome::Refused,
-                            Some(reason),
-                            None,
-                            None,
-                            None,
-                            None,
+                            errorlog::Fields {
+                                reason: Some(reason),
+                                correlation: Some(call_id),
+                                ..Default::default()
+                            },
                         );
                     }
                 }

@@ -66,17 +66,19 @@ pub fn tool_reply(
         diagnostics,
         reason: reply_reason(reply),
     });
-    if let Some(outcome) = errorlog_outcome(reply) {
-        crate::errorlog::record(
-            errorlog_method(method),
-            outcome,
-            reply_reason(reply),
-            None,
-            None,
-            None,
-            None,
-        );
-    }
+    // T107 full-logging extension: every call is logged now, not just a non-success one, so an
+    // agent's whole round trip (mint -> helper claim -> settle -> inspect) can be followed by
+    // `correlation` alone; `level` is a pure function of `outcome` and never logged separately.
+    crate::errorlog::record(
+        errorlog_method(method),
+        errorlog_outcome(reply),
+        crate::errorlog::Fields {
+            reason: reply_reason(reply),
+            correlation: reply_correlation(reply),
+            duration_ms: elapsed.as_millis().try_into().ok(),
+            ..Default::default()
+        },
+    );
 }
 
 /// Converts the closed telemetry method tag into the closed error-log method tag.
@@ -91,18 +93,28 @@ fn errorlog_method(method: ToolMethod) -> crate::errorlog::Method {
     }
 }
 
-/// Converts a typed daemon reply into a closed error-log outcome; `None` for a completed or
-/// legitimately pending reply, so the error log stays silent for the overwhelming majority of
-/// ordinary calls and only telemetry's bucketed `pending` outcome records that round trip.
-fn errorlog_outcome(reply: &PeerReply) -> Option<crate::errorlog::Outcome> {
-    Some(match reply_outcome(reply) {
-        ToolOutcome::Completed | ToolOutcome::Pending => return None,
+/// Converts a typed daemon reply into its closed error-log outcome, one-to-one with
+/// [`reply_outcome`]'s telemetry classification.
+fn errorlog_outcome(reply: &PeerReply) -> crate::errorlog::Outcome {
+    match reply_outcome(reply) {
+        ToolOutcome::Completed => crate::errorlog::Outcome::Completed,
+        ToolOutcome::Pending => crate::errorlog::Outcome::Pending,
         ToolOutcome::Invalid => crate::errorlog::Outcome::Invalid,
         ToolOutcome::Unavailable => crate::errorlog::Outcome::Unavailable,
         ToolOutcome::Failed => crate::errorlog::Outcome::Failed,
         ToolOutcome::Incomplete => crate::errorlog::Outcome::Incomplete,
         ToolOutcome::Cancelled => crate::errorlog::Outcome::Cancelled,
-    })
+    }
+}
+
+/// Extracts the opaque `detail_ref` a completed or pending reply already carries, when it has
+/// one, purely so one agent operation can be followed across its several log lines.
+fn reply_correlation(reply: &PeerReply) -> Option<&str> {
+    match reply {
+        PeerReply::Complete { detail_ref, .. } => detail_ref.as_deref(),
+        PeerReply::Pending { detail_ref, .. } => Some(detail_ref.as_str()),
+        _ => None,
+    }
 }
 
 /// Records an unavailable native hook boundary without retaining or interpreting the hook payload.
@@ -162,24 +174,34 @@ pub fn execution_summary(
 /// Problem paths, messages and codes are never read; counts are bucketed and the duration is
 /// saturated to whole `u32` milliseconds. Recording is synchronous, bounded and fail-open.
 pub fn project_check(telemetry: &Telemetry, snapshot: &ProblemSnapshot) {
-    if let CheckState::Unavailable(
-        reason @ (UnavailableReason::Fatal | UnavailableReason::Timeout),
-    ) = snapshot.state
-    {
-        crate::errorlog::record(
-            crate::errorlog::Method::Check,
-            match reason {
-                UnavailableReason::Fatal => crate::errorlog::Outcome::Fatal,
-                UnavailableReason::Timeout => crate::errorlog::Outcome::Timeout,
-                _ => unreachable!("guarded above"),
-            },
-            Some(reason.into()),
-            None,
-            None,
-            None,
-            snapshot.detail.as_deref(),
-        );
-    }
+    // T107 full-logging extension: every completed check is logged (`info` for Ready/Partial,
+    // `warn`/`error` per `Outcome::level` for the rest), not just a `Fatal`/`Timeout` failure.
+    // Counts fill `detail` only when the checker left no sanitized explanation of its own, since
+    // the schema has one bounded free-text slot and `Fatal`'s existing detail is the higher-value
+    // fact when both exist.
+    let (outcome, reason) = match snapshot.state {
+        CheckState::Ready | CheckState::Partial | CheckState::Checking => {
+            (crate::errorlog::Outcome::Completed, None)
+        }
+        CheckState::Unavailable(reason @ UnavailableReason::Fatal) => {
+            (crate::errorlog::Outcome::Fatal, Some(reason))
+        }
+        CheckState::Unavailable(reason @ UnavailableReason::Timeout) => {
+            (crate::errorlog::Outcome::Timeout, Some(reason))
+        }
+        CheckState::Unavailable(reason) => (crate::errorlog::Outcome::Unavailable, Some(reason)),
+    };
+    let counts = format!("errors={} warnings={}", snapshot.errors, snapshot.warnings);
+    crate::errorlog::record(
+        crate::errorlog::Method::Check,
+        outcome,
+        crate::errorlog::Fields {
+            reason: reason.map(Into::into),
+            detail: Some(snapshot.detail.as_deref().unwrap_or(&counts)),
+            duration_ms: u32::try_from(snapshot.duration_ms).ok(),
+            ..Default::default()
+        },
+    );
     telemetry.record(Event::ProjectCheckCompleted {
         language: match snapshot.language {
             checks::Language::Rust => Language::Rust,
@@ -311,34 +333,34 @@ mod tests {
             }),
             ToolOutcome::Pending
         );
-        assert!(
+        assert_eq!(
             errorlog_outcome(&PeerReply::Pending {
                 detail_ref: "detail".to_owned(),
                 helper: None,
-            })
-            .is_none()
+            }),
+            crate::errorlog::Outcome::Pending
         );
     }
 
-    /// Proves the error log stays silent for a completed reply and carries the closed reason for
-    /// a failed one, using the same [`FailureCode`] the telemetry event already records.
+    /// Proves a completed reply logs `Outcome::Completed` (info level) and a failed one carries
+    /// the same closed [`FailureCode`] the telemetry event already records.
     #[test]
-    fn error_log_outcome_is_none_for_completed_and_set_for_a_failure() {
-        assert!(
+    fn error_log_outcome_matches_completed_and_failure_replies() {
+        assert_eq!(
             errorlog_outcome(&PeerReply::Complete {
                 kind: crate::assistance::reply::ResultKind::Context,
                 text: String::new(),
                 detail_ref: None,
                 truncated: false,
                 continuation: false,
-            })
-            .is_none()
+            }),
+            crate::errorlog::Outcome::Completed
         );
         assert_eq!(
             errorlog_outcome(&PeerReply::Error {
                 code: FailureCode::SourceUnavailable,
             }),
-            Some(crate::errorlog::Outcome::Failed)
+            crate::errorlog::Outcome::Failed
         );
         assert_eq!(
             reply_reason(&PeerReply::Error {

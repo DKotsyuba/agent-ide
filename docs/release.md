@@ -105,12 +105,14 @@ previous `<prefix>/share/agent-ide/plugin/<old-version>/` directory.
 `agent-ide -v`, `-V`, `--version`, and `version` all print `agent-ide <version>` and exit 0
 without touching the daemon, runtime dir, config, or network.
 
-`agent-ide errors [--repo <path>] [--since <minutes>] [--limit <n>] [--summary]` reads the local
-append-only error log at `~/.agent-ide/logs/<repository-key>/events.jsonl[.1]` (`--repo` defaults
+`agent-ide errors [--repo <path>] [--since <minutes>] [--limit <n>] [--summary] [--all]` reads the
+local append-only log at `~/.agent-ide/logs/<repository-key>/events.jsonl[.1]` (`--repo` defaults
 to the current directory; the repository key is the same one an `ai-r-<id>` runtime directory
-uses). It works with no daemon running, prints one compact `time method outcome reason worktree
-detail` line per event (bounded to `--limit`, default 200, most recent last), and `--summary`
-prints grouped `(method, outcome, reason)` counts instead. See
+uses). It works with no daemon running. Every tool call and daemon/client lifecycle fact is
+logged with a closed `level` (`error`/`warn`/`info`); by default only `warn` and `error` are shown,
+`--all` also includes `info` (successes, `pending`, lifecycle). Prints one compact `time level
+method outcome reason worktree detail` line per event (bounded to `--limit`, default 200, most
+recent last), or with `--summary` grouped `(level, method, outcome, reason)` counts instead. See
 [`docs/contracts/error-log-v0.3.md`](contracts/error-log-v0.3.md).
 
 ## Publication gate

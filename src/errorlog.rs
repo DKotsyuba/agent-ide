@@ -1,11 +1,16 @@
-//! Append-only, best-effort error log: one bounded JSON line per non-success operation outcome.
+//! Append-only, best-effort error log: one bounded JSON line per operation completion or
+//! lifecycle fact.
 //!
 //! This is deliberately separate from `telemetry`, which stays a bucketed, restart-only, durable
 //! SQLite sink with no per-event detail. The error log is a plain rotated file so it can be read
 //! without a running daemon, and it carries just enough closed context (worktree, host, actor,
-//! method, outcome, reason) to tell a normal pending/helper round trip apart from a real failure
-//! and to say *why* a real failure happened, without ever logging source text, file contents,
-//! diffs, command lines, prompts, environment values, or an arbitrary OS error string.
+//! correlation id, method, outcome, reason) to tell a normal pending/helper round trip apart from
+//! a real failure, to say *why* a real failure happened, and to follow one agent operation across
+//! several calls, without ever logging source text, file contents, diffs, command lines, prompts,
+//! environment values, or an arbitrary OS error string. Every call and lifecycle fact is logged,
+//! not just a failing one, with a closed `level` derived from its `outcome` (`Outcome::level`);
+//! the `errors` CLI reader defaults to showing only `warn`/`error` and opts into `info` with
+//! `--all`.
 //!
 //! Writing never blocks or fails the calling operation: every I/O error is swallowed and every
 //! critical section is one open-check-write under a short-held lock.
@@ -32,7 +37,10 @@ use crate::checks::UnavailableReason;
 /// Log file name inside `~/.agent-ide/logs/<repository-key>/`.
 const LOG_FILE_NAME: &str = "events.jsonl";
 /// Rotation threshold; the current file is renamed to `events.jsonl.1` once it exceeds this size.
-const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+///
+/// Raised from the original 5 MiB once every tool call and lifecycle fact started being logged
+/// (not just failures), which grows volume by roughly two orders of magnitude.
+const MAX_LOG_BYTES: u64 = 20 * 1024 * 1024;
 /// Hard cap on the optional bounded `detail` text, matching the checks contract's own cap.
 const MAX_DETAIL_BYTES: usize = 160;
 /// Prefix shared with `CLAUDE_RUNTIME_PREFIX` in `main.rs` for the `ai-r-<16 hex>` runtime dir name.
@@ -59,8 +67,10 @@ pub enum Method {
     HelperClaim,
     /// A confined background project check.
     Check,
-    /// Daemon process lifecycle (start, stop, idle exit).
+    /// Daemon process lifecycle (start, stop, idle exit, client lease open/close).
     Daemon,
+    /// MCP client process lifecycle (re-establishment, transport unavailable).
+    Client,
 }
 
 impl Method {
@@ -77,6 +87,29 @@ impl Method {
             Self::HelperClaim => "helper_claim",
             Self::Check => "check",
             Self::Daemon => "daemon",
+            Self::Client => "client",
+        }
+    }
+}
+
+/// Closed severity class, always a pure function of [`Outcome`] so it can never disagree with it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Level {
+    /// A real failure: the operation did not do what it was asked.
+    Error,
+    /// A boundary was unavailable, refused, cancelled, or retried, without failing outright.
+    Warn,
+    /// A success, a legitimate pending round trip, or a lifecycle fact.
+    Info,
+}
+
+impl Level {
+    /// Renders the closed lowercase tag used in the log line and by the reader/summary.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
         }
     }
 }
@@ -84,6 +117,8 @@ impl Method {
 /// Closed outcome class for one logged event; never a free-form status string.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Outcome {
+    /// The operation returned its typed result.
+    Completed,
     /// The peer answered `pending`: a helper round trip is required and is not itself a failure.
     Pending,
     /// The result was incomplete or timed out at the bounded observation point.
@@ -110,12 +145,17 @@ pub enum Outcome {
     IdleExit,
     /// Lifecycle fact: an MCP client re-established its connection to the daemon.
     Reestablished,
+    /// Lifecycle fact: a client lease (open `ClientLease` connection) was admitted.
+    LeaseOpened,
+    /// Lifecycle fact: a client lease was released.
+    LeaseClosed,
 }
 
 impl Outcome {
     /// Renders the closed lowercase tag used in the log line and by the reader/summary.
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Completed => "completed",
             Self::Pending => "pending",
             Self::Incomplete => "incomplete",
             Self::Unavailable => "unavailable",
@@ -129,6 +169,30 @@ impl Outcome {
             Self::Stopped => "stopped",
             Self::IdleExit => "idle_exit",
             Self::Reestablished => "reestablished",
+            Self::LeaseOpened => "lease_opened",
+            Self::LeaseClosed => "lease_closed",
+        }
+    }
+
+    /// Maps this outcome to its closed severity (T107 full-logging extension): `error` for a real
+    /// failure, `warn` for an unavailable/refused/cancelled/transient-check boundary, `info` for a
+    /// success, a legitimate pending round trip, or a lifecycle fact.
+    pub const fn level(self) -> Level {
+        match self {
+            Self::Failed | Self::Invalid | Self::Fatal => Level::Error,
+            Self::Incomplete
+            | Self::Unavailable
+            | Self::Cancelled
+            | Self::Refused
+            | Self::Timeout => Level::Warn,
+            Self::Completed
+            | Self::Pending
+            | Self::Started
+            | Self::Stopped
+            | Self::IdleExit
+            | Self::Reestablished
+            | Self::LeaseOpened
+            | Self::LeaseClosed => Level::Info,
         }
     }
 }
@@ -533,22 +597,39 @@ fn log_root() -> Option<PathBuf> {
         .then(|| home.join(".agent-ide").join("logs"))
 }
 
-/// Records one non-success (or lifecycle) event, best-effort.
+/// Optional closed context for one [`record`] call; every field is logged only when the caller
+/// has it cheaply at hand.
+///
+/// `correlation` is the call id / `detail_ref` / activation id already known to the daemon for
+/// this one operation, so one agent action (hook -> mint -> helper claim -> settle -> inspect) can
+/// be followed across its several log lines; it is an opaque id, never source text. `detail` is
+/// bounded to 160 bytes and must already be privacy-safe (an opaque id, or existing sanitized
+/// checker text) before this call; it typically carries a fact `correlation` cannot (a checker's
+/// sanitized error line, a byte length).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Fields<'a> {
+    /// Closed reason code for a non-success outcome.
+    pub reason: Option<ReasonCode>,
+    /// Worktree path, when a specific worktree is already resolved.
+    pub worktree: Option<&'a Path>,
+    /// Host contract, when already known.
+    pub host: Option<HostKind>,
+    /// Actor id, when already known.
+    pub actor: Option<&'a str>,
+    /// Opaque call id / `detail_ref` / activation id already known to the daemon.
+    pub correlation: Option<&'a str>,
+    /// Bounded, already privacy-safe free text (at most 160 bytes; longer text is truncated).
+    pub detail: Option<&'a str>,
+    /// Elapsed wall-clock duration of the logged operation, saturated to whole milliseconds.
+    pub duration_ms: Option<u32>,
+}
+
+/// Records one event, best-effort: never blocks, never panics, never surfaces an error.
 ///
 /// A no-op before [`init`], when initialization failed, or when the process-wide writer is
-/// otherwise unavailable. `worktree`, `host`, `actor`, and `detail` are each logged only when the
-/// caller has them cheaply at hand; `detail` is bounded to 160 bytes and must already be
-/// privacy-safe (an opaque id, or existing sanitized checker text) before this call.
-#[allow(clippy::too_many_arguments)]
-pub fn record(
-    method: Method,
-    outcome: Outcome,
-    reason: Option<ReasonCode>,
-    worktree: Option<&Path>,
-    host: Option<HostKind>,
-    actor: Option<&str>,
-    detail: Option<&str>,
-) {
+/// otherwise unavailable. `level` is derived from `outcome` (see [`Outcome::level`]) so it can
+/// never disagree with it.
+pub fn record(method: Method, outcome: Outcome, fields: Fields<'_>) {
     let Some(Some(writer)) = WRITER.get() else {
         return;
     };
@@ -556,10 +637,20 @@ pub fn record(
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
+    writer.append(&build_line(method, outcome, fields, timestamp));
+}
+
+/// Renders one canonical JSON Lines record (without its trailing newline); pure and side-effect
+/// free so [`record`]'s exact wire shape is unit-testable without touching the global writer.
+fn build_line(method: Method, outcome: Outcome, fields: Fields<'_>, timestamp: u64) -> Vec<u8> {
     let mut object = serde_json::Map::new();
     object.insert(
         "ts".to_owned(),
         serde_json::Value::String(format_rfc3339(timestamp)),
+    );
+    object.insert(
+        "level".to_owned(),
+        serde_json::Value::String(outcome.level().as_str().to_owned()),
     );
     object.insert(
         "method".to_owned(),
@@ -569,19 +660,19 @@ pub fn record(
         "outcome".to_owned(),
         serde_json::Value::String(outcome.as_str().to_owned()),
     );
-    if let Some(reason) = reason {
+    if let Some(reason) = fields.reason {
         object.insert(
             "reason".to_owned(),
             serde_json::Value::String(reason.as_str().to_owned()),
         );
     }
-    if let Some(worktree) = worktree {
+    if let Some(worktree) = fields.worktree {
         object.insert(
             "worktree".to_owned(),
             serde_json::Value::String(worktree.to_string_lossy().into_owned()),
         );
     }
-    if let Some(host) = host {
+    if let Some(host) = fields.host {
         let host = match host {
             HostKind::Claude => "claude",
             HostKind::Codex => "codex",
@@ -591,48 +682,43 @@ pub fn record(
             serde_json::Value::String(host.to_owned()),
         );
     }
-    if let Some(actor) = actor {
+    if let Some(actor) = fields.actor {
         object.insert(
             "actor".to_owned(),
             serde_json::Value::String(actor.to_owned()),
         );
     }
-    if let Some(detail) = detail {
+    if let Some(correlation) = fields.correlation {
+        object.insert(
+            "correlation".to_owned(),
+            serde_json::Value::String(correlation.to_owned()),
+        );
+    }
+    if let Some(detail) = fields.detail {
         object.insert(
             "detail".to_owned(),
             serde_json::Value::String(bounded_detail(detail).to_owned()),
         );
     }
-    if let Ok(line) = serde_json::to_vec(&serde_json::Value::Object(object)) {
-        writer.append(&line);
-    }
-}
-
-/// Logs the closed reason class a `Bash` pre-hook was ignored for, when the payload otherwise
-/// looked like a helper launch attempt worth explaining.
-///
-/// Kept here (rather than in `assistance::claude_worker`) purely as a thin call-site convenience;
-/// the classification itself lives on `LaunchLedger::diagnose_ignored`.
-pub fn record_hook_ignored(reason: Option<ReasonCode>) {
-    if let Some(reason) = reason {
-        record(
-            Method::Hook,
-            Outcome::Refused,
-            Some(reason),
-            None,
-            None,
-            None,
-            None,
+    if let Some(duration_ms) = fields.duration_ms {
+        object.insert(
+            "duration_ms".to_owned(),
+            serde_json::Value::Number(duration_ms.into()),
         );
     }
+    serde_json::to_vec(&serde_json::Value::Object(object)).unwrap_or_default()
 }
 
 /// One decoded log line, as read back by [`read_events`].
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LoggedEvent {
     /// RFC 3339 UTC timestamp.
     #[serde(rename = "ts")]
     pub timestamp: String,
+    /// Closed severity tag. Defaults to `warn` for a line written before this field existed, since
+    /// every event logged back then was already a non-success outcome.
+    #[serde(default = "default_level")]
+    pub level: String,
     /// Closed method tag.
     pub method: String,
     /// Closed outcome tag.
@@ -649,9 +735,38 @@ pub struct LoggedEvent {
     /// Actor id, when the event carried one.
     #[serde(default)]
     pub actor: Option<String>,
+    /// Opaque call id / `detail_ref` / activation id, when the event carried one.
+    #[serde(default)]
+    pub correlation: Option<String>,
     /// Bounded sanitized detail text, when the event carried one.
     #[serde(default)]
     pub detail: Option<String>,
+    /// Elapsed duration of the logged operation in milliseconds, when the event carried one.
+    #[serde(default)]
+    pub duration_ms: Option<u32>,
+}
+
+impl Default for LoggedEvent {
+    fn default() -> Self {
+        Self {
+            timestamp: String::new(),
+            level: default_level(),
+            method: String::new(),
+            outcome: String::new(),
+            reason: None,
+            worktree: None,
+            host: None,
+            actor: None,
+            correlation: None,
+            detail: None,
+            duration_ms: None,
+        }
+    }
+}
+
+/// Fallback [`LoggedEvent::level`] for a line written before that field existed.
+fn default_level() -> String {
+    Level::Warn.as_str().to_owned()
 }
 
 /// Parses one JSON Lines record; a malformed or empty line yields `None` and is skipped rather
@@ -679,11 +794,20 @@ pub fn read_events(dir: &Path) -> Vec<LoggedEvent> {
     events
 }
 
-/// Renders one compact `time method outcome reason worktree detail` line; absent fields are `-`.
+/// Keeps only events at `Level::Warn` or `Level::Error`, the default `errors` CLI view.
+///
+/// A caller wanting every level (`--all`) simply skips calling this at all.
+pub fn retain_warn_and_error(events: &mut Vec<LoggedEvent>) {
+    events.retain(|event| event.level != Level::Info.as_str());
+}
+
+/// Renders one compact `time level method outcome reason worktree detail` line; absent fields are
+/// `-`.
 pub fn format_line(event: &LoggedEvent) -> String {
     format!(
-        "{} {} {} {} {} {}",
+        "{} {} {} {} {} {} {}",
         event.timestamp,
+        event.level,
         event.method,
         event.outcome,
         event.reason.as_deref().unwrap_or("-"),
@@ -692,27 +816,27 @@ pub fn format_line(event: &LoggedEvent) -> String {
     )
 }
 
-/// Groups `events` by `(method, outcome, reason)`, sorted by descending count then method/outcome.
-pub fn summarize(events: &[LoggedEvent]) -> Vec<(String, String, String, usize)> {
-    let mut counts: std::collections::BTreeMap<(String, String, String), usize> =
+/// Groups `events` by `(level, method, outcome, reason)`, sorted by descending count then by key.
+pub fn summarize(events: &[LoggedEvent]) -> Vec<(String, String, String, String, usize)> {
+    let mut counts: std::collections::BTreeMap<(String, String, String, String), usize> =
         std::collections::BTreeMap::new();
     for event in events {
         let key = (
+            event.level.clone(),
             event.method.clone(),
             event.outcome.clone(),
             event.reason.clone().unwrap_or_else(|| "-".to_owned()),
         );
         *counts.entry(key).or_insert(0) += 1;
     }
-    let mut rows: Vec<(String, String, String, usize)> = counts
+    let mut rows: Vec<(String, String, String, String, usize)> = counts
         .into_iter()
-        .map(|((method, outcome, reason), count)| (method, outcome, reason, count))
+        .map(|((level, method, outcome, reason), count)| (level, method, outcome, reason, count))
         .collect();
     rows.sort_by(|left, right| {
-        right
-            .3
-            .cmp(&left.3)
-            .then_with(|| (&left.0, &left.1, &left.2).cmp(&(&right.0, &right.1, &right.2)))
+        right.4.cmp(&left.4).then_with(|| {
+            (&left.0, &left.1, &left.2, &left.3).cmp(&(&right.0, &right.1, &right.2, &right.3))
+        })
     });
     rows
 }
@@ -825,11 +949,10 @@ mod tests {
         record(
             Method::Start,
             Outcome::Failed,
-            Some(ReasonCode::Internal),
-            None,
-            None,
-            None,
-            None,
+            Fields {
+                reason: Some(ReasonCode::Internal),
+                ..Default::default()
+            },
         );
     }
 
@@ -865,42 +988,102 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].method, "start");
         assert_eq!(events[1].method, "stop");
+        // A line written before `level` existed defaults to `warn`, matching every event that
+        // reached the log back when only non-success outcomes were recorded.
+        assert_eq!(events[0].level, "warn");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn outcome_level_is_a_pure_function_of_outcome() {
+        assert_eq!(Outcome::Failed.level(), Level::Error);
+        assert_eq!(Outcome::Invalid.level(), Level::Error);
+        assert_eq!(Outcome::Fatal.level(), Level::Error);
+        assert_eq!(Outcome::Unavailable.level(), Level::Warn);
+        assert_eq!(Outcome::Refused.level(), Level::Warn);
+        assert_eq!(Outcome::Timeout.level(), Level::Warn);
+        assert_eq!(Outcome::Completed.level(), Level::Info);
+        assert_eq!(Outcome::Pending.level(), Level::Info);
+        assert_eq!(Outcome::Started.level(), Level::Info);
+        assert_eq!(Outcome::LeaseOpened.level(), Level::Info);
+    }
+
+    #[test]
+    fn record_writes_level_and_correlation_for_every_call_not_just_failures() {
+        let dir = temp_dir("full-logging");
+        let writer = Writer::new(dir.clone());
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let line = build_line(
+            Method::Inspect,
+            Outcome::Completed,
+            Fields {
+                correlation: Some("detail-ref-42"),
+                duration_ms: Some(7),
+                ..Default::default()
+            },
+            timestamp,
+        );
+        writer.append(&line);
+        let events = read_events(&dir);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].level, "info");
+        assert_eq!(events[0].outcome, "completed");
+        assert_eq!(events[0].correlation.as_deref(), Some("detail-ref-42"));
+        assert_eq!(events[0].duration_ms, Some(7));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retain_warn_and_error_drops_only_info_events() {
+        let mk = |level: &str| LoggedEvent {
+            level: level.to_owned(),
+            ..Default::default()
+        };
+        let mut events = vec![mk("info"), mk("warn"), mk("error"), mk("info")];
+        retain_warn_and_error(&mut events);
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| event.level != "info"));
     }
 
     #[test]
     fn format_line_uses_a_dash_for_every_absent_field() {
         let event = LoggedEvent {
             timestamp: "2026-09-18T00:00:00Z".to_owned(),
+            level: "warn".to_owned(),
             method: "start".to_owned(),
             outcome: "unavailable".to_owned(),
             ..Default::default()
         };
         assert_eq!(
             format_line(&event),
-            "2026-09-18T00:00:00Z start unavailable - - -"
+            "2026-09-18T00:00:00Z warn start unavailable - - -"
         );
     }
 
     #[test]
     fn summarize_groups_and_orders_by_descending_count() {
-        let mk = |method: &str, outcome: &str, reason: Option<&str>| LoggedEvent {
+        let mk = |level: &str, method: &str, outcome: &str, reason: Option<&str>| LoggedEvent {
             timestamp: "2026-09-18T00:00:00Z".to_owned(),
+            level: level.to_owned(),
             method: method.to_owned(),
             outcome: outcome.to_owned(),
             reason: reason.map(str::to_owned),
             ..Default::default()
         };
         let events = vec![
-            mk("inspect", "incomplete", None),
-            mk("inspect", "incomplete", None),
-            mk("inspect", "failed", Some("source_unavailable")),
-            mk("start", "unavailable", Some("missing_pre")),
+            mk("warn", "inspect", "incomplete", None),
+            mk("warn", "inspect", "incomplete", None),
+            mk("error", "inspect", "failed", Some("source_unavailable")),
+            mk("warn", "start", "unavailable", Some("missing_pre")),
         ];
         let summary = summarize(&events);
         assert_eq!(
             summary[0],
             (
+                "warn".to_owned(),
                 "inspect".to_owned(),
                 "incomplete".to_owned(),
                 "-".to_owned(),

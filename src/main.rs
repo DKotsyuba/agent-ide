@@ -287,7 +287,8 @@ async fn main() -> ExitCode {
             since_minutes,
             limit,
             summary,
-        }) => match errors_command(repo, since_minutes, limit, summary).await {
+            all,
+        }) => match errors_command(repo, since_minutes, limit, summary, all).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(error),
         },
@@ -547,8 +548,11 @@ enum Command {
         since_minutes: Option<u64>,
         /// Bounds the number of printed or summarized events; defaults to 200.
         limit: usize,
-        /// Prints grouped `(method, outcome, reason)` counts instead of individual lines.
+        /// Prints grouped `(level, method, outcome, reason)` counts instead of individual lines.
         summary: bool,
+        /// Includes `info`-level events (every completed call, lifecycle facts); default is
+        /// `warn`/`error` only.
+        all: bool,
     },
 }
 
@@ -827,6 +831,7 @@ async fn errors_command(
     since_minutes: Option<u64>,
     limit: usize,
     summary: bool,
+    all: bool,
 ) -> Result<(), AppError> {
     let repo = match repo {
         Some(repo) => repo,
@@ -841,9 +846,12 @@ async fn errors_command(
         let cutoff = rfc3339_cutoff(since_minutes);
         events.retain(|event| event.timestamp >= cutoff);
     }
+    if !all {
+        agent_ide::errorlog::retain_warn_and_error(&mut events);
+    }
     if summary {
-        for (method, outcome, reason, count) in agent_ide::errorlog::summarize(&events) {
-            println!("{count} {method} {outcome} {reason}");
+        for (level, method, outcome, reason, count) in agent_ide::errorlog::summarize(&events) {
+            println!("{count} {level} {method} {outcome} {reason}");
         }
         return Ok(());
     }
@@ -865,18 +873,23 @@ fn rfc3339_cutoff(since_minutes: u64) -> String {
     agent_ide::errorlog::format_rfc3339(cutoff)
 }
 
-/// Parses `errors`' optional, any-order `--repo`/`--since`/`--limit`/`--summary` flags.
+/// Parses `errors`' optional, any-order `--repo`/`--since`/`--limit`/`--summary`/`--all` flags.
 fn parse_errors_command(rest: &[OsString]) -> Result<Command, AppError> {
     let mut repo = None;
     let mut since_minutes = None;
     let mut limit = 200usize;
     let mut summary = false;
+    let mut all = false;
     let mut index = 0;
     while index < rest.len() {
         let flag = rest[index].to_str().ok_or(AppError::InvalidResponse)?;
         match flag {
             "--summary" if !summary => {
                 summary = true;
+                index += 1;
+            }
+            "--all" if !all => {
+                all = true;
                 index += 1;
             }
             "--repo" | "--since" | "--limit" => {
@@ -908,6 +921,7 @@ fn parse_errors_command(rest: &[OsString]) -> Result<Command, AppError> {
         since_minutes,
         limit,
         summary,
+        all,
     })
 }
 

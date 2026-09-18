@@ -278,11 +278,7 @@ async fn run_daemon_inner(
         crate::errorlog::record(
             crate::errorlog::Method::Daemon,
             crate::errorlog::Outcome::Started,
-            None,
-            None,
-            None,
-            None,
-            None,
+            crate::errorlog::Fields::default(),
         );
 
         loop {
@@ -323,11 +319,7 @@ async fn run_daemon_inner(
         } else {
             crate::errorlog::Outcome::Stopped
         },
-        None,
-        None,
-        None,
-        None,
-        None,
+        crate::errorlog::Fields::default(),
     );
     if result.is_ok()
         && owned_socket.is_some()

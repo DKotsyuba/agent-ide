@@ -228,11 +228,11 @@ fn claim(
             crate::errorlog::record(
                 crate::errorlog::Method::HelperClaim,
                 crate::errorlog::Outcome::Refused,
-                Some(code.into()),
-                None,
-                None,
-                None,
-                Some(&request.detail_ref),
+                crate::errorlog::Fields {
+                    reason: Some(code.into()),
+                    correlation: Some(&request.detail_ref),
+                    ..Default::default()
+                },
             );
             refuse(code)
         }

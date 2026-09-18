@@ -674,11 +674,10 @@ impl Inner {
                 crate::errorlog::record(
                     crate::errorlog::Method::Check,
                     crate::errorlog::Outcome::Failed,
-                    Some(crate::errorlog::ReasonCode::SchedulerCacheCloneFailed),
-                    None,
-                    None,
-                    None,
-                    None,
+                    crate::errorlog::Fields {
+                        reason: Some(crate::errorlog::ReasonCode::SchedulerCacheCloneFailed),
+                        ..Default::default()
+                    },
                 );
                 RustCacheClone::Failed
             }
