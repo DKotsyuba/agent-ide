@@ -905,8 +905,8 @@ async fn context(
             freshness::Freshness,
         },
         workspace::observation::{
-            ObservationRef, ObservedState, SourceBytes, SourceCoverage, SourceObservation,
-            SourceReadLimits, SourceRevision, read_authorized_source,
+            MAX_SOURCE_BYTES, ObservationRef, ObservedState, SourceBytes, SourceCoverage,
+            SourceObservation, SourceReadLimits, SourceRevision, read_authorized_source,
         },
     };
     let Some(scope) = job.scope.as_ref() else {
@@ -926,10 +926,13 @@ async fn context(
         );
     };
     let relative = PathBuf::from(path);
+    // The source read ceiling is the v0.1 reader's own bound, not the helper's discovery-command
+    // output budget: `job.budgets.output_bytes` sizes bounded Git process captures and is far
+    // smaller than a source file may legitimately be.
     let read = read_authorized_source(
         &worktree,
         &relative,
-        match SourceReadLimits::new(1024, job.budgets.output_bytes) {
+        match SourceReadLimits::new(1024, MAX_SOURCE_BYTES) {
             Ok(limits) => limits,
             Err(_) => {
                 return (
@@ -950,6 +953,17 @@ async fn context(
         }
         Err(crate::workspace::observation::ObservationError::Missing) => {
             (Vec::new(), None, ObservedState::Missing, "missing".into())
+        }
+        Err(crate::workspace::observation::ObservationError::TooLarge { size }) => {
+            return (
+                HelperOutcome::Failed {
+                    code: FailureCode::SourceTooLarge {
+                        size,
+                        ceiling: MAX_SOURCE_BYTES as u64,
+                    },
+                },
+                None,
+            );
         }
         Err(_) => {
             return (
@@ -1884,6 +1898,96 @@ mod tests {
         assert!(children.settled() && children.spawned > 64);
         assert!(text.contains("changed.txt"), "diff text: {text}");
         assert!(matches!(payload, Some(HelperPayload::Diff { .. })));
+        let _ = std::fs::remove_dir_all(&candidate);
+    }
+
+    /// Builds one Context job over a real worktree, with a small `output_bytes` discovery budget
+    /// that must never bound the source read itself (T13B).
+    fn context_job(candidate: &Path, path: &str) -> HelperJob {
+        let root_identity = crate::workspace::observation::native_directory_identity(
+            &std::fs::File::open(candidate).unwrap(),
+        )
+        .expect("fixture worktree has a native root identity");
+        HelperJob {
+            protocol: HELPER_PROTOCOL,
+            operation: HelperOperation::Context,
+            candidate: candidate.to_path_buf(),
+            git: PathBuf::from("/usr/bin/git"),
+            canonical_root: Some(candidate.to_path_buf()),
+            scope: Some(HelperScope {
+                worktree_id: "worktree".into(),
+                incarnation: 1,
+                root: candidate.to_path_buf(),
+                repository_root: candidate.to_path_buf(),
+                git_common_dir: PathBuf::from(".git"),
+                native_root_identity: root_identity,
+                authority_epoch: 1,
+            }),
+            baseline: None,
+            provider: None,
+            edit_source: None,
+            parameters: serde_json::json!({"path": path}),
+            budgets: HelperBudgets {
+                // Deliberately tiny: this is the discovery/output-capture budget, never the
+                // ceiling the source read itself uses.
+                output_bytes: 4096,
+                processes: 2,
+                deadline_ms: 30_000,
+            },
+        }
+    }
+
+    /// A source file well over the helper's tiny `output_bytes` discovery budget, but under the
+    /// v0.1 source reader's `MAX_SOURCE_BYTES` ceiling, is still read completely rather than
+    /// failing closed as `source_unavailable` (T13B).
+    #[tokio::test]
+    async fn context_helper_reads_a_source_larger_than_the_output_budget() {
+        let candidate = worktree();
+        // 114000 bytes: matches the reported live-stability failure size, comfortably over the
+        // 4096-byte `output_bytes` budget and Intelligence's 64 KiB `MAX_CONTEXT_BYTES` render
+        // cap, but well under the 1 MiB `MAX_SOURCE_BYTES` read ceiling.
+        let content = "x".repeat(114_000);
+        std::fs::write(candidate.join("large.txt"), &content).unwrap();
+        let (outcome, _children, _discovery, payload) =
+            perform(&context_job(&candidate, "large.txt"), "detail").await;
+        let HelperOutcome::Complete { text } = outcome else {
+            panic!("a source under MAX_SOURCE_BYTES must read completely, saw {outcome:?}")
+        };
+        assert!(text.contains('x'), "context text: {text}");
+        let Some(HelperPayload::Context {
+            source, truncated, ..
+        }) = payload
+        else {
+            panic!("Context must return its payload")
+        };
+        assert_eq!(source.length, content.len() as u64);
+        assert!(
+            truncated,
+            "Intelligence's own 64 KiB render cap still truncates the exposed text"
+        );
+        let _ = std::fs::remove_dir_all(&candidate);
+    }
+
+    /// A source file over the v0.1 reader's `MAX_SOURCE_BYTES` ceiling reports the exact size and
+    /// ceiling through `FailureCode::SourceTooLarge`, never the generic `source_unavailable`
+    /// (T13B).
+    #[tokio::test]
+    async fn context_helper_reports_source_too_large_above_the_ceiling() {
+        let candidate = worktree();
+        let size = crate::workspace::observation::MAX_SOURCE_BYTES + 1;
+        std::fs::write(candidate.join("huge.txt"), vec![b'y'; size]).unwrap();
+        let (outcome, _children, _discovery, payload) =
+            perform(&context_job(&candidate, "huge.txt"), "detail").await;
+        assert_eq!(
+            outcome,
+            HelperOutcome::Failed {
+                code: FailureCode::SourceTooLarge {
+                    size: size as u64,
+                    ceiling: crate::workspace::observation::MAX_SOURCE_BYTES as u64,
+                }
+            }
+        );
+        assert!(payload.is_none());
         let _ = std::fs::remove_dir_all(&candidate);
     }
 

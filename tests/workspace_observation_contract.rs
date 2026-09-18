@@ -278,7 +278,7 @@ async fn workspace_source_observations_are_durable_bounded_and_honest() {
     fs::write(root.join("large"), b"four").unwrap();
     assert_eq!(
         read_authorized_source(&tree, Path::new("large"), limits),
-        Err(ObservationError::TooLarge)
+        Err(ObservationError::TooLarge { size: 4 })
     );
     let raw = PathBuf::from(OsString::from_vec(b"non-utf8-\xFF".to_vec()));
     // APFS rejects this spelling, while common Unix filesystems preserve the raw byte.

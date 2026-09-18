@@ -5027,6 +5027,76 @@ async fn diff_oversized_single_hunk_reports_capacity_without_false_continuation(
     daemon.wait().await.unwrap();
 }
 
+/// A real Claude foreground helper reads a source file well over the reported live-stability
+/// failure size in one capture, and the daemon pages the composed text across repeated
+/// `ide.inspect` calls until the whole bounded (`MAX_CONTEXT_BYTES`-capped) text has been
+/// delivered — never the generic `source_unavailable` (T13B).
+#[tokio::test]
+async fn claude_context_pagination_delivers_a_source_larger_than_the_output_budget() {
+    let fixture = ProductFixture::new_claude(json!([]));
+    // 114000 bytes: matches the reported live-stability failure size, well over the fixture's
+    // small default `output_bytes` and over Intelligence's 64 KiB `MAX_CONTEXT_BYTES` render cap.
+    let content = "x".repeat(114_000);
+    std::fs::write(fixture.root.join("claude-large.txt"), &content).unwrap();
+    fixture.git(&["add", "--", "claude-large.txt"]);
+    fixture.git(&["commit", "--quiet", "-m", "claude large source"]);
+
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "claude-large-context").await;
+    let started = actor
+        .call_claude(&fixture, "ide.start", json!({"activation_id":"start"}))
+        .await;
+    let (started, _) = actor.complete_claude_pending(&fixture, &started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    let first_call = actor
+        .call_claude(&fixture, "ide.context", json!({"path":"claude-large.txt"}))
+        .await;
+    let (page1, _) = actor.complete_claude_pending(&fixture, &first_call).await;
+    assert_eq!(page1["kind"], "context", "{page1}");
+    assert_eq!(page1["truncated"], true, "{page1}");
+    assert_eq!(page1["continuation"], true, "{page1}");
+    let reference = page1["detail_ref"]
+        .as_str()
+        .expect("a multi-page Context result must carry a detail_ref")
+        .to_owned();
+
+    let mut collected = page1["text"].as_str().unwrap().to_owned();
+    let mut continuation = true;
+    let mut pages = 1;
+    while continuation {
+        pages += 1;
+        assert!(pages < 12, "pagination did not terminate");
+        let next = actor
+            .call_claude(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
+            .await;
+        assert_eq!(next["kind"], "context", "{next}");
+        assert_eq!(
+            next["detail_ref"].as_str().unwrap(),
+            reference,
+            "every page must echo the same detail_ref"
+        );
+        continuation = next["continuation"].as_bool().unwrap();
+        assert_eq!(
+            next["truncated"],
+            json!(true),
+            "content beyond MAX_CONTEXT_BYTES was never captured, so every page stays truncated: {next}"
+        );
+        collected.push_str(next["text"].as_str().unwrap());
+    }
+    assert!(pages >= 2, "the fixture file must force multiple pages");
+    assert!(
+        collected.ends_with(&content[..64 * 1024]),
+        "the exposed text must end with the exact MAX_CONTEXT_BYTES-bounded prefix of the source"
+    );
+
+    let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Drives real foreground Claude helper Start, Diff, Context and Edit launches end to end: each
 /// helper instruction is armed by a native Bash pre-hook, settles through its matching post-hook,
 /// and publishes only through `ide.inspect`, including an escape-heavy Diff that must fit whole;

@@ -2714,18 +2714,20 @@ impl<'a> Worker<'a> {
     ) -> Result<(SourceObservation, Vec<u8>), FailureCode> {
         use crate::workspace::{
             observation::{
-                ObservationError, ObservationRef, SourceCoverage, SourceReadLimits, SourceRevision,
-                read_authorized_source,
+                MAX_SOURCE_BYTES, ObservationError, ObservationRef, SourceCoverage,
+                SourceReadLimits, SourceRevision, read_authorized_source,
             },
             store::{ObservationAdmission, ObservationDraft},
         };
         let authority = self.authority(binding).await?;
         validate_read_scope(&self.shared, binding, observed_scope, target, &authority)?;
+        // The source read ceiling is the v0.1 reader's own bound, not the launcher's discovery and
+        // check-process output budget: `limits.output_bytes` sizes bounded command captures and is
+        // far smaller than a source file may legitimately be.
         let read = read_authorized_source(
             authority.worktree(),
             &path,
-            SourceReadLimits::new(1024, self.shared.launcher.limits.output_bytes)
-                .map_err(|_| FailureCode::Internal)?,
+            SourceReadLimits::new(1024, MAX_SOURCE_BYTES).map_err(|_| FailureCode::Internal)?,
         );
         self.source_sequence = self
             .source_sequence
@@ -2771,6 +2773,12 @@ impl<'a> Worker<'a> {
                 .map_err(|_| FailureCode::SourceUnavailable)?,
                 Vec::new(),
             ),
+            Err(ObservationError::TooLarge { size }) => {
+                return Err(FailureCode::SourceTooLarge {
+                    size,
+                    ceiling: MAX_SOURCE_BYTES as u64,
+                });
+            }
             Err(_) => return Err(FailureCode::SourceUnavailable),
         };
         let active = self.shared.active(binding)?;
@@ -5274,6 +5282,166 @@ mod stop_retry_tests {
         assert!(
             collected.ends_with(&content),
             "concatenated chunks must end with the exact source bytes"
+        );
+    }
+
+    /// A source file far larger than the launcher's tiny `output_bytes` discovery/output-capture
+    /// budget still reads completely (up to Intelligence's own bounded render cap) instead of
+    /// failing closed as `source_unavailable`: the read ceiling is `MAX_SOURCE_BYTES`, never the
+    /// unrelated `output_bytes` budget (T13B).
+    #[tokio::test]
+    async fn managed_context_reads_a_source_larger_than_the_output_budget() {
+        let fixture = Fixture::new();
+        // 114000 bytes: matches the reported live-stability failure size, well over both the
+        // fixture's default 1024-byte `output_bytes` and Intelligence's 64 KiB `MAX_CONTEXT_BYTES`
+        // render cap, but comfortably under the 1 MiB `MAX_SOURCE_BYTES` read ceiling.
+        let content = "x".repeat(114_000);
+        std::fs::write(fixture.root.join("main.rs"), &content).unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        // The fixture default (1024 bytes) is deliberately left unchanged here: it must never
+        // bound the source read itself.
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (binding, _) = production_start(&mut worker, "large-actor", "large-start").await;
+        let (invocation, observed) =
+            production_call(&worker, &fixture.root, "large-actor", "large-call");
+        let (mut job, _cancel_sender) = context_job(&fixture.root, invocation, observed.clone());
+        worker.shared.ledger.lock().unwrap().details.insert(
+            job.reference.clone(),
+            Detail {
+                binding: binding.clone(),
+                reply: PeerReply::Pending {
+                    detail_ref: job.reference.clone(),
+                    helper: None,
+                },
+                selection: (AssistanceTool::Context, selection(&job.parameters)),
+                authority: None,
+                source: None,
+                native_epoch: 0,
+                diff_page: None,
+                diff_page_fresh: false,
+                context_page: None,
+                context_page_fresh: false,
+            },
+        );
+        let (first_reply, authority, source) = worker.context(&mut job).await.unwrap();
+        worker
+            .shared
+            .complete(&job.reference, first_reply.clone(), authority, source, 0);
+        let PeerReply::Complete {
+            text: first_text,
+            truncated: true,
+            continuation: true,
+            ..
+        } = &first_reply
+        else {
+            panic!(
+                "a file over MAX_CONTEXT_BYTES must overflow one reply envelope: {first_reply:?}"
+            );
+        };
+        let mut collected = first_text.clone();
+        let mut pages = 1;
+        loop {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            serve_inspection(
+                &worker.workspace,
+                &worker.shared,
+                Inspection {
+                    binding: binding.clone(),
+                    reference: job.reference.clone(),
+                    observed: Some(observed.clone()),
+                    target: production_target(&fixture.root),
+                    expected: None,
+                    reply: reply_tx,
+                },
+            )
+            .await;
+            let reply = reply_rx.await.unwrap();
+            let PeerReply::Complete {
+                text,
+                truncated,
+                continuation,
+                ..
+            } = &reply
+            else {
+                panic!("continuation must stay a Context Complete reply: {reply:?}")
+            };
+            pages += 1;
+            assert!(
+                pages < 50,
+                "continuation must terminate in a bounded page count"
+            );
+            collected.push_str(text);
+            if *continuation {
+                assert!(*truncated, "a page with more to come must report truncated");
+            } else {
+                // Intelligence's own 64 KiB render cap genuinely omitted the file's tail, so the
+                // final page must still honestly report it, unlike a fully recovered file.
+                assert!(
+                    *truncated,
+                    "content beyond MAX_CONTEXT_BYTES was never captured, so this must stay truncated"
+                );
+                break;
+            }
+        }
+        assert!(pages >= 2, "the fixture file must force multiple pages");
+        // `collected` is the fixed rendered header followed by the exact bounded source text; the
+        // file is homogeneous ASCII with no newlines, so the exact MAX_CONTEXT_BYTES-bounded
+        // prefix of the source is simply the tail of the concatenated pages.
+        assert!(
+            collected.ends_with(&content[..crate::intelligence::context::MAX_CONTEXT_BYTES]),
+            "the exposed text must end with the exact MAX_CONTEXT_BYTES-bounded prefix of the source"
+        );
+        assert!(
+            !collected.ends_with(&content[..crate::intelligence::context::MAX_CONTEXT_BYTES + 1]),
+            "no more than MAX_CONTEXT_BYTES of the source may have been exposed"
+        );
+    }
+
+    /// A source file over the v0.1 reader's `MAX_SOURCE_BYTES` ceiling reports the exact size and
+    /// ceiling through `FailureCode::SourceTooLarge`, never the generic `source_unavailable`, on
+    /// the managed path (T13B).
+    #[tokio::test]
+    async fn managed_context_reports_source_too_large_above_the_ceiling() {
+        let fixture = Fixture::new();
+        let size = crate::workspace::observation::MAX_SOURCE_BYTES + 1;
+        std::fs::write(fixture.root.join("main.rs"), vec![b'y'; size]).unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (binding, _) = production_start(&mut worker, "huge-actor", "huge-start").await;
+        let (invocation, observed) =
+            production_call(&worker, &fixture.root, "huge-actor", "huge-call");
+        let (mut job, _cancel_sender) = context_job(&fixture.root, invocation, observed);
+        worker.shared.ledger.lock().unwrap().details.insert(
+            job.reference.clone(),
+            Detail {
+                binding,
+                reply: PeerReply::Pending {
+                    detail_ref: job.reference.clone(),
+                    helper: None,
+                },
+                selection: (AssistanceTool::Context, selection(&job.parameters)),
+                authority: None,
+                source: None,
+                native_epoch: 0,
+                diff_page: None,
+                diff_page_fresh: false,
+                context_page: None,
+                context_page_fresh: false,
+            },
+        );
+        let Err(code) = worker.context(&mut job).await else {
+            panic!("a source over MAX_SOURCE_BYTES must never be observed")
+        };
+        assert_eq!(
+            code,
+            FailureCode::SourceTooLarge {
+                size: size as u64,
+                ceiling: crate::workspace::observation::MAX_SOURCE_BYTES as u64,
+            }
         );
     }
 

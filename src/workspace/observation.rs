@@ -152,7 +152,7 @@ impl SourceBytes {
     pub(crate) fn from_reported(digest: [u8; 32], length: u64) -> Result<Self, ObservationError> {
         (length <= MAX_SOURCE_BYTES as u64)
             .then_some(Self { digest, length })
-            .ok_or(ObservationError::TooLarge)
+            .ok_or(ObservationError::TooLarge { size: length })
     }
 
     /// Rebuilds trusted persisted metadata after validating its fixed digest and nonnegative length.
@@ -422,7 +422,10 @@ pub enum ObservationError {
     /// The final object was not a regular file.
     NotRegularFile,
     /// The source payload exceeded its configured byte ceiling before hashing or return.
-    TooLarge,
+    TooLarge {
+        /// Exact on-disk size observed from the same opened descriptor, never a follow-up stat.
+        size: u64,
+    },
     /// The registered source path was absent; this does not claim worktree closure.
     Missing,
     /// The worktree root is unavailable; no descendant absence or Close fact is established.
@@ -455,7 +458,9 @@ pub fn read_authorized_source(
         .read_to_end(&mut contents)
         .map_err(classify_io)?;
     if contents.len() > limits.max_bytes {
-        return Err(ObservationError::TooLarge);
+        return Err(ObservationError::TooLarge {
+            size: metadata.len(),
+        });
     }
     let bytes = SourceBytes::from_bytes(&contents);
     Ok(SourceRead {
@@ -486,14 +491,16 @@ pub fn read_authorized_resolution_input(
     if max_bytes > MAX_RESOLUTION_INPUT_BYTES {
         return Err(ObservationError::InvalidLimits);
     }
-    let (mut file, _) = open_authorized_regular_file(worktree, path, MAX_SOURCE_PATH_BYTES)?;
+    let (mut file, metadata) = open_authorized_regular_file(worktree, path, MAX_SOURCE_PATH_BYTES)?;
     let mut contents = Vec::with_capacity(max_bytes.min(8192));
     file.by_ref()
         .take((max_bytes as u64).saturating_add(1))
         .read_to_end(&mut contents)
         .map_err(classify_io)?;
     if contents.len() > max_bytes {
-        return Err(ObservationError::TooLarge);
+        return Err(ObservationError::TooLarge {
+            size: metadata.len(),
+        });
     }
     Ok(ResolutionInputRead {
         path: path.to_path_buf(),

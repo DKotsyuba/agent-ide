@@ -86,6 +86,12 @@ fn render_text(reply: &PeerReply) -> String {
         PeerReply::Error {
             code: FailureCode::ResolutionUnverified,
         } => "error: resolution_unverified; establish a supported configured project with exact document membership, then retry ide.context".to_owned(),
+        PeerReply::Error {
+            code: FailureCode::SourceTooLarge { size, ceiling },
+        } => format!(
+            "error: source_too_large; source is {size} bytes, exceeding the {ceiling} byte read \
+             ceiling; continue with native tools"
+        ),
         PeerReply::Error { code } => format!(
             "error: {}; continue with native tools",
             match code {
@@ -102,6 +108,7 @@ fn render_text(reply: &PeerReply) -> String {
                 FailureCode::Capacity => "capacity",
                 FailureCode::InvalidDetail => "invalid_detail",
                 FailureCode::SourceUnavailable => "source_unavailable",
+                FailureCode::SourceTooLarge { .. } => unreachable!("handled above"),
                 FailureCode::Conflict => "conflict",
                 FailureCode::Internal => "internal",
             }

@@ -55,6 +55,13 @@ pub enum FailureCode {
     InvalidDetail,
     /// Registered source bytes could not be observed in the authorized scope.
     SourceUnavailable,
+    /// The registered source exceeded the bounded read ceiling before any content was captured.
+    SourceTooLarge {
+        /// Exact on-disk size of the source that exceeded `ceiling`.
+        size: u64,
+        /// The read ceiling `size` exceeded.
+        ceiling: u64,
+    },
     /// A single-owner resource is already held: an idempotent operation retried with different
     /// immutable parameters, or another live actor that currently owns this worktree incarnation
     /// or its provider cache namespace. The refusal never disturbs the actor that already owns it,
