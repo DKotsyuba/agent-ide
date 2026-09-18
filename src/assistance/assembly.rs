@@ -353,6 +353,50 @@ impl ProductDispatcher {
         }
     }
 
+    /// Retrieves one Claude-host detail reference, trying the foreground-helper ticket ledger
+    /// first and falling back to the worker's own retained-detail ledger (T09B).
+    ///
+    /// A reference minted by [`Self::mint_claude`] names a still-outstanding or just-settled
+    /// helper ticket and belongs in [`LaunchLedger`]. A reference published inside an already
+    /// delivered `Complete`/`Edit` reply's `detail_ref` (a continuation page, or an Edit's pending
+    /// diagnostics) instead names a [`WorkerHandle`]-owned detail that `retrieve_claude` alone can
+    /// never see, because it only consults the ticket ledger. Trying the ticket ledger first and
+    /// falling back only on its absence is safe: both ledgers independently re-verify this exact
+    /// binding owns the reference, so a lookup that reaches the second ledger cannot leak a
+    /// different binding's result, and a reference that is neither a live ticket nor a retained
+    /// worker detail still fails closed as `invalid_detail`.
+    async fn retrieve_claude_detail(
+        &self,
+        invocation: &ValidatedInvocation,
+        detail_ref: &str,
+        attachment: &str,
+    ) -> PeerReply {
+        let owner = invocation.binding_ref().fingerprint();
+        let is_ticket = self
+            .launches
+            .lock()
+            .is_ok_and(|launches| launches.owned_by(detail_ref, owner));
+        if is_ticket {
+            return self
+                .retrieve_claude(invocation, detail_ref, attachment)
+                .await;
+        }
+        let Some(worker) = &self.worker else {
+            return PeerReply::Unavailable {
+                reason: MissingPeer::WorkspaceActivation,
+            };
+        };
+        worker
+            .inspect(
+                invocation.binding_ref().clone(),
+                detail_ref.to_owned(),
+                None,
+                attachment,
+                None,
+            )
+            .await
+    }
+
     /// Retrieves an already settled helper result without any daemon source or provider read.
     ///
     /// Only the exact owning binding generation can retrieve a handle. A still-unsettled operation
@@ -946,7 +990,7 @@ impl ProductDispatcher {
                         AssistanceMethod::Context | AssistanceMethod::Diff
                             if call.parameters().get("detail_ref").is_some() =>
                         {
-                            self.retrieve_claude(
+                            self.retrieve_claude_detail(
                                 &invocation,
                                 call.parameters()["detail_ref"].as_str()?,
                                 method.opaque_attachment(),
@@ -955,7 +999,7 @@ impl ProductDispatcher {
                         }
                         // Inspect is pure retrieval: same binding/generation, no daemon source read.
                         AssistanceMethod::Inspect => {
-                            self.retrieve_claude(
+                            self.retrieve_claude_detail(
                                 &invocation,
                                 call.parameters()["detail_ref"].as_str()?,
                                 method.opaque_attachment(),
@@ -1061,7 +1105,7 @@ impl ProductDispatcher {
                             .inspect(
                                 invocation.binding_ref().clone(),
                                 call.parameters()["detail_ref"].as_str()?.to_owned(),
-                                observed?,
+                                Some(observed?),
                                 method.opaque_attachment(),
                                 None,
                             )

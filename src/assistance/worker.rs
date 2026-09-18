@@ -4,6 +4,7 @@ use super::{
     claude_worker::{
         HelperBaseline, HelperOperation, HelperOutcome, HelperScope, SettledClaudeOperation,
     },
+    content,
     facade::{AssistanceTool, FeedbackDelta, render_reply},
     host_binding::{
         ActiveBindingUse, BindingRef, HostBindingGuard, ObservedSandboxState, ValidatedInvocation,
@@ -118,6 +119,31 @@ struct Detail {
     /// `ide.inspect` on such a detail must return that already-composed page unchanged instead of
     /// eagerly expanding past it; every later call then advances.
     diff_page_fresh: bool,
+    /// Retained complete Context text for the next chunk; absent once fully delivered. Mirrors
+    /// `diff_page` (T09B): never serialized into a `PeerReply`, exists only to resume the same
+    /// owner cursor without a second Claude foreground-helper run or daemon source re-read.
+    context_page: Option<ContextPageState>,
+    /// Same first-page semantics as `diff_page_fresh`, for `context_page`.
+    context_page_fresh: bool,
+}
+
+/// Retained bounded state needed to resume one Context detail cursor from `ide.inspect` (T09B).
+///
+/// Unlike [`snapshots::DiffPageState`], no Git re-selection is needed: the complete text was
+/// already composed once by the job (managed read or settled Claude helper evidence), so later
+/// pages are pure byte slices of it. Never serialized into a `PeerReply`.
+#[derive(Clone)]
+struct ContextPageState {
+    /// Complete composed text for this Context result (fixed header plus full observed source);
+    /// every page is a line-bounded UTF-8 slice of this buffer, so pages always join byte-exactly.
+    text: String,
+    /// Exact byte offset into `text` already handed to a caller.
+    delivered: usize,
+    /// `true` when the upstream capture itself already lost bytes (Workspace's own source cap or
+    /// the Claude helper's output budget), independent of this pagination. Carried onto the final
+    /// page's `truncated` field once every captured byte has been paged out, so completing
+    /// pagination is never confused with having recovered bytes that were never captured.
+    source_truncated: bool,
 }
 
 /// Retains one versioned provider delta until a later native post-hook rechecks its exact source.
@@ -262,7 +288,10 @@ struct Inspection {
     /// Opaque result handle supplied by the model; it does not confer ownership.
     reference: String,
     /// Current host-correlated sandbox metadata, never a cached prior permission observation.
-    observed: ObservedSandboxState,
+    /// Absent only for a Claude-originated reference (T09B): Claude never reports
+    /// `codex/sandbox-state-meta`, so there is no host-observed catalog/profile scope to recheck,
+    /// exactly as its own job-creation path never calls `validate_read_scope` either.
+    observed: Option<ObservedSandboxState>,
     /// Exact trusted attachment target used for current read-scope validation.
     target: LaunchTarget,
     /// Optional owner/path constraint for method-specific detail retrieval.
@@ -460,6 +489,30 @@ impl Shared {
             }
         }
         retained
+    }
+    /// Retains or clears the bounded Context pagination state for one same-binding detail
+    /// reference (T09B). Mirrors `set_diff_page`'s fresh-page and continuation-clearing semantics,
+    /// minus its aggregate byte ceiling: a Context page's text is already bounded by the source or
+    /// Claude helper capture limits, so the existing `limits.details` count ledger alone is enough
+    /// to bound retained memory here.
+    fn set_context_page(&self, reference: &str, page: Option<ContextPageState>) {
+        let Ok(mut ledger) = self.ledger.lock() else {
+            return;
+        };
+        let retained = page.is_some();
+        if let Some(detail) = ledger.details.get_mut(reference) {
+            detail.context_page = page;
+            detail.context_page_fresh = retained;
+            if !retained
+                && let PeerReply::Complete {
+                    kind: ResultKind::Context,
+                    continuation,
+                    ..
+                } = &mut detail.reply
+            {
+                *continuation = false;
+            }
+        }
     }
 }
 
@@ -880,7 +933,13 @@ impl WorkerHandle {
         let expected = Some((tool, selection(&parameters)));
         if let Some(reference) = parameters.get("detail_ref").and_then(Value::as_str) {
             return self
-                .inspect(binding, reference.to_owned(), current, attachment, expected)
+                .inspect(
+                    binding,
+                    reference.to_owned(),
+                    Some(current),
+                    attachment,
+                    expected,
+                )
                 .await;
         }
         let Some(target) = self.shared.launcher.target(attachment).cloned() else {
@@ -900,7 +959,7 @@ impl WorkerHandle {
             )
         }) {
             Ok((reference, permit)) => {
-                self.inspect_reserved(binding, reference, current, target, expected, permit)
+                self.inspect_reserved(binding, reference, Some(current), target, expected, permit)
                     .await
             }
             Err(code) => PeerReply::Error { code },
@@ -1196,11 +1255,14 @@ impl WorkerHandle {
     }
 
     /// Asks the sole worker for a same-binding, current-profile, durably authorized result.
+    ///
+    /// `observed` is `None` only for a Claude-originated reference, which has no host-reported
+    /// sandbox catalog/profile scope to recheck (T09B).
     pub async fn inspect(
         &self,
         binding: BindingRef,
         reference: String,
-        observed: ObservedSandboxState,
+        observed: Option<ObservedSandboxState>,
         attachment: &str,
         expected: Option<(AssistanceTool, [u8; 32])>,
     ) -> PeerReply {
@@ -1222,7 +1284,7 @@ impl WorkerHandle {
         &self,
         binding: BindingRef,
         reference: String,
-        observed: ObservedSandboxState,
+        observed: Option<ObservedSandboxState>,
         target: LaunchTarget,
         expected: Option<(AssistanceTool, [u8; 32])>,
         permit: mpsc::OwnedPermit<Inspection>,
@@ -1417,6 +1479,8 @@ impl WorkerHandle {
                     native_epoch: 0,
                     diff_page: None,
                     diff_page_fresh: false,
+                    context_page: None,
+                    context_page_fresh: false,
                 },
             );
         }
@@ -2491,22 +2555,20 @@ impl<'a> Worker<'a> {
                 }
             }
         }
-        Ok((
-            PeerReply::Complete {
-                kind: ResultKind::Context,
-                text: format!(
-                    "source_sequence: {}\nauthority_epoch: {}\n{}",
-                    observed.sequence(),
-                    authority.epoch(),
-                    text
-                ),
-                detail_ref: Some(job.reference.clone()),
-                truncated: *truncated,
-                continuation: false,
-            },
-            Some(authority),
-            Some(observed),
-        ))
+        let full_text = format!(
+            "source_sequence: {}\nauthority_epoch: {}\n{}",
+            observed.sequence(),
+            authority.epoch(),
+            text
+        );
+        let (delivered, reply) = fit_context_page(&full_text, &job.reference, *truncated)?;
+        let context_page = (delivered < full_text.len()).then_some(ContextPageState {
+            text: full_text,
+            delivered,
+            source_truncated: *truncated,
+        });
+        self.shared.set_context_page(&job.reference, context_page);
+        Ok((reply, Some(authority), Some(observed)))
     }
 
     /// Publishes one settled helper-composed Diff after current authority and scope rechecks.
@@ -2935,17 +2997,14 @@ impl<'a> Worker<'a> {
                 ledger.feedback.remove(&binding);
             }
         }
-        Ok((
-            PeerReply::Complete {
-                kind: ResultKind::Context,
-                text,
-                detail_ref: Some(job.reference.clone()),
-                truncated: context.truncated,
-                continuation: false,
-            },
-            Some(authority),
-            Some(observed),
-        ))
+        let (delivered, reply) = fit_context_page(&text, &job.reference, context.truncated)?;
+        let context_page = (delivered < text.len()).then_some(ContextPageState {
+            text,
+            delivered,
+            source_truncated: context.truncated,
+        });
+        self.shared.set_context_page(&job.reference, context_page);
+        Ok((reply, Some(authority), Some(observed)))
     }
 
     /// Returns the project problem feed for `kind: "problems"` from the configured snapshot source.
@@ -3688,7 +3747,16 @@ async fn inspection_loop(
 async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, request: Inspection) {
     let result = async {
         let active = shared.active(&request.binding)?;
-        let (reply, authority, source, native_epoch, diff_page, diff_page_fresh) = {
+        let (
+            reply,
+            authority,
+            source,
+            native_epoch,
+            diff_page,
+            diff_page_fresh,
+            context_page,
+            context_page_fresh,
+        ) = {
             let ledger = shared.ledger.lock().map_err(|_| FailureCode::Internal)?;
             let detail = ledger
                 .details
@@ -3709,6 +3777,8 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 detail.native_epoch,
                 detail.diff_page.clone(),
                 detail.diff_page_fresh,
+                detail.context_page.clone(),
+                detail.context_page_fresh,
             )
         };
         // Ownership of this exact reference is established above, so releasing its retained page is
@@ -3718,6 +3788,7 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
         // compact retry outcome the caller receives survives.
         let invalidate = |code: FailureCode| {
             shared.set_diff_page(&request.reference, None);
+            shared.set_context_page(&request.reference, None);
             code
         };
         if let Some(authority) = &authority {
@@ -3725,14 +3796,19 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 .authorize(authority, &active)
                 .await
                 .map_err(|_| invalidate(FailureCode::WorkspaceAuthority))?;
-            validate_read_scope(
-                shared,
-                &request.binding,
-                &request.observed,
-                &request.target,
-                authority,
-            )
-            .map_err(invalidate)?;
+            // Claude never reports `codex/sandbox-state-meta`, so a Claude-originated detail has no
+            // host-observed catalog/profile scope to recheck here — exactly as its own job-creation
+            // path (`context_claude`/`diff_claude`) never calls this check either (T09B).
+            if let Some(observed) = &request.observed {
+                validate_read_scope(
+                    shared,
+                    &request.binding,
+                    observed,
+                    &request.target,
+                    authority,
+                )
+                .map_err(invalidate)?;
+            }
         }
         if let Some(source) = source
             && !source_matches(&source)
@@ -3765,67 +3841,105 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 .map_err(|_| invalidate(FailureCode::WorkspaceAuthority))?;
         }
         shared.active(&request.binding)?;
-        let Some(page) = diff_page else {
-            return Ok::<_, FailureCode>(reply);
-        };
-        if diff_page_fresh {
-            // `reply` already holds this exact page's composed text, produced by the job (page 1)
-            // or a prior expansion, and no caller has retrieved it yet. Hand it over unchanged;
-            // only a later inspection may advance past it.
+        if let Some(page) = diff_page {
+            if diff_page_fresh {
+                // `reply` already holds this exact page's composed text, produced by the job
+                // (page 1) or a prior expansion, and no caller has retrieved it yet. Hand it over
+                // unchanged; only a later inspection may advance past it.
+                if let Ok(mut ledger) = shared.ledger.lock()
+                    && let Some(detail) = ledger.details.get_mut(&request.reference)
+                {
+                    detail.diff_page_fresh = false;
+                }
+                return Ok::<_, FailureCode>(reply);
+            }
+            let Some(authority) = &authority else {
+                return Err(FailureCode::WorkspaceAuthority);
+            };
+            let expected_scope =
+                crate::workspace::git::GitScope::from_authority(authority, page.mode());
+            // Revalidate the retained evidence's working-tree material against the current
+            // worktree before trusting it: an out-of-band edit with no native hook never bumps
+            // native_epoch, so that check alone cannot catch it. Staged-only comparisons never
+            // depend on working-tree bytes, so this is skipped rather than used as unrelated
+            // "proof" for them.
+            if !page.working_tree_bytes_unchanged(authority.worktree()) {
+                return Err(invalidate(FailureCode::SourceUnavailable));
+            }
+            // Expansion uses exactly the same whole-page fitting path as the initial composition,
+            // so reply text always serializes under the bounded envelope without
+            // `PeerReply::encode` needing to shrink it: a shrink cuts at a UTF-8 boundary, not a
+            // hunk boundary, which would silently deliver a partial hunk while the cursor advanced
+            // past it as if it were whole.
+            let (advanced, next) = snapshots::fit_diff_page(
+                page.mode(),
+                authority.epoch(),
+                &request.reference,
+                page.budget().max_hunks,
+                true,
+                |max_hunks| page.expand_with_max_hunks(&expected_scope, max_hunks),
+            )
+            .map_err(|code| match code {
+                // A structurally unavailable or failed selection can never be repaired by a later
+                // page.
+                FailureCode::SourceUnavailable => invalidate(code),
+                // A budget refusal delivered nothing, so the retained evidence stays: dropping the
+                // continuation here would lose hunks the caller can still reach later.
+                code => code,
+            })?;
+            let encoded = next
+                .clone()
+                .encode()
+                .and_then(|value| PeerReply::decode(value.as_str()));
+            let Some(next) = encoded else {
+                shared.set_diff_page(&request.reference, None);
+                return Err(FailureCode::Internal);
+            };
             if let Ok(mut ledger) = shared.ledger.lock()
                 && let Some(detail) = ledger.details.get_mut(&request.reference)
             {
+                detail.reply = next.clone();
+                detail.diff_page = page.advance(&advanced);
                 detail.diff_page_fresh = false;
             }
-            return Ok::<_, FailureCode>(reply);
+            return Ok::<_, FailureCode>(next);
         }
-        let Some(authority) = &authority else {
-            return Err(FailureCode::WorkspaceAuthority);
-        };
-        let expected_scope =
-            crate::workspace::git::GitScope::from_authority(authority, page.mode());
-        // Revalidate the retained evidence's working-tree material against the current worktree
-        // before trusting it: an out-of-band edit with no native hook never bumps native_epoch, so
-        // that check alone cannot catch it. Staged-only comparisons never depend on working-tree
-        // bytes, so this is skipped rather than used as unrelated "proof" for them.
-        if !page.working_tree_bytes_unchanged(authority.worktree()) {
-            return Err(invalidate(FailureCode::SourceUnavailable));
+        if let Some(page) = context_page {
+            if context_page_fresh {
+                // Same first-page semantics as the Diff branch above: page one was already
+                // composed and stored by the job; hand it over unchanged and let a later call
+                // advance past it.
+                if let Ok(mut ledger) = shared.ledger.lock()
+                    && let Some(detail) = ledger.details.get_mut(&request.reference)
+                {
+                    detail.context_page_fresh = false;
+                }
+                return Ok::<_, FailureCode>(reply);
+            }
+            // Staleness is already fully covered above (source bytes and native epoch), unlike
+            // Diff there is no separate working-tree re-check to perform: `source` is always
+            // retained for a Context detail, so the generic `source_matches` check already ran.
+            let (advanced, next) = fit_context_page(
+                &page.text[page.delivered..],
+                &request.reference,
+                page.source_truncated,
+            )?;
+            let delivered = page.delivered + advanced;
+            let next_page = (delivered < page.text.len()).then_some(ContextPageState {
+                text: page.text,
+                delivered,
+                source_truncated: page.source_truncated,
+            });
+            if let Ok(mut ledger) = shared.ledger.lock()
+                && let Some(detail) = ledger.details.get_mut(&request.reference)
+            {
+                detail.reply = next.clone();
+                detail.context_page = next_page;
+                detail.context_page_fresh = false;
+            }
+            return Ok::<_, FailureCode>(next);
         }
-        // Expansion uses exactly the same whole-page fitting path as the initial composition, so
-        // reply text always serializes under the bounded envelope without `PeerReply::encode`
-        // needing to shrink it: a shrink cuts at a UTF-8 boundary, not a hunk boundary, which would
-        // silently deliver a partial hunk while the cursor advanced past it as if it were whole.
-        let (advanced, next) = snapshots::fit_diff_page(
-            page.mode(),
-            authority.epoch(),
-            &request.reference,
-            page.budget().max_hunks,
-            true,
-            |max_hunks| page.expand_with_max_hunks(&expected_scope, max_hunks),
-        )
-        .map_err(|code| match code {
-            // A structurally unavailable or failed selection can never be repaired by a later page.
-            FailureCode::SourceUnavailable => invalidate(code),
-            // A budget refusal delivered nothing, so the retained evidence stays: dropping the
-            // continuation here would lose hunks the caller can still reach later.
-            code => code,
-        })?;
-        let encoded = next
-            .clone()
-            .encode()
-            .and_then(|value| PeerReply::decode(value.as_str()));
-        let Some(next) = encoded else {
-            shared.set_diff_page(&request.reference, None);
-            return Err(FailureCode::Internal);
-        };
-        if let Ok(mut ledger) = shared.ledger.lock()
-            && let Some(detail) = ledger.details.get_mut(&request.reference)
-        {
-            detail.reply = next.clone();
-            detail.diff_page = page.advance(&advanced);
-            detail.diff_page_fresh = false;
-        }
-        Ok::<_, FailureCode>(next)
+        Ok::<_, FailureCode>(reply)
     }
     .await;
     let reply = result.unwrap_or_else(|code| PeerReply::Error { code });
@@ -3988,6 +4102,58 @@ fn diagnostics_reserve_known_edit_settlement_time() {
     let deadline = now + EDIT_SETTLEMENT_RESERVE + Duration::from_millis(50);
     assert!(edit_diagnostic_deadline(deadline).is_some());
     assert!(edit_diagnostic_deadline(now + Duration::from_millis(1)).is_none());
+}
+
+/// Splits the next line-bounded, byte-exact UTF-8 chunk off `remaining` that provably fits the
+/// bounded reply envelope, returning how many bytes of `remaining` it consumed alongside the
+/// rendered [`PeerReply`] (T09B).
+///
+/// Mirrors `snapshots::fit_diff_page`'s fitting discipline: the same [`content::fits`] predicate
+/// that gates the real final MCP envelope decides acceptance, so a chunk is never handed out only
+/// to have the facade re-cut it later. `remaining` is never mutated; the caller advances its own
+/// cursor by the returned length, so repeated chunks join byte-exactly back into the original text.
+///
+/// Starts by trying the complete `remaining` text as the final chunk; if that fits, `truncated` is
+/// `source_truncated` and `continuation` is `false`. Otherwise halves the candidate length — same
+/// discipline as `PeerReply::shrink_text` — snapping each candidate back to the preceding newline
+/// so no existing line is ever split across two pages, until one fits.
+///
+/// # Errors
+///
+/// [`FailureCode::Capacity`] when even one byte cannot fit the serialized envelope.
+fn fit_context_page(
+    remaining: &str,
+    reference: &str,
+    source_truncated: bool,
+) -> Result<(usize, PeerReply), FailureCode> {
+    let mut len = remaining.len();
+    loop {
+        let mut cut = len.min(remaining.len());
+        while !remaining.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let more_after = cut < remaining.len();
+        let snapped = if more_after {
+            remaining[..cut].rfind('\n').map_or(cut, |index| index + 1)
+        } else {
+            cut
+        };
+        let continuation = snapped < remaining.len();
+        let reply = PeerReply::Complete {
+            kind: ResultKind::Context,
+            text: remaining[..snapped].to_owned(),
+            detail_ref: Some(reference.to_owned()),
+            truncated: continuation || source_truncated,
+            continuation,
+        };
+        if content::fits(&reply) {
+            return Ok((snapped, reply));
+        }
+        if snapped == 0 {
+            return Err(FailureCode::Capacity);
+        }
+        len = snapped / 2;
+    }
 }
 
 /// Intersects a current durable stamp and fresh invocation metadata before any native/cached source read.
@@ -4247,8 +4413,22 @@ mod stop_retry_tests {
         workspace: DurableWorkspace<'a>,
         runtime: std::path::PathBuf,
     ) -> Worker<'a> {
+        worker_with_output_bytes(store, workspace, runtime, 1024)
+    }
+
+    /// Same as [`worker`], but with a configurable source-read/output-capture ceiling: several
+    /// Context pagination tests (T09B) need a fixture file larger than the fixed 1024-byte default.
+    fn worker_with_output_bytes<'a>(
+        store: &'a Store,
+        workspace: DurableWorkspace<'a>,
+        runtime: std::path::PathBuf,
+        output_bytes: usize,
+    ) -> Worker<'a> {
         let launcher = LauncherConfig::parse(
-            br#"{"version":1,"limits":{"queued":8,"details":8,"operation_ms":5000,"output_bytes":1024},"targets":[]}"#,
+            format!(
+                r#"{{"version":1,"limits":{{"queued":8,"details":8,"operation_ms":5000,"output_bytes":{output_bytes}}},"targets":[]}}"#
+            )
+            .as_bytes(),
         )
         .unwrap();
         Worker {
@@ -4323,6 +4503,8 @@ mod stop_retry_tests {
                 native_epoch: 0,
                 diff_page: None,
                 diff_page_fresh: false,
+                context_page: None,
+                context_page_fresh: false,
             },
         );
 
@@ -4382,6 +4564,8 @@ mod stop_retry_tests {
                 native_epoch: 0,
                 diff_page: None,
                 diff_page_fresh: false,
+                context_page: None,
+                context_page_fresh: false,
             },
         );
         // Claude's foreground ticket path must admit the same successful Edit source detail that
@@ -4951,6 +5135,292 @@ mod stop_retry_tests {
             "{text}"
         );
         assert_eq!(fake.queried(), vec![fixture.root.clone()]);
+    }
+
+    /// Builds a bounded, easily reasoned-about test job for the fixture worktree's `main.rs`.
+    fn context_job(
+        root: &std::path::Path,
+        invocation: ValidatedInvocation,
+        observed: ObservedSandboxState,
+    ) -> (Job, watch::Sender<bool>) {
+        let (cancel_sender, cancel) = watch::channel(false);
+        (
+            Job {
+                input: JobInput::Managed,
+                reference: "continuation-detail".into(),
+                invocation,
+                observed: Some(observed),
+                tool: AssistanceTool::Context,
+                parameters: serde_json::json!({"path":"main.rs"}),
+                target: production_target(root),
+                deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+                cancel,
+                stop_reply: None,
+                native_epoch: 0,
+            },
+            cancel_sender,
+        )
+    }
+
+    /// A source file larger than one reply envelope but under Intelligence's own capture cap is
+    /// fully recoverable by repeating `ide.inspect` (`serve_inspection`) with the same detail_ref
+    /// until a chunk reports `continuation: false`; the concatenated chunks equal the exact
+    /// composed text byte-for-byte, every non-final chunk ends on a line boundary, and the final
+    /// chunk honestly reports `truncated: false` because nothing was lost (T09B).
+    #[tokio::test]
+    async fn context_continuation_serves_the_complete_text_through_repeated_inspect() {
+        let fixture = Fixture::new();
+        // 60800 bytes: comfortably below Intelligence's 64 KiB `MAX_CONTEXT_BYTES` capture cap (so
+        // the source is never itself truncated), but well above any plausible single reply
+        // envelope, so at least two continuation pages are required regardless of exact overhead.
+        let content = "let value = 1;\n".repeat(3800);
+        assert!(content.len() < 64 * 1024, "must stay under the source cap");
+        std::fs::write(fixture.root.join("main.rs"), &content).unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        // The default 1024-byte fixture read cap would itself truncate this file before Context
+        // pagination ever sees it; raise it well past `content.len()`.
+        let mut worker = worker_with_output_bytes(&store, workspace, fixture.root.clone(), 200_000);
+        worker.observations.install_schema().await.unwrap();
+        let (binding, _) =
+            production_start(&mut worker, "continuation-actor", "continuation-start").await;
+
+        let (invocation, observed) = production_call(
+            &worker,
+            &fixture.root,
+            "continuation-actor",
+            "continuation-call",
+        );
+        let (mut job, _cancel_sender) = context_job(&fixture.root, invocation, observed.clone());
+
+        // Pre-insert the placeholder detail exactly as `enqueue` would: `context()`'s own
+        // `set_context_page` call only mutates an *already retained* detail, matching production.
+        worker.shared.ledger.lock().unwrap().details.insert(
+            job.reference.clone(),
+            Detail {
+                binding: binding.clone(),
+                reply: PeerReply::Pending {
+                    detail_ref: job.reference.clone(),
+                    helper: None,
+                },
+                selection: (AssistanceTool::Context, selection(&job.parameters)),
+                authority: None,
+                source: None,
+                native_epoch: 0,
+                diff_page: None,
+                diff_page_fresh: false,
+                context_page: None,
+                context_page_fresh: false,
+            },
+        );
+        let (first_reply, authority, source) = worker.context(&mut job).await.unwrap();
+        worker
+            .shared
+            .complete(&job.reference, first_reply.clone(), authority, source, 0);
+
+        let PeerReply::Complete {
+            text: first_text,
+            truncated: true,
+            continuation: true,
+            ..
+        } = &first_reply
+        else {
+            panic!("fixture file must overflow one reply envelope: {first_reply:?}");
+        };
+        assert!(first_text.ends_with('\n'), "must cut on a line boundary");
+        let mut collected = first_text.clone();
+
+        let mut pages = 1;
+        loop {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            serve_inspection(
+                &worker.workspace,
+                &worker.shared,
+                Inspection {
+                    binding: binding.clone(),
+                    reference: job.reference.clone(),
+                    observed: Some(observed.clone()),
+                    target: production_target(&fixture.root),
+                    expected: None,
+                    reply: reply_tx,
+                },
+            )
+            .await;
+            let reply = reply_rx.await.unwrap();
+            let PeerReply::Complete {
+                text,
+                truncated,
+                continuation,
+                ..
+            } = &reply
+            else {
+                panic!("continuation must stay a Context Complete reply: {reply:?}")
+            };
+            pages += 1;
+            assert!(
+                pages < 50,
+                "continuation must terminate in a bounded page count"
+            );
+            collected.push_str(text);
+            if *continuation {
+                assert!(text.ends_with('\n'), "must cut on a line boundary");
+                assert!(*truncated, "a page with more to come must report truncated");
+            } else {
+                assert!(!truncated, "fully recovered text must not claim truncation");
+                break;
+            }
+        }
+        assert!(pages >= 3, "the fixture file must force multiple pages");
+        assert!(
+            collected.ends_with(&content),
+            "concatenated chunks must end with the exact source bytes"
+        );
+    }
+
+    /// A reference absent from the ledger, and one that belongs to a different binding, both fail
+    /// closed as `invalid_detail` instead of leaking another binding's retained continuation state
+    /// (T09B).
+    #[tokio::test]
+    async fn context_continuation_rejects_a_stale_or_foreign_reference() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join("main.rs"), "let value = 1;\n").unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (binding, _) = production_start(&mut worker, "stale-actor", "stale-start").await;
+        let (_invocation, observed) =
+            production_call(&worker, &fixture.root, "stale-actor", "stale-call");
+
+        // No reference was ever retained under this or any other binding.
+        let (reply_tx, reply_rx) = oneshot::channel();
+        serve_inspection(
+            &worker.workspace,
+            &worker.shared,
+            Inspection {
+                binding: binding.clone(),
+                reference: "never-retained".into(),
+                observed: Some(observed.clone()),
+                target: production_target(&fixture.root),
+                expected: None,
+                reply: reply_tx,
+            },
+        )
+        .await;
+        assert!(matches!(
+            reply_rx.await.unwrap(),
+            PeerReply::Error {
+                code: FailureCode::InvalidDetail
+            }
+        ));
+
+        // A reference retained under a genuinely *different* binding (a distinct actor, since
+        // `establish_start` reuses the existing generation for a repeated actor) must not be
+        // reachable either.
+        let (other_invocation, other_observed) =
+            production_call(&worker, &fixture.root, "foreign-actor", "other-call");
+        let other_binding = other_invocation.binding_ref().clone();
+        worker.shared.ledger.lock().unwrap().details.insert(
+            "foreign-detail".into(),
+            Detail {
+                binding: other_binding,
+                reply: PeerReply::Complete {
+                    kind: ResultKind::Context,
+                    text: "owned by a different binding".into(),
+                    detail_ref: Some("foreign-detail".into()),
+                    truncated: false,
+                    continuation: false,
+                },
+                selection: (
+                    AssistanceTool::Context,
+                    selection(&serde_json::json!({"path":"main.rs"})),
+                ),
+                authority: None,
+                source: None,
+                native_epoch: 0,
+                diff_page: None,
+                diff_page_fresh: false,
+                context_page: None,
+                context_page_fresh: false,
+            },
+        );
+        let (reply_tx, reply_rx) = oneshot::channel();
+        serve_inspection(
+            &worker.workspace,
+            &worker.shared,
+            Inspection {
+                binding,
+                reference: "foreign-detail".into(),
+                observed: Some(other_observed),
+                target: production_target(&fixture.root),
+                expected: None,
+                reply: reply_tx,
+            },
+        )
+        .await;
+        assert!(matches!(
+            reply_rx.await.unwrap(),
+            PeerReply::Error {
+                code: FailureCode::InvalidDetail
+            }
+        ));
+    }
+
+    /// A small file's Context reply is byte-for-byte unchanged by the chunking path: it fits one
+    /// page, so no `context_page` is retained and `continuation` stays `false`, exactly as before
+    /// T09B introduced pagination.
+    #[tokio::test]
+    async fn small_context_reply_is_unchanged_by_chunking() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join("main.rs"), "fn small() {}\n").unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (binding, _) = production_start(&mut worker, "small-actor", "small-start").await;
+        let (invocation, observed) =
+            production_call(&worker, &fixture.root, "small-actor", "small-call");
+        let (mut job, _cancel_sender) = context_job(&fixture.root, invocation, observed);
+        worker.shared.ledger.lock().unwrap().details.insert(
+            job.reference.clone(),
+            Detail {
+                binding,
+                reply: PeerReply::Pending {
+                    detail_ref: job.reference.clone(),
+                    helper: None,
+                },
+                selection: (AssistanceTool::Context, selection(&job.parameters)),
+                authority: None,
+                source: None,
+                native_epoch: 0,
+                diff_page: None,
+                diff_page_fresh: false,
+                context_page: None,
+                context_page_fresh: false,
+            },
+        );
+        let (reply, _authority, _source) = worker.context(&mut job).await.unwrap();
+        assert!(matches!(
+            reply,
+            PeerReply::Complete {
+                truncated: false,
+                continuation: false,
+                ..
+            }
+        ));
+        assert!(
+            worker
+                .shared
+                .ledger
+                .lock()
+                .unwrap()
+                .details
+                .get(&job.reference)
+                .unwrap()
+                .context_page
+                .is_none(),
+            "a whole-page result must retain no continuation state"
+        );
     }
 }
 
