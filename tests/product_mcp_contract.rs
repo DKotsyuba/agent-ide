@@ -227,7 +227,8 @@ fn assert_claude_envelope(reply: &Value) -> &str {
     );
     assert_eq!(
         result.get("isError") == Some(&json!(true)),
-        text.starts_with("error")
+        text.starts_with("error"),
+        "{reply}"
     );
     text
 }
@@ -5259,12 +5260,16 @@ async fn claude_diff_pagination_delivers_every_hunk_across_repeated_inspect() {
             .call_claude(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
             .await;
         assert_eq!(next["kind"], "diff", "{next}");
-        assert_eq!(
-            next["detail_ref"].as_str().unwrap(),
-            reference,
-            "every page must echo the same detail_ref"
-        );
         continuation = next["continuation"].as_bool().unwrap();
+        // A further page names the exact detail_ref to inspect next; the terminal page carries
+        // nothing left to fetch, so the compact Claude text omits it by design (T14B).
+        if continuation {
+            assert_eq!(
+                next["detail_ref"].as_str().unwrap(),
+                reference,
+                "a page with more to fetch must echo the same detail_ref"
+            );
+        }
         assert_eq!(
             next["truncated"],
             json!(continuation),
@@ -5628,14 +5633,18 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
     daemon.wait().await.unwrap();
 }
 
-/// Keeps a bounded Claude worker usable across repeated helper Diff finalization, repeated
-/// re-inspection of one already-delivered Diff, and repeated failures.
+/// Keeps a bounded Claude worker usable across repeated helper Diff finalization and repeated
+/// failures.
 ///
 /// One retained activation occupies the first slot. A second actor's settled-but-conflicting Start
 /// is inspected repeatedly; each identical failure must retire its unusable worker detail. A
-/// helper-composed Diff now retains a detail exactly like Context (T13B), so it can be paged and
-/// re-inspected; the capacity here is sized for the activation, each of the three Diffs, and the
-/// trailing source-producing Context.
+/// helper-composed Diff now retains a detail exactly like Context (T13B), so its capacity is sized
+/// for the activation, each of the three Diffs, and the trailing source-producing Context: if a
+/// completed Diff's detail were wrongly dropped or, conversely, never released, this sequence would
+/// either under- or over-count against the bound and the fourth-through-sixth operation would fail.
+/// A completed, non-continuation Diff's retained detail is never named in the Claude host's compact
+/// text (T14B): unlike Context's `source_ref`, it has no later `ide.edit` use, so the real client
+/// has no way to name it for an explicit re-inspection, and this test does not attempt one.
 #[tokio::test]
 async fn claude_diff_and_failed_reinspection_do_not_exhaust_detail_capacity() {
     let fixture = ProductFixture::new_claude(json!([]));
@@ -5670,28 +5679,14 @@ async fn claude_diff_and_failed_reinspection_do_not_exhaust_detail_capacity() {
         assert_eq!(conflict["code"], "conflict", "{conflict}");
     }
 
-    let mut diff_detail_ref = None;
     for _ in 0..3 {
-        let diff = first
+        let pending = first
             .call_claude(&fixture, "ide.diff", json!({"mode":"head"}))
             .await;
-        let (diff, _) = first.complete_claude_pending(&fixture, &diff).await;
+        let (diff, _) = first.complete_claude_pending(&fixture, &pending).await;
         assert_eq!(diff["kind"], "diff", "{diff}");
-        assert!(diff["detail_ref"].is_string(), "{diff}");
         assert_eq!(diff["continuation"], false, "{diff}");
-        diff_detail_ref = Some(diff["detail_ref"].as_str().unwrap().to_owned());
     }
-
-    // A completed Diff detail is genuinely retained: a same-binding re-inspection reaches the exact
-    // same unchanged result rather than `invalid_detail` (T13B).
-    let reinspected = first
-        .call_claude(
-            &fixture,
-            "ide.inspect",
-            json!({"detail_ref":diff_detail_ref.unwrap()}),
-        )
-        .await;
-    assert_eq!(reinspected["kind"], "diff", "{reinspected}");
 
     let context = first
         .call_claude(&fixture, "ide.context", json!({"path":"tracked.txt"}))
