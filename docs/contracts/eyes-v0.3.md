@@ -85,6 +85,16 @@ with the existing launcher configuration error.
   A new lease cancels the timer. On expiry the daemon cancels checks, kills their process groups,
   closes the socket and removes its runtime directory.
 - The existing per-call IPC (hook submit and the five assistance methods) is unchanged.
+- Client-side re-establishment: a Claude MCP server never caches a dead connection. Each tool call
+  dispatches against the live `runtime_dir`/attachment pair it currently holds; if that dispatch
+  comes back transport-unavailable (the daemon exited — idle timeout, `SIGTERM`, a crash, or a
+  binary upgrade — while this MCP process kept running), the server re-runs the exact same
+  rendezvous it started with (adopt-or-spawn under the runtime-dir lock, so several MCP servers
+  racing to relaunch still end up with one daemon), stores the refreshed pair for itself and every
+  later call, and retries that one call once. No retry loop and no background polling: a rendezvous
+  failure, or a retry that is still unavailable, surfaces the normal unavailable outcome for that
+  call. A pending peer-side binding from the dead daemon is gone; the next `ide.start` establishes a
+  fresh one.
 
 Success example: agents A and B in two worktrees of one repository call `ide.start`; one daemon
 serves both; A exits; B keeps working; B exits; the daemon stops 300 s later.

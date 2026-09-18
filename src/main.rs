@@ -16,7 +16,7 @@ use agent_ide::app::{
 };
 use agent_ide::assistance::{
     assembly::ProductDispatcher,
-    facade::StdioFacade,
+    facade::{ReestablishFn, StdioFacade},
     host_binding::HostKind,
     launcher::{AcceptedExecutable, LauncherConfig},
 };
@@ -1449,13 +1449,38 @@ async fn run_managed_claude_mcp(
             // one `ClientLease` connection open for its own entire lifetime instead: the daemon's
             // idle-shutdown countdown only ever runs while zero managed Claude MCPs are attached.
             let lease = open_client_lease(&runtime_path).await;
-            match StdioFacade::with_host_attachment(runtime_path, attachment) {
+            let reestablish = claude_reestablish_hook(path, key, launcher_template, candidate);
+            match StdioFacade::with_reestablishing_attachment(runtime_path, attachment, reestablish)
+            {
                 Some(facade) => serve_managed_stdio(facade, None, None, lease).await,
                 None => serve_managed_stdio(StdioFacade::unavailable(), None, None, lease).await,
             }
         }
         None => serve_managed_stdio(StdioFacade::unavailable(), None, None, None).await,
     }
+}
+
+/// Builds the closure a Claude [`StdioFacade`] calls to re-establish a lost shared daemon.
+///
+/// Repeats the exact [`rendezvous_with_claude_daemon`] path used at startup, so a daemon that
+/// exited (idle timeout, `SIGTERM`, a crash, or a binary upgrade) is relaunched or re-adopted under
+/// the same runtime-dir lock, and several MCP clients racing to relaunch it still end up with one
+/// daemon (EYES-r2 §2).
+fn claude_reestablish_hook(
+    path: PathBuf,
+    key: PathBuf,
+    launcher_template: PathBuf,
+    candidate: PathBuf,
+) -> ReestablishFn {
+    Arc::new(move || {
+        let path = path.clone();
+        let key = key.clone();
+        let launcher_template = launcher_template.clone();
+        let candidate = candidate.clone();
+        Box::pin(async move {
+            rendezvous_with_claude_daemon(&path, &key, &launcher_template, &candidate).await
+        })
+    })
 }
 
 /// Opens and acknowledges one long-lived `ClientLease` connection to the daemon at `runtime`.

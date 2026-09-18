@@ -6,7 +6,10 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
+    sync::Arc,
     time::Duration,
 };
 
@@ -15,6 +18,7 @@ use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, tool, tool_router};
 use serde_json::{Map, Value, json};
+use tokio::sync::Mutex;
 
 use crate::{
     app::{
@@ -472,6 +476,34 @@ impl AssistanceFacade {
         let Some(runtime_dir) = &self.runtime_dir else {
             return FacadeOutcome::Unavailable;
         };
+        self.dispatch_validated(runtime_dir, host, call).await
+    }
+
+    /// Validates and sends exactly one current method against an explicit `runtime_dir`.
+    ///
+    /// Used by a caller that tracks its own live rendezvous target (e.g. after re-establishing a
+    /// lost shared daemon) instead of the fixed directory this facade was constructed with.
+    pub async fn dispatch_at(
+        &self,
+        runtime_dir: &Path,
+        host: &TrustedTransport,
+        tool: AssistanceTool,
+        parameters: Value,
+    ) -> FacadeOutcome {
+        let Ok(call) = validate_call(tool, parameters) else {
+            return FacadeOutcome::InvalidParameters;
+        };
+        self.dispatch_validated(runtime_dir, host, call).await
+    }
+
+    /// Shared tail of [`Self::dispatch`] and [`Self::dispatch_at`] once parameters are validated.
+    async fn dispatch_validated(
+        &self,
+        runtime_dir: &Path,
+        host: &TrustedTransport,
+        call: ValidatedCall,
+    ) -> FacadeOutcome {
+        let tool = call.tool();
         let Some(parameters) = OpaqueJson::from_value(
             &json!({"parameters":call.parameters(),"host_meta":host.host_meta}),
             MAX_HOOK_BYTES,
@@ -838,13 +870,54 @@ impl FeedbackLedger {
     }
 }
 
+/// Redoes the shared-daemon launch-or-adopt rendezvous the exact way MCP startup performs it.
+///
+/// Returns the freshly reachable `(runtime_dir, attachment)` pair, or `None` if that rendezvous
+/// itself failed; the caller then reports the call unavailable exactly as it would have without
+/// ever attempting a reconnect.
+pub type ReestablishFn =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Option<(PathBuf, String)>> + Send>> + Send + Sync>;
+
+/// Shares one live `(runtime_dir, attachment)` pair across every clone of a [`StdioFacade`].
+///
+/// A daemon this generation never owns (EYES-r2 §2) can exit while the MCP process keeps running
+/// (idle timeout, `SIGTERM`, a crash, or a binary upgrade). Rather than caching a connection that
+/// silently goes stale forever, every call reads the current pair and, on failure, re-runs
+/// `reestablish` once and stores its result here for itself and every later call.
+#[derive(Clone)]
+struct ManagedConnection {
+    current: Arc<Mutex<(PathBuf, String)>>,
+    reestablish: ReestablishFn,
+}
+
+impl ManagedConnection {
+    fn new(runtime_dir: PathBuf, attachment: String, reestablish: ReestablishFn) -> Self {
+        Self {
+            current: Arc::new(Mutex::new((runtime_dir, attachment))),
+            reestablish,
+        }
+    }
+
+    async fn current(&self) -> (PathBuf, String) {
+        self.current.lock().await.clone()
+    }
+
+    async fn store(&self, runtime_dir: PathBuf, attachment: String) {
+        *self.current.lock().await = (runtime_dir, attachment);
+    }
+}
+
 /// Hosts the static six-tool rmcp surface even when no trusted host attachment exists.
 #[derive(Clone)]
 pub struct StdioFacade {
     /// Connect-only Application endpoint and finite deadline.
     facade: AssistanceFacade,
     /// Host-launcher attachment, never populated from model tool arguments or request metadata.
+    ///
+    /// Unused (always `None`) once `reconnect` is set, which tracks its own current attachment.
     attachment: Option<String>,
+    /// Live rendezvous target and re-establish hook for a shared daemon this facade does not own.
+    reconnect: Option<ManagedConnection>,
     /// Generated static tool router; independent of daemon availability.
     router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
@@ -855,6 +928,7 @@ impl StdioFacade {
         Self {
             facade: AssistanceFacade::new(runtime_dir),
             attachment: None,
+            reconnect: None,
             router: Self::tool_router(),
         }
     }
@@ -868,6 +942,7 @@ impl StdioFacade {
         Self {
             facade: AssistanceFacade::unavailable(),
             attachment: None,
+            reconnect: None,
             router: Self::tool_router(),
         }
     }
@@ -881,8 +956,117 @@ impl StdioFacade {
         Some(Self {
             facade: AssistanceFacade::new(runtime_dir),
             attachment: Some(attachment),
+            reconnect: None,
             router: Self::tool_router(),
         })
+    }
+
+    /// Configures a bounded opaque attachment for a shared daemon this facade can re-establish.
+    ///
+    /// Identical bounds to [`Self::with_host_attachment`], plus `reestablish` is stored for later
+    /// calls to redo the launch-or-adopt rendezvous once a live connection is lost (EYES-r2 §2).
+    pub fn with_reestablishing_attachment(
+        runtime_dir: PathBuf,
+        attachment: String,
+        reestablish: ReestablishFn,
+    ) -> Option<Self> {
+        TrustedTransport::from_host_ingress("validate", "validate", attachment.clone())?;
+        Some(Self {
+            facade: AssistanceFacade::new(runtime_dir.clone()),
+            attachment: None,
+            reconnect: Some(ManagedConnection::new(runtime_dir, attachment, reestablish)),
+            router: Self::tool_router(),
+        })
+    }
+
+    /// Builds one trusted transport envelope from `attachment` and this call's host request metadata.
+    ///
+    /// `None` for missing/unsupported host metadata or an oversized selected fragment; this never
+    /// grants binding authority, it only carries the identity the daemon must establish itself.
+    fn build_host(
+        &self,
+        attachment: &str,
+        context: &RequestContext<RoleServer>,
+    ) -> Option<TrustedTransport> {
+        let (call_id, selected) = match parse_host_kind(&context.meta).ok()? {
+            HostKind::Codex => {
+                let candidate = parse_candidate(&context.meta).ok()?;
+                let mut selected = json!({"threadId":candidate.actor_id(),"callId":candidate.call_id(),"x-codex-turn-metadata":{}});
+                if let Some(state) = context.meta.get("codex/sandbox-state-meta") {
+                    selected["codex/sandbox-state-meta"] = state.clone();
+                }
+                (candidate.call_id().to_owned(), selected)
+            }
+            HostKind::Claude => {
+                // Real Claude Code 2.1.267 MCP `_meta` carries only this call identity plus
+                // unrelated progress metadata; actor and sandbox values never do.
+                let call_id = parse_claude_call_id(&context.meta).ok()?;
+                let selected = json!({"claudecode/toolUseId":call_id});
+                (call_id, selected)
+            }
+        };
+        let mut host = TrustedTransport::from_host_ingress(
+            context.id.to_string(),
+            call_id,
+            attachment.to_owned(),
+        )?;
+        if serde_json::to_vec(&selected).ok()?.len() > MAX_HOOK_BYTES {
+            return None;
+        }
+        host.host_meta = Some(selected);
+        Some(host)
+    }
+
+    /// Returns the current `(runtime_dir, attachment)` this facade should dispatch against.
+    async fn current_connection(&self) -> Option<(PathBuf, String)> {
+        match &self.reconnect {
+            Some(reconnect) => Some(reconnect.current().await),
+            None => Some((self.facade.runtime_dir.clone()?, self.attachment.clone()?)),
+        }
+    }
+
+    /// Dispatches one already-validated call, re-establishing a lost shared daemon exactly once.
+    ///
+    /// A facade without `reconnect` (Codex, plain `--runtime-dir`, or startup failure) dispatches
+    /// once, matching prior behaviour. A facade with `reconnect` additionally treats a transport
+    /// `Unavailable` outcome as "the shared daemon may be gone": it re-runs the same launch-or-adopt
+    /// rendezvous this facade started with, stores the refreshed pair for itself and every later
+    /// call, and retries this one call exactly once more. There is no retry loop: a still-unavailable
+    /// retry, or a failed rendezvous, returns the original outcome.
+    async fn dispatch_with_reconnect(
+        &self,
+        tool: AssistanceTool,
+        parameters: Value,
+        context: &RequestContext<RoleServer>,
+    ) -> FacadeOutcome {
+        let Some((runtime_dir, attachment)) = self.current_connection().await else {
+            return FacadeOutcome::Unavailable;
+        };
+        let Some(host) = self.build_host(&attachment, context) else {
+            return FacadeOutcome::Unavailable;
+        };
+        let outcome = self
+            .facade
+            .dispatch_at(&runtime_dir, &host, tool, parameters.clone())
+            .await;
+        let Some(reconnect) = &self.reconnect else {
+            return outcome;
+        };
+        if !matches!(outcome, FacadeOutcome::Unavailable) {
+            return outcome;
+        }
+        let Some((runtime_dir, attachment)) = (reconnect.reestablish)().await else {
+            return outcome;
+        };
+        reconnect
+            .store(runtime_dir.clone(), attachment.clone())
+            .await;
+        let Some(host) = self.build_host(&attachment, context) else {
+            return outcome;
+        };
+        self.facade
+            .dispatch_at(&runtime_dir, &host, tool, parameters)
+            .await
     }
 
     /// Validates model parameters before using separately supplied host metadata for finite IPC.
@@ -897,40 +1081,8 @@ impl StdioFacade {
     ) -> CallToolResult {
         let outcome = match validate_call(tool, parameters.clone()) {
             Ok(_) => {
-                let host = self.attachment.as_ref().and_then(|attachment| {
-                    let (call_id, selected) = match parse_host_kind(&context.meta).ok()? {
-                        HostKind::Codex => {
-                            let candidate = parse_candidate(&context.meta).ok()?;
-                            let mut selected = json!({"threadId":candidate.actor_id(),"callId":candidate.call_id(),"x-codex-turn-metadata":{}});
-                            if let Some(state) = context.meta.get("codex/sandbox-state-meta") {
-                                selected["codex/sandbox-state-meta"] = state.clone();
-                            }
-                            (candidate.call_id().to_owned(), selected)
-                        }
-                        HostKind::Claude => {
-                            // Real Claude Code 2.1.267 MCP `_meta` carries only this call identity
-                            // plus unrelated progress metadata; actor and sandbox values never do.
-                            let call_id = parse_claude_call_id(&context.meta).ok()?;
-                            let selected = json!({"claudecode/toolUseId":call_id});
-                            (call_id, selected)
-                        }
-                    };
-                    let mut host = TrustedTransport::from_host_ingress(
-                        context.id.to_string(),
-                        call_id,
-                        attachment.clone(),
-                    )?;
-                    if serde_json::to_vec(&selected).ok()?.len() > MAX_HOOK_BYTES {
-                        return None;
-                    }
-                    host.host_meta = Some(selected);
-
-                    Some(host)
-                });
-                match host {
-                    Some(host) => self.facade.dispatch(&host, tool, parameters).await,
-                    None => FacadeOutcome::Unavailable,
-                }
+                self.dispatch_with_reconnect(tool, parameters, &context)
+                    .await
             }
             Err(_) => FacadeOutcome::InvalidParameters,
         };

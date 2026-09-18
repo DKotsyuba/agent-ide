@@ -499,6 +499,86 @@ async fn daemon_survives_mcp_eof_and_is_adopted_by_a_later_mcp() {
     let _ = std::fs::remove_dir_all(candidate);
 }
 
+/// Sends one `ide.start` call over `mcp` with a fresh Claude tool-use id and returns the raw reply.
+async fn call_ide_start(mcp: &mut Mcp, id: u64, activation_id: &str) -> Value {
+    mcp.exchange(
+        json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+            "name":"ide.start","arguments":{"activation_id":activation_id},
+            "_meta":{"claudecode/toolUseId":format!("call-{id}")}
+        }}),
+    )
+    .await
+}
+
+/// Asserts one `ide.start` reply reached a live daemon and got its typed no-prior-hook outcome,
+/// rather than the transport-level "daemon is unavailable" fallback text this contract targets.
+fn assert_reached_live_daemon(response: &Value) {
+    assert_ne!(response["result"]["isError"], json!(true), "{response}");
+    assert_eq!(
+        response["result"]["structuredContent"],
+        json!({"state":"unavailable","reason":"host_binding"}),
+        "{response}"
+    );
+}
+
+/// After the shared daemon an MCP client is using exits (here, the test's own `SIGTERM`, standing
+/// in for idle shutdown, a crash, or a binary upgrade), the client re-establishes it on the next
+/// call instead of failing every later call, and the repository still ends up with exactly one
+/// live daemon.
+#[tokio::test]
+async fn mcp_client_re_establishes_a_lost_shared_daemon_and_serves_the_next_call() {
+    let candidate = init_repo();
+    let runtime = expected_runtime_path(&candidate);
+    let _guard = DaemonGuard(runtime.clone());
+    let template = write_launcher_template(&candidate);
+
+    let mut mcp = Mcp::start(&template, &candidate).await;
+    wait_for_healthy_locked_daemon(&runtime).await;
+    let generation_before = match doctor_report(&runtime).await.unwrap().status {
+        DoctorStatus::Healthy { daemon_generation } => daemon_generation,
+        DoctorStatus::Unavailable => panic!("daemon must be healthy before the reconnect scenario"),
+    };
+
+    assert_reached_live_daemon(&call_ide_start(&mut mcp, 2, "before").await);
+
+    // The test owns this daemon process and terminates it directly, standing in for a graceful
+    // idle shutdown, a crash, or a binary upgrade while the MCP process itself keeps running.
+    terminate_shared_daemon(&runtime);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if !runtime.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the terminated daemon must remove its own runtime directory");
+
+    // The very next call must reach a live daemon again, not repeat the stale unavailable error.
+    assert_reached_live_daemon(&call_ide_start(&mut mcp, 3, "after").await);
+
+    wait_for_healthy_locked_daemon(&runtime).await;
+    let generation_after = match doctor_report(&runtime).await.unwrap().status {
+        DoctorStatus::Healthy { daemon_generation } => daemon_generation,
+        DoctorStatus::Unavailable => panic!("the re-established daemon must be healthy"),
+    };
+    assert_ne!(
+        generation_after, generation_before,
+        "the re-established daemon must be a fresh generation, not the terminated one"
+    );
+    assert_eq!(
+        lock_holder_count(&runtime),
+        1,
+        "the repository must still end up with exactly one live daemon"
+    );
+
+    mcp.close().await;
+    assert!(runtime.is_dir());
+
+    let _ = std::fs::remove_dir_all(candidate);
+}
+
 /// Accepts every dispatch as unavailable; the lease/idle scenarios below never exercise Assistance
 /// semantics, only the Application-layer lease count and idle-timeout shutdown path.
 struct NoopDispatcher;
