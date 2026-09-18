@@ -127,23 +127,29 @@ struct Detail {
     context_page_fresh: bool,
 }
 
-/// Retained bounded state needed to resume one Context detail cursor from `ide.inspect` (T09B).
+/// Retained bounded state needed to resume one Context or Claude-Diff detail cursor from
+/// `ide.inspect` (T09B, extended to Diff by T13B).
 ///
 /// Unlike [`snapshots::DiffPageState`], no Git re-selection is needed: the complete text was
-/// already composed once by the job (managed read or settled Claude helper evidence), so later
-/// pages are pure byte slices of it. Never serialized into a `PeerReply`.
+/// already composed once by the job (managed read, settled Claude Context evidence, or a settled
+/// Claude Diff capture), so later pages are pure byte slices of it. Never serialized into a
+/// `PeerReply`.
 #[derive(Clone)]
 struct ContextPageState {
-    /// Complete composed text for this Context result (fixed header plus full observed source);
+    /// Complete composed text for this result (fixed header plus full observed source or diff);
     /// every page is a line-bounded UTF-8 slice of this buffer, so pages always join byte-exactly.
     text: String,
     /// Exact byte offset into `text` already handed to a caller.
     delivered: usize,
-    /// `true` when the upstream capture itself already lost bytes (Workspace's own source cap or
-    /// the Claude helper's output budget), independent of this pagination. Carried onto the final
-    /// page's `truncated` field once every captured byte has been paged out, so completing
-    /// pagination is never confused with having recovered bytes that were never captured.
+    /// `true` when the upstream capture itself already lost bytes (Workspace's own source cap, a
+    /// Diff selection budget's own overflow, or the Claude helper's output budget), independent of
+    /// this pagination. Carried onto the final page's `truncated` field once every captured byte
+    /// has been paged out, so completing pagination is never confused with having recovered bytes
+    /// that were never captured.
     source_truncated: bool,
+    /// Result kind rendered onto every page cut from `text`, so a Claude-captured Diff resumes as
+    /// `ResultKind::Diff` and never masquerades as a Context result.
+    kind: ResultKind,
 }
 
 /// Retains one versioned provider delta until a later native post-hook rechecks its exact source.
@@ -490,11 +496,11 @@ impl Shared {
         }
         retained
     }
-    /// Retains or clears the bounded Context pagination state for one same-binding detail
-    /// reference (T09B). Mirrors `set_diff_page`'s fresh-page and continuation-clearing semantics,
-    /// minus its aggregate byte ceiling: a Context page's text is already bounded by the source or
-    /// Claude helper capture limits, so the existing `limits.details` count ledger alone is enough
-    /// to bound retained memory here.
+    /// Retains or clears the bounded Context (or Claude-captured Diff, T13B) pagination state for
+    /// one same-binding detail reference (T09B). Mirrors `set_diff_page`'s fresh-page and
+    /// continuation-clearing semantics, minus its aggregate byte ceiling: this page's text is
+    /// already bounded by the source, Diff selection, or Claude helper capture limits, so the
+    /// existing `limits.details` count ledger alone is enough to bound retained memory here.
     fn set_context_page(&self, reference: &str, page: Option<ContextPageState>) {
         let Ok(mut ledger) = self.ledger.lock() else {
             return;
@@ -505,7 +511,7 @@ impl Shared {
             detail.context_page_fresh = retained;
             if !retained
                 && let PeerReply::Complete {
-                    kind: ResultKind::Context,
+                    kind: ResultKind::Context | ResultKind::Diff,
                     continuation,
                     ..
                 } = &mut detail.reply
@@ -1535,16 +1541,15 @@ fn is_claude_edit_settlement(input: &JobInput) -> bool {
 
 /// Returns whether an operation needs a retained result detail after it completes.
 ///
-/// Stop, Claude Diff, and Claude edit settlement (terminal or successful) return directly to their
-/// waiting caller. A helper-composed Diff has no continuation and therefore no usable retained
-/// detail. Edit settlement deliberately bypasses ordinary detail capacity so a mint failure,
+/// Stop and Claude edit settlement (terminal or successful) return directly to their waiting
+/// caller. Edit settlement deliberately bypasses ordinary detail capacity so a mint failure,
 /// expiry, or stop cannot strand receipt/ticket cleanup behind live result details — and, for a
 /// successful completion, so saturated capacity can never turn a write the foreground helper
-/// already performed into a bare `Capacity` error instead of its settled receipt.
+/// already performed into a bare `Capacity` error instead of its settled receipt. A helper-composed
+/// Diff retains a detail exactly like Context (T13B): its captured text may span several
+/// `ide.inspect` pages, so it needs the same addressable, capacity-bounded slot.
 fn retains_detail(tool: AssistanceTool, input: &JobInput) -> bool {
-    tool != AssistanceTool::Stop
-        && !matches!(input, JobInput::Claude(settled) if settled.operation() == HelperOperation::Diff)
-        && !is_claude_edit_settlement(input)
+    tool != AssistanceTool::Stop && !is_claude_edit_settlement(input)
 }
 
 /// Returns the finite queue ceiling, reserving bounded cleanup headroom for terminal work.
@@ -2561,11 +2566,13 @@ impl<'a> Worker<'a> {
             authority.epoch(),
             text
         );
-        let (delivered, reply) = fit_context_page(&full_text, &job.reference, *truncated)?;
+        let (delivered, reply) =
+            fit_context_page(&full_text, &job.reference, *truncated, ResultKind::Context)?;
         let context_page = (delivered < full_text.len()).then_some(ContextPageState {
             text: full_text,
             delivered,
             source_truncated: *truncated,
+            kind: ResultKind::Context,
         });
         self.shared.set_context_page(&job.reference, context_page);
         Ok((reply, Some(authority), Some(observed)))
@@ -2610,17 +2617,20 @@ impl<'a> Worker<'a> {
             return Err(FailureCode::WorkspaceAuthority);
         }
         self.shared.active(&binding)?;
-        Ok((
-            PeerReply::Complete {
-                kind: ResultKind::Diff,
-                text: text.clone(),
-                detail_ref: None,
-                truncated: *truncated,
-                continuation: false,
-            },
-            Some(authority),
-            None,
-        ))
+        // Mirrors `context_claude` (T09B): the helper already composed the complete bounded Diff
+        // text in one capture, so later `ide.inspect` calls page through it byte-exactly instead of
+        // re-running Git, which the daemon cannot do for Claude at all (T13B).
+        let full_text = text.clone();
+        let (delivered, reply) =
+            fit_context_page(&full_text, &job.reference, *truncated, ResultKind::Diff)?;
+        let context_page = (delivered < full_text.len()).then_some(ContextPageState {
+            text: full_text,
+            delivered,
+            source_truncated: *truncated,
+            kind: ResultKind::Diff,
+        });
+        self.shared.set_context_page(&job.reference, context_page);
+        Ok((reply, Some(authority), None))
     }
 
     /// Locks the daemon's single admission controller for one synchronous accounting call.
@@ -3005,11 +3015,17 @@ impl<'a> Worker<'a> {
                 ledger.feedback.remove(&binding);
             }
         }
-        let (delivered, reply) = fit_context_page(&text, &job.reference, context.truncated)?;
+        let (delivered, reply) = fit_context_page(
+            &text,
+            &job.reference,
+            context.truncated,
+            ResultKind::Context,
+        )?;
         let context_page = (delivered < text.len()).then_some(ContextPageState {
             text,
             delivered,
             source_truncated: context.truncated,
+            kind: ResultKind::Context,
         });
         self.shared.set_context_page(&job.reference, context_page);
         Ok((reply, Some(authority), Some(observed)))
@@ -3924,19 +3940,23 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 }
                 return Ok::<_, FailureCode>(reply);
             }
-            // Staleness is already fully covered above (source bytes and native epoch), unlike
-            // Diff there is no separate working-tree re-check to perform: `source` is always
-            // retained for a Context detail, so the generic `source_matches` check already ran.
+            // Staleness is already fully covered above (source bytes and native epoch). A
+            // Context detail always retains `source`, so the generic `source_matches` check
+            // already ran; a Claude-captured Diff page is a frozen text snapshot with no `source`
+            // and no re-derivable Git cursor (unlike the managed `diff_page` branch above), so
+            // later pages of it need no further working-tree re-check either — exactly like Context.
             let (advanced, next) = fit_context_page(
                 &page.text[page.delivered..],
                 &request.reference,
                 page.source_truncated,
+                page.kind,
             )?;
             let delivered = page.delivered + advanced;
             let next_page = (delivered < page.text.len()).then_some(ContextPageState {
                 text: page.text,
                 delivered,
                 source_truncated: page.source_truncated,
+                kind: page.kind,
             });
             if let Ok(mut ledger) = shared.ledger.lock()
                 && let Some(detail) = ledger.details.get_mut(&request.reference)
@@ -4114,7 +4134,8 @@ fn diagnostics_reserve_known_edit_settlement_time() {
 
 /// Splits the next line-bounded, byte-exact UTF-8 chunk off `remaining` that provably fits the
 /// bounded reply envelope, returning how many bytes of `remaining` it consumed alongside the
-/// rendered [`PeerReply`] (T09B).
+/// rendered [`PeerReply`] (T09B). `kind` is stamped onto the rendered reply unchanged, so the same
+/// fitter serves both a Context result and a Claude-captured Diff result (T13B).
 ///
 /// Mirrors `snapshots::fit_diff_page`'s fitting discipline: the same [`content::fits`] predicate
 /// that gates the real final MCP envelope decides acceptance, so a chunk is never handed out only
@@ -4133,6 +4154,7 @@ fn fit_context_page(
     remaining: &str,
     reference: &str,
     source_truncated: bool,
+    kind: ResultKind,
 ) -> Result<(usize, PeerReply), FailureCode> {
     let mut len = remaining.len();
     loop {
@@ -4148,7 +4170,7 @@ fn fit_context_page(
         };
         let continuation = snapped < remaining.len();
         let reply = PeerReply::Complete {
-            kind: ResultKind::Context,
+            kind,
             text: remaining[..snapped].to_owned(),
             detail_ref: Some(reference.to_owned()),
             truncated: continuation || source_truncated,

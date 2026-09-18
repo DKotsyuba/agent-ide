@@ -50,10 +50,10 @@ compact text as a second response schema.
 5. `ide.diff` before finishing the task, to review the accumulated change.
 6. `ide.inspect` with the returned `detail_ref` whenever a reply is `Pending`
    or reports truncated content. Do not repeat the same call instead. A
-   `Context` reply with `continuation: true` means the file is larger than one
-   reply: call `ide.inspect` with that same `detail_ref` again to get the next
-   chunk, and repeat until a chunk reports `continuation: false`; concatenate
-   the chunks in order for the complete text.
+   `Context` or `Diff` reply with `continuation: true` means the result is
+   larger than one reply: call `ide.inspect` with that same `detail_ref` again
+   to get the next chunk, and repeat until a chunk reports `continuation:
+   false`; concatenate the chunks in order for the complete text.
 7. `ide.stop` at handoff to another actor, or when the task ends, to release
    this binding's activation.
 

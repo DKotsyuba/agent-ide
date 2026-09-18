@@ -103,10 +103,13 @@ same-generation retrieval only. Retrieval launches no second helper and performs
 read. Helper-observed source and diagnostic freshness remain provisional rather than presenting
 unobserved out-of-band changes as current. A later ordinary native Pre/Post pair may consume that
 delta once; delivery advances the binding epoch but does not pretend the daemon re-read source.
-A completed helper Diff has no continuation and is returned directly without retaining an unusable
-second daemon detail. A failed helper finalization retires its transient daemon detail (including a
-failed Start mapping), so repeated inspection returns the same bounded failure without consuming
-the global detail ceiling.
+A completed helper Context or Diff whose composed text does not fit one reply retains that exact
+text as a daemon-side pagination cursor: the reply reports `truncated`/`continuation: true`, and
+each further `ide.inspect` on the same `detail_ref` slices the next chunk from the same capture,
+with no second helper launch and no daemon re-read, until a chunk reports `continuation: false`.
+A failed helper finalization retires its transient daemon detail (including a failed Start
+mapping), so repeated inspection returns the same bounded failure without consuming the global
+detail ceiling.
 
 `stop` is daemon-owned and never launches a helper. It first closes the binding to external calls
 and helper claims. Ready Edit proof captured for that exact generation may still settle its
