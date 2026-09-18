@@ -412,8 +412,9 @@ impl Shared {
             feedback.text.clone()
         };
         // Rendering runs the real shrink loop; keep it off the ledger lock so a large reply never
-        // holds up unrelated bindings.
-        let survives = render_reply(reply.clone())
+        // holds up unrelated bindings. This traces the typed structured value regardless of which
+        // host actually receives the call, so it always renders with the structured envelope (T14B).
+        let survives = render_reply(reply.clone(), content::Envelope::WithStructured)
             .structured_content
             .as_ref()
             .and_then(|value| value.get("text"))
@@ -4146,7 +4147,10 @@ fn fit_context_page(
             truncated: continuation || source_truncated,
             continuation,
         };
-        if content::fits(&reply) {
+        // Same host-unaware conservative sizing as `snapshots::fit_diff_page` (T14B): this daemon
+        // path never learns which MCP host will receive the page, so it stays sized to fit even
+        // alongside the structured JSON copy.
+        if content::fits(&reply, content::Envelope::WithStructured) {
             return Ok((snapped, reply));
         }
         if snapped == 0 {

@@ -212,6 +212,100 @@ fn assert_compact_envelope(reply: &Value) {
     );
 }
 
+/// Asserts the Claude host projection carries no `structuredContent` duplicate (T14B): Claude hands
+/// that field straight to its model in place of `content`, defeating the compact renderer, so the
+/// managed Claude MCP omits it entirely. Returns the sole compact text block for `claude_fields`.
+fn assert_claude_envelope(reply: &Value) -> &str {
+    let result = reply["result"].as_object().expect("tool result object");
+    let content = result["content"].as_array().expect("content array");
+    assert_eq!(content.len(), 1, "{reply}");
+    let text = content[0]["text"].as_str().expect("sole text block");
+    assert!(serde_json::from_str::<Value>(text).is_err(), "{reply}");
+    assert!(
+        result.get("structuredContent").is_none(),
+        "Claude must never receive the structured JSON duplicate: {reply}"
+    );
+    assert_eq!(
+        result.get("isError") == Some(&json!(true)),
+        text.starts_with("error")
+    );
+    text
+}
+
+/// Reconstructs the compact-text facts a Claude-path test needs, mirroring
+/// [`agent_ide::assistance::content`]'s deterministic `render_text` formats (T14B): the server no
+/// longer sends `structuredContent` to Claude, so tests read the same facts the model itself
+/// receives instead of the typed JSON copy. Unset fields are simply absent from the returned
+/// object, matching `serde_json::Value`'s null-on-missing-key indexing.
+fn claude_fields(text: &str) -> Value {
+    /// Returns the bounded token starting at `text`, ending at the first space, `;`, `\n`, `.` or
+    /// the string end; every identifier this parser extracts (`reason`, `code`, `outcome`,
+    /// `detail_ref`, `source_ref`) is itself a single space-free token, so this stops exactly where
+    /// the surrounding sentence resumes.
+    fn token(text: &str) -> &str {
+        let end = text.find([' ', ';', '\n', '.']).unwrap_or(text.len());
+        text[..end].trim()
+    }
+    /// Returns the bounded token immediately following the first occurrence of `marker`, if any.
+    fn after<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
+        text.find(marker)
+            .map(|index| token(&text[index + marker.len()..]))
+    }
+
+    if let Some(rest) = text.strip_prefix("unavailable: ") {
+        return json!({"state":"unavailable","reason":token(rest)});
+    }
+    if let Some(rest) = text.strip_prefix("error: ") {
+        return json!({"state":"error","code":token(rest)});
+    }
+    if let Some(rest) = text.strip_prefix("pending: ") {
+        let helper = rest
+            .strip_prefix(
+                "run exactly this command with Bash in the foreground, with no editing, \
+                 wrapping, or appended arguments:\n",
+            )
+            .and_then(|rest| rest.split('\n').next());
+        return json!({
+            "state":"pending",
+            "detail_ref":after(rest, "detail_ref "),
+            "helper":helper,
+        });
+    }
+    if let Some(rest) = text.strip_prefix("edit: ") {
+        let outcome = token(rest);
+        let source_ref = after(rest, "source_ref ");
+        return json!({
+            "state":"edit",
+            "result":{"outcome":outcome,"source_ref":source_ref},
+        });
+    }
+    for kind in ["activation", "context", "diff", "stop"] {
+        let Some(rest) = text.strip_prefix(&format!("complete {kind}: ")) else {
+            continue;
+        };
+        let continuation = rest.contains("\nOutput is truncated; use ide.inspect");
+        let truncated = continuation || rest.contains("\nOutput is incomplete;");
+        let detail_ref = after(rest, "detail_ref ").or_else(|| after(rest, "source_ref "));
+        let body_end = [
+            "\nNext: use ide.context",
+            "\nOutput is truncated;",
+            "\nOutput is incomplete;",
+            "\nDiagnostics are exactly as reported;",
+            "\nNext: use ide.stop",
+            "\nWorkspace authority is released",
+        ]
+        .into_iter()
+        .filter_map(|marker| rest.find(marker))
+        .min()
+        .unwrap_or(rest.len());
+        return json!({
+            "state":"complete","kind":kind,"text":&rest[..body_end],
+            "truncated":truncated,"continuation":continuation,"detail_ref":detail_ref,
+        });
+    }
+    json!({"text":text})
+}
+
 /// Calls one managed Codex tool using only trusted request metadata for actor and sandbox identity.
 async fn managed_call(
     mcp: &mut Mcp,
@@ -1616,8 +1710,7 @@ impl ProductActor {
             )
             .await;
         self.claude_lifecycle(fixture, "PostToolUse", &call).await;
-        assert_compact_envelope(&reply);
-        reply["result"]["structuredContent"].clone()
+        claude_fields(assert_claude_envelope(&reply))
     }
     /// Runs one native Claude tool's Pre/Post hooks and returns the post hook's stdout.
     ///
@@ -1724,9 +1817,8 @@ impl ProductActor {
             .claude_lifecycle_output(fixture, "PostToolUse", &inspect_call)
             .await;
         assert!(feedback.status.success() && feedback.stderr.is_empty());
-        assert_compact_envelope(&reply);
         (
-            reply["result"]["structuredContent"].clone(),
+            claude_fields(assert_claude_envelope(&reply)),
             feedback.stdout,
         )
     }
@@ -1872,8 +1964,7 @@ async fn managed_claude_call(
     )
     .await;
     assert!(post.status.success() && post.stderr.is_empty());
-    assert!(!reply["result"]["structuredContent"].is_null(), "{reply}");
-    reply["result"]["structuredContent"].clone()
+    claude_fields(assert_claude_envelope(&reply))
 }
 
 /// Executes and settles one pending managed Claude start through the ordinary foreground helper.
@@ -2262,9 +2353,8 @@ async fn managed_claude_root_child_rendezvous_shared_daemon_survives_eof() {
             }}),
         )
         .await;
-    assert_compact_envelope(&unbound);
     assert_eq!(
-        unbound["result"]["structuredContent"],
+        claude_fields(assert_claude_envelope(&unbound)),
         json!({"state":"unavailable","reason":"host_binding"}),
         "{unbound}"
     );
@@ -2302,9 +2392,8 @@ async fn managed_claude_root_child_rendezvous_shared_daemon_survives_eof() {
             }}),
         )
         .await;
-    assert_compact_envelope(&denied);
     assert_eq!(
-        denied["result"]["structuredContent"],
+        claude_fields(assert_claude_envelope(&denied)),
         json!({"state":"unavailable","reason":"host_binding"}),
         "{denied}"
     );
@@ -5143,7 +5232,6 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
     )
     .await;
     assert_eq!(started["kind"], "activation", "{started}");
-    let detail_ref = started["detail_ref"].as_str().unwrap().to_owned();
     let database = rusqlite::Connection::open(fixture.runtime.join("state.sqlite")).unwrap();
     let (operation, actor, outcome, active): (String, String, String, bool) = database
         .query_row(
@@ -5333,10 +5421,12 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
     first
         .claude_lifecycle(&fixture, "PreToolUse", &stale_call)
         .await;
+    // Stop already released the host binding itself, so any detail reference fails the same way
+    // here, before a stale detail lookup is even reached.
     let stale_detail = first
         .mcp
         .exchange(json!({"jsonrpc":"2.0","id":first.next,"method":"tools/call","params":{
-            "name":"ide.inspect","arguments":{"detail_ref":detail_ref},"_meta":{"claudecode/toolUseId":stale_call}}}))
+            "name":"ide.inspect","arguments":{"detail_ref":"post-stop-detail"},"_meta":{"claudecode/toolUseId":stale_call}}}))
         .await;
     first
         .claude_lifecycle(&fixture, "PostToolUse", &stale_call)
@@ -5346,9 +5436,8 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
         json!(true),
         "{stale_detail}"
     );
-    assert_eq!(
-        stale_detail["result"]["structuredContent"],
-        json!({"state":"unavailable","reason":"host_binding"}),
+    assert!(
+        stale_detail["result"].get("structuredContent").is_none(),
         "{stale_detail}"
     );
     assert!(

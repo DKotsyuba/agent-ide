@@ -7,14 +7,30 @@ use super::reply::{
 };
 use crate::changes::edit::{EditOutcome, EditResult};
 
+/// Selects whether a projected [`CallToolResult`] also carries the duplicate typed
+/// `structuredContent` copy alongside the compact `content` text block.
+///
+/// The Codex host reads only `structuredContent`, so its acceptance evidence needs
+/// [`Self::WithStructured`]. The Claude host instead hands `structuredContent` straight to its
+/// model in place of `content`, defeating the compact renderer (T14B); the managed Claude MCP
+/// therefore projects [`Self::TextOnly`], so the model sees only the deterministic compact text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Envelope {
+    /// Omits `structuredContent` entirely; the compact `content` text is the only carrier.
+    TextOnly,
+    /// Carries both the compact `content` text and the complete typed `structuredContent` copy.
+    WithStructured,
+}
+
 /// Renders one validated reply and shrinks only owner text until the final MCP envelope fits.
 ///
-/// The returned result contains exactly one text content block and the complete serialized reply
-/// in `structured_content`. Only [`PeerReply::Error`] sets `is_error`; invalid serialization or a
-/// non-shrinkable oversized result returns `None` without partially emitting identifiers.
-pub(crate) fn render(mut reply: PeerReply) -> Option<CallToolResult> {
+/// The returned result contains exactly one text content block and, when `envelope` is
+/// [`Envelope::WithStructured`], the complete serialized reply in `structured_content`. Only
+/// [`PeerReply::Error`] sets `is_error`; invalid serialization or a non-shrinkable oversized result
+/// returns `None` without partially emitting identifiers.
+pub(crate) fn render(mut reply: PeerReply, envelope: Envelope) -> Option<CallToolResult> {
     loop {
-        let rendered = project(&reply)?;
+        let rendered = project(&reply, envelope)?;
         if call_tool_result_fits(&rendered) {
             return Some(rendered);
         }
@@ -28,15 +44,18 @@ pub(crate) fn render(mut reply: PeerReply) -> Option<CallToolResult> {
 ///
 /// This predicate never shrinks text. Diff pagination uses it to accept only whole-hunk pages that
 /// the facade can later render byte-for-byte without advancing a cursor past omitted content.
-pub(crate) fn fits(reply: &PeerReply) -> bool {
-    project(reply).is_some_and(|rendered| call_tool_result_fits(&rendered))
+pub(crate) fn fits(reply: &PeerReply, envelope: Envelope) -> bool {
+    project(reply, envelope).is_some_and(|rendered| call_tool_result_fits(&rendered))
 }
 
-/// Projects one unchanged reply into compact content plus the complete typed structured value.
+/// Projects one unchanged reply into compact content plus, per `envelope`, the complete typed
+/// structured value.
 ///
-/// Serialization failure returns `None`. The projection performs no I/O, host inspection,
-/// diagnostics inference, or model call, and never places the serialized JSON in `content`.
-fn project(reply: &PeerReply) -> Option<CallToolResult> {
+/// Serialization failure returns `None` regardless of `envelope`, so a value this renderer cannot
+/// faithfully represent never silently drops its structured copy. The projection performs no I/O,
+/// host inspection, diagnostics inference, or model call, and never places the serialized JSON in
+/// `content`.
+fn project(reply: &PeerReply, envelope: Envelope) -> Option<CallToolResult> {
     let structured = serde_json::to_value(reply).ok()?;
     let content = vec![ContentBlock::text(render_text(reply))];
     let mut rendered = if matches!(reply, PeerReply::Error { .. }) {
@@ -44,7 +63,9 @@ fn project(reply: &PeerReply) -> Option<CallToolResult> {
     } else {
         CallToolResult::success(content)
     };
-    rendered.structured_content = Some(structured);
+    if matches!(envelope, Envelope::WithStructured) {
+        rendered.structured_content = Some(structured);
+    }
     rendered.is_error = matches!(reply, PeerReply::Error { .. }).then_some(true);
     Some(rendered)
 }
@@ -124,11 +145,30 @@ fn render_text(reply: &PeerReply) -> String {
         PeerReply::Complete {
             kind: ResultKind::Context,
             text,
+            detail_ref: Some(detail_ref),
+            truncated: true,
+            ..
+        } => format!(
+            "complete context: {text}\nOutput is incomplete; use ide.edit with source_ref \
+             {detail_ref} when available, otherwise use the native editor"
+        ),
+        PeerReply::Complete {
+            kind: ResultKind::Context,
+            text,
             truncated: true,
             ..
         } => format!(
             "complete context: {text}\nOutput is incomplete; use ide.edit when available, \
              otherwise use the native editor"
+        ),
+        PeerReply::Complete {
+            kind: ResultKind::Context,
+            text,
+            detail_ref: Some(detail_ref),
+            ..
+        } => format!(
+            "complete context: {text}\nDiagnostics are exactly as reported; use ide.edit with \
+             source_ref {detail_ref} when available, otherwise use the native editor"
         ),
         PeerReply::Complete {
             kind: ResultKind::Context,
@@ -341,7 +381,7 @@ mod tests {
         ];
         for reply in replies {
             let expected = serde_json::to_value(&reply).unwrap();
-            let rendered = render(reply).unwrap();
+            let rendered = render(reply, Envelope::WithStructured).unwrap();
             let text = text_of(&rendered);
             assert!(!text.starts_with('{') && !text.contains("\"state\""));
             for field in ["reason", "code"] {
@@ -362,10 +402,13 @@ mod tests {
     fn pending_helper_and_reference_are_exact() {
         let helper = "helper --argument='🦀 value'";
         let detail_ref = "exact-detail-reference";
-        let rendered = render(PeerReply::Pending {
-            detail_ref: detail_ref.into(),
-            helper: Some(helper.into()),
-        })
+        let rendered = render(
+            PeerReply::Pending {
+                detail_ref: detail_ref.into(),
+                helper: Some(helper.into()),
+            },
+            Envelope::WithStructured,
+        )
         .unwrap();
         let text = text_of(&rendered);
         assert!(text.contains(helper) && text.contains(detail_ref));
@@ -379,7 +422,7 @@ mod tests {
             code: FailureCode::ResolutionUnverified,
         };
         let expected = serde_json::to_value(&reply).unwrap();
-        let rendered = render(reply).unwrap();
+        let rendered = render(reply, Envelope::WithStructured).unwrap();
         let text = text_of(&rendered);
         assert!(text.contains("resolution_unverified") && text.contains("ide.context"));
         assert!(!text.contains("native"));
@@ -408,7 +451,7 @@ mod tests {
                 diagnostics: EditDiagnostics::Unknown {},
             };
             let expected = serde_json::to_value(&reply).unwrap();
-            let rendered = render(reply).unwrap();
+            let rendered = render(reply, Envelope::WithStructured).unwrap();
             let text = text_of(&rendered);
             assert!(text.starts_with(&format!("edit: {}", outcome.as_str())));
             assert!(text.contains("src/lib.rs"));
@@ -454,7 +497,7 @@ mod tests {
         for (diagnostics, state, next_tool) in cases {
             let reply = successful_edit_reply(diagnostics);
             let expected = serde_json::to_value(&reply).unwrap();
-            let rendered = render(reply).unwrap();
+            let rendered = render(reply, Envelope::WithStructured).unwrap();
             let text = text_of(&rendered);
             assert_eq!(rendered.content.len(), 1);
             assert!(text.contains(state) && text.contains(next_tool));
@@ -464,15 +507,23 @@ mod tests {
     }
 
     /// Keeps exact truncated references in model text and omits unrelated structured field names.
+    ///
+    /// Diff's `detail_ref` is only ever useful for a retained continuation (never for a later
+    /// `ide.edit`, which requires a Context source), so a non-continuation truncated Diff must not
+    /// name it; Context's own `detail_ref` doubling as an `ide.edit` `source_ref` is covered by
+    /// [`context_text_always_carries_its_edit_source_ref`].
     #[test]
     fn compact_text_excludes_json_duplication_and_unneeded_fields() {
-        let rendered = render(PeerReply::Complete {
-            kind: ResultKind::Context,
-            text: "bounded owner evidence".into(),
-            detail_ref: Some("private-live-detail".into()),
-            truncated: true,
-            continuation: false,
-        })
+        let rendered = render(
+            PeerReply::Complete {
+                kind: ResultKind::Diff,
+                text: "bounded owner evidence".into(),
+                detail_ref: Some("private-live-detail".into()),
+                truncated: true,
+                continuation: false,
+            },
+            Envelope::WithStructured,
+        )
         .unwrap();
         let text = text_of(&rendered);
         assert!(text.contains("bounded owner evidence"));
@@ -482,32 +533,67 @@ mod tests {
         }
     }
 
+    /// Closes the T14B gap where a Claude reader, which never sees `structuredContent`, would have
+    /// no way to learn the `source_ref` a later `ide.edit` needs: unlike Diff, Context's
+    /// `detail_ref` names the exact same-binding source an `ide.edit` `source_ref` must match, so
+    /// it belongs in the compact text whenever it is `Some`, truncated or not, continuation or not.
+    #[test]
+    fn context_text_always_carries_its_edit_source_ref() {
+        for (truncated, continuation) in [(false, false), (true, false)] {
+            let rendered = render(
+                PeerReply::Complete {
+                    kind: ResultKind::Context,
+                    text: "owner evidence".into(),
+                    detail_ref: Some("live-source-detail".into()),
+                    truncated,
+                    continuation,
+                },
+                Envelope::WithStructured,
+            )
+            .unwrap();
+            let text = text_of(&rendered);
+            assert!(
+                text.contains("source_ref live-source-detail") && text.contains("ide.edit"),
+                "{text}"
+            );
+        }
+    }
+
     /// Recommends inspection only for a typed retained continuation, never merely for a handle.
     #[test]
     fn incomplete_results_do_not_infer_continuation_from_detail_reference() {
-        let context = render(PeerReply::Complete {
-            kind: ResultKind::Context,
-            text: "partial context".into(),
-            detail_ref: Some("context-detail".into()),
-            truncated: true,
-            continuation: false,
-        })
+        let context = render(
+            PeerReply::Complete {
+                kind: ResultKind::Context,
+                text: "partial context".into(),
+                detail_ref: Some("context-detail".into()),
+                truncated: true,
+                continuation: false,
+            },
+            Envelope::WithStructured,
+        )
         .unwrap();
-        let diff = render(PeerReply::Complete {
-            kind: ResultKind::Diff,
-            text: "partial diff".into(),
-            detail_ref: Some("diff-detail".into()),
-            truncated: true,
-            continuation: false,
-        })
+        let diff = render(
+            PeerReply::Complete {
+                kind: ResultKind::Diff,
+                text: "partial diff".into(),
+                detail_ref: Some("diff-detail".into()),
+                truncated: true,
+                continuation: false,
+            },
+            Envelope::WithStructured,
+        )
         .unwrap();
-        let paged = render(PeerReply::Complete {
-            kind: ResultKind::Diff,
-            text: "paged diff".into(),
-            detail_ref: Some("page-detail".into()),
-            truncated: true,
-            continuation: true,
-        })
+        let paged = render(
+            PeerReply::Complete {
+                kind: ResultKind::Diff,
+                text: "paged diff".into(),
+                detail_ref: Some("page-detail".into()),
+                truncated: true,
+                continuation: true,
+            },
+            Envelope::WithStructured,
+        )
         .unwrap();
         assert!(
             text_of(&context).contains("incomplete") && !text_of(&context).contains("ide.inspect")
@@ -521,10 +607,13 @@ mod tests {
     /// Sends duplicate-edit recovery through the IDE context path with a fresh operation identity.
     #[test]
     fn conflicting_duplicate_requests_context_and_a_new_operation_id() {
-        let rendered = render(PeerReply::Edit {
-            result: edit_result(EditOutcome::ConflictingDuplicate).unwrap(),
-            diagnostics: EditDiagnostics::Unknown {},
-        })
+        let rendered = render(
+            PeerReply::Edit {
+                result: edit_result(EditOutcome::ConflictingDuplicate).unwrap(),
+                diagnostics: EditDiagnostics::Unknown {},
+            },
+            Envelope::WithStructured,
+        )
         .unwrap();
         let text = text_of(&rendered);
         assert!(text.contains("use ide.context") && text.contains("new operation_id"));
@@ -534,18 +623,39 @@ mod tests {
     /// Shrinks only complete owner text on UTF-8 boundaries and measures the final MCP bytes.
     #[test]
     fn utf8_shrinking_fits_the_final_call_tool_result() {
-        let rendered = render(PeerReply::Complete {
-            kind: ResultKind::Context,
-            text: "\0🦀\"\\".repeat(16_000),
-            detail_ref: Some("same-binding-detail".into()),
-            truncated: false,
-            continuation: false,
-        })
+        let rendered = render(
+            PeerReply::Complete {
+                kind: ResultKind::Context,
+                text: "\0🦀\"\\".repeat(16_000),
+                detail_ref: Some("same-binding-detail".into()),
+                truncated: false,
+                continuation: false,
+            },
+            Envelope::WithStructured,
+        )
         .unwrap();
         assert!(call_tool_result_fits(&rendered));
         let structured = rendered.structured_content.as_ref().unwrap();
         assert_eq!(structured["truncated"], true);
         assert!(structured["text"].as_str().unwrap().contains('🦀'));
         assert!(text_of(&rendered).contains('🦀'));
+    }
+
+    /// The Claude host reads `structuredContent` straight into its model in place of `content`
+    /// (T14B); `Envelope::TextOnly` must therefore never populate it, while the compact text stays
+    /// exactly as informative as the `WithStructured` projection of the same reply.
+    #[test]
+    fn text_only_envelope_omits_structured_content() {
+        let reply = PeerReply::Complete {
+            kind: ResultKind::Activation,
+            text: "durable capture true".into(),
+            detail_ref: None,
+            truncated: false,
+            continuation: false,
+        };
+        let rendered = render(reply, Envelope::TextOnly).unwrap();
+        assert_eq!(rendered.structured_content, None);
+        assert_eq!(rendered.content.len(), 1);
+        assert!(text_of(&rendered).contains("durable capture true"));
     }
 }

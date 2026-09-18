@@ -366,7 +366,10 @@ pub(crate) fn fit_diff_page(
                 || candidate.overflow_bytes() > 0,
             continuation: retain_continuation && candidate.detail_cursor().is_some(),
         };
-        if content::fits(&reply) {
+        // The daemon composing this page has no host-kind signal of its own (T14B): only the MCP
+        // facade, at final per-call render time, knows whether the caller is Claude or Codex. This
+        // stays conservative for both hosts, sized to fit even alongside the structured JSON copy.
+        if content::fits(&reply, content::Envelope::WithStructured) {
             return Ok((candidate, reply));
         }
         if max_hunks == 1 {
