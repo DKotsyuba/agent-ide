@@ -327,19 +327,34 @@ pub fn parse_language(value: &str) -> Option<Language> {
 /// parentheses — followed by up to [`PROBLEMS_PAGE_SIZE`] problem lines
 /// `path:line:column severity [code] message`. `next_offset: <offset + page>` is appended
 /// exactly when more problems remain after the page. Empty input, or a filter matching no
-/// configured language, renders the single line `checks disabled`. Every rendered textual field
+/// configured language, renders the single line `checks disabled`. A language absent from the
+/// worktree (T10B: `Unavailable(Disabled)`) contributes no state line and no problems, exactly as
+/// it is omitted from the `<agent-ide>` block; when every matched language is absent this way,
+/// the single line `no supported project detected` renders instead. Every rendered textual field
 /// is stripped of control characters so each problem stays one plain, untrusted line.
 pub fn problems_text(
     snapshots: &[ProblemSnapshot],
     language: Option<Language>,
     offset: u32,
 ) -> String {
-    let selected: Vec<&ProblemSnapshot> = snapshots
+    let matched: Vec<&ProblemSnapshot> = snapshots
         .iter()
         .filter(|snapshot| language.is_none_or(|selected| snapshot.language == selected))
         .collect();
-    if selected.is_empty() {
+    if matched.is_empty() {
         return "checks disabled".to_owned();
+    }
+    let selected: Vec<&ProblemSnapshot> = matched
+        .into_iter()
+        .filter(|snapshot| {
+            !matches!(
+                snapshot.state,
+                CheckState::Unavailable(UnavailableReason::Disabled)
+            )
+        })
+        .collect();
+    if selected.is_empty() {
+        return "no supported project detected".to_owned();
     }
     let mut lines: Vec<String> = Vec::new();
     let mut skipped = offset as usize;
@@ -611,7 +626,6 @@ mod tests {
         assert!(!text.contains("python: checking;"), "{text}");
 
         for (reason, rendered) in [
-            (UnavailableReason::Disabled, "rust: unavailable:disabled"),
             (
                 UnavailableReason::OutsideRoots,
                 "rust: unavailable:outside_roots",
@@ -630,6 +644,37 @@ mod tests {
             let snapshots = [ProblemSnapshot::unavailable(Language::Rust, reason, 1)];
             assert_eq!(problems_text(&snapshots, None, 0), rendered);
         }
+    }
+
+    /// A language absent from the worktree (T10B: `Unavailable(Disabled)`) contributes no state
+    /// line at all; when every matched language is absent this way, the page renders the single
+    /// line `no supported project detected` rather than `checks disabled` (which stays reserved
+    /// for no configured language / no filter match).
+    #[test]
+    fn absent_language_is_omitted_and_all_absent_reports_no_supported_project() {
+        let rust_only = [ProblemSnapshot::unavailable(
+            Language::Rust,
+            UnavailableReason::Disabled,
+            1,
+        )];
+        assert_eq!(
+            problems_text(&rust_only, None, 0),
+            "no supported project detected"
+        );
+
+        let mixed = [
+            ProblemSnapshot::unavailable(Language::Rust, UnavailableReason::Disabled, 1),
+            ready(
+                Language::Python,
+                vec![problem("b.py", 2, 1, Severity::Warning, "python one")],
+            ),
+        ];
+        let text = problems_text(&mixed, None, 0);
+        assert!(!text.contains("rust"), "{text}");
+        assert!(
+            text.contains("python: ready; errors: 0; warnings: 1"),
+            "{text}"
+        );
     }
 
     /// An `unavailable` snapshot carrying a detail appends it in parentheses, stripped of control

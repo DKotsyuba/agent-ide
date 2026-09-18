@@ -12,7 +12,7 @@ pub mod rust;
 
 use std::collections::HashSet;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -55,7 +55,39 @@ impl Language {
             Language::Python => "python",
         }
     }
+
+    /// Reports whether `worktree` looks like a project of this language, per the cheap and
+    /// deterministic presence rule (T10B): a language absent from a worktree is never checked and
+    /// never mentioned. Rust is present iff `<worktree>/Cargo.toml` exists. Python is present iff
+    /// the worktree root has any of `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt`,
+    /// `Pipfile`, `pyrightconfig.json`, or a `.venv`/`venv` directory. This deliberately never
+    /// walks the tree for source files (for example `*.py`): presence is a handful of `stat`
+    /// calls at the worktree root, cheap enough to re-evaluate on every trigger so a worktree that
+    /// later gains a `Cargo.toml` starts being checked on its next trigger.
+    pub fn is_present(self, worktree: &Path) -> bool {
+        match self {
+            Language::Rust => worktree.join("Cargo.toml").exists(),
+            Language::Python => {
+                PYTHON_PRESENCE_FILES
+                    .iter()
+                    .any(|name| worktree.join(name).exists())
+                    || worktree.join(".venv").is_dir()
+                    || worktree.join("venv").is_dir()
+            }
+        }
+    }
 }
+
+/// Root-level marker files whose presence identifies a worktree as a Python project (T10B),
+/// besides a `.venv`/`venv` directory (checked separately since it is a directory, not a file).
+const PYTHON_PRESENCE_FILES: [&str; 6] = [
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "requirements.txt",
+    "Pipfile",
+    "pyrightconfig.json",
+];
 
 /// Severity of one reported problem.
 ///
@@ -71,7 +103,9 @@ pub enum Severity {
 /// Why a language has no check result at all.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum UnavailableReason {
-    /// Project checks are disabled by configuration (no `project_checks` or empty `allowed_roots`).
+    /// Project checks are disabled by configuration (no `project_checks` or empty `allowed_roots`),
+    /// or (T10B) this language is absent from the worktree per [`Language::is_present`]. Every
+    /// renderer treats this reason as nothing rather than a fixed phrase (feed §6, problems §7).
     Disabled,
     /// The worktree's canonical path is not under any configured allowed root.
     OutsideRoots,
@@ -636,5 +670,48 @@ mod tests {
         let text = serde_json::to_string(&unavailable).expect("snapshot serializes");
         let parsed: ProblemSnapshot = serde_json::from_str(&text).expect("snapshot parses");
         assert_eq!(parsed, unavailable);
+    }
+
+    /// Builds a fresh empty scratch directory for presence-detection tests.
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "agent-ide-checks-mod-{}-{name}-{}",
+            std::process::id(),
+            name.len()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir created");
+        dir
+    }
+
+    #[test]
+    fn is_present_rust_requires_cargo_toml_at_the_worktree_root() {
+        let dir = scratch_dir("rust-presence");
+        assert!(!Language::Rust.is_present(&dir));
+        std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+        assert!(Language::Rust.is_present(&dir));
+    }
+
+    #[test]
+    fn is_present_python_accepts_any_marker_file_or_venv_directory() {
+        for marker in PYTHON_PRESENCE_FILES {
+            let dir = scratch_dir(&format!("python-presence-{marker}"));
+            assert!(!Language::Python.is_present(&dir), "{marker}");
+            std::fs::write(dir.join(marker), "").unwrap();
+            assert!(Language::Python.is_present(&dir), "{marker}");
+        }
+        for venv_name in [".venv", "venv"] {
+            let dir = scratch_dir(&format!("python-presence-{venv_name}"));
+            assert!(!Language::Python.is_present(&dir), "{venv_name}");
+            std::fs::create_dir(dir.join(venv_name)).unwrap();
+            assert!(Language::Python.is_present(&dir), "{venv_name}");
+        }
+    }
+
+    #[test]
+    fn is_present_neither_language_on_an_empty_worktree() {
+        let dir = scratch_dir("empty-presence");
+        assert!(!Language::Rust.is_present(&dir));
+        assert!(!Language::Python.is_present(&dir));
     }
 }

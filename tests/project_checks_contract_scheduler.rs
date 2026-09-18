@@ -9,7 +9,7 @@ use agent_ide::checks::{
 };
 use std::collections::VecDeque;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -162,6 +162,26 @@ fn scratch_dir(name: &str) -> PathBuf {
     dir
 }
 
+/// Builds a scratch worktree that is present for `language` (T10B), so tests exercising the
+/// scheduler through `RecordingChecker` are not short-circuited by the presence gate meant for
+/// real per-language checkers.
+fn scratch_worktree(name: &str, language: Language) -> PathBuf {
+    let dir = scratch_dir(name);
+    match language {
+        Language::Rust => std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap(),
+        Language::Python => std::fs::write(dir.join("pyproject.toml"), "").unwrap(),
+    }
+    dir
+}
+
+/// Builds a scratch worktree present for both languages (T10B).
+fn scratch_worktree_both_languages(name: &str) -> PathBuf {
+    let dir = scratch_dir(name);
+    std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+    std::fs::write(dir.join("pyproject.toml"), "").unwrap();
+    dir
+}
+
 /// Advances the paused tokio clock by `step` and yields several times so tasks woken by expired
 /// timers actually get polled before the next assertion.
 ///
@@ -200,7 +220,7 @@ async fn settle(total: Duration, step: Duration) {
 async fn scheduler_burst_of_triggers_debounces_to_one_check() {
     let checker = RecordingChecker::new(Language::Python);
     let cache_root = scratch_dir("burst-cache");
-    let worktree = scratch_dir("burst-worktree");
+    let worktree = scratch_worktree("burst-worktree", Language::Python);
     let scheduler = Scheduler::new(
         vec![Arc::new(checker.clone())],
         Duration::from_millis(50),
@@ -230,7 +250,7 @@ async fn scheduler_burst_of_triggers_debounces_to_one_check() {
 async fn scheduler_trigger_during_running_check_causes_one_extra_run_with_newest_generation() {
     let checker = RecordingChecker::with_delay(Language::Python, Duration::from_millis(200));
     let cache_root = scratch_dir("dirty-cache");
-    let worktree = scratch_dir("dirty-worktree");
+    let worktree = scratch_worktree("dirty-worktree", Language::Python);
     let scheduler = Scheduler::new(
         vec![Arc::new(checker.clone())],
         Duration::from_millis(50),
@@ -297,7 +317,7 @@ async fn scheduler_never_runs_more_than_max_concurrent_checks_across_worktrees_a
     );
 
     let worktrees: Vec<PathBuf> = (0..5)
-        .map(|i| scratch_dir(&format!("fanout-wt-{i}")))
+        .map(|i| scratch_worktree_both_languages(&format!("fanout-wt-{i}")))
         .collect();
     for worktree in &worktrees {
         scheduler.trigger("repo", worktree);
@@ -326,7 +346,7 @@ async fn scheduler_never_runs_more_than_max_concurrent_checks_across_worktrees_a
 async fn scheduler_latest_reflects_previous_snapshot_while_a_newer_check_runs() {
     let checker = RecordingChecker::with_delay(Language::Python, Duration::from_millis(200));
     let cache_root = scratch_dir("latest-cache");
-    let worktree = scratch_dir("latest-worktree");
+    let worktree = scratch_worktree("latest-worktree", Language::Python);
     let scheduler = Scheduler::new(
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),
@@ -373,7 +393,7 @@ async fn scheduler_latest_reflects_previous_snapshot_while_a_newer_check_runs() 
 async fn scheduler_shutdown_cancels_a_long_running_check_promptly() {
     let checker = RecordingChecker::with_delay(Language::Python, Duration::from_secs(3600));
     let cache_root = scratch_dir("shutdown-cache");
-    let worktree = scratch_dir("shutdown-worktree");
+    let worktree = scratch_worktree("shutdown-worktree", Language::Python);
     let scheduler = Scheduler::new(
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),
@@ -412,8 +432,8 @@ async fn scheduler_shutdown_cancels_a_long_running_check_promptly() {
 async fn scheduler_clones_rust_target_from_sibling_worktree_of_the_same_repository() {
     let checker = RecordingChecker::new(Language::Rust);
     let cache_root = scratch_dir("clone-cache");
-    let worktree_a = scratch_dir("clone-worktree-a");
-    let worktree_b = scratch_dir("clone-worktree-b");
+    let worktree_a = scratch_worktree("clone-worktree-a", Language::Rust);
+    let worktree_b = scratch_worktree("clone-worktree-b", Language::Rust);
     let scheduler = Scheduler::new(
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),
@@ -478,7 +498,7 @@ async fn scheduler_fatal_or_timeout_completion_never_replaces_a_ready_snapshot()
         ],
     );
     let cache_root = scratch_dir("fatal-cache");
-    let worktree = scratch_dir("fatal-worktree");
+    let worktree = scratch_worktree("fatal-worktree", Language::Python);
     let scheduler = Scheduler::new(
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),
@@ -575,7 +595,7 @@ async fn scheduler_enforces_a_cooldown_of_max_debounce_and_previous_duration() {
     let run_duration = Duration::from_millis(150);
     let checker = RecordingChecker::with_delay(Language::Python, run_duration);
     let cache_root = scratch_dir("cooldown-cache");
-    let worktree = scratch_dir("cooldown-worktree");
+    let worktree = scratch_worktree("cooldown-worktree", Language::Python);
     let scheduler = Scheduler::new(vec![Arc::new(checker.clone())], debounce, 2, cache_root);
 
     // Settle just past the expected completion (debounce + 150ms delay), with only a small
@@ -601,4 +621,212 @@ async fn scheduler_enforces_a_cooldown_of_max_debounce_and_previous_duration() {
         2,
         "run 2 should dispatch once the full cooldown has elapsed"
     );
+}
+
+/// A worktree with only a `Cargo.toml`: Rust is checked, Python is never dispatched and reports
+/// `Unavailable(Disabled)` without creating a cache directory (T10B).
+#[tokio::test(start_paused = true)]
+async fn scheduler_rust_only_worktree_checks_rust_and_reports_python_disabled() {
+    let rust_checker = RecordingChecker::new(Language::Rust);
+    let python_checker = RecordingChecker::new(Language::Python);
+    let cache_root = scratch_dir("presence-rust-only-cache");
+    let worktree = scratch_worktree("presence-rust-only-worktree", Language::Rust);
+    let scheduler = Scheduler::new(
+        vec![
+            Arc::new(rust_checker.clone()),
+            Arc::new(python_checker.clone()),
+        ],
+        Duration::from_millis(10),
+        2,
+        cache_root.clone(),
+    );
+
+    scheduler.trigger("repo", &worktree);
+    settle(Duration::from_millis(60), Duration::from_millis(5)).await;
+
+    assert_eq!(
+        rust_checker.calls().len(),
+        1,
+        "rust is present and must run"
+    );
+    assert_eq!(
+        python_checker.calls().len(),
+        0,
+        "python is absent and must never be dispatched"
+    );
+    let latest = scheduler.latest(&worktree);
+    let python_snapshot = latest
+        .iter()
+        .find(|snapshot| snapshot.language == Language::Python)
+        .expect("python still reports a snapshot");
+    assert_eq!(
+        python_snapshot.state,
+        CheckState::Unavailable(UnavailableReason::Disabled)
+    );
+    assert!(
+        !any_entry_named(&cache_root, "python"),
+        "no python cache directory may be created for an absent language"
+    );
+}
+
+/// Reports whether any file or directory named `name` exists anywhere under `root`, walking
+/// exactly two levels deep (the cache layout's repository and worktree segments).
+fn any_entry_named(root: &Path, name: &str) -> bool {
+    let Ok(repo_entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    for repo_entry in repo_entries.flatten() {
+        let Ok(worktree_entries) = std::fs::read_dir(repo_entry.path()) else {
+            continue;
+        };
+        for worktree_entry in worktree_entries.flatten() {
+            if worktree_entry.file_name() == name || worktree_entry.path().join(name).exists() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// A worktree with only a Python marker file: Python is checked, Rust is never dispatched and
+/// reports `Unavailable(Disabled)` (T10B).
+#[tokio::test(start_paused = true)]
+async fn scheduler_python_only_worktree_checks_python_and_reports_rust_disabled() {
+    let rust_checker = RecordingChecker::new(Language::Rust);
+    let python_checker = RecordingChecker::new(Language::Python);
+    let cache_root = scratch_dir("presence-python-only-cache");
+    let worktree = scratch_worktree("presence-python-only-worktree", Language::Python);
+    let scheduler = Scheduler::new(
+        vec![
+            Arc::new(rust_checker.clone()),
+            Arc::new(python_checker.clone()),
+        ],
+        Duration::from_millis(10),
+        2,
+        cache_root,
+    );
+
+    scheduler.trigger("repo", &worktree);
+    settle(Duration::from_millis(60), Duration::from_millis(5)).await;
+
+    assert_eq!(
+        python_checker.calls().len(),
+        1,
+        "python is present and must run"
+    );
+    assert_eq!(
+        rust_checker.calls().len(),
+        0,
+        "rust is absent and must never be dispatched"
+    );
+    let latest = scheduler.latest(&worktree);
+    let rust_snapshot = latest
+        .iter()
+        .find(|snapshot| snapshot.language == Language::Rust)
+        .expect("rust still reports a snapshot");
+    assert_eq!(
+        rust_snapshot.state,
+        CheckState::Unavailable(UnavailableReason::Disabled)
+    );
+}
+
+/// A worktree with both a `Cargo.toml` and a Python marker file: both languages are checked
+/// (T10B).
+#[tokio::test(start_paused = true)]
+async fn scheduler_worktree_with_both_manifests_checks_both_languages() {
+    let rust_checker = RecordingChecker::new(Language::Rust);
+    let python_checker = RecordingChecker::new(Language::Python);
+    let cache_root = scratch_dir("presence-both-cache");
+    let worktree = scratch_worktree_both_languages("presence-both-worktree");
+    let scheduler = Scheduler::new(
+        vec![
+            Arc::new(rust_checker.clone()),
+            Arc::new(python_checker.clone()),
+        ],
+        Duration::from_millis(10),
+        2,
+        cache_root,
+    );
+
+    scheduler.trigger("repo", &worktree);
+    settle(Duration::from_millis(60), Duration::from_millis(5)).await;
+
+    assert_eq!(rust_checker.calls().len(), 1);
+    assert_eq!(python_checker.calls().len(), 1);
+    let latest = scheduler.latest(&worktree);
+    assert!(
+        latest
+            .iter()
+            .all(|snapshot| snapshot.state == CheckState::Ready)
+    );
+}
+
+/// An empty worktree (neither manifest present): neither checker is ever dispatched and both
+/// languages report `Unavailable(Disabled)` (T10B).
+#[tokio::test(start_paused = true)]
+async fn scheduler_empty_worktree_checks_neither_language() {
+    let rust_checker = RecordingChecker::new(Language::Rust);
+    let python_checker = RecordingChecker::new(Language::Python);
+    let cache_root = scratch_dir("presence-empty-cache");
+    let worktree = scratch_dir("presence-empty-worktree");
+    let scheduler = Scheduler::new(
+        vec![
+            Arc::new(rust_checker.clone()),
+            Arc::new(python_checker.clone()),
+        ],
+        Duration::from_millis(10),
+        2,
+        cache_root,
+    );
+
+    scheduler.trigger("repo", &worktree);
+    settle(Duration::from_millis(60), Duration::from_millis(5)).await;
+
+    assert_eq!(rust_checker.calls().len(), 0);
+    assert_eq!(python_checker.calls().len(), 0);
+    let latest = scheduler.latest(&worktree);
+    assert_eq!(latest.len(), 2);
+    assert!(
+        latest
+            .iter()
+            .all(|snapshot| snapshot.state == CheckState::Unavailable(UnavailableReason::Disabled))
+    );
+}
+
+/// A worktree that gains a `Cargo.toml` between two triggers starts being checked on the next
+/// one, without requiring a restart (T10B).
+#[tokio::test(start_paused = true)]
+async fn scheduler_worktree_gaining_cargo_toml_is_checked_on_the_next_trigger() {
+    let rust_checker = RecordingChecker::new(Language::Rust);
+    let cache_root = scratch_dir("presence-late-cache");
+    let worktree = scratch_dir("presence-late-worktree");
+    let scheduler = Scheduler::new(
+        vec![Arc::new(rust_checker.clone())],
+        Duration::from_millis(10),
+        2,
+        cache_root,
+    );
+
+    scheduler.trigger("repo", &worktree);
+    settle(Duration::from_millis(60), Duration::from_millis(5)).await;
+    assert_eq!(
+        rust_checker.calls().len(),
+        0,
+        "rust must not be dispatched before Cargo.toml exists"
+    );
+    assert_eq!(
+        scheduler.latest(&worktree)[0].state,
+        CheckState::Unavailable(UnavailableReason::Disabled)
+    );
+
+    std::fs::write(worktree.join("Cargo.toml"), "[package]\n").unwrap();
+    scheduler.trigger("repo", &worktree);
+    settle(Duration::from_millis(60), Duration::from_millis(5)).await;
+
+    assert_eq!(
+        rust_checker.calls().len(),
+        1,
+        "rust must be dispatched once Cargo.toml appears"
+    );
+    assert_eq!(scheduler.latest(&worktree)[0].state, CheckState::Ready);
 }

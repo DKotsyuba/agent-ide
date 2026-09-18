@@ -366,11 +366,15 @@ impl Inner {
     /// Drives one or more sequential check runs for `(worktree, language)` until no rerun is
     /// pending.
     ///
-    /// Each iteration first waits out any pending EYES-r2 cooldown (see
-    /// [`Inner::cooldown_remaining`]), then prepares the cache directory (cloning Rust's
-    /// `target/` on the worktree's first Rust check when possible), acquires the shared
-    /// concurrency permit, dispatches the configured [`Checker`], reports the completion to the
-    /// optional [`CompletionHook`], stores the resulting snapshot
+    /// Each iteration first re-evaluates [`Language::is_present`] for `worktree` (T10B): an
+    /// absent language spawns no confined process, creates no cache directory, and reports no
+    /// telemetry, it only stores an `Unavailable(Disabled)` snapshot so the feed and `ide.context`
+    /// omit it. Presence is re-checked on every iteration rather than cached, so a worktree that
+    /// gains its manifest between triggers is checked again on the next one. Otherwise, this
+    /// waits out any pending EYES-r2 cooldown (see [`Inner::cooldown_remaining`]), then prepares
+    /// the cache directory (cloning Rust's `target/` on the worktree's first Rust check when
+    /// possible), acquires the shared concurrency permit, dispatches the configured [`Checker`],
+    /// reports the completion to the optional [`CompletionHook`], stores the resulting snapshot
     /// (subject to the generation and Fatal/Timeout guards in [`Inner::store_snapshot`]),
     /// records this completion's timing for the next iteration's cooldown, and records Rust
     /// cache completion for sibling worktrees. If the pair was marked dirty while this run was
@@ -383,6 +387,16 @@ impl Inner {
             if inner.is_shutting_down() {
                 inner.finish_run(&worktree, language, false);
                 return;
+            }
+            if !language.is_present(&worktree) {
+                let generation = inner.current_generation(&worktree);
+                let snapshot =
+                    ProblemSnapshot::unavailable(language, UnavailableReason::Disabled, generation);
+                inner.store_snapshot(&worktree, snapshot);
+                if !inner.finish_run(&worktree, language, true) {
+                    return;
+                }
+                continue;
             }
             let cooldown = inner.cooldown_remaining(&worktree, language);
             if !cooldown.is_zero() {

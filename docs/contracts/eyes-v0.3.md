@@ -165,6 +165,28 @@ access is denied by the OS profile; the check reports whatever cargo reports.
 
 ## 4. Problem snapshot
 
+### Language presence (T10B)
+
+Both languages are configurable, but only the ones actually present in a worktree are ever
+checked or mentioned. Presence is a handful of `stat` calls at the worktree root — cheap and
+deterministic, never a tree walk for source files (for example `*.py`) — and it is re-evaluated
+every time a check would be scheduled (the top of each scheduler run, §5), not cached once per
+worktree: a worktree that gains its manifest between triggers is checked starting on its next
+trigger, no daemon restart required.
+
+- Rust is present iff `<worktree>/Cargo.toml` exists.
+- Python is present iff the worktree root has any of `pyproject.toml`, `setup.py`, `setup.cfg`,
+  `requirements.txt`, `Pipfile`, `pyrightconfig.json`, or a `.venv`/`venv` directory.
+
+An absent language spawns no confined process, creates no cache directory, and records no
+`ProjectCheckCompleted` telemetry (§8); the scheduler stores `Unavailable(Disabled)` for it
+directly, without dispatching the configured [`Checker`]. Every renderer (the `<agent-ide>` block,
+§6, and the `ide.context` problems page, §7) treats `Unavailable(Disabled)` as nothing — omitted
+entirely, not a fixed phrase — so a pure-Python worktree never sees `rust: check failed` and a
+pure-Rust worktree never sees `python: environment not found`. `Unavailable(EnvMissing)` stays
+reserved for a language that *is* present but whose interpreter or environment could not be
+resolved (§4 Python).
+
 ```rust
 pub enum Language { Rust, Python }
 pub enum UnavailableReason { Disabled, OutsideRoots, ToolMissing, EnvMissing, Fatal, Timeout }
@@ -239,7 +261,10 @@ pub struct ProblemSnapshot { pub language: Language, pub state: CheckState,
 - Per `(worktree, language)`: debounce `debounce_ms` after the last trigger; at most one running
   check; a trigger during a run marks it dirty and one more run follows (latest wins). The next run
   for a pair starts no earlier than `max(debounce_ms, previous run duration)` after the previous
-  completion. At most two checks run concurrently across the daemon.
+  completion. At most two checks run concurrently across the daemon. (T10B) Language presence (§4)
+  is the first thing re-evaluated once a debounce fires, before the cooldown wait, cache directory
+  preparation or checker dispatch: an absent language stores `Unavailable(Disabled)` directly and
+  skips the rest of the run, so it spawns no process and creates no cache directory.
 - A new worktree's Rust cache directory, when absent, is first cloned copy-on-write
   (`clonefile`/`cp -c -R`) from the most recently completed sibling worktree of the same repository;
   clone failure falls back to a cold check.
@@ -251,7 +276,8 @@ pub struct ProblemSnapshot { pub language: Language, pub state: CheckState,
 ## 6. The `<agent-ide>` block
 
 Rendered from the latest completed snapshots of the actor's worktree, in fixed language order
-(rust, python), only for configured languages:
+(rust, python), only for configured **and present** (§4) languages — a mixed-stack worktree with
+both a `Cargo.toml` and a `pyproject.toml`:
 
 ```
 <agent-ide>
@@ -263,11 +289,21 @@ rust: 3 errors (+2), 5 warnings | python: environment not found
   `(+N)`/`(-N)` after a count appears only when that count changed since the last block delivered
   to this actor for this worktree. `Unavailable` renders fixed text: `checks disabled`,
   `outside allowed roots`, `tool not found`, `environment not found`, `check failed`,
-  `check timed out`. A language still `Checking` without any completed snapshot is omitted.
+  `check timed out`. A language still `Checking` without any completed snapshot is omitted, and
+  (T10B) so is a language absent from the worktree (`Unavailable(Disabled)`, §4) — it never
+  renders `checks disabled` or any other phrase, it is simply not mentioned. A pure-Python
+  worktree therefore renders `<agent-ide>\npython: 2 errors, 0 warnings\n</agent-ide>` with no
+  `rust:` item at all; when no configured language is present, no block is emitted, the same as
+  when every language is still `Checking`.
 - Total size including tags ≤ 256 UTF-8 bytes; no paths, messages or code.
 - Emission rule: the block is emitted only when the item set without deltas differs from the last
   block delivered to that `(actor binding, worktree)`. The first completed result is emitted once.
-  Identical state is never re-emitted.
+  Identical state is never re-emitted. A language's disappearance from the rendered set is only
+  ever a consequence of an actual state change (it stopped being present, or an admitted worktree
+  went `outside_roots`, etc.) reflected in the stored snapshots — never something the emission or
+  delta logic manufactures on its own account (for example, on a binary upgrade with no change
+  underneath, the daemon restarts and the next block for each actor is simply a fresh first
+  delivery, not a synthetic delta).
 - Delivery: Claude `PostToolUse` / `PostToolUseFailure` hook `additionalContext`, taken from the
   ready cache inside the existing hook deadline. The hook never waits for a check. Marking as
   delivered happens when the hook response is produced (at most once; a lost hook response is not
@@ -289,6 +325,14 @@ detail is never included in the `<agent-ide>` block (§6), which stays within it
 new tool and no new `AssistanceMethod`. The problems kind is answered from the daemon's in-memory
 snapshots for the caller's bound worktree on every host; it is never dispatched to the Claude
 foreground helper and needs no provider.
+
+A language absent from the worktree (T10B: `Unavailable(Disabled)`, §4) contributes no state line
+and no problems at all — omitted exactly as it is from the `<agent-ide>` block, never rendered as
+`rust: unavailable:disabled`. `checks disabled` stays reserved for no configured language at all
+(no `project_checks`/`allowed_roots`) or a `language` filter matching no configured language, as
+before. When every language the request matches is present-but-absent this way (for example a
+pure-Python worktree with no `language` filter, or `language=rust` against a pure-Python
+worktree), the page renders the single line `no supported project detected` instead.
 
 ## 8. Telemetry
 

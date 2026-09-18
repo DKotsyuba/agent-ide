@@ -87,9 +87,12 @@ pub struct FeedState {
 impl FeedState {
     /// Builds the block for `snapshots` and returns it, or `None` when nothing may be emitted.
     ///
-    /// Items render in fixed [`Language`] order (rust, python), skipping `Checking` languages; a
-    /// language absent from `snapshots` is treated like `Checking`, and the last snapshot of a
-    /// language wins. When the item set without deltas equals the last block delivered for `key`,
+    /// Items render in fixed [`Language`] order (rust, python), skipping `Checking` languages and
+    /// languages absent from the worktree (T10B: `Unavailable(Disabled)`, rendered as nothing); a
+    /// language absent from `snapshots` is treated the same way, and the last snapshot of a
+    /// language wins. When every configured language is absent, `snapshots` is empty, or every
+    /// item is `Checking`/absent, no block is emitted at all. When the item set without deltas
+    /// equals the last block delivered for `key`,
     /// returns `None` and changes nothing. Otherwise deltas `(+N)`/`(-N)` are inserted after each
     /// count that changed versus the last delivered counts of the same language (a language's
     /// first numeric delivery has no deltas), the items join into the tagged block, and oversized
@@ -205,7 +208,10 @@ impl FeedState {
 /// Builds the rendered items for `snapshots` in fixed [`Language`] order, skipping `Checking`.
 ///
 /// Several snapshots per language are allowed; the last one in `snapshots` wins, matching the
-/// scheduler's latest-completed-wins rule. A language with no snapshot is skipped.
+/// scheduler's latest-completed-wins rule. A language with no snapshot is skipped. A language
+/// absent from the worktree (T10B: `Unavailable(Disabled)`) is skipped exactly like `Checking` —
+/// it renders as nothing rather than a fixed unavailable phrase, so a project that only has one
+/// of the two languages never mentions the other.
 fn build_items(snapshots: &[ProblemSnapshot]) -> Vec<FeedItem> {
     let mut items = Vec::new();
     for language in [Language::Rust, Language::Python] {
@@ -214,6 +220,7 @@ fn build_items(snapshots: &[ProblemSnapshot]) -> Vec<FeedItem> {
         };
         let state = match &snapshot.state {
             CheckState::Checking => continue,
+            CheckState::Unavailable(UnavailableReason::Disabled) => continue,
             CheckState::Ready | CheckState::Partial => ItemState::Counts {
                 errors: snapshot.errors,
                 warnings: snapshot.warnings,
@@ -452,7 +459,6 @@ mod tests {
     #[test]
     fn unavailable_reasons_render_fixed_phrases() {
         let phrases = [
-            (UnavailableReason::Disabled, "checks disabled"),
             (UnavailableReason::OutsideRoots, "outside allowed roots"),
             (UnavailableReason::ToolMissing, "tool not found"),
             (UnavailableReason::EnvMissing, "environment not found"),
@@ -491,6 +497,38 @@ mod tests {
         assert_eq!(
             block,
             "<agent-ide>\npython: 0 errors, 1 warning\n</agent-ide>"
+        );
+    }
+
+    /// A language absent from the worktree (T10B: `Unavailable(Disabled)`) renders as nothing,
+    /// exactly like `Checking`; when every language is absent, no block is emitted at all.
+    #[test]
+    fn absent_language_renders_as_nothing() {
+        let mut state = FeedState::default();
+        let hook = key("hook");
+        assert_eq!(
+            state.next_block(
+                &hook,
+                &[
+                    unavailable(Language::Rust, UnavailableReason::Disabled),
+                    unavailable(Language::Python, UnavailableReason::Disabled)
+                ]
+            ),
+            None,
+            "no supported language present: no block at all"
+        );
+        let block = state
+            .next_block(
+                &hook,
+                &[
+                    unavailable(Language::Rust, UnavailableReason::Disabled),
+                    ready(Language::Python, 2, 0),
+                ],
+            )
+            .expect("the present language still emits");
+        assert_eq!(
+            block, "<agent-ide>\npython: 2 errors, 0 warnings\n</agent-ide>",
+            "the absent rust language is never mentioned"
         );
     }
 
