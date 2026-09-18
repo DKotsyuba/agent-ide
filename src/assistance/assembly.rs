@@ -22,6 +22,7 @@ use crate::app::transport::{
     AssistanceDispatch, AssistanceDispatchReply, AssistanceDispatchUnavailable,
     AssistanceDispatcher, AssistanceMethod,
 };
+use crate::errorlog;
 use crate::telemetry::{CacheState, DiagnosticState, adapters};
 use serde_json::{Value, json};
 use std::{
@@ -74,6 +75,35 @@ pub(crate) fn monotonic_ms() -> u64 {
         .try_into()
         .unwrap_or(u64::MAX)
 }
+/// Logs the specific closed [`BindingUnavailable`](super::host_binding::BindingUnavailable) reason
+/// a host/MCP correlation was refused for (T107), right before it is collapsed into the coarse
+/// `MissingPeer::HostBinding` reply every peer actually sees. `correlation_id` is the opaque
+/// `tool_use_id`/`call_id` the model already holds, logged only as an activation-id detail.
+fn log_binding_unavailable(
+    tool: super::facade::AssistanceTool,
+    host: HostKind,
+    correlation_id: &str,
+    reason: super::host_binding::BindingUnavailable,
+) {
+    let method = match tool {
+        super::facade::AssistanceTool::Start => errorlog::Method::Start,
+        super::facade::AssistanceTool::Context => errorlog::Method::Context,
+        super::facade::AssistanceTool::Diff => errorlog::Method::Diff,
+        super::facade::AssistanceTool::Inspect => errorlog::Method::Inspect,
+        super::facade::AssistanceTool::Stop => errorlog::Method::Stop,
+        super::facade::AssistanceTool::Edit => errorlog::Method::Edit,
+    };
+    errorlog::record(
+        method,
+        errorlog::Outcome::Unavailable,
+        Some(reason.into()),
+        None,
+        Some(host),
+        None,
+        Some(correlation_id),
+    );
+}
+
 /// Reports whether one validated context call names the in-memory `kind: "problems"` feed.
 ///
 /// EYES-r2: such calls are answered entirely from the daemon's in-memory problem source for the
@@ -715,13 +745,32 @@ impl ProductDispatcher {
                     && let Ok(actor) = HelperActor::new(event.actor_id(), event.session_id())
                     && let Ok(mut launches) = self.launches.lock()
                 {
-                    launches.recognize(
+                    let now_ms = monotonic_ms();
+                    if launches.recognize(
                         launch.command(),
                         launch.run_in_background(),
                         call_id,
                         &actor,
-                        monotonic_ms(),
-                    );
+                        now_ms,
+                    ) == super::claude_worker::LaunchRecognition::Ignored
+                        && let Some(reason) = launches.diagnose_ignored(
+                            launch.command(),
+                            launch.run_in_background(),
+                            call_id,
+                            &actor,
+                            now_ms,
+                        )
+                    {
+                        errorlog::record(
+                            errorlog::Method::Hook,
+                            errorlog::Outcome::Refused,
+                            Some(reason),
+                            None,
+                            None,
+                            None,
+                            None,
+                        );
+                    }
                 }
                 let call_id = event.optional_call_id().map(str::to_owned);
                 let failed = event.failed();
@@ -842,6 +891,9 @@ impl ProductDispatcher {
                         }
                     };
                     let BindingStatus::Validated(invocation) = status else {
+                        if let BindingStatus::Unavailable(reason) = status {
+                            log_binding_unavailable(tool, host, method.correlation_id(), reason);
+                        }
                         return None;
                     };
                     if method.method() == AssistanceMethod::Stop && host != HostKind::Claude {

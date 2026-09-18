@@ -224,7 +224,18 @@ fn claim(
         live,
     ) {
         ClaimOutcome::Granted(job) => ClaimReply::Granted(job),
-        ClaimOutcome::Rejected(code) => refuse(code),
+        ClaimOutcome::Rejected(code) => {
+            crate::errorlog::record(
+                crate::errorlog::Method::HelperClaim,
+                crate::errorlog::Outcome::Refused,
+                Some(code.into()),
+                None,
+                None,
+                None,
+                Some(&request.detail_ref),
+            );
+            refuse(code)
+        }
     }
 }
 
