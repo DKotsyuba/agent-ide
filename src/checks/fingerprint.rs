@@ -40,7 +40,12 @@ pub fn git_worktree_fingerprint(worktree: &Path) -> Option<u64> {
     if !worktree.join(".git").exists() {
         return None;
     }
-    let mut child = Command::new("git")
+    // Absolute program path, like every other git call of the daemon; `core.fsmonitor` is forced
+    // off because a repository-configured fsmonitor hook would otherwise run unconfined here.
+    let mut child = Command::new("/usr/bin/git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .args(["-c", "core.fsmonitor=false"])
         .arg("-C")
         .arg(worktree)
         .args([

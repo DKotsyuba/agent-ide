@@ -278,6 +278,12 @@ impl Scheduler {
         }
         for language in self.inner.checkers.keys().copied().collect::<Vec<_>>() {
             let lang = wt.languages.entry(language).or_default();
+            if activation {
+                // An ordinary trigger inside the debounce window clears `activation_armed`; the
+                // dropped baseline keeps the session's first check from being skipped anyway.
+                lang.skip_eligible = false;
+                lang.completed_fingerprint = None;
+            }
             if let Some(previous) = lang.timer_abort.take() {
                 previous.abort();
             }
