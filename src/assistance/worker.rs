@@ -497,6 +497,15 @@ impl Shared {
         }
         retained
     }
+    /// Records that the caller already received the retained page-one reply, so the next
+    /// `ide.inspect` advances instead of re-serving it (T16B).
+    fn mark_context_page_delivered(&self, reference: &str) {
+        if let Ok(mut ledger) = self.ledger.lock()
+            && let Some(detail) = ledger.details.get_mut(reference)
+        {
+            detail.context_page_fresh = false;
+        }
+    }
     /// Retains or clears the bounded Context (or Claude-captured Diff, T13B) pagination state for
     /// one same-binding detail reference (T09B). Mirrors `set_diff_page`'s fresh-page and
     /// continuation-clearing semantics, minus its aggregate byte ceiling: this page's text is
@@ -1980,11 +1989,28 @@ impl<'a> Worker<'a> {
                 }
             );
             let mark_reply = is_context.then(|| reply.clone());
-            if sender.send(reply).is_ok()
-                && let Some(mark_reply) = mark_reply
-            {
-                self.shared
-                    .mark_feedback_inline_delivered(&binding, &job.reference, &mark_reply);
+            let paged = matches!(
+                reply,
+                PeerReply::Complete {
+                    kind: ResultKind::Context | ResultKind::Diff,
+                    continuation: true,
+                    ..
+                }
+            );
+            if sender.send(reply).is_ok() {
+                if let Some(mark_reply) = mark_reply {
+                    self.shared.mark_feedback_inline_delivered(
+                        &binding,
+                        &job.reference,
+                        &mark_reply,
+                    );
+                }
+                if paged {
+                    // Page one just reached the caller through this settlement, so the first
+                    // `ide.inspect` of its `detail_ref` must serve page two, not repeat page one
+                    // (T16B). Only a lost receiver leaves the page undelivered and fresh.
+                    self.shared.mark_context_page_delivered(&job.reference);
+                }
             }
         }
     }

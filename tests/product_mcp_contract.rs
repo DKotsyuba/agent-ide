@@ -5161,6 +5161,14 @@ async fn claude_context_pagination_delivers_a_source_larger_than_the_output_budg
             .call_claude(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
             .await;
         assert_eq!(next["kind"], "context", "{next}");
+        if pages == 2 {
+            // Page one was delivered by the ticket settlement: the first continuation call must
+            // serve the next page, never page one again (T16B).
+            assert_ne!(
+                next["text"], page1["text"],
+                "the first ide.inspect of the worker ref re-served page one"
+            );
+        }
         assert_eq!(
             next["detail_ref"].as_str().unwrap(),
             reference,
