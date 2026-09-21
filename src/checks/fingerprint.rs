@@ -1,6 +1,6 @@
 //! Cheap worktree input fingerprint for the scheduler's skip-unchanged rule (T20B).
 //!
-//! [`git_worktree_fingerprint`] hashes everything `git ls-files` considers part of the worktree
+//! `git_worktree_fingerprint` hashes everything `git ls-files` considers part of the worktree
 //! (tracked plus untracked, non-ignored files): for every listed path it mixes the path bytes,
 //! the file's size and its mtime in nanoseconds into a blake3 digest. A content-identical rewrite
 //! still bumps the mtime and is therefore reported as a change — the fingerprint must be cheap,
@@ -31,7 +31,7 @@ const MISSING_FILE_MARKER: u64 = u64::MAX;
 ///
 /// `None` is returned when `worktree` is not a git checkout (no `.git` entry — a synchronous
 /// check, so the common non-git case never spawns a process), when `git ls-files` fails, or when
-/// it exceeds [`GIT_BUDGET`]. The scheduler treats `None` as "unknown, assume changed" and runs
+/// it exceeds `GIT_BUDGET`. The scheduler treats `None` as "unknown, assume changed" and runs
 /// the check. Spawned with a plain `std::process::Command` because the value must be computable
 /// from a synchronous `Fn` (the scheduler off-threads it); the stdout pipe is drained on a helper
 /// thread so a path list larger than the pipe buffer cannot deadlock the child while this thread

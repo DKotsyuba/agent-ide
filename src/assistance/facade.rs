@@ -187,7 +187,7 @@ pub enum ParameterError {
     /// The object named a field outside the selected method's closed schema.
     ///
     /// Carries the caller-supplied field name only when it passed the conservative
-    /// [`echoable_field`] check; otherwise the refusal omits the name entirely.
+    /// `echoable_field` check; otherwise the refusal omits the name entirely.
     UnknownField(Option<String>),
     /// One named field violated one specific closed rule of the selected method.
     InvalidField {
@@ -253,7 +253,7 @@ impl FieldRule {
 impl ParameterError {
     /// Renders the single-line model-facing refusal naming exactly what to fix (T21B).
     ///
-    /// Only caller field names that passed [`echoable_field`] are echoed back, and no field value
+    /// Only caller field names that passed `echoable_field` are echoed back, and no field value
     /// is ever included, so the text stays safe and bounded under 256 bytes on one line.
     pub fn message(&self, tool: AssistanceTool) -> String {
         match self {
