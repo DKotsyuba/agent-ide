@@ -37,6 +37,17 @@ async fn main() -> ExitCode {
         println!("agent-ide {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
+    match usage_request(&arguments) {
+        Some(UsageRequest::Help) => {
+            print!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Some(UsageRequest::Unknown) => {
+            eprint!("{USAGE}");
+            return ExitCode::from(2);
+        }
+        None => {}
+    }
     // Claude's workspace identity is captured before argument parsing or asynchronous setup and is
     // never accepted from an MCP call, hook payload, or later environment read.
     let claude_project_dir = std::env::var_os("CLAUDE_PROJECT_DIR");
@@ -604,6 +615,64 @@ fn is_version_request(arguments: &[OsString]) -> bool {
         arguments,
         [only] if matches!(only.to_str(), Some("-v" | "-V" | "--version" | "version"))
     )
+}
+
+/// Usage listing printed for `--help`/`-h`/`help` and for a missing or unknown subcommand.
+const USAGE: &str = "\
+usage: agent-ide <command> [args]
+
+commands:
+  mcp --runtime-dir <dir>                 MCP server over an existing daemon
+  mcp --launcher-template <file>          managed Codex MCP server
+  mcp --claude-launcher-template <file>   managed Claude MCP server
+  mcp --auto-launcher-template <file>     managed MCP server, host auto-detected
+  daemon --runtime-dir <dir>              run the repository daemon
+  doctor --runtime-dir <dir>              report daemon health
+  codex-hook --runtime-dir <dir>          Codex native hook
+  claude-hook [--runtime-dir <dir>]       Claude native hook
+  claude-worker --runtime-dir <dir> --attachment <id> --detail-ref <ref>
+                                          Claude foreground helper
+  claude-rendezvous <project-dir>         print the Claude runtime and helper socket paths
+  errors [--repo <path>] [--all] [--summary] [--since <minutes>] [--limit <n>]
+                                          read the error log
+  evidence record|executable ...          launcher evidence fragments
+  launcher check <file>                   validate a launcher configuration
+  telemetry query|export --database <file> [--tag <tag>] [--cursor <n>]
+  -v, --version, version                  print the version
+  -h, --help, help                        print this listing
+";
+
+/// Subcommand names accepted as the first argument; everything else is an unknown subcommand.
+const SUBCOMMANDS: &[&str] = &[
+    "mcp",
+    "daemon",
+    "doctor",
+    "codex-hook",
+    "claude-hook",
+    "claude-worker",
+    "claude-rendezvous",
+    "errors",
+    "evidence",
+    "launcher",
+    "telemetry",
+];
+
+/// How a command line asks for the usage listing instead of a real command.
+#[derive(Debug, Eq, PartialEq)]
+enum UsageRequest {
+    /// `--help`, `-h` or `help`: print the listing to stdout and succeed.
+    Help,
+    /// A missing or unknown subcommand: print the listing to stderr and exit 2.
+    Unknown,
+}
+
+/// Classifies only the first argument; a known subcommand with bad arguments keeps its own error.
+fn usage_request(arguments: &[OsString]) -> Option<UsageRequest> {
+    match arguments.first().map(|first| first.to_str()) {
+        Some(Some("--help" | "-h" | "help")) => Some(UsageRequest::Help),
+        Some(Some(first)) if SUBCOMMANDS.contains(&first) => None,
+        _ => Some(UsageRequest::Unknown),
+    }
 }
 
 /// Rejects unknown, missing, and extra CLI arguments before any filesystem or daemon action.
@@ -2425,4 +2494,25 @@ mod tests {
 
         fs::remove_dir_all(parent).unwrap();
     }
+
+    /// Only a missing or unknown first argument (or an explicit help spelling) asks for usage; a
+    /// known subcommand with bad arguments keeps its own error path.
+    #[test]
+    fn usage_is_requested_only_for_help_and_unknown_subcommands() {
+        let request = |values: &[&str]| usage_request(&args(values).collect::<Vec<_>>());
+        for help in ["--help", "-h", "help"] {
+            assert_eq!(request(&[help]), Some(UsageRequest::Help));
+        }
+        assert_eq!(request(&[]), Some(UsageRequest::Unknown));
+        assert_eq!(request(&["frobnicate"]), Some(UsageRequest::Unknown));
+        assert_eq!(
+            request(&["--runtime-dir", "x"]),
+            Some(UsageRequest::Unknown)
+        );
+        for known in SUBCOMMANDS {
+            assert_eq!(request(&[known]), None, "{known}");
+            assert!(USAGE.contains(known), "usage lacks {known}");
+        }
+    }
+
 }
