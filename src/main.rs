@@ -2971,7 +2971,11 @@ mod tests {
         .unwrap();
         for _ in 0..100 {
             if discover(&root, &identity).is_none() {
-                assert!(!root.join(identity.digest()).exists());
+                // The route directory stays for reuse (T29B-3r); only the record is retired.
+                let leftovers = fs::read_dir(root.join(identity.digest()))
+                    .map(|entries| entries.count())
+                    .unwrap_or(0);
+                assert_eq!(leftovers, 0, "the published record is retired");
                 terminate_owned_daemon(Arc::clone(&child)).await;
                 shared_publisher
                     .lock()
