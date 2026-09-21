@@ -756,8 +756,9 @@ pub async fn submit_inactive_hook(
 
 /// Submits one already host-validated event using only its selected identity and lifecycle fields.
 ///
-/// The serialized observation explicitly names its host contract. Claude session and optional
-/// agent type are retained for isolation evidence; raw hook fields never enter the transport.
+/// The serialized observation explicitly names its host contract. The root session (retained for
+/// both hosts) and Claude's optional agent type are kept for isolation evidence, and the post
+/// phase tool name selects check triggers; raw hook fields never enter the transport.
 pub async fn submit_hook_event(
     runtime_dir: &Path,
     host: &TrustedTransport,

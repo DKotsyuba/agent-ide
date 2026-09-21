@@ -231,7 +231,7 @@ pub struct HookEvent {
     actor_id: String,
     /// Exact tool ID, absent only when the host supplied an uncorrelated batch boundary.
     call_id: Option<String>,
-    /// Claude's required root session identity, including on child events; absent for Codex.
+    /// The host's root session identity, retained for both contracts including on child events.
     session_id: Option<String>,
     /// Claude's optional descriptive subagent type; absent for Codex and parent events.
     agent_type: Option<String>,
@@ -270,7 +270,7 @@ impl HookEvent {
         self.call_id.as_deref()
     }
 
-    /// Returns Claude's exact root session identity, retained even for a subagent event.
+    /// Returns the exact root session identity, retained even for a subagent or child event.
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
     }
@@ -554,6 +554,13 @@ impl HostBindingGuard {
     }
 
     /// Applies the shared bounded binding and replay rules to one direct managed Codex call.
+    ///
+    /// A native catch-all hook observes the pre phase of this same invocation before the MCP call
+    /// arrives, so an exact otherwise-valid buffered pre-observation is permitted and consumed
+    /// here rather than rejected as a replay (T29B). Duplicated pre-events, completed or rejected
+    /// call IDs, and conflicting settling state are still rejected first, and completion is
+    /// recorded exactly as before: the call's own later native post is then an ordinary completed
+    /// replay and stays silent.
     fn validate_managed_codex(
         &mut self,
         candidate: CandidateInvocation,
@@ -563,11 +570,11 @@ impl HostBindingGuard {
         let invocation = (candidate.clone(), channel.clone());
         if candidate.host != HostKind::Codex
             || self.replay_disposition(&candidate, &channel).is_some()
-            || self.pre_observed.contains(&invocation)
             || self.settling.contains_key(&invocation)
         {
             return BindingStatus::Unavailable(BindingUnavailable::Replay);
         }
+        self.pre_observed.remove(&invocation);
         if self.replay_scope_saturated(&candidate, &channel)
             || self.ensure_replay_scope(&candidate, &channel).is_err()
         {
@@ -1196,13 +1203,16 @@ pub fn parse_claude_call_id(meta: &Map<String, Value>) -> Result<String, Binding
     required_identifier(meta, CLAUDE_TOOL_USE_ID)
 }
 
-/// Parses one bounded Codex hook payload while retaining only host, phase, actor, and call ID.
+/// Parses one bounded Codex hook payload while retaining host, phase, actor, root session, and
+/// call ID plus the post-phase tool name.
 ///
-/// Root hooks identify the actor with `session_id`. Native child hooks retain that root session and
-/// additionally provide `agent_id`; the child ID is the actor while the root session is validated
-/// and discarded. A payload with neither identity, an invalid identity, or duplicate known JSON
-/// keys is unavailable. The parser never returns tool input/output, source, cwd, transcript paths,
-/// or unknown fields.
+/// Root hooks identify the actor with `session_id`, which is validated and retained. Native child
+/// hooks retain that root session and additionally provide `agent_id`; the child ID is the actor
+/// while the root session stays attached as isolation context. A payload with neither identity,
+/// an invalid identity, or duplicate known JSON keys is unavailable. A valid bounded `tool_name`
+/// is retained only for the post phases; an invalid name is dropped rather than rejecting the
+/// event. The parser never returns tool input/output, source, cwd, transcript paths, or unknown
+/// fields.
 pub fn parse_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnavailable> {
     if payload.len() > MAX_HOOK_METADATA_BYTES {
         return Err(BindingUnavailable::InvalidMetadata);
@@ -1217,13 +1227,26 @@ pub fn parse_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnavailable>
         "PostToolBatch" => HookPhase::PostBatch,
         _ => return Err(BindingUnavailable::UnsupportedHookPhase),
     };
-    let actor_id = match (payload.agent_id, payload.session_id) {
-        (Some(actor), None) | (None, Some(actor)) => checked_identifier(actor, "hook actor")?,
-        (Some(actor), Some(session)) => {
-            checked_identifier(session, "hook session")?;
-            checked_identifier(actor, "hook actor")?
-        }
-        (None, None) => return Err(BindingUnavailable::MissingField("hook actor")),
+    let session_id = payload
+        .session_id
+        .map(|value| checked_identifier(value, "session_id"))
+        .transpose()?;
+    let agent_id = payload
+        .agent_id
+        .map(|value| checked_identifier(value, "agent_id"))
+        .transpose()?;
+    let actor_id = match agent_id {
+        Some(actor) => actor,
+        None => session_id
+            .clone()
+            .ok_or(BindingUnavailable::MissingField("hook actor"))?,
+    };
+    let tool_name = match phase {
+        HookPhase::Post | HookPhase::PostFailure => payload
+            .tool_name
+            .clone()
+            .and_then(|name| checked_identifier(name, "tool_name").ok()),
+        _ => None,
     };
     Ok(HookEvent {
         host: HostKind::Codex,
@@ -1234,11 +1257,11 @@ pub fn parse_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnavailable>
             (_, Some(value)) => Some(checked_identifier(value, "tool_use_id")?),
             _ => return Err(BindingUnavailable::MissingField("tool_use_id")),
         },
-        session_id: None,
+        session_id,
         agent_type: None,
         launch: None,
         failed: false,
-        tool_name: None,
+        tool_name,
     })
 }
 
@@ -1319,7 +1342,9 @@ pub fn parse_claude_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnava
     })
 }
 
-/// Selects only Codex correlation fields and rejects duplicate known JSON keys while discarding extras.
+/// Selects only Codex correlation fields plus the post-phase tool name, rejects duplicate known
+/// JSON keys, and discards every other host field (cwd, model, permission mode, tool input and
+/// response, transcript path, turn ID, agent type) that real codex-cli payloads carry.
 #[derive(Deserialize)]
 struct CodexHookPayload {
     /// Native lifecycle name, restricted to pre, post, or post-batch after decoding.
@@ -1330,6 +1355,8 @@ struct CodexHookPayload {
     agent_id: Option<String>,
     /// Exact native tool-call identifier, optional only for `PostToolBatch`.
     tool_use_id: Option<String>,
+    /// Native tool name; retained only for the post phases after bounded validation.
+    tool_name: Option<String>,
 }
 
 /// Selects only Claude Code correlation fields while Serde rejects duplicate known keys.
@@ -1584,6 +1611,184 @@ mod tests {
             BindingStatus::Unavailable(BindingUnavailable::MissingPre)
         ));
         guard.stop_binding(started.binding_ref()).unwrap();
+    }
+
+    /// Retains the validated root session and post-phase tool name with the Claude parser's
+    /// bounds, while the actor stays `agent_id.unwrap_or(session_id)`.
+    #[test]
+    fn codex_hooks_retain_root_session_and_post_tool_name_only() {
+        let child = parse_hook_event(
+            br#"{"hook_event_name":"PostToolUse","session_id":"root-session","agent_id":"child-thread","tool_use_id":"call","tool_name":"Bash"}"#,
+        )
+        .expect("test hook is valid");
+        assert_eq!(child.actor_id(), "child-thread");
+        assert_eq!(child.session_id(), Some("root-session"));
+        assert_eq!(child.tool_name(), Some("Bash"));
+        let root = parse_hook_event(
+            br#"{"hook_event_name":"PostToolUseFailure","session_id":"root-session","tool_use_id":"call","tool_name":"apply_patch"}"#,
+        )
+        .expect("test hook is valid");
+        assert_eq!(root.actor_id(), "root-session");
+        assert_eq!(root.session_id(), Some("root-session"));
+        assert_eq!(root.tool_name(), Some("apply_patch"));
+        let pre = parse_hook_event(
+            br#"{"hook_event_name":"PreToolUse","session_id":"root-session","tool_use_id":"call","tool_name":"Bash"}"#,
+        )
+        .expect("test hook is valid");
+        assert_eq!(pre.tool_name(), None);
+        // An over-bound tool name is dropped, never rejected and never truncated.
+        let unnamed = parse_hook_event(
+            json!({"hook_event_name":"PostToolUse","session_id":"root-session","tool_use_id":"call",
+                "tool_name":"x".repeat(MAX_IDENTIFIER_BYTES + 1)})
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("test hook is valid");
+        assert_eq!(unnamed.tool_name(), None);
+        assert!(
+            parse_hook_event(
+                br#"{"hook_event_name":"PostToolUse","session_id":"","tool_use_id":"c"}"#
+            )
+            .is_err()
+        );
+    }
+
+    /// Accepts a full realistic codex-cli 0.155.1 hook payload and retains only selected fields.
+    #[test]
+    fn codex_parser_drops_every_unselected_real_host_field() {
+        let event = parse_hook_event(
+            br#"{"hook_event_name":"PostToolUse","session_id":"0f1croot","tool_use_id":"call-7",
+                "tool_name":"Bash","cwd":"/Users/u/secret-project","model":"gpt-5.3",
+                "permission_mode":"workspace-write","transcript_path":"/Users/u/.codex/t.jsonl",
+                "turn_id":"turn-91","agent_type":"full-access",
+                "tool_input":{"command":"printf secret"},
+                "tool_response":{"exit_code":0,"output":"secret"}}"#,
+        )
+        .expect("realistic payload is valid");
+        assert_eq!(event.host(), HostKind::Codex);
+        assert_eq!(event.phase(), HookPhase::Post);
+        assert_eq!(event.actor_id(), "0f1croot");
+        assert_eq!(event.session_id(), Some("0f1croot"));
+        assert_eq!(event.call_id(), "call-7");
+        assert_eq!(event.tool_name(), Some("Bash"));
+        let debug = format!("{event:?}");
+        for secret in [
+            "secret",
+            "gpt-5.3",
+            "transcript",
+            "turn-91",
+            "workspace-write",
+            "full-access",
+        ] {
+            assert!(!debug.contains(secret), "{debug}");
+        }
+    }
+
+    /// Pins the managed pairing state machine (T29B §4): managed MCP admission consumes its
+    /// paired exact pre-observation and silences its own post, while duplicate pres, completed
+    /// call IDs, conflicting settling state and pre-less native posts stay rejected.
+    #[test]
+    fn managed_codex_admission_consumes_a_paired_pre_and_keeps_rejections() {
+        let mut guard = HostBindingGuard::default();
+        let channel = channel("managed-pair-channel");
+        assert!(matches!(
+            guard.establish_managed_codex_start(
+                codex_candidate("actor-a", "start"),
+                channel.clone()
+            ),
+            BindingStatus::Validated(_)
+        ));
+        // Native pre buffered before the managed call for the same invocation: permitted, consumed.
+        assert!(matches!(
+            guard.observe_hook(
+                codex_hook("PreToolUse", "actor-a", "call-1"),
+                channel.clone()
+            ),
+            BindingStatus::PreObserved
+        ));
+        let BindingStatus::Validated(call) = guard
+            .validate_managed_codex_active(codex_candidate("actor-a", "call-1"), channel.clone())
+        else {
+            panic!("a paired native pre must not reject managed admission");
+        };
+        assert_eq!(call.call_id(), "call-1");
+        // The MCP call's own later native post is an ordinary completed replay: silent.
+        assert!(matches!(
+            guard.observe_hook(
+                codex_hook("PostToolUse", "actor-a", "call-1"),
+                channel.clone()
+            ),
+            BindingStatus::Unavailable(BindingUnavailable::Replay)
+        ));
+        // A duplicated pre-event poisons the invocation permanently, for hooks and admission alike.
+        assert!(matches!(
+            guard.observe_hook(
+                codex_hook("PreToolUse", "actor-a", "call-2"),
+                channel.clone()
+            ),
+            BindingStatus::PreObserved
+        ));
+        assert!(matches!(
+            guard.observe_hook(
+                codex_hook("PreToolUse", "actor-a", "call-2"),
+                channel.clone()
+            ),
+            BindingStatus::Unavailable(BindingUnavailable::Replay)
+        ));
+        assert!(matches!(
+            guard.validate_managed_codex_active(
+                codex_candidate("actor-a", "call-2"),
+                channel.clone()
+            ),
+            BindingStatus::Unavailable(BindingUnavailable::Replay)
+        ));
+        // A call settling through legacy MCP correlation conflicts with managed admission.
+        assert!(matches!(
+            guard.observe_hook(
+                codex_hook("PreToolUse", "actor-a", "call-3"),
+                channel.clone()
+            ),
+            BindingStatus::PreObserved
+        ));
+        assert!(matches!(
+            guard.establish_start(codex_candidate("actor-a", "call-3"), channel.clone()),
+            BindingStatus::Validated(_)
+        ));
+        assert!(matches!(
+            guard.validate_managed_codex_active(
+                codex_candidate("actor-a", "call-3"),
+                channel.clone()
+            ),
+            BindingStatus::Unavailable(BindingUnavailable::Replay)
+        ));
+        // A native post without a matching pre never yields NativeObserved or a settling.
+        assert!(matches!(
+            guard.observe_hook(
+                codex_hook("PostToolUse", "actor-a", "call-4"),
+                channel.clone()
+            ),
+            BindingStatus::Unavailable(BindingUnavailable::Mismatch)
+        ));
+        // Replayed managed admission of a completed call ID stays permanently rejected.
+        assert!(matches!(
+            guard.validate_managed_codex_active(
+                codex_candidate("actor-a", "call-1"),
+                channel.clone()
+            ),
+            BindingStatus::Unavailable(BindingUnavailable::Replay)
+        ));
+        // Native-only pairing for a bound actor still coalesces its own hint: Pre then Post.
+        assert!(matches!(
+            guard.observe_hook(
+                codex_hook("PreToolUse", "actor-a", "call-5"),
+                channel.clone()
+            ),
+            BindingStatus::PreObserved
+        ));
+        assert!(matches!(
+            guard.observe_hook(codex_hook("PostToolUse", "actor-a", "call-5"), channel),
+            BindingStatus::NativeObserved(_)
+        ));
     }
 
     /// Caps pending calls per exact scope so one actor cannot deny a peer in the same channel.
