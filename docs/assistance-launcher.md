@@ -105,9 +105,10 @@ surviving backend or proven warm opaque provider index.
 
 Limits are explicit: 1–64 queued operations, 1–128 retained details, 1–300000 ms per
 operation, and 1–1048576 retained bytes per output stream. There are at most 64 distinct
-attachment mappings, four provider languages per target and two accepted Execution profile
-classes. Duplicate attachment mappings, unknown fields, invalid limits, relative paths,
-malformed executable digests and mismatched profile evidence are rejected.
+attachment mappings, four provider languages per target and eight accepted Execution
+profiles across the two supported profile classes. Duplicate attachment mappings, unknown
+fields, invalid limits, relative paths, malformed executable digests, duplicate profile
+digests, and mismatched profile evidence are rejected.
 
 The fourth provider is the immutable `TypeScriptProviderBundleV1` in
 [TYPESCRIPT-r3](contracts/intelligence-v0.2.md). It accepts only an explicit accepted Node,
@@ -132,6 +133,39 @@ inferred or scanned.
 
 Configuration contains private attachment and evidence values. Diagnostic formatting
 redacts the configuration; it must never be rendered in model-facing tool results.
+
+## Accepting a new Codex sandbox mode
+
+A Codex host is admitted only when its live sandbox state exactly matches an operator-accepted
+profile. A read-only and a workspace-write Codex sandbox are both class `managed`, so several
+profiles of one class may be needed; a target may list up to eight profiles whose digests all
+differ. `permit` succeeds only when some accepted profile of the observed class matches the live
+state's digest exactly — a changed sandbox is refused, never approximated.
+
+When the daemon refuses a profile, it captures the raw observed state once per distinct digest
+under `~/.agent-ide/rejected-profiles/<16-hex>.json` (mode 0600 at creation; the directory is
+created 0700; the 16-capture limit is a soft cap — concurrent daemons can transiently exceed it).
+The capture is skipped silently when the directory is a symlink, is not owned by the current
+user, or carries group/other permission bits; the error-log detail then reads
+`profile_digest_mismatch:managed; capture_skipped:io`. No capture is ever written for an
+observed state that carries any top-level field beyond the four documented
+`codex/sandbox-state-meta` fields (`permissionProfile`, `codexLinuxSandboxExe`, `sandboxCwd`,
+`useLegacyLandlock`): the digest covers unknown fields, so a filtered copy would be useless and
+the raw state is treated as unreviewable — the detail reads `capture_skipped:unknown_fields`.
+Otherwise the detail names the capture stem (`profile_digest_mismatch:managed;
+captured:<16-hex>`). To accept the new
+sandbox mode:
+
+1. Run the host once against this worktree so the daemon observes and refuses its sandbox state.
+2. `agent-ide evidence rejected` — lists each capture as `name class sandbox-cwd mtime`.
+3. Review the file `~/.agent-ide/rejected-profiles/<name>.json`. It is the exact
+   `codex/sandbox-state-meta` envelope the host advertised.
+4. Run a real D03 experiment under that exact state, then mint the profile fragment:
+   `agent-ide evidence record --sandbox-state <file> --profile-id <id> --revision <n>
+   --provider-binary <v> --toolchain <v> --configuration <v> --trust <v> --transport <v>
+   --d03-evidence <id>` (flags in this fixed order).
+5. Append the printed `{record, sandbox_state}` object to the target's `profiles` array and
+   restart the daemon, or validate first with `agent-ide launcher check <config-file>`.
 
 ## Confined project checks (EYES-r2)
 

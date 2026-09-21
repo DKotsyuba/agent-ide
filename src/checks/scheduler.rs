@@ -209,7 +209,7 @@ impl Scheduler {
     }
 
     /// Installs `fingerprint` as the worktree input fingerprint (T20B), replacing the
-    /// git-based [`git_worktree_fingerprint`] default; used by tests to script unchanged and
+    /// git-based `git_worktree_fingerprint` default; used by tests to script unchanged and
     /// changed inputs (`None` = unknown = run).
     ///
     /// Must be called on the freshly built scheduler before it is cloned or triggered.

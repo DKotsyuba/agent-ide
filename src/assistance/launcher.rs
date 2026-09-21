@@ -660,7 +660,8 @@ struct RawTarget {
     cwd_trampoline: Option<AcceptedExecutable>,
     /// At most the two current language profiles; duplicate settings/languages are rejected.
     providers: Vec<ProviderLaunch>,
-    /// Trusted Execution records and exact evidence states, limited to two supported profile classes.
+    /// Trusted Execution records and exact evidence states, at most
+    /// [`crate::execution::MAX_ACCEPTED_PROFILES`] whose digests must all differ (T25B).
     profiles: Vec<AcceptedProfile>,
     /// Explicit policy acceptance for an observed disabled host; false never weakens sandboxing.
     allow_disabled_host: bool,
@@ -825,7 +826,7 @@ impl LauncherConfig {
                 || target.attachment.len() > 128
                 || !absolute(&target.candidate)
                 || target.profiles.is_empty()
-                || target.profiles.len() > 2
+                || target.profiles.len() > crate::execution::MAX_ACCEPTED_PROFILES
                 || target.providers.len() > 4
             {
                 return Err(LauncherError::Rejected);

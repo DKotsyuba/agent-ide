@@ -790,3 +790,258 @@ fn permit_distinguishes_no_template_from_digest_mismatch() {
     // The exact accepted state itself still mints its permit.
     assert!(catalog.permit(&disabled(true)).is_ok());
 }
+
+/// Builds one managed sandbox envelope whose digest follows its effective `network` policy.
+fn managed_value(network: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "permissionProfile":{"type":"managed","file_system":{"roots":["/private/tmp/host/work"]},"network":network},
+        "codexLinuxSandboxExe":null,"sandboxCwd":"file:///private/tmp/host/work","useLegacyLandlock":false
+    })
+}
+
+/// Parses one [`managed_value`] envelope into a validated host sandbox state.
+fn managed_state(network: serde_json::Value) -> HostSandboxState {
+    HostSandboxState::parse(Some(managed_value(network))).unwrap()
+}
+
+/// T25B: several accepted profiles of one class each admit exactly their own state.
+#[test]
+fn catalog_permits_each_accepted_profile_of_one_class() {
+    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence(
+            "managed-readonly",
+            1,
+            &managed_state(false.into()),
+        )
+        .unwrap(),
+        ExecutionProfileTemplate::from_execution_evidence(
+            "managed-write",
+            1,
+            &managed_state("restricted".into()),
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    // Both accepted managed states mint their own permits; neither disturbs the other.
+    assert!(catalog.permit(&managed_state(false.into())).is_ok());
+    assert!(catalog.permit(&managed_state("restricted".into())).is_ok());
+    // A third managed state no accepted template matches is still refused, naming the class.
+    assert!(matches!(
+        catalog.permit(&managed_state(true.into())),
+        Err(RequestError::ExecutionProfileDigestMismatch(
+            ProfileClass::Managed
+        ))
+    ));
+}
+
+/// T25B: digest remains a template's identity and eight stays the total accepted-profile cap.
+#[test]
+fn catalog_rejects_duplicate_digests_and_more_than_eight_profiles() {
+    let template = |network| {
+        ExecutionProfileTemplate::from_execution_evidence(
+            "linear-contract",
+            1,
+            &managed_state(network),
+        )
+        .unwrap()
+    };
+    // An exact duplicate digest is denied even though both templates are well-formed.
+    assert!(
+        ExecutionProfileCatalog::from_execution_evidence(vec![
+            template(false.into()),
+            template(false.into())
+        ])
+        .is_err()
+    );
+    // Nine distinct profiles exceed the catalog's total cap and are denied outright.
+    let networks: Vec<serde_json::Value> = (0..9)
+        .map(|index| serde_json::json!(format!("net-{index}")))
+        .collect();
+    assert!(
+        ExecutionProfileCatalog::from_execution_evidence(
+            networks
+                .iter()
+                .map(|network| template(network.clone()))
+                .collect()
+        )
+        .is_err()
+    );
+    // Eight distinct profiles, mixing classes, are still accepted.
+    let eight: Vec<ExecutionProfileTemplate> = networks[..8]
+        .iter()
+        .map(|network| template(network.clone()))
+        .collect();
+    assert!(ExecutionProfileCatalog::from_execution_evidence(eight).is_ok());
+}
+
+/// Creates one unique empty per-test home directory below the system temporary directory.
+fn rejected_capture_home(tag: &str) -> PathBuf {
+    let home = std::env::temp_dir().join(format!(
+        "agent-ide-rejected-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    home
+}
+
+/// Creates the capture directory below `home` as a real, private (0700) directory.
+fn private_capture_dir(home: &Path) -> PathBuf {
+    let dir = home.join(".agent-ide").join(super::REJECTED_PROFILES_DIR);
+    std::fs::create_dir_all(&dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    dir
+}
+
+/// T25B: a refused profile is captured once, privately, and round-trips to the same digest.
+#[test]
+fn rejected_capture_round_trips_once_and_never_rewrites() {
+    let home = rejected_capture_home("capture");
+    let state_value = managed_value(true.into());
+    let expected = HostSandboxState::parse(Some(state_value.clone()))
+        .unwrap()
+        .profile_digest()
+        .to_hex()
+        .to_string();
+    // The first rejection writes exactly one private file.
+    let super::RejectedCapture::Captured(stem) =
+        super::capture_rejected_profile_in(&home, &state_value)
+    else {
+        panic!("expected a capture");
+    };
+    assert_eq!(stem.len(), 16);
+    assert_eq!(stem, expected[..16]);
+    let path = home
+        .join(".agent-ide")
+        .join(super::REJECTED_PROFILES_DIR)
+        .join(format!("{stem}.json"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    // The capture is the exact envelope `evidence record --sandbox-state` reads.
+    let reparsed = HostSandboxState::parse_json(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(reparsed.profile_digest().to_hex().to_string(), expected);
+    // A second identical rejection never rewrites: the directory still holds one file.
+    assert_eq!(
+        super::capture_rejected_profile_in(&home, &state_value),
+        super::RejectedCapture::Unavailable
+    );
+    assert_eq!(
+        std::fs::read_dir(home.join(".agent-ide").join(super::REJECTED_PROFILES_DIR))
+            .unwrap()
+            .count(),
+        1
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// T25B: the capture directory retains at most sixteen files and skips beyond that silently.
+#[test]
+fn rejected_capture_stops_at_sixteen_files() {
+    let home = rejected_capture_home("cap");
+    let dir = private_capture_dir(&home);
+    for index in 0..15 {
+        std::fs::write(dir.join(format!("{index:016x}.json")), b"{}").unwrap();
+    }
+    // The sixteenth capture succeeds; the seventeenth distinct state is skipped silently.
+    assert!(matches!(
+        super::capture_rejected_profile_in(&home, &managed_value(true.into())),
+        super::RejectedCapture::Captured(_)
+    ));
+    assert_eq!(
+        super::capture_rejected_profile_in(&home, &managed_value("restricted".into())),
+        super::RejectedCapture::Unavailable
+    );
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 16);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// T25B: a symlinked capture directory is never written through; its target stays untouched.
+#[cfg(unix)]
+#[test]
+fn rejected_capture_skips_a_symlinked_directory() {
+    let home = rejected_capture_home("symlink");
+    let real = home.join("real-target");
+    std::fs::create_dir_all(&real).unwrap();
+    let parent = home.join(".agent-ide");
+    std::fs::create_dir_all(&parent).unwrap();
+    std::os::unix::fs::symlink(&real, parent.join(super::REJECTED_PROFILES_DIR)).unwrap();
+    assert_eq!(
+        super::capture_rejected_profile_in(&home, &managed_value(true.into())),
+        super::RejectedCapture::Unavailable
+    );
+    assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// T25B: a capture directory with group or other permission bits is never used.
+#[cfg(unix)]
+#[test]
+fn rejected_capture_skips_a_shared_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = rejected_capture_home("shared");
+    let dir = home.join(".agent-ide").join(super::REJECTED_PROFILES_DIR);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        super::capture_rejected_profile_in(&home, &managed_value(true.into())),
+        super::RejectedCapture::Unavailable
+    );
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// T25B: a state with an unknown top-level field is never written, not even filtered.
+#[test]
+fn rejected_capture_skips_unknown_top_level_fields() {
+    let home = rejected_capture_home("unknown");
+    let dir = private_capture_dir(&home);
+    let mut state = managed_value(true.into());
+    state["session_id"] = serde_json::json!("leaky-host-session");
+    assert_eq!(
+        super::capture_rejected_profile_in(&home, &state),
+        super::RejectedCapture::UnknownFields
+    );
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// T25B: listing admits only bounded, correctly named regular captures, never symlinks.
+#[cfg(unix)]
+#[test]
+fn rejected_listing_admits_only_bounded_regular_captures() {
+    let home = rejected_capture_home("list");
+    let dir = private_capture_dir(&home);
+    // A symlinked entry whose target holds a valid state is ignored.
+    let target = home.join("target.json");
+    std::fs::write(&target, managed_value(true.into()).to_string()).unwrap();
+    std::os::unix::fs::symlink(&target, dir.join("aaaaaaaaaaaaaaaa.json")).unwrap();
+    // An oversized regular file and a wrongly named file are ignored, as is uppercase hex.
+    std::fs::write(dir.join("bbbbbbbbbbbbbbbb.json"), vec![b'x'; 64 * 1024 + 1]).unwrap();
+    std::fs::write(dir.join("not-a-capture.json"), b"{}").unwrap();
+    std::fs::write(dir.join("CCCCCCCCCCCCCCCC.json"), b"{}").unwrap();
+    // One genuine capture survives.
+    std::fs::write(
+        dir.join("0123456789abcdef.json"),
+        managed_value(true.into()).to_string(),
+    )
+    .unwrap();
+    let captures = super::list_rejected_profiles_in(&home);
+    assert_eq!(captures.len(), 1);
+    assert_eq!(captures[0].name, "0123456789abcdef");
+    assert_eq!(captures[0].class, super::ProfileClass::Managed);
+    assert_eq!(captures[0].sandbox_cwd, "file:///private/tmp/host/work");
+    let _ = std::fs::remove_dir_all(&home);
+}

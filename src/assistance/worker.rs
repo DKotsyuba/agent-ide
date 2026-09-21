@@ -2158,14 +2158,25 @@ impl<'a> Worker<'a> {
                 operation.clone(),
             )
             .map_err(|_| FailureCode::SandboxState)?;
-            let request = request
-                .validate_query(query, &policy, &job.target.catalog)
-                .map_err(|error| {
-                    let detail = execution_profile_detail(&error)
+            let request = match request.validate_query(query, &policy, &job.target.catalog) {
+                Ok(request) => request,
+                Err(error) => {
+                    let mut detail = execution_profile_detail(&error)
                         .unwrap_or_else(|| "query_policy".to_owned());
+                    // A refused profile is captured once for operator review (T25B); the capture
+                    // runs off-thread under a hard deadline and its outcome never changes this
+                    // reply.
+                    if matches!(
+                        error,
+                        crate::execution::RequestError::ExecutionProfileNoTemplate(_)
+                            | crate::execution::RequestError::ExecutionProfileDigestMismatch(_)
+                    ) {
+                        detail.push_str(&capture_rejected_state(observed.state().as_json()).await);
+                    }
                     record_execution_profile(errorlog_method(job.tool), &detail);
-                    FailureCode::ExecutionProfile
-                })?;
+                    return Err(FailureCode::ExecutionProfile);
+                }
+            };
             if *job.cancel.borrow() {
                 return Err(FailureCode::Cancelled);
             }
@@ -4319,7 +4330,9 @@ fn validate_read_scope(
 ///
 /// Only closed class and variant names are ever rendered — never paths, sandbox-state JSON,
 /// profile digests, or error strings — and the tag is shared verbatim by the agent-facing
-/// policy text in `content.rs` documentation.
+/// policy text in `content.rs` documentation. The caller may append one bounded
+/// `; captured:<16-hex>` file stem naming a rejected-profile capture (T25B); the prefix the
+/// agent-facing text matches stays unchanged.
 fn execution_profile_detail(error: &crate::execution::RequestError) -> Option<String> {
     use crate::execution::RequestError;
     Some(match error {
@@ -4339,6 +4352,28 @@ fn profile_class_tag(class: crate::execution::ProfileClass) -> &'static str {
     match class {
         crate::execution::ProfileClass::Managed => "managed",
         crate::execution::ProfileClass::Disabled => "disabled",
+    }
+}
+
+/// The hard wall-clock ceiling for one rejected-state capture attempt (T25B).
+const REJECTED_CAPTURE_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Runs one rejected-state capture off the worker thread and returns its error-log suffix (T25B).
+///
+/// The capture blocks on the filesystem, so it runs in `spawn_blocking` under a two-second
+/// timeout; a timeout, panic, or join failure degrades to `; capture_skipped:io` and the refusal
+/// reply is identical in every outcome — only this error-log annotation differs.
+async fn capture_rejected_state(state_json: &serde_json::Value) -> String {
+    let state_json = state_json.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        crate::execution::capture_rejected_profile(&state_json)
+    });
+    match tokio::time::timeout(REJECTED_CAPTURE_DEADLINE, task).await {
+        Ok(Ok(crate::execution::RejectedCapture::Captured(stem))) => format!("; captured:{stem}"),
+        Ok(Ok(crate::execution::RejectedCapture::UnknownFields)) => {
+            "; capture_skipped:unknown_fields".to_owned()
+        }
+        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => "; capture_skipped:io".to_owned(),
     }
 }
 

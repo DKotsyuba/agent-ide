@@ -7,7 +7,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::OsString,
-    io::{self, Read},
+    io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::{Arc, Mutex},
@@ -23,7 +23,7 @@ use tokio::{
 };
 
 use crate::assistance::host_binding::{
-    ActiveBindingUse, ObservedSandboxState, SandboxStateProvenance,
+    ActiveBindingUse, ObservedSandboxState, SANDBOX_STATE_FIELDS, SandboxStateProvenance,
 };
 
 /// Classifies the host permission profile whose complete state accompanies a request.
@@ -50,6 +50,9 @@ pub enum SandboxStateError {
     UnsupportedCwd,
 }
 
+/// Maximum accepted profiles in one catalog across every host profile class (T25B).
+pub const MAX_ACCEPTED_PROFILES: usize = 8;
+
 /// Names the tested host mechanism/profile class that Execution supports across worktrees.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionProfileTemplate {
@@ -59,15 +62,16 @@ pub struct ExecutionProfileTemplate {
     version: u32,
     /// Host profile class covered by this template.
     class: ProfileClass,
-    /// Effective permission/trust value proven by this template, portable across equivalent worktrees.
+    /// Effective permission/trust value proven by this template, portable across equivalent
+    /// worktrees. This digest is the template's identity: two accepted templates never share one.
     profile_digest: blake3::Hash,
 }
 
 /// Holds Execution-owned templates whose real evidence permits physical effects.
 #[derive(Clone, Debug)]
 pub struct ExecutionProfileCatalog {
-    /// Exactly one current tested template per host profile class.
-    templates: BTreeMap<ProfileClass, ExecutionProfileTemplate>,
+    /// Up to [`MAX_ACCEPTED_PROFILES`] tested templates; several may share one class (T25B).
+    templates: BTreeMap<ProfileClass, Vec<ExecutionProfileTemplate>>,
 }
 
 /// Is the durable, Execution-owned record that Application may store without interpreting it.
@@ -376,14 +380,27 @@ impl ExecutionProfileTemplate {
 
 impl ExecutionProfileCatalog {
     /// Builds the catalog from Execution-accepted D03 or disabled-host evidence, not Application policy.
+    ///
+    /// The catalog accepts at most [`MAX_ACCEPTED_PROFILES`] templates, and several templates may
+    /// cover one profile class (T25B): a read-only and a workspace-write managed state can both be
+    /// accepted. A template's identity is its `profile_digest`, so an exact duplicate digest is
+    /// denied exactly as before; admitting it twice would add no tested evidence.
     pub fn from_execution_evidence(
         templates: Vec<ExecutionProfileTemplate>,
     ) -> Result<Self, RequestError> {
-        let mut entries = BTreeMap::new();
+        if templates.len() > MAX_ACCEPTED_PROFILES {
+            return Err(RequestError::ExecutionProfileDenied);
+        }
+        let mut entries: BTreeMap<ProfileClass, Vec<ExecutionProfileTemplate>> = BTreeMap::new();
         for template in templates {
-            if entries.insert(template.class, template).is_some() {
+            if entries
+                .values()
+                .flatten()
+                .any(|accepted| accepted.profile_digest == template.profile_digest)
+            {
                 return Err(RequestError::ExecutionProfileDenied);
             }
+            entries.entry(template.class).or_default().push(template);
         }
         Ok(Self { templates: entries })
     }
@@ -392,12 +409,12 @@ impl ExecutionProfileCatalog {
     ///
     /// `expected` comes from Execution-owned trusted configuration/evidence, never the durable
     /// store or a model request. The caller supplies each current D01-bound state; extra, missing,
-    /// stale, corrupt, duplicate-class, or value-mismatched records are unavailable.
+    /// stale, corrupt, duplicate-digest, or value-mismatched records are unavailable.
     pub fn from_persisted_records(
         records: Vec<(PersistedProfileRecord, HostSandboxState)>,
         expected: &[PersistedProfileRecord],
     ) -> Result<Self, RequestError> {
-        if records.len() != expected.len() {
+        if records.len() != expected.len() || records.len() > MAX_ACCEPTED_PROFILES {
             return Err(RequestError::ExecutionProfileDenied);
         }
         let mut templates = Vec::with_capacity(records.len());
@@ -418,21 +435,223 @@ impl ExecutionProfileCatalog {
         Self::from_execution_evidence(templates)
     }
 
-    /// Mints an Execution-owned permit when the invocation's supported class has real evidence.
+    /// Mints an Execution-owned permit when one accepted template of the observed class matches.
+    ///
+    /// The permit retains exactly the template whose digest equals the live state's digest, so
+    /// every later consumer uses the evidence that actually admitted this invocation (T25B). The
+    /// refusal semantics are unchanged: no template of that class is
+    /// [`RequestError::ExecutionProfileNoTemplate`], and templates of the class that all differ
+    /// are [`RequestError::ExecutionProfileDigestMismatch`].
     fn permit(&self, state: &HostSandboxState) -> Result<ExecutionProfilePermit, RequestError> {
-        let template = self
+        let class_templates = self
             .templates
             .get(&state.class)
-            .cloned()
             .ok_or(RequestError::ExecutionProfileNoTemplate(state.class))?;
-        if template.profile_digest != state.profile_digest() {
-            return Err(RequestError::ExecutionProfileDigestMismatch(state.class));
-        }
+        let template = class_templates
+            .iter()
+            .find(|template| template.profile_digest == state.profile_digest())
+            .cloned()
+            .ok_or(RequestError::ExecutionProfileDigestMismatch(state.class))?;
         Ok(ExecutionProfilePermit {
             template,
             state_digest: blake3::hash(state.json_argument().as_bytes()),
         })
     }
+}
+
+/// Directory below the real `.agent-ide` home holding captured rejected sandbox states (T25B).
+pub const REJECTED_PROFILES_DIR: &str = "rejected-profiles";
+
+/// Soft cap on captured rejected sandbox states retained for operator review (T25B).
+///
+/// There is no locking: concurrent daemons on one machine can transiently exceed this cap. The
+/// check is best-effort housekeeping, never a security boundary.
+const MAX_REJECTED_PROFILES: usize = 16;
+
+/// Maximum captured rejected-state JSON bytes, matching `evidence record --sandbox-state` (T25B).
+const MAX_REJECTED_STATE_BYTES: usize = 64 * 1024;
+
+/// Outcome of one best-effort rejected-state capture attempt (T25B).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RejectedCapture {
+    /// A new private capture file was written; the stem is its 16-hex file name.
+    Captured(String),
+    /// The state carried a top-level field outside the documented envelope; nothing was written.
+    UnknownFields,
+    /// Any other silent skip (unsafe directory, soft cap, existing file, I/O); nothing was written.
+    Unavailable,
+}
+
+/// One captured rejected host sandbox state offered for operator review (T25B).
+#[derive(Clone, Debug)]
+pub struct RejectedProfileCapture {
+    /// 16-hex file-name stem, the first half of the state's profile digest.
+    pub name: String,
+    /// Profile class parsed back from the captured state.
+    pub class: ProfileClass,
+    /// Exact `sandboxCwd` value retained inside the captured state.
+    pub sandbox_cwd: String,
+    /// File modification time, when the filesystem reports one.
+    pub modified: Option<std::time::SystemTime>,
+}
+
+/// Captures one rejected observed sandbox state for operator review; best-effort, never authorizing.
+///
+/// The file holds the exact bounded JSON envelope `agent-ide evidence record --sandbox-state`
+/// reads, written private (mode 0600 at creation, `O_NOFOLLOW`) below the real user home under
+/// [`REJECTED_PROFILES_DIR`]. The directory is created private (0700) at birth and is used only
+/// when `symlink_metadata` confirms a real directory owned by the current uid with no group/other
+/// permission bits; an existing directory is never chmod'ed. A capture is refused with
+/// [`RejectedCapture::UnknownFields`] for any state carrying a top-level field outside the
+/// documented sandbox-state envelope: the profile digest covers unknown fields, so a filtered
+/// copy would be useless and the unfiltered state could carry secrets. An existing capture is
+/// never overwritten and every failure is silent: a capture never changes an admission reply or
+/// becomes an authority input.
+pub fn capture_rejected_profile(state_json: &Value) -> RejectedCapture {
+    let Some(home) = crate::userhome::user_home() else {
+        return RejectedCapture::Unavailable;
+    };
+    capture_rejected_profile_in(&home, state_json)
+}
+
+/// [`capture_rejected_profile`] below an explicit home; the seam exists only for tests.
+pub(crate) fn capture_rejected_profile_in(home: &Path, state_json: &Value) -> RejectedCapture {
+    let Ok(state) = HostSandboxState::parse(Some(state_json.clone())) else {
+        return RejectedCapture::Unavailable;
+    };
+    if !state_json.as_object().is_some_and(|object| {
+        object
+            .keys()
+            .all(|key| SANDBOX_STATE_FIELDS.contains(&key.as_str()))
+    }) {
+        return RejectedCapture::UnknownFields;
+    }
+    let json = state_json.to_string();
+    if json.len() > MAX_REJECTED_STATE_BYTES {
+        return RejectedCapture::Unavailable;
+    }
+    let dir = home.join(".agent-ide").join(REJECTED_PROFILES_DIR);
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    if builder.create(&dir).is_err() {
+        return RejectedCapture::Unavailable;
+    }
+    #[cfg(unix)]
+    if !usable_private_directory(&dir) {
+        return RejectedCapture::Unavailable;
+    }
+    if std::fs::read_dir(&dir).is_ok_and(|entries| entries.count() >= MAX_REJECTED_PROFILES) {
+        return RejectedCapture::Unavailable;
+    }
+    let hex = state.profile_digest().to_hex().to_string();
+    let stem = hex[..16].to_owned();
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let Ok(mut file) = options.open(dir.join(format!("{stem}.json"))) else {
+        return RejectedCapture::Unavailable;
+    };
+    if file.write_all(json.as_bytes()).is_err() {
+        return RejectedCapture::Unavailable;
+    }
+    RejectedCapture::Captured(stem)
+}
+
+/// Reports whether `dir` is a real, privately owned directory fit for captures (T25B).
+///
+/// `symlink_metadata` never follows links, so a symlinked directory fails `is_dir`; a directory
+/// this process does not own, or one readable or writable by group or other, is equally refused.
+#[cfg(unix)]
+fn usable_private_directory(dir: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) => {
+            // SAFETY: `getuid` merely reports the calling thread's real uid.
+            metadata.is_dir()
+                && metadata.uid() == unsafe { libc::getuid() }
+                && metadata.permissions().mode() & 0o077 == 0
+        }
+        Err(_) => false,
+    }
+}
+
+/// Lists the captured rejected sandbox states below the real user home, ordered by name (T25B).
+///
+/// Only strictly well-formed captures are listed: a name of exactly 16 lowercase hex digits plus
+/// `.json`, a regular file of at most 64 KiB opened `O_NOFOLLOW`, and parseable JSON. Symlinks,
+/// special files, oversized or foreign entries are ignored silently, and at most 16 entries are
+/// returned.
+pub fn list_rejected_profiles() -> Vec<RejectedProfileCapture> {
+    let Some(home) = crate::userhome::user_home() else {
+        return Vec::new();
+    };
+    list_rejected_profiles_in(&home)
+}
+
+/// [`list_rejected_profiles`] below an explicit home; the seam exists only for tests.
+pub(crate) fn list_rejected_profiles_in(home: &Path) -> Vec<RejectedProfileCapture> {
+    let Ok(entries) = std::fs::read_dir(home.join(".agent-ide").join(REJECTED_PROFILES_DIR)) else {
+        return Vec::new();
+    };
+    let mut captures = Vec::new();
+    for entry in entries.flatten() {
+        let Some(capture) = parse_rejected_entry(&entry) else {
+            continue;
+        };
+        captures.push(capture);
+    }
+    captures.sort_by(|first, second| first.name.cmp(&second.name));
+    captures.truncate(MAX_REJECTED_PROFILES);
+    captures
+}
+
+/// Reads one directory entry as a well-formed rejected-state capture, or [`None`] to skip it.
+fn parse_rejected_entry(entry: &std::fs::DirEntry) -> Option<RejectedProfileCapture> {
+    let file_name = entry.file_name();
+    let name = file_name.to_str()?.strip_suffix(".json")?;
+    // Capture stems are always the lowercase hex prefix of a profile digest.
+    if name.len() != 16
+        || !name
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+    // Symlink metadata never follows links: symlinks and special files fail `is_file`.
+    let metadata = std::fs::symlink_metadata(entry.path()).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_REJECTED_STATE_BYTES as u64 {
+        return None;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(entry.path()).ok()?;
+    let mut bytes = Vec::new();
+    let mut bounded = file.take(MAX_REJECTED_STATE_BYTES as u64 + 1);
+    bounded.read_to_end(&mut bytes).ok()?;
+    if bytes.len() > MAX_REJECTED_STATE_BYTES {
+        return None;
+    }
+    let state = HostSandboxState::parse_json(std::str::from_utf8(&bytes).ok()?).ok()?;
+    Some(RejectedProfileCapture {
+        name: name.to_owned(),
+        class: state.class(),
+        sandbox_cwd: state.sandbox_cwd().to_owned(),
+        modified: metadata.modified().ok(),
+    })
 }
 
 /// Identifies a host invocation already proven by Assistance's host-binding adapter.
@@ -1258,7 +1477,7 @@ pub enum RequestError {
     ExecutionProfileDenied,
     /// Execution has no accepted template for the observed host profile class (T24B).
     ExecutionProfileNoTemplate(ProfileClass),
-    /// The observed profile digest differs from the accepted template for this class (T24B).
+    /// The observed profile digest differs from every accepted template for this class (T24B).
     ExecutionProfileDigestMismatch(ProfileClass),
     /// The consumed active binding does not match the observed sandbox-state generation.
     BindingMismatch,
