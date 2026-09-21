@@ -790,3 +790,86 @@ fn permit_distinguishes_no_template_from_digest_mismatch() {
     // The exact accepted state itself still mints its permit.
     assert!(catalog.permit(&disabled(true)).is_ok());
 }
+
+/// Builds one managed sandbox envelope whose digest follows its effective `network` policy.
+fn managed_value(network: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "permissionProfile":{"type":"managed","file_system":{"roots":["/private/tmp/host/work"]},"network":network},
+        "codexLinuxSandboxExe":null,"sandboxCwd":"file:///private/tmp/host/work","useLegacyLandlock":false
+    })
+}
+
+/// Parses one [`managed_value`] envelope into a validated host sandbox state.
+fn managed_state(network: serde_json::Value) -> HostSandboxState {
+    HostSandboxState::parse(Some(managed_value(network))).unwrap()
+}
+
+/// T25B: several accepted profiles of one class each admit exactly their own state.
+#[test]
+fn catalog_permits_each_accepted_profile_of_one_class() {
+    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence(
+            "managed-readonly",
+            1,
+            &managed_state(false.into()),
+        )
+        .unwrap(),
+        ExecutionProfileTemplate::from_execution_evidence(
+            "managed-write",
+            1,
+            &managed_state("restricted".into()),
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    // Both accepted managed states mint their own permits; neither disturbs the other.
+    assert!(catalog.permit(&managed_state(false.into())).is_ok());
+    assert!(catalog.permit(&managed_state("restricted".into())).is_ok());
+    // A third managed state no accepted template matches is still refused, naming the class.
+    assert!(matches!(
+        catalog.permit(&managed_state(true.into())),
+        Err(RequestError::ExecutionProfileDigestMismatch(
+            ProfileClass::Managed
+        ))
+    ));
+}
+
+/// T25B: digest remains a template's identity and eight stays the total accepted-profile cap.
+#[test]
+fn catalog_rejects_duplicate_digests_and_more_than_eight_profiles() {
+    let template = |network| {
+        ExecutionProfileTemplate::from_execution_evidence(
+            "linear-contract",
+            1,
+            &managed_state(network),
+        )
+        .unwrap()
+    };
+    // An exact duplicate digest is denied even though both templates are well-formed.
+    assert!(
+        ExecutionProfileCatalog::from_execution_evidence(vec![
+            template(false.into()),
+            template(false.into())
+        ])
+        .is_err()
+    );
+    // Nine distinct profiles exceed the catalog's total cap and are denied outright.
+    let networks: Vec<serde_json::Value> = (0..9)
+        .map(|index| serde_json::json!(format!("net-{index}")))
+        .collect();
+    assert!(
+        ExecutionProfileCatalog::from_execution_evidence(
+            networks
+                .iter()
+                .map(|network| template(network.clone()))
+                .collect()
+        )
+        .is_err()
+    );
+    // Eight distinct profiles, mixing classes, are still accepted.
+    let eight: Vec<ExecutionProfileTemplate> = networks[..8]
+        .iter()
+        .map(|network| template(network.clone()))
+        .collect();
+    assert!(ExecutionProfileCatalog::from_execution_evidence(eight).is_ok());
+}

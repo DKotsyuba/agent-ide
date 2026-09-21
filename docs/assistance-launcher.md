@@ -105,9 +105,10 @@ surviving backend or proven warm opaque provider index.
 
 Limits are explicit: 1–64 queued operations, 1–128 retained details, 1–300000 ms per
 operation, and 1–1048576 retained bytes per output stream. There are at most 64 distinct
-attachment mappings, four provider languages per target and two accepted Execution profile
-classes. Duplicate attachment mappings, unknown fields, invalid limits, relative paths,
-malformed executable digests and mismatched profile evidence are rejected.
+attachment mappings, four provider languages per target and eight accepted Execution
+profiles across the two supported profile classes. Duplicate attachment mappings, unknown
+fields, invalid limits, relative paths, malformed executable digests, duplicate profile
+digests, and mismatched profile evidence are rejected.
 
 The fourth provider is the immutable `TypeScriptProviderBundleV1` in
 [TYPESCRIPT-r3](contracts/intelligence-v0.2.md). It accepts only an explicit accepted Node,

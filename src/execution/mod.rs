@@ -50,6 +50,9 @@ pub enum SandboxStateError {
     UnsupportedCwd,
 }
 
+/// Maximum accepted profiles in one catalog across every host profile class (T25B).
+pub const MAX_ACCEPTED_PROFILES: usize = 8;
+
 /// Names the tested host mechanism/profile class that Execution supports across worktrees.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionProfileTemplate {
@@ -59,15 +62,16 @@ pub struct ExecutionProfileTemplate {
     version: u32,
     /// Host profile class covered by this template.
     class: ProfileClass,
-    /// Effective permission/trust value proven by this template, portable across equivalent worktrees.
+    /// Effective permission/trust value proven by this template, portable across equivalent
+    /// worktrees. This digest is the template's identity: two accepted templates never share one.
     profile_digest: blake3::Hash,
 }
 
 /// Holds Execution-owned templates whose real evidence permits physical effects.
 #[derive(Clone, Debug)]
 pub struct ExecutionProfileCatalog {
-    /// Exactly one current tested template per host profile class.
-    templates: BTreeMap<ProfileClass, ExecutionProfileTemplate>,
+    /// Up to [`MAX_ACCEPTED_PROFILES`] tested templates; several may share one class (T25B).
+    templates: BTreeMap<ProfileClass, Vec<ExecutionProfileTemplate>>,
 }
 
 /// Is the durable, Execution-owned record that Application may store without interpreting it.
@@ -376,14 +380,27 @@ impl ExecutionProfileTemplate {
 
 impl ExecutionProfileCatalog {
     /// Builds the catalog from Execution-accepted D03 or disabled-host evidence, not Application policy.
+    ///
+    /// The catalog accepts at most [`MAX_ACCEPTED_PROFILES`] templates, and several templates may
+    /// cover one profile class (T25B): a read-only and a workspace-write managed state can both be
+    /// accepted. A template's identity is its `profile_digest`, so an exact duplicate digest is
+    /// denied exactly as before; admitting it twice would add no tested evidence.
     pub fn from_execution_evidence(
         templates: Vec<ExecutionProfileTemplate>,
     ) -> Result<Self, RequestError> {
-        let mut entries = BTreeMap::new();
+        if templates.len() > MAX_ACCEPTED_PROFILES {
+            return Err(RequestError::ExecutionProfileDenied);
+        }
+        let mut entries: BTreeMap<ProfileClass, Vec<ExecutionProfileTemplate>> = BTreeMap::new();
         for template in templates {
-            if entries.insert(template.class, template).is_some() {
+            if entries
+                .values()
+                .flatten()
+                .any(|accepted| accepted.profile_digest == template.profile_digest)
+            {
                 return Err(RequestError::ExecutionProfileDenied);
             }
+            entries.entry(template.class).or_default().push(template);
         }
         Ok(Self { templates: entries })
     }
@@ -392,7 +409,7 @@ impl ExecutionProfileCatalog {
     ///
     /// `expected` comes from Execution-owned trusted configuration/evidence, never the durable
     /// store or a model request. The caller supplies each current D01-bound state; extra, missing,
-    /// stale, corrupt, duplicate-class, or value-mismatched records are unavailable.
+    /// stale, corrupt, duplicate-digest, or value-mismatched records are unavailable.
     pub fn from_persisted_records(
         records: Vec<(PersistedProfileRecord, HostSandboxState)>,
         expected: &[PersistedProfileRecord],
@@ -418,16 +435,23 @@ impl ExecutionProfileCatalog {
         Self::from_execution_evidence(templates)
     }
 
-    /// Mints an Execution-owned permit when the invocation's supported class has real evidence.
+    /// Mints an Execution-owned permit when one accepted template of the observed class matches.
+    ///
+    /// The permit retains exactly the template whose digest equals the live state's digest, so
+    /// every later consumer uses the evidence that actually admitted this invocation (T25B). The
+    /// refusal semantics are unchanged: no template of that class is
+    /// [`RequestError::ExecutionProfileNoTemplate`], and templates of the class that all differ
+    /// are [`RequestError::ExecutionProfileDigestMismatch`].
     fn permit(&self, state: &HostSandboxState) -> Result<ExecutionProfilePermit, RequestError> {
-        let template = self
+        let class_templates = self
             .templates
             .get(&state.class)
-            .cloned()
             .ok_or(RequestError::ExecutionProfileNoTemplate(state.class))?;
-        if template.profile_digest != state.profile_digest() {
-            return Err(RequestError::ExecutionProfileDigestMismatch(state.class));
-        }
+        let template = class_templates
+            .iter()
+            .find(|template| template.profile_digest == state.profile_digest())
+            .cloned()
+            .ok_or(RequestError::ExecutionProfileDigestMismatch(state.class))?;
         Ok(ExecutionProfilePermit {
             template,
             state_digest: blake3::hash(state.json_argument().as_bytes()),
@@ -1258,7 +1282,7 @@ pub enum RequestError {
     ExecutionProfileDenied,
     /// Execution has no accepted template for the observed host profile class (T24B).
     ExecutionProfileNoTemplate(ProfileClass),
-    /// The observed profile digest differs from the accepted template for this class (T24B).
+    /// The observed profile digest differs from every accepted template for this class (T24B).
     ExecutionProfileDigestMismatch(ProfileClass),
     /// The consumed active binding does not match the observed sandbox-state generation.
     BindingMismatch,

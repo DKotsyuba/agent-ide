@@ -1215,7 +1215,9 @@ fn inherited_sandbox_cwd_validates_only_for_a_recognized_read_all_profile_with_a
         "sandboxCwd is never rewritten toward the target worktree"
     );
 
-    // A catalog whose access mode differs still refuses the otherwise portable profile.
+    // A catalog whose access mode differs still refuses the otherwise portable profile. The
+    // managed class has a template, so the refusal names the digest mismatch (T24B), not a
+    // missing class template.
     let (invocation, _) = inherited_invocation(&inherited, true);
     let (_, foreign) = inherited_invocation(&worktree(), false);
     assert_eq!(
@@ -1227,7 +1229,7 @@ fn inherited_sandbox_cwd_validates_only_for_a_recognized_read_all_profile_with_a
             &foreign
         )
         .unwrap_err(),
-        RequestError::ExecutionProfileDenied
+        RequestError::ExecutionProfileDigestMismatch(ProfileClass::Managed)
     );
 
     // The added `-C <root> <program>` bytes count against the local argv ceiling.
