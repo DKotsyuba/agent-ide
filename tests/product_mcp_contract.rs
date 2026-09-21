@@ -8,6 +8,9 @@ use std::{
     time::Duration,
 };
 
+use agent_ide::assistance::codex_rendezvous::{
+    CodexRouteIdentity, ManagedCodexPublisher, discover,
+};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -97,6 +100,26 @@ impl Mcp {
         candidate: &Path,
         home: Option<&Path>,
     ) -> Self {
+        Self::start_managed_custom(template, candidate, home, None).await
+    }
+
+    /// Same, with the managed Codex rendezvous root (`AGENT_IDE_CODEX_RENDEZVOUS_ROOT`, the product
+    /// test seam for T29B) redirected into the fixture so route publication is fully observable.
+    async fn start_managed_with_rendezvous(
+        template: &Path,
+        candidate: &Path,
+        rendezvous_root: &Path,
+    ) -> Self {
+        Self::start_managed_custom(template, candidate, None, Some(rendezvous_root)).await
+    }
+
+    /// Starts one managed Codex MCP with optional home and rendezvous-root redirection.
+    async fn start_managed_custom(
+        template: &Path,
+        candidate: &Path,
+        home: Option<&Path>,
+        rendezvous_root: Option<&Path>,
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
         command
             .env("TOKIO_WORKER_THREADS", "1")
@@ -110,6 +133,9 @@ impl Mcp {
             .kill_on_drop(true);
         if let Some(home) = home {
             command.env(agent_ide::userhome::HOME_OVERRIDE_ENV, home);
+        }
+        if let Some(rendezvous_root) = rendezvous_root {
+            command.env("AGENT_IDE_CODEX_RENDEZVOUS_ROOT", rendezvous_root);
         }
         let mut child = command.spawn().unwrap();
         let mut mcp = Self {
@@ -740,6 +766,104 @@ async fn hook(runtime: &Path, phase: &str, field: &str, actor: &str, call: &str)
     assert!(output.stdout.is_empty() && output.stderr.is_empty());
 }
 
+/// Creates one fresh owner-only rendezvous test area directly below `/private/tmp`.
+///
+/// Kept short and outside `std::env::temp_dir()`: fixture Unix-socket paths must stay under
+/// `SUN_LEN`, and the area must never be a real production rendezvous root.
+fn rendezvous_area(tag: &str) -> PathBuf {
+    let base = PathBuf::from(format!(
+        "/private/tmp/.airvb-{tag}-{}-{}",
+        std::process::id(),
+        NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir(&base).unwrap();
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+    base
+}
+
+/// Creates one valid fixture runtime: `0700` directory with an owner-only bound daemon socket.
+///
+/// The listener stays with the caller so a scenario decides whether the socket answers, stalls, or
+/// is already dead (a dropped listener leaves the socket file in place with nothing behind it).
+fn fixture_runtime(base: &Path) -> (PathBuf, tokio::net::UnixListener) {
+    use tokio::net::UnixListener;
+    let runtime_dir = base.join("runtime");
+    std::fs::create_dir(&runtime_dir).unwrap();
+    std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = UnixListener::bind(runtime_dir.join("agent-ide.sock")).unwrap();
+    std::fs::set_permissions(
+        runtime_dir.join("agent-ide.sock"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    (runtime_dir, listener)
+}
+
+/// Starts the real managed Codex hook: no runtime dir, no credential; discovery via the test root.
+fn managed_codex_hook_process(root: &Path, decoy_attachment: Option<&str>) -> Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
+    command.env("TOKIO_WORKER_THREADS", "1");
+    command
+        .args(["codex-hook", "--managed"])
+        .env("AGENT_IDE_CODEX_RENDEZVOUS_ROOT", root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(attachment) = decoy_attachment {
+        command.env("AGENT_IDE_HOST_ATTACHMENT", attachment);
+    } else {
+        command.env_remove("AGENT_IDE_HOST_ATTACHMENT");
+    }
+    command.spawn().unwrap()
+}
+
+/// Sends one payload through the managed hook and returns its bounded process output.
+async fn managed_codex_hook(root: &Path, payload: &Value) -> std::process::Output {
+    let mut child = managed_codex_hook_process(root, None);
+    let mut input = child.stdin.take().unwrap();
+    input
+        .write_all(payload.to_string().as_bytes())
+        .await
+        .unwrap();
+    input.shutdown().await.unwrap();
+    drop(input);
+    tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// Asserts one managed hook run failed open exactly as the contract requires: silent success.
+fn assert_managed_hook_silent(output: &std::process::Output) {
+    assert!(output.status.success());
+    assert!(
+        output.stdout.is_empty() && output.stderr.is_empty(),
+        "managed hook must stay silent: {output:?}"
+    );
+}
+
+/// Calls one managed Codex tool whose trusted metadata carries an explicit root session id.
+async fn managed_root_call(
+    mcp: &mut Mcp,
+    id: usize,
+    actor: &str,
+    root_session: &str,
+    name: &str,
+    arguments: Value,
+    state: &Value,
+) -> Value {
+    let reply = mcp
+        .exchange(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,
+            "arguments":arguments,
+            "_meta":{"threadId":actor,"callId":format!("managed-{actor}-{id}"),
+            "x-codex-turn-metadata":{"session_id":root_session},"codex/sandbox-state-meta":state}}}))
+        .await;
+    assert_compact_envelope(&reply);
+    reply["result"]["structuredContent"].clone()
+}
+
 /// Builds identical model inputs and request/call IDs for actors whose identity differs only in host metadata.
 fn host_call(actor: &str, call: &str, name: &str) -> Value {
     let arguments = if name == "ide.start" {
@@ -1034,6 +1158,223 @@ async fn binary_codex_hook_hung_daemon_deadline_sends_only_selected_fields() {
     );
     drop(listener);
     std::fs::remove_dir_all(runtime).unwrap();
+}
+
+/// The managed hook discovers a published route, submits its published attachment (never the env
+/// credential override), and renders the daemon's feedback — legacy forms are untouched elsewhere.
+#[tokio::test]
+async fn binary_managed_codex_hook_discovers_route_and_renders_feedback() {
+    let base = rendezvous_area("hook-feedback");
+    let root = base.join("rendezvous");
+    let (runtime_dir, listener) = fixture_runtime(&base);
+    let attachment = "a1b2c3d4".repeat(8);
+    let identity = CodexRouteIdentity::new("root-session-1", "actor-1").unwrap();
+    let mut publisher = ManagedCodexPublisher::new(root.clone(), runtime_dir, attachment.clone());
+    publisher.publish(&identity).unwrap();
+    let payload = json!({"hook_event_name":"PostToolUse","session_id":"root-session-1",
+        "agent_id":"actor-1","tool_use_id":"call-1","tool_name":"Bash",
+        "tool_input":{"secret":"must-never-leave-hook"},"cwd":"private-cwd"});
+    // Warm the binary first: cold executable startup must not pollute the measured round trip.
+    // The warm invocation carries no stdin, so it exits silently the moment the payload is absent.
+    let mut warm = managed_codex_hook_process(&root, None);
+    drop(warm.stdin.take());
+    let warm_output = tokio::time::timeout(Duration::from_secs(2), warm.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_managed_hook_silent(&warm_output);
+    // The decoy environment credential must be ignored entirely in managed mode.
+    let started = std::time::Instant::now();
+    let mut child = managed_codex_hook_process(&root, Some(&"f".repeat(64)));
+    let server = async {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let size = stream.read_u32().await.unwrap();
+        let mut body = vec![0; size as usize];
+        stream.read_exact(&mut body).await.unwrap();
+        let request: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            request["opaque_attachment"], attachment,
+            "the published attachment is submitted, never the environment override"
+        );
+        assert_eq!(request["sanitized_observation_json"]["host"], "codex");
+        assert_eq!(request["sanitized_observation_json"]["phase"], "post");
+        assert_eq!(
+            request["sanitized_observation_json"]["session_id"],
+            "root-session-1"
+        );
+        assert_eq!(request["sanitized_observation_json"]["actor_id"], "actor-1");
+        assert_eq!(request["sanitized_observation_json"]["tool_name"], "Bash");
+        assert!(
+            !String::from_utf8_lossy(&body).contains("must-never-leave-hook"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let reply = serde_json::to_vec(&json!({
+            "version": 2,
+            "request_id": request["request_id"],
+            "correlation_id": request["correlation_id"],
+            "opaque_reply_json": {"state":"feedback","text":"one bounded fact"}
+        }))
+        .unwrap();
+        stream.write_u32(reply.len() as u32).await.unwrap();
+        stream.write_all(&reply).await.unwrap();
+    };
+    let output = async {
+        let mut input = child.stdin.take().unwrap();
+        input
+            .write_all(payload.to_string().as_bytes())
+            .await
+            .unwrap();
+        input.shutdown().await.unwrap();
+        drop(input);
+        tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    let (output, ()) = tokio::join!(output, server);
+    assert!(
+        started.elapsed() < HOOK_EXIT_CEILING,
+        "managed feedback round trip exceeded the hook budget, took {:?}",
+        started.elapsed()
+    );
+    assert!(output.status.success() && output.stderr.is_empty());
+    let rendered: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        rendered,
+        json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"one bounded fact"}})
+    );
+    drop(publisher);
+    drop(listener);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+/// Missing, ambiguous, stale, malformed, and unsupported-phase managed routes all stay silent.
+#[tokio::test]
+async fn binary_managed_codex_hook_missing_ambiguous_and_stale_routes_are_silent() {
+    let base = rendezvous_area("hook-silent");
+    let root = base.join("rendezvous");
+    let payload = json!({"hook_event_name":"PostToolUse","session_id":"root-session-1",
+        "agent_id":"actor-1","tool_use_id":"call-1","tool_name":"Bash"});
+
+    // Missing route: nothing was ever published under this root.
+    assert_managed_hook_silent(&managed_codex_hook(&root, &payload).await);
+
+    // Malformed identity: no root session at all in the payload.
+    let identityless =
+        json!({"hook_event_name":"PostToolUse","agent_id":"actor-1","tool_use_id":"call-1"});
+    assert_managed_hook_silent(&managed_codex_hook(&root, &identityless).await);
+
+    // Unsupported phase: managed mode accepts only PreToolUse and PostToolUse.
+    let batch = json!({"hook_event_name":"PostToolBatch","session_id":"root-session-1",
+        "agent_id":"actor-1"});
+    assert_managed_hook_silent(&managed_codex_hook(&root, &batch).await);
+
+    // Ambiguous route: two live publishers for one identity.
+    let (runtime_dir, _listener) = fixture_runtime(&base);
+    let attachment = "a1b2c3d4".repeat(8);
+    let identity = CodexRouteIdentity::new("root-session-1", "actor-1").unwrap();
+    let mut first =
+        ManagedCodexPublisher::new(root.clone(), runtime_dir.clone(), attachment.clone());
+    let mut second = ManagedCodexPublisher::new(root.clone(), runtime_dir.clone(), attachment);
+    first.publish(&identity).unwrap();
+    second.publish(&identity).unwrap();
+    assert_managed_hook_silent(&managed_codex_hook(&root, &payload).await);
+
+    // Stale route: the daemon runtime is gone while the publication stays live.
+    drop(second);
+    std::fs::remove_dir_all(&runtime_dir).unwrap();
+    assert_managed_hook_silent(&managed_codex_hook(&root, &payload).await);
+
+    drop(first);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+/// An oversized managed payload is discarded whole and silently, never parsed or submitted.
+#[tokio::test]
+async fn binary_managed_codex_hook_oversized_stdin_is_silent() {
+    let base = rendezvous_area("hook-oversize");
+    let root = base.join("rendezvous");
+    let mut child = managed_codex_hook_process(&root, None);
+    let mut input = child.stdin.take().unwrap();
+    // Exactly one byte over the 64 KiB ingress bound: the whole payload must be discarded.
+    let oversized = vec![b'x'; 64 * 1024 + 1];
+    input.write_all(&oversized).await.unwrap();
+    input.shutdown().await.unwrap();
+    drop(input);
+    let output = tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_managed_hook_silent(&output);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+/// A live publication whose daemon socket accepts but never answers still exits within the deadline.
+#[tokio::test]
+async fn binary_managed_codex_hook_stalled_daemon_returns_within_deadline() {
+    let base = rendezvous_area("hook-stalled");
+    let root = base.join("rendezvous");
+    let payload = json!({"hook_event_name":"PostToolUse","session_id":"root-session-1",
+        "agent_id":"actor-1","tool_use_id":"call-1","tool_name":"Bash"});
+    // Warm the binary first: cold executable startup must not pollute the measured invocation.
+    // The warm invocation carries no stdin, so it exits silently the moment the payload is absent.
+    let mut warm = managed_codex_hook_process(&root, None);
+    drop(warm.stdin.take());
+    let warm_output = tokio::time::timeout(Duration::from_secs(2), warm.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_managed_hook_silent(&warm_output);
+
+    let (runtime_dir, listener) = fixture_runtime(&base);
+    let identity = CodexRouteIdentity::new("root-session-1", "actor-1").unwrap();
+    let mut publisher = ManagedCodexPublisher::new(root.clone(), runtime_dir, "a1b2c3d4".repeat(8));
+    publisher.publish(&identity).unwrap();
+    let started = std::time::Instant::now();
+    let output = managed_codex_hook(&root, &payload).await;
+    assert_managed_hook_silent(&output);
+    assert!(
+        started.elapsed() < HOOK_EXIT_CEILING,
+        "stalled daemon must return within the hook deadline, took {:?}",
+        started.elapsed()
+    );
+    drop(publisher);
+    drop(listener);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+/// `codex-hooks print` emits only the §6 JSON fragment for the running executable.
+#[tokio::test]
+async fn binary_codex_hooks_print_emits_only_the_managed_fragment() {
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+        .args(["codex-hooks", "print"])
+        .env_remove("AGENT_IDE_CODEX_RENDEZVOUS_ROOT")
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success() && output.stderr.is_empty());
+    let rendered: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let executable = std::fs::canonicalize(env!("CARGO_BIN_EXE_agent-ide")).unwrap();
+    let command = format!("{} codex-hook --managed", shell_quote_for_test(&executable));
+    assert_eq!(
+        rendered,
+        json!({
+            "hooks": {
+                "PreToolUse": [{"matcher": ".*", "hooks": [{
+                    "type": "command", "command": command, "timeout": 1}]}],
+                "PostToolUse": [{"matcher": ".*", "hooks": [{
+                    "type": "command", "command": command, "timeout": 1}]}],
+            }
+        })
+    );
+    // Exactly one line of JSON on stdout and nothing else anywhere.
+    assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 1);
+}
+
+/// Mirrors the product's POSIX-shell single-quoting for the print snapshot assertion.
+fn shell_quote_for_test(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
 /// Proves CLI query follows its returned cursor and read-only query/export report unknown drops.
@@ -2228,6 +2569,121 @@ async fn managed_codex_smoke_and_eof_cleanup() {
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     mcp.close().await;
     assert_eq!(managed_runtime_paths(), before);
+}
+
+/// Managed Codex publishes distinct actor routes on first valid calls and retires them on clean
+/// shutdown, with the record pointing at exactly this MCP process's private runtime (T29B §2).
+#[tokio::test]
+async fn managed_codex_publishes_distinct_actor_routes_and_retires_them_on_shutdown() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let fixture = ProductFixture::new(json!([]));
+    let base = rendezvous_area("publish");
+    let root = base.join("rendezvous");
+    let before = managed_runtime_paths();
+    let mut mcp = Mcp::start_managed_with_rendezvous(&fixture.config, &fixture.root, &root).await;
+    let during = managed_runtime_paths();
+    let mut runtimes = during.difference(&before).cloned().collect::<Vec<_>>();
+    assert_eq!(runtimes.len(), 1, "{before:?} -> {during:?}");
+    let runtime_dir = runtimes.remove(0);
+    let state = fixture.state();
+    let actor = "managed-root";
+    let mut next = 10;
+
+    // The first valid call with a root session publishes this process's route for that actor.
+    let start = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        "root-session-a",
+        "ide.start",
+        json!({"activation_id":"publish-start"}),
+        &state,
+    )
+    .await;
+    let route_a = CodexRouteIdentity::new("root-session-a", actor).unwrap();
+    let target = discover(&root, &route_a).expect("first valid call publishes the actor route");
+    assert_eq!(
+        target.runtime_dir(),
+        std::fs::canonicalize(&runtime_dir).unwrap(),
+        "the record points at this MCP process's own runtime"
+    );
+    let started = settle_managed(&mut mcp, &mut next, actor, &state, start).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    // A second root session over the same repository gets its own distinct route; both stay live.
+    next += 1;
+    let refreshed = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        "root-session-b",
+        "ide.context",
+        json!({"path":"tracked.txt"}),
+        &state,
+    )
+    .await;
+    assert_eq!(refreshed["state"], "pending", "{refreshed}");
+    let route_b = CodexRouteIdentity::new("root-session-b", actor).unwrap();
+    assert_ne!(route_a.digest(), route_b.digest());
+    assert!(
+        discover(&root, &route_b).is_some(),
+        "second session publishes its own route"
+    );
+    assert!(discover(&root, &route_a).is_some(), "routes coexist");
+
+    // Clean EOF shutdown retires every route before removing the runtime.
+    mcp.close().await;
+    assert!(discover(&root, &route_a).is_none(), "route a retired");
+    assert!(discover(&root, &route_b).is_none(), "route b retired");
+    assert_eq!(managed_runtime_paths(), before);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+/// A publication failure (unusable rendezvous root) never touches managed MCP replies.
+#[tokio::test]
+async fn managed_codex_publication_failure_leaves_replies_working() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let fixture = ProductFixture::new(json!([]));
+    let base = rendezvous_area("publish-failure");
+    // A regular file occupies the rendezvous root path: every publication fails quietly.
+    let blocked = base.join("rendezvous");
+    std::fs::write(&blocked, b"not a directory").unwrap();
+    let mut mcp =
+        Mcp::start_managed_with_rendezvous(&fixture.config, &fixture.root, &blocked).await;
+    let state = fixture.state();
+    let actor = "managed-root";
+    let mut next = 10;
+
+    let start = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        "root-session-a",
+        "ide.start",
+        json!({"activation_id":"publish-failure-start"}),
+        &state,
+    )
+    .await;
+    let started = settle_managed(&mut mcp, &mut next, actor, &state, start).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    next += 1;
+    let context = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        "root-session-a",
+        "ide.context",
+        json!({"path":"tracked.txt"}),
+        &state,
+    )
+    .await;
+    let settled = settle_managed(&mut mcp, &mut next, actor, &state, context).await;
+    assert!(
+        settled["text"].as_str().unwrap().contains("worktree"),
+        "{settled}"
+    );
+    mcp.close().await;
+    std::fs::remove_dir_all(base).unwrap();
 }
 
 /// Proves two managed sessions share only telemetry ownership, not Workspace boot authority.

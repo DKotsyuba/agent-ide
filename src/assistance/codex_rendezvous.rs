@@ -435,6 +435,18 @@ pub fn default_root() -> Option<PathBuf> {
     Some(temporary.join(format!("ai-c-{}", unsafe { libc::geteuid() })))
 }
 
+/// Returns the rendezvous root this process uses, honoring the test seam when it is set.
+///
+/// `AGENT_IDE_CODEX_RENDEZVOUS_ROOT` redirects both publication and discovery away from the fixed
+/// [`default_root`]; only product tests set it, and production resolves [`default_root`]. A missing
+/// or empty value falls back to [`default_root`].
+pub fn effective_root() -> Option<PathBuf> {
+    match std::env::var_os("AGENT_IDE_CODEX_RENDEZVOUS_ROOT") {
+        Some(value) if !value.is_empty() => Some(PathBuf::from(value)),
+        _ => default_root(),
+    }
+}
+
 /// Discovers the single live, validated hook target for one actor route, or [`None`].
 ///
 /// The root and route directories are opened descriptor-relative with `O_NOFOLLOW|O_DIRECTORY`

@@ -1,8 +1,9 @@
 //! Fail-open native host hook entrypoint with a deadline independent of MCP calls.
 
 use super::{
+    codex_rendezvous::{CodexRouteIdentity, discover, effective_root},
     facade::{HookIngressOutcome, TrustedTransport, render_hook_context, submit_hook_event},
-    host_binding::{HostKind, parse_claude_hook_event, parse_hook_event},
+    host_binding::{HookPhase, HostKind, parse_claude_hook_event, parse_hook_event},
 };
 use crate::telemetry::{Telemetry, adapters};
 use std::{
@@ -255,6 +256,63 @@ pub async fn run(runtime_dir: &Path, attachment: Option<String>, host_kind: Host
     if unavailable && let Some(attachment) = fallback_attachment.as_deref() {
         let _ = report_native_fallback(runtime_dir, attachment);
     }
+    if let Some((event, HookIngressOutcome::Feedback(text))) = hook
+        && let Some(output) = render_hook_context(&event, &text)
+    {
+        println!("{output}");
+    }
+}
+
+/// Runs one managed Codex hook: bounded stdin, private-route discovery, one submit, quiet failures.
+///
+/// Managed mode ignores every credential and runtime environment override: the daemon destination
+/// is discovered solely from the payload identity (root session `session_id`, actor
+/// `agent_id.unwrap_or(session_id)`) against the fixed private rendezvous records, so a missing,
+/// ambiguous, stale, contended, or unusable route exits successfully with no output exactly like a
+/// malformed, oversized, or late payload does. Only `PreToolUse` and `PostToolUse` are accepted;
+/// every other phase exits silently. The single 250 ms deadline starts before stdin is read and
+/// covers reading, parsing, discovery, connect and reply; the blocking filesystem discovery runs
+/// off the async executor and its result is simply abandoned at the deadline. Never retries,
+/// starts a daemon, runs Git, or sends the legacy fallback marker.
+pub async fn run_managed() {
+    let deadline = tokio::time::Instant::now() + TOTAL_DEADLINE;
+    let hook = tokio::time::timeout_at(deadline, async {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("codex-hook-input".into())
+            .spawn(move || {
+                let mut payload = Vec::new();
+                let result = std::io::stdin()
+                    .take(MAX_INPUT_BYTES + 1)
+                    .read_to_end(&mut payload);
+                let _ = sender.send(result.ok().map(|_| payload));
+            })
+            .ok()?;
+        let payload = receiver.await.ok()??;
+        if payload.len() > MAX_INPUT_BYTES as usize {
+            return None;
+        }
+        let event = parse_hook_event(&payload).ok()?;
+        if !matches!(event.phase(), HookPhase::Pre | HookPhase::Post) {
+            return None;
+        }
+        let identity = CodexRouteIdentity::new(event.session_id()?, event.actor_id()).ok()?;
+        let root = effective_root()?;
+        let target = tokio::task::spawn_blocking(move || discover(&root, &identity))
+            .await
+            .ok()??;
+        let correlation = event.optional_call_id().unwrap_or("post-tool-batch");
+        let host = TrustedTransport::from_host_ingress(
+            correlation,
+            correlation,
+            target.attachment().to_owned(),
+        )?;
+        let outcome = submit_hook_event(target.runtime_dir(), &host, &event).await;
+        Some((event, outcome))
+    })
+    .await
+    .ok()
+    .flatten();
     if let Some((event, HookIngressOutcome::Feedback(text))) = hook
         && let Some(output) = render_hook_context(&event, &text)
     {
