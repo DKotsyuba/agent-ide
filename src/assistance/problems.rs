@@ -21,7 +21,8 @@ use crate::checks::runner::{ConfinedRunner, SeatbeltRunner};
 use crate::checks::rust::RustChecker;
 use crate::checks::scheduler::{CompletionHook, Scheduler, sweep_stale_caches};
 use crate::checks::{
-    CheckState, Checker, Language, Problem, ProblemSnapshot, Recheck, Severity, UnavailableReason,
+    CheckState, Checker, Language, MAX_PROBLEMS, Problem, ProblemSnapshot, Recheck, Severity,
+    UnavailableReason,
 };
 use crate::feed::{FeedKey, FeedState, MAX_FEED_KEYS};
 
@@ -381,8 +382,11 @@ pub fn parse_language(value: &str) -> Option<Language> {
 /// `errors`/`warnings` counts, while `checking` and `unavailable:<reason>` never render numeric
 /// counts, though an `unavailable` line with a carried [`ProblemSnapshot::detail`] appends it in
 /// parentheses — followed by up to [`PROBLEMS_PAGE_SIZE`] problem lines
-/// `path:line:column severity [code] message`. `next_offset: <offset + page>` is appended
-/// exactly when more problems remain after the page. Empty input, or a filter matching no
+/// `path:line:column severity [code] message`. A snapshot that dropped problems to the
+/// [`MAX_PROBLEMS`] cap (T19B) adds one header line directly after its state line —
+/// `<language>: list truncated to first MAX_PROBLEMS problems; counts above are complete` —
+/// rendered on every page, so paging can never silently drop it. `next_offset: <offset + page>`
+/// is appended exactly when more problems remain after the page. Empty input, or a filter matching no
 /// configured language, renders the single line `checks disabled`. A language absent from the
 /// worktree (T10B: `Unavailable(Disabled)`) contributes no state line and no problems, exactly as
 /// it is omitted from the `<agent-ide>` block; when every matched language is absent this way,
@@ -436,6 +440,15 @@ pub fn problems_text_with_rechecks(
             .find(|(recheck_language, _)| *recheck_language == snapshot.language)
             .map(|(_, recheck)| *recheck);
         lines.push(state_line(snapshot, recheck));
+        if snapshot.truncated {
+            // The counts in the state line are computed before the [`MAX_PROBLEMS`] cap, so only
+            // the list is cut. This sits in the header next to the state line: paging skips
+            // per-language problem lines, and the notice must survive every page (T19B).
+            lines.push(format!(
+                "{}: list truncated to first {MAX_PROBLEMS} problems; counts above are complete",
+                snapshot.language.as_str()
+            ));
+        }
         for problem in &snapshot.problems {
             if skipped > 0 {
                 skipped -= 1;
@@ -678,6 +691,46 @@ mod tests {
             problems_text(&snapshots, Some(Language::Python), 0),
             "checks disabled"
         );
+    }
+
+    /// A snapshot over the [`MAX_PROBLEMS`] cap (T19B) announces the truncation in the header
+    /// right after its state line — with complete counts, which are computed before the cap — on
+    /// every page, so paging cannot silently drop the notice.
+    #[test]
+    fn truncated_snapshot_announces_the_cap_next_to_the_state_line_on_every_page() {
+        let problems: Vec<Problem> = (0..=MAX_PROBLEMS as u32)
+            .map(|line| problem("e.rs", line, 1, Severity::Error, "e"))
+            .collect();
+        let snapshot =
+            ProblemSnapshot::from_problems(Language::Rust, CheckState::Ready, problems, 1, 1);
+        assert!(snapshot.truncated);
+        let notice = format!(
+            "rust: list truncated to first {MAX_PROBLEMS} problems; counts above are complete"
+        );
+
+        let first = problems_text(std::slice::from_ref(&snapshot), None, 0);
+        let first_lines: Vec<&str> = first.lines().collect();
+        assert_eq!(
+            first_lines[0], "rust: ready; errors: 501; warnings: 0",
+            "{first}"
+        );
+        assert_eq!(first_lines[1], notice, "{first}");
+        assert_eq!(first_lines.len(), 23, "{first}");
+
+        // The notice survives paging, including a page past the end of the retained list.
+        let paged = problems_text(&[snapshot], None, 40);
+        assert_eq!(paged.lines().nth(1), Some(notice.as_str()), "{paged}");
+    }
+
+    /// An under-cap snapshot (T19B) renders no truncation notice.
+    #[test]
+    fn under_cap_snapshot_renders_no_truncation_notice() {
+        let snapshots = [ready(
+            Language::Rust,
+            vec![problem("a.rs", 1, 1, Severity::Error, "e")],
+        )];
+        let text = problems_text(&snapshots, None, 0);
+        assert!(!text.contains("list truncated"), "{text}");
     }
 
     /// Non-reporting states never render numeric counts and unavailable reasons stay closed.

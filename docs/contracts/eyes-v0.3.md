@@ -199,7 +199,7 @@ pub enum CheckState {
 }
 pub struct Problem { pub path: String, pub line: u32, pub column: u32,
                      pub severity: Severity /* Error | Warning */, pub code: Option<String>,
-                     pub message: String /* <= 200 chars, untrusted data */ }
+                     pub message: String /* <= 200 chars, cuts end in `…`, untrusted data */ }
 pub struct ProblemSnapshot { pub language: Language, pub state: CheckState,
                              pub errors: u32, pub warnings: u32,
                              pub problems: Vec<Problem> /* <= 500, sorted: errors first, path, line */,
@@ -358,7 +358,11 @@ failed check's detail. Process states use the block's vocabulary (T18B): a check
 session's last result renders `<lang>: checking (files changed); last result: errors: N; warnings:
 M`, and a stored result predating this session's activation renders `<lang>: checking (first check
 in this session); previous session result: errors: N; warnings: M`; a language with no result yet
-renders `<lang>: checking (first check in this session)`. No
+renders `<lang>: checking (first check in this session)`. A language whose snapshot dropped
+problems to the 500-entry cap (T19B) adds one header line directly after its state line, on every
+page: `<lang>: list truncated to first 500 problems; counts above are complete` — the counts in
+the state line are computed before the cap, so only the list is cut. A truncated `Problem`
+message ends in `…` (T19B). No
 new tool and no new `AssistanceMethod`. The problems kind is answered from the daemon's in-memory
 snapshots for the caller's bound worktree on every host; it is never dispatched to the Claude
 foreground helper and needs no provider.

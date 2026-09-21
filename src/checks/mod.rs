@@ -30,8 +30,9 @@ pub const MAX_PROBLEMS: usize = 500;
 
 /// Maximum retained characters in one [`Problem::message`].
 ///
-/// Longer checker messages are truncated to this cap; the contract bound is on characters, not
-/// bytes, so multi-byte text keeps up to 200 characters.
+/// Longer checker messages are cut to `MAX_MESSAGE_CHARS - 1` characters plus one trailing `…`
+/// so a truncated message is visible as such; the contract bound is on characters, not bytes,
+/// so multi-byte text keeps up to 200 characters.
 pub const MAX_MESSAGE_CHARS: usize = 200;
 
 /// Language a project check runs for.
@@ -348,13 +349,20 @@ fn problem_sort_key(problem: &Problem) -> (Severity, &str, u32, u32, &str, &str)
     )
 }
 
-/// Truncates a message to [`MAX_MESSAGE_CHARS`] characters, leaving shorter messages intact.
+/// Truncates a message to at most [`MAX_MESSAGE_CHARS`] characters, leaving shorter messages
+/// intact (T19B).
+///
+/// A message longer than the cap is cut to `MAX_MESSAGE_CHARS - 1` characters and suffixed with
+/// one `…`, so an agent can see where the text was cut. Idempotent: any message that already
+/// fits — including one previously truncated to exactly the cap ending in `…` — passes through
+/// unchanged, so the second truncation at the snapshot boundary is a no-op.
 fn truncate_message(message: String) -> String {
     if message.chars().count() <= MAX_MESSAGE_CHARS {
-        message
-    } else {
-        message.chars().take(MAX_MESSAGE_CHARS).collect()
+        return message;
     }
+    let mut truncated: String = message.chars().take(MAX_MESSAGE_CHARS - 1).collect();
+    truncated.push('…');
+    truncated
 }
 
 /// One confined check invocation.
@@ -628,6 +636,28 @@ mod tests {
             "short".to_string(),
         );
         assert_eq!(short.message, "short");
+    }
+
+    /// Truncation (T19B) marks a cut message with one trailing `…`, keeps the total at
+    /// [`MAX_MESSAGE_CHARS`] characters for multi-byte text, leaves shorter and exactly-cap
+    /// messages intact, and is idempotent: re-truncating an already-truncated message — at the
+    /// snapshot boundary, or an arbitrary 200-character message that happens to end in `…` —
+    /// changes nothing.
+    #[test]
+    fn truncate_message_marks_cuts_with_ellipsis_and_is_idempotent() {
+        let short = truncate_message("short".to_owned());
+        assert_eq!(short, "short");
+
+        let exact: String = "ё".repeat(MAX_MESSAGE_CHARS);
+        assert_eq!(truncate_message(exact.clone()), exact);
+
+        let long = truncate_message("ё".repeat(300));
+        assert_eq!(long.chars().count(), MAX_MESSAGE_CHARS);
+        assert!(long.ends_with('…'));
+        assert_eq!(truncate_message(long.clone()), long);
+
+        let capped_ellipsis: String = "a".repeat(MAX_MESSAGE_CHARS - 1) + "…";
+        assert_eq!(truncate_message(capped_ellipsis.clone()), capped_ellipsis);
     }
 
     #[test]
