@@ -150,6 +150,116 @@ struct ContextPageState {
     /// Result kind rendered onto every page cut from `text`, so a Claude-captured Diff resumes as
     /// `ResultKind::Diff` and never masquerades as a Context result.
     kind: ResultKind,
+    /// Offset in `text` where the counted body starts: the exact source bytes of a Context result
+    /// (its fixed header precedes them), `0` for a Diff. Position markers count from here, so the
+    /// total of a Context result equals the file's byte length (T16B).
+    body_start: usize,
+    /// One-based number of the page `delivered` is about to produce.
+    page: usize,
+}
+
+impl ContextPageState {
+    /// Starts paging `text` at its first page.
+    fn new(text: String, body_start: usize, source_truncated: bool, kind: ResultKind) -> Self {
+        Self {
+            text,
+            delivered: 0,
+            source_truncated,
+            kind,
+            body_start,
+            page: 1,
+        }
+    }
+
+    /// Cuts the next line-bounded, byte-exact chunk that provably fits the bounded reply envelope
+    /// (T09B), returning its [`PeerReply`] and the state for the following page, `None` once the
+    /// last page was cut. `self` is never mutated, so repeated chunks join byte-exactly back into
+    /// `text`.
+    ///
+    /// Mirrors `snapshots::fit_diff_page`'s fitting discipline: the same [`content::fits`]
+    /// predicate that gates the real final MCP envelope decides acceptance, so a chunk is never
+    /// handed out only to have the facade re-cut it later. Starts by trying the complete remainder
+    /// as the final chunk, then halves the candidate length, snapping each candidate back to the
+    /// preceding newline so no line is split across two pages, until one fits.
+    ///
+    /// Every page of a multi-page result starts with one position marker line, `page N; bytes
+    /// A-B of TOTAL`, the last one `page N (last); ...; complete` (`incomplete: capture truncated`
+    /// when the upstream capture itself lost bytes). A Diff page that starts inside a file's hunks
+    /// is prefixed with `file: <path> (continued)` so every hunk stays attributable (T16B). A
+    /// result that fits one page carries neither.
+    ///
+    /// # Errors
+    ///
+    /// [`FailureCode::Capacity`] when even one byte cannot fit the serialized envelope.
+    fn next(&self, reference: &str) -> Result<(PeerReply, Option<Self>), FailureCode> {
+        let remaining = &self.text[self.delivered..];
+        let total = self.text.len() - self.body_start;
+        let continued_file = (self.kind == ResultKind::Diff && self.delivered > 0)
+            .then(|| {
+                self.text[..self.delivered]
+                    .lines()
+                    .rev()
+                    .find(|line| line.starts_with("file: "))
+            })
+            .flatten();
+        let mut len = remaining.len();
+        loop {
+            let mut cut = len.min(remaining.len());
+            while !remaining.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let more_after = cut < remaining.len();
+            let snapped = if more_after {
+                remaining[..cut].rfind('\n').map_or(cut, |index| index + 1)
+            } else {
+                cut
+            };
+            let continuation = snapped < remaining.len();
+            let mut text = String::new();
+            if self.delivered > 0 || continuation {
+                let start = self.delivered.saturating_sub(self.body_start);
+                let end = (self.delivered + snapped).saturating_sub(self.body_start);
+                let (last, status) = match (continuation, self.source_truncated) {
+                    (true, _) => ("", ""),
+                    (false, false) => (" (last)", "; complete"),
+                    (false, true) => (" (last)", "; incomplete: capture truncated"),
+                };
+                text.push_str(&format!(
+                    "page {}{last}; bytes {start}-{end} of {total}{status}\n",
+                    self.page
+                ));
+                if let Some(line) = continued_file
+                    && !remaining.starts_with("file: ")
+                {
+                    text.push_str(line);
+                    text.push_str(" (continued)\n");
+                }
+            }
+            text.push_str(&remaining[..snapped]);
+            let reply = PeerReply::Complete {
+                kind: self.kind,
+                text,
+                detail_ref: Some(reference.to_owned()),
+                truncated: continuation || self.source_truncated,
+                continuation,
+            };
+            // Same host-unaware conservative sizing as `snapshots::fit_diff_page` (T14B): this
+            // daemon path never learns which MCP host will receive the page, so it stays sized to
+            // fit even alongside the structured JSON copy.
+            if content::fits(&reply, content::Envelope::WithStructured) {
+                let next = continuation.then(|| Self {
+                    delivered: self.delivered + snapped,
+                    page: self.page + 1,
+                    ..self.clone()
+                });
+                return Ok((reply, next));
+            }
+            if snapped == 0 {
+                return Err(FailureCode::Capacity);
+            }
+            len = snapped / 2;
+        }
+    }
 }
 
 /// Retains one versioned provider delta until a later native post-hook rechecks its exact source.
@@ -496,6 +606,15 @@ impl Shared {
             }
         }
         retained
+    }
+    /// Records that the caller already received the retained page-one reply, so the next
+    /// `ide.inspect` advances instead of re-serving it (T16B).
+    fn mark_context_page_delivered(&self, reference: &str) {
+        if let Ok(mut ledger) = self.ledger.lock()
+            && let Some(detail) = ledger.details.get_mut(reference)
+        {
+            detail.context_page_fresh = false;
+        }
     }
     /// Retains or clears the bounded Context (or Claude-captured Diff, T13B) pagination state for
     /// one same-binding detail reference (T09B). Mirrors `set_diff_page`'s fresh-page and
@@ -1980,11 +2099,28 @@ impl<'a> Worker<'a> {
                 }
             );
             let mark_reply = is_context.then(|| reply.clone());
-            if sender.send(reply).is_ok()
-                && let Some(mark_reply) = mark_reply
-            {
-                self.shared
-                    .mark_feedback_inline_delivered(&binding, &job.reference, &mark_reply);
+            let paged = matches!(
+                reply,
+                PeerReply::Complete {
+                    kind: ResultKind::Context | ResultKind::Diff,
+                    continuation: true,
+                    ..
+                }
+            );
+            if sender.send(reply).is_ok() {
+                if let Some(mark_reply) = mark_reply {
+                    self.shared.mark_feedback_inline_delivered(
+                        &binding,
+                        &job.reference,
+                        &mark_reply,
+                    );
+                }
+                if paged {
+                    // Page one just reached the caller through this settlement, so the first
+                    // `ide.inspect` of its `detail_ref` must serve page two, not repeat page one
+                    // (T16B). Only a lost receiver leaves the page undelivered and fresh.
+                    self.shared.mark_context_page_delivered(&job.reference);
+                }
             }
         }
     }
@@ -2567,14 +2703,19 @@ impl<'a> Worker<'a> {
             authority.epoch(),
             text
         );
-        let (delivered, reply) =
-            fit_context_page(&full_text, &job.reference, *truncated, ResultKind::Context)?;
-        let context_page = (delivered < full_text.len()).then_some(ContextPageState {
-            text: full_text,
-            delivered,
-            source_truncated: *truncated,
-            kind: ResultKind::Context,
-        });
+        // The helper text ends with the exact source bytes, so the counted body starts
+        // `source.length` bytes before its end; anything unexpected falls back to counting the
+        // whole text rather than mis-marking positions.
+        let body_start = full_text
+            .len()
+            .checked_sub(usize::try_from(source.length).unwrap_or(usize::MAX))
+            .filter(|start| {
+                full_text.is_char_boundary(*start) && full_text[..*start].ends_with("\n\n")
+            })
+            .unwrap_or(0);
+        let (reply, context_page) =
+            ContextPageState::new(full_text, body_start, *truncated, ResultKind::Context)
+                .next(&job.reference)?;
         self.shared.set_context_page(&job.reference, context_page);
         Ok((reply, Some(authority), Some(observed)))
     }
@@ -2621,15 +2762,14 @@ impl<'a> Worker<'a> {
         // Mirrors `context_claude` (T09B): the helper already composed the complete bounded Diff
         // text in one capture, so later `ide.inspect` calls page through it byte-exactly instead of
         // re-running Git, which the daemon cannot do for Claude at all (T13B).
-        let full_text = text.clone();
-        let (delivered, reply) =
-            fit_context_page(&full_text, &job.reference, *truncated, ResultKind::Diff)?;
-        let context_page = (delivered < full_text.len()).then_some(ContextPageState {
-            text: full_text,
-            delivered,
-            source_truncated: *truncated,
-            kind: ResultKind::Diff,
-        });
+        let mut state = ContextPageState::new(text.clone(), 0, *truncated, ResultKind::Diff);
+        let (mut reply, mut context_page) = state.next(&job.reference)?;
+        if context_page.is_some() {
+            // The helper cannot know its text will be paged; the header must not say
+            // `more_available: false` above a reply that ends with `Output is truncated` (T16B).
+            state.text = snapshots::mark_more_available(&state.text);
+            (reply, context_page) = state.next(&job.reference)?;
+        }
         self.shared.set_context_page(&job.reference, context_page);
         Ok((reply, Some(authority), None))
     }
@@ -3016,18 +3156,10 @@ impl<'a> Worker<'a> {
                 ledger.feedback.remove(&binding);
             }
         }
-        let (delivered, reply) = fit_context_page(
-            &text,
-            &job.reference,
-            context.truncated,
-            ResultKind::Context,
-        )?;
-        let context_page = (delivered < text.len()).then_some(ContextPageState {
-            text,
-            delivered,
-            source_truncated: context.truncated,
-            kind: ResultKind::Context,
-        });
+        let body_start = text.len() - context.text.len();
+        let (reply, context_page) =
+            ContextPageState::new(text, body_start, context.truncated, ResultKind::Context)
+                .next(&job.reference)?;
         self.shared.set_context_page(&job.reference, context_page);
         Ok((reply, Some(authority), Some(observed)))
     }
@@ -3946,19 +4078,7 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
             // already ran; a Claude-captured Diff page is a frozen text snapshot with no `source`
             // and no re-derivable Git cursor (unlike the managed `diff_page` branch above), so
             // later pages of it need no further working-tree re-check either — exactly like Context.
-            let (advanced, next) = fit_context_page(
-                &page.text[page.delivered..],
-                &request.reference,
-                page.source_truncated,
-                page.kind,
-            )?;
-            let delivered = page.delivered + advanced;
-            let next_page = (delivered < page.text.len()).then_some(ContextPageState {
-                text: page.text,
-                delivered,
-                source_truncated: page.source_truncated,
-                kind: page.kind,
-            });
+            let (next, next_page) = page.next(&request.reference)?;
             if let Ok(mut ledger) = shared.ledger.lock()
                 && let Some(detail) = ledger.details.get_mut(&request.reference)
             {
@@ -4034,7 +4154,9 @@ fn source_matches(source: &SourceObservation) -> bool {
 /// Context and a successful prior Edit are the only source-producing details. A prior Edit must
 /// name this exact reference as its post-read source and retain a source observation for the same
 /// requested path; every other detail, missing observation, mismatched binding, or failed edit is
-/// rejected as stale rather than being used to authorize bytes the caller has not observed.
+/// rejected as stale rather than being used to authorize bytes the caller has not observed. A
+/// Context whose pages are not all delivered yet is likewise rejected: its reference denotes the
+/// full observed source, but the caller has only seen part of it (T16B).
 fn admitted_edit_source(
     detail: &Detail,
     binding: &BindingRef,
@@ -4042,6 +4164,10 @@ fn admitted_edit_source(
     path: &str,
 ) -> Option<SourceObservation> {
     (detail.binding == *binding
+        // A Context source_ref names the complete observed source, but its pages are the only
+        // view the caller has: while any page is still undelivered the caller has not observed
+        // the whole file, so a full-content replace built on it could silently truncate it (T16B).
+        && detail.context_page.is_none()
         && matches!(
             detail.selection.0,
             AssistanceTool::Context | AssistanceTool::Edit
@@ -4131,63 +4257,6 @@ fn diagnostics_reserve_known_edit_settlement_time() {
     let deadline = now + EDIT_SETTLEMENT_RESERVE + Duration::from_millis(50);
     assert!(edit_diagnostic_deadline(deadline).is_some());
     assert!(edit_diagnostic_deadline(now + Duration::from_millis(1)).is_none());
-}
-
-/// Splits the next line-bounded, byte-exact UTF-8 chunk off `remaining` that provably fits the
-/// bounded reply envelope, returning how many bytes of `remaining` it consumed alongside the
-/// rendered [`PeerReply`] (T09B). `kind` is stamped onto the rendered reply unchanged, so the same
-/// fitter serves both a Context result and a Claude-captured Diff result (T13B).
-///
-/// Mirrors `snapshots::fit_diff_page`'s fitting discipline: the same [`content::fits`] predicate
-/// that gates the real final MCP envelope decides acceptance, so a chunk is never handed out only
-/// to have the facade re-cut it later. `remaining` is never mutated; the caller advances its own
-/// cursor by the returned length, so repeated chunks join byte-exactly back into the original text.
-///
-/// Starts by trying the complete `remaining` text as the final chunk; if that fits, `truncated` is
-/// `source_truncated` and `continuation` is `false`. Otherwise halves the candidate length — same
-/// discipline as `PeerReply::shrink_text` — snapping each candidate back to the preceding newline
-/// so no existing line is ever split across two pages, until one fits.
-///
-/// # Errors
-///
-/// [`FailureCode::Capacity`] when even one byte cannot fit the serialized envelope.
-fn fit_context_page(
-    remaining: &str,
-    reference: &str,
-    source_truncated: bool,
-    kind: ResultKind,
-) -> Result<(usize, PeerReply), FailureCode> {
-    let mut len = remaining.len();
-    loop {
-        let mut cut = len.min(remaining.len());
-        while !remaining.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        let more_after = cut < remaining.len();
-        let snapped = if more_after {
-            remaining[..cut].rfind('\n').map_or(cut, |index| index + 1)
-        } else {
-            cut
-        };
-        let continuation = snapped < remaining.len();
-        let reply = PeerReply::Complete {
-            kind,
-            text: remaining[..snapped].to_owned(),
-            detail_ref: Some(reference.to_owned()),
-            truncated: continuation || source_truncated,
-            continuation,
-        };
-        // Same host-unaware conservative sizing as `snapshots::fit_diff_page` (T14B): this daemon
-        // path never learns which MCP host will receive the page, so it stays sized to fit even
-        // alongside the structured JSON copy.
-        if content::fits(&reply, content::Envelope::WithStructured) {
-            return Ok((snapped, reply));
-        }
-        if snapped == 0 {
-            return Err(FailureCode::Capacity);
-        }
-        len = snapped / 2;
-    }
 }
 
 /// Intersects a current durable stamp and fresh invocation metadata before any native/cached source read.
@@ -5196,19 +5265,24 @@ mod stop_retry_tests {
         )
     }
 
-    /// A source file larger than one reply envelope but under Intelligence's own capture cap is
-    /// fully recoverable by repeating `ide.inspect` (`serve_inspection`) with the same detail_ref
-    /// until a chunk reports `continuation: false`; the concatenated chunks equal the exact
-    /// composed text byte-for-byte, every non-final chunk ends on a line boundary, and the final
-    /// chunk honestly reports `truncated: false` because nothing was lost (T09B).
+    /// Drops the position marker line every page of a multi-page result starts with (T16B).
+    fn strip_page_marker(text: &str) -> &str {
+        assert!(text.starts_with("page "), "missing position marker: {text}");
+        text.split_once('\n').expect("marker line ends").1
+    }
+
+    /// A source file larger than one reply envelope is fully recoverable by repeating
+    /// `ide.inspect` (`serve_inspection`) with the same detail_ref until a chunk reports
+    /// `continuation: false`; on the managed path the first inspect delivers the still undelivered
+    /// page one (T16B), the marker-stripped chunks equal the exact composed text byte-for-byte,
+    /// every non-final chunk ends on a line boundary, and the final chunk honestly reports
+    /// `truncated: false` because nothing was lost (T09B).
     #[tokio::test]
     async fn context_continuation_serves_the_complete_text_through_repeated_inspect() {
         let fixture = Fixture::new();
-        // 60800 bytes: comfortably below Intelligence's 64 KiB `MAX_CONTEXT_BYTES` capture cap (so
-        // the source is never itself truncated), but well above any plausible single reply
-        // envelope, so at least two continuation pages are required regardless of exact overhead.
+        // 60800 bytes, well above any plausible single reply envelope, so at least two
+        // continuation pages are required regardless of exact overhead.
         let content = "let value = 1;\n".repeat(3800);
-        assert!(content.len() < 64 * 1024, "must stay under the source cap");
         std::fs::write(fixture.root.join("main.rs"), &content).unwrap();
         let store = fixture.store();
         let workspace = DurableWorkspace::open(&store).await.unwrap();
@@ -5262,9 +5336,14 @@ mod stop_retry_tests {
             panic!("fixture file must overflow one reply envelope: {first_reply:?}");
         };
         assert!(first_text.ends_with('\n'), "must cut on a line boundary");
-        let mut collected = first_text.clone();
+        assert!(
+            first_text.starts_with("page 1; bytes 0-"),
+            "page one carries its position marker: {}",
+            &first_text[..80]
+        );
+        let mut collected = String::new();
 
-        let mut pages = 1;
+        let mut pages = 0;
         loop {
             let (reply_tx, reply_rx) = oneshot::channel();
             serve_inspection(
@@ -5295,16 +5374,31 @@ mod stop_retry_tests {
                 pages < 50,
                 "continuation must terminate in a bounded page count"
             );
-            collected.push_str(text);
+            if pages == 1 {
+                assert_eq!(
+                    &reply, &first_reply,
+                    "the managed first inspect must deliver the undelivered page one"
+                );
+            }
+            assert!(
+                text.starts_with(&format!("page {pages}")),
+                "page {pages} marker: {}",
+                &text[..text.len().min(80)]
+            );
+            collected.push_str(strip_page_marker(text));
             if *continuation {
                 assert!(text.ends_with('\n'), "must cut on a line boundary");
                 assert!(*truncated, "a page with more to come must report truncated");
             } else {
                 assert!(!truncated, "fully recovered text must not claim truncation");
+                assert!(
+                    text.lines().next().unwrap().ends_with("; complete"),
+                    "the last page states completion: {text}"
+                );
                 break;
             }
         }
-        assert!(pages >= 3, "the fixture file must force multiple pages");
+        assert!(pages >= 2, "the fixture file must force multiple pages");
         assert!(
             collected.ends_with(&content),
             "concatenated chunks must end with the exact source bytes"
@@ -5312,16 +5406,16 @@ mod stop_retry_tests {
     }
 
     /// A source file far larger than the launcher's tiny `output_bytes` discovery/output-capture
-    /// budget still reads completely (up to Intelligence's own bounded render cap) instead of
-    /// failing closed as `source_unavailable`: the read ceiling is `MAX_SOURCE_BYTES`, never the
-    /// unrelated `output_bytes` budget (T13B).
+    /// budget, and over the former 64 KiB render cap, is paged out completely instead of failing
+    /// closed as `source_unavailable` or being cut to a prefix: the read ceiling is
+    /// `MAX_SOURCE_BYTES`, never the unrelated `output_bytes` budget (T13B, T16B).
     #[tokio::test]
     async fn managed_context_reads_a_source_larger_than_the_output_budget() {
         let fixture = Fixture::new();
         // 114000 bytes: matches the reported live-stability failure size, well over both the
-        // fixture's default 1024-byte `output_bytes` and Intelligence's 64 KiB `MAX_CONTEXT_BYTES`
-        // render cap, but comfortably under the 1 MiB `MAX_SOURCE_BYTES` read ceiling.
-        let content = "x".repeat(114_000);
+        // fixture's default 1024-byte `output_bytes` and the former 64 KiB render cap, but
+        // comfortably under the 1 MiB `MAX_SOURCE_BYTES` read ceiling.
+        let content = "let value = 1;\n".repeat(7600);
         std::fs::write(fixture.root.join("main.rs"), &content).unwrap();
         let store = fixture.store();
         let workspace = DurableWorkspace::open(&store).await.unwrap();
@@ -5356,18 +5450,15 @@ mod stop_retry_tests {
             .shared
             .complete(&job.reference, first_reply.clone(), authority, source, 0);
         let PeerReply::Complete {
-            text: first_text,
             truncated: true,
             continuation: true,
             ..
         } = &first_reply
         else {
-            panic!(
-                "a file over MAX_CONTEXT_BYTES must overflow one reply envelope: {first_reply:?}"
-            );
+            panic!("a file over one reply envelope must page: {first_reply:?}");
         };
-        let mut collected = first_text.clone();
-        let mut pages = 1;
+        let mut collected = String::new();
+        let mut pages = 0;
         loop {
             let (reply_tx, reply_rx) = oneshot::channel();
             serve_inspection(
@@ -5398,30 +5489,19 @@ mod stop_retry_tests {
                 pages < 50,
                 "continuation must terminate in a bounded page count"
             );
-            collected.push_str(text);
-            if *continuation {
-                assert!(*truncated, "a page with more to come must report truncated");
-            } else {
-                // Intelligence's own 64 KiB render cap genuinely omitted the file's tail, so the
-                // final page must still honestly report it, unlike a fully recovered file.
+            collected.push_str(strip_page_marker(text));
+            if !continuation {
                 assert!(
-                    *truncated,
-                    "content beyond MAX_CONTEXT_BYTES was never captured, so this must stay truncated"
+                    !truncated,
+                    "the whole file was delivered, so the last page is not truncated"
                 );
                 break;
             }
         }
         assert!(pages >= 2, "the fixture file must force multiple pages");
-        // `collected` is the fixed rendered header followed by the exact bounded source text; the
-        // file is homogeneous ASCII with no newlines, so the exact MAX_CONTEXT_BYTES-bounded
-        // prefix of the source is simply the tail of the concatenated pages.
         assert!(
-            collected.ends_with(&content[..crate::intelligence::context::MAX_CONTEXT_BYTES]),
-            "the exposed text must end with the exact MAX_CONTEXT_BYTES-bounded prefix of the source"
-        );
-        assert!(
-            !collected.ends_with(&content[..crate::intelligence::context::MAX_CONTEXT_BYTES + 1]),
-            "no more than MAX_CONTEXT_BYTES of the source may have been exposed"
+            collected.ends_with(&content),
+            "the pages must cover the whole source, not a prefix"
         );
     }
 

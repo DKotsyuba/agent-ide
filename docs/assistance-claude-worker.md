@@ -48,8 +48,11 @@ the contract for shipped behaviour.
    carries the daemon-selected completed-context digest, length, sequence and revision so the
    helper can reject stale bytes without trusting a path reopened by the daemon.
 
-   Each length-prefixed helper frame is capped at 256 KiB before allocation or JSON decoding. Raw
-   discovery/baseline streams remain capped at 8 KiB each and rendered owner text at 32 KiB.
+   Each length-prefixed helper frame is capped at 8 MiB before allocation or JSON decoding: room
+   for one rendered owner text of up to 1.25 MiB (a 1 MiB source plus its header) even when every
+   byte is a control character that JSON escapes to six bytes. Raw discovery/baseline streams
+   remain capped at 8 KiB each. A Context render above the owner-text ceiling fails closed as
+   `capacity`; a source is never cut to fit it.
 
 4. **Work.** All Git discovery, baseline capture, source reads, descriptor-safe single-file writes
    and language-server traffic for a
@@ -107,6 +110,24 @@ A completed helper Context or Diff whose composed text does not fit one reply re
 text as a daemon-side pagination cursor: the reply reports `truncated`/`continuation: true`, and
 each further `ide.inspect` on the same `detail_ref` slices the next chunk from the same capture,
 with no second helper launch and no daemon re-read, until a chunk reports `continuation: false`.
+
+Paging contract (T16B):
+
+- A source up to the 1 MiB read ceiling is paged whole; the render is never cut to a prefix. Every
+  page is cut on a line boundary, and the pages of a Context join to the exact file bytes.
+- The reply that settles the helper ticket already delivers page one. The first `ide.inspect` of
+  the reply's `detail_ref` therefore returns page two (on the managed path, where page one was
+  never delivered, the first inspect still returns page one). Each later call advances by one page.
+- Every page of a multi-page result starts with `page N; bytes A-B of TOTAL` (`TOTAL` is the
+  source length for Context, the composed text length for Diff). The last page is
+  `page N (last); bytes A-TOTAL of TOTAL; complete`. A single-page result carries no marker.
+- Inspecting again after the last page re-serves that last page unchanged (idempotent, like a
+  single-page result); it never advances past the end.
+- `ide.edit` is refused (`stale_source`) on the `source_ref` of a paged Context until its last
+  page was delivered: the reference names the whole observed source, but the caller has seen only
+  part of it.
+- A paged Diff header says `more_available: true`; every hunk is preceded by a `file: <path>` line
+  and a page that starts inside a file's hunks begins with `file: <path> (continued)`.
 A failed helper finalization retires its transient daemon detail (including a failed Start
 mapping), so repeated inspection returns the same bounded failure without consuming the global
 detail ceiling.

@@ -274,7 +274,8 @@ fn render_edit(result: &EditResult, diagnostics: &EditDiagnostics) -> String {
             }
         }
         EditOutcome::StaleSource => format!(
-            "edit: {outcome}; path {}. No write occurred; use ide.context before another edit",
+            "edit: {outcome}; path {}. No write occurred; use ide.context before another edit, \
+             and read every page of a paged context (ide.inspect) first",
             result.path
         ),
         EditOutcome::ConflictingDuplicate => format!(

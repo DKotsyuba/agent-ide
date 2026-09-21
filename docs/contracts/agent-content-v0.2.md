@@ -35,7 +35,9 @@ The final serialized CallToolResult, not an intermediate reply, must fit the exi
 
 Compact content must not add source text, prompts, credentials, native tool payloads, arbitrary provider or operating-system errors, host metadata or telemetry fields beyond facts already admitted by the typed result.
 
-Diff and Context pagination (`fit_diff_page`, `fit_context_page`) compose a page on the daemon side, before any MCP call has identified its host, so both stay sized to fit the worst-case carrier — content plus structuredContent — even though a Claude call's actual final envelope, once projected, has no structuredContent to fit at all.
+Every page of a multi-page Context or Claude-captured Diff starts with a position marker line, `page N; bytes A-B of TOTAL`, and the last is `page N (last); bytes A-TOTAL of TOTAL; complete`; a single-page result has none. Page one of a Claude result is delivered by the ticket settlement, so its first `ide.inspect` returns page two; a re-inspect after the last page re-serves the last page. A Context is paged whole up to the 1 MiB source ceiling, and its `source_ref` is refused for `ide.edit` until the last page was delivered. Each Diff hunk is preceded by a `file: <path>` line, and a continuation page that starts inside a file's hunks begins with `file: <path> (continued)`.
+
+Diff and Context pagination (`fit_diff_page`, `ContextPageState::next`) compose a page on the daemon side, before any MCP call has identified its host, so both stay sized to fit the worst-case carrier — content plus structuredContent — even though a Claude call's actual final envelope, once projected, has no structuredContent to fit at all.
 
 ## Gates
 

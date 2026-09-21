@@ -1183,7 +1183,16 @@ async fn context(
         serde_json::to_string(&context.lexical_matches).unwrap_or_else(|_| "[]".into()),
         context.text,
     );
-    let (text, clipped) = fit_result_text(rendered);
+    // A source is never silently cut to fit the result ceiling: an agent nudged to edit from a
+    // partial view could truncate the file, so an over-ceiling render fails closed instead (T16B).
+    if rendered.len() > MAX_RESULT_TEXT_BYTES {
+        return (
+            HelperOutcome::Failed {
+                code: FailureCode::Capacity,
+            },
+            None,
+        );
+    }
     let payload = HelperPayload::Context {
         source: HelperSource {
             path: path.to_owned(),
@@ -1193,9 +1202,9 @@ async fn context(
         },
         feedback,
         diagnostic_fingerprint,
-        truncated: context.truncated || clipped,
+        truncated: context.truncated,
     };
-    (HelperOutcome::Complete { text }, Some(payload))
+    (HelperOutcome::Complete { text: rendered }, Some(payload))
 }
 
 /// Runs one accepted provider over exact helper-observed bytes and reaps it before returning.
@@ -2077,8 +2086,8 @@ mod tests {
     async fn context_helper_reads_a_source_larger_than_the_output_budget() {
         let candidate = worktree();
         // 114000 bytes: matches the reported live-stability failure size, comfortably over the
-        // 4096-byte `output_bytes` budget and Intelligence's 64 KiB `MAX_CONTEXT_BYTES` render
-        // cap, but well under the 1 MiB `MAX_SOURCE_BYTES` read ceiling.
+        // 4096-byte `output_bytes` budget and the former 64 KiB render cap, but well under the
+        // 1 MiB `MAX_SOURCE_BYTES` read ceiling.
         let content = "x".repeat(114_000);
         std::fs::write(candidate.join("large.txt"), &content).unwrap();
         let (outcome, _children, _discovery, payload) =
@@ -2086,7 +2095,10 @@ mod tests {
         let HelperOutcome::Complete { text } = outcome else {
             panic!("a source under MAX_SOURCE_BYTES must read completely, saw {outcome:?}")
         };
-        assert!(text.contains('x'), "context text: {text}");
+        assert!(
+            text.ends_with(&content),
+            "the helper text must carry the whole source (T16B)"
+        );
         let Some(HelperPayload::Context {
             source, truncated, ..
         }) = payload
@@ -2094,10 +2106,7 @@ mod tests {
             panic!("Context must return its payload")
         };
         assert_eq!(source.length, content.len() as u64);
-        assert!(
-            truncated,
-            "Intelligence's own 64 KiB render cap still truncates the exposed text"
-        );
+        assert!(!truncated, "the whole source was rendered, nothing was cut");
         let _ = std::fs::remove_dir_all(&candidate);
     }
 

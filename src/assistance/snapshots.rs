@@ -438,13 +438,26 @@ pub(crate) fn render_diff_text(
     for path in result.conflicts() {
         text.push_str(&format!("conflicted_path: {:?}\n", path.path()));
     }
+    // Every file's first hunk is preceded by its `file:` line, so no hunk on any page depends on
+    // the header's path list for attribution (T16B).
+    let mut current: Option<&std::path::PathBuf> = None;
     for hunk in result.selected_hunks() {
+        if current != Some(hunk.path()) {
+            text.push_str(&format!("file: {:?}\n", hunk.path()));
+            current = Some(hunk.path());
+        }
         match std::str::from_utf8(hunk.patch()) {
             Ok(patch) => text.push_str(patch),
             Err(_) => text.push_str(&format!("raw_patch_hex: {:02x?}\n", hunk.patch())),
         }
     }
     text
+}
+
+/// Flips the first (header) `more_available: false` of a rendered Diff text to `true`, for a text
+/// composed without a pager that the daemon then pages (T16B). A no-op when it is already `true`.
+pub(crate) fn mark_more_available(text: &str) -> String {
+    text.replacen("more_available: false\n", "more_available: true\n", 1)
 }
 
 impl Worker<'_> {
