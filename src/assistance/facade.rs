@@ -180,14 +180,22 @@ fn schema(tool: AssistanceTool, input_schema: Value) -> ToolSchema {
 }
 
 /// Explains why a model-facing tool argument object was rejected before routing.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParameterError {
     /// The argument value was not an object under the hard byte limit.
     InvalidObject,
     /// The object named a field outside the selected method's closed schema.
-    UnknownField,
-    /// A required field was absent, empty, non-string, or over its method-specific limit.
-    InvalidField,
+    ///
+    /// Carries the caller-supplied field name only when it passed the conservative
+    /// [`echoable_field`] check; otherwise the refusal omits the name entirely.
+    UnknownField(Option<String>),
+    /// One named field violated one specific closed rule of the selected method.
+    InvalidField {
+        /// Facade-owned field name, always safe to echo back.
+        field: &'static str,
+        /// The exact closed rule the field value violated.
+        rule: FieldRule,
+    },
     /// `ide.context` named neither `path` nor `kind: "problems"`.
     ///
     /// The published schema stays a plain object (providers such as GLM drop a tool whose schema
@@ -195,9 +203,143 @@ pub enum ParameterError {
     ContextTarget,
 }
 
+/// Names the specific closed rule one field value violated (T21B).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FieldRule {
+    /// The closed method cannot proceed without this field.
+    Required,
+    /// The value must be a bounded nonempty string.
+    NonEmptyString,
+    /// The value must be a string; an empty one is allowed.
+    String,
+    /// The string exceeds its method-specific byte limit.
+    TooLong(usize),
+    /// The path must stay beneath the worktree root.
+    RelativePath,
+    /// A `..` path segment would leave the worktree root.
+    NoDotDot,
+    /// The string carries a NUL byte.
+    NoNul,
+    /// The value must be an integer between zero and the carried inclusive maximum.
+    NonNegativeInteger(u64),
+    /// The value must be one of the carried quoted alternatives.
+    OneOf(&'static str),
+    /// The field is meaningless without `kind: "problems"`.
+    RequiresProblemsKind,
+}
+
+impl FieldRule {
+    /// Renders the rule text appended after the quoted field name in one refusal line.
+    fn text(self) -> String {
+        match self {
+            Self::Required => "is required".to_string(),
+            Self::NonEmptyString => "must be a non-empty string".to_string(),
+            Self::String => "must be a string".to_string(),
+            Self::TooLong(limit) => format!("is longer than {limit} bytes"),
+            Self::RelativePath => {
+                "must be a path relative to the worktree root, not absolute".to_string()
+            }
+            Self::NoDotDot => "must not contain \"..\"".to_string(),
+            Self::NoNul => "must not contain a NUL byte".to_string(),
+            Self::NonNegativeInteger(limit) => {
+                format!("must be a non-negative integer up to {limit}")
+            }
+            Self::OneOf(values) => format!("must be {values}"),
+            Self::RequiresProblemsKind => "requires \"kind\":\"problems\"".to_string(),
+        }
+    }
+}
+
+impl ParameterError {
+    /// Renders the single-line model-facing refusal naming exactly what to fix (T21B).
+    ///
+    /// Only caller field names that passed [`echoable_field`] are echoed back, and no field value
+    /// is ever included, so the text stays safe and bounded under 256 bytes on one line.
+    pub fn message(&self, tool: AssistanceTool) -> String {
+        match self {
+            Self::InvalidObject => format!(
+                "invalid bounded parameters: arguments must be a JSON object under {} bytes",
+                parameter_limit(tool)
+            ),
+            Self::UnknownField(name) => {
+                let named = name
+                    .as_ref()
+                    .map(|name| format!(" \"{name}\""))
+                    .unwrap_or_default();
+                let allowed = allowed_fields(tool).join(", ");
+                if allowed.is_empty() {
+                    format!("invalid bounded parameters: unknown field{named}")
+                } else {
+                    format!("invalid bounded parameters: unknown field{named}; allowed: {allowed}")
+                }
+            }
+            Self::InvalidField { field, rule } => {
+                format!("invalid bounded parameters: \"{field}\" {}", rule.text())
+            }
+            Self::ContextTarget => CONTEXT_TARGET_MESSAGE.to_string(),
+        }
+    }
+}
+
 /// Model-facing text for a context request that names neither a path nor the problems kind.
 const CONTEXT_TARGET_MESSAGE: &str =
     "invalid bounded parameters: ide.context needs either \"path\" or \"kind\":\"problems\"";
+
+/// Returns the closed allowed field list for one logical tool.
+fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
+    match tool {
+        AssistanceTool::Start => &["activation_id"],
+        AssistanceTool::Context => &[
+            "path",
+            "byte_offset",
+            "detail_ref",
+            "kind",
+            "language",
+            "offset",
+        ],
+        AssistanceTool::Diff => &["mode", "detail_ref"],
+        AssistanceTool::Inspect => &["detail_ref"],
+        AssistanceTool::Stop => &[],
+        AssistanceTool::Edit => &["operation_id", "path", "source_ref", "content"],
+    }
+}
+
+/// Returns the hard argument-object byte limit for one logical tool.
+fn parameter_limit(tool: AssistanceTool) -> usize {
+    if tool == AssistanceTool::Edit {
+        crate::changes::edit::MAX_EDIT_ARGUMENT_BYTES
+    } else {
+        MAX_PARAMETER_BYTES
+    }
+}
+
+/// Echoes one caller-supplied field name only when it passes a conservative shape check.
+fn echoable_field(field: &str) -> Option<String> {
+    (!field.is_empty()
+        && field.len() <= 32
+        && field
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
+    .then(|| field.to_string())
+}
+
+/// Builds one field-level rejection naming the violated closed rule.
+fn invalid_field(field: &'static str, rule: FieldRule) -> ParameterError {
+    ParameterError::InvalidField { field, rule }
+}
+
+/// Names the closed relative-path rule one already-bounded path string violated, if any.
+fn path_shape_rule(path: &str) -> Option<FieldRule> {
+    if path.as_bytes().contains(&0) {
+        Some(FieldRule::NoNul)
+    } else if path.split('/').any(|part| part == "..") {
+        Some(FieldRule::NoDotDot)
+    } else if path.split('/').any(|part| matches!(part, "" | ".")) {
+        Some(FieldRule::RelativePath)
+    } else {
+        None
+    }
+}
 
 /// Holds one validated bounded method payload with no identity or authority fields.
 #[derive(Clone, Debug, PartialEq)]
@@ -225,11 +367,7 @@ pub fn validate_call(
     tool: AssistanceTool,
     mut parameters: Value,
 ) -> Result<ValidatedCall, ParameterError> {
-    let parameter_limit = if tool == AssistanceTool::Edit {
-        crate::changes::edit::MAX_EDIT_ARGUMENT_BYTES
-    } else {
-        MAX_PARAMETER_BYTES
-    };
+    let parameter_limit = parameter_limit(tool);
     if serde_json::to_vec(&parameters)
         .ok()
         .is_none_or(|value| value.len() > parameter_limit)
@@ -239,26 +377,12 @@ pub fn validate_call(
     let object = parameters
         .as_object()
         .ok_or(ParameterError::InvalidObject)?;
-    let allowed = match tool {
-        AssistanceTool::Start => &["activation_id"][..],
-        AssistanceTool::Context => &[
-            "path",
-            "byte_offset",
-            "detail_ref",
-            "kind",
-            "language",
-            "offset",
-        ][..],
-        AssistanceTool::Diff => &["mode", "detail_ref"][..],
-        AssistanceTool::Inspect => &["detail_ref"][..],
-        AssistanceTool::Stop => &[][..],
-        AssistanceTool::Edit => &["operation_id", "path", "source_ref", "content"][..],
-    };
-    if object
+    let allowed = allowed_fields(tool);
+    if let Some(field) = object
         .keys()
-        .any(|field| !allowed.contains(&field.as_str()))
+        .find(|field| !allowed.contains(&field.as_str()))
     {
-        return Err(ParameterError::UnknownField);
+        return Err(ParameterError::UnknownField(echoable_field(field)));
     }
     match tool {
         AssistanceTool::Start => {
@@ -271,7 +395,7 @@ pub fn validate_call(
                     Some("problems") => true,
                     // Any other kind value keeps the exact v0.2 context behaviour (EYES-r1 §7).
                     Some(_) => false,
-                    None => return Err(ParameterError::InvalidField),
+                    None => return Err(invalid_field("kind", FieldRule::String)),
                 },
             };
             if !problems && !object.contains_key("path") {
@@ -282,35 +406,47 @@ pub fn validate_call(
                     .get("language")
                     .is_some_and(|value| !matches!(value.as_str(), Some("rust" | "python")))
                 {
-                    return Err(ParameterError::InvalidField);
+                    return Err(invalid_field(
+                        "language",
+                        FieldRule::OneOf("\"rust\" or \"python\""),
+                    ));
                 }
                 if object.get("offset").is_some_and(|value| {
                     value
                         .as_u64()
                         .is_none_or(|offset| offset > MAX_PROBLEM_OFFSET)
                 }) {
-                    return Err(ParameterError::InvalidField);
+                    return Err(invalid_field(
+                        "offset",
+                        FieldRule::NonNegativeInteger(MAX_PROBLEM_OFFSET),
+                    ));
                 }
             } else {
                 // The problem-feed fields are meaningless without `kind: "problems"`; v0.2 keeps
                 // its exact closed field set, so a request naming them there is rejected.
                 if object.contains_key("language") || object.contains_key("offset") {
-                    return Err(ParameterError::InvalidField);
+                    let field = if object.contains_key("language") {
+                        "language"
+                    } else {
+                        "offset"
+                    };
+                    return Err(invalid_field(field, FieldRule::RequiresProblemsKind));
                 }
             }
             if !problems || object.contains_key("path") {
                 let path = required_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
-                if path.as_bytes().contains(&0)
-                    || path.split('/').any(|part| matches!(part, "" | "." | ".."))
-                {
-                    return Err(ParameterError::InvalidField);
+                if let Some(rule) = path_shape_rule(path) {
+                    return Err(invalid_field("path", rule));
                 }
             }
             if object
                 .get("byte_offset")
                 .is_some_and(|value| value.as_u64().is_none_or(|offset| offset > MAX_BYTE_OFFSET))
             {
-                return Err(ParameterError::InvalidField);
+                return Err(invalid_field(
+                    "byte_offset",
+                    FieldRule::NonNegativeInteger(MAX_BYTE_OFFSET),
+                ));
             }
 
             optional_string(object, "detail_ref", MAX_DETAIL_REF_BYTES)?;
@@ -320,7 +456,10 @@ pub fn validate_call(
             if object.get("mode").is_some_and(|value| {
                 !matches!(value.as_str(), Some("head" | "staged" | "unstaged"))
             }) {
-                return Err(ParameterError::InvalidField);
+                return Err(invalid_field(
+                    "mode",
+                    FieldRule::OneOf("\"head\", \"staged\", or \"unstaged\""),
+                ));
             }
         }
 
@@ -329,17 +468,34 @@ pub fn validate_call(
         }
         AssistanceTool::Stop => {}
         AssistanceTool::Edit => {
+            let operation_id = required_string(object, "operation_id", 128)?;
+            let path = required_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
             let request = crate::changes::edit::EditRequest::new(
-                required_string(object, "operation_id", 128)?,
-                required_string(object, "path", MAX_RELATIVE_PATH_BYTES)?,
+                operation_id,
+                path,
                 required_string(object, "source_ref", MAX_DETAIL_REF_BYTES)?,
                 object
                     .get("content")
                     .and_then(Value::as_str)
-                    .ok_or(ParameterError::InvalidField)?,
+                    .ok_or_else(|| invalid_field("content", FieldRule::String))?,
             )
-            .map_err(|_| ParameterError::InvalidField)?;
-            parameters = serde_json::to_value(request).map_err(|_| ParameterError::InvalidField)?;
+            .map_err(|error| match error {
+                crate::changes::edit::EditRequestError::ContentTooLarge => invalid_field(
+                    "content",
+                    FieldRule::TooLong(crate::workspace::edit::MAX_EDIT_CONTENT_BYTES),
+                ),
+                // `operation_id` and `source_ref` bounds already held above and the path length
+                // already held at 1024 bytes, so only the path shape can remain invalid here.
+                crate::changes::edit::EditRequestError::InvalidArgument => invalid_field(
+                    "path",
+                    path_shape_rule(path).unwrap_or(FieldRule::RelativePath),
+                ),
+                crate::changes::edit::EditRequestError::ArgumentsTooLarge => {
+                    ParameterError::InvalidObject
+                }
+            })?;
+            parameters =
+                serde_json::to_value(request).map_err(|_| ParameterError::InvalidObject)?;
         }
     }
     if tool == AssistanceTool::Diff {
@@ -355,22 +511,32 @@ pub fn validate_call(
 /// Reads one required bounded nonempty string from a closed method object.
 fn required_string<'a>(
     object: &'a Map<String, Value>,
-    field: &str,
+    field: &'static str,
     max_bytes: usize,
 ) -> Result<&'a str, ParameterError> {
-    let value = object
-        .get(field)
-        .and_then(Value::as_str)
-        .ok_or(ParameterError::InvalidField)?;
-    (!value.is_empty() && value.len() <= max_bytes)
-        .then_some(value)
-        .ok_or(ParameterError::InvalidField)
+    let Some(value) = object.get(field).and_then(Value::as_str) else {
+        return Err(invalid_field(
+            field,
+            if object.contains_key(field) {
+                FieldRule::NonEmptyString
+            } else {
+                FieldRule::Required
+            },
+        ));
+    };
+    if value.is_empty() {
+        return Err(invalid_field(field, FieldRule::NonEmptyString));
+    }
+    if value.len() > max_bytes {
+        return Err(invalid_field(field, FieldRule::TooLong(max_bytes)));
+    }
+    Ok(value)
 }
 
 /// Reads one optional bounded nonempty string and rejects a present non-string or empty value.
 fn optional_string(
     object: &Map<String, Value>,
-    field: &str,
+    field: &'static str,
     max_bytes: usize,
 ) -> Result<(), ParameterError> {
     object
@@ -1098,10 +1264,9 @@ impl StdioFacade {
                 self.dispatch_with_reconnect(tool, parameters, &context)
                     .await
             }
-            Err(ParameterError::ContextTarget) => {
-                return CallToolResult::error(vec![ContentBlock::text(CONTEXT_TARGET_MESSAGE)]);
+            Err(error) => {
+                return CallToolResult::error(vec![ContentBlock::text(error.message(tool))]);
             }
-            Err(_) => (FacadeOutcome::InvalidParameters, false),
         };
         // The Claude host hands `structuredContent` straight to its model in place of `content`,
         // defeating the compact renderer (T14B); its calls therefore never receive that duplicate
@@ -1373,5 +1538,196 @@ impl rmcp::ServerHandler for StdioFacade {
                 .enable_experimental_with(experimental)
                 .build(),
         )
+    }
+}
+
+/// Collects one T21B refusal per validation rule so every message names the field to fix.
+#[cfg(test)]
+fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
+    let oversized = json!({"path": "a".repeat(5000)});
+    vec![
+        (
+            validate_call(
+                AssistanceTool::Start,
+                json!({"activation_id":"a","actor_id":"x"}),
+            )
+            .unwrap_err(),
+            AssistanceTool::Start,
+            "invalid bounded parameters: unknown field \"actor_id\"; allowed: activation_id"
+                .to_string(),
+        ),
+        (
+            validate_call(AssistanceTool::Stop, json!({"authority":1}))
+                .unwrap_err(),
+            AssistanceTool::Stop,
+            "invalid bounded parameters: unknown field \"authority\"".to_string(),
+        ),
+        (
+            validate_call(AssistanceTool::Context, json!({"../escape":1})).unwrap_err(),
+            AssistanceTool::Context,
+            "invalid bounded parameters: unknown field; allowed: path, byte_offset, detail_ref, kind, language, offset"
+                .to_string(),
+        ),
+        (
+            validate_call(AssistanceTool::Inspect, json!({})).unwrap_err(),
+            AssistanceTool::Inspect,
+            "invalid bounded parameters: \"detail_ref\" is required".to_string(),
+        ),
+        (
+            validate_call(
+                AssistanceTool::Context,
+                json!({"path": "/private/tmp/agent-ide-stability/agent-tasks/pyproject.toml"}),
+            )
+            .unwrap_err(),
+            AssistanceTool::Context,
+            "invalid bounded parameters: \"path\" must be a path relative to the worktree root, not absolute"
+                .to_string(),
+        ),
+        (
+            validate_call(AssistanceTool::Context, json!({"path": "../secrets"})).unwrap_err(),
+            AssistanceTool::Context,
+            "invalid bounded parameters: \"path\" must not contain \"..\"".to_string(),
+        ),
+        (
+            validate_call(AssistanceTool::Context, oversized).unwrap_err(),
+            AssistanceTool::Context,
+            "invalid bounded parameters: arguments must be a JSON object under 4096 bytes"
+                .to_string(),
+        ),
+        (
+            validate_call(AssistanceTool::Context, json!({"path": "a".repeat(1025)})).unwrap_err(),
+            AssistanceTool::Context,
+            "invalid bounded parameters: \"path\" is longer than 1024 bytes".to_string(),
+        ),
+        (
+            validate_call(AssistanceTool::Start, json!({"activation_id": ""})).unwrap_err(),
+            AssistanceTool::Start,
+            "invalid bounded parameters: \"activation_id\" must be a non-empty string".to_string(),
+        ),
+        (
+            validate_call(AssistanceTool::Start, json!({"activation_id": 7})).unwrap_err(),
+            AssistanceTool::Start,
+            "invalid bounded parameters: \"activation_id\" must be a non-empty string".to_string(),
+        ),
+        (
+            validate_call(AssistanceTool::Context, json!({"kind":"problems","offset":-1}))
+                .unwrap_err(),
+            AssistanceTool::Context,
+            "invalid bounded parameters: \"offset\" must be a non-negative integer up to 4294967295"
+                .to_string(),
+        ),
+        (
+            validate_call(
+                AssistanceTool::Context,
+                json!({"path":"src/main.rs","byte_offset":"soonest"}),
+            )
+            .unwrap_err(),
+            AssistanceTool::Context,
+            "invalid bounded parameters: \"byte_offset\" must be a non-negative integer up to 1048576"
+                .to_string(),
+        ),
+        (
+            validate_call(
+                AssistanceTool::Context,
+                json!({"kind":"problems","language":"go"}),
+            )
+            .unwrap_err(),
+            AssistanceTool::Context,
+            "invalid bounded parameters: \"language\" must be \"rust\" or \"python\"".to_string(),
+        ),
+        (
+            validate_call(AssistanceTool::Context, json!({"path":"a.rs","offset":5})).unwrap_err(),
+            AssistanceTool::Context,
+            "invalid bounded parameters: \"offset\" requires \"kind\":\"problems\"".to_string(),
+        ),
+        (
+            validate_call(AssistanceTool::Diff, json!({"mode":"all"})).unwrap_err(),
+            AssistanceTool::Diff,
+            "invalid bounded parameters: \"mode\" must be \"head\", \"staged\", or \"unstaged\""
+                .to_string(),
+        ),
+        (
+            validate_call(
+                AssistanceTool::Edit,
+                json!({"operation_id":"o","path":"a.rs","source_ref":"s","content":5}),
+            )
+            .unwrap_err(),
+            AssistanceTool::Edit,
+            "invalid bounded parameters: \"content\" must be a string".to_string(),
+        ),
+        (
+            validate_call(
+                AssistanceTool::Edit,
+                json!({"operation_id":"o","path":"a.rs","source_ref":"s","content":"x".repeat(49 * 1024)}),
+            )
+            .unwrap_err(),
+            AssistanceTool::Edit,
+            "invalid bounded parameters: \"content\" is longer than 49152 bytes".to_string(),
+        ),
+        (
+            validate_call(
+                AssistanceTool::Edit,
+                json!({"operation_id":"o","path":"/abs/a.rs","source_ref":"s","content":""}),
+            )
+            .unwrap_err(),
+            AssistanceTool::Edit,
+            "invalid bounded parameters: \"path\" must be a path relative to the worktree root, not absolute"
+                .to_string(),
+        ),
+        (
+            validate_call(AssistanceTool::Context, json!({})).unwrap_err(),
+            AssistanceTool::Context,
+            "invalid bounded parameters: ide.context needs either \"path\" or \"kind\":\"problems\""
+                .to_string(),
+        ),
+    ]
+}
+
+/// Every T21B refusal names the exact parameter to fix, stays single-line, and stays bounded.
+#[test]
+fn invalid_parameter_refusals_name_the_field_and_rule() {
+    for (error, tool, expected) in t21b_refusals() {
+        let message = error.message(tool);
+        assert_eq!(message, expected);
+        assert!(!message.contains('\n'), "refusal must stay single-line");
+        assert!(message.len() < 256, "refusal must stay under 256 bytes");
+    }
+}
+
+/// The observed live failure (an absolute `ide.context` path) now explains the relative-path rule.
+#[test]
+fn absolute_context_path_refusal_names_the_relative_path_rule() {
+    let message = validate_call(
+        AssistanceTool::Context,
+        json!({"path": "/private/tmp/agent-ide-stability/agent-tasks/pyproject.toml"}),
+    )
+    .unwrap_err()
+    .message(AssistanceTool::Context);
+    assert_eq!(
+        message,
+        "invalid bounded parameters: \"path\" must be a path relative to the worktree root, not absolute"
+    );
+}
+
+/// Caller field names are echoed only when they pass the conservative echo check (T21B).
+#[test]
+fn unknown_field_names_are_echoed_only_when_safe() {
+    for (name, echoed) in [
+        ("actor_id".to_string(), true),
+        ("Actor_9".to_string(), true),
+        ("a".repeat(32), true),
+        ("a".repeat(33), false),
+        ("actor-id".to_string(), false),
+        ("../escape".to_string(), false),
+        (String::new(), false),
+    ] {
+        let mut object = Map::new();
+        object.insert("activation_id".to_string(), json!("a"));
+        object.insert(name.clone(), json!("x"));
+        let error = validate_call(AssistanceTool::Start, Value::Object(object)).unwrap_err();
+        let ParameterError::UnknownField(carried) = error else {
+            panic!("unknown field must be carried");
+        };
+        assert_eq!(carried.as_deref(), echoed.then_some(name.as_str()));
     }
 }
