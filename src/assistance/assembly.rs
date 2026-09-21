@@ -117,6 +117,23 @@ fn is_problems_context(method: AssistanceMethod, parameters: &Value) -> bool {
         && parameters.get("kind").and_then(Value::as_str) == Some("problems")
 }
 
+/// Returns the due `<agent-ide>` status plate for one Claude post phase, or `None`.
+///
+/// Reads only in-memory snapshots and never waits for a running check. The plate is skipped, and
+/// stays due for a later hook, whenever it could not fit beside `feedback` inside one bounded hook
+/// context (EYES-r2 §5/§6).
+fn due_plate(
+    feed: Option<&Arc<ProjectProblemFeed>>,
+    fingerprint: &[u8; 32],
+    feedback: Option<&str>,
+) -> Option<String> {
+    let reserved = feedback.map_or(0, |text| text.len() + 1);
+    if reserved + crate::feed::MAX_BLOCK_BYTES > super::reply::MAX_FEEDBACK_BYTES {
+        return None;
+    }
+    feed?.next_block(fingerprint)
+}
+
 impl std::fmt::Debug for ProductDispatcher {
     /// Omits private channel nonces, host identities and all worker state.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -789,7 +806,22 @@ impl ProductDispatcher {
                 let status = self.bindings.lock().ok()?.observe_hook(event, channel);
                 match status {
                     BindingStatus::PreObserved => Some(PeerReply::HookObserved {}),
-                    BindingStatus::Settled(_) => Some(PeerReply::HookSettled {}),
+                    BindingStatus::Settled(binding) => {
+                        // Settlement itself stays silent and never rechecks; but the settled MCP
+                        // call may just have completed an activation or a check, so a due status
+                        // plate is still delivered on this Claude post phase (T22B).
+                        if claude_post
+                            && let Some(worker) = &self.worker
+                            && let Some(block) = due_plate(
+                                worker.project_feed(),
+                                &binding.binding_ref().fingerprint(),
+                                None,
+                            )
+                        {
+                            return Some(PeerReply::Feedback { text: block });
+                        }
+                        Some(PeerReply::HookSettled {})
+                    }
                     BindingStatus::NativeObserved(binding) => {
                         // A helper's own post settles the operation it belongs to. It must not be
                         // treated as a generic native edit, or the helper would invalidate the
@@ -802,6 +834,16 @@ impl ProductDispatcher {
                             // leaving it pending: the tool ran, so expiry must not be the only
                             // thing that ever resolves it.
                             let _ = launches.settle_post(call_id, !failed);
+                            // Settlement still delivers a due status plate: none was sent while
+                            // the helper ran, and this may be the first hook after it finished
+                            // (T22B). It triggers no recheck and advances no native epoch.
+                            if claude_post
+                                && let Some(worker) = &self.worker
+                                && let Some(block) =
+                                    due_plate(worker.project_feed(), &binding.fingerprint(), None)
+                            {
+                                return Some(PeerReply::Feedback { text: block });
+                            }
                             return Some(PeerReply::NativeHookObserved {});
                         }
                         if let Some(worker) = &self.worker {
@@ -815,13 +857,7 @@ impl ProductDispatcher {
                             // The block is taken from in-memory snapshots only. It is skipped, and
                             // stays due for a later hook, whenever it could not fit beside the
                             // feedback inside one bounded hook context.
-                            let block = feed
-                                .filter(|_| {
-                                    feedback.as_ref().map_or(0, |text| text.len() + 1)
-                                        + crate::feed::MAX_BLOCK_BYTES
-                                        <= super::reply::MAX_FEEDBACK_BYTES
-                                })
-                                .and_then(|feed| feed.next_block(&fingerprint));
+                            let block = due_plate(feed, &fingerprint, feedback.as_deref());
                             let text = match (block, feedback) {
                                 (Some(block), Some(feedback)) => {
                                     Some(format!("{block}\n{feedback}"))
