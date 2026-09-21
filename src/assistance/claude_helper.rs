@@ -1830,14 +1830,14 @@ mod tests {
     }
 
     /// A launched helper claims once, runs real Git children, reaps them, and settles its frame.
-    /// Proves the daemon-minted Diff budget covers the snapshot's bounded per-path walk.
+    /// Proves the snapshot walk's child count no longer scales with tracked-path count (T27B).
     ///
-    /// A real repository with more tracked paths than the old per-operation process ceiling
-    /// used to exhaust the helper's child budget mid-walk and fail every Claude Diff closed as
+    /// A real repository with more tracked paths than the old per-operation process ceiling used
+    /// to exhaust the helper's child budget mid-walk and fail every Claude Diff closed as
     /// `capacity` without any write. This regression runs the real helper Diff over a worktree
-    /// with more than sixty-four tracked paths using exactly the minted production ceilings, and
-    /// additionally shows the previous small budget fails on the same repository, so the budget
-    /// and the snapshot bound can never silently diverge again.
+    /// with more than sixty-four tracked paths and shows even the small legacy budget completes
+    /// the whole walk — unchanged paths cost no per-path children since the batched no-filter
+    /// hash classification — so the budget and the snapshot bound can never silently diverge.
     #[tokio::test]
     async fn diff_helper_completes_the_bounded_snapshot_walk_of_a_real_repository() {
         let candidate = worktree();
@@ -1913,23 +1913,16 @@ mod tests {
                 deadline_ms: 120_000,
             },
         };
-        // The previously minted ceiling cannot finish the walk of this repository and fails
-        // closed partway through its child budget instead of delivering any diff.
+        // The small legacy budget now completes the same walk: classification is batched, so the
+        // child count stays far below the ceiling no matter how many tracked paths are unchanged.
         let (outcome, small, _, _) = perform(&diff_job(64, 64 * 1024)).await;
         assert!(
-            matches!(
-                outcome,
-                HelperOutcome::Failed {
-                    code: FailureCode::Capacity
-                } | HelperOutcome::Failed {
-                    code: FailureCode::SourceUnavailable
-                }
-            ),
-            "the small legacy budget must fail closed, saw {outcome:?}"
+            matches!(outcome, HelperOutcome::Complete { .. }),
+            "the small legacy budget must complete the batched walk, saw {outcome:?}"
         );
         assert!(
-            small.spawned > 8,
-            "legacy budget consumed {}",
+            small.spawned <= 32,
+            "81 tracked paths must not cost per-path children, used {}",
             small.spawned
         );
         // The minted production ceilings complete the same walk and deliver a real diff.
@@ -1941,7 +1934,12 @@ mod tests {
         let HelperOutcome::Complete { text } = outcome else {
             panic!("the bounded snapshot walk completes, saw {outcome:?}")
         };
-        assert!(children.settled() && children.spawned > 64);
+        assert!(children.settled());
+        assert!(
+            children.spawned <= 32,
+            "81 tracked paths must not cost per-path children, used {}",
+            children.spawned
+        );
         assert!(text.contains("changed.txt"), "diff text: {text}");
         assert!(matches!(payload, Some(HelperPayload::Diff { .. })));
         let _ = std::fs::remove_dir_all(&candidate);
