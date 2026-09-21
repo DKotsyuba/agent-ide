@@ -23,6 +23,10 @@ pub mod claude_worker;
 /// Exposes the bounded fail-open native Codex and Claude hook command modes.
 pub mod codex_hook;
 
+/// Publishes, discovers and retires bounded private actor-addressed Codex rendezvous records.
+#[cfg(unix)]
+pub mod codex_rendezvous;
+
 /// Defines the confined project-problem source seam and the compact problems page text.
 pub mod problems;
 
