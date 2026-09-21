@@ -29,9 +29,10 @@ use std::{
 
 /// Maximum complete serialized helper frame in either direction, before JSON decoding.
 ///
-/// Sized to comfortably carry one complete `MAX_RESULT_TEXT_BYTES` result even after JSON string
-/// escaping, plus the bounded discovery/source fields alongside it (T13B).
-pub const MAX_HELPER_FRAME_BYTES: usize = 1024 * 1024;
+/// Sized to carry one complete `MAX_RESULT_TEXT_BYTES` result even in the worst case where every
+/// byte is a control character that JSON escapes to six bytes (`\u00XX`), plus the bounded
+/// discovery/source fields alongside it (T16B).
+pub const MAX_HELPER_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// Only this closed helper wire revision is accepted in either direction.
 pub const HELPER_PROTOCOL: u32 = 3;
 /// Bounds concurrently outstanding launch tickets within one daemon boot.
@@ -44,8 +45,9 @@ const MAX_IDENTIFIER_BYTES: usize = 256;
 ///
 /// One capture must be large enough to hold a full bounded Context or Diff render for the daemon
 /// to page through on later `ide.inspect` calls, rather than repeatedly re-launching the Claude
-/// foreground helper (T13B).
-pub(super) const MAX_RESULT_TEXT_BYTES: usize = 256 * 1024;
+/// foreground helper (T13B). A source up to `MAX_SOURCE_BYTES` (1 MiB) must fit whole beside its
+/// fixed header, so this is that ceiling plus 256 KiB of header room (T16B).
+pub(super) const MAX_RESULT_TEXT_BYTES: usize = 1024 * 1024 + 256 * 1024;
 /// Maximum raw bytes one reported discovery stream may carry.
 const MAX_DISCOVERY_STREAM_BYTES: usize = 8 * 1024;
 /// Fixed helper subcommand; the model never selects an executable, argument or shell fragment.

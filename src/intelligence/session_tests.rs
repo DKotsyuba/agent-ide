@@ -165,7 +165,10 @@ fn exact_lexical_context_and_positions() {
     .unwrap();
     assert!(result.truncated);
     assert_eq!(result.lexical_matches.len(), MAX_CONTEXT_ITEMS);
-    assert_eq!(result.text.len(), context::MAX_CONTEXT_BYTES);
+    assert_eq!(
+        result.text, large,
+        "the whole observed text is returned (T16B)"
+    );
 }
 
 /// Creates bounded router state with one synchronized document and unknown diagnostics.

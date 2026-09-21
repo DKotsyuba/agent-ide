@@ -4,7 +4,10 @@ use super::freshness::{Freshness, SourceBinding, ViewGeneration};
 use crate::workspace::observation::{MAX_SOURCE_BYTES, SourceBytes, SourceObservation};
 use async_lsp::lsp_types::{GotoDefinitionResponse, Location, Position, PositionEncodingKind, Url};
 
-/// Maximum retained text in one context response, independent of provider availability.
+/// Maximum retained identifier text selected by one symbol query.
+///
+/// The source text itself is no longer capped here: the complete observed file (at most
+/// `MAX_SOURCE_BYTES`) is returned and the caller pages it into bounded replies (T16B).
 pub const MAX_CONTEXT_BYTES: usize = 64 * 1024;
 /// Maximum retained semantic locations or lexical matches in one response.
 pub const MAX_CONTEXT_ITEMS: usize = 128;
@@ -12,7 +15,7 @@ pub const MAX_CONTEXT_ITEMS: usize = 128;
 /// Selects an exact file or the identifier at a zero-based UTF-8 byte offset.
 #[derive(Clone, Copy, Debug)]
 pub enum ContextQuery {
-    /// Returns a bounded prefix of the exact observed file.
+    /// Returns the complete exact observed file.
     File,
     /// Looks up the identifier containing this byte; offsets inside UTF-8 code points are rejected.
     Symbol {
@@ -50,7 +53,7 @@ pub struct ContextResult {
     pub mode: ContextMode,
     /// Freshness of this exact source observation, not a claim of workspace-wide readiness.
     pub freshness: Freshness,
-    /// Exact UTF-8 prefix of the observed bytes, capped at `MAX_CONTEXT_BYTES`.
+    /// Exact UTF-8 text of the complete observed file, at most `MAX_SOURCE_BYTES`.
     pub text: String,
     /// Identifier selected by the query, absent for a file query or nonidentifier position.
     pub symbol: Option<String>,
@@ -60,7 +63,7 @@ pub struct ContextResult {
     pub references: Option<Vec<Location>>,
     /// Exact-file lexical token matches, never a project-wide symbol identity claim.
     pub lexical_matches: Vec<Location>,
-    /// At least one text or location ceiling omitted requested data.
+    /// At least one location ceiling omitted requested data; the source text is never cut.
     pub truncated: bool,
 }
 
@@ -140,7 +143,7 @@ pub fn lexical_context(
         }
     };
     let mut matches = Vec::new();
-    let mut truncated = text.len() > MAX_CONTEXT_BYTES;
+    let mut truncated = false;
     if let Some(symbol) = &symbol {
         for (start, candidate) in text.match_indices(symbol) {
             let end = start + candidate.len();
@@ -176,7 +179,7 @@ pub fn lexical_context(
         } else {
             Freshness::Unknown
         },
-        text: prefix(text, MAX_CONTEXT_BYTES).to_owned(),
+        text: text.to_owned(),
         symbol,
         definitions: None,
         references: None,

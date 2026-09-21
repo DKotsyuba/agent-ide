@@ -55,8 +55,14 @@ instead of parsing the compact text as a second response schema.
    or reports truncated content. Do not repeat the same call instead. A
    `Context` or `Diff` reply with `continuation: true` means the result is
    larger than one reply: call `ide.inspect` with that same `detail_ref` again
-   to get the next chunk, and repeat until a chunk reports `continuation:
-   false`; concatenate the chunks in order for the complete text.
+   to get the next chunk (the reply you already hold is page one, so the
+   first call returns page two), and repeat until a chunk reports
+   `continuation: false`; concatenate the chunks in order for the complete
+   text. Every page starts with `page N; bytes A-B of TOTAL`; the last one says
+   `(last)` and `complete`. A whole source up to 1 MiB is delivered this way;
+   do not `ide.edit` from a `Context` until its last page arrived — the edit is
+   refused as `stale_source` otherwise. Calling `ide.inspect` again after the
+   last page just repeats the last page.
 7. `ide.stop` at handoff to another actor, or when the task ends, to release
    this binding's activation.
 

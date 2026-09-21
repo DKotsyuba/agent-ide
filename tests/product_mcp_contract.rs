@@ -5117,18 +5117,50 @@ async fn diff_oversized_single_hunk_reports_capacity_without_false_continuation(
     daemon.wait().await.unwrap();
 }
 
-/// A real Claude foreground helper reads a source file well over the reported live-stability
-/// failure size in one capture, and the daemon pages the composed text across repeated
-/// `ide.inspect` calls until the whole bounded (`MAX_CONTEXT_BYTES`-capped) text has been
-/// delivered — never the generic `source_unavailable` (T13B).
+/// Parses one page's `page N[ (last)]; bytes A-B of TOTAL[; status]` position marker (T16B).
+fn page_marker(text: &str) -> (usize, bool, usize, usize, usize) {
+    let line = text.lines().next().unwrap_or_default();
+    let rest = line.strip_prefix("page ").unwrap_or_else(|| {
+        panic!(
+            "page must start with a position marker:\n{}",
+            &text[..text.len().min(200)]
+        )
+    });
+    let (head, tail) = rest.split_once("; bytes ").expect("marker bytes");
+    let last = head.ends_with(" (last)");
+    let number = head
+        .trim_end_matches(" (last)")
+        .parse()
+        .expect("page number");
+    let (range, total) = tail.split_once(" of ").expect("marker total");
+    let total = total.split(';').next().unwrap();
+    let (from, to) = range.split_once('-').expect("marker range");
+    (
+        number,
+        last,
+        from.parse().unwrap(),
+        to.parse().unwrap(),
+        total.parse().unwrap(),
+    )
+}
+
+/// A real Claude foreground helper reads a source file far over the former 64 KiB render cap in
+/// one capture, and the daemon pages the whole composed text across repeated `ide.inspect` calls:
+/// the first continuation call serves page two (not page one again), every page starts with a
+/// contiguous position marker, the pages join to the exact file bytes, the last page states
+/// completion, re-inspecting after it re-serves that last page, and `ide.edit` is refused on the
+/// source reference until every page was delivered (T13B, T16B).
 #[tokio::test]
-async fn claude_context_pagination_delivers_a_source_larger_than_the_output_budget() {
+async fn claude_context_pagination_delivers_the_whole_source_across_repeated_inspect() {
     let fixture = ProductFixture::new_claude(json!([]));
-    // 114000 bytes: matches the reported live-stability failure size, well over the fixture's
-    // small default `output_bytes` and over Intelligence's 64 KiB `MAX_CONTEXT_BYTES` render cap.
-    let content = "x".repeat(114_000);
-    std::fs::write(fixture.root.join("claude-large.txt"), &content).unwrap();
-    fixture.git(&["add", "--", "claude-large.txt"]);
+    // ~150 KB of short lines with a multibyte character: over the former 64 KiB cap, over the
+    // 114000-byte live report, and well under the 1 MiB read ceiling.
+    let content: String = (0..3300)
+        .map(|line| format!("value_{line:05} = \"caf\u{e9} {line:05} padding padding padding\"\n"))
+        .collect();
+    assert!(content.len() > 140_000, "{}", content.len());
+    std::fs::write(fixture.root.join("claude-large.py"), &content).unwrap();
+    fixture.git(&["add", "--", "claude-large.py"]);
     fixture.git(&["commit", "--quiet", "-m", "claude large source"]);
 
     let mut daemon = fixture.daemon().await;
@@ -5140,7 +5172,7 @@ async fn claude_context_pagination_delivers_a_source_larger_than_the_output_budg
     assert_eq!(started["kind"], "activation", "{started}");
 
     let first_call = actor
-        .call_claude(&fixture, "ide.context", json!({"path":"claude-large.txt"}))
+        .call_claude(&fixture, "ide.context", json!({"path":"claude-large.py"}))
         .await;
     let (page1, _) = actor.complete_claude_pending(&fixture, &first_call).await;
     assert_eq!(page1["kind"], "context", "{page1}");
@@ -5150,43 +5182,76 @@ async fn claude_context_pagination_delivers_a_source_larger_than_the_output_budg
         .as_str()
         .expect("a multi-page Context result must carry a detail_ref")
         .to_owned();
+    let page1_text = page1["text"].as_str().unwrap().to_owned();
+    assert!(
+        page1_text.contains("coverage: complete helper-observed path"),
+        "{page1_text}"
+    );
+    let (number, last, from, mut end, total) = page_marker(&page1_text);
+    assert_eq!((number, last, from, total), (1, false, 0, content.len()));
+    let mut collected = page1_text
+        .split_once("\n\n")
+        .expect("header ends at the first blank line")
+        .1
+        .to_owned();
 
-    let mut collected = page1["text"].as_str().unwrap().to_owned();
     let mut continuation = true;
-    let mut pages = 1;
+    let mut expected_page = 1;
+    let mut last_page = String::new();
     while continuation {
-        pages += 1;
-        assert!(pages < 12, "pagination did not terminate");
+        expected_page += 1;
+        assert!(expected_page < 20, "pagination did not terminate");
         let next = actor
             .call_claude(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
             .await;
         assert_eq!(next["kind"], "context", "{next}");
-        if pages == 2 {
-            // Page one was delivered by the ticket settlement: the first continuation call must
-            // serve the next page, never page one again (T16B).
-            assert_ne!(
-                next["text"], page1["text"],
-                "the first ide.inspect of the worker ref re-served page one"
-            );
-        }
+        let text = next["text"].as_str().unwrap();
+        let (number, last, from, to, total) = page_marker(text);
         assert_eq!(
-            next["detail_ref"].as_str().unwrap(),
-            reference,
-            "every page must echo the same detail_ref"
+            number, expected_page,
+            "the first continuation call must serve page two, never page one again: {text}"
         );
+        assert_eq!((from, total), (end, content.len()), "{text}");
+        end = to;
         continuation = next["continuation"].as_bool().unwrap();
-        assert_eq!(
-            next["truncated"],
-            json!(true),
-            "content beyond MAX_CONTEXT_BYTES was never captured, so every page stays truncated: {next}"
-        );
-        collected.push_str(next["text"].as_str().unwrap());
+        assert_eq!(last, !continuation, "{text}");
+        assert_eq!(next["truncated"], json!(continuation), "{next}");
+        collected.push_str(text.split_once('\n').unwrap().1);
+        if expected_page == 2 {
+            // Two pages of a longer file are a partial view: an edit built on its source
+            // reference could truncate the file, so it is refused before the last page.
+            let edit = actor
+                .call_claude(
+                    &fixture,
+                    "ide.edit",
+                    json!({"operation_id":"partial-view","path":"claude-large.py",
+                           "source_ref":&reference,"content":"x = 1\n"}),
+                )
+                .await;
+            assert_eq!(edit["result"]["outcome"], "stale_source", "{edit}");
+            assert_eq!(edit["result"]["source_ref"], Value::Null, "{edit}");
+        }
+        if !continuation {
+            assert!(
+                text.lines().next().unwrap().ends_with("; complete"),
+                "{text}"
+            );
+            last_page = text.to_owned();
+        }
     }
-    assert!(pages >= 2, "the fixture file must force multiple pages");
-    assert!(
-        collected.ends_with(&content[..64 * 1024]),
-        "the exposed text must end with the exact MAX_CONTEXT_BYTES-bounded prefix of the source"
+    assert!(expected_page >= 3, "the fixture must force several pages");
+    assert_eq!(end, content.len(), "the last page must reach the end");
+    assert_eq!(
+        collected, content,
+        "pages must join to the exact file bytes"
     );
+
+    // Terminal behaviour: a further inspect re-serves the same last page, byte-identical.
+    let again = actor
+        .call_claude(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
+        .await;
+    assert_eq!(again["text"].as_str().unwrap(), last_page, "{again}");
+    assert_eq!(again["continuation"], false, "{again}");
 
     let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
@@ -5258,6 +5323,8 @@ async fn claude_diff_pagination_delivers_every_hunk_across_repeated_inspect() {
         "{page1_text}"
     );
 
+    assert_eq!(page_marker(&page1_text).0, 1, "{page1_text}");
+
     let mut collected = page1_text;
     let mut continuation = page1["continuation"].as_bool().unwrap();
     let mut pages = 1;
@@ -5268,6 +5335,12 @@ async fn claude_diff_pagination_delivers_every_hunk_across_repeated_inspect() {
             .call_claude(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
             .await;
         assert_eq!(next["kind"], "diff", "{next}");
+        let next_text = next["text"].as_str().unwrap();
+        assert_eq!(
+            page_marker(next_text).0,
+            pages,
+            "the first continuation call must serve page two: {next_text}"
+        );
         continuation = next["continuation"].as_bool().unwrap();
         // A further page names the exact detail_ref to inspect next; the terminal page carries
         // nothing left to fetch, so the compact Claude text omits it by design (T14B).

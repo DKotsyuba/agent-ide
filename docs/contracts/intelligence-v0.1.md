@@ -115,8 +115,9 @@ On unavailable synchronization, unsupported methods or failed requests, the resu
 explicitly reports lexical provenance and no semantic locations. The standalone
 `intelligence::context::lexical_context` provides the same fallback even when a
 provider cannot initialize. It scans only the exact supplied observation and labels
-matches as lexical, never as project-wide references. Results retain at most 64 KiB
-of source text and 128 locations per collection, with explicit truncation. Source
+matches as lexical, never as project-wide references. Results carry the complete
+observed source text (at most the 1 MiB ceiling; callers page it) and at most 128
+locations per collection, with explicit truncation of the locations. Source
 binding and generation/version facts accompany results; callers must compare these
 snapshots with their latest Workspace/provider observations before reuse.
 
