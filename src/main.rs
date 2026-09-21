@@ -102,6 +102,14 @@ async fn main() -> ExitCode {
             .await;
             ExitCode::SUCCESS
         }
+        Ok(Command::ManagedCodexHook) => {
+            agent_ide::assistance::codex_hook::run_managed().await;
+            ExitCode::SUCCESS
+        }
+        Ok(Command::CodexHooksPrint) => match codex_hooks_print() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(error),
+        },
         Ok(Command::ClaudeHook { runtime_dir }) => {
             agent_ide::assistance::codex_hook::run(
                 &runtime_dir,
@@ -521,6 +529,12 @@ enum Command {
         /// Existing daemon endpoint directory; never created by the hook command.
         runtime_dir: PathBuf,
     },
+    /// Submits one managed Codex hook discovered solely from private rendezvous records (T29B §3).
+    ManagedCodexHook,
+    /// Prints the managed Codex hooks.json fragment for the running executable (T29B §6).
+    ///
+    /// Pure offline reporting; stdout carries only the JSON and nothing is ever written anywhere.
+    CodexHooksPrint,
     /// Submits one bounded native Claude Code hook and always fails open at host ingress.
     ClaudeHook {
         /// Existing daemon endpoint directory; never created by the hook command.
@@ -685,6 +699,8 @@ commands:
   daemon --runtime-dir <dir>              run the repository daemon
   doctor --runtime-dir <dir>              report daemon health
   codex-hook --runtime-dir <dir>          Codex native hook
+  codex-hook --managed                    Codex native hook, managed route discovery
+  codex-hooks print                       print the managed Codex hooks.json fragment
   claude-hook [--runtime-dir <dir>]       Claude native hook
   claude-worker --runtime-dir <dir> --attachment <id> --detail-ref <ref>
                                           Claude foreground helper
@@ -705,6 +721,7 @@ const SUBCOMMANDS: &[&str] = &[
     "daemon",
     "doctor",
     "codex-hook",
+    "codex-hooks",
     "claude-hook",
     "claude-worker",
     "claude-rendezvous",
@@ -899,6 +916,15 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
             .and_then(|value| value.parse::<u64>().ok())
             .ok_or(AppError::InvalidResponse)?;
         return telemetry_command(sub, PathBuf::from(database), filter, Some(cursor));
+    }
+    // Fixed two-argument managed Codex hook forms; every other mode keeps its existing shape.
+    if let [mode, argument] = arguments.as_slice() {
+        if mode == "codex-hook" && argument == "--managed" {
+            return Ok(Command::ManagedCodexHook);
+        }
+        if mode == "codex-hooks" && argument == "print" {
+            return Ok(Command::CodexHooksPrint);
+        }
     }
     let [mode, flag, value] = arguments.as_slice() else {
         return Err(AppError::InvalidResponse);
@@ -1607,6 +1633,47 @@ fn valid_random_attachment(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// POSIX-shell single-quotes one absolute executable path, surviving spaces and apostrophes.
+///
+/// Every embedded apostrophe is closed, escaped as `\'`, and reopened, so the result is exactly
+/// one shell word that expands to the original path.
+fn shell_single_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+/// Builds the exact managed Codex `hooks.json` fragment from T29B §6 for one executable path.
+///
+/// Both handlers use one catch-all matcher, one second timeout, and no async execution, so the
+/// pre-observation arrives before the post and the post feedback stays immediate.
+fn managed_hooks_fragment(executable: &Path) -> serde_json::Value {
+    let command = format!("{} codex-hook --managed", shell_single_quote(executable));
+    let handler = serde_json::json!({
+        "matcher": ".*",
+        "hooks": [{"type": "command", "command": command, "timeout": 1}]
+    });
+    serde_json::json!({
+        "hooks": {
+            "PreToolUse": [handler],
+            "PostToolUse": [handler],
+        }
+    })
+}
+
+/// Prints only the managed Codex `hooks.json` fragment for this running executable (T29B §6).
+///
+/// The path is the installed executable's absolute, canonical path, so a symlinked command name
+/// still resolves to the real binary. Stdout carries JSON only; nothing is ever written anywhere.
+fn codex_hooks_print() -> Result<(), AppError> {
+    let executable = std::env::current_exe().map_err(|_| AppError::InvalidResponse)?;
+    let executable = fs::canonicalize(&executable).unwrap_or(executable);
+    println!(
+        "{}",
+        serde_json::to_string(&managed_hooks_fragment(&executable))
+            .map_err(|_| AppError::InvalidResponse)?
+    );
+    Ok(())
 }
 
 /// Reads one key-derived managed Claude rendezvous after strict owner/mode/identity checks.
@@ -2780,6 +2847,70 @@ mod tests {
         }
         assert_eq!(common_dir_from_git_files(&base.join("nowhere")), None);
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Parses the two managed Codex hook CLI forms and rejects every wrong shape.
+    #[test]
+    fn managed_codex_hook_cli_forms_parse() {
+        let parsed = |values: &[&str]| command(args(values));
+        assert!(matches!(
+            parsed(&["codex-hook", "--managed"]),
+            Ok(Command::ManagedCodexHook)
+        ));
+        assert!(matches!(
+            parsed(&["codex-hooks", "print"]),
+            Ok(Command::CodexHooksPrint)
+        ));
+        assert!(matches!(
+            parsed(&["codex-hook", "--runtime-dir", "/x"]),
+            Ok(Command::CodexHook { .. })
+        ));
+        for wrong in [
+            &["codex-hook"][..],
+            &["codex-hook", "--managed", "extra"],
+            &["codex-hook", "--runtime-dir"],
+            &["codex-hooks"],
+            &["codex-hooks", "write"],
+            &["codex-hooks", "print", "extra"],
+        ] {
+            assert!(parsed(wrong).is_err(), "{wrong:?}");
+        }
+    }
+
+    /// Shell-quoting survives spaces and apostrophes, and the printed fragment carries both.
+    #[test]
+    fn hooks_fragment_quotes_the_executable_and_snapshots() {
+        let path = Path::new("/operator tools/a'b/agent-ide");
+        let quoted = shell_single_quote(path);
+        assert_eq!(quoted, "'/operator tools/a'\\''b/agent-ide'");
+        // The real shell must expand the quoting back to exactly the original path.
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("printf '%s' {quoted}"))
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            path.to_str().unwrap()
+        );
+        let fragment = managed_hooks_fragment(path);
+        assert_eq!(
+            fragment,
+            serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [{"matcher": ".*", "hooks": [{
+                        "type": "command",
+                        "command": "'/operator tools/a'\\''b/agent-ide' codex-hook --managed",
+                        "timeout": 1
+                    }]}],
+                    "PostToolUse": [{"matcher": ".*", "hooks": [{
+                        "type": "command",
+                        "command": "'/operator tools/a'\\''b/agent-ide' codex-hook --managed",
+                        "timeout": 1
+                    }]}],
+                }
+            })
+        );
     }
 
     /// Retires the managed Codex publication exactly when the owned daemon child exit is observed.
