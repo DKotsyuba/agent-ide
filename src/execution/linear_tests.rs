@@ -873,3 +873,76 @@ fn catalog_rejects_duplicate_digests_and_more_than_eight_profiles() {
         .collect();
     assert!(ExecutionProfileCatalog::from_execution_evidence(eight).is_ok());
 }
+
+/// T25B: a refused profile is captured once, privately, and round-trips to the same digest.
+#[test]
+fn rejected_capture_round_trips_once_and_never_rewrites() {
+    let home = std::env::temp_dir().join(format!(
+        "agent-ide-rejected-capture-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    let state_value = managed_value(true.into());
+    let expected = HostSandboxState::parse(Some(state_value.clone()))
+        .unwrap()
+        .profile_digest()
+        .to_hex()
+        .to_string();
+    // The first rejection writes exactly one private file.
+    let stem = super::capture_rejected_profile_in(&home, &state_value).unwrap();
+    assert_eq!(stem.len(), 16);
+    assert_eq!(stem, expected[..16]);
+    let path = home
+        .join(".agent-ide")
+        .join(super::REJECTED_PROFILES_DIR)
+        .join(format!("{stem}.json"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    // The capture is the exact envelope `evidence record --sandbox-state` reads.
+    let reparsed = HostSandboxState::parse_json(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(reparsed.profile_digest().to_hex().to_string(), expected);
+    // A second identical rejection never rewrites: the directory still holds one file.
+    assert!(super::capture_rejected_profile_in(&home, &state_value).is_none());
+    assert_eq!(
+        std::fs::read_dir(home.join(".agent-ide").join(super::REJECTED_PROFILES_DIR))
+            .unwrap()
+            .count(),
+        1
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// T25B: the capture directory retains at most sixteen files and skips beyond that silently.
+#[test]
+fn rejected_capture_stops_at_sixteen_files() {
+    let home = std::env::temp_dir().join(format!(
+        "agent-ide-rejected-cap-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let dir = home.join(".agent-ide").join(super::REJECTED_PROFILES_DIR);
+    std::fs::create_dir_all(&dir).unwrap();
+    for index in 0..15 {
+        std::fs::write(dir.join(format!("{index:016x}.json")), b"{}").unwrap();
+    }
+    // The sixteenth capture succeeds; the seventeenth distinct state is skipped silently.
+    assert!(super::capture_rejected_profile_in(&home, &managed_value(true.into())).is_some());
+    assert!(
+        super::capture_rejected_profile_in(&home, &managed_value("restricted".into())).is_none()
+    );
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 16);
+    let _ = std::fs::remove_dir_all(&home);
+}

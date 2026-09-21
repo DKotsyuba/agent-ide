@@ -20,7 +20,9 @@ use agent_ide::assistance::{
     host_binding::HostKind,
     launcher::{AcceptedExecutable, LauncherConfig},
 };
-use agent_ide::execution::{D03ProfileEvidence, HostSandboxState, PersistedProfileRecord};
+use agent_ide::execution::{
+    D03ProfileEvidence, HostSandboxState, PersistedProfileRecord, ProfileClass,
+};
 use agent_ide::{
     app::store::Store,
     telemetry::{Filter, Telemetry, TelemetryConfig},
@@ -233,6 +235,10 @@ async fn main() -> ExitCode {
             }
             Err(error) => fail(error),
         },
+        Ok(Command::EvidenceRejected) => {
+            evidence_rejected();
+            ExitCode::SUCCESS
+        }
         Ok(Command::TelemetryQuery {
             database,
             filter,
@@ -374,6 +380,28 @@ fn evidence_executable(identity: &str, path: PathBuf) -> Result<String, AppError
         "blake3": executable.blake3,
     })
     .to_string())
+}
+
+/// Prints one line per captured rejected sandbox state below the real user home (T25B).
+///
+/// Each line is `name class sandbox-cwd mtime`, where `name` is the 16-hex capture stem an
+/// operator joins with `~/.agent-ide/rejected-profiles/<name>.json` and `mtime` uses the error
+/// log's RFC 3339 UTC form. A missing or unreadable capture is skipped; the command still
+/// succeeds.
+fn evidence_rejected() {
+    for capture in agent_ide::execution::list_rejected_profiles() {
+        let class = match capture.class {
+            ProfileClass::Managed => "managed",
+            ProfileClass::Disabled => "disabled",
+        };
+        let mtime = capture
+            .modified
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|elapsed| elapsed.as_secs())
+            .map(agent_ide::errorlog::format_rfc3339)
+            .unwrap_or_else(|| "-".to_owned());
+        println!("{} {class} {} {mtime}", capture.name, capture.sandbox_cwd);
+    }
 }
 
 /// Loads and verifies one launcher configuration's accepted executables without a running daemon.
@@ -529,6 +557,10 @@ enum Command {
         /// Launcher configuration file to load and verify.
         path: PathBuf,
     },
+    /// Lists captured rejected sandbox states below the real home for operator review (T25B).
+    ///
+    /// Pure offline listing; creates no runtime state and never starts a daemon.
+    EvidenceRejected,
     /// Prints one deterministic bounded telemetry page from an operator-selected local database.
     TelemetryQuery {
         /// Existing local SQLite database owned through Application's Store thread.
@@ -640,6 +672,7 @@ commands:
   errors [--repo <path>] [--all] [--summary] [--since <minutes>] [--limit <n>]
                                           read the error log
   evidence record|executable ...          launcher evidence fragments
+  evidence rejected                       list captured rejected sandbox states
   launcher check <file>                   validate a launcher configuration
   telemetry query|export --database <file> [--tag <tag>] [--cursor <n>]
   -v, --version, version                  print the version
@@ -773,6 +806,13 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
             identity: identity.to_owned(),
             path: PathBuf::from(path),
         });
+    }
+    // `evidence rejected` lists captured rejected sandbox states; it takes no flag at all.
+    if let [mode, sub] = arguments.as_slice()
+        && mode == "evidence"
+        && sub == "rejected"
+    {
+        return Ok(Command::EvidenceRejected);
     }
     // `errors` accepts its flags in any order, unlike every other mode above.
     if let [mode, rest @ ..] = arguments.as_slice()
@@ -2259,6 +2299,19 @@ mod tests {
         assert_eq!(value["identity"], "accepted-git");
         assert_eq!(value["blake3"].as_str().unwrap().len(), 64);
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// `evidence rejected` parses with no flag and refuses any extra argument (T25B).
+    #[test]
+    fn evidence_rejected_parses_only_bare() {
+        assert!(matches!(
+            command(args(&["evidence", "rejected"])),
+            Ok(Command::EvidenceRejected)
+        ));
+        assert!(matches!(
+            command(args(&["evidence", "rejected", "--extra"])),
+            Err(AppError::InvalidResponse)
+        ));
     }
 
     /// `launcher check` parses a bare path and reports the same failure as a direct call for a

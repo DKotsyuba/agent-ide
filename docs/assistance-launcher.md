@@ -134,6 +134,31 @@ inferred or scanned.
 Configuration contains private attachment and evidence values. Diagnostic formatting
 redacts the configuration; it must never be rendered in model-facing tool results.
 
+## Accepting a new Codex sandbox mode
+
+A Codex host is admitted only when its live sandbox state exactly matches an operator-accepted
+profile. A read-only and a workspace-write Codex sandbox are both class `managed`, so several
+profiles of one class may be needed; a target may list up to eight profiles whose digests all
+differ. `permit` succeeds only when some accepted profile of the observed class matches the live
+state's digest exactly — a changed sandbox is refused, never approximated.
+
+When the daemon refuses a profile, it captures the raw observed state once per distinct digest
+under `~/.agent-ide/rejected-profiles/<16-hex>.json` (mode 0600; the directory is 0700; at most
+16 captures are retained; failures to capture are silent). The refusal's error-log detail names
+the capture stem (`profile_digest_mismatch:managed; captured:<16-hex>`). To accept the new
+sandbox mode:
+
+1. Run the host once against this worktree so the daemon observes and refuses its sandbox state.
+2. `agent-ide evidence rejected` — lists each capture as `name class sandbox-cwd mtime`.
+3. Review the file `~/.agent-ide/rejected-profiles/<name>.json`. It is the exact
+   `codex/sandbox-state-meta` envelope the host advertised.
+4. Run a real D03 experiment under that exact state, then mint the profile fragment:
+   `agent-ide evidence record --sandbox-state <file> --profile-id <id> --revision <n>
+   --provider-binary <v> --toolchain <v> --configuration <v> --trust <v> --transport <v>
+   --d03-evidence <id>` (flags in this fixed order).
+5. Append the printed `{record, sandbox_state}` object to the target's `profiles` array and
+   restart the daemon, or validate first with `agent-ide launcher check <config-file>`.
+
 ## Confined project checks (EYES-r2)
 
 Two optional top-level fields extend the configuration for the v0.3 project problem feed. They

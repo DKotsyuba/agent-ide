@@ -2161,8 +2161,19 @@ impl<'a> Worker<'a> {
             let request = request
                 .validate_query(query, &policy, &job.target.catalog)
                 .map_err(|error| {
-                    let detail = execution_profile_detail(&error)
+                    let mut detail = execution_profile_detail(&error)
                         .unwrap_or_else(|| "query_policy".to_owned());
+                    // A refused profile is captured once for operator review (T25B); the write is
+                    // best-effort and its outcome never changes this reply.
+                    if matches!(
+                        error,
+                        crate::execution::RequestError::ExecutionProfileNoTemplate(_)
+                            | crate::execution::RequestError::ExecutionProfileDigestMismatch(_)
+                    ) && let Some(stem) =
+                        crate::execution::capture_rejected_profile(observed.state().as_json())
+                    {
+                        detail.push_str(&format!("; captured:{stem}"));
+                    }
                     record_execution_profile(errorlog_method(job.tool), &detail);
                     FailureCode::ExecutionProfile
                 })?;
@@ -4319,7 +4330,9 @@ fn validate_read_scope(
 ///
 /// Only closed class and variant names are ever rendered — never paths, sandbox-state JSON,
 /// profile digests, or error strings — and the tag is shared verbatim by the agent-facing
-/// policy text in `content.rs` documentation.
+/// policy text in `content.rs` documentation. The caller may append one bounded
+/// `; captured:<16-hex>` file stem naming a rejected-profile capture (T25B); the prefix the
+/// agent-facing text matches stays unchanged.
 fn execution_profile_detail(error: &crate::execution::RequestError) -> Option<String> {
     use crate::execution::RequestError;
     Some(match error {

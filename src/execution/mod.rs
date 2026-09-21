@@ -7,7 +7,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::OsString,
-    io::{self, Read},
+    io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::{Arc, Mutex},
@@ -457,6 +457,112 @@ impl ExecutionProfileCatalog {
             state_digest: blake3::hash(state.json_argument().as_bytes()),
         })
     }
+}
+
+/// Directory below the real `.agent-ide` home holding captured rejected sandbox states (T25B).
+pub const REJECTED_PROFILES_DIR: &str = "rejected-profiles";
+
+/// Maximum captured rejected sandbox states retained for operator review (T25B).
+const MAX_REJECTED_PROFILES: usize = 16;
+
+/// Maximum captured rejected-state JSON bytes, matching `evidence record --sandbox-state` (T25B).
+const MAX_REJECTED_STATE_BYTES: usize = 64 * 1024;
+
+/// One captured rejected host sandbox state offered for operator review (T25B).
+#[derive(Clone, Debug)]
+pub struct RejectedProfileCapture {
+    /// 16-hex file-name stem, the first half of the state's profile digest.
+    pub name: String,
+    /// Profile class parsed back from the captured state.
+    pub class: ProfileClass,
+    /// Exact `sandboxCwd` value retained inside the captured state.
+    pub sandbox_cwd: String,
+    /// File modification time, when the filesystem reports one.
+    pub modified: Option<std::time::SystemTime>,
+}
+
+/// Captures one rejected observed sandbox state for operator review; best-effort, never authorizing.
+///
+/// The file holds the exact bounded JSON envelope `agent-ide evidence record --sandbox-state`
+/// reads, written private (mode 0600, directory 0700) below the real user home under
+/// [`REJECTED_PROFILES_DIR`]. An existing capture is never overwritten, the directory retains at
+/// most 16 files, and every failure is silent: a capture never changes an admission reply or
+/// becomes an authority input. Returns the captured file-name stem (16 hex) only when a new file
+/// was written.
+pub fn capture_rejected_profile(state_json: &Value) -> Option<String> {
+    let home = crate::userhome::user_home()?;
+    capture_rejected_profile_in(&home, state_json)
+}
+
+/// [`capture_rejected_profile`] below an explicit home; the seam exists only for tests.
+pub(crate) fn capture_rejected_profile_in(home: &Path, state_json: &Value) -> Option<String> {
+    let state = HostSandboxState::parse(Some(state_json.clone())).ok()?;
+    let json = state_json.to_string();
+    if json.len() > MAX_REJECTED_STATE_BYTES {
+        return None;
+    }
+    let dir = home.join(".agent-ide").join(REJECTED_PROFILES_DIR);
+    std::fs::create_dir_all(&dir).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    if std::fs::read_dir(&dir).ok()?.count() >= MAX_REJECTED_PROFILES {
+        return None;
+    }
+    let hex = state.profile_digest().to_hex().to_string();
+    let stem = hex[..16].to_owned();
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(dir.join(format!("{stem}.json"))).ok()?;
+    file.write_all(json.as_bytes()).ok()?;
+    Some(stem)
+}
+
+/// Lists the captured rejected sandbox states below the real user home, ordered by name (T25B).
+pub fn list_rejected_profiles() -> Vec<RejectedProfileCapture> {
+    let Some(home) = crate::userhome::user_home() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(home.join(".agent-ide").join(REJECTED_PROFILES_DIR)) else {
+        return Vec::new();
+    };
+    let mut captures = Vec::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(stem) = file_name.to_str() else {
+            continue;
+        };
+        let Some(name) = stem.strip_suffix(".json") else {
+            continue;
+        };
+        if name.len() != 16 || !name.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(state) = HostSandboxState::parse_json(&raw) else {
+            continue;
+        };
+        captures.push(RejectedProfileCapture {
+            name: name.to_ascii_lowercase(),
+            class: state.class(),
+            sandbox_cwd: state.sandbox_cwd().to_owned(),
+            modified: entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok()),
+        });
+    }
+    captures.sort_by(|first, second| first.name.cmp(&second.name));
+    captures
 }
 
 /// Identifies a host invocation already proven by Assistance's host-binding adapter.
