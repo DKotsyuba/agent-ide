@@ -21,7 +21,7 @@ use crate::checks::runner::{ConfinedRunner, SeatbeltRunner};
 use crate::checks::rust::RustChecker;
 use crate::checks::scheduler::{CompletionHook, Scheduler, sweep_stale_caches};
 use crate::checks::{
-    CheckState, Checker, Language, Problem, ProblemSnapshot, Severity, UnavailableReason,
+    CheckState, Checker, Language, Problem, ProblemSnapshot, Recheck, Severity, UnavailableReason,
 };
 use crate::feed::{FeedKey, FeedState, MAX_FEED_KEYS};
 
@@ -54,9 +54,11 @@ pub trait ProblemSource: Send + Sync {
     /// which the renderer reports as `checks disabled`.
     fn latest(&self, worktree: &Path) -> Vec<ProblemSnapshot>;
 
-    /// Returns the languages whose [`ProblemSource::latest`] snapshot predates the worktree's
-    /// newest inputs while a re-check is pending or running. Defaults to none.
-    fn stale(&self, _worktree: &Path) -> Vec<Language> {
+    /// Returns why a language's [`ProblemSource::latest`] snapshot is not the current state of
+    /// the worktree: [`Recheck::FirstCheck`] when it predates the session's activation and its
+    /// re-check is pending or running, [`Recheck::FilesChanged`] while a check for newer inputs
+    /// is running. Defaults to none.
+    fn rechecks(&self, _worktree: &Path) -> Vec<(Language, Recheck)> {
         Vec::new()
     }
 }
@@ -189,7 +191,7 @@ impl ProjectProblemFeed {
         let admitted = admit_worktree(&self.allowed_roots, worktree).is_ok();
         let repository_key = repository_key.to_string_lossy().into_owned();
         if admitted {
-            self.scheduler.trigger(&repository_key, worktree);
+            self.scheduler.activate(&repository_key, worktree);
         }
         let Ok(mut state) = self.state.lock() else {
             return;
@@ -238,11 +240,17 @@ impl ProjectProblemFeed {
             binding: hex(binding),
             worktree: bound.worktree.clone(),
         };
-        let snapshots = self.feed_snapshots(&bound.worktree, bound.admitted);
-        let block = state.feed.next_block(&key, &snapshots)?;
+        let snapshots = self.snapshots(&bound.worktree, bound.admitted);
+        let rechecks = self.rechecks_for(&bound.worktree);
+        let block = state.feed.next_block(&key, &snapshots, &rechecks)?;
         let languages = snapshots
             .iter()
-            .filter(|snapshot| !matches!(snapshot.state, CheckState::Checking))
+            .filter(|snapshot| {
+                !matches!(
+                    snapshot.state,
+                    CheckState::Unavailable(UnavailableReason::Disabled)
+                )
+            })
             .map(|snapshot| snapshot.language.as_str())
             .collect::<Vec<_>>()
             .join(",");
@@ -307,17 +315,26 @@ impl ProjectProblemFeed {
             .collect()
     }
 
-    /// Like [`Self::snapshots`], but a language whose result predates a running re-check counts as
-    /// `checking`, so the `<agent-ide>` block never presents stale counts as current.
-    fn feed_snapshots(&self, worktree: &Path, admitted: bool) -> Vec<ProblemSnapshot> {
+    /// Returns the languages of `worktree` whose stored result is not its current state (T18B).
+    ///
+    /// A result predating this session's activation is [`Recheck::FirstCheck`]; otherwise a
+    /// language with a check running is [`Recheck::FilesChanged`]. A pending debounce timer alone
+    /// changes nothing, so a quiet or no-op session stays silent.
+    fn rechecks_for(&self, worktree: &Path) -> Vec<(Language, Recheck)> {
         let stale = self.scheduler.stale(worktree);
-        let mut snapshots = self.snapshots(worktree, admitted);
-        for snapshot in &mut snapshots {
-            if stale.contains(&snapshot.language) {
-                *snapshot = ProblemSnapshot::checking(snapshot.language, snapshot.input_generation);
-            }
-        }
-        snapshots
+        let running = self.scheduler.running(worktree);
+        self.languages
+            .iter()
+            .filter_map(|language| {
+                if stale.contains(language) {
+                    Some((*language, Recheck::FirstCheck))
+                } else {
+                    running
+                        .contains(language)
+                        .then_some((*language, Recheck::FilesChanged))
+                }
+            })
+            .collect()
     }
 }
 
@@ -334,8 +351,8 @@ impl ProblemSource for ProjectProblemFeed {
         self.snapshots(worktree, admitted)
     }
 
-    fn stale(&self, worktree: &Path) -> Vec<Language> {
-        self.scheduler.stale(worktree)
+    fn rechecks(&self, worktree: &Path) -> Vec<(Language, Recheck)> {
+        self.rechecks_for(worktree)
     }
 }
 
@@ -376,15 +393,17 @@ pub fn problems_text(
     language: Option<Language>,
     offset: u32,
 ) -> String {
-    problems_text_with_stale(snapshots, &[], language, offset)
+    problems_text_with_rechecks(snapshots, &[], language, offset)
 }
 
-/// Like [`problems_text`], but a `ready`/`partial` line of a language in `stale` renders
-/// `<language>: ready (stale; re-check running); errors: N; warnings: M`, because a check for
-/// newer inputs is pending or running and the counts describe the previous inputs.
-pub fn problems_text_with_stale(
+/// Like [`problems_text`], but a `ready`/`partial` line of a language in `rechecks` names why its
+/// counts are not current (T18B): `<language>: checking (files changed); last result: errors: N;
+/// warnings: M` while a check for newer inputs runs, and `<language>: checking (first check in this
+/// session); previous session result: errors: N; warnings: M` for a result predating this
+/// session's activation.
+pub fn problems_text_with_rechecks(
     snapshots: &[ProblemSnapshot],
-    stale: &[Language],
+    rechecks: &[(Language, Recheck)],
     language: Option<Language>,
     offset: u32,
 ) -> String {
@@ -412,7 +431,11 @@ pub fn problems_text_with_stale(
     let mut rendered: u32 = 0;
     let mut more = false;
     for snapshot in &selected {
-        lines.push(state_line(snapshot, stale.contains(&snapshot.language)));
+        let recheck = rechecks
+            .iter()
+            .find(|(recheck_language, _)| *recheck_language == snapshot.language)
+            .map(|(_, recheck)| *recheck);
+        lines.push(state_line(snapshot, recheck));
         for problem in &snapshot.problems {
             if skipped > 0 {
                 skipped -= 1;
@@ -440,23 +463,22 @@ pub fn problems_text_with_stale(
 /// `unavailable` snapshot carrying [`ProblemSnapshot::detail`] appends it in parentheses, stripped
 /// of control characters like every other untrusted checker text field; a snapshot with no detail
 /// renders exactly as before.
-fn state_line(snapshot: &ProblemSnapshot, stale: bool) -> String {
+fn state_line(snapshot: &ProblemSnapshot, recheck: Option<Recheck>) -> String {
     let language = snapshot.language.as_str();
-    let stale = if stale {
-        " (stale; re-check running)"
-    } else {
-        ""
-    };
+    let counts = format!(
+        "errors: {}; warnings: {}",
+        snapshot.errors, snapshot.warnings
+    );
     match &snapshot.state {
-        CheckState::Ready => format!(
-            "{language}: ready{stale}; errors: {}; warnings: {}",
-            snapshot.errors, snapshot.warnings
+        CheckState::Ready | CheckState::Partial if recheck == Some(Recheck::FilesChanged) => {
+            format!("{language}: checking (files changed); last result: {counts}")
+        }
+        CheckState::Ready | CheckState::Partial if recheck == Some(Recheck::FirstCheck) => format!(
+            "{language}: checking (first check in this session); previous session result: {counts}"
         ),
-        CheckState::Partial => format!(
-            "{language}: partial{stale}; errors: {}; warnings: {}",
-            snapshot.errors, snapshot.warnings
-        ),
-        CheckState::Checking => format!("{language}: checking"),
+        CheckState::Ready => format!("{language}: ready; {counts}"),
+        CheckState::Partial => format!("{language}: partial; {counts}"),
+        CheckState::Checking => format!("{language}: checking (first check in this session)"),
         CheckState::Unavailable(reason) => match &snapshot.detail {
             Some(detail) => format!(
                 "{language}: unavailable:{} ({})",
@@ -677,10 +699,14 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.lines().any(|line| line == "python: checking"),
+            text.lines()
+                .any(|line| line == "python: checking (first check in this session)"),
             "{text}"
         );
-        assert!(!text.contains("python: checking;"), "{text}");
+        assert!(
+            !text.contains("python: checking (first check in this session);"),
+            "{text}"
+        );
 
         for (reason, rendered) in [
             (
@@ -877,54 +903,195 @@ mod tests {
         }
     }
 
-    /// A first call after a re-activation must not present the previous inputs' counts as current:
-    /// the problems text says the re-check is running, the feed emits no block, and both follow
-    /// the normal rules once the new result lands.
-    #[tokio::test(start_paused = true)]
-    async fn activation_over_an_older_snapshot_is_stale_until_the_recheck_lands() {
+    /// Checker whose result the test swaps between runs and whose runs take 200 ms of paused time,
+    /// so a running check is observable; stamps the request's generation like the real checkers.
+    struct ScriptedChecker(Arc<Mutex<Vec<Problem>>>);
+
+    impl crate::checks::Checker for ScriptedChecker {
+        fn language(&self) -> Language {
+            Language::Rust
+        }
+
+        fn check(
+            &self,
+            request: crate::checks::CheckRequest,
+        ) -> crate::checks::BoxFuture<'_, ProblemSnapshot> {
+            let problems = self.0.lock().unwrap().clone();
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                ProblemSnapshot::from_problems(
+                    Language::Rust,
+                    CheckState::Ready,
+                    problems,
+                    request.input_generation,
+                    1,
+                )
+            })
+        }
+    }
+
+    /// Builds a feed over a [`ScriptedChecker`] and returns it with its problem list and root.
+    fn scripted_feed(name: &str) -> (ProjectProblemFeed, Arc<Mutex<Vec<Problem>>>, PathBuf) {
         let root = std::env::temp_dir()
             .canonicalize()
             .unwrap()
-            .join(format!("agent-ide-stale-{}", std::process::id()));
+            .join(format!("agent-ide-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let worktree = root.join("wt");
-        std::fs::create_dir_all(&worktree).unwrap();
-        std::fs::write(worktree.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::create_dir_all(root.join("wt")).unwrap();
+        std::fs::write(root.join("wt/Cargo.toml"), "[package]\n").unwrap();
+        let problems = Arc::new(Mutex::new(Vec::new()));
         let scheduler = Scheduler::new(
-            vec![Arc::new(crate::checks::FakeChecker::new(
-                Language::Rust,
-                ready(Language::Rust, Vec::new()),
-            ))],
+            vec![Arc::new(ScriptedChecker(Arc::clone(&problems)))],
             std::time::Duration::from_millis(50),
             2,
             root.join("cache"),
         );
         let feed = ProjectProblemFeed::new(scheduler, vec![root.clone()], vec![Language::Rust]);
+        (feed, problems, root)
+    }
+
+    /// Advances paused time until the feed sees a check running for `worktree`.
+    async fn until_running(feed: &ProjectProblemFeed, worktree: &Path) {
+        for _ in 0..100 {
+            if !feed.scheduler.running(worktree).is_empty() {
+                return;
+            }
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("no check started");
+    }
+
+    /// Wraps one status line in the block tags.
+    fn plate(line: &str) -> Option<String> {
+        Some(format!("<agent-ide>\n{line}\n</agent-ide>"))
+    }
+
+    /// A first call after a re-activation must not present the previous inputs' counts as current:
+    /// the problems text says the first check of this session is running, the plate says so too,
+    /// and both follow the normal rules once the new result lands.
+    #[tokio::test(start_paused = true)]
+    async fn activation_over_an_older_snapshot_is_stale_until_the_recheck_lands() {
+        let (feed, _problems, root) = scripted_feed("stale");
+        let worktree = root.join("wt");
         feed.activated([1; 32], &worktree, Path::new("repo"));
         settle().await;
-        assert!(feed.stale(&worktree).is_empty());
+        assert!(feed.rechecks(&worktree).is_empty());
         assert!(feed.next_block(&[1; 32]).is_some());
 
         feed.activated([2; 32], &worktree, Path::new("repo"));
-        let stale = feed.stale(&worktree);
-        assert_eq!(stale, vec![Language::Rust]);
+        let rechecks = feed.rechecks(&worktree);
+        assert_eq!(rechecks, vec![(Language::Rust, Recheck::FirstCheck)]);
         assert_eq!(
-            problems_text_with_stale(&feed.latest(&worktree), &stale, None, 0),
-            "rust: ready (stale; re-check running); errors: 0; warnings: 0"
+            problems_text_with_rechecks(&feed.latest(&worktree), &rechecks, None, 0),
+            "rust: checking (first check in this session); previous session result: errors: 0; warnings: 0"
         );
         assert_eq!(
             feed.next_block(&[2; 32]),
-            None,
-            "stale counts must not be delivered"
+            plate("rust: checking (first check)"),
+            "previous session counts must not be presented as current"
         );
 
         settle().await;
-        assert!(feed.stale(&worktree).is_empty());
+        assert!(feed.rechecks(&worktree).is_empty());
         assert_eq!(
-            problems_text_with_stale(&feed.latest(&worktree), &[], None, 0),
+            problems_text_with_rechecks(&feed.latest(&worktree), &[], None, 0),
             "rust: ready; errors: 0; warnings: 0"
         );
-        assert!(feed.next_block(&[2; 32]).is_some());
+        assert_eq!(
+            feed.next_block(&[2; 32]),
+            plate("rust: 0 errors, 0 warnings")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// T18B status plate over a whole session: a quiet session emits one plate per state change;
+    /// an armed debounce timer alone (a possible no-op) emits nothing; a running check emits one
+    /// `checking (…last result…)` plate and its result one more, with deltas; a no-op check
+    /// returns the plate to its previous text exactly once.
+    #[tokio::test(start_paused = true)]
+    async fn status_plate_follows_activation_edit_noop_and_fix() {
+        let (feed, problems, root) = scripted_feed("t18b");
+        let worktree = root.join("wt");
+        let hook = [1; 32];
+        feed.activated(hook, &worktree, Path::new("repo"));
+        assert_eq!(
+            feed.next_block(&hook),
+            plate("rust: checking (first check)")
+        );
+        assert_eq!(feed.next_block(&hook), None);
+        settle().await;
+        assert_eq!(feed.next_block(&hook), plate("rust: 0 errors, 0 warnings"));
+        assert_eq!(feed.next_block(&hook), None);
+
+        // Quiet session: hook events re-arm the timer, but nothing runs or changes yet.
+        feed.changed(&hook);
+        feed.changed(&hook);
+        assert!(feed.rechecks(&worktree).is_empty());
+        assert_eq!(feed.next_block(&hook), None);
+        assert_eq!(
+            problems_text_with_rechecks(&feed.latest(&worktree), &[], None, 0),
+            "rust: ready; errors: 0; warnings: 0"
+        );
+        settle().await;
+        assert_eq!(
+            feed.next_block(&hook),
+            None,
+            "a no-op check changes nothing"
+        );
+
+        // A no-op check observed while running: checking plate, then the old text once.
+        feed.changed(&hook);
+        until_running(&feed, &worktree).await;
+        let rechecks = feed.rechecks(&worktree);
+        assert_eq!(rechecks, vec![(Language::Rust, Recheck::FilesChanged)]);
+        assert_eq!(
+            problems_text_with_rechecks(&feed.latest(&worktree), &rechecks, None, 0),
+            "rust: checking (files changed); last result: errors: 0; warnings: 0"
+        );
+        assert_eq!(
+            feed.next_block(&hook),
+            plate("rust: checking (files changed; last result: 0 errors, 0 warnings)")
+        );
+        assert_eq!(feed.next_block(&hook), None);
+        settle().await;
+        assert_eq!(feed.next_block(&hook), plate("rust: 0 errors, 0 warnings"));
+        assert_eq!(feed.next_block(&hook), None);
+
+        // Edit adds a warning.
+        problems
+            .lock()
+            .unwrap()
+            .push(problem("a.rs", 1, 1, Severity::Warning, "careful"));
+        feed.changed(&hook);
+        until_running(&feed, &worktree).await;
+        assert_eq!(
+            feed.next_block(&hook),
+            plate("rust: checking (files changed; last result: 0 errors, 0 warnings)")
+        );
+        settle().await;
+        assert_eq!(
+            feed.next_block(&hook),
+            plate("rust: 0 errors, 1 warning (+1)")
+        );
+        assert_eq!(feed.next_block(&hook), None);
+
+        // Fix.
+        problems.lock().unwrap().clear();
+        feed.changed(&hook);
+        until_running(&feed, &worktree).await;
+        assert_eq!(
+            feed.next_block(&hook),
+            plate("rust: checking (files changed; last result: 0 errors, 1 warning)")
+        );
+        settle().await;
+        assert_eq!(
+            feed.next_block(&hook),
+            plate("rust: 0 errors, 0 warnings (-1)")
+        );
+        assert_eq!(feed.next_block(&hook), None);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

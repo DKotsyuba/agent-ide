@@ -6075,6 +6075,16 @@ async fn await_eyes_block(actor: &mut ProductActor, fixture: &ProductFixture) ->
     }
 }
 
+/// Waits for the next delivered block that is a result plate, skipping `checking (…)` plates (T18B).
+async fn await_eyes_result(actor: &mut ProductActor, fixture: &ProductFixture) -> String {
+    loop {
+        let block = await_eyes_block(actor, fixture).await;
+        if !block.contains("checking") {
+            return block;
+        }
+    }
+}
+
 /// Reads the `ide.context` problems page for an active Claude actor.
 async fn eyes_problems(actor: &mut ProductActor, fixture: &ProductFixture) -> String {
     let reply = actor
@@ -6095,7 +6105,7 @@ async fn eyes_claude_post_hook_delivers_problem_block_and_delta() {
     let mut daemon = fixture.daemon_with_home(Some(&home)).await;
     let mut actor = eyes_claude_actor(&fixture, "claude-eyes").await;
 
-    let first = await_eyes_block(&mut actor, &fixture).await;
+    let first = await_eyes_result(&mut actor, &fixture).await;
     assert_eq!(
         first,
         "<agent-ide>\nrust: 2 errors, 0 warnings\n</agent-ide>"
@@ -6112,7 +6122,7 @@ async fn eyes_claude_post_hook_delivers_problem_block_and_delta() {
 
     std::fs::write(fixture.root.join("problems.count"), "5").unwrap();
     let _ = actor.claude_native_post(&fixture, "Edit").await;
-    let changed = await_eyes_block(&mut actor, &fixture).await;
+    let changed = await_eyes_result(&mut actor, &fixture).await;
     assert_eq!(
         changed,
         "<agent-ide>\nrust: 5 errors (+3), 0 warnings\n</agent-ide>"

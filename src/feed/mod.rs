@@ -1,7 +1,7 @@
 //! Renders the bounded `<agent-ide>` problem block and tracks per-actor delivery state (EYES-r1 §6).
 //!
 //! The feed turns the latest completed [`ProblemSnapshot`](crate::checks::ProblemSnapshot)s of an actor's worktree into one compact
-//! block: fixed language order, no paths, messages or codes, at most [`MAX_BLOCK_BYTES`](crate::feed::MAX_BLOCK_BYTES) bytes
+//! block: fixed language order, no paths, messages or codes (a failed check adds at most 80 bytes of sanitized detail), at most [`MAX_BLOCK_BYTES`](crate::feed::MAX_BLOCK_BYTES) bytes
 //! including tags. [`FeedState`](crate::feed::FeedState) remembers the last block delivered per (actor binding, worktree)
 //! so identical state is never re-emitted and changed counts render as `(+N)`/`(-N)` deltas. The
 //! state is bounded and purely in-memory; hook and IPC wiring live elsewhere.
@@ -9,13 +9,16 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 
-use crate::checks::{CheckState, Language, ProblemSnapshot, UnavailableReason};
+use crate::checks::{CheckState, Language, ProblemSnapshot, Recheck, UnavailableReason};
 
 /// Maximum UTF-8 byte length of one rendered `<agent-ide>` block, tags included (EYES-r1 §6).
 pub const MAX_BLOCK_BYTES: usize = 256;
 
 /// Maximum number of keys [`FeedState`] remembers; further keys evict the least recently used one.
 pub const MAX_FEED_KEYS: usize = 1024;
+
+/// Maximum UTF-8 byte length of the detail appended to a `check failed` item.
+const MAX_DETAIL_BYTES: usize = 80;
 
 /// Separator between rendered language items inside one block.
 const ITEM_SEPARATOR: &str = " | ";
@@ -44,8 +47,16 @@ enum ItemState {
         /// `true` when coverage was incomplete (`Partial` state).
         partial: bool,
     },
-    /// No result; renders the fixed unavailable phrase for the carried reason.
-    Unavailable(UnavailableReason),
+    /// No result; renders the fixed unavailable phrase for the carried reason, plus the sanitized
+    /// detail for a failed check.
+    Unavailable(UnavailableReason, Option<String>),
+    /// A check is due or running; the last known counts, if any, stay visible.
+    Checking {
+        /// `false` for the first check of the session, `true` when a check for changed files runs.
+        files_changed: bool,
+        /// Last known `(errors, warnings)` shown inside the checking text.
+        last: Option<(u32, u32)>,
+    },
 }
 
 /// One candidate block item: a language plus its current state.
@@ -85,30 +96,36 @@ pub struct FeedState {
 }
 
 impl FeedState {
-    /// Builds the block for `snapshots` and returns it, or `None` when nothing may be emitted.
+    /// Builds the status plate for `snapshots` and returns it, or `None` when nothing changed.
     ///
-    /// Items render in fixed [`Language`] order (rust, python), skipping `Checking` languages and
-    /// languages absent from the worktree (T10B: `Unavailable(Disabled)`, rendered as nothing); a
-    /// language absent from `snapshots` is treated the same way, and the last snapshot of a
-    /// language wins. When every configured language is absent, `snapshots` is empty, or every
-    /// item is `Checking`/absent, no block is emitted at all. When the item set without deltas
-    /// equals the last block delivered for `key`,
-    /// returns `None` and changes nothing. Otherwise deltas `(+N)`/`(-N)` are inserted after each
-    /// count that changed versus the last delivered counts of the same language (a language's
-    /// first numeric delivery has no deltas), the items join into the tagged block, and oversized
-    /// blocks shrink in order: deltas are dropped, then unavailable phrases shorten to
-    /// `unavailable`, then trailing items drop, and finally — only if one remaining item still
-    /// exceeds the cap — that item's text is hard-truncated on a UTF-8 boundary, so
-    /// [`MAX_BLOCK_BYTES`] is never exceeded. The result records as delivered for `key`, which
-    /// also marks `key` most recently used.
-    pub fn next_block(&mut self, key: &FeedKey, snapshots: &[ProblemSnapshot]) -> Option<String> {
-        let items = build_items(snapshots);
+    /// The block is a status plate (T18B): it names each language's current state, process states
+    /// included, and is (re)sent whenever the rendered status changes — never while it is
+    /// unchanged. Items render in fixed [`Language`] order (rust, python), skipping languages
+    /// absent from the worktree (T10B: `Unavailable(Disabled)`) and languages without any
+    /// snapshot; the last snapshot of a language wins. A language in `rechecks` — or with a
+    /// `Checking` snapshot — renders `checking (first check)` or `checking (files changed; last
+    /// result: N errors, M warnings)` instead of stale counts. When every configured language is
+    /// absent or `snapshots` is empty, no block is emitted. When the item set without deltas equals
+    /// the last block delivered for `key`, returns `None` and changes nothing. Otherwise deltas
+    /// `(+N)`/`(-N)` are inserted after each count that changed versus the last delivered counts
+    /// of the same language (a language's first numeric delivery has no deltas). An oversized
+    /// block shrinks in order: deltas are dropped, then details and last-result texts are
+    /// dropped, and finally — only if it still exceeds the cap — every item is hard-truncated on a
+    /// UTF-8 boundary; a language is never dropped, so [`MAX_BLOCK_BYTES`] is never exceeded. The
+    /// result records as delivered for `key`, which also marks `key` most recently used.
+    pub fn next_block(
+        &mut self,
+        key: &FeedKey,
+        snapshots: &[ProblemSnapshot],
+        rechecks: &[(Language, Recheck)],
+    ) -> Option<String> {
+        let items = build_items(snapshots, rechecks);
         if items.is_empty() {
             return None;
         }
         let content = items
             .iter()
-            .map(|item| render_item(item, None))
+            .map(|item| render_item(item, None, false))
             .collect::<Vec<_>>()
             .join(ITEM_SEPARATOR);
         if self
@@ -130,42 +147,41 @@ impl FeedState {
         };
         let mut rendered: Vec<String> = items
             .iter()
-            .map(|item| render_item(item, last_counts(item.language)))
+            .map(|item| render_item(item, last_counts(item.language), false))
             .collect();
         let mut block = wrap_block(&rendered);
         if block.len() > MAX_BLOCK_BYTES {
-            rendered = items.iter().map(|item| render_item(item, None)).collect();
+            rendered = items
+                .iter()
+                .map(|item| render_item(item, None, true))
+                .collect();
             block = wrap_block(&rendered);
             if block.len() > MAX_BLOCK_BYTES {
-                rendered = items.iter().map(short_item).collect();
+                // Compact items are short, so this only guards against implausibly large counts:
+                // give every item an equal share, on UTF-8 boundaries, and keep every language.
+                let overhead = wrap_block(&[]).len() + ITEM_SEPARATOR.len() * (rendered.len() - 1);
+                let share = MAX_BLOCK_BYTES.saturating_sub(overhead) / rendered.len();
+                for item in &mut rendered {
+                    *item = truncate_to_byte_len(item, share);
+                }
                 block = wrap_block(&rendered);
-                while block.len() > MAX_BLOCK_BYTES && rendered.len() > 1 {
-                    rendered.pop();
-                    block = wrap_block(&rendered);
-                }
-                // The ladder above only drops whole items; a single remaining item can still
-                // exceed the cap (an implausibly large count still renders a bounded number of
-                // digits, but nothing upstream stops this from growing). Hard-truncate its text
-                // on a UTF-8 boundary so the emitted block can never exceed the byte cap.
-                if block.len() > MAX_BLOCK_BYTES {
-                    let overhead = wrap_block(&[String::new()]).len();
-                    let budget = MAX_BLOCK_BYTES.saturating_sub(overhead);
-                    rendered[0] = truncate_to_byte_len(&rendered[0], budget);
-                    block = wrap_block(&rendered);
-                }
             }
         }
         debug_assert!(
             block.len() <= MAX_BLOCK_BYTES,
             "rendered block must never exceed MAX_BLOCK_BYTES"
         );
+        // A checking item keeps its language's last delivered counts as the delta baseline, so
+        // the result that follows renders its change against them.
         let counts: Vec<(Language, u32, u32)> = items
             .iter()
             .filter_map(|item| match &item.state {
                 ItemState::Counts {
                     errors, warnings, ..
                 } => Some((item.language, *errors, *warnings)),
-                ItemState::Unavailable(_) => None,
+                ItemState::Checking { .. } => last_counts(item.language)
+                    .map(|(errors, warnings)| (item.language, errors, warnings)),
+                ItemState::Unavailable(..) => None,
             })
             .collect();
         self.record(key, DeliveredFeed { content, counts });
@@ -205,39 +221,85 @@ impl FeedState {
     }
 }
 
-/// Builds the rendered items for `snapshots` in fixed [`Language`] order, skipping `Checking`.
+/// Builds the rendered items for `snapshots` in fixed [`Language`] order.
 ///
 /// Several snapshots per language are allowed; the last one in `snapshots` wins, matching the
 /// scheduler's latest-completed-wins rule. A language with no snapshot is skipped. A language
-/// absent from the worktree (T10B: `Unavailable(Disabled)`) is skipped exactly like `Checking` —
-/// it renders as nothing rather than a fixed unavailable phrase, so a project that only has one
-/// of the two languages never mentions the other.
-fn build_items(snapshots: &[ProblemSnapshot]) -> Vec<FeedItem> {
+/// absent from the worktree (T10B: `Unavailable(Disabled)`) is skipped too — it renders as
+/// nothing rather than a fixed unavailable phrase, so a project that only has one of the two
+/// languages never mentions the other. A `Checking` snapshot or a [`Recheck::FirstCheck`] renders
+/// as the first check of the session; a [`Recheck::FilesChanged`] keeps the last counts in view.
+fn build_items(snapshots: &[ProblemSnapshot], rechecks: &[(Language, Recheck)]) -> Vec<FeedItem> {
     let mut items = Vec::new();
     for language in [Language::Rust, Language::Python] {
         let Some(snapshot) = snapshots.iter().rev().find(|s| s.language == language) else {
             continue;
         };
-        let state = match &snapshot.state {
-            CheckState::Checking => continue,
-            CheckState::Unavailable(UnavailableReason::Disabled) => continue,
-            CheckState::Ready | CheckState::Partial => ItemState::Counts {
+        let recheck = rechecks
+            .iter()
+            .rev()
+            .find(|(recheck_language, _)| *recheck_language == language)
+            .map(|(_, recheck)| *recheck);
+        let first_check = ItemState::Checking {
+            files_changed: false,
+            last: None,
+        };
+        let state = match (&snapshot.state, recheck) {
+            (CheckState::Unavailable(UnavailableReason::Disabled), _) => continue,
+            (CheckState::Checking, _) | (_, Some(Recheck::FirstCheck)) => first_check,
+            (CheckState::Ready | CheckState::Partial, Some(Recheck::FilesChanged)) => {
+                ItemState::Checking {
+                    files_changed: true,
+                    last: Some((snapshot.errors, snapshot.warnings)),
+                }
+            }
+            (CheckState::Unavailable(_), Some(Recheck::FilesChanged)) => ItemState::Checking {
+                files_changed: true,
+                last: None,
+            },
+            (CheckState::Ready | CheckState::Partial, None) => ItemState::Counts {
                 errors: snapshot.errors,
                 warnings: snapshot.warnings,
                 partial: matches!(snapshot.state, CheckState::Partial),
             },
-            CheckState::Unavailable(reason) => ItemState::Unavailable(*reason),
+            (CheckState::Unavailable(reason), None) => ItemState::Unavailable(
+                *reason,
+                matches!(reason, UnavailableReason::Fatal)
+                    .then(|| snapshot.detail.as_deref().and_then(feed_detail))
+                    .flatten(),
+            ),
         };
         items.push(FeedItem { language, state });
     }
     items
 }
 
+/// Reduces a checker detail to one plain line of at most [`MAX_DETAIL_BYTES`] bytes.
+///
+/// The detail is untrusted checker output: control characters become spaces and angle brackets
+/// become `?`, so it can neither break the single-line block nor forge its framing tags. `None`
+/// when nothing printable remains.
+fn feed_detail(detail: &str) -> Option<String> {
+    let plain: String = detail
+        .chars()
+        .map(|c| match c {
+            c if c.is_control() => ' ',
+            '<' | '>' => '?',
+            c => c,
+        })
+        .collect();
+    let cut = truncate_to_byte_len(plain.trim(), MAX_DETAIL_BYTES);
+    let cut = cut.trim_end();
+    (!cut.is_empty()).then(|| cut.to_owned())
+}
+
 /// Renders one item, annotating numeric counts with deltas versus `last_counts`.
 ///
 /// `last_counts` is the last delivered `(errors, warnings)` of the item's language, or `None` for
-/// a first numeric delivery or a non-numeric item; both render without deltas.
-fn render_item(item: &FeedItem, last_counts: Option<(u32, u32)>) -> String {
+/// a first numeric delivery or a non-numeric item; both render without deltas. `compact` drops
+/// the failure detail and the last-result text, the over-cap form.
+fn render_item(item: &FeedItem, last_counts: Option<(u32, u32)>, compact: bool) -> String {
+    let language = item.language.as_str();
     match &item.state {
         ItemState::Counts {
             errors,
@@ -249,8 +311,7 @@ fn render_item(item: &FeedItem, last_counts: Option<(u32, u32)>) -> String {
                 None => (None, None),
             };
             let mut text = format!(
-                "{}: {}, {}",
-                item.language.as_str(),
+                "{language}: {}, {}",
                 render_count(*errors, "error", "errors", last_errors),
                 render_count(*warnings, "warning", "warnings", last_warnings),
             );
@@ -259,18 +320,31 @@ fn render_item(item: &FeedItem, last_counts: Option<(u32, u32)>) -> String {
             }
             text
         }
-        ItemState::Unavailable(reason) => {
-            format!("{}: {}", item.language.as_str(), unavailable_text(*reason))
-        }
-    }
-}
-
-/// Renders one item in the shortened over-cap form: counts without deltas, unavailable phrases
-/// reduced to `unavailable`.
-fn short_item(item: &FeedItem) -> String {
-    match &item.state {
-        ItemState::Counts { .. } => render_item(item, None),
-        ItemState::Unavailable(_) => format!("{}: unavailable", item.language.as_str()),
+        ItemState::Checking {
+            files_changed: false,
+            ..
+        } => format!(
+            "{language}: checking{}",
+            if compact { "" } else { " (first check)" }
+        ),
+        ItemState::Checking {
+            files_changed: true,
+            last,
+        } => match last {
+            _ if compact => format!("{language}: checking"),
+            None => format!("{language}: checking (files changed)"),
+            Some((errors, warnings)) => format!(
+                "{language}: checking (files changed; last result: {}, {})",
+                render_count(*errors, "error", "errors", None),
+                render_count(*warnings, "warning", "warnings", None),
+            ),
+        },
+        ItemState::Unavailable(reason, detail) => match detail {
+            Some(detail) if !compact => {
+                format!("{language}: {} ({detail})", unavailable_text(*reason))
+            }
+            _ => format!("{language}: {}", unavailable_text(*reason)),
+        },
     }
 }
 
@@ -378,7 +452,7 @@ mod tests {
     #[test]
     fn first_ready_snapshot_emits_without_deltas() {
         let mut state = FeedState::default();
-        let block = state.next_block(&key("hook"), &[ready(Language::Rust, 3, 5)]);
+        let block = state.next_block(&key("hook"), &[ready(Language::Rust, 3, 5)], &[]);
         assert_eq!(
             block,
             Some("<agent-ide>\nrust: 3 errors, 5 warnings\n</agent-ide>".to_string())
@@ -391,11 +465,11 @@ mod tests {
         let hook = key("hook");
         assert!(
             state
-                .next_block(&hook, &[ready(Language::Rust, 1, 0)])
+                .next_block(&hook, &[ready(Language::Rust, 1, 0)], &[])
                 .is_some()
         );
         assert_eq!(
-            state.next_block(&hook, &[ready(Language::Rust, 1, 0)]),
+            state.next_block(&hook, &[ready(Language::Rust, 1, 0)], &[]),
             None
         );
     }
@@ -405,10 +479,10 @@ mod tests {
         let mut state = FeedState::default();
         let hook = key("hook");
         state
-            .next_block(&hook, &[ready(Language::Rust, 1, 0)])
+            .next_block(&hook, &[ready(Language::Rust, 1, 0)], &[])
             .expect("first delivery emits");
         let block = state
-            .next_block(&hook, &[ready(Language::Rust, 3, 0)])
+            .next_block(&hook, &[ready(Language::Rust, 3, 0)], &[])
             .expect("changed state emits");
         assert_eq!(
             block,
@@ -421,13 +495,13 @@ mod tests {
         let mut state = FeedState::default();
         let hook = key("hook");
         state
-            .next_block(&hook, &[ready(Language::Rust, 1, 0)])
+            .next_block(&hook, &[ready(Language::Rust, 1, 0)], &[])
             .expect("first delivery emits");
         state
-            .next_block(&hook, &[ready(Language::Rust, 3, 0)])
+            .next_block(&hook, &[ready(Language::Rust, 3, 0)], &[])
             .expect("changed state emits");
         let block = state
-            .next_block(&hook, &[ready(Language::Rust, 1, 0)])
+            .next_block(&hook, &[ready(Language::Rust, 1, 0)], &[])
             .expect("restored state emits");
         assert_eq!(
             block,
@@ -441,18 +515,18 @@ mod tests {
         let hook = key("hook");
         assert!(
             state
-                .next_block(&hook, &[ready(Language::Rust, 2, 1)])
+                .next_block(&hook, &[ready(Language::Rust, 2, 1)], &[])
                 .is_some()
         );
         let block = state
-            .next_block(&hook, &[partial(Language::Rust, 2, 1)])
+            .next_block(&hook, &[partial(Language::Rust, 2, 1)], &[])
             .expect("partial change emits");
         assert_eq!(
             block,
             "<agent-ide>\nrust: 2 errors, 1 warning (partial)\n</agent-ide>"
         );
         assert_eq!(
-            state.next_block(&hook, &[partial(Language::Rust, 2, 1)]),
+            state.next_block(&hook, &[partial(Language::Rust, 2, 1)], &[]),
             None
         );
     }
@@ -470,7 +544,7 @@ mod tests {
         for (reason, phrase) in phrases {
             let mut state = FeedState::default();
             let block = state
-                .next_block(&key("hook"), &[unavailable(Language::Python, reason)])
+                .next_block(&key("hook"), &[unavailable(Language::Python, reason)], &[])
                 .expect("unavailable state emits");
             assert_eq!(
                 block,
@@ -479,31 +553,167 @@ mod tests {
         }
     }
 
+    /// A language still on its first check renders `checking (first check)` instead of being
+    /// omitted, and the plate is re-sent once its result lands.
     #[test]
-    fn checking_only_snapshots_emit_nothing() {
+    fn first_check_renders_a_checking_plate_then_the_result() {
         let mut state = FeedState::default();
         let hook = key("hook");
+        let checking_both = [checking(Language::Rust), checking(Language::Python)];
         assert_eq!(
-            state.next_block(
-                &hook,
-                &[checking(Language::Rust), checking(Language::Python)]
-            ),
-            None
+            state.next_block(&hook, &checking_both, &[]),
+            Some(
+                "<agent-ide>\nrust: checking (first check) | python: checking (first check)\n</agent-ide>"
+                    .to_string()
+            )
         );
+        assert_eq!(state.next_block(&hook, &checking_both, &[]), None);
         let block = state
             .next_block(
                 &hook,
                 &[checking(Language::Rust), ready(Language::Python, 0, 1)],
+                &[],
             )
             .expect("completed language emits");
         assert_eq!(
             block,
-            "<agent-ide>\npython: 0 errors, 1 warning\n</agent-ide>"
+            "<agent-ide>\nrust: checking (first check) | python: 0 errors, 1 warning\n</agent-ide>"
         );
     }
 
-    /// A language absent from the worktree (T10B: `Unavailable(Disabled)`) renders as nothing,
-    /// exactly like `Checking`; when every language is absent, no block is emitted at all.
+    /// A running re-check keeps the last counts in view, the result renders its delta against them,
+    /// and an unchanged result returns to the pre-check text (one plate, no delta).
+    #[test]
+    fn files_changed_recheck_keeps_last_counts_and_the_delta_baseline() {
+        let mut state = FeedState::default();
+        let hook = key("hook");
+        let changed = [(Language::Rust, Recheck::FilesChanged)];
+        state.next_block(&hook, &[ready(Language::Rust, 0, 0)], &[]);
+        assert_eq!(
+            state.next_block(&hook, &[ready(Language::Rust, 0, 0)], &changed),
+            Some(
+                "<agent-ide>\nrust: checking (files changed; last result: 0 errors, 0 warnings)\n</agent-ide>"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            state.next_block(&hook, &[ready(Language::Rust, 0, 0)], &changed),
+            None
+        );
+        assert_eq!(
+            state.next_block(&hook, &[ready(Language::Rust, 0, 1)], &[]),
+            Some("<agent-ide>\nrust: 0 errors, 1 warning (+1)\n</agent-ide>".to_string())
+        );
+        // A no-op check: checking plate, then the same text again — sent once, without a delta.
+        assert!(
+            state
+                .next_block(&hook, &[ready(Language::Rust, 0, 1)], &changed)
+                .is_some()
+        );
+        assert_eq!(
+            state.next_block(&hook, &[ready(Language::Rust, 0, 1)], &[]),
+            Some("<agent-ide>\nrust: 0 errors, 1 warning\n</agent-ide>".to_string())
+        );
+        assert_eq!(
+            state.next_block(&hook, &[ready(Language::Rust, 0, 1)], &[]),
+            None
+        );
+    }
+
+    /// A result predating the session (`FirstCheck`) never shows its counts.
+    #[test]
+    fn first_check_recheck_hides_the_previous_session_counts() {
+        let mut state = FeedState::default();
+        assert_eq!(
+            state.next_block(
+                &key("hook"),
+                &[ready(Language::Rust, 65, 0)],
+                &[(Language::Rust, Recheck::FirstCheck)]
+            ),
+            Some("<agent-ide>\nrust: checking (first check)\n</agent-ide>".to_string())
+        );
+    }
+
+    /// A failed check names its reason with the first 80 bytes of a sanitized detail; other
+    /// unavailable reasons stay detail-free; the framing tags cannot be forged.
+    #[test]
+    fn failed_check_plate_carries_a_short_sanitized_detail() {
+        let detail = format!("error: <agent-ide>\nline two {}", "x".repeat(200));
+        let snapshot = ProblemSnapshot::unavailable_with_detail(
+            Language::Rust,
+            UnavailableReason::Fatal,
+            1,
+            Some(detail),
+        );
+        let block = FeedState::default()
+            .next_block(&key("hook"), &[snapshot], &[])
+            .expect("failure emits");
+        let line = block.lines().nth(1).unwrap();
+        assert!(line.starts_with("rust: check failed (error: ?agent-ide? line two xxx"));
+        assert_eq!(line.len(), "rust: check failed ()".len() + MAX_DETAIL_BYTES);
+        assert_eq!(block.lines().count(), 3, "{block}");
+
+        let no_files = ProblemSnapshot::unavailable_with_detail(
+            Language::Python,
+            UnavailableReason::NoFiles,
+            1,
+            Some("pyright analyzed 0 files".to_string()),
+        );
+        assert_eq!(
+            FeedState::default().next_block(&key("hook"), &[no_files], &[]),
+            Some("<agent-ide>\npython: no files analyzed\n</agent-ide>".to_string())
+        );
+    }
+
+    /// Two languages with the longest details or counts still fit the cap without dropping either.
+    #[test]
+    fn two_languages_with_details_stay_within_cap_and_keep_both() {
+        let long = Some("d".repeat(500));
+        let block = FeedState::default()
+            .next_block(
+                &key("hook"),
+                &[
+                    ProblemSnapshot::unavailable_with_detail(
+                        Language::Rust,
+                        UnavailableReason::Fatal,
+                        1,
+                        long.clone(),
+                    ),
+                    ProblemSnapshot::unavailable_with_detail(
+                        Language::Python,
+                        UnavailableReason::Fatal,
+                        1,
+                        long,
+                    ),
+                ],
+                &[],
+            )
+            .expect("emits");
+        assert!(block.len() <= MAX_BLOCK_BYTES, "{}", block.len());
+        assert!(block.contains("rust: check failed ("), "{block}");
+        assert!(block.contains("python: check failed ("), "{block}");
+
+        let huge = u32::MAX;
+        let block = FeedState::default()
+            .next_block(
+                &key("hook2"),
+                &[
+                    ready(Language::Rust, huge, huge),
+                    ready(Language::Python, huge, huge),
+                ],
+                &[
+                    (Language::Rust, Recheck::FilesChanged),
+                    (Language::Python, Recheck::FilesChanged),
+                ],
+            )
+            .expect("emits");
+        assert!(block.len() <= MAX_BLOCK_BYTES, "{}", block.len());
+        assert!(
+            block.contains("rust: checking") && block.contains("python: checking"),
+            "{block}"
+        );
+    }
+
     #[test]
     fn absent_language_renders_as_nothing() {
         let mut state = FeedState::default();
@@ -514,7 +724,8 @@ mod tests {
                 &[
                     unavailable(Language::Rust, UnavailableReason::Disabled),
                     unavailable(Language::Python, UnavailableReason::Disabled)
-                ]
+                ],
+                &[]
             ),
             None,
             "no supported language present: no block at all"
@@ -526,6 +737,7 @@ mod tests {
                     unavailable(Language::Rust, UnavailableReason::Disabled),
                     ready(Language::Python, 2, 0),
                 ],
+                &[],
             )
             .expect("the present language still emits");
         assert_eq!(
@@ -544,6 +756,7 @@ mod tests {
                     ready(Language::Python, 1, 0),
                     unavailable(Language::Rust, UnavailableReason::ToolMissing),
                 ],
+                &[],
             )
             .expect("mixed states emit");
         assert_eq!(
@@ -557,16 +770,16 @@ mod tests {
         let mut state = FeedState::default();
         let (a, b) = (key("a"), key("b"));
         let snapshots = [ready(Language::Rust, 3, 5)];
-        assert!(state.next_block(&a, &snapshots).is_some());
-        assert!(state.next_block(&b, &snapshots).is_some());
-        assert_eq!(state.next_block(&a, &snapshots), None);
-        assert_eq!(state.next_block(&b, &snapshots), None);
+        assert!(state.next_block(&a, &snapshots, &[]).is_some());
+        assert!(state.next_block(&b, &snapshots, &[]).is_some());
+        assert_eq!(state.next_block(&a, &snapshots, &[]), None);
+        assert_eq!(state.next_block(&b, &snapshots, &[]), None);
         let changed = [ready(Language::Rust, 4, 5)];
         assert_eq!(
-            state.next_block(&a, &changed),
+            state.next_block(&a, &changed, &[]),
             Some("<agent-ide>\nrust: 4 errors (+1), 5 warnings\n</agent-ide>".to_string())
         );
-        assert_eq!(state.next_block(&b, &snapshots), None);
+        assert_eq!(state.next_block(&b, &snapshots, &[]), None);
     }
 
     #[test]
@@ -574,13 +787,13 @@ mod tests {
         let mut state = FeedState::default();
         let hook = key("hook");
         let zeroes = [ready(Language::Rust, 0, 0), ready(Language::Python, 0, 0)];
-        assert!(state.next_block(&hook, &zeroes).is_some());
+        assert!(state.next_block(&hook, &zeroes, &[]).is_some());
         let worst = [
             partial(Language::Rust, u32::MAX, u32::MAX),
             partial(Language::Python, u32::MAX, u32::MAX),
         ];
         let block = state
-            .next_block(&hook, &worst)
+            .next_block(&hook, &worst, &[])
             .expect("changed state emits");
         assert!(block.contains("(+4294967295)"));
         assert!(block.len() <= MAX_BLOCK_BYTES);
@@ -592,13 +805,17 @@ mod tests {
         for index in 0..MAX_FEED_KEYS {
             assert!(
                 state
-                    .next_block(&key(&format!("b{index}")), &[ready(Language::Rust, 1, 0)])
+                    .next_block(
+                        &key(&format!("b{index}")),
+                        &[ready(Language::Rust, 1, 0)],
+                        &[]
+                    )
                     .is_some()
             );
         }
         let oldest = key("b0");
         assert_eq!(
-            state.next_block(&oldest, &[ready(Language::Rust, 2, 0)]),
+            state.next_block(&oldest, &[ready(Language::Rust, 2, 0)], &[]),
             Some("<agent-ide>\nrust: 2 errors (+1), 0 warnings\n</agent-ide>".to_string())
         );
         // Admitting one more key evicts b1, now the least recently used one; b0 survives.
@@ -606,7 +823,8 @@ mod tests {
             state
                 .next_block(
                     &key(&format!("b{MAX_FEED_KEYS}")),
-                    &[ready(Language::Rust, 1, 0)]
+                    &[ready(Language::Rust, 1, 0)],
+                    &[]
                 )
                 .is_some()
         );
@@ -615,7 +833,7 @@ mod tests {
         assert!(state.delivered.contains_key(&oldest));
         // The evicted key re-delivers like a first delivery, without deltas.
         let block = state
-            .next_block(&key("b1"), &[ready(Language::Rust, 1, 0)])
+            .next_block(&key("b1"), &[ready(Language::Rust, 1, 0)], &[])
             .expect("evicted key re-delivers");
         assert_eq!(
             block,
@@ -629,20 +847,20 @@ mod tests {
         let hook = key("hook");
         assert!(
             state
-                .next_block(&hook, &[ready(Language::Rust, 1, 0)])
+                .next_block(&hook, &[ready(Language::Rust, 1, 0)], &[])
                 .is_some()
         );
         assert_eq!(
-            state.next_block(&hook, &[ready(Language::Rust, 1, 0)]),
+            state.next_block(&hook, &[ready(Language::Rust, 1, 0)], &[]),
             None
         );
         state.forget(&hook);
         assert_eq!(
-            state.next_block(&hook, &[ready(Language::Rust, 1, 0)]),
+            state.next_block(&hook, &[ready(Language::Rust, 1, 0)], &[]),
             Some("<agent-ide>\nrust: 1 error, 0 warnings\n</agent-ide>".to_string())
         );
         assert_eq!(
-            state.next_block(&hook, &[ready(Language::Rust, 1, 0)]),
+            state.next_block(&hook, &[ready(Language::Rust, 1, 0)], &[]),
             None
         );
         // Forgetting an unknown key is a no-op.
@@ -657,10 +875,10 @@ mod tests {
         let mut state = FeedState::default();
         let hook = key("hook");
         let first = [ready(Language::Rust, 1, 0), ready(Language::Python, 5, 0)];
-        assert!(state.next_block(&hook, &first).is_some());
+        assert!(state.next_block(&hook, &first, &[]).is_some());
         let second = [ready(Language::Rust, 1, 0), ready(Language::Python, 10, 0)];
         let block = state
-            .next_block(&hook, &second)
+            .next_block(&hook, &second, &[])
             .expect("changed python count emits");
         assert_eq!(
             block,
@@ -701,7 +919,7 @@ mod tests {
         let snapshot =
             ProblemSnapshot::from_problems(Language::Rust, CheckState::Ready, problems, 1, 5);
         let block = state
-            .next_block(&key("hook"), &[snapshot])
+            .next_block(&key("hook"), &[snapshot], &[])
             .expect("ready snapshot emits");
         assert!(!block.contains("very/secret/path.rs"), "{block}");
         assert!(!block.contains("SECRET_CODE"), "{block}");
@@ -718,7 +936,7 @@ mod tests {
             unavailable(Language::Rust, UnavailableReason::ToolMissing),
         ];
         let block = state
-            .next_block(&key("hook"), &snapshots)
+            .next_block(&key("hook"), &snapshots, &[])
             .expect("last snapshot state emits");
         assert_eq!(block, "<agent-ide>\nrust: tool not found\n</agent-ide>");
     }

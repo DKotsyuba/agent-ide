@@ -290,9 +290,10 @@ pub struct ProblemSnapshot { pub language: Language, pub state: CheckState,
 
 ## 6. The `<agent-ide>` block
 
-Rendered from the latest completed snapshots of the actor's worktree, in fixed language order
-(rust, python), only for configured **and present** (§4) languages — a mixed-stack worktree with
-both a `Cargo.toml` and a `pyproject.toml`:
+The block is a **status plate** (T18B): it always tells the agent the current state of each
+configured **and present** (§4) language, in fixed order (rust, python), process states included,
+and it is (re)sent whenever the rendered status changes — and only then. A mixed-stack worktree
+with both a `Cargo.toml` and a `pyproject.toml`:
 
 ```
 <agent-ide>
@@ -300,26 +301,40 @@ rust: 3 errors (+2), 5 warnings | python: environment not found
 </agent-ide>
 ```
 
-- Item forms: `<lang>: <E> errors, <W> warnings`; append ` (partial)` for `Partial`; the delta
-  `(+N)`/`(-N)` after a count appears only when that count changed since the last block delivered
-  to this actor for this worktree. `Unavailable` renders fixed text: `checks disabled`,
-  `outside allowed roots`, `tool not found`, `environment not found`, `no files analyzed` (T12B),
-  `check failed`, `check timed out`. A language still `Checking` without any completed snapshot is
-  omitted, and
-  (T10B) so is a language absent from the worktree (`Unavailable(Disabled)`, §4) — it never
-  renders `checks disabled` or any other phrase, it is simply not mentioned. A pure-Python
-  worktree therefore renders `<agent-ide>\npython: 2 errors, 0 warnings\n</agent-ide>` with no
-  `rust:` item at all; when no configured language is present, no block is emitted, the same as
-  when every language is still `Checking`.
-- Total size including tags ≤ 256 UTF-8 bytes; no paths, messages or code.
-- Emission rule: the block is emitted only when the item set without deltas differs from the last
-  block delivered to that `(actor binding, worktree)`. The first completed result is emitted once.
-  Identical state is never re-emitted. A language's disappearance from the rendered set is only
-  ever a consequence of an actual state change (it stopped being present, or an admitted worktree
-  went `outside_roots`, etc.) reflected in the stored snapshots — never something the emission or
-  delta logic manufactures on its own account (for example, on a binary upgrade with no change
-  underneath, the daemon restarts and the next block for each actor is simply a fresh first
-  delivery, not a synthetic delta).
+- Item forms:
+  - Result: `<lang>: <E> errors, <W> warnings`; append ` (partial)` for `Partial`; the delta
+    `(+N)`/`(-N)` after a count appears only when that count changed since the last counts
+    delivered to this actor for this worktree (a `checking` plate keeps that baseline).
+  - `<lang>: checking (first check)` — this session has no result for the language yet (none
+    exists, or the stored one predates this session's activation of the worktree; its counts are
+    never shown).
+  - `<lang>: checking (files changed; last result: <E> errors, <W> warnings)` — a check is running
+    after the session's last result; the last counts stay visible (`checking (files changed)` when
+    the last result carried no counts).
+  - `Unavailable` renders fixed text: `outside allowed roots`, `tool not found`, `environment not
+    found`, `no files analyzed` (T12B), `check timed out`, and `check failed` — the last with the
+    first 80 UTF-8 bytes of the snapshot detail in parentheses, `check failed (<detail>)`, control
+    characters replaced by spaces and `<`/`>` by `?` so the detail cannot forge the framing.
+  - (T10B) A language absent from the worktree (`Unavailable(Disabled)`, §4) is never mentioned; a
+    pure-Python worktree renders `<agent-ide>\npython: 2 errors, 0 warnings\n</agent-ide>` with no
+    `rust:` item. When no configured language is present, no block is emitted.
+- Total size including tags ≤ 256 UTF-8 bytes. Over the cap the block shrinks in order: deltas,
+  then details and last-result texts (`check failed`, `checking`), then an equal byte share per
+  item; a language is never dropped.
+- When `checking` is shown: only while a check is actually **running** (or when the language has no
+  session result), not while a debounce timer is merely armed. Hook events cannot tell a source
+  change from a no-op tool, so a trigger alone never flips the plate. A real change therefore costs
+  at most two plates (`checking (…)` while the check runs, then the result with its delta), and a
+  quiet session costs none; a no-op check observed while running costs the same two, the second
+  being the unchanged pre-check text. A hook that fires before the check starts sees the
+  previous plate and emits nothing.
+- Emission rule: the plate is emitted only when the item set without deltas differs from the last
+  block delivered to that `(actor binding, worktree)`. Identical state is never re-emitted. A
+  language's disappearance from the rendered set is only ever a consequence of an actual state
+  change (it stopped being present, or an admitted worktree went `outside_roots`, etc.) — never
+  something the emission or delta logic manufactures on its own account (for example, on a binary
+  upgrade with no change underneath, the daemon restarts and the next block for each actor is
+  simply a fresh first delivery, not a synthetic delta).
 - Delivery: Claude `PostToolUse` / `PostToolUseFailure` hook `additionalContext`, taken from the
   ready cache inside the existing hook deadline. The hook never waits for a check. Marking as
   delivered happens when the hook response is produced (at most once; a lost hook response is not
@@ -338,8 +353,12 @@ untrusted text. An `unavailable:<reason>` state line carrying a [`ProblemSnapsho
 appends it in parentheses, for example `rust: unavailable:fatal (error: failed to run custom
 build command for \`blake3 v1.5.0\`)` or (T12B) `python: unavailable:no_files (pyright analyzed 0
 files; check "include"/"exclude" in pyrightconfig.json or [tool.pyright])`; a snapshot with no
-detail renders exactly as before. This
-detail is never included in the `<agent-ide>` block (§6), which stays within its 256-byte cap. No
+detail renders exactly as before. The `<agent-ide>` block (§6) carries only the first 80 bytes of a
+failed check's detail. Process states use the block's vocabulary (T18B): a check running after the
+session's last result renders `<lang>: checking (files changed); last result: errors: N; warnings:
+M`, and a stored result predating this session's activation renders `<lang>: checking (first check
+in this session); previous session result: errors: N; warnings: M`; a language with no result yet
+renders `<lang>: checking (first check in this session)`. No
 new tool and no new `AssistanceMethod`. The problems kind is answered from the daemon's in-memory
 snapshots for the caller's bound worktree on every host; it is never dispatched to the Claude
 foreground helper and needs no provider.

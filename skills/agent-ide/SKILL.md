@@ -68,12 +68,15 @@ instead of parsing the compact text as a second response schema.
 
 ## Project problem feed
 
-The `<agent-ide>` block reports project-wide Rust/Python error and warning counts for this
-worktree and appears in hook context only when those items change; no block means unchanged, not
-finished. When counts rise after your edit, call `ide.context` with `{"kind": "problems"}`
-(optionally `"language": "rust" | "python"` and `"offset"`) to read the bounded problem list
-before continuing. Fixed texts such as `environment not found`, `outside allowed roots`, or
-`checks disabled` mean the feed has no counts for that language — never treat them as a clean
+The `<agent-ide>` block is a status plate for the worktree's Rust/Python checks. It is sent in
+hook context whenever the status changes and not while it stays the same, so no block means
+unchanged, not finished. `rust: checking (first check)` means no result yet this session;
+`rust: checking (files changed; last result: 0 errors, 1 warning)` means a check is running and the
+last counts may be outdated; the next plate carries the result with `(+N)`/`(-N)` deltas. When
+counts rise after your edit, call `ide.context` with `{"kind": "problems"}` (optionally
+`"language": "rust" | "python"` and `"offset"`) to read the bounded problem list before continuing.
+`check failed (<reason>)`, `environment not found`, `no files analyzed`, `outside allowed roots`
+or `checks disabled` mean the feed has no counts for that language — never treat them as a clean
 result.
 
 ## Pending replies and the Claude foreground helper

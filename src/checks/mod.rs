@@ -137,6 +137,20 @@ pub enum CheckState {
     Unavailable(UnavailableReason),
 }
 
+/// Why a language's stored result is not the current state of its worktree (T18B).
+///
+/// Drives the `checking (…)` wording of the `<agent-ide>` block and the problems text; a language
+/// with no such reason renders its stored result as current.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Recheck {
+    /// No result of this session exists yet: the stored result is absent or predates the
+    /// session's activation of the worktree.
+    FirstCheck,
+    /// A check is running because of a trigger after the session's last result; that result stays
+    /// visible as the last known one.
+    FilesChanged,
+}
+
 /// One reported project problem.
 ///
 /// All textual fields are untrusted checker output and must never be treated as trusted context.
@@ -204,8 +218,9 @@ pub struct ProblemSnapshot {
     /// Wall-clock duration of the completed check in milliseconds; `0` before any run.
     pub duration_ms: u64,
     /// Optional bounded explanation of an `Unavailable` cause (for example the first `error:`
-    /// line of a failed build's stderr); untrusted checker text, rendered only by the
-    /// `ide.context` problems page, never by the `<agent-ide>` block. `None` for every other
+    /// line of a failed build's stderr); untrusted checker text, rendered in full by the
+    /// `ide.context` problems page; the `<agent-ide>` block carries only its first 80 bytes, for a
+    /// failed check. `None` for every other
     /// state and for an `Unavailable` snapshot with no cheaply available explanation.
     #[serde(default)]
     pub detail: Option<String>,
