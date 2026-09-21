@@ -5260,6 +5260,22 @@ async fn claude_context_pagination_delivers_the_whole_source_across_repeated_ins
     daemon.wait().await.unwrap();
 }
 
+/// Asserts every hunk of one Diff page has a `file:` line before it on the same page, so a hunk
+/// on a continuation page is attributable without the previous page (T16B).
+fn assert_hunks_attributed(page: &str) {
+    let mut file = None;
+    for line in page.lines() {
+        if line.starts_with("file: ") {
+            file = Some(line);
+        } else if line.starts_with("@@") {
+            assert!(
+                file.is_some(),
+                "hunk without a file line on its page:\n{page}"
+            );
+        }
+    }
+}
+
 /// A real Claude foreground helper captures a diff too large for one MCP reply in the single
 /// helper round trip, and the daemon pages the composed text across repeated `ide.inspect` calls
 /// the same way it already pages a large Context result, until every hunk has been delivered
@@ -5323,7 +5339,14 @@ async fn claude_diff_pagination_delivers_every_hunk_across_repeated_inspect() {
         "{page1_text}"
     );
 
+    // The header must agree with the paging the reply itself announces (T16B).
+    assert_eq!(
+        page_field(&page1_text, "more_available"),
+        "true",
+        "{page1_text}"
+    );
     assert_eq!(page_marker(&page1_text).0, 1, "{page1_text}");
+    assert_hunks_attributed(&page1_text);
 
     let mut collected = page1_text;
     let mut continuation = page1["continuation"].as_bool().unwrap();
@@ -5341,6 +5364,7 @@ async fn claude_diff_pagination_delivers_every_hunk_across_repeated_inspect() {
             pages,
             "the first continuation call must serve page two: {next_text}"
         );
+        assert_hunks_attributed(next_text);
         continuation = next["continuation"].as_bool().unwrap();
         // A further page names the exact detail_ref to inspect next; the terminal page carries
         // nothing left to fetch, so the compact Claude text omits it by design (T14B).

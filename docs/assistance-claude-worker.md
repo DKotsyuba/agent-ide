@@ -126,6 +126,8 @@ Paging contract (T16B):
 - `ide.edit` is refused (`stale_source`) on the `source_ref` of a paged Context until its last
   page was delivered: the reference names the whole observed source, but the caller has seen only
   part of it.
+- A paged Diff header says `more_available: true`; every hunk is preceded by a `file: <path>` line
+  and a page that starts inside a file's hunks begins with `file: <path> (continued)`.
 A failed helper finalization retires its transient daemon detail (including a failed Start
 mapping), so repeated inspection returns the same bounded failure without consuming the global
 detail ceiling.

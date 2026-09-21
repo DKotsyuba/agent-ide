@@ -2762,9 +2762,14 @@ impl<'a> Worker<'a> {
         // Mirrors `context_claude` (T09B): the helper already composed the complete bounded Diff
         // text in one capture, so later `ide.inspect` calls page through it byte-exactly instead of
         // re-running Git, which the daemon cannot do for Claude at all (T13B).
-        let (reply, context_page) =
-            ContextPageState::new(text.clone(), 0, *truncated, ResultKind::Diff)
-                .next(&job.reference)?;
+        let mut state = ContextPageState::new(text.clone(), 0, *truncated, ResultKind::Diff);
+        let (mut reply, mut context_page) = state.next(&job.reference)?;
+        if context_page.is_some() {
+            // The helper cannot know its text will be paged; the header must not say
+            // `more_available: false` above a reply that ends with `Output is truncated` (T16B).
+            state.text = snapshots::mark_more_available(&state.text);
+            (reply, context_page) = state.next(&job.reference)?;
+        }
         self.shared.set_context_page(&job.reference, context_page);
         Ok((reply, Some(authority), None))
     }
