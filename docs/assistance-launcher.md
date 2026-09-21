@@ -143,9 +143,17 @@ differ. `permit` succeeds only when some accepted profile of the observed class 
 state's digest exactly — a changed sandbox is refused, never approximated.
 
 When the daemon refuses a profile, it captures the raw observed state once per distinct digest
-under `~/.agent-ide/rejected-profiles/<16-hex>.json` (mode 0600; the directory is 0700; at most
-16 captures are retained; failures to capture are silent). The refusal's error-log detail names
-the capture stem (`profile_digest_mismatch:managed; captured:<16-hex>`). To accept the new
+under `~/.agent-ide/rejected-profiles/<16-hex>.json` (mode 0600 at creation; the directory is
+created 0700; the 16-capture limit is a soft cap — concurrent daemons can transiently exceed it).
+The capture is skipped silently when the directory is a symlink, is not owned by the current
+user, or carries group/other permission bits; the error-log detail then reads
+`profile_digest_mismatch:managed; capture_skipped:io`. No capture is ever written for an
+observed state that carries any top-level field beyond the four documented
+`codex/sandbox-state-meta` fields (`permissionProfile`, `codexLinuxSandboxExe`, `sandboxCwd`,
+`useLegacyLandlock`): the digest covers unknown fields, so a filtered copy would be useless and
+the raw state is treated as unreviewable — the detail reads `capture_skipped:unknown_fields`.
+Otherwise the detail names the capture stem (`profile_digest_mismatch:managed;
+captured:<16-hex>`). To accept the new
 sandbox mode:
 
 1. Run the host once against this worktree so the daemon observes and refuses its sandbox state.

@@ -382,12 +382,27 @@ fn evidence_executable(identity: &str, path: PathBuf) -> Result<String, AppError
     .to_string())
 }
 
+/// Renders one state-derived string as a single bounded, control-free operator field (T25B).
+///
+/// Captured values come from the host, so control characters and non-printables are escaped
+/// (`char::escape_default`) and the field is capped at [`MAX_RENDERED_FIELD_CHARS`] characters:
+/// every listed entry stays exactly one line and cannot smuggle terminal escapes into operator
+/// review.
+fn escaped_field(value: &str) -> String {
+    const MAX_RENDERED_FIELD_CHARS: usize = 256;
+    value
+        .chars()
+        .take(MAX_RENDERED_FIELD_CHARS)
+        .flat_map(char::escape_default)
+        .collect()
+}
+
 /// Prints one line per captured rejected sandbox state below the real user home (T25B).
 ///
 /// Each line is `name class sandbox-cwd mtime`, where `name` is the 16-hex capture stem an
 /// operator joins with `~/.agent-ide/rejected-profiles/<name>.json` and `mtime` uses the error
-/// log's RFC 3339 UTC form. A missing or unreadable capture is skipped; the command still
-/// succeeds.
+/// log's RFC 3339 UTC form. The state-derived `sandbox-cwd` is rendered through
+/// [`escaped_field`]. A missing or unreadable capture is skipped; the command still succeeds.
 fn evidence_rejected() {
     for capture in agent_ide::execution::list_rejected_profiles() {
         let class = match capture.class {
@@ -400,7 +415,11 @@ fn evidence_rejected() {
             .map(|elapsed| elapsed.as_secs())
             .map(agent_ide::errorlog::format_rfc3339)
             .unwrap_or_else(|| "-".to_owned());
-        println!("{} {class} {} {mtime}", capture.name, capture.sandbox_cwd);
+        println!(
+            "{} {class} {} {mtime}",
+            capture.name,
+            escaped_field(&capture.sandbox_cwd)
+        );
     }
 }
 
@@ -2312,6 +2331,16 @@ mod tests {
             command(args(&["evidence", "rejected", "--extra"])),
             Err(AppError::InvalidResponse)
         ));
+    }
+
+    /// `evidence rejected` renders state-derived fields as one bounded control-free line (T25B).
+    #[test]
+    fn evidence_rejected_escapes_control_characters_in_fields() {
+        assert_eq!(
+            escaped_field("/tmp/\u{1b}[2J\nFORGED"),
+            "/tmp/\\u{1b}[2J\\nFORGED"
+        );
+        assert_eq!(escaped_field(&"x".repeat(300)).chars().count(), 256);
     }
 
     /// `launcher check` parses a bare path and reports the same failure as a direct call for a

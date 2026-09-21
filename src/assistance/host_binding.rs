@@ -36,7 +36,7 @@ const TURN_METADATA: &str = "x-codex-turn-metadata";
 const SANDBOX_STATE_METADATA: &str = "codex/sandbox-state-meta";
 /// Claude's trusted MCP `_meta` field; Claude never supplies an actor, session, or sandbox field here.
 const CLAUDE_TOOL_USE_ID: &str = "claudecode/toolUseId";
-const SANDBOX_STATE_FIELDS: &[&str] = &[
+pub(crate) const SANDBOX_STATE_FIELDS: &[&str] = &[
     "permissionProfile",
     "codexLinuxSandboxExe",
     "sandboxCwd",

@@ -23,7 +23,7 @@ use tokio::{
 };
 
 use crate::assistance::host_binding::{
-    ActiveBindingUse, ObservedSandboxState, SandboxStateProvenance,
+    ActiveBindingUse, ObservedSandboxState, SANDBOX_STATE_FIELDS, SandboxStateProvenance,
 };
 
 /// Classifies the host permission profile whose complete state accompanies a request.
@@ -414,7 +414,7 @@ impl ExecutionProfileCatalog {
         records: Vec<(PersistedProfileRecord, HostSandboxState)>,
         expected: &[PersistedProfileRecord],
     ) -> Result<Self, RequestError> {
-        if records.len() != expected.len() {
+        if records.len() != expected.len() || records.len() > MAX_ACCEPTED_PROFILES {
             return Err(RequestError::ExecutionProfileDenied);
         }
         let mut templates = Vec::with_capacity(records.len());
@@ -462,11 +462,25 @@ impl ExecutionProfileCatalog {
 /// Directory below the real `.agent-ide` home holding captured rejected sandbox states (T25B).
 pub const REJECTED_PROFILES_DIR: &str = "rejected-profiles";
 
-/// Maximum captured rejected sandbox states retained for operator review (T25B).
+/// Soft cap on captured rejected sandbox states retained for operator review (T25B).
+///
+/// There is no locking: concurrent daemons on one machine can transiently exceed this cap. The
+/// check is best-effort housekeeping, never a security boundary.
 const MAX_REJECTED_PROFILES: usize = 16;
 
 /// Maximum captured rejected-state JSON bytes, matching `evidence record --sandbox-state` (T25B).
 const MAX_REJECTED_STATE_BYTES: usize = 64 * 1024;
+
+/// Outcome of one best-effort rejected-state capture attempt (T25B).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RejectedCapture {
+    /// A new private capture file was written; the stem is its 16-hex file name.
+    Captured(String),
+    /// The state carried a top-level field outside the documented envelope; nothing was written.
+    UnknownFields,
+    /// Any other silent skip (unsafe directory, soft cap, existing file, I/O); nothing was written.
+    Unavailable,
+}
 
 /// One captured rejected host sandbox state offered for operator review (T25B).
 #[derive(Clone, Debug)]
@@ -484,32 +498,55 @@ pub struct RejectedProfileCapture {
 /// Captures one rejected observed sandbox state for operator review; best-effort, never authorizing.
 ///
 /// The file holds the exact bounded JSON envelope `agent-ide evidence record --sandbox-state`
-/// reads, written private (mode 0600, directory 0700) below the real user home under
-/// [`REJECTED_PROFILES_DIR`]. An existing capture is never overwritten, the directory retains at
-/// most 16 files, and every failure is silent: a capture never changes an admission reply or
-/// becomes an authority input. Returns the captured file-name stem (16 hex) only when a new file
-/// was written.
-pub fn capture_rejected_profile(state_json: &Value) -> Option<String> {
-    let home = crate::userhome::user_home()?;
+/// reads, written private (mode 0600 at creation, `O_NOFOLLOW`) below the real user home under
+/// [`REJECTED_PROFILES_DIR`]. The directory is created private (0700) at birth and is used only
+/// when `symlink_metadata` confirms a real directory owned by the current uid with no group/other
+/// permission bits; an existing directory is never chmod'ed. A capture is refused with
+/// [`RejectedCapture::UnknownFields`] for any state carrying a top-level field outside the
+/// documented sandbox-state envelope: the profile digest covers unknown fields, so a filtered
+/// copy would be useless and the unfiltered state could carry secrets. An existing capture is
+/// never overwritten and every failure is silent: a capture never changes an admission reply or
+/// becomes an authority input.
+pub fn capture_rejected_profile(state_json: &Value) -> RejectedCapture {
+    let Some(home) = crate::userhome::user_home() else {
+        return RejectedCapture::Unavailable;
+    };
     capture_rejected_profile_in(&home, state_json)
 }
 
 /// [`capture_rejected_profile`] below an explicit home; the seam exists only for tests.
-pub(crate) fn capture_rejected_profile_in(home: &Path, state_json: &Value) -> Option<String> {
-    let state = HostSandboxState::parse(Some(state_json.clone())).ok()?;
+pub(crate) fn capture_rejected_profile_in(home: &Path, state_json: &Value) -> RejectedCapture {
+    let Ok(state) = HostSandboxState::parse(Some(state_json.clone())) else {
+        return RejectedCapture::Unavailable;
+    };
+    if !state_json.as_object().is_some_and(|object| {
+        object
+            .keys()
+            .all(|key| SANDBOX_STATE_FIELDS.contains(&key.as_str()))
+    }) {
+        return RejectedCapture::UnknownFields;
+    }
     let json = state_json.to_string();
     if json.len() > MAX_REJECTED_STATE_BYTES {
-        return None;
+        return RejectedCapture::Unavailable;
     }
     let dir = home.join(".agent-ide").join(REJECTED_PROFILES_DIR);
-    std::fs::create_dir_all(&dir).ok()?;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
     }
-    if std::fs::read_dir(&dir).ok()?.count() >= MAX_REJECTED_PROFILES {
-        return None;
+    if builder.create(&dir).is_err() {
+        return RejectedCapture::Unavailable;
+    }
+    #[cfg(unix)]
+    if !usable_private_directory(&dir) {
+        return RejectedCapture::Unavailable;
+    }
+    if std::fs::read_dir(&dir).is_ok_and(|entries| entries.count() >= MAX_REJECTED_PROFILES) {
+        return RejectedCapture::Unavailable;
     }
     let hex = state.profile_digest().to_hex().to_string();
     let stem = hex[..16].to_owned();
@@ -518,51 +555,103 @@ pub(crate) fn capture_rejected_profile_in(home: &Path, state_json: &Value) -> Op
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = options.open(dir.join(format!("{stem}.json"))).ok()?;
-    file.write_all(json.as_bytes()).ok()?;
-    Some(stem)
+    let Ok(mut file) = options.open(dir.join(format!("{stem}.json"))) else {
+        return RejectedCapture::Unavailable;
+    };
+    if file.write_all(json.as_bytes()).is_err() {
+        return RejectedCapture::Unavailable;
+    }
+    RejectedCapture::Captured(stem)
+}
+
+/// Reports whether `dir` is a real, privately owned directory fit for captures (T25B).
+///
+/// `symlink_metadata` never follows links, so a symlinked directory fails `is_dir`; a directory
+/// this process does not own, or one readable or writable by group or other, is equally refused.
+#[cfg(unix)]
+fn usable_private_directory(dir: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) => {
+            // SAFETY: `getuid` merely reports the calling thread's real uid.
+            metadata.is_dir()
+                && metadata.uid() == unsafe { libc::getuid() }
+                && metadata.permissions().mode() & 0o077 == 0
+        }
+        Err(_) => false,
+    }
 }
 
 /// Lists the captured rejected sandbox states below the real user home, ordered by name (T25B).
+///
+/// Only strictly well-formed captures are listed: a name of exactly 16 lowercase hex digits plus
+/// `.json`, a regular file of at most 64 KiB opened `O_NOFOLLOW`, and parseable JSON. Symlinks,
+/// special files, oversized or foreign entries are ignored silently, and at most 16 entries are
+/// returned.
 pub fn list_rejected_profiles() -> Vec<RejectedProfileCapture> {
     let Some(home) = crate::userhome::user_home() else {
         return Vec::new();
     };
+    list_rejected_profiles_in(&home)
+}
+
+/// [`list_rejected_profiles`] below an explicit home; the seam exists only for tests.
+pub(crate) fn list_rejected_profiles_in(home: &Path) -> Vec<RejectedProfileCapture> {
     let Ok(entries) = std::fs::read_dir(home.join(".agent-ide").join(REJECTED_PROFILES_DIR)) else {
         return Vec::new();
     };
     let mut captures = Vec::new();
     for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let Some(stem) = file_name.to_str() else {
+        let Some(capture) = parse_rejected_entry(&entry) else {
             continue;
         };
-        let Some(name) = stem.strip_suffix(".json") else {
-            continue;
-        };
-        if name.len() != 16 || !name.chars().all(|c| c.is_ascii_hexdigit()) {
-            continue;
-        }
-        let Ok(raw) = std::fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        let Ok(state) = HostSandboxState::parse_json(&raw) else {
-            continue;
-        };
-        captures.push(RejectedProfileCapture {
-            name: name.to_ascii_lowercase(),
-            class: state.class(),
-            sandbox_cwd: state.sandbox_cwd().to_owned(),
-            modified: entry
-                .metadata()
-                .ok()
-                .and_then(|metadata| metadata.modified().ok()),
-        });
+        captures.push(capture);
     }
     captures.sort_by(|first, second| first.name.cmp(&second.name));
+    captures.truncate(MAX_REJECTED_PROFILES);
     captures
+}
+
+/// Reads one directory entry as a well-formed rejected-state capture, or [`None`] to skip it.
+fn parse_rejected_entry(entry: &std::fs::DirEntry) -> Option<RejectedProfileCapture> {
+    let file_name = entry.file_name();
+    let name = file_name.to_str()?.strip_suffix(".json")?;
+    // Capture stems are always the lowercase hex prefix of a profile digest.
+    if name.len() != 16
+        || !name
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+    // Symlink metadata never follows links: symlinks and special files fail `is_file`.
+    let metadata = std::fs::symlink_metadata(entry.path()).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_REJECTED_STATE_BYTES as u64 {
+        return None;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(entry.path()).ok()?;
+    let mut bytes = Vec::new();
+    let mut bounded = file.take(MAX_REJECTED_STATE_BYTES as u64 + 1);
+    bounded.read_to_end(&mut bytes).ok()?;
+    if bytes.len() > MAX_REJECTED_STATE_BYTES {
+        return None;
+    }
+    let state = HostSandboxState::parse_json(std::str::from_utf8(&bytes).ok()?).ok()?;
+    Some(RejectedProfileCapture {
+        name: name.to_owned(),
+        class: state.class(),
+        sandbox_cwd: state.sandbox_cwd().to_owned(),
+        modified: metadata.modified().ok(),
+    })
 }
 
 /// Identifies a host invocation already proven by Assistance's host-binding adapter.
