@@ -110,6 +110,7 @@ fn missing_or_invalid_host_fields_are_unavailable() {
     )
     .unwrap();
     assert_eq!(child.actor_id(), "child");
+    assert_eq!(child.session_id(), Some("root"));
     assert!(parse_hook_event(
         br#"{"hook_event_name":"PreToolUse","session_id":"","agent_id":"child","tool_use_id":"c"}"#,
     )
@@ -285,7 +286,7 @@ fn claude_parent_and_two_subagents_remain_explicit_and_isolated() {
     }
 }
 
-/// Retains the native tool name for Claude post phases only, never for pre-hooks or Codex.
+/// Retains the native tool name for Claude post phases only, never for pre-hooks.
 #[test]
 fn claude_post_phases_retain_only_the_tool_name() {
     for phase in ["PostToolUse", "PostToolUseFailure"] {
@@ -304,11 +305,6 @@ fn claude_post_phases_retain_only_the_tool_name() {
     )
     .unwrap();
     assert_eq!(pre.tool_name(), None);
-    let codex = parse_hook_event(
-        br#"{"hook_event_name":"PostToolUse","session_id":"session","tool_use_id":"call","tool_name":"Edit"}"#,
-    )
-    .unwrap();
-    assert_eq!(codex.tool_name(), None);
 }
 
 /// Accepts a host-declared batch boundary without fabricating a tool or session-derived call ID.

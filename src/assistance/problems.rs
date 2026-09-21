@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use super::host_binding::HostKind;
 use super::launcher::{LauncherConfig, admit_worktree};
 use crate::checks::python::PythonChecker;
 use crate::checks::runner::{ConfinedRunner, SeatbeltRunner};
@@ -31,6 +32,31 @@ const MAX_CONCURRENT_CHECKS: usize = 2;
 
 /// Native Claude tools whose completed post-hook triggers a project check (EYES-r2 §5).
 pub const CHECK_TRIGGER_TOOLS: [&str; 5] = ["Edit", "Write", "MultiEdit", "NotebookEdit", "Bash"];
+
+/// Native tool-name prefixes of this product's own managed MCP tools (T29B §4).
+///
+/// An Agent IDE MCP call settles through its validated MCP reply, so its paired native post must
+/// never schedule a check that would treat the helper's own result as a foreign change. Both the
+/// underscore and hyphen spellings occur in tool naming.
+const SELF_MCP_TOOL_PREFIXES: [&str; 2] = ["mcp__agent_ide__", "mcp__agent-ide__"];
+
+/// Decides whether one settled native post phase schedules a project check (T29B §4).
+///
+/// Claude keeps the exact [`CHECK_TRIGGER_TOOLS`] writer allowlist. Codex has no certified writer
+/// allowlist yet, so every paired post triggers except this product's own MCP tool names; other
+/// servers' MCP tools are deliberately never excluded because they may edit files. A missing or
+/// unrecognized name triggers conservatively — an unchanged-status post still stays silent, and
+/// T20B eligibility bounds the repeated-check cost.
+pub fn triggers_check(host: HostKind, tool_name: Option<&str>) -> bool {
+    match host {
+        HostKind::Claude => tool_name.is_some_and(|name| CHECK_TRIGGER_TOOLS.contains(&name)),
+        HostKind::Codex => tool_name.is_none_or(|name| {
+            !SELF_MCP_TOOL_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        }),
+    }
+}
 
 /// Maximum problems rendered on one `ide.context` problems page.
 pub const PROBLEMS_PAGE_SIZE: u32 = 20;
@@ -639,6 +665,40 @@ mod tests {
         let past = problems_text(&snapshots, None, 45);
         assert_eq!(past.lines().count(), 1, "{past}");
         assert!(!past.contains("next_offset"));
+    }
+
+    /// Host-specific check triggers (T29B §4): Claude keeps its exact writer allowlist while
+    /// Codex triggers conservatively on every name except this product's own MCP tools.
+    #[test]
+    fn check_trigger_predicate_is_host_specific_and_conservative() {
+        for name in CHECK_TRIGGER_TOOLS {
+            assert!(triggers_check(HostKind::Claude, Some(name)), "{name}");
+            assert!(triggers_check(HostKind::Codex, Some(name)), "{name}");
+        }
+        // Claude: exact allowlist, no conservative default.
+        assert!(!triggers_check(HostKind::Claude, Some("Grep")));
+        assert!(!triggers_check(HostKind::Claude, None));
+        // Codex: known and unknown writers trigger, missing names trigger.
+        assert!(triggers_check(HostKind::Codex, Some("apply_patch")));
+        assert!(triggers_check(HostKind::Codex, Some("exec_command")));
+        assert!(triggers_check(
+            HostKind::Codex,
+            Some("mcp__other-server__write")
+        ));
+        assert!(triggers_check(HostKind::Codex, None));
+        // Only this product's own MCP tool names are excluded, in both spellings.
+        assert!(!triggers_check(
+            HostKind::Codex,
+            Some("mcp__agent_ide__context")
+        ));
+        assert!(!triggers_check(
+            HostKind::Codex,
+            Some("mcp__agent-ide__edit")
+        ));
+        assert!(triggers_check(
+            HostKind::Codex,
+            Some("mcp__agent_ide_extra__edit")
+        ));
     }
 
     /// A language filter renders only the matching configured language and its problems.

@@ -14,7 +14,7 @@ use super::{
         parse_hook_event, parse_host_kind, parse_observed_sandbox_state,
     },
     launcher::{AcceptedProviderSettings, LaunchTarget, LauncherConfig},
-    problems::{CHECK_TRIGGER_TOOLS, ProjectProblemFeed},
+    problems::{ProjectProblemFeed, triggers_check},
     reply::FailureCode,
     worker::WorkerHandle,
 };
@@ -768,7 +768,7 @@ impl ProductDispatcher {
                 };
                 let event = match object.get("host")?.as_str()? {
                     "codex" => parse_hook_event(
-                        json!({"hook_event_name":phase,"session_id":object.get("actor_id")?,"tool_use_id":object.get("call_id")?})
+                        json!({"hook_event_name":phase,"session_id":object.get("session_id")?,"agent_id":(object.get("actor_id")? != object.get("session_id")?).then_some(object.get("actor_id")?),"tool_use_id":object.get("call_id")?,"tool_name":object.get("tool_name")})
                             .to_string().as_bytes(),
                     ),
                     "claude" => parse_claude_hook_event(
@@ -839,10 +839,7 @@ impl ProductDispatcher {
                 // Reply-delivered hosts get their plates on terminal `ide.*` replies instead.
                 let hook_post = event.host().feed_delivery() == FeedDelivery::Hooks
                     && matches!(event.phase(), HookPhase::Post | HookPhase::PostFailure);
-                let triggers_check = hook_post
-                    && event
-                        .tool_name()
-                        .is_some_and(|name| CHECK_TRIGGER_TOOLS.contains(&name));
+                let triggers_check = hook_post && triggers_check(event.host(), event.tool_name());
                 let status = self.bindings.lock().ok()?.observe_hook(event, channel);
                 match status {
                     BindingStatus::PreObserved => Some(PeerReply::HookObserved {}),
