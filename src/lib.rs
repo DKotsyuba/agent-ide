@@ -29,3 +29,6 @@ pub mod telemetry;
 
 /// Owns the append-only, bounded, closed-reason-code error log (T107).
 pub mod errorlog;
+
+/// Resolves the real per-user home from the password database instead of `$HOME`.
+pub mod userhome;

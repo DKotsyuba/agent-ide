@@ -21,6 +21,20 @@ start/stop/idle-exit, client lease open/close, a completed project check) to
 hex character id an `ai-r-<id>` runtime directory and `~/.agent-ide/checks/<id>` already use, so one
 repository's worktrees share one log directory. The directory is `0700` and the file is `0600`.
 
+`~` is the real user home from the password database (`getpwuid_r`), **never** `$HOME`: hosts such
+as `agent-run` start MCP clients, daemons and shells with a substituted `HOME`, which used to split
+one repository's log across several homes. The only override is the absolute-path environment
+variable `AGENT_IDE_HOME` (tests and explicit relocation); it moves every per-user root
+(`.agent-ide/logs`, `.agent-ide/checks`, telemetry, and the cargo/rustup homes of the Rust check).
+`.cargo/config.toml` sets it to `target/test-home` for every `cargo test` process, and spawned
+daemons inherit it, so tests never write under the real home.
+
+A managed Codex daemon runs in a random `ai-<random>` runtime directory that names no repository,
+so the spawning MCP passes `AGENT_IDE_LOG_KEY=<repository-key>`, which wins over the runtime
+directory name. The reader tries, in order, the key from `git rev-parse --git-common-dir`, the key
+from reading `.git` files itself (when `git` fails or times out), and the canonical path itself, and
+uses the first whose log directory exists.
+
 r2 (T107 full-logging extension) logs *every* call and lifecycle fact, not only a non-success one:
 each line carries a closed `level` (`error`/`warn`/`info`), a pure function of `outcome`
 ([`Outcome::level`]), so a successful `ide.start` and a `pending` round trip are on the record too,
@@ -31,7 +45,7 @@ opts into `info` as well.
 
 Every field is one of: an RFC 3339 UTC timestamp; a closed `level` tag; a closed `method` tag
 (`start`, `context`, `diff`, `edit`, `inspect`, `stop`, `hook`, `helper_claim`, `check`, `daemon`,
-`client`); a closed `outcome` tag; an optional closed `reason` tag, which is always the most
+`client`, `feed`); a closed `outcome` tag; an optional closed `reason` tag, which is always the most
 specific existing enum variant at the point of failure (for example `BindingUnavailable::MissingPre`,
 `FailureCode::InvalidDetail`, or `UnavailableReason::Fatal`, rendered
 `missing_pre`/`invalid_detail`/`check_fatal`); an optional `worktree` path; an optional `host` tag
@@ -48,6 +62,16 @@ model, existing already-sanitized checker text (`checks::ProblemSnapshot::detail
 160 bytes), or (for a completed check with no such text) a fixed `errors=<n> warnings=<n>` count
 summary. `worktree`, when present, is an absolute path; every other path-shaped fact stays relative
 to the worktree, matching what a reply already exposes to the model.
+
+Every typed tool reply leaving the dispatcher is logged once from the dispatcher itself
+(`adapters::log_tool_reply`), independently of whether the durable telemetry sink is available:
+that sink is absent whenever its lock is contended or its initialization failed, for example while a
+replaced daemon generation is still shutting down, and the log must not go silent then. The same
+holds for completed checks. Also logged: `check started` (scheduler dispatch, language in
+`detail`), client re-establishment (`client reestablished`, or `client unavailable
+provider_unavailable`), an oversize reply envelope (`client failed oversize_envelope`), and each
+emitted `<agent-ide>` feed block (`feed completed`, `detail` = `languages=<list> bytes=<n>`, no
+text).
 
 ## Failure semantics
 
@@ -98,7 +122,8 @@ prove at least `BindingUnavailable::MissingPre`, `FailureCode::InvalidDetail`, a
 snapshot with a `detail` map to their exact closed tags; `Outcome::level` is proved a pure,
 exhaustive function of `Outcome`; a level-default-on-read test proves an r1-shaped line without
 `level` reads back as `warn`. A binary-level test exercises `agent-ide errors --summary` against a
-fixture log. No gate proves product adoption at every call site listed in the T107 brief; client
-re-establishment, the MCP oversize-envelope boundary, and a `check started` lifecycle event (only
-`check` *completions* are wired) are not yet logged and are called out as left undone in that
-task's report.
+fixture log. `tests/error_log_contract.rs` proves daemon restarts append rather than truncate, that
+`errors --repo` finds the log from the repository, a linked worktree and a subdirectory under a
+substituted `$HOME`, that `AGENT_IDE_LOG_KEY` names a random runtime's log, and that a spawned daemon
+never writes under the real home; `tests/error_log_replies.rs` proves each typed failure reply
+(including `source_too_large`) and `check started` are logged with no telemetry.

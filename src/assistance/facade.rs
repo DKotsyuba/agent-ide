@@ -1136,6 +1136,14 @@ impl StdioFacade {
 /// re-approximating the fitting boundary.
 pub(super) fn render_reply(reply: PeerReply, envelope: content::Envelope) -> CallToolResult {
     content::render(reply, envelope).unwrap_or_else(|| {
+        crate::errorlog::record(
+            crate::errorlog::Method::Client,
+            crate::errorlog::Outcome::Failed,
+            crate::errorlog::Fields {
+                reason: Some(crate::errorlog::ReasonCode::OversizeEnvelope),
+                ..Default::default()
+            },
+        );
         CallToolResult::error(vec![ContentBlock::text(
             "Assistance result exceeds the bounded envelope; continue with native tools",
         )])

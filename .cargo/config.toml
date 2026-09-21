@@ -1,0 +1,4 @@
+# Keeps every test-spawned daemon/MCP process (which inherit this) out of the developer's real
+# `~/.agent-ide`: per-user state resolves from `AGENT_IDE_HOME` (see `agent_ide::userhome`).
+[env]
+AGENT_IDE_HOME = { value = "target/test-home", relative = true }

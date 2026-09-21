@@ -168,6 +168,7 @@ impl ProductDispatcher {
             let feed = ProjectProblemFeed::from_launcher(
                 &launcher,
                 Arc::new(move |snapshot: &crate::checks::ProblemSnapshot| {
+                    adapters::log_project_check(snapshot);
                     if let Some(telemetry) = telemetry.lock().ok().and_then(|slot| slot.clone()) {
                         adapters::project_check(&telemetry, snapshot);
                     }
@@ -1278,36 +1279,30 @@ impl AssistanceDispatcher for ProductDispatcher {
                 .unwrap_or(PeerReply::Unavailable {
                     reason: MissingPeer::HostBinding,
                 });
-            if let Some(telemetry) = self.worker.as_ref().and_then(WorkerHandle::telemetry) {
-                match &request {
-                    AssistanceDispatch::HookSubmit(_) => {
-                        // Hook payloads are intentionally never accepted by telemetry adapters.
-                    }
-                    AssistanceDispatch::MethodDispatch(method) => {
-                        let tool = match method.method() {
-                            AssistanceMethod::Start => Some(super::facade::AssistanceTool::Start),
-                            AssistanceMethod::Context => {
-                                Some(super::facade::AssistanceTool::Context)
-                            }
-                            AssistanceMethod::Diff => Some(super::facade::AssistanceTool::Diff),
-                            AssistanceMethod::Inspect => {
-                                Some(super::facade::AssistanceTool::Inspect)
-                            }
-                            AssistanceMethod::Stop => Some(super::facade::AssistanceTool::Stop),
-                            AssistanceMethod::Edit => Some(super::facade::AssistanceTool::Edit),
-                            AssistanceMethod::HookSubmit => None,
-                        };
-                        if let Some(tool) = tool {
-                            adapters::tool_reply(
-                                &telemetry,
-                                tool,
-                                &result,
-                                started.elapsed(),
-                                None,
-                                CacheState::NotApplicable,
-                                DiagnosticState::NotApplicable,
-                            );
-                        }
+            // Hook payloads are intentionally never accepted by telemetry adapters or the log.
+            if let AssistanceDispatch::MethodDispatch(method) = &request {
+                let tool = match method.method() {
+                    AssistanceMethod::Start => Some(super::facade::AssistanceTool::Start),
+                    AssistanceMethod::Context => Some(super::facade::AssistanceTool::Context),
+                    AssistanceMethod::Diff => Some(super::facade::AssistanceTool::Diff),
+                    AssistanceMethod::Inspect => Some(super::facade::AssistanceTool::Inspect),
+                    AssistanceMethod::Stop => Some(super::facade::AssistanceTool::Stop),
+                    AssistanceMethod::Edit => Some(super::facade::AssistanceTool::Edit),
+                    AssistanceMethod::HookSubmit => None,
+                };
+                if let Some(tool) = tool {
+                    adapters::log_tool_reply(tool, &result, started.elapsed());
+                    if let Some(telemetry) = self.worker.as_ref().and_then(WorkerHandle::telemetry)
+                    {
+                        adapters::tool_reply(
+                            &telemetry,
+                            tool,
+                            &result,
+                            started.elapsed(),
+                            None,
+                            CacheState::NotApplicable,
+                            DiagnosticState::NotApplicable,
+                        );
                     }
                 }
             }

@@ -124,7 +124,9 @@ impl PythonChecker {
         let base_prefix = grandparent_or_self(&canonical_interpreter);
 
         let tmp_dir = request.cache_dir.join("tmp");
-        let home = std::env::var("HOME").unwrap_or_default();
+        let home = crate::userhome::user_home()
+            .map(|home| home.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let path_env = format!("{}:/usr/bin:/bin", node_bin_dir.display());
 
         RunSpec {

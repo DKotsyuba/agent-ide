@@ -146,7 +146,7 @@ impl ProjectProblemFeed {
         if checkers.is_empty() {
             return None;
         }
-        let cache_root = PathBuf::from(std::env::var_os("HOME")?)
+        let cache_root = crate::userhome::user_home()?
             .join(".agent-ide")
             .join("checks");
         {

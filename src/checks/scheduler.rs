@@ -430,6 +430,15 @@ impl Inner {
                 cache_dir: cache_dir.clone(),
                 input_generation: generation,
             };
+            crate::errorlog::record(
+                crate::errorlog::Method::Check,
+                crate::errorlog::Outcome::Started,
+                crate::errorlog::Fields {
+                    worktree: Some(&worktree),
+                    detail: Some(language.as_str()),
+                    ..Default::default()
+                },
+            );
             let started = Instant::now();
             let snapshot = checker.check(request).await;
             let duration = started.elapsed();

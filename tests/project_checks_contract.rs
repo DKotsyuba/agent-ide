@@ -122,11 +122,32 @@ fn rust_toolchain(root: &Path, with_cargo: bool) -> PathBuf {
     dir
 }
 
-/// The user home directory, mirroring the checker's `HOME` resolution.
+/// The user home directory, mirroring the checker's home resolution (never `$HOME`).
 fn rust_home() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir())
+    agent_ide::userhome::user_home().unwrap_or_else(std::env::temp_dir)
+}
+
+/// A host that substitutes `HOME` (as `agent-run` does per runtime) must not move the cargo home,
+/// the rustup home, or the `HOME` handed to the confined check.
+#[test]
+fn rust_cargo_check_spec_ignores_a_substituted_home_variable() {
+    let root = rust_scratch("spec-substituted-home");
+    let request = rust_request(&root, true);
+    let checker = rust_checker(&root, FakeRunner::default());
+    // SAFETY: nothing in this test binary reads `HOME`; home resolution ignores it.
+    unsafe { std::env::set_var("HOME", "/nonexistent-substitute-home") };
+    let spec = checker.cargo_check_spec(&request);
+    let home = rust_home().to_string_lossy().into_owned();
+    assert!(spec.env.contains(&("HOME".to_owned(), home)));
+    assert!(
+        spec.read_roots
+            .iter()
+            .all(|root| !root.starts_with("/nonexistent-substitute-home")),
+        "{:?}",
+        spec.read_roots
+    );
+    assert!(spec.read_roots.contains(&rust_home().join(".cargo")));
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Proves the confined spec matches the contract: cargo program, fixed argument list with

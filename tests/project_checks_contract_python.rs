@@ -359,7 +359,9 @@ async fn python_checker_builds_exact_run_spec_for_default_venv_interpreter() {
             ),
             (
                 "HOME".to_string(),
-                std::env::var("HOME").unwrap_or_default()
+                agent_ide::userhome::user_home()
+                    .map(|home| home.to_string_lossy().into_owned())
+                    .unwrap_or_default()
             ),
             (
                 "TMPDIR".to_string(),
