@@ -28,9 +28,18 @@ pub(crate) enum Envelope {
 /// [`Envelope::WithStructured`], the complete serialized reply in `structured_content`. Only
 /// [`PeerReply::Error`] sets `is_error`; invalid serialization or a non-shrinkable oversized result
 /// returns `None` without partially emitting identifiers.
-pub(crate) fn render(mut reply: PeerReply, envelope: Envelope) -> Option<CallToolResult> {
+///
+/// `status` is the optional due status plate (T28B): the complete `<agent-ide>` plate text, which
+/// prefixes the compact content text, separated by one newline, and is the leading `status` string
+/// field of the structured copy. The plate itself is never shrunk or cut — only owner text is — so
+/// a fitted result always carries it whole.
+pub(crate) fn render_with_status(
+    mut reply: PeerReply,
+    status: Option<&str>,
+    envelope: Envelope,
+) -> Option<CallToolResult> {
     loop {
-        let rendered = project(&reply, envelope)?;
+        let rendered = project(&reply, status, envelope)?;
         if call_tool_result_fits(&rendered) {
             return Some(rendered);
         }
@@ -45,7 +54,16 @@ pub(crate) fn render(mut reply: PeerReply, envelope: Envelope) -> Option<CallToo
 /// This predicate never shrinks text. Diff pagination uses it to accept only whole-hunk pages that
 /// the facade can later render byte-for-byte without advancing a cursor past omitted content.
 pub(crate) fn fits(reply: &PeerReply, envelope: Envelope) -> bool {
-    project(reply, envelope).is_some_and(|rendered| call_tool_result_fits(&rendered))
+    project(reply, None, envelope).is_some_and(|rendered| call_tool_result_fits(&rendered))
+}
+
+/// Reports whether one unchanged reply fits the final MCP carrier with `status` attached whole.
+///
+/// The daemon-side twin of [`render_with_status`]'s fitting: a host without hook delivery
+/// attaches a plate only after this accepts it, so the facade's own render can never be the
+/// call that cuts it.
+pub(crate) fn fits_with_status(reply: &PeerReply, status: &str, envelope: Envelope) -> bool {
+    project(reply, Some(status), envelope).is_some_and(|rendered| call_tool_result_fits(&rendered))
 }
 
 /// Projects one unchanged reply into compact content plus, per `envelope`, the complete typed
@@ -55,9 +73,28 @@ pub(crate) fn fits(reply: &PeerReply, envelope: Envelope) -> bool {
 /// faithfully represent never silently drops its structured copy. The projection performs no I/O,
 /// host inspection, diagnostics inference, or model call, and never places the serialized JSON in
 /// `content`.
-fn project(reply: &PeerReply, envelope: Envelope) -> Option<CallToolResult> {
+fn project(reply: &PeerReply, status: Option<&str>, envelope: Envelope) -> Option<CallToolResult> {
     let structured = serde_json::to_value(reply).ok()?;
-    let content = vec![ContentBlock::text(render_text(reply))];
+    let structured = match status {
+        Some(status) => match structured {
+            serde_json::Value::Object(mut fields) => {
+                let mut carried = serde_json::Map::new();
+                carried.insert(
+                    "status".to_owned(),
+                    serde_json::Value::String(status.to_owned()),
+                );
+                carried.append(&mut fields);
+                serde_json::Value::Object(carried)
+            }
+            other => other,
+        },
+        None => structured,
+    };
+    let text = match status {
+        Some(status) => format!("{status}\n{}", render_text(reply)),
+        None => render_text(reply),
+    };
+    let content = vec![ContentBlock::text(text)];
     let mut rendered = if matches!(reply, PeerReply::Error { .. }) {
         CallToolResult::error(content)
     } else {
@@ -313,6 +350,11 @@ pub(crate) fn call_tool_result_fits(rendered: &CallToolResult) -> bool {
 mod tests {
     use super::*;
     use crate::changes::edit::EditReceiptError;
+
+    /// Renders with no carried status plate, the projection every reply had before T28B.
+    fn render(reply: PeerReply, envelope: Envelope) -> Option<CallToolResult> {
+        render_with_status(reply, None, envelope)
+    }
 
     /// Extracts the sole model-facing text block from a rendered test result.
     fn text_of(rendered: &CallToolResult) -> &str {
@@ -708,5 +750,72 @@ mod tests {
         assert_eq!(rendered.structured_content, None);
         assert_eq!(rendered.content.len(), 1);
         assert!(text_of(&rendered).contains("durable capture true"));
+    }
+
+    /// A carried status plate (T28B) leads both carriers: one newline after the plate, the
+    /// compact reply text follows, and the structured copy names the plate as its leading
+    /// `status` string field.
+    #[test]
+    fn carried_status_leads_both_carriers() {
+        let plate = "<agent-ide>\nrust: 2 errors, 0 warnings\n</agent-ide>";
+        let rendered = render_with_status(
+            PeerReply::Complete {
+                kind: ResultKind::Context,
+                text: "rust: ready; errors: 2; warnings: 0".into(),
+                detail_ref: None,
+                truncated: false,
+                continuation: false,
+            },
+            Some(plate),
+            Envelope::WithStructured,
+        )
+        .unwrap();
+        assert!(
+            text_of(&rendered).starts_with(&format!("{plate}\ncomplete context: rust: ready")),
+            "{}",
+            text_of(&rendered)
+        );
+        let structured = rendered.structured_content.unwrap();
+        let fields = structured.as_object().unwrap();
+        // `status` is exposed on the structured copy; serde_json's map is order-free, so only
+        // presence and verbatim content are asserted, not key position.
+        assert_eq!(fields["status"], plate, "{fields:?}");
+        assert_eq!(structured["state"], "complete");
+        assert_eq!(structured["text"], "rust: ready; errors: 2; warnings: 0");
+    }
+
+    /// The plate is never a shrink candidate: a reply that only fits with the plate after owner
+    /// text was cut still carries the plate whole, and `fits_with_status` accepts exactly the
+    /// forms the facade's own render loop accepts.
+    #[test]
+    fn fitting_cuts_owner_text_never_the_plate() {
+        let plate = "<agent-ide>\nrust: 2 errors, 0 warnings\n</agent-ide>";
+        let mut reply = PeerReply::Complete {
+            kind: ResultKind::Context,
+            text: "evidence ".repeat(6000),
+            detail_ref: None,
+            truncated: false,
+            continuation: false,
+        };
+        assert!(!fits_with_status(&reply, plate, Envelope::WithStructured));
+        let rendered = loop {
+            if fits_with_status(&reply, plate, Envelope::WithStructured) {
+                break render_with_status(reply.clone(), Some(plate), Envelope::WithStructured)
+                    .unwrap();
+            }
+            assert!(
+                reply.shrink_text(),
+                "owner text must make room, never the plate"
+            );
+        };
+        assert!(call_tool_result_fits(&rendered));
+        assert!(
+            text_of(&rendered).starts_with(&format!("{plate}\ncomplete context:")),
+            "{}",
+            text_of(&rendered)
+        );
+        let structured = rendered.structured_content.unwrap();
+        assert_eq!(structured["status"], plate);
+        assert_eq!(structured["truncated"], true);
     }
 }

@@ -274,6 +274,20 @@ impl std::fmt::Debug for PeerReply {
         formatter.write_str("PeerReply(..)")
     }
 }
+
+/// One daemon method reply wrapped around an attached status plate (T28B).
+///
+/// The daemon encodes this shape exactly when a terminal reply carries a due plate for a host
+/// whose feed delivery rides replies; every other reply stays a bare [`PeerReply`], byte-identical
+/// to earlier releases.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct StatusCarriedReply {
+    /// The complete `<agent-ide>` plate, delivered verbatim at the top of the rendered reply.
+    status: String,
+    /// The closed reply the plate was attached to.
+    reply: PeerReply,
+}
 impl PeerReply {
     /// Fits the complete serialized budget by trimming only owner text at UTF-8 boundaries.
     /// Invalid references fail closed. Trimming sets truncated and never changes the evidence kind.
@@ -318,6 +332,33 @@ impl PeerReply {
         }
         let reply: Self = serde_json::from_str(value).ok()?;
         reply.valid_reference().then_some(reply)
+    }
+    /// Decodes one daemon method reply with its optional carried status plate (T28B).
+    ///
+    /// Accepts the bare closed reply (`status` absent, the historical wire form) and the
+    /// [`StatusCarriedReply`] wrapper. Both forms enforce the same byte bound; a carried plate
+    /// must be a nonempty block within [`crate::feed::MAX_BLOCK_BYTES`] and its reply must pass
+    /// the same closed-reference validation as a bare one.
+    pub(crate) fn decode_delivered(value: &str) -> Option<(Self, Option<String>)> {
+        if let Ok(carried) = serde_json::from_str::<StatusCarriedReply>(value) {
+            if value.len() > MAX_REPLY_BYTES {
+                return None;
+            }
+            let valid = carried.reply.valid_reference()
+                && !carried.status.is_empty()
+                && carried.status.len() <= crate::feed::MAX_BLOCK_BYTES;
+            return valid.then_some((carried.reply, Some(carried.status)));
+        }
+        Some((Self::decode(value)?, None))
+    }
+    /// Encodes one reply with an attached status plate in the [`StatusCarriedReply`] wire form.
+    ///
+    /// Callers attach a plate only after the complete final MCP carrier was proven to fit
+    /// (`content::fits_with_status`), so the wrapper — strictly smaller than that carrier —
+    /// always stays inside the transport bound; failure returns `None` rather than a cut plate.
+    pub(crate) fn encode_with_status(reply: &Self, status: &str) -> Option<OpaqueJson> {
+        let wrapped = serde_json::json!({"status": status, "reply": reply});
+        OpaqueJson::new(serde_json::to_string(&wrapped).ok()?, MAX_REPLY_BYTES)
     }
     /// Checks reference syntax; ownership and current liveness remain worker admission gates.
     fn valid_reference(&self) -> bool {
@@ -369,4 +410,43 @@ fn envelopes_are_closed_and_fit_serialized_budget() {
     ] {
         assert!(PeerReply::decode(raw).is_none());
     }
+}
+
+/// The status-carried wire form (T28B) round-trips the plate and the closed reply, keeps the bare
+/// form decoding without a plate, and refuses oversize, overlong-plate or invalid-reference wraps.
+#[test]
+fn status_carried_replies_round_trip_and_stay_closed() {
+    let plate = "<agent-ide>\nrust: 2 errors, 0 warnings\n</agent-ide>";
+    let reply = PeerReply::Complete {
+        kind: ResultKind::Context,
+        text: "owner evidence".into(),
+        detail_ref: Some("detail-1".into()),
+        truncated: false,
+        continuation: false,
+    };
+    let encoded = PeerReply::encode_with_status(&reply, plate).unwrap();
+    let (decoded, status) = PeerReply::decode_delivered(encoded.as_str()).unwrap();
+    assert_eq!(decoded, reply);
+    assert_eq!(status.as_deref(), Some(plate));
+
+    // Bare replies decode exactly as before, with no plate.
+    let (bare, status) =
+        PeerReply::decode_delivered(reply.clone().encode().unwrap().as_str()).unwrap();
+    assert_eq!((bare, status), (reply.clone(), None));
+
+    // A wrapped reply whose inner reference is invalid fails closed.
+    let forged = serde_json::json!({
+        "status": plate,
+        "reply": {"state":"pending","detail_ref":""}
+    })
+    .to_string();
+    assert!(PeerReply::decode_delivered(&forged).is_none());
+
+    // A plate over the feed's block cap never decodes.
+    let overlong = format!(
+        "<agent-ide>\n{}\n</agent-ide>",
+        "x".repeat(crate::feed::MAX_BLOCK_BYTES)
+    );
+    let encoded = PeerReply::encode_with_status(&reply, &overlong).unwrap();
+    assert!(PeerReply::decode_delivered(encoded.as_str()).is_none());
 }

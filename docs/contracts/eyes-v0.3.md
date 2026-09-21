@@ -7,9 +7,11 @@ Claude-only scope of the shared rendezvous. Sections are otherwise unchanged.
 
 This contract defines the v0.3 MVP: a shared per-repository Agent IDE service that runs confined
 background project checks for Rust and Python and gives the active agent a compact problem-count
-block. macOS and Claude Code are the supported target; Codex keeps working through the existing
-v0.2 path without the active block. Linux is `not_tested`. Evidence for the design choices is in
-`docs/evidence/v03-*-probe.md` on the `probe/v03-*` branches.
+block. macOS is the supported platform and both supported hosts receive the block: Claude Code in
+hook context, Codex (and any future host without hook delivery) at the top of its terminal `ide.*`
+replies (T28B). There is no split in the data itself — every host sees the same plate, emitted
+under the same rules; only the carrier differs. Linux is `not_tested`. Evidence for the design
+choices is in `docs/evidence/v03-*-probe.md` on the `probe/v03-*` branches.
 
 All v0.2 contracts (TELEMETRY-r1, EDIT-r1, TYPESCRIPT-r3, AGENT-CONTENT-r1) stay valid, with two
 explicit amendments: §8 extends the TELEMETRY-r1 event scope by one event tag, and §2 supersedes
@@ -267,11 +269,17 @@ pub struct ProblemSnapshot { pub language: Language, pub state: CheckState,
 - Triggers: successful `ide.start` (initial warm check), a Claude `PostToolUse`/`PostToolUseFailure`
   hook event whose retained `tool_name` is one of `Edit`, `Write`, `MultiEdit`, `NotebookEdit`,
   `Bash` (the hook parser retains `tool_name` for post phases only; tool input and output stay
-  discarded), and a completed `ide.edit`. An actor whose `ide.start` was refused (for example
-  `conflict` because another actor owns the worktree) has no binding: it triggers no check and
-  receives no block.
+  discarded), a completed `ide.edit`, and — (T28B) for every host whose plate delivery rides
+  replies (see §6) — each `ide.*` tool call of that host, so a native edit made between two calls
+  (`apply_patch`, shell) is noticed without any hook stream. That per-call trigger is free while
+  the worktree inputs are unchanged (see the T20B skip below). An actor whose `ide.start` was
+  refused (for example `conflict` because another actor owns the worktree) has no binding: it
+  triggers no check and receives no block.
 - Per `(worktree, language)`: debounce `debounce_ms` after the last trigger; at most one running
-  check; a trigger during a run marks it dirty and one more run follows (latest wins). The next run
+  check; a trigger during a run marks it dirty and one more run follows (latest wins), and that
+  follow-up run is subject to the same T20B skip-unchanged rule — with inputs unchanged from the
+  last completed `Ready` run it spawns no process (T28B; reply-delivered hosts trigger on every
+  tool call, so an unchanged worktree must not keep a check perpetually dirty). The next run
   for a pair starts no earlier than `max(debounce_ms, previous run duration)` after the previous
   completion. At most two checks run concurrently across the daemon. (T10B) Language presence (§4)
   is the first thing re-evaluated once a debounce fires, before the cooldown wait, cache directory
@@ -344,15 +352,30 @@ rust: 3 errors (+2), 5 warnings | python: environment not found
   something the emission or delta logic manufactures on its own account (for example, on a binary
   upgrade with no change underneath, the daemon restarts and the next block for each actor is
   simply a fresh first delivery, not a synthetic delta).
-- Delivery: Claude `PostToolUse` / `PostToolUseFailure` hook `additionalContext`, taken from the
+- Delivery: `HostKind::feed_delivery` decides the carrier in one place — `Hooks` for Claude,
+  `Replies` for every other supported host (T28B). The plate data and emission rule are identical;
+  only the carrier differs.
+- Claude (`Hooks`): `PostToolUse` / `PostToolUseFailure` hook `additionalContext`, taken from the
   ready cache inside the existing hook deadline. The hook never waits for a check. Marking as
   delivered happens when the hook response is produced (at most once; a lost hook response is not
   retried). When the v0.2 one-shot native feedback is eligible in the same hook response, the block
   is prepended and both are concatenated once within `MAX_FEEDBACK_BYTES`; each is marked delivered
   independently. A due plate is also delivered on a foreground helper's own `Bash` post hook after
   its settlement, and on the `PostToolUse` of the Claude MCP tool whose invocation settled (T22B);
-  neither triggers a recheck nor advances the native epoch.
-- Codex and other hosts: no active block in v0.3.
+  neither triggers a recheck nor advances the native epoch. Claude `ide.*` replies never carry the
+  plate, even while one is due.
+- Codex and other hosts without hook delivery (`Replies`, T28B): every terminal `ide.*` reply —
+  `ide.context` (file pages and the problems kind), `ide.diff`, `ide.edit` in every outcome,
+  `ide.inspect` results that resolve a pending job, `ide.start` completion, and typed error
+  replies — carries the due plate at the start of what the model reads, followed by a newline and
+  the normal reply text. Concretely, the plate leads the compact `content` text and is exposed
+  verbatim as the `status` string field of the `structuredContent` object (the field
+  Codex reads). `ide.stop` replies and `pending` placeholders carry no plate: a placeholder is
+  not terminal, so the plate goes with the answer that resolves it. Before the plate is attached,
+  the complete final MCP envelope (plate plus possibly shrunk reply body) is fitted by the daemon
+  against the same byte bound the reply renderer applies, shrinking only owner text; the plate is
+  marked delivered only when it was attached whole — a plate that cannot fit stays due for the
+  next terminal reply, exactly like the hook-carried case.
 
 ## 7. `ide.context` with `kind: "problems"`
 

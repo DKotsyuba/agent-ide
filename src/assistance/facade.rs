@@ -599,8 +599,8 @@ pub enum FacadeOutcome {
     Unavailable,
     /// IPC accepted the envelope but no typed peer result was available for safe rendering.
     Incomplete,
-    /// Typed peer result accepted from the daemon.
-    Reply(PeerReply),
+    /// Typed peer result accepted from the daemon, with its optional carried status plate (T28B).
+    Reply(PeerReply, Option<String>),
 }
 
 /// Owns one local facade endpoint and the finite limits for every connect-only dispatch.
@@ -696,19 +696,20 @@ impl AssistanceFacade {
         match dispatch_method_if_running(runtime_dir, request, self.limits).await {
             MethodDispatchTransportResult::Unavailable => FacadeOutcome::Unavailable,
             MethodDispatchTransportResult::Dispatched { opaque_result_json } => {
-                match PeerReply::decode(opaque_result_json.as_str()) {
-                    Some(
+                match PeerReply::decode_delivered(opaque_result_json.as_str()) {
+                    Some((
                         reply @ (PeerReply::Unavailable { .. }
                         | PeerReply::HostStopped {}
                         | PeerReply::Pending { .. }
                         | PeerReply::Error { .. }),
-                    ) => FacadeOutcome::Reply(reply),
-                    Some(reply @ PeerReply::Edit { .. })
+                        status,
+                    )) => FacadeOutcome::Reply(reply, status),
+                    Some((reply @ PeerReply::Edit { .. }, status))
                         if matches!(tool, AssistanceTool::Edit | AssistanceTool::Inspect) =>
                     {
-                        FacadeOutcome::Reply(reply)
+                        FacadeOutcome::Reply(reply, status)
                     }
-                    Some(reply @ PeerReply::Complete { kind, .. })
+                    Some((reply @ PeerReply::Complete { kind, .. }, status))
                         if tool == AssistanceTool::Inspect
                             || matches!(
                                 (tool, kind),
@@ -718,7 +719,7 @@ impl AssistanceFacade {
                                     | (AssistanceTool::Stop, ResultKind::Stop)
                             ) =>
                     {
-                        FacadeOutcome::Reply(reply)
+                        FacadeOutcome::Reply(reply, status)
                     }
                     _ => FacadeOutcome::Incomplete,
                 }
@@ -1278,10 +1279,12 @@ impl StdioFacade {
             _ => content::Envelope::WithStructured,
         };
         let message = match outcome {
-            FacadeOutcome::Reply(reply) if reconnected => {
-                return render_reply_after_reconnect(reply, envelope);
+            FacadeOutcome::Reply(reply, status) if reconnected => {
+                return render_reply_after_reconnect(reply, status.as_deref(), envelope);
             }
-            FacadeOutcome::Reply(reply) => return render_reply(reply, envelope),
+            FacadeOutcome::Reply(reply, status) => {
+                return render_reply_with_status(reply, status.as_deref(), envelope);
+            }
             FacadeOutcome::InvalidParameters => {
                 "invalid bounded parameters; inspect the tool schema"
             }
@@ -1311,7 +1314,20 @@ impl StdioFacade {
 /// `pub(super)` so `worker::Shared::mark_feedback_inline_delivered` can call it directly instead of
 /// re-approximating the fitting boundary.
 pub(super) fn render_reply(reply: PeerReply, envelope: content::Envelope) -> CallToolResult {
-    content::render(reply, envelope).unwrap_or_else(|| {
+    render_reply_with_status(reply, None, envelope)
+}
+
+/// Like [`render_reply`], but a due status plate (T28B) leads the rendered reply.
+///
+/// `status` is the complete plate text a host without hook delivery attached at the daemon
+/// boundary; [`content::render_with_status`] leads both the compact text and the structured
+/// copy with it and never cuts it.
+pub(super) fn render_reply_with_status(
+    reply: PeerReply,
+    status: Option<&str>,
+    envelope: content::Envelope,
+) -> CallToolResult {
+    content::render_with_status(reply, status, envelope).unwrap_or_else(|| {
         crate::errorlog::record(
             crate::errorlog::Method::Client,
             crate::errorlog::Outcome::Failed,
@@ -1340,14 +1356,18 @@ const RECONNECT_RETRY_HINT: &str = "daemon restarted; repeat this call once";
 /// the existing machine fields and adds a short stable `retry` hint instead. Every other reply
 /// following a reconnect (including a still-unavailable transport outcome, which never reaches
 /// this function) renders unchanged.
-fn render_reply_after_reconnect(reply: PeerReply, envelope: content::Envelope) -> CallToolResult {
+fn render_reply_after_reconnect(
+    reply: PeerReply,
+    status: Option<&str>,
+    envelope: content::Envelope,
+) -> CallToolResult {
     let is_host_binding_unavailable = matches!(
         reply,
         PeerReply::Unavailable {
             reason: MissingPeer::HostBinding
         }
     );
-    let mut rendered = render_reply(reply, envelope);
+    let mut rendered = render_reply_with_status(reply, status, envelope);
     if !is_host_binding_unavailable {
         return rendered;
     }
@@ -1437,6 +1457,7 @@ fn claude_envelope_reconnect_retry_hint_survives_in_content_text() {
         PeerReply::Unavailable {
             reason: crate::assistance::reply::MissingPeer::HostBinding,
         },
+        None,
         content::Envelope::TextOnly,
     );
     assert_eq!(rendered.structured_content, None);

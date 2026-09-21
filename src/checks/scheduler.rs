@@ -547,6 +547,7 @@ impl Inner {
     /// [`Scheduler::shutdown`] aborts this task mid-await (including while it is waiting out a
     /// cooldown).
     async fn run_check_loop(inner: Arc<Self>, worktree: PathBuf, language: Language) {
+        let mut dirty_rerun = false;
         loop {
             if inner.is_shutting_down() {
                 inner.finish_run(&worktree, language, false);
@@ -558,10 +559,22 @@ impl Inner {
                     ProblemSnapshot::unavailable(language, UnavailableReason::Disabled, generation);
                 inner.store_snapshot(&worktree, snapshot);
                 inner.mark_run_ineligible(&worktree, language);
-                if !inner.finish_run(&worktree, language, true) {
+                dirty_rerun = inner.finish_run(&worktree, language, true);
+                if !dirty_rerun {
                     return;
                 }
                 continue;
+            }
+            // (T28B) A dirty follow-up run obeys the same skip-unchanged rule as a debounce
+            // firing (T20B): reply-delivered hosts trigger on every `ide.*` call, so triggers
+            // arrive while a check runs even though nothing changed, and the follow-up must
+            // then not spawn a checker process at all.
+            if dirty_rerun && inner.rerun_skip_candidate(&worktree, language) {
+                let fingerprint = inner.fingerprint_value(&worktree).await;
+                if inner.skip_dirty_rerun(&worktree, language, fingerprint) {
+                    inner.finish_run(&worktree, language, false);
+                    return;
+                }
             }
             let cooldown = inner.cooldown_remaining(&worktree, language);
             if !cooldown.is_zero() {
@@ -634,7 +647,48 @@ impl Inner {
             if !inner.finish_run(&worktree, language, true) {
                 return;
             }
+            dirty_rerun = true;
         }
+    }
+
+    /// Reports whether a dirty follow-up run for this pair can still be skipped by the T20B
+    /// fingerprint comparison: the baseline exists and was armed by a completed `Ready` run.
+    fn rerun_skip_candidate(&self, worktree: &Path, language: Language) -> bool {
+        let state = self.lock_state();
+        state
+            .worktrees
+            .get(worktree)
+            .and_then(|wt| wt.languages.get(&language))
+            .is_some_and(|lang| lang.skip_eligible && lang.completed_fingerprint.is_some())
+    }
+
+    /// Applies the T20B skip to a dirty follow-up run (T28B): returns `true` when the current
+    /// worktree input fingerprint still equals the last completed `Ready` run's baseline, in
+    /// which case the pair stops running — no checker process, the stored snapshot stays
+    /// current — and a later changed-input trigger starts a fresh run.
+    fn skip_dirty_rerun(
+        &self,
+        worktree: &Path,
+        language: Language,
+        fingerprint: Option<u64>,
+    ) -> bool {
+        let mut state = self.lock_state();
+        let Some(lang) = state
+            .worktrees
+            .get_mut(worktree)
+            .and_then(|wt| wt.languages.get_mut(&language))
+        else {
+            return false;
+        };
+        let skip = lang.skip_eligible
+            && fingerprint.is_some()
+            && lang.completed_fingerprint == fingerprint;
+        if skip {
+            lang.running = false;
+            lang.dirty = false;
+            lang.run_abort = None;
+        }
+        skip
     }
 
     /// Reports whether [`Scheduler::shutdown`] has started.

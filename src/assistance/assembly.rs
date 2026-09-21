@@ -9,9 +9,9 @@ use super::{
         HelperTypeScriptFileV1, HelperTypeScriptProfileV1, LaunchLedger, RustEffectiveSettings,
     },
     host_binding::{
-        BindingStatus, HookPhase, HostBindingGuard, HostKind, ValidatedInvocation, parse_candidate,
-        parse_channel_session, parse_claude_call_id, parse_claude_hook_event, parse_hook_event,
-        parse_host_kind, parse_observed_sandbox_state,
+        BindingStatus, FeedDelivery, HookPhase, HostBindingGuard, HostKind, ValidatedInvocation,
+        parse_candidate, parse_channel_session, parse_claude_call_id, parse_claude_hook_event,
+        parse_hook_event, parse_host_kind, parse_observed_sandbox_state,
     },
     launcher::{AcceptedProviderSettings, LaunchTarget, LauncherConfig},
     problems::{CHECK_TRIGGER_TOOLS, ProjectProblemFeed},
@@ -117,11 +117,12 @@ fn is_problems_context(method: AssistanceMethod, parameters: &Value) -> bool {
         && parameters.get("kind").and_then(Value::as_str) == Some("problems")
 }
 
-/// Returns the due `<agent-ide>` status plate for one Claude post phase, or `None`.
+/// Returns the due `<agent-ide>` status plate for one hook-delivering host's post phase, or `None`.
 ///
 /// Reads only in-memory snapshots and never waits for a running check. The plate is skipped, and
 /// stays due for a later hook, whenever it could not fit beside `feedback` inside one bounded hook
-/// context (EYES-r2 §5/§6).
+/// context (EYES-r2 §5/§6). Hosts whose [`FeedDelivery`] is [`FeedDelivery::Replies`] never take
+/// this path; their plates ride terminal `ide.*` replies instead (`attach_reply_plate`).
 fn due_plate(
     feed: Option<&Arc<ProjectProblemFeed>>,
     fingerprint: &[u8; 32],
@@ -132,6 +133,37 @@ fn due_plate(
         return None;
     }
     feed?.next_block(fingerprint)
+}
+
+/// Attaches the due status plate to one reply-delivered host's terminal reply (T28B).
+///
+/// The plate is marked delivered only once it was actually attached: the whole reply is fitted
+/// into the exact final MCP carrier the host reads (`Envelope::WithStructured`), shrinking only
+/// owner text, and a plate that cannot fit beside any (possibly shrunk) body stays due for the
+/// next terminal reply. The fitting decision and the delivery record are one atomic feed step.
+fn attach_reply_plate(
+    feed: Option<&Arc<ProjectProblemFeed>>,
+    fingerprint: &[u8; 32],
+    reply: &mut PeerReply,
+) -> Option<String> {
+    let feed = feed?;
+    let mut fitting = reply.clone();
+    let plate = feed.next_block_when(fingerprint, |plate| {
+        loop {
+            if super::content::fits_with_status(
+                &fitting,
+                plate,
+                super::content::Envelope::WithStructured,
+            ) {
+                return true;
+            }
+            if !fitting.shrink_text() {
+                return false;
+            }
+        }
+    })?;
+    *reply = fitting;
+    Some(plate)
 }
 
 impl std::fmt::Debug for ProductDispatcher {
@@ -700,7 +732,14 @@ impl ProductDispatcher {
         }
     }
     /// Parses separated ingress and commits binding transitions before queue, inspection or stop I/O.
-    async fn handle(&self, request: &AssistanceDispatch) -> Option<PeerReply> {
+    ///
+    /// `status` is written only when a terminal `ide.*` reply for a reply-delivered host (T28B)
+    /// carries the due status plate on top; the caller renders it ahead of the reply.
+    async fn handle(
+        &self,
+        request: &AssistanceDispatch,
+        status: &mut Option<String>,
+    ) -> Option<PeerReply> {
         self.sweep_launches();
         match request {
             AssistanceDispatch::HookSubmit(hook) => {
@@ -795,11 +834,12 @@ impl ProductDispatcher {
                 }
                 let call_id = event.optional_call_id().map(str::to_owned);
                 let failed = event.failed();
-                // EYES-r2 §5/§6: only Claude post phases receive the problem block, and only the
-                // named native writers additionally trigger a project check.
-                let claude_post = event.host() == HostKind::Claude
+                // EYES-r2 §5/§6: only a hook-delivering host's post phases receive the problem
+                // block, and only the named native writers additionally trigger a project check.
+                // Reply-delivered hosts get their plates on terminal `ide.*` replies instead.
+                let hook_post = event.host().feed_delivery() == FeedDelivery::Hooks
                     && matches!(event.phase(), HookPhase::Post | HookPhase::PostFailure);
-                let triggers_check = claude_post
+                let triggers_check = hook_post
                     && event
                         .tool_name()
                         .is_some_and(|name| CHECK_TRIGGER_TOOLS.contains(&name));
@@ -809,8 +849,8 @@ impl ProductDispatcher {
                     BindingStatus::Settled(binding) => {
                         // Settlement itself stays silent and never rechecks; but the settled MCP
                         // call may just have completed an activation or a check, so a due status
-                        // plate is still delivered on this Claude post phase (T22B).
-                        if claude_post
+                        // plate is still delivered on this post phase (T22B).
+                        if hook_post
                             && let Some(worker) = &self.worker
                             && let Some(block) = due_plate(
                                 worker.project_feed(),
@@ -837,7 +877,7 @@ impl ProductDispatcher {
                             // Settlement still delivers a due status plate: none was sent while
                             // the helper ran, and this may be the first hook after it finished
                             // (T22B). It triggers no recheck and advances no native epoch.
-                            if claude_post
+                            if hook_post
                                 && let Some(worker) = &self.worker
                                 && let Some(block) =
                                     due_plate(worker.project_feed(), &binding.fingerprint(), None)
@@ -849,7 +889,7 @@ impl ProductDispatcher {
                         if let Some(worker) = &self.worker {
                             worker.native_hint(binding.clone());
                             let fingerprint = binding.fingerprint();
-                            let feed = worker.project_feed().filter(|_| claude_post);
+                            let feed = worker.project_feed().filter(|_| hook_post);
                             if triggers_check && let Some(feed) = feed {
                                 feed.changed(&fingerprint);
                             }
@@ -1188,7 +1228,8 @@ impl ProductDispatcher {
                             && call.parameters().get("detail_ref").is_none(),
                     );
                 }
-                Some(match method.method() {
+                let fingerprint = invocation.binding_ref().fingerprint();
+                let mut reply = match method.method() {
                     AssistanceMethod::Stop => {
                         worker.stop(invocation, method.opaque_attachment()).await
                     }
@@ -1225,7 +1266,25 @@ impl ProductDispatcher {
                             )
                             .await
                     }
-                })
+                };
+                // T28B: a reply-delivered host has no hook stream to notice its native edits
+                // (`apply_patch`, shell) or to carry its plates, so every `ide.*` call first
+                // reconciles the bound worktree's inputs (free while unchanged, T20B) and every
+                // terminal reply then carries the due plate at its top. `ide.stop` ends the
+                // binding and stays plate-free, and a `pending` placeholder is not terminal —
+                // the plate goes with the answer that resolves it.
+                if host.feed_delivery() == FeedDelivery::Replies
+                    && method.method() != AssistanceMethod::Stop
+                {
+                    if let Some(feed) = worker.project_feed() {
+                        feed.changed(&fingerprint);
+                    }
+                    if !matches!(reply, PeerReply::Pending { .. }) {
+                        *status =
+                            attach_reply_plate(worker.project_feed(), &fingerprint, &mut reply);
+                    }
+                }
+                Some(reply)
             }
         }
     }
@@ -1316,12 +1375,13 @@ impl AssistanceDispatcher for ProductDispatcher {
     > {
         Box::pin(async move {
             let started = std::time::Instant::now();
-            let result = self
-                .handle(&request)
-                .await
-                .unwrap_or(PeerReply::Unavailable {
-                    reason: MissingPeer::HostBinding,
-                });
+            let mut status = None;
+            let result =
+                self.handle(&request, &mut status)
+                    .await
+                    .unwrap_or(PeerReply::Unavailable {
+                        reason: MissingPeer::HostBinding,
+                    });
             // Hook payloads are intentionally never accepted by telemetry adapters or the log.
             if let AssistanceDispatch::MethodDispatch(method) = &request {
                 let tool = match method.method() {
@@ -1349,7 +1409,13 @@ impl AssistanceDispatcher for ProductDispatcher {
                     }
                 }
             }
-            let reply = result.encode().ok_or(AssistanceDispatchUnavailable)?;
+            // A carried status plate (T28B) rides on top of the closed reply in the wrapped wire
+            // form; without one the encoding stays byte-identical to earlier releases.
+            let reply = match &status {
+                Some(plate) => PeerReply::encode_with_status(&result, plate),
+                None => result.encode(),
+            }
+            .ok_or(AssistanceDispatchUnavailable)?;
             Ok(match request {
                 AssistanceDispatch::HookSubmit(_) => AssistanceDispatchReply::HookSubmit(reply),
                 AssistanceDispatch::MethodDispatch(_) => {
@@ -1417,7 +1483,7 @@ async fn host_shaped_mixed_metadata_is_unavailable_at_daemon_ingress() {
         )
         .expect("test dispatch is valid"),
     );
-    assert_eq!(dispatcher.handle(&request).await, None);
+    assert_eq!(dispatcher.handle(&request, &mut None).await, None);
 }
 
 /// Proves a Claude start reaches no Workspace and invents no sandbox authority for itself.
@@ -1450,7 +1516,7 @@ async fn host_shaped_claude_start_never_reaches_workspace_without_sandbox_author
             .expect("test hook dispatch is valid"),
     );
     assert_eq!(
-        dispatcher.handle(&hook).await,
+        dispatcher.handle(&hook, &mut None).await,
         Some(PeerReply::HookObserved {})
     );
 
@@ -1473,7 +1539,7 @@ async fn host_shaped_claude_start_never_reaches_workspace_without_sandbox_author
         .expect("test method dispatch is valid"),
     );
     assert_eq!(
-        dispatcher.handle(&method).await,
+        dispatcher.handle(&method, &mut None).await,
         Some(PeerReply::Unavailable {
             reason: MissingPeer::WorkspaceActivation
         })
@@ -1499,7 +1565,7 @@ async fn host_shaped_claude_start_never_reaches_workspace_without_sandbox_author
             .expect("test hook dispatch is valid"),
     );
     assert_eq!(
-        dispatcher.handle(&next_hook).await,
+        dispatcher.handle(&next_hook, &mut None).await,
         Some(PeerReply::HookObserved {})
     );
     let next_parameters = OpaqueJson::from_value(
@@ -1525,7 +1591,7 @@ async fn host_shaped_claude_start_never_reaches_workspace_without_sandbox_author
     // matters is that it is never a grant and never reaches Workspace: no binding, authority or
     // helper ticket survived the sandbox-authority refusal above.
     assert_eq!(
-        dispatcher.handle(&next_method).await,
+        dispatcher.handle(&next_method, &mut None).await,
         Some(PeerReply::Unavailable {
             reason: MissingPeer::WorkspaceActivation
         })
@@ -1708,7 +1774,7 @@ async fn claude_problems_context_short_circuits_before_helper_mint() {
     )
     .unwrap();
     let reply = dispatcher
-        .handle(&AssistanceDispatch::MethodDispatch(request))
+        .handle(&AssistanceDispatch::MethodDispatch(request), &mut None)
         .await
         .expect("problems dispatch must produce a typed reply");
     assert_eq!(
@@ -1839,7 +1905,7 @@ async fn managed_codex_problems_context_short_circuits_before_read_boundary_reco
     )
     .unwrap();
     let reply = dispatcher
-        .handle(&AssistanceDispatch::MethodDispatch(request))
+        .handle(&AssistanceDispatch::MethodDispatch(request), &mut None)
         .await
         .expect("codex problems dispatch must produce a typed reply");
     assert_eq!(

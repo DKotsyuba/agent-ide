@@ -300,6 +300,86 @@ async fn scheduler_trigger_during_running_check_causes_one_extra_run_with_newest
     assert_eq!(latest[0].input_generation, 2);
 }
 
+/// (T28B) A trigger that lands while a check runs marks the pair dirty, but the follow-up run is
+/// subject to the same T20B skip-unchanged rule: with inputs unchanged from the completed `Ready`
+/// run, the follow-up spawns no checker process at all and leaves the stored snapshot current.
+#[tokio::test(start_paused = true)]
+async fn scheduler_dirty_rerun_with_unchanged_fingerprint_is_skipped() {
+    let checker = RecordingChecker::with_delay(Language::Python, Duration::from_millis(200));
+    let cache_root = scratch_dir("dirty-skip-cache");
+    let worktree = scratch_worktree("dirty-skip-worktree", Language::Python);
+    let scheduler = Scheduler::new(
+        vec![Arc::new(checker.clone())],
+        Duration::from_millis(50),
+        2,
+        cache_root,
+    )
+    .with_fingerprint(constant_fingerprint(Some(7)));
+
+    scheduler.trigger("repo", &worktree);
+    settle(Duration::from_millis(80), Duration::from_millis(5)).await;
+    assert_eq!(checker.calls().len(), 1, "first check runs");
+
+    scheduler.trigger("repo", &worktree);
+    settle(Duration::from_millis(80), Duration::from_millis(5)).await;
+    assert_eq!(
+        checker.calls().len(),
+        1,
+        "the trigger during the run must mark dirty, not start a second run"
+    );
+
+    settle(Duration::from_millis(700), Duration::from_millis(5)).await;
+    assert_eq!(
+        checker.calls().len(),
+        1,
+        "the dirty follow-up with unchanged inputs must be skipped entirely"
+    );
+    assert!(
+        scheduler.running(&worktree).is_empty(),
+        "a skipped follow-up must not leave the running flag set"
+    );
+    assert!(!scheduler.is_busy());
+    assert_eq!(scheduler.latest(&worktree)[0].state, CheckState::Ready);
+}
+
+/// (T28B) A dirty follow-up run whose inputs changed while the first run was in flight still
+/// runs: latest wins.
+#[tokio::test(start_paused = true)]
+async fn scheduler_dirty_rerun_with_changed_fingerprint_runs() {
+    let checker = RecordingChecker::with_delay(Language::Python, Duration::from_millis(200));
+    let cell = Arc::new(AtomicU64::new(7));
+    let cache_root = scratch_dir("dirty-changed-cache");
+    let worktree = scratch_worktree("dirty-changed-worktree", Language::Python);
+    let scheduler = Scheduler::new(
+        vec![Arc::new(checker.clone())],
+        Duration::from_millis(50),
+        2,
+        cache_root,
+    )
+    .with_fingerprint(shared_fingerprint(Arc::clone(&cell)));
+
+    scheduler.trigger("repo", &worktree);
+    settle(Duration::from_millis(80), Duration::from_millis(5)).await;
+    assert_eq!(checker.calls().len(), 1);
+
+    // An edit lands while the first check is in flight.
+    cell.store(8, Ordering::SeqCst);
+    scheduler.trigger("repo", &worktree);
+    settle(Duration::from_millis(80), Duration::from_millis(5)).await;
+    assert_eq!(
+        checker.calls().len(),
+        1,
+        "the trigger during the run must mark dirty, not start a second run yet"
+    );
+
+    settle(Duration::from_millis(700), Duration::from_millis(5)).await;
+    assert_eq!(
+        checker.calls().len(),
+        2,
+        "the dirty follow-up with changed inputs must run"
+    );
+}
+
 /// Five worktrees times two languages never exceed the configured global concurrency cap.
 #[tokio::test(start_paused = true)]
 async fn scheduler_never_runs_more_than_max_concurrent_checks_across_worktrees_and_languages() {
