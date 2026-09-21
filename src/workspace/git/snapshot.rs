@@ -44,11 +44,25 @@ pub const MAX_SNAPSHOT_BLOB_BYTES: usize = 1024 * 1024;
 pub const MAX_SNAPSHOT_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum aggregate retained patch bytes across every path in one attempt.
 pub const MAX_SNAPSHOT_PATCH_BYTES: usize = 1024 * 1024;
-/// Estimated scratch-argv bytes of one batched `hash-object` command. Every managed sandbox
-/// replay pays a fixed multi-second startup per child, so batches stay far below every known
-/// execution-policy argv ceiling (8 KiB in fixtures, 64 KiB in the product) regardless of the
-/// host temp-root depth; more entries simply mean one more bounded child.
+/// Target scratch-argv bytes of one batched `hash-object` command. Every managed sandbox replay
+/// pays a fixed multi-second startup per child, so batches pack toward this goal, far below the
+/// execution-policy ceiling regardless of the host temp-root depth; more entries simply mean one
+/// more bounded child. This is the packing goal only — the hard ceiling is
+/// [`crate::execution::MAX_PRODUCT_ARGV_BYTES`].
 const MAX_HASH_BATCH_ARGV_BYTES: usize = 4096;
+/// Fixed non-path arguments every batched `hash-object` command starts with; the argv budget
+/// counts these exact strings plus one canonical scratch path per entry.
+const HASH_BATCH_FLAGS: [&str; 7] = [
+    "--no-pager",
+    "--no-lazy-fetch",
+    "-c",
+    "core.fsmonitor=false",
+    "hash-object",
+    "--no-filters",
+    "--",
+];
+/// Scratch-directory name stem shared by creation and argv budgeting so neither drifts.
+const SNAPSHOT_SCRATCH_STEM: &str = "agent-ide-snapshot-";
 /// Process-local suffix that prevents accidental reuse of a scratch directory.
 static NEXT_SNAPSHOT: AtomicU64 = AtomicU64::new(1);
 
@@ -88,7 +102,7 @@ impl SnapshotDirectory {
         }
         for _ in 0..16 {
             let path = temp.join(format!(
-                "agent-ide-snapshot-{}-{}",
+                "{SNAPSHOT_SCRATCH_STEM}{}-{}",
                 std::process::id(),
                 NEXT_SNAPSHOT.fetch_add(1, Ordering::Relaxed)
             ));
@@ -300,15 +314,7 @@ impl SnapshotIntent {
         directory: Arc<SnapshotDirectory>,
         names: &[String],
     ) -> Result<Self, GitError> {
-        let mut arguments: Vec<OsString> = vec![
-            "--no-pager".into(),
-            "--no-lazy-fetch".into(),
-            "-c".into(),
-            "core.fsmonitor=false".into(),
-            "hash-object".into(),
-            "--no-filters".into(),
-            "--".into(),
-        ];
+        let mut arguments: Vec<OsString> = HASH_BATCH_FLAGS.iter().map(Into::into).collect();
         arguments.extend(
             names
                 .iter()
@@ -434,20 +440,25 @@ fn parse_batch_hashes(output: &[u8], count: usize) -> Result<Vec<GitObjectId>, G
 
 /// Packs `count` ordered entries into consecutive `[start, end)` batches whose estimated argv
 /// bytes stay below [`MAX_HASH_BATCH_ARGV_BYTES`], whatever the host temp-root depth. A single
-/// oversized entry still forms its own batch; boundaries never reorder output.
+/// entry too large even alone for `limit` fails closed with [`GitError::EvidenceTooLarge`]
+/// before any scratch file is written; smaller boundaries never reorder output.
 fn hash_batch_ranges(
     count: usize,
     prefix_cost: usize,
     name_cost: impl Fn(usize) -> usize,
-) -> Vec<(usize, usize)> {
+    limit: usize,
+) -> Result<Vec<(usize, usize)>, GitError> {
     if count == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut ranges = Vec::new();
     let mut start = 0usize;
     let mut used = prefix_cost;
     for position in 0..count {
         let cost = prefix_cost + name_cost(position) + 1;
+        if cost > limit {
+            return Err(GitError::EvidenceTooLarge);
+        }
         if position > start && used + cost > MAX_HASH_BATCH_ARGV_BYTES {
             ranges.push((start, position));
             start = position;
@@ -456,7 +467,27 @@ fn hash_batch_ranges(
         used += cost;
     }
     ranges.push((start, count));
-    ranges
+    Ok(ranges)
+}
+
+/// Returns the fixed argv bytes every batched hash command pays beyond its per-entry names: the
+/// fixed flags plus one canonical scratch-directory path, each counted with a separating byte.
+/// The estimate mirrors what the execution policy actually measures, so it uses the canonical
+/// temp root and the real directory template — an unresolved `TMPDIR` alias can be arbitrarily
+/// deeper than the paths that are really passed — and reserves full counter digits so it never
+/// undershoots.
+fn hash_batch_prefix_bytes() -> Result<usize, GitError> {
+    let temp = fs::canonicalize(std::env::temp_dir()).map_err(|_| GitError::SnapshotIo)?;
+    Ok(
+        HASH_BATCH_FLAGS.iter().map(|flag| flag.len() + 1).sum::<usize>()
+            + temp.as_os_str().len()
+            + 1 // separator before the scratch directory name
+            + SNAPSHOT_SCRATCH_STEM.len()
+            + std::process::id().to_string().len()
+            + 1 // separator before the counter suffix
+            + 20 // counter digits reserved at full u64 width
+            + 1, // separator before each path argument
+    )
 }
 
 /// Hashes indexed private snapshots through as few bounded no-filter commands as possible.
@@ -471,12 +502,16 @@ async fn batch_hashes<R: SnapshotRunner>(
     entries: Vec<(usize, Vec<u8>)>,
     runner: &mut R,
 ) -> Result<Vec<GitObjectId>, GitError> {
-    // SnapshotDirectory names share one temp-root prefix; its depth only shifts the batch
-    // boundary, never correctness, because every batch is one ordered `hash-object` command.
-    let prefix_cost = std::env::temp_dir().as_os_str().len() + 32;
-    let ranges = hash_batch_ranges(entries.len(), prefix_cost, |index| {
-        format!("{marker}{index}").len()
-    });
+    // The budget uses the real argument strings — canonical scratch paths and the fixed flags —
+    // and a singleton past the execution ceiling fails closed here, before any scratch file is
+    // written for it.
+    let prefix_cost = hash_batch_prefix_bytes()?;
+    let ranges = hash_batch_ranges(
+        entries.len(),
+        prefix_cost,
+        |index| format!("{marker}{index}").len(),
+        crate::execution::MAX_PRODUCT_ARGV_BYTES,
+    )?;
     let mut hashes = Vec::with_capacity(entries.len());
     for (start, end) in ranges {
         let directory = SnapshotDirectory::new(scope)?;
@@ -1179,8 +1214,37 @@ fn inspect_untracked(worktree: &WorktreeRef, path: &Path) -> Result<(), GitError
 
 #[cfg(test)]
 mod batch_tests {
-    use super::{MAX_HASH_BATCH_ARGV_BYTES, hash_batch_ranges, parse_batch_hashes};
+    use super::{
+        GitError, MAX_HASH_BATCH_ARGV_BYTES, hash_batch_prefix_bytes, hash_batch_ranges,
+        parse_batch_hashes,
+    };
     use crate::workspace::git::GitObjectId;
+
+    /// The planning estimate covers the real argument strings: fixed flags plus one canonical
+    /// scratch path, never smaller than the unresolved temp directory it is derived from.
+    #[test]
+    fn batch_prefix_budget_uses_the_canonical_scratch_path() {
+        let prefix = hash_batch_prefix_bytes().unwrap();
+        let resolved = std::env::temp_dir();
+        let flags = super::HASH_BATCH_FLAGS
+            .iter()
+            .map(|f| f.len() + 1)
+            .sum::<usize>();
+        assert!(
+            prefix > flags + resolved.as_os_str().len(),
+            "prefix {prefix} must cover the flags and the resolved temp root"
+        );
+        // The reserved name shape (stem, pid digits, full-width counter) is part of the estimate.
+        let canonical = std::fs::canonicalize(&resolved).unwrap();
+        assert!(
+            prefix
+                >= flags
+                    + canonical.as_os_str().len()
+                    + super::SNAPSHOT_SCRATCH_STEM.len()
+                    + std::process::id().to_string().len()
+                    + 2
+        );
+    }
 
     /// Batch output must be exactly one terminal-LF object name per argument, in argument order.
     #[test]
@@ -1208,12 +1272,20 @@ mod batch_tests {
     }
 
     /// Batches stay below the argv budget whatever the temp-root depth, never reorder entries,
-    /// and a single oversized entry still forms its own bounded batch.
+    /// a single oversized entry still forms its own bounded batch, and an entry whose own argv
+    /// would exceed the execution ceiling fails closed instead of planning any batch.
     #[test]
     fn batch_ranges_pack_below_the_argv_budget() {
-        assert!(hash_batch_ranges(0, 100, |_| 4).is_empty());
-        assert_eq!(hash_batch_ranges(3, 100, |_| 4), vec![(0, 3)]);
-        let ranges = hash_batch_ranges(100, 100, |_| 4);
+        assert!(
+            hash_batch_ranges(0, 100, |_| 4, usize::MAX)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            hash_batch_ranges(3, 100, |_| 4, usize::MAX).unwrap(),
+            vec![(0, 3)]
+        );
+        let ranges = hash_batch_ranges(100, 100, |_| 4, usize::MAX).unwrap();
         let mut cursor = 0usize;
         for (start, end) in &ranges {
             assert_eq!(*start, cursor, "ranges are consecutive and ordered");
@@ -1227,8 +1299,21 @@ mod batch_tests {
         assert_eq!(cursor, 100);
         // A 4096-byte scratch pathname cannot fit any shared batch; it still runs alone.
         assert_eq!(
-            hash_batch_ranges(2, 100, |index| if index == 0 { 4000 } else { 4 }),
+            hash_batch_ranges(
+                2,
+                100,
+                |index| if index == 0 { 4000 } else { 4 },
+                usize::MAX
+            )
+            .unwrap(),
             vec![(0, 1), (1, 2)]
         );
+        // An entry whose own argv (prefix + name + separator) exceeds the ceiling fails closed
+        // before any batch — and therefore any scratch file — is planned.
+        let error =
+            hash_batch_ranges(2, 100, |index| if index == 0 { 5000 } else { 4 }, 4096).unwrap_err();
+        assert!(matches!(error, GitError::EvidenceTooLarge));
+        // Even a zero-byte name fails closed when the fixed prefix alone is past the ceiling.
+        assert!(hash_batch_ranges(1, 5000, |_| 0, 4096).is_err());
     }
 }

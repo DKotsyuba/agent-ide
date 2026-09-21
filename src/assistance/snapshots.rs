@@ -250,6 +250,19 @@ fn git_failure_detail(
     }
 }
 
+/// Names the closed pre-spawn wait failure at the execution-request boundary: a real
+/// cancellation stays `cancelled`, while deadline expiry alone is `deadline` — never reported
+/// as a cancellation just because the two checks used to share one arm (T27B).
+fn request_wait_failure(cancel: bool, past_deadline: bool) -> Option<FailureCode> {
+    if cancel {
+        Some(FailureCode::Cancelled)
+    } else if past_deadline {
+        Some(FailureCode::Deadline)
+    } else {
+        None
+    }
+}
+
 /// Retained bounded state needed to resume one Diff detail cursor from `ide.inspect`.
 /// Never serialized; only the same worker that captured `evidence` may expand it further.
 #[derive(Clone)]
@@ -722,8 +735,11 @@ impl Worker<'_> {
             .authorize(authority, &active)
             .await
             .map_err(|_| FailureCode::WorkspaceAuthority)?;
-        if tokio::time::Instant::now() >= job.deadline || *job.cancel.borrow() {
-            return Err(FailureCode::Cancelled);
+        if let Some(code) = request_wait_failure(
+            *job.cancel.borrow(),
+            tokio::time::Instant::now() >= job.deadline,
+        ) {
+            return Err(code);
         }
         let invocation = ValidatedHostInvocation::from_active_observation(
             self.shared.active(binding)?,
@@ -753,14 +769,17 @@ impl Worker<'_> {
         let policy = match trampoline {
             Some(trampoline) => LocalExecutionPolicy::with_env_trampoline(
                 programs,
-                64 * 1024,
+                crate::execution::MAX_PRODUCT_ARGV_BYTES,
                 16,
                 job.target.allow_disabled_host,
                 trampoline,
             ),
-            None => {
-                LocalExecutionPolicy::new(programs, 64 * 1024, 16, job.target.allow_disabled_host)
-            }
+            None => LocalExecutionPolicy::new(
+                programs,
+                crate::execution::MAX_PRODUCT_ARGV_BYTES,
+                16,
+                job.target.allow_disabled_host,
+            ),
         }
         .map_err(|_| FailureCode::ExecutionProfile)?;
         ValidatedExecutionRequest::validate(
@@ -987,6 +1006,44 @@ mod diff_failure_detail_tests {
                 Some(FailureCode::ExecutionProfile)
             ),
             "diff:execution_profile"
+        );
+    }
+
+    /// At the execution-request boundary, deadline expiry between children yields `deadline`
+    /// (surfacing as `diff:deadline`) while a real cancellation stays `cancelled` (T27B).
+    #[test]
+    fn request_boundary_separates_deadline_expiry_from_cancellation() {
+        use super::{FailureCode, request_wait_failure};
+        assert_eq!(request_wait_failure(false, false), None);
+        // Expiry with the cancellation flag still false is a deadline, not a cancellation.
+        assert_eq!(
+            request_wait_failure(false, true),
+            Some(FailureCode::Deadline)
+        );
+        assert_eq!(
+            request_wait_failure(true, false),
+            Some(FailureCode::Cancelled)
+        );
+        assert_eq!(
+            request_wait_failure(true, true),
+            Some(FailureCode::Cancelled)
+        );
+        // Both boundary codes keep their distinct fixed detail tags end to end.
+        assert_eq!(
+            git_failure_detail(
+                &GitError::IncompleteIdentity,
+                Some("rev-parse"),
+                request_wait_failure(false, true)
+            ),
+            "diff:deadline"
+        );
+        assert_eq!(
+            git_failure_detail(
+                &GitError::IncompleteIdentity,
+                Some("rev-parse"),
+                request_wait_failure(true, false)
+            ),
+            "diff:cancelled"
         );
     }
 }
