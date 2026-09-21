@@ -1291,12 +1291,17 @@ impl AssistanceDispatcher for ProductDispatcher {
             }
         })
     }
-    /// Reports a pending or running project check, which keeps the idle daemon alive.
+    /// Reports pending/running assistance work (a queued or executing job, or a project check),
+    /// which keeps the idle daemon alive until the work reaches its terminal state (T26B).
     fn is_busy(&self) -> bool {
         self.worker
             .as_ref()
-            .and_then(WorkerHandle::project_feed)
-            .is_some_and(|feed| feed.is_busy())
+            .is_some_and(WorkerHandle::is_processing)
+            || self
+                .worker
+                .as_ref()
+                .and_then(WorkerHandle::project_feed)
+                .is_some_and(|feed| feed.is_busy())
     }
     /// Returns bounded closed outcomes; slow jobs become pending while short inspections stay finite.
     fn dispatch(

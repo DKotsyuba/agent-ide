@@ -340,6 +340,10 @@ pub(super) fn admission_controller() -> crate::execution::AdmissionController {
 
 /// Shared bounded transport-side bookkeeping; no lock survives an I/O await.
 struct Ledger {
+    /// Jobs popped for execution and not yet settled; maintained in the same locked section that
+    /// moves a job off `queue`, so an observer can never see both counts zero while a job runs.
+    /// A queued or in-flight job defers idle shutdown (T26B) until it reaches its terminal state.
+    in_flight: usize,
     /// FIFO ordinary jobs; explicit stop is prioritized at the front.
     queue: VecDeque<Job>,
     /// Retained results, never silently evicted to admit more work.
@@ -366,6 +370,7 @@ impl Default for Ledger {
     /// Creates empty finite bookkeeping; no file or process work occurs.
     fn default() -> Self {
         Self {
+            in_flight: 0,
             queue: VecDeque::new(),
             details: BTreeMap::new(),
             starts: BTreeMap::new(),
@@ -734,6 +739,18 @@ impl WorkerHandle {
     /// behavior.
     pub fn accepts_attachment(&self, attachment: &str) -> bool {
         self.shared.launcher.target(attachment).is_some()
+    }
+
+    /// Returns whether a job is queued or currently executing, without blocking.
+    ///
+    /// This defers idle shutdown (T26B): a job that only ever reaches its terminal state through
+    /// the sole worker must not be killed by a daemon that considers itself idle while it runs.
+    /// Both counts live behind one short-held lock, so the answer is a consistent snapshot.
+    pub fn is_processing(&self) -> bool {
+        self.shared
+            .ledger
+            .lock()
+            .is_ok_and(|ledger| ledger.in_flight > 0 || !ledger.queue.is_empty())
     }
 
     /// Creates finite channels only; Store and Workspace are opened later under the daemon lock.
@@ -1954,13 +1971,21 @@ impl<'a> Worker<'a> {
             }
             let shared = self.shared.clone();
             let wake = shared.notify.notified();
-            let job = shared
-                .ledger
-                .lock()
-                .ok()
-                .and_then(|mut ledger| ledger.queue.pop_front());
+            // The in-flight count moves in the same locked section as the pop, so "queue empty
+            // and nothing in flight" is never observed while a job is between the two (T26B).
+            let job = shared.ledger.lock().ok().and_then(|mut ledger| {
+                ledger
+                    .queue
+                    .pop_front()
+                    .inspect(|_| ledger.in_flight = ledger.in_flight.saturating_add(1))
+            });
             match job {
-                Some(job) => self.perform(job).await,
+                Some(job) => {
+                    self.perform(job).await;
+                    if let Ok(mut ledger) = shared.ledger.lock() {
+                        ledger.in_flight = ledger.in_flight.saturating_sub(1);
+                    }
+                }
                 None => wake.await,
             }
         }
@@ -2024,6 +2049,24 @@ impl<'a> Worker<'a> {
             Ok(result) => result,
             Err(code) => (PeerReply::Error { code }, None, None),
         };
+        if let PeerReply::Error { code } = &reply {
+            // T26B: a queued job's terminal failure must reach the error log with its closed
+            // reason even when no caller view ever does — the dispatch path only logs the initial
+            // `pending` placeholder a slow job returns, and daemon shutdown drops retained
+            // details, so this line is otherwise the only record the job ever failed.
+            let lifetime = Duration::from_millis(self.shared.launcher.limits.operation_ms);
+            let started = job.deadline.checked_sub(lifetime).unwrap_or(job.deadline);
+            crate::errorlog::record(
+                errorlog_method(job.tool),
+                job_failure_outcome(*code),
+                crate::errorlog::Fields {
+                    reason: Some((*code).into()),
+                    correlation: Some(job.reference.as_str()),
+                    duration_ms: u32::try_from(started.elapsed().as_millis()).ok(),
+                    ..Default::default()
+                },
+            );
+        }
         if let Some(feed) = &self.shared.project_feed {
             match (&reply, &authority) {
                 (
@@ -4436,6 +4479,17 @@ fn record_execution_profile(method: crate::errorlog::Method, detail: &str) {
     );
 }
 
+/// Classifies one job's terminal error reply into its closed error-log outcome, mirroring the
+/// caller-view classification in `telemetry::adapters` so a background job failure and the same
+/// failure observed through a later poll can never disagree (T26B).
+fn job_failure_outcome(code: FailureCode) -> crate::errorlog::Outcome {
+    match code {
+        FailureCode::Cancelled => crate::errorlog::Outcome::Cancelled,
+        FailureCode::Deadline => crate::errorlog::Outcome::Incomplete,
+        _ => crate::errorlog::Outcome::Failed,
+    }
+}
+
 /// Binds detail reuse to the exact closed query (including diff mode and context byte offset).
 fn selection(parameters: &Value) -> [u8; 32] {
     let mut selected = parameters.clone();
@@ -4463,6 +4517,56 @@ fn initial_inspection_admission_is_atomic_and_distinguishes_closure() {
     drop(receiver);
     let result = admit_initial_inspection(&sender, || panic!("closed service published detail"));
     assert!(matches!(result, Err(FailureCode::Internal)));
+}
+
+/// A queued or executing job defers idle shutdown: `is_processing` must report both counts from
+/// one consistent ledger snapshot, and report idle again once neither applies (T26B).
+#[test]
+fn processing_reports_in_flight_and_queued_jobs() {
+    let launcher = LauncherConfig::parse(
+        br#"{"version":1,"limits":{"queued":1,"details":1,"operation_ms":1000,"output_bytes":1024},"targets":[]}"#,
+    )
+    .unwrap();
+    let handle = WorkerHandle::new(
+        Arc::new(Mutex::new(HostBindingGuard::default())),
+        launcher,
+        [3; 32],
+        Arc::new(Mutex::new(admission_controller())),
+    );
+    assert!(
+        !handle.is_processing(),
+        "an idle worker must not defer idle shutdown"
+    );
+    handle.shared.ledger.lock().unwrap().in_flight = 1;
+    assert!(
+        handle.is_processing(),
+        "an executing job must defer idle shutdown"
+    );
+    handle.shared.ledger.lock().unwrap().in_flight = 0;
+    assert!(!handle.is_processing());
+    // No task was ever started, so dropping the handle cancels nothing.
+    drop(handle);
+}
+
+/// A job's terminal error line must classify every closed failure the way the caller-view adapter
+/// does, so a background failure and its polled view can never disagree (T26B).
+#[test]
+fn job_failure_outcome_covers_every_terminal_error_class() {
+    for (code, expected) in [
+        (FailureCode::Cancelled, crate::errorlog::Outcome::Cancelled),
+        (FailureCode::Deadline, crate::errorlog::Outcome::Incomplete),
+        (
+            FailureCode::SourceUnavailable,
+            crate::errorlog::Outcome::Failed,
+        ),
+        (FailureCode::Internal, crate::errorlog::Outcome::Failed),
+        (
+            FailureCode::WorkspaceAuthority,
+            crate::errorlog::Outcome::Failed,
+        ),
+    ] {
+        assert_eq!(job_failure_outcome(code), expected, "{code:?}");
+    }
 }
 
 /// KSC3: a real SQLite writer-lock failure on stop must retain the receipt/pending-recovery marker
