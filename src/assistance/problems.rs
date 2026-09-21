@@ -53,6 +53,12 @@ pub trait ProblemSource: Send + Sync {
     /// snapshots for a different worktree. An empty result means no language is configured,
     /// which the renderer reports as `checks disabled`.
     fn latest(&self, worktree: &Path) -> Vec<ProblemSnapshot>;
+
+    /// Returns the languages whose [`ProblemSource::latest`] snapshot predates the worktree's
+    /// newest inputs while a re-check is pending or running. Defaults to none.
+    fn stale(&self, _worktree: &Path) -> Vec<Language> {
+        Vec::new()
+    }
 }
 
 /// Worktree bound to one activated actor binding, as recorded at `ide.start`.
@@ -232,8 +238,24 @@ impl ProjectProblemFeed {
             binding: hex(binding),
             worktree: bound.worktree.clone(),
         };
-        let snapshots = self.snapshots(&bound.worktree, bound.admitted);
-        state.feed.next_block(&key, &snapshots)
+        let snapshots = self.feed_snapshots(&bound.worktree, bound.admitted);
+        let block = state.feed.next_block(&key, &snapshots)?;
+        let languages = snapshots
+            .iter()
+            .filter(|snapshot| !matches!(snapshot.state, CheckState::Checking))
+            .map(|snapshot| snapshot.language.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        crate::errorlog::record(
+            crate::errorlog::Method::Feed,
+            crate::errorlog::Outcome::Completed,
+            crate::errorlog::Fields {
+                worktree: Some(&bound.worktree),
+                detail: Some(&format!("languages={languages} bytes={}", block.len())),
+                ..Default::default()
+            },
+        );
+        Some(block)
     }
 
     /// Drops `binding`'s worktree record and delivery state; called on `ide.stop`.
@@ -284,6 +306,19 @@ impl ProjectProblemFeed {
             })
             .collect()
     }
+
+    /// Like [`Self::snapshots`], but a language whose result predates a running re-check counts as
+    /// `checking`, so the `<agent-ide>` block never presents stale counts as current.
+    fn feed_snapshots(&self, worktree: &Path, admitted: bool) -> Vec<ProblemSnapshot> {
+        let stale = self.scheduler.stale(worktree);
+        let mut snapshots = self.snapshots(worktree, admitted);
+        for snapshot in &mut snapshots {
+            if stale.contains(&snapshot.language) {
+                *snapshot = ProblemSnapshot::checking(snapshot.language, snapshot.input_generation);
+            }
+        }
+        snapshots
+    }
 }
 
 impl ProblemSource for ProjectProblemFeed {
@@ -297,6 +332,10 @@ impl ProblemSource for ProjectProblemFeed {
                 .any(|bound| bound.worktree == worktree && !bound.admitted)
         });
         self.snapshots(worktree, admitted)
+    }
+
+    fn stale(&self, worktree: &Path) -> Vec<Language> {
+        self.scheduler.stale(worktree)
     }
 }
 
@@ -337,6 +376,18 @@ pub fn problems_text(
     language: Option<Language>,
     offset: u32,
 ) -> String {
+    problems_text_with_stale(snapshots, &[], language, offset)
+}
+
+/// Like [`problems_text`], but a `ready`/`partial` line of a language in `stale` renders
+/// `<language>: ready (stale; re-check running); errors: N; warnings: M`, because a check for
+/// newer inputs is pending or running and the counts describe the previous inputs.
+pub fn problems_text_with_stale(
+    snapshots: &[ProblemSnapshot],
+    stale: &[Language],
+    language: Option<Language>,
+    offset: u32,
+) -> String {
     let matched: Vec<&ProblemSnapshot> = snapshots
         .iter()
         .filter(|snapshot| language.is_none_or(|selected| snapshot.language == selected))
@@ -361,7 +412,7 @@ pub fn problems_text(
     let mut rendered: u32 = 0;
     let mut more = false;
     for snapshot in &selected {
-        lines.push(state_line(snapshot));
+        lines.push(state_line(snapshot, stale.contains(&snapshot.language)));
         for problem in &snapshot.problems {
             if skipped > 0 {
                 skipped -= 1;
@@ -389,15 +440,20 @@ pub fn problems_text(
 /// `unavailable` snapshot carrying [`ProblemSnapshot::detail`] appends it in parentheses, stripped
 /// of control characters like every other untrusted checker text field; a snapshot with no detail
 /// renders exactly as before.
-fn state_line(snapshot: &ProblemSnapshot) -> String {
+fn state_line(snapshot: &ProblemSnapshot, stale: bool) -> String {
     let language = snapshot.language.as_str();
+    let stale = if stale {
+        " (stale; re-check running)"
+    } else {
+        ""
+    };
     match &snapshot.state {
         CheckState::Ready => format!(
-            "{language}: ready; errors: {}; warnings: {}",
+            "{language}: ready{stale}; errors: {}; warnings: {}",
             snapshot.errors, snapshot.warnings
         ),
         CheckState::Partial => format!(
-            "{language}: partial; errors: {}; warnings: {}",
+            "{language}: partial{stale}; errors: {}; warnings: {}",
             snapshot.errors, snapshot.warnings
         ),
         CheckState::Checking => format!("{language}: checking"),
@@ -809,5 +865,66 @@ mod tests {
         let text = problems_text(&snapshots, None, 0);
         assert!(text.contains("a.rs:1:1 warning plain"), "{text}");
         assert!(!text.contains("[]"), "{text}");
+    }
+
+    /// Advances the paused clock in small steps so chained debounce and run timers all fire.
+    async fn settle() {
+        for _ in 0..40 {
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A first call after a re-activation must not present the previous inputs' counts as current:
+    /// the problems text says the re-check is running, the feed emits no block, and both follow
+    /// the normal rules once the new result lands.
+    #[tokio::test(start_paused = true)]
+    async fn activation_over_an_older_snapshot_is_stale_until_the_recheck_lands() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("agent-ide-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let worktree = root.join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join("Cargo.toml"), "[package]\n").unwrap();
+        let scheduler = Scheduler::new(
+            vec![Arc::new(crate::checks::FakeChecker::new(
+                Language::Rust,
+                ready(Language::Rust, Vec::new()),
+            ))],
+            std::time::Duration::from_millis(50),
+            2,
+            root.join("cache"),
+        );
+        let feed = ProjectProblemFeed::new(scheduler, vec![root.clone()], vec![Language::Rust]);
+        feed.activated([1; 32], &worktree, Path::new("repo"));
+        settle().await;
+        assert!(feed.stale(&worktree).is_empty());
+        assert!(feed.next_block(&[1; 32]).is_some());
+
+        feed.activated([2; 32], &worktree, Path::new("repo"));
+        let stale = feed.stale(&worktree);
+        assert_eq!(stale, vec![Language::Rust]);
+        assert_eq!(
+            problems_text_with_stale(&feed.latest(&worktree), &stale, None, 0),
+            "rust: ready (stale; re-check running); errors: 0; warnings: 0"
+        );
+        assert_eq!(
+            feed.next_block(&[2; 32]),
+            None,
+            "stale counts must not be delivered"
+        );
+
+        settle().await;
+        assert!(feed.stale(&worktree).is_empty());
+        assert_eq!(
+            problems_text_with_stale(&feed.latest(&worktree), &[], None, 0),
+            "rust: ready; errors: 0; warnings: 0"
+        );
+        assert!(feed.next_block(&[2; 32]).is_some());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -71,6 +71,8 @@ pub enum Method {
     Daemon,
     /// MCP client process lifecycle (re-establishment, transport unavailable).
     Client,
+    /// An `<agent-ide>` problems feed block was emitted into a reply.
+    Feed,
 }
 
 impl Method {
@@ -88,6 +90,7 @@ impl Method {
             Self::Check => "check",
             Self::Daemon => "daemon",
             Self::Client => "client",
+            Self::Feed => "feed",
         }
     }
 }
