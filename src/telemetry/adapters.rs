@@ -37,11 +37,7 @@ pub fn tool_reply(
     cache: CacheState,
     diagnostics: DiagnosticState,
 ) {
-    let method = if matches!(reply, PeerReply::Edit { .. }) {
-        ToolMethod::Edit
-    } else {
-        tool_method(tool)
-    };
+    let method = reply_method(tool, reply);
     let diagnostics = match reply {
         PeerReply::Edit {
             diagnostics: EditDiagnostics::CurrentClean {},
@@ -66,11 +62,28 @@ pub fn tool_reply(
         diagnostics,
         reason: reply_reason(reply),
     });
-    // T107 full-logging extension: every call is logged now, not just a non-success one, so an
-    // agent's whole round trip (mint -> helper claim -> settle -> inspect) can be followed by
-    // `correlation` alone; `level` is a pure function of `outcome` and never logged separately.
+}
+
+/// Attributes a settled edit retrieved through `ide.inspect` to `edit`, else to `tool` itself.
+fn reply_method(tool: AssistanceTool, reply: &PeerReply) -> ToolMethod {
+    if matches!(reply, PeerReply::Edit { .. }) {
+        ToolMethod::Edit
+    } else {
+        tool_method(tool)
+    }
+}
+
+/// Logs one Assistance tool reply to the error log, independent of telemetry availability.
+///
+/// T107 full-logging extension: every call is logged, not just a non-success one, so an agent's
+/// whole round trip (mint -> helper claim -> settle -> inspect) can be followed by `correlation`
+/// alone; `level` is a pure function of `outcome` and never logged separately. This must not
+/// depend on the durable telemetry sink: that sink is absent whenever its lock is contended or its
+/// initialization failed (for example while a replaced daemon generation is still shutting down),
+/// and the error log is exactly what is needed then.
+pub fn log_tool_reply(tool: AssistanceTool, reply: &PeerReply, elapsed: Duration) {
     crate::errorlog::record(
-        errorlog_method(method),
+        errorlog_method(reply_method(tool, reply)),
         errorlog_outcome(reply),
         crate::errorlog::Fields {
             reason: reply_reason(reply),
@@ -169,11 +182,8 @@ pub fn execution_summary(
     });
 }
 
-/// Records one completed project check from its snapshot's language, state, duration and counts.
-///
-/// Problem paths, messages and codes are never read; counts are bucketed and the duration is
-/// saturated to whole `u32` milliseconds. Recording is synchronous, bounded and fail-open.
-pub fn project_check(telemetry: &Telemetry, snapshot: &ProblemSnapshot) {
+/// Logs one completed project check to the error log, independent of telemetry availability.
+pub fn log_project_check(snapshot: &ProblemSnapshot) {
     // T107 full-logging extension: every completed check is logged (`info` for Ready/Partial,
     // `warn`/`error` per `Outcome::level` for the rest), not just a `Fatal`/`Timeout` failure.
     // Counts fill `detail` only when the checker left no sanitized explanation of its own, since
@@ -202,6 +212,13 @@ pub fn project_check(telemetry: &Telemetry, snapshot: &ProblemSnapshot) {
             ..Default::default()
         },
     );
+}
+
+/// Records one completed project check from its snapshot's language, state, duration and counts.
+///
+/// Problem paths, messages and codes are never read; counts are bucketed and the duration is
+/// saturated to whole `u32` milliseconds. Recording is synchronous, bounded and fail-open.
+pub fn project_check(telemetry: &Telemetry, snapshot: &ProblemSnapshot) {
     telemetry.record(Event::ProjectCheckCompleted {
         language: match snapshot.language {
             checks::Language::Rust => Language::Rust,

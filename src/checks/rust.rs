@@ -218,15 +218,11 @@ fn ancestor_manifest_roots(worktree: &Path) -> Vec<PathBuf> {
     roots
 }
 
-/// Returns the real user home directory.
-///
-/// Reads `HOME` from the process environment; when the variable is unset (not expected on the
-/// supported macOS target) the system temp dir is substituted so path construction stays
-/// absolute.
+/// Returns the real user home directory from the password database (never `$HOME`, which a host
+/// may substitute), honoring only the `AGENT_IDE_HOME` override; when neither resolves the system
+/// temp dir is substituted so path construction stays absolute.
 fn real_home() -> PathBuf {
-    env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| env::temp_dir())
+    crate::userhome::user_home().unwrap_or_else(env::temp_dir)
 }
 
 /// Derives the rustup home from the toolchain directory.

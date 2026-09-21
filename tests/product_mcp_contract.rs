@@ -1467,12 +1467,13 @@ impl ProductFixture {
     async fn daemon(&self) -> Child {
         self.daemon_with_home(None).await
     }
-    /// Starts the configured daemon, optionally with `HOME` redirected into the fixture so its
-    /// project check caches never touch the real home directory.
+    /// Starts the configured daemon, optionally with its home (`AGENT_IDE_HOME`, which the product
+    /// resolves instead of `$HOME`) redirected into the fixture so its project check caches never
+    /// touch the real home directory. Without one it inherits the test-wide `AGENT_IDE_HOME`.
     async fn daemon_with_home(&self, home: Option<&Path>) -> Child {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
         if let Some(home) = home {
-            command.env("HOME", home);
+            command.env(agent_ide::userhome::HOME_OVERRIDE_ENV, home);
         }
         let mut daemon = command
             .args(["daemon", "--runtime-dir"])
@@ -6008,7 +6009,7 @@ async fn configured_product_claude_helper_returns_context_diff_and_feedback() {
 ///
 /// The fake `cargo` runs under the real Seatbelt runner and reports one error per line of the
 /// worktree's untracked `problems.count` value, so tests change counts without a real compiler.
-/// `allowed_root` is the configured admission root. Returns the redirected daemon `HOME`.
+/// `allowed_root` is the configured admission root. Returns the redirected daemon home (`AGENT_IDE_HOME`).
 fn enable_fake_rust_checks(fixture: &ProductFixture, allowed_root: &Path) -> PathBuf {
     let home = fixture.base.join("home");
     let toolchain = home.join(".rustup/toolchains/fake");

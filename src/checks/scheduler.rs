@@ -253,6 +253,34 @@ impl Scheduler {
         snapshots
     }
 
+    /// Returns the languages whose stored snapshot for `worktree` predates its newest input
+    /// generation while a debounce timer is pending or a check is running, in language order.
+    ///
+    /// Such a snapshot describes the previous inputs; the pending or running check will replace
+    /// it. Non-blocking and synchronous.
+    pub fn stale(&self, worktree: &Path) -> Vec<Language> {
+        let worktree = canonical_worktree(worktree);
+        let state = self.inner.lock_state();
+        let mut stale: Vec<Language> = state
+            .worktrees
+            .get(&worktree)
+            .map(|wt| {
+                wt.languages
+                    .iter()
+                    .filter(|(_, lang)| {
+                        (lang.running || lang.timer_abort.is_some())
+                            && lang.latest_snapshot.as_ref().is_some_and(|snapshot| {
+                                snapshot.input_generation < wt.input_generation
+                            })
+                    })
+                    .map(|(language, _)| *language)
+                    .collect()
+            })
+            .unwrap_or_default();
+        stale.sort();
+        stale
+    }
+
     /// Reports whether any `(worktree, language)` pair has a check running or a debounce timer
     /// pending.
     ///
@@ -430,6 +458,15 @@ impl Inner {
                 cache_dir: cache_dir.clone(),
                 input_generation: generation,
             };
+            crate::errorlog::record(
+                crate::errorlog::Method::Check,
+                crate::errorlog::Outcome::Started,
+                crate::errorlog::Fields {
+                    worktree: Some(&worktree),
+                    detail: Some(language.as_str()),
+                    ..Default::default()
+                },
+            );
             let started = Instant::now();
             let snapshot = checker.check(request).await;
             let duration = started.elapsed();

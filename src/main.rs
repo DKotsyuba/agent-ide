@@ -37,6 +37,17 @@ async fn main() -> ExitCode {
         println!("agent-ide {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
+    match usage_request(&arguments) {
+        Some(UsageRequest::Help) => {
+            print!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Some(UsageRequest::Unknown) => {
+            eprint!("{USAGE}");
+            return ExitCode::from(2);
+        }
+        None => {}
+    }
     // Claude's workspace identity is captured before argument parsing or asynchronous setup and is
     // never accepted from an MCP call, hook payload, or later environment read.
     let claude_project_dir = std::env::var_os("CLAUDE_PROJECT_DIR");
@@ -610,6 +621,64 @@ fn is_version_request(arguments: &[OsString]) -> bool {
     )
 }
 
+/// Usage listing printed for `--help`/`-h`/`help` and for a missing or unknown subcommand.
+const USAGE: &str = "\
+usage: agent-ide <command> [args]
+
+commands:
+  mcp --runtime-dir <dir>                 MCP server over an existing daemon
+  mcp --launcher-template <file>          managed Codex MCP server
+  mcp --claude-launcher-template <file>   managed Claude MCP server
+  mcp --auto-launcher-template <file>     managed MCP server, host auto-detected
+  daemon --runtime-dir <dir>              run the repository daemon
+  doctor --runtime-dir <dir>              report daemon health
+  codex-hook --runtime-dir <dir>          Codex native hook
+  claude-hook [--runtime-dir <dir>]       Claude native hook
+  claude-worker --runtime-dir <dir> --attachment <id> --detail-ref <ref>
+                                          Claude foreground helper
+  claude-rendezvous <project-dir>         print the Claude runtime and helper socket paths
+  errors [--repo <path>] [--all] [--summary] [--since <minutes>] [--limit <n>]
+                                          read the error log
+  evidence record|executable ...          launcher evidence fragments
+  launcher check <file>                   validate a launcher configuration
+  telemetry query|export --database <file> [--tag <tag>] [--cursor <n>]
+  -v, --version, version                  print the version
+  -h, --help, help                        print this listing
+";
+
+/// Subcommand names accepted as the first argument; everything else is an unknown subcommand.
+const SUBCOMMANDS: &[&str] = &[
+    "mcp",
+    "daemon",
+    "doctor",
+    "codex-hook",
+    "claude-hook",
+    "claude-worker",
+    "claude-rendezvous",
+    "errors",
+    "evidence",
+    "launcher",
+    "telemetry",
+];
+
+/// How a command line asks for the usage listing instead of a real command.
+#[derive(Debug, Eq, PartialEq)]
+enum UsageRequest {
+    /// `--help`, `-h` or `help`: print the listing to stdout and succeed.
+    Help,
+    /// A missing or unknown subcommand: print the listing to stderr and exit 2.
+    Unknown,
+}
+
+/// Classifies only the first argument; a known subcommand with bad arguments keeps its own error.
+fn usage_request(arguments: &[OsString]) -> Option<UsageRequest> {
+    match arguments.first().map(|first| first.to_str()) {
+        Some(Some("--help" | "-h" | "help")) => Some(UsageRequest::Help),
+        Some(Some(first)) if SUBCOMMANDS.contains(&first) => None,
+        _ => Some(UsageRequest::Unknown),
+    }
+}
+
 /// Rejects unknown, missing, and extra CLI arguments before any filesystem or daemon action.
 fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppError> {
     let arguments = arguments.collect::<Vec<_>>();
@@ -842,9 +911,8 @@ async fn errors_command(
         None => std::env::current_dir().map_err(|_| AppError::InvalidResponse)?,
     };
     let candidate = fs::canonicalize(&repo).map_err(|_| AppError::InvalidResponse)?;
-    let key = &claude_rendezvous_identity(&claude_rendezvous_key(&candidate).await)[..16];
-    let home = PathBuf::from(std::env::var_os("HOME").ok_or(AppError::InvalidResponse)?);
-    let dir = home.join(".agent-ide").join("logs").join(key);
+    let root = agent_ide::errorlog::log_root().ok_or(AppError::InvalidResponse)?;
+    let dir = error_log_dir(&root, &candidate).await;
     let mut events = agent_ide::errorlog::read_events(&dir);
     if let Some(since_minutes) = since_minutes {
         let cutoff = rfc3339_cutoff(since_minutes);
@@ -864,6 +932,47 @@ async fn errors_command(
         println!("{}", agent_ide::errorlog::format_line(event));
     }
     Ok(())
+}
+
+/// Finds the log directory the daemon of `candidate`'s repository writes, below `root`.
+///
+/// The first key whose directory exists wins, in the order the writer could have derived it: the
+/// repository's git common directory as `git` reports it, the same directory found by reading
+/// `.git` files (when the `git` probe failed or timed out here), then `candidate` itself (the
+/// writer's own fallback outside a repository). With none present, the first key is returned so
+/// the reader simply finds nothing.
+async fn error_log_dir(root: &Path, candidate: &Path) -> PathBuf {
+    let mut keys = vec![claude_rendezvous_key(candidate).await];
+    keys.extend(common_dir_from_git_files(candidate));
+    keys.push(candidate.to_owned());
+    let dirs = keys
+        .iter()
+        .map(|key| root.join(&claude_rendezvous_identity(key)[..16]))
+        .collect::<Vec<_>>();
+    dirs.iter()
+        .find(|dir| dir.is_dir())
+        .unwrap_or(&dirs[0])
+        .clone()
+}
+
+/// Resolves a repository's canonical git common directory by reading `.git` files, without `git`.
+///
+/// Walks up from `start` to the first `.git`. A directory is the common directory itself; a
+/// worktree's `.git` file names its `gitdir:`, whose `commondir` file points at the common one.
+fn common_dir_from_git_files(start: &Path) -> Option<PathBuf> {
+    let dot_git = start
+        .ancestors()
+        .map(|dir| dir.join(".git"))
+        .find(|path| path.exists())?;
+    if dot_git.is_dir() {
+        return fs::canonicalize(dot_git).ok();
+    }
+    let text = fs::read_to_string(&dot_git).ok()?;
+    let gitdir = dot_git
+        .parent()?
+        .join(text.trim().strip_prefix("gitdir:")?.trim());
+    let common = fs::read_to_string(gitdir.join("commondir")).ok()?;
+    fs::canonicalize(gitdir.join(common.trim())).ok()
 }
 
 /// Renders `now - since_minutes` as the same RFC 3339 UTC form error-log timestamps use, so a
@@ -1375,16 +1484,16 @@ fn managed_telemetry_database_in(
 /// prior events while runtime cleanup cannot delete them. Unsafe or symlinked state is rejected,
 /// and Workspace/Changes authority remains in each daemon's private runtime.
 fn managed_telemetry_database(candidate: &Path) -> std::io::Result<PathBuf> {
-    let home =
-        PathBuf::from(std::env::var_os("HOME").ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is unavailable")
-        })?);
+    let home = agent_ide::userhome::user_home()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "home is unavailable"))?;
     if !absolute_local_path(&home) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "HOME is not absolute and normalized",
+            "home is not absolute and normalized",
         ));
     }
+    // A relocated (`AGENT_IDE_HOME`) home may not exist yet; a real one always does.
+    let _ = fs::create_dir_all(&home);
     let home = fs::canonicalize(home)?;
     let metadata = fs::symlink_metadata(&home)?;
     if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
@@ -1546,6 +1655,9 @@ async fn run_managed_codex_mcp(
     let Ok(runtime) = ManagedRuntime::create() else {
         return serve_managed_stdio(StdioFacade::unavailable(), None, None, None).await;
     };
+    agent_ide::errorlog::init_repository(
+        &claude_rendezvous_identity(&claude_rendezvous_key(&candidate).await)[..16],
+    );
     let runtime_path = runtime.path.clone();
     let started = start_managed_daemon(
         &runtime,
@@ -1596,6 +1708,8 @@ async fn run_managed_claude_mcp(
     let Ok(path) = claude_runtime_path(&key) else {
         return serve_managed_stdio(StdioFacade::unavailable(), None, None, None).await;
     };
+    // Lets this client log its own lifecycle facts into the daemon's per-repository log.
+    agent_ide::errorlog::init(&path);
     match rendezvous_with_claude_daemon(&path, &key, &launcher_template, &candidate).await {
         Some((runtime_path, attachment)) => {
             // Per EYES-r2 §2, this generation never owns the shared daemon's lifetime, so it holds
@@ -1645,11 +1759,29 @@ fn claude_reestablish_hook(
         let candidate = candidate.clone();
         let lease = Arc::clone(&lease);
         Box::pin(async move {
+            let started = std::time::Instant::now();
             let result =
                 rendezvous_with_claude_daemon(&path, &key, &launcher_template, &candidate).await;
             if let Some((runtime_path, _)) = &result {
                 *lease.lock().await = open_client_lease(runtime_path).await;
             }
+            agent_ide::errorlog::record(
+                agent_ide::errorlog::Method::Client,
+                if result.is_some() {
+                    agent_ide::errorlog::Outcome::Reestablished
+                } else {
+                    agent_ide::errorlog::Outcome::Unavailable
+                },
+                agent_ide::errorlog::Fields {
+                    reason: result
+                        .is_none()
+                        .then_some(agent_ide::errorlog::ReasonCode::ProviderUnavailable),
+                    worktree: Some(&candidate),
+                    host: Some(HostKind::Claude),
+                    duration_ms: started.elapsed().as_millis().try_into().ok(),
+                    ..Default::default()
+                },
+            );
             result
         })
     })
@@ -1842,6 +1974,11 @@ async fn start_managed_daemon(
             Err(_) => return Err(StartDaemonError::Other),
         }
     }
+    // The error log is keyed by the repository, which a random Codex runtime directory cannot say.
+    let log_key_source = match host {
+        ManagedHost::Codex => claude_rendezvous_key(candidate).await,
+        ManagedHost::Claude => identity.to_owned(),
+    };
     let mut command =
         tokio::process::Command::new(std::env::current_exe().map_err(|_| StartDaemonError::Other)?);
     command
@@ -1849,6 +1986,10 @@ async fn start_managed_daemon(
         .arg(&runtime.path)
         .env("AGENT_IDE_LAUNCHER_CONFIG", launcher_path)
         .env("AGENT_IDE_TELEMETRY_DATABASE", telemetry_database)
+        .env(
+            agent_ide::errorlog::LOG_KEY_ENV,
+            &claude_rendezvous_identity(&log_key_source)[..16],
+        )
         .env_remove("AGENT_IDE_STATE_DATABASE")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -2428,5 +2569,62 @@ mod tests {
         );
 
         fs::remove_dir_all(parent).unwrap();
+    }
+
+    /// Only a missing or unknown first argument (or an explicit help spelling) asks for usage; a
+    /// known subcommand with bad arguments keeps its own error path.
+    #[test]
+    fn usage_is_requested_only_for_help_and_unknown_subcommands() {
+        let request = |values: &[&str]| usage_request(&args(values).collect::<Vec<_>>());
+        for help in ["--help", "-h", "help"] {
+            assert_eq!(request(&[help]), Some(UsageRequest::Help));
+        }
+        assert_eq!(request(&[]), Some(UsageRequest::Unknown));
+        assert_eq!(request(&["frobnicate"]), Some(UsageRequest::Unknown));
+        assert_eq!(
+            request(&["--runtime-dir", "x"]),
+            Some(UsageRequest::Unknown)
+        );
+        for known in SUBCOMMANDS {
+            assert_eq!(request(&[known]), None, "{known}");
+            assert!(USAGE.contains(known), "usage lacks {known}");
+        }
+    }
+
+    /// The reader's `git`-free fallback resolves a repository, a linked worktree and a path inside
+    /// either (also through a symlink) to the same canonical git common directory.
+    #[test]
+    fn common_dir_from_git_files_resolves_worktrees_without_git() {
+        let base = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("agent-ide-commondir-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let common = base.join("main/.git");
+        fs::create_dir_all(common.join("worktrees/linked")).unwrap();
+        fs::write(common.join("worktrees/linked/commondir"), "../..\n").unwrap();
+        let linked = base.join("linked/deep");
+        fs::create_dir_all(&linked).unwrap();
+        fs::write(
+            base.join("linked/.git"),
+            format!("gitdir: {}\n", common.join("worktrees/linked").display()),
+        )
+        .unwrap();
+        fs::create_dir_all(base.join("main/sub")).unwrap();
+        std::os::unix::fs::symlink(base.join("linked"), base.join("alias")).unwrap();
+        for start in [
+            base.join("main"),
+            base.join("main/sub"),
+            base.join("linked"),
+            linked.clone(),
+            base.join("alias/deep"),
+        ] {
+            assert_eq!(
+                common_dir_from_git_files(&start),
+                Some(common.clone()),
+                "{start:?}"
+            );
+        }
+        assert_eq!(common_dir_from_git_files(&base.join("nowhere")), None);
+        fs::remove_dir_all(&base).unwrap();
     }
 }

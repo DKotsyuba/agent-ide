@@ -71,6 +71,8 @@ pub enum Method {
     Daemon,
     /// MCP client process lifecycle (re-establishment, transport unavailable).
     Client,
+    /// An `<agent-ide>` problems feed block was emitted into a reply.
+    Feed,
 }
 
 impl Method {
@@ -88,6 +90,7 @@ impl Method {
             Self::Check => "check",
             Self::Daemon => "daemon",
             Self::Client => "client",
+            Self::Feed => "feed",
         }
     }
 }
@@ -589,16 +592,45 @@ static WRITER: OnceLock<Option<Writer>> = OnceLock::new();
 ///
 /// Idempotent: only the first call in a process takes effect. Creates no file; the directory and
 /// file are created lazily by the first [`record`] call that actually has something to log.
+///
+/// The log directory is keyed by [`LOG_KEY_ENV`] when the spawning MCP process supplied it (a
+/// managed Codex daemon runs in a random `ai-<random>` runtime that says nothing about its
+/// repository), else by [`repository_key`] of `runtime_dir`.
 pub fn init(runtime_dir: &Path) {
-    let key = repository_key(runtime_dir);
-    let _ = WRITER.set(log_root().map(|root| Writer::new(root.join(key))));
+    let key = std::env::var(LOG_KEY_ENV)
+        .ok()
+        .filter(|key| valid_key(key))
+        .unwrap_or_else(|| repository_key(runtime_dir));
+    init_repository(&key);
 }
 
-/// Returns `~/.agent-ide/logs`, or `None` when `HOME` is unavailable or not absolute.
-fn log_root() -> Option<PathBuf> {
-    let home = PathBuf::from(std::env::var_os("HOME")?);
-    home.is_absolute()
-        .then(|| home.join(".agent-ide").join("logs"))
+/// Initializes the process-wide writer for an already derived repository `key` (first call wins).
+///
+/// For an MCP client whose own runtime directory says nothing about its repository.
+pub fn init_repository(key: &str) {
+    let _ = WRITER.set(
+        log_root()
+            .filter(|_| valid_key(key))
+            .map(|root| Writer::new(root.join(key))),
+    );
+}
+
+/// Environment variable carrying the 16 lowercase hex repository key the reader derives for the
+/// daemon's repository, set by the MCP process that spawns the daemon.
+pub const LOG_KEY_ENV: &str = "AGENT_IDE_LOG_KEY";
+
+/// Whether `key` has the shape of a repository key: 16 lowercase hex characters.
+fn valid_key(key: &str) -> bool {
+    key.len() == 16 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Returns `<real home>/.agent-ide/logs` (see [`crate::userhome`]), or `None` without a home.
+pub fn log_root() -> Option<PathBuf> {
+    Some(
+        crate::userhome::user_home()?
+            .join(".agent-ide")
+            .join("logs"),
+    )
 }
 
 /// Optional closed context for one [`record`] call; every field is logged only when the caller
