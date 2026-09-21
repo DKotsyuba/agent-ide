@@ -10,7 +10,7 @@ use super::{
         ActiveBindingUse, BindingRef, HostBindingGuard, ObservedSandboxState, ValidatedInvocation,
     },
     launcher::{AcceptedProviderSettings, LaunchTarget, LauncherConfig},
-    problems::{ProblemSource, ProjectProblemFeed, parse_language, problems_text_with_stale},
+    problems::{ProblemSource, ProjectProblemFeed, parse_language, problems_text_with_rechecks},
     reply::{EditDiagnostics, FailureCode, PeerReply, ResultKind},
 };
 use crate::telemetry::{
@@ -3192,8 +3192,8 @@ impl<'a> Worker<'a> {
                     .get("offset")
                     .and_then(Value::as_u64)
                     .map_or(0, |offset| u32::try_from(offset).unwrap_or(u32::MAX));
-                let stale = source.stale(authority.worktree().worktree_path());
-                problems_text_with_stale(&snapshots, &stale, language, offset)
+                let rechecks = source.rechecks(authority.worktree().worktree_path());
+                problems_text_with_rechecks(&snapshots, &rechecks, language, offset)
             }
             None => "checks disabled".to_owned(),
         };

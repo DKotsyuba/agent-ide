@@ -100,6 +100,9 @@ struct WorktreeState {
     repository_key: String,
     /// Counter incremented on every [`Scheduler::trigger`] call for this worktree.
     input_generation: u64,
+    /// `input_generation` at the most recent [`Scheduler::activate`]; a snapshot older than it
+    /// predates the current session's activation.
+    activation_generation: u64,
     /// Per-language state, created lazily on first trigger or debounce firing.
     languages: HashMap<Language, LanguageState>,
     /// Outcome of this worktree's Rust `target/` clone decision, for [`Scheduler::rust_cache_clone_outcome`].
@@ -112,6 +115,7 @@ impl WorktreeState {
         Self {
             repository_key: repository_key.to_string(),
             input_generation: 0,
+            activation_generation: 0,
             languages: HashMap::new(),
             rust_clone_outcome: RustCacheClone::NotAttempted,
         }
@@ -203,6 +207,18 @@ impl Scheduler {
     /// `input_generation` once regardless of how many languages are configured. A trigger
     /// received after [`Scheduler::shutdown`] has started is silently ignored.
     pub fn trigger(&self, repository_key: &str, worktree: &Path) {
+        self.trigger_inner(repository_key, worktree, false);
+    }
+
+    /// Like [`Scheduler::trigger`], for a session activating `worktree`: also records the new
+    /// `input_generation` as the activation generation, so [`Scheduler::stale`] flags every
+    /// snapshot produced before this activation until a check completed after it replaces it.
+    pub fn activate(&self, repository_key: &str, worktree: &Path) {
+        self.trigger_inner(repository_key, worktree, true);
+    }
+
+    /// Shared body of [`Scheduler::trigger`] and [`Scheduler::activate`].
+    fn trigger_inner(&self, repository_key: &str, worktree: &Path, activation: bool) {
         let worktree = canonical_worktree(worktree);
         let mut state = self.inner.lock_state();
         if state.shutting_down {
@@ -214,6 +230,9 @@ impl Scheduler {
             .or_insert_with(|| WorktreeState::new(repository_key));
         wt.repository_key = repository_key.to_string();
         wt.input_generation += 1;
+        if activation {
+            wt.activation_generation = wt.input_generation;
+        }
         for language in self.inner.checkers.keys().copied().collect::<Vec<_>>() {
             let lang = wt.languages.entry(language).or_default();
             if let Some(previous) = lang.timer_abort.take() {
@@ -253,11 +272,14 @@ impl Scheduler {
         snapshots
     }
 
-    /// Returns the languages whose stored snapshot for `worktree` predates its newest input
-    /// generation while a debounce timer is pending or a check is running, in language order.
+    /// Returns the languages whose stored snapshot for `worktree` predates the latest
+    /// [`Scheduler::activate`] while a debounce timer is pending or a check is running, in
+    /// language order.
     ///
-    /// Such a snapshot describes the previous inputs; the pending or running check will replace
-    /// it. Non-blocking and synchronous.
+    /// Such a snapshot may describe another session's inputs; the pending or running check will
+    /// replace it. Ordinary [`Scheduler::trigger`]s do not make a snapshot stale: within a session
+    /// the last completed snapshot stays current until a newer one lands. Non-blocking and
+    /// synchronous.
     pub fn stale(&self, worktree: &Path) -> Vec<Language> {
         let worktree = canonical_worktree(worktree);
         let state = self.inner.lock_state();
@@ -270,7 +292,7 @@ impl Scheduler {
                     .filter(|(_, lang)| {
                         (lang.running || lang.timer_abort.is_some())
                             && lang.latest_snapshot.as_ref().is_some_and(|snapshot| {
-                                snapshot.input_generation < wt.input_generation
+                                snapshot.input_generation < wt.activation_generation
                             })
                     })
                     .map(|(language, _)| *language)
@@ -279,6 +301,29 @@ impl Scheduler {
             .unwrap_or_default();
         stale.sort();
         stale
+    }
+
+    /// Returns the languages of `worktree` with a check running right now, in language order.
+    ///
+    /// Only a started check counts, not an armed debounce timer: a trigger that changes nothing
+    /// (a no-op tool) then never flips the status before its check actually runs (T18B).
+    /// Non-blocking and synchronous.
+    pub fn running(&self, worktree: &Path) -> Vec<Language> {
+        let worktree = canonical_worktree(worktree);
+        let state = self.inner.lock_state();
+        let mut running: Vec<Language> = state
+            .worktrees
+            .get(&worktree)
+            .map(|wt| {
+                wt.languages
+                    .iter()
+                    .filter(|(_, lang)| lang.running)
+                    .map(|(language, _)| *language)
+                    .collect()
+            })
+            .unwrap_or_default();
+        running.sort();
+        running
     }
 
     /// Reports whether any `(worktree, language)` pair has a check running or a debounce timer
