@@ -122,10 +122,6 @@ pub fn tool_schemas() -> [ToolSchema; 6] {
             AssistanceTool::Context,
             json!({
                 "type": "object", "additionalProperties": false,
-                "allOf": [{
-                    "if": {"properties": {"kind": {"const": "problems"}}, "required": ["kind"]},
-                    "else": {"required": ["path"]}
-                }],
                 "properties": {
                     "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES},
                     "byte_offset": {"type": "integer", "minimum": 0, "maximum": MAX_BYTE_OFFSET},
@@ -192,7 +188,16 @@ pub enum ParameterError {
     UnknownField,
     /// A required field was absent, empty, non-string, or over its method-specific limit.
     InvalidField,
+    /// `ide.context` named neither `path` nor `kind: "problems"`.
+    ///
+    /// The published schema stays a plain object (providers such as GLM drop a tool whose schema
+    /// uses `allOf`/`if`/`else`), so this either-or rule lives here instead of in the schema.
+    ContextTarget,
 }
+
+/// Model-facing text for a context request that names neither a path nor the problems kind.
+const CONTEXT_TARGET_MESSAGE: &str =
+    "invalid bounded parameters: ide.context needs either \"path\" or \"kind\":\"problems\"";
 
 /// Holds one validated bounded method payload with no identity or authority fields.
 #[derive(Clone, Debug, PartialEq)]
@@ -269,6 +274,9 @@ pub fn validate_call(
                     None => return Err(ParameterError::InvalidField),
                 },
             };
+            if !problems && !object.contains_key("path") {
+                return Err(ParameterError::ContextTarget);
+            }
             if problems {
                 if object
                     .get("language")
@@ -1090,6 +1098,9 @@ impl StdioFacade {
                 self.dispatch_with_reconnect(tool, parameters, &context)
                     .await
             }
+            Err(ParameterError::ContextTarget) => {
+                return CallToolResult::error(vec![ContentBlock::text(CONTEXT_TARGET_MESSAGE)]);
+            }
             Err(_) => (FacadeOutcome::InvalidParameters, false),
         };
         // The Claude host hands `structuredContent` straight to its model in place of `content`,
@@ -1274,7 +1285,8 @@ impl StdioFacade {
         self.call(AssistanceTool::Start, parameters, context).await
     }
 
-    /// Reads bounded source and diagnostics before or after editing with the native host writer.
+    /// Reads bounded source and diagnostics before or after editing with the native host writer;
+    /// needs `path`, or `kind` set to `problems`.
     #[tool(name = "ide.context", input_schema = tool_schemas()[1].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn context(
         &self,

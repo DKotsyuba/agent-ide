@@ -8,7 +8,7 @@ use std::{
 
 use agent_ide::{
     assistance::{
-        facade::{AssistanceTool, tool_schemas, validate_call},
+        facade::{AssistanceTool, ParameterError, tool_schemas, validate_call},
         problems::{PROBLEMS_PAGE_SIZE, ProblemSource, parse_language, problems_text},
     },
     checks::{CheckState, Language, Problem, ProblemSnapshot, Severity},
@@ -91,8 +91,8 @@ fn context_schema_advertises_bounded_problems_fields() {
     assert_eq!(schema["properties"]["offset"]["type"], "integer");
     assert_eq!(schema["properties"]["offset"]["minimum"], 0);
     assert_eq!(schema["properties"]["offset"]["maximum"], u32::MAX);
-    // A request without the problems kind still advertises the required v0.2 path.
-    assert_eq!(schema["allOf"][0]["else"], json!({"required": ["path"]}));
+    // The either-or rule is enforced by the handler, so the schema names no requirement at all.
+    assert!(schema.get("required").is_none());
 }
 
 /// Accepts the problems kind without a path while rejecting every unbounded argument shape.
@@ -117,6 +117,24 @@ fn validation_accepts_problems_without_path_and_keeps_bounds_closed() {
             "{invalid}"
         );
     }
+}
+
+/// A context request naming neither `path` nor `kind: "problems"` gets the dedicated typed error.
+#[test]
+fn context_without_path_or_problems_kind_is_a_context_target_error() {
+    for invalid in [
+        json!({}),
+        json!({"byte_offset":0}),
+        json!({"detail_ref":"detail-1"}),
+        json!({"kind":"other"}),
+    ] {
+        assert_eq!(
+            validate_call(AssistanceTool::Context, invalid.clone()).unwrap_err(),
+            ParameterError::ContextTarget,
+            "{invalid}"
+        );
+    }
+    assert!(validate_call(AssistanceTool::Context, json!({"path":"src/main.rs"})).is_ok());
 }
 
 /// The source seam stays usable as a shared trait object behind the worker builder.

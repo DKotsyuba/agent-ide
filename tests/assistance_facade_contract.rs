@@ -67,6 +67,45 @@ fn discovery_is_static_and_contains_exactly_six_current_methods() {
     );
 }
 
+/// Walks a schema value and reports every JSON-Schema composition keyword it finds.
+fn composition_keywords(value: &serde_json::Value, found: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                if matches!(
+                    key.as_str(),
+                    "allOf" | "anyOf" | "oneOf" | "if" | "then" | "else" | "not"
+                ) {
+                    found.push(key.clone());
+                }
+                composition_keywords(child, found);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            items
+                .iter()
+                .for_each(|item| composition_keywords(item, found));
+        }
+        _ => {}
+    }
+}
+
+/// Providers that accept only a plain object schema (GLM) drop a tool using composition keywords.
+#[test]
+fn published_schemas_are_plain_objects_without_composition_keywords() {
+    for schema in tool_schemas() {
+        let mut found = Vec::new();
+        composition_keywords(&schema.input_schema, &mut found);
+        assert!(found.is_empty(), "{} uses {found:?}", schema.name);
+        assert_eq!(schema.input_schema["type"], "object", "{}", schema.name);
+        assert!(
+            schema.input_schema["properties"].is_object(),
+            "{}",
+            schema.name
+        );
+    }
+}
+
 #[test]
 fn validation_rejects_unknown_identity_and_requires_stable_operation_and_detail_ids() {
     assert!(validate_call(AssistanceTool::Start, json!({"activation_id":"activate-1"})).is_ok());

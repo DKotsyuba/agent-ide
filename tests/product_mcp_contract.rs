@@ -432,6 +432,19 @@ async fn binary_discovery_is_static_and_inactive_calls_are_fail_open() {
             .unwrap()
             .contains("invalid bounded parameters")
     );
+    // The plain `ide.context` schema cannot express "path or problems", so the handler explains it.
+    let no_target = mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{
+                "name":"ide.context","arguments":{}
+            }}),
+        )
+        .await;
+    assert_eq!(no_target["result"]["isError"], true);
+    assert_eq!(
+        no_target["result"]["content"][0]["text"],
+        "invalid bounded parameters: ide.context needs either \"path\" or \"kind\":\"problems\""
+    );
     mcp.close().await;
     assert!(!runtime.exists());
 }
