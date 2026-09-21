@@ -9,6 +9,8 @@
 //! copy-on-write clone of a sibling worktree's `target/` directory. Between completions, a run
 //! is further throttled by a cooldown of `max(debounce, previous run duration)`, and a
 //! transient `Fatal`/`Timeout` completion never overwrites an existing `Ready`/`Partial` result.
+//! (T20B) A debounce firing whose worktree inputs are unchanged since the pair's last completed
+//! `Ready` run skips the run entirely; an activation-requested check is never skipped.
 //! Cache directories live under a caller-supplied `cache_root` (for example
 //! `$HOME/.agent-ide/checks`) and record enough to let [`sweep_stale_caches`](crate::checks::scheduler::sweep_stale_caches) reclaim caches for
 //! worktrees that no longer exist.
@@ -26,11 +28,16 @@ use tokio::task::AbortHandle;
 // `tokio::time::advance` deterministically.
 use tokio::time::Instant;
 
+use super::fingerprint::git_worktree_fingerprint;
 use super::{CheckRequest, CheckState, Checker, Language, ProblemSnapshot, UnavailableReason};
 
 /// Name of the marker file written in each worktree-level cache directory, recording the
 /// worktree's canonical path so [`sweep_stale_caches`] can find directories to remove.
 const WORKTREE_MARKER_FILE_NAME: &str = "worktree.path";
+
+/// Fingerprint of one worktree's check-relevant inputs: `Some(hash)` when the inputs could be
+/// fingerprinted cheaply, `None` when unknown (the scheduler then assumes "changed" and runs).
+pub type FingerprintFn = Arc<dyn Fn(&Path) -> Option<u64> + Send + Sync>;
 
 /// Outcome of the copy-on-write `target/` clone attempted before a worktree's first Rust check.
 ///
@@ -71,6 +78,9 @@ struct Inner {
     state: Mutex<State>,
     /// Optional observer called once with every snapshot a [`Checker`] run completes with.
     on_complete: Option<CompletionHook>,
+    /// Worktree input fingerprint consulted when a debounce fires for a pair whose last
+    /// completed run was `Ready` (T20B); always called off the state lock.
+    fingerprint: FingerprintFn,
 }
 
 /// Observer of completed check runs, installed through [`Scheduler::with_completion_hook`].
@@ -105,6 +115,10 @@ struct WorktreeState {
     activation_generation: u64,
     /// Per-language state, created lazily on first trigger or debounce firing.
     languages: HashMap<Language, LanguageState>,
+    /// `true` while the currently armed debounce timers were armed by [`Scheduler::activate`];
+    /// their firings must run even when the worktree inputs are unchanged (T20B). Cleared by
+    /// the next ordinary [`Scheduler::trigger`].
+    activation_armed: bool,
     /// Outcome of this worktree's Rust `target/` clone decision, for [`Scheduler::rust_cache_clone_outcome`].
     rust_clone_outcome: RustCacheClone,
 }
@@ -117,6 +131,7 @@ impl WorktreeState {
             input_generation: 0,
             activation_generation: 0,
             languages: HashMap::new(),
+            activation_armed: false,
             rust_clone_outcome: RustCacheClone::NotAttempted,
         }
     }
@@ -142,6 +157,16 @@ struct LanguageState {
     last_completion: Option<Instant>,
     /// Wall-clock duration of the most recent run, for the EYES-r2 cooldown.
     last_duration: Duration,
+    /// Worktree fingerprint captured at the current (or most recent) run's start (T20B); moved
+    /// into `completed_fingerprint` when that run completes, so an edit made mid-run is not
+    /// mistaken for unchanged input.
+    run_start_fingerprint: Option<u64>,
+    /// Fingerprint the last completed run started with (T20B); the skip comparison baseline.
+    completed_fingerprint: Option<u64>,
+    /// `true` only when the last completed run ended `Ready` (T20B): any other outcome —
+    /// `Partial`, `Checking`, or an `Unavailable` failure or condition — must be re-checked on
+    /// the next trigger, so only a `Ready` completion arms the skip-unchanged rule.
+    skip_eligible: bool,
 }
 
 /// Per-repository state shared across sibling worktrees.
@@ -178,8 +203,25 @@ impl Scheduler {
                 cache_root,
                 state: Mutex::new(State::default()),
                 on_complete: None,
+                fingerprint: Arc::new(git_worktree_fingerprint),
             }),
         }
+    }
+
+    /// Installs `fingerprint` as the worktree input fingerprint (T20B), replacing the
+    /// git-based [`git_worktree_fingerprint`] default; used by tests to script unchanged and
+    /// changed inputs (`None` = unknown = run).
+    ///
+    /// Must be called on the freshly built scheduler before it is cloned or triggered.
+    ///
+    /// # Panics
+    ///
+    /// Panics when another clone of this scheduler already exists.
+    pub fn with_fingerprint(mut self, fingerprint: FingerprintFn) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("fingerprint function must be installed before the scheduler is shared")
+            .fingerprint = fingerprint;
+        self
     }
 
     /// Installs `hook`, called with every snapshot a check run completes with (for example to
@@ -230,11 +272,18 @@ impl Scheduler {
             .or_insert_with(|| WorktreeState::new(repository_key));
         wt.repository_key = repository_key.to_string();
         wt.input_generation += 1;
+        wt.activation_armed = activation;
         if activation {
             wt.activation_generation = wt.input_generation;
         }
         for language in self.inner.checkers.keys().copied().collect::<Vec<_>>() {
             let lang = wt.languages.entry(language).or_default();
+            if activation {
+                // An ordinary trigger inside the debounce window clears `activation_armed`; the
+                // dropped baseline keeps the session's first check from being skipped anyway.
+                lang.skip_eligible = false;
+                lang.completed_fingerprint = None;
+            }
             if let Some(previous) = lang.timer_abort.take() {
                 previous.abort();
             }
@@ -395,10 +444,16 @@ impl Inner {
     ///
     /// Clears the timer handle first so a subsequent trigger starts an independent new timer
     /// rather than perceiving this firing one as still pending. If a check is already running for
-    /// this pair, marks it dirty and returns; otherwise marks the pair running and spawns
-    /// [`Inner::run_check_loop`] to perform it.
+    /// this pair, marks it dirty and returns. Otherwise (T20B) the worktree input fingerprint is
+    /// computed *off* the state lock, and the run is skipped entirely when it equals the
+    /// fingerprint the pair's last completed `Ready` run started with and the timers were not
+    /// armed by an activation: no checker process, no `running` flag, no snapshot, no completion
+    /// hook. During the fingerprint computation the pair is momentarily neither running nor
+    /// timer-armed, so `is_busy` can briefly report idle; a trigger arriving in that window
+    /// re-arms a timer whose firing owns the decision instead (this firing sees the newer timer
+    /// or run on re-locking and stands down).
     async fn on_debounce_fire(inner: Arc<Self>, worktree: PathBuf, language: Language) {
-        let should_run = {
+        let (force_run, skip_eligible, completed_fingerprint) = {
             let mut state = inner.lock_state();
             if state.shutting_down {
                 return;
@@ -412,6 +467,42 @@ impl Inner {
             lang.timer_abort = None;
             if lang.running {
                 lang.dirty = true;
+                return;
+            }
+            (
+                wt.activation_armed,
+                lang.skip_eligible,
+                lang.completed_fingerprint,
+            )
+        };
+        // Only a fingerprint that could actually cause a skip is worth computing; git may take
+        // up to its own budget, so this never happens under the state lock.
+        let fingerprint = if !force_run && skip_eligible {
+            inner.fingerprint_value(&worktree).await
+        } else {
+            None
+        };
+        let should_run = {
+            let mut state = inner.lock_state();
+            if state.shutting_down {
+                return;
+            }
+            let Some(wt) = state.worktrees.get_mut(&worktree) else {
+                return;
+            };
+            if wt
+                .languages
+                .get(&language)
+                .is_some_and(|lang| lang.running || lang.timer_abort.is_some())
+            {
+                // A trigger since the fingerprint was taken re-armed a timer or started a run;
+                // that newer decision supersedes this firing.
+                return;
+            }
+            let Some(lang) = wt.languages.get_mut(&language) else {
+                return;
+            };
+            if !force_run && fingerprint.is_some() && completed_fingerprint == fingerprint {
                 false
             } else {
                 lang.running = true;
@@ -466,6 +557,7 @@ impl Inner {
                 let snapshot =
                     ProblemSnapshot::unavailable(language, UnavailableReason::Disabled, generation);
                 inner.store_snapshot(&worktree, snapshot);
+                inner.mark_run_ineligible(&worktree, language);
                 if !inner.finish_run(&worktree, language, true) {
                     return;
                 }
@@ -503,6 +595,20 @@ impl Inner {
                 cache_dir: cache_dir.clone(),
                 input_generation: generation,
             };
+            // Fingerprint at the START of the run (T20B), so an edit made while the check is in
+            // flight is recorded as the completed run's baseline only if it happened before the
+            // run began; computed off the state lock, just before dispatch.
+            let run_start_fingerprint = inner.fingerprint_value(&worktree).await;
+            {
+                let mut state = inner.lock_state();
+                if let Some(lang) = state
+                    .worktrees
+                    .get_mut(&worktree)
+                    .and_then(|wt| wt.languages.get_mut(&language))
+                {
+                    lang.run_start_fingerprint = run_start_fingerprint;
+                }
+            }
             crate::errorlog::record(
                 crate::errorlog::Method::Check,
                 crate::errorlog::Outcome::Started,
@@ -519,8 +625,9 @@ impl Inner {
             if let Some(hook) = &inner.on_complete {
                 hook(&snapshot);
             }
+            let completed_state = snapshot.state.clone();
             inner.store_snapshot(&worktree, snapshot);
-            inner.record_completion(&worktree, language, duration);
+            inner.record_completion(&worktree, language, duration, &completed_state);
             if language == Language::Rust {
                 inner.record_completed_rust_cache(&worktree, &cache_dir);
             }
@@ -580,8 +687,18 @@ impl Inner {
 
     /// Records `duration` as the wall-clock time `(worktree, language)`'s most recently
     /// completed run took, together with the completion instant, for the next iteration's
-    /// [`Inner::cooldown_remaining`] check.
-    fn record_completion(&self, worktree: &Path, language: Language, duration: Duration) {
+    /// [`Inner::cooldown_remaining`] check, and moves that run's start fingerprint into the
+    /// skip-unchanged baseline (T20B). Only a `Ready` completion arms the skip rule: a `Partial`
+    /// result still has incomplete coverage and every `Unavailable` outcome — transient failure
+    /// or durable condition — must be re-checked on the next trigger, so any non-`Ready` state
+    /// (and the stale baseline with it) is dropped here.
+    fn record_completion(
+        &self,
+        worktree: &Path,
+        language: Language,
+        duration: Duration,
+        completed_state: &CheckState,
+    ) {
         let mut state = self.lock_state();
         if let Some(lang) = state
             .worktrees
@@ -590,7 +707,37 @@ impl Inner {
         {
             lang.last_completion = Some(Instant::now());
             lang.last_duration = duration;
+            lang.completed_fingerprint = lang.run_start_fingerprint.take();
+            lang.skip_eligible = matches!(completed_state, CheckState::Ready);
         }
+    }
+
+    /// Drops the skip-unchanged baseline for a `(worktree, language)` pair whose latest run
+    /// completed without dispatching a checker (T20B: a language found absent stores
+    /// `Unavailable(Disabled)` directly); the next trigger must not compare against an
+    /// out-of-date baseline.
+    fn mark_run_ineligible(&self, worktree: &Path, language: Language) {
+        let mut state = self.lock_state();
+        if let Some(lang) = state
+            .worktrees
+            .get_mut(worktree)
+            .and_then(|wt| wt.languages.get_mut(&language))
+        {
+            lang.run_start_fingerprint = None;
+            lang.completed_fingerprint = None;
+            lang.skip_eligible = false;
+        }
+    }
+
+    /// Computes `worktree`'s input fingerprint through [`Inner::fingerprint`], off the state
+    /// lock, on the blocking thread pool (the git-based implementation spawns a process and may
+    /// take up to its own budget). A panicking or cancelled computation is `None`: unknown, run.
+    async fn fingerprint_value(&self, worktree: &Path) -> Option<u64> {
+        let fingerprint = Arc::clone(&self.fingerprint);
+        let worktree = worktree.to_path_buf();
+        tokio::task::spawn_blocking(move || fingerprint(&worktree))
+            .await
+            .unwrap_or(None)
     }
 
     /// Computes how much longer `(worktree, language)` must wait before its next run starts

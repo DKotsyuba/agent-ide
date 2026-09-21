@@ -10,6 +10,9 @@ pub mod python;
 pub mod runner;
 pub mod rust;
 
+/// Cheap whole-worktree input fingerprint backing the scheduler's skip-unchanged rule (T20B).
+pub mod fingerprint;
+
 use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};

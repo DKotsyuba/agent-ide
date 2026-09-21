@@ -277,6 +277,15 @@ pub struct ProblemSnapshot { pub language: Language, pub state: CheckState,
   is the first thing re-evaluated once a debounce fires, before the cooldown wait, cache directory
   preparation or checker dispatch: an absent language stores `Unavailable(Disabled)` directly and
   skips the rest of the run, so it spawns no process and creates no cache directory.
+- (T20B) After presence, a firing for a pair whose last completed run ended `Ready` fingerprints
+  the worktree inputs off the scheduler lock — a bounded `git ls-files -z --cached --others
+  --exclude-standard` walk hashing each path with its size and mtime; failure, timeout or a
+  non-git worktree counts as unknown — and skips the run when the fingerprint equals the one
+  recorded at that completed run's start: no checker process, no `running` flag, no snapshot, no
+  completion hook, and the stored snapshot stays current. A check requested by `ide.start`
+  activation always runs, as does a pair with no completed snapshot, a pair whose last run ended
+  in any non-`Ready` state, and any run whose inputs changed (the fingerprint is retaken at run
+  start, so an edit made mid-run is not lost).
 - A new worktree's Rust cache directory, when absent, is first cloned copy-on-write
   (`clonefile`/`cp -c -R`) from the most recently completed sibling worktree of the same repository;
   clone failure falls back to a cold check.
