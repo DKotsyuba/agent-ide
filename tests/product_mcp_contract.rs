@@ -1757,8 +1757,16 @@ impl ProductActor {
         }
         post
     }
-    /// Runs the exact foreground helper named by a pending reply and returns its owned handle.
-    async fn launch_claude_pending(&self, fixture: &ProductFixture, pending: &Value) -> String {
+    /// Arms and runs the exact foreground helper named by a pending reply.
+    ///
+    /// Sends the `Bash` pre-hook that makes the launch recognizable, runs the helper to delivery,
+    /// and returns `(detail_ref, launch_call)` with the helper's own `Bash` post hook left for the
+    /// caller, which may want to inspect or withhold it (T22B).
+    async fn run_claude_pending(
+        &self,
+        fixture: &ProductFixture,
+        pending: &Value,
+    ) -> (String, String) {
         assert_eq!(pending["state"], "pending", "{pending}");
         let detail_ref = pending["detail_ref"].as_str().unwrap().to_owned();
         let helper = pending["helper"].as_str().unwrap().to_owned();
@@ -1790,6 +1798,14 @@ impl ProductActor {
             "helper failed: {}",
             String::from_utf8_lossy(&helper_output.stderr)
         );
+        (detail_ref, launch_call)
+    }
+    /// Runs the exact foreground helper named by a pending reply and returns its owned handle.
+    ///
+    /// The helper's own `Bash` post hook is sent and asserted silent; a caller that expects model
+    /// context there must use [`Self::run_claude_pending`] and send the post itself (T22B).
+    async fn launch_claude_pending(&self, fixture: &ProductFixture, pending: &Value) -> String {
+        let (detail_ref, launch_call) = self.run_claude_pending(fixture, pending).await;
         let mut post = claude_hook_process(&fixture.runtime, Some(self.attachment));
         post.stdin
             .take()
@@ -1809,7 +1825,8 @@ impl ProductActor {
     /// Runs the exact foreground helper named by a pending reply, then inspects its settled result.
     ///
     /// Returns the structured result and the inspect call's post-hook stdout. Start/Diff produce an
-    /// empty hook output; Context may produce the actual bounded `additionalContext` delta.
+    /// empty hook output unless a status plate is due there (T22B); Context may produce the actual
+    /// bounded `additionalContext` delta.
     async fn complete_claude_pending(
         &mut self,
         fixture: &ProductFixture,
@@ -6011,13 +6028,27 @@ async fn configured_product_claude_helper_returns_context_diff_and_feedback() {
 /// worktree's untracked `problems.count` value, so tests change counts without a real compiler.
 /// `allowed_root` is the configured admission root. Returns the redirected daemon home (`AGENT_IDE_HOME`).
 fn enable_fake_rust_checks(fixture: &ProductFixture, allowed_root: &Path) -> PathBuf {
+    enable_fake_rust_checks_holding(fixture, allowed_root, "")
+}
+
+/// Same, with a shell command prepended to the fake `cargo` so a test can hold the first check
+/// in its running state long enough to observe a `checking (…)` plate (T22B).
+fn enable_fake_rust_checks_holding(
+    fixture: &ProductFixture,
+    allowed_root: &Path,
+    hold: &str,
+) -> PathBuf {
     let home = fixture.base.join("home");
     let toolchain = home.join(".rustup/toolchains/fake");
     std::fs::create_dir_all(toolchain.join("bin")).unwrap();
     std::fs::create_dir_all(home.join(".cargo")).unwrap();
     let cargo = toolchain.join("bin/cargo");
-    std::fs::write(
-        &cargo,
+    let mut script = String::new();
+    if !hold.is_empty() {
+        script.push_str(hold);
+        script.push('\n');
+    }
+    script.push_str(
         r#"#!/bin/sh
 n=$(/bin/cat problems.count 2>/dev/null || echo 0)
 i=0
@@ -6028,8 +6059,8 @@ done
 printf '{"reason":"compiler-artifact","package_id":"fixture"}\n'
 printf '{"reason":"build-finished","success":true}\n'
 "#,
-    )
-    .unwrap();
+    );
+    std::fs::write(&cargo, script).unwrap();
     std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
     let mut config: Value =
         serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
@@ -6039,16 +6070,34 @@ printf '{"reason":"build-finished","success":true}\n'
     home
 }
 
-/// Activates a Claude actor through the real foreground helper and returns it.
-async fn eyes_claude_actor(fixture: &ProductFixture, actor: &'static str) -> ProductActor {
+/// Activates a Claude actor through the real foreground helper.
+///
+/// Returns the actor and the `additionalContext` the activation inspect call's own post hook
+/// delivered: the first due status plate arrives there now (T22B), empty when checks are off.
+async fn eyes_claude_actor(
+    fixture: &ProductFixture,
+    actor: &'static str,
+) -> (ProductActor, String) {
     let mut actor = ProductActor::new(fixture, actor).await;
     let started = actor
         .call_claude(fixture, "ide.start", json!({"activation_id":"eyes"}))
         .await;
     let (started, feedback) = actor.complete_claude_pending(fixture, &started).await;
     assert_eq!(started["kind"], "activation", "{started}");
-    assert!(feedback.is_empty());
-    actor
+    let context = if feedback.is_empty() {
+        String::new()
+    } else {
+        let rendered: Value = serde_json::from_str(&String::from_utf8(feedback).unwrap()).unwrap();
+        assert_eq!(
+            rendered["hookSpecificOutput"]["hookEventName"], "PostToolUse",
+            "{rendered}"
+        );
+        rendered["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    (actor, context)
 }
 
 /// Polls native `Read` post-hooks until one carries a model context, returning its text.
@@ -6103,7 +6152,10 @@ async fn eyes_claude_post_hook_delivers_problem_block_and_delta() {
     let home = enable_fake_rust_checks(&fixture, &fixture.base);
     std::fs::write(fixture.root.join("problems.count"), "2").unwrap();
     let mut daemon = fixture.daemon_with_home(Some(&home)).await;
-    let mut actor = eyes_claude_actor(&fixture, "claude-eyes").await;
+    let (mut actor, checking) = eyes_claude_actor(&fixture, "claude-eyes").await;
+    // The first due plate reaches the activation inspect call's own post hook (T22B); the 100 ms
+    // debounce means the check cannot have completed before that hook fires.
+    assert!(checking.contains("checking (first check)"), "{checking}");
 
     let first = await_eyes_result(&mut actor, &fixture).await;
     assert_eq!(
@@ -6168,6 +6220,97 @@ async fn eyes_claude_post_hook_delivers_problem_block_and_delta() {
     assert!(home.join(".agent-ide/checks").is_dir());
 }
 
+/// A plate that becomes due while a helper runs is delivered on the helper's own `Bash` post (T22B).
+///
+/// The activation inspect call's post hook and a second helper's minting post hook are both
+/// withheld, so no hook fires between the activation and the helper's own `Bash` post; that post
+/// delivers the still-running first check's plate exactly once, and the withheld posts plus the
+/// following native post stay silent.
+#[tokio::test]
+async fn eyes_claude_helper_post_delivers_due_first_check_plate_once() {
+    let fixture = ProductFixture::new_claude(json!([]));
+    let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, "sleep 20");
+    std::fs::write(fixture.root.join("problems.count"), "1").unwrap();
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "claude-eyes-helper-post").await;
+
+    let started = actor
+        .call_claude(&fixture, "ide.start", json!({"activation_id":"eyes"}))
+        .await;
+    // The start helper's own Bash post stays silent: activation is not complete yet.
+    let start_ref = actor.launch_claude_pending(&fixture, &started).await;
+
+    // Activation completes inside this inspect exchange; its post hook is withheld so the
+    // first-check plate stays due.
+    actor.next += 1;
+    let inspect_call = format!("call-{}", actor.next);
+    actor
+        .claude_lifecycle(&fixture, "PreToolUse", &inspect_call)
+        .await;
+    let reply = actor
+        .mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
+            "name":"ide.inspect","arguments":{"detail_ref":start_ref},
+            "_meta":{"claudecode/toolUseId":inspect_call}}}),
+        )
+        .await;
+    let started = claude_fields(assert_claude_envelope(&reply));
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    // A second helper is minted (its own post hook withheld too), then armed and run while the
+    // first check is still held running by the sleeping fake cargo.
+    actor.next += 1;
+    let diff_call = format!("call-{}", actor.next);
+    actor
+        .claude_lifecycle(&fixture, "PreToolUse", &diff_call)
+        .await;
+    let diff_reply = actor
+        .mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
+            "name":"ide.diff","arguments":{"mode":"head"},
+            "_meta":{"claudecode/toolUseId":diff_call}}}),
+        )
+        .await;
+    let diff = claude_fields(assert_claude_envelope(&diff_reply));
+    assert_eq!(diff["state"], "pending", "{diff}");
+    let (_detail_ref, launch_call) = actor.run_claude_pending(&fixture, &diff).await;
+
+    // The helper's own Bash post hook carries the due plate.
+    let post = actor
+        .claude_lifecycle_output(&fixture, "PostToolUse", &launch_call)
+        .await;
+    assert!(post.status.success() && post.stderr.is_empty());
+    let rendered: Value = serde_json::from_str(&String::from_utf8(post.stdout).unwrap()).unwrap();
+    assert_eq!(
+        rendered["hookSpecificOutput"]["hookEventName"], "PostToolUse",
+        "{rendered}"
+    );
+    let plate = rendered["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(plate.contains("checking (first check)"), "{plate}");
+
+    // The identical plate is never repeated: the two withheld MCP posts and the next native post
+    // stay silent.
+    for call in [diff_call, inspect_call] {
+        let withheld = actor
+            .claude_lifecycle_output(&fixture, "PostToolUse", &call)
+            .await;
+        assert!(
+            withheld.status.success() && withheld.stdout.is_empty() && withheld.stderr.is_empty()
+        );
+    }
+    assert!(actor.claude_native_post(&fixture, "Read").await.is_empty());
+
+    let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A worktree outside every allowed root schedules no check and reports `outside allowed roots`.
 #[tokio::test]
 async fn eyes_outside_roots_reports_unavailable_without_checking() {
@@ -6176,13 +6319,15 @@ async fn eyes_outside_roots_reports_unavailable_without_checking() {
     std::fs::create_dir_all(&elsewhere).unwrap();
     let home = enable_fake_rust_checks(&fixture, &elsewhere);
     let mut daemon = fixture.daemon_with_home(Some(&home)).await;
-    let mut actor = eyes_claude_actor(&fixture, "claude-eyes-outside").await;
+    let (mut actor, block) = eyes_claude_actor(&fixture, "claude-eyes-outside").await;
 
-    let block = await_eyes_block(&mut actor, &fixture).await;
+    // No check can ever complete here, so the one due plate already arrived on the activation
+    // inspect call's own post hook (T22B) and the next native post must not repeat it.
     assert_eq!(
         block,
         "<agent-ide>\nrust: outside allowed roots\n</agent-ide>"
     );
+    assert!(actor.claude_native_post(&fixture, "Read").await.is_empty());
     assert_eq!(
         eyes_problems(&mut actor, &fixture).await,
         "rust: unavailable:outside_roots"
@@ -6205,7 +6350,8 @@ async fn eyes_outside_roots_reports_unavailable_without_checking() {
 async fn eyes_absent_configuration_keeps_v02_hook_replies() {
     let fixture = ProductFixture::new_claude(json!([]));
     let mut daemon = fixture.daemon().await;
-    let mut actor = eyes_claude_actor(&fixture, "claude-eyes-absent").await;
+    let (mut actor, delivered) = eyes_claude_actor(&fixture, "claude-eyes-absent").await;
+    assert!(delivered.is_empty(), "{delivered}");
 
     for tool in ["Edit", "Read"] {
         assert!(actor.claude_native_post(&fixture, tool).await.is_empty());

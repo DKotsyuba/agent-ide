@@ -349,7 +349,9 @@ rust: 3 errors (+2), 5 warnings | python: environment not found
   delivered happens when the hook response is produced (at most once; a lost hook response is not
   retried). When the v0.2 one-shot native feedback is eligible in the same hook response, the block
   is prepended and both are concatenated once within `MAX_FEEDBACK_BYTES`; each is marked delivered
-  independently.
+  independently. A due plate is also delivered on a foreground helper's own `Bash` post hook after
+  its settlement, and on the `PostToolUse` of the Claude MCP tool whose invocation settled (T22B);
+  neither triggers a recheck nor advances the native epoch.
 - Codex and other hosts: no active block in v0.3.
 
 ## 7. `ide.context` with `kind: "problems"`
