@@ -25,7 +25,7 @@ use agent_ide::app::{
 };
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
     process::{Child, ChildStdin, ChildStdout, Command},
 };
@@ -837,4 +837,64 @@ async fn daemon_survives_first_of_two_mcp_leases_exiting_and_idles_after_the_sec
         .expect("idle expiry must fire once the second, and last, lease also releases")
         .unwrap();
     assert!(!runtime.exists());
+}
+
+/// Sends one raw v3 `assistance.method_dispatch` frame to the in-process daemon and returns its
+/// correlated reply; the real v2/v3 Assistance framing (one big-endian u32 length prefix).
+async fn exchange_v3(runtime: &Path, request_id: &str) -> Value {
+    let mut stream = UnixStream::connect(runtime.join("agent-ide.sock"))
+        .await
+        .unwrap();
+    let request = json!({
+        "version": 3,
+        "request_id": request_id,
+        "correlation_id": format!("corr-{request_id}"),
+        "opaque_attachment": "private-host-channel",
+        "method": "assistance.method_dispatch",
+        "dispatch_method": "start",
+        "params_json": {"parameters": {"activation_id": request_id}}
+    });
+    let body = serde_json::to_vec(&request).unwrap();
+    stream
+        .write_all(&(body.len() as u32).to_be_bytes())
+        .await
+        .unwrap();
+    stream.write_all(&body).await.unwrap();
+    let mut length = [0_u8; 4];
+    stream.read_exact(&mut length).await.unwrap();
+    let mut body = vec![0; u32::from_be_bytes(length) as usize];
+    stream.read_exact(&mut body).await.unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+/// A lease-free client session is visible to the daemon only through the calls it serves (T26B):
+/// the managed Codex MCP owns its per-session daemon outright and holds no `ClientLease` at all.
+/// A served v3 Assistance call within the idle window must restart the countdown — the daemon
+/// outlives the original deadline — and one full silent window after the last served call must
+/// still end it, so the idle-shutdown contract keeps exactly its configured meaning.
+#[tokio::test]
+async fn a_served_assistance_call_restarts_the_idle_countdown() {
+    const IDLE_MS: u64 = 600;
+    let (runtime, task) = start_lease_test_daemon(Duration::from_millis(IDLE_MS)).await;
+
+    // One served call at half the window; without the restart the daemon would exit at 1x window.
+    tokio::time::sleep(Duration::from_millis(IDLE_MS / 2)).await;
+    let reply = exchange_v3(&runtime, "idle-probe").await;
+    assert_eq!(reply["status"], json!("unavailable"), "{reply}");
+
+    // Past the ORIGINAL deadline; still alive proves the served call restarted the countdown.
+    tokio::time::sleep(Duration::from_millis(IDLE_MS * 3 / 4)).await;
+    assert!(
+        !task.is_finished(),
+        "a served call within the idle window must restart the idle countdown"
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("one full silent window after the last served call must still end the daemon")
+        .unwrap();
+    assert!(
+        !runtime.exists(),
+        "orderly idle shutdown must remove its own runtime directory"
+    );
 }

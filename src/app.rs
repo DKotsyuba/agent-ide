@@ -259,7 +259,8 @@ async fn run_daemon_inner(
     }
     let mut connections = tokio::task::JoinSet::new();
     let mut owned_socket = None;
-    // A pending or running project check keeps a lease-free daemon from idling out (EYES-r2 §2).
+    // Pending/running assistance jobs and project checks keep a lease-free daemon from idling
+    // out (EYES-r2 §2); served calls restart the countdown at the connection layer (T26B).
     let busy = dispatcher.clone();
     let lease = lease::LeaseController::new(idle_timeout, move || {
         busy.as_ref().is_some_and(|dispatcher| dispatcher.is_busy())
@@ -654,6 +655,11 @@ async fn serve_accepted_connection(
                 Ok(None)
             }
             Some(2 | 3) => {
+                // A served v2/v3 Assistance call proves a live client session. A lease-free
+                // session (the managed Codex MCP owns its per-session daemon and holds no
+                // `ClientLease`) is visible only through these calls, so each one restarts the
+                // idle countdown instead of letting the daemon exit mid-conversation (T26B).
+                lease.mark_activity();
                 if let (Some(dispatcher), Some(limits)) = (dispatcher, transport_limits)
                     && let Ok(_permit) = permits.try_acquire_owned()
                 {

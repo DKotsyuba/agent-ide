@@ -71,6 +71,18 @@ impl LeaseController {
         self.0.hooks.lock().unwrap().push(Box::new(hook));
     }
 
+    /// Reports one served client call, restarting the idle countdown from now (T26B).
+    ///
+    /// A lease-free client session (the managed Codex MCP owns its per-session daemon outright and
+    /// holds no `ClientLease` at all) is visible to the daemon only through the calls it serves.
+    /// Every served Assistance call counts as activity, so a session that made a call within the
+    /// idle window is never idled out mid-conversation; a session that goes completely silent
+    /// still lets the daemon exit after exactly one full idle timeout, unchanged from EYES-r2 §2.
+    pub fn mark_activity(&self) {
+        *self.0.became_idle_at.lock().unwrap() = Some(Instant::now());
+        self.0.changed.notify_waiters();
+    }
+
     /// Admits one open lease if the bounded pool has room, cancelling any pending idle countdown.
     ///
     /// Returns `None` when [`LEASE_POOL_CAPACITY`] is already reached; the caller must drop the
@@ -107,6 +119,8 @@ impl LeaseController {
     ///
     /// While no lease is open but the daemon is busy, the busy predicate is re-polled every
     /// `BUSY_POLL_INTERVAL` (one second), because nothing else signals the end of daemon-owned work.
+    /// A served client call ([`Self::mark_activity`], T26B) restarts the same countdown instead of
+    /// signalling busyness, so a silent session still expires after exactly one full timeout.
     pub async fn idle_expired(&self) {
         loop {
             let changed = self.0.changed.notified();
@@ -115,7 +129,10 @@ impl LeaseController {
                 Some(deadline) => {
                     tokio::select! {
                         () = tokio::time::sleep_until(deadline) => {
-                            if self.current_deadline().is_some() {
+                            // Exit only when this is still the same countdown: a restarted
+                            // countdown (admission, release, or served activity) moved the due
+                            // instant later, and the already-slept deadline must not expire it.
+                            if self.current_deadline() == Some(deadline) {
                                 return;
                             }
                         }
@@ -247,6 +264,30 @@ mod tests {
             lease.try_admit().is_some(),
             "releasing one lease must free exactly one admission slot"
         );
+    }
+
+    /// Served client activity within the idle window restarts the countdown (T26B): the already
+    /// slept deadline must not expire a countdown that moved, and one full silent window after the
+    /// last activity still ends the daemon.
+    #[tokio::test(start_paused = true)]
+    async fn served_activity_restarts_the_idle_countdown() {
+        let lease = LeaseController::new(Duration::from_millis(50), || false);
+        let expiry = tokio::spawn({
+            let lease = lease.clone();
+            async move { lease.idle_expired().await }
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        lease.mark_activity();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !expiry.is_finished(),
+            "activity within the idle window must restart the countdown past its original deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::time::timeout(Duration::from_millis(200), expiry)
+            .await
+            .expect("one full silent window after the last activity must still expire")
+            .unwrap();
     }
 
     /// Busy daemon-owned work suppresses expiry, and the countdown restarts once the work ends.
