@@ -304,14 +304,20 @@ impl ProjectProblemFeed {
                 .collect();
         }
         let completed = self.scheduler.latest(worktree);
+        // A language absent from the worktree never gets a `checking` placeholder: before its
+        // first result a Python-only project would otherwise announce `rust: checking` (T10B).
         self.languages
             .iter()
-            .map(|language| {
+            .filter_map(|language| {
                 completed
                     .iter()
                     .find(|snapshot| snapshot.language == *language)
                     .cloned()
-                    .unwrap_or_else(|| ProblemSnapshot::checking(*language, 0))
+                    .or_else(|| {
+                        language
+                            .is_present(worktree)
+                            .then(|| ProblemSnapshot::checking(*language, 0))
+                    })
             })
             .collect()
     }
