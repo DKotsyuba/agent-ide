@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use agent_ide::assistance::codex_rendezvous::{CodexRouteIdentity, discover};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -97,6 +98,26 @@ impl Mcp {
         candidate: &Path,
         home: Option<&Path>,
     ) -> Self {
+        Self::start_managed_custom(template, candidate, home, None).await
+    }
+
+    /// Same, with the managed Codex rendezvous root (`AGENT_IDE_CODEX_RENDEZVOUS_ROOT`, the product
+    /// test seam for T29B) redirected into the fixture so route publication is fully observable.
+    async fn start_managed_with_rendezvous(
+        template: &Path,
+        candidate: &Path,
+        rendezvous_root: &Path,
+    ) -> Self {
+        Self::start_managed_custom(template, candidate, None, Some(rendezvous_root)).await
+    }
+
+    /// Starts one managed Codex MCP with optional home and rendezvous-root redirection.
+    async fn start_managed_custom(
+        template: &Path,
+        candidate: &Path,
+        home: Option<&Path>,
+        rendezvous_root: Option<&Path>,
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
         command
             .env("TOKIO_WORKER_THREADS", "1")
@@ -110,6 +131,9 @@ impl Mcp {
             .kill_on_drop(true);
         if let Some(home) = home {
             command.env(agent_ide::userhome::HOME_OVERRIDE_ENV, home);
+        }
+        if let Some(rendezvous_root) = rendezvous_root {
+            command.env("AGENT_IDE_CODEX_RENDEZVOUS_ROOT", rendezvous_root);
         }
         let mut child = command.spawn().unwrap();
         let mut mcp = Self {
@@ -738,6 +762,42 @@ async fn hook(runtime: &Path, phase: &str, field: &str, actor: &str, call: &str)
         .unwrap();
     assert!(output.status.success());
     assert!(output.stdout.is_empty() && output.stderr.is_empty());
+}
+
+/// Creates one fresh owner-only rendezvous test area directly below `/private/tmp`.
+///
+/// Kept short and outside `std::env::temp_dir()`: fixture Unix-socket paths must stay under
+/// `SUN_LEN`, and the area must never be a real production rendezvous root.
+fn rendezvous_area(tag: &str) -> PathBuf {
+    let base = PathBuf::from(format!(
+        "/private/tmp/.airvb-{tag}-{}-{}",
+        std::process::id(),
+        NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir(&base).unwrap();
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+    base
+}
+
+/// Calls one managed Codex tool whose trusted metadata carries an explicit root session id.
+async fn managed_root_call(
+    mcp: &mut Mcp,
+    id: usize,
+    actor: &str,
+    root_session: &str,
+    name: &str,
+    arguments: Value,
+    state: &Value,
+) -> Value {
+    let reply = mcp
+        .exchange(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,
+            "arguments":arguments,
+            "_meta":{"threadId":actor,"callId":format!("managed-{actor}-{id}"),
+            "x-codex-turn-metadata":{"session_id":root_session},"codex/sandbox-state-meta":state}}}))
+        .await;
+    assert_compact_envelope(&reply);
+    reply["result"]["structuredContent"].clone()
 }
 
 /// Builds identical model inputs and request/call IDs for actors whose identity differs only in host metadata.
@@ -2228,6 +2288,121 @@ async fn managed_codex_smoke_and_eof_cleanup() {
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     mcp.close().await;
     assert_eq!(managed_runtime_paths(), before);
+}
+
+/// Managed Codex publishes distinct actor routes on first valid calls and retires them on clean
+/// shutdown, with the record pointing at exactly this MCP process's private runtime (T29B §2).
+#[tokio::test]
+async fn managed_codex_publishes_distinct_actor_routes_and_retires_them_on_shutdown() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let fixture = ProductFixture::new(json!([]));
+    let base = rendezvous_area("publish");
+    let root = base.join("rendezvous");
+    let before = managed_runtime_paths();
+    let mut mcp = Mcp::start_managed_with_rendezvous(&fixture.config, &fixture.root, &root).await;
+    let during = managed_runtime_paths();
+    let mut runtimes = during.difference(&before).cloned().collect::<Vec<_>>();
+    assert_eq!(runtimes.len(), 1, "{before:?} -> {during:?}");
+    let runtime_dir = runtimes.remove(0);
+    let state = fixture.state();
+    let actor = "managed-root";
+    let mut next = 10;
+
+    // The first valid call with a root session publishes this process's route for that actor.
+    let start = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        "root-session-a",
+        "ide.start",
+        json!({"activation_id":"publish-start"}),
+        &state,
+    )
+    .await;
+    let route_a = CodexRouteIdentity::new("root-session-a", actor).unwrap();
+    let target = discover(&root, &route_a).expect("first valid call publishes the actor route");
+    assert_eq!(
+        target.runtime_dir(),
+        std::fs::canonicalize(&runtime_dir).unwrap(),
+        "the record points at this MCP process's own runtime"
+    );
+    let started = settle_managed(&mut mcp, &mut next, actor, &state, start).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    // A second root session over the same repository gets its own distinct route; both stay live.
+    next += 1;
+    let refreshed = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        "root-session-b",
+        "ide.context",
+        json!({"path":"tracked.txt"}),
+        &state,
+    )
+    .await;
+    assert_eq!(refreshed["state"], "pending", "{refreshed}");
+    let route_b = CodexRouteIdentity::new("root-session-b", actor).unwrap();
+    assert_ne!(route_a.digest(), route_b.digest());
+    assert!(
+        discover(&root, &route_b).is_some(),
+        "second session publishes its own route"
+    );
+    assert!(discover(&root, &route_a).is_some(), "routes coexist");
+
+    // Clean EOF shutdown retires every route before removing the runtime.
+    mcp.close().await;
+    assert!(discover(&root, &route_a).is_none(), "route a retired");
+    assert!(discover(&root, &route_b).is_none(), "route b retired");
+    assert_eq!(managed_runtime_paths(), before);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+/// A publication failure (unusable rendezvous root) never touches managed MCP replies.
+#[tokio::test]
+async fn managed_codex_publication_failure_leaves_replies_working() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let fixture = ProductFixture::new(json!([]));
+    let base = rendezvous_area("publish-failure");
+    // A regular file occupies the rendezvous root path: every publication fails quietly.
+    let blocked = base.join("rendezvous");
+    std::fs::write(&blocked, b"not a directory").unwrap();
+    let mut mcp =
+        Mcp::start_managed_with_rendezvous(&fixture.config, &fixture.root, &blocked).await;
+    let state = fixture.state();
+    let actor = "managed-root";
+    let mut next = 10;
+
+    let start = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        "root-session-a",
+        "ide.start",
+        json!({"activation_id":"publish-failure-start"}),
+        &state,
+    )
+    .await;
+    let started = settle_managed(&mut mcp, &mut next, actor, &state, start).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    next += 1;
+    let context = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        "root-session-a",
+        "ide.context",
+        json!({"path":"tracked.txt"}),
+        &state,
+    )
+    .await;
+    let settled = settle_managed(&mut mcp, &mut next, actor, &state, context).await;
+    assert!(
+        settled["text"].as_str().unwrap().contains("worktree"),
+        "{settled}"
+    );
+    mcp.close().await;
+    std::fs::remove_dir_all(base).unwrap();
 }
 
 /// Proves two managed sessions share only telemetry ownership, not Workspace boot authority.

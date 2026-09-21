@@ -29,6 +29,7 @@ use crate::{
         },
     },
     assistance::{
+        codex_rendezvous::{CodexRouteIdentity, ManagedCodexPublisher},
         content,
         host_binding::{
             HookEvent, HookLaunch, HookPhase, HostBindingGuard, HostKind, parse_candidate,
@@ -1054,6 +1055,13 @@ impl FeedbackLedger {
 pub type ReestablishFn =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Option<(PathBuf, String)>> + Send>> + Send + Sync>;
 
+/// Shares one managed Codex publisher between the facade call path and MCP teardown (T29B §2).
+///
+/// The facade publishes actor routes before dispatching valid managed Codex calls; the MCP process
+/// retires them at teardown and when its owned daemon exit is observed. The plain lock is only ever
+/// held across bounded local filesystem work.
+pub type SharedCodexPublisher = Arc<std::sync::Mutex<ManagedCodexPublisher>>;
+
 /// Shares one live `(runtime_dir, attachment)` pair across every clone of a [`StdioFacade`].
 ///
 /// A daemon this generation never owns (EYES-r2 §2) can exit while the MCP process keeps running
@@ -1083,6 +1091,21 @@ impl ManagedConnection {
     }
 }
 
+/// Extracts the managed Codex route identity from the original trusted request `_meta`.
+///
+/// The root session is `_meta["x-codex-turn-metadata"].session_id` and the actor is
+/// `_meta.threadId`, the same measured fields `parse_candidate` validates for the call lifecycle
+/// (docs/host-probe.md, observed Codex field contract). `CodexRouteIdentity::new` re-validates both
+/// components; anything missing, non-string, or out of bounds disables only publication.
+fn codex_route_identity(meta: &Map<String, Value>) -> Option<CodexRouteIdentity> {
+    let root_session = meta
+        .get("x-codex-turn-metadata")?
+        .get("session_id")?
+        .as_str()?;
+    let actor = meta.get("threadId")?.as_str()?;
+    CodexRouteIdentity::new(root_session, actor).ok()
+}
+
 /// Hosts the static six-tool rmcp surface even when no trusted host attachment exists.
 #[derive(Clone)]
 pub struct StdioFacade {
@@ -1094,6 +1117,11 @@ pub struct StdioFacade {
     attachment: Option<String>,
     /// Live rendezvous target and re-establish hook for a shared daemon this facade does not own.
     reconnect: Option<ManagedConnection>,
+    /// Managed Codex publisher owned by this MCP process; publication stays best-effort and quiet.
+    ///
+    /// Only the managed Codex constructor sets this. Publication never activates anything and is
+    /// skipped entirely when the trusted request metadata lacks a root session or actor.
+    publisher: Option<SharedCodexPublisher>,
     /// Generated static tool router; independent of daemon availability.
     router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
@@ -1105,6 +1133,7 @@ impl StdioFacade {
             facade: AssistanceFacade::new(runtime_dir),
             attachment: None,
             reconnect: None,
+            publisher: None,
             router: Self::tool_router(),
         }
     }
@@ -1119,6 +1148,7 @@ impl StdioFacade {
             facade: AssistanceFacade::unavailable(),
             attachment: None,
             reconnect: None,
+            publisher: None,
             router: Self::tool_router(),
         }
     }
@@ -1133,6 +1163,27 @@ impl StdioFacade {
             facade: AssistanceFacade::new(runtime_dir),
             attachment: Some(attachment),
             reconnect: None,
+            publisher: None,
+            router: Self::tool_router(),
+        })
+    }
+
+    /// Configures the managed Codex facade: fixed attachment plus this process's route publisher.
+    ///
+    /// Identical bounds to [`Self::with_host_attachment`]. The publisher publishes actor routes
+    /// before dispatching valid calls (T29B §2) but never activates anything: every publication
+    /// failure, like every missing route identity, only skips publication.
+    pub fn with_managed_codex(
+        runtime_dir: PathBuf,
+        attachment: String,
+        publisher: SharedCodexPublisher,
+    ) -> Option<Self> {
+        TrustedTransport::from_host_ingress("validate", "validate", attachment.clone())?;
+        Some(Self {
+            facade: AssistanceFacade::new(runtime_dir),
+            attachment: Some(attachment),
+            reconnect: None,
+            publisher: Some(publisher),
             router: Self::tool_router(),
         })
     }
@@ -1151,8 +1202,34 @@ impl StdioFacade {
             facade: AssistanceFacade::new(runtime_dir.clone()),
             attachment: None,
             reconnect: Some(ManagedConnection::new(runtime_dir, attachment, reestablish)),
+            publisher: None,
             router: Self::tool_router(),
         })
+    }
+
+    /// Publishes this process's actor route for the managed Codex native hook, best-effort.
+    ///
+    /// The identity comes from the original trusted request `_meta` before projection: the root
+    /// session is `_meta["x-codex-turn-metadata"].session_id` and the actor is `_meta.threadId`
+    /// (docs/host-probe.md, observed Codex field contract). Missing identity, an invalid identity,
+    /// or any publication error skips publication silently and leaves the call path unchanged.
+    /// The bounded local filesystem work runs off the async executor, so dispatch never waits on
+    /// this process's own publication lock beyond that bounded operation.
+    async fn publish_codex_route(&self, meta: &Map<String, Value>) {
+        let Some(publisher) = &self.publisher else {
+            return;
+        };
+        let Some(identity) = codex_route_identity(meta) else {
+            return;
+        };
+        let publisher = Arc::clone(publisher);
+        let _ = tokio::task::spawn_blocking(move || {
+            publisher
+                .lock()
+                .expect("managed codex publisher mutex")
+                .publish(&identity)
+        })
+        .await;
     }
 
     /// Builds one trusted transport envelope from `attachment` and this call's host request metadata.
@@ -1225,6 +1302,9 @@ impl StdioFacade {
         let Some(host) = self.build_host(&attachment, context) else {
             return (FacadeOutcome::Unavailable, false);
         };
+        // Managed Codex only: publish this process's route before the first dispatch of every
+        // valid call. Idempotent, so retried calls after publication failure still publish.
+        self.publish_codex_route(&context.meta).await;
         let outcome = self
             .facade
             .dispatch_at(&runtime_dir, &host, tool, parameters.clone())

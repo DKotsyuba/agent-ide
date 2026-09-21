@@ -16,7 +16,8 @@ use agent_ide::app::{
 };
 use agent_ide::assistance::{
     assembly::ProductDispatcher,
-    facade::{ReestablishFn, StdioFacade},
+    codex_rendezvous::ManagedCodexPublisher,
+    facade::{ReestablishFn, SharedCodexPublisher, StdioFacade},
     host_binding::HostKind,
     launcher::{AcceptedExecutable, LauncherConfig},
 };
@@ -1709,10 +1710,10 @@ async fn run_managed_codex_mcp(
     candidate: std::io::Result<PathBuf>,
 ) -> ExitCode {
     let Ok(candidate) = candidate else {
-        return serve_managed_stdio(StdioFacade::unavailable(), None, None, None).await;
+        return serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None).await;
     };
     let Ok(runtime) = ManagedRuntime::create() else {
-        return serve_managed_stdio(StdioFacade::unavailable(), None, None, None).await;
+        return serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None).await;
     };
     agent_ide::errorlog::init_repository(
         &claude_rendezvous_identity(&claude_rendezvous_key(&candidate).await)[..16],
@@ -1728,18 +1729,42 @@ async fn run_managed_codex_mcp(
     .await;
     match started {
         Ok((attachment, child)) => {
-            let Some(facade) = StdioFacade::with_host_attachment(runtime_path, attachment) else {
+            let child = Arc::new(Mutex::new(child));
+            let publisher = managed_codex_publisher(&runtime.path, &attachment);
+            let facade = match &publisher {
+                Some(publisher) => {
+                    StdioFacade::with_managed_codex(runtime_path, attachment, Arc::clone(publisher))
+                }
+                None => StdioFacade::with_host_attachment(runtime_path, attachment),
+            };
+            let Some(facade) = facade else {
                 terminate_owned_daemon(child).await;
                 let _ = runtime.remove();
-                return serve_managed_stdio(StdioFacade::unavailable(), None, None, None).await;
+                return serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None)
+                    .await;
             };
-            serve_managed_stdio(facade, Some(child), Some(runtime), None).await
+            serve_managed_stdio(facade, Some(child), Some(runtime), None, publisher).await
         }
         Err(_) => {
             let _ = runtime.remove();
-            serve_managed_stdio(StdioFacade::unavailable(), None, None, None).await
+            serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None).await
         }
     }
+}
+
+/// Creates this MCP process's managed Codex rendezvous publisher, if a rendezvous root resolves.
+///
+/// Nothing is published here: the actor route identity is only known from the first valid call's
+/// trusted metadata (T29B §2). The root is the fixed effective-UID rendezvous root, redirected only
+/// by the product-test seam `AGENT_IDE_CODEX_RENDEZVOUS_ROOT`; an unresolvable root disables
+/// publication while every MCP reply keeps working exactly as before.
+fn managed_codex_publisher(runtime_dir: &Path, attachment: &str) -> Option<SharedCodexPublisher> {
+    let root = agent_ide::assistance::codex_rendezvous::effective_root()?;
+    Some(Arc::new(std::sync::Mutex::new(ManagedCodexPublisher::new(
+        root,
+        runtime_dir.to_owned(),
+        attachment,
+    ))))
 }
 
 /// Finds or starts the one daemon shared by every worktree of `candidate`'s repository, and serves.
@@ -1753,19 +1778,19 @@ async fn run_managed_claude_mcp(
     candidate: std::io::Result<PathBuf>,
 ) -> ExitCode {
     let Ok(candidate) = candidate else {
-        return serve_managed_stdio(StdioFacade::unavailable(), None, None, None).await;
+        return serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None).await;
     };
     if !absolute_local_path(&candidate)
         || !fs::symlink_metadata(&candidate).is_ok_and(|metadata| metadata.is_dir())
     {
-        return serve_managed_stdio(StdioFacade::unavailable(), None, None, None).await;
+        return serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None).await;
     }
     let key = claude_rendezvous_key(&candidate).await;
     // The MCP server can afford this one bounded `git` probe at its own startup; the hook cannot,
     // so it is left this cache instead of ever resolving the key itself (EYES-r2 §3).
     write_claude_key_cache(&candidate, &key);
     let Ok(path) = claude_runtime_path(&key) else {
-        return serve_managed_stdio(StdioFacade::unavailable(), None, None, None).await;
+        return serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None).await;
     };
     // Lets this client log its own lifecycle facts into the daemon's per-repository log.
     agent_ide::errorlog::init(&path);
@@ -1786,13 +1811,14 @@ async fn run_managed_claude_mcp(
             );
             match StdioFacade::with_reestablishing_attachment(runtime_path, attachment, reestablish)
             {
-                Some(facade) => serve_managed_stdio(facade, None, None, Some(lease)).await,
+                Some(facade) => serve_managed_stdio(facade, None, None, Some(lease), None).await,
                 None => {
-                    serve_managed_stdio(StdioFacade::unavailable(), None, None, Some(lease)).await
+                    serve_managed_stdio(StdioFacade::unavailable(), None, None, Some(lease), None)
+                        .await
                 }
             }
         }
-        None => serve_managed_stdio(StdioFacade::unavailable(), None, None, None).await,
+        None => serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None).await,
     }
 }
 
@@ -2069,7 +2095,7 @@ async fn start_managed_daemon(
     }
     let mut child = command.spawn().map_err(|_| StartDaemonError::Other)?;
     if !health_check_owned_daemon(&mut child, &runtime.path).await {
-        terminate_owned_daemon(child).await;
+        terminate_owned_daemon(Arc::new(Mutex::new(child))).await;
         return Err(StartDaemonError::Other);
     }
     Ok((attachment, child))
@@ -2120,12 +2146,23 @@ async fn health_check_owned_daemon(child: &mut tokio::process::Child, runtime: &
 /// `lease` is an optional held-open `ClientLease` connection (Claude only), refreshed in place by
 /// [`claude_reestablish_hook`] on every reconnect; it is dropped once serving ends, whatever the
 /// reason, which is the client-side EOF that releases the daemon's lease count (EYES-r2 §2).
+/// `publisher` is the managed Codex route publisher (Codex only): its records are retired before
+/// the owned daemon is terminated and its runtime removed, on every exit path including signals.
 async fn serve_managed_stdio(
     facade: StdioFacade,
-    child: Option<tokio::process::Child>,
+    child: Option<SharedChild>,
     runtime: Option<ManagedRuntime>,
     lease: Option<Arc<Mutex<Option<UnixStream>>>>,
+    publisher: Option<SharedCodexPublisher>,
 ) -> ExitCode {
+    // If the owned daemon exits while the MCP keeps serving, hooks must stop discovering this
+    // process's records immediately instead of failing against a dead socket (T29B §2).
+    if let (Some(child), Some(publisher)) = (&child, &publisher) {
+        tokio::spawn(unpublish_when_daemon_exits(
+            Arc::clone(child),
+            Arc::clone(publisher),
+        ));
+    }
     let served = match serve_server(facade, stdio()).await {
         Ok(service) => {
             tokio::select! {
@@ -2136,6 +2173,12 @@ async fn serve_managed_stdio(
         Err(_) => false,
     };
     drop(lease);
+    if let Some(publisher) = publisher {
+        publisher
+            .lock()
+            .expect("managed codex publisher mutex")
+            .unpublish_all();
+    }
     if let Some(child) = child {
         terminate_owned_daemon(child).await;
     }
@@ -2146,6 +2189,34 @@ async fn serve_managed_stdio(
         ExitCode::SUCCESS
     } else {
         fail(AppError::InvalidResponse)
+    }
+}
+
+/// The managed Codex daemon-child handle shared between exit observation and owned teardown.
+///
+/// The lock is only ever held across bounded synchronous probes or the final terminate/reap, so
+/// the exit observer can always retry its non-blocking attempt.
+type SharedChild = Arc<Mutex<tokio::process::Child>>;
+
+/// Retires the managed Codex publication once the owned daemon child exit is observed (T29B §2).
+///
+/// The daemon may exit on its own while its MCP process keeps serving; its records must then stop
+/// being discoverable. The child lock is taken only for the bounded synchronous probe, so the
+/// final owned teardown at MCP exit is never delayed; the publisher's own lock is quiet and never
+/// held elsewhere at that moment.
+async fn unpublish_when_daemon_exits(child: SharedChild, publisher: SharedCodexPublisher) {
+    loop {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let Ok(mut child) = child.try_lock() else {
+            continue;
+        };
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            publisher
+                .lock()
+                .expect("managed codex publisher mutex")
+                .unpublish_all();
+            return;
+        }
     }
 }
 
@@ -2165,7 +2236,8 @@ async fn managed_termination_signal() {
 }
 
 /// Sends SIGTERM to the exact owned daemon PID, waits for its provider cleanup, then force-reaps.
-async fn terminate_owned_daemon(mut child: tokio::process::Child) {
+async fn terminate_owned_daemon(child: SharedChild) {
+    let mut child = child.lock().await;
     if child.try_wait().ok().flatten().is_some() {
         return;
     }
@@ -2708,5 +2780,77 @@ mod tests {
         }
         assert_eq!(common_dir_from_git_files(&base.join("nowhere")), None);
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Retires the managed Codex publication exactly when the owned daemon child exit is observed.
+    #[tokio::test]
+    async fn publisher_unpublishes_when_the_owned_daemon_child_exits() {
+        use agent_ide::assistance::codex_rendezvous::{CodexRouteIdentity, discover};
+        use std::os::unix::{fs::PermissionsExt as _, net::UnixListener};
+
+        // Kept directly below /private/tmp: the fixture socket path must stay under SUN_LEN.
+        let base = PathBuf::from(format!(
+            "/private/tmp/.aipw-{}-{}",
+            std::process::id() % 100_000,
+            random_hex(4).unwrap()
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&base).unwrap();
+        let root = base.join("rendezvous");
+        let runtime_dir = base.join("runtime");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&runtime_dir)
+            .unwrap();
+        let listener = UnixListener::bind(runtime_dir.join("agent-ide.sock")).unwrap();
+        fs::set_permissions(
+            runtime_dir.join("agent-ide.sock"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let identity = CodexRouteIdentity::new("watched-session", "watched-actor").unwrap();
+        let mut publisher =
+            ManagedCodexPublisher::new(root.clone(), runtime_dir.clone(), "a1b2c3d4".repeat(8));
+        publisher.publish(&identity).unwrap();
+        drop(publisher);
+        drop(listener);
+        let child: SharedChild = Arc::new(Mutex::new(
+            tokio::process::Command::new("/bin/sleep")
+                .arg("0.3")
+                .spawn()
+                .unwrap(),
+        ));
+        let shared_publisher: SharedCodexPublisher = Arc::new(std::sync::Mutex::new(
+            ManagedCodexPublisher::new(root.clone(), runtime_dir.clone(), "a1b2c3d4".repeat(8)),
+        ));
+        shared_publisher
+            .lock()
+            .expect("managed codex publisher mutex")
+            .publish(&identity)
+            .unwrap();
+        assert!(discover(&root, &identity).is_some(), "route is published");
+        tokio::spawn(unpublish_when_daemon_exits(
+            Arc::clone(&child),
+            Arc::clone(&shared_publisher),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut child = child.lock().await;
+            child.wait().await.unwrap();
+        })
+        .await
+        .unwrap();
+        for _ in 0..100 {
+            if discover(&root, &identity).is_none() {
+                assert!(!root.join(identity.digest()).exists());
+                terminate_owned_daemon(Arc::clone(&child)).await;
+                shared_publisher
+                    .lock()
+                    .expect("managed codex publisher mutex")
+                    .unpublish_all();
+                fs::remove_dir_all(base).unwrap();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("daemon exit was observed but the publication stayed discoverable");
     }
 }
