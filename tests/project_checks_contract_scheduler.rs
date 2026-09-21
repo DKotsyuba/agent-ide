@@ -3,14 +3,14 @@
 //! `FakeChecker` (in `agent_ide::checks`) does not record concurrency or reflect the dispatched
 //! `input_generation`, so these tests use `RecordingChecker` below instead.
 
-use agent_ide::checks::scheduler::{RustCacheClone, Scheduler, sweep_stale_caches};
+use agent_ide::checks::scheduler::{FingerprintFn, RustCacheClone, Scheduler, sweep_stale_caches};
 use agent_ide::checks::{
     BoxFuture, CheckRequest, CheckState, Checker, Language, ProblemSnapshot, UnavailableReason,
 };
 use std::collections::VecDeque;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -180,6 +180,18 @@ fn scratch_worktree_both_languages(name: &str) -> PathBuf {
     std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
     std::fs::write(dir.join("pyproject.toml"), "").unwrap();
     dir
+}
+
+/// Builds a fingerprint seam reporting `value` for every worktree (T20B): `None` means unknown,
+/// which the scheduler treats as changed and runs.
+fn constant_fingerprint(value: Option<u64>) -> FingerprintFn {
+    Arc::new(move |_| value)
+}
+
+/// Builds a fingerprint seam reading its value from `cell` on every call, so a test can flip the
+/// worktree between unchanged and changed inputs.
+fn shared_fingerprint(cell: Arc<AtomicU64>) -> FingerprintFn {
+    Arc::new(move |_| Some(cell.load(Ordering::SeqCst)))
 }
 
 /// Advances the paused tokio clock by `step` and yields several times so tasks woken by expired
@@ -829,4 +841,187 @@ async fn scheduler_worktree_gaining_cargo_toml_is_checked_on_the_next_trigger() 
         "rust must be dispatched once Cargo.toml appears"
     );
     assert_eq!(scheduler.latest(&worktree)[0].state, CheckState::Ready);
+}
+
+/// (T20B) A trigger whose fingerprint equals the last `Ready` completion's inputs skips the run
+/// entirely: no second checker call, no `running` flag, and the stored snapshot stays current.
+#[tokio::test(start_paused = true)]
+async fn scheduler_trigger_with_unchanged_fingerprint_after_a_ready_result_skips_the_run() {
+    let checker = RecordingChecker::new(Language::Python);
+    let cache_root = scratch_dir("skip-unchanged-cache");
+    let worktree = scratch_worktree("skip-unchanged-worktree", Language::Python);
+    let scheduler = Scheduler::new(
+        vec![Arc::new(checker.clone())],
+        Duration::from_millis(10),
+        2,
+        cache_root,
+    )
+    .with_fingerprint(constant_fingerprint(Some(7)));
+
+    scheduler.trigger("repo", &worktree);
+    settle(Duration::from_millis(60), Duration::from_millis(5)).await;
+    assert_eq!(checker.calls().len(), 1, "the first run always runs");
+    let stored = scheduler.latest(&worktree);
+
+    scheduler.trigger("repo", &worktree);
+    settle(Duration::from_millis(120), Duration::from_millis(5)).await;
+    assert_eq!(
+        checker.calls().len(),
+        1,
+        "unchanged inputs must not re-run the checker"
+    );
+    assert!(
+        scheduler.running(&worktree).is_empty(),
+        "a skipped run must never flip the running flag"
+    );
+    assert!(!scheduler.is_busy());
+    assert_eq!(
+        scheduler.latest(&worktree),
+        stored,
+        "the stored snapshot must stay exactly as the skipped-over completion left it"
+    );
+}
+
+/// (T20B) A trigger whose fingerprint differs from the last completion's inputs runs.
+#[tokio::test(start_paused = true)]
+async fn scheduler_trigger_with_a_changed_fingerprint_reruns_the_check() {
+    let checker = RecordingChecker::new(Language::Python);
+    let cell = Arc::new(AtomicU64::new(7));
+    let cache_root = scratch_dir("skip-changed-cache");
+    let worktree = scratch_worktree("skip-changed-worktree", Language::Python);
+    let scheduler = Scheduler::new(
+        vec![Arc::new(checker.clone())],
+        Duration::from_millis(10),
+        2,
+        cache_root,
+    )
+    .with_fingerprint(shared_fingerprint(Arc::clone(&cell)));
+
+    scheduler.trigger("repo", &worktree);
+    settle(Duration::from_millis(60), Duration::from_millis(5)).await;
+    assert_eq!(checker.calls().len(), 1);
+
+    cell.store(8, Ordering::SeqCst);
+    scheduler.trigger("repo", &worktree);
+    settle(Duration::from_millis(120), Duration::from_millis(5)).await;
+    assert_eq!(
+        checker.calls().len(),
+        2,
+        "changed inputs must re-run the checker"
+    );
+}
+
+/// (T20B) An activation's check always runs even with unchanged inputs, and a later ordinary
+/// trigger with the same unchanged inputs skips again.
+#[tokio::test(start_paused = true)]
+async fn scheduler_activate_with_unchanged_fingerprint_still_runs() {
+    let checker = RecordingChecker::new(Language::Python);
+    let cache_root = scratch_dir("skip-activate-cache");
+    let worktree = scratch_worktree("skip-activate-worktree", Language::Python);
+    let scheduler = Scheduler::new(
+        vec![Arc::new(checker.clone())],
+        Duration::from_millis(10),
+        2,
+        cache_root,
+    )
+    .with_fingerprint(constant_fingerprint(Some(7)));
+
+    scheduler.trigger("repo", &worktree);
+    settle(Duration::from_millis(60), Duration::from_millis(5)).await;
+    assert_eq!(checker.calls().len(), 1);
+
+    scheduler.activate("repo", &worktree);
+    settle(Duration::from_millis(120), Duration::from_millis(5)).await;
+    assert_eq!(
+        checker.calls().len(),
+        2,
+        "an activation-requested check must never be skipped"
+    );
+
+    scheduler.trigger("repo", &worktree);
+    settle(Duration::from_millis(120), Duration::from_millis(5)).await;
+    assert_eq!(
+        checker.calls().len(),
+        2,
+        "an ordinary trigger after the activation's run skips on unchanged inputs again"
+    );
+}
+
+/// (T20B) An unknown fingerprint (`None`) never skips: unknown means changed means run.
+#[tokio::test(start_paused = true)]
+async fn scheduler_unknown_fingerprint_always_runs() {
+    let checker = RecordingChecker::new(Language::Python);
+    let cache_root = scratch_dir("skip-unknown-cache");
+    let worktree = scratch_worktree("skip-unknown-worktree", Language::Python);
+    let scheduler = Scheduler::new(
+        vec![Arc::new(checker.clone())],
+        Duration::from_millis(10),
+        2,
+        cache_root,
+    )
+    .with_fingerprint(constant_fingerprint(None));
+
+    scheduler.trigger("repo", &worktree);
+    settle(Duration::from_millis(60), Duration::from_millis(5)).await;
+    assert_eq!(checker.calls().len(), 1);
+
+    scheduler.trigger("repo", &worktree);
+    settle(Duration::from_millis(120), Duration::from_millis(5)).await;
+    assert_eq!(
+        checker.calls().len(),
+        2,
+        "an unknown fingerprint must always run the check"
+    );
+}
+
+/// (T20B) A run that ended `Fatal` (like any non-`Ready` outcome) is re-checked on the next
+/// trigger even when the fingerprint is unchanged since that failed run; only a `Ready`
+/// completion arms the skip.
+#[tokio::test(start_paused = true)]
+async fn scheduler_trigger_after_a_fatal_completion_reruns_despite_unchanged_fingerprint() {
+    let checker = RecordingChecker::with_states(
+        Language::Python,
+        vec![
+            CheckState::Unavailable(UnavailableReason::Fatal),
+            CheckState::Ready,
+        ],
+    );
+    let cache_root = scratch_dir("skip-fatal-cache");
+    let worktree = scratch_worktree("skip-fatal-worktree", Language::Python);
+    let scheduler = Scheduler::new(
+        vec![Arc::new(checker.clone())],
+        Duration::from_millis(10),
+        2,
+        cache_root,
+    )
+    .with_fingerprint(constant_fingerprint(Some(7)));
+
+    scheduler.trigger("repo", &worktree);
+    settle(Duration::from_millis(60), Duration::from_millis(5)).await;
+    assert_eq!(
+        checker.calls().len(),
+        1,
+        "a pair with no completed snapshot runs"
+    );
+    assert_eq!(
+        scheduler.latest(&worktree)[0].state,
+        CheckState::Unavailable(UnavailableReason::Fatal)
+    );
+
+    scheduler.trigger("repo", &worktree);
+    settle(Duration::from_millis(60), Duration::from_millis(5)).await;
+    assert_eq!(
+        checker.calls().len(),
+        2,
+        "unchanged inputs must still re-run after a Fatal completion"
+    );
+    assert_eq!(scheduler.latest(&worktree)[0].state, CheckState::Ready);
+
+    scheduler.trigger("repo", &worktree);
+    settle(Duration::from_millis(120), Duration::from_millis(5)).await;
+    assert_eq!(
+        checker.calls().len(),
+        2,
+        "only a Ready completion arms the skip"
+    );
 }
