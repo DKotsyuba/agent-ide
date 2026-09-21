@@ -73,6 +73,14 @@ provider_unavailable`), an oversize reply envelope (`client failed oversize_enve
 emitted `<agent-ide>` feed block (`feed completed`, `detail` = `languages=<list> bytes=<n>`, no
 text).
 
+T24B: each `execution_profile` conversion site on the activation/read path also logs its own
+`<method> failed execution_profile` event (in addition to the dispatcher's reply event) whose
+`detail` names exactly which condition failed, from this closed vocabulary: `git_policy`,
+`query_policy`, `host_disabled`, `no_profile_for_class:<managed|disabled>`,
+`profile_digest_mismatch:<managed|disabled>`, `spawn:<process error variant>`, `git_unsupported`,
+and `read_scope:<variant>`. Only class names and closed variant names are ever recorded — never
+paths, sandbox-state JSON, digests, or OS error strings.
+
 ## Failure semantics
 
 Writing is fail-open and nonblocking: a missing or unwritable directory, a rotation failure, or a

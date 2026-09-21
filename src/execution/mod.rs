@@ -424,9 +424,9 @@ impl ExecutionProfileCatalog {
             .templates
             .get(&state.class)
             .cloned()
-            .ok_or(RequestError::ExecutionProfileDenied)?;
+            .ok_or(RequestError::ExecutionProfileNoTemplate(state.class))?;
         if template.profile_digest != state.profile_digest() {
-            return Err(RequestError::ExecutionProfileDenied);
+            return Err(RequestError::ExecutionProfileDigestMismatch(state.class));
         }
         Ok(ExecutionProfilePermit {
             template,
@@ -1256,6 +1256,10 @@ pub enum RequestError {
     DisabledHostDenied,
     /// Execution has no accepted template for this host profile class or shape.
     ExecutionProfileDenied,
+    /// Execution has no accepted template for the observed host profile class (T24B).
+    ExecutionProfileNoTemplate(ProfileClass),
+    /// The observed profile digest differs from the accepted template for this class (T24B).
+    ExecutionProfileDigestMismatch(ProfileClass),
     /// The consumed active binding does not match the observed sandbox-state generation.
     BindingMismatch,
     /// The observed host state cannot satisfy Execution's bounded parser.

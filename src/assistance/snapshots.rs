@@ -118,7 +118,13 @@ impl ProductSnapshotRunner<'_, '_> {
             self.worker.shared.launcher.limits.output_bytes,
         ) {
             Ok(child) => child,
-            Err(error) => return Err(self.worker.spawn_failure(error, &binding)),
+            Err(error) => {
+                return Err(self.worker.spawn_failure(
+                    error,
+                    &binding,
+                    errorlog_method(self.job.tool),
+                ));
+            }
         };
         if intent.snapshot_directory().is_some() {
             let Some(identity) = child.take_process_identity() else {
@@ -566,7 +572,9 @@ impl Worker<'_> {
                 self.shared.launcher.limits.output_bytes,
             ) {
                 Ok(child) => child,
-                Err(error) => return Err(self.spawn_failure(error, &binding)),
+                Err(error) => {
+                    return Err(self.spawn_failure(error, &binding, errorlog_method(job.tool)));
+                }
             };
             let remaining = job
                 .deadline
@@ -719,6 +727,7 @@ impl Worker<'_> {
             job.observed.as_ref().ok_or(FailureCode::SandboxState)?,
             &job.target,
             &authority,
+            errorlog_method(job.tool),
         )?;
         let mode = match job.parameters["mode"].as_str() {
             Some("head") => DiffMode::Head,

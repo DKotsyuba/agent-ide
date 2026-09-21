@@ -755,3 +755,38 @@ fn read_all_recognition_rejects_unknown_permission_profile_keys() {
         .remove("network");
     assert!(!grants_read_of_all_roots(&narrowed));
 }
+
+/// T24B: `permit` distinguishes a missing template from a stale profile digest, so the Assistance
+/// error log can name exactly which execution-profile condition refused the observed class.
+#[test]
+fn permit_distinguishes_no_template_from_digest_mismatch() {
+    let disabled = |landlock: bool| {
+        HostSandboxState::parse(Some(serde_json::json!(
+            {"permissionProfile":{"type":"disabled"},"codexLinuxSandboxExe":null,"sandboxCwd":"/private/tmp","useLegacyLandlock":landlock}
+        )))
+        .unwrap()
+    };
+    let observed = disabled(false);
+    // No accepted template for the class at all.
+    let empty = ExecutionProfileCatalog::from_execution_evidence(vec![]).unwrap();
+    assert!(matches!(
+        empty.permit(&observed),
+        Err(RequestError::ExecutionProfileNoTemplate(
+            ProfileClass::Disabled
+        ))
+    ));
+    // A template for the class whose accepted digest differs from the observed state.
+    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence("linear-contract", 1, &disabled(true))
+            .unwrap(),
+    ])
+    .unwrap();
+    assert!(matches!(
+        catalog.permit(&observed),
+        Err(RequestError::ExecutionProfileDigestMismatch(
+            ProfileClass::Disabled
+        ))
+    ));
+    // The exact accepted state itself still mints its permit.
+    assert!(catalog.permit(&disabled(true)).is_ok());
+}

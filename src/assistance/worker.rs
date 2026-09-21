@@ -2141,7 +2141,10 @@ impl<'a> Worker<'a> {
             self.shared.launcher.limits.output_bytes,
             job.target.allow_disabled_host,
         )
-        .map_err(|_| FailureCode::ExecutionProfile)?;
+        .map_err(|_| {
+            record_execution_profile(errorlog_method(job.tool), "git_policy");
+            FailureCode::ExecutionProfile
+        })?;
         let mut evidence = Vec::with_capacity(3);
         for query in [
             GitDiscoveryQuery::ShowTopLevel,
@@ -2157,7 +2160,12 @@ impl<'a> Worker<'a> {
             .map_err(|_| FailureCode::SandboxState)?;
             let request = request
                 .validate_query(query, &policy, &job.target.catalog)
-                .map_err(|_| FailureCode::ExecutionProfile)?;
+                .map_err(|error| {
+                    let detail = execution_profile_detail(&error)
+                        .unwrap_or_else(|| "query_policy".to_owned());
+                    record_execution_profile(errorlog_method(job.tool), &detail);
+                    FailureCode::ExecutionProfile
+                })?;
             if *job.cancel.borrow() {
                 return Err(FailureCode::Cancelled);
             }
@@ -2168,7 +2176,9 @@ impl<'a> Worker<'a> {
             let lease = self.admit(&binding)?;
             let mut child = match request.spawn(lease, active, &job.target.codex.path) {
                 Ok(child) => child,
-                Err(error) => return Err(self.spawn_failure(error, &binding)),
+                Err(error) => {
+                    return Err(self.spawn_failure(error, &binding, errorlog_method(job.tool)));
+                }
             };
             let remaining = job
                 .deadline
@@ -2222,6 +2232,7 @@ impl<'a> Worker<'a> {
         )
         .map_err(|error| match error {
             crate::workspace::git::GitError::UnsupportedDiscoveryGit => {
+                record_execution_profile(errorlog_method(job.tool), "git_unsupported");
                 FailureCode::ExecutionProfile
             }
             _ => FailureCode::WorkspaceActivation,
@@ -2812,7 +2823,9 @@ impl<'a> Worker<'a> {
         &mut self,
         error: crate::execution::ProcessError,
         binding: &BindingRef,
+        method: crate::errorlog::Method,
     ) -> FailureCode {
+        let detail = spawn_detail(&error);
         if let crate::execution::ProcessError::NeverStarted { settlement, .. } = error {
             if self.admission().settle_never_started(settlement).is_err() {
                 self.uncertain.insert(binding.clone());
@@ -2820,6 +2833,7 @@ impl<'a> Worker<'a> {
         } else {
             self.uncertain.insert(binding.clone());
         }
+        record_execution_profile(method, &detail);
         FailureCode::ExecutionProfile
     }
 
@@ -2862,6 +2876,7 @@ impl<'a> Worker<'a> {
         path: std::path::PathBuf,
         observed_scope: &ObservedSandboxState,
         target: &LaunchTarget,
+        method: crate::errorlog::Method,
     ) -> Result<(SourceObservation, Vec<u8>), FailureCode> {
         use crate::workspace::{
             observation::{
@@ -2871,7 +2886,14 @@ impl<'a> Worker<'a> {
             store::{ObservationAdmission, ObservationDraft},
         };
         let authority = self.authority(binding).await?;
-        validate_read_scope(&self.shared, binding, observed_scope, target, &authority)?;
+        validate_read_scope(
+            &self.shared,
+            binding,
+            observed_scope,
+            target,
+            &authority,
+            method,
+        )?;
         // The source read ceiling is the v0.1 reader's own bound, not the launcher's discovery and
         // check-process output budget: `limits.output_bytes` sizes bounded command captures and is
         // far smaller than a source file may legitimately be.
@@ -2975,7 +2997,7 @@ impl<'a> Worker<'a> {
                     break;
                 }
                 if self
-                    .observe(binding, path, scope, &job.target)
+                    .observe(binding, path, scope, &job.target, errorlog_method(job.tool))
                     .await
                     .is_err()
                 {
@@ -3005,6 +3027,7 @@ impl<'a> Worker<'a> {
                 path.clone().into(),
                 job.observed.as_ref().ok_or(FailureCode::SandboxState)?,
                 &job.target,
+                errorlog_method(job.tool),
             )
             .await?;
         let query = job
@@ -3371,6 +3394,7 @@ impl<'a> Worker<'a> {
                     request.path.clone().into(),
                     job.observed.as_ref().expect("checked present"),
                     &job.target,
+                    errorlog_method(job.tool),
                 )
                 .await
             {
@@ -3964,6 +3988,7 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                     observed,
                     &request.target,
                     authority,
+                    crate::errorlog::Method::Inspect,
                 )
                 .map_err(invalidate)?;
             }
@@ -4267,6 +4292,7 @@ fn validate_read_scope(
     observed: &ObservedSandboxState,
     target: &LaunchTarget,
     authority: &AuthorityStamp,
+    method: crate::errorlog::Method,
 ) -> Result<(), FailureCode> {
     let scoped = crate::execution::WorkspaceAuthority::from_workspace(
         authority.worktree().id(),
@@ -4283,7 +4309,96 @@ fn validate_read_scope(
         target.allow_disabled_host,
     )
     .map(|_| ())
-    .map_err(|_| FailureCode::ExecutionProfile)
+    .map_err(|error| {
+        record_execution_profile(method, &read_scope_detail(&error));
+        FailureCode::ExecutionProfile
+    })
+}
+
+/// Renders the closed error-log detail naming which execution-profile condition failed (T24B).
+///
+/// Only closed class and variant names are ever rendered — never paths, sandbox-state JSON,
+/// profile digests, or error strings — and the tag is shared verbatim by the agent-facing
+/// policy text in `content.rs` documentation.
+fn execution_profile_detail(error: &crate::execution::RequestError) -> Option<String> {
+    use crate::execution::RequestError;
+    Some(match error {
+        RequestError::ExecutionProfileNoTemplate(class) => {
+            format!("no_profile_for_class:{}", profile_class_tag(*class))
+        }
+        RequestError::ExecutionProfileDigestMismatch(class) => {
+            format!("profile_digest_mismatch:{}", profile_class_tag(*class))
+        }
+        RequestError::DisabledHostDenied => "host_disabled".to_owned(),
+        _ => return None,
+    })
+}
+
+/// Renders the closed lowercase tag for one observed host profile class.
+fn profile_class_tag(class: crate::execution::ProfileClass) -> &'static str {
+    match class {
+        crate::execution::ProfileClass::Managed => "managed",
+        crate::execution::ProfileClass::Disabled => "disabled",
+    }
+}
+
+/// Renders the closed read-scope detail for a failed workspace-read recheck (T24B).
+fn read_scope_detail(error: &crate::execution::RequestError) -> String {
+    use crate::execution::RequestError;
+    if let Some(profile) = execution_profile_detail(error) {
+        return profile;
+    }
+    match error {
+        RequestError::BindingMismatch => "read_scope:binding_mismatch",
+        RequestError::ObservedStateUnavailable(_) => "read_scope:observed_state_unavailable",
+        RequestError::SandboxCwdMismatch => "read_scope:sandbox_cwd_mismatch",
+        _ => "read_scope:refused",
+    }
+    .to_owned()
+}
+
+/// Names one owned-child launch failure by its closed [`crate::execution::ProcessError`] variant
+/// tag; a `NeverStarted` wrapper is unwrapped to its definite cause. Never the OS error string.
+fn spawn_detail(error: &crate::execution::ProcessError) -> String {
+    use crate::execution::ProcessError;
+    format!(
+        "spawn:{}",
+        match error {
+            ProcessError::Io(_) => "io",
+            ProcessError::Request(_) => "request",
+            ProcessError::ProtocolStdoutReserved => "protocol_stdout_reserved",
+            ProcessError::ReapTimedOut => "reap_timed_out",
+            ProcessError::NeverStarted { cause, .. } => {
+                return spawn_detail(cause);
+            }
+        }
+    )
+}
+
+/// Maps one assistance tool onto the closed error-log method tag (T24B).
+fn errorlog_method(tool: AssistanceTool) -> crate::errorlog::Method {
+    match tool {
+        AssistanceTool::Start => crate::errorlog::Method::Start,
+        AssistanceTool::Context => crate::errorlog::Method::Context,
+        AssistanceTool::Diff => crate::errorlog::Method::Diff,
+        AssistanceTool::Inspect => crate::errorlog::Method::Inspect,
+        AssistanceTool::Stop => crate::errorlog::Method::Stop,
+        AssistanceTool::Edit => crate::errorlog::Method::Edit,
+    }
+}
+
+/// Records one execution-profile refusal with its closed condition detail; best-effort like every
+/// error-log write, and always an addition: it never changes the returned failure code (T24B).
+fn record_execution_profile(method: crate::errorlog::Method, detail: &str) {
+    crate::errorlog::record(
+        method,
+        crate::errorlog::Outcome::Failed,
+        crate::errorlog::Fields {
+            reason: Some(crate::errorlog::ReasonCode::ExecutionProfile),
+            detail: Some(detail),
+            ..Default::default()
+        },
+    );
 }
 
 /// Binds detail reuse to the exact closed query (including diff mode and context byte offset).
@@ -6016,5 +6131,89 @@ mod feedback_dedup_tests {
             .shared
             .mark_feedback_inline_delivered(&binding, "detail-1", &reply);
         assert_eq!(handle.take_current_feedback(binding).await, None);
+    }
+}
+
+/// T24B: the closed detail vocabulary names exactly which execution-profile condition failed.
+#[cfg(test)]
+mod execution_profile_detail_tests {
+    use super::*;
+
+    /// The no-template condition carries the observed class, matching the accepted catalog's
+    /// own closed class tags.
+    #[test]
+    fn no_template_names_the_observed_class() {
+        let error = crate::execution::RequestError::ExecutionProfileNoTemplate(
+            crate::execution::ProfileClass::Managed,
+        );
+        assert_eq!(
+            execution_profile_detail(&error).as_deref(),
+            Some("no_profile_for_class:managed")
+        );
+    }
+
+    /// The digest-mismatch condition is distinguishable from no-template and carries the class.
+    #[test]
+    fn digest_mismatch_names_the_observed_class() {
+        let error = crate::execution::RequestError::ExecutionProfileDigestMismatch(
+            crate::execution::ProfileClass::Disabled,
+        );
+        assert_eq!(
+            execution_profile_detail(&error).as_deref(),
+            Some("profile_digest_mismatch:disabled")
+        );
+    }
+
+    /// A disabled host, a spawn failure, and a read-scope refusal each use their closed tag,
+    /// never the underlying error or OS text.
+    #[test]
+    fn host_spawn_and_read_scope_conditions_use_closed_variant_tags() {
+        assert_eq!(
+            execution_profile_detail(&crate::execution::RequestError::DisabledHostDenied)
+                .as_deref(),
+            Some("host_disabled")
+        );
+        assert_eq!(
+            spawn_detail(&crate::execution::ProcessError::Io(std::io::Error::other(
+                "os text discarded"
+            ))),
+            "spawn:io"
+        );
+        assert_eq!(
+            read_scope_detail(&crate::execution::RequestError::SandboxCwdMismatch),
+            "read_scope:sandbox_cwd_mismatch"
+        );
+        assert_eq!(
+            read_scope_detail(&crate::execution::RequestError::ProgramDenied),
+            "read_scope:refused"
+        );
+    }
+
+    /// The recorded line itself carries the closed reason and the condition detail.
+    #[test]
+    fn recorded_line_carries_reason_and_condition_detail() {
+        let line = crate::errorlog::build_line(
+            crate::errorlog::Method::Start,
+            crate::errorlog::Outcome::Failed,
+            crate::errorlog::Fields {
+                reason: Some(crate::errorlog::ReasonCode::ExecutionProfile),
+                detail: Some(
+                    &execution_profile_detail(
+                        &crate::execution::RequestError::ExecutionProfileNoTemplate(
+                            crate::execution::ProfileClass::Managed,
+                        ),
+                    )
+                    .unwrap(),
+                ),
+                ..Default::default()
+            },
+            0,
+        );
+        let event = crate::errorlog::parse_line(std::str::from_utf8(&line).unwrap()).unwrap();
+        assert_eq!(event.reason.as_deref(), Some("execution_profile"));
+        assert_eq!(
+            event.detail.as_deref(),
+            Some("no_profile_for_class:managed")
+        );
     }
 }

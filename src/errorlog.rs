@@ -678,7 +678,12 @@ pub fn record(method: Method, outcome: Outcome, fields: Fields<'_>) {
 
 /// Renders one canonical JSON Lines record (without its trailing newline); pure and side-effect
 /// free so [`record`]'s exact wire shape is unit-testable without touching the global writer.
-fn build_line(method: Method, outcome: Outcome, fields: Fields<'_>, timestamp: u64) -> Vec<u8> {
+pub(crate) fn build_line(
+    method: Method,
+    outcome: Outcome,
+    fields: Fields<'_>,
+    timestamp: u64,
+) -> Vec<u8> {
     let mut object = serde_json::Map::new();
     object.insert(
         "ts".to_owned(),
