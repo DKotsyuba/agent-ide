@@ -4,9 +4,10 @@
 //! the native `codex-hook --managed` can find the private runtime serving its exact root session
 //! and actor. The layout is `<root>/<full-route-digest>/<publication-nonce>.json` under a fixed
 //! effective-UID rendezvous root, with the random runtime directory named only inside the record.
-//! Discovery is deterministic and bounded: absence, ambiguity, corruption, contention and stale
-//! state all return [`None`] silently; nothing here repairs, chmods, follows symlinks, launches a
-//! daemon, reads host configuration, or grants workspace authority.
+//! Discovery is deterministic and bounded: absence, ambiguity, corruption, contention, syscall
+//! errors and stale state all return [`None`] silently; nothing here repairs, chmods, follows
+//! symlinks (every component from `/` down is opened no-follow through pinned descriptors),
+//! launches a daemon, reads host configuration, or grants workspace authority.
 //!
 //! A record is live only while its publisher holds an exclusive advisory lock on the record
 //! descriptor, so crash leftovers are inert until a later publisher removes them under the route
@@ -15,14 +16,13 @@
 //! cooperating same-UID processes are trusted, and no protection against hostile same-UID
 //! processes is claimed.
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -229,8 +229,6 @@ struct Publication {
     record: File,
     /// Pinned, validated route directory the record was renamed into.
     route_dir: File,
-    /// Pinned, validated rendezvous root holding the route directory.
-    root_dir: File,
 }
 
 impl Publication {
@@ -238,8 +236,9 @@ impl Publication {
     ///
     /// Under the short exclusive route-directory lock, the captured nonce name is unlinked only
     /// while it still refers to the captured record inode; a replaced or missing record is left
-    /// untouched. Removal is never recursive, and the route directory is removed only when empty,
-    /// with any failure ignored.
+    /// untouched. Removal is never recursive and never removes the route directory itself: it
+    /// stays behind (empty) for a later publisher to reuse, so cleanup can never delete a
+    /// successor route directory installed by someone else.
     fn unpublish(&self) {
         if lock_directory_exclusive(&self.route_dir) {
             let name = format!("{}{RECORD_SUFFIX}", self.nonce);
@@ -249,10 +248,9 @@ impl Publication {
             ) && current.st_dev == own.st_dev
                 && current.st_ino == own.st_ino
             {
-                let _ = unlink_at(&self.route_dir, &name, 0);
+                let _ = unlink_at(&self.route_dir, &name);
             }
         }
-        let _ = unlink_at(&self.root_dir, &self.route, libc::AT_REMOVEDIR);
     }
 }
 
@@ -319,7 +317,7 @@ impl ManagedCodexPublisher {
             return Err(PublishError::InvalidRuntime);
         }
 
-        match create_directory_at(&root_dir, &route) {
+        match create_directory_at(&root_dir, OsStr::new(&route)) {
             Ok(()) | Err(libc::EEXIST) => {}
             Err(_) => return Err(PublishError::Unavailable),
         }
@@ -355,7 +353,7 @@ impl ManagedCodexPublisher {
         let record = match write_locked_record(&route_dir, &temp_name, &final_name, &body) {
             Ok(record) => record,
             Err(error) => {
-                let _ = unlink_at(&route_dir, &temp_name, 0);
+                let _ = unlink_at(&route_dir, &temp_name);
                 return Err(error);
             }
         };
@@ -366,12 +364,12 @@ impl ManagedCodexPublisher {
             nonce,
             record,
             route_dir,
-            root_dir,
         });
         Ok(())
     }
 
-    /// Unpublishes every retained record: only the captured nonce files, never successors.
+    /// Unpublishes every retained record: only the captured nonce files, never successors, and
+    /// never the route directories themselves, which a later publisher reuses.
     pub fn unpublish_all(&mut self) {
         for publication in self.publications.drain(..) {
             publication.unpublish();
@@ -450,8 +448,12 @@ pub fn default_root() -> Option<PathBuf> {
 /// Zero or several live valid records, and any unsafe state, return [`None`] without ever
 /// repairing, deleting, or picking the newest record.
 ///
-/// Every wait is bounded and non-blocking, so the whole lookup stays far inside the hook's total
-/// deadline and never blocks unboundedly.
+/// Timing is bounded by construction, not by a promise: every `flock` here is non-blocking and
+/// the only wait is the bounded route-directory lock retry (around sixteen milliseconds). Opens
+/// carry `O_NONBLOCK` where a special file named like a record could otherwise stall, enumeration
+/// stops at `MAX_ROUTE_ENTRIES` entries, and record reads stop at `MAX_RECORD_BYTES` bytes,
+/// so the lookup fits inside the hook's total deadline for everything this module itself creates;
+/// arbitrary hostile directory contents can only make discovery refuse the route, never block it.
 pub fn discover(root: &Path, identity: &CodexRouteIdentity) -> Option<HookTarget> {
     let route = identity.digest();
     let root_dir = open_directory_at_path(root)?;
@@ -480,20 +482,12 @@ pub fn discover(root: &Path, identity: &CodexRouteIdentity) -> Option<HookTarget
     let mut target: Option<HookTarget> = None;
     for name in candidates {
         // One corrupt or unsafe candidate is skipped, never allowed to poison the route's valid
-        // siblings and never repaired.
-        let Some(record) = (|| {
-            let record = open_file_at(&route_dir, name)?;
-            let status = stat_descriptor(&record)?;
-            if !is_owned_private_record(&status) || status.st_size as usize > MAX_RECORD_BYTES {
-                return None;
-            }
-            // Liveness: if this shared probe succeeds, no publisher holds the record any more.
-            if try_lock(&record, libc::LOCK_SH | libc::LOCK_NB) {
-                return None;
-            }
-            Some(record)
-        })() else {
-            continue;
+        // siblings and never repaired. A failed liveness syscall is different: a record that
+        // cannot be probed is neither known live nor stale, so the whole route is refused.
+        let record = match probe_candidate(&route_dir, name) {
+            CandidateProbe::Stale => continue,
+            CandidateProbe::Live(record) => record,
+            CandidateProbe::Error => return None,
         };
         let Some(parsed) = validate_record(&record, name, &route) else {
             continue;
@@ -535,6 +529,72 @@ fn validate_record(record: &File, name: &str, route: &str) -> Option<Publication
     Some(parsed)
 }
 
+/// The outcome of one non-blocking `flock` probe on a record descriptor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LockProbe {
+    /// The probe lock was taken, so no publisher holds the record: it is stale.
+    Unlocked,
+    /// The probe saw contention, the only errno that means a publisher is live.
+    Contended,
+    /// Any other `flock` error carries no liveness information at all.
+    Failed,
+}
+
+/// Reports whether one `flock` errno is lock contention — the only failure that carries meaning.
+///
+/// Everything else (for example `ENOLCK`) must never be read as "held ⇒ live": an environment
+/// where locks fail outright would otherwise make every stale record eligible.
+fn is_contention_errno(error: Option<libc::c_int>) -> bool {
+    // `EWOULDBLOCK` and `EAGAIN` share one value on the certified platforms, so a plain
+    // comparison keeps both names without a duplicate-match warning.
+    error == Some(libc::EWOULDBLOCK) || error == Some(libc::EAGAIN)
+}
+
+/// Applies one non-blocking `flock` operation and classifies the outcome for liveness decisions.
+fn probe_record_lock(file: &File, operation: libc::c_int) -> LockProbe {
+    // SAFETY: the descriptor is valid and owned.
+    if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+        LockProbe::Unlocked
+    } else if is_contention_errno(std::io::Error::last_os_error().raw_os_error()) {
+        LockProbe::Contended
+    } else {
+        LockProbe::Failed
+    }
+}
+
+/// The outcome of opening and liveness-probing one candidate record name.
+enum CandidateProbe {
+    /// The name is not a live valid record; skip it quietly.
+    Stale,
+    /// A live record descriptor held by a publisher.
+    Live(File),
+    /// A filesystem probe failed unexpectedly; refuse the whole route.
+    Error,
+}
+
+/// Opens one candidate record, validates its descriptor, and probes its publisher liveness.
+///
+/// Only lock contention establishes liveness: a shared probe that succeeds means no publisher
+/// holds the record any more, and a probe that fails with anything but `EWOULDBLOCK`/`EAGAIN`
+/// makes the whole route refuse rather than risk false liveness.
+fn probe_candidate(route_dir: &File, name: &str) -> CandidateProbe {
+    let Some(record) = open_file_at(route_dir, name) else {
+        return CandidateProbe::Stale;
+    };
+    let Some(status) = stat_descriptor(&record) else {
+        return CandidateProbe::Stale;
+    };
+    if !is_owned_private_record(&status) || status.st_size as usize > MAX_RECORD_BYTES {
+        return CandidateProbe::Stale;
+    }
+    match probe_record_lock(&record, libc::LOCK_SH | libc::LOCK_NB) {
+        LockProbe::Contended => CandidateProbe::Live(record),
+        // The shared probe lock, if it was taken, is released by dropping the descriptor here.
+        LockProbe::Unlocked => CandidateProbe::Stale,
+        LockProbe::Failed => CandidateProbe::Error,
+    }
+}
+
 /// Re-verifies the recorded runtime directory and its owner-only daemon socket.
 ///
 /// The path must be absolute and already canonical, must open `O_NOFOLLOW|O_DIRECTORY` as a real
@@ -569,9 +629,10 @@ fn validate_runtime(runtime: &str, device: u64, inode: u64) -> Option<bool> {
 ///
 /// Called only while the publisher holds the exclusive route-directory lock, so no concurrent
 /// publication is in flight in this directory. A leftover is removed only after it validates as a
-/// regular owner-only bounded record whose body still names this route, and only while it can be
-/// locked exclusively — a live record of another publisher is never touched. Any invalid or locked
-/// entry is left in place; publication never repairs foreign state.
+/// regular owner-only bounded record whose body still names this route, and only while an
+/// exclusive probe shows it is unlocked — a live record of another publisher is never touched,
+/// and a failed lock syscall leaves the entry in place. Any enumeration error stops the sweep
+/// without deleting anything further; publication never repairs foreign state.
 fn sweep_route_directory(route_dir: &File, route: &str) {
     let Some(names) = list_directory(route_dir, MAX_ROUTE_ENTRIES) else {
         return;
@@ -583,10 +644,11 @@ fn sweep_route_directory(route_dir: &File, route: &str) {
             };
             let removable = stat_descriptor(&record).is_some_and(|status| {
                 is_owned_private_record(&status) && status.st_size as usize <= MAX_RECORD_BYTES
-            }) && try_lock(&record, libc::LOCK_EX | libc::LOCK_NB)
+            }) && probe_record_lock(&record, libc::LOCK_EX | libc::LOCK_NB)
+                == LockProbe::Unlocked
                 && validate_record(&record, &name, route).is_some();
             if removable {
-                let _ = unlink_at(route_dir, &name, 0);
+                let _ = unlink_at(route_dir, &name);
             }
         } else if let Some(nonce) = name.strip_prefix(TEMP_PREFIX) {
             if !is_nonce_hex(nonce) {
@@ -596,7 +658,7 @@ fn sweep_route_directory(route_dir: &File, route: &str) {
                 continue;
             };
             if is_owned_private_record(&status) {
-                let _ = unlink_at(route_dir, &name, 0);
+                let _ = unlink_at(route_dir, &name);
             }
         }
     }
@@ -606,45 +668,77 @@ fn sweep_route_directory(route_dir: &File, route: &str) {
 // Descriptor-relative filesystem primitives (macOS-certified path, T29B §2).
 // ---------------------------------------------------------------------------
 
-/// Reports whether a status describes a real directory owned by the effective uid with exact `0700`.
+/// Reports whether a status describes a real directory owned by the effective uid with exactly
+/// mode `0700`: `st_mode & 0o7777` must equal `0o700`, so setuid, setgid and sticky bits are
+/// rejected rather than masked away.
 fn is_owned_private_directory(status: &libc::stat) -> bool {
     status.st_mode & libc::S_IFMT == libc::S_IFDIR
         && status.st_uid == unsafe { libc::geteuid() }
-        && status.st_mode & 0o777 == 0o700
+        && status.st_mode & 0o7777 == 0o700
 }
 
-/// Reports whether a status describes a regular file owned by the effective uid with exact `0600`
-/// and exactly one link — hard-linked records are rejected.
+/// Reports whether a status describes a regular file owned by the effective uid with exactly mode
+/// `0600` (`st_mode & 0o7777`, so special bits are rejected) and exactly one link — hard-linked
+/// records are rejected.
 fn is_owned_private_record(status: &libc::stat) -> bool {
     status.st_mode & libc::S_IFMT == libc::S_IFREG
         && status.st_uid == unsafe { libc::geteuid() }
-        && status.st_mode & 0o777 == 0o600
+        && status.st_mode & 0o7777 == 0o600
         && status.st_nlink == 1
 }
 
 /// Creates the rendezvous root if missing and returns it pinned and validated, never repaired.
 ///
-/// A missing directory is created with mode `0700` at birth; an existing one is only ever checked
-/// through an `O_NOFOLLOW|O_DIRECTORY` descriptor, so a wrong-mode, foreign-owned, or symlinked
-/// root is refused instead of fixed.
+/// The parent chain is walked component-wise with no-follow opens first, so a symlink anywhere
+/// above the root refuses publication instead of creating the root inside a redirected location.
+/// A missing directory is created with mode `0700` at birth, descriptor-relative on the pinned
+/// parent; an existing one is only ever checked through an `O_NOFOLLOW|O_DIRECTORY` descriptor,
+/// so a wrong-mode, foreign-owned, or symlinked root is refused instead of fixed.
 fn ensure_private_directory(path: &Path) -> Result<File, PublishError> {
-    let mut builder = fs::DirBuilder::new();
-    builder.mode(0o700);
-    match builder.create(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+    let Some(parent) = path.parent() else {
+        return Err(PublishError::UnsafeRoot);
+    };
+    let Some(name) = path.file_name() else {
+        return Err(PublishError::UnsafeRoot);
+    };
+    let parent_directory = open_directory_at_path(parent).ok_or(PublishError::UnsafeRoot)?;
+    match create_directory_at(&parent_directory, name) {
+        Ok(()) | Err(libc::EEXIST) => {}
         Err(_) => return Err(PublishError::Unavailable),
     }
-    let directory = open_directory_at_path(path).ok_or(PublishError::UnsafeRoot)?;
+    let directory =
+        open_directory_at_os(&parent_directory, name).ok_or(PublishError::UnsafeRoot)?;
     if !is_owned_private_directory(&stat_descriptor(&directory).ok_or(PublishError::UnsafeRoot)?) {
         return Err(PublishError::UnsafeRoot);
     }
     Ok(directory)
 }
 
-/// Opens one path as a real directory, refusing a symlinked final component.
+/// Opens one absolute path as a real directory by walking every component from `/` over pinned
+/// descriptors with `O_NOFOLLOW|O_DIRECTORY`, so a symlink at any depth is refused, not only a
+/// symlinked final component (T29B review).
+///
+/// Intermediate components are validated only as "real directory, not a symlink" — they are
+/// system directories such as `/private/tmp`; the exact owner and mode rules belong to the
+/// rendezvous root and below, which callers check on the returned descriptor.
 fn open_directory_at_path(path: &Path) -> Option<File> {
-    let raw = CString::new(path.as_os_str().as_bytes()).ok()?;
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut pinned: Option<File> = None;
+    for component in path.components() {
+        match component {
+            Component::RootDir => pinned = open_root_directory(),
+            Component::Prefix(_) | Component::CurDir | Component::ParentDir => return None,
+            Component::Normal(name) => pinned = open_directory_at_os(pinned.as_ref()?, name),
+        }
+    }
+    pinned
+}
+
+/// Opens the filesystem root `/`, the pinned start of every component-wise walk.
+fn open_root_directory() -> Option<File> {
+    let raw = CString::new("/").ok()?;
     // SAFETY: `raw` is a valid NUL-terminated path; the descriptor is owned from here on.
     let descriptor = unsafe {
         libc::openat(
@@ -656,9 +750,9 @@ fn open_directory_at_path(path: &Path) -> Option<File> {
     nonnegative_file(descriptor)
 }
 
-/// Opens one directory component relative to a pinned parent descriptor.
-fn open_directory_at(parent: &File, name: &str) -> Option<File> {
-    let raw = CString::new(name).ok()?;
+/// Opens one directory component relative to a pinned parent descriptor, refusing symlinks.
+fn open_directory_at_os(parent: &File, name: &OsStr) -> Option<File> {
+    let raw = CString::new(name.as_bytes()).ok()?;
     // SAFETY: `raw` is valid for the call; the returned descriptor is owned from here on.
     let descriptor = unsafe {
         libc::openat(
@@ -670,7 +764,16 @@ fn open_directory_at(parent: &File, name: &str) -> Option<File> {
     nonnegative_file(descriptor)
 }
 
+/// Opens one named directory component relative to a pinned parent descriptor.
+fn open_directory_at(parent: &File, name: &str) -> Option<File> {
+    open_directory_at_os(parent, OsStr::new(name))
+}
+
 /// Opens one regular-file component relative to a pinned parent descriptor, refusing symlinks.
+///
+/// The open carries `O_NONBLOCK` so a special file named like a record (a FIFO with no writer)
+/// can never stall discovery; descriptor validation still rejects anything that is not a real
+/// owner-only regular record.
 fn open_file_at(parent: &File, name: &str) -> Option<File> {
     let raw = CString::new(name).ok()?;
     // SAFETY: `raw` is valid for the call; the returned descriptor is owned from here on.
@@ -678,7 +781,7 @@ fn open_file_at(parent: &File, name: &str) -> Option<File> {
         libc::openat(
             parent.as_raw_fd(),
             raw.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
         )
     };
     nonnegative_file(descriptor)
@@ -705,8 +808,8 @@ fn create_file_at(parent: &File, name: &str) -> std::io::Result<File> {
 /// Creates one mode-`0700` directory relative to a pinned parent descriptor.
 ///
 /// Returns the raw errno value so the one special case (`EEXIST`) stays cheap to match.
-fn create_directory_at(parent: &File, name: &str) -> Result<(), libc::c_int> {
-    let raw = CString::new(name).map_err(|_| libc::EINVAL)?;
+fn create_directory_at(parent: &File, name: &OsStr) -> Result<(), libc::c_int> {
+    let raw = CString::new(name.as_bytes()).map_err(|_| libc::EINVAL)?;
     // SAFETY: `raw` is valid for the call.
     let outcome = unsafe { libc::mkdirat(parent.as_raw_fd(), raw.as_ptr(), 0o700) };
     if outcome == 0 {
@@ -743,11 +846,12 @@ fn rename_at(
     }
 }
 
-/// Unlinks or removes one entry relative to a pinned descriptor; flags may add `AT_REMOVEDIR`.
-fn unlink_at(parent: &File, name: &str, flags: libc::c_int) -> std::io::Result<()> {
+/// Unlinks one entry relative to a pinned descriptor; never a directory (`AT_REMOVEDIR` is not
+/// used anywhere, so cleanup can never remove a route directory).
+fn unlink_at(parent: &File, name: &str) -> std::io::Result<()> {
     let raw = CString::new(name).map_err(|_| std::io::ErrorKind::InvalidInput)?;
     // SAFETY: `raw` is valid for the call.
-    let outcome = unsafe { libc::unlinkat(parent.as_raw_fd(), raw.as_ptr(), flags) };
+    let outcome = unsafe { libc::unlinkat(parent.as_raw_fd(), raw.as_ptr(), 0) };
     if outcome == 0 {
         Ok(())
     } else {
@@ -826,13 +930,16 @@ fn nonnegative_file(descriptor: libc::c_int) -> Option<File> {
     }
 }
 
-/// Reads at most `cap` entry names through a pinned directory descriptor, or [`None`] if larger.
+/// Reads at most `cap` entry names through a pinned directory descriptor, or [`None`] if the
+/// directory holds more entries or the enumeration fails.
+///
+/// The descriptor is duplicated with `F_DUPFD_CLOEXEC`, so the copy is close-on-exec from birth
+/// and a concurrent fork/exec between the duplication and `fdopendir` can never inherit a
+/// directory descriptor that still carries a lock (plain `dup` clears `FD_CLOEXEC`). `readdir`
+/// reports end-of-directory only while `errno` is still zero; any enumeration error returns
+/// [`None`], so a partial scan never produces a truncated candidate set.
 fn list_directory(directory: &File, cap: usize) -> Option<Vec<String>> {
-    // SAFETY: duplicating a valid descriptor yields another owned descriptor.
-    let duplicated = unsafe { libc::dup(directory.as_raw_fd()) };
-    if duplicated < 0 {
-        return None;
-    }
+    let duplicated = duplicate_cloexec_descriptor(directory.as_raw_fd())?;
     // SAFETY: `duplicated` is a valid directory descriptor; `fdopendir` takes ownership.
     let stream = unsafe { libc::fdopendir(duplicated) };
     if stream.is_null() {
@@ -842,9 +949,16 @@ fn list_directory(directory: &File, cap: usize) -> Option<Vec<String>> {
     }
     let mut names = Vec::new();
     loop {
+        clear_errno();
         // SAFETY: `stream` is a valid directory stream until `closedir`.
         let entry = unsafe { libc::readdir(stream) };
         if entry.is_null() {
+            // `readdir` distinguishes end-of-directory from failure only through `errno`.
+            if last_errno() != 0 {
+                // SAFETY: `stream` is still open here.
+                unsafe { libc::closedir(stream) };
+                return None;
+            }
             break;
         }
         // SAFETY: the entry's name is a NUL-terminated string valid until the next `readdir`.
@@ -864,6 +978,41 @@ fn list_directory(directory: &File, cap: usize) -> Option<Vec<String>> {
     // SAFETY: `stream` is open exactly once here.
     unsafe { libc::closedir(stream) };
     Some(names)
+}
+
+/// Duplicates one descriptor with `FD_CLOEXEC` set atomically via `F_DUPFD_CLOEXEC`.
+///
+/// Plain `dup` always clears the close-on-exec flag, leaving a window where a concurrent
+/// fork/exec inherits the duplicated directory descriptor — and with it any advisory lock it
+/// still holds — past the lifetime of this module's discovery.
+fn duplicate_cloexec_descriptor(descriptor: libc::c_int) -> Option<libc::c_int> {
+    // SAFETY: duplicating a valid descriptor yields another owned descriptor.
+    let duplicated = unsafe { libc::fcntl(descriptor, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicated >= 0 {
+        Some(duplicated)
+    } else {
+        None
+    }
+}
+
+/// Clears the calling thread's `errno` ahead of a call whose end-of-stream outcome is only
+/// distinguishable from failure through it.
+#[cfg(target_os = "macos")]
+fn clear_errno() {
+    // SAFETY: `__error` returns the address of the calling thread's `errno` slot.
+    unsafe { *libc::__error() = 0 };
+}
+
+/// See the macOS variant; the same contract through the platform's `errno` slot.
+#[cfg(not(target_os = "macos"))]
+fn clear_errno() {
+    // SAFETY: `__errno_location` returns the address of the calling thread's `errno` slot.
+    unsafe { *libc::__errno_location() = 0 };
+}
+
+/// Returns the calling thread's current `errno` value, or `0` when it cannot be read.
+fn last_errno() -> libc::c_int {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
 /// Returns `bytes` of operating-system randomness as lowercase hexadecimal.
@@ -895,6 +1044,7 @@ mod tests {
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
 
     /// One isolated test area below the OS temporary directory, never a production rendezvous root.
     struct TestArea {
@@ -906,13 +1056,19 @@ mod tests {
     impl TestArea {
         /// Creates a fresh owner-only base directory unique to one test.
         ///
-        /// The name is kept short on purpose: the fixture runtime holds a Unix socket, whose
-        /// bound path must stay under `SUN_LEN`, so the tag is deliberately not part of it.
+        /// The OS temporary directory is canonicalized first: on macOS `/tmp` and `/var` are
+        /// symlinks and `temp_dir()` may return a `/var/folders` path, while the code under test
+        /// refuses any symlinked ancestor. The name is kept short on purpose: the fixture runtime
+        /// holds a Unix socket, whose bound path must stay under `SUN_LEN`, so the tag is
+        /// deliberately not part of it.
         fn new(tag: &str) -> Self {
             let _ = tag;
             let ordinal = AREA_ORDINAL.fetch_add(1, Ordering::Relaxed);
-            let base = std::env::temp_dir()
-                .join(format!(".airdv{}-{ordinal}", std::process::id() % 100_000));
+            let temporary = std::env::temp_dir().canonicalize().unwrap_or_else(|_| {
+                println!("skipping canonicalization: temp dir could not be resolved");
+                std::env::temp_dir()
+            });
+            let base = temporary.join(format!(".airdv{}-{ordinal}", std::process::id() % 100_000));
             let _ = fs::remove_dir_all(&base);
             fs::create_dir(&base).unwrap();
             fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
@@ -957,17 +1113,7 @@ mod tests {
 
     /// A complete valid record body for `identity`, addressed at `runtime`.
     fn record_body(identity: &CodexRouteIdentity, nonce: &str, runtime: &Path) -> Vec<u8> {
-        let status = fs::symlink_metadata(runtime).unwrap();
-        serde_json::to_vec(&PublicationRecord {
-            version: RECORD_VERSION,
-            route: identity.digest(),
-            nonce: nonce.to_owned(),
-            runtime: runtime.to_string_lossy().into_owned(),
-            device: status.dev(),
-            inode: status.ino(),
-            attachment: fixture_attachment(),
-        })
-        .unwrap()
+        adjusted_record_body(identity, nonce, runtime, |_| {})
     }
 
     /// Creates the rendezvous root and one route directory by hand, both `0700`.
@@ -981,6 +1127,9 @@ mod tests {
     }
 
     /// Seeds a live-locked record with `body` under `name`, returning its held locked descriptor.
+    ///
+    /// An existing entry under the same name is replaced, so a test can re-seed one route after
+    /// dropping the previous holder without removing the file by hand.
     fn seed_locked_record(
         root: &Path,
         identity: &CodexRouteIdentity,
@@ -990,13 +1139,72 @@ mod tests {
         let path = seed_route_area(root, identity).join(name);
         let mut file = fs::OpenOptions::new()
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(true)
             .mode(0o600)
             .open(path)
             .unwrap();
         file.write_all(body).unwrap();
         assert!(try_lock(&file, libc::LOCK_EX | libc::LOCK_NB));
         file
+    }
+
+    /// A complete valid record body for `identity` with exactly one field replaced by `adjust`.
+    fn adjusted_record_body(
+        identity: &CodexRouteIdentity,
+        nonce: &str,
+        runtime: &Path,
+        adjust: impl FnOnce(&mut PublicationRecord),
+    ) -> Vec<u8> {
+        let status = fs::symlink_metadata(runtime).unwrap();
+        let mut record = PublicationRecord {
+            version: RECORD_VERSION,
+            route: identity.digest(),
+            nonce: nonce.to_owned(),
+            runtime: runtime.to_string_lossy().into_owned(),
+            device: status.dev(),
+            inode: status.ino(),
+            attachment: fixture_attachment(),
+        };
+        adjust(&mut record);
+        serde_json::to_vec(&record).unwrap()
+    }
+
+    /// One single-mutation negative case (T29B review).
+    ///
+    /// First seeds the unmodified valid record and asserts it is discoverable — so the case can
+    /// never pass vacuously — then re-seeds the same live-locked name with exactly one mutated
+    /// field and asserts discovery refuses the route.
+    fn assert_single_mutation_rejected(
+        area: &TestArea,
+        identity: &CodexRouteIdentity,
+        runtime: &Path,
+        mutate: impl FnOnce(&mut PublicationRecord),
+    ) {
+        let nonce = "1".repeat(NONCE_BYTES * 2);
+        let name = record_name(&nonce);
+        let held = seed_locked_record(
+            &area.root(),
+            identity,
+            &name,
+            &record_body(identity, &nonce, runtime),
+        );
+        assert!(
+            discover(&area.root(), identity).is_some(),
+            "precondition: the unmodified fixture is discoverable"
+        );
+        drop(held);
+        let held = seed_locked_record(
+            &area.root(),
+            identity,
+            &name,
+            &adjusted_record_body(identity, &nonce, runtime, mutate),
+        );
+        assert!(
+            discover(&area.root(), identity).is_none(),
+            "the single mutated field must refuse the record"
+        );
+        drop(held);
     }
 
     /// Publishes one live record and returns the publisher, runtime path, and identity.
@@ -1043,7 +1251,7 @@ mod tests {
     }
 
     #[test]
-    fn dropped_publisher_unpublishes_its_record() {
+    fn dropped_publisher_unpublishes_its_record_and_keeps_the_route_directory() {
         let area = TestArea::new("drop");
         let (publisher, _, identity) = publish_fixture(&area);
         let root = area.root();
@@ -1051,8 +1259,12 @@ mod tests {
         assert!(route_dir.is_dir());
         drop(publisher);
         assert!(
-            !route_dir.exists(),
-            "drop unpublishes: record and empty route removed"
+            fs::read_dir(&route_dir).unwrap().next().is_none(),
+            "drop unpublishes the captured record"
+        );
+        assert!(
+            route_dir.is_dir(),
+            "the route directory stays for a later publisher to reuse"
         );
         assert!(discover(&root, &identity).is_none());
     }
@@ -1078,12 +1290,19 @@ mod tests {
     }
 
     #[test]
-    fn unpublish_all_removes_own_record_and_empty_route_directory() {
+    fn unpublish_all_removes_only_the_records_and_keeps_route_directories() {
         let area = TestArea::new("unpublish");
         let (mut publisher, _, identity) = publish_fixture(&area);
         let route_dir = area.root().join(identity.digest());
         publisher.unpublish_all();
-        assert!(!route_dir.exists(), "empty route directory is removed");
+        assert!(
+            fs::read_dir(&route_dir).unwrap().next().is_none(),
+            "the captured record is removed"
+        );
+        assert!(
+            route_dir.is_dir(),
+            "the route directory is left in place for a later publisher"
+        );
         assert!(area.root().is_dir(), "the root itself is left in place");
         assert!(discover(&area.root(), &identity).is_none());
     }
@@ -1162,6 +1381,10 @@ mod tests {
         let (publisher, _, identity) = publish_fixture(&area);
         let root = area.root();
         let record = published_record_path(&root, &identity);
+        assert!(
+            discover(&root, &identity).is_some(),
+            "precondition: the unmodified fixture is discoverable"
+        );
         fs::set_permissions(&record, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(discover(&root, &identity).is_none());
         drop(publisher);
@@ -1216,6 +1439,10 @@ mod tests {
         let (publisher, _, identity) = publish_fixture(&area);
         let root = area.root();
         let route_dir = root.join(identity.digest());
+        assert!(
+            discover(&root, &identity).is_some(),
+            "precondition: the unmodified fixture is discoverable"
+        );
         fs::hard_link(
             published_record_path(&root, &identity),
             route_dir.join(record_name(&"e".repeat(NONCE_BYTES * 2))),
@@ -1229,88 +1456,219 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_live_records_are_skipped_and_never_poison_valid_ones() {
-        let area = TestArea::new("corrupt");
+    fn record_with_a_foreign_route_digest_is_refused() {
+        let area = TestArea::new("route-digest");
+        let runtime = area.runtime();
+        let identity = fixture_identity("main");
+        let other = fixture_identity("other");
+        assert_single_mutation_rejected(&area, &identity, &runtime, |record| {
+            record.route = other.digest();
+        });
+    }
+
+    #[test]
+    fn record_with_a_nonce_mismatching_its_name_is_refused() {
+        let area = TestArea::new("nonce");
+        let runtime = area.runtime();
+        let identity = fixture_identity("main");
+        assert_single_mutation_rejected(&area, &identity, &runtime, |record| {
+            record.nonce = "9".repeat(NONCE_BYTES * 2);
+        });
+    }
+
+    #[test]
+    fn record_with_an_unknown_version_is_refused() {
+        let area = TestArea::new("version");
+        let runtime = area.runtime();
+        let identity = fixture_identity("main");
+        assert_single_mutation_rejected(&area, &identity, &runtime, |record| {
+            record.version = RECORD_VERSION + 1;
+        });
+    }
+
+    #[test]
+    fn record_with_an_invalid_attachment_format_is_refused() {
+        let area = TestArea::new("attachment");
+        let runtime = area.runtime();
+        let identity = fixture_identity("main");
+        assert_single_mutation_rejected(&area, &identity, &runtime, |record| {
+            record.attachment = "nope".to_owned();
+        });
+    }
+
+    #[test]
+    fn record_with_an_unknown_json_field_is_refused() {
+        let area = TestArea::new("unknown-field");
         let runtime = area.runtime();
         let identity = fixture_identity("main");
         let nonce = "1".repeat(NONCE_BYTES * 2);
-        // One locked malformed record alone: live-looking, still no target.
-        let held = seed_locked_record(&area.root(), &identity, &record_name(&nonce), b"not json");
-        assert!(discover(&area.root(), &identity).is_none());
+        let name = record_name(&nonce);
+        let held = seed_locked_record(
+            &area.root(),
+            &identity,
+            &name,
+            &record_body(&identity, &nonce, &runtime),
+        );
+        assert!(
+            discover(&area.root(), &identity).is_some(),
+            "precondition: the unmodified fixture is discoverable"
+        );
+        drop(held);
+        // Exactly one change: one unknown top-level JSON field, spliced ahead of "version".
+        let mut valid = record_body(&identity, &nonce, &runtime);
+        let mutated = {
+            let mut text = String::from_utf8(std::mem::take(&mut valid)).unwrap();
+            text.insert_str(1, r#""extra":1,"#);
+            text.into_bytes()
+        };
+        let held = seed_locked_record(&area.root(), &identity, &name, &mutated);
+        assert!(
+            discover(&area.root(), &identity).is_none(),
+            "a closed JSON schema rejects unknown fields"
+        );
+        drop(held);
+    }
 
-        // A live publisher plus locked junk records: only the valid publication counts.
-        let mut publisher =
-            ManagedCodexPublisher::new(area.root(), runtime.clone(), fixture_attachment());
-        publisher.publish(&identity).unwrap();
+    #[test]
+    fn record_with_a_non_canonical_runtime_path_is_refused() {
+        let area = TestArea::new("non-canonical");
+        let runtime = area.runtime();
+        let identity = fixture_identity("main");
+        assert_single_mutation_rejected(&area, &identity, &runtime, |record| {
+            // A `..` component is never canonical; canonicalization resolves it away.
+            record.runtime = format!("{}/..", record.runtime);
+        });
+    }
 
+    #[test]
+    fn record_with_a_runtime_device_inode_mismatch_is_refused() {
+        let area = TestArea::new("dev-ino");
+        let runtime = area.runtime();
+        let identity = fixture_identity("main");
+        assert_single_mutation_rejected(&area, &identity, &runtime, |record| {
+            record.inode += 1;
+        });
+    }
+
+    #[test]
+    fn record_over_the_record_size_bound_is_refused() {
+        let area = TestArea::new("oversized");
+        let runtime = area.runtime();
+        let identity = fixture_identity("main");
+        let nonce = "1".repeat(NONCE_BYTES * 2);
+        let name = record_name(&nonce);
+        let held = seed_locked_record(
+            &area.root(),
+            &identity,
+            &name,
+            &record_body(&identity, &nonce, &runtime),
+        );
+        assert!(
+            discover(&area.root(), &identity).is_some(),
+            "precondition: the unmodified fixture is discoverable"
+        );
+        drop(held);
         let mut oversized = record_body(&identity, &nonce, &runtime);
         oversized.resize(MAX_RECORD_BYTES + 1, b' ');
-        let mismatched = {
-            let mut body = record_body(&identity, &nonce, &runtime);
-            body[8] = b'x'; // Corrupt the JSON body after the opening brace.
-            body
-        };
-        let wrong_nonce = serde_json::to_vec(&PublicationRecord {
-            version: RECORD_VERSION,
-            route: identity.digest(),
-            nonce: "deadbeef".repeat(4),
-            runtime: runtime.to_string_lossy().into_owned(),
-            device: 0,
-            inode: 0,
-            attachment: fixture_attachment(),
-        })
-        .unwrap();
-        let wrong_version = serde_json::to_vec(&PublicationRecord {
-            version: RECORD_VERSION + 1,
-            route: identity.digest(),
-            nonce: nonce.clone(),
-            runtime: runtime.to_string_lossy().into_owned(),
-            device: 0,
-            inode: 0,
-            attachment: fixture_attachment(),
-        })
-        .unwrap();
-        let bad_attachment = seed_locked_record(
+        let held = seed_locked_record(&area.root(), &identity, &name, &oversized);
+        assert!(
+            discover(&area.root(), &identity).is_none(),
+            "a record over MAX_RECORD_BYTES is refused"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn runtime_socket_validation_refuses_missing_wrong_type_and_loose_modes() {
+        let area = TestArea::new("socket");
+        let identity = fixture_identity("main");
+        let runtime = area.runtime();
+        let socket = runtime.join(SOCKET_NAME);
+        let nonce = "1".repeat(NONCE_BYTES * 2);
+        let name = record_name(&nonce);
+        let held = seed_locked_record(
             &area.root(),
             &identity,
-            &record_name(&"2".repeat(NONCE_BYTES * 2)),
-            br#"{"version":1,"route":"","nonce":"","runtime":"","device":0,"inode":0,"attachment":"nope"}"#,
+            &name,
+            &record_body(&identity, &nonce, &runtime),
         );
-        let held_oversized = seed_locked_record(
-            &area.root(),
-            &identity,
-            &record_name(&"3".repeat(NONCE_BYTES * 2)),
-            &oversized,
+
+        // Change exactly one thing: remove the daemon socket.
+        assert!(
+            discover(&area.root(), &identity).is_some(),
+            "precondition: the unmodified fixture is discoverable"
         );
-        let held_mismatched = seed_locked_record(
-            &area.root(),
-            &identity,
-            &record_name(&"4".repeat(NONCE_BYTES * 2)),
-            &mismatched,
+        fs::remove_file(&socket).unwrap();
+        assert!(
+            discover(&area.root(), &identity).is_none(),
+            "a runtime without a socket is refused"
         );
-        let held_wrong_nonce = seed_locked_record(
-            &area.root(),
-            &identity,
-            &record_name(&"5".repeat(NONCE_BYTES * 2)),
-            &wrong_nonce,
+
+        // Restore the live state, then change exactly one thing again: the socket inode's type.
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        drop(listener);
+        assert!(
+            discover(&area.root(), &identity).is_some(),
+            "the restored socket is discoverable again"
         );
-        let held_wrong_version = seed_locked_record(
-            &area.root(),
-            &identity,
-            &record_name(&"6".repeat(NONCE_BYTES * 2)),
-            &wrong_version,
+        fs::remove_file(&socket).unwrap();
+        fs::write(&socket, b"").unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            discover(&area.root(), &identity).is_none(),
+            "a regular file at the socket name is refused"
         );
+
+        // Restore the live state, then change exactly one thing again: the socket mode.
+        fs::remove_file(&socket).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        drop(listener);
+        assert!(
+            discover(&area.root(), &identity).is_some(),
+            "the restored socket is discoverable again"
+        );
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(
+            discover(&area.root(), &identity).is_none(),
+            "a group-readable socket is refused"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn invalid_records_are_skipped_without_poisoning_the_valid_one() {
+        let area = TestArea::new("poison");
+        let runtime = area.runtime();
+        let identity = fixture_identity("main");
+        let mut publisher = ManagedCodexPublisher::new(area.root(), runtime, fixture_attachment());
+        publisher.publish(&identity).unwrap();
+        assert!(
+            discover(&area.root(), &identity).is_some(),
+            "precondition: the unmodified fixture is discoverable"
+        );
+
+        // Locked malformed and schema-violating siblings never poison the valid publication.
+        let mut held = Vec::new();
+        for (index, body) in [
+            &b"not json"[..],
+            &br#"{"version":1,"route":"","nonce":"","runtime":"","device":0,"inode":0,"attachment":"nope"}"#[..],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            held.push(seed_locked_record(
+                &area.root(),
+                &identity,
+                &record_name(&format!("{index:0>32}")),
+                body,
+            ));
+        }
         assert!(
             discover(&area.root(), &identity).is_some(),
             "invalid records are skipped without poisoning the valid one"
         );
-        drop(bad_attachment);
-        drop(held_oversized);
-        drop(held_mismatched);
-        drop(held_wrong_nonce);
-        drop(held_wrong_version);
-        drop(held);
-        drop(publisher);
     }
 
     #[test]
@@ -1373,11 +1731,18 @@ mod tests {
             Err(PublishError::TooManyRoutes)
         );
         publisher.unpublish_all();
-        assert_eq!(
-            fs::read_dir(area.root()).unwrap().count(),
-            0,
-            "every route directory is removed"
-        );
+        for entry in fs::read_dir(area.root()).unwrap() {
+            let entry = entry.unwrap();
+            assert!(
+                entry.file_type().unwrap().is_dir(),
+                "only route directories remain after unpublish"
+            );
+            assert_eq!(
+                fs::read_dir(entry.path()).unwrap().count(),
+                0,
+                "every retained record was removed; route directories stay for reuse"
+            );
+        }
     }
 
     #[test]
@@ -1460,10 +1825,176 @@ mod tests {
         let area = TestArea::new("absent");
         let identity = fixture_identity("absent");
         assert!(discover(&area.root(), &identity).is_none());
+        let root = default_root().expect("the production root resolves");
         assert!(
-            default_root()
-                .is_some_and(|root| root.to_string_lossy().starts_with("/private/tmp/ai-c-")),
+            root.to_string_lossy().starts_with("/private/tmp/ai-c-"),
             "the production root is the fixed /private/tmp/ai-c-<euid> path"
         );
+        let parent = root.parent().expect("the production root has a parent");
+        assert!(
+            open_directory_at_path(parent).is_some(),
+            "the production default root's parent chain walks cleanly without symlinks"
+        );
+    }
+
+    #[test]
+    fn fifo_named_like_a_record_cannot_stall_discovery() {
+        let area = TestArea::new("fifo");
+        let (publisher, _, identity) = publish_fixture(&area);
+        let root = area.root();
+        let fifo = root
+            .join(identity.digest())
+            .join(record_name(&"9".repeat(NONCE_BYTES * 2)));
+        let raw = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0);
+        let started = Instant::now();
+        let target = discover(&root, &identity);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "a FIFO named like a record must not block discovery (took {elapsed:?})"
+        );
+        assert!(
+            target.is_some(),
+            "the valid record beside the FIFO is still found"
+        );
+        drop(publisher);
+    }
+
+    #[test]
+    fn duplicated_descriptors_are_close_on_exec_from_birth() {
+        let area = TestArea::new("cloexec");
+        let file = File::open(&area.base).unwrap();
+        let duplicated =
+            duplicate_cloexec_descriptor(file.as_raw_fd()).expect("F_DUPFD_CLOEXEC succeeds");
+        // SAFETY: `duplicated` is a test-owned descriptor, inspected and closed right here.
+        let flags = unsafe { libc::fcntl(duplicated, libc::F_GETFD) };
+        assert_ne!(flags, -1);
+        assert!(
+            flags & libc::FD_CLOEXEC != 0,
+            "F_DUPFD_CLOEXEC sets FD_CLOEXEC atomically; plain dup would clear it"
+        );
+        // SAFETY: the duplicated descriptor is owned by this test and closed exactly once.
+        unsafe { libc::close(duplicated) };
+    }
+
+    #[test]
+    fn special_bits_on_directories_are_rejected() {
+        let area = TestArea::new("dir-special");
+        let identity = fixture_identity("main");
+        let runtime = area.runtime();
+        // The rendezvous root itself at 0o1700 (sticky): refused for publication and discovery.
+        fs::create_dir(area.root()).unwrap();
+        fs::set_permissions(area.root(), fs::Permissions::from_mode(0o1700)).unwrap();
+        if fs::metadata(area.root()).unwrap().permissions().mode() & 0o7777 != 0o1700 {
+            println!("skipping: this platform refused the sticky bit for the test user");
+            return;
+        }
+        let mut publisher =
+            ManagedCodexPublisher::new(area.root(), runtime.clone(), fixture_attachment());
+        assert_eq!(publisher.publish(&identity), Err(PublishError::UnsafeRoot));
+        assert!(discover(&area.root(), &identity).is_none());
+
+        // The same special bits on a route directory under a valid root: refused too.
+        fs::set_permissions(area.root(), fs::Permissions::from_mode(0o700)).unwrap();
+        let route_dir = area.root().join(identity.digest());
+        fs::create_dir(&route_dir).unwrap();
+        fs::set_permissions(&route_dir, fs::Permissions::from_mode(0o1700)).unwrap();
+        if fs::metadata(&route_dir).unwrap().permissions().mode() & 0o7777 != 0o1700 {
+            println!("skipping: this platform refused the sticky bit for the test user");
+            return;
+        }
+        assert_eq!(publisher.publish(&identity), Err(PublishError::UnsafeRoute));
+        assert!(
+            discover(&area.root(), &identity).is_none(),
+            "mode 0o1700 is not exactly 0o700 and is refused"
+        );
+    }
+
+    #[test]
+    fn special_bits_on_records_are_rejected() {
+        let area = TestArea::new("record-special");
+        let (publisher, _, identity) = publish_fixture(&area);
+        let root = area.root();
+        let record = published_record_path(&root, &identity);
+        assert!(
+            discover(&root, &identity).is_some(),
+            "precondition: the unmodified fixture is discoverable"
+        );
+        fs::set_permissions(&record, fs::Permissions::from_mode(0o4600)).unwrap();
+        if fs::metadata(&record).unwrap().permissions().mode() & 0o7777 != 0o4600 {
+            println!("skipping: this platform refused the set-user-ID bit for the test user");
+            return;
+        }
+        assert!(
+            discover(&root, &identity).is_none(),
+            "mode 0o4600 is not exactly 0o600 and is refused"
+        );
+        drop(publisher);
+    }
+
+    #[test]
+    fn a_root_beneath_a_symlinked_parent_is_refused() {
+        let area = TestArea::new("symlink-parent");
+        let real = area.base.join("real-parent");
+        fs::create_dir(&real).unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).unwrap();
+        let linked = area.base.join("linked-parent");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        let root = linked.join("rendezvous");
+        let identity = fixture_identity("main");
+        let runtime = area.runtime();
+        let mut publisher = ManagedCodexPublisher::new(root.clone(), runtime, fixture_attachment());
+        assert_eq!(
+            publisher.publish(&identity),
+            Err(PublishError::UnsafeRoot),
+            "publication refuses a root reached through a symlinked parent"
+        );
+        assert!(
+            discover(&root, &identity).is_none(),
+            "discovery refuses a root reached through a symlinked parent"
+        );
+    }
+
+    #[test]
+    fn enumeration_over_the_entry_cap_refuses_the_route_quickly() {
+        let area = TestArea::new("entry-cap");
+        let (publisher, _, identity) = publish_fixture(&area);
+        let route_dir = area.root().join(identity.digest());
+        // 513 junk entries: one past the enumeration cap, regardless of readdir order.
+        for index in 0..=(MAX_ROUTE_ENTRIES) {
+            fs::write(route_dir.join(format!("junk-{index:04}")), b"").unwrap();
+        }
+        let started = Instant::now();
+        assert!(
+            discover(&area.root(), &identity).is_none(),
+            "over the enumeration cap the whole route is refused"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the cap stops enumeration early instead of scanning unboundedly"
+        );
+        drop(publisher);
+    }
+
+    #[test]
+    fn concurrent_probes_all_find_the_live_record() {
+        let area = TestArea::new("concurrent");
+        let (publisher, _, identity) = publish_fixture(&area);
+        let root = area.root();
+        let probes: Vec<_> = (0..2)
+            .map(|_| {
+                let root = root.clone();
+                let identity = identity.clone();
+                std::thread::spawn(move || discover(&root, &identity))
+            })
+            .collect();
+        for probe in probes {
+            assert!(
+                probe.join().unwrap().is_some(),
+                "a shared discovery probe coexists with the publisher's lock"
+            );
+        }
+        drop(publisher);
     }
 }
