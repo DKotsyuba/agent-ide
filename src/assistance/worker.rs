@@ -95,6 +95,9 @@ struct Job {
     stop_reply: Option<oneshot::Sender<PeerReply>>,
     /// Native lifecycle revision captured when execution begins, not when it was queued.
     native_epoch: u64,
+    /// Closed failing-stage tag for the terminal error log (T27B); never repository paths or
+    /// child output, only fixed tags such as `diff:deadline` or `diff:child_exit:cat-file`.
+    failure_detail: Option<String>,
 }
 
 /// A retained outcome requiring exact binding ownership and fresh durable authorization on access.
@@ -1643,6 +1646,7 @@ impl WorkerHandle {
             cancel,
             stop_reply,
             native_epoch: 0,
+            failure_detail: None,
         };
         if tool == AssistanceTool::Stop {
             let cleanup = ledger
@@ -2062,6 +2066,7 @@ impl<'a> Worker<'a> {
                 crate::errorlog::Fields {
                     reason: Some((*code).into()),
                     correlation: Some(job.reference.as_str()),
+                    detail: job.failure_detail.as_deref(),
                     duration_ms: u32::try_from(started.elapsed().as_millis()).ok(),
                     ..Default::default()
                 },
@@ -4757,6 +4762,7 @@ mod stop_retry_tests {
             cancel,
             stop_reply: None,
             native_epoch: 0,
+            failure_detail: None,
         };
         worker.activate(&mut job).await.unwrap();
         let receipt = worker.grants.get(&binding).cloned().unwrap();
@@ -4848,6 +4854,7 @@ mod stop_retry_tests {
             cancel,
             stop_reply: None,
             native_epoch: 0,
+            failure_detail: None,
         };
         let (context_reply, authority, source) = worker.context(&mut context_job).await.unwrap();
         worker.shared.ledger.lock().unwrap().details.insert(
@@ -4886,6 +4893,7 @@ mod stop_retry_tests {
             cancel,
             stop_reply: None,
             native_epoch: 0,
+            failure_detail: None,
         };
         let (reply, authority, source) = worker.edit(&mut edit_job).await.unwrap();
         assert!(matches!(
@@ -4957,6 +4965,7 @@ mod stop_retry_tests {
             cancel,
             stop_reply: None,
             native_epoch: 0,
+            failure_detail: None,
         };
         let (claude_reply, _, _) = worker
             .prepare_claude_edit_job(&mut claude_prepare)
@@ -5060,6 +5069,7 @@ mod stop_retry_tests {
             cancel,
             stop_reply: None,
             native_epoch: 0,
+            failure_detail: None,
         };
         let (reply, _, _) = worker.settle_stopped_claude_edit(&mut job).await.unwrap();
         assert!(matches!(
@@ -5238,6 +5248,7 @@ mod stop_retry_tests {
             cancel,
             stop_reply: None,
             native_epoch: 0,
+            failure_detail: None,
         };
         let (reply, authority, source) = worker.settle_stopped_claude_edit(&mut job).await.unwrap();
         assert!(matches!(
@@ -5413,6 +5424,7 @@ mod stop_retry_tests {
             cancel,
             stop_reply: None,
             native_epoch: 0,
+            failure_detail: None,
         };
         let (reply, _, source) = worker.context(&mut job).await.unwrap();
         assert!(matches!(
@@ -5515,6 +5527,7 @@ mod stop_retry_tests {
                 cancel,
                 stop_reply: None,
                 native_epoch: 0,
+                failure_detail: None,
             },
             cancel_sender,
         )

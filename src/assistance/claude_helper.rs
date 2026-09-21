@@ -1830,14 +1830,14 @@ mod tests {
     }
 
     /// A launched helper claims once, runs real Git children, reaps them, and settles its frame.
-    /// Proves the daemon-minted Diff budget covers the snapshot's bounded per-path walk.
+    /// Proves the snapshot walk's child count no longer scales with tracked-path count (T27B).
     ///
-    /// A real repository with more tracked paths than the old per-operation process ceiling
-    /// used to exhaust the helper's child budget mid-walk and fail every Claude Diff closed as
+    /// A real repository with more tracked paths than the old per-operation process ceiling used
+    /// to exhaust the helper's child budget mid-walk and fail every Claude Diff closed as
     /// `capacity` without any write. This regression runs the real helper Diff over a worktree
-    /// with more than sixty-four tracked paths using exactly the minted production ceilings, and
-    /// additionally shows the previous small budget fails on the same repository, so the budget
-    /// and the snapshot bound can never silently diverge again.
+    /// with more than sixty-four tracked paths and shows even the small legacy budget completes
+    /// the whole walk — unchanged paths cost no per-path children since the batched no-filter
+    /// hash classification — so the budget and the snapshot bound can never silently diverge.
     #[tokio::test]
     async fn diff_helper_completes_the_bounded_snapshot_walk_of_a_real_repository() {
         let candidate = worktree();
@@ -1913,23 +1913,16 @@ mod tests {
                 deadline_ms: 120_000,
             },
         };
-        // The previously minted ceiling cannot finish the walk of this repository and fails
-        // closed partway through its child budget instead of delivering any diff.
+        // The small legacy budget now completes the same walk: classification is batched, so the
+        // child count stays far below the ceiling no matter how many tracked paths are unchanged.
         let (outcome, small, _, _) = perform(&diff_job(64, 64 * 1024)).await;
         assert!(
-            matches!(
-                outcome,
-                HelperOutcome::Failed {
-                    code: FailureCode::Capacity
-                } | HelperOutcome::Failed {
-                    code: FailureCode::SourceUnavailable
-                }
-            ),
-            "the small legacy budget must fail closed, saw {outcome:?}"
+            matches!(outcome, HelperOutcome::Complete { .. }),
+            "the small legacy budget must complete the batched walk, saw {outcome:?}"
         );
         assert!(
-            small.spawned > 8,
-            "legacy budget consumed {}",
+            small.spawned <= 32,
+            "81 tracked paths must not cost per-path children, used {}",
             small.spawned
         );
         // The minted production ceilings complete the same walk and deliver a real diff.
@@ -1941,9 +1934,121 @@ mod tests {
         let HelperOutcome::Complete { text } = outcome else {
             panic!("the bounded snapshot walk completes, saw {outcome:?}")
         };
-        assert!(children.settled() && children.spawned > 64);
+        assert!(children.settled());
+        assert!(
+            children.spawned <= 32,
+            "81 tracked paths must not cost per-path children, used {}",
+            children.spawned
+        );
         assert!(text.contains("changed.txt"), "diff text: {text}");
         assert!(matches!(payload, Some(HelperPayload::Diff { .. })));
+        let _ = std::fs::remove_dir_all(&candidate);
+    }
+
+    /// Enough changed paths still exceed the legacy child budget and fail it closed (T27B).
+    ///
+    /// Batched classification removed the per-unchanged-path children, but every changed path
+    /// still costs its own bounded commands. This regression runs the real helper Diff over a
+    /// worktree whose changed-path count alone passes the small legacy budget, and asserts the
+    /// walk stops with the closed `capacity` failure and no diff payload — the safety bound the
+    /// batching must never silently lift.
+    #[tokio::test]
+    async fn diff_helper_fails_closed_when_changed_paths_exceed_the_child_budget() {
+        let candidate = worktree();
+        for index in 0..24 {
+            std::fs::write(
+                candidate.join(format!("file-{index:02}.txt")),
+                format!("before {index}\n"),
+            )
+            .unwrap();
+        }
+        let status = std::process::Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(&candidate)
+            .args([
+                "-c",
+                "user.name=helper",
+                "-c",
+                "user.email=helper@invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(["add", "--", "."])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = std::process::Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(&candidate)
+            .args([
+                "-c",
+                "user.name=helper",
+                "-c",
+                "user.email=helper@invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(["commit", "--quiet", "-m", "many changed paths"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        // Every tracked path changes, so the walk pays per-changed-path commands alone.
+        for index in 0..24 {
+            std::fs::write(
+                candidate.join(format!("file-{index:02}.txt")),
+                format!("after {index}\n"),
+            )
+            .unwrap();
+        }
+        let root_identity = crate::workspace::observation::native_directory_identity(
+            &std::fs::File::open(&candidate).unwrap(),
+        )
+        .expect("fixture worktree has a native root identity");
+        let job = HelperJob {
+            protocol: HELPER_PROTOCOL,
+            operation: HelperOperation::Diff,
+            candidate: candidate.clone(),
+            git: PathBuf::from("/usr/bin/git"),
+            canonical_root: Some(candidate.clone()),
+            scope: Some(HelperScope {
+                worktree_id: "worktree".into(),
+                incarnation: 1,
+                root: candidate.clone(),
+                repository_root: candidate.clone(),
+                git_common_dir: PathBuf::from(".git"),
+                native_root_identity: root_identity,
+                authority_epoch: 1,
+            }),
+            baseline: Some(HelperBaseline {
+                reference: "baseline".into(),
+                captured: false,
+                digest: None,
+            }),
+            provider: None,
+            edit_source: None,
+            parameters: serde_json::json!({"mode":"head"}),
+            budgets: HelperBudgets {
+                output_bytes: 64 * 1024,
+                // The small legacy budget: 24 changed paths need far more children than this.
+                processes: 6,
+                deadline_ms: 120_000,
+            },
+        };
+        let (outcome, children, _, payload) = perform(&job).await;
+        assert!(
+            matches!(
+                outcome,
+                HelperOutcome::Failed {
+                    code: FailureCode::Capacity
+                }
+            ),
+            "changed paths past the legacy budget must fail closed, saw {outcome:?}"
+        );
+        assert_eq!(
+            children.spawned, 6,
+            "the walk must stop at the budget, not past it"
+        );
+        assert!(payload.is_none(), "no diff payload may be delivered");
         let _ = std::fs::remove_dir_all(&candidate);
     }
 

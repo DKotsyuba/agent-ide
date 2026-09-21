@@ -20,6 +20,7 @@ use crate::{
 };
 use std::{
     collections::BTreeMap,
+    ffi::OsString,
     fs::{self, DirBuilder, OpenOptions},
     io::Write,
     os::unix::{
@@ -43,6 +44,25 @@ pub const MAX_SNAPSHOT_BLOB_BYTES: usize = 1024 * 1024;
 pub const MAX_SNAPSHOT_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum aggregate retained patch bytes across every path in one attempt.
 pub const MAX_SNAPSHOT_PATCH_BYTES: usize = 1024 * 1024;
+/// Target scratch-argv bytes of one batched `hash-object` command. Every managed sandbox replay
+/// pays a fixed multi-second startup per child, so batches pack toward this goal, far below the
+/// execution-policy ceiling regardless of the host temp-root depth; more entries simply mean one
+/// more bounded child. This is the packing goal only — the hard ceiling is
+/// [`crate::execution::MAX_PRODUCT_ARGV_BYTES`].
+const MAX_HASH_BATCH_ARGV_BYTES: usize = 4096;
+/// Fixed non-path arguments every batched `hash-object` command starts with; the argv budget
+/// counts these exact strings plus one canonical scratch path per entry.
+const HASH_BATCH_FLAGS: [&str; 7] = [
+    "--no-pager",
+    "--no-lazy-fetch",
+    "-c",
+    "core.fsmonitor=false",
+    "hash-object",
+    "--no-filters",
+    "--",
+];
+/// Scratch-directory name stem shared by creation and argv budgeting so neither drifts.
+const SNAPSHOT_SCRATCH_STEM: &str = "agent-ide-snapshot-";
 /// Process-local suffix that prevents accidental reuse of a scratch directory.
 static NEXT_SNAPSHOT: AtomicU64 = AtomicU64::new(1);
 
@@ -82,7 +102,7 @@ impl SnapshotDirectory {
         }
         for _ in 0..16 {
             let path = temp.join(format!(
-                "agent-ide-snapshot-{}-{}",
+                "{SNAPSHOT_SCRATCH_STEM}{}-{}",
                 std::process::id(),
                 NEXT_SNAPSHOT.fetch_add(1, Ordering::Relaxed)
             ));
@@ -140,6 +160,8 @@ pub struct SnapshotIntent {
     directory: Option<Arc<SnapshotDirectory>>,
     /// Whether exit one is the successful no-index differences result.
     differences_allowed: bool,
+    /// Closed stage name used only for the bounded terminal diff failure detail.
+    label: &'static str,
 }
 
 impl SnapshotIntent {
@@ -230,11 +252,22 @@ impl SnapshotIntent {
             query.mode(),
         )?;
         let intent = GitReadIntent::from_scope(query_scope, program.to_path_buf(), query)?;
+        let label = match query {
+            GitReadQuery::HeadIdentity => "rev-parse",
+            GitReadQuery::IndexState => "ls-files-stage",
+            GitReadQuery::HeadTree => "ls-tree",
+            GitReadQuery::UntrackedPaths => "ls-files-others",
+            GitReadQuery::Status
+            | GitReadQuery::HeadDiff
+            | GitReadQuery::StagedDiff
+            | GitReadQuery::UnstagedDiff => "git-metadata",
+        };
         Ok(Self {
             scope: intent.scope().clone(),
             command: intent.controlled_command()?,
             directory: None,
             differences_allowed: false,
+            label,
         })
     }
     /// Builds a no-filter immutable-object read; full OIDs prevent revision or option injection.
@@ -258,6 +291,7 @@ impl SnapshotIntent {
             command,
             directory: None,
             differences_allowed: false,
+            label: "cat-file",
         })
     }
     /// Returns whether this intent is a no-index comparison rather than metadata/blob verification.
@@ -265,33 +299,41 @@ impl SnapshotIntent {
         self.differences_allowed
     }
 
-    /// Hashes an exact private blob snapshot with the repository's SHA-1/SHA-256 format and no filters.
-    /// No object is written; callers must compare the returned full hash with the requested blob OID.
-    fn verify_blob(scope: GitScope, program: &Path, bytes: &[u8]) -> Result<Self, GitError> {
-        let directory = SnapshotDirectory::new(&scope)?;
-        directory.write("blob", bytes)?;
+    /// Returns the closed stage name of this operation for bounded failure detail.
+    pub const fn label(&self) -> &'static str {
+        self.label
+    }
+
+    /// Hashes exact private snapshot files in one bounded command using the repository's
+    /// SHA-1/SHA-256 format and no filters. No object is written; output order matches `names`
+    /// order. One child replaces one hash command per blob, which dominates wall time when every
+    /// spawn replays a managed sandbox at a fixed multi-second startup cost.
+    fn hash_files(
+        scope: &GitScope,
+        program: &Path,
+        directory: Arc<SnapshotDirectory>,
+        names: &[String],
+    ) -> Result<Self, GitError> {
+        let mut arguments: Vec<OsString> = HASH_BATCH_FLAGS.iter().map(Into::into).collect();
+        arguments.extend(
+            names
+                .iter()
+                .map(|name| directory.path.join(name).into_os_string()),
+        );
         let command = ControlledCommand::from_validated_peer(
             CommandKind::Git,
             program.to_path_buf(),
-            vec![
-                "--no-pager".into(),
-                "--no-lazy-fetch".into(),
-                "-c".into(),
-                "core.fsmonitor=false".into(),
-                "hash-object".into(),
-                "--no-filters".into(),
-                "--".into(),
-                directory.path.join("blob").into_os_string(),
-            ],
+            arguments,
             scope.worktree().worktree_path().to_path_buf(),
             safe_git_environment(),
         )
         .map_err(|_| GitError::InvalidGitProgram)?;
         Ok(Self {
-            scope,
+            scope: scope.clone(),
             command,
             directory: Some(directory),
             differences_allowed: false,
+            label: "hash-object",
         })
     }
 
@@ -348,6 +390,7 @@ impl SnapshotIntent {
             command,
             directory: Some(directory),
             differences_allowed: true,
+            label: "diff-no-index",
         })
     }
     /// Accepts only reaped, fully drained bounded output with the command's exact success exit set.
@@ -381,6 +424,108 @@ impl SnapshotIntent {
         }
         Ok(result.stdout().bytes.clone())
     }
+}
+
+/// Parses exactly one terminal-LF object name per line, in command argument order.
+fn parse_batch_hashes(output: &[u8], count: usize) -> Result<Vec<GitObjectId>, GitError> {
+    let lines: Vec<&[u8]> = output.split(|byte| *byte == b'\n').collect();
+    if lines.last() != Some(&&b""[..]) || lines.len() != count + 1 {
+        return Err(GitError::InvalidIdentity);
+    }
+    lines[..count]
+        .iter()
+        .map(|line| GitObjectId::parse(line)?.ok_or(GitError::InvalidIdentity))
+        .collect()
+}
+
+/// Packs `count` ordered entries into consecutive `[start, end)` batches whose estimated argv
+/// bytes stay below [`MAX_HASH_BATCH_ARGV_BYTES`], whatever the host temp-root depth. A single
+/// entry too large even alone for `limit` fails closed with [`GitError::EvidenceTooLarge`]
+/// before any scratch file is written; smaller boundaries never reorder output.
+fn hash_batch_ranges(
+    count: usize,
+    prefix_cost: usize,
+    name_cost: impl Fn(usize) -> usize,
+    limit: usize,
+) -> Result<Vec<(usize, usize)>, GitError> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut used = prefix_cost;
+    for position in 0..count {
+        let cost = prefix_cost + name_cost(position) + 1;
+        if cost > limit {
+            return Err(GitError::EvidenceTooLarge);
+        }
+        if position > start && used + cost > MAX_HASH_BATCH_ARGV_BYTES {
+            ranges.push((start, position));
+            start = position;
+            used = prefix_cost;
+        }
+        used += cost;
+    }
+    ranges.push((start, count));
+    Ok(ranges)
+}
+
+/// Returns the fixed argv bytes every batched hash command pays beyond its per-entry names: the
+/// fixed flags plus one canonical scratch-directory path, each counted with a separating byte.
+/// The estimate mirrors what the execution policy actually measures, so it uses the canonical
+/// temp root and the real directory template — an unresolved `TMPDIR` alias can be arbitrarily
+/// deeper than the paths that are really passed — and reserves full counter digits so it never
+/// undershoots.
+fn hash_batch_prefix_bytes() -> Result<usize, GitError> {
+    let temp = fs::canonicalize(std::env::temp_dir()).map_err(|_| GitError::SnapshotIo)?;
+    Ok(
+        HASH_BATCH_FLAGS.iter().map(|flag| flag.len() + 1).sum::<usize>()
+            + temp.as_os_str().len()
+            + 1 // separator before the scratch directory name
+            + SNAPSHOT_SCRATCH_STEM.len()
+            + std::process::id().to_string().len()
+            + 1 // separator before the counter suffix
+            + 20 // counter digits reserved at full u64 width
+            + 1, // separator before each path argument
+    )
+}
+
+/// Hashes indexed private snapshots through as few bounded no-filter commands as possible.
+///
+/// One managed sandbox replay costs a fixed multi-second startup per child, and packed batches
+/// keep that cost per ~4 KiB of scratch argv instead of per blob. Indexes may be sparse; the
+/// returned hashes align with `entries` order and each proves the exact written bytes.
+async fn batch_hashes<R: SnapshotRunner>(
+    scope: &GitScope,
+    program: &Path,
+    marker: char,
+    entries: Vec<(usize, Vec<u8>)>,
+    runner: &mut R,
+) -> Result<Vec<GitObjectId>, GitError> {
+    // The budget uses the real argument strings — canonical scratch paths and the fixed flags —
+    // and a singleton past the execution ceiling fails closed here, before any scratch file is
+    // written for it.
+    let prefix_cost = hash_batch_prefix_bytes()?;
+    let ranges = hash_batch_ranges(
+        entries.len(),
+        prefix_cost,
+        |index| format!("{marker}{index}").len(),
+        crate::execution::MAX_PRODUCT_ARGV_BYTES,
+    )?;
+    let mut hashes = Vec::with_capacity(entries.len());
+    for (start, end) in ranges {
+        let directory = SnapshotDirectory::new(scope)?;
+        let mut names = Vec::with_capacity(end - start);
+        for (index, bytes) in &entries[start..end] {
+            let name = format!("{marker}{index}");
+            directory.write(&name, bytes)?;
+            names.push(name);
+        }
+        let intent = SnapshotIntent::hash_files(scope, program, directory, &names)?;
+        let output = intent.accept(runner.run(intent.clone()).await?)?;
+        hashes.extend(parse_batch_hashes(&output, names.len())?);
+    }
+    Ok(hashes)
 }
 
 /// Integration boundary: Execution owns admission, live-use checks, timeouts, cancellation and reap.
@@ -728,6 +873,20 @@ fn parse_entries(
 
 /// Assembles one generation from safe plumbing and exact raw file reads under aggregate budgets.
 /// Rename inference is deliberately absent: old/new raw identities are separate delete/add records.
+/// One selected changed path awaiting its blob fetch and private no-index comparison.
+/// `right` is a committed/index object side for `Staged` (an absent side compares as empty
+/// bytes) and the already-captured worktree content for `Head`/`Unstaged`.
+struct PendingCompare {
+    /// Exact status identity pushed into the snapshot regardless of comparison success.
+    entry: PathStatus,
+    /// Left comparison object; an absent left side compares as empty bytes.
+    left: Option<GitObjectId>,
+    /// Right comparison object for `Staged`; `None` selects the worktree content.
+    right: Option<Option<GitObjectId>>,
+    /// Exact captured worktree source carried into the snapshot evidence.
+    source: SnapshotSource,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn capture_attempt<R: SnapshotRunner>(
     authority: Option<&AuthorityStamp>,
@@ -789,19 +948,20 @@ async fn capture_attempt<R: SnapshotRunner>(
     for entry in status.untracked() {
         inspect_untracked(scope.worktree(), entry.path())?;
     }
-    let mut blobs = BTreeMap::new();
+    // Exact safe in-process reads cover every non-conflict union path, not only paths Git's stat
+    // cache happened to mark dirty. Blob bytes are fetched later, only for sides a selected
+    // comparison actually needs.
     let mut paths = Vec::new();
     let mut sources = BTreeMap::new();
     let mut total_bytes = 0usize;
     let mut patch_bytes = 0usize;
     let mut working = blake3::Hasher::new();
-    for path in union {
-        let head = head_entries.get(&path).and_then(|entries| entries.get(&0));
-        let stages = index_entries.get(&path);
+    for path in &union {
+        let stages = index_entries.get(path);
         if stages.is_some_and(|entries| !entries.contains_key(&0)) {
             status.conflicts.push(PathStatus {
                 kind: super::StatusKind::Unmerged,
-                path,
+                path: path.clone(),
                 original_path: None,
                 status: None,
                 modes: None,
@@ -818,27 +978,55 @@ async fn capture_attempt<R: SnapshotRunner>(
             });
             continue;
         }
-        let index = stages.and_then(|entries| entries.get(&0));
         let current = match authority {
-            Some(authority) => runner.current_observation(authority, &path).await,
+            Some(authority) => runner.current_observation(authority, path).await,
             None => None,
         };
         let source =
-            SnapshotSource::capture(scope.worktree(), scope.authority_epoch(), &path, current)?;
+            SnapshotSource::capture(scope.worktree(), scope.authority_epoch(), path, current)?;
         total_bytes += source.contents().len();
         if total_bytes > MAX_SNAPSHOT_TOTAL_BYTES {
             return Err(GitError::EvidenceTooLarge);
         }
-        let index_oid = index.map(|entry| entry.oid.clone());
-        let index_bytes = blob_bytes(
-            &scope,
-            program,
-            &index_oid,
-            &mut blobs,
-            &mut total_bytes,
-            runner,
-        )
-        .await?;
+        let mode_w = source.read.as_ref().map_or(0, SourceRead::git_mode);
+        let raw_path = path.as_os_str().as_bytes();
+        working.update(&(raw_path.len() as u64).to_le_bytes());
+        working.update(raw_path);
+        working.update(&mode_w.to_le_bytes());
+        working.update(&(source.contents().len() as u64).to_le_bytes());
+        working.update(source.contents());
+        sources.insert(path.clone(), source);
+    }
+    // One batched no-filter hash command classifies every unchanged worktree side by object name,
+    // replacing the per-path cat-file plus per-blob verification commands that made a sandboxed
+    // capture cost two multi-second sandbox replays for every clean tracked path.
+    let present: Vec<&PathBuf> = sources
+        .iter()
+        .filter(|(_, source)| source.read.is_some())
+        .map(|(path, _)| path)
+        .collect();
+    let mut work_hashes: BTreeMap<PathBuf, GitObjectId> = BTreeMap::new();
+    if !present.is_empty() {
+        let entries: Vec<(usize, Vec<u8>)> = present
+            .iter()
+            .enumerate()
+            .map(|(index, path)| (index, sources[*path].contents().to_vec()))
+            .collect();
+        let hashes = batch_hashes(&scope, program, 'w', entries, runner).await?;
+        for (path, oid) in present.into_iter().zip(hashes) {
+            work_hashes.insert(path.clone(), oid);
+        }
+    }
+    // Pure classification: X from committed/index identities, Y from the proven worktree hash.
+    let mut compares: Vec<PendingCompare> = Vec::new();
+    for path in union {
+        let head = head_entries.get(&path).and_then(|entries| entries.get(&0));
+        let stages = index_entries.get(&path);
+        if stages.is_some_and(|entries| !entries.contains_key(&0)) {
+            continue;
+        }
+        let index = stages.and_then(|entries| entries.get(&0));
+        let source = &sources[&path];
         let mode_w = source.read.as_ref().map_or(0, SourceRead::git_mode);
         let x = match (head, index) {
             (None, Some(_)) => b'A',
@@ -848,18 +1036,17 @@ async fn capture_attempt<R: SnapshotRunner>(
         };
         let y = match (index, &source.read) {
             (Some(_), None) => b'D',
-            (Some(index), Some(_)) if index_bytes != source.contents() || index.mode != mode_w => {
-                b'M'
+            (Some(index), Some(_)) => {
+                if index.mode == mode_w
+                    && work_hashes.get(&path).is_some_and(|oid| oid == &index.oid)
+                {
+                    b'.'
+                } else {
+                    b'M'
+                }
             }
             _ => b'.',
         };
-        let raw_path = path.as_os_str().as_bytes();
-        working.update(&(raw_path.len() as u64).to_le_bytes());
-        working.update(raw_path);
-        working.update(&mode_w.to_le_bytes());
-        working.update(&(source.contents().len() as u64).to_le_bytes());
-        working.update(source.contents());
-        sources.insert(path.clone(), source.clone());
         if [x, y] == *b".." {
             continue;
         }
@@ -868,7 +1055,10 @@ async fn capture_attempt<R: SnapshotRunner>(
             index.map_or(0, |entry| entry.mode),
             mode_w,
         ];
-        let objects = [head.map(|entry| entry.oid.clone()), index_oid];
+        let objects = [
+            head.map(|entry| entry.oid.clone()),
+            index.map(|entry| entry.oid.clone()),
+        ];
         let entry = PathStatus {
             kind: super::StatusKind::Ordinary,
             path,
@@ -887,25 +1077,74 @@ async fn capture_attempt<R: SnapshotRunner>(
             continue;
         }
         status.tracked.push(entry.clone());
-        let left = if scope.mode() == DiffMode::Unstaged {
-            index_bytes.clone()
-        } else {
-            blob_bytes(
-                &scope,
-                program,
-                &objects[0],
-                &mut blobs,
-                &mut total_bytes,
-                runner,
-            )
-            .await?
+        // Left is always a committed/index side; right is a blob only for `Staged`, whose absent
+        // side compares as empty bytes rather than the working-tree content.
+        let (left, right) = match scope.mode() {
+            DiffMode::Head => (objects[0].clone(), None),
+            DiffMode::Staged => (
+                objects[0].clone(),
+                Some(index.map(|entry| entry.oid.clone())),
+            ),
+            DiffMode::Unstaged => (index.map(|entry| entry.oid.clone()), None),
         };
-        let right = if scope.mode() == DiffMode::Staged {
-            &index_bytes
-        } else {
-            source.contents()
+        compares.push(PendingCompare {
+            entry,
+            left,
+            right,
+            source: source.clone(),
+        });
+    }
+    // Fetch each distinct comparison side once, then prove every fetched blob's bytes against its
+    // requested full object name in one batched verification before any comparison uses them.
+    let mut needed: Vec<GitObjectId> = compares
+        .iter()
+        .flat_map(|pending| {
+            pending
+                .left
+                .iter()
+                .cloned()
+                .chain(pending.right.iter().flatten().cloned())
+        })
+        .collect();
+    needed.sort();
+    needed.dedup();
+    let mut blobs = BTreeMap::new();
+    let mut fetched: Vec<(GitObjectId, Vec<u8>)> = Vec::new();
+    for oid in needed {
+        let intent = SnapshotIntent::blob(scope.clone(), program, &oid)?;
+        let bytes = intent.accept(runner.run(intent.clone()).await?)?;
+        total_bytes += bytes.len();
+        if total_bytes > MAX_SNAPSHOT_TOTAL_BYTES {
+            return Err(GitError::EvidenceTooLarge);
+        }
+        fetched.push((oid.clone(), bytes.clone()));
+        blobs.insert(oid, bytes);
+    }
+    if !fetched.is_empty() {
+        let entries: Vec<(usize, Vec<u8>)> = fetched
+            .iter()
+            .enumerate()
+            .map(|(index, (_, bytes))| (index, bytes.clone()))
+            .collect();
+        let verified = batch_hashes(&scope, program, 'v', entries, runner).await?;
+        for ((oid, _), hash) in fetched.iter().zip(verified) {
+            if oid != &hash {
+                return Err(GitError::ObjectHashMismatch);
+            }
+        }
+    }
+    for pending in compares {
+        let empty = Vec::new();
+        let left = match &pending.left {
+            Some(oid) => &blobs[oid],
+            None => &empty,
         };
-        let intent = SnapshotIntent::compare(scope.clone(), program, &left, right)?;
+        let right = match &pending.right {
+            Some(Some(oid)) => &blobs[oid],
+            Some(None) => &empty,
+            None => pending.source.contents(),
+        };
+        let intent = SnapshotIntent::compare(scope.clone(), program, left, right)?;
         let patch = intent.accept(runner.run(intent.clone()).await?)?;
         patch_bytes += patch.len();
         if patch_bytes > MAX_SNAPSHOT_PATCH_BYTES {
@@ -914,9 +1153,9 @@ async fn capture_attempt<R: SnapshotRunner>(
         paths.push(PathSnapshot {
             scope: scope.clone(),
             generation,
-            status: entry,
+            status: pending.entry,
             patch,
-            source: (scope.mode() != DiffMode::Staged).then_some(source),
+            source: (scope.mode() != DiffMode::Staged).then_some(pending.source),
         });
     }
     // Exact safe reads cover every union path, not only paths Git's stat cache happened to mark dirty.
@@ -958,41 +1197,6 @@ async fn capture_attempt<R: SnapshotRunner>(
     })
 }
 
-/// Reads each full OID once, enforcing per-blob and aggregate caps before retaining immutable bytes.
-async fn blob_bytes<R: SnapshotRunner>(
-    scope: &GitScope,
-    program: &Path,
-    oid: &Option<GitObjectId>,
-    cache: &mut BTreeMap<GitObjectId, Vec<u8>>,
-    total: &mut usize,
-    runner: &mut R,
-) -> Result<Vec<u8>, GitError> {
-    let Some(oid) = oid else {
-        return Ok(Vec::new());
-    };
-    if let Some(bytes) = cache.get(oid) {
-        return Ok(bytes.clone());
-    }
-    let intent = SnapshotIntent::blob(scope.clone(), program, oid)?;
-    let bytes = intent.accept(runner.run(intent.clone()).await?)?;
-    *total += bytes.len();
-    if *total > MAX_SNAPSHOT_TOTAL_BYTES {
-        return Err(GitError::EvidenceTooLarge);
-    }
-    let verification = SnapshotIntent::verify_blob(scope.clone(), program, &bytes)?;
-    let hash = verification.accept(runner.run(verification.clone()).await?)?;
-    let verified = GitObjectId::parse(
-        hash.strip_suffix(b"\n")
-            .ok_or(GitError::ObjectHashMismatch)?,
-    )?
-    .ok_or(GitError::ObjectHashMismatch)?;
-    if &verified != oid {
-        return Err(GitError::ObjectHashMismatch);
-    }
-    cache.insert(oid.clone(), bytes.clone());
-    Ok(bytes)
-}
-
 /// Rejects untracked symlink/special entries without reading bytes; disappearing paths trigger retry.
 fn inspect_untracked(worktree: &WorktreeRef, path: &Path) -> Result<(), GitError> {
     crate::workspace::observation::inspect_authorized_source_kind(worktree, path).map_err(|error| {
@@ -1006,4 +1210,110 @@ fn inspect_untracked(worktree: &WorktreeRef, path: &Path) -> Result<(), GitError
             _ => GitError::SnapshotIo,
         }
     })
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::{
+        GitError, MAX_HASH_BATCH_ARGV_BYTES, hash_batch_prefix_bytes, hash_batch_ranges,
+        parse_batch_hashes,
+    };
+    use crate::workspace::git::GitObjectId;
+
+    /// The planning estimate covers the real argument strings: fixed flags plus one canonical
+    /// scratch path, never smaller than the unresolved temp directory it is derived from.
+    #[test]
+    fn batch_prefix_budget_uses_the_canonical_scratch_path() {
+        let prefix = hash_batch_prefix_bytes().unwrap();
+        let resolved = std::env::temp_dir();
+        let flags = super::HASH_BATCH_FLAGS
+            .iter()
+            .map(|f| f.len() + 1)
+            .sum::<usize>();
+        assert!(
+            prefix > flags + resolved.as_os_str().len(),
+            "prefix {prefix} must cover the flags and the resolved temp root"
+        );
+        // The reserved name shape (stem, pid digits, full-width counter) is part of the estimate.
+        let canonical = std::fs::canonicalize(&resolved).unwrap();
+        assert!(
+            prefix
+                >= flags
+                    + canonical.as_os_str().len()
+                    + super::SNAPSHOT_SCRATCH_STEM.len()
+                    + std::process::id().to_string().len()
+                    + 2
+        );
+    }
+
+    /// Batch output must be exactly one terminal-LF object name per argument, in argument order.
+    #[test]
+    fn batch_hash_output_parses_in_argument_order() {
+        let line = |index: u8| {
+            (0..40)
+                .map(|_| format!("{index:x}"))
+                .collect::<String>()
+                .into_bytes()
+        };
+        let mut output = Vec::new();
+        // Indexes start at one: the all-zero name is the absent-object sentinel and fails closed.
+        for index in 1u8..4 {
+            output.extend(line(index));
+            output.push(b'\n');
+        }
+        let parsed = parse_batch_hashes(&output, 3).unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[1], GitObjectId::parse(&line(2)).unwrap().unwrap());
+        // Missing lines, extra lines, a missing terminal LF, or a malformed name fail closed.
+        assert!(parse_batch_hashes(&output, 2).is_err());
+        assert!(parse_batch_hashes(&output[..output.len() - 1], 3).is_err());
+        output.truncate(output.len() - 41);
+        assert!(parse_batch_hashes(&output, 3).is_err());
+    }
+
+    /// Batches stay below the argv budget whatever the temp-root depth, never reorder entries,
+    /// a single oversized entry still forms its own bounded batch, and an entry whose own argv
+    /// would exceed the execution ceiling fails closed instead of planning any batch.
+    #[test]
+    fn batch_ranges_pack_below_the_argv_budget() {
+        assert!(
+            hash_batch_ranges(0, 100, |_| 4, usize::MAX)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            hash_batch_ranges(3, 100, |_| 4, usize::MAX).unwrap(),
+            vec![(0, 3)]
+        );
+        let ranges = hash_batch_ranges(100, 100, |_| 4, usize::MAX).unwrap();
+        let mut cursor = 0usize;
+        for (start, end) in &ranges {
+            assert_eq!(*start, cursor, "ranges are consecutive and ordered");
+            cursor = *end;
+            let bytes: usize = 100 + (100 + 4 + 1) * (*end - *start);
+            assert!(
+                bytes <= MAX_HASH_BATCH_ARGV_BYTES,
+                "batch argv {bytes} exceeds budget"
+            );
+        }
+        assert_eq!(cursor, 100);
+        // A 4096-byte scratch pathname cannot fit any shared batch; it still runs alone.
+        assert_eq!(
+            hash_batch_ranges(
+                2,
+                100,
+                |index| if index == 0 { 4000 } else { 4 },
+                usize::MAX
+            )
+            .unwrap(),
+            vec![(0, 1), (1, 2)]
+        );
+        // An entry whose own argv (prefix + name + separator) exceeds the ceiling fails closed
+        // before any batch — and therefore any scratch file — is planned.
+        let error =
+            hash_batch_ranges(2, 100, |index| if index == 0 { 5000 } else { 4 }, 4096).unwrap_err();
+        assert!(matches!(error, GitError::EvidenceTooLarge));
+        // Even a zero-byte name fails closed when the fixed prefix alone is past the ceiling.
+        assert!(hash_batch_ranges(1, 5000, |_| 0, 4096).is_err());
+    }
 }

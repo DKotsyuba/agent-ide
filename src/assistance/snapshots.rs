@@ -28,10 +28,15 @@ struct ProductSnapshotRunner<'w, 'store> {
     authority: AuthorityStamp,
     /// Safe typed failure retained separately from Workspace's parsing errors.
     failure: Option<FailureCode>,
+    /// Closed stage label of the most recent intent this runner ran.
+    stage: Option<&'static str>,
+    /// Closed terminal detail recorded by the runner's own failure branches.
+    detail: Option<String>,
 }
 impl SnapshotRunner for ProductSnapshotRunner<'_, '_> {
     /// Executes only the peer-owned intent, settles direct-child proof, then returns immutable data.
     async fn run(&mut self, intent: SnapshotIntent) -> Result<CapturedProcessEvidence, GitError> {
+        self.stage = Some(intent.label());
         match self.run_owned(intent).await {
             Ok(evidence) => Ok(evidence),
             Err(code) => {
@@ -86,6 +91,16 @@ impl SnapshotRunner for ProductSnapshotRunner<'_, '_> {
     }
 }
 impl ProductSnapshotRunner<'_, '_> {
+    /// Names the bounded wait outcome: the job deadline, or one child's own 60-second ceiling.
+    fn timeout_detail(&self) -> String {
+        let stage = self.stage.unwrap_or("unknown");
+        if tokio::time::Instant::now() >= self.job.deadline {
+            "diff:deadline".to_owned()
+        } else {
+            format!("diff:child_timeout:{stage}")
+        }
+    }
+
     /// Keeps private snapshot files alive through wait/cancellation/reap; uncertain reaps retain the intent.
     async fn run_owned(
         &mut self,
@@ -95,18 +110,19 @@ impl ProductSnapshotRunner<'_, '_> {
         if intent.scope().worktree() != self.authority.worktree()
             || intent.scope().authority_epoch() != self.authority.epoch()
         {
+            self.detail = Some("diff:authority".to_owned());
             return Err(FailureCode::WorkspaceAuthority);
         }
+        let command = match intent.command() {
+            Ok(command) => command,
+            Err(_) => {
+                self.detail = Some("diff:scratch".to_owned());
+                return Err(FailureCode::SourceUnavailable);
+            }
+        };
         let request = self
             .worker
-            .execution_request(
-                self.job,
-                &self.authority,
-                intent
-                    .command()
-                    .map_err(|_| FailureCode::SourceUnavailable)?,
-                &self.job.target.git,
-            )
+            .execution_request(self.job, &self.authority, command, &self.job.target.git)
             .await?;
         let active = self.worker.shared.active(&binding)?;
         let lease = self.worker.admit(&binding)?;
@@ -127,12 +143,12 @@ impl ProductSnapshotRunner<'_, '_> {
             }
         };
         if intent.snapshot_directory().is_some() {
-            let Some(identity) = child.take_process_identity() else {
-                self.worker.uncertain.insert(binding);
-                self.worker.uncertain_snapshots.push(intent);
-                return Err(FailureCode::Internal);
+            let identity_correlated = match child.take_process_identity() {
+                Some(identity) => intent.bind_process(identity).is_ok(),
+                None => false,
             };
-            if intent.bind_process(identity).is_err() {
+            if !identity_correlated {
+                self.detail = Some("diff:internal".to_owned());
                 self.worker.uncertain.insert(binding);
                 self.worker.uncertain_snapshots.push(intent);
                 return Err(FailureCode::Internal);
@@ -156,15 +172,21 @@ impl ProductSnapshotRunner<'_, '_> {
         let completed = match reaped {
             Ok(completed) => completed,
             Err(_) => {
+                self.detail = Some(self.timeout_detail());
                 self.worker.uncertain.insert(binding);
                 self.worker.uncertain_snapshots.push(intent);
                 return Err(FailureCode::Deadline);
             }
         };
-        self.worker
+        if self
+            .worker
             .admission()
             .release_reaped(completed.settlement)
-            .map_err(|_| FailureCode::Internal)?;
+            .is_err()
+        {
+            self.detail = Some("diff:internal".to_owned());
+            return Err(FailureCode::Internal);
+        }
         self.worker.record_execution(
             completed.evidence.elapsed(),
             completed
@@ -176,18 +198,68 @@ impl ProductSnapshotRunner<'_, '_> {
             completed.evidence.stdout().truncated || completed.evidence.stderr().truncated,
             completed.evidence.cancellation().is_some(),
         );
-        intent
-            .acknowledge_reap(&completed.evidence)
-            .map_err(|_| FailureCode::Internal)?;
+        if intent.acknowledge_reap(&completed.evidence).is_err() {
+            self.detail = Some("diff:internal".to_owned());
+            return Err(FailureCode::Internal);
+        }
         self.worker.shared.active(&binding)?;
         if interrupted {
-            return Err(if *self.job.cancel.borrow() {
-                FailureCode::Cancelled
-            } else {
-                FailureCode::Deadline
-            });
+            if *self.job.cancel.borrow() {
+                self.detail = Some("diff:cancelled".to_owned());
+                return Err(FailureCode::Cancelled);
+            }
+            self.detail = Some(self.timeout_detail());
+            return Err(FailureCode::Deadline);
         }
         Ok(completed.evidence)
+    }
+}
+
+/// Names the closed snapshot stage behind a diff failure for the bounded error-log detail.
+///
+/// Runner-level codes carry their own recorded detail; collector errors are mapped from the
+/// closed GitError variant plus the label of the last intent that ran. Never repository paths
+/// or child stderr — only these fixed tags.
+fn git_failure_detail(
+    error: &GitError,
+    stage: Option<&str>,
+    failure: Option<FailureCode>,
+) -> String {
+    let stage = stage.unwrap_or("unknown");
+    if let Some(code) = failure {
+        return match code {
+            FailureCode::Cancelled => "diff:cancelled".to_owned(),
+            FailureCode::Deadline => "diff:deadline".to_owned(),
+            FailureCode::Capacity => "diff:capacity".to_owned(),
+            FailureCode::WorkspaceAuthority => "diff:authority".to_owned(),
+            FailureCode::SandboxState => "diff:sandbox_state".to_owned(),
+            FailureCode::ExecutionProfile => "diff:execution_profile".to_owned(),
+            FailureCode::Internal => "diff:internal".to_owned(),
+            _ => format!("diff:execution:{stage}"),
+        };
+    }
+    match error {
+        GitError::UnsupportedSnapshotGit => "diff:unsupported_git".to_owned(),
+        GitError::SnapshotIo => "diff:scratch".to_owned(),
+        GitError::UnstableSnapshot => "diff:unstable".to_owned(),
+        GitError::UnsupportedSnapshot => "diff:unsupported_entry".to_owned(),
+        GitError::EvidenceTooLarge => "diff:too_large".to_owned(),
+        GitError::ObjectHashMismatch => "diff:hash_mismatch".to_owned(),
+        GitError::UnbornHead => "diff:unborn_head".to_owned(),
+        _ => format!("diff:child_exit:{stage}"),
+    }
+}
+
+/// Names the closed pre-spawn wait failure at the execution-request boundary: a real
+/// cancellation stays `cancelled`, while deadline expiry alone is `deadline` — never reported
+/// as a cancellation just because the two checks used to share one arm (T27B).
+fn request_wait_failure(cancel: bool, past_deadline: bool) -> Option<FailureCode> {
+    if cancel {
+        Some(FailureCode::Cancelled)
+    } else if past_deadline {
+        Some(FailureCode::Deadline)
+    } else {
+        None
     }
 }
 
@@ -663,8 +735,11 @@ impl Worker<'_> {
             .authorize(authority, &active)
             .await
             .map_err(|_| FailureCode::WorkspaceAuthority)?;
-        if tokio::time::Instant::now() >= job.deadline || *job.cancel.borrow() {
-            return Err(FailureCode::Cancelled);
+        if let Some(code) = request_wait_failure(
+            *job.cancel.borrow(),
+            tokio::time::Instant::now() >= job.deadline,
+        ) {
+            return Err(code);
         }
         let invocation = ValidatedHostInvocation::from_active_observation(
             self.shared.active(binding)?,
@@ -694,14 +769,17 @@ impl Worker<'_> {
         let policy = match trampoline {
             Some(trampoline) => LocalExecutionPolicy::with_env_trampoline(
                 programs,
-                64 * 1024,
+                crate::execution::MAX_PRODUCT_ARGV_BYTES,
                 16,
                 job.target.allow_disabled_host,
                 trampoline,
             ),
-            None => {
-                LocalExecutionPolicy::new(programs, 64 * 1024, 16, job.target.allow_disabled_host)
-            }
+            None => LocalExecutionPolicy::new(
+                programs,
+                crate::execution::MAX_PRODUCT_ARGV_BYTES,
+                16,
+                job.target.allow_disabled_host,
+            ),
         }
         .map_err(|_| FailureCode::ExecutionProfile)?;
         ValidatedExecutionRequest::validate(
@@ -759,6 +837,8 @@ impl Worker<'_> {
             job,
             authority: authority.clone(),
             failure: None,
+            stage: None,
+            detail: None,
         };
         let capture = collect_snapshot(
             &authority,
@@ -773,10 +853,20 @@ impl Worker<'_> {
         let evidence = match capture {
             Ok(evidence) => evidence,
             Err(error) => {
-                return Err(runner.failure.unwrap_or(match error {
+                // T27B: the terminal diff failure carries the closed failing stage, so a
+                // sandboxed capture that can never finish is diagnosable from the error log.
+                let failure = runner.failure;
+                let fallback = match &error {
                     GitError::UnsupportedSnapshotGit => FailureCode::UnsupportedGit,
                     _ => FailureCode::SourceUnavailable,
-                }));
+                };
+                let detail = runner
+                    .detail
+                    .clone()
+                    .unwrap_or_else(|| git_failure_detail(&error, runner.stage, runner.failure));
+                drop(runner);
+                job.failure_detail = Some(detail);
+                return Err(failure.unwrap_or(fallback));
             }
         };
         let comparison = evidence.comparison().clone();
@@ -830,5 +920,130 @@ impl Worker<'_> {
             return Err(FailureCode::Capacity);
         }
         Ok((reply, Some(authority), None))
+    }
+}
+
+/// Maps one collector failure onto its closed failing-stage tag (T27B).
+#[cfg(test)]
+mod diff_failure_detail_tests {
+    use super::git_failure_detail;
+    use crate::workspace::git::GitError;
+
+    /// Collector errors map to fixed stage tags only: never repository paths or child output.
+    #[test]
+    fn collector_errors_name_the_failing_stage() {
+        assert_eq!(
+            git_failure_detail(&GitError::SnapshotIo, Some("cat-file"), None),
+            "diff:scratch"
+        );
+        assert_eq!(
+            git_failure_detail(&GitError::EvidenceTooLarge, None, None),
+            "diff:too_large"
+        );
+        assert_eq!(
+            git_failure_detail(&GitError::UnstableSnapshot, Some("ls-tree"), None),
+            "diff:unstable"
+        );
+        assert_eq!(
+            git_failure_detail(&GitError::ObjectHashMismatch, Some("hash-object"), None),
+            "diff:hash_mismatch"
+        );
+        assert_eq!(
+            git_failure_detail(&GitError::UnbornHead, None, None),
+            "diff:unborn_head"
+        );
+        assert_eq!(
+            git_failure_detail(&GitError::UnsupportedSnapshotGit, None, None),
+            "diff:unsupported_git"
+        );
+        assert_eq!(
+            git_failure_detail(&GitError::UnsupportedSnapshot, None, None),
+            "diff:unsupported_entry"
+        );
+        // Rejected child evidence on the last-run intent names that exact stage.
+        assert_eq!(
+            git_failure_detail(&GitError::IncompleteIdentity, Some("cat-file"), None),
+            "diff:child_exit:cat-file"
+        );
+        assert_eq!(
+            git_failure_detail(&GitError::InvalidPorcelain, None, None),
+            "diff:child_exit:unknown"
+        );
+    }
+
+    /// Runner-level codes that reached the collector keep their closed tags.
+    #[test]
+    fn runner_codes_keep_their_closed_tags() {
+        use super::FailureCode;
+        assert_eq!(
+            git_failure_detail(
+                &GitError::IncompleteIdentity,
+                Some("diff-no-index"),
+                Some(FailureCode::Deadline)
+            ),
+            "diff:deadline"
+        );
+        assert_eq!(
+            git_failure_detail(
+                &GitError::IncompleteIdentity,
+                Some("cat-file"),
+                Some(FailureCode::Capacity)
+            ),
+            "diff:capacity"
+        );
+        assert_eq!(
+            git_failure_detail(
+                &GitError::IncompleteIdentity,
+                Some("rev-parse"),
+                Some(FailureCode::Cancelled)
+            ),
+            "diff:cancelled"
+        );
+        assert_eq!(
+            git_failure_detail(
+                &GitError::IncompleteIdentity,
+                Some("cat-file"),
+                Some(FailureCode::ExecutionProfile)
+            ),
+            "diff:execution_profile"
+        );
+    }
+
+    /// At the execution-request boundary, deadline expiry between children yields `deadline`
+    /// (surfacing as `diff:deadline`) while a real cancellation stays `cancelled` (T27B).
+    #[test]
+    fn request_boundary_separates_deadline_expiry_from_cancellation() {
+        use super::{FailureCode, request_wait_failure};
+        assert_eq!(request_wait_failure(false, false), None);
+        // Expiry with the cancellation flag still false is a deadline, not a cancellation.
+        assert_eq!(
+            request_wait_failure(false, true),
+            Some(FailureCode::Deadline)
+        );
+        assert_eq!(
+            request_wait_failure(true, false),
+            Some(FailureCode::Cancelled)
+        );
+        assert_eq!(
+            request_wait_failure(true, true),
+            Some(FailureCode::Cancelled)
+        );
+        // Both boundary codes keep their distinct fixed detail tags end to end.
+        assert_eq!(
+            git_failure_detail(
+                &GitError::IncompleteIdentity,
+                Some("rev-parse"),
+                request_wait_failure(false, true)
+            ),
+            "diff:deadline"
+        );
+        assert_eq!(
+            git_failure_detail(
+                &GitError::IncompleteIdentity,
+                Some("rev-parse"),
+                request_wait_failure(true, false)
+            ),
+            "diff:cancelled"
+        );
     }
 }

@@ -1369,6 +1369,10 @@ impl ControlledTrampoline {
     }
 }
 
+/// Product argv ceiling handed to [`LocalExecutionPolicy`]: the bound snapshot batch planners
+/// must fail closed against, so the ceiling lives here once instead of a duplicated literal.
+pub const MAX_PRODUCT_ARGV_BYTES: usize = 64 * 1024;
+
 /// Applies local ceilings to already validated peer input without widening host permissions.
 #[derive(Clone, Debug)]
 pub struct LocalExecutionPolicy {

@@ -999,6 +999,46 @@ fn uncertain_issued_snapshot_drop_quarantines_files() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+/// Unchanged paths must not cost per-path sandboxed blob commands: worktree sides are classified
+/// by one batched no-filter hash command, and blobs are fetched only for changed comparison sides
+/// (T27B: every managed sandbox replay costs a fixed multi-second startup per child).
+#[tokio::test]
+async fn unchanged_paths_cost_no_per_path_blob_commands() {
+    let fixture = GitFixture::new();
+    // The fixture's only worktree change is unstaged.txt; make it clean, add bulk clean paths,
+    // then leave exactly one tracked path changed.
+    fixture.write(b"unstaged.txt", b"base\n");
+    for n in 0..14 {
+        fixture.write(
+            format!("bulk-{n:02}.txt").as_bytes(),
+            format!("bulk {n}\n").as_bytes(),
+        );
+    }
+    fixture.git(["add", "."]);
+    fixture.git(["commit", "--quiet", "-m", "bulk baseline"]);
+    fixture.write(b"bulk-07.txt", b"changed\n");
+    let mut runner = Runner::default();
+    let snapshot = collect(&fixture, DiffMode::Unstaged, &mut runner)
+        .await
+        .unwrap();
+    // 8 metadata + 1 batched worktree hash + 1 cat-file + 1 batched verify + 1 comparison.
+    assert!(
+        runner.operations <= 12,
+        "sandboxed spawns must stay bounded, got {}",
+        runner.operations
+    );
+    assert_eq!(runner.blobs, 1);
+    assert_eq!(runner.comparisons, 1);
+    assert_eq!(snapshot.paths().len(), 1);
+    assert_eq!(
+        snapshot.paths()[0].status().path(),
+        std::path::Path::new("bulk-07.txt")
+    );
+    assert_eq!(snapshot.paths()[0].status().status(), Some(*b".M"));
+    assert!(!snapshot.paths()[0].patch().is_empty());
+    assert!(runner.directories.iter().all(|dir| !dir.exists()));
+}
+
 /// Real truncated cat-file output is rejected despite successful exit and actual wait identity.
 #[tokio::test]
 async fn real_truncated_blob_evidence_is_not_complete() {
