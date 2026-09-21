@@ -444,7 +444,7 @@ impl ProductDispatcher {
         let owner = invocation.binding_ref().fingerprint();
         // The settled token is minted under the ledger lock and the lock is released before any
         // await: no daemon lock crosses the Worker call below.
-        let (delivery, settled) = {
+        let (delivery, settled, unrun) = {
             let Ok(launches) = self.launches.lock() else {
                 return PeerReply::Error {
                     code: FailureCode::Internal,
@@ -458,6 +458,7 @@ impl ProductDispatcher {
             (
                 launches.delivery(detail_ref),
                 launches.settled(detail_ref, owner),
+                launches.unrun_command(detail_ref).map(str::to_owned),
             )
         };
         match delivery {
@@ -491,9 +492,10 @@ impl ProductDispatcher {
                 }
                 HelperOutcome::Failed { code } => PeerReply::Error { code },
             },
+            // A ticket the pre-hook never recognized repeats its command: polling cannot settle it.
             Delivery::Waiting => PeerReply::Pending {
                 detail_ref: detail_ref.to_owned(),
-                helper: None,
+                helper: unrun,
             },
             Delivery::Failed(code) => PeerReply::Error { code },
             Delivery::DeadlineNoEffect(job) => {

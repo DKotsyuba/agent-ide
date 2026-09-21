@@ -97,8 +97,11 @@ fn render_text(reply: &PeerReply) -> String {
             helper: Some(helper),
         } => format!(
             "pending: run exactly this command with Bash in the foreground, with no editing, \
-             wrapping, or appended arguments:\n{helper}\nAfter it completes, use ide.inspect with \
-             detail_ref {detail_ref}; do not inspect before completion"
+             wrapping, or appended arguments:\n{helper}\nRun it as the only command of one Bash \
+             call (no prefix such as \"date;\"). If ide.inspect answers pending again, the helper \
+             has not been run yet, or it was run in a modified form and was refused; run the \
+             command above exactly. After it completes, use ide.inspect with detail_ref \
+             {detail_ref}; do not inspect before completion"
         ),
         PeerReply::Pending {
             detail_ref,
@@ -113,6 +116,12 @@ fn render_text(reply: &PeerReply) -> String {
             "error: source_too_large; source is {size} bytes, exceeding the {ceiling} byte read \
              ceiling; continue with native tools"
         ),
+        PeerReply::Error {
+            code: FailureCode::InvalidDetail,
+        } => "error: invalid_detail; this detail_ref is unknown or has expired (an un-run or \
+              refused helper ticket expires unclaimed); repeat the original ide.* call to get a \
+              fresh one, or continue with native tools"
+            .to_owned(),
         PeerReply::Error { code } => format!(
             "error: {}; continue with native tools",
             match code {
@@ -127,7 +136,7 @@ fn render_text(reply: &PeerReply) -> String {
                 FailureCode::Cancelled => "cancelled",
                 FailureCode::Deadline => "deadline",
                 FailureCode::Capacity => "capacity",
-                FailureCode::InvalidDetail => "invalid_detail",
+                FailureCode::InvalidDetail => unreachable!("handled above"),
                 FailureCode::SourceUnavailable => "source_unavailable",
                 FailureCode::SourceTooLarge { .. } => unreachable!("handled above"),
                 FailureCode::Conflict => "conflict",
@@ -420,6 +429,40 @@ mod tests {
         let text = text_of(&rendered);
         assert!(text.contains(helper) && text.contains(detail_ref));
         assert!(text.find(helper).unwrap() < text.find("ide.inspect").unwrap());
+    }
+
+    /// A pending helper instruction says the command must stand alone and how an un-run ticket
+    /// looks, and an expired or unknown detail says to repeat the original call.
+    #[test]
+    fn pending_helper_and_expired_detail_explain_the_recovery() {
+        let pending = render(
+            PeerReply::Pending {
+                detail_ref: "detail-1".into(),
+                helper: Some("agent-ide claude-worker --detail-ref detail-1".into()),
+            },
+            Envelope::TextOnly,
+        )
+        .unwrap();
+        let text = text_of(&pending);
+        assert!(
+            text.contains("agent-ide claude-worker --detail-ref detail-1"),
+            "{text}"
+        );
+        assert!(text.contains("only command of one Bash call"), "{text}");
+        assert!(text.contains("has not been run yet"), "{text}");
+        assert!(text.contains("refused"), "{text}");
+
+        let expired = render(
+            PeerReply::Error {
+                code: FailureCode::InvalidDetail,
+            },
+            Envelope::TextOnly,
+        )
+        .unwrap();
+        let text = text_of(&expired);
+        assert!(text.starts_with("error: invalid_detail;"), "{text}");
+        assert!(text.contains("repeat the original ide.* call"), "{text}");
+        assert_eq!(expired.is_error, Some(true));
     }
 
     /// Keeps unresolved TypeScript configuration actionable without claiming a native substitute.

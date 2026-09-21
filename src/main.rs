@@ -153,13 +153,17 @@ async fn main() -> ExitCode {
             attachment,
             detail_ref,
         }) => {
-            agent_ide::assistance::claude_helper::run(
+            let claimed = agent_ide::assistance::claude_helper::run(
                 &runtime_dir,
                 Some(attachment),
                 Some(detail_ref),
             )
             .await;
-            ExitCode::SUCCESS
+            if claimed {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
         }
         Ok(Command::Doctor { runtime_dir }) => match doctor_report(&runtime_dir).await {
             Ok(report) => {

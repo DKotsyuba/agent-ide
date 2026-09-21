@@ -337,9 +337,32 @@ pub fn discovery_evidence(
 /// `Bash`, reports a bounded result with real child-settlement counts, and returns. It prints a
 /// single short status line so the tool call has visible output, and never prints source,
 /// diagnostics, configuration or host payloads.
-pub async fn run(runtime_dir: &Path, attachment: Option<String>, detail_ref: Option<String>) {
+///
+/// Returns `false` for a refused claim so the process can exit non-zero: the host then shows the
+/// failed `Bash` call together with an explanation instead of a silent success.
+pub async fn run(
+    runtime_dir: &Path,
+    attachment: Option<String>,
+    detail_ref: Option<String>,
+) -> bool {
     let outcome = execute(runtime_dir, attachment, detail_ref).await;
-    println!("agent-ide claude-worker: {outcome}");
+    println!("{}", status_line(outcome));
+    outcome != REFUSED
+}
+
+/// Status word of a claim the daemon refused, e.g. a helper wrapped in a compound command.
+const REFUSED: &str = "refused";
+
+/// Renders the one line the helper prints; a refusal tells the model exactly how to retry.
+fn status_line(outcome: &str) -> String {
+    if outcome == REFUSED {
+        "agent-ide claude-worker: refused — run this command alone, as the only command of one \
+         foreground Bash call, exactly as given (no prefix such as \"date;\", no wrapping, no \
+         background)"
+            .to_owned()
+    } else {
+        format!("agent-ide claude-worker: {outcome}")
+    }
 }
 
 /// Performs the claim/work/report sequence, returning one fixed status word for the tool output.
@@ -372,7 +395,7 @@ async fn execute(
     };
     let job = match serde_json::from_str::<ClaimReply>(&frame) {
         Ok(ClaimReply::Granted(job)) => *job,
-        _ => return "refused",
+        _ => return REFUSED,
     };
     let (outcome, children, discovery, payload) = perform(&job).await;
     let settled = children.settled();
@@ -2238,6 +2261,22 @@ mod tests {
 
         drop(endpoint);
         let _ = std::fs::remove_dir_all(&candidate);
+    }
+
+    /// A refusal names the retry rule for the model; every other status word stays terse.
+    #[test]
+    fn refused_status_line_tells_the_model_how_to_retry() {
+        assert_eq!(
+            status_line(REFUSED),
+            "agent-ide claude-worker: refused — run this command alone, as the only command of one \
+             foreground Bash call, exactly as given (no prefix such as \"date;\", no wrapping, no \
+             background)"
+        );
+        assert_eq!(status_line("complete"), "agent-ide claude-worker: complete");
+        assert_eq!(
+            status_line("unavailable"),
+            "agent-ide claude-worker: unavailable"
+        );
     }
 
     /// A handle with no recognized native launch is refused without any Git or source effect.

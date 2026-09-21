@@ -2109,6 +2109,17 @@ impl LaunchLedger {
         terminals
     }
 
+    /// Returns the exact helper command of a ticket the native pre-hook never recognized.
+    ///
+    /// A `Minted` ticket means the model has not run the command, or ran a modified form that was
+    /// refused; retrieval repeats the command so the model can run it exactly instead of polling.
+    pub fn unrun_command(&self, detail_ref: &str) -> Option<&str> {
+        self.tickets
+            .get(detail_ref)
+            .filter(|ticket| ticket.state == TicketState::Minted)
+            .map(LaunchTicket::command)
+    }
+
     /// Returns whether one handle exists and belongs to the supplied binding generation.
     ///
     /// Retrieval uses this before reading any outcome, so a handle copied into another actor's
@@ -2718,6 +2729,29 @@ mod tests {
             ledger.claim(&reference, "channel", 0, live),
             ClaimOutcome::Rejected(FailureCode::InvalidDetail)
         );
+    }
+
+    /// Only a ticket the pre-hook never recognized reports its command for a repeated instruction.
+    #[test]
+    fn unrun_command_is_reported_only_while_minted() {
+        let (mut ledger, reference, actor) = ledger();
+        let command = LaunchLedger::helper_command(
+            std::path::Path::new("/usr/local/bin/agent-ide"),
+            std::path::Path::new("/private/tmp/rt"),
+            "attach",
+            "detail-1",
+        );
+        assert_eq!(ledger.unrun_command(&reference), Some(command.as_str()));
+        assert_eq!(ledger.unrun_command("missing"), None);
+        // A wrapped command is not recognized, so the ticket keeps asking for the exact one.
+        let wrapped = format!("date '+%H:%M:%S'; {command}");
+        assert_eq!(
+            ledger.recognize(&wrapped, false, "call", &actor, 0),
+            LaunchRecognition::Ignored
+        );
+        assert_eq!(ledger.unrun_command(&reference), Some(command.as_str()));
+        ledger.recognize(&command, false, "call", &actor, 0);
+        assert_eq!(ledger.unrun_command(&reference), None);
     }
 
     /// An unclaimed expiry disappears with no effect; a claimed one stays quarantined.

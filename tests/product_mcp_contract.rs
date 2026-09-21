@@ -5332,6 +5332,14 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
         let helper = pending["helper"].as_str().unwrap().to_owned();
         assert!(helper.contains("claude-worker"), "{helper}");
 
+        // Inspecting a ticket whose helper never ran repeats the exact command instead of a bare
+        // pending line the model could poll until the ticket expires.
+        let early = actor
+            .call_claude(fixture, "ide.inspect", json!({"detail_ref": &detail_ref}))
+            .await;
+        assert_eq!(early["state"], "pending", "{early}");
+        assert_eq!(early["helper"], helper.as_str(), "{early}");
+
         // The ordinary Bash pre-hook recognizes the exact expected command; this is silent by
         // construction and performs no admission decision itself. Each invocation needs its own
         // unique tool-call id: a repeated helper launch under the same id would let the post-hook

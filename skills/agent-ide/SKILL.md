@@ -76,7 +76,8 @@ A `Pending` reply may carry an exact `helper` command. On Claude, run that
 command yourself with the Bash tool in the foreground
 (`run_in_background` must stay `false`), without editing, wrapping, or
 appending to it. Call `ide.inspect` only after that command has completed —
-never before, and never construct the helper command yourself.
+never before, and never construct the helper command yourself. The helper must be the ONLY command
+in its Bash call (no `date;` prefix or other wrapper); take timestamps in a separate call.
 
 If that exact helper reports `unavailable` under Claude's strict macOS sandbox, report the exact
 `/private/tmp/ai-c-…/claude-helper.sock` path derived from its `--runtime-dir` argument. The operator
