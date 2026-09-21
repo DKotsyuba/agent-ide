@@ -193,6 +193,30 @@ pub enum HostKind {
     Claude,
 }
 
+/// Names how one host receives the project problem feed's status plate (T28B).
+///
+/// There is no third shape and no per-feature split: every supported host gets the same plate
+/// data, and [`HostKind::feed_delivery`] is the one place that decides the carrier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FeedDelivery {
+    /// The host relays native post-hooks; due plates ride hook context (Claude).
+    Hooks,
+    /// The host has no hook delivery for the plate; due plates lead terminal `ide.*` replies.
+    Replies,
+}
+
+impl HostKind {
+    /// Decides, in this one place, whether a host's plate rides native hooks or tool replies.
+    ///
+    /// A future third host picks a side here and every feed path follows.
+    pub fn feed_delivery(&self) -> FeedDelivery {
+        match self {
+            HostKind::Claude => FeedDelivery::Hooks,
+            HostKind::Codex => FeedDelivery::Replies,
+        }
+    }
+}
+
 /// Holds bounded selected fields extracted from one native Codex or Claude hook payload.
 ///
 /// The parser discards tool input, tool response, cwd, transcript paths, and all other hook

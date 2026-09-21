@@ -68,9 +68,13 @@ instead of parsing the compact text as a second response schema.
 
 ## Project problem feed
 
-The `<agent-ide>` block is a status plate for the worktree's Rust/Python checks. It is sent in
-hook context whenever the status changes and not while it stays the same, so no block means
-unchanged, not finished. `rust: checking (first check)` means no result yet this session;
+The `<agent-ide>` block is a status plate for the worktree's Rust/Python checks. It arrives
+whenever the status changes and not while it stays the same, so no block means unchanged, not
+finished. On Claude it is sent in hook context; on every other host (Codex included) a due plate
+leads a terminal `ide.*` reply instead — the plate is the first thing you read, followed by a
+newline and the normal reply text, and the `structuredContent` object carries it verbatim as its
+`status` field. `ide.stop` replies and `pending` placeholders carry no plate. `rust: checking
+(first check)` means no result yet this session;
 `rust: checking (files changed; last result: 0 errors, 1 warning)` means a check is running and the
 last counts may be outdated; the next plate carries the result with `(+N)`/`(-N)` deltas. When
 counts rise after your edit, call `ide.context` with `{"kind": "problems"}` (optionally

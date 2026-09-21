@@ -119,6 +119,41 @@ impl FeedState {
         snapshots: &[ProblemSnapshot],
         rechecks: &[(Language, Recheck)],
     ) -> Option<String> {
+        self.next_block_when(key, snapshots, rechecks, |_| true)
+    }
+
+    /// Like [`FeedState::next_block`], but records the block as delivered only when `fits`
+    /// accepts the rendered text (T28B).
+    ///
+    /// The record happens atomically with the `fits` decision: a refused block is never marked
+    /// delivered and stays due for the next call, so a carrier that could not hold the whole
+    /// block loses nothing. Nothing changed means `None` either way.
+    pub fn next_block_when(
+        &mut self,
+        key: &FeedKey,
+        snapshots: &[ProblemSnapshot],
+        rechecks: &[(Language, Recheck)],
+        fits: impl FnOnce(&str) -> bool,
+    ) -> Option<String> {
+        let (block, delivered) = self.build_block(key, snapshots, rechecks)?;
+        if !fits(&block) {
+            return None;
+        }
+        self.record(key, delivered);
+        Some(block)
+    }
+
+    /// Renders the due block for `key` without recording delivery, returning it with the
+    /// delivery record a commit would store; `None` when nothing changed.
+    ///
+    /// This is [`FeedState::next_block`]'s exact body up to the record: the unchanged-state path
+    /// still touches recency, and the returned record is what [`FeedState::record`] would store.
+    fn build_block(
+        &mut self,
+        key: &FeedKey,
+        snapshots: &[ProblemSnapshot],
+        rechecks: &[(Language, Recheck)],
+    ) -> Option<(String, DeliveredFeed)> {
         let items = build_items(snapshots, rechecks);
         if items.is_empty() {
             return None;
@@ -184,8 +219,7 @@ impl FeedState {
                 ItemState::Unavailable(..) => None,
             })
             .collect();
-        self.record(key, DeliveredFeed { content, counts });
-        Some(block)
+        Some((block, DeliveredFeed { content, counts }))
     }
 
     /// Drops the delivery state for `key`; called when the actor stops.
@@ -939,5 +973,32 @@ mod tests {
             .next_block(&key("hook"), &snapshots, &[])
             .expect("last snapshot state emits");
         assert_eq!(block, "<agent-ide>\nrust: tool not found\n</agent-ide>");
+    }
+
+    /// A block `next_block_when` refuses (T28B) is never recorded as delivered: it stays due and
+    /// the next accepted call emits it unchanged, exactly once.
+    #[test]
+    fn refused_blocks_stay_due_and_deliver_once_accepted() {
+        let mut state = FeedState::default();
+        let hook = key("hook");
+        let snapshots = [ready(Language::Rust, 2, 0)];
+        let block = "<agent-ide>\nrust: 2 errors, 0 warnings\n</agent-ide>";
+        assert_eq!(
+            state.next_block_when(&hook, &snapshots, &[], |_| false),
+            None,
+            "a refused block is not delivered"
+        );
+        // Still due: refusing again returns the same block, not a suppression.
+        assert_eq!(
+            state.next_block_when(&hook, &snapshots, &[], |_| false),
+            None
+        );
+        assert_eq!(
+            state
+                .next_block_when(&hook, &snapshots, &[], |_| true)
+                .as_deref(),
+            Some(block)
+        );
+        assert_eq!(state.next_block(&hook, &snapshots, &[]), None);
     }
 }

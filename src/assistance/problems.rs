@@ -234,6 +234,21 @@ impl ProjectProblemFeed {
     /// binding is unknown, no language has a completed result yet, or the item set equals the
     /// last block delivered to this binding for its worktree (EYES-r1 §6).
     pub fn next_block(&self, binding: &[u8; 32]) -> Option<String> {
+        self.next_block_when(binding, |_| true)
+    }
+
+    /// Like [`ProjectProblemFeed::next_block`], but marks the block delivered only once `fits`
+    /// accepts the rendered text (T28B).
+    ///
+    /// The whole decision — snapshot read, render, `fits`, delivery record — happens under the
+    /// one wiring lock, so a block refused by `fits` is never recorded and stays due for the
+    /// next call. This is the reply-carried delivery used by hosts without a hook stream: the
+    /// plate may only be consumed by a reply that actually carries it whole.
+    pub fn next_block_when(
+        &self,
+        binding: &[u8; 32],
+        fits: impl FnOnce(&str) -> bool,
+    ) -> Option<String> {
         let mut guard = self.state.lock().ok()?;
         let state = &mut *guard;
         let bound = state.bindings.get(binding)?;
@@ -243,7 +258,9 @@ impl ProjectProblemFeed {
         };
         let snapshots = self.snapshots(&bound.worktree, bound.admitted);
         let rechecks = self.rechecks_for(&bound.worktree);
-        let block = state.feed.next_block(&key, &snapshots, &rechecks)?;
+        let block = state
+            .feed
+            .next_block_when(&key, &snapshots, &rechecks, fits)?;
         let languages = snapshots
             .iter()
             .filter(|snapshot| {
@@ -1151,6 +1168,28 @@ mod tests {
             plate("rust: 0 errors, 0 warnings (-1)")
         );
         assert_eq!(feed.next_block(&hook), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// T28B: a feed block handed to a carrier that cannot hold it whole is not consumed — the
+    /// refusal keeps it due, and the next accepting carrier receives exactly that block once.
+    #[tokio::test(start_paused = true)]
+    async fn next_block_when_refuses_without_losing_the_due_block() {
+        let (feed, _problems, root) = scripted_feed("t28b");
+        let worktree = root.join("wt");
+        let hook = [1; 32];
+        feed.activated(hook, &worktree, Path::new("repo"));
+        let due = plate("rust: checking (first check)").unwrap();
+        assert_eq!(
+            feed.next_block_when(&hook, |_| false),
+            None,
+            "refused: not delivered, stays due"
+        );
+        assert_eq!(feed.next_block_when(&hook, |_| false), None);
+        assert_eq!(feed.next_block_when(&hook, |_| true), Some(due.clone()));
+        // Delivered exactly once; the accepting predicate alone does not re-emit.
+        assert_eq!(feed.next_block_when(&hook, |_| true), None);
+        assert_eq!(feed.next_block_when(&hook, |_| false), None);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

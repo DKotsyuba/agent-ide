@@ -57,16 +57,17 @@ Caches follow the worktree across stop and sequential handoff. Actor termination
 
 The current increment is the [EYES-r2](contracts/eyes-v0.3.md) MVP: a shared per-repository daemon
 runs confined background `cargo check` and pyright checks for admitted Rust and Python worktrees on
-macOS and feeds the active Claude actor a compact `<agent-ide>` problem-count block plus an
+macOS and feeds the active agent a compact `<agent-ide>` problem-count block plus an
 `ide.context` `{"kind":"problems"}` reader. Done in the MVP: restart-only launcher admission
 (`allowed_roots`, `project_checks`), lease-based shared daemon lifecycle with idle stop, sandboxed
 read-only check execution with private per-repository caches under `$HOME/.agent-ide/checks`, the
 Claude rendezvous (`/private/tmp/ai-r-…`) and its hook key cache (`/private/tmp/ai-k-…`),
 delta-only block emission, problems retrieval, and one bucketed `ProjectCheckCompleted` telemetry
-event. Codex keeps the v0.2 path without the active block; Linux stays `not_tested`.
+event. Every supported host receives the block: Claude in hook context, Codex and any future
+hook-less host at the top of its terminal `ide.*` replies (T28B); Linux stays `not_tested`.
 
 Deferred to phase 2, in this order: warm LSP checks, launchd registration, a per-user service,
-subagent attach, TypeScript checks, the Codex active block, and Go checks last.
+subagent attach, TypeScript checks, and Go checks last.
 
 ## Later increments
 

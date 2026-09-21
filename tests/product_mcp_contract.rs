@@ -87,6 +87,16 @@ impl Mcp {
 
     /// Starts the shipping self-contained managed MCP in `candidate` from one launcher template.
     async fn start_managed(template: &Path, candidate: &Path) -> Self {
+        Self::start_managed_with_home(template, candidate, None).await
+    }
+
+    /// Same, with the managed daemon's home (`AGENT_IDE_HOME`) redirected into the fixture so its
+    /// project check caches never touch the real home directory.
+    async fn start_managed_with_home(
+        template: &Path,
+        candidate: &Path,
+        home: Option<&Path>,
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
         command
             .env("TOKIO_WORKER_THREADS", "1")
@@ -98,6 +108,9 @@ impl Mcp {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if let Some(home) = home {
+            command.env(agent_ide::userhome::HOME_OVERRIDE_ENV, home);
+        }
         let mut child = command.spawn().unwrap();
         let mut mcp = Self {
             input: child.stdin.take().unwrap(),
@@ -195,6 +208,8 @@ impl Mcp {
 /// `reply` must be a JSON-RPC tools/call response with `structuredContent`. The assertion performs
 /// no I/O and deliberately compares only the closed state projection: source and diagnostic text
 /// may legitimately occur in the compact block, while the complete typed value remains separate.
+/// A reply-delivered host's terminal reply may lead with the due status plate (T28B); the plate is
+/// stripped from the text before the state comparison and must lead the structured copy's text too.
 fn assert_compact_envelope(reply: &Value) {
     let result = reply["result"].as_object().expect("tool result object");
     let content = result["content"].as_array().expect("content array");
@@ -205,11 +220,23 @@ fn assert_compact_envelope(reply: &Value) {
         .as_object()
         .expect("typed structured result");
     let state = structured["state"].as_str().expect("closed reply state");
+    let text = match text.strip_prefix("<agent-ide>\n") {
+        Some(rest) => {
+            let end = rest.find("\n</agent-ide>\n").expect("closed status plate");
+            &rest[end + "\n</agent-ide>\n".len()..]
+        }
+        None => text,
+    };
     assert!(text.starts_with(state), "{reply}");
     assert_eq!(
         result.get("isError") == Some(&json!(true)),
         state == "error"
     );
+}
+
+/// Returns the carried status plate of a structured reply, absent when none was attached (T28B).
+fn carried_status(structured: &Value) -> Option<&str> {
+    structured["status"].as_str()
 }
 
 /// Asserts the Claude host projection carries no `structuredContent` duplicate (T14B): Claude hands
@@ -6218,6 +6245,302 @@ async fn eyes_claude_post_hook_delivers_problem_block_and_delta() {
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
     assert!(home.join(".agent-ide/checks").is_dir());
+}
+
+/// Reads the `ide.context` problems page for an active Codex actor, with its carried status plate.
+async fn eyes_codex_problems(
+    actor: &mut ProductActor,
+    fixture: &ProductFixture,
+) -> (String, Option<String>) {
+    let reply = actor
+        .call(fixture, "ide.context", json!({"kind":"problems"}))
+        .await;
+    assert_eq!(reply["kind"], "context", "{reply}");
+    (
+        reply["text"].as_str().unwrap().to_owned(),
+        carried_status(&reply).map(str::to_owned),
+    )
+}
+
+/// Polls Codex `ide.context` problems replies until one carries exactly `expected` (T28B).
+///
+/// Intermediate `checking (…)` plates are legitimately delivered once each; only the exact
+/// expected plate satisfies the wait.
+async fn await_eyes_codex_plate(
+    actor: &mut ProductActor,
+    fixture: &ProductFixture,
+    expected: &str,
+) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (_, plate) = eyes_codex_problems(actor, fixture).await;
+        if plate.as_deref() == Some(expected) {
+            return plate.expect("plate present");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no problem block was delivered on a reply: {plate:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// A Codex host has no hook delivery: every terminal `ide.*` reply carries the due status plate
+/// at its top, unchanged status is never repeated, an `ide.edit` that changes the check inputs is
+/// followed by a reply with the delta, and `ide.stop` carries none (T28B).
+#[tokio::test]
+async fn eyes_codex_reply_carries_due_plate_and_delta() {
+    let fixture = ProductFixture::new(json!([]));
+    // The fake cargo holds its first run briefly so the activation reply cannot carry the result.
+    let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, "sleep 1");
+    std::fs::write(fixture.root.join("problems.count"), "2").unwrap();
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "codex-eyes").await;
+
+    // Start completion carries the due first-check plate. Pending placeholders carry no plate;
+    // the resolving terminal reply does.
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"eyes"}))
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let first = carried_status(&started).expect("start completion carries the due plate");
+    assert!(
+        first.contains("checking (first check)") || first.contains("rust:"),
+        "{first}"
+    );
+
+    // A following terminal reply carries the first result (already carried at activation only
+    // when that reply itself observed the completed check).
+    if first.contains("2 errors") {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let (text, plate) = eyes_codex_problems(&mut actor, &fixture).await;
+            assert_eq!(plate, None, "delivered results must not be re-emitted");
+            if text.starts_with("rust: ready; errors: 2") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "problems page never reached readiness: {text}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    } else {
+        let result = await_eyes_codex_plate(
+            &mut actor,
+            &fixture,
+            "<agent-ide>\nrust: 2 errors, 0 warnings\n</agent-ide>",
+        )
+        .await;
+        assert_eq!(
+            result,
+            "<agent-ide>\nrust: 2 errors, 0 warnings\n</agent-ide>"
+        );
+    }
+    // Unchanged status is not repeated.
+    for _ in 0..3 {
+        let (_, plate) = eyes_codex_problems(&mut actor, &fixture).await;
+        assert_eq!(plate, None, "unchanged status must not be re-emitted");
+    }
+
+    // An `ide.edit` that changes the check inputs is followed by a reply carrying the delta.
+    let original = actor
+        .call(&fixture, "ide.context", json!({"path":"problems.count"}))
+        .await;
+    let original = actor.settle(&fixture, original).await;
+    let edited = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"codex-eyes-edit-1",
+                "path":"problems.count",
+                "source_ref":original["detail_ref"],
+                "content":"5\n"
+            }),
+        )
+        .await;
+    let edited = actor.settle(&fixture, edited).await;
+    assert_eq!(edited["state"], "edit", "{edited}");
+    let delta = await_eyes_codex_plate(
+        &mut actor,
+        &fixture,
+        "<agent-ide>\nrust: 5 errors (+3), 0 warnings\n</agent-ide>",
+    )
+    .await;
+    assert_eq!(
+        delta,
+        "<agent-ide>\nrust: 5 errors (+3), 0 warnings\n</agent-ide>"
+    );
+
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    assert!(
+        carried_status(&stopped).is_none(),
+        "ide.stop replies carry no plate"
+    );
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+    assert!(home.join(".agent-ide/checks").is_dir());
+}
+
+/// Managed Codex (no hook stream at all) gets the plate on its managed replies too: activation
+/// completion carries the first-check plate, a native edit between two calls is noticed and a
+/// following managed reply carries the delta, and stop stays plate-free (T28B).
+#[tokio::test]
+async fn eyes_codex_managed_reply_carries_due_plate_after_native_edit() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let fixture = ProductFixture::new(json!([]));
+    // The fake cargo holds its first run briefly so the activation reply cannot carry the result.
+    let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, "sleep 1");
+    std::fs::write(fixture.root.join("problems.count"), "1").unwrap();
+    let mut mcp = Mcp::start_managed_with_home(&fixture.config, &fixture.root, Some(&home)).await;
+    let state = fixture.state();
+    let actor = "managed-eyes";
+    let mut next = 10;
+
+    let started = managed_call(
+        &mut mcp,
+        next,
+        actor,
+        "ide.start",
+        json!({"activation_id":"eyes"}),
+        &state,
+    )
+    .await;
+    let started = settle_managed(&mut mcp, &mut next, actor, &state, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let first = carried_status(&started).expect("activation completion carries the due plate");
+    assert!(
+        first.contains("checking (first check)") || first.contains("rust:"),
+        "{first}"
+    );
+
+    // A following managed reply carries the first result (already carried at activation only
+    // when that reply itself observed the completed check).
+    if !first.contains("1 error") {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let result = loop {
+            next += 1;
+            let reply = managed_call(
+                &mut mcp,
+                next,
+                actor,
+                "ide.context",
+                json!({"kind":"problems"}),
+                &state,
+            )
+            .await;
+            if carried_status(&reply)
+                == Some("<agent-ide>\nrust: 1 error, 0 warnings\n</agent-ide>")
+            {
+                break carried_status(&reply).unwrap().to_owned();
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no problem block was delivered on a managed reply: {reply}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        assert_eq!(
+            result,
+            "<agent-ide>\nrust: 1 error, 0 warnings\n</agent-ide>"
+        );
+    }
+
+    // A native edit between two tool calls is noticed without any hook stream.
+    std::fs::write(fixture.root.join("problems.count"), "3").unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let delta = loop {
+        next += 1;
+        let reply = managed_call(
+            &mut mcp,
+            next,
+            actor,
+            "ide.context",
+            json!({"kind":"problems"}),
+            &state,
+        )
+        .await;
+        if carried_status(&reply)
+            == Some("<agent-ide>\nrust: 3 errors (+2), 0 warnings\n</agent-ide>")
+        {
+            break carried_status(&reply).unwrap().to_owned();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no delta was delivered on a managed reply: {reply}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(
+        delta,
+        "<agent-ide>\nrust: 3 errors (+2), 0 warnings\n</agent-ide>"
+    );
+
+    next += 1;
+    let stopped = managed_call(&mut mcp, next, actor, "ide.stop", json!({}), &state).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    assert!(carried_status(&stopped).is_none(), "{stopped}");
+    mcp.close().await;
+}
+
+/// Claude keeps hook-only plate delivery: `ide.*` replies never carry the plate even while one is
+/// due, the withheld posts stay silent, and the still-due plate reaches the next native post (T28B).
+#[tokio::test]
+async fn eyes_claude_method_replies_never_carry_the_plate() {
+    let fixture = ProductFixture::new_claude(json!([]));
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    std::fs::write(fixture.root.join("problems.count"), "2").unwrap();
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let (mut actor, checking) = eyes_claude_actor(&fixture, "claude-eyes-replies").await;
+    assert!(checking.contains("checking (first check)"), "{checking}");
+
+    // Method calls with their posts withheld read the problems page while the first result is
+    // becoming due; no reply ever leads with the plate.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let problems = loop {
+        actor.next += 1;
+        let call = format!("call-{}", actor.next);
+        actor.claude_lifecycle(&fixture, "PreToolUse", &call).await;
+        let reply = actor
+            .mcp
+            .exchange(
+                json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
+                "name":"ide.context","arguments":{"kind":"problems"},
+                "_meta":{"claudecode/toolUseId":call}}}),
+            )
+            .await;
+        let text = assert_claude_envelope(&reply);
+        assert!(!text.starts_with("<agent-ide>"), "{text}");
+        if text.starts_with("complete context: rust: ready; errors: 2") {
+            break text.to_owned();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "problems page never reached readiness: {text}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert!(
+        problems.starts_with("complete context: rust: ready; errors: 2"),
+        "{problems}"
+    );
+
+    // The plate was never consumed by a method reply: the next native post hook delivers it.
+    let first = await_eyes_result(&mut actor, &fixture).await;
+    assert_eq!(
+        first,
+        "<agent-ide>\nrust: 2 errors, 0 warnings\n</agent-ide>"
+    );
+
+    let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
 }
 
 /// A plate that becomes due while a helper runs is delivered on the helper's own `Bash` post (T22B).
