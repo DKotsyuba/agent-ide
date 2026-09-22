@@ -1038,13 +1038,6 @@ impl LauncherConfig {
             .flatten()
     }
 
-    /// Returns the private attachment of the sole managed launch target.
-    pub fn sole_attachment(&self) -> Option<&str> {
-        (self.targets.len() == 1)
-            .then(|| self.targets.keys().next().map(String::as_str))
-            .flatten()
-    }
-
     /// Returns the configured absolute allowed roots; an empty slice disables project checks.
     ///
     /// Values are the operator's declared lexical forms; canonicalization against the live

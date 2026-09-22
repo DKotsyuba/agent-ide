@@ -816,6 +816,7 @@ impl ProductDispatcher {
                 {
                     let now_ms = monotonic_ms();
                     if launches.recognize(
+                        hook.opaque_attachment(),
                         launch.command(),
                         launch.run_in_background(),
                         call_id,
@@ -823,6 +824,7 @@ impl ProductDispatcher {
                         now_ms,
                     ) == super::claude_worker::LaunchRecognition::Ignored
                         && let Some(reason) = launches.diagnose_ignored(
+                            hook.opaque_attachment(),
                             launch.command(),
                             launch.run_in_background(),
                             call_id,

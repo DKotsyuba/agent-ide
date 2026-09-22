@@ -526,7 +526,16 @@ async fn call_ide_start(mcp: &mut Mcp, id: u64, activation_id: &str) -> Value {
 
 /// Runs a real managed Claude hook whose payload cwd identifies `worktree`, even when the
 /// inherited project environment identifies another worktree of the same repository.
-async fn worktree_hook(inherited_project: &Path, worktree: &Path, phase: &str, id: u64) {
+/// `phase` and `id` identify the native event for `session`; `command` selects a Bash launch
+/// instead of an MCP call. The child must exit successfully within two seconds.
+async fn worktree_hook(
+    inherited_project: &Path,
+    worktree: &Path,
+    phase: &str,
+    id: u64,
+    command: Option<&str>,
+    session: &str,
+) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
         .arg("claude-hook")
         .env("CLAUDE_PROJECT_DIR", inherited_project)
@@ -537,9 +546,11 @@ async fn worktree_hook(inherited_project: &Path, worktree: &Path, phase: &str, i
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    let payload = json!({"hook_event_name":phase,"session_id":"shared-session",
-        "tool_use_id":format!("call-{id}"),"tool_name":"mcp__agent-ide__ide_start",
-        "cwd":worktree});
+    let payload = json!({"hook_event_name":phase,"session_id":session,
+        "tool_use_id":format!("call-{id}"),
+        "tool_name":if command.is_some() { "Bash" } else { "mcp__agent-ide__ide_start" },
+        "tool_input":command.map(|command| json!({"command":command})),
+        "tool_response":{"success":true},"cwd":worktree});
     child
         .stdin
         .take()
@@ -558,40 +569,185 @@ async fn worktree_hook(inherited_project: &Path, worktree: &Path, phase: &str, i
     );
 }
 
-/// Both worktrees' real hook processes must submit on the channel of their own managed MCP lease.
+/// Completes `pending` for `session` on `worktree` through its exact Bash hook, real helper, and
+/// inspect call. `id` reserves distinct call IDs for the launch and inspection; both must finish.
+async fn worktree_start_flow(
+    mcp: &mut Mcp,
+    inherited_project: &Path,
+    worktree: &Path,
+    id: u64,
+    session: &str,
+    pending: Value,
+) {
+    let text = pending["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("pending:"),
+        "{} {pending}",
+        worktree.display()
+    );
+    let helper = text.split_once('\n').unwrap().1.split_once('\n').unwrap().0;
+    let detail_ref = text
+        .split("detail_ref ")
+        .nth(1)
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    let cache = std::fs::canonicalize("/private/tmp").unwrap().join(format!(
+        "ai-k-{}",
+        &blake3::hash(worktree.as_os_str().as_bytes())
+            .to_hex()
+            .as_str()[..16]
+    ));
+    let hook_attachment = std::fs::read_to_string(cache.join("candidate-attachment")).unwrap();
+    assert!(
+        helper.contains(&hook_attachment),
+        "{} {helper}",
+        worktree.display()
+    );
+
+    worktree_hook(
+        inherited_project,
+        worktree,
+        "PreToolUse",
+        id + 10,
+        Some(helper),
+        session,
+    )
+    .await;
+    let output = tokio::time::timeout(
+        Duration::from_secs(90),
+        Command::new("/bin/sh").arg("-c").arg(helper).output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("complete"),
+        "{} helper: {} {}",
+        worktree.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    worktree_hook(
+        inherited_project,
+        worktree,
+        "PostToolUse",
+        id + 10,
+        Some(helper),
+        session,
+    )
+    .await;
+
+    worktree_hook(
+        inherited_project,
+        worktree,
+        "PreToolUse",
+        id + 20,
+        None,
+        session,
+    )
+    .await;
+    let inspected = mcp
+        .exchange(json!({"jsonrpc":"2.0","id":id + 20,
+        "method":"tools/call","params":{"name":"ide.inspect",
+        "arguments":{"detail_ref":detail_ref},
+        "_meta":{"claudecode/toolUseId":format!("call-{}", id + 20)}}}))
+        .await;
+    worktree_hook(
+        inherited_project,
+        worktree,
+        "PostToolUse",
+        id + 20,
+        None,
+        session,
+    )
+    .await;
+    assert!(
+        inspected["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("complete"),
+        "{inspected}"
+    );
+}
+
+/// Both worktrees' real hooks and helpers must share each managed MCP lease's channel.
 #[tokio::test]
 async fn managed_claude_hooks_pair_with_second_worktree_lease() {
     let repo = init_repo();
+    let first_worktree = add_worktree(&repo, "hook-left");
     let right = add_worktree(&repo, "hook-right");
     let runtime = expected_runtime_path(&repo);
     let _guard = DaemonGuard(runtime.clone());
-    let left_template = write_launcher_template(&repo);
+    let left_template = write_launcher_template(&first_worktree);
     let right_template = write_launcher_template(&right);
-    let mut left = Mcp::start(&left_template, &repo).await;
+    let mut left = Mcp::start(&left_template, &first_worktree).await;
     let mut second = Mcp::start(&right_template, &right).await;
     wait_for_healthy_locked_daemon(&runtime).await;
 
-    worktree_hook(&repo, &repo, "PreToolUse", 2).await;
-    let left_response = call_ide_start(&mut left, 2, "left").await;
-    assert!(
-        left_response.to_string().contains("pending:"),
-        "{left_response}"
+    worktree_hook(
+        &repo,
+        &first_worktree,
+        "PreToolUse",
+        2,
+        None,
+        "left-session",
+    )
+    .await;
+    let left_pending = call_ide_start(&mut left, 2, "left").await;
+    worktree_hook(
+        &repo,
+        &first_worktree,
+        "PostToolUse",
+        2,
+        None,
+        "left-session",
+    )
+    .await;
+    worktree_hook(&repo, &right, "PreToolUse", 3, None, "right-session").await;
+    let right_pending = call_ide_start(&mut second, 3, "right").await;
+    worktree_hook(&repo, &right, "PostToolUse", 3, None, "right-session").await;
+    let shared_attachment = std::fs::read_to_string(runtime.join("attachment")).unwrap();
+    let shared_attachment = shared_attachment.split_whitespace().nth(1).unwrap();
+    let left_helper = left_pending.to_string();
+    tokio::join!(
+        worktree_start_flow(
+            &mut left,
+            &repo,
+            &first_worktree,
+            2,
+            "left-session",
+            left_pending
+        ),
+        worktree_start_flow(
+            &mut second,
+            &repo,
+            &right,
+            3,
+            "right-session",
+            right_pending
+        ),
     );
-    worktree_hook(&repo, &repo, "PostToolUse", 2).await;
-
-    worktree_hook(&repo, &right, "PreToolUse", 3).await;
-    let right_response = call_ide_start(&mut second, 3, "right").await;
     assert!(
-        right_response.to_string().contains("pending:"),
-        "{right_response}"
+        !left_helper.contains(shared_attachment),
+        "first worktree helper must use its lease attachment: {left_helper}"
     );
-    worktree_hook(&repo, &right, "PostToolUse", 3).await;
 
     left.close().await;
     second.close().await;
     git(
         &repo,
         &["worktree", "remove", "--force", right.to_str().unwrap()],
+    );
+    git(
+        &repo,
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            first_worktree.to_str().unwrap(),
+        ],
     );
     std::fs::remove_dir_all(repo).unwrap();
 }

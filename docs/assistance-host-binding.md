@@ -71,7 +71,9 @@ attachment file's owner, exact modes, shape, and full repository digest. It read
 daemon-minted lease attachment from the private cache and reuses the existing Claude parser and
 connect-only transport. Missing
 or corrupt state is silent fail-open. Root and child lifecycle identity, permission denial,
-failed-tool settlement, feedback output, and exact foreground-helper recognition are unchanged.
+failed-tool settlement and feedback output are unchanged. Foreground-helper recognition requires
+the exact command, actor, and lease attachment that minted the ticket; the helper claim checks that
+same attachment before releasing work.
 The installed binary and launcher template remain machine-specific values in normal Claude MCP
 configuration; they are not embedded in the plugin manifest.
 
