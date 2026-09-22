@@ -668,7 +668,8 @@ async fn serve_accepted_connection(
                 Ok(None)
             }
             Some(version) if version == u64::from(transport::CLIENT_LEASE_WIRE_VERSION) => {
-                serve_client_lease_handshake(&mut stream, request, &lease).await
+                serve_client_lease_handshake(&mut stream, request, &lease, dispatcher.as_deref())
+                    .await
             }
             _ => Ok(None),
         }
@@ -698,6 +699,7 @@ async fn serve_client_lease_handshake(
     stream: &mut UnixStream,
     request: Value,
     lease: &lease::LeaseController,
+    dispatcher: Option<&dyn AssistanceDispatcher>,
 ) -> io::Result<Option<lease::LeaseGuard>> {
     let Ok(request) = serde_json::from_value::<transport::ClientLeaseRequest>(request) else {
         return Ok(None);
@@ -712,10 +714,20 @@ async fn serve_client_lease_handshake(
     let Some(guard) = lease.try_admit() else {
         return Ok(None);
     };
+    let attachment = match request.candidate.as_deref() {
+        Some(candidate) => {
+            match dispatcher.and_then(|owner| owner.register_claude_candidate(candidate)) {
+                Some(attachment) => Some(attachment),
+                None => return Ok(None),
+            }
+        }
+        None => None,
+    };
     let ack = transport::ClientLeaseAck {
         version: transport::CLIENT_LEASE_WIRE_VERSION,
         request_id: request.request_id,
         status: "ok".to_owned(),
+        attachment,
     };
     write_frame(stream, &ack, MAX_V1_FRAME_BYTES).await?;
     Ok(Some(guard))
@@ -743,6 +755,27 @@ pub async fn open_client_lease(
         && ack.status == "ok"
         && ack.request_id == request.request_id)
         .then_some(stream)
+}
+
+/// Opens a lease and registers one host-selected Claude worktree on the shared daemon.
+/// A missing registration acknowledgement leaves the caller unavailable.
+pub async fn open_claude_client_lease(
+    runtime_dir: &Path,
+    candidate: &Path,
+) -> Option<(UnixStream, String)> {
+    let mut stream = UnixStream::connect(runtime_dir.join(SOCKET_NAME))
+        .await
+        .ok()?;
+    let mut request = transport::ClientLeaseRequest::new("managed-claude-mcp");
+    request.candidate = Some(candidate.to_path_buf());
+    write_frame(&mut stream, &request, MAX_V1_FRAME_BYTES)
+        .await
+        .ok()?;
+    let ack: transport::ClientLeaseAck = read_frame(&mut stream, MAX_V1_FRAME_BYTES).await.ok()?;
+    (ack.version == transport::CLIENT_LEASE_WIRE_VERSION
+        && ack.status == "ok"
+        && ack.request_id == request.request_id)
+        .then_some((stream, ack.attachment?))
 }
 
 /// Validates the unchanged v1 health request and emits only its existing correlated health reply.

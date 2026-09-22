@@ -60,6 +60,8 @@ pub struct ProductDispatcher {
     admission: Arc<Mutex<crate::execution::AdmissionController>>,
     /// Enables direct trusted Codex metadata binding only for an owned managed-MCP daemon.
     managed_codex: bool,
+    /// Enables lease-registered Claude worktrees only for the managed shared daemon.
+    managed_claude: bool,
 }
 
 /// Returns a monotonic millisecond reading for ticket deadlines.
@@ -195,6 +197,7 @@ impl Default for ProductDispatcher {
             runtime_dir: Arc::new(Mutex::new(None)),
             endpoint: Mutex::new(None),
             managed_codex: false,
+            managed_claude: false,
         }
     }
 }
@@ -238,6 +241,12 @@ impl ProductDispatcher {
     pub fn with_managed_codex_launcher(launcher: LauncherConfig) -> Self {
         let mut dispatcher = Self::with_launcher(launcher);
         dispatcher.managed_codex = true;
+        dispatcher
+    }
+    /// Installs the shared Claude launcher with per-MCP candidate registration.
+    pub fn with_managed_claude_launcher(launcher: LauncherConfig) -> Self {
+        let mut dispatcher = Self::with_launcher(launcher);
+        dispatcher.managed_claude = true;
         dispatcher
     }
     /// Derives the same opaque channel for hook/MCP input under this exact daemon nonce.
@@ -1297,6 +1306,13 @@ impl ProductDispatcher {
     }
 }
 impl AssistanceDispatcher for ProductDispatcher {
+    /// Gives a managed Claude MCP its own target on this repository's shared daemon.
+    fn register_claude_candidate(&self, candidate: &Path) -> Option<String> {
+        if !self.managed_claude {
+            return None;
+        }
+        self.worker.as_ref()?.register_claude_candidate(candidate)
+    }
     /// Opens configured peers once, only after Application owns the daemon endpoint lock.
     fn initialize<'a>(
         &'a self,

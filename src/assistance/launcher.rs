@@ -1031,6 +1031,20 @@ impl LauncherConfig {
         self.targets.get(attachment)
     }
 
+    /// Returns the sole managed launch target as a template for another host-selected worktree.
+    pub fn sole_target(&self) -> Option<&LaunchTarget> {
+        (self.targets.len() == 1)
+            .then(|| self.targets.values().next())
+            .flatten()
+    }
+
+    /// Returns the private attachment of the sole managed launch target.
+    pub fn sole_attachment(&self) -> Option<&str> {
+        (self.targets.len() == 1)
+            .then(|| self.targets.keys().next().map(String::as_str))
+            .flatten()
+    }
+
     /// Returns the configured absolute allowed roots; an empty slice disables project checks.
     ///
     /// Values are the operator's declared lexical forms; canonicalization against the live

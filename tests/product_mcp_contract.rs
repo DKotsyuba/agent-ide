@@ -3374,6 +3374,92 @@ async fn managed_claude_root_child_rendezvous_shared_daemon_survives_eof() {
     );
 }
 
+/// A removed worktree must not poison later activation in the same repository daemon.
+#[tokio::test]
+async fn managed_claude_activates_after_removing_an_earlier_worktree() {
+    let fixture = ProductFixture::new_claude(json!([]));
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    let left = fixture.base.join("left");
+    let right = fixture.base.join("right");
+    fixture.git(&[
+        "worktree",
+        "add",
+        "--quiet",
+        "-b",
+        "left",
+        left.to_str().unwrap(),
+    ]);
+    let mut first = Mcp::start_managed_claude(&fixture.config, &left).await;
+    let original_attachment = std::fs::read(runtime.join("attachment")).unwrap();
+    let mut next = 1;
+    let pending = managed_claude_call(
+        &mut first,
+        &left,
+        next,
+        "left-session",
+        None,
+        "ide.start",
+        json!({"activation_id":"left-start"}),
+    )
+    .await;
+    let started =
+        settle_managed_claude_start(&mut first, &left, &mut next, "left-session", None, &pending)
+            .await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    next += 1;
+    let stopped = managed_claude_call(
+        &mut first,
+        &left,
+        next,
+        "left-session",
+        None,
+        "ide.stop",
+        json!({}),
+    )
+    .await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    first.close().await;
+    assert!(runtime.is_dir());
+
+    fixture.git(&["worktree", "remove", left.to_str().unwrap()]);
+    fixture.git(&[
+        "worktree",
+        "add",
+        "--quiet",
+        "-b",
+        "right",
+        right.to_str().unwrap(),
+    ]);
+    let mut second = Mcp::start_managed_claude(&fixture.config, &right).await;
+    assert_eq!(
+        std::fs::read(runtime.join("attachment")).unwrap(),
+        original_attachment
+    );
+    next += 1;
+    let pending = managed_claude_call(
+        &mut second,
+        &right,
+        next,
+        "right-session",
+        None,
+        "ide.start",
+        json!({"activation_id":"right-start"}),
+    )
+    .await;
+    let started = settle_managed_claude_start(
+        &mut second,
+        &right,
+        &mut next,
+        "right-session",
+        None,
+        &pending,
+    )
+    .await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    second.close().await;
+}
+
 /// The hook resolves its rendezvous key from its own cache, never by probing `git` itself
 /// (EYES-r2 §3): once that cache is warm, a hook call still correlates correctly even after the
 /// candidate's `.git` directory is moved away, which a live re-probe would instead treat as a
