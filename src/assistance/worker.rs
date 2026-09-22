@@ -4442,9 +4442,19 @@ fn diagnostics_reserve_known_edit_settlement_time() {
 
 /// A refused read-scope recheck: the closed public code plus the closed error-log detail
 /// (T36B-r), so callers that surface the refusal beyond the error log keep the exact condition.
+///
+/// Produced only by [`validate_read_scope`], which has already written `detail` to the error log
+/// by the time an `ExecutionProfile` refusal is returned. Callers that only reply to the agent
+/// (fresh Context `observe`, cached delivery) keep `code` and drop `detail`; Diff capture copies
+/// `detail` into the job's `failure_detail`.
 #[derive(Debug)]
 struct ReadScopeRefusal {
+    /// The public failure code the reply carries: `WorkspaceAuthority` when the durable stamp
+    /// cannot be restated, the binding's own liveness code when it is no longer active, and
+    /// `ExecutionProfile` for every workspace-read recheck refusal.
     code: FailureCode,
+    /// The closed, privacy-safe condition tag (for example `read_scope:path_unproven`,
+    /// `workspace_authority`, `internal`); never a path, sandbox-state JSON or error text.
     detail: String,
 }
 
@@ -6872,6 +6882,125 @@ mod stop_retry_tests {
                 code: FailureCode::ExecutionProfile
             }
         ));
+    }
+
+    /// A fresh `ide.context {"path": ...}` job runs through the real `perform` -> `context` ->
+    /// `observe` read-proof guard (T36B-r follow-up): under one live deny-bearing managed state
+    /// (root read plus a `secret` path deny), the proven `src/main.py` returns its source bytes,
+    /// while `secret/key.txt` is refused with the public `execution_profile` code, none of its
+    /// bytes reach the retained reply, and it is never read into the registered path set. The
+    /// Context path keeps only the public code on the reply; the closed
+    /// `read_scope:path_unproven` detail it logs is asserted through the same guard call on
+    /// identical inputs. Removing `observe`'s guard makes this test fail on the registered set
+    /// (the later post-read re-proof in `context` still withholds the reply bytes).
+    #[tokio::test]
+    async fn fresh_context_read_refuses_denied_path_through_observe() {
+        let fixture = Fixture::new();
+        let allowed = "print('allowed-context-marker')\n";
+        let secret = "SECRET-CONTEXT-TOKEN-7f3a\n";
+        std::fs::create_dir_all(fixture.root.join("src")).unwrap();
+        std::fs::create_dir_all(fixture.root.join("secret")).unwrap();
+        std::fs::write(fixture.root.join("src/main.py"), allowed).unwrap();
+        std::fs::write(fixture.root.join("secret/key.txt"), secret).unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (binding, _clean, authority, target) =
+            activate_read_scope(&mut worker, "fresh-context-actor", "fresh-context-start").await;
+
+        for (reference, path) in [
+            ("allowed-context", "src/main.py"),
+            ("denied-context", "secret/key.txt"),
+        ] {
+            let (invocation, denied) = read_scope_call(
+                &worker,
+                Some("secret"),
+                "fresh-context-actor",
+                &format!("{reference}-call"),
+            );
+            let (mut job, _cancel) = diff_job(&fixture.root, invocation, denied, reference);
+            job.tool = AssistanceTool::Context;
+            job.parameters = serde_json::json!({ "path": path });
+            retain_detail(
+                &worker,
+                &binding,
+                reference,
+                AssistanceTool::Context,
+                &authority,
+            );
+            worker.perform(job).await;
+        }
+        let retained = |reference: &str| {
+            worker
+                .shared
+                .ledger
+                .lock()
+                .unwrap()
+                .details
+                .get(reference)
+                .unwrap()
+                .reply
+                .clone()
+        };
+
+        // The proven path reads natively and the reply carries its real source bytes.
+        let PeerReply::Complete {
+            kind: ResultKind::Context,
+            text,
+            ..
+        } = retained("allowed-context")
+        else {
+            panic!(
+                "the proven path must read: {:?}",
+                retained("allowed-context")
+            )
+        };
+        assert!(text.contains(allowed.trim_end()), "{text}");
+
+        // The denied path is refused by `observe` before any read: public code only, no bytes.
+        // `PeerReply`'s Debug is redacted, so the checks read its full serialized wire form.
+        let denied_wire = serde_json::to_string(&retained("denied-context")).unwrap();
+        assert!(
+            !denied_wire.contains("SECRET-CONTEXT-TOKEN"),
+            "the denied source must appear nowhere in the reply: {denied_wire}"
+        );
+        assert!(
+            matches!(
+                retained("denied-context"),
+                PeerReply::Error {
+                    code: FailureCode::ExecutionProfile
+                }
+            ),
+            "{denied_wire}"
+        );
+        // `context` re-proves after the read, so the reply alone cannot tell whether `observe`
+        // read first: only `observe`'s own guard keeps the denied file unread and unregistered
+        // (a registered path is re-read on every later native-change hint).
+        let registered = worker.registered.get(&binding).cloned().unwrap_or_default();
+        assert!(
+            registered.contains(Path::new("src/main.py"))
+                && !registered.contains(Path::new("secret/key.txt")),
+            "only the proven path may be read and registered: {registered:?}"
+        );
+        let (_, denied) = read_scope_call(
+            &worker,
+            Some("secret"),
+            "fresh-context-actor",
+            "detail-call",
+        );
+        let refusal = validate_read_scope(
+            &worker.shared,
+            &binding,
+            &denied,
+            &target,
+            &authority,
+            errorlog_method(AssistanceTool::Context),
+            crate::execution::ReadScope::Path(Path::new("secret/key.txt")),
+        )
+        .unwrap_err();
+        assert_eq!(refusal.code, FailureCode::ExecutionProfile);
+        assert_eq!(refusal.detail, "read_scope:path_unproven");
     }
 }
 

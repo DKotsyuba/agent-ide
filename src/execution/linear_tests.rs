@@ -2535,6 +2535,9 @@ fn t36b_relevant_glob_depth_beyond_a_present_cap_is_unproven() {
     );
 }
 
+/// Proves the per-path read proof never declares a non-ASCII deny path, deny-glob base or
+/// target disjoint from another name, because Unicode normalization can make two different
+/// byte spellings name the same file (T36B-r, review finding 2).
 #[test]
 fn t36b_non_ascii_denies_and_targets_are_never_provably_disjoint() {
     // NFC folds the Kelvin sign `K` (U+212A) onto ASCII `K`, and a filesystem may store one
