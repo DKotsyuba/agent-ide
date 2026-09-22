@@ -1045,3 +1045,908 @@ fn rejected_listing_admits_only_bounded_regular_captures() {
     assert_eq!(captures[0].sandbox_cwd, "file:///private/tmp/host/work");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// ---------------------------------------------------------------------------
+// T35B: profile-shape v2 derivation, conservative narrowing, and versioned
+// records. The fixtures below are the nine captured sandbox states of the
+// design's acceptance matrix; each test states which design row it seals.
+// ---------------------------------------------------------------------------
+
+/// Reads one captured sandbox-state fixture by its exact file name.
+fn sandbox_fixture(name: &str) -> String {
+    std::fs::read_to_string(format!(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/sandbox-states/{}.json"
+        ),
+        name.trim_end_matches(".json")
+    ))
+    .unwrap()
+}
+
+/// Parses one captured sandbox-state fixture into a validated host state.
+fn fixture_state(name: &str) -> HostSandboxState {
+    HostSandboxState::parse_json(&sandbox_fixture(name)).unwrap()
+}
+
+/// The short names the design matrix uses for the nine fixtures.
+const FIXTURE_1ED: &str = "1ed43a00ce845709.json";
+const FIXTURE_555: &str = "555ebcab7e884d62.json";
+const FIXTURE_B8A: &str = "b8a736675faa7cba.json";
+const FIXTURE_C9E: &str = "c9ea07ed289773b3.json";
+const FIXTURE_FD3: &str = "fd37241d7322ebc3.json";
+const FIXTURE_84F: &str = "84f07fac27b67d1d.json";
+const FIXTURE_728: &str = "728b26d824d0d380.json";
+const FIXTURE_READONLY_V1: &str = "accepted-codex-managed-read-only-v1.json";
+const FIXTURE_WORKSPACE_WRITE_V1: &str = "accepted-codex-managed-workspace-write-v1.json";
+
+/// Mints one v2 catalog carrying exactly the named fixture as its accepted template.
+fn v2_catalog(name: &str) -> ExecutionProfileCatalog {
+    ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence_v2(
+            "t35b-template",
+            1,
+            &fixture_state(name),
+        )
+        .unwrap(),
+    ])
+    .unwrap()
+}
+
+/// Runs the v2 permit decision of one accepted fixture template against one live fixture.
+fn permit_fixture(template: &str, live: &str) -> Result<(), RequestError> {
+    v2_catalog(template)
+        .permit(&fixture_state(live))
+        .map(|_| ())
+}
+
+/// Derives the v2 shape of one sandbox-state JSON value, or reports the unsupported reason.
+fn shape_of(value: serde_json::Value) -> Result<ProfileShapeV2, UnsupportedShape> {
+    HostSandboxState::parse(Some(value)).unwrap().shape_v2()
+}
+
+/// The exact fixture name every replay-preservation assertion re-checks.
+#[test]
+fn v2_fixture_matrix_admits_and_refuses_as_designed() {
+    // One template minted from `1ed…` admits `1ed…`, `555…`, and `b8…` after portable
+    // normalization of the cwd-derived selectors and glob bases.
+    for admitted in [FIXTURE_1ED, FIXTURE_555, FIXTURE_B8A] {
+        assert!(
+            permit_fixture(FIXTURE_1ED, admitted).is_ok(),
+            "the workspace-write template must admit {admitted}"
+        );
+    }
+    // `c9…` and `fd…` carry additional, different absolute write grants and are refused.
+    for refused in [FIXTURE_C9E, FIXTURE_FD3] {
+        assert!(
+            matches!(
+                permit_fixture(FIXTURE_1ED, refused),
+                Err(RequestError::ExecutionProfileShapeNotNarrower(
+                    ProfileClass::Managed
+                ))
+            ),
+            "the template must refuse {refused}"
+        );
+    }
+    // `84f…` grants write of the whole root and is refused by every workspace-write template.
+    for template in [FIXTURE_1ED, FIXTURE_WORKSPACE_WRITE_V1] {
+        assert!(matches!(
+            permit_fixture(template, FIXTURE_84F),
+            Err(RequestError::ExecutionProfileShapeNotNarrower(_))
+        ));
+    }
+    // `728…` matches the read-only template exactly.
+    assert!(permit_fixture(FIXTURE_READONLY_V1, FIXTURE_728).is_ok());
+    // The read-only template does not admit a workspace-write state.
+    assert!(matches!(
+        permit_fixture(FIXTURE_READONLY_V1, FIXTURE_1ED),
+        Err(RequestError::ExecutionProfileShapeNotNarrower(_))
+    ));
+}
+
+/// Both accepted legacy files keep v1 behaviour byte-for-byte (T35B compatibility half).
+#[test]
+fn accepted_legacy_files_keep_v1_digest_admission() {
+    for name in [FIXTURE_READONLY_V1, FIXTURE_WORKSPACE_WRITE_V1] {
+        let state = fixture_state(name);
+        let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+            ExecutionProfileTemplate::from_execution_evidence("legacy-v1", 1, &state).unwrap(),
+        ])
+        .unwrap();
+        // The exact state admits through the legacy exact-digest path.
+        assert!(catalog.permit(&state).is_ok());
+        // The v1 record layout is unchanged: eleven fields, no shape_version key.
+        let record = PersistedProfileRecord::from_execution_evidence(
+            "legacy-v1",
+            1,
+            D03ProfileEvidence {
+                provider_binary: "p".into(),
+                toolchain: "t".into(),
+                configuration: "c".into(),
+                trust: "u".into(),
+                transport: "x".into(),
+                d03_evidence: "d".into(),
+            },
+            &state,
+        )
+        .unwrap();
+        assert!(!record.to_json().contains("shape_version"));
+        assert_eq!(
+            PersistedProfileRecord::from_json(&record.to_json()).unwrap(),
+            record
+        );
+    }
+    // The read-only v1 file and its compact reserialization of `728…` even share one legacy
+    // digest, proving v1 portability is untouched.
+    assert_eq!(
+        fixture_state(FIXTURE_READONLY_V1).profile_digest(),
+        fixture_state(FIXTURE_728).profile_digest()
+    );
+}
+
+/// Reordering entries and duplicating identical rules never change the v2 shape (T35B).
+#[test]
+fn reordering_and_duplicates_do_not_change_the_v2_shape() {
+    let base = sandbox_fixture(FIXTURE_1ED);
+    let entries = serde_json::from_str::<serde_json::Value>(&base).unwrap()
+        ["permissionProfile"]["file_system"]["entries"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let mut reordered = entries.clone();
+    reordered.reverse();
+    let mut duplicated = entries.clone();
+    duplicated.extend(entries.iter().cloned());
+    let digest = |entries: &[serde_json::Value]| {
+        let mut value = serde_json::from_str::<serde_json::Value>(&base).unwrap();
+        value["permissionProfile"]["file_system"]["entries"] = entries.to_vec().into();
+        shape_of(value).unwrap().digest()
+    };
+    assert_eq!(digest(&entries), digest(&reordered));
+    assert_eq!(digest(&entries), digest(&duplicated));
+    // And the reordered, duplicated live state still matches the pristine template exactly.
+    let template = fixture_state(FIXTURE_1ED);
+    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence_v2("t35b-template", 1, &template)
+            .unwrap(),
+    ])
+    .unwrap();
+    let mut live = serde_json::from_str::<serde_json::Value>(&base).unwrap();
+    live["permissionProfile"]["file_system"]["entries"] = duplicated.into();
+    let live = HostSandboxState::parse(Some(live)).unwrap();
+    assert!(catalog.permit(&live).is_ok());
+}
+
+/// Returns the permit outcome for one mutated copy of the T35B base state (attack harness).
+///
+/// The unmutated base state is the positive control: it is admitted by the template minted
+/// from it. Every attack applies exactly one mutation to a fresh copy.
+fn t35b_permit_outcome(mutation: impl FnOnce(&mut serde_json::Value)) -> Result<(), RequestError> {
+    let mut live_value = t35b_base_state();
+    mutation(&mut live_value);
+    permit_values(t35b_base_state(), live_value)
+}
+
+/// Mints a v2 template from `template_value` and permits `live_value` against it.
+fn permit_values(
+    template_value: serde_json::Value,
+    live_value: serde_json::Value,
+) -> Result<(), RequestError> {
+    let template = HostSandboxState::parse(Some(template_value)).unwrap();
+    let live = HostSandboxState::parse(Some(live_value)).unwrap();
+    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence_v2("t35b-base", 1, &template).unwrap(),
+    ])
+    .unwrap();
+    catalog.permit(&live).map(|_| ())
+}
+
+/// Builds one synthetic workspace-write managed state shaped like a real default capture.
+fn t35b_base_state() -> serde_json::Value {
+    serde_json::json!({
+        "codexLinuxSandboxExe": null,
+        "permissionProfile": {
+            "file_system": {
+                "entries": [
+                    {"access":"read","path":{"type":"special","value":{"kind":"root"}}},
+                    {"access":"write","path":{"path":"/private/tmp/t35b/work","type":"path"}},
+                    {"access":"write","path":{"type":"special","value":{"kind":"slash_tmp"}}},
+                    {"access":"write","path":{"type":"special","value":{"kind":"tmpdir"}}},
+                    {"access":"read","missing_path_behavior":"skip",
+                     "path":{"path":"/private/tmp/t35b/work/.git","type":"path"}},
+                    {"access":"deny","path":{"path":"/Users/pluto/.aws","type":"path"}},
+                    {"access":"deny","path":{"pattern":"/private/tmp/t35b/work/**/.env","type":"glob_pattern"}}
+                ],
+                "glob_scan_max_depth": 8,
+                "type": "restricted"
+            },
+            "network": "enabled",
+            "type": "managed"
+        },
+        "sandboxCwd": "/private/tmp/t35b/work",
+        "useLegacyLandlock": false
+    })
+}
+
+/// Every positive-selector set mutation is refused; the unmutated control is admitted (§5).
+#[test]
+fn attack_selector_set_mutations_refuse() {
+    // Positive control first: the exact base state admits.
+    assert!(t35b_permit_outcome(|_| {}).is_ok());
+
+    // Add an outside write selector.
+    assert!(matches!(
+        t35b_permit_outcome(|state| {
+            state["permissionProfile"]["file_system"]["entries"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!(
+                    {"access":"write","path":{"path":"/opt/escape","type":"path"}}
+                ));
+        }),
+        Err(RequestError::ExecutionProfileShapeNotNarrower(_))
+    ));
+    // Add an outside read selector.
+    assert!(matches!(
+        t35b_permit_outcome(|state| {
+            state["permissionProfile"]["file_system"]["entries"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!(
+                    {"access":"read","path":{"path":"/opt/secret","type":"path"}}
+                ));
+        }),
+        Err(RequestError::ExecutionProfileShapeNotNarrower(_))
+    ));
+    // Replace the cwd write with a root write (`84f…` shape). The mutated state also carries
+    // two conflicting accesses at the root selector, so the closed refusal is either the
+    // unsupported-shape reason or the shape-proof failure — never an admission.
+    assert!(matches!(
+        t35b_permit_outcome(|state| {
+            let entries = state["permissionProfile"]["file_system"]["entries"]
+                .as_array_mut()
+                .unwrap();
+            entries[1] = serde_json::json!(
+                {"access":"write","path":{"type":"special","value":{"kind":"root"}}}
+            );
+        }),
+        Err(RequestError::ExecutionProfileShapeNotNarrower(_)
+            | RequestError::ExecutionProfileShapeUnsupported(_))
+    ));
+    // Replace `slash_tmp` with `tmpdir`: special selectors are distinct, so the template over a
+    // `slash_tmp` write never admits a state whose temporary-directory write moved to `tmpdir`.
+    assert!(matches!(
+        t35b_permit_outcome(|state| {
+            state["permissionProfile"]["file_system"]["entries"][2]["path"]["value"]["kind"] =
+                serde_json::json!("tmpdir");
+        }),
+        Err(RequestError::ExecutionProfileShapeNotNarrower(_))
+    ));
+    // Add a read below an accepted deny: a new positive selector can reopen a denied subtree.
+    assert!(matches!(
+        t35b_permit_outcome(|state| {
+            state["permissionProfile"]["file_system"]["entries"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!(
+                    {"access":"read","path":{"path":"/Users/pluto/.aws/creds","type":"path"}}
+                ));
+        }),
+        Err(RequestError::ExecutionProfileShapeNotNarrower(_))
+    ));
+    // Remove the `.git` skip-read restriction: never treated as redundant root-read coverage.
+    assert!(matches!(
+        t35b_permit_outcome(|state| {
+            state["permissionProfile"]["file_system"]["entries"]
+                .as_array_mut()
+                .unwrap()
+                .remove(4);
+        }),
+        Err(RequestError::ExecutionProfileShapeNotNarrower(_))
+    ));
+    // Removing a write selector stays refused by this deliberately incomplete proof.
+    assert!(matches!(
+        t35b_permit_outcome(|state| {
+            state["permissionProfile"]["file_system"]["entries"]
+                .as_array_mut()
+                .unwrap()
+                .remove(2);
+        }),
+        Err(RequestError::ExecutionProfileShapeNotNarrower(_))
+    ));
+}
+
+/// Network and mechanism mutations refuse; the safe network direction may pass (§5).
+#[test]
+fn attack_network_and_mechanism_mutations_refuse() {
+    // Restricted → enabled network refuses.
+    let mut restricted_template = t35b_base_state();
+    restricted_template["permissionProfile"]["network"] = serde_json::json!("restricted");
+    let mut enabled_live = restricted_template.clone();
+    enabled_live["permissionProfile"]["network"] = serde_json::json!("enabled");
+    assert!(matches!(
+        permit_values(restricted_template.clone(), enabled_live),
+        Err(RequestError::ExecutionProfileShapeNotNarrower(_))
+    ));
+    // The reverse direction may pass.
+    assert!(
+        t35b_permit_outcome(|state| {
+            state["permissionProfile"]["network"] = serde_json::json!("restricted");
+        })
+        .is_ok()
+    );
+    // Flipping the Landlock mode refuses: exact mechanism mismatch.
+    assert!(matches!(
+        t35b_permit_outcome(|state| {
+            state["useLegacyLandlock"] = serde_json::json!(true);
+        }),
+        Err(RequestError::ExecutionProfileShapeNotNarrower(_))
+    ));
+    // A differing helper path refuses; the exact null helper matches.
+    assert!(matches!(
+        t35b_permit_outcome(|state| {
+            state["codexLinuxSandboxExe"] = serde_json::json!("/usr/local/bin/codex-sandbox");
+        }),
+        Err(RequestError::ExecutionProfileShapeNotNarrower(_))
+    ));
+}
+
+/// Accepted denies are required; added supported denies narrow without native-read authority.
+#[test]
+fn deny_churn_is_monotonic_and_never_creates_read_authority() {
+    // Removing an accepted path deny refuses.
+    assert!(matches!(
+        t35b_permit_outcome(|state| {
+            let entries = state["permissionProfile"]["file_system"]["entries"]
+                .as_array_mut()
+                .unwrap();
+            entries.retain(|entry| entry["access"] != "deny" || entry["path"]["type"] != "path");
+        }),
+        Err(RequestError::ExecutionProfileShapeNotNarrower(_))
+    ));
+    // Weakening an accepted glob deny refuses: a different tail is a different required rule.
+    assert!(matches!(
+        t35b_permit_outcome(|state| {
+            let entries = state["permissionProfile"]["file_system"]["entries"]
+                .as_array_mut()
+                .unwrap();
+            for entry in entries.iter_mut() {
+                if entry["access"] == "deny" && entry["path"]["type"] == "glob_pattern" {
+                    entry["path"]["pattern"] =
+                        serde_json::json!("/private/tmp/t35b/work/**/.env.bak");
+                }
+            }
+        }),
+        Err(RequestError::ExecutionProfileShapeNotNarrower(_))
+    ));
+    // Adding supported deny rules narrows without re-minting, but it grants no native-read
+    // authority: the whole-root read classifier still refuses deny-bearing states unchanged.
+    let mut narrowed = t35b_base_state();
+    narrowed["permissionProfile"]["file_system"]["entries"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!(
+            {"access":"deny","path":{"path":"/Users/pluto/.ssh","type":"path"}}
+        ));
+    let template = HostSandboxState::parse(Some(t35b_base_state())).unwrap();
+    let live = HostSandboxState::parse(Some(narrowed.clone())).unwrap();
+    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence_v2("t35b-base", 1, &template).unwrap(),
+    ])
+    .unwrap();
+    assert!(catalog.permit(&live).is_ok());
+    assert!(
+        !live.grants_read_of_all_roots(),
+        "admission never creates native-read or cached-disclosure authority"
+    );
+}
+
+/// Unknown fields and selectors refuse v2 derivation itself, even benign-looking ones (§5).
+#[test]
+fn unknown_fields_and_selectors_refuse_derivation() {
+    let refuse = |mutation: &dyn Fn(&mut serde_json::Value)| {
+        let mut value = t35b_base_state();
+        mutation(&mut value);
+        assert!(
+            shape_of(value).is_err(),
+            "an unknown field or selector must refuse v2 derivation"
+        );
+    };
+    // Unknown top-level, permission-profile, filesystem, entry, and selector fields.
+    refuse(&|state| {
+        state["future_top_level"] = serde_json::json!(1);
+    });
+    refuse(&|state| {
+        state["permissionProfile"]["future_permission"] = serde_json::json!({"deny": ["/"]});
+    });
+    refuse(&|state| {
+        state["permissionProfile"]["file_system"]["future"] = serde_json::json!(1);
+    });
+    refuse(&|state| {
+        let entries = state["permissionProfile"]["file_system"]["entries"]
+            .as_array_mut()
+            .unwrap();
+        entries[0]
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown".into(), serde_json::json!(1));
+    });
+    refuse(&|state| {
+        state["permissionProfile"]["file_system"]["entries"][0]["path"]["unknown"] =
+            serde_json::json!(1);
+    });
+    refuse(&|state| {
+        state["permissionProfile"]["file_system"]["entries"][0]["path"]["value"]["unknown"] =
+            serde_json::json!(1);
+    });
+    // Unknown selector and access values: never guessed.
+    refuse(&|state| {
+        state["permissionProfile"]["file_system"]["entries"][0]["path"]["type"] =
+            serde_json::json!("glob");
+    });
+    refuse(&|state| {
+        state["permissionProfile"]["file_system"]["entries"][0]["path"]["value"]["kind"] =
+            serde_json::json!("home");
+    });
+    refuse(&|state| {
+        state["permissionProfile"]["file_system"]["entries"][0]["access"] =
+            serde_json::json!("none");
+    });
+    // Unknown network and missing-path values, and an unknown filesystem type.
+    refuse(&|state| {
+        state["permissionProfile"]["network"] = serde_json::json!(true);
+    });
+    refuse(&|state| {
+        state["permissionProfile"]["file_system"]["entries"][0]["missing_path_behavior"] =
+            serde_json::json!("error");
+    });
+    refuse(&|state| {
+        state["permissionProfile"]["file_system"]["type"] = serde_json::json!("unrestricted");
+    });
+    // A missing-path behavior on a deny has unreviewed semantics and refuses.
+    refuse(&|state| {
+        let entries = state["permissionProfile"]["file_system"]["entries"]
+            .as_array_mut()
+            .unwrap();
+        entries[5]
+            .as_object_mut()
+            .unwrap()
+            .insert("missing_path_behavior".into(), serde_json::json!("skip"));
+    });
+    // A `/` cwd refuses the portable workspace binding outright.
+    refuse(&|state| {
+        state["sandboxCwd"] = serde_json::json!("/");
+    });
+    // A disabled profile has no v2 shape; it stays a legacy v1 exact-digest concern.
+    assert!(
+        shape_of(serde_json::json!({
+            "permissionProfile": {"type": "disabled"},
+            "codexLinuxSandboxExe": null,
+            "sandboxCwd": "/private/tmp/t35b/work",
+            "useLegacyLandlock": false
+        }))
+        .is_err()
+    );
+}
+
+/// Identical duplicates are harmless; conflicting accesses at one selector refuse (§5).
+#[test]
+fn duplicate_rules_deduplicate_and_conflicts_refuse() {
+    // Two identical read entries and two identical denies deduplicate to one shape.
+    let mut deduped = t35b_base_state();
+    let root_read = serde_json::json!(
+        {"access":"read","path":{"type":"special","value":{"kind":"root"}}}
+    );
+    let aws_deny =
+        serde_json::json!({"access":"deny","path":{"path":"/Users/pluto/.aws","type":"path"}});
+    deduped["permissionProfile"]["file_system"]["entries"]
+        .as_array_mut()
+        .unwrap()
+        .extend([root_read, aws_deny]);
+    assert_eq!(
+        shape_of(t35b_base_state()).unwrap().digest(),
+        shape_of(deduped).unwrap().digest()
+    );
+    // The same selector with conflicting accesses refuses outright.
+    let mut conflicting = t35b_base_state();
+    conflicting["permissionProfile"]["file_system"]["entries"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!(
+            {"access":"read","path":{"path":"/private/tmp/t35b/work","type":"path"}}
+        ));
+    assert!(shape_of(conflicting).is_err());
+    // Order never decides: the conflict refuses in either array position.
+    let mut conflicting = t35b_base_state();
+    conflicting["permissionProfile"]["file_system"]["entries"]
+        .as_array_mut()
+        .unwrap()
+        .insert(
+            0,
+            serde_json::json!(
+                {"access":"read","path":{"path":"/private/tmp/t35b/work","type":"path"}}
+            ),
+        );
+    assert!(shape_of(conflicting).is_err());
+}
+
+/// The strict local path grammar refuses traversal, relative, NUL, and URI variants (§5).
+#[test]
+fn path_grammar_refuses_before_normalization() {
+    let entry = |path: serde_json::Value| {
+        let mut value = t35b_base_state();
+        value["permissionProfile"]["file_system"]["entries"][1]["path"] = path;
+        shape_of(value)
+    };
+    // `..`, embedded `.`, relative paths, NUL, and ambiguous separators.
+    for refused in [
+        "/private/tmp/t35b/../t35b/work",
+        "/private/tmp/t35b/./work",
+        "private/tmp/t35b/work",
+        "/private/tmp/t35b/work\0",
+        "/private/tmp//t35b/work",
+        "/private/tmp/t35b/work/",
+    ] {
+        assert!(
+            entry(serde_json::json!({"path": refused, "type": "path"})).is_err(),
+            "the grammar must refuse {refused:?}"
+        );
+    }
+    // `file://host`, percent encoding, and query/fragment URI variants.
+    for refused in [
+        "file://localhost/private/tmp/t35b/work",
+        "file:///private/tmp/t35b%32/work",
+        "file:///private/tmp/t35b/work?x=1",
+        "file:///private/tmp/t35b/work#frag",
+        "file:private/tmp/t35b/work",
+    ] {
+        assert!(
+            entry(serde_json::json!({"path": refused, "type": "path"})).is_err(),
+            "the grammar must refuse {refused:?}"
+        );
+    }
+    // The supported local spellings both derive.
+    assert!(entry(serde_json::json!({"path": "/private/tmp/t35b/work", "type": "path"})).is_ok());
+    assert!(
+        entry(serde_json::json!({"path": "file:///private/tmp/t35b/work", "type": "path"})).is_ok()
+    );
+}
+
+/// Case, Unicode, and prefix collisions never merge two distinct selectors (§5).
+#[test]
+fn selector_identities_are_byte_exact_and_component_wise() {
+    // A sibling sharing a string prefix stays outside the trusted cwd, component-wise.
+    let value = |cwd: &str, write: &str| {
+        let mut state = t35b_base_state();
+        state["sandboxCwd"] = serde_json::json!(cwd);
+        state["permissionProfile"]["file_system"]["entries"][1]["path"] =
+            serde_json::json!({"path": write, "type": "path"});
+        state
+    };
+    let inside = shape_of(value(
+        "/private/tmp/t35b/work",
+        "/private/tmp/t35b/work/sub",
+    ))
+    .unwrap();
+    let escape = shape_of(value(
+        "/private/tmp/t35b/work",
+        "/private/tmp/t35b/work-escape",
+    ))
+    .unwrap();
+    let escape_components = vec![
+        "private".to_owned(),
+        "tmp".to_owned(),
+        "t35b".to_owned(),
+        "work-escape".to_owned(),
+    ];
+    // The sibling string-prefix path stays an absolute selector outside the workspace form.
+    assert!(
+        escape
+            .rules
+            .contains_key(&profile_shape::Selector::Absolute(
+                escape_components.clone()
+            ))
+    );
+    assert!(
+        !escape
+            .rules
+            .contains_key(&profile_shape::Selector::WorkspaceRelative(Vec::new()))
+    );
+    let inside_components = vec!["sub".to_owned()];
+    assert!(
+        inside
+            .rules
+            .contains_key(&profile_shape::Selector::WorkspaceRelative(
+                inside_components
+            ))
+    );
+    assert!(
+        !inside
+            .rules
+            .contains_key(&profile_shape::Selector::Absolute(escape_components))
+    );
+    // Case and Unicode spellings never fold: a differing spelling is a different selector, so
+    // a template over one spelling never admits a state spelled differently. The composed and
+    // decomposed spellings of the same directory name are likewise never merged.
+    for spelled in [
+        "/Private/tmp/t35b/work",
+        "/private/tmp/t35b/w\u{f6}rk",
+        "/private/tmp/t35b/wo\u{308}rk",
+    ] {
+        let mut live = t35b_base_state();
+        live["permissionProfile"]["file_system"]["entries"][1]["path"] =
+            serde_json::json!({"path": spelled, "type": "path"});
+        assert!(matches!(
+            permit_values(t35b_base_state(), live),
+            Err(RequestError::ExecutionProfileShapeNotNarrower(_))
+        ));
+    }
+}
+
+/// The v2 shape digest is domain-separated and independent of JSON spelling (T35B).
+#[test]
+fn shape_digest_is_domain_separated_and_spelling_independent() {
+    let compact = fixture_state(FIXTURE_1ED);
+    // The same state reserialized with pretty spacing derives the identical shape.
+    let pretty = {
+        let value: serde_json::Value = serde_json::from_str(&sandbox_fixture(FIXTURE_1ED)).unwrap();
+        HostSandboxState::parse_json(&serde_json::to_string_pretty(&value).unwrap()).unwrap()
+    };
+    let compact_shape = compact.shape_v2().unwrap();
+    assert_eq!(compact_shape, pretty.shape_v2().unwrap());
+    assert_eq!(compact_shape.digest(), pretty.shape_v2().unwrap().digest());
+    // The shape digest is not the raw-state digest and differs across states.
+    assert_ne!(
+        compact_shape.digest().to_hex().to_string(),
+        blake3::hash(compact.sandbox_state_json().as_bytes())
+            .to_hex()
+            .to_string()
+    );
+    assert_ne!(
+        compact_shape.digest(),
+        fixture_state(FIXTURE_WORKSPACE_WRITE_V1)
+            .shape_v2()
+            .unwrap()
+            .digest()
+    );
+    // A v2 record's captured-state identity is separately domain-separated and pins the cwd.
+    let captured = super::captured_state_identity_v2(&compact);
+    assert_ne!(captured, super::semantic_state_identity(&compact));
+    let moved = sandbox_fixture(FIXTURE_1ED).replace(
+        "file:///Users/pluto/projects/agent-pipline-compressor",
+        "file:///Users/pluto/projects/elsewhere",
+    );
+    assert_ne!(
+        captured,
+        super::captured_state_identity_v2(&HostSandboxState::parse_json(&moved).unwrap()),
+        "the v2 captured-state identity includes the actual cwd"
+    );
+}
+
+/// A v2 record round-trips, restores only against its own capture, and replays byte-for-byte.
+#[test]
+fn v2_records_round_trip_and_pin_the_exact_capture() {
+    let captured_text = sandbox_fixture(FIXTURE_1ED);
+    let captured = HostSandboxState::parse_json(&captured_text).unwrap();
+    let record = PersistedProfileRecord::from_execution_evidence_v2(
+        "t35b-managed-write",
+        3,
+        D03ProfileEvidence {
+            provider_binary: "codex".into(),
+            toolchain: "toolchain".into(),
+            configuration: "default".into(),
+            trust: "accepted-local".into(),
+            transport: "managed".into(),
+            d03_evidence: "d03-run".into(),
+        },
+        &captured,
+    )
+    .unwrap();
+    // Twelve fields, explicit shape_version, exact capture identity.
+    let parsed = PersistedProfileRecord::from_json(&record.to_json()).unwrap();
+    assert_eq!(parsed, record);
+    assert!(parsed.matches_state(&captured));
+    // Restoration is exact evidence matching, never subtyping: a different managed capture
+    // (even one the minted template would admit live) does not match the record.
+    assert!(!parsed.matches_state(&fixture_state(FIXTURE_555)));
+    // A v2 catalog rebuilt from the record admits the live narrower states through `permit`.
+    let expected = vec![record.clone()];
+    let catalog = ExecutionProfileCatalog::from_persisted_records(
+        vec![(parsed, captured.clone())],
+        &expected,
+    )
+    .unwrap();
+    assert!(catalog.permit(&captured).is_ok());
+    assert!(catalog.permit(&fixture_state(FIXTURE_555)).is_ok());
+    // Derivation, digests, and permits never rewrite the replay JSON.
+    assert_eq!(captured.sandbox_state_json(), captured_text);
+}
+
+/// Record-version confusion, tampered identities, and unknown keys all fail closed (T35B).
+#[test]
+fn record_version_parsing_is_closed() {
+    let captured = fixture_state(FIXTURE_1ED);
+    let record = PersistedProfileRecord::from_execution_evidence_v2(
+        "t35b-managed-write",
+        1,
+        D03ProfileEvidence {
+            provider_binary: "codex".into(),
+            toolchain: "toolchain".into(),
+            configuration: "default".into(),
+            trust: "accepted-local".into(),
+            transport: "managed".into(),
+            d03_evidence: "d03-run".into(),
+        },
+        &captured,
+    )
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&record.to_json()).unwrap();
+    // Unknown versions, an explicit v1 key (a mixed layout), string/null versions, and unknown
+    // or missing keys refuse.
+    for refused in [
+        {
+            let mut refused = value.clone();
+            refused["shape_version"] = serde_json::json!(3);
+            refused
+        },
+        {
+            let mut refused = value.clone();
+            refused["shape_version"] = serde_json::json!(1);
+            refused
+        },
+        {
+            let mut refused = value.clone();
+            refused["shape_version"] = serde_json::json!("2");
+            refused
+        },
+        {
+            let mut refused = value.clone();
+            refused["shape_version"] = serde_json::Value::Null;
+            refused
+        },
+        {
+            let mut refused = value.clone();
+            refused["unknown_field"] = serde_json::json!(1);
+            refused
+        },
+        {
+            let mut refused = value.clone();
+            refused.as_object_mut().unwrap().remove("trust");
+            refused
+        },
+    ] {
+        assert!(
+            PersistedProfileRecord::from_json(&refused.to_string()).is_err(),
+            "record layout must fail closed: {refused}"
+        );
+    }
+    // Tampered identities parse but never match their capture, so restoration is refused.
+    for tampered in ["permission_value", "semantic_state"] {
+        let mut forged = value.clone();
+        forged[tampered] = serde_json::json!("0".repeat(64));
+        let forged = PersistedProfileRecord::from_json(&forged.to_string()).unwrap();
+        assert!(!forged.matches_state(&captured));
+        assert!(
+            ExecutionProfileCatalog::from_persisted_records(
+                vec![(forged, captured.clone())],
+                std::slice::from_ref(&record),
+            )
+            .is_err()
+        );
+    }
+}
+
+/// A mixed v1/v2 catalog admits each generation by its own rules and never mixes proofs (T35B).
+#[test]
+fn mixed_version_catalog_selects_one_complete_template() {
+    let readonly = fixture_state(FIXTURE_READONLY_V1);
+    let write = fixture_state(FIXTURE_WORKSPACE_WRITE_V1);
+    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+        // A v2 template over the read-only capture.
+        ExecutionProfileTemplate::from_execution_evidence_v2("t35b-readonly", 1, &readonly)
+            .unwrap(),
+        // A v1 template over the workspace-write capture.
+        ExecutionProfileTemplate::from_execution_evidence("legacy-write", 1, &write).unwrap(),
+    ])
+    .unwrap();
+    // Each generation admits its own state; the v2 side also admits the equivalent live
+    // read-only state.
+    assert!(catalog.permit(&readonly).is_ok());
+    assert!(catalog.permit(&fixture_state(FIXTURE_728)).is_ok());
+    assert!(catalog.permit(&write).is_ok());
+    // A drifted workspace-write variant matches neither the v1 digest nor any v2 proof and
+    // refuses through the closed shape reason, never a looser comparison.
+    let mut drifted =
+        serde_json::from_str::<serde_json::Value>(&sandbox_fixture(FIXTURE_WORKSPACE_WRITE_V1))
+            .unwrap();
+    drifted["permissionProfile"]["network"] = serde_json::json!("enabled");
+    let drifted = HostSandboxState::parse(Some(drifted)).unwrap();
+    assert!(matches!(
+        catalog.permit(&drifted),
+        Err(RequestError::ExecutionProfileShapeNotNarrower(_))
+    ));
+    // Duplicate identities are refused within one generation.
+    assert!(
+        ExecutionProfileCatalog::from_execution_evidence(vec![
+            ExecutionProfileTemplate::from_execution_evidence_v2("t35b-readonly", 1, &readonly)
+                .unwrap(),
+            ExecutionProfileTemplate::from_execution_evidence_v2(
+                "t35b-readonly-again",
+                2,
+                &readonly
+            )
+            .unwrap(),
+        ])
+        .is_err()
+    );
+}
+
+/// Permit selection prefers an exact v2 shape, then a v1 exact digest, then a deterministic
+/// narrower proof (T35B §4 decision order).
+#[test]
+fn permit_selection_is_exact_first_and_deterministic() {
+    // `1ed…` and `555…` normalize to the same v2 shape, so a v2 template over either is an
+    // exact match for both; an exact v2 shape beats a v1 digest match.
+    let v2_template = fixture_state(FIXTURE_1ED);
+    let v1_template = fixture_state(FIXTURE_555);
+    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence_v2("v2-template", 1, &v2_template)
+            .unwrap(),
+        ExecutionProfileTemplate::from_execution_evidence("v1-template", 1, &v1_template).unwrap(),
+    ])
+    .unwrap();
+    assert_eq!(
+        catalog
+            .permit(&fixture_state(FIXTURE_555))
+            .unwrap()
+            .template
+            .id,
+        "v2-template",
+        "an exact v2 shape match is preferred over a v1 digest match"
+    );
+    // A v1 exact digest beats a merely-narrower v2 proof.
+    let write = fixture_state(FIXTURE_WORKSPACE_WRITE_V1);
+    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence_v2("v2-template", 1, &v2_template)
+            .unwrap(),
+        ExecutionProfileTemplate::from_execution_evidence("v1-write", 1, &write).unwrap(),
+    ])
+    .unwrap();
+    assert_eq!(
+        catalog.permit(&write).unwrap().template.id,
+        "v1-write",
+        "a v1 exact digest beats a v2 narrowing proof"
+    );
+    // With only narrower proofs left, selection is deterministic by template identity.
+    let mut extra_deny =
+        serde_json::from_str::<serde_json::Value>(&sandbox_fixture(FIXTURE_1ED)).unwrap();
+    extra_deny["permissionProfile"]["file_system"]["entries"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!(
+            {"access":"deny","path":{"path":"/Users/pluto/.t35b-extra-secret","type":"path"}}
+        ));
+    let mut fewer_denies =
+        serde_json::from_str::<serde_json::Value>(&sandbox_fixture(FIXTURE_1ED)).unwrap();
+    fewer_denies["permissionProfile"]["file_system"]["entries"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|entry| entry["access"] != "deny" || entry["path"]["type"] != "path");
+    let live = HostSandboxState::parse(Some(extra_deny)).unwrap();
+    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence_v2("b-template", 1, &v2_template)
+            .unwrap(),
+        ExecutionProfileTemplate::from_execution_evidence_v2(
+            "a-template",
+            1,
+            &HostSandboxState::parse(Some(fewer_denies)).unwrap(),
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    assert_eq!(
+        catalog.permit(&live).unwrap().template.id,
+        "a-template",
+        "equal narrower proofs select the lowest template identity"
+    );
+}

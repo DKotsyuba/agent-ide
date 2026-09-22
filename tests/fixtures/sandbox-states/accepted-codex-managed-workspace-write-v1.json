@@ -1,0 +1,72 @@
+{
+ "codexLinuxSandboxExe": null,
+ "permissionProfile": {
+  "file_system": {
+   "entries": [
+    {
+     "access": "read",
+     "path": {
+      "type": "special",
+      "value": {
+       "kind": "root"
+      }
+     }
+    },
+    {
+     "access": "write",
+     "path": {
+      "path": "/Users/pluto/projects/agent-run",
+      "type": "path"
+     }
+    },
+    {
+     "access": "write",
+     "path": {
+      "type": "special",
+      "value": {
+       "kind": "slash_tmp"
+      }
+     }
+    },
+    {
+     "access": "write",
+     "path": {
+      "type": "special",
+      "value": {
+       "kind": "tmpdir"
+      }
+     }
+    },
+    {
+     "access": "read",
+     "missing_path_behavior": "skip",
+     "path": {
+      "path": "/Users/pluto/projects/agent-run/.git",
+      "type": "path"
+     }
+    },
+    {
+     "access": "read",
+     "missing_path_behavior": "skip",
+     "path": {
+      "path": "/Users/pluto/projects/agent-run/.agents",
+      "type": "path"
+     }
+    },
+    {
+     "access": "read",
+     "missing_path_behavior": "skip",
+     "path": {
+      "path": "/Users/pluto/projects/agent-run/.codex",
+      "type": "path"
+     }
+    }
+   ],
+   "type": "restricted"
+  },
+  "network": "restricted",
+  "type": "managed"
+ },
+ "sandboxCwd": "file:///Users/pluto/projects/agent-run",
+ "useLegacyLandlock": false
+}

@@ -1410,3 +1410,174 @@ async fn physical_inherited_cwd_runs_the_marker_only_in_an_accessible_target_wor
     }
     fs::remove_dir_all(target).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// T35B: profile-shape v2 end-to-end contract over the nine captured sandbox
+// states, through the same public validation path a managed request uses.
+// ---------------------------------------------------------------------------
+
+/// Reads one captured sandbox-state fixture from the shared T35B fixture directory.
+fn t35b_fixture(name: &str) -> String {
+    fs::read_to_string(format!(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/sandbox-states/{}.json"
+        ),
+        name.trim_end_matches(".json")
+    ))
+    .unwrap()
+}
+
+/// Parses one captured sandbox-state fixture into a validated host state.
+fn t35b_state(name: &str) -> HostSandboxState {
+    HostSandboxState::parse_json(&t35b_fixture(name)).unwrap()
+}
+
+/// Validates one full controlled request for the live state against one catalog.
+///
+/// This is the exact public path a managed request takes: the profile permit is minted inside
+/// `ValidatedExecutionRequest::validate`, so every admission and refusal below is observable
+/// without any spawn.
+fn t35b_validate(
+    live: &HostSandboxState,
+    catalog: &ExecutionProfileCatalog,
+) -> Result<ValidatedExecutionRequest, RequestError> {
+    let invocation =
+        ValidatedHostInvocation::from_verified_binding("t35b-contract", live.clone()).unwrap();
+    let authority = WorkspaceAuthority::from_workspace(
+        "t35b-worktree",
+        "t35b-incarnation",
+        live.cwd().to_path_buf(),
+        1,
+    )
+    .unwrap();
+    let command = ControlledCommand::from_validated_peer(
+        CommandKind::Job,
+        PathBuf::from("/usr/bin/true"),
+        vec![],
+        live.cwd().to_path_buf(),
+        BTreeMap::new(),
+    )
+    .unwrap();
+    let policy = LocalExecutionPolicy::new(
+        BTreeSet::from([PathBuf::from("/usr/bin/true")]),
+        4096,
+        0,
+        false,
+    )
+    .unwrap();
+    ValidatedExecutionRequest::validate(invocation, authority, command, &policy, catalog)
+}
+
+/// Builds a v2 catalog carrying exactly one accepted fixture template.
+fn t35b_v2_catalog(template: &str) -> ExecutionProfileCatalog {
+    ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence_v2(
+            "t35b-template",
+            1,
+            &t35b_state(template),
+        )
+        .unwrap(),
+    ])
+    .unwrap()
+}
+
+/// The design's fixture acceptance matrix, proven through the full request-validation path.
+#[test]
+fn profile_shape_v2_admits_the_captured_matrix_through_request_validation() {
+    let workspace_write = "1ed43a00ce845709.json";
+    let read_only = "accepted-codex-managed-read-only-v1.json";
+    let catalog = t35b_v2_catalog(workspace_write);
+    for admitted in [
+        "1ed43a00ce845709.json",
+        "555ebcab7e884d62.json",
+        "b8a736675faa7cba.json",
+    ] {
+        assert!(
+            t35b_validate(&t35b_state(admitted), &catalog).is_ok(),
+            "the workspace-write template must admit {admitted}"
+        );
+    }
+    for refused in ["c9ea07ed289773b3.json", "fd37241d7322ebc3.json"] {
+        assert!(matches!(
+            t35b_validate(&t35b_state(refused), &catalog),
+            Err(RequestError::ExecutionProfileShapeNotNarrower(
+                ProfileClass::Managed
+            ))
+        ));
+    }
+    // The root-write capture is refused by every workspace-write template.
+    for template in [
+        workspace_write,
+        "accepted-codex-managed-workspace-write-v1.json",
+    ] {
+        assert!(matches!(
+            t35b_validate(
+                &t35b_state("84f07fac27b67d1d.json"),
+                &t35b_v2_catalog(template)
+            ),
+            Err(RequestError::ExecutionProfileShapeNotNarrower(_))
+        ));
+    }
+    // The read-only template admits the equivalent live read-only state.
+    let read_only_catalog = t35b_v2_catalog(read_only);
+    assert!(t35b_validate(&t35b_state("728b26d824d0d380.json"), &read_only_catalog).is_ok());
+}
+
+/// A v2 record restores its catalog only against its own capture, and the replayed sandbox JSON
+/// stays byte-for-byte identical through every derivation and permit attempt.
+#[test]
+fn v2_records_restore_exactly_and_replay_json_is_unchanged() {
+    let captured_text = t35b_fixture("1ed43a00ce845709.json");
+    let captured = HostSandboxState::parse_json(&captured_text).unwrap();
+    let record = PersistedProfileRecord::from_execution_evidence_v2(
+        "t35b-managed-write",
+        1,
+        D03ProfileEvidence {
+            provider_binary: "codex".into(),
+            toolchain: "toolchain".into(),
+            configuration: "default".into(),
+            trust: "accepted-local".into(),
+            transport: "managed".into(),
+            d03_evidence: "d03-run".into(),
+        },
+        &captured,
+    )
+    .unwrap();
+    let expected = vec![record.clone()];
+    let catalog = ExecutionProfileCatalog::from_persisted_records(
+        vec![(record, captured.clone())],
+        &expected,
+    )
+    .unwrap();
+    // The live narrower states mint permits through the restored catalog.
+    for admitted in [
+        "1ed43a00ce845709.json",
+        "555ebcab7e884d62.json",
+        "b8a736675faa7cba.json",
+    ] {
+        assert!(t35b_validate(&t35b_state(admitted), &catalog).is_ok());
+    }
+    // A v1 record for the same capture restores by the legacy exact-digest rules.
+    let legacy = PersistedProfileRecord::from_execution_evidence(
+        "legacy-managed-write",
+        1,
+        D03ProfileEvidence {
+            provider_binary: "codex".into(),
+            toolchain: "toolchain".into(),
+            configuration: "default".into(),
+            trust: "accepted-local".into(),
+            transport: "managed".into(),
+            d03_evidence: "d03-run".into(),
+        },
+        &captured,
+    )
+    .unwrap();
+    assert!(PersistedProfileRecord::from_json(&legacy.to_json()).is_ok());
+    // Nothing above rewrote the replay argument.
+    assert_eq!(captured.sandbox_state_json(), captured_text);
+    assert_eq!(
+        t35b_state("1ed43a00ce845709.json").sandbox_state_json(),
+        captured_text
+    );
+}

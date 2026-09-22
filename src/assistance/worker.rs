@@ -2218,6 +2218,8 @@ impl<'a> Worker<'a> {
                         error,
                         crate::execution::RequestError::ExecutionProfileNoTemplate(_)
                             | crate::execution::RequestError::ExecutionProfileDigestMismatch(_)
+                            | crate::execution::RequestError::ExecutionProfileShapeUnsupported(_)
+                            | crate::execution::RequestError::ExecutionProfileShapeNotNarrower(_)
                     ) {
                         detail.push_str(&capture_rejected_state(observed.state().as_json()).await);
                     }
@@ -4390,6 +4392,12 @@ fn execution_profile_detail(error: &crate::execution::RequestError) -> Option<St
         RequestError::ExecutionProfileDigestMismatch(class) => {
             format!("profile_digest_mismatch:{}", profile_class_tag(*class))
         }
+        RequestError::ExecutionProfileShapeUnsupported(class) => {
+            format!("shape_unsupported:{}", profile_class_tag(*class))
+        }
+        RequestError::ExecutionProfileShapeNotNarrower(class) => {
+            format!("shape_not_narrower:{}", profile_class_tag(*class))
+        }
         RequestError::DisabledHostDenied => "host_disabled".to_owned(),
         _ => return None,
     })
@@ -6314,6 +6322,28 @@ mod execution_profile_detail_tests {
             execution_profile_detail(&error).as_deref(),
             Some("profile_digest_mismatch:disabled")
         );
+    }
+
+    /// T35B: the two shape-refusal conditions use their own closed detail values so the error
+    /// log distinguishes an unsupported live shape from one no accepted template proves narrower.
+    #[test]
+    fn shape_refusals_name_the_observed_class() {
+        for (error, expected) in [
+            (
+                crate::execution::RequestError::ExecutionProfileShapeUnsupported(
+                    crate::execution::ProfileClass::Managed,
+                ),
+                "shape_unsupported:managed",
+            ),
+            (
+                crate::execution::RequestError::ExecutionProfileShapeNotNarrower(
+                    crate::execution::ProfileClass::Managed,
+                ),
+                "shape_not_narrower:managed",
+            ),
+        ] {
+            assert_eq!(execution_profile_detail(&error).as_deref(), Some(expected));
+        }
     }
 
     /// A disabled host, a spawn failure, and a read-scope refusal each use their closed tag,

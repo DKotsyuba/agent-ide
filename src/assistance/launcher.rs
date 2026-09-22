@@ -920,13 +920,9 @@ impl LauncherConfig {
             }
             let mut records = Vec::new();
             for profile in target.profiles {
-                if profile
-                    .record
-                    .as_object()
-                    .is_none_or(|record| record.len() != 11)
-                {
-                    return Err(LauncherError::Rejected);
-                }
+                // Record-key and shape-version validation is Execution's version-aware closed
+                // parser: the launcher delegates the schema instead of pinning a field count,
+                // so v1 and v2 records are both validated by their own generation's rules (T35B).
                 let record = PersistedProfileRecord::from_json(&profile.record.to_string())
                     .map_err(|_| LauncherError::Rejected)?;
                 let state = HostSandboxState::parse(Some(profile.sandbox_state))
@@ -1346,4 +1342,66 @@ fn startup_fingerprint_verification_is_cooperatively_cancellable() {
         program.verify_cancellable(&cancel),
         Err(LauncherError::Cancelled)
     );
+}
+
+/// T35B: a v2 record restores through the delegated version-aware parser, and an unknown record
+/// key or shape-version value is rejected by the same parser instead of a pinned field count.
+#[test]
+fn launcher_accepts_v2_records_and_rejects_unknown_record_keys() {
+    use crate::execution::D03ProfileEvidence;
+    use serde_json::json;
+    let fixture = format!(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/sandbox-states/{}.json"
+        ),
+        "accepted-codex-managed-read-only-v1"
+    );
+    let state = HostSandboxState::parse_json(&std::fs::read_to_string(fixture).unwrap()).unwrap();
+    let record = PersistedProfileRecord::from_execution_evidence_v2(
+        "accepted-managed-readonly",
+        1,
+        D03ProfileEvidence {
+            provider_binary: "accepted-codex".into(),
+            toolchain: "toolchain".into(),
+            configuration: "default".into(),
+            trust: "accepted-local".into(),
+            transport: "managed".into(),
+            d03_evidence: "accepted-d03".into(),
+        },
+        &state,
+    )
+    .unwrap();
+    let executable = json!({"path":"/private/tmp/accepted-program","identity":"accepted-codex","blake3":"0".repeat(64)});
+    let target = |record_value: Value| json!({"attachment":"t35b-attachment","candidate":"/private/tmp/worktree","git":executable,"codex":executable,"providers":[],"profiles":[{"record":record_value,"sandbox_state":serde_json::from_str::<Value>(state.sandbox_state_json()).unwrap()}],"allow_disabled_host":false});
+    // The twelve-field v2 record parses through the delegated closed parser.
+    let record_value: Value = serde_json::from_str(&record.to_json()).unwrap();
+    let config = json!({"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[target(record_value.clone())]});
+    assert!(LauncherConfig::parse(config.to_string().as_bytes()).is_ok());
+    // Any extra record key, a downgraded version, or a forged digest is unavailable.
+    for refused in [
+        {
+            let mut refused = record_value.clone();
+            refused["unknown_field"] = json!(1);
+            refused
+        },
+        {
+            let mut refused = record_value.clone();
+            refused["shape_version"] = json!(1);
+            refused
+        },
+        {
+            let mut refused = record_value.clone();
+            refused["shape_version"] = json!(3);
+            refused
+        },
+        {
+            let mut refused = record_value.clone();
+            refused["permission_value"] = json!("0".repeat(64));
+            refused
+        },
+    ] {
+        let config = json!({"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[target(refused)]});
+        assert!(LauncherConfig::parse(config.to_string().as_bytes()).is_err());
+    }
 }

@@ -1,4 +1,12 @@
 //! Real managed-sandbox D03 check driven by a captured host state and disposable targets.
+//!
+//! T35B note: the fixed expectations below (cwd write succeeds, `.git` and one outside write
+//! fail, loopback networking fails) describe the *legacy workspace-write* profile only. A
+//! root-write profile cannot pass "outside all write roots is denied", and a network-enabled
+//! profile cannot reuse restricted-network evidence, so a reviewed profile-specific expectation
+//! manifest (allowed cwd/outside/temp writes, carve-outs, network behavior, rule-order and
+//! duplicate behavior) remains a documented follow-up; these tests are `#[ignore]`d by ordinary
+//! runs and were deliberately not rewritten in T35B.
 
 use agent_ide::{
     assistance::host_binding::{

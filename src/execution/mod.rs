@@ -26,6 +26,10 @@ use crate::assistance::host_binding::{
     ActiveBindingUse, ObservedSandboxState, SANDBOX_STATE_FIELDS, SandboxStateProvenance,
 };
 
+mod profile_shape;
+
+use profile_shape::{ProfileShapeV2, UnsupportedShape};
+
 /// Classifies the host permission profile whose complete state accompanies a request.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ProfileClass {
@@ -53,6 +57,25 @@ pub enum SandboxStateError {
 /// Maximum accepted profiles in one catalog across every host profile class (T25B).
 pub const MAX_ACCEPTED_PROFILES: usize = 8;
 
+/// The versioned comparison data one accepted template carries (T35B).
+///
+/// A template stores what its admission proof needs, not only a digest: v1 compares exact
+/// legacy digests, v2 compares the accepted rule structure through
+/// [`ProfileShapeV2::prove_narrower`]. The two generations are never mixed inside one proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TemplateShape {
+    /// Legacy exact-digest admission; behaviour is byte-for-byte unchanged (T35B).
+    V1 {
+        /// The worktree-portable legacy profile digest; the template's v1 identity.
+        profile_digest: blake3::Hash,
+    },
+    /// Conservative shape-based admission via the seven sufficient narrowing conditions.
+    V2 {
+        /// The complete accepted rule structure derived from the captured state.
+        shape: ProfileShapeV2,
+    },
+}
+
 /// Names the tested host mechanism/profile class that Execution supports across worktrees.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionProfileTemplate {
@@ -62,9 +85,9 @@ pub struct ExecutionProfileTemplate {
     version: u32,
     /// Host profile class covered by this template.
     class: ProfileClass,
-    /// Effective permission/trust value proven by this template, portable across equivalent
-    /// worktrees. This digest is the template's identity: two accepted templates never share one.
-    profile_digest: blake3::Hash,
+    /// Versioned comparison data; its digest is the template's identity, so two accepted
+    /// templates never share one (v1 and v2 digests are domain-separated).
+    shape: TemplateShape,
 }
 
 /// Holds Execution-owned templates whose real evidence permits physical effects.
@@ -80,6 +103,13 @@ pub struct ExecutionProfileCatalog {
 /// pipeline.  The record deliberately stores the semantic state digest alongside its separate
 /// provider/toolchain/config/trust/transport identities: matching a template name alone never
 /// makes a changed profile executable.
+///
+/// Records are versioned by `shape_version` (T35B): an absent field is the legacy v1 layout and
+/// keeps its exact digest algorithms and field set byte-for-byte; only the value `2` adds the
+/// field, stores the domain-separated shape digest in `permission_value`, and stores the
+/// domain-separated digest of the complete captured state in `semantic_state`. Any other value,
+/// an explicit `1`, or an unknown field fails closed; a v1 record is never silently upgraded or
+/// reinterpreted.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistedProfileRecord {
     /// Stable profile-template identity selected by Execution code.
@@ -98,13 +128,33 @@ pub struct PersistedProfileRecord {
     pub trust: String,
     /// Sandbox transport/mechanism identity observed by the D03 run.
     pub transport: String,
-    /// Effective permission-value identity with only worktree-local path prefixes made portable.
+    /// V1: effective permission-value identity with only worktree-local path prefixes made
+    /// portable. V2: the domain-separated profile-shape digest of the captured state.
     pub permission_value: String,
     /// Immutable D03 evidence identity for this tested record.
     pub d03_evidence: String,
-    /// Semantic state identity with only worktree-local path prefixes made portable.
+    /// V1: semantic state identity with only worktree-local path prefixes made portable.
+    /// V2: the domain-separated canonical digest of the complete captured state, including its
+    /// actual cwd and all restrictions.
     pub semantic_state: String,
+    /// `None` is the legacy v1 layout; `Some(2)` is the v2 layout. Nothing else may exist.
+    shape_version: Option<u32>,
 }
+
+/// The record's eleven v1 identity fields, in the v1 JSON layout order.
+const RECORD_IDENTITY_FIELDS: &[&str] = &[
+    "profile_id",
+    "revision",
+    "class",
+    "provider_binary",
+    "toolchain",
+    "configuration",
+    "trust",
+    "transport",
+    "permission_value",
+    "d03_evidence",
+    "semantic_state",
+];
 
 /// Carries the non-state identities captured by one verified D03 profile experiment.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -127,13 +177,58 @@ impl PersistedProfileRecord {
     /// Creates a complete record from one verified D03 result and the exact observed host state.
     ///
     /// Each supplied identity must be nonempty and comes from the Execution verification path,
-    /// never from a model request or a persisted record being replayed.
+    /// never from a model request or a persisted record being replayed. This constructor mints
+    /// the legacy v1 layout; see [`PersistedProfileRecord::from_execution_evidence_versioned`].
     pub fn from_execution_evidence(
         profile_id: impl Into<String>,
         revision: u32,
         evidence: D03ProfileEvidence,
         state: &HostSandboxState,
     ) -> Result<Self, RequestError> {
+        Self::from_execution_evidence_versioned(profile_id, revision, evidence, state, 1)
+    }
+
+    /// Creates a v2 record from one verified D03 result and the exact captured state (T35B).
+    ///
+    /// `permission_value` becomes the domain-separated profile-shape digest and
+    /// `semantic_state` the separately domain-separated canonical digest of the complete
+    /// captured state, including its actual cwd and all restrictions. The state must derive a
+    /// supported profile-shape v2 value; unsupported shapes are denied instead of downgraded.
+    pub fn from_execution_evidence_v2(
+        profile_id: impl Into<String>,
+        revision: u32,
+        evidence: D03ProfileEvidence,
+        state: &HostSandboxState,
+    ) -> Result<Self, RequestError> {
+        Self::from_execution_evidence_versioned(profile_id, revision, evidence, state, 2)
+    }
+
+    /// Builds one versioned record; `shape_version` is `1` (legacy) or `2` only.
+    pub fn from_execution_evidence_versioned(
+        profile_id: impl Into<String>,
+        revision: u32,
+        evidence: D03ProfileEvidence,
+        state: &HostSandboxState,
+        shape_version: u32,
+    ) -> Result<Self, RequestError> {
+        let (permission_value, semantic_state, shape_version) = match shape_version {
+            1 => (
+                state.profile_digest().to_hex().to_string(),
+                semantic_state_identity(state),
+                None,
+            ),
+            2 => {
+                let shape = state
+                    .shape_v2()
+                    .map_err(|_| RequestError::ExecutionProfileDenied)?;
+                (
+                    shape.digest().to_hex().to_string(),
+                    captured_state_identity_v2(state),
+                    Some(2),
+                )
+            }
+            _ => return Err(RequestError::ExecutionProfileDenied),
+        };
         let record = Self {
             profile_id: profile_id.into(),
             revision,
@@ -143,9 +238,10 @@ impl PersistedProfileRecord {
             configuration: evidence.configuration,
             trust: evidence.trust,
             transport: evidence.transport,
-            permission_value: state.profile_digest().to_hex().to_string(),
+            permission_value,
             d03_evidence: evidence.d03_evidence,
-            semantic_state: semantic_state_identity(state),
+            semantic_state,
+            shape_version,
         };
         (record.revision != 0
             && [
@@ -167,15 +263,35 @@ impl PersistedProfileRecord {
 
     /// Validates an opaque durable record before Execution may use it to rebuild a catalog.
     ///
-    /// Empty identities, zero revisions, malformed JSON, and records for a different semantic
-    /// state are unavailable.  Application only persists the returned JSON; permit minting stays
-    /// in `ExecutionProfileCatalog`.
+    /// This is the version-aware, closed record parser (T35B): the field set must be exactly the
+    /// eleven v1 identities, or exactly those plus `shape_version: 2`. Empty identities, zero
+    /// revisions, malformed JSON, unknown or missing fields, an explicit `shape_version: 1`
+    /// (a mixed layout: v1 records never carried the field), or any other version value are
+    /// unavailable. Application only persists the returned JSON; permit minting stays in
+    /// `ExecutionProfileCatalog`.
     pub fn from_json(json: &str) -> Result<Self, RequestError> {
         let value: Value =
             serde_json::from_str(json).map_err(|_| RequestError::ExecutionProfileDenied)?;
         let object = value
             .as_object()
             .ok_or(RequestError::ExecutionProfileDenied)?;
+        let shape_version = match object.get("shape_version") {
+            None => None,
+            Some(value) => {
+                if value.as_u64() != Some(2) {
+                    return Err(RequestError::ExecutionProfileDenied);
+                }
+                Some(2)
+            }
+        };
+        let expected_len = RECORD_IDENTITY_FIELDS.len() + usize::from(shape_version.is_some());
+        if object.len() != expected_len
+            || !object
+                .keys()
+                .all(|key| RECORD_IDENTITY_FIELDS.contains(&key.as_str()) || key == "shape_version")
+        {
+            return Err(RequestError::ExecutionProfileDenied);
+        }
         let string = |name: &str| {
             object
                 .get(name)
@@ -207,12 +323,16 @@ impl PersistedProfileRecord {
             permission_value: string("permission_value")?,
             d03_evidence: string("d03_evidence")?,
             semantic_state: string("semantic_state")?,
+            shape_version,
         })
     }
 
     /// Serializes this complete record in a stable field layout for Application's opaque store.
+    ///
+    /// A v1 record emits exactly the legacy eleven fields; only a v2 record adds
+    /// `shape_version: 2`.
     pub fn to_json(&self) -> String {
-        serde_json::json!({
+        let mut record = serde_json::json!({
             "profile_id": self.profile_id,
             "revision": self.revision,
             "class": match self.class { ProfileClass::Managed => "managed", ProfileClass::Disabled => "disabled" },
@@ -224,14 +344,35 @@ impl PersistedProfileRecord {
             "permission_value": self.permission_value,
             "d03_evidence": self.d03_evidence,
             "semantic_state": self.semantic_state,
-        })
-        .to_string()
+        });
+        if self.shape_version.is_some() {
+            record["shape_version"] = Value::from(2);
+        }
+        record.to_string()
     }
 
     /// Returns whether this durable record is exactly applicable to the supplied observed state.
+    ///
+    /// v1 compares the legacy portable identities exactly. v2 verifies both of its new
+    /// identities against the supplied capture: the domain-separated shape digest and the
+    /// domain-separated digest of the complete captured state (T35B). Restoration uses exact
+    /// evidence matching; subtyping is only ever applied later, between the accepted capture and
+    /// a live state, inside `permit`.
     pub fn matches_state(&self, state: &HostSandboxState) -> bool {
-        self.semantic_state == semantic_state_identity(state)
-            && self.permission_value == state.profile_digest().to_hex().to_string()
+        match self.shape_version {
+            None => {
+                self.semantic_state == semantic_state_identity(state)
+                    && self.permission_value == state.profile_digest().to_hex().to_string()
+            }
+            Some(2) => match state.shape_v2() {
+                Ok(shape) => {
+                    self.semantic_state == captured_state_identity_v2(state)
+                        && self.permission_value == shape.digest().to_hex().to_string()
+                }
+                Err(_) => false,
+            },
+            Some(_) => false,
+        }
     }
 }
 
@@ -356,10 +497,24 @@ impl HostSandboxState {
     fn profile_digest(&self) -> blake3::Hash {
         blake3::hash(profile_template_value(self).to_string().as_bytes())
     }
+
+    /// Derives the closed profile-shape v2 value of this state, or reports why none exists (T35B).
+    ///
+    /// The derivation is a read-only closed parse of the raw state; the replay JSON is never
+    /// rewritten and nothing is normalized on the host's behalf. An unsupported-shape state
+    /// keeps replaying byte-for-byte and can then only be admitted by a legacy v1 template's
+    /// exact digest — never by a looser fallback.
+    pub(crate) fn shape_v2(&self) -> Result<ProfileShapeV2, UnsupportedShape> {
+        ProfileShapeV2::derive(self)
+    }
 }
 
 impl ExecutionProfileTemplate {
     /// Defines a nonempty, tested Execution profile template and its owned revision.
+    ///
+    /// This constructor mints the legacy v1 exact-digest template; behaviour is unchanged.
+    /// See [`ExecutionProfileTemplate::from_execution_evidence_v2`] for the conservative
+    /// shape-based generation (T35B).
     pub fn from_execution_evidence(
         id: impl Into<String>,
         version: u32,
@@ -373,8 +528,75 @@ impl ExecutionProfileTemplate {
             id,
             version,
             class: state.class,
-            profile_digest: state.profile_digest(),
+            shape: TemplateShape::V1 {
+                profile_digest: state.profile_digest(),
+            },
         })
+    }
+
+    /// Defines a v2 template carrying the captured state's derived rule structure (T35B).
+    ///
+    /// The state must derive a supported v2 shape; an unsupported shape is denied
+    /// outright instead of being stored as a looser comparison. The template's identity is the
+    /// domain-separated shape digest, so a v2 and a v1 template over the same state remain two
+    /// distinct accepted identities.
+    pub fn from_execution_evidence_v2(
+        id: impl Into<String>,
+        version: u32,
+        state: &HostSandboxState,
+    ) -> Result<Self, RequestError> {
+        let id = id.into();
+        if id.is_empty() || version == 0 {
+            return Err(RequestError::ExecutionProfileDenied);
+        }
+        let shape = state
+            .shape_v2()
+            .map_err(|_| RequestError::ExecutionProfileDenied)?;
+        Ok(Self {
+            id,
+            version,
+            class: state.class,
+            shape: TemplateShape::V2 { shape },
+        })
+    }
+
+    /// Builds this template from one version-aware persisted record and its captured state.
+    ///
+    /// `record.matches_state` has already verified both identities against `state`; this only
+    /// re-derives the comparison data the permit proof needs. A v2 record whose captured state
+    /// no longer derives its shape is denied (fail closed), never downgraded to v1.
+    fn from_record(
+        record: &PersistedProfileRecord,
+        state: &HostSandboxState,
+    ) -> Result<Self, RequestError> {
+        let shape = match record.shape_version {
+            None => TemplateShape::V1 {
+                profile_digest: state.profile_digest(),
+            },
+            Some(2) => TemplateShape::V2 {
+                shape: state
+                    .shape_v2()
+                    .map_err(|_| RequestError::ExecutionProfileDenied)?,
+            },
+            Some(_) => return Err(RequestError::ExecutionProfileDenied),
+        };
+        Ok(Self {
+            id: record.profile_id.clone(),
+            version: record.revision,
+            class: record.class,
+            shape,
+        })
+    }
+
+    /// Returns the template's authority identity: two accepted templates never share one.
+    ///
+    /// v1 and v2 digests are domain-separated, so a legacy digest and a shape digest can never
+    /// collide or be cross-compared by accident.
+    fn identity(&self) -> blake3::Hash {
+        match &self.shape {
+            TemplateShape::V1 { profile_digest } => *profile_digest,
+            TemplateShape::V2 { shape } => shape.digest(),
+        }
     }
 }
 
@@ -396,7 +618,7 @@ impl ExecutionProfileCatalog {
             if entries
                 .values()
                 .flatten()
-                .any(|accepted| accepted.profile_digest == template.profile_digest)
+                .any(|accepted| accepted.identity() == template.identity())
             {
                 return Err(RequestError::ExecutionProfileDenied);
             }
@@ -409,7 +631,9 @@ impl ExecutionProfileCatalog {
     ///
     /// `expected` comes from Execution-owned trusted configuration/evidence, never the durable
     /// store or a model request. The caller supplies each current D01-bound state; extra, missing,
-    /// stale, corrupt, duplicate-digest, or value-mismatched records are unavailable.
+    /// stale, corrupt, duplicate-digest, value-mismatched, unknown-version, or mixed-layout
+    /// records are unavailable. Records restore by exact evidence matching: a v2 record rebuilds
+    /// the captured rule structure from its own stored capture, never by subtyping (T35B).
     pub fn from_persisted_records(
         records: Vec<(PersistedProfileRecord, HostSandboxState)>,
         expected: &[PersistedProfileRecord],
@@ -425,33 +649,81 @@ impl ExecutionProfileCatalog {
             {
                 return Err(RequestError::ExecutionProfileDenied);
             }
-            templates.push(ExecutionProfileTemplate {
-                id: record.profile_id,
-                version: record.revision,
-                class: record.class,
-                profile_digest: state.profile_digest(),
-            });
+            templates.push(ExecutionProfileTemplate::from_record(&record, &state)?);
         }
         Self::from_execution_evidence(templates)
     }
 
-    /// Mints an Execution-owned permit when one accepted template of the observed class matches.
+    /// Mints an Execution-owned permit when one accepted template of the observed class admits
+    /// the live state, matching one complete template and never combining grants (T25B, T35B).
     ///
-    /// The permit retains exactly the template whose digest equals the live state's digest, so
-    /// every later consumer uses the evidence that actually admitted this invocation (T25B). The
-    /// refusal semantics are unchanged: no template of that class is
-    /// [`RequestError::ExecutionProfileNoTemplate`], and templates of the class that all differ
-    /// are [`RequestError::ExecutionProfileDigestMismatch`].
+    /// The decision is ordered and fail-closed:
+    ///
+    /// 1. no template for the class → [`RequestError::ExecutionProfileNoTemplate`];
+    /// 2. an exact v2 shape match is preferred;
+    /// 3. otherwise a v1 template whose legacy digest equals the live state's keeps its
+    ///    unchanged exact-digest admission;
+    /// 4. otherwise a v2 template proving the live shape a narrower authority admits, chosen
+    ///    deterministically by template identity;
+    /// 5. no passing candidate refuses with the most specific closed reason: a live state that
+    ///    derives no v2 shape is [`RequestError::ExecutionProfileShapeUnsupported`], a state all
+    ///    v2 templates fail to prove narrower is
+    ///    [`RequestError::ExecutionProfileShapeNotNarrower`], and a class with only v1 templates
+    ///    whose digests all differ stays [`RequestError::ExecutionProfileDigestMismatch`].
+    ///
+    /// Unsupported semantics never fall back to a looser comparison, and the permit keeps the
+    /// live raw-state correlation digest: it establishes *which* exact state ran, never subset
+    /// containment.
     fn permit(&self, state: &HostSandboxState) -> Result<ExecutionProfilePermit, RequestError> {
         let class_templates = self
             .templates
             .get(&state.class)
             .ok_or(RequestError::ExecutionProfileNoTemplate(state.class))?;
-        let template = class_templates
-            .iter()
-            .find(|template| template.profile_digest == state.profile_digest())
-            .cloned()
-            .ok_or(RequestError::ExecutionProfileDigestMismatch(state.class))?;
+        let live_digest = state.profile_digest();
+        let live_shape = state.shape_v2().ok();
+        let mut v1_match = None;
+        let mut v2_exact = None;
+        let mut v2_narrower: Vec<&ExecutionProfileTemplate> = Vec::new();
+        let mut has_v2 = false;
+        for template in class_templates {
+            match &template.shape {
+                TemplateShape::V1 { profile_digest } => {
+                    if *profile_digest == live_digest {
+                        v1_match = Some(template);
+                    }
+                }
+                TemplateShape::V2 { shape } => {
+                    has_v2 = true;
+                    let Some(live) = &live_shape else {
+                        continue;
+                    };
+                    if *live == *shape {
+                        v2_exact = Some(template);
+                    } else if live.prove_narrower(shape) {
+                        v2_narrower.push(template);
+                    }
+                }
+            }
+        }
+        let template = if let Some(template) = v2_exact {
+            template.clone()
+        } else if let Some(template) = v1_match {
+            template.clone()
+        } else {
+            v2_narrower.sort_by_key(|template| (template.id.clone(), template.version));
+            match v2_narrower.first() {
+                Some(template) => (*template).clone(),
+                None => {
+                    return Err(match (has_v2, live_shape.is_some()) {
+                        (false, _) => RequestError::ExecutionProfileDigestMismatch(state.class),
+                        (true, false) => {
+                            RequestError::ExecutionProfileShapeUnsupported(state.class)
+                        }
+                        (true, true) => RequestError::ExecutionProfileShapeNotNarrower(state.class),
+                    });
+                }
+            }
+        };
         Ok(ExecutionProfilePermit {
             template,
             state_digest: blake3::hash(state.json_argument().as_bytes()),
@@ -1483,6 +1755,12 @@ pub enum RequestError {
     ExecutionProfileNoTemplate(ProfileClass),
     /// The observed profile digest differs from every accepted template for this class (T24B).
     ExecutionProfileDigestMismatch(ProfileClass),
+    /// The live managed state derives no profile-shape v2 value, so no accepted v2 template
+    /// could even evaluate it; only a v1 template's exact legacy digest could admit it (T35B).
+    ExecutionProfileShapeUnsupported(ProfileClass),
+    /// The live state derives a v2 shape but no accepted template proves it a narrower authority
+    /// under the seven sufficient conditions, and no v1 digest matched (T35B).
+    ExecutionProfileShapeNotNarrower(ProfileClass),
     /// The consumed active binding does not match the observed sandbox-state generation.
     BindingMismatch,
     /// The observed host state cannot satisfy Execution's bounded parser.
@@ -4109,6 +4387,19 @@ fn semantic_state_identity(state: &HostSandboxState) -> String {
     blake3::hash(canonical_json(&profile_template_value(state)).as_bytes())
         .to_hex()
         .to_string()
+}
+
+/// Hashes the complete captured state for a v2 record's `semantic_state` identity (T35B).
+///
+/// `BLAKE3("agent-ide/captured-state/v2\0" || canonical_json(raw))`: domain-separated from every
+/// other digest in this module, key-order and whitespace independent, and deliberately *not*
+/// worktree-portable — it pins the capture itself, cwd included, so a v2 record is only ever
+/// restored against its own reviewed evidence while shape portability lives in the shape digest.
+fn captured_state_identity_v2(state: &HostSandboxState) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"agent-ide/captured-state/v2\0");
+    hasher.update(canonical_json(&state.raw).as_bytes());
+    hasher.finalize().to_hex().to_string()
 }
 
 /// Produces a key-order-independent JSON representation while retaining every value and array order.
