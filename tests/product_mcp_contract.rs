@@ -1,7 +1,7 @@
 //! Executable MCP roundtrips for static discovery, separated ingress, and finite daemon routing.
 
 use std::{
-    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+    os::unix::{ffi::OsStrExt, fs::DirBuilderExt, fs::PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
     sync::atomic::{AtomicUsize, Ordering},
@@ -1898,6 +1898,12 @@ struct ProductFixture {
     runtime: PathBuf,
     /// Restart-only launcher JSON, never sent as model arguments.
     config: PathBuf,
+    /// Durable telemetry database outside the transient runtime directory, in a `0700` parent.
+    ///
+    /// An orderly daemon shutdown removes its whole runtime directory, so telemetry that must
+    /// survive a restart is selected through the absolute `AGENT_IDE_TELEMETRY_DATABASE` override,
+    /// exactly as the managed launcher does.
+    telemetry: PathBuf,
 }
 impl ProductFixture {
     /// Creates committed source plus staged/unstaged changes, without user Git configuration or hooks.
@@ -1911,9 +1917,16 @@ impl ProductFixture {
             ));
         let root = base.join("repo");
         std::fs::create_dir_all(root.join("src")).unwrap();
+        let telemetry_dir = base.join("telemetry");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&telemetry_dir)
+            .unwrap();
         let fixture = Self {
             runtime: base.join("ipc"),
             config: base.join("launcher.json"),
+            telemetry: telemetry_dir.join("telemetry.sqlite"),
             base,
             root,
         };
@@ -2019,13 +2032,31 @@ impl ProductFixture {
     async fn daemon(&self) -> Child {
         self.daemon_with_home(None).await
     }
+    /// Starts the configured daemon with durable telemetry captured at [`Self::telemetry`].
+    ///
+    /// An orderly daemon shutdown removes its whole runtime directory, so only the absolute
+    /// `AGENT_IDE_TELEMETRY_DATABASE` override — exactly what the managed launcher selects — makes
+    /// sanitized telemetry queryable and exportable after a restart.
+    async fn daemon_with_durable_telemetry(&self) -> Child {
+        self.spawn_configured_daemon(None, true).await
+    }
     /// Starts the configured daemon, optionally with its home (`AGENT_IDE_HOME`, which the product
     /// resolves instead of `$HOME`) redirected into the fixture so its project check caches never
     /// touch the real home directory. Without one it inherits the test-wide `AGENT_IDE_HOME`.
     async fn daemon_with_home(&self, home: Option<&Path>) -> Child {
+        self.spawn_configured_daemon(home, false).await
+    }
+    /// Starts one configured shipping daemon and waits only for its real private endpoint.
+    ///
+    /// `durable_telemetry` selects the absolute `AGENT_IDE_TELEMETRY_DATABASE` override exactly as
+    /// the managed launcher does, keeping capture alive when shutdown removes the runtime directory.
+    async fn spawn_configured_daemon(&self, home: Option<&Path>, durable_telemetry: bool) -> Child {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
         if let Some(home) = home {
             command.env(agent_ide::userhome::HOME_OVERRIDE_ENV, home);
+        }
+        if durable_telemetry {
+            command.env("AGENT_IDE_TELEMETRY_DATABASE", &self.telemetry);
         }
         let mut daemon = command
             .args(["daemon", "--runtime-dir"])
@@ -3992,9 +4023,11 @@ async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
 /// This ignored release gate uses the exact configured Pyright and Node files. It proves a known
 /// diagnostic can be edited to another same-response reported diagnostic and then to current clean,
 /// with every MCP carrier checked by [`assert_compact_envelope`]. It also proves a stale source
-/// reference writes nothing, a later native edit remains usable, and sanitized edit telemetry is
-/// queryable and exportable after a graceful daemon restart. Host CLI identity/containment remains
-/// outside this product-contract test and is recorded by the external acceptance driver.
+/// reference writes nothing, a later native edit remains usable, and sanitized edit telemetry
+/// selected by the durable `AGENT_IDE_TELEMETRY_DATABASE` override is queryable and exportable
+/// after a graceful daemon restart removed the transient runtime directory. Host CLI
+/// identity/containment remains outside this product-contract test and is recorded by the external
+/// acceptance driver.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
 async fn configured_product_acceptance_edit_diagnostics_telemetry_and_fallback() {
@@ -4008,7 +4041,7 @@ async fn configured_product_acceptance_edit_diagnostics_telemetry_and_fallback()
     fixture.git(&["add", "--", "main.py"]);
     fixture.git(&["commit", "--quiet", "-m", "acceptance fixture"]);
 
-    let mut daemon = fixture.daemon().await;
+    let mut daemon = fixture.daemon_with_durable_telemetry().await;
     let mut actor = ProductActor::new(&fixture, "acceptance-product").await;
     let started = actor
         .call(
@@ -4145,7 +4178,7 @@ async fn configured_product_acceptance_edit_diagnostics_telemetry_and_fallback()
             .success()
     );
 
-    let mut restarted = fixture.daemon().await;
+    let mut restarted = fixture.daemon_with_durable_telemetry().await;
     let mut restarted_actor = ProductActor::new(&fixture, "acceptance-restarted").await;
     let fresh = restarted_actor
         .call(
@@ -4170,7 +4203,7 @@ async fn configured_product_acceptance_edit_diagnostics_telemetry_and_fallback()
             .success()
     );
 
-    let telemetry = fixture.runtime.join("telemetry.sqlite");
+    let telemetry = fixture.telemetry.clone();
     let query = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
         .args(["telemetry", "query", "--database"])
         .arg(&telemetry)
