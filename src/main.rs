@@ -158,7 +158,7 @@ async fn main() -> ExitCode {
             run_managed_mcp(launcher_template, candidate, host).await
         }
         Ok(Command::ManagedClaudeHook) => {
-            run_managed_claude_hook(claude_project_dir).await;
+            run_managed_claude_hook().await;
             ExitCode::SUCCESS
         }
         Ok(Command::ClaudeRendezvous { project_dir }) => {
@@ -1817,26 +1817,68 @@ fn read_claude_attachment(key: &Path) -> std::io::Result<(PathBuf, String)> {
     Ok((runtime, attachment.to_owned()))
 }
 
-/// Submits one argument-free managed Claude hook through its shared repository rendezvous.
+/// Submits one argument-free managed Claude hook on the payload cwd's lease channel.
 ///
-/// Missing project identity, cached key, runtime, attachment, or daemon state returns silently.
+/// The hook's inherited project environment can name another worktree of the same repository.
+/// Missing or malformed cwd, cached key, runtime, candidate attachment, or daemon returns silently.
 /// Per EYES-r2 §3, this never spawns `git` itself and so never risks the existing bounded 250 ms
 /// total deadline on that account: the rendezvous key is only ever read from
 /// [`read_claude_key_cache`], a hint the owning MCP server left behind at its own startup. Once
 /// validated, the existing bounded Claude parser, sanitized transport, exact lifecycle correlation,
 /// feedback rendering, and foreground-helper recognition remain unchanged.
-async fn run_managed_claude_hook(project: Option<OsString>) {
-    let Ok(project) = canonical_claude_project(project) else {
+async fn run_managed_claude_hook() {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    if std::thread::Builder::new()
+        .name("claude-hook-input".into())
+        .spawn(move || {
+            let mut payload = Vec::new();
+            let result = std::io::stdin()
+                .take(64 * 1024 + 1)
+                .read_to_end(&mut payload);
+            let _ = sender.send(result.ok().map(|_| payload));
+        })
+        .is_err()
+    {
+        return;
+    }
+    let Ok(Ok(Some(payload))) = tokio::time::timeout_at(deadline, receiver).await else {
         return;
     };
-    let Some(key) = read_claude_key_cache(&project) else {
+    if payload.len() > 64 * 1024 {
+        return;
+    }
+    let Some(cwd) = serde_json::from_slice::<serde_json::Value>(&payload)
+        .ok()
+        .and_then(|value| value.get("cwd")?.as_str().map(PathBuf::from))
+        .filter(|path| absolute_local_path(path))
+        .and_then(|path| fs::canonicalize(path).ok())
+    else {
         return;
     };
-    let Ok((runtime, original_attachment)) = read_claude_attachment(&key) else {
+    let Some(project) = cwd
+        .ancestors()
+        .find(|path| read_claude_key_cache(path).is_some())
+    else {
         return;
     };
-    let attachment = read_claude_candidate_attachment(&project).unwrap_or(original_attachment);
-    agent_ide::assistance::codex_hook::run(&runtime, Some(attachment), HostKind::Claude).await;
+    let Some(key) = read_claude_key_cache(project) else {
+        return;
+    };
+    let Ok((runtime, _)) = read_claude_attachment(&key) else {
+        return;
+    };
+    let Some(attachment) = read_claude_candidate_attachment(project) else {
+        return;
+    };
+    agent_ide::assistance::codex_hook::run_with_payload(
+        &runtime,
+        Some(attachment),
+        HostKind::Claude,
+        Some(payload),
+        deadline,
+    )
+    .await;
 }
 
 /// Dispatches one self-contained managed MCP generation to its host-specific lifecycle contract.

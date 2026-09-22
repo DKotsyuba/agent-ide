@@ -740,6 +740,7 @@ fn managed_claude_hook_process(project: Option<&Path>) -> Child {
         .kill_on_drop(true);
     if let Some(project) = project {
         command.env("CLAUDE_PROJECT_DIR", project);
+        command.current_dir(project);
     }
     command.spawn().unwrap()
 }
@@ -747,6 +748,10 @@ fn managed_claude_hook_process(project: Option<&Path>) -> Child {
 /// Sends one native Claude payload through the managed hook and returns its bounded process output.
 async fn managed_claude_hook(project: Option<&Path>, payload: Value) -> std::process::Output {
     let mut child = managed_claude_hook_process(project);
+    let mut payload = payload;
+    if let Some(project) = project {
+        payload["cwd"] = json!(project);
+    }
     let mut input = child.stdin.take().unwrap();
     input
         .write_all(payload.to_string().as_bytes())

@@ -524,6 +524,78 @@ async fn call_ide_start(mcp: &mut Mcp, id: u64, activation_id: &str) -> Value {
     .await
 }
 
+/// Runs a real managed Claude hook whose payload cwd identifies `worktree`, even when the
+/// inherited project environment identifies another worktree of the same repository.
+async fn worktree_hook(inherited_project: &Path, worktree: &Path, phase: &str, id: u64) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+        .arg("claude-hook")
+        .env("CLAUDE_PROJECT_DIR", inherited_project)
+        .current_dir(worktree)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let payload = json!({"hook_event_name":phase,"session_id":"shared-session",
+        "tool_use_id":format!("call-{id}"),"tool_name":"mcp__agent-ide__ide_start",
+        "cwd":worktree});
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.to_string().as_bytes())
+        .await
+        .unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Both worktrees' real hook processes must submit on the channel of their own managed MCP lease.
+#[tokio::test]
+async fn managed_claude_hooks_pair_with_second_worktree_lease() {
+    let repo = init_repo();
+    let right = add_worktree(&repo, "hook-right");
+    let runtime = expected_runtime_path(&repo);
+    let _guard = DaemonGuard(runtime.clone());
+    let left_template = write_launcher_template(&repo);
+    let right_template = write_launcher_template(&right);
+    let mut left = Mcp::start(&left_template, &repo).await;
+    let mut second = Mcp::start(&right_template, &right).await;
+    wait_for_healthy_locked_daemon(&runtime).await;
+
+    worktree_hook(&repo, &repo, "PreToolUse", 2).await;
+    let left_response = call_ide_start(&mut left, 2, "left").await;
+    assert!(
+        left_response.to_string().contains("pending:"),
+        "{left_response}"
+    );
+    worktree_hook(&repo, &repo, "PostToolUse", 2).await;
+
+    worktree_hook(&repo, &right, "PreToolUse", 3).await;
+    let right_response = call_ide_start(&mut second, 3, "right").await;
+    assert!(
+        right_response.to_string().contains("pending:"),
+        "{right_response}"
+    );
+    worktree_hook(&repo, &right, "PostToolUse", 3).await;
+
+    left.close().await;
+    second.close().await;
+    git(
+        &repo,
+        &["worktree", "remove", "--force", right.to_str().unwrap()],
+    );
+    std::fs::remove_dir_all(repo).unwrap();
+}
+
 /// Asserts one `ide.start` reply reached a live daemon and got its typed no-prior-hook outcome,
 /// rather than the transport-level "daemon is unavailable" fallback text this contract targets.
 ///

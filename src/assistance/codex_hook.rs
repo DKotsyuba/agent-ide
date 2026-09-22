@@ -222,24 +222,52 @@ fn report_native_fallback(runtime_dir: &Path, attachment: &str) -> bool {
 /// fixed-shape marker authenticated to this runtime and attachment. This ingress never opens
 /// SQLite, contends with its writer, persists the credential, or creates a database.
 pub async fn run(runtime_dir: &Path, attachment: Option<String>, host_kind: HostKind) {
+    run_with_payload(
+        runtime_dir,
+        attachment,
+        host_kind,
+        None,
+        tokio::time::Instant::now() + TOTAL_DEADLINE,
+    )
+    .await;
+}
+
+/// Submits a caller-read bounded payload before the same absolute hook deadline expires.
+///
+/// `None` reads stdin itself for legacy hooks; managed Claude supplies already-read bytes so its
+/// worktree can be resolved first. Invalid input, transport failures, and expiry fail open.
+pub async fn run_with_payload(
+    runtime_dir: &Path,
+    attachment: Option<String>,
+    host_kind: HostKind,
+    payload: Option<Vec<u8>>,
+    deadline: tokio::time::Instant,
+) {
     let fallback_attachment = attachment.clone();
     let valid_boundary = Arc::new(AtomicBool::new(false));
     let valid_for_hook = Arc::clone(&valid_boundary);
-    let hook = tokio::time::timeout(TOTAL_DEADLINE, async {
+    let hook = tokio::time::timeout_at(deadline, async {
         let attachment = attachment?;
         TrustedTransport::from_host_ingress("hook", "hook", attachment.clone())?;
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        std::thread::Builder::new()
-            .name("codex-hook-input".into())
-            .spawn(move || {
-                let mut payload = Vec::new();
-                let result = std::io::stdin()
-                    .take(MAX_INPUT_BYTES + 1)
-                    .read_to_end(&mut payload);
-                let _ = sender.send(result.ok().map(|_| payload));
-            })
-            .ok()?;
-        let payload = receiver.await.ok()??;
+        let payload = if let Some(payload) = payload {
+            payload
+        } else {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            std::thread::Builder::new()
+                .name("codex-hook-input".into())
+                .spawn(move || {
+                    let mut payload = Vec::new();
+                    let result = std::io::stdin()
+                        .take(MAX_INPUT_BYTES + 1)
+                        .read_to_end(&mut payload);
+                    let _ = sender.send(result.ok().map(|_| payload));
+                })
+                .ok()?;
+            receiver.await.ok()??
+        };
+        if payload.len() > MAX_INPUT_BYTES as usize {
+            return None;
+        }
         let event = match host_kind {
             HostKind::Codex => parse_hook_event(&payload),
             HostKind::Claude => parse_claude_hook_event(&payload),
