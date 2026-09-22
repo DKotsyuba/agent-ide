@@ -40,6 +40,20 @@ pub const CHECK_TRIGGER_TOOLS: [&str; 5] = ["Edit", "Write", "MultiEdit", "Noteb
 /// underscore and hyphen spellings occur in tool naming.
 const SELF_MCP_TOOL_PREFIXES: [&str; 2] = ["mcp__agent_ide__", "mcp__agent-ide__"];
 
+/// Reports whether one post-phase tool name is this product's own managed MCP tool (T29B §4).
+///
+/// A post carrying such a name is the native shadow of an `ide.*` MCP call. When its exact pre
+/// is still buffered, the call can never have reached managed admission — an admitted call
+/// consumes its pre and records completion — so the pairing proves the call was rejected before
+/// admission and must never become a native observation.
+pub(crate) fn is_self_mcp_tool_name(tool_name: Option<&str>) -> bool {
+    tool_name.is_some_and(|name| {
+        SELF_MCP_TOOL_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+    })
+}
+
 /// Decides whether one settled native post phase schedules a project check (T29B §4).
 ///
 /// Claude keeps the exact [`CHECK_TRIGGER_TOOLS`] writer allowlist. Codex has no certified writer
@@ -50,11 +64,7 @@ const SELF_MCP_TOOL_PREFIXES: [&str; 2] = ["mcp__agent_ide__", "mcp__agent-ide__
 pub fn triggers_check(host: HostKind, tool_name: Option<&str>) -> bool {
     match host {
         HostKind::Claude => tool_name.is_some_and(|name| CHECK_TRIGGER_TOOLS.contains(&name)),
-        HostKind::Codex => tool_name.is_none_or(|name| {
-            !SELF_MCP_TOOL_PREFIXES
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
-        }),
+        HostKind::Codex => !is_self_mcp_tool_name(tool_name),
     }
 }
 
