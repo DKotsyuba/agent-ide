@@ -127,20 +127,29 @@ fn release_archive_and_smoke_use_the_packaged_executable() {
     assert!(!smoke.contains("CARGO_BIN_EXE"));
 }
 
-/// Verifies Claude hooks cannot select an ambient executable, the Claude plugin manifest relies
-/// on Claude Code auto-loading the standard `hooks/hooks.json` instead of a duplicate explicit
-/// reference, and the release guide binds their absolute executable setting to the same stable
-/// path used by the MCP command after updates.
+/// Verifies Claude hooks cannot select an ambient executable, the Claude plugin manifest
+/// registers the standard `hooks/hooks.json` through the explicit `hooks` reference (Claude Code
+/// 2.1.274 does not auto-load it for `--plugin-dir` sessions, T33B), and the release guide binds
+/// their absolute executable setting to the same stable path used by the MCP command after
+/// updates.
 #[test]
 fn claude_hook_and_mcp_share_the_installed_binary() {
     let hook = include_str!("../hooks/claude-hook.sh");
     let guide = include_str!("../docs/release.md");
+    let claude_hooks = include_str!("../hooks/hooks.json");
     let claude_manifest: Value =
         serde_json::from_str(include_str!("../.claude-plugin/plugin.json")).unwrap();
     assert!(hook.contains("[ -n \"${AGENT_IDE_BIN:-}\" ] || exit 0"));
     assert!(hook.contains("exec \"$AGENT_IDE_BIN\" claude-hook"));
     assert!(!hook.contains("command -v"));
-    assert!(claude_manifest.get("hooks").is_none());
+    assert_eq!(
+        claude_manifest.get("hooks").and_then(Value::as_str),
+        Some("./hooks/hooks.json")
+    );
+    // Inline `--plugin-dir` sessions resolve neither `${CLAUDE_PLUGIN_ROOT}` nor a plugin
+    // hook otherwise (T33B); the command stays absolute-safe through the session cwd.
+    assert!(claude_hooks.contains("${CLAUDE_PLUGIN_ROOT:-$(pwd)}/hooks/claude-hook.sh"));
+    assert!(!claude_hooks.contains("\"${CLAUDE_PLUGIN_ROOT}/"));
     assert!(guide.contains("use that identical path"));
     assert!(guide.contains("as the MCP `command`"));
     assert!(guide.contains("claude plugin update agent-ide@agent-ide"));

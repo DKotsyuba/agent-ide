@@ -40,6 +40,11 @@
 #                                     are never copied, read, or printed.
 #   AGENT_IDE_ACCEPTANCE_SESSION_SECONDS wall-clock bound per session; default
 #                                     900.
+#   AGENT_IDE_ACCEPTANCE_ONLY        optional comma-separated scenario filter
+#                                    (l1,l1b,l2,l3,l4,r5,r5b) for single-scenario
+#                                    diagnostic reruns; unset runs the complete
+#                                    cell, and a filtered run never emits the
+#                                    closed result document.
 
 set -eu
 
@@ -60,6 +65,19 @@ MODEL=${AGENT_IDE_ACCEPTANCE_MODEL:-haiku}
 LAUNCHER=${AGENT_IDE_ACCEPTANCE_LAUNCHER:-/Users/pluto/.config/agent-ide/launcher.json}
 OPERATOR_HOME=${AGENT_IDE_ACCEPTANCE_OPERATOR_HOME:-/Users/pluto}
 SESSION_SECONDS=${AGENT_IDE_ACCEPTANCE_SESSION_SECONDS:-900}
+# Session PATH: the accepted node directory keeps the operator's other SessionStart
+# hooks working; the system-only tail keeps an ambient `agent-ide` (for example
+# ~/.local/bin) off PATH so no stale host hook can register a duplicate
+# pre-observation for the same tool call.
+SESSION_PATH=/Users/pluto/.nvm/versions/node/v24.4.0/bin:/usr/bin:/bin:/usr/sbin:/sbin
+
+# Optional single-scenario diagnostic filter; empty means the complete cell.
+ONLY=${AGENT_IDE_ACCEPTANCE_ONLY:-}
+selected() {
+    [ -z "$ONLY" ] && return 0
+    case ",$ONLY," in *",$1,"*) return 0 ;; esac
+    return 1
+}
 
 # Dry run: print the exact session command lines and exit without running
 # anything. Contract variables only need to be set; no host is touched.
@@ -68,7 +86,7 @@ if [ "${AGENT_IDE_ACCEPTANCE_DRY:-0}" = 1 ]; then
         label=${scenario%%:*}
         eval "worktree=\$AGENT_IDE_ACCEPTANCE_${scenario##*:}_WORKTREE"
         printf '%s\n' "cd $worktree && HOME=$OPERATOR_HOME AGENT_IDE_BIN=$BINARY \
-CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0 PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0 PATH=$SESSION_PATH \
 /usr/bin/env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL -u ANTHROPIC_API_KEY \
 -u ANTHROPIC_MODEL -u ANTHROPIC_SMALL_FAST_MODEL -u CLAUDECODE \
 -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_EXECPATH \
@@ -89,11 +107,26 @@ fi
 [ -r "$LAUNCHER" ] || fail E_LAUNCHER_MISSING "$LAUNCHER"
 [ -d "$OPERATOR_HOME" ] || fail E_OPERATOR_HOME_MISSING "$OPERATOR_HOME"
 
+# Resolves the repository-wide Claude rendezvous of one worktree through the
+# candidate binary: every worktree of one repository shares the runtime
+# directory, and the minted helper commands carry exactly this path. The first
+# argument is the candidate binary and the second the canonical worktree; the
+# runtime directory and helper socket land in RENDEZVOUS_RUNTIME and
+# RENDEZVOUS_SOCKET.
+resolve_rendezvous() {
+    out=$("$1" claude-rendezvous "$2" 2>>"$DIAG_LOG") || return 1
+    RENDEZVOUS_RUNTIME=$(printf '%s\n' "$out" | sed -n 's/^runtime_dir=//p')
+    RENDEZVOUS_SOCKET=$(printf '%s\n' "$out" | sed -n 's/^helper_socket=//p')
+    [ -n "$RENDEZVOUS_RUNTIME" ] && [ -n "$RENDEZVOUS_SOCKET" ] || return 1
+}
+
 LEFT=$(canonical_dir "$AGENT_IDE_ACCEPTANCE_LEFT_WORKTREE") || fail E_LEFT_CANONICAL
 RIGHT=$(canonical_dir "$AGENT_IDE_ACCEPTANCE_RIGHT_WORKTREE") || fail E_RIGHT_CANONICAL
 LEFT_IDENTITY=$(project_identity "$BINARY" "$LEFT") || fail E_LEFT_IDENTITY
 [ "${#LEFT_IDENTITY}" = 64 ] || fail E_LEFT_IDENTITY_LENGTH
-LEFT_RUNTIME=/private/tmp/ai-c-$(printf '%s' "$LEFT_IDENTITY" | cut -c1-16)
+resolve_rendezvous "$BINARY" "$LEFT" || fail E_LEFT_RUNTIME
+LEFT_RUNTIME=$RENDEZVOUS_RUNTIME
+LEFT_SOCKET=$RENDEZVOUS_SOCKET
 
 mkdir -p -- "$DIAG_DIR"
 
@@ -105,10 +138,10 @@ jq -n --arg command "$BINARY" --arg launcher "$LAUNCHER" \
     >"$MCP_CONFIG" || fail E_MCP_CONFIG
 
 # Prepares one worktree for sessions: project-local sandbox settings allowing
-# exactly this project's helper socket.
-# The first argument is the canonical worktree and the second its runtime root.
+# exactly the repository's shared helper socket.
+# The first argument is the canonical worktree and the second the helper socket.
 prepare_worktree() {
-    socket=$2/claude-helper.sock
+    socket=$2
     mkdir -p -- "$1/.claude" || fail E_SETTINGS_DIR "$1"
     jq -n --arg socket "$socket" \
         '{sandbox:{network:{allowUnixSockets:[$socket]}}}' \
@@ -130,10 +163,11 @@ reset_fixture() {
 # AGENT_IDE_BIN so the plugin hooks exec the candidate binary. Every inherited
 # authentication and nested-session variable of the invoking agent is removed,
 # so the route really exercises the operator's Claude login instead of a wrapper
-# backend. PATH is reduced to system directories: an ambient `agent-ide` on PATH
-# would let a second, stale host hook register a duplicate pre-observation for
-# the same tool call, which the daemon correctly rejects as ambiguous, so only
-# the candidate plugin hook may deliver binding evidence. The complete
+# backend. PATH is the accepted node directory plus system directories: an
+# ambient `agent-ide` on PATH would let a second, stale host hook register a
+# duplicate pre-observation for the same tool call, which the daemon correctly
+# rejects as ambiguous, so only the candidate plugin hook may deliver binding
+# evidence. The complete
 # stream-json transcript stays in the private diagnostic directory.
 run_session() {
     label=$1
@@ -142,7 +176,7 @@ run_session() {
     transcript=$DIAG_DIR/transcript-$label.jsonl
     rm -f -- "$transcript"
     if (cd "$worktree" && HOME="$OPERATOR_HOME" AGENT_IDE_BIN="$BINARY" \
-        CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0 PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+        CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0 PATH="$SESSION_PATH" \
         /usr/bin/env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL \
         -u ANTHROPIC_API_KEY -u ANTHROPIC_MODEL -u ANTHROPIC_SMALL_FAST_MODEL \
         -u CLAUDECODE -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_ENTRYPOINT \
@@ -193,9 +227,9 @@ run_scenario() {
     fail "$code" "scenario $label never passed within $MAX_ATTEMPTS attempts"
 }
 
-HELPER_MARKER="claude-worker --runtime-dir '$LEFT_RUNTIME"
+HELPER_MARKER="claude-worker --runtime-dir $LEFT_RUNTIME"
 
-prepare_worktree "$LEFT" "$LEFT_RUNTIME"
+prepare_worktree "$LEFT" "$LEFT_SOCKET"
 
 # Expected fixture states shared by verification and retry resets.
 FIXED_PY='def value() -> int:
@@ -288,57 +322,69 @@ verify_r5() {
 }
 
 # Scenario L1: real edit/diagnostic/fix/diff/stop loop over Pyright.
-cp -- "$DRIVER_DIR/claude-prompts/l1.txt" "$DIAG_DIR/prompt-l1.txt"
-run_scenario l1 "$LEFT" "$DIAG_DIR/prompt-l1.txt" verify_l1 reset_fixture A_L1_SCENARIO
+if selected l1; then
+    cp -- "$DRIVER_DIR/claude-prompts/l1.txt" "$DIAG_DIR/prompt-l1.txt"
+    run_scenario l1 "$LEFT" "$DIAG_DIR/prompt-l1.txt" verify_l1 reset_fixture A_L1_SCENARIO
+fi
 
 # Scenario L1B: the composed diff of the finished loop in a fresh session.
-cp -- "$DRIVER_DIR/claude-prompts/l1b.txt" "$DIAG_DIR/prompt-l1b.txt"
-run_scenario l1b "$LEFT" "$DIAG_DIR/prompt-l1b.txt" verify_l1b reset_left_fixed A_L1B_SCENARIO
+if selected l1b; then
+    cp -- "$DRIVER_DIR/claude-prompts/l1b.txt" "$DIAG_DIR/prompt-l1b.txt"
+    run_scenario l1b "$LEFT" "$DIAG_DIR/prompt-l1b.txt" verify_l1b reset_left_fixed A_L1B_SCENARIO
+fi
 
 # Scenario L2: native fallback while inactive, then a stale edit with zero
 # writes. Retries restart from the post-L1 fixed state.
-reset_left_fixed "$LEFT"
-cp -- "$DRIVER_DIR/claude-prompts/l2.txt" "$DIAG_DIR/prompt-l2.txt"
-run_scenario l2 "$LEFT" "$DIAG_DIR/prompt-l2.txt" verify_l2 reset_left_fixed A_L2_SCENARIO
+if selected l2; then
+    reset_left_fixed "$LEFT"
+    cp -- "$DRIVER_DIR/claude-prompts/l2.txt" "$DIAG_DIR/prompt-l2.txt"
+    run_scenario l2 "$LEFT" "$DIAG_DIR/prompt-l2.txt" verify_l2 reset_left_fixed A_L2_SCENARIO
+fi
 
 # Scenario L3: real TypeScript semantic context through the accepted bundle.
-reset_left_native "$LEFT"
-cp -- "$DRIVER_DIR/claude-prompts/l3.txt" "$DIAG_DIR/prompt-l3.txt"
-run_scenario l3 "$LEFT" "$DIAG_DIR/prompt-l3.txt" verify_l3 reset_left_native A_L3_SCENARIO
+if selected l3; then
+    reset_left_native "$LEFT"
+    cp -- "$DRIVER_DIR/claude-prompts/l3.txt" "$DIAG_DIR/prompt-l3.txt"
+    run_scenario l3 "$LEFT" "$DIAG_DIR/prompt-l3.txt" verify_l3 reset_left_native A_L3_SCENARIO
+fi
 
 # Restart-safe telemetry: durable events survive the daemon restart of a fresh
 # session and both query and export read them back through the CLI.
-TELEMETRY_DB=$OPERATOR_HOME/.agent-ide/telemetry/$LEFT_IDENTITY/state.sqlite
-[ -f "$TELEMETRY_DB" ] || fail A_TELEMETRY_DB_MISSING "no durable database before restart"
-before_rows=$("$BINARY" telemetry export --database "$TELEMETRY_DB" 2>>"$DIAG_LOG" | wc -l | tr -d ' ')
-[ "${before_rows:-0}" -ge 1 ] || fail A_TELEMETRY_PRE_RESTART_EMPTY "export before restart"
+if selected l4; then
+    TELEMETRY_DB=$OPERATOR_HOME/.agent-ide/telemetry/$LEFT_IDENTITY/state.sqlite
+    [ -f "$TELEMETRY_DB" ] || fail A_TELEMETRY_DB_MISSING "no durable database before restart"
+    before_rows=$("$BINARY" telemetry export --database "$TELEMETRY_DB" 2>>"$DIAG_LOG" | wc -l | tr -d ' ')
+    [ "${before_rows:-0}" -ge 1 ] || fail A_TELEMETRY_PRE_RESTART_EMPTY "export before restart"
 
-# Scenario L4: one minimal session whose daemon generation must append events.
-cp -- "$DRIVER_DIR/claude-prompts/l4.txt" "$DIAG_DIR/prompt-l4.txt"
-l4_attempt=1
-while [ "$l4_attempt" -le "$MAX_ATTEMPTS" ]; do
-    note "scenario-l4-attempt" "$l4_attempt"
-    if run_session l4 "$LEFT" "$DIAG_DIR/prompt-l4.txt" \
-        && require_transcript_text "$DIAG_DIR/transcript-l4.jsonl" "LEFT_RESTART_OK" A_L4_FINAL; then
-        break
-    fi
-    l4_attempt=$((l4_attempt + 1))
-done
-[ "$l4_attempt" -le "$MAX_ATTEMPTS" ] || fail A_L4_SCENARIO "restart session never completed"
+    # Scenario L4: one minimal session whose daemon generation must append events.
+    cp -- "$DRIVER_DIR/claude-prompts/l4.txt" "$DIAG_DIR/prompt-l4.txt"
+    l4_attempt=1
+    while [ "$l4_attempt" -le "$MAX_ATTEMPTS" ]; do
+        note "scenario-l4-attempt" "$l4_attempt"
+        if run_session l4 "$LEFT" "$DIAG_DIR/prompt-l4.txt" \
+            && require_transcript_text "$DIAG_DIR/transcript-l4.jsonl" "LEFT_RESTART_OK" A_L4_FINAL; then
+            break
+        fi
+        l4_attempt=$((l4_attempt + 1))
+    done
+    [ "$l4_attempt" -le "$MAX_ATTEMPTS" ] || fail A_L4_SCENARIO "restart session never completed"
 
-after_rows=$("$BINARY" telemetry export --database "$TELEMETRY_DB" 2>>"$DIAG_LOG" | wc -l | tr -d ' ')
-[ "$after_rows" -gt "$before_rows" ] || fail A_TELEMETRY_RESTART_LOST "no new rows after restart"
-"$BINARY" telemetry query --database "$TELEMETRY_DB" >"$DIAG_DIR/telemetry-query.json" 2>>"$DIAG_LOG" \
-    || fail A_TELEMETRY_QUERY_EXIT "query exited nonzero"
-jq -e '.events | length >= 1' "$DIAG_DIR/telemetry-query.json" >/dev/null 2>&1 \
-    || fail A_TELEMETRY_QUERY_ROWS "query returned no events"
+    after_rows=$("$BINARY" telemetry export --database "$TELEMETRY_DB" 2>>"$DIAG_LOG" | wc -l | tr -d ' ')
+    [ "$after_rows" -gt "$before_rows" ] || fail A_TELEMETRY_RESTART_LOST "no new rows after restart"
+    "$BINARY" telemetry query --database "$TELEMETRY_DB" >"$DIAG_DIR/telemetry-query.json" 2>>"$DIAG_LOG" \
+        || fail A_TELEMETRY_QUERY_EXIT "query exited nonzero"
+    jq -e '.events | length >= 1' "$DIAG_DIR/telemetry-query.json" >/dev/null 2>&1 \
+        || fail A_TELEMETRY_QUERY_ROWS "query returned no events"
+fi
 
 # Scenario R5: the complete loop in the divergent right worktree.
 RIGHT_IDENTITY=$(project_identity "$BINARY" "$RIGHT") || fail E_RIGHT_IDENTITY
-RIGHT_RUNTIME=/private/tmp/ai-c-$(printf '%s' "$RIGHT_IDENTITY" | cut -c1-16)
-prepare_worktree "$RIGHT" "$RIGHT_RUNTIME"
-cp -- "$DRIVER_DIR/claude-prompts/r5.txt" "$DIAG_DIR/prompt-r5.txt"
-run_scenario r5 "$RIGHT" "$DIAG_DIR/prompt-r5.txt" verify_r5 reset_fixture A_R5_SCENARIO
+resolve_rendezvous "$BINARY" "$RIGHT" || fail E_RIGHT_RUNTIME
+prepare_worktree "$RIGHT" "$RENDEZVOUS_SOCKET"
+if selected r5; then
+    cp -- "$DRIVER_DIR/claude-prompts/r5.txt" "$DIAG_DIR/prompt-r5.txt"
+    run_scenario r5 "$RIGHT" "$DIAG_DIR/prompt-r5.txt" verify_r5 reset_fixture A_R5_SCENARIO
+fi
 
 # Verifies the R5 diff session in the divergent right worktree.
 verify_r5b() {
@@ -353,14 +399,23 @@ verify_r5b() {
 }
 
 # Scenario R5B: the composed diff of the right loop in a fresh session.
-cp -- "$DRIVER_DIR/claude-prompts/r5b.txt" "$DIAG_DIR/prompt-r5b.txt"
-run_scenario r5b "$RIGHT" "$DIAG_DIR/prompt-r5b.txt" verify_r5b reset_fixture A_R5B_SCENARIO
+if selected r5b; then
+    cp -- "$DRIVER_DIR/claude-prompts/r5b.txt" "$DIAG_DIR/prompt-r5b.txt"
+    run_scenario r5b "$RIGHT" "$DIAG_DIR/prompt-r5b.txt" verify_r5b reset_fixture A_R5B_SCENARIO
+fi
 
 # Compact projection holds across every captured session.
 for transcript in "$DIAG_DIR"/transcript-l*.jsonl "$DIAG_DIR"/transcript-r5*.jsonl; do
+    [ -f "$transcript" ] || continue
     require_compact_replies "$transcript" A_COMPACT_REPLIES
 done
 
-write_pass_result
+# A filtered run is a diagnostic rerun and never emits the closed result
+# document; only the complete cell may claim every scenario real_pass.
+if [ -z "$ONLY" ]; then
+    write_pass_result
+else
+    note driver-filtered-run "$ONLY"
+fi
 note driver-complete claude
 exit 0
