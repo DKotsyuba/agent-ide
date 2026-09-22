@@ -410,8 +410,23 @@ async fn execute(
         discovery,
         payload,
     };
-    let Ok(encoded) = result.encode() else {
-        return "unavailable";
+    let encoded = match result.encode() {
+        Ok(encoded) => encoded,
+        Err(code) => {
+            // Never drop a result silently: the claim is already consumed, so this is the only
+            // trace of why the model saw `unavailable` (T39G).
+            crate::errorlog::record(
+                crate::errorlog::Method::HelperClaim,
+                crate::errorlog::Outcome::Unavailable,
+                crate::errorlog::Fields {
+                    reason: Some(code.into()),
+                    correlation: Some(&result.detail_ref),
+                    detail: Some("helper_result_rejected"),
+                    ..Default::default()
+                },
+            );
+            return "unavailable";
+        }
     };
     if write_frame(&mut stream, &encoded).await.is_err() {
         return "unavailable";
