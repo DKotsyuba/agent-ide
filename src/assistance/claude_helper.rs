@@ -1886,7 +1886,7 @@ mod tests {
             )
             .expect("ticket mints");
         assert_eq!(
-            guard.recognize(&command, false, "call", &actor, 0),
+            guard.recognize("attach", &command, false, "call", &actor, 0),
             LaunchRecognition::Recognized
         );
         drop(guard);

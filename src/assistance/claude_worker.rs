@@ -1651,10 +1651,12 @@ impl LaunchLedger {
     /// `helper_words`'s conservative parser — so a shell-equivalent requoting of the identical
     /// argv still matches. `run_in_background == false` is still required. A background launch, a
     /// compound command, an added or missing argument, a shell expansion or any other tool
-    /// payload is [`LaunchRecognition::Ignored`] and discarded. Recognition is not authorization:
-    /// it only records that the native launch happened.
+    /// payload or a hook on another attachment is [`LaunchRecognition::Ignored`] and discarded.
+    /// `channel` is the exact lease attachment carried by the trusted hook transport.
+    /// Recognition is not authorization: it only records that the native launch happened.
     pub fn recognize(
         &mut self,
+        channel: &str,
         command: &str,
         run_in_background: bool,
         tool_use_id: &str,
@@ -1674,6 +1676,7 @@ impl LaunchLedger {
                     .as_deref()
                     .is_some_and(|words| helper_words(&ticket.command).as_deref() == Some(words)))
                 && &ticket.actor == actor
+                && ticket.channel == channel
         }) else {
             return LaunchRecognition::Ignored;
         };
@@ -1692,9 +1695,10 @@ impl LaunchLedger {
     /// Returns `None` for a command that does not even superficially look like a foreground helper
     /// launch (does not contain the fixed helper subcommand word), so an ordinary `Bash` call never
     /// produces log noise. The command text itself is never returned or logged, only the closed
-    /// class.
+    /// class. A matching command from another channel is reported as `NoTicket`.
     pub fn diagnose_ignored(
         &self,
+        channel: &str,
         command: &str,
         run_in_background: bool,
         tool_use_id: &str,
@@ -1718,6 +1722,9 @@ impl LaunchLedger {
         let Some(ticket) = matched else {
             return Some(ReasonCode::NoTicket);
         };
+        if ticket.channel != channel {
+            return Some(ReasonCode::NoTicket);
+        }
         if &ticket.actor != actor {
             return Some(ReasonCode::ActorMismatch);
         }
@@ -2386,6 +2393,7 @@ mod tests {
             .expect("ticket mints");
         assert_eq!(
             ledger.recognize(
+                "channel",
                 &LaunchLedger::helper_command(
                     std::path::Path::new("/usr/local/bin/agent-ide"),
                     std::path::Path::new("/private/tmp/rt"),
@@ -2547,23 +2555,30 @@ mod tests {
             "detail-1",
         );
         assert_eq!(
-            ledger.recognize(&format!("{exact} ; rm -rf /"), false, "call", &actor, 0),
+            ledger.recognize(
+                "channel",
+                &format!("{exact} ; rm -rf /"),
+                false,
+                "call",
+                &actor,
+                0
+            ),
             LaunchRecognition::Ignored
         );
         assert_eq!(
-            ledger.recognize("cargo test", false, "call", &actor, 0),
+            ledger.recognize("channel", "cargo test", false, "call", &actor, 0),
             LaunchRecognition::Ignored
         );
         assert_eq!(
-            ledger.recognize(&exact, true, "call", &actor, 0),
+            ledger.recognize("channel", &exact, true, "call", &actor, 0),
             LaunchRecognition::Ignored
         );
         assert_eq!(
-            ledger.recognize(&exact, false, "call", &actor, 0),
+            ledger.recognize("channel", &exact, false, "call", &actor, 0),
             LaunchRecognition::Recognized
         );
         assert_eq!(
-            ledger.recognize(&exact, false, "call-2", &actor, 0),
+            ledger.recognize("channel", &exact, false, "call-2", &actor, 0),
             LaunchRecognition::Ignored
         );
     }
@@ -2577,7 +2592,7 @@ mod tests {
         let (mut ledger, _, actor) = ledger_with_command(quoted);
         let unquoted = "/usr/local/bin/agent-ide claude-worker --runtime-dir /private/tmp/rt --attachment attach --detail-ref detail-1";
         assert_eq!(
-            ledger.recognize(unquoted, false, "call", &actor, 0),
+            ledger.recognize("channel", unquoted, false, "call", &actor, 0),
             LaunchRecognition::Recognized
         );
     }
@@ -2591,7 +2606,7 @@ mod tests {
         let (mut ledger, _, actor) = ledger_with_command(quoted);
         let double_quoted = "\"/usr/local/bin/agent-ide\" \"claude-worker\" --runtime-dir \"/private/tmp/rt\" --attachment \"attach\" --detail-ref \"detail-1\"";
         assert_eq!(
-            ledger.recognize(double_quoted, false, "call", &actor, 0),
+            ledger.recognize("channel", double_quoted, false, "call", &actor, 0),
             LaunchRecognition::Recognized
         );
     }
@@ -2613,7 +2628,7 @@ mod tests {
 
         let (mut first_ledger, _, first_actor) = ledger_with_command(&command);
         assert_eq!(
-            first_ledger.recognize(&command, false, "call", &first_actor, 0),
+            first_ledger.recognize("channel", &command, false, "call", &first_actor, 0),
             LaunchRecognition::Recognized
         );
 
@@ -2623,7 +2638,7 @@ mod tests {
         );
         let (mut other_ledger, _, other_actor) = ledger_with_command(&command);
         assert_eq!(
-            other_ledger.recognize(&double_quoted, false, "call", &other_actor, 0),
+            other_ledger.recognize("channel", &double_quoted, false, "call", &other_actor, 0),
             LaunchRecognition::Recognized
         );
     }
@@ -2640,25 +2655,39 @@ mod tests {
             "detail-1",
         );
         assert_eq!(
-            ledger.recognize(&format!("{exact}; echo x"), false, "call", &actor, 0),
+            ledger.recognize(
+                "channel",
+                &format!("{exact}; echo x"),
+                false,
+                "call",
+                &actor,
+                0
+            ),
             LaunchRecognition::Ignored
         );
         assert_eq!(
-            ledger.recognize(&format!("{exact} --extra"), false, "call", &actor, 0),
+            ledger.recognize(
+                "channel",
+                &format!("{exact} --extra"),
+                false,
+                "call",
+                &actor,
+                0
+            ),
             LaunchRecognition::Ignored
         );
         let missing_argument = exact.rsplit_once(' ').expect("multi-word command").0;
         assert_eq!(
-            ledger.recognize(missing_argument, false, "call", &actor, 0),
+            ledger.recognize("channel", missing_argument, false, "call", &actor, 0),
             LaunchRecognition::Ignored
         );
         let expanded = exact.replace("detail-1", "$HOME");
         assert_eq!(
-            ledger.recognize(&expanded, false, "call", &actor, 0),
+            ledger.recognize("channel", &expanded, false, "call", &actor, 0),
             LaunchRecognition::Ignored
         );
         assert_eq!(
-            ledger.recognize(&exact, true, "call", &actor, 0),
+            ledger.recognize("channel", &exact, true, "call", &actor, 0),
             LaunchRecognition::Ignored
         );
     }
@@ -2689,7 +2718,11 @@ mod tests {
             "detail-1",
         );
         assert_eq!(
-            ledger.recognize(&command, false, "call", &actor, 0),
+            ledger.recognize("other-channel", &command, false, "wrong-channel", &actor, 0),
+            LaunchRecognition::Ignored
+        );
+        assert_eq!(
+            ledger.recognize("channel", &command, false, "call", &actor, 0),
             LaunchRecognition::Recognized
         );
 
@@ -2724,7 +2757,7 @@ mod tests {
         );
         let parent = HelperActor::new("session", None).unwrap();
         assert_eq!(
-            ledger.recognize(&command, false, "call", &parent, 0),
+            ledger.recognize("channel", &command, false, "call", &parent, 0),
             LaunchRecognition::Ignored
         );
         assert_eq!(
@@ -2748,11 +2781,11 @@ mod tests {
         // A wrapped command is not recognized, so the ticket keeps asking for the exact one.
         let wrapped = format!("date '+%H:%M:%S'; {command}");
         assert_eq!(
-            ledger.recognize(&wrapped, false, "call", &actor, 0),
+            ledger.recognize("channel", &wrapped, false, "call", &actor, 0),
             LaunchRecognition::Ignored
         );
         assert_eq!(ledger.unrun_command(&reference), Some(command.as_str()));
-        ledger.recognize(&command, false, "call", &actor, 0);
+        ledger.recognize("channel", &command, false, "call", &actor, 0);
         assert_eq!(ledger.unrun_command(&reference), None);
     }
 
@@ -2776,7 +2809,7 @@ mod tests {
             "attach",
             "detail-1",
         );
-        ledger.recognize(&command, false, "call", &actor, 0);
+        ledger.recognize("channel", &command, false, "call", &actor, 0);
         assert!(matches!(
             ledger.claim(&reference, "channel", 0, live),
             ClaimOutcome::Granted(_)
@@ -2812,7 +2845,7 @@ mod tests {
             "detail-1",
         );
         assert_eq!(
-            ledger.recognize(&command, false, "edit-call", &actor, 0),
+            ledger.recognize("channel", &command, false, "edit-call", &actor, 0),
             LaunchRecognition::Recognized
         );
         assert!(matches!(
@@ -2842,7 +2875,7 @@ mod tests {
             "detail-1",
         );
         assert_eq!(
-            ledger.recognize(&command, false, "call", &actor, 700),
+            ledger.recognize("channel", &command, false, "call", &actor, 700),
             LaunchRecognition::Recognized
         );
         let ClaimOutcome::Granted(granted) = ledger.claim(&reference, "channel", 700, live) else {
@@ -2903,7 +2936,7 @@ mod tests {
             "detail-1",
         );
         assert_eq!(
-            ledger.recognize(&command, false, "edit-call", &actor, 0),
+            ledger.recognize("channel", &command, false, "edit-call", &actor, 0),
             LaunchRecognition::Recognized
         );
         assert!(matches!(
@@ -2956,7 +2989,7 @@ mod tests {
             "detail-1",
         );
         assert_eq!(
-            ledger.recognize(&command, false, "edit-call", &actor, 0),
+            ledger.recognize("channel", &command, false, "edit-call", &actor, 0),
             LaunchRecognition::Recognized
         );
         assert!(matches!(
@@ -3005,7 +3038,7 @@ mod tests {
                 "attach",
                 "detail-1",
             );
-            ledger.recognize(&command, false, "call", &actor, 0);
+            ledger.recognize("channel", &command, false, "call", &actor, 0);
             ledger.claim(&reference, "channel", 0, live);
             assert_eq!(ledger.delivery(&reference), Delivery::Waiting);
 
@@ -3046,7 +3079,7 @@ mod tests {
             "attach",
             "detail-1",
         );
-        ledger.recognize(&command, false, "call", &actor, 0);
+        ledger.recognize("channel", &command, false, "call", &actor, 0);
         ledger.claim(&reference, "channel", 0, live);
         ledger
             .settle_frame(HelperResult {
@@ -3078,7 +3111,7 @@ mod tests {
             "attach",
             "detail-1",
         );
-        ledger.recognize(&command, false, "call", &actor, 0);
+        ledger.recognize("channel", &command, false, "call", &actor, 0);
         ledger.claim(&reference, "channel", 0, live);
         assert!(ledger.owns_post("call"));
         assert!(!ledger.owns_post("some-native-edit"));
@@ -3122,7 +3155,7 @@ mod tests {
             "detail-1",
         );
         assert_eq!(
-            ledger.recognize(&command, false, "call", &actor, 0),
+            ledger.recognize("channel", &command, false, "call", &actor, 0),
             LaunchRecognition::Recognized
         );
         assert!(matches!(
@@ -3315,7 +3348,14 @@ mod tests {
                 )
                 .expect("ticket mints");
             assert_eq!(
-                ledger.recognize(&command, false, &format!("call-{index}"), &actor, 0),
+                ledger.recognize(
+                    "channel",
+                    &command,
+                    false,
+                    &format!("call-{index}"),
+                    &actor,
+                    0
+                ),
                 LaunchRecognition::Recognized
             );
             assert!(matches!(
@@ -3333,7 +3373,7 @@ mod tests {
             "detail-1",
         );
         assert_eq!(
-            ledger.recognize(&command, false, "call", &actor, 0),
+            ledger.recognize("channel", &command, false, "call", &actor, 0),
             LaunchRecognition::Recognized
         );
         assert_eq!(
@@ -3356,7 +3396,7 @@ mod tests {
             "detail-1",
         );
         assert_eq!(
-            ledger.recognize(&command, false, "call", &actor, 0),
+            ledger.recognize("channel", &command, false, "call", &actor, 0),
             LaunchRecognition::Recognized
         );
         assert_eq!(
@@ -3425,7 +3465,7 @@ mod tests {
             "attach",
             "detail-1",
         );
-        ledger.recognize(&command, false, "call", &actor, 0);
+        ledger.recognize("channel", &command, false, "call", &actor, 0);
         ledger.revoke(binding_fixture().fingerprint());
         assert!(ledger.is_empty());
         assert_eq!(

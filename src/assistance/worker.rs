@@ -783,14 +783,6 @@ impl WorkerHandle {
                 .retired_initial_claude_target
                 .store(true, std::sync::atomic::Ordering::Release);
         }
-        if template.candidate == candidate
-            && !self
-                .shared
-                .retired_initial_claude_target
-                .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return self.shared.launcher.sole_attachment().map(str::to_owned);
-        }
         let mut targets = self.shared.claude_targets.lock().ok()?;
         targets.retain(|_, target| target.candidate.is_dir());
         if let Some((attachment, _)) = targets
@@ -1891,7 +1883,7 @@ fn settled_claude_edit(binding: BindingRef) -> SettledClaudeOperation {
         )
         .unwrap();
     assert_eq!(
-        ledger.recognize(&command, false, "edit-call", &actor, 0),
+        ledger.recognize("channel", &command, false, "edit-call", &actor, 0),
         LaunchRecognition::Recognized
     );
     let ClaimOutcome::Granted(_) = ledger.claim("detail-1", "channel", 0, |current| {
