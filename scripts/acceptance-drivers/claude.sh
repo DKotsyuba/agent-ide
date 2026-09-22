@@ -167,7 +167,9 @@ reset_fixture() {
 # ambient `agent-ide` on PATH would let a second, stale host hook register a
 # duplicate pre-observation for the same tool call, which the daemon correctly
 # rejects as ambiguous, so only the candidate plugin hook may deliver binding
-# evidence. The complete
+# evidence. User-level settings are excluded for the same reason: an operator may
+# register the installed agent-ide hook there (crew does), which would fire a
+# second hook for every tool call; login stays in the keychain. The complete
 # stream-json transcript stays in the private diagnostic directory.
 # The edit ledger is durable per repository, so a retried scenario must never reuse
 # an earlier attempt's operation_id (it would answer conflicting_duplicate). Each
@@ -197,7 +199,7 @@ run_session() {
         /usr/bin/perl -e 'alarm shift; exec @ARGV' "$SESSION_SECONDS" \
         "$CLAUDE" -p "$(session_prompt "$prompt_file")" \
         --model "$MODEL" --output-format stream-json --verbose \
-        --dangerously-skip-permissions \
+        --dangerously-skip-permissions --setting-sources project,local \
         --strict-mcp-config --mcp-config "$MCP_CONFIG" --plugin-dir "$worktree" \
         >"$transcript" 2>"$DIAG_DIR/session-$label.err")
     then
