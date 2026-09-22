@@ -759,7 +759,8 @@ pub async fn submit_inactive_hook(
 ///
 /// The serialized observation explicitly names its host contract. The root session (retained for
 /// both hosts) and Claude's optional agent type are kept for isolation evidence, and the post
-/// phase tool name selects check triggers; raw hook fields never enter the transport.
+/// phase tool name selects check triggers; raw hook fields never enter the transport. Only an
+/// observed, settled, or feedback reply counts as submission; a daemon refusal is unavailable.
 pub async fn submit_hook_event(
     runtime_dir: &Path,
     host: &TrustedTransport,
@@ -815,7 +816,12 @@ pub async fn submit_hook_event(
             opaque_reply_json, ..
         } => match PeerReply::decode(opaque_reply_json.as_str()) {
             Some(PeerReply::Feedback { text }) => HookIngressOutcome::Feedback(text),
-            _ => HookIngressOutcome::Submitted,
+            Some(
+                PeerReply::HookObserved {}
+                | PeerReply::HookSettled {}
+                | PeerReply::NativeHookObserved {},
+            ) => HookIngressOutcome::Submitted,
+            _ => HookIngressOutcome::Unavailable,
         },
         HookSubmitTransportResult::Unavailable => HookIngressOutcome::Unavailable,
     }
