@@ -1600,6 +1600,9 @@ fn v2_records_restore_exactly_and_replay_json_is_unchanged() {
 /// finding 3). A v1-only catalog is untouched by the binding, exactly as before.
 #[test]
 fn discovery_binds_the_trusted_candidate_to_the_sandbox_cwd() {
+    // The binding canonicalizes both sides through the filesystem (T37B), so the capture's cwd
+    // must exist exactly as a live capture's would.
+    std::fs::create_dir_all("/private/tmp/t35b-discovery").unwrap();
     let managed = json!({
         "codexLinuxSandboxExe": null,
         "permissionProfile": {"type":"managed","file_system":{"entries":[

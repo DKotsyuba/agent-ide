@@ -1106,10 +1106,29 @@ fn permit_fixture(template: &str, live: &str) -> Result<(), RequestError> {
     v2_catalog(template).permit(&live, live.cwd()).map(|_| ())
 }
 
+/// Creates one synthetic capture cwd on disk so derivation's canonicalization sees it (T37B).
+///
+/// Real captures always name an existing directory; the synthetic fixtures name constants, so
+/// the helpers materialize them. Failures are ignored: states whose cwd the grammar or the
+/// binding must refuse keep refusing, only through the refusal they are testing.
+fn ensure_real_dir(path: &str) -> &str {
+    let _ = std::fs::create_dir_all(path);
+    path
+}
+
+/// Creates the local directory of one sandbox-state JSON value's `sandboxCwd` spelling.
+fn ensure_value_cwd(value: &serde_json::Value) {
+    if let Some(cwd) = value.get("sandboxCwd").and_then(serde_json::Value::as_str) {
+        let local = cwd.strip_prefix("file://").unwrap_or(cwd);
+        let _ = std::fs::create_dir_all(local);
+    }
+}
+
 /// Derives the v2 shape of one sandbox-state JSON value, or reports the unsupported reason.
 ///
 /// The trusted candidate is the state's own cwd: the self-consistent binding.
 fn shape_of(value: serde_json::Value) -> Result<ProfileShapeV2, UnsupportedShape> {
+    ensure_value_cwd(&value);
     let state = HostSandboxState::parse(Some(value)).unwrap();
     state.shape_v2(state.cwd())
 }
@@ -1241,6 +1260,8 @@ fn permit_values(
     template_value: serde_json::Value,
     live_value: serde_json::Value,
 ) -> Result<(), RequestError> {
+    ensure_value_cwd(&template_value);
+    ensure_value_cwd(&live_value);
     let template = HostSandboxState::parse(Some(template_value)).unwrap();
     let live = HostSandboxState::parse(Some(live_value)).unwrap();
     let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
@@ -1252,6 +1273,7 @@ fn permit_values(
 
 /// Builds one synthetic workspace-write managed state shaped like a real default capture.
 fn t35b_base_state() -> serde_json::Value {
+    ensure_real_dir("/private/tmp/t35b/work");
     serde_json::json!({
         "codexLinuxSandboxExe": null,
         "permissionProfile": {
@@ -2094,24 +2116,43 @@ fn raw_cwd_grammar_refuses_uri_variants() {
 /// Relocating the cwd grant beneath an absolute path deny refuses derivation outright — exactly
 /// the reviewed attack where the shape used to stay identical while the grant moved beneath a
 /// retained deny — and a permit whose trusted candidate is not the state's own `sandboxCwd`
-/// never derives a v2 shape at all.
+/// never derives a v2 shape at all. The relocation target, the deny's subtree, and the foreign
+/// candidate are real directories: the binding compares them through the filesystem (T37B).
+#[cfg(unix)]
 #[test]
 fn cwd_binding_refuses_relocation_under_an_absolute_deny_and_a_foreign_candidate() {
     // The reviewed attack: relocate cwd, its write, its nested read, and its glob denies onto
-    // `/secrets/project` while retaining the absolute deny of `/secrets`. Every cwd-derived
-    // selector normalizes identically, so the shape digests used to match; derivation must
-    // refuse because the cwd now sits inside an absolute deny's subtree.
+    // one real directory while retaining an absolute deny of that directory's parent. Every
+    // cwd-derived selector normalizes identically, so the shape digests used to match;
+    // derivation must refuse because the cwd now sits inside an absolute deny's subtree.
+    let base = std::env::temp_dir().join(format!(
+        "t35b-relocate-{}-{}",
+        std::process::id(),
+        blake3::hash(b"t35b-relocate").to_hex()
+    ));
+    let denied = base.join("denied");
+    let relocated_dir = denied.join("project");
+    std::fs::create_dir_all(&relocated_dir).unwrap();
+    let foreign_dir = base.join("other");
+    std::fs::create_dir_all(&foreign_dir).unwrap();
+    // The entries are spelled the way the host emits them: canonically (T37B probe evidence).
+    let denied = std::fs::canonicalize(&denied).unwrap();
+    let relocated_dir = std::fs::canonicalize(&relocated_dir).unwrap();
     let relocated_under_deny = |mutation: fn(&mut serde_json::Value)| {
         let mut value = t35b_base_state();
-        value["sandboxCwd"] = serde_json::json!("/secrets/project");
+        value["sandboxCwd"] = serde_json::json!(relocated_dir.to_string_lossy().as_ref());
         let entries = value["permissionProfile"]["file_system"]["entries"]
             .as_array_mut()
             .unwrap();
-        entries[1]["path"]["path"] = serde_json::json!("/secrets/project");
-        entries[4]["path"]["path"] = serde_json::json!("/secrets/project/.git");
-        entries[6]["path"]["pattern"] = serde_json::json!("/secrets/project/**/.env");
+        entries[1]["path"]["path"] = serde_json::json!(relocated_dir.to_string_lossy().as_ref());
+        entries[4]["path"]["path"] =
+            serde_json::json!(relocated_dir.join(".git").to_string_lossy().as_ref());
+        entries[6]["path"]["pattern"] = serde_json::json!(format!(
+            "{}/.env",
+            relocated_dir.join("**").to_string_lossy()
+        ));
         entries.push(serde_json::json!(
-            {"access":"deny","path":{"path":"/secrets","type":"path"}}
+            {"access":"deny","path":{"path":denied.to_string_lossy().as_ref(),"type":"path"}}
         ));
         mutation(&mut value);
         HostSandboxState::parse(Some(value)).unwrap()
@@ -2123,17 +2164,17 @@ fn cwd_binding_refuses_relocation_under_an_absolute_deny_and_a_foreign_candidate
         relocated.shape_v2(relocated.cwd()).unwrap_err(),
         UnsupportedShape("cwd overlap")
     );
-    // ...and the pristine base state derived against a foreign candidate refuses on binding.
-    let base = HostSandboxState::parse(Some(t35b_base_state())).unwrap();
+    // ...and the pristine base state derived against a foreign real candidate refuses on
+    // binding.
+    let base_state = HostSandboxState::parse(Some(t35b_base_state())).unwrap();
     assert_eq!(
-        base.shape_v2(Path::new("/private/tmp/t35b/other"))
-            .unwrap_err(),
+        base_state.shape_v2(&foreign_dir).unwrap_err(),
         UnsupportedShape("cwd binding")
     );
     // Through the public permit decision both arrive as the typed unsupported reason, never a
     // silent admission.
     let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
-        ExecutionProfileTemplate::from_execution_evidence_v2("t35b-base", 1, &base).unwrap(),
+        ExecutionProfileTemplate::from_execution_evidence_v2("t35b-base", 1, &base_state).unwrap(),
     ])
     .unwrap();
     assert!(matches!(
@@ -2141,19 +2182,24 @@ fn cwd_binding_refuses_relocation_under_an_absolute_deny_and_a_foreign_candidate
         Err(RequestError::ExecutionProfileShapeUnsupported(_))
     ));
     assert!(matches!(
-        catalog.permit(&base, Path::new("/private/tmp/t35b/other")),
+        catalog.permit(&base_state, &foreign_dir),
         Err(RequestError::ExecutionProfileShapeUnsupported(_))
     ));
     // Relocation to a different trusted candidate with no deny overlap stays admitted: that is
     // the portability the fixtures require, now with the candidate checked.
+    let moved_dir = base.join("work2");
+    std::fs::create_dir_all(&moved_dir).unwrap();
+    let moved_dir = std::fs::canonicalize(&moved_dir).unwrap();
     let mut moved = t35b_base_state();
-    moved["sandboxCwd"] = serde_json::json!("/private/tmp/t35b/work2");
+    moved["sandboxCwd"] = serde_json::json!(moved_dir.to_string_lossy().as_ref());
     let entries = moved["permissionProfile"]["file_system"]["entries"]
         .as_array_mut()
         .unwrap();
-    entries[1]["path"]["path"] = serde_json::json!("/private/tmp/t35b/work2");
-    entries[4]["path"]["path"] = serde_json::json!("/private/tmp/t35b/work2/.git");
-    entries[6]["path"]["pattern"] = serde_json::json!("/private/tmp/t35b/work2/**/.env");
+    entries[1]["path"]["path"] = serde_json::json!(moved_dir.to_string_lossy().as_ref());
+    entries[4]["path"]["path"] =
+        serde_json::json!(moved_dir.join(".git").to_string_lossy().as_ref());
+    entries[6]["path"]["pattern"] =
+        serde_json::json!(format!("{}/.env", moved_dir.join("**").to_string_lossy()));
     let moved = HostSandboxState::parse(Some(moved)).unwrap();
     let template = HostSandboxState::parse(Some(t35b_base_state())).unwrap();
     let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
@@ -2161,14 +2207,16 @@ fn cwd_binding_refuses_relocation_under_an_absolute_deny_and_a_foreign_candidate
     ])
     .unwrap();
     assert!(catalog.permit(&moved, moved.cwd()).is_ok());
+    let _ = std::fs::remove_dir_all(&base);
 }
 
-/// A symlinked cwd alias is a different directory from the trusted candidate (T35B-r findings
-/// 3 and 6): the binding is component-wise on the raw paths, never canonicalized, so a symlink
-/// alias refuses derivation while the real directory derives.
+/// Two spellings of one real directory bind to one directory (T35B-r findings 3 and 6, T37B):
+/// the binding canonicalizes both sides through the filesystem, so the symlinked `/var/folders`
+/// style spelling and its canonical `/private/var/folders` form derive against each other,
+/// while a different real directory and an unresolvable candidate still refuse.
 #[cfg(unix)]
 #[test]
-fn symlinked_cwd_alias_refuses_against_the_trusted_candidate() {
+fn symlinked_cwd_alias_and_canonical_spelling_bind_to_one_real_directory() {
     let base = std::env::temp_dir().join(format!(
         "t35b-symlink-{}-{}",
         std::process::id(),
@@ -2178,6 +2226,8 @@ fn symlinked_cwd_alias_refuses_against_the_trusted_candidate() {
     std::fs::create_dir_all(&real).unwrap();
     let alias = base.join("alias");
     std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let escape = base.join("escape");
+    std::fs::create_dir_all(&escape).unwrap();
     let mut state = t35b_base_state();
     state["sandboxCwd"] = serde_json::json!(real.to_string_lossy().as_ref());
     let entries = state["permissionProfile"]["file_system"]["entries"]
@@ -2188,12 +2238,18 @@ fn symlinked_cwd_alias_refuses_against_the_trusted_candidate() {
     entries[6]["path"]["pattern"] =
         serde_json::json!(format!("{}/.env", real.join("**").to_string_lossy()));
     let state = HostSandboxState::parse(Some(state)).unwrap();
-    // The real directory is the trusted candidate and derives.
+    // The real directory and its symlink alias are one directory: both derive.
     assert!(state.shape_v2(&real).is_ok());
-    // The symlink alias is component-wise a different path and refuses.
+    assert!(state.shape_v2(&alias).is_ok());
+    // A different real directory — a sibling outside the granted worktree — still refuses.
     assert_eq!(
-        state.shape_v2(&alias).unwrap_err(),
+        state.shape_v2(&escape).unwrap_err(),
         UnsupportedShape("cwd binding")
+    );
+    // A candidate that cannot be canonicalized refuses fail-closed.
+    assert_eq!(
+        state.shape_v2(&base.join("missing")).unwrap_err(),
+        UnsupportedShape("trusted cwd canonicalization")
     );
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -2294,6 +2350,7 @@ fn v1_exact_and_v2_narrower_templates_compete_over_compatible_selectors() {
 
 /// Builds one minimal managed restricted state with the given cwd and filesystem entries.
 fn proof_state(cwd: &str, entries: serde_json::Value) -> HostSandboxState {
+    ensure_real_dir(cwd);
     HostSandboxState::parse(Some(serde_json::json!({
         "permissionProfile":{"type":"managed","file_system":{"entries":entries,"type":"restricted"},"network":"restricted"},
         "codexLinuxSandboxExe":null,"sandboxCwd":cwd,"useLegacyLandlock":false
@@ -2640,4 +2697,199 @@ fn t36b_write_fixtures_prove_main_refuse_env_and_key() {
             "{name}: certs/x.key must be unproven"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// T37B: the live Codex 0.155.1 workspace-write state, captured by T25B from a
+// real `codex exec -s workspace-write` session at a temporary-directory
+// worktree. macOS `$TMPDIR` is the symlinked `/var/folders/...` spelling while
+// every trusted product path is the canonical `/private/var/folders/...`
+// spelling, so these tests drive the exact cwd spellings the acceptance route
+// sees.
+// ---------------------------------------------------------------------------
+
+/// The 43 filesystem entries Codex 0.155.1 advertises for workspace-write at a
+/// temporary worktree, exactly as T25B captured them; `<<CWD>>` marks the five
+/// cwd-bound entries (the worktree write and the four credential globs).
+fn t37b_live_entries() -> serde_json::Value {
+    serde_json::json!([
+        {"access":"read","path":{"path":"/Users/pluto/.agent-run","type":"path"}},
+        {"access":"deny","path":{"path":"/Users/pluto/.agent-run/accounts","type":"path"}},
+        {"access":"deny","path":{"path":"/Users/pluto/.aws","type":"path"}},
+        {"access":"deny","path":{"path":"/Users/pluto/.azure","type":"path"}},
+        {"access":"write","path":{"path":"/Users/pluto/.cache/uv","type":"path"}},
+        {"access":"deny","path":{"path":"/Users/pluto/.cargo/credentials","type":"path"}},
+        {"access":"deny","path":{"path":"/Users/pluto/.cargo/credentials.toml","type":"path"}},
+        {"access":"write","path":{"path":"/Users/pluto/.cargo/registry","type":"path"}},
+        {"access":"deny","path":{"path":"/Users/pluto/.codex/auth.json","type":"path"}},
+        {"access":"deny","path":{"path":"/Users/pluto/.config/gcloud","type":"path"}},
+        {"access":"read","path":{"path":"/Users/pluto/.config/gh/hosts.yml","type":"path"}},
+        {"access":"deny","path":{"path":"/Users/pluto/.config/opencode/auth.json","type":"path"}},
+        {"access":"deny","path":{"path":"/Users/pluto/.docker/config.json","type":"path"}},
+        {"access":"deny","path":{"path":"/Users/pluto/.git-credentials","type":"path"}},
+        {"access":"deny","path":{"path":"/Users/pluto/.kube","type":"path"}},
+        {"access":"deny","path":{"path":"/Users/pluto/.local/share/opencode/auth.json","type":"path"}},
+        {"access":"deny","path":{"path":"/Users/pluto/.netrc","type":"path"}},
+        {"access":"write","path":{"path":"/Users/pluto/.npm","type":"path"}},
+        {"access":"deny","path":{"path":"/Users/pluto/.npmrc","type":"path"}},
+        {"access":"deny","path":{"path":"/Users/pluto/.pypirc","type":"path"}},
+        {"access":"deny","path":{"path":"/Users/pluto/.ssh","type":"path"}},
+        {"access":"read","path":{"path":"/Users/pluto/.ssh/known_hosts","type":"path"}},
+        {"access":"write","path":{"path":"/Users/pluto/Library/Caches/go-build","type":"path"}},
+        {"access":"write","path":{"path":"/Users/pluto/Library/Caches/pip","type":"path"}},
+        {"access":"deny","path":{"path":"/Users/pluto/Library/Keychains","type":"path"}},
+        {"access":"read","path":{"type":"special","value":{"kind":"root"}}},
+        {"access":"write","path":{"type":"special","value":{"kind":"slash_tmp"}}},
+        {"access":"write","path":{"type":"special","value":{"kind":"tmpdir"}}},
+        {"access":"deny","path":{"pattern":"<<CWD>>/**/*.key","type":"glob_pattern"}},
+        {"access":"deny","path":{"pattern":"<<CWD>>/**/*.pem","type":"glob_pattern"}},
+        {"access":"deny","path":{"pattern":"<<CWD>>/**/.env","type":"glob_pattern"}},
+        {"access":"deny","path":{"pattern":"<<CWD>>/**/.env.*","type":"glob_pattern"}},
+        {"access":"write","path":{"path":"<<CWD>>","type":"path"}},
+        {"access":"deny","path":{"pattern":"/Users/pluto/.codex/worktrees/**/*.key","type":"glob_pattern"}},
+        {"access":"deny","path":{"pattern":"/Users/pluto/projects/**/*.key","type":"glob_pattern"}},
+        {"access":"deny","path":{"pattern":"/Users/pluto/.codex/worktrees/**/*.pem","type":"glob_pattern"}},
+        {"access":"deny","path":{"pattern":"/Users/pluto/projects/**/*.pem","type":"glob_pattern"}},
+        {"access":"deny","path":{"pattern":"/Users/pluto/.codex/worktrees/**/.env","type":"glob_pattern"}},
+        {"access":"deny","path":{"pattern":"/Users/pluto/projects/**/.env","type":"glob_pattern"}},
+        {"access":"deny","path":{"pattern":"/Users/pluto/.codex/worktrees/**/.env.*","type":"glob_pattern"}},
+        {"access":"deny","path":{"pattern":"/Users/pluto/projects/**/.env.*","type":"glob_pattern"}},
+        {"access":"write","path":{"path":"/Users/pluto/.codex/worktrees","type":"path"}},
+        {"access":"write","path":{"path":"/Users/pluto/projects","type":"path"}}
+    ])
+}
+
+/// Builds the live 0.155.1 state with every cwd-bound value spelled through `cwd`.
+fn t37b_live_state(cwd: &str) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "permissionProfile":{"type":"managed","file_system":{
+            "entries":t37b_live_entries(),"type":"restricted","glob_scan_max_depth":8},
+            "network":"enabled"},
+        "codexLinuxSandboxExe":null,
+        "sandboxCwd":serde_json::Value::Null,
+        "useLegacyLandlock":false
+    });
+    value["sandboxCwd"] = serde_json::json!(format!("file://{cwd}"));
+    let entries = value["permissionProfile"]["file_system"]["entries"]
+        .as_array_mut()
+        .unwrap();
+    for entry in entries {
+        let spelled = serde_json::to_string(entry)
+            .unwrap()
+            .replace("<<CWD>>", cwd);
+        *entry = serde_json::from_str(&spelled).unwrap();
+    }
+    value
+}
+
+/// Creates one real directory below the symlinked per-user temporary directory
+/// plus its canonical spelling, mirroring the acceptance `$TMPDIR` worktrees.
+#[cfg(unix)]
+fn t37b_symlinked_worktree(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    use blake3::Hasher;
+    let unique = {
+        let mut hasher = Hasher::new();
+        hasher.update(tag.as_bytes());
+        hasher.update(&std::process::id().to_le_bytes());
+        hasher.finalize().to_hex().to_string()[..12].to_owned()
+    };
+    let logical = std::env::temp_dir().join(format!("t37b-{tag}-{unique}"));
+    std::fs::create_dir_all(&logical).unwrap();
+    let canonical = std::fs::canonicalize(&logical).unwrap();
+    (canonical, logical)
+}
+
+/// Pins the acceptance route's cwd comparison against the real 0.155.1 state (T37B).
+///
+/// Codex 0.155.1 emits `sandboxCwd` as `file://` plus the canonical physical
+/// worktree path, while a path spelled through the symlinked `$TMPDIR`
+/// (`/var/folders/...`) is the same real directory as its canonical
+/// `/private/var/folders/...` spelling. The trusted candidate is canonical
+/// (`current_dir`, git discovery), so:
+///
+/// 1. the state Codex really sends derives against the canonical candidate and
+///    proves the acceptance diff path `acceptance-fixture/fixture.py` under
+///    the live deny set — the whole l1b scenario must work;
+/// 2. the same real directory spelled through the symlink alias binds to the
+///    canonical trusted candidate too: realpath, not the raw spelling, is the
+///    directory's identity, so a host that emits the logical temporary
+///    directory form can never false-refuse every path as `path_unproven`.
+#[cfg(unix)]
+#[test]
+fn t37b_live_codex_state_at_a_symlinked_tmp_worktree() {
+    let (canonical, alias) = t37b_symlinked_worktree("state");
+    // 1. The state exactly as the live probe captured it: canonical spelling.
+    let live = HostSandboxState::parse(Some(t37b_live_state(canonical.to_str().unwrap()))).unwrap();
+    let shape = live.shape_v2(&canonical).expect("live state must derive");
+    assert_eq!(
+        super::profile_shape::read_proof(
+            &shape,
+            &canonical,
+            Path::new("acceptance-fixture/fixture.py")
+        ),
+        super::profile_shape::ReadProof::Proven,
+        "the diff fixture path must prove under the real deny set"
+    );
+    // 2. The same real directory reached through the symlink alias spelling binds.
+    let aliased = HostSandboxState::parse(Some(t37b_live_state(alias.to_str().unwrap()))).unwrap();
+    let aliased_shape = aliased
+        .shape_v2(&canonical)
+        .expect("the alias spelling must bind to the same real directory");
+    assert_eq!(
+        super::profile_shape::read_proof(
+            &aliased_shape,
+            &canonical,
+            Path::new("acceptance-fixture/fixture.py")
+        ),
+        super::profile_shape::ReadProof::Proven
+    );
+    let _ = std::fs::remove_dir_all(&canonical);
+}
+
+/// Every tracked path the acceptance fixture worktree reads natively stays within the live
+/// profile's conservative glob reach (T37B).
+///
+/// The captured 0.155.1 workspace-write profile carries `glob_scan_max_depth: 8` and `**`
+/// credential globs, so a tracked file more than eight components below the worktree root is
+/// conservatively `Unproven` and the diff capture refuses — which is exactly how the
+/// nine-and-ten-deep checker fixtures used to fail the l1b scenario three of three times. The
+/// fixture tree keeps its deepest paths at eight components, and this pins the decision on the
+/// real captured entries: the relocated acceptance paths prove, a ninth component refuses.
+#[test]
+fn t37b_deep_repo_fixture_paths_stay_within_the_live_glob_cap() {
+    ensure_real_dir(PROOF_CWD);
+    let state = HostSandboxState::parse(Some(serde_json::json!({
+        "codexLinuxSandboxExe":null,
+        "permissionProfile":{"type":"managed","file_system":{"entries":[
+            {"access":"read","path":{"type":"special","value":{"kind":"root"}}},
+            {"access":"write","path":{"path":PROOF_CWD,"type":"path"}},
+            {"access":"deny","path":{"pattern":format!("{PROOF_CWD}/**/*.key"),"type":"glob_pattern"}},
+            {"access":"deny","path":{"pattern":format!("{PROOF_CWD}/**/*.pem"),"type":"glob_pattern"}},
+            {"access":"deny","path":{"pattern":format!("{PROOF_CWD}/**/.env"),"type":"glob_pattern"}},
+            {"access":"deny","path":{"pattern":format!("{PROOF_CWD}/**/.env.*"),"type":"glob_pattern"}}
+        ],"type":"restricted","glob_scan_max_depth":8},"network":"restricted"},
+        "sandboxCwd":PROOF_CWD,"useLegacyLandlock":false
+    })))
+    .unwrap();
+    let shape = state.shape_v2(state.cwd()).unwrap();
+    let prove =
+        |relative: &str| super::profile_shape::read_proof(&shape, state.cwd(), Path::new(relative));
+    // The acceptance fixture paths at their relocated (eight-component) depth.
+    for relative in [
+        "acceptance-fixture/fixture.py",
+        "tests/fixtures/checks/errors/src/pkg/excluded/broken.py",
+        "tests/fixtures/checks/interpreter_pyproject/env/myenv/bin/python",
+        "tests/fixtures/checks/toolchain/pyright/node_modules/pyright/index.js",
+    ] {
+        assert_eq!(
+            prove(relative),
+            super::profile_shape::ReadProof::Proven,
+            "{relative}"
+        );
+    }
+    // A ninth component below the root exceeds the captured cap and stays refused.
+    assert_eq!(
+        prove("tests/fixtures/checks/interpreter_pyproject/env/myenv/deep/bin/python"),
+        super::profile_shape::ReadProof::Unproven
+    );
 }
