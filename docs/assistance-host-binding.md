@@ -65,9 +65,11 @@ end this one MCP process only, leaving an adopted or spawned daemon running for 
 same repository to find.
 
 The plugin's `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, and `PermissionDenied` handlers run
-the argument-free `agent-ide claude-hook`. That command independently derives the same path from
-`CLAUDE_PROJECT_DIR`, validates the runtime and bounded attachment file's owner, exact modes, shape,
-and full project digest, then reuses the existing Claude parser and connect-only transport. Missing
+the argument-free `agent-ide claude-hook`. That command resolves the hook payload's canonical `cwd`
+to the nearest worktree with a private candidate cache, then validates the shared runtime and bounded
+attachment file's owner, exact modes, shape, and full repository digest. It reads that worktree's
+daemon-minted lease attachment from the private cache and reuses the existing Claude parser and
+connect-only transport. Missing
 or corrupt state is silent fail-open. Root and child lifecycle identity, permission denial,
 failed-tool settlement, feedback output, and exact foreground-helper recognition are unchanged.
 The installed binary and launcher template remain machine-specific values in normal Claude MCP
