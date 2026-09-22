@@ -136,11 +136,22 @@ redacts the configuration; it must never be rendered in model-facing tool result
 
 ## Accepting a new Codex sandbox mode
 
-A Codex host is admitted only when its live sandbox state exactly matches an operator-accepted
+A Codex host is admitted only when a live sandbox state is authorized by an operator-accepted
 profile. A read-only and a workspace-write Codex sandbox are both class `managed`, so several
-profiles of one class may be needed; a target may list up to eight profiles whose digests all
-differ. `permit` succeeds only when some accepted profile of the observed class matches the live
-state's digest exactly — a changed sandbox is refused, never approximated.
+profiles of one class may be needed; a target may list up to eight profiles whose identities all
+differ. Records are versioned by `shape_version` (T35B): an absent field is the legacy v1
+layout, whose exact-digest admission is unchanged byte-for-byte and never silently upgraded, and
+`shape_version: 2` carries the conservative shape-based admission: a live state is admitted when
+one accepted template proves it a *narrower authority* than the accepted capture — the same
+mechanism, the same positive selectors with access equal or reduced, every accepted deny
+restriction still present, network equal or reduced, and the same glob expansion settings.
+Everything else is refused; unknown or unsupported state shapes never fall back to a looser
+comparison. Because outside write roots are preserved exactly in the shape, a new outside write
+selector (for example a visualization directory a host added) always requires re-acceptance, and
+a state that grants write of the whole filesystem root is refused by every workspace-write
+template. The error log names the closed reason: `no_profile_for_class:<class>`,
+`profile_digest_mismatch:<class>` (v1-only catalogs), `shape_unsupported:<class>` (the live state
+derives no v2 shape), or `shape_not_narrower:<class>` (no accepted template proves it narrower).
 
 When the daemon refuses a profile, it captures the raw observed state once per distinct digest
 under `~/.agent-ide/rejected-profiles/<16-hex>.json` (mode 0600 at creation; the directory is
@@ -152,20 +163,33 @@ observed state that carries any top-level field beyond the four documented
 `codex/sandbox-state-meta` fields (`permissionProfile`, `codexLinuxSandboxExe`, `sandboxCwd`,
 `useLegacyLandlock`): the digest covers unknown fields, so a filtered copy would be useless and
 the raw state is treated as unreviewable — the detail reads `capture_skipped:unknown_fields`.
-Otherwise the detail names the capture stem (`profile_digest_mismatch:managed;
+Otherwise the detail names the capture stem (`shape_not_narrower:managed;
 captured:<16-hex>`). To accept the new
 sandbox mode:
 
 1. Run the host once against this worktree so the daemon observes and refuses its sandbox state.
 2. `agent-ide evidence rejected` — lists each capture as `name class sandbox-cwd mtime`.
 3. Review the file `~/.agent-ide/rejected-profiles/<name>.json`. It is the exact
-   `codex/sandbox-state-meta` envelope the host advertised.
+   `codex/sandbox-state-meta` envelope the host advertised; check its actual outside grants,
+   network mode, and restrictions — those are the authority you are about to accept.
 4. Run a real D03 experiment under that exact state, then mint the profile fragment:
    `agent-ide evidence record --sandbox-state <file> --profile-id <id> --revision <n>
    --provider-binary <v> --toolchain <v> --configuration <v> --trust <v> --transport <v>
-   --d03-evidence <id>` (flags in this fixed order).
+   --d03-evidence <id> [--shape-version <1|2>]` (the nine flags in this fixed order; the
+   optional `--shape-version` flag trails them). The default is `2`: the shape-based record for
+   supported managed captures. A capture whose state cannot support v2 (a `disabled` or
+   unrecognized state) is refused rather than downgraded; pass `--shape-version 1` explicitly to
+   mint the legacy exact-digest record.
 5. Append the printed `{record, sandbox_state}` object to the target's `profiles` array and
-   restart the daemon, or validate first with `agent-ide launcher check <config-file>`.
+   restart the daemon, or validate first with `agent-ide launcher check <config-file>`. Existing
+   v1 records keep validating unchanged.
+
+Known limitation (T35B): shape v2 changes admission only. Native context/diff reads and cached
+result delivery still require an independent read proof, and deny-bearing states — including
+credential-glob captures admitted for managed execution — keep those operations unavailable
+until the follow-up same-cwd native-read proof lands. D03's current fixed expectations describe
+the legacy workspace-write profile; a reviewed profile-specific expectation manifest is part of
+that follow-up.
 
 ## Confined project checks (EYES-r2)
 
