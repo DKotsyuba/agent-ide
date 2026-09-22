@@ -1,8 +1,6 @@
 #!/bin/sh
-# WORK IN PROGRESS: this driver is unfinished and committed as-is to carry the
-# work forward. The direct Claude route is partially debugged and has not yet
-# produced a real_pass host-cell result, so nothing may wire it into release
-# acceptance yet.
+# Status: refreshed for the current hosts; first passing run pending; see
+# docs/macos-acceptance.md results table.
 
 # Shared helpers for the committed real-host acceptance drivers.
 #

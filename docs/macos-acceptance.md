@@ -28,12 +28,51 @@ scripts/macos-acceptance.sh --route product --evidence /absolute/output/evidence
 
 The `codex`, `claude`, and `agent-run-claude` routes accept an optional absolute `--driver`
 executable. Without one, the runner creates bounded `not_tested` evidence and makes no host claim.
-With one, `AGENT_IDE_ACCEPTANCE_HOST_VERSION` must be a public version token. The driver is invoked
-with no arguments and receives only these environment variables:
+With one, `AGENT_IDE_ACCEPTANCE_HOST_VERSION` must be a public version token — for the committed
+drivers that is `claude-code-2.1.274` (direct Claude) or `agent-run-0.12.4+claude-code-2.1.274`
+(agent-run to Claude). The driver is invoked with no arguments and receives only these environment
+variables:
 
 - `AGENT_IDE_ACCEPTANCE_ROUTE`;
 - `AGENT_IDE_ACCEPTANCE_LEFT_WORKTREE` and `AGENT_IDE_ACCEPTANCE_RIGHT_WORKTREE`;
 - `AGENT_IDE_ACCEPTANCE_RESULT`.
+
+Setting `AGENT_IDE_ACCEPTANCE_DRY=1` makes either committed driver print the exact session command
+lines and exit 0 without running anything.
+
+The direct `claude` driver runs `claude -p` sessions in each fixture worktree against the candidate
+binary's managed MCP and plugin, capturing stream-json transcripts:
+
+```sh
+claude -p "$(cat <prompt>)" --model haiku --output-format stream-json --verbose \
+  --dangerously-skip-permissions --strict-mcp-config --mcp-config <generated> \
+  --plugin-dir <worktree>
+```
+
+Claude Code 2.1.274 documents no flag that bounds agentic turns (`--max-turns` is gone from
+`claude --help`), so each session is bounded only by the driver's outer `perl alarm` wall clock.
+The strict launcher template defaults to `/Users/pluto/.config/agent-ide/launcher.json`, which
+carries the merged Codex profiles, Pyright, and the accepted TypeScript r3 provider
+`claude-r3-2026-09-14`.
+
+The `agent-run-claude` driver starts real agents through the installed agent-run 0.12.4 resident
+broker and reads their final answers:
+
+```sh
+agent-run start --runtime claude --model sonnet --profile implement \
+  --task "$(cat <task>)" --workdir <worktree> --write --wait
+agent-run answer <agent_id>
+```
+
+The route's intent is a real Claude host driven through agent-run, so the defaults select the
+`claude` runtime with `sonnet`; the owner's `glm`/`glm-5.3-flash` code-work delegation stays
+available through `AGENT_IDE_ACCEPTANCE_AGENT_RUN_RUNTIME`/`_MODEL`. The resident broker spawns the
+agent process, so environment set on the start command line (`AGENT_IDE_BIN`, `HOME`) does not
+reach the agent: the agent's MCP comes from the operator's `~/.agent-run/config.toml`
+`[mcp.agent_ide]` entry. `start --timeout` is legacy metadata only and does not stop execution, so
+the outer `perl alarm` is the only wall-clock bound. Because the driver cannot redirect the agent
+to the candidate, it fails closed with `installed_binary_differs` unless the installed
+`/Users/pluto/.local/bin/agent-ide` is byte-identical to the candidate binary.
 
 The driver must exercise the real host route and write exactly this ordered result to the result
 path:
@@ -68,7 +107,7 @@ Non-macOS execution emits `not_tested` evidence and does not create worktrees or
 Linux therefore remains explicitly `not_tested` until a separate real Linux acceptance contract is
 implemented.
 
-## v0.2 candidate results
+## Host-cell results
 
 The product candidate at revision `d88af079ac1e0c06d411208f513a1bfefeddf4b1` was exercised on
 macOS 26.6.2 arm64. Its locked [product gate](evidence/macos-v0.2-product.json) passed with the
@@ -78,11 +117,16 @@ documentation and evidence, not the tested product. The real-host matrix remains
 partially successful route is not a `real_pass`, and the runner marks every scenario `failed` when
 its strict driver withholds the exact complete result document.
 
+The committed drivers have since been refreshed for the current hosts (Claude Code 2.1.274,
+agent-run 0.12.4, launcher.json with the accepted `claude-r3-2026-09-14` TypeScript record; see
+the driver section above). The first passing run against those hosts is pending; the table below
+records the last executed cells, which ran on the earlier host versions shown.
+
 | Route | Public evidence | Result |
 |---|---|---|
-| Direct Codex CLI 0.154.0 | [JSON](evidence/macos-v0.2-direct-codex.json) | `failed`: real Pyright edit/stale/native behavior and TypeScript semantic Context ran; the first Diff inspection completed, then a further driver inspection failed without preserving its closed code, so no complete host claim exists |
-| Direct Claude Code 2.1.267 | [JSON](evidence/macos-v0.2-direct-claude.json) | `failed`: authenticated helper-backed Pyright activity ran in both worktrees; a focused registered-source Diff returned `workspace_authority`, and TypeScript remained lexical because no Claude TypeScript record is accepted |
-| Installed agent-run 0.11.8 to Claude Code 2.1.267 | [JSON](evidence/macos-v0.2-agent-run-claude.json) | `failed`: both divergent worktrees completed the real Pyright/helper path, including stale zero-write and native fallback; Diff inspection returned `capacity`, and TypeScript remained lexical because the tested Claude launcher had no accepted provider, so the complete cell did not pass |
+| Direct Codex CLI 0.154.0 | [JSON](evidence/macos-v0.2-direct-codex.json) | `failed` (Codex CLI 0.154.0): real Pyright edit/stale/native behavior and TypeScript semantic Context ran; the first Diff inspection completed, then a further driver inspection failed without preserving its closed code, so no complete host claim exists |
+| Direct Claude Code 2.1.267 | [JSON](evidence/macos-v0.2-direct-claude.json) | `failed` (Claude Code 2.1.267): authenticated helper-backed Pyright activity ran in both worktrees; a focused registered-source Diff returned `workspace_authority`, and TypeScript remained lexical because no Claude TypeScript record is accepted |
+| Installed agent-run 0.11.8 to Claude Code 2.1.267 | [JSON](evidence/macos-v0.2-agent-run-claude.json) | `failed` (agent-run 0.11.8 to Claude Code 2.1.267): both divergent worktrees completed the real Pyright/helper path, including stale zero-write and native fallback; Diff inspection returned `capacity`, and TypeScript remained lexical because the tested Claude launcher had no accepted provider, so the complete cell did not pass |
 
 The installed agent-run route is separate evidence and is not relabeled as direct Claude. Private
 driver prompts, local paths, credentials, transcripts, and host/run identifiers were retained only
@@ -97,6 +141,7 @@ the candidate MCP and foreground-helper route. This environment correction chang
 
 The remaining failures do not justify a product change in this task. The locked Claude helper gate
 passes real Pyright Context and Diff, while the live direct-Claude Diff failure is
-`workspace_authority`. The agent-run Diff failure is the distinct closed `capacity` result. Claude
-TypeScript is intentionally unavailable until an independently compiled macOS acceptance record is
-implemented, so enabling it here would bypass the release boundary rather than correct the driver.
+`workspace_authority`. The agent-run Diff failure is the distinct closed `capacity` result. The
+accepted TypeScript r3 provider `claude-r3-2026-09-14` has since been compiled and merged into the
+default launcher, so the refreshed drivers exercise it; whether it closes the TypeScript scenarios
+on the current hosts is exactly what the pending first passing run must show.
