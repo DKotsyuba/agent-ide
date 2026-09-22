@@ -1,7 +1,7 @@
 //! Contract tests for [`agent_ide::checks::python::PythonChecker`] (T098, EYES-r2 §4 "Python").
 //!
 //! Every test name is prefixed `python_` per the module task's naming convention. Fixtures live
-//! under `tests/fixtures/checks/python/`; the `errors`/`clean`/`badconfig` JSON fixtures were
+//! under `tests/fixtures/checks/`; the `errors`/`clean`/`badconfig` JSON fixtures were
 //! recorded from a real pinned-pyright run against the sibling fixture source and are replayed
 //! here through [`FakeRunner`], never re-invoking pyright. The real-runner (non-fake) end-to-end
 //! test is out of scope for this task; it is added at integration (T102).
@@ -17,10 +17,10 @@ use agent_ide::checks::python::{PythonChecker, parse_pyright_output, resolve_int
 use agent_ide::checks::runner::{ConfinedRunner, FakeRunner, RunOutput};
 use agent_ide::checks::{CheckRequest, CheckState, Checker, Severity, UnavailableReason};
 
-/// Returns the absolute path of one fixture under `tests/fixtures/checks/python/`.
+/// Returns the absolute path of one fixture under `tests/fixtures/checks/`.
 fn fixture(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/checks/python")
+        .join("tests/fixtures/checks")
         .join(relative)
 }
 
@@ -42,12 +42,13 @@ fn unique_temp_dir(label: &str) -> PathBuf {
 /// Returns the committed placeholder `(node, pyright_cli)` pair used by checker-level tests.
 ///
 /// Neither file is ever executed: [`FakeRunner`] intercepts every run before a process is
-/// spawned. Their layout (`.../bin/node`, `.../lib/node_modules/pyright/index.js`) mirrors a real
-/// npm-installed toolchain closely enough for `read_roots` assertions to be meaningful.
+/// spawned. Their layout (`.../bin/node`, `.../node_modules/pyright/index.js`) mirrors a real
+/// npm-installed toolchain closely enough for `read_roots` assertions to be meaningful, at a
+/// fixture depth the execution profile's conservative glob cap can prove (T37B).
 fn toolchain_paths() -> (PathBuf, PathBuf) {
     (
         fixture("toolchain/node/bin/node"),
-        fixture("toolchain/pyright/lib/node_modules/pyright/index.js"),
+        fixture("toolchain/pyright/node_modules/pyright/index.js"),
     )
 }
 

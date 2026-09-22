@@ -739,37 +739,54 @@ fn sorted_canonical_array(rules: impl Iterator<Item = Value>) -> Vec<Value> {
         .collect()
 }
 
-/// Returns the cwd's strict raw components after binding them to the trusted candidate (T35B-r).
+/// Returns the cwd's canonical components after binding them to the trusted candidate (T35B-r).
 ///
-/// The RAW `sandboxCwd` string is validated with the full local path/URI grammar before any
-/// `file://` conversion is consulted, so a fragment, query, host part, or percent-encoding in the
-/// original spelling refuses derivation instead of surviving as an ordinary path character. The
-/// result must then equal `trusted_cwd` component-wise: the trusted candidate or Workspace
-/// worktree is the directory the operation actually touches, and cwd-derived authority is never
-/// allowed to relocate beneath different restrictions. A `/` cwd also refuses: it would make
-/// every absolute path a workspace-relative descendant and widen the template.
+/// The RAW `sandboxCwd` string is validated with the full local path/URI grammar BEFORE any
+/// canonicalization is consulted, so a fragment, query, host part, or percent-encoding in the
+/// original spelling refuses derivation instead of surviving as an ordinary path character.
+/// Both sides are then canonicalized through the filesystem (`realpath` of an existing
+/// directory; a failed canonicalization refuses) and compared component-wise: the trusted
+/// candidate or Workspace worktree is the directory the operation actually touches, and
+/// cwd-derived authority is never allowed to relocate beneath different restrictions. Two
+/// spellings of the same real directory — for example the symlinked `/var/folders/...` form of
+/// the per-user temporary directory and its canonical `/private/var/folders/...` form — are one
+/// directory and bind, while a different real directory still refuses. A `/` cwd also refuses:
+/// it would make every absolute path a workspace-relative descendant and widen the template.
 fn cwd_components(
     state: &HostSandboxState,
     trusted_cwd: &Path,
 ) -> Result<Vec<String>, UnsupportedShape> {
-    let components = parse_path_components(state.sandbox_cwd())?;
-    if components.is_empty() {
+    let raw = parse_path_components(state.sandbox_cwd())?;
+    if raw.is_empty() {
         return Err(UnsupportedShape("root cwd"));
     }
+    let components = trusted_path_components(state.cwd())?;
     if trusted_path_components(trusted_cwd)? != components {
         return Err(UnsupportedShape("cwd binding"));
     }
     Ok(components)
 }
 
-/// Returns one trusted candidate/worktree path's strict raw components (T35B-r).
+/// Returns one trusted candidate/worktree path's canonical strict components (T35B-r).
 ///
-/// Only an absolute path whose every component is a normal, nonempty, non-UTF8-lossy name is
-/// accepted; the comparison against the state's cwd is component-wise, never a string prefix,
-/// so a symlinked alias or a `/work-escape` sibling is a different directory and refuses.
+/// The path is canonicalized through the filesystem first: `realpath` of an existing directory
+/// is the filesystem's own identity for that directory, so the symlinked `$TMPDIR` spelling and
+/// its canonical form bind to one directory while a failed canonicalization (a missing or
+/// otherwise unresolvable candidate) refuses. Only an absolute canonical path whose every
+/// component is a normal, nonempty, non-UTF8-lossy name is accepted; the comparison against the
+/// state's cwd is component-wise, never a string prefix, so a different real directory — a
+/// `/work-escape` sibling, for example — is a different directory and refuses.
 fn trusted_path_components(trusted_cwd: &Path) -> Result<Vec<String>, UnsupportedShape> {
+    canonical_path_components(
+        &std::fs::canonicalize(trusted_cwd)
+            .map_err(|_| UnsupportedShape("trusted cwd canonicalization"))?,
+    )
+}
+
+/// Returns one already-canonical absolute path's strict raw components (T35B-r).
+fn canonical_path_components(canonical: &Path) -> Result<Vec<String>, UnsupportedShape> {
     let mut components = Vec::new();
-    for component in trusted_cwd.components() {
+    for component in canonical.components() {
         match component {
             std::path::Component::Normal(name) => {
                 let name = name
