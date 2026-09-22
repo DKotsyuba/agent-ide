@@ -2630,6 +2630,8 @@ mod tests {
     /// capture never silently becomes one, and unknown shape versions refuse.
     #[test]
     fn evidence_record_defaults_to_shape_v2_for_supported_managed_captures() {
+        // The v2 shape binds the capture's cwd by realpath, so it must exist on any machine.
+        std::fs::create_dir_all("/private/tmp/t35b-capture").unwrap();
         let sandbox_state = std::env::temp_dir().join(format!(
             "agent-ide-evidence-record-v2-{}.json",
             std::process::id()
