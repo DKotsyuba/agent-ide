@@ -538,7 +538,7 @@ after_rows=$("$BINARY" telemetry export --database "$TELEMETRY_DB" 2>>"$DIAG_LOG
 [ "$after_rows" -gt "$before_rows" ] || fail A_TELEMETRY_RESTART_LOST "no new rows after restart"
 "$BINARY" telemetry query --database "$TELEMETRY_DB" >"$DIAG_DIR/telemetry-query.json" 2>>"$DIAG_LOG" \
     || fail A_TELEMETRY_QUERY_EXIT "query exited nonzero"
-jq -e '.events | length >= 1' "$DIAG_DIR/telemetry-query.json" >/dev/null 2>&1 \
+jq -e '.rows | length >= 1' "$DIAG_DIR/telemetry-query.json" >/dev/null 2>&1 \
     || fail A_TELEMETRY_QUERY_ROWS "query returned no events"
 fi
 
