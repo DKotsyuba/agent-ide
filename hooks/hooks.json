@@ -4,25 +4,25 @@
     "PreToolUse": [
       {
         "matcher": "",
-        "hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT:-$(pwd)}/hooks/claude-hook.sh", "args": []}]
+        "hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT:-$(pwd)}/hooks/claude-hook.sh"}]
       }
     ],
     "PostToolUse": [
       {
         "matcher": "",
-        "hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT:-$(pwd)}/hooks/claude-hook.sh", "args": []}]
+        "hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT:-$(pwd)}/hooks/claude-hook.sh"}]
       }
     ],
     "PostToolUseFailure": [
       {
         "matcher": "",
-        "hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT:-$(pwd)}/hooks/claude-hook.sh", "args": []}]
+        "hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT:-$(pwd)}/hooks/claude-hook.sh"}]
       }
     ],
     "PermissionDenied": [
       {
         "matcher": "",
-        "hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT:-$(pwd)}/hooks/claude-hook.sh", "args": []}]
+        "hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT:-$(pwd)}/hooks/claude-hook.sh"}]
       }
     ]
   }

@@ -150,6 +150,9 @@ fn claude_hook_and_mcp_share_the_installed_binary() {
     // hook otherwise (T33B); the command stays absolute-safe through the session cwd.
     assert!(claude_hooks.contains("${CLAUDE_PLUGIN_ROOT:-$(pwd)}/hooks/claude-hook.sh"));
     assert!(!claude_hooks.contains("\"${CLAUDE_PLUGIN_ROOT}/"));
+    // Claude Code 2.1.280 runs an entry that carries `args` in exec form without a shell, so the
+    // `${CLAUDE_PLUGIN_ROOT:-$(pwd)}` command above would never expand and the hook never runs.
+    assert!(!claude_hooks.contains("\"args\""));
     assert!(guide.contains("use that identical path"));
     assert!(guide.contains("as the MCP `command`"));
     assert!(guide.contains("claude plugin update agent-ide@agent-ide"));
