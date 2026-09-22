@@ -2536,6 +2536,77 @@ fn t36b_relevant_glob_depth_beyond_a_present_cap_is_unproven() {
 }
 
 #[test]
+fn t36b_non_ascii_denies_and_targets_are_never_provably_disjoint() {
+    // NFC folds the Kelvin sign `K` (U+212A) onto ASCII `K`, and a filesystem may store one
+    // spelling under the other's normalization form, so a byte-wise disjoint answer is never
+    // sound: every non-ASCII deny path, glob base, or target leaves the proof Unproven
+    // (T36B-r, review finding 2). `composed` and `decomposed` are the two normalization
+    // forms of the same name "Kéy"; the decomposed form even starts with an ASCII byte.
+    let composed = "K\u{e9}y";
+    let decomposed = "Ke\u{301}y";
+    let kelvin = "K\u{212a}ey";
+    assert_ne!(composed.as_bytes(), decomposed.as_bytes());
+    // A non-ASCII path deny (composed, decomposed, or Kelvin-signed) is ambiguous against
+    // every ASCII target under this cwd — exactly the reviewed counterexample.
+    for denied in [composed, decomposed, kelvin] {
+        let entries = serde_json::json!([
+            read_root(),
+            {"access":"deny","path":{"path":format!("{PROOF_CWD}/{denied}"),"type":"path"}}
+        ]);
+        assert_eq!(
+            proof_of(PROOF_CWD, entries, "Key"),
+            super::profile_shape::ReadProof::Unproven,
+            "non-ASCII path deny {denied:?} must not be declared disjoint from \"Key\""
+        );
+    }
+    // The mirror direction: an ASCII deny stays ambiguous against a non-ASCII target, so the
+    // target refuses even though its first byte matches no deny byte.
+    let ascii_deny = serde_json::json!([
+        read_root(),
+        {"access":"deny","path":{"path":format!("{PROOF_CWD}/Key"),"type":"path"}}
+    ]);
+    assert_eq!(
+        proof_of(PROOF_CWD, ascii_deny, decomposed),
+        super::profile_shape::ReadProof::Unproven,
+        "a non-ASCII target is never proven under a cwd with any deny"
+    );
+    // The same rule for glob bases: a wildcard-free glob whose base carries non-ASCII bytes
+    // refuses every target under the cwd instead of being cleared as disjoint.
+    for base in [composed, decomposed, kelvin] {
+        let glob = serde_json::json!([
+            read_root(),
+            {"access":"deny","path":{"pattern":format!("{PROOF_CWD}/{base}"),"type":"glob_pattern"}}
+        ]);
+        for target in ["Key", "other.txt", "src/main.py"] {
+            assert_eq!(
+                proof_of(PROOF_CWD, glob.clone(), target),
+                super::profile_shape::ReadProof::Unproven,
+                "non-ASCII glob base {base:?} must stay ambiguous for {target:?}"
+            );
+        }
+    }
+    // A relevant glob deny against a non-ASCII target cannot prove a nonmatch either: the
+    // matcher reports Unknown, and Unknown never clears a deny.
+    let ascii_glob = serde_json::json!([
+        read_root(),
+        {"access":"deny","path":{"pattern":format!("{PROOF_CWD}/*.key"),"type":"glob_pattern"}}
+    ]);
+    assert_eq!(
+        proof_of(PROOF_CWD, ascii_glob, decomposed),
+        super::profile_shape::ReadProof::Unproven
+    );
+    // Positive control: an all-ASCII deny set against an all-ASCII target still proves.
+    let ascii_pair = serde_json::json!([
+        read_root(),
+        {"access":"deny","path":{"path":format!("{PROOF_CWD}/Key"),"type":"path"}}
+    ]);
+    assert_eq!(
+        proof_of(PROOF_CWD, ascii_pair, "other.txt"),
+        super::profile_shape::ReadProof::Proven
+    );
+}
+
+#[test]
 fn t36b_write_fixtures_prove_main_refuse_env_and_key() {
     for name in [
         FIXTURE_1ED,

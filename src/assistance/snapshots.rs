@@ -50,6 +50,8 @@ impl SnapshotRunner for ProductSnapshotRunner<'_, '_> {
     /// This is the required Execution-backed boundary of [`SnapshotRunner`]: a denied or
     /// otherwise unprovable path fails the capture attempt before any native byte is read,
     /// so denied content can never reach a scratch file, a blob hash, or a cached page.
+    /// The refusal keeps the public `execution_profile` code and its closed
+    /// `read_scope:` condition (T36B-r) instead of degrading to a missing-source error.
     async fn authorize_read_path(&mut self, path: &Path) -> Result<(), GitError> {
         // The managed `diff` entry point has already required `observed` before any capture.
         let observed = self
@@ -67,7 +69,13 @@ impl SnapshotRunner for ProductSnapshotRunner<'_, '_> {
             errorlog_method(self.job.tool),
             crate::execution::ReadScope::Path(path),
         )
-        .map_err(|_| GitError::UnsupportedSnapshot)
+        .map_err(|refusal| {
+            // T36B-r: a per-path proof refusal is an execution-profile failure, never a
+            // missing source: preserve the public code and name the exact closed condition.
+            self.failure = Some(refusal.code);
+            self.detail = Some(refusal.detail);
+            GitError::UnsupportedSnapshot
+        })
     }
     /// Correlates this exact path with its current durable revision/sequence, when one exists.
     /// Never fabricates a token: an absent row, a store error, or a binding that stopped being
@@ -932,6 +940,8 @@ impl Worker<'_> {
         // delivered path plus its rename source — independently of the disposable pagination
         // state, so cached delivery must prove each under the live profile before it hands
         // back any composed page. The collector already bounded the path count and bytes.
+        // T36B-r: rendered pages also name untracked and conflict paths, so those names are
+        // provenance too — a name denied after capture refuses cached delivery.
         let provenance: BTreeSet<PathBuf> = evidence
             .paths()
             .iter()
@@ -940,6 +950,20 @@ impl Worker<'_> {
                 represented.extend(path.status().original_path().map(Path::to_path_buf));
                 represented
             })
+            .chain(
+                evidence
+                    .status()
+                    .untracked()
+                    .iter()
+                    .map(|entry| entry.path().to_path_buf()),
+            )
+            .chain(
+                evidence
+                    .status()
+                    .conflicts()
+                    .iter()
+                    .map(|entry| entry.path().to_path_buf()),
+            )
             .collect();
         self.shared.set_diff_provenance(&job.reference, provenance);
         let diff_page = result.detail_cursor().map(|cursor| DiffPageState {

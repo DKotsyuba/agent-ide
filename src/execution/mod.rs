@@ -1914,26 +1914,6 @@ pub fn validate_workspace_read(
     catalog.permit(&invocation.sandbox, authority.root())
 }
 
-/// Reports whether one observed host state independently proves whole-tree read coverage (T36B).
-///
-/// This is the T35B whole-tree proof — the recognized whole-root read grant AND no deny
-/// entries — for a managed state, and unconditional coverage for a disabled host (whose
-/// legacy read authority is the strict per-request cwd equality, not this classification).
-/// A state that fails to parse proves nothing. It feeds bookkeeping that must remember, at
-/// capture time, whether a later disclosure path can still be reread without a live per-path
-/// proof; it never replaces the live [`validate_workspace_read`] recheck.
-pub fn proves_whole_tree_read(observed: &ObservedSandboxState) -> bool {
-    match HostSandboxState::parse(Some(observed.state().as_json().clone())) {
-        Ok(sandbox) => match sandbox.class() {
-            ProfileClass::Managed => {
-                sandbox.grants_read_of_all_roots() && !sandbox.has_deny_entries()
-            }
-            ProfileClass::Disabled => true,
-        },
-        Err(_) => false,
-    }
-}
-
 impl ValidatedExecutionRequest {
     /// Intersects host state, local policy, and Workspace authority before an admission request.
     ///

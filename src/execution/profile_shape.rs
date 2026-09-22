@@ -441,6 +441,10 @@ pub(crate) enum ReadProof {
 ///
 /// ASCII case folding is applied on deny matching only (patterns, path denies, and glob
 /// bases alike), so a casing variant of a denied name can never read; grants are never folded.
+/// Non-ASCII is never folded and never provably disjoint: a non-ASCII byte in the target or
+/// in any relevant deny's path or glob base leaves the whole proof `Unproven`, because
+/// filesystem normalization can identify such a spelling with an ASCII name and Unicode
+/// wildcard semantics are out of scope (T36B-r).
 pub(crate) fn read_proof(
     shape: &ProfileShapeV2,
     trusted_cwd: &Path,
@@ -483,8 +487,10 @@ pub(crate) fn read_proof(
         return ReadProof::Unproven;
     }
     // Deny matching folds ASCII case on both sides — a casing variant of a denied name must
-    // never read — while non-ASCII stays byte-exact only when it provably cannot collide.
-    // Grants are never folded: coverage is decided above on the exact components.
+    // never read — and any non-ASCII byte on either side of a deny comparison refuses outright:
+    // filesystem normalization can identify a non-ASCII spelling with an ASCII name (NFC folds
+    // `K` U+212A onto `K`), so byte inequality never proves disjointness (T36B-r). Grants are
+    // never folded: coverage is decided above on the exact components.
     let target_folded = fold_components(&target);
     for deny in &shape.denies {
         match deny {
@@ -499,11 +505,11 @@ pub(crate) fn read_proof(
                             return ReadProof::Unproven;
                         }
                     }
-                    // A non-ASCII target is ambiguous against every deny: Unicode wildcard
-                    // and normalization semantics are out of scope, so the read refuses.
-                    (None, _) => return ReadProof::Unproven,
-                    // A non-ASCII deny can never prefix an all-ASCII target, folded or not.
-                    (Some(_), None) => {}
+                    // A non-ASCII target is ambiguous against every deny, and a non-ASCII deny
+                    // is ambiguous against every target under this cwd: Unicode wildcard and
+                    // filesystem-normalization semantics are out of scope, so neither side is
+                    // ever provably disjoint (T36B-r) and the read refuses.
+                    (None, _) | (Some(_), None) => return ReadProof::Unproven,
                 }
             }
             // 4. Glob denies: an unreachable base is irrelevant; every reachable suffix —
@@ -514,15 +520,17 @@ pub(crate) fn read_proof(
                     return ReadProof::Unproven;
                 };
                 // Relevance is decided on the folded components, so a casing variant of the
-                // base is never declared provably disjoint.
+                // base is never declared provably disjoint. A non-ASCII component on either
+                // side is ambiguity, never disjointness: filesystem normalization could bind
+                // the base to an ASCII spelling, so every target under this cwd refuses
+                // (T36B-r) instead of clearing the glob.
                 match (&target_folded, fold_components(&base_components)) {
                     (Some(target), Some(base)) => {
                         if !target.starts_with(base.as_slice()) {
                             continue;
                         }
                     }
-                    (None, _) => return ReadProof::Unproven,
-                    (Some(_), None) => continue,
+                    (None, _) | (Some(_), None) => return ReadProof::Unproven,
                 }
                 if let Some(limit) = shape.glob_scan_max_depth {
                     // Conservative depth accounting: base depth zero, one per target component
@@ -553,6 +561,9 @@ pub(crate) fn read_proof(
 }
 
 /// ASCII-folds every component of one path, or `None` when any component is non-ASCII (T36B).
+///
+/// `None` is ambiguity, never disjointness: callers must treat it as `Unproven` on whichever
+/// side of a deny comparison it appears (T36B-r).
 fn fold_components(components: &[String]) -> Option<Vec<String>> {
     components
         .iter()
