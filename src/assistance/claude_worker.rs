@@ -48,8 +48,15 @@ const MAX_IDENTIFIER_BYTES: usize = 256;
 /// foreground helper (T13B). A source up to `MAX_SOURCE_BYTES` (1 MiB) must fit whole beside its
 /// fixed header, so this is that ceiling plus 256 KiB of header room (T16B).
 pub(super) const MAX_RESULT_TEXT_BYTES: usize = 1024 * 1024 + 256 * 1024;
-/// Maximum raw bytes one reported discovery stream may carry.
-const MAX_DISCOVERY_STREAM_BYTES: usize = 8 * 1024;
+/// Maximum raw stdout bytes one reported discovery stream may carry.
+///
+/// `worktree list --porcelain -z` grows with every worktree (~200 bytes each); 8 KiB refused a
+/// repository with ~50 worktrees and the helper then dropped its whole result (T39G). Bytes travel
+/// JSON-encoded (up to ~4x), so six frames at this cap still fit one `MAX_HELPER_FRAME_BYTES` frame.
+// ponytail: fixed cap (~600 worktrees); stream or trim the list if a repository ever exceeds it.
+const MAX_DISCOVERY_STDOUT_BYTES: usize = 128 * 1024;
+/// Maximum raw stderr bytes one reported discovery stream may carry.
+const MAX_DISCOVERY_STDERR_BYTES: usize = 16 * 1024;
 /// Fixed helper subcommand; the model never selects an executable, argument or shell fragment.
 const HELPER_SUBCOMMAND: &str = "claude-worker";
 
@@ -792,8 +799,8 @@ pub struct DiscoveryFrame {
 impl DiscoveryFrame {
     /// Rejects an over-bound stream or non-Unix exit code before discovery status conversion.
     pub fn validate(&self) -> Result<(), FailureCode> {
-        if self.stdout.len() > MAX_DISCOVERY_STREAM_BYTES
-            || self.stderr.len() > MAX_DISCOVERY_STREAM_BYTES
+        if self.stdout.len() > MAX_DISCOVERY_STDOUT_BYTES
+            || self.stderr.len() > MAX_DISCOVERY_STDERR_BYTES
         {
             return Err(FailureCode::Capacity);
         }
@@ -1036,8 +1043,8 @@ impl HelperResult {
         if let Some(HelperPayload::Start { baseline }) = &self.payload
             && (baseline.len() != 3
                 || baseline.iter().any(|frame| {
-                    frame.stdout.len() > MAX_DISCOVERY_STREAM_BYTES
-                        || frame.stderr.len() > MAX_DISCOVERY_STREAM_BYTES
+                    frame.stdout.len() > MAX_DISCOVERY_STDOUT_BYTES
+                        || frame.stderr.len() > MAX_DISCOVERY_STDERR_BYTES
                 }))
         {
             return Err(FailureCode::Capacity);
@@ -3453,6 +3460,39 @@ mod tests {
                 Err(FailureCode::ExecutionProfile)
             );
         }
+    }
+
+    /// A worktree list from a repository with many worktrees (~10 KiB, seen live with ~50) is a
+    /// valid discovery frame, and a full three-frame result with it still encodes (T39G).
+    #[test]
+    fn many_worktree_discovery_frames_fit_the_helper_result() {
+        let frame = |stdout: Vec<u8>| DiscoveryFrame {
+            query: HelperQuery::WorktreeListPorcelainZ,
+            stdout,
+            stderr: Vec::new(),
+            exit_code: Some(0),
+            truncated: false,
+        };
+        let live = frame(vec![b'w'; 10_169]);
+        assert_eq!(live.validate(), Ok(()));
+        let result = HelperResult {
+            protocol: HELPER_PROTOCOL,
+            detail_ref: "d".into(),
+            outcome: HelperOutcome::Failed {
+                code: FailureCode::Capacity,
+            },
+            children: ChildSettlement {
+                spawned: 3,
+                reaped: 3,
+            },
+            discovery: vec![frame(vec![0xff; MAX_DISCOVERY_STDOUT_BYTES]); 3],
+            payload: None,
+        };
+        assert!(result.encode().is_ok());
+        assert_eq!(
+            frame(vec![b'w'; MAX_DISCOVERY_STDOUT_BYTES + 1]).validate(),
+            Err(FailureCode::Capacity)
+        );
     }
 
     /// Stop revokes first: a ticket on a revoked generation can no longer be claimed.
