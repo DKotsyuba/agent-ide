@@ -28,6 +28,9 @@ pub struct ClientLeaseRequest {
     pub request_id: String,
     /// Must equal the fixed literal `"assistance.client_lease"`.
     pub method: String,
+    /// Host-selected Claude candidate; absent for ordinary lease holders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate: Option<std::path::PathBuf>,
 }
 
 impl ClientLeaseRequest {
@@ -37,6 +40,7 @@ impl ClientLeaseRequest {
             version: CLIENT_LEASE_WIRE_VERSION,
             request_id: request_id.into(),
             method: "assistance.client_lease".to_owned(),
+            candidate: None,
         }
     }
 }
@@ -54,6 +58,9 @@ pub struct ClientLeaseAck {
     pub request_id: String,
     /// Always the fixed literal `"ok"`; admission failure closes the connection without a reply.
     pub status: String,
+    /// Daemon-minted target attachment for a registered Claude candidate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<String>,
 }
 
 /// Limits one finite Assistance transport call without creating a generic event channel.
@@ -301,6 +308,12 @@ pub struct AssistanceDispatchUnavailable;
 
 /// Allows Assistance to receive exactly one bounded dispatch while retaining all host/tool semantics.
 pub trait AssistanceDispatcher: Send + Sync {
+    /// Registers one host-selected Claude candidate on an existing repository daemon.
+    /// The returned opaque attachment selects only this candidate; activation still proves Git
+    /// identity and durable authority. Other dispatchers reject registration by default.
+    fn register_claude_candidate(&self, _candidate: &std::path::Path) -> Option<String> {
+        None
+    }
     /// Initializes optional daemon-owned peers only after Application holds its exclusive lock.
     /// Default dispatchers have no startup effects; failures prevent a partially initialized daemon.
     fn initialize<'a>(

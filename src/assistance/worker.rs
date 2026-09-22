@@ -445,6 +445,10 @@ struct Shared {
     notify: Notify,
     /// Immutable trusted restart configuration.
     launcher: LauncherConfig,
+    /// Additional Claude targets admitted by live managed MCP leases for this repository.
+    claude_targets: Mutex<BTreeMap<String, LaunchTarget>>,
+    /// The original Claude target is retired once a later lease observes its directory vanished.
+    retired_initial_claude_target: std::sync::atomic::AtomicBool,
     /// Boot-unique opaque prefix prevents detail/SQLite operation collisions after restart.
     nonce: [u8; 32],
     /// True after daemon shutdown fences admission and requests owned cleanup.
@@ -759,13 +763,60 @@ impl Drop for WorkerHandle {
     }
 }
 impl WorkerHandle {
-    /// Returns whether this configured worker owns the exact trusted launcher attachment.
-    ///
-    /// The immutable launcher map is consulted without allocating, performing I/O, or changing a
-    /// binding. Discovery-only dispatchers have no worker and retain their existing unavailable
-    /// behavior.
+    /// Returns whether this worker owns the exact launcher or lease-registered attachment.
+    /// Discovery-only dispatchers have no worker and retain their unavailable behavior.
     pub fn accepts_attachment(&self, attachment: &str) -> bool {
-        self.shared.launcher.target(attachment).is_some()
+        self.target(attachment).is_some()
+    }
+
+    /// Registers a separate target for a host-selected Claude project without changing live peers.
+    pub fn register_claude_candidate(&self, candidate: &Path) -> Option<String> {
+        let template = self.shared.launcher.sole_target()?.clone();
+        template.claude_profile?;
+        let resolved = std::fs::canonicalize(candidate).ok()?;
+        if resolved != candidate {
+            return None;
+        }
+        let candidate = resolved;
+        if !template.candidate.is_dir() {
+            self.shared
+                .retired_initial_claude_target
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        if template.candidate == candidate
+            && !self
+                .shared
+                .retired_initial_claude_target
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return self.shared.launcher.sole_attachment().map(str::to_owned);
+        }
+        let mut targets = self.shared.claude_targets.lock().ok()?;
+        targets.retain(|_, target| target.candidate.is_dir());
+        if let Some((attachment, _)) = targets
+            .iter()
+            .find(|(_, target)| target.candidate == candidate)
+        {
+            return Some(attachment.clone());
+        }
+        if targets.len() >= 63 {
+            return None;
+        }
+        let mut nonce = [0_u8; 32];
+        std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom").ok()?, &mut nonce)
+            .ok()?;
+        let attachment = nonce
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        targets.insert(
+            attachment.clone(),
+            LaunchTarget {
+                candidate,
+                ..template
+            },
+        );
+        Some(attachment)
     }
 
     /// Returns whether a job is queued or currently executing, without blocking.
@@ -814,6 +865,8 @@ impl WorkerHandle {
                 ledger: Mutex::new(Ledger::default()),
                 notify: Notify::new(),
                 launcher,
+                claude_targets: Mutex::new(BTreeMap::new()),
+                retired_initial_claude_target: std::sync::atomic::AtomicBool::new(false),
                 nonce,
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
                 shutdown_failure: Mutex::new(None),
@@ -1112,7 +1165,7 @@ impl WorkerHandle {
                 )
                 .await;
         }
-        let Some(target) = self.shared.launcher.target(attachment).cloned() else {
+        let Some(target) = self.target(attachment) else {
             return PeerReply::Error {
                 code: FailureCode::LauncherConfiguration,
             };
@@ -1436,7 +1489,7 @@ impl WorkerHandle {
         attachment: &str,
         expected: Option<(AssistanceTool, [u8; 32])>,
     ) -> PeerReply {
-        let Some(target) = self.shared.launcher.target(attachment).cloned() else {
+        let Some(target) = self.target(attachment) else {
             return PeerReply::Error {
                 code: FailureCode::LauncherConfiguration,
             };
@@ -1473,12 +1526,27 @@ impl WorkerHandle {
         })
     }
 
-    /// Returns the trusted immutable target mapped to one opaque attachment, if any.
-    ///
-    /// The mapping comes only from restart-loaded launcher configuration; no model argument,
-    /// working directory, PID or timing contributes to it.
+    /// Returns the launcher or lease-registered target mapped to one opaque attachment.
+    /// No model argument, working directory, PID or timing selects the target.
     pub fn target(&self, attachment: &str) -> Option<LaunchTarget> {
-        self.shared.launcher.target(attachment).cloned()
+        self.shared
+            .claude_targets
+            .lock()
+            .ok()?
+            .get(attachment)
+            .cloned()
+            .or_else(|| {
+                self.shared
+                    .launcher
+                    .target(attachment)
+                    .filter(|_| {
+                        !self
+                            .shared
+                            .retired_initial_claude_target
+                            .load(std::sync::atomic::Ordering::Acquire)
+                    })
+                    .cloned()
+            })
     }
 
     /// Returns the daemon-derived current scope and retained cache paths for one Claude binding.
@@ -1593,10 +1661,7 @@ impl WorkerHandle {
             return Err(FailureCode::Internal);
         }
         let target = self
-            .shared
-            .launcher
             .target(attachment)
-            .cloned()
             .ok_or(FailureCode::LauncherConfiguration)?;
         let binding = invocation.binding_ref().clone();
         let retain_detail = retains_detail(tool, &input);
@@ -2486,6 +2551,14 @@ impl<'a> Worker<'a> {
         let Some(super::claude_worker::HelperPayload::Start { baseline }) =
             settled.result().payload.as_ref()
         else {
+            job.failure_detail = Some(
+                if job.target.candidate.is_dir() {
+                    "helper_start_incomplete"
+                } else {
+                    "candidate_worktree_missing"
+                }
+                .to_owned(),
+            );
             return Err(FailureCode::SourceUnavailable);
         };
         let activation = job.parameters["activation_id"]
@@ -4962,6 +5035,8 @@ mod stop_retry_tests {
                 ledger: Mutex::new(Ledger::default()),
                 notify: Notify::new(),
                 launcher,
+                claude_targets: Mutex::new(BTreeMap::new()),
+                retired_initial_claude_target: std::sync::atomic::AtomicBool::new(false),
                 nonce: [7; 32],
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
                 shutdown_failure: Mutex::new(None),

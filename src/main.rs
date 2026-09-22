@@ -70,6 +70,10 @@ async fn main() -> ExitCode {
                                 .is_some_and(|attachment| config.target(&attachment).is_some())
                             {
                                 ProductDispatcher::with_managed_codex_launcher(config)
+                            } else if std::env::var("AGENT_IDE_MANAGED_CLAUDE_DAEMON").as_deref()
+                                == Ok("1")
+                            {
+                                ProductDispatcher::with_managed_claude_launcher(config)
                             } else {
                                 ProductDispatcher::with_launcher(config)
                             }
@@ -1389,6 +1393,8 @@ const CLAUDE_RUNTIME_PREFIX: &str = "ai-r-";
 const GIT_COMMON_DIR_TIMEOUT: Duration = Duration::from_secs(2);
 /// Fixed owner-only file carrying the full project identity and random transport attachment.
 const CLAUDE_ATTACHMENT_FILE: &str = "attachment";
+/// Per-candidate attachment cache written only after the daemon registers that candidate.
+const CLAUDE_CANDIDATE_ATTACHMENT_FILE: &str = "candidate-attachment";
 /// Exact record length: 64 digest bytes, one separator, 64 attachment bytes, and one newline.
 const CLAUDE_ATTACHMENT_BYTES: u64 = 130;
 
@@ -1508,6 +1514,57 @@ fn write_claude_key_cache(candidate: &Path, key: &Path) {
         .mode(0o600)
         .open(cache.join(CLAUDE_KEY_CACHE_FILE))
         .and_then(|mut file| file.write_all(key.as_os_str().as_bytes()));
+}
+
+/// Caches the daemon-minted candidate attachment in the existing private key-cache directory.
+fn write_claude_candidate_attachment(candidate: &Path, attachment: &str) {
+    if !valid_random_attachment(attachment) {
+        return;
+    }
+    if read_claude_key_cache(candidate).is_none() {
+        return;
+    }
+    let Ok(cache) = claude_key_cache_path(candidate) else {
+        return;
+    };
+    let path = cache.join(CLAUDE_CANDIDATE_ATTACHMENT_FILE);
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o600)
+        .open(path);
+    if let Ok(mut file) = file
+        && file.metadata().is_ok_and(|meta| {
+            meta.is_file()
+                && meta.uid() == unsafe { libc::geteuid() }
+                && meta.permissions().mode() & 0o777 == 0o600
+        })
+    {
+        let _ = file.set_len(0);
+        let _ = file.write_all(attachment.as_bytes());
+    }
+}
+
+/// Reads only a private bounded daemon-minted candidate attachment, when one is cached.
+fn read_claude_candidate_attachment(candidate: &Path) -> Option<String> {
+    let cache = claude_key_cache_path(candidate).ok()?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(cache.join(CLAUDE_CANDIDATE_ATTACHMENT_FILE))
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file()
+        || meta.uid() != unsafe { libc::geteuid() }
+        || meta.permissions().mode() & 0o777 != 0o600
+        || meta.len() != 64
+    {
+        return None;
+    }
+    let mut attachment = String::new();
+    file.take(65).read_to_string(&mut attachment).ok()?;
+    valid_random_attachment(&attachment).then_some(attachment)
 }
 
 /// Reads one candidate's cached rendezvous key without ever invoking `git`.
@@ -1775,9 +1832,10 @@ async fn run_managed_claude_hook(project: Option<OsString>) {
     let Some(key) = read_claude_key_cache(&project) else {
         return;
     };
-    let Ok((runtime, attachment)) = read_claude_attachment(&key) else {
+    let Ok((runtime, original_attachment)) = read_claude_attachment(&key) else {
         return;
     };
+    let attachment = read_claude_candidate_attachment(&project).unwrap_or(original_attachment);
     agent_ide::assistance::codex_hook::run(&runtime, Some(attachment), HostKind::Claude).await;
 }
 
@@ -1891,13 +1949,19 @@ async fn run_managed_claude_mcp(
     // Lets this client log its own lifecycle facts into the daemon's per-repository log.
     agent_ide::errorlog::init(&path);
     match rendezvous_with_claude_daemon(&path, &key, &launcher_template, &candidate).await {
-        Some((runtime_path, attachment)) => {
+        Some((runtime_path, _)) => {
             // Per EYES-r2 §2, this generation never owns the shared daemon's lifetime, so it holds
             // one `ClientLease` connection open for its own entire lifetime instead: the daemon's
             // idle-shutdown countdown only ever runs while zero managed Claude MCPs are attached.
             // `claude_reestablish_hook` replaces this handle with a fresh lease against the
             // re-established daemon, so the same guarantee holds across a reconnect.
-            let lease = Arc::new(Mutex::new(open_client_lease(&runtime_path).await));
+            let Some((connection, attachment)) = open_client_lease(&runtime_path, &candidate).await
+            else {
+                return serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None)
+                    .await;
+            };
+            write_claude_candidate_attachment(&candidate, &attachment);
+            let lease = Arc::new(Mutex::new(Some(connection)));
             let reestablish = claude_reestablish_hook(
                 path,
                 key,
@@ -1943,9 +2007,19 @@ fn claude_reestablish_hook(
             let started = std::time::Instant::now();
             let result =
                 rendezvous_with_claude_daemon(&path, &key, &launcher_template, &candidate).await;
-            if let Some((runtime_path, _)) = &result {
-                *lease.lock().await = open_client_lease(runtime_path).await;
-            }
+            let result = if let Some((runtime_path, _)) = result {
+                if let Some((connection, attachment)) =
+                    open_client_lease(&runtime_path, &candidate).await
+                {
+                    write_claude_candidate_attachment(&candidate, &attachment);
+                    *lease.lock().await = Some(connection);
+                    Some((runtime_path, attachment))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             agent_ide::errorlog::record(
                 agent_ide::errorlog::Method::Client,
                 if result.is_some() {
@@ -1973,8 +2047,8 @@ fn claude_reestablish_hook(
 /// Fails open: any connect, framing, or correlation fault yields `None`, and the managed MCP still
 /// serves normally without ever holding up an idle daemon's shutdown (EYES-r2 §2). The caller must
 /// hold the returned stream for its own entire process lifetime.
-async fn open_client_lease(runtime: &Path) -> Option<UnixStream> {
-    agent_ide::app::open_client_lease(runtime, "managed-claude-mcp").await
+async fn open_client_lease(runtime: &Path, candidate: &Path) -> Option<(UnixStream, String)> {
+    agent_ide::app::open_claude_client_lease(runtime, candidate).await
 }
 
 /// Adopts a currently live daemon, or spawns one and adopts the eventual winner of a start race.
@@ -2179,12 +2253,14 @@ async fn start_managed_daemon(
     match host {
         ManagedHost::Codex => {
             command.env("AGENT_IDE_MANAGED_CODEX_ATTACHMENT", &attachment);
+            command.env_remove("AGENT_IDE_MANAGED_CLAUDE_DAEMON");
         }
         ManagedHost::Claude => {
             // Claude deliberately uses the existing hook-correlated daemon path. The daemon is
             // shared by every worktree of this repository, so it must outlive this one MCP process:
             // it runs detached, in its own process group, and is never killed by dropping the handle.
             command.env_remove("AGENT_IDE_MANAGED_CODEX_ATTACHMENT");
+            command.env("AGENT_IDE_MANAGED_CLAUDE_DAEMON", "1");
             command.kill_on_drop(false);
             command.process_group(0);
         }
