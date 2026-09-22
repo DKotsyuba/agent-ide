@@ -287,6 +287,12 @@ impl SnapshotRunner for Runner {
             .cloned()
     }
 
+    /// Test harness: these fixtures run without a host sandbox, so every path is provable.
+    /// Production authorization lives in the Assistance product runner through Execution.
+    async fn authorize_read_path(&mut self, _path: &Path) -> Result<(), GitError> {
+        Ok(())
+    }
+
     /// Admits and reaps the exact peer command; scratch remains owned through process completion.
     async fn run(&mut self, intent: SnapshotIntent) -> Result<CapturedProcessEvidence, GitError> {
         use std::os::unix::fs::PermissionsExt;

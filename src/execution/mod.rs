@@ -512,6 +512,23 @@ impl HostSandboxState {
         ProfileShapeV2::derive(self, trusted_cwd)
     }
 
+    /// Proves one worktree-relative path readable under this state's live cwd-bound shape (T36B).
+    ///
+    /// The shape is derived against `trusted_cwd` — the authoritative worktree the read will
+    /// touch — so a state whose `sandboxCwd` is a different directory refuses derivation and
+    /// reports the conservative `Unproven` outcome here like any other unprovable path.
+    /// This is a pure permission proof of the already-validated state: no filesystem I/O, no
+    /// admission change, and no widening of the replayed state.
+    pub(crate) fn proves_read_path(&self, trusted_cwd: &Path, relative_path: &Path) -> bool {
+        match self.shape_v2(trusted_cwd) {
+            Ok(shape) => {
+                profile_shape::read_proof(&shape, trusted_cwd, relative_path)
+                    == profile_shape::ReadProof::Proven
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Reports whether any filesystem entry of the replayed profile denies access (T35B-r).
     ///
     /// Every `deny` entry counts, whatever its selector: a deny-bearing state keeps native reads
@@ -1814,6 +1831,23 @@ pub enum RequestError {
     TrampolineUnavailable,
     /// A trampolined program path would be misread by BSD `env` as an environment assignment.
     TrampolineProgramRejected,
+    /// A managed state without whole-tree read coverage could not prove one exact path under
+    /// the conservative per-path read proof (T36B). Distinct from a cwd mismatch: the binding
+    /// was sound, but grants, denies, or matcher ambiguity leave this path unprovable.
+    ReadPathUnproven,
+}
+
+/// The read scope one workspace-read recheck must prove (T36B).
+///
+/// `Path` names one exact worktree-relative path whose native read or cached disclosure is
+/// being authorized; `WholeTree` is the legacy restrictive behavior for callers that cannot
+/// name every path they may touch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadScope<'a> {
+    /// Prove this exact worktree-relative path under the live cwd-bound shape.
+    Path(&'a Path),
+    /// Prove whole-tree read authority; deny-bearing managed states always refuse.
+    WholeTree,
 }
 
 /// Couples the only inputs permitted to reach an owned operating-system spawn.
@@ -1835,30 +1869,44 @@ pub struct ValidatedExecutionRequest {
 /// Consumes fresh binding liveness, requires the accepted current profile, and applies local
 /// disabled-host policy without fabricating a command, child, or new Workspace grant.
 ///
-/// A managed state must independently prove whole-tree read authority of the live state, even
-/// when its `sandboxCwd` already is this worktree root (T35B-r): admission through a narrower v2
-/// shape must never confer read authority, so the proof is the recognized whole-root read grant
-/// AND no deny entries at all (path or glob). Any deny-bearing or otherwise unproven managed
-/// state stays unavailable for native reads and cached delivery — the known T35B limitation
-/// until per-path read proofs exist. A disabled host keeps the legacy strict cwd equality.
-/// Nothing else is relaxed: a stale binding, a mismatched authority, or an unaccepted profile
-/// still fails, and no permission is rewritten or widened.
+/// A managed state must independently prove read authority of the live state, even when its
+/// `sandboxCwd` already is this worktree root (T35B-r): admission through a narrower v2 shape
+/// must never confer read authority. [`ReadScope::WholeTree`] keeps the restrictive T35B
+/// behavior — the recognized whole-root read grant AND no deny entries at all (path or glob).
+/// [`ReadScope::Path`] first tries that same deny-free fast path (it skips only policy
+/// matching, never containment or no-follow enforcement) and otherwise derives the live
+/// cwd-bound shape v2 and requires the conservative per-path read proof (T36B): the
+/// derivation already refuses any state whose `sandboxCwd` is not the authoritative root, so
+/// a relocated grant cannot vouch for this directory. A disabled host keeps the legacy strict
+/// cwd equality. Nothing else is relaxed: a stale binding, a mismatched authority, or an
+/// unaccepted profile still fails, and no permission is rewritten or widened.
 pub fn validate_workspace_read(
     active_use: ActiveBindingUse,
     observed: ObservedSandboxState,
     authority: &WorkspaceAuthority,
     catalog: &ExecutionProfileCatalog,
     allow_explicit_disabled_host: bool,
+    scope: ReadScope<'_>,
 ) -> Result<ExecutionProfilePermit, RequestError> {
     let invocation = ValidatedHostInvocation::from_active_observation(active_use, observed)?;
+    let whole_tree =
+        invocation.sandbox.grants_read_of_all_roots() && !invocation.sandbox.has_deny_entries();
     let read_proven = match invocation.sandbox.class() {
-        ProfileClass::Managed => {
-            invocation.sandbox.grants_read_of_all_roots() && !invocation.sandbox.has_deny_entries()
-        }
+        ProfileClass::Managed => match scope {
+            ReadScope::WholeTree => whole_tree,
+            ReadScope::Path(path) => {
+                whole_tree || invocation.sandbox.proves_read_path(authority.root(), path)
+            }
+        },
         ProfileClass::Disabled => invocation.sandbox.cwd() == authority.root(),
     };
     if !read_proven {
-        return Err(RequestError::SandboxCwdMismatch);
+        // The cwd-mismatch refusal stays distinct: it names the Disabled host's failed cwd
+        // equality and the unscoped whole-tree refusal, never a per-path proof outcome.
+        return Err(match (invocation.sandbox.class(), scope) {
+            (ProfileClass::Managed, ReadScope::Path(_)) => RequestError::ReadPathUnproven,
+            _ => RequestError::SandboxCwdMismatch,
+        });
     }
     if invocation.sandbox.class() == ProfileClass::Disabled && !allow_explicit_disabled_host {
         return Err(RequestError::DisabledHostDenied);

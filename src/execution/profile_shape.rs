@@ -397,6 +397,328 @@ impl ProfileShapeV2 {
     }
 }
 
+/// Outcome of the conservative per-path native-read proof (T36B).
+///
+/// `Proven` means permission coverage of exactly one path under the supported conservative
+/// model of the live derived shape — never catalog admission, never a reusable filesystem
+/// capability, and never a claim about the path's current filesystem state. Everything this
+/// build cannot reason about is `Unproven`; there is no third, "probably fine" answer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReadProof {
+    /// The live shape's own grants positively cover this path and no deny can reach it.
+    Proven,
+    /// The path grammar, the binding, the grants, or any deny is missing, ambiguous, or
+    /// unsupported. The caller must refuse the native read.
+    Unproven,
+}
+
+/// Proves one worktree-relative path may be read natively under one live derived shape (T36B).
+///
+/// This is the design's exact four-condition decision, evaluated against the shape bound to
+/// `trusted_cwd` — the authoritative worktree the operation will actually touch. The shape
+/// itself carries no cwd (it never enters serialization or digests), so the binding is a
+/// per-call argument and a shape derived against a different directory simply refuses here
+/// through [`trusted_path_components`] and the [`Selector::WorkspaceRelative`] resolution.
+///
+/// The four conditions:
+///
+/// 1. **Path and binding:** `relative_path` must be nonempty with normal components only —
+///    absolute paths, `.`, `..`, empty components, NUL, and backslashes refuse before any
+///    normalization — and is joined component-wise beneath `trusted_cwd`.
+/// 2. **Positive coverage:** a `Root` read/write rule, or a `WorkspaceRelative` read/write
+///    rule whose components prefix the target's, with an *absent* (not `skip`)
+///    `missing_path_behavior`: a grant the host declared skipped when absent cannot establish
+///    authority. Temporary selectors and outside grants never count.
+/// 3. **Path denies:** any deny whose resolved selector is an ancestor of, or equal to, the
+///    target makes the result `Unproven` — even where a narrower grant might reopen it; this
+///    proof deliberately solves no precedence.
+/// 4. **Glob denies:** a glob whose literal base cannot reach the target is irrelevant;
+///    otherwise the pattern must provably not match the target suffix *and every intervening
+///    ancestor suffix up to and including base equality*, under the conservative matcher
+///    ([`glob_match_segments`]). A relevant glob under a present `glob_scan_max_depth` beyond
+///    the configured expansion depth refuses; the limit is never used to declare a glob
+///    irrelevant.
+///
+/// ASCII case folding is applied on deny matching only (patterns, path denies, and glob
+/// bases alike), so a casing variant of a denied name can never read; grants are never folded.
+/// Non-ASCII is never folded and never provably disjoint: a non-ASCII byte in the target or
+/// in any relevant deny's path or glob base leaves the whole proof `Unproven`, because
+/// filesystem normalization can identify such a spelling with an ASCII name and Unicode
+/// wildcard semantics are out of scope (T36B-r).
+pub(crate) fn read_proof(
+    shape: &ProfileShapeV2,
+    trusted_cwd: &Path,
+    relative_path: &Path,
+) -> ReadProof {
+    // 1. Path and binding grammar: strict raw components only, joined beneath the cwd.
+    //    The relative path is split on raw bytes, never `Path::components`, which silently
+    //    normalizes away `.` and empty components the grammar must refuse before normalization.
+    let cwd = match trusted_path_components(trusted_cwd) {
+        Ok(cwd) => cwd,
+        Err(_) => return ReadProof::Unproven,
+    };
+    let raw = match std::str::from_utf8(relative_path.as_os_str().as_encoded_bytes()) {
+        Ok(raw) => raw,
+        Err(_) => return ReadProof::Unproven,
+    };
+    if raw.is_empty() || raw.starts_with('/') || raw.contains(['\\', '\0']) {
+        return ReadProof::Unproven;
+    }
+    let mut target = cwd.clone();
+    for component in raw.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return ReadProof::Unproven;
+        }
+        target.push(component.to_owned());
+    }
+    let relative = &target[cwd.len()..];
+    // 2. Positive coverage: Root, or a workspace-relative selector prefixing the target.
+    //    `MissingPath::Skip` grants are not discarded — an absent skipped grant establishes
+    //    no authority — and temporary selectors or outside grants never cover a cwd path.
+    let covered = shape.rules.iter().any(|(selector, (_, missing))| {
+        *missing == MissingPath::Absent
+            && match selector {
+                Selector::Root => true,
+                Selector::WorkspaceRelative(components) => relative.starts_with(components),
+                Selector::Absolute(_) | Selector::SlashTmp | Selector::Tmpdir => false,
+            }
+    });
+    if !covered {
+        return ReadProof::Unproven;
+    }
+    // Deny matching folds ASCII case on both sides — a casing variant of a denied name must
+    // never read — and any non-ASCII byte on either side of a deny comparison refuses outright:
+    // filesystem normalization can identify a non-ASCII spelling with an ASCII name (NFC folds
+    // `K` U+212A onto `K`), so byte inequality never proves disjointness (T36B-r). Grants are
+    // never folded: coverage is decided above on the exact components.
+    let target_folded = fold_components(&target);
+    for deny in &shape.denies {
+        match deny {
+            // 3. Any ancestor-or-equal path deny refuses, regardless of grant precedence.
+            DenyRule::Path(selector) => {
+                let Some(denied) = resolve_selector(selector, &cwd) else {
+                    return ReadProof::Unproven;
+                };
+                match (&target_folded, fold_components(&denied)) {
+                    (Some(target), Some(denied)) => {
+                        if target.starts_with(denied.as_slice()) {
+                            return ReadProof::Unproven;
+                        }
+                    }
+                    // A non-ASCII target is ambiguous against every deny, and a non-ASCII deny
+                    // is ambiguous against every target under this cwd: Unicode wildcard and
+                    // filesystem-normalization semantics are out of scope, so neither side is
+                    // ever provably disjoint (T36B-r) and the read refuses.
+                    (None, _) | (Some(_), None) => return ReadProof::Unproven,
+                }
+            }
+            // 4. Glob denies: an unreachable base is irrelevant; every reachable suffix —
+            //    the target's own and each ancestor's, including the empty base-equality
+            //    suffix — must provably not match.
+            DenyRule::Glob { base, pattern } => {
+                let Some(base_components) = resolve_selector(base, &cwd) else {
+                    return ReadProof::Unproven;
+                };
+                // Relevance is decided on the folded components, so a casing variant of the
+                // base is never declared provably disjoint. A non-ASCII component on either
+                // side is ambiguity, never disjointness: filesystem normalization could bind
+                // the base to an ASCII spelling, so every target under this cwd refuses
+                // (T36B-r) instead of clearing the glob.
+                match (&target_folded, fold_components(&base_components)) {
+                    (Some(target), Some(base)) => {
+                        if !target.starts_with(base.as_slice()) {
+                            continue;
+                        }
+                    }
+                    (None, _) | (Some(_), None) => return ReadProof::Unproven,
+                }
+                if let Some(limit) = shape.glob_scan_max_depth {
+                    // Conservative depth accounting: base depth zero, one per target component
+                    // below the base. Exceeding a present cap refuses; it never clears a glob.
+                    if target.len() - base_components.len() > limit as usize {
+                        return ReadProof::Unproven;
+                    }
+                }
+                let Some(pattern_segments) = glob_pattern_segments(pattern) else {
+                    return ReadProof::Unproven;
+                };
+                // The compared paths are the target and every ancestor at or below the base:
+                // prefix by prefix below the base, so a pattern matching an ancestor directory
+                // (for example `*.key` against `x.key/child`) refuses the descendant too. The
+                // empty prefix is base equality itself, which a wildcard-free stored remainder
+                // (empty pattern) matches exactly.
+                let below = &target[base_components.len()..];
+                for end in 0..=below.len() {
+                    match glob_match_segments(&pattern_segments, &below[..end]) {
+                        GlobMatch::DoesNotMatch => {}
+                        GlobMatch::Matches | GlobMatch::Unknown => return ReadProof::Unproven,
+                    }
+                }
+            }
+        }
+    }
+    ReadProof::Proven
+}
+
+/// ASCII-folds every component of one path, or `None` when any component is non-ASCII (T36B).
+///
+/// `None` is ambiguity, never disjointness: callers must treat it as `Unproven` on whichever
+/// side of a deny comparison it appears (T36B-r).
+fn fold_components(components: &[String]) -> Option<Vec<String>> {
+    components
+        .iter()
+        .map(|component| {
+            if component.is_ascii() {
+                Some(component.to_ascii_lowercase())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Resolves one deny selector into absolute components in the proof's coordinate system (T36B).
+///
+/// `cwd` is the trusted cwd's strict components; workspace-relative selectors join beneath it
+/// and absolute selectors are taken as-is. Special selectors cannot be resolved to a path in
+/// this coordinate system and deliberately yield `None` (which callers treat as unproven);
+/// derivation never produces them for denies, so this is defense in depth, not a live branch.
+fn resolve_selector(selector: &Selector, cwd: &[String]) -> Option<Vec<String>> {
+    match selector {
+        Selector::WorkspaceRelative(components) => {
+            let mut resolved = cwd.to_vec();
+            resolved.extend(components.iter().cloned());
+            Some(resolved)
+        }
+        Selector::Absolute(components) => Some(components.clone()),
+        Selector::Root | Selector::SlashTmp | Selector::Tmpdir => None,
+    }
+}
+
+/// Splits one stored glob deny remainder into conservative pattern segments (T36B).
+///
+/// The stored nonempty remainder starts with the base boundary separator; exactly that one
+/// leading separator is removed and the rest splits on separators. Any empty segment
+/// (doubled or trailing separator), any bracket/brace/negation/escape syntax, any `**` that
+/// is not a complete segment, and any non-ASCII byte are unsupported: the caller must treat
+/// the whole glob as unprovable instead of falling back to literal matching.
+fn glob_pattern_segments(pattern: &str) -> Option<Vec<&str>> {
+    if pattern.is_empty() {
+        // A wildcard-free glob stores the empty remainder and matches exactly its base.
+        return Some(Vec::new());
+    }
+    let pattern = pattern.strip_prefix('/')?;
+    if pattern.is_empty() {
+        // A lone separator leaves no pattern at all: a malformed base boundary.
+        return None;
+    }
+    let mut segments = Vec::new();
+    for segment in pattern.split('/') {
+        if segment.is_empty()
+            || !segment.is_ascii()
+            || segment.contains(['\\', '[', ']', '{', '}', '!'])
+            || (segment.contains("**") && segment != "**")
+        {
+            return None;
+        }
+        segments.push(segment);
+    }
+    Some(segments)
+}
+
+/// Outcome of one conservative anchored whole-path glob comparison (T36B).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GlobMatch {
+    /// The pattern provably matches the candidate path.
+    Matches,
+    /// The pattern provably cannot match the candidate path.
+    DoesNotMatch,
+    /// The pattern uses syntax or characters this conservative matcher does not interpret;
+    /// the caller must refuse rather than fall back to a literal comparison.
+    Unknown,
+}
+
+/// Anchored whole-path conservative glob comparison over complete segments (T36B).
+///
+/// Supported syntax: literal bytes (ASCII, case-folded on both sides — a deny match must
+/// survive a casing variant), `*` for zero or more characters within one segment, `?` for
+/// exactly one character within one segment, and a complete `**` segment for zero or more
+/// complete segments (including zero depth). Dotfiles get no special treatment. Both inputs
+/// must be ASCII — the caller rejects non-ASCII patterns, and any non-ASCII candidate segment
+/// is `Unknown` because Unicode wildcard and filesystem-normalization semantics are out of
+/// scope. Matching is bounded dynamic programming: the per-segment wildcard DP is
+/// O(pattern × name) and the segment sweep is O(pattern segments × path segments), so no
+/// input can trigger exponential backtracking.
+fn glob_match_segments(pattern: &[&str], path: &[String]) -> GlobMatch {
+    let mut reachable = vec![0_usize];
+    for segment in pattern {
+        let mut next = Vec::new();
+        if *segment == "**" {
+            // Zero or more complete segments: every position from the minimum reachable one
+            // onward stays reachable. `reachable` is always sorted and dense from its start.
+            let start = reachable[0];
+            next.extend(start..=path.len());
+        } else {
+            let folded = match ascii_fold(segment) {
+                Some(folded) => folded,
+                None => return GlobMatch::Unknown,
+            };
+            for &position in &reachable {
+                if position < path.len() {
+                    let candidate = match ascii_fold(&path[position]) {
+                        Some(candidate) => candidate,
+                        None => return GlobMatch::Unknown,
+                    };
+                    if wildcard_segment_matches(folded.as_bytes(), candidate.as_bytes()) {
+                        next.push(position + 1);
+                    }
+                }
+            }
+        }
+        if next.is_empty() {
+            return GlobMatch::DoesNotMatch;
+        }
+        reachable = next;
+    }
+    if reachable.contains(&(path.len())) {
+        GlobMatch::Matches
+    } else {
+        GlobMatch::DoesNotMatch
+    }
+}
+
+/// Folds one ASCII segment to lowercase, or `None` when it contains non-ASCII bytes (T36B).
+fn ascii_fold(segment: &str) -> Option<String> {
+    if !segment.is_ascii() {
+        return None;
+    }
+    Some(segment.to_ascii_lowercase())
+}
+
+/// Bounded wildcard DP for one segment: `*` spans characters, `?` matches one (T36B).
+///
+/// `pattern` and `name` are already ASCII-folded. Classic two-row dynamic programming over
+/// prefix lengths, so worst-case work is linear in the product of the input lengths.
+fn wildcard_segment_matches(pattern: &[u8], name: &[u8]) -> bool {
+    let mut previous = vec![false; name.len() + 1];
+    let mut current = vec![false; name.len() + 1];
+    previous[0] = true;
+    for &byte in pattern {
+        current[0] = previous[0] && byte == b'*';
+        for (name_index, &name_byte) in name.iter().enumerate() {
+            current[name_index + 1] = match byte {
+                // `*` extends a match that either already covered this name prefix without
+                // consuming it, or covered one fewer name character and consumes this one.
+                b'*' => previous[name_index + 1] || current[name_index],
+                b'?' => previous[name_index],
+                literal => previous[name_index] && literal == name_byte,
+            };
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[name.len()]
+}
+
 /// Returns the closed `missing_path_behavior` spelling, or `None` when the entry was absent.
 fn missing_behavior_tag(missing: MissingPath) -> Option<&'static str> {
     match missing {
@@ -731,4 +1053,176 @@ fn derive_entry(
         }
     }
     Ok(())
+}
+
+/// Focused unit tests for the conservative matcher and pattern splitter (T36B).
+///
+/// Patterns are given in their exact stored spelling: the stored nonempty remainder starts
+/// with the base boundary separator, and `glob_pattern_segments` removes exactly that one
+/// separator before splitting.
+#[cfg(test)]
+mod matcher_tests {
+    use super::{GlobMatch, glob_match_segments, glob_pattern_segments};
+
+    /// Builds pattern segments exactly as a derived deny stores them.
+    fn pattern(raw: &str) -> Vec<&str> {
+        glob_pattern_segments(raw).unwrap_or_else(|| panic!("pattern must parse: {raw}"))
+    }
+
+    /// Classifies one comparison against a candidate path of complete segments.
+    fn classify(raw: &str, path: &[&str]) -> GlobMatch {
+        glob_match_segments(
+            &pattern(raw),
+            &path.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn literals_match_themselves_whole_path_only() {
+        assert_eq!(classify("/.env", &[".env"]), GlobMatch::Matches);
+        assert_eq!(classify("/.env", &[".env2"]), GlobMatch::DoesNotMatch);
+        // Anchored: a whole-path match never matches a deeper or shallower path.
+        assert_eq!(classify("/.env", &["src", ".env"]), GlobMatch::DoesNotMatch);
+        assert_eq!(classify("/src/.env", &[".env"]), GlobMatch::DoesNotMatch);
+        assert_eq!(
+            classify("/src/.env", &["src", ".env", "child"]),
+            GlobMatch::DoesNotMatch
+        );
+    }
+
+    #[test]
+    fn star_spans_within_one_segment_only() {
+        assert_eq!(classify("/*.key", &["x.key"]), GlobMatch::Matches);
+        assert_eq!(classify("/*.key", &[".key"]), GlobMatch::Matches);
+        assert_eq!(
+            classify("/*.key", &["dir", "x.key"]),
+            GlobMatch::DoesNotMatch
+        );
+        assert_eq!(
+            classify("/src/*.rs", &["a", "b.rs"]),
+            GlobMatch::DoesNotMatch
+        );
+        assert_eq!(classify("/src/*.rs", &["src", "b.rs"]), GlobMatch::Matches);
+        assert_eq!(classify("/a*c", &["abc"]), GlobMatch::Matches);
+        // `*` spans any characters, so `a*c` does match `abbc`.
+        assert_eq!(classify("/a*c", &["abbc"]), GlobMatch::Matches);
+    }
+
+    #[test]
+    fn question_matches_exactly_one_character() {
+        assert_eq!(classify("/?.key", &["x.key"]), GlobMatch::Matches);
+        assert_eq!(classify("/?.key", &[".key"]), GlobMatch::DoesNotMatch);
+        assert_eq!(classify("/?.key", &["xy.key"]), GlobMatch::DoesNotMatch);
+        assert_eq!(classify("/??", &["ab"]), GlobMatch::Matches);
+        assert_eq!(classify("/??", &["abc"]), GlobMatch::DoesNotMatch);
+    }
+
+    #[test]
+    fn double_star_segment_matches_zero_or_many_segments() {
+        assert_eq!(classify("/**/.env", &[".env"]), GlobMatch::Matches);
+        assert_eq!(classify("/**/.env", &["a", ".env"]), GlobMatch::Matches);
+        assert_eq!(
+            classify("/**/.env", &["a", "b", "c", ".env"]),
+            GlobMatch::Matches
+        );
+        assert_eq!(
+            classify("/**/.env", &["a", "b", "c"]),
+            GlobMatch::DoesNotMatch
+        );
+        assert_eq!(classify("/a/**/b", &["a", "b"]), GlobMatch::Matches);
+        assert_eq!(
+            classify("/a/**/b", &["a", "x", "y", "b"]),
+            GlobMatch::Matches
+        );
+        assert_eq!(
+            classify("/a/**/b", &["a", "x", "y", "c"]),
+            GlobMatch::DoesNotMatch
+        );
+        assert_eq!(classify("/**", &[]), GlobMatch::Matches);
+        assert_eq!(classify("/**", &["a", "b"]), GlobMatch::Matches);
+    }
+
+    #[test]
+    fn dotfiles_and_boundaries_get_no_special_treatment() {
+        // A literal dot is a dot, and `*` still spans dotfile names.
+        assert_eq!(classify("/*", &[".env"]), GlobMatch::Matches);
+        assert_eq!(classify("/.env.*", &[".env.local"]), GlobMatch::Matches);
+        assert_eq!(classify("/.env.*", &[".env"]), GlobMatch::DoesNotMatch);
+        assert_eq!(
+            classify("/.env.*", &[".env.production.key"]),
+            GlobMatch::Matches
+        );
+    }
+
+    #[test]
+    fn ancestor_prefixes_are_compared_by_the_caller_not_the_matcher() {
+        // The matcher itself is a plain anchored whole-path comparison; read_proof applies it
+        // to every ancestor-or-equal prefix below the base. `*.key` cannot match the
+        // two-segment child path here...
+        assert_eq!(
+            classify("/*.key", &["x.key", "child"]),
+            GlobMatch::DoesNotMatch
+        );
+        // ...but it does match the ancestor directory itself, which read_proof therefore
+        // refuses on (`*.key` against `x.key/child` is Unproven).
+        assert_eq!(classify("/*.key", &["x.key"]), GlobMatch::Matches);
+    }
+
+    #[test]
+    fn ascii_case_folding_makes_deny_matches_case_insensitive() {
+        assert_eq!(classify("/.ENV", &[".env"]), GlobMatch::Matches);
+        assert_eq!(
+            classify("/**/*.KEY", &["certs", "X.key"]),
+            GlobMatch::Matches
+        );
+        assert_eq!(classify("/Readme?", &["README2"]), GlobMatch::Matches);
+    }
+
+    #[test]
+    fn unsupported_syntax_and_characters_are_unknown_never_literal() {
+        for raw in [
+            "/[a-z].env",  // bracket class
+            "/se?ret[!x]", // negated bracket class
+            "/{a,b}.env",  // brace alternation
+            "/a**b",       // embedded `**`
+            "/**//x",      // doubled separator
+            "/**/x/",      // trailing separator
+            "/café",       // non-ASCII pattern
+            "/ba\\ck",     // escape (already refused at derivation, never literal here)
+        ] {
+            assert_eq!(
+                glob_pattern_segments(raw),
+                None,
+                "{raw} must be unsupported"
+            );
+        }
+    }
+
+    #[test]
+    fn non_ascii_candidates_are_unknown() {
+        assert_eq!(classify("/**/x", &["café"]), GlobMatch::Unknown);
+        assert_ne!(classify("/**/x", &["x"]), GlobMatch::Unknown);
+    }
+
+    #[test]
+    fn empty_remainder_matches_only_base_equality() {
+        let empty = glob_pattern_segments("").unwrap();
+        assert!(empty.is_empty(), "a wildcard-free glob stores no remainder");
+        assert_eq!(classify("", &[]), GlobMatch::Matches);
+        assert_eq!(classify("", &["anything"]), GlobMatch::DoesNotMatch);
+    }
+
+    #[test]
+    fn matching_is_bounded_on_pathological_inputs() {
+        // Bounded DP: an alternating-star pattern stays polynomial and exact. (Runs of
+        // adjacent stars would be unsupported `**` syntax, not a backtracking hazard.)
+        let pattern = format!("/x{}", "*y".repeat(64));
+        let name = format!("x{}", "y".repeat(64));
+        let longer = format!("{name}z");
+        assert_eq!(classify(&pattern, &[name.as_str()]), GlobMatch::Matches);
+        assert_eq!(
+            classify(&pattern, &[longer.as_str()]),
+            GlobMatch::DoesNotMatch
+        );
+    }
 }

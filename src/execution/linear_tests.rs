@@ -2285,3 +2285,356 @@ fn v1_exact_and_v2_narrower_templates_compete_over_compatible_selectors() {
         "a v1 exact digest beats a genuine v2 narrowing proof"
     );
 }
+
+// ---------------------------------------------------------------------------
+// T36B: the conservative per-path native-read proof. Synthetic states below
+// carry the minimal entries each rule needs; the six captured write fixtures
+// seal the same decisions on real host captures.
+// ---------------------------------------------------------------------------
+
+/// Builds one minimal managed restricted state with the given cwd and filesystem entries.
+fn proof_state(cwd: &str, entries: serde_json::Value) -> HostSandboxState {
+    HostSandboxState::parse(Some(serde_json::json!({
+        "permissionProfile":{"type":"managed","file_system":{"entries":entries,"type":"restricted"},"network":"restricted"},
+        "codexLinuxSandboxExe":null,"sandboxCwd":cwd,"useLegacyLandlock":false
+    })))
+    .unwrap()
+}
+
+/// Derives the shape of a synthetic state bound to its own cwd and runs the read proof.
+fn proof_of(
+    cwd: &str,
+    entries: serde_json::Value,
+    relative: &str,
+) -> super::profile_shape::ReadProof {
+    let state = proof_state(cwd, entries);
+    let shape = state.shape_v2(state.cwd()).unwrap();
+    super::profile_shape::read_proof(&shape, state.cwd(), Path::new(relative))
+}
+
+/// The `read`-of-root grant that stands in for whole-tree coverage in synthetic states.
+fn read_root() -> serde_json::Value {
+    serde_json::json!({"access":"read","path":{"type":"special","value":{"kind":"root"}}})
+}
+
+const PROOF_CWD: &str = "/private/tmp/t36b-work";
+
+#[test]
+fn t36b_path_grammar_refuses_every_non_normal_relative_path() {
+    for relative in [
+        "",            // empty
+        "/etc/passwd", // absolute
+        "..",          // parent
+        "a/../b",      // embedded parent
+        "a/./b",       // embedded dot
+        "a//b",        // empty component
+        "a\\b",        // backslash
+        "a/\0b",       // NUL byte — matches any byte after the slash, so it stays refused
+    ] {
+        assert_eq!(
+            proof_of(PROOF_CWD, serde_json::json!([read_root()]), relative),
+            super::profile_shape::ReadProof::Unproven,
+            "{relative:?} must be unprovable"
+        );
+    }
+}
+
+#[test]
+fn t36b_positive_coverage_requires_root_or_prefixing_workspace_relative_absent_grant() {
+    let write_cwd = serde_json::json!([
+        {"access":"write","path":{"path":PROOF_CWD,"type":"path"}}
+    ]);
+    assert_eq!(
+        proof_of(PROOF_CWD, write_cwd, "src/main.py"),
+        super::profile_shape::ReadProof::Proven,
+        "a cwd write selector prefixes the target and covers it"
+    );
+    let write_subdir = serde_json::json!([
+        {"access":"write","path":{"path":format!("{PROOF_CWD}/src"),"type":"path"}}
+    ]);
+    assert_eq!(
+        proof_of(PROOF_CWD, write_subdir.clone(), "src/main.py"),
+        super::profile_shape::ReadProof::Proven,
+        "a nested prefixing selector covers the target"
+    );
+    assert_eq!(
+        proof_of(PROOF_CWD, write_subdir, "tests/main.py"),
+        super::profile_shape::ReadProof::Unproven,
+        "a selector that does not prefix the target covers nothing"
+    );
+    // A skipped grant is not discarded as noise: an absent skipped grant cannot establish
+    // authority, so only the root grant below carries the coverage decision.
+    let skipped_only = serde_json::json!([
+        {"access":"read","path":{"path":format!("{PROOF_CWD}/src"),"type":"path"},"missing_path_behavior":"skip"}
+    ]);
+    assert_eq!(
+        proof_of(PROOF_CWD, skipped_only, "src/main.py"),
+        super::profile_shape::ReadProof::Unproven,
+        "a MissingPath::Skip grant does not establish authority"
+    );
+    let skipped_plus_root = serde_json::json!([
+        {"access":"read","path":{"type":"special","value":{"kind":"root"}}},
+        {"access":"read","path":{"path":format!("{PROOF_CWD}/src"),"type":"path"},"missing_path_behavior":"skip"}
+    ]);
+    assert_eq!(
+        proof_of(PROOF_CWD, skipped_plus_root, "src/main.py"),
+        super::profile_shape::ReadProof::Proven,
+        "coverage comes from the present root grant, not the skipped one"
+    );
+}
+
+#[test]
+fn t36b_binding_refuses_a_relocated_cwd() {
+    // The cwd never enters the serialized shape, so binding safety comes from derivation:
+    // deriving against a trusted cwd that is not the state's own `sandboxCwd` refuses, which
+    // is exactly how `validate_workspace_read` binds the live shape to the authoritative root.
+    let state = proof_state(
+        PROOF_CWD,
+        serde_json::json!([{"access":"write","path":{"path":PROOF_CWD,"type":"path"}}]),
+    );
+    assert!(state.shape_v2(state.cwd()).is_ok());
+    assert!(state.shape_v2(Path::new("/private/tmp/elsewhere")).is_err());
+    let shape = state.shape_v2(state.cwd()).unwrap();
+    assert_eq!(
+        super::profile_shape::read_proof(&shape, state.cwd(), Path::new("src/main.py")),
+        super::profile_shape::ReadProof::Proven
+    );
+}
+
+#[test]
+fn t36b_path_denies_refuse_ancestors_and_equality() {
+    let entries = serde_json::json!([
+        {"access":"read","path":{"type":"special","value":{"kind":"root"}}},
+        {"access":"deny","path":{"path":format!("{PROOF_CWD}/certs/x.key"),"type":"path"}}
+    ]);
+    assert_eq!(
+        proof_of(PROOF_CWD, entries.clone(), "certs/x.key"),
+        super::profile_shape::ReadProof::Unproven,
+        "an exact denied file is unproven"
+    );
+    let dir_deny = serde_json::json!([
+        read_root(),
+        {"access":"deny","path":{"path":format!("{PROOF_CWD}/certs"),"type":"path"}}
+    ]);
+    assert_eq!(
+        proof_of(PROOF_CWD, dir_deny, "certs/x.key"),
+        super::profile_shape::ReadProof::Unproven,
+        "an ancestor deny refuses its descendants"
+    );
+    // A deny below the target is not an ancestor deny: reading the parent directory itself
+    // is decided by grants and other denies only (no precedence solving in either direction).
+    assert_eq!(
+        proof_of(PROOF_CWD, entries.clone(), "certs"),
+        super::profile_shape::ReadProof::Proven
+    );
+    // ASCII case-folded path denies count as possible matches: a casing variant stays denied.
+    assert_eq!(
+        proof_of(PROOF_CWD, entries.clone(), "CERTS/X.KEY"),
+        super::profile_shape::ReadProof::Unproven
+    );
+    // Grants are never folded: coverage was decided on exact components before this point.
+    assert_eq!(
+        proof_of(PROOF_CWD, entries, "certs/other.key"),
+        super::profile_shape::ReadProof::Proven
+    );
+}
+
+#[test]
+fn t36b_glob_denies_stay_conservative_per_the_design_matrix() {
+    let with_glob = |pattern: &str| {
+        serde_json::json!([
+            read_root(),
+            {"access":"deny","path":{"pattern":format!("{PROOF_CWD}{pattern}"),"type":"glob_pattern"}}
+        ])
+    };
+    // `**/.env` against `.env.local` is a nonmatch — but other denies still apply, and here
+    // none do, so the file proves.
+    assert_eq!(
+        proof_of(PROOF_CWD, with_glob("/.env"), ".env.local"),
+        super::profile_shape::ReadProof::Proven
+    );
+    assert_eq!(
+        proof_of(PROOF_CWD, with_glob("/**/.env"), ".env"),
+        super::profile_shape::ReadProof::Unproven,
+        "the exact denied file matches `**/.env`"
+    );
+    // `*.key` against `x.key/child`: the ancestor directory matches, so the child is unproven.
+    assert_eq!(
+        proof_of(PROOF_CWD, with_glob("/*.key"), "x.key/child"),
+        super::profile_shape::ReadProof::Unproven
+    );
+    // A case variant of a denied name stays denied under conservative ASCII folding.
+    assert_eq!(
+        proof_of(PROOF_CWD, with_glob("/**/.env"), ".ENV"),
+        super::profile_shape::ReadProof::Unproven
+    );
+    assert_eq!(
+        proof_of(PROOF_CWD, with_glob("/*.KEY"), "x.key"),
+        super::profile_shape::ReadProof::Unproven
+    );
+    // A relevant glob containing `[` (or any unsupported syntax) is never declared irrelevant.
+    assert_eq!(
+        proof_of(PROOF_CWD, with_glob("/**/x[0]"), "src/main.py"),
+        super::profile_shape::ReadProof::Unproven
+    );
+    // A provably disjoint base is irrelevant and never refuses on its own.
+    let disjoint = serde_json::json!([
+        read_root(),
+        {"access":"deny","path":{"pattern":"/private/tmp/other-work/**/*.key","type":"glob_pattern"}}
+    ]);
+    assert_eq!(
+        proof_of(PROOF_CWD, disjoint, "src/main.py"),
+        super::profile_shape::ReadProof::Proven
+    );
+}
+
+#[test]
+fn t36b_relevant_glob_depth_beyond_a_present_cap_is_unproven() {
+    let deep = "a/b/c/d/e/f/g/h/i.txt";
+    let shallow = "a/b.txt";
+    assert_eq!(deep.split('/').count(), 9, "nine components below the base");
+    assert_eq!(shallow.split('/').count(), 2);
+    // The glob `/**/*.key` is relevant to both targets, yet neither matches it.
+    let with_cap = |depth: serde_json::Value| {
+        let mut raw = serde_json::json!({
+            "permissionProfile":{"type":"managed","file_system":{"entries":[
+                {"access":"read","path":{"type":"special","value":{"kind":"root"}}},
+                {"access":"deny","path":{"pattern":format!("{PROOF_CWD}/**/*.key"),"type":"glob_pattern"}}
+            ],"type":"restricted"},"network":"restricted"},
+            "codexLinuxSandboxExe":null,"sandboxCwd":PROOF_CWD,"useLegacyLandlock":false
+        });
+        if !depth.is_null() {
+            raw["permissionProfile"]["file_system"]["glob_scan_max_depth"] = depth;
+        }
+        HostSandboxState::parse(Some(raw)).unwrap()
+    };
+    let prove = |state: &HostSandboxState, relative: &str| {
+        let shape = super::profile_shape::ProfileShapeV2::derive(state, state.cwd()).unwrap();
+        super::profile_shape::read_proof(&shape, state.cwd(), Path::new(relative))
+    };
+    // Depth nine exceeds the captured cap of eight: the glob may expand differently, so the
+    // read refuses. The limit never declares the glob irrelevant.
+    assert_eq!(
+        prove(&with_cap(serde_json::json!(8)), deep),
+        super::profile_shape::ReadProof::Unproven
+    );
+    // Two components sit below the cap, and the glob provably cannot match anyway.
+    assert_eq!(
+        prove(&with_cap(serde_json::json!(8)), shallow),
+        super::profile_shape::ReadProof::Proven
+    );
+    assert_eq!(
+        prove(&with_cap(serde_json::json!(16)), deep),
+        super::profile_shape::ReadProof::Proven,
+        "a higher cap admits the deep path once the glob cannot match"
+    );
+    // An absent cap never depth-refuses.
+    assert_eq!(
+        prove(&with_cap(serde_json::Value::Null), deep),
+        super::profile_shape::ReadProof::Proven
+    );
+}
+
+#[test]
+fn t36b_non_ascii_denies_and_targets_are_never_provably_disjoint() {
+    // NFC folds the Kelvin sign `K` (U+212A) onto ASCII `K`, and a filesystem may store one
+    // spelling under the other's normalization form, so a byte-wise disjoint answer is never
+    // sound: every non-ASCII deny path, glob base, or target leaves the proof Unproven
+    // (T36B-r, review finding 2). `composed` and `decomposed` are the two normalization
+    // forms of the same name "Kéy"; the decomposed form even starts with an ASCII byte.
+    let composed = "K\u{e9}y";
+    let decomposed = "Ke\u{301}y";
+    let kelvin = "K\u{212a}ey";
+    assert_ne!(composed.as_bytes(), decomposed.as_bytes());
+    // A non-ASCII path deny (composed, decomposed, or Kelvin-signed) is ambiguous against
+    // every ASCII target under this cwd — exactly the reviewed counterexample.
+    for denied in [composed, decomposed, kelvin] {
+        let entries = serde_json::json!([
+            read_root(),
+            {"access":"deny","path":{"path":format!("{PROOF_CWD}/{denied}"),"type":"path"}}
+        ]);
+        assert_eq!(
+            proof_of(PROOF_CWD, entries, "Key"),
+            super::profile_shape::ReadProof::Unproven,
+            "non-ASCII path deny {denied:?} must not be declared disjoint from \"Key\""
+        );
+    }
+    // The mirror direction: an ASCII deny stays ambiguous against a non-ASCII target, so the
+    // target refuses even though its first byte matches no deny byte.
+    let ascii_deny = serde_json::json!([
+        read_root(),
+        {"access":"deny","path":{"path":format!("{PROOF_CWD}/Key"),"type":"path"}}
+    ]);
+    assert_eq!(
+        proof_of(PROOF_CWD, ascii_deny, decomposed),
+        super::profile_shape::ReadProof::Unproven,
+        "a non-ASCII target is never proven under a cwd with any deny"
+    );
+    // The same rule for glob bases: a wildcard-free glob whose base carries non-ASCII bytes
+    // refuses every target under the cwd instead of being cleared as disjoint.
+    for base in [composed, decomposed, kelvin] {
+        let glob = serde_json::json!([
+            read_root(),
+            {"access":"deny","path":{"pattern":format!("{PROOF_CWD}/{base}"),"type":"glob_pattern"}}
+        ]);
+        for target in ["Key", "other.txt", "src/main.py"] {
+            assert_eq!(
+                proof_of(PROOF_CWD, glob.clone(), target),
+                super::profile_shape::ReadProof::Unproven,
+                "non-ASCII glob base {base:?} must stay ambiguous for {target:?}"
+            );
+        }
+    }
+    // A relevant glob deny against a non-ASCII target cannot prove a nonmatch either: the
+    // matcher reports Unknown, and Unknown never clears a deny.
+    let ascii_glob = serde_json::json!([
+        read_root(),
+        {"access":"deny","path":{"pattern":format!("{PROOF_CWD}/*.key"),"type":"glob_pattern"}}
+    ]);
+    assert_eq!(
+        proof_of(PROOF_CWD, ascii_glob, decomposed),
+        super::profile_shape::ReadProof::Unproven
+    );
+    // Positive control: an all-ASCII deny set against an all-ASCII target still proves.
+    let ascii_pair = serde_json::json!([
+        read_root(),
+        {"access":"deny","path":{"path":format!("{PROOF_CWD}/Key"),"type":"path"}}
+    ]);
+    assert_eq!(
+        proof_of(PROOF_CWD, ascii_pair, "other.txt"),
+        super::profile_shape::ReadProof::Proven
+    );
+}
+
+#[test]
+fn t36b_write_fixtures_prove_main_refuse_env_and_key() {
+    for name in [
+        FIXTURE_1ED,
+        FIXTURE_555,
+        FIXTURE_B8A,
+        FIXTURE_C9E,
+        FIXTURE_FD3,
+        FIXTURE_84F,
+    ] {
+        let state = fixture_state(name);
+        let shape = state.shape_v2(state.cwd()).unwrap();
+        let prove = |relative: &str| {
+            super::profile_shape::read_proof(&shape, state.cwd(), Path::new(relative))
+        };
+        assert_eq!(
+            prove("src/main.py"),
+            super::profile_shape::ReadProof::Proven,
+            "{name}: src/main.py must be proven"
+        );
+        assert_eq!(
+            prove(".env"),
+            super::profile_shape::ReadProof::Unproven,
+            "{name}: .env must be unproven"
+        );
+        assert_eq!(
+            prove("certs/x.key"),
+            super::profile_shape::ReadProof::Unproven,
+            "{name}: certs/x.key must be unproven"
+        );
+    }
+}

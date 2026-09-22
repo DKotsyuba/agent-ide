@@ -184,12 +184,15 @@ sandbox mode:
    restart the daemon, or validate first with `agent-ide launcher check <config-file>`. Existing
    v1 records keep validating unchanged.
 
-Known limitation (T35B): shape v2 changes admission only. Native context/diff reads and cached
-result delivery still require an independent read proof, and deny-bearing states — including
-credential-glob captures admitted for managed execution — keep those operations unavailable
-until the follow-up same-cwd native-read proof lands. D03's current fixed expectations describe
-the legacy workspace-write profile; a reviewed profile-specific expectation manifest is part of
-that follow-up.
+Known limitation (updated by T36B): shape v2 changes admission, and native reads are no longer
+all-or-nothing. Since the T36B per-path read proof, native context/diff reads and cached result
+delivery also work on deny-bearing states — including credential-glob captures admitted for
+managed execution — for every path the live cwd-bound shape proves: `observe` proves its exact
+source, diff proves each tracked path, reread, and untracked inspection before reading, and
+cached delivery proves every represented path before disclosing anything. Paths a deny can
+reach (or that the conservative matcher cannot reason about) still refuse with
+`read_scope:path_unproven`, and whole-tree scope keeps the restrictive deny-free behavior.
+D03's current fixed acceptance expectations describe the legacy workspace-write profile.
 
 ## Confined project checks (EYES-r2)
 

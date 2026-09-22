@@ -443,10 +443,34 @@ impl Worker<'_> {
         let bundle = launch
             .typescript_bundle()
             .map_err(|_| FailureCode::ExecutionProfile)?;
+        // T36B: the resolution inputs are auxiliary native reads — proving the requested
+        // source never authorizes them — so every candidate is proven per path under the
+        // live cwd-bound profile before Workspace touches it.
+        let shared = self.shared.clone();
+        let observed = job.observed.clone();
+        let target = job.target.clone();
+        let stamp = authority.clone();
+        let proof_binding = binding.clone();
+        let method = errorlog_method(job.tool);
+        let path_proof = move |path: &Path| {
+            observed.as_ref().is_some_and(|observed| {
+                validate_read_scope(
+                    &shared,
+                    &proof_binding,
+                    observed,
+                    &target,
+                    &stamp,
+                    method,
+                    crate::execution::ReadScope::Path(path),
+                )
+                .is_ok()
+            })
+        };
         let resolution = ProjectResolutionInputsV1::observe(
             authority.worktree().clone(),
             authority.worktree().worktree_path().join(source.path()),
             &bundle,
+            &path_proof,
         )
         .map_err(|_| FailureCode::ResolutionUnverified)?;
         let profile = TypeScriptProfile::new(
@@ -461,10 +485,12 @@ impl Worker<'_> {
             execution_authority(&authority)?,
         )
         .map_err(|_| FailureCode::WorkspaceAuthority)?;
-        let command = profile.command(&worktree).map_err(|error| match error {
-            TypeScriptProfileError::InvalidResolution => FailureCode::ResolutionUnverified,
-            _ => FailureCode::ExecutionProfile,
-        })?;
+        let command = profile
+            .command(&worktree, &path_proof)
+            .map_err(|error| match error {
+                TypeScriptProfileError::InvalidResolution => FailureCode::ResolutionUnverified,
+                _ => FailureCode::ExecutionProfile,
+            })?;
         let node = launch.node.as_ref().ok_or(FailureCode::ExecutionProfile)?;
         let request = self
             .execution_request(job, &authority, command, node)
@@ -511,6 +537,7 @@ impl Worker<'_> {
                 Some(active),
                 &job.target.codex.path,
                 self.shared.launcher.limits.output_bytes,
+                &path_proof,
             )
         };
         let mut child = match child {
@@ -607,7 +634,9 @@ impl Worker<'_> {
                 return Err(FailureCode::Deadline);
             }
         };
-        if profile.verify_resolution().is_err() {
+        // T36B: the post-operation remeasure rereads every resolution input, so it proves
+        // each one again under the live profile instead of trusting the spawn-time proof.
+        if profile.verify_resolution(&path_proof).is_err() {
             self.providers
                 .typescript
                 .quarantine_after(&view, TypeScriptShutdownFailure::Operation);

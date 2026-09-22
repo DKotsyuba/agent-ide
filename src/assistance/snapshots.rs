@@ -45,6 +45,38 @@ impl SnapshotRunner for ProductSnapshotRunner<'_, '_> {
             }
         }
     }
+    /// Proves one worktree-relative path readable under the live cwd-bound profile (T36B).
+    ///
+    /// This is the required Execution-backed boundary of [`SnapshotRunner`]: a denied or
+    /// otherwise unprovable path fails the capture attempt before any native byte is read,
+    /// so denied content can never reach a scratch file, a blob hash, or a cached page.
+    /// The refusal keeps the public `execution_profile` code and its closed
+    /// `read_scope:` condition (T36B-r) instead of degrading to a missing-source error.
+    async fn authorize_read_path(&mut self, path: &Path) -> Result<(), GitError> {
+        // The managed `diff` entry point has already required `observed` before any capture.
+        let observed = self
+            .job
+            .observed
+            .as_ref()
+            .ok_or(GitError::UnsupportedSnapshot)?;
+        let binding = self.job.invocation.binding_ref().clone();
+        validate_read_scope(
+            &self.worker.shared,
+            &binding,
+            observed,
+            &self.job.target,
+            &self.authority,
+            errorlog_method(self.job.tool),
+            crate::execution::ReadScope::Path(path),
+        )
+        .map_err(|refusal| {
+            // T36B-r: a per-path proof refusal is an execution-profile failure, never a
+            // missing source: preserve the public code and name the exact closed condition.
+            self.failure = Some(refusal.code);
+            self.detail = Some(refusal.detail);
+            GitError::UnsupportedSnapshot
+        })
+    }
     /// Correlates this exact path with its current durable revision/sequence, when one exists.
     /// Never fabricates a token: an absent row, a store error, or a binding that stopped being
     /// live across the awaited store round-trip all fall through to `None`, exactly like a path
@@ -799,14 +831,14 @@ impl Worker<'_> {
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
         let binding = job.invocation.binding_ref().clone();
         let authority = self.authority(&binding).await?;
-        validate_read_scope(
-            &self.shared,
-            &binding,
-            job.observed.as_ref().ok_or(FailureCode::SandboxState)?,
-            &job.target,
-            &authority,
-            errorlog_method(job.tool),
-        )?;
+        // T36B: the former entry-level whole-tree read gate is replaced by per-path
+        // authorization inside the capture — `SnapshotRunner::authorize_read_path` routes
+        // every native read (tracked captures, staged mode, consistency rereads, untracked
+        // inspection) through `validate_workspace_read` with `ReadScope::Path`, which still
+        // performs the binding, catalog, and disabled-host checks per path. A whole-tree gate
+        // here would refuse every deny-bearing state before any per-path proof could run,
+        // making proven-path diffs on such states unreachable. A capture that reads no path
+        // at all discloses no worktree bytes either.
         let mode = match job.parameters["mode"].as_str() {
             Some("head") => DiffMode::Head,
             Some("staged") => DiffMode::Staged,
@@ -904,6 +936,36 @@ impl Worker<'_> {
                 )
             },
         )?;
+        // T36B: retain the bounded provenance of every path this diff represents — each
+        // delivered path plus its rename source — independently of the disposable pagination
+        // state, so cached delivery must prove each under the live profile before it hands
+        // back any composed page. The collector already bounded the path count and bytes.
+        // T36B-r: rendered pages also name untracked and conflict paths, so those names are
+        // provenance too — a name denied after capture refuses cached delivery.
+        let provenance: BTreeSet<PathBuf> = evidence
+            .paths()
+            .iter()
+            .flat_map(|path| {
+                let mut represented = vec![path.status().path().to_path_buf()];
+                represented.extend(path.status().original_path().map(Path::to_path_buf));
+                represented
+            })
+            .chain(
+                evidence
+                    .status()
+                    .untracked()
+                    .iter()
+                    .map(|entry| entry.path().to_path_buf()),
+            )
+            .chain(
+                evidence
+                    .status()
+                    .conflicts()
+                    .iter()
+                    .map(|entry| entry.path().to_path_buf()),
+            )
+            .collect();
+        self.shared.set_diff_provenance(&job.reference, provenance);
         let diff_page = result.detail_cursor().map(|cursor| DiffPageState {
             scope: scope.clone(),
             comparison: comparison.clone(),

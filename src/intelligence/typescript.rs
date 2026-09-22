@@ -174,6 +174,14 @@ impl TypeScriptProviderBundleV1 {
     }
 }
 
+/// The per-path native-read proof required before any resolution input is read (T36B).
+///
+/// `true` means the caller's live host profile covers exactly this relative path; any
+/// `false` fails the whole resolution closed. Implementations without a sandbox model (the
+/// Claude helper) admit every path; the Codex session routes each candidate through
+/// Execution's cwd-bound per-path read proof.
+pub type ResolutionPathProof<'a> = dyn Fn(&Path) -> bool + 'a;
+
 /// One already-observed project-resolution file identity; this type performs no filesystem read.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectResolutionFileV1 {
@@ -228,6 +236,7 @@ impl ProjectResolutionInputsV1 {
         document: PathBuf,
         bundle: &TypeScriptProviderBundleV1,
         files: Vec<ProjectResolutionFileV1>,
+        path_proof: &ResolutionPathProof<'_>,
     ) -> Result<Self, TypeScriptProfileError> {
         let relative = document
             .strip_prefix(worktree.worktree_path())
@@ -238,7 +247,7 @@ impl ProjectResolutionInputsV1 {
         let language_id =
             typescript_language_id(&relative).ok_or(TypeScriptProfileError::InvalidResolution)?;
         validate_resolution_files(&relative, &files)?;
-        if observe_resolution_files(&worktree, &relative)? != files {
+        if observe_resolution_files(&worktree, &relative, path_proof)? != files {
             return Err(TypeScriptProfileError::InvalidResolution);
         }
         let bundle_id = bundle.bundle_id();
@@ -267,6 +276,7 @@ impl ProjectResolutionInputsV1 {
         worktree: WorktreeRef,
         document: PathBuf,
         bundle: &TypeScriptProviderBundleV1,
+        path_proof: &ResolutionPathProof<'_>,
     ) -> Result<Self, TypeScriptProfileError> {
         let relative = document
             .strip_prefix(worktree.worktree_path())
@@ -274,16 +284,19 @@ impl ProjectResolutionInputsV1 {
             .filter(|path| normal_relative(path))
             .ok_or(TypeScriptProfileError::InvalidResolution)?
             .to_path_buf();
-        let files = observe_resolution_files(&worktree, &relative)?;
-        Self::new(worktree, document, bundle, files)
+        let files = observe_resolution_files(&worktree, &relative, path_proof)?;
+        Self::new(worktree, document, bundle, files, path_proof)
     }
 
     /// Remeasures every present and missing ancestor candidate against this exact snapshot.
     ///
     /// Any addition, removal, replacement, byte change, unsupported shape, root replacement, or
     /// bound failure returns `InvalidResolution`. No caller receives a partially updated identity.
-    pub fn verify(&self) -> Result<(), TypeScriptProfileError> {
-        (observe_resolution_files(&self.worktree, &self.document)? == self.files)
+    pub fn verify(
+        &self,
+        path_proof: &ResolutionPathProof<'_>,
+    ) -> Result<(), TypeScriptProfileError> {
+        (observe_resolution_files(&self.worktree, &self.document, path_proof)? == self.files)
             .then_some(())
             .ok_or(TypeScriptProfileError::InvalidResolution)
     }
@@ -348,12 +361,13 @@ impl TypeScriptProfile {
     pub fn command(
         &self,
         worktree: &TypeScriptWorktree,
+        path_proof: &ResolutionPathProof<'_>,
     ) -> Result<ControlledCommand, TypeScriptProfileError> {
         if self.resolution.worktree() != worktree.worktree() {
             return Err(TypeScriptProfileError::WorktreeMismatch);
         }
         self.bundle.verify()?;
-        self.resolution.verify()?;
+        self.resolution.verify(path_proof)?;
         let command = ControlledCommand::from_validated_peer(
             CommandKind::Provider,
             self.bundle.node().to_path_buf(),
@@ -380,8 +394,11 @@ impl TypeScriptProfile {
     }
 
     /// Remeasures the complete document-to-worktree resolution boundary.
-    pub fn verify_resolution(&self) -> Result<(), TypeScriptProfileError> {
-        self.resolution.verify()
+    pub fn verify_resolution(
+        &self,
+        path_proof: &ResolutionPathProof<'_>,
+    ) -> Result<(), TypeScriptProfileError> {
+        self.resolution.verify(path_proof)
     }
 
     /// Returns fixed initialization options disabling typing acquisition, plugins, package auto
@@ -665,10 +682,11 @@ impl TypeScriptProtocolChild {
         active_use: Option<ActiveBindingUse>,
         codex_executable: &Path,
         output_cap: usize,
+        path_proof: &ResolutionPathProof<'_>,
     ) -> Result<Self, TypeScriptProfileError> {
         if let Err(error) = profile
             .verify_bundle()
-            .and_then(|()| profile.verify_resolution())
+            .and_then(|()| profile.verify_resolution(path_proof))
         {
             registry
                 .cancel_unstarted(admission, view)
@@ -925,9 +943,14 @@ fn validate_resolution_files(
 }
 
 /// Reads the complete deterministic ancestor candidate set and returns sorted present identities.
+///
+/// `path_proof` must authorize each auxiliary resolution input before Workspace reads it
+/// (T36B): proving the requested source document never authorizes these files. An unproven
+/// candidate fails the resolution closed — it is never skipped as if missing.
 fn observe_resolution_files(
     worktree: &WorktreeRef,
     document: &Path,
+    path_proof: &ResolutionPathProof<'_>,
 ) -> Result<Vec<ProjectResolutionFileV1>, TypeScriptProfileError> {
     if ancestor_has_node_modules(&worktree.worktree_path().join(document))? {
         return Err(TypeScriptProfileError::InvalidResolution);
@@ -946,6 +969,9 @@ fn observe_resolution_files(
     let mut files = Vec::new();
     let mut remaining = MAX_RESOLUTION_BYTES as usize;
     for path in candidates {
+        if !path_proof(&path) {
+            return Err(TypeScriptProfileError::InvalidResolution);
+        }
         let observed = match read_authorized_resolution_input(worktree, &path, remaining) {
             Ok(observed) => observed,
             Err(ObservationError::Missing) => continue,
@@ -1276,6 +1302,7 @@ mod tests {
                     blake3: blake3::hash(config),
                     bytes: config.len() as u64,
                 }],
+                &|_| true,
             )
             .unwrap();
             let profile =
@@ -1308,7 +1335,7 @@ mod tests {
         ValidatedExecutionRequest::validate(
             ValidatedHostInvocation::from_verified_binding("typescript-test", sandbox).unwrap(),
             worktree.authority().clone(),
-            profile.command(worktree).unwrap(),
+            profile.command(worktree, &|_| true).unwrap(),
             &policy,
             &catalog,
         )
@@ -1349,6 +1376,7 @@ mod tests {
                     blake3: blake3::hash(config),
                     bytes: config.len() as u64,
                 }],
+                &|_| true,
             )
             .unwrap();
             assert_eq!(resolution.language_id(), language);
@@ -1357,7 +1385,13 @@ mod tests {
         let bundle = fixture.bundle();
         let (worktree, _) = fixture.worktree();
         assert!(matches!(
-            ProjectResolutionInputsV1::new(worktree, fixture.root.join("file.md"), &bundle, vec![]),
+            ProjectResolutionInputsV1::new(
+                worktree,
+                fixture.root.join("file.md"),
+                &bundle,
+                vec![],
+                &|_| true,
+            ),
             Err(TypeScriptProfileError::InvalidResolution)
         ));
     }
@@ -1430,12 +1464,20 @@ mod tests {
         let nested_config =
             br#"{"compilerOptions":{"types":[],"moduleResolution":"node10"},"files":["src/file.ts"]}"#;
         std::fs::write(fixture.root.join("tsconfig.json"), nested_config).unwrap();
-        let resolution =
-            ProjectResolutionInputsV1::observe(worktree.clone(), document.clone(), &bundle)
-                .unwrap();
-        let repeated =
-            ProjectResolutionInputsV1::observe(worktree.clone(), document.clone(), &bundle)
-                .unwrap();
+        let resolution = ProjectResolutionInputsV1::observe(
+            worktree.clone(),
+            document.clone(),
+            &bundle,
+            &|_| true,
+        )
+        .unwrap();
+        let repeated = ProjectResolutionInputsV1::observe(
+            worktree.clone(),
+            document.clone(),
+            &bundle,
+            &|_| true,
+        )
+        .unwrap();
         assert_eq!(resolution.files(), repeated.files());
         assert_eq!(resolution.identity, repeated.identity);
 
@@ -1448,9 +1490,13 @@ mod tests {
         ] {
             std::fs::write(fixture.root.join(name), bytes).unwrap();
         }
-        let complete =
-            ProjectResolutionInputsV1::observe(worktree.clone(), document.clone(), &bundle)
-                .unwrap();
+        let complete = ProjectResolutionInputsV1::observe(
+            worktree.clone(),
+            document.clone(),
+            &bundle,
+            &|_| true,
+        )
+        .unwrap();
         assert_eq!(
             complete
                 .files()
@@ -1471,13 +1517,18 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            resolution.verify(),
+            resolution.verify(&|_| true),
             Err(TypeScriptProfileError::InvalidResolution)
         ));
 
         std::fs::remove_file(fixture.root.join("tsconfig.json")).unwrap();
         assert!(matches!(
-            ProjectResolutionInputsV1::observe(worktree.clone(), document.clone(), &bundle),
+            ProjectResolutionInputsV1::observe(
+                worktree.clone(),
+                document.clone(),
+                &bundle,
+                &|_| true
+            ),
             Err(TypeScriptProfileError::InvalidResolution)
         ));
         std::fs::write(fixture.root.join("tsconfig.json"), nested_config).unwrap();
@@ -1487,7 +1538,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            ProjectResolutionInputsV1::observe(worktree, document, &bundle),
+            ProjectResolutionInputsV1::observe(worktree, document, &bundle, &|_| true),
             Err(TypeScriptProfileError::InvalidResolution)
         ));
     }
@@ -1510,7 +1561,12 @@ mod tests {
         ] {
             std::fs::write(fixture.root.join("tsconfig.json"), config).unwrap();
             assert!(matches!(
-                ProjectResolutionInputsV1::observe(worktree.clone(), document.clone(), &bundle),
+                ProjectResolutionInputsV1::observe(
+                    worktree.clone(),
+                    document.clone(),
+                    &bundle,
+                    &|_| true
+                ),
                 Err(TypeScriptProfileError::InvalidResolution)
             ));
         }
@@ -1521,14 +1577,19 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            ProjectResolutionInputsV1::observe(worktree.clone(), document.clone(), &bundle),
+            ProjectResolutionInputsV1::observe(
+                worktree.clone(),
+                document.clone(),
+                &bundle,
+                &|_| true
+            ),
             Err(TypeScriptProfileError::InvalidResolution)
         ));
 
         std::fs::write(fixture.root.join("tsconfig.json"), CLOSED_CONFIG).unwrap();
         std::fs::create_dir(fixture.cleanup_root.join("node_modules")).unwrap();
         assert!(matches!(
-            ProjectResolutionInputsV1::observe(worktree, document, &bundle),
+            ProjectResolutionInputsV1::observe(worktree, document, &bundle, &|_| true),
             Err(TypeScriptProfileError::InvalidResolution)
         ));
     }
@@ -1717,7 +1778,7 @@ mod tests {
     fn profile_command_and_settings_are_closed() {
         let fixture = Fixture::new();
         let (profile, worktree) = fixture.profile("tsx");
-        let command = profile.command(&worktree).unwrap();
+        let command = profile.command(&worktree, &|_| true).unwrap();
         assert!(command.has_program_digest(&profile.bundle.identity.node_blake3));
         assert_eq!(
             profile.initialization_options(),
@@ -1776,6 +1837,7 @@ mod tests {
             None,
             Path::new("/unused"),
             64,
+            &|_| true,
         )
         .unwrap();
         let waited = child.wait_for_exit(Duration::from_secs(1)).await.unwrap();
@@ -1845,6 +1907,7 @@ mod tests {
             None,
             Path::new("/unused"),
             64,
+            &|_| true,
         )
         .unwrap();
         assert!(

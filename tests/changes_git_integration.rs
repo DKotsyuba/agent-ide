@@ -13,6 +13,7 @@ use agent_ide::{
     },
 };
 use std::{
+    collections::BTreeSet,
     ffi::OsString,
     fs,
     os::unix::ffi::OsStrExt,
@@ -35,6 +36,11 @@ impl SnapshotRunner for CurrentRunner {
         intent: SnapshotIntent,
     ) -> Result<agent_ide::execution::CapturedProcessEvidence, GitError> {
         self.inner.run(intent).await
+    }
+
+    /// Test harness: delegates to the shared runner, which admits every fixture path.
+    async fn authorize_read_path(&mut self, _path: &Path) -> Result<(), GitError> {
+        Ok(())
     }
 
     /// Returns the sealed observation only for its exact raw source path.
@@ -1068,4 +1074,225 @@ async fn real_truncated_blob_evidence_is_not_complete() {
         intent.accept(completed.evidence),
         Err(GitError::IncompleteIdentity)
     );
+}
+
+/// One runner that refuses every path authorization, as an Execution owner must be able to
+/// when the live host profile denies a path (T36B). It forwards commands to the shared
+/// harness — capture legitimately learns the changed paths through sandboxed Git metadata
+/// commands first — while recording whether any scratch-writing intent ever ran.
+struct RefusingRunner {
+    /// Shared process harness running only the sandboxed Git metadata commands.
+    inner: Runner,
+    /// Count of intents that would have written captured bytes into a scratch file.
+    scratch_intents: usize,
+}
+
+impl SnapshotRunner for RefusingRunner {
+    /// Forwards the intent, counting any scratch-writing command that must never run.
+    async fn run(
+        &mut self,
+        intent: SnapshotIntent,
+    ) -> Result<agent_ide::execution::CapturedProcessEvidence, GitError> {
+        if intent.snapshot_directory().is_some() {
+            self.scratch_intents += 1;
+        }
+        self.inner.run(intent).await
+    }
+
+    /// Refuses every path, exactly like an unprovable path under a deny-bearing profile.
+    async fn authorize_read_path(&mut self, _path: &Path) -> Result<(), GitError> {
+        Err(GitError::UnsupportedSnapshot)
+    }
+}
+
+/// A refused path authorization fails the whole capture attempt before any native byte is
+/// read, so denied content can never reach a scratch file, a blob hash, or a cached page.
+#[tokio::test]
+async fn refused_path_authorization_fails_the_capture_before_any_native_read() {
+    let fixture = GitFixture::new();
+    fixture.write(b"main.txt", b"proven bytes\n");
+    fixture.git(["add", "."]);
+    fixture.git([
+        "-c",
+        "user.email=t36b@example",
+        "-c",
+        "user.name=t36b",
+        "commit",
+        "-m",
+        "base",
+    ]);
+    fixture.write(b"main.txt", b"changed proven bytes\n");
+    fixture.write(b"untracked.txt", b"untracked bytes\n");
+    for mode in [DiffMode::Head, DiffMode::Staged, DiffMode::Unstaged] {
+        let mut runner = RefusingRunner {
+            inner: Runner::default(),
+            scratch_intents: 0,
+        };
+        let result = collect_snapshot(
+            &authority_for(&fixture),
+            Path::new(GIT),
+            mode,
+            1,
+            "snapshot-operation",
+            BaselineContext::new("baseline", BaselineCoverage::Partial).unwrap(),
+            &mut runner,
+        )
+        .await;
+        assert_eq!(result, Err(GitError::UnsupportedSnapshot));
+        assert_eq!(
+            runner.scratch_intents, 0,
+            "no scratch-writing command may run once a path authorization is refused"
+        );
+        assert!(
+            runner.inner.directories.is_empty(),
+            "no scratch directory may even be created"
+        );
+        assert_eq!(runner.inner.comparisons, 0, "no private comparison may run");
+    }
+}
+
+/// One runner that authorizes exactly the paths in its allow-set and refuses every other,
+/// as an Execution owner must when the live host profile proves some paths and denies others
+/// (T36B-r, review finding 5). Scratch-writing intents are counted, so the test can prove a
+/// refused path's bytes never even reach a scratch file.
+struct MixedRunner {
+    /// Shared process harness running only the sandboxed Git metadata commands.
+    inner: Runner,
+    /// Worktree-relative paths whose authorization the live profile could prove.
+    allowed: BTreeSet<String>,
+    /// Count of intents that would have written captured bytes into a scratch file.
+    scratch_intents: usize,
+}
+
+impl SnapshotRunner for MixedRunner {
+    /// Forwards the intent, counting any scratch-writing command.
+    async fn run(
+        &mut self,
+        intent: SnapshotIntent,
+    ) -> Result<agent_ide::execution::CapturedProcessEvidence, GitError> {
+        if intent.snapshot_directory().is_some() {
+            self.scratch_intents += 1;
+        }
+        self.inner.run(intent).await
+    }
+
+    /// Proves only the allow-set; every other path is unprovable under the live profile.
+    async fn authorize_read_path(&mut self, path: &Path) -> Result<(), GitError> {
+        if self.allowed.contains(&path.to_string_lossy().into_owned()) {
+            Ok(())
+        } else {
+            Err(GitError::UnsupportedSnapshot)
+        }
+    }
+}
+
+/// A mixed runner — some paths proven, others denied — discloses only proven bytes: a
+/// capture whose union still contains one refused path fails before any scratch-writing
+/// intent or private comparison runs, so the refused path's bytes reach neither scratch
+/// files nor output, while the same mixed runner lets the allowed path's real bytes flow
+/// through the whole pipeline once the refused path has left the capture's union entirely.
+#[tokio::test]
+async fn mixed_path_authorization_discloses_only_proven_bytes() {
+    let fixture = GitFixture::new();
+    fixture.write(b"allowed.txt", b"base\n");
+    fixture.write(b"secret.txt", b"base\n");
+    fixture.git(["add", "."]);
+    fixture.git([
+        "-c",
+        "user.email=t36b@example",
+        "-c",
+        "user.name=t36b",
+        "commit",
+        "--quiet",
+        "-m",
+        "base",
+    ]);
+    fixture.write(b"allowed.txt", b"allowed proven bytes\n");
+    fixture.write(b"secret.txt", b"secret denied bytes\n");
+    // Keep both changes unstaged so the working tree holds the refused bytes.
+    // The proven set covers every fixture path except the refused one, including the
+    // fixture's own untracked entries (their names are authorized before any capture).
+    let allowed = [
+        "allowed.txt",
+        "staged.txt",
+        "unstaged.txt",
+        "special space\n-leading.txt",
+        "untracked space\n-leading.txt",
+        // The fixture's non-UTF-8 untracked name, spelled exactly as the collector's
+        // lossy rendering of it spells.
+        "untracked-non-utf8-\u{FFFD}.txt",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<BTreeSet<_>>();
+
+    // The union still contains the refused path: the capture fails before any native byte
+    // is read — neither path's bytes reach scratch files or output.
+    let mut runner = MixedRunner {
+        inner: Runner::default(),
+        allowed: allowed.clone(),
+        scratch_intents: 0,
+    };
+    let result = collect_snapshot(
+        &authority_for(&fixture),
+        Path::new(GIT),
+        DiffMode::Unstaged,
+        1,
+        "snapshot-operation",
+        BaselineContext::new("baseline", BaselineCoverage::Partial).unwrap(),
+        &mut runner,
+    )
+    .await;
+    assert_eq!(
+        result,
+        Err(GitError::UnsupportedSnapshot),
+        "one refused union path must fail the whole capture attempt"
+    );
+    assert_eq!(
+        runner.scratch_intents, 0,
+        "no scratch-writing command may run, so the refused bytes never reach disk"
+    );
+    assert!(
+        runner.inner.directories.is_empty(),
+        "no scratch directory may even be created"
+    );
+    assert_eq!(runner.inner.comparisons, 0, "no private comparison may run");
+
+    // Removing the refused path from the repository entirely (deletion committed) leaves a
+    // union of proven paths only: the same mixed runner captures, the allowed path's real
+    // working-tree bytes reach the rendered evidence, and the refused bytes are nowhere in it.
+    fixture.git(["rm", "--quiet", "--force", "secret.txt"]);
+    fixture.git(["commit", "--quiet", "-m", "drop secret"]);
+    let mut runner = MixedRunner {
+        inner: Runner::default(),
+        allowed,
+        scratch_intents: 0,
+    };
+    let snapshot = collect_snapshot(
+        &authority_for(&fixture),
+        Path::new(GIT),
+        DiffMode::Unstaged,
+        1,
+        "snapshot-operation",
+        BaselineContext::new("baseline", BaselineCoverage::Partial).unwrap(),
+        &mut runner,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("a union of proven paths must capture: {error:?}"));
+    let allowed = snapshot
+        .paths()
+        .iter()
+        .find(|path| path.status().path() == Path::new("allowed.txt"))
+        .expect("the allowed changed path must be captured");
+    let patch = std::str::from_utf8(allowed.patch()).unwrap();
+    assert!(patch.contains("allowed proven bytes"), "{patch}");
+    for path in snapshot.paths() {
+        assert!(
+            !path
+                .patch()
+                .windows(b"secret".len())
+                .any(|part| part == b"secret"),
+            "refused content must not appear anywhere in the rendered evidence"
+        );
+    }
 }
