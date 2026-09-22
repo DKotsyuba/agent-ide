@@ -1423,16 +1423,36 @@ async fn physical_inherited_cwd_runs_the_marker_only_in_an_accessible_target_wor
 // states, through the same public validation path a managed request uses.
 // ---------------------------------------------------------------------------
 
-/// Reads one captured sandbox-state fixture from the shared T35B fixture directory.
+/// Reads one captured sandbox-state fixture, relocated into this process's temporary tree.
+///
+/// The captures carry the capturing machine's paths, and v2 binds the cwd by realpath, so every
+/// path under the developer's home or stability tree gets one new prefix (relative structure and
+/// deny/glob relationships unchanged) and the relocated cwd is created, as the library tests do
+/// (T41B).
 fn t35b_fixture(name: &str) -> String {
-    fs::read_to_string(format!(
+    let captured = fs::read_to_string(format!(
         concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/sandbox-states/{}.json"
         ),
         name.trim_end_matches(".json")
     ))
-    .unwrap()
+    .unwrap();
+    let root = fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("agent-ide-test-fixtures-{}", std::process::id()));
+    let relocated = captured
+        .replace("/Users/pluto", root.join("home").to_str().unwrap())
+        .replace(
+            "/private/tmp/agent-ide-stability",
+            root.join("stability").to_str().unwrap(),
+        );
+    assert!(!relocated.contains("/Users/pluto"));
+    assert!(!relocated.contains("/private/tmp/agent-ide-stability"));
+    let value: serde_json::Value = serde_json::from_str(&relocated).unwrap();
+    let cwd = value["sandboxCwd"].as_str().unwrap();
+    fs::create_dir_all(cwd.strip_prefix("file://").unwrap_or(cwd)).unwrap();
+    relocated
 }
 
 /// Parses one captured sandbox-state fixture into a validated host state.
