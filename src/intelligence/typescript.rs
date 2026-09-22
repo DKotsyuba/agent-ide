@@ -358,6 +358,12 @@ impl TypeScriptProfile {
     }
 
     /// Builds fixed `node <bridge> --stdio` with a private temp and no caller-visible `PATH`.
+    ///
+    /// The private temp is `TMPDIR`-redirected to `<host temp>/<cache namespace id>/tmp`, not into
+    /// the daemon runtime directory that owns the cache namespace: host command sandboxes (the
+    /// macOS 27 Claude Bash seatbelt refused every `/private/tmp/ai-r-*` write, T38B acceptance
+    /// evidence) admit the per-user temp directory but not the daemon's private runtime, and the
+    /// bridge creates its own directories under `TMPDIR` before its first protocol byte.
     pub fn command(
         &self,
         worktree: &TypeScriptWorktree,
@@ -368,6 +374,12 @@ impl TypeScriptProfile {
         }
         self.bundle.verify()?;
         self.resolution.verify(path_proof)?;
+        let namespace = self
+            .cache_namespace
+            .file_name()
+            .ok_or(TypeScriptProfileError::InvalidProfile)?;
+        let temp = std::env::temp_dir().join(namespace).join("tmp");
+        std::fs::create_dir_all(&temp).map_err(|_| TypeScriptProfileError::InvalidProfile)?;
         let command = ControlledCommand::from_validated_peer(
             CommandKind::Provider,
             self.bundle.node().to_path_buf(),
@@ -376,10 +388,7 @@ impl TypeScriptProfile {
                 OsString::from("--stdio"),
             ],
             worktree.worktree().worktree_path().to_path_buf(),
-            BTreeMap::from([(
-                OsString::from("TMPDIR"),
-                self.cache_namespace.join("tmp").into_os_string(),
-            )]),
+            BTreeMap::from([(OsString::from("TMPDIR"), temp.into_os_string())]),
         )
         .map_err(|_| TypeScriptProfileError::InvalidProfile)?;
         command
@@ -1794,6 +1803,28 @@ mod tests {
                 .get_envs()
                 .all(|(name, _)| name != std::ffi::OsStr::new("PATH")),
             "the exact Node path needs no ambient executable search directory"
+        );
+        // T38B: the bridge creates directories under `TMPDIR` before its first protocol byte, so
+        // the private temp must live under the host temp directory — which host command sandboxes
+        // admit — named by the opaque cache namespace id, never inside the daemon runtime.
+        let temp = std::env::temp_dir()
+            .join(fixture.root.join("cache").file_name().unwrap())
+            .join("tmp");
+        let redirected = process
+            .as_std()
+            .get_envs()
+            .find(|(name, _)| *name == std::ffi::OsStr::new("TMPDIR"))
+            .and_then(|(_, value)| value)
+            .map(std::path::PathBuf::from)
+            .unwrap();
+        assert_eq!(redirected, temp, "private temp is host-temp namespaced");
+        assert!(
+            redirected.is_dir(),
+            "the private temp is prepared before the bridge starts"
+        );
+        assert!(
+            !redirected.starts_with(fixture.root.join("cache")),
+            "the daemon runtime directory is not writable under host command sandboxes"
         );
     }
 
