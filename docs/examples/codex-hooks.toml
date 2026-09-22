@@ -1,4 +1,7 @@
-# Merge into config.toml after replacing placeholders. Use the same fresh attachment
+# LEGACY form (operator-run daemon). Prefer the managed JSON fragment:
+# run `agent-ide codex-hooks print` and see docs/examples/codex-hooks.json.
+# This TOML targets an explicitly configured `agent-ide mcp --runtime-dir` daemon:
+# merge into config.toml after replacing placeholders, use the same fresh attachment
 # for MCP and hooks, and approve these hook definitions through Codex's trust prompt.
 # Placeholders must be absolute paths or an attachment value without single quotes.
 

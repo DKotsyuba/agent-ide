@@ -70,8 +70,10 @@ instead of parsing the compact text as a second response schema.
 
 The `<agent-ide>` block is a status plate for the worktree's Rust/Python checks. It arrives
 whenever the status changes and not while it stays the same, so no block means unchanged, not
-finished. On Claude it is sent in hook context; on every other host (Codex included) a due plate
-leads a terminal `ide.*` reply instead — the plate is the first thing you read, followed by a
+finished. On Claude it is sent in hook context. On Codex it may arrive in native hook context
+right after one of your actions (the operator must have installed and trusted the hooks; a plate
+is delivered by whichever channel fires first and never repeated by the other) — otherwise a due
+plate leads a terminal `ide.*` reply instead: the plate is the first thing you read, followed by a
 newline and the normal reply text, and the `structuredContent` object carries it verbatim as its
 `status` field. `ide.stop` replies and `pending` placeholders carry no plate. `rust: checking
 (first check)` means no result yet this session;

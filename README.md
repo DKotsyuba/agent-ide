@@ -93,11 +93,14 @@ environment to load the restart-only [trusted execution configuration](docs/assi
 Without that configuration, methods report the missing Workspace boundary.
 See [product MCP boundary](docs/assistance-host-binding.md#product-mcp-boundary) for its limits.
 Placeholder-only host examples are shipped for
-[Codex](docs/examples/codex-hooks.toml) and [Claude Code](docs/examples/claude-settings.json).
+[Codex](docs/examples/codex-hooks.json) (managed; `agent-ide codex-hooks print` emits it, the
+[TOML](docs/examples/codex-hooks.toml) form is legacy) and
+[Claude Code](docs/examples/claude-settings.json).
 
 The v0.3 project problem feed adds confined background checks for Rust (`cargo check --offline
 --locked`) and Python (pyright) on macOS, a compact `<agent-ide>` error/warning block on Claude
-`PostToolUse` hooks, and `ide.context` with `{"kind":"problems"}`. Enable it only through the
+`PostToolUse` hooks (on managed Codex it rides native hooks and terminal replies at once,
+T29B), and `ide.context` with `{"kind":"problems"}`. Enable it only through the
 trusted launcher configuration (`AGENT_IDE_LAUNCHER_CONFIG`): declare normalized absolute
 `allowed_roots` plus a `project_checks` section naming the Rust toolchain and the Node/Pyright
 pair, as in the shipped fragment

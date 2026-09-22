@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/ABSOLUTE/PATH/agent-ide' codex-hook --managed",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/ABSOLUTE/PATH/agent-ide' codex-hook --managed",
+            "timeout": 1
+          }
+        ]
+      }
+    ]
+  }
+}

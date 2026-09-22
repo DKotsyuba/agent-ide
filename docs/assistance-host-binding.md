@@ -76,7 +76,8 @@ configuration; they are not embedded in the plugin manifest.
 For legacy Codex mode, configure native `PreToolUse`, `PostToolUse`, and available `PostToolBatch` commands to invoke
 `agent-ide codex-hook --runtime-dir PATH` for supported native tools as well as this MCP
 server's five `ide.*` tools. The placeholder-only example is
-[`docs/examples/codex-hooks.toml`](examples/codex-hooks.toml). Supply the same `AGENT_IDE_HOST_ATTACHMENT` launch
+[`docs/examples/codex-hooks.toml`](examples/codex-hooks.toml) (legacy, operator-run daemon).
+Supply the same `AGENT_IDE_HOST_ATTACHMENT` launch
 environment value to those commands and the MCP process. It must be a fresh opaque
 handle for that host channel/session, nonempty UTF-8 and at most 128 bytes. Distinct host
 sessions must use distinct handles; root and native children in the same channel may
@@ -84,6 +85,68 @@ share one. Do not put the handle in model arguments or tool output. Missing hook
 configuration or mismatched handles leaves calls unavailable. Ordinary edits, deletes,
 renames and failed commands must remain observable after activation; their hook payloads
 are not a source-effect authority.
+
+## Managed Codex native hooks (T29B)
+
+Managed Codex MCP servers additionally publish private, actor-addressed rendezvous records so
+native hooks can find the same daemon without any operator-configured runtime or credential.
+
+- **Discovery.** The daemon destination is derived solely from bounded hook identity — root
+  session `session_id` and actor `agent_id.unwrap_or(session_id)` — matched against private
+  records under `canonical("/private/tmp")/ai-c-<euid>/<route digest>/<nonce>.json`. The route
+  digest is a versioned, domain-separated, length-framed BLAKE3 over effective UID, root session,
+  and actor; it is never derived from CWD, repository, PID, tool arguments, or timing. A record is
+  live only while its publisher's advisory lock is held; exactly one live record is eligible, and
+  zero or several live records (or any unsafe state) are a silent no-match. Discovery never
+  repairs, deletes, or picks the newest record, and never starts a daemon. The hook submits the
+  record's published attachment — the same credential the MCP bound at startup — through the
+  ordinary `assistance.hook_submit` route, so a served hook submission is an ordinary served call
+  that also restarts the daemon's idle countdown (T26B).
+- **Filesystem and security checks.** Directories must be owned by the effective UID, be exactly
+  mode `0700`, and be real directories; records must be owned, exactly `0600`, regular, bounded,
+  and not hard-linked. Components are opened descriptor-relative with `O_NOFOLLOW` and validated
+  with `fstat`; records are published by atomic rename; runtimes and sockets are re-verified
+  through pinned descriptors before use. Unsafe state is rejected without chmod, repair, or
+  following symlinks — including when the location was set through the environment.
+- **`AGENT_IDE_CODEX_RENDEZVOUS_ROOT`.** This environment override redirects publication and
+  discovery away from the fixed root. It exists for tests; the product never sets it. Every safety
+  check above (owner, exact `0700`/`0600`, no symlinks) still applies to an overridden root — an
+  overridden root with loose permissions is refused by the managed hook with a silent exit 0,
+  which a product contract test verifies.
+- **Threat model.** Trusted: the installed binary, owner-managed configuration, the host metadata
+  ingress, and cooperating same-UID processes. Publishing records deliberately removes obscurity
+  against processes of the same owner. There is **no protection against a malicious same-UID
+  process**: it could discover credentials more easily than before, forge observations, consume
+  feed delivery, or attempt existing authenticated RPCs. The protection goal is other users,
+  accidental cross-session/cross-actor routing, stale generations, and unsafe filesystem objects —
+  the same documented trust assumption as the Claude worker, not OS attestation; Unix-socket
+  pathname connection still relies on the trusted same-user boundary.
+- **Managed pairing exception.** Managed MCP admission accepts an otherwise-valid, exact buffered
+  pre-observation and consumes it instead of rejecting it as a replay (a catch-all hook observes
+  the pre phase of the MCP call itself). Completion is recorded exactly as before, duplicated
+  pre-events and completed/rejected call IDs stay rejected, and the call's own later native post is
+  then an ordinary completed replay: it stays silent, triggers no check, and cannot invalidate the
+  result the MCP call just produced.
+- **Supported phases.** Managed mode accepts only `PreToolUse` and `PostToolUse`; Codex has no
+  `PostToolUseFailure`, `PostToolBatch`, or `PermissionDenied` handler shipped for it, and none is
+  synthesized. The legacy parser keeps accepting the other phases for compatibility.
+- **Capacity.** More native events consume the existing bounded replay storage faster: 128
+  pending per exact channel/host/actor scope and 1,024 retained rejected/completed IDs per scope,
+  never evicted (see the bounds paragraph below). A long-lived session that exhausts its scope
+  stays unavailable for that scope until daemon restart.
+
+`agent-ide codex-hook --managed` is the managed hook command: it ignores every credential and
+runtime environment override, reads stdin once (at most 64 KiB plus an overflow byte) inside one
+250 ms total deadline, discovers exactly one live route, submits once, and renders only a
+successful `PostToolUse` feedback result. Missing, ambiguous, stale, or contended routes,
+malformed or oversized payloads, unsupported phases, and deadline expiry all exit 0 with empty
+stdout. `agent-ide codex-hooks print` prints the managed `hooks.json` fragment (JSON only, the
+installed path shell-quoted) — the placeholder-only example is
+[`docs/examples/codex-hooks.json`](examples/codex-hooks.json). The owner merges the two handlers
+into the existing `PreToolUse`/`PostToolUse` arrays of `~/.codex/hooks.json` preserving existing
+entries, then reviews and trusts both definitions through Codex's normal UI; the product never
+writes `hooks.json` or any host configuration, and duplicate agent-ide handlers must not be
+registered (duplicate pre-events are rejected as replays).
 
 Claude Code 2.1.267 is the tested target. Its example config includes exact `PreToolUse`,
 `PostToolUse`, `PostToolUseFailure`, and `PermissionDenied` commands; older Claude versions
