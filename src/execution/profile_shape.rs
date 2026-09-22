@@ -525,6 +525,13 @@ fn refuse_cwd_overlap(
 /// trailing separator, a URI host part, percent-encoding, and query or fragment suffixes. Case
 /// and Unicode bytes are preserved: no folding or normalization ever merges two spellings.
 fn parse_path_components(raw: &str) -> Result<Vec<String>, UnsupportedShape> {
+    // A backslash is a literal byte in a path but an escape in a Codex glob, so a path or glob
+    // base containing one can change which files a byte-identical glob deny matches once the cwd
+    // is normalized away. No supported workspace path needs one: refuse before normalization
+    // (T35B-r2).
+    if raw.contains('\\') {
+        return Err(UnsupportedShape("backslash in path"));
+    }
     let path = if let Some(rest) = raw.strip_prefix("file://") {
         if !rest.starts_with('/') || rest.contains(['%', '?', '#']) {
             // `file://host/…`, percent-encoded, query, and fragment variants are all outside
@@ -596,6 +603,11 @@ fn parse_deny_selector(
 /// byte-for-byte. No glob containment or rewriting is ever computed, so a weakened pattern is
 /// simply a different required rule.
 fn parse_glob_deny(pattern: &str, cwd_components: &[String]) -> Result<DenyRule, UnsupportedShape> {
+    // Escapes are refused in the whole pattern, not only in the base the path grammar sees:
+    // an escaped metacharacter in the tail would otherwise survive normalization (T35B-r2).
+    if pattern.contains('\\') {
+        return Err(UnsupportedShape("backslash in glob"));
+    }
     let (base, glob) = match pattern
         .as_bytes()
         .iter()

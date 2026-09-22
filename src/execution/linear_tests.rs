@@ -1973,15 +1973,25 @@ fn glob_and_path_denies_are_distinct_identities() {
         shape(serde_json::json!({"type":"glob_pattern","pattern":"/Users/pluto/.aws"})),
         "a path deny and a same-text glob deny must digest differently"
     );
-    // Backslashes have literal path meaning versus glob-escape meaning: both spellings differ
-    // from each other and from their path-denied counterparts.
-    assert_ne!(
-        shape(serde_json::json!({"type":"path","path":"/Users/pluto/work\\dir"})),
-        shape(serde_json::json!({"type":"glob_pattern","pattern":"/Users/pluto/work\\dir"})),
-    );
-    assert_ne!(
-        shape(serde_json::json!({"type":"path","path":"/Users/pluto/work\\dir"})),
-        shape(serde_json::json!({"type":"glob_pattern","pattern":"/Users/pluto/work\\*"})),
+    // A backslash is a literal path byte but a glob escape (T35B-r2): any path, cwd, or glob
+    // base carrying one refuses derivation outright instead of being normalized, so a relocated
+    // cwd can never turn an escaped glob into a different matcher under the same digest.
+    for raw in ["/Users/pluto/work\\dir", "/Users/pluto/work\\*"] {
+        let mut value = t35b_base_state();
+        value["permissionProfile"]["file_system"]["entries"][5]["path"] =
+            serde_json::json!({"type":"path","path":raw});
+        assert!(shape_of(value).is_err(), "path {raw:?} must refuse");
+        let mut value = t35b_base_state();
+        value["permissionProfile"]["file_system"]["entries"][5]["path"] =
+            serde_json::json!({"type":"glob_pattern","pattern":raw});
+        assert!(shape_of(value).is_err(), "glob {raw:?} must refuse");
+    }
+    let mut relocated = t35b_base_state();
+    relocated["sandboxCwd"] = serde_json::json!("file:///work\\dir");
+    let state = HostSandboxState::parse(Some(relocated)).unwrap();
+    assert!(
+        state.shape_v2(Path::new("/work\\dir")).is_err(),
+        "a backslash cwd must refuse even when it equals the trusted candidate"
     );
     // The derived glob rule keeps the glob tag and the byte-exact pattern remainder.
     let mut globbed = t35b_base_state();
