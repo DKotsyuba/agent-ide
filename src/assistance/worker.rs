@@ -2218,6 +2218,8 @@ impl<'a> Worker<'a> {
                         error,
                         crate::execution::RequestError::ExecutionProfileNoTemplate(_)
                             | crate::execution::RequestError::ExecutionProfileDigestMismatch(_)
+                            | crate::execution::RequestError::ExecutionProfileShapeUnsupported(_)
+                            | crate::execution::RequestError::ExecutionProfileShapeNotNarrower(_)
                     ) {
                         detail.push_str(&capture_rejected_state(observed.state().as_json()).await);
                     }
@@ -4390,6 +4392,12 @@ fn execution_profile_detail(error: &crate::execution::RequestError) -> Option<St
         RequestError::ExecutionProfileDigestMismatch(class) => {
             format!("profile_digest_mismatch:{}", profile_class_tag(*class))
         }
+        RequestError::ExecutionProfileShapeUnsupported(class) => {
+            format!("shape_unsupported:{}", profile_class_tag(*class))
+        }
+        RequestError::ExecutionProfileShapeNotNarrower(class) => {
+            format!("shape_not_narrower:{}", profile_class_tag(*class))
+        }
         RequestError::DisabledHostDenied => "host_disabled".to_owned(),
         _ => return None,
     })
@@ -5964,6 +5972,218 @@ mod stop_retry_tests {
             "a whole-page result must retain no continuation state"
         );
     }
+    /// Builds the managed read-scope sandbox state used by the consumer refusal test: deny-free
+    /// (the accepted capture) or with one appended deny (the genuinely narrower live state).
+    fn read_scope_managed_state(root: &std::path::Path, deny: bool) -> serde_json::Value {
+        let mut state = serde_json::json!({
+            "codexLinuxSandboxExe": null,
+            "permissionProfile": {"type":"managed","file_system":{"entries":[
+                {"access":"read","path":{"type":"special","value":{"kind":"root"}}},
+                {"access":"write","path":{"path":root,"type":"path"}},
+                {"access":"write","path":{"type":"special","value":{"kind":"slash_tmp"}}},
+                {"access":"write","path":{"type":"special","value":{"kind":"tmpdir"}}}
+            ],"type":"restricted"},"network":"restricted"},
+            "sandboxCwd":root,
+            "useLegacyLandlock":false
+        });
+        if deny {
+            state["permissionProfile"]["file_system"]["entries"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!(
+                    {"access":"deny","path":{"path":root.join("secret"),"type":"path"}}
+                ));
+        }
+        state
+    }
+
+    /// Builds the managed launcher whose v2 catalog admits the deny-bearing narrowed state.
+    fn read_scope_target(root: &std::path::Path) -> LaunchTarget {
+        let clean = HostSandboxState::parse(Some(read_scope_managed_state(root, false))).unwrap();
+        let record = PersistedProfileRecord::from_execution_evidence_v2(
+            "read-scope-managed",
+            1,
+            D03ProfileEvidence {
+                provider_binary: "fixture-git".into(),
+                toolchain: "fixture-toolchain".into(),
+                configuration: "default".into(),
+                trust: "fixture-local".into(),
+                transport: "managed".into(),
+                d03_evidence: "fixture-d03".into(),
+            },
+            &clean,
+        )
+        .unwrap();
+        let git = std::path::Path::new("/usr/bin/git");
+        let executable = serde_json::json!({
+            "path":git,
+            "identity":"fixture-git",
+            "blake3":blake3::hash(&std::fs::read(git).unwrap()).to_hex().to_string()
+        });
+        let config = serde_json::json!({
+            "version":1,
+            "limits":{"queued":8,"details":8,"operation_ms":5000,"output_bytes":1024},
+            "targets":[{
+                "attachment":"stop-retry",
+                "candidate":root,
+                "git":executable,
+                "codex":executable,
+                "providers":[],
+                "profiles":[{"record":serde_json::from_str::<serde_json::Value>(&record.to_json()).unwrap(),"sandbox_state":serde_json::from_str::<serde_json::Value>(clean.sandbox_state_json()).unwrap()}],
+                "allow_disabled_host":false
+            }]
+        });
+        LauncherConfig::parse(config.to_string().as_bytes())
+            .unwrap()
+            .target("stop-retry")
+            .unwrap()
+            .clone()
+    }
+
+    /// Creates one current host binding and a managed (deny-free or deny-bearing) observation.
+    fn read_scope_call(
+        worker: &Worker<'_>,
+        deny: bool,
+        actor: &str,
+        id: &str,
+    ) -> (ValidatedInvocation, ObservedSandboxState) {
+        let mut guard = worker.shared.bindings.lock().unwrap();
+        let channel = parse_channel_session(b"stop-retry").unwrap();
+        let hook = parse_hook_event(
+            serde_json::json!({"hook_event_name":"PreToolUse","session_id":actor,"tool_use_id":id})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+        assert!(matches!(
+            guard.observe_hook(hook, channel.clone()),
+            BindingStatus::PreObserved
+        ));
+        let candidate = parse_candidate(
+            serde_json::json!({"threadId":actor,"callId":id,"x-codex-turn-metadata":{"turn":"stop-retry"}})
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap();
+        let BindingStatus::Validated(invocation) = guard.establish_start(candidate, channel) else {
+            panic!("fixture binding must validate")
+        };
+        let active = guard.consume_active(invocation.binding_ref()).unwrap();
+        let meta = serde_json::json!({
+            "codex/sandbox-state-meta": read_scope_managed_state(&worker.runtime, deny)
+        });
+        let observed =
+            parse_observed_sandbox_state(meta.as_object().unwrap(), &invocation, &active, true)
+                .unwrap();
+        (invocation, observed)
+    }
+
+    /// Both native-read consumers (`observe` and `serve_inspection` cached delivery) share
+    /// `validate_read_scope`, and a deny-bearing state admitted through a narrower v2 shape
+    /// must be refused by that shared proof even at the same cwd (T35B-r finding 2). The
+    /// durable authority is granted through the real Workspace activation, so the consumers
+    /// run with a current stamp exactly as the managed start flow leaves behind.
+    #[tokio::test]
+    async fn read_scope_refuses_a_same_cwd_deny_bearing_state_for_both_consumers() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join("main.rs"), "fn main() {}\n").unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+
+        // One live binding with the accepted deny-free capture, and its durable authority.
+        let (invocation, clean_observed) =
+            read_scope_call(&worker, false, "read-scope-actor", "call-1");
+        let binding = invocation.binding_ref().clone();
+        let tree = worker
+            .workspace
+            .resolve_worktree(
+                fixture.root.clone(),
+                fixture.root.clone(),
+                fixture.root.join(".git"),
+            )
+            .await
+            .unwrap();
+        let request = crate::workspace::authority::ActivationRequest::new(
+            "read-scope-activation",
+            invocation,
+            worker.shared.active(&binding).unwrap(),
+            tree,
+        )
+        .unwrap();
+        let receipt = worker.workspace.activate(request).await.unwrap();
+        worker.grants.insert(binding.clone(), receipt);
+        let authority = worker.authority(&binding).await.unwrap();
+        let target = read_scope_target(&fixture.root);
+
+        // Consumer 1 (the `observe` native read path): the deny-free same-cwd state proves
+        // whole-tree read coverage and reads natively...
+        validate_read_scope(
+            &worker.shared,
+            &binding,
+            &clean_observed,
+            &target,
+            &authority,
+            crate::errorlog::Method::Inspect,
+        )
+        .unwrap();
+        // ...while the deny-bearing state — admitted by the v2 catalog as genuinely narrower —
+        // loses native reads at the same cwd.
+        let (_, denied_observed) = read_scope_call(&worker, true, "read-scope-actor", "deny-call");
+        assert!(matches!(
+            validate_read_scope(
+                &worker.shared,
+                &binding,
+                &denied_observed,
+                &target,
+                &authority,
+                crate::errorlog::Method::Inspect,
+            ),
+            Err(FailureCode::ExecutionProfile)
+        ));
+
+        // Consumer 2 (the `serve_inspection` cached-delivery path): a retained result with a
+        // current authority is not delivered under the deny-bearing observation.
+        worker.shared.ledger.lock().unwrap().details.insert(
+            "read-scope-detail".into(),
+            Detail {
+                binding: binding.clone(),
+                reply: PeerReply::Pending {
+                    detail_ref: "read-scope-detail".into(),
+                    helper: None,
+                },
+                selection: (AssistanceTool::Inspect, [0; 32]),
+                authority: Some(authority),
+                source: None,
+                native_epoch: 0,
+                diff_page: None,
+                diff_page_fresh: false,
+                context_page: None,
+                context_page_fresh: false,
+            },
+        );
+        let (reply_tx, reply_rx) = oneshot::channel();
+        serve_inspection(
+            &worker.workspace,
+            &worker.shared,
+            Inspection {
+                binding,
+                reference: "read-scope-detail".into(),
+                observed: Some(denied_observed),
+                target,
+                expected: None,
+                reply: reply_tx,
+            },
+        )
+        .await;
+        assert!(matches!(
+            reply_rx.await.unwrap(),
+            PeerReply::Error {
+                code: FailureCode::ExecutionProfile
+            }
+        ));
+    }
 }
 
 /// Cross-channel feedback dedup: a fact is consumed on submission to a real caller, never on the
@@ -6314,6 +6534,28 @@ mod execution_profile_detail_tests {
             execution_profile_detail(&error).as_deref(),
             Some("profile_digest_mismatch:disabled")
         );
+    }
+
+    /// T35B: the two shape-refusal conditions use their own closed detail values so the error
+    /// log distinguishes an unsupported live shape from one no accepted template proves narrower.
+    #[test]
+    fn shape_refusals_name_the_observed_class() {
+        for (error, expected) in [
+            (
+                crate::execution::RequestError::ExecutionProfileShapeUnsupported(
+                    crate::execution::ProfileClass::Managed,
+                ),
+                "shape_unsupported:managed",
+            ),
+            (
+                crate::execution::RequestError::ExecutionProfileShapeNotNarrower(
+                    crate::execution::ProfileClass::Managed,
+                ),
+                "shape_not_narrower:managed",
+            ),
+        ] {
+            assert_eq!(execution_profile_detail(&error).as_deref(), Some(expected));
+        }
     }
 
     /// A disabled host, a spawn failure, and a read-scope refusal each use their closed tag,

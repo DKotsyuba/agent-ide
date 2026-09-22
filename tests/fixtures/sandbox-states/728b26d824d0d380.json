@@ -1,0 +1,1 @@
+{"codexLinuxSandboxExe":null,"permissionProfile":{"file_system":{"entries":[{"access":"read","path":{"type":"special","value":{"kind":"root"}}}],"type":"restricted"},"network":"restricted","type":"managed"},"sandboxCwd":"file:///private/tmp/agent-ide-stability/Scalpel","useLegacyLandlock":false}

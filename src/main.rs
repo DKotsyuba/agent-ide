@@ -209,6 +209,7 @@ async fn main() -> ExitCode {
             trust,
             transport,
             d03_evidence,
+            shape_version,
         }) => match evidence_record(
             &sandbox_state,
             &profile_id,
@@ -221,6 +222,7 @@ async fn main() -> ExitCode {
                 transport,
                 d03_evidence,
             },
+            shape_version,
         ) {
             Ok(fragment) => {
                 println!("{fragment}");
@@ -349,23 +351,33 @@ fn read_sandbox_state(path: &std::path::Path) -> Result<HostSandboxState, AppErr
 /// Builds the exact `{record, sandbox_state}` launcher-profile fragment for one verified D03 run.
 ///
 /// This is a pure offline helper for an operator preparing a launcher configuration file: it
-/// reuses [`PersistedProfileRecord::from_execution_evidence`] and never starts a daemon, spawns a
-/// provider, or writes any file. `sandbox_state` names a file holding the exact captured
-/// `codex/sandbox-state-meta` envelope for the tested run; `evidence` carries the non-state D03
-/// identities. The returned JSON text is the exact shape a `profiles` entry in a launcher
+/// reuses [`PersistedProfileRecord::from_execution_evidence_versioned`] and never starts a
+/// daemon, spawns a provider, or writes any file. `sandbox_state` names a file holding the exact
+/// captured `codex/sandbox-state-meta` envelope for the tested run; `evidence` carries the
+/// non-state D03 identities. `shape_version` is `2` (the default: the conservative shape-based
+/// record for supported managed captures) or `1` (the legacy exact-digest layout, requested
+/// explicitly). The returned JSON text is the exact shape a `profiles` entry in a launcher
 /// configuration expects. Returns
-/// [`AppError::InvalidResponse`] for an unreadable/malformed sandbox-state file or evidence that
-/// [`PersistedProfileRecord::from_execution_evidence`] rejects (an empty identity or zero revision).
+/// [`AppError::InvalidResponse`] for an unreadable/malformed sandbox-state file, a capture whose
+/// state cannot support the requested generation (a `disabled` or unrecognized state never
+/// silently becomes a v2 record), or evidence that the record constructor rejects (an empty
+/// identity or zero revision).
 fn evidence_record(
     sandbox_state: &std::path::Path,
     profile_id: &str,
     revision: u32,
     evidence: D03ProfileEvidence,
+    shape_version: u32,
 ) -> Result<String, AppError> {
     let state = read_sandbox_state(sandbox_state)?;
-    let record =
-        PersistedProfileRecord::from_execution_evidence(profile_id, revision, evidence, &state)
-            .map_err(|_| AppError::InvalidResponse)?;
+    let record = PersistedProfileRecord::from_execution_evidence_versioned(
+        profile_id,
+        revision,
+        evidence,
+        &state,
+        shape_version,
+    )
+    .map_err(|_| AppError::InvalidResponse)?;
     let record_value: serde_json::Value =
         serde_json::from_str(&record.to_json()).map_err(|_| AppError::InvalidResponse)?;
     let sandbox_value: serde_json::Value =
@@ -576,6 +588,9 @@ enum Command {
         transport: String,
         /// Immutable D03 evidence identity for this tested record.
         d03_evidence: String,
+        /// Record generation: `2` (default) mints the shape-based v2 layout for supported
+        /// managed captures; `1` explicitly mints the legacy v1 exact-digest layout.
+        shape_version: u32,
     },
     /// Emits one `{path, identity, blake3}` accepted-executable fragment for a measured file.
     ///
@@ -793,11 +808,24 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
         });
     }
     // `evidence record` has its own fixed nine-flag shape, in the exact declared order; no flag
-    // may be reordered, omitted, or repeated.
+    // may be reordered, omitted, or repeated. One optional trailing `--shape-version <1|2>` flag
+    // selects the record generation; the default is the v2 shape-based layout (T35B), and the
+    // legacy v1 layout must be requested explicitly.
     if let [mode, sub, rest @ ..] = arguments.as_slice()
         && mode == "evidence"
         && sub == "record"
     {
+        let (rest, shape_version) = match rest {
+            [head @ .., flag, value] if flag == "--shape-version" => {
+                let version = match value.to_str() {
+                    Some("1") => 1,
+                    Some("2") => 2,
+                    _ => return Err(AppError::InvalidResponse),
+                };
+                (head, version)
+            }
+            _ => (rest, 2),
+        };
         let values = ordered_flags(
             rest,
             &[
@@ -826,6 +854,7 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
             trust: values[6].to_owned(),
             transport: values[7].to_owned(),
             d03_evidence: values[8].to_owned(),
+            shape_version,
         });
     }
     // `evidence executable` measures one file; the identity flag always precedes the bare path.
@@ -2349,8 +2378,10 @@ mod tests {
         assert_eq!(ordered_flags(&pairs[..2], &["--a", "--b"]), None);
     }
 
-    /// `evidence record` parses its nine ordered flags and emits the `{record, sandbox_state}`
-    /// fragment a launcher configuration's `profiles` entry expects.
+    /// `evidence record` parses its nine ordered flags plus the optional trailing
+    /// `--shape-version` flag and emits the `{record, sandbox_state}` fragment a launcher
+    /// configuration's `profiles` entry expects. A legacy v1 record is minted only when
+    /// explicitly requested; the default is the v2 layout for supported managed captures.
     #[test]
     fn evidence_record_round_trips_through_the_cli() {
         let sandbox_state = std::env::temp_dir().join(format!(
@@ -2383,6 +2414,8 @@ mod tests {
             "direct",
             "--d03-evidence",
             "accepted-d03",
+            "--shape-version",
+            "1",
         ]))
         .unwrap();
         let Command::EvidenceRecord {
@@ -2395,10 +2428,12 @@ mod tests {
             trust,
             transport,
             d03_evidence,
+            shape_version,
         } = parsed
         else {
             panic!("expected EvidenceRecord");
         };
+        assert_eq!(shape_version, 1);
         let fragment = evidence_record(
             &parsed_state,
             &profile_id,
@@ -2411,11 +2446,16 @@ mod tests {
                 transport,
                 d03_evidence,
             },
+            shape_version,
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&fragment).unwrap();
         assert_eq!(value["record"]["profile_id"], "accepted-disabled");
         assert_eq!(value["sandbox_state"]["sandboxCwd"], "/private/tmp");
+        assert!(
+            value["record"].get("shape_version").is_none(),
+            "a v1 record never grows the shape_version field"
+        );
         assert!(matches!(
             command(args(&["evidence", "record", "--profile-id", "x"])),
             Err(AppError::InvalidResponse)
@@ -2423,6 +2463,104 @@ mod tests {
         std::fs::write(&sandbox_state, vec![b' '; 64 * 1024 + 1]).unwrap();
         assert!(matches!(
             read_sandbox_state(&sandbox_state),
+            Err(AppError::InvalidResponse)
+        ));
+        std::fs::remove_file(sandbox_state).unwrap();
+    }
+
+    /// T35B: a supported managed capture defaults to a v2 record without the flag, a `disabled`
+    /// capture never silently becomes one, and unknown shape versions refuse.
+    #[test]
+    fn evidence_record_defaults_to_shape_v2_for_supported_managed_captures() {
+        let sandbox_state = std::env::temp_dir().join(format!(
+            "agent-ide-evidence-record-v2-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &sandbox_state,
+            r#"{"codexLinuxSandboxExe":null,"permissionProfile":{"file_system":{"entries":[{"access":"read","path":{"type":"special","value":{"kind":"root"}}}],"type":"restricted"},"network":"restricted","type":"managed"},"sandboxCwd":"file:///private/tmp/t35b-capture","useLegacyLandlock":false}"#,
+        )
+        .unwrap();
+        let evidence = D03ProfileEvidence {
+            provider_binary: "accepted-codex".into(),
+            toolchain: "toolchain".into(),
+            configuration: "default".into(),
+            trust: "accepted-local".into(),
+            transport: "direct".into(),
+            d03_evidence: "accepted-d03".into(),
+        };
+        let fragment = evidence_record(
+            &sandbox_state,
+            "accepted-managed-readonly",
+            1,
+            evidence.clone(),
+            2,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&fragment).unwrap();
+        assert_eq!(value["record"]["shape_version"], 2);
+        // The stored capture is replayed byte-for-byte inside the fragment.
+        let stored = value["sandbox_state"].to_string();
+        let expected: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&sandbox_state).unwrap()).unwrap();
+        assert_eq!(stored, expected.to_string());
+
+        // The default for a managed capture is v2; the flag only makes it explicit.
+        let parsed = command(args(&[
+            "evidence",
+            "record",
+            "--sandbox-state",
+            sandbox_state.to_str().unwrap(),
+            "--profile-id",
+            "accepted-managed-readonly",
+            "--revision",
+            "1",
+            "--provider-binary",
+            "accepted-codex",
+            "--toolchain",
+            "toolchain",
+            "--configuration",
+            "default",
+            "--trust",
+            "accepted-local",
+            "--transport",
+            "direct",
+            "--d03-evidence",
+            "accepted-d03",
+        ]))
+        .unwrap();
+        let Command::EvidenceRecord { shape_version, .. } = parsed else {
+            panic!("expected EvidenceRecord");
+        };
+        assert_eq!(shape_version, 2);
+
+        // A disabled capture cannot support v2 and is refused instead of downgraded.
+        std::fs::write(
+            &sandbox_state,
+            r#"{"permissionProfile":{"type":"disabled"},"codexLinuxSandboxExe":null,"sandboxCwd":"/private/tmp","useLegacyLandlock":false}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            evidence_record(&sandbox_state, "accepted-disabled", 1, evidence.clone(), 2),
+            Err(AppError::InvalidResponse)
+        ));
+        assert!(
+            evidence_record(&sandbox_state, "accepted-disabled", 1, evidence.clone(), 1).is_ok()
+        );
+        // Unknown generations refuse outright.
+        assert!(matches!(
+            evidence_record(&sandbox_state, "accepted-disabled", 1, evidence.clone(), 3),
+            Err(AppError::InvalidResponse)
+        ));
+        assert!(matches!(
+            command(args(&[
+                "evidence",
+                "record",
+                "--sandbox-state",
+                sandbox_state.to_str().unwrap(),
+                "--shape-version",
+                "9",
+            ])),
             Err(AppError::InvalidResponse)
         ));
         std::fs::remove_file(sandbox_state).unwrap();

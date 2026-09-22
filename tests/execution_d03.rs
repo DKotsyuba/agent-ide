@@ -1,4 +1,12 @@
 //! Real managed-sandbox D03 check driven by a captured host state and disposable targets.
+//!
+//! T35B note: the fixed expectations below (cwd write succeeds, `.git` and one outside write
+//! fail, loopback networking fails) describe the *legacy workspace-write* profile only. A
+//! root-write profile cannot pass "outside all write roots is denied", and a network-enabled
+//! profile cannot reuse restricted-network evidence, so a reviewed profile-specific expectation
+//! manifest (allowed cwd/outside/temp writes, carve-outs, network behavior, rule-order and
+//! duplicate behavior) remains a documented follow-up; these tests are `#[ignore]`d by ordinary
+//! runs and were deliberately not rewritten in T35B.
 
 use agent_ide::{
     assistance::host_binding::{
@@ -226,6 +234,24 @@ async fn captured_managed_profile_enforces_fixture_boundaries() {
     assert!(
         !network_result.status().success(),
         "network-restricted profile connected to the controlled listener"
+    );
+}
+
+/// Placeholder for the reviewed, profile-specific expectation-manifest experiment (T35B note).
+///
+/// The manifest run must consume an explicit reviewed expectation file for the *accepted*
+/// authority shape — allowed cwd/outside/temp writes against disposable targets, deny-protected
+/// disposable files, read-only carve-outs, expected network behavior, and rule-order, duplicate,
+/// missing-path, special-path, and symlink behavior — and replay it through the exact Codex
+/// sandbox argv, so a profile whose expectations differ (root-write, network-enabled) cannot
+/// reuse legacy evidence. It is named here so the gap stays visible in test listings and so the
+/// follow-up lands as this test's body rather than as new undocumented evidence.
+#[tokio::test]
+#[ignore = "the reviewed profile-specific expectation manifest (see module note) is not yet implemented"]
+async fn profile_specific_expectation_manifest_enforces_the_accepted_authority() {
+    panic!(
+        "the profile-specific D03 expectation-manifest experiment is pending; \
+         see the module note and docs/contracts/execution.md"
     );
 }
 
