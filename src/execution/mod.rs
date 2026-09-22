@@ -5012,4 +5012,5 @@ pub async fn run_inherited_child(
 pub mod seatbelt;
 
 #[cfg(test)]
-mod linear_tests;
+/// Execution unit tests and their shared portable sandbox fixture loader.
+pub(crate) mod linear_tests;
