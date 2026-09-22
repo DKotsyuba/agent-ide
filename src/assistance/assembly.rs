@@ -9,9 +9,9 @@ use super::{
         HelperTypeScriptFileV1, HelperTypeScriptProfileV1, LaunchLedger, RustEffectiveSettings,
     },
     host_binding::{
-        BindingStatus, FeedDelivery, HookPhase, HostBindingGuard, HostKind, ValidatedInvocation,
-        parse_candidate, parse_channel_session, parse_claude_call_id, parse_claude_hook_event,
-        parse_hook_event, parse_host_kind, parse_observed_sandbox_state,
+        BindingStatus, HookPhase, HostBindingGuard, HostKind, ValidatedInvocation, parse_candidate,
+        parse_channel_session, parse_claude_call_id, parse_claude_hook_event, parse_hook_event,
+        parse_host_kind, parse_observed_sandbox_state,
     },
     launcher::{AcceptedProviderSettings, LaunchTarget, LauncherConfig},
     problems::{ProjectProblemFeed, triggers_check},
@@ -834,20 +834,28 @@ impl ProductDispatcher {
                 }
                 let call_id = event.optional_call_id().map(str::to_owned);
                 let failed = event.failed();
-                // EYES-r2 §5/§6: only a hook-delivering host's post phases receive the problem
-                // block, and only the named native writers additionally trigger a project check.
-                // Reply-delivered hosts get their plates on terminal `ide.*` replies instead.
-                let hook_post = event.host().feed_delivery() == FeedDelivery::Hooks
+                // EYES-r2 §5/§6: a hook-delivering host's paired native post both triggers a
+                // project check (`triggers_check` is host-specific; T29B §4) and evaluates the
+                // due plate even when it does not trigger. Managed Codex delivers on hooks and
+                // replies at once; hosts without hook delivery take replies instead.
+                let hook_post = event.host().feed_delivery().allows_hooks()
                     && matches!(event.phase(), HookPhase::Post | HookPhase::PostFailure);
                 let triggers_check = hook_post && triggers_check(event.host(), event.tool_name());
+                // The settling post of an MCP call itself (T22B) carries a due plate only for a
+                // host whose replies can never carry one. A reply-capable host already had the
+                // first shot on this same call's terminal reply, so its settled post stays a
+                // silent carrier: everything still due reaches the next native post or reply
+                // exactly once (T29B §5).
+                let settled_plate = hook_post && !event.host().feed_delivery().allows_replies();
                 let status = self.bindings.lock().ok()?.observe_hook(event, channel);
                 match status {
                     BindingStatus::PreObserved => Some(PeerReply::HookObserved {}),
                     BindingStatus::Settled(binding) => {
                         // Settlement itself stays silent and never rechecks; but the settled MCP
                         // call may just have completed an activation or a check, so a due status
-                        // plate is still delivered on this post phase (T22B).
-                        if hook_post
+                        // plate is still delivered on this post phase (T22B) for hosts whose
+                        // replies never carry one.
+                        if settled_plate
                             && let Some(worker) = &self.worker
                             && let Some(block) = due_plate(
                                 worker.project_feed(),
@@ -874,7 +882,7 @@ impl ProductDispatcher {
                             // Settlement still delivers a due status plate: none was sent while
                             // the helper ran, and this may be the first hook after it finished
                             // (T22B). It triggers no recheck and advances no native epoch.
-                            if hook_post
+                            if settled_plate
                                 && let Some(worker) = &self.worker
                                 && let Some(block) =
                                     due_plate(worker.project_feed(), &binding.fingerprint(), None)
@@ -1264,13 +1272,15 @@ impl ProductDispatcher {
                             .await
                     }
                 };
-                // T28B: a reply-delivered host has no hook stream to notice its native edits
-                // (`apply_patch`, shell) or to carry its plates, so every `ide.*` call first
-                // reconciles the bound worktree's inputs (free while unchanged, T20B) and every
-                // terminal reply then carries the due plate at its top. `ide.stop` ends the
-                // binding and stays plate-free, and a `pending` placeholder is not terminal —
-                // the plate goes with the answer that resolves it.
-                if host.feed_delivery() == FeedDelivery::Replies
+                // T28B/T29B: reply-carrying hosts lead every terminal `ide.*` reply with the due
+                // plate. Every such call first reconciles the bound worktree's inputs (free while
+                // unchanged, T20B) — for managed Codex this stays even though hooks may now
+                // deliver natively, because installed hooks can be untrusted or stop running and
+                // the reply path must keep working unchanged. `ide.stop` ends the binding and
+                // stays plate-free, and a `pending` placeholder is not terminal — the plate goes
+                // with the answer that resolves it. The feed deduplicates by binding fingerprint,
+                // so a plate the native post already delivered is never repeated here.
+                if host.feed_delivery().allows_replies()
                     && method.method() != AssistanceMethod::Stop
                 {
                     if let Some(feed) = worker.project_feed() {

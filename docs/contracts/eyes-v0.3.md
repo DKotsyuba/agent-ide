@@ -266,15 +266,26 @@ pub struct ProblemSnapshot { pub language: Language, pub state: CheckState,
 
 ## 5. Scheduling
 
-- Triggers: successful `ide.start` (initial warm check), a Claude `PostToolUse`/`PostToolUseFailure`
-  hook event whose retained `tool_name` is one of `Edit`, `Write`, `MultiEdit`, `NotebookEdit`,
-  `Bash` (the hook parser retains `tool_name` for post phases only; tool input and output stay
-  discarded), a completed `ide.edit`, and — (T28B) for every host whose plate delivery rides
-  replies (see §6) — each `ide.*` tool call of that host, so a native edit made between two calls
-  (`apply_patch`, shell) is noticed without any hook stream. That per-call trigger is free while
-  the worktree inputs are unchanged (see the T20B skip below). An actor whose `ide.start` was
-  refused (for example `conflict` because another actor owns the worktree) has no binding: it
-  triggers no check and receives no block.
+- Triggers: successful `ide.start` (initial warm check), a native `PostToolUse`/`PostToolUseFailure`
+  hook event whose retained `tool_name` passes the host's trigger predicate (the hook parser
+  retains `tool_name` for post phases only; tool input and output stay discarded), a completed
+  `ide.edit`, and — (T28B) for every host whose plate delivery rides replies (see §6) — each
+  `ide.*` tool call of that host, so a native edit made between two calls (`apply_patch`, shell)
+  is noticed even without any hook stream. That per-call trigger is free while the worktree inputs
+  are unchanged (see the T20B skip below). An actor whose `ide.start` was refused (for example
+  `conflict` because another actor owns the worktree) has no binding: it triggers no check and
+  receives no block.
+- Trigger predicate (`triggers_check`, T29B §4): Claude keeps the exact
+  `Edit`/`Write`/`MultiEdit`/`NotebookEdit`/`Bash` writer allowlist. Codex has no certified writer
+  allowlist, so every paired native `PostToolUse` triggers — except this product's own MCP tool
+  names beginning `mcp__agent_ide__` or `mcp__agent-ide__`, whose results the helper just produced
+  and whose paired native post must stay silent (the managed admission records the call as
+  completed, so its own post is a replay and neither triggers a check nor delivers a plate).
+  Other servers' MCP tools are deliberately never excluded because they may edit files; a missing
+  or unrecognized `tool_name` triggers conservatively. This favors correctness over an incomplete
+  writer allowlist; the T20B skip bounds the repeated-check cost (broad triggering is inexpensive
+  in the common case, not universally free). Codex plate delivery is evaluated on every paired
+  native post even when the event does not trigger a check.
 - Per `(worktree, language)`: debounce `debounce_ms` after the last trigger; at most one running
   check; a trigger during a run marks it dirty and one more run follows (latest wins), and that
   follow-up run is subject to the same T20B skip-unchanged rule — with inputs unchanged from the
@@ -352,9 +363,20 @@ rust: 3 errors (+2), 5 warnings | python: environment not found
   something the emission or delta logic manufactures on its own account (for example, on a binary
   upgrade with no change underneath, the daemon restarts and the next block for each actor is
   simply a fresh first delivery, not a synthetic delta).
-- Delivery: `HostKind::feed_delivery` decides the carrier in one place — `Hooks` for Claude,
-  `Replies` for every other supported host (T28B). The plate data and emission rule are identical;
-  only the carrier differs.
+- Delivery: `HostKind::feed_delivery` decides the carriers in one place, and consumers use only
+  its `allows_hooks`/`allows_replies` capability predicates — `Hooks` for Claude, and (T29B)
+  `HooksAndReplies` for Codex, unconditionally. The plate data and emission rule are identical;
+  only the carriers differ. Codex's policy never inspects `hooks.json` and never latches a
+  "hooks work" flag: when the operator's hooks are absent, untrusted, or stopped working, the same
+  capability set simply operates replies-only.
+- Deduplication across carriers (T29B §5): both carriers resolve exactly the same binding
+  fingerprint — the hook derives the daemon channel from the same published attachment, the hook
+  actor is the MCP `threadId`, and a paired native post looks up the already-active actor/channel
+  binding instead of minting a generation — and both call the same feed under its wiring lock with
+  fingerprint plus worktree. The first carrier to find a due status consumes it; the second sees
+  unchanged status and stays silent, for either arrival order and for concurrent delivery. This
+  guarantees deduplication at response construction, **not exactly-once model receipt**: a plate
+  is marked sent when the response is produced, and a lost response is never retried.
 - Claude (`Hooks`): `PostToolUse` / `PostToolUseFailure` hook `additionalContext`, taken from the
   ready cache inside the existing hook deadline. The hook never waits for a check. Marking as
   delivered happens when the hook response is produced (at most once; a lost hook response is not
@@ -364,7 +386,10 @@ rust: 3 errors (+2), 5 warnings | python: environment not found
   its settlement, and on the `PostToolUse` of the Claude MCP tool whose invocation settled (T22B);
   neither triggers a recheck nor advances the native epoch. Claude `ide.*` replies never carry the
   plate, even while one is due.
-- Codex and other hosts without hook delivery (`Replies`, T28B): every terminal `ide.*` reply —
+- Codex (`HooksAndReplies`, T28B/T29B): the native hook carrier works like Claude's — a paired
+  native `PostToolUse` delivers the due plate in `hookSpecificOutput.additionalContext` inside the
+  existing 250 ms hook deadline, never waiting for a check, followed by any eligible one-shot
+  native feedback within the same bounded context. In addition, every terminal `ide.*` reply —
   `ide.context` (file pages and the problems kind), `ide.diff`, `ide.edit` in every outcome,
   `ide.inspect` results that resolve a pending job, `ide.start` completion, and typed error
   replies — carries the due plate at the start of what the model reads, followed by a newline and

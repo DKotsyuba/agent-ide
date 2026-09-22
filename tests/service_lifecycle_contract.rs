@@ -867,6 +867,36 @@ async fn exchange_v3(runtime: &Path, request_id: &str) -> Value {
     serde_json::from_slice(&body).unwrap()
 }
 
+/// Sends one raw v2 `assistance.hook_submit` frame, exactly the request a native Codex or Claude
+/// hook process issues, and returns the daemon's correlated reply.
+async fn exchange_hook_submit(runtime: &Path, request_id: &str) -> Value {
+    let mut stream = UnixStream::connect(runtime.join("agent-ide.sock"))
+        .await
+        .unwrap();
+    let request = json!({
+        "version": 2,
+        "request_id": request_id,
+        "correlation_id": format!("corr-{request_id}"),
+        "opaque_attachment": "private-host-channel",
+        "method": "assistance.hook_submit",
+        "sanitized_observation_json": {"host": "codex", "phase": "pre", "actor_id": "actor",
+            "call_id": request_id, "session_id": null, "agent_type": null,
+            "launch_command": null, "launch_background": null, "failed": false,
+            "tool_name": null}
+    });
+    let body = serde_json::to_vec(&request).unwrap();
+    stream
+        .write_all(&(body.len() as u32).to_be_bytes())
+        .await
+        .unwrap();
+    stream.write_all(&body).await.unwrap();
+    let mut length = [0_u8; 4];
+    stream.read_exact(&mut length).await.unwrap();
+    let mut body = vec![0; u32::from_be_bytes(length) as usize];
+    stream.read_exact(&mut body).await.unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
 /// A lease-free client session is visible to the daemon only through the calls it serves (T26B):
 /// the managed Codex MCP owns its per-session daemon outright and holds no `ClientLease` at all.
 /// A served v3 Assistance call within the idle window must restart the countdown — the daemon
@@ -897,4 +927,32 @@ async fn a_served_assistance_call_restarts_the_idle_countdown() {
         !runtime.exists(),
         "orderly idle shutdown must remove its own runtime directory"
     );
+}
+
+/// Native hook traffic is served Assistance traffic too (T26B, T29B): a lease-free managed Codex
+/// daemon is kept alive by its hooks' `assistance.hook_submit` submissions alone, so operator
+/// hooks firing between two `ide.*` calls never let the daemon idle out mid-conversation.
+#[tokio::test]
+async fn a_served_hook_submit_restarts_the_idle_countdown() {
+    const IDLE_MS: u64 = 600;
+    let (runtime, task) = start_lease_test_daemon(Duration::from_millis(IDLE_MS)).await;
+
+    // One served hook submission at half the window; without the restart the daemon would exit
+    // at 1x window. The dispatcher rejects the observation (no worker); only serving matters.
+    tokio::time::sleep(Duration::from_millis(IDLE_MS / 2)).await;
+    let reply = exchange_hook_submit(&runtime, "hook-probe").await;
+    assert_eq!(reply["status"], json!("unavailable"), "{reply}");
+
+    // Past the ORIGINAL deadline; still alive proves the served hook restarted the countdown.
+    tokio::time::sleep(Duration::from_millis(IDLE_MS * 3 / 4)).await;
+    assert!(
+        !task.is_finished(),
+        "a served hook submission within the idle window must restart the countdown"
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("one full silent window after the last hook must still end the daemon")
+        .unwrap();
+    assert!(!runtime.exists());
 }

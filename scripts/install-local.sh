@@ -175,3 +175,12 @@ printf 'agent-ide install: %s -> %s\n' "${old_version_label:-none}" "$version"
 printf '  binary:  %s\n' "$installed_bin"
 printf '  plugin:  %s\n' "$version_dir"
 printf '  current: %s\n' "$current_link"
+
+# Codex native hooks (T29B): this installer never reads or writes ~/.codex. It only prints
+# the printer command and the operator's manual merge/trust steps.
+printf '\n'
+printf 'Codex native hooks (managed): print the exact hooks.json fragment with\n'
+printf '  %s codex-hooks print\n' "$installed_bin"
+printf 'then merge its two handlers into the existing PreToolUse/PostToolUse arrays of ~/.codex/hooks.json, preserving existing entries.\n'
+printf 'Review and trust both definitions in Codex itself (/hooks); untrusted hooks simply stay silent.\n'
+printf 'Never register the agent-ide handler twice: duplicate pre-events are rejected as replays. The product never writes ~/.codex.\n'

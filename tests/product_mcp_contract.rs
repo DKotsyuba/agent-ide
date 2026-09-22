@@ -1377,6 +1377,68 @@ fn shell_quote_for_test(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
+/// An overridden rendezvous root that is group/other-readable is refused outright by the managed
+/// hook (silent exit 0): the environment override exists only for tests, and every safety check
+/// — effective-UID owner, exact `0700` directories, `0600` records, no symlinks — still applies
+/// to an overridden root (T29B §8). The same root at `0700` answers through the same live daemon,
+/// proving only the mode kept the first invocation silent.
+#[tokio::test]
+async fn binary_managed_codex_hook_refuses_a_loose_rendezvous_root() {
+    let base = rendezvous_area("hook-loose-root");
+    let root = base.join("rendezvous");
+    let (runtime_dir, listener) = fixture_runtime(&base);
+    let attachment = "a1b2c3d4".repeat(8);
+    let identity = CodexRouteIdentity::new("root-session-1", "actor-1").unwrap();
+    let mut publisher = ManagedCodexPublisher::new(root.clone(), runtime_dir, attachment.clone());
+    publisher.publish(&identity).unwrap();
+    // Warm the binary first: cold executable startup must not eat into the hook deadline.
+    let mut warm = managed_codex_hook_process(&root, None);
+    drop(warm.stdin.take());
+    let warm_output = tokio::time::timeout(Duration::from_secs(2), warm.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_managed_hook_silent(&warm_output);
+    // One live answerer: any discovery that gets past the checks renders this feedback.
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let size = stream.read_u32().await.unwrap();
+            let mut body = vec![0; size as usize];
+            stream.read_exact(&mut body).await.unwrap();
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            let reply = serde_json::to_vec(&json!({
+                "version": 2,
+                "request_id": request["request_id"],
+                "correlation_id": request["correlation_id"],
+                "opaque_reply_json": {"state":"feedback","text":"loose-root probe"}
+            }))
+            .unwrap();
+            stream.write_u32(reply.len() as u32).await.unwrap();
+            stream.write_all(&reply).await.unwrap();
+        }
+    });
+    let payload = json!({"hook_event_name":"PostToolUse","session_id":"root-session-1",
+        "agent_id":"actor-1","tool_use_id":"call-1","tool_name":"Bash"});
+
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_managed_hook_silent(&managed_codex_hook(&root, &payload).await);
+
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let output = managed_codex_hook(&root, &payload).await;
+    assert!(
+        output.status.success() && output.stderr.is_empty(),
+        "{output:?}"
+    );
+    let rendered: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        rendered["hookSpecificOutput"]["additionalContext"],
+        "loose-root probe"
+    );
+    drop(publisher);
+    server.abort();
+    std::fs::remove_dir_all(base).unwrap();
+}
+
 /// Proves CLI query follows its returned cursor and read-only query/export report unknown drops.
 #[tokio::test]
 async fn telemetry_cli_continues_after_first_page_and_never_invents_drops() {
@@ -6941,6 +7003,741 @@ async fn eyes_codex_managed_reply_carries_due_plate_after_native_edit() {
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     assert!(carried_status(&stopped).is_none(), "{stopped}");
     mcp.close().await;
+}
+
+/// Runs one managed Codex native hook phase through the real `codex-hook --managed` command with
+/// the exact identity a paired native call carries: root session, actor, tool-use id, tool name.
+async fn managed_native_phase(
+    root: &Path,
+    session: &str,
+    actor: &str,
+    phase: &str,
+    call: &str,
+    tool: Option<&str>,
+) -> std::process::Output {
+    let mut payload = json!({
+        "hook_event_name": phase,
+        "session_id": session,
+        "agent_id": actor,
+        "tool_use_id": call,
+    });
+    if let Some(tool) = tool {
+        payload["tool_name"] = json!(tool);
+    }
+    managed_codex_hook(root, &payload).await
+}
+
+/// Runs one paired native Pre/Post for an actor and returns the post hook's raw stdout.
+///
+/// The pre hook must stay silent and succeed; the post may carry model context.
+async fn managed_native_post(
+    root: &Path,
+    session: &str,
+    actor: &str,
+    call: &str,
+    tool: &str,
+) -> String {
+    let pre = managed_native_phase(root, session, actor, "PreToolUse", call, None).await;
+    assert!(
+        pre.status.success() && pre.stdout.is_empty() && pre.stderr.is_empty(),
+        "managed pre hook must stay silent: {pre:?}"
+    );
+    let post = managed_native_phase(root, session, actor, "PostToolUse", call, Some(tool)).await;
+    assert!(
+        post.status.success() && post.stderr.is_empty(),
+        "managed post hook failed: {post:?}"
+    );
+    String::from_utf8(post.stdout).unwrap()
+}
+
+/// Extracts `hookSpecificOutput.additionalContext` from a managed post hook's stdout; empty when
+/// the hook was silent.
+fn managed_hook_context(stdout: &str) -> String {
+    if stdout.is_empty() {
+        return String::new();
+    }
+    let rendered: Value = serde_json::from_str(stdout).expect("hook stdout is the JSON contract");
+    rendered["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("post context carries additionalContext")
+        .to_owned()
+}
+
+/// Polls one actor's paired managed native post hooks until one delivers exactly `expected`
+/// (T29B §7). No `ide.*` call participates in this loop: the hook carrier is the only channel.
+/// Intermediate `checking (…)` plates are legitimately delivered once each and simply consumed.
+async fn await_eyes_codex_hook_plate(
+    root: &Path,
+    session: &str,
+    actor: &str,
+    expected: &str,
+    poll: &mut usize,
+) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        *poll += 1;
+        let stdout =
+            managed_native_post(root, session, actor, &format!("native-{poll}"), "Bash").await;
+        let context = managed_hook_context(&stdout);
+        if context == expected {
+            return context;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no problem block was delivered on a managed hook: {context:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
+/// Polls managed `ide.context` problems replies (explicit root session) until one carries exactly
+/// `expected` on its reply carrier (T28B), returning the plate.
+async fn await_eyes_codex_managed_root_plate(
+    mcp: &mut Mcp,
+    next: &mut usize,
+    actor: &str,
+    session: &str,
+    state: &Value,
+    expected: &str,
+) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        *next += 1;
+        let reply = managed_root_call(
+            mcp,
+            *next,
+            actor,
+            session,
+            "ide.context",
+            json!({"kind":"problems"}),
+            state,
+        )
+        .await;
+        if carried_status(&reply) == Some(expected) {
+            return expected.to_owned();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no problem block was delivered on a managed reply: {reply}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Managed Codex native hooks deliver the plate without any later `ide.*` call: after the
+/// activation, paired native post hooks carry the first result and then the `(+1)` delta of a
+/// native edit, and the reply carrier never repeats the hook's plate (T29B §5, §7).
+#[tokio::test]
+async fn eyes_codex_managed_native_post_delivers_plate_and_delta_without_ide_calls() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let fixture = ProductFixture::new(json!([]));
+    // The fake cargo holds its first run briefly so the activation reply cannot carry the result.
+    let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, "sleep 1");
+    std::fs::write(fixture.root.join("problems.count"), "1").unwrap();
+    let base = rendezvous_area("eyes-hooks");
+    let root = base.join("rendezvous");
+    let mut mcp =
+        Mcp::start_managed_custom(&fixture.config, &fixture.root, Some(&home), Some(&root)).await;
+    let state = fixture.state();
+    let session = "eyes-session";
+    let actor = "eyes-actor";
+    let mut next = 100;
+
+    let started = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        session,
+        "ide.start",
+        json!({"activation_id":"eyes-hooks"}),
+        &state,
+    )
+    .await;
+    let started = settle_managed(&mut mcp, &mut next, actor, &state, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    // From here on every delivery happens through managed native hooks only.
+    let first = await_eyes_codex_hook_plate(
+        &root,
+        session,
+        actor,
+        "<agent-ide>\nrust: 1 error, 0 warnings\n</agent-ide>",
+        &mut next,
+    )
+    .await;
+    assert_eq!(
+        first,
+        "<agent-ide>\nrust: 1 error, 0 warnings\n</agent-ide>"
+    );
+
+    // A native edit that no `ide.*` call ever observes still produces the (+1) delta, on a hook.
+    std::fs::write(fixture.root.join("problems.count"), "2").unwrap();
+    let delta = await_eyes_codex_hook_plate(
+        &root,
+        session,
+        actor,
+        "<agent-ide>\nrust: 2 errors (+1), 0 warnings\n</agent-ide>",
+        &mut next,
+    )
+    .await;
+    assert_eq!(
+        delta,
+        "<agent-ide>\nrust: 2 errors (+1), 0 warnings\n</agent-ide>"
+    );
+
+    // Hook→reply dedup: the terminal reply must not repeat the hook's plate. A `checking (…)`
+    // plate for the reconciliation the reply itself scheduled is a new state, not a repeat.
+    next += 1;
+    let reply = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        session,
+        "ide.context",
+        json!({"kind":"problems"}),
+        &state,
+    )
+    .await;
+    let plate = carried_status(&reply);
+    assert_ne!(
+        plate,
+        Some(delta.as_str()),
+        "the reply carrier repeated the hook's plate: {reply}"
+    );
+    assert!(
+        plate.is_none() || plate.unwrap().contains("checking"),
+        "{plate:?}"
+    );
+
+    mcp.close().await;
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+/// Reply→hook dedup: when the reply carrier delivers a due plate first, the paired managed native
+/// post hook that follows stays silent, and the next reply carries nothing either (T29B §5).
+#[tokio::test]
+async fn eyes_codex_reply_carrier_consumes_the_plate_before_the_native_hook() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let fixture = ProductFixture::new(json!([]));
+    let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, "sleep 1");
+    std::fs::write(fixture.root.join("problems.count"), "1").unwrap();
+    let base = rendezvous_area("eyes-reply-first");
+    let root = base.join("rendezvous");
+    let mut mcp =
+        Mcp::start_managed_custom(&fixture.config, &fixture.root, Some(&home), Some(&root)).await;
+    let state = fixture.state();
+    let session = "eyes-session";
+    let actor = "eyes-actor";
+    let mut next = 100;
+
+    let started = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        session,
+        "ide.start",
+        json!({"activation_id":"eyes-reply-first"}),
+        &state,
+    )
+    .await;
+    let started = settle_managed(&mut mcp, &mut next, actor, &state, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    let result = await_eyes_codex_managed_root_plate(
+        &mut mcp,
+        &mut next,
+        actor,
+        session,
+        &state,
+        "<agent-ide>\nrust: 1 error, 0 warnings\n</agent-ide>",
+    )
+    .await;
+    assert_eq!(
+        result,
+        "<agent-ide>\nrust: 1 error, 0 warnings\n</agent-ide>"
+    );
+
+    // The reply consumed it: the paired native post that follows this call is silent, and so is
+    // the next terminal reply.
+    let stdout = managed_native_post(&root, session, actor, "native-reply-first", "Bash").await;
+    assert!(
+        managed_hook_context(&stdout).is_empty(),
+        "the hook repeated the reply's plate: {stdout}"
+    );
+    next += 1;
+    let reply = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        session,
+        "ide.context",
+        json!({"kind":"problems"}),
+        &state,
+    )
+    .await;
+    assert!(
+        carried_status(&reply).is_none() || carried_status(&reply).unwrap().contains("checking"),
+        "the reply repeated its own plate: {reply}"
+    );
+
+    mcp.close().await;
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+/// Concurrent delivery: a managed native post hook and a terminal reply fired at the same moment
+/// yield exactly one plate between them, and neither carrier repeats it afterwards (T29B §5).
+#[tokio::test]
+async fn eyes_codex_concurrent_hook_and_reply_deliver_exactly_one_plate() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let fixture = ProductFixture::new(json!([]));
+    let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, "sleep 1");
+    std::fs::write(fixture.root.join("problems.count"), "1").unwrap();
+    let base = rendezvous_area("eyes-concurrent");
+    let root = base.join("rendezvous");
+    let mut mcp =
+        Mcp::start_managed_custom(&fixture.config, &fixture.root, Some(&home), Some(&root)).await;
+    let state = fixture.state();
+    let session = "eyes-session";
+    let actor = "eyes-actor";
+    let mut next = 100;
+
+    let started = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        session,
+        "ide.start",
+        json!({"activation_id":"eyes-concurrent"}),
+        &state,
+    )
+    .await;
+    let started = settle_managed(&mut mcp, &mut next, actor, &state, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    let expected = "<agent-ide>\nrust: 1 error, 0 warnings\n</agent-ide>";
+    // Fire both carriers concurrently against the same binding fingerprint. While the held first
+    // check is still running neither carrier has the plate due, so an all-silent round simply
+    // retries; the moment the result is due, this race must yield exactly one delivery.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        next += 1;
+        let next_for_reply = next;
+        let race_call = format!("native-race-{next}");
+        let hook_run = managed_native_post(&root, session, actor, &race_call, "Bash");
+        let state_for_race = state.clone();
+        let reply_run = mcp.exchange(
+            json!({"jsonrpc":"2.0","id":next_for_reply,"method":"tools/call","params":{"name":"ide.context",
+                "arguments":{"kind":"problems"},
+                "_meta":{"threadId":actor,"callId":format!("managed-{actor}-{next_for_reply}"),
+                "x-codex-turn-metadata":{"session_id":session},"codex/sandbox-state-meta":state_for_race}}}),
+        );
+        let (hook_stdout, reply) = tokio::join!(hook_run, reply_run);
+        assert_compact_envelope(&reply);
+        let hook_plate = managed_hook_context(&hook_stdout);
+        let reply_plate = carried_status(&reply["result"]["structuredContent"]).map(str::to_owned);
+        let carried = [
+            hook_plate == expected,
+            reply_plate.as_deref() == Some(expected),
+        ];
+        let deliveries = carried.iter().filter(|delivered| **delivered).count();
+        if deliveries == 1 {
+            break;
+        }
+        assert_eq!(
+            deliveries, 0,
+            "both carriers delivered the same plate: hook={hook_plate:?} reply={reply_plate:?}"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the result never became due for the concurrent race"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    // And the losing carrier (and any later one) never repeats it.
+    let stdout = managed_native_post(&root, session, actor, "native-race-2", "Bash").await;
+    assert_ne!(
+        managed_hook_context(&stdout),
+        expected,
+        "the hook repeated the delivered plate"
+    );
+    next += 1;
+    let later = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        session,
+        "ide.context",
+        json!({"kind":"problems"}),
+        &state,
+    )
+    .await;
+    assert_ne!(
+        carried_status(&later),
+        Some(expected),
+        "the reply repeated the delivered plate: {later}"
+    );
+
+    mcp.close().await;
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+/// A parent and two child actors on one root session are fully isolated. Each actor owns its own
+/// managed MCP process (a daemon's workspace authority admits one worktree owner, so a child
+/// session runs its own), and all three share one rendezvous root: a child's hook never falls
+/// back to the parent's route before the child published its own, each route is distinct and
+/// live, and each actor's delta is delivered exactly once, by its own binding (T29B §7).
+#[tokio::test]
+async fn eyes_codex_parent_and_two_children_are_isolated_without_route_fallback() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let fixture = ProductFixture::new(json!([]));
+    let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, "sleep 1");
+    std::fs::write(fixture.root.join("problems.count"), "1").unwrap();
+    let base = rendezvous_area("eyes-family");
+    let root = base.join("rendezvous");
+    let state = fixture.state();
+    let session = "eyes-family";
+    let parent = "eyes-parent";
+    let children = ["eyes-child-1", "eyes-child-2"];
+
+    // Before any child MCP process exists there is no child route: the hook must stay silent
+    // instead of falling back to the parent's published route.
+    let mut parent_mcp =
+        Mcp::start_managed_custom(&fixture.config, &fixture.root, Some(&home), Some(&root)).await;
+    let mut next = 100;
+    let started = managed_root_call(
+        &mut parent_mcp,
+        next,
+        parent,
+        session,
+        "ide.start",
+        json!({"activation_id":"eyes-family"}),
+        &state,
+    )
+    .await;
+    let settled = settle_managed(&mut parent_mcp, &mut next, parent, &state, started).await;
+    assert_eq!(settled["kind"], "activation", "{settled}");
+    let orphan = managed_native_phase(
+        &root,
+        session,
+        children[0],
+        "PostToolUse",
+        "orphan-child",
+        Some("Bash"),
+    )
+    .await;
+    assert_managed_hook_silent(&orphan);
+
+    // Each child is its own managed MCP: it publishes its own distinct route for the shared root
+    // session and activates its own binding, so each actor gets only its own daemon's plates.
+    let mut child_mcps = Vec::new();
+    for child in children {
+        let mut mcp =
+            Mcp::start_managed_custom(&fixture.config, &fixture.root, Some(&home), Some(&root))
+                .await;
+        let mut child_next = 100;
+        let started = managed_root_call(
+            &mut mcp,
+            child_next,
+            child,
+            session,
+            "ide.start",
+            json!({"activation_id":format!("eyes-family-{child}")}),
+            &state,
+        )
+        .await;
+        let settled = settle_managed(&mut mcp, &mut child_next, child, &state, started).await;
+        assert_eq!(settled["kind"], "activation", "{settled}");
+        child_mcps.push(mcp);
+    }
+    let parent_identity = CodexRouteIdentity::new(session, parent).unwrap();
+    assert!(discover(&root, &parent_identity).is_some(), "parent route");
+    for child in children {
+        let identity = CodexRouteIdentity::new(session, child).unwrap();
+        assert_ne!(identity.digest(), parent_identity.digest());
+        assert!(discover(&root, &identity).is_some(), "{child} route");
+    }
+
+    // The `(+1)` delta needs the first result delivered as each actor's delta baseline first.
+    // Every activation completion happened while its check was held, so no reply carried the
+    // result: each actor's own hooks deliver it, each exactly once.
+    let mut poll = 200;
+    for actor in [parent, children[0], children[1]] {
+        let baseline = await_eyes_codex_hook_plate(
+            &root,
+            session,
+            actor,
+            "<agent-ide>\nrust: 1 error, 0 warnings\n</agent-ide>",
+            &mut poll,
+        )
+        .await;
+        assert_eq!(
+            baseline,
+            "<agent-ide>\nrust: 1 error, 0 warnings\n</agent-ide>"
+        );
+    }
+
+    // One shared native edit: every actor's own hooks deliver the same delta exactly once,
+    // each through its own binding — an entangled route would consume a sibling's due plate.
+    std::fs::write(fixture.root.join("problems.count"), "2").unwrap();
+    for actor in [parent, children[0], children[1]] {
+        let delta = await_eyes_codex_hook_plate(
+            &root,
+            session,
+            actor,
+            "<agent-ide>\nrust: 2 errors (+1), 0 warnings\n</agent-ide>",
+            &mut poll,
+        )
+        .await;
+        assert_eq!(
+            delta,
+            "<agent-ide>\nrust: 2 errors (+1), 0 warnings\n</agent-ide>"
+        );
+        // Immediately delivered again to the same actor? Never. (A fresh `checking (…)` plate
+        // for a scheduled recheck would be a new state, not a repeat.)
+        let stdout = managed_native_post(
+            &root,
+            session,
+            actor,
+            &format!("native-again-{actor}"),
+            "Bash",
+        )
+        .await;
+        let context = managed_hook_context(&stdout);
+        assert!(
+            context.is_empty() || context.contains("checking"),
+            "{actor}'s delta was delivered twice: {context}"
+        );
+    }
+
+    parent_mcp.close().await;
+    for mcp in child_mcps {
+        mcp.close().await;
+    }
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+/// Two root sessions on the same repository converge on one actor binding: both routes are
+/// published and live, but a plate delivered through session A's route is never delivered again
+/// through session B's route, because both resolve the same binding fingerprint (T29B §5).
+#[tokio::test]
+async fn eyes_codex_two_sessions_on_one_repository_deliver_once_across_routes() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let fixture = ProductFixture::new(json!([]));
+    let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, "sleep 1");
+    std::fs::write(fixture.root.join("problems.count"), "1").unwrap();
+    let base = rendezvous_area("eyes-sessions");
+    let root = base.join("rendezvous");
+    let mut mcp =
+        Mcp::start_managed_custom(&fixture.config, &fixture.root, Some(&home), Some(&root)).await;
+    let state = fixture.state();
+    let actor = "eyes-resumed";
+    let session_a = "eyes-session-a";
+    let session_b = "eyes-session-b";
+    let mut next = 100;
+
+    let started = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        session_a,
+        "ide.start",
+        json!({"activation_id":"eyes-session-a"}),
+        &state,
+    )
+    .await;
+    let settled = settle_managed(&mut mcp, &mut next, actor, &state, started).await;
+    assert_eq!(settled["kind"], "activation", "{settled}");
+    // The second session publishes its own route through an ordinary call on the same actor; a
+    // second explicit start would not be an idempotent replay of the first activation.
+    next += 1;
+    let resumed = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        session_b,
+        "ide.context",
+        json!({"kind":"problems"}),
+        &state,
+    )
+    .await;
+    assert_eq!(resumed["state"], "complete", "{resumed}");
+    let route_a = CodexRouteIdentity::new(session_a, actor).unwrap();
+    let route_b = CodexRouteIdentity::new(session_b, actor).unwrap();
+    assert_ne!(route_a.digest(), route_b.digest(), "two distinct routes");
+    assert!(discover(&root, &route_a).is_some());
+    assert!(discover(&root, &route_b).is_some());
+
+    // The delta needs the first result as its baseline first; the replies could not have carried
+    // it (the held check was still running), so the hook carrier delivers it now.
+    let baseline = await_eyes_codex_hook_plate(
+        &root,
+        session_a,
+        actor,
+        "<agent-ide>\nrust: 1 error, 0 warnings\n</agent-ide>",
+        &mut next,
+    )
+    .await;
+    assert_eq!(
+        baseline,
+        "<agent-ide>\nrust: 1 error, 0 warnings\n</agent-ide>"
+    );
+
+    std::fs::write(fixture.root.join("problems.count"), "2").unwrap();
+    let expected = "<agent-ide>\nrust: 2 errors (+1), 0 warnings\n</agent-ide>";
+    let delta = await_eyes_codex_hook_plate(&root, session_a, actor, expected, &mut next).await;
+    assert_eq!(delta, expected);
+
+    // The same actor through the OTHER session's route: same binding fingerprint, same feed key,
+    // so the delta is not delivered again.
+    let stdout = managed_native_post(&root, session_b, actor, "native-session-b", "Bash").await;
+    let context = managed_hook_context(&stdout);
+    assert_ne!(
+        context, expected,
+        "session B's route repeated session A's plate: {context}"
+    );
+    assert!(
+        context.is_empty() || context.contains("checking"),
+        "{context}"
+    );
+
+    mcp.close().await;
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+/// Managed Codex hook lifecycles that must never speak: a post without its pre, the MCP call's
+/// own paired native hooks (which poison nothing), a late post after `ide.stop`, malformed and
+/// oversized payloads, and a stale publication after the MCP exited — all silent exit 0 (T29B §7).
+#[tokio::test]
+async fn eyes_codex_managed_hook_lifecycles_stay_silent_without_delivery() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let fixture = ProductFixture::new(json!([]));
+    let base = rendezvous_area("eyes-lifecycle");
+    let root = base.join("rendezvous");
+    let mut mcp = Mcp::start_managed_with_rendezvous(&fixture.config, &fixture.root, &root).await;
+    let state = fixture.state();
+    let session = "edge-session";
+    let actor = "edge-actor";
+    let mut next = 100;
+
+    let started = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        session,
+        "ide.start",
+        json!({"activation_id":"edge-start"}),
+        &state,
+    )
+    .await;
+    let started = settle_managed(&mut mcp, &mut next, actor, &state, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    // A post whose pre was never observed correlates to nothing and schedules nothing.
+    let orphan = managed_native_phase(
+        &root,
+        session,
+        actor,
+        "PostToolUse",
+        "orphan-1",
+        Some("Bash"),
+    )
+    .await;
+    assert_managed_hook_silent(&orphan);
+
+    // The MCP call's own paired native hooks stay silent: the call's admission consumed the
+    // pre phase and completed the call, so its pre replays and its post is a completed replay —
+    // and neither may trigger a check that would treat the call's own result as a foreign change.
+    next += 1;
+    let own_call = format!("managed-{actor}-{next}");
+    let reply = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        session,
+        "ide.context",
+        json!({"path":"tracked.txt"}),
+        &state,
+    )
+    .await;
+    assert_eq!(reply["state"], "pending", "{reply}");
+    let own_pre = managed_native_phase(&root, session, actor, "PreToolUse", &own_call, None).await;
+    assert_managed_hook_silent(&own_pre);
+    let own_post = managed_native_phase(
+        &root,
+        session,
+        actor,
+        "PostToolUse",
+        &own_call,
+        Some("mcp__agent_ide__context"),
+    )
+    .await;
+    assert_managed_hook_silent(&own_post);
+    // Poisoned nothing: the same actor's next call still validates and answers.
+    next += 1;
+    let followup = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        session,
+        "ide.context",
+        json!({"path":"tracked.txt"}),
+        &state,
+    )
+    .await;
+    assert_eq!(followup["state"], "pending", "{followup}");
+
+    // A late paired post after ide.stop is silent.
+    next += 1;
+    let stopped = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        session,
+        "ide.stop",
+        json!({}),
+        &state,
+    )
+    .await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    let late_pre = managed_native_phase(&root, session, actor, "PreToolUse", "late-1", None).await;
+    assert_managed_hook_silent(&late_pre);
+    let late_post =
+        managed_native_phase(&root, session, actor, "PostToolUse", "late-1", Some("Bash")).await;
+    assert_managed_hook_silent(&late_post);
+
+    // Malformed (identity-less) and oversized payloads are discarded silently.
+    let malformed = managed_codex_hook(
+        &root,
+        &json!({"hook_event_name":"PostToolUse","tool_use_id":"x"}),
+    )
+    .await;
+    assert_managed_hook_silent(&malformed);
+    let mut child = managed_codex_hook_process(&root, None);
+    let mut input = child.stdin.take().unwrap();
+    input.write_all(&vec![b'x'; 64 * 1024 + 1]).await.unwrap();
+    input.shutdown().await.unwrap();
+    drop(input);
+    let oversized = tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_managed_hook_silent(&oversized);
+
+    // After the MCP exits, its routes are retired and its daemon is gone: a stale hook stays
+    // silent and exits 0.
+    mcp.close().await;
+    let stale = managed_native_phase(
+        &root,
+        session,
+        actor,
+        "PostToolUse",
+        "stale-1",
+        Some("Bash"),
+    )
+    .await;
+    assert_managed_hook_silent(&stale);
+    std::fs::remove_dir_all(base).unwrap();
 }
 
 /// Claude keeps hook-only plate delivery: `ide.*` replies never carry the plate even while one is

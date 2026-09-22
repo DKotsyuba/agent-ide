@@ -63,8 +63,9 @@ macOS and feeds the active agent a compact `<agent-ide>` problem-count block plu
 read-only check execution with private per-repository caches under `$HOME/.agent-ide/checks`, the
 Claude rendezvous (`/private/tmp/ai-r-…`) and its hook key cache (`/private/tmp/ai-k-…`),
 delta-only block emission, problems retrieval, and one bucketed `ProjectCheckCompleted` telemetry
-event. Every supported host receives the block: Claude in hook context, Codex and any future
-hook-less host at the top of its terminal `ide.*` replies (T28B); Linux stays `not_tested`.
+event. Every supported host receives the block: Claude in hook context, Codex through its native
+hooks and terminal replies at once (T29B) — and any future host without a hook carrier at the top
+of its terminal `ide.*` replies (T28B); Linux stays `not_tested`.
 
 Deferred to phase 2, in this order: warm LSP checks, launchd registration, a per-user service,
 subagent attach, TypeScript checks, and Go checks last.

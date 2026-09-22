@@ -195,24 +195,46 @@ pub enum HostKind {
 
 /// Names how one host receives the project problem feed's status plate (T28B).
 ///
-/// There is no third shape and no per-feature split: every supported host gets the same plate
-/// data, and [`HostKind::feed_delivery`] is the one place that decides the carrier.
+/// There is no per-feature split: every supported host gets the same plate data, and
+/// [`HostKind::feed_delivery`] is the one place that decides the carrier. Whether a carrier is
+/// actually used is decided only by [`FeedDelivery::allows_hooks`] and
+/// [`FeedDelivery::allows_replies`]; no consumer compares variants directly (T29B §5).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FeedDelivery {
     /// The host relays native post-hooks; due plates ride hook context (Claude).
     Hooks,
     /// The host has no hook delivery for the plate; due plates lead terminal `ide.*` replies.
     Replies,
+    /// The host relays native post-hooks and also reads terminal replies (managed Codex, T29B §5).
+    ///
+    /// This is unconditional: hooks.json is never inspected and no "hooks work" flag is latched,
+    /// so a previously working hook that stops running keeps reply delivery available.
+    HooksAndReplies,
+}
+
+impl FeedDelivery {
+    /// Whether this host's native post phases may carry the due plate.
+    pub fn allows_hooks(self) -> bool {
+        matches!(self, FeedDelivery::Hooks | FeedDelivery::HooksAndReplies)
+    }
+
+    /// Whether this host's terminal `ide.*` replies may carry the due plate.
+    pub fn allows_replies(self) -> bool {
+        matches!(self, FeedDelivery::Replies | FeedDelivery::HooksAndReplies)
+    }
 }
 
 impl HostKind {
-    /// Decides, in this one place, whether a host's plate rides native hooks or tool replies.
+    /// Decides, in this one place, which carriers a host's plate may ride.
     ///
-    /// A future third host picks a side here and every feed path follows.
+    /// A future third host picks a side here and every feed path follows. Managed Codex takes
+    /// [`FeedDelivery::HooksAndReplies`] unconditionally (T29B §5): when the operator installed
+    /// and trusted the hooks the native post delivers the plate, and when they are absent or
+    /// untrusted the same policy still delivers it on terminal replies.
     pub fn feed_delivery(&self) -> FeedDelivery {
         match self {
             HostKind::Claude => FeedDelivery::Hooks,
-            HostKind::Codex => FeedDelivery::Replies,
+            HostKind::Codex => FeedDelivery::HooksAndReplies,
         }
     }
 }
@@ -239,8 +261,9 @@ pub struct HookEvent {
     launch: Option<HookLaunch>,
     /// Whether a post reported explicit failure; `false` for every non-post event.
     failed: bool,
-    /// Native tool name retained only for Claude `PostToolUse`/`PostToolUseFailure`; the name
-    /// alone selects project-check triggers (EYES-r2 §5) and never carries tool input or output.
+    /// Native tool name retained only for post phases of either host; the name alone selects the
+    /// host-specific project-check triggers (EYES-r2 §5, T29B §4) and never carries tool input
+    /// or output.
     tool_name: Option<String>,
 }
 
@@ -289,10 +312,10 @@ impl HookEvent {
         self.failed
     }
 
-    /// Returns the native tool name of a Claude post or post-failure event.
+    /// Returns the native tool name of a post or post-failure event of either host.
     ///
-    /// Absent for Codex, for pre, permission-denied and batch phases, and whenever the host sent
-    /// no valid bounded name.
+    /// Absent for pre, permission-denied and batch phases, and whenever the host sent no valid
+    /// bounded name.
     pub fn tool_name(&self) -> Option<&str> {
         self.tool_name.as_deref()
     }
@@ -1789,6 +1812,61 @@ mod tests {
             guard.observe_hook(codex_hook("PostToolUse", "actor-a", "call-5"), channel),
             BindingStatus::NativeObserved(_)
         ));
+    }
+
+    /// Both plate carriers resolve one binding fingerprint (T29B §5): the paired native post's
+    /// `NativeObserved` binding is exactly the active generation a managed reply validates,
+    /// because hook actor, channel (same published attachment), and generation all coincide —
+    /// the feed's `(fingerprint, worktree)` key is therefore shared and deduplicates.
+    #[test]
+    fn native_post_and_managed_reply_resolve_one_fingerprint() {
+        // The carrier policy is decided only here, and only via the capability predicates.
+        assert_eq!(HostKind::Claude.feed_delivery(), FeedDelivery::Hooks);
+        let delivery = HostKind::Codex.feed_delivery();
+        assert_eq!(delivery, FeedDelivery::HooksAndReplies);
+        assert!(delivery.allows_hooks() && delivery.allows_replies());
+        assert!(!FeedDelivery::Hooks.allows_replies());
+        assert!(!FeedDelivery::Replies.allows_hooks());
+
+        let mut guard = HostBindingGuard::default();
+        let channel = channel("dedup-channel");
+        let BindingStatus::Validated(started) = guard
+            .establish_managed_codex_start(codex_candidate("actor-a", "start"), channel.clone())
+        else {
+            panic!("managed start must bind directly");
+        };
+        // A paired native Pre/Post with no MCP call resolves the already-active generation and
+        // never mints a new one.
+        assert!(matches!(
+            guard.observe_hook(
+                codex_hook("PreToolUse", "actor-a", "edit-1"),
+                channel.clone()
+            ),
+            BindingStatus::PreObserved
+        ));
+        let BindingStatus::NativeObserved(observed) = guard.observe_hook(
+            codex_hook("PostToolUse", "actor-a", "edit-1"),
+            channel.clone(),
+        ) else {
+            panic!("a paired native post must observe the active binding");
+        };
+        assert_eq!(
+            observed.fingerprint(),
+            started.binding_ref().fingerprint(),
+            "the native post must reuse the active generation's fingerprint"
+        );
+        // An ordinary managed call validates that same generation, so its reply delivery shares
+        // the feed key with anything the native post already delivered.
+        let BindingStatus::Validated(call) =
+            guard.validate_managed_codex_active(codex_candidate("actor-a", "context"), channel)
+        else {
+            panic!("ordinary managed admission must validate");
+        };
+        assert_eq!(
+            call.binding_ref().fingerprint(),
+            observed.fingerprint(),
+            "reply and hook carriers must share one feed key"
+        );
     }
 
     /// Caps pending calls per exact scope so one actor cannot deny a peer in the same channel.
