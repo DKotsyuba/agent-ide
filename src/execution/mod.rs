@@ -219,7 +219,7 @@ impl PersistedProfileRecord {
             ),
             2 => {
                 let shape = state
-                    .shape_v2()
+                    .shape_v2(state.cwd())
                     .map_err(|_| RequestError::ExecutionProfileDenied)?;
                 (
                     shape.digest().to_hex().to_string(),
@@ -364,7 +364,7 @@ impl PersistedProfileRecord {
                 self.semantic_state == semantic_state_identity(state)
                     && self.permission_value == state.profile_digest().to_hex().to_string()
             }
-            Some(2) => match state.shape_v2() {
+            Some(2) => match state.shape_v2(state.cwd()) {
                 Ok(shape) => {
                     self.semantic_state == captured_state_identity_v2(state)
                         && self.permission_value == shape.digest().to_hex().to_string()
@@ -500,12 +500,34 @@ impl HostSandboxState {
 
     /// Derives the closed profile-shape v2 value of this state, or reports why none exists (T35B).
     ///
-    /// The derivation is a read-only closed parse of the raw state; the replay JSON is never
+    /// `trusted_cwd` is the trusted candidate or Workspace worktree the operation will actually
+    /// touch: derivation binds the portable cwd-derived authority to it and refuses any state
+    /// whose `sandboxCwd` is a different directory (T35B-r). Restoration- and minting-side
+    /// callers pass the captured state's own cwd, which is self-consistent by construction. The
+    /// derivation is a read-only closed parse of the raw state; the replay JSON is never
     /// rewritten and nothing is normalized on the host's behalf. An unsupported-shape state
     /// keeps replaying byte-for-byte and can then only be admitted by a legacy v1 template's
     /// exact digest — never by a looser fallback.
-    pub(crate) fn shape_v2(&self) -> Result<ProfileShapeV2, UnsupportedShape> {
-        ProfileShapeV2::derive(self)
+    pub(crate) fn shape_v2(&self, trusted_cwd: &Path) -> Result<ProfileShapeV2, UnsupportedShape> {
+        ProfileShapeV2::derive(self, trusted_cwd)
+    }
+
+    /// Reports whether any filesystem entry of the replayed profile denies access (T35B-r).
+    ///
+    /// Every `deny` entry counts, whatever its selector: a deny-bearing state keeps native reads
+    /// and cached delivery unavailable, because whole-tree read coverage cannot be proven for a
+    /// state whose own entries subtract from its grants.
+    fn has_deny_entries(&self) -> bool {
+        self.raw
+            .get("permissionProfile")
+            .and_then(|profile| profile.get("file_system"))
+            .and_then(|file_system| file_system.get("entries"))
+            .and_then(Value::as_array)
+            .is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|entry| entry.get("access").and_then(Value::as_str) == Some("deny"))
+            })
     }
 }
 
@@ -550,7 +572,7 @@ impl ExecutionProfileTemplate {
             return Err(RequestError::ExecutionProfileDenied);
         }
         let shape = state
-            .shape_v2()
+            .shape_v2(state.cwd())
             .map_err(|_| RequestError::ExecutionProfileDenied)?;
         Ok(Self {
             id,
@@ -575,7 +597,7 @@ impl ExecutionProfileTemplate {
             },
             Some(2) => TemplateShape::V2 {
                 shape: state
-                    .shape_v2()
+                    .shape_v2(state.cwd())
                     .map_err(|_| RequestError::ExecutionProfileDenied)?,
             },
             Some(_) => return Err(RequestError::ExecutionProfileDenied),
@@ -657,6 +679,11 @@ impl ExecutionProfileCatalog {
     /// Mints an Execution-owned permit when one accepted template of the observed class admits
     /// the live state, matching one complete template and never combining grants (T25B, T35B).
     ///
+    /// `trusted_cwd` is the trusted candidate or Workspace worktree the operation will actually
+    /// touch: a v2 candidate is derived with the portable cwd bound to it, so a live state whose
+    /// `sandboxCwd` is not this directory never derives a v2 shape here and can only be admitted
+    /// by a v1 template's exact legacy digest (T35B-r).
+    ///
     /// The decision is ordered and fail-closed:
     ///
     /// 1. no template for the class → [`RequestError::ExecutionProfileNoTemplate`];
@@ -674,13 +701,17 @@ impl ExecutionProfileCatalog {
     /// Unsupported semantics never fall back to a looser comparison, and the permit keeps the
     /// live raw-state correlation digest: it establishes *which* exact state ran, never subset
     /// containment.
-    fn permit(&self, state: &HostSandboxState) -> Result<ExecutionProfilePermit, RequestError> {
+    fn permit(
+        &self,
+        state: &HostSandboxState,
+        trusted_cwd: &Path,
+    ) -> Result<ExecutionProfilePermit, RequestError> {
         let class_templates = self
             .templates
             .get(&state.class)
             .ok_or(RequestError::ExecutionProfileNoTemplate(state.class))?;
         let live_digest = state.profile_digest();
-        let live_shape = state.shape_v2().ok();
+        let live_shape = state.shape_v2(trusted_cwd).ok();
         let mut v1_match = None;
         let mut v2_exact = None;
         let mut v2_narrower: Vec<&ExecutionProfileTemplate> = Vec::new();
@@ -1274,7 +1305,10 @@ impl DiscoverWorktreeRequest {
             self.invocation.sandbox.cwd().to_path_buf(),
             BTreeMap::new(),
         )?;
-        let permit = catalog.permit(&self.invocation.sandbox)?;
+        // The raw candidate is the trusted directory this discovery will actually run in: a v2
+        // candidate binds the portable sandbox-cwd authority to it, so discovery with a
+        // candidate other than the state's own `sandboxCwd` never derives a v2 shape (T35B-r).
+        let permit = catalog.permit(&self.invocation.sandbox, Path::new(&self.candidate_cwd))?;
         Ok(ValidatedGitDiscovery {
             invocation: self.invocation,
             command,
@@ -1801,11 +1835,12 @@ pub struct ValidatedExecutionRequest {
 /// Consumes fresh binding liveness, requires the accepted current profile, and applies local
 /// disabled-host policy without fabricating a command, child, or new Workspace grant.
 ///
-/// The host's `sandboxCwd` must be this worktree root, with one exception: a managed state whose
-/// own recognized restricted profile already grants read of the whole filesystem root reads this
-/// worktree under its unchanged policy, so its inherited parent cwd is accepted. Every other
-/// state — including any profile shape this module does not fully recognize — keeps strict
-/// equality.
+/// A managed state must independently prove whole-tree read authority of the live state, even
+/// when its `sandboxCwd` already is this worktree root (T35B-r): admission through a narrower v2
+/// shape must never confer read authority, so the proof is the recognized whole-root read grant
+/// AND no deny entries at all (path or glob). Any deny-bearing or otherwise unproven managed
+/// state stays unavailable for native reads and cached delivery — the known T35B limitation
+/// until per-path read proofs exist. A disabled host keeps the legacy strict cwd equality.
 /// Nothing else is relaxed: a stale binding, a mismatched authority, or an unaccepted profile
 /// still fails, and no permission is rewritten or widened.
 pub fn validate_workspace_read(
@@ -1816,15 +1851,19 @@ pub fn validate_workspace_read(
     allow_explicit_disabled_host: bool,
 ) -> Result<ExecutionProfilePermit, RequestError> {
     let invocation = ValidatedHostInvocation::from_active_observation(active_use, observed)?;
-    if invocation.sandbox.cwd() != authority.root()
-        && !invocation.sandbox.grants_read_of_all_roots()
-    {
+    let read_proven = match invocation.sandbox.class() {
+        ProfileClass::Managed => {
+            invocation.sandbox.grants_read_of_all_roots() && !invocation.sandbox.has_deny_entries()
+        }
+        ProfileClass::Disabled => invocation.sandbox.cwd() == authority.root(),
+    };
+    if !read_proven {
         return Err(RequestError::SandboxCwdMismatch);
     }
     if invocation.sandbox.class() == ProfileClass::Disabled && !allow_explicit_disabled_host {
         return Err(RequestError::DisabledHostDenied);
     }
-    catalog.permit(&invocation.sandbox)
+    catalog.permit(&invocation.sandbox, authority.root())
 }
 
 impl ValidatedExecutionRequest {
@@ -1878,7 +1917,9 @@ impl ValidatedExecutionRequest {
         {
             return Err(RequestError::DisabledHostDenied);
         }
-        let permit = catalog.permit(&invocation.sandbox)?;
+        // The Workspace worktree is the trusted directory this child will run in: a v2
+        // candidate binds the portable sandbox-cwd authority to it (T35B-r).
+        let permit = catalog.permit(&invocation.sandbox, &authority.root)?;
         Ok(Self {
             invocation,
             authority,

@@ -770,7 +770,7 @@ fn permit_distinguishes_no_template_from_digest_mismatch() {
     // No accepted template for the class at all.
     let empty = ExecutionProfileCatalog::from_execution_evidence(vec![]).unwrap();
     assert!(matches!(
-        empty.permit(&observed),
+        empty.permit(&observed, observed.cwd()),
         Err(RequestError::ExecutionProfileNoTemplate(
             ProfileClass::Disabled
         ))
@@ -782,13 +782,14 @@ fn permit_distinguishes_no_template_from_digest_mismatch() {
     ])
     .unwrap();
     assert!(matches!(
-        catalog.permit(&observed),
+        catalog.permit(&observed, observed.cwd()),
         Err(RequestError::ExecutionProfileDigestMismatch(
             ProfileClass::Disabled
         ))
     ));
     // The exact accepted state itself still mints its permit.
-    assert!(catalog.permit(&disabled(true)).is_ok());
+    let accepted = disabled(true);
+    assert!(catalog.permit(&accepted, accepted.cwd()).is_ok());
 }
 
 /// Builds one managed sandbox envelope whose digest follows its effective `network` policy.
@@ -823,11 +824,14 @@ fn catalog_permits_each_accepted_profile_of_one_class() {
     ])
     .unwrap();
     // Both accepted managed states mint their own permits; neither disturbs the other.
-    assert!(catalog.permit(&managed_state(false.into())).is_ok());
-    assert!(catalog.permit(&managed_state("restricted".into())).is_ok());
+    let readonly = managed_state(false.into());
+    let write = managed_state("restricted".into());
+    assert!(catalog.permit(&readonly, readonly.cwd()).is_ok());
+    assert!(catalog.permit(&write, write.cwd()).is_ok());
     // A third managed state no accepted template matches is still refused, naming the class.
+    let unmatched = managed_state(true.into());
     assert!(matches!(
-        catalog.permit(&managed_state(true.into())),
+        catalog.permit(&unmatched, unmatched.cwd()),
         Err(RequestError::ExecutionProfileDigestMismatch(
             ProfileClass::Managed
         ))
@@ -1094,15 +1098,20 @@ fn v2_catalog(name: &str) -> ExecutionProfileCatalog {
 }
 
 /// Runs the v2 permit decision of one accepted fixture template against one live fixture.
+///
+/// The trusted candidate is the live state's own cwd, exactly as a request validated in that
+/// directory would bind it.
 fn permit_fixture(template: &str, live: &str) -> Result<(), RequestError> {
-    v2_catalog(template)
-        .permit(&fixture_state(live))
-        .map(|_| ())
+    let live = fixture_state(live);
+    v2_catalog(template).permit(&live, live.cwd()).map(|_| ())
 }
 
 /// Derives the v2 shape of one sandbox-state JSON value, or reports the unsupported reason.
+///
+/// The trusted candidate is the state's own cwd: the self-consistent binding.
 fn shape_of(value: serde_json::Value) -> Result<ProfileShapeV2, UnsupportedShape> {
-    HostSandboxState::parse(Some(value)).unwrap().shape_v2()
+    let state = HostSandboxState::parse(Some(value)).unwrap();
+    state.shape_v2(state.cwd())
 }
 
 /// The exact fixture name every replay-preservation assertion re-checks.
@@ -1154,7 +1163,7 @@ fn accepted_legacy_files_keep_v1_digest_admission() {
         ])
         .unwrap();
         // The exact state admits through the legacy exact-digest path.
-        assert!(catalog.permit(&state).is_ok());
+        assert!(catalog.permit(&state, state.cwd()).is_ok());
         // The v1 record layout is unchanged: eleven fields, no shape_version key.
         let record = PersistedProfileRecord::from_execution_evidence(
             "legacy-v1",
@@ -1214,7 +1223,7 @@ fn reordering_and_duplicates_do_not_change_the_v2_shape() {
     let mut live = serde_json::from_str::<serde_json::Value>(&base).unwrap();
     live["permissionProfile"]["file_system"]["entries"] = duplicated.into();
     let live = HostSandboxState::parse(Some(live)).unwrap();
-    assert!(catalog.permit(&live).is_ok());
+    assert!(catalog.permit(&live, live.cwd()).is_ok());
 }
 
 /// Returns the permit outcome for one mutated copy of the T35B base state (attack harness).
@@ -1238,7 +1247,7 @@ fn permit_values(
         ExecutionProfileTemplate::from_execution_evidence_v2("t35b-base", 1, &template).unwrap(),
     ])
     .unwrap();
-    catalog.permit(&live).map(|_| ())
+    catalog.permit(&live, live.cwd()).map(|_| ())
 }
 
 /// Builds one synthetic workspace-write managed state shaped like a real default capture.
@@ -1382,13 +1391,6 @@ fn attack_network_and_mechanism_mutations_refuse() {
         }),
         Err(RequestError::ExecutionProfileShapeNotNarrower(_))
     ));
-    // A differing helper path refuses; the exact null helper matches.
-    assert!(matches!(
-        t35b_permit_outcome(|state| {
-            state["codexLinuxSandboxExe"] = serde_json::json!("/usr/local/bin/codex-sandbox");
-        }),
-        Err(RequestError::ExecutionProfileShapeNotNarrower(_))
-    ));
 }
 
 /// Accepted denies are required; added supported denies narrow without native-read authority.
@@ -1434,9 +1436,9 @@ fn deny_churn_is_monotonic_and_never_creates_read_authority() {
         ExecutionProfileTemplate::from_execution_evidence_v2("t35b-base", 1, &template).unwrap(),
     ])
     .unwrap();
-    assert!(catalog.permit(&live).is_ok());
+    assert!(catalog.permit(&live, live.cwd()).is_ok());
     assert!(
-        !live.grants_read_of_all_roots(),
+        !live.grants_read_of_all_roots() && live.has_deny_entries(),
         "admission never creates native-read or cached-disclosure authority"
     );
 }
@@ -1692,9 +1694,10 @@ fn shape_digest_is_domain_separated_and_spelling_independent() {
         let value: serde_json::Value = serde_json::from_str(&sandbox_fixture(FIXTURE_1ED)).unwrap();
         HostSandboxState::parse_json(&serde_json::to_string_pretty(&value).unwrap()).unwrap()
     };
-    let compact_shape = compact.shape_v2().unwrap();
-    assert_eq!(compact_shape, pretty.shape_v2().unwrap());
-    assert_eq!(compact_shape.digest(), pretty.shape_v2().unwrap().digest());
+    let compact_shape = compact.shape_v2(compact.cwd()).unwrap();
+    let pretty_shape = pretty.shape_v2(pretty.cwd()).unwrap();
+    assert_eq!(compact_shape, pretty_shape);
+    assert_eq!(compact_shape.digest(), pretty_shape.digest());
     // The shape digest is not the raw-state digest and differs across states.
     assert_ne!(
         compact_shape.digest().to_hex().to_string(),
@@ -1702,10 +1705,11 @@ fn shape_digest_is_domain_separated_and_spelling_independent() {
             .to_hex()
             .to_string()
     );
+    let write_fixture = fixture_state(FIXTURE_WORKSPACE_WRITE_V1);
     assert_ne!(
         compact_shape.digest(),
-        fixture_state(FIXTURE_WORKSPACE_WRITE_V1)
-            .shape_v2()
+        write_fixture
+            .shape_v2(write_fixture.cwd())
             .unwrap()
             .digest()
     );
@@ -1756,8 +1760,9 @@ fn v2_records_round_trip_and_pin_the_exact_capture() {
         &expected,
     )
     .unwrap();
-    assert!(catalog.permit(&captured).is_ok());
-    assert!(catalog.permit(&fixture_state(FIXTURE_555)).is_ok());
+    assert!(catalog.permit(&captured, captured.cwd()).is_ok());
+    let live = fixture_state(FIXTURE_555);
+    assert!(catalog.permit(&live, live.cwd()).is_ok());
     // Derivation, digests, and permits never rewrite the replay JSON.
     assert_eq!(captured.sandbox_state_json(), captured_text);
 }
@@ -1851,9 +1856,11 @@ fn mixed_version_catalog_selects_one_complete_template() {
     .unwrap();
     // Each generation admits its own state; the v2 side also admits the equivalent live
     // read-only state.
-    assert!(catalog.permit(&readonly).is_ok());
-    assert!(catalog.permit(&fixture_state(FIXTURE_728)).is_ok());
-    assert!(catalog.permit(&write).is_ok());
+    let live_readonly = fixture_state(FIXTURE_READONLY_V1);
+    let live_728 = fixture_state(FIXTURE_728);
+    assert!(catalog.permit(&live_readonly, live_readonly.cwd()).is_ok());
+    assert!(catalog.permit(&live_728, live_728.cwd()).is_ok());
+    assert!(catalog.permit(&write, write.cwd()).is_ok());
     // A drifted workspace-write variant matches neither the v1 digest nor any v2 proof and
     // refuses through the closed shape reason, never a looser comparison.
     let mut drifted =
@@ -1862,7 +1869,7 @@ fn mixed_version_catalog_selects_one_complete_template() {
     drifted["permissionProfile"]["network"] = serde_json::json!("enabled");
     let drifted = HostSandboxState::parse(Some(drifted)).unwrap();
     assert!(matches!(
-        catalog.permit(&drifted),
+        catalog.permit(&drifted, drifted.cwd()),
         Err(RequestError::ExecutionProfileShapeNotNarrower(_))
     ));
     // Duplicate identities are refused within one generation.
@@ -1895,9 +1902,10 @@ fn permit_selection_is_exact_first_and_deterministic() {
         ExecutionProfileTemplate::from_execution_evidence("v1-template", 1, &v1_template).unwrap(),
     ])
     .unwrap();
+    let live_555 = fixture_state(FIXTURE_555);
     assert_eq!(
         catalog
-            .permit(&fixture_state(FIXTURE_555))
+            .permit(&live_555, live_555.cwd())
             .unwrap()
             .template
             .id,
@@ -1913,7 +1921,7 @@ fn permit_selection_is_exact_first_and_deterministic() {
     ])
     .unwrap();
     assert_eq!(
-        catalog.permit(&write).unwrap().template.id,
+        catalog.permit(&write, write.cwd()).unwrap().template.id,
         "v1-write",
         "a v1 exact digest beats a v2 narrowing proof"
     );
@@ -1945,8 +1953,325 @@ fn permit_selection_is_exact_first_and_deterministic() {
     ])
     .unwrap();
     assert_eq!(
-        catalog.permit(&live).unwrap().template.id,
+        catalog.permit(&live, live.cwd()).unwrap().template.id,
         "a-template",
         "equal narrower proofs select the lowest template identity"
+    );
+}
+/// A path deny and a same-text glob deny are never one identity (T35B-r finding 1).
+#[test]
+fn glob_and_path_denies_are_distinct_identities() {
+    // The same deny text under both spellings produces different shape digests: the glob keeps
+    // its tag, and a wildcard-free glob is never collapsed into a path deny.
+    let shape = |deny: serde_json::Value| {
+        let mut value = t35b_base_state();
+        value["permissionProfile"]["file_system"]["entries"][5]["path"] = deny;
+        shape_of(value).unwrap().digest()
+    };
+    assert_ne!(
+        shape(serde_json::json!({"type":"path","path":"/Users/pluto/.aws"})),
+        shape(serde_json::json!({"type":"glob_pattern","pattern":"/Users/pluto/.aws"})),
+        "a path deny and a same-text glob deny must digest differently"
+    );
+    // Backslashes have literal path meaning versus glob-escape meaning: both spellings differ
+    // from each other and from their path-denied counterparts.
+    assert_ne!(
+        shape(serde_json::json!({"type":"path","path":"/Users/pluto/work\\dir"})),
+        shape(serde_json::json!({"type":"glob_pattern","pattern":"/Users/pluto/work\\dir"})),
+    );
+    assert_ne!(
+        shape(serde_json::json!({"type":"path","path":"/Users/pluto/work\\dir"})),
+        shape(serde_json::json!({"type":"glob_pattern","pattern":"/Users/pluto/work\\*"})),
+    );
+    // The derived glob rule keeps the glob tag and the byte-exact pattern remainder.
+    let mut globbed = t35b_base_state();
+    globbed["permissionProfile"]["file_system"]["entries"][5]["path"] =
+        serde_json::json!({"type":"glob_pattern","pattern":"/Users/pluto/.aws"});
+    let state = HostSandboxState::parse(Some(globbed)).unwrap();
+    let shape = state.shape_v2(state.cwd()).unwrap();
+    assert!(shape.denies.iter().any(|deny| matches!(
+        deny,
+        profile_shape::DenyRule::Glob { base, pattern }
+            if *base == profile_shape::Selector::Absolute(vec!["Users".into(), "pluto".into(), ".aws".into()])
+                && pattern.is_empty()
+    )));
+    // Swapping the accepted path deny for the same-text glob deny is not admission: the
+    // accepted required rule is missing, whatever else the live state carries.
+    assert!(matches!(
+        t35b_permit_outcome(|state| {
+            state["permissionProfile"]["file_system"]["entries"][5]["path"] =
+                serde_json::json!({"type":"glob_pattern","pattern":"/Users/pluto/.aws"});
+        }),
+        Err(RequestError::ExecutionProfileShapeNotNarrower(_))
+    ));
+}
+
+/// A non-null `codexLinuxSandboxExe` refuses v2 derivation entirely; v1 is unchanged (T35B-r
+/// finding 4). The accepted helper string is evidence of a path, never a pin on the executable's
+/// identity, so a replaced helper can never slip through a v2 admission.
+#[test]
+fn non_null_helper_refuses_v2_derivation_but_keeps_v1() {
+    for helper in ["/trusted/helper", "/replaced/helper"] {
+        let mut state = t35b_base_state();
+        state["codexLinuxSandboxExe"] = serde_json::json!(helper);
+        assert_eq!(
+            shape_of(state.clone()).unwrap_err(),
+            UnsupportedShape("codexLinuxSandboxExe helper"),
+            "a non-null helper must refuse v2 derivation"
+        );
+        // The permit decision names the typed unsupported reason; it never falls back.
+        let parsed = HostSandboxState::parse(Some(state.clone())).unwrap();
+        let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+            ExecutionProfileTemplate::from_execution_evidence_v2(
+                "t35b-base",
+                1,
+                &HostSandboxState::parse(Some(t35b_base_state())).unwrap(),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            catalog.permit(&parsed, parsed.cwd()),
+            Err(RequestError::ExecutionProfileShapeUnsupported(_))
+        ));
+        // Legacy v1 behaviour is unchanged: the exact helper state admits by its digest.
+        let v1 = ExecutionProfileCatalog::from_execution_evidence(vec![
+            ExecutionProfileTemplate::from_execution_evidence("legacy-v1", 1, &parsed).unwrap(),
+        ])
+        .unwrap();
+        assert!(v1.permit(&parsed, parsed.cwd()).is_ok());
+    }
+}
+
+/// The RAW `sandboxCwd` string is validated with the full grammar before any `file://` stripping
+/// (T35B-r finding 5): a fragment, query, host part, or percent-encoding in the original
+/// spelling is refused — a host part or percent-encoding already refuses at the opaque parse
+/// layer, and a fragment or query, which that layer used to strip into an ordinary path
+/// character, now refuses v2 derivation itself.
+#[test]
+fn raw_cwd_grammar_refuses_uri_variants() {
+    // Refused before derivation: the opaque cwd parser rejects these spellings outright.
+    for parse_refused in ["file://host/work", "file:///work%2Fx"] {
+        let mut state = t35b_base_state();
+        state["sandboxCwd"] = serde_json::json!(parse_refused);
+        assert_eq!(
+            HostSandboxState::parse(Some(state)).unwrap_err(),
+            SandboxStateError::UnsupportedCwd,
+            "the opaque parser must refuse {parse_refused:?}"
+        );
+    }
+    // Refused by the v2 derivation: the raw spelling carries a query or fragment the legacy
+    // parser used to strip away, and derivation validates the raw string instead.
+    for derive_refused in ["file:///work#fragment", "file:///work?x"] {
+        let mut state = t35b_base_state();
+        state["sandboxCwd"] = serde_json::json!(derive_refused);
+        let state = HostSandboxState::parse(Some(state)).unwrap();
+        assert!(
+            state.shape_v2(state.cwd()).is_err(),
+            "derivation must refuse the raw cwd spelling {derive_refused:?}"
+        );
+    }
+    // The supported local spellings still derive.
+    for accepted in ["/private/tmp/t35b/work", "file:///private/tmp/t35b/work"] {
+        let mut state = t35b_base_state();
+        state["sandboxCwd"] = serde_json::json!(accepted);
+        assert!(shape_of(state).is_ok(), "{accepted:?} must derive");
+    }
+}
+
+/// The portable cwd is bound to the trusted candidate/Workspace worktree (T35B-r finding 3).
+///
+/// Relocating the cwd grant beneath an absolute path deny refuses derivation outright — exactly
+/// the reviewed attack where the shape used to stay identical while the grant moved beneath a
+/// retained deny — and a permit whose trusted candidate is not the state's own `sandboxCwd`
+/// never derives a v2 shape at all.
+#[test]
+fn cwd_binding_refuses_relocation_under_an_absolute_deny_and_a_foreign_candidate() {
+    // The reviewed attack: relocate cwd, its write, its nested read, and its glob denies onto
+    // `/secrets/project` while retaining the absolute deny of `/secrets`. Every cwd-derived
+    // selector normalizes identically, so the shape digests used to match; derivation must
+    // refuse because the cwd now sits inside an absolute deny's subtree.
+    let relocated_under_deny = |mutation: fn(&mut serde_json::Value)| {
+        let mut value = t35b_base_state();
+        value["sandboxCwd"] = serde_json::json!("/secrets/project");
+        let entries = value["permissionProfile"]["file_system"]["entries"]
+            .as_array_mut()
+            .unwrap();
+        entries[1]["path"]["path"] = serde_json::json!("/secrets/project");
+        entries[4]["path"]["path"] = serde_json::json!("/secrets/project/.git");
+        entries[6]["path"]["pattern"] = serde_json::json!("/secrets/project/**/.env");
+        entries.push(serde_json::json!(
+            {"access":"deny","path":{"path":"/secrets","type":"path"}}
+        ));
+        mutation(&mut value);
+        HostSandboxState::parse(Some(value)).unwrap()
+    };
+    let relocated = relocated_under_deny(|_| {});
+    // Positive control over the untrusted parse path is the binding check itself: the same
+    // relocated state derived against its own cwd refuses on the deny overlap...
+    assert_eq!(
+        relocated.shape_v2(relocated.cwd()).unwrap_err(),
+        UnsupportedShape("cwd overlap")
+    );
+    // ...and the pristine base state derived against a foreign candidate refuses on binding.
+    let base = HostSandboxState::parse(Some(t35b_base_state())).unwrap();
+    assert_eq!(
+        base.shape_v2(Path::new("/private/tmp/t35b/other"))
+            .unwrap_err(),
+        UnsupportedShape("cwd binding")
+    );
+    // Through the public permit decision both arrive as the typed unsupported reason, never a
+    // silent admission.
+    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence_v2("t35b-base", 1, &base).unwrap(),
+    ])
+    .unwrap();
+    assert!(matches!(
+        catalog.permit(&relocated, relocated.cwd()),
+        Err(RequestError::ExecutionProfileShapeUnsupported(_))
+    ));
+    assert!(matches!(
+        catalog.permit(&base, Path::new("/private/tmp/t35b/other")),
+        Err(RequestError::ExecutionProfileShapeUnsupported(_))
+    ));
+    // Relocation to a different trusted candidate with no deny overlap stays admitted: that is
+    // the portability the fixtures require, now with the candidate checked.
+    let mut moved = t35b_base_state();
+    moved["sandboxCwd"] = serde_json::json!("/private/tmp/t35b/work2");
+    let entries = moved["permissionProfile"]["file_system"]["entries"]
+        .as_array_mut()
+        .unwrap();
+    entries[1]["path"]["path"] = serde_json::json!("/private/tmp/t35b/work2");
+    entries[4]["path"]["path"] = serde_json::json!("/private/tmp/t35b/work2/.git");
+    entries[6]["path"]["pattern"] = serde_json::json!("/private/tmp/t35b/work2/**/.env");
+    let moved = HostSandboxState::parse(Some(moved)).unwrap();
+    let template = HostSandboxState::parse(Some(t35b_base_state())).unwrap();
+    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence_v2("t35b-base", 1, &template).unwrap(),
+    ])
+    .unwrap();
+    assert!(catalog.permit(&moved, moved.cwd()).is_ok());
+}
+
+/// A symlinked cwd alias is a different directory from the trusted candidate (T35B-r findings
+/// 3 and 6): the binding is component-wise on the raw paths, never canonicalized, so a symlink
+/// alias refuses derivation while the real directory derives.
+#[cfg(unix)]
+#[test]
+fn symlinked_cwd_alias_refuses_against_the_trusted_candidate() {
+    let base = std::env::temp_dir().join(format!(
+        "t35b-symlink-{}-{}",
+        std::process::id(),
+        blake3::hash(b"t35b-symlink").to_hex()
+    ));
+    let real = base.join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    let alias = base.join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let mut state = t35b_base_state();
+    state["sandboxCwd"] = serde_json::json!(real.to_string_lossy().as_ref());
+    let entries = state["permissionProfile"]["file_system"]["entries"]
+        .as_array_mut()
+        .unwrap();
+    entries[1]["path"]["path"] = serde_json::json!(real.to_string_lossy().as_ref());
+    entries[4]["path"]["path"] = serde_json::json!(real.join(".git").to_string_lossy().as_ref());
+    entries[6]["path"]["pattern"] =
+        serde_json::json!(format!("{}/.env", real.join("**").to_string_lossy()));
+    let state = HostSandboxState::parse(Some(state)).unwrap();
+    // The real directory is the trusted candidate and derives.
+    assert!(state.shape_v2(&real).is_ok());
+    // The symlink alias is component-wise a different path and refuses.
+    assert_eq!(
+        state.shape_v2(&alias).unwrap_err(),
+        UnsupportedShape("cwd binding")
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// `glob_scan_max_depth` presence and value are essential: changing the expansion depth can
+/// change which restrictions take effect, so any change refuses (T35B-r finding 6).
+#[test]
+fn glob_scan_max_depth_changes_refuse() {
+    let depth = |value: Option<u64>| {
+        let mut template = t35b_base_state();
+        match value {
+            None => {
+                template["permissionProfile"]["file_system"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("glob_scan_max_depth");
+            }
+            Some(depth) => {
+                template["permissionProfile"]["file_system"]["glob_scan_max_depth"] =
+                    serde_json::json!(depth);
+            }
+        }
+        template
+    };
+    // A different depth or a dropped depth refuses against the accepted depth-8 capture.
+    for live in [depth(Some(9)), depth(None)] {
+        assert!(matches!(
+            permit_values(depth(Some(8)), live),
+            Err(RequestError::ExecutionProfileShapeNotNarrower(_))
+        ));
+    }
+    // An added depth refuses against an accepted depth-free capture.
+    assert!(matches!(
+        permit_values(depth(None), depth(Some(8))),
+        Err(RequestError::ExecutionProfileShapeNotNarrower(_))
+    ));
+    // Presence and value are part of the shape identity itself.
+    assert_ne!(
+        shape_of(depth(Some(8))).unwrap().digest(),
+        shape_of(depth(Some(9))).unwrap().digest()
+    );
+    assert_ne!(
+        shape_of(depth(Some(8))).unwrap().digest(),
+        shape_of(depth(None)).unwrap().digest()
+    );
+}
+
+/// A genuine competing-template selection: a v1-exact and a v2-narrower template over
+/// compatible selector sets both admit the live state, and the documented order — exact v2
+/// shape, then v1 digest, then deterministic v2 narrowing — is what selects (T35B-r finding 6).
+#[test]
+fn v1_exact_and_v2_narrower_templates_compete_over_compatible_selectors() {
+    // Live = the capture plus one more deny. The v1 template carries exactly this state; the
+    // v2 template carries the deny-free ceiling, so the live state is a genuine *narrower*
+    // match for it — same non-deny selectors, every accepted deny present, one extra deny.
+    let mut live_value = sandbox_fixture(FIXTURE_1ED);
+    live_value = live_value.replace(
+        "\"entries\":[",
+        "\"entries\":[{\"access\":\"deny\",\"path\":{\"path\":\"/Users/pluto/.t35b-extra-secret\",\"type\":\"path\"}},",
+    );
+    let live = HostSandboxState::parse_json(&live_value).unwrap();
+    let v1 = ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence("v1-template", 1, &live).unwrap(),
+        ExecutionProfileTemplate::from_execution_evidence_v2(
+            "v2-template",
+            1,
+            &fixture_state(FIXTURE_1ED),
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    // Each candidate alone admits: the v1 by exact digest, the v2 by a genuine narrowing proof
+    // (never an exact shape match — the live state carries the extra deny).
+    assert!(v1.permit(&live, live.cwd()).is_ok());
+    let v2_only = ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence_v2(
+            "v2-template",
+            1,
+            &fixture_state(FIXTURE_1ED),
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    assert!(v2_only.permit(&live, live.cwd()).is_ok());
+    // Competing together over these compatible selector sets, the v1 exact digest wins.
+    assert_eq!(
+        v1.permit(&live, live.cwd()).unwrap().template.id,
+        "v1-template",
+        "a v1 exact digest beats a genuine v2 narrowing proof"
     );
 }

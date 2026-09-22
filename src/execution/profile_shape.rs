@@ -7,10 +7,11 @@
 //! refuses everything else, so an unproven change is never admitted by a looser fallback.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use serde_json::Value;
 
-use super::{HostSandboxState, ProfileClass, canonical_json, is_normal_absolute};
+use super::{HostSandboxState, ProfileClass, canonical_json};
 
 /// Domain separator prefixing every profile-shape v2 digest input (T35B).
 const SHAPE_DIGEST_DOMAIN: &[u8] = b"agent-ide/profile-shape/v2\0";
@@ -92,8 +93,9 @@ pub(crate) enum MissingPath {
 pub(crate) enum Selector {
     /// The state's own validated sandbox cwd (empty component list) or a component descendant
     /// of it. This is the portable form the v1 `<workspace-cwd>` placeholder approximated;
-    /// binding cwd-derived authority to a real directory stays with the existing strict
-    /// cwd-equality checks, which this module does not change.
+    /// derivation binds it to the trusted candidate/Workspace worktree supplied to
+    /// [`ProfileShapeV2::derive`], refusing any state whose `sandboxCwd` is a different
+    /// directory or whose cwd subtree overlaps an absolute restriction unprovably (T35B-r).
     WorkspaceRelative(Vec<String>),
     /// An absolute local path outside the trusted cwd, one component per element; an empty
     /// component list is the filesystem root itself.
@@ -127,17 +129,25 @@ impl Selector {
 
 /// One recognized deny rule: a required exclusion the accepted capture proved (T35B).
 ///
-/// Only path denies and exact `glob_pattern` denies are recognized. Any other deny selector type
-/// refuses the whole derivation, because an unknown deny vocabulary can hide a permission this
-/// build cannot reason about.
+/// Only path denies and exact `glob_pattern` denies are recognized, and they stay distinct rule
+/// identities: a wildcard-free glob is never collapsed into a path deny, because subtree
+/// containment and exact glob matching are different semantics and a backslash has literal path
+/// meaning but glob-escape meaning. Any other deny selector type refuses the whole derivation,
+/// because an unknown deny vocabulary can hide a permission this build cannot reason about.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum DenyRule {
     /// A `{"type":"path"}` deny naming one recognized selector.
     Path(Selector),
-    /// A `{"type":"glob_pattern"}` deny split into its literal absolute base selector and the
-    /// raw glob tail that follows it. The tail is preserved byte-for-byte; no glob containment
-    /// is ever computed, so a weakened pattern is simply a different required rule.
-    Glob { base: Selector, tail: String },
+    /// A `{"type":"glob_pattern"}` deny. `base` is the cwd-normalized literal selector the
+    /// pattern starts from and `pattern` is the host pattern's remainder starting at that base
+    /// boundary, byte-for-byte (empty for a wildcard-free glob). The canonical form always
+    /// carries the glob tag, the base, and this exact pattern text, so a path deny and a
+    /// same-text glob deny are never one identity, a backslash is never reinterpreted, and a
+    /// weakened pattern is simply a different required rule. No glob containment is ever
+    /// computed; for an absolute base, base and pattern concatenate back to the host pattern
+    /// byte-for-byte, and a workspace-relative base is the cwd-relative spelling the portable
+    /// shape exists to keep.
+    Glob { base: Selector, pattern: String },
 }
 
 impl DenyRule {
@@ -148,10 +158,10 @@ impl DenyRule {
                 "type": "path",
                 "selector": selector.to_canonical(),
             }),
-            DenyRule::Glob { base, tail } => serde_json::json!({
+            DenyRule::Glob { base, pattern } => serde_json::json!({
                 "type": "glob_pattern",
                 "base": base.to_canonical(),
-                "tail": tail,
+                "pattern": pattern,
             }),
         }
     }
@@ -165,11 +175,10 @@ impl DenyRule {
 /// entry, or selector fields produce [`UnsupportedShape`] and never a partial shape.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProfileShapeV2 {
-    /// Exact `useLegacyLandlock` boolean: part of the replayed sandbox mechanism.
+    /// Exact `useLegacyLandlock` boolean: part of the replayed sandbox mechanism. A non-null
+    /// `codexLinuxSandboxExe` refuses derivation entirely (no executable identity pin exists in
+    /// this build), so no helper field is part of the shape.
     pub(crate) use_legacy_landlock: bool,
-    /// Exact `codexLinuxSandboxExe` helper path; a non-null helper is additionally pinned by the
-    /// record's provider-binary identity, never matched loosely here.
-    pub(crate) codex_linux_sandbox_exe: Option<String>,
     /// Declared network mode; only `restricted` and `enabled` are recognized.
     pub(crate) network: NetworkMode,
     /// Preserved `glob_scan_max_depth`; changing expansion depth can change which restrictions
@@ -185,13 +194,21 @@ pub(crate) struct ProfileShapeV2 {
 impl ProfileShapeV2 {
     /// Derives the closed shape from one already-validated managed sandbox state (T35B).
     ///
-    /// Every key set is closed: unknown top-level fields, unknown permission-profile or
+    /// `trusted_cwd` is the trusted candidate or Workspace worktree the operation will actually
+    /// touch; the portable cwd-derived authority is bound to it, so a state whose `sandboxCwd`
+    /// is not component-wise this directory refuses derivation instead of relocating its grant
+    /// (T35B-r). Every key set is closed: unknown top-level fields, unknown permission-profile or
     /// filesystem fields, unknown entry or selector fields, an unknown access, network, special
-    /// kind, or missing-path value, a cwd of `/`, and any path outside the strict local grammar
-    /// all return [`UnsupportedShape`] for the whole state. Identical duplicate rules
-    /// deduplicate; the same selector with conflicting accesses refuses instead of guessing from
-    /// array order or selecting the strongest access.
-    pub(crate) fn derive(state: &HostSandboxState) -> Result<Self, UnsupportedShape> {
+    /// kind, or missing-path value, a cwd of `/`, a non-null `codexLinuxSandboxExe` helper (no
+    /// executable identity pin exists yet), any path outside the strict local grammar, and any
+    /// absolute deny/restriction whose overlap with the cwd subtree changes precedence all
+    /// return [`UnsupportedShape`] for the whole state. Identical duplicate rules deduplicate;
+    /// the same selector with conflicting accesses refuses instead of guessing from array order
+    /// or selecting the strongest access.
+    pub(crate) fn derive(
+        state: &HostSandboxState,
+        trusted_cwd: &Path,
+    ) -> Result<Self, UnsupportedShape> {
         if state.class != ProfileClass::Managed {
             // v2 initially supports managed restricted profiles only; `disabled` stays a
             // separate legacy v1 exact-digest concern.
@@ -217,14 +234,14 @@ impl ProfileShapeV2 {
             .get("useLegacyLandlock")
             .and_then(Value::as_bool)
             .ok_or(UnsupportedShape("useLegacyLandlock"))?;
-        let codex_linux_sandbox_exe = match object.get("codexLinuxSandboxExe") {
-            Some(Value::Null) => None,
-            Some(Value::String(path)) if is_normal_absolute(std::path::Path::new(path)) => {
-                Some(path.clone())
-            }
-            Some(_) => return Err(UnsupportedShape("codexLinuxSandboxExe")),
-            None => return Err(UnsupportedShape("codexLinuxSandboxExe")),
-        };
+        // A non-null helper refuses the whole derivation: the accepted string is evidence of a
+        // path, not a pin on the executable's identity, so a replaced helper could change the
+        // replayed mechanism without changing this shape. Until an executable identity is
+        // pinned and revalidated, only the exact null helper derives.
+        match object.get("codexLinuxSandboxExe") {
+            Some(Value::Null) => {}
+            _ => return Err(UnsupportedShape("codexLinuxSandboxExe helper")),
+        }
         let profile = object
             .get("permissionProfile")
             .and_then(Value::as_object)
@@ -264,15 +281,15 @@ impl ProfileShapeV2 {
             .ok_or(UnsupportedShape("entries"))?;
         // The trusted cwd must be a real directory prefix, never `/`: a root cwd would collapse
         // every absolute path into the portable workspace-relative form and widen the template.
-        let cwd_components = cwd_components(state)?;
+        let cwd_components = cwd_components(state, trusted_cwd)?;
         let mut rules = BTreeMap::new();
         let mut denies = BTreeSet::new();
         for entry in entries {
             derive_entry(entry, &cwd_components, &mut rules, &mut denies)?;
         }
+        refuse_cwd_overlap(&rules, &denies, &cwd_components)?;
         Ok(Self {
             use_legacy_landlock,
-            codex_linux_sandbox_exe,
             network,
             glob_scan_max_depth,
             rules,
@@ -299,7 +316,7 @@ impl ProfileShapeV2 {
             "mechanism": {
                 "file_system": "restricted",
                 "use_legacy_landlock": self.use_legacy_landlock,
-                "codex_linux_sandbox_exe": self.codex_linux_sandbox_exe,
+                "codex_linux_sandbox_exe": null,
             },
             "network": self.network.tag(),
             "rules": sorted_canonical_array(
@@ -332,10 +349,9 @@ impl ProfileShapeV2 {
     pub(crate) fn prove_narrower(&self, accepted: &Self) -> bool {
         // 1. Same supported mechanism, selector vocabulary, and filesystem type. Both shapes
         //    come from the same closed parser, so the vocabulary and the `restricted` filesystem
-        //    type are invariants; the replayed mechanism must match exactly.
-        if self.use_legacy_landlock != accepted.use_legacy_landlock
-            || self.codex_linux_sandbox_exe != accepted.codex_linux_sandbox_exe
-        {
+        //    type are invariants, a non-null helper never derived at all, and the replayed
+        //    mechanism must match exactly.
+        if self.use_legacy_landlock != accepted.use_legacy_landlock {
             return false;
         }
         // 2. Same normalized set of non-deny selectors: an added positive selector can reopen a
@@ -401,17 +417,103 @@ fn sorted_canonical_array(rules: impl Iterator<Item = Value>) -> Vec<Value> {
         .collect()
 }
 
-/// Returns the cwd's strict raw components, refusing a root cwd (T35B).
+/// Returns the cwd's strict raw components after binding them to the trusted candidate (T35B-r).
 ///
-/// A `/` cwd would make every absolute path a workspace-relative descendant, so no portable
-/// shape is derived and the state stays with the strict legacy path.
-fn cwd_components(state: &HostSandboxState) -> Result<Vec<String>, UnsupportedShape> {
-    let text = state.cwd.to_str().ok_or(UnsupportedShape("non-UTF8 cwd"))?;
-    let components = parse_path_components(text)?;
+/// The RAW `sandboxCwd` string is validated with the full local path/URI grammar before any
+/// `file://` conversion is consulted, so a fragment, query, host part, or percent-encoding in the
+/// original spelling refuses derivation instead of surviving as an ordinary path character. The
+/// result must then equal `trusted_cwd` component-wise: the trusted candidate or Workspace
+/// worktree is the directory the operation actually touches, and cwd-derived authority is never
+/// allowed to relocate beneath different restrictions. A `/` cwd also refuses: it would make
+/// every absolute path a workspace-relative descendant and widen the template.
+fn cwd_components(
+    state: &HostSandboxState,
+    trusted_cwd: &Path,
+) -> Result<Vec<String>, UnsupportedShape> {
+    let components = parse_path_components(state.sandbox_cwd())?;
     if components.is_empty() {
         return Err(UnsupportedShape("root cwd"));
     }
+    if trusted_path_components(trusted_cwd)? != components {
+        return Err(UnsupportedShape("cwd binding"));
+    }
     Ok(components)
+}
+
+/// Returns one trusted candidate/worktree path's strict raw components (T35B-r).
+///
+/// Only an absolute path whose every component is a normal, nonempty, non-UTF8-lossy name is
+/// accepted; the comparison against the state's cwd is component-wise, never a string prefix,
+/// so a symlinked alias or a `/work-escape` sibling is a different directory and refuses.
+fn trusted_path_components(trusted_cwd: &Path) -> Result<Vec<String>, UnsupportedShape> {
+    let mut components = Vec::new();
+    for component in trusted_cwd.components() {
+        match component {
+            std::path::Component::Normal(name) => {
+                let name = name
+                    .to_str()
+                    .ok_or(UnsupportedShape("non-UTF8 trusted cwd"))?;
+                if name.is_empty() || name == "." || name == ".." {
+                    return Err(UnsupportedShape("trusted cwd components"));
+                }
+                components.push(name.to_owned());
+            }
+            std::path::Component::RootDir => {}
+            _ => return Err(UnsupportedShape("trusted cwd components")),
+        }
+    }
+    if components.is_empty() {
+        return Err(UnsupportedShape("trusted root cwd"));
+    }
+    Ok(components)
+}
+
+/// Refuses cwd/absolute-restriction overlaps whose precedence this build cannot prove (T35B-r).
+///
+/// Moving the portable grant is only sound while every absolute rule keeps the same precedence
+/// relative to the cwd subtree. Two conservative directions refuse: any absolute rule sitting
+/// inside the cwd subtree (structurally unreachable after cwd-relative normalization, but
+/// asserted so a future classification change can never silently admit an unproven overlap),
+/// and any absolute *path* deny whose subtree contains the cwd, where a relocated more-specific
+/// cwd grant could reopen the denied subtree — the reviewed relocation attack. An absolute
+/// *grant* that contains the cwd is the normal portability case and does not refuse, and a glob
+/// deny whose literal base contains the cwd does not refuse either: real captured credential
+/// globs carry exactly that shape in both the accepted capture and the live state, so their
+/// grant interplay is equally (un)proven on both sides and is deliberately not modeled here.
+fn refuse_cwd_overlap(
+    rules: &BTreeMap<Selector, (Access, MissingPath)>,
+    denies: &BTreeSet<DenyRule>,
+    cwd_components: &[String],
+) -> Result<(), UnsupportedShape> {
+    let inside_cwd = |absolute: &Vec<String>| absolute.starts_with(cwd_components);
+    let contains_cwd = |absolute: &Vec<String>| {
+        absolute.len() < cwd_components.len() && cwd_components.starts_with(absolute.as_slice())
+    };
+    for selector in rules.keys() {
+        if let Selector::Absolute(absolute) = selector
+            && inside_cwd(absolute)
+        {
+            return Err(UnsupportedShape("cwd overlap"));
+        }
+    }
+    for deny in denies {
+        match deny {
+            DenyRule::Path(Selector::Absolute(absolute)) => {
+                if inside_cwd(absolute) || contains_cwd(absolute) {
+                    return Err(UnsupportedShape("cwd overlap"));
+                }
+            }
+            DenyRule::Glob { base, .. } => {
+                if let Selector::Absolute(absolute) = base
+                    && inside_cwd(absolute)
+                {
+                    return Err(UnsupportedShape("cwd overlap"));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Splits one absolute local path or `file://` local URI into strict raw components (T35B).
@@ -483,31 +585,34 @@ fn parse_deny_selector(
     }
 }
 
-/// Splits one exact glob pattern into its literal base selector and raw glob tail (T35B).
+/// Splits one exact glob pattern into its base selector and byte-exact pattern remainder (T35B).
 ///
-/// The base is every leading segment before the first metacharacter; it must itself satisfy the
-/// strict path grammar and is classified workspace-relative only by component-wise containment
-/// in the trusted cwd (a `/work-escape` sibling never joins a `/work` base). The tail is kept
-/// byte-for-byte: no glob containment or rewriting is ever computed, so a weakened pattern is
+/// A wildcard-free glob stays a tagged glob deny — it is never collapsed into a path deny,
+/// because subtree containment and exact glob matching are different semantics and a backslash
+/// has literal path meaning but glob-escape meaning. The base is the literal prefix ending at
+/// the segment boundary at or before the first metacharacter (the whole pattern when it has
+/// none); it is classified by component-wise containment in the trusted cwd (a `/work-escape`
+/// sibling never joins a `/work` base), and the remainder starting at that boundary is kept
+/// byte-for-byte. No glob containment or rewriting is ever computed, so a weakened pattern is
 /// simply a different required rule.
 fn parse_glob_deny(pattern: &str, cwd_components: &[String]) -> Result<DenyRule, UnsupportedShape> {
-    let Some(first_meta) = pattern
+    let (base, glob) = match pattern
         .as_bytes()
         .iter()
         .position(|byte| is_glob_metacharacter(*byte))
-    else {
-        // A pattern with no metacharacter is a plain-path deny in glob notation; representing it
-        // as the equivalent path deny keeps one identity per required exclusion.
-        return parse_path_selector(pattern, cwd_components).map(DenyRule::Path);
+    {
+        None => (pattern, ""),
+        // The literal base ends at the segment boundary at or before the first metacharacter.
+        Some(first_meta) => {
+            let base_end = pattern[..first_meta]
+                .rfind('/')
+                .ok_or(UnsupportedShape("deny glob base"))?;
+            pattern.split_at(base_end)
+        }
     };
-    // The base ends at the segment boundary at or before the first metacharacter.
-    let base_end = pattern[..first_meta]
-        .rfind('/')
-        .ok_or(UnsupportedShape("deny glob base"))?;
-    let (base, tail) = pattern.split_at(base_end);
     Ok(DenyRule::Glob {
         base: parse_path_selector(base, cwd_components)?,
-        tail: tail.to_owned(),
+        pattern: glob.to_owned(),
     })
 }
 

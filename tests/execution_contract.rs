@@ -1581,3 +1581,150 @@ fn v2_records_restore_exactly_and_replay_json_is_unchanged() {
         captured_text
     );
 }
+
+// ---------------------------------------------------------------------------
+// T35B-r: discovery binds the trusted candidate to the portable sandbox cwd,
+// and native reads require an independent live read proof even at the same cwd.
+// ---------------------------------------------------------------------------
+
+/// Fixed Git discovery binds the raw candidate as the trusted directory: with a v2 template,
+/// a candidate other than the observed state's own `sandboxCwd` never derives a v2 shape and
+/// refuses with the typed unsupported reason, while the matching candidate admits (T35B-r
+/// finding 3). A v1-only catalog is untouched by the binding, exactly as before.
+#[test]
+fn discovery_binds_the_trusted_candidate_to_the_sandbox_cwd() {
+    let managed = json!({
+        "codexLinuxSandboxExe": null,
+        "permissionProfile": {"type":"managed","file_system":{"entries":[
+            {"access":"read","path":{"type":"special","value":{"kind":"root"}}},
+            {"access":"write","path":{"path":"/private/tmp/t35b-discovery","type":"path"}}
+        ],"type":"restricted"},"network":"restricted"},
+        "sandboxCwd": "/private/tmp/t35b-discovery",
+        "useLegacyLandlock": false
+    });
+    let state = HostSandboxState::parse(Some(managed.clone())).unwrap();
+    let v2_catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence_v2("t35b-discovery", 1, &state).unwrap(),
+    ])
+    .unwrap();
+    let v1_catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence("t35b-discovery-v1", 1, &state).unwrap(),
+    ])
+    .unwrap();
+    let discovery = |candidate_path: &str, catalog: &ExecutionProfileCatalog| {
+        let mut guard = HostBindingGuard::default();
+        let channel = channel();
+        assert!(matches!(
+            guard.observe_hook(pre_hook("discover-actor", "discover-call"), channel.clone()),
+            BindingStatus::PreObserved
+        ));
+        let BindingStatus::Validated(invocation) =
+            guard.establish_start(candidate("discover-actor", "discover-call"), channel)
+        else {
+            panic!("explicit start must validate");
+        };
+        let active = guard.consume_active(invocation.binding_ref()).unwrap();
+        let observed = parse_observed_sandbox_state(
+            json!({"codex/sandbox-state-meta": managed})
+                .as_object()
+                .unwrap(),
+            &invocation,
+            &active,
+            true,
+        )
+        .unwrap();
+        DiscoverWorktreeRequest::from_active_observation(
+            active,
+            observed,
+            OsString::from(candidate_path),
+            DiscoveryOperationRef::new("t35b-discovery").unwrap(),
+        )
+        .unwrap()
+        .validate_query(
+            GitDiscoveryQuery::ShowTopLevel,
+            &GitDiscoveryPolicy::new(PathBuf::from("/usr/bin/git"), 1024, false).unwrap(),
+            catalog,
+        )
+    };
+    // The candidate matching the state's own sandboxCwd admits through the v2 template...
+    assert!(
+        discovery("/private/tmp/t35b-discovery", &v2_catalog).is_ok(),
+        "a bound candidate must admit"
+    );
+    // ...a relocated candidate never derives a v2 shape and refuses...
+    assert!(matches!(
+        discovery("/secrets/project", &v2_catalog).unwrap_err(),
+        RequestError::ExecutionProfileShapeUnsupported(ProfileClass::Managed)
+    ));
+    // ...and the legacy v1 catalog is unchanged: the exact digest still admits any candidate.
+    assert!(discovery("/secrets/project", &v1_catalog).is_ok());
+}
+
+/// A deny-bearing managed state keeps native reads and cached delivery unavailable even when
+/// its `sandboxCwd` already is the authorized root (T35B-r finding 2): admission through a
+/// narrower v2 shape never confers read authority, and the closed refusal is the existing
+/// `SandboxCwdMismatch` unavailability code. This is the shared proof both the observe path and
+/// the cached-delivery path require before any native or cached disclosure.
+#[test]
+fn native_read_refuses_a_same_cwd_deny_bearing_state() {
+    let root = worktree();
+    let managed = |deny: bool| {
+        let mut state = json!({
+            "codexLinuxSandboxExe": null,
+            "permissionProfile": {"type":"managed","file_system":{"entries":[
+                {"access":"read","path":{"type":"special","value":{"kind":"root"}}},
+                {"access":"write","path":{"path": root, "type":"path"}},
+                {"access":"write","path":{"type":"special","value":{"kind":"slash_tmp"}}},
+                {"access":"write","path":{"type":"special","value":{"kind":"tmpdir"}}}
+            ],"type":"restricted"},"network":"restricted"},
+            "sandboxCwd": root,
+            "useLegacyLandlock": false
+        });
+        if deny {
+            state["permissionProfile"]["file_system"]["entries"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"access":"deny","path":{"path": root.join("secret"), "type":"path"}}));
+        }
+        state
+    };
+    // The v2 template is minted from the deny-free capture, so the deny-bearing live state is
+    // genuinely narrower and its admission succeeds — the premise of the bypass.
+    let clean = HostSandboxState::parse(Some(managed(false))).unwrap();
+    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence_v2("t35b-read", 1, &clean).unwrap(),
+    ])
+    .unwrap();
+    let read = |state: serde_json::Value, authority: &WorkspaceAuthority| {
+        let mut guard = HostBindingGuard::default();
+        let channel = channel();
+        assert!(matches!(
+            guard.observe_hook(pre_hook("read-actor", "read-call"), channel.clone()),
+            BindingStatus::PreObserved
+        ));
+        let BindingStatus::Validated(invocation) =
+            guard.establish_start(candidate("read-actor", "read-call"), channel)
+        else {
+            panic!("explicit start must establish the binding");
+        };
+        let active = guard.consume_active(invocation.binding_ref()).unwrap();
+        let observed = parse_observed_sandbox_state(
+            json!({"codex/sandbox-state-meta": state})
+                .as_object()
+                .unwrap(),
+            &invocation,
+            &active,
+            true,
+        )
+        .unwrap();
+        execution::validate_workspace_read(active, observed, authority, &catalog, false)
+    };
+    let authority = WorkspaceAuthority::from_workspace("t35b-read", "1", root.clone(), 1).unwrap();
+    // The deny-free same-cwd state proves whole-tree read coverage and reads natively.
+    read(managed(false), &authority).unwrap();
+    // The deny-bearing state — admitted — loses native reads at the same cwd.
+    assert_eq!(
+        read(managed(true), &authority).unwrap_err(),
+        RequestError::SandboxCwdMismatch
+    );
+}

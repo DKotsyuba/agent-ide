@@ -237,6 +237,24 @@ async fn captured_managed_profile_enforces_fixture_boundaries() {
     );
 }
 
+/// Placeholder for the reviewed, profile-specific expectation-manifest experiment (T35B note).
+///
+/// The manifest run must consume an explicit reviewed expectation file for the *accepted*
+/// authority shape — allowed cwd/outside/temp writes against disposable targets, deny-protected
+/// disposable files, read-only carve-outs, expected network behavior, and rule-order, duplicate,
+/// missing-path, special-path, and symlink behavior — and replay it through the exact Codex
+/// sandbox argv, so a profile whose expectations differ (root-write, network-enabled) cannot
+/// reuse legacy evidence. It is named here so the gap stays visible in test listings and so the
+/// follow-up lands as this test's body rather than as new undocumented evidence.
+#[tokio::test]
+#[ignore = "the reviewed profile-specific expectation manifest (see module note) is not yet implemented"]
+async fn profile_specific_expectation_manifest_enforces_the_accepted_authority() {
+    panic!(
+        "the profile-specific D03 expectation-manifest experiment is pending; \
+         see the module note and docs/contracts/execution.md"
+    );
+}
+
 /// Proves Codex accepts the captured sandbox JSON after semantic Value serialization, not only original spelling.
 #[tokio::test]
 #[ignore = "requires AGENT_IDE_D03_STATE and AGENT_IDE_D03_CODEX"]
