@@ -1,8 +1,22 @@
 #!/bin/sh
-# WORK IN PROGRESS: codex route driver — first live run pending. This driver
-# has never produced a host-cell result and makes no real_pass claim; it is
-# committed as-is to carry the route forward and is run only through
-# scripts/macos-acceptance.sh.
+# Status: sessions start live and complete the scripted tool loop (measured
+# 2026-09-22 against codex-cli 0.155.1), but no host-cell real_pass exists yet:
+# the default operator launcher's accepted codex-managed workspace-write record
+# predates the installed CLI, so the managed host refuses ide.start with the
+# closed `execution_profile` code until the operator re-mints that record.
+#
+# Measured `codex exec --json` transcript shape (codex-cli 0.155.1): one JSON
+# object per line. A session opens with `{"type":"thread.started","thread_id":..}`
+# and `{"type":"turn.started"}`; every tool call is a pair of events carrying an
+# `item` object with `type:"mcp_tool_call"`, `server:"agent-ide"`, the dotted
+# `tool:"ide.start"` spelling, `arguments`, and on `item.completed` a
+# `result:{content,structured_content}` plus `status:"completed"|"failed"`. A
+# turn closes with `{"type":"turn.completed","usage":{...}}`. Example line,
+# values redacted:
+#   {"type":"item.completed","item":{"id":"item_8","type":"mcp_tool_call",
+#    "server":"agent-ide","tool":"ide.edit","arguments":{...},
+#    "result":{"content":[..],"structured_content":{..}},"error":null,
+#    "status":"completed"}}
 
 # Real-host driver for the direct Codex acceptance route.
 #
@@ -42,6 +56,17 @@
 #   AGENT_IDE_ACCEPTANCE_MODEL        model alias; default gpt-5.6-luna.
 #   AGENT_IDE_ACCEPTANCE_SESSION_SECONDS wall-clock bound per session; default
 #                                     900.
+#   AGENT_IDE_ACCEPTANCE_FIRST_EVENT_SECONDS first-event watchdog; a session
+#                                     whose transcript is still empty this many
+#                                     seconds after launch is killed and coded
+#                                     E_SESSION_NO_START instead of burning the
+#                                     whole session bound on a dead start.
+#                                     Default 60.
+#   AGENT_IDE_ACCEPTANCE_ONLY        optional comma-separated scenario filter
+#                                    (l1,l1b,l2,l3,l4,r5,r5b) for single-scenario
+#                                    diagnostic reruns; unset runs the complete
+#                                    cell, and a filtered run never emits the
+#                                    closed result document.
 #   AGENT_IDE_ACCEPTANCE_DRY          1 prints the exact session commands and
 #                                     writes nothing.
 
@@ -52,6 +77,17 @@ DRIVER_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 # Maximum model-session attempts per scenario before the driver fails.
 MAX_ATTEMPTS=3
+# A session must record its first transcript event within this window; a dead
+# start is killed instead of consuming the full session bound (T34B).
+FIRST_EVENT_SECONDS=${AGENT_IDE_ACCEPTANCE_FIRST_EVENT_SECONDS:-60}
+
+# Optional single-scenario diagnostic filter; empty means the complete cell.
+ONLY=${AGENT_IDE_ACCEPTANCE_ONLY:-}
+selected() {
+    [ -z "$ONLY" ] && return 0
+    case ",$ONLY," in *",$1,"*) return 0 ;; esac
+    return 1
+}
 
 [ "${AGENT_IDE_ACCEPTANCE_ROUTE:-}" = codex ] || fail E_ROUTE "route is not codex"
 [ -n "${AGENT_IDE_ACCEPTANCE_LEFT_WORKTREE:-}" ] || fail E_LEFT_WORKTREE_MISSING
@@ -81,7 +117,7 @@ CONFIG
 # Dry mode: print every exact command the live run would execute and exit
 # without writing anything, including the diagnostic log.
 if [ "$DRY" = 1 ]; then
-    printf '%s\n' '# codex route driver — first live run pending; dry printout only'
+    printf '%s\n' '# codex route driver — live sessions; dry printout only'
     printf '%s\n' '# private CODEX_HOME/config.toml:'
     print_codex_config
     printf '%s\n' "# $BINARY codex-hooks print > <codex-home>/hooks.json"
@@ -176,18 +212,23 @@ SESSION_PATH="/usr/bin:/bin:/usr/sbin:/sbin:$(dirname -- "$CODEX")"
 #
 # The first argument is a short session label, the second the canonical
 # worktree, and the third the prompt file. The session runs inside that
-# worktree with the private CODEX_HOME and the operator's real home. Every
-# inherited nested-session and managed-rendezvous variable of the invoking
-# agent is removed, so the route really exercises the operator's Codex login
-# instead of an enclosing wrapper. The complete JSONL event transcript stays in
-# the private diagnostic directory.
+# worktree with the private CODEX_HOME and the operator's real home. The
+# prompt is passed positionally and stdin is closed with `</dev/null`: a
+# piped open stdin makes `codex exec` wait in "Reading additional input from
+# stdin..." forever, which is exactly how the first live attempt burned three
+# full 900 s alarms. A first-event watchdog kills a session that has recorded
+# no transcript line after FIRST_EVENT_SECONDS and codes it E_SESSION_NO_START.
+# Every inherited nested-session and managed-rendezvous variable of the
+# invoking agent is removed, so the route really exercises the operator's Codex
+# login instead of an enclosing wrapper. The complete JSONL event transcript
+# stays in the private diagnostic directory.
 run_session() {
     label=$1
     worktree=$2
     prompt_file=$3
     transcript=$DIAG_DIR/transcript-$label.jsonl
     rm -f -- "$transcript"
-    if (cd "$worktree" && CODEX_HOME="$CODEX_HOME_DIR" HOME="$OPERATOR_HOME" \
+    (cd "$worktree" && CODEX_HOME="$CODEX_HOME_DIR" HOME="$OPERATOR_HOME" \
         PATH="$SESSION_PATH" \
         /usr/bin/env -u CODEX_SANDBOX -u CODEX_SANDBOX_NETWORK_DISABLED \
         -u CODEX_PID -u CODEX_THREAD_ID -u CODEX_SESSION_ID \
@@ -197,11 +238,24 @@ run_session() {
         "$CODEX" exec --json -C "$worktree" -s workspace-write \
             --skip-git-repo-check -m "$MODEL" "$HOOK_TRUST_FLAG" \
             -o "$DIAG_DIR/last-$label.txt" "$(cat "$prompt_file")" \
-        >"$transcript" 2>"$DIAG_DIR/session-$label.err")
-    then
+        >"$transcript" 2>"$DIAG_DIR/session-$label.err") </dev/null &
+    session_pid=$!
+    (
+        sleep "$FIRST_EVENT_SECONDS"
+        if kill -0 "$session_pid" 2>/dev/null && [ ! -s "$transcript" ]; then
+            note E_SESSION_NO_START \
+                "no transcript event within ${FIRST_EVENT_SECONDS}s in session-$label"
+            kill -TERM "$session_pid" 2>/dev/null || :
+        fi
+    ) &
+    watchdog_pid=$!
+    status=0
+    wait "$session_pid" || status=$?
+    kill "$watchdog_pid" 2>/dev/null || :
+    wait "$watchdog_pid" 2>/dev/null || :
+    if [ "$status" -eq 0 ]; then
         note "session-$label-complete"
     else
-        status=$?
         note "session-$label-status" "$status"
         return 1
     fi
@@ -239,12 +293,14 @@ run_scenario() {
 # Prints how many transcript events record a tool call with the given name.
 #
 # `codex exec --json` emits thread events whose item objects carry the MCP
-# tool call. The match is tolerant of the measured 0.155 shape and of drift:
+# tool call. The match is tolerant of drift around the measured 0.155 shape
+# (`"type":"mcp_tool_call"`, `"tool":"ide.start"`, `"server":"agent-ide"`):
 # only events that also stringify a known tool-call item type are counted, and
-# the name may appear bare ("tool":"ide_start"), host-prefixed
-# ("name":"mcp__agent-ide__ide_start"), or dotted ("agent-ide.ide_start").
+# the name may appear dotted ("tool":"ide.start"), underscored
+# ("tool":"ide_start"), or host-prefixed ("mcp__agent-ide__ide_start").
 codex_tool_call_count() {
-    jq -s --arg tool "$2" '
+    tool_pattern=$(printf '%s' "$2" | sed 's/_/[._]/g')
+    jq -s --arg tool "$tool_pattern" '
         [.[]
          | tostring
          | select(test("mcp_tool_call|tool_call|tool_use|local_shell_call|file_change"))
@@ -256,7 +312,8 @@ codex_tool_call_count() {
 # JSONL shape drift can be retuned from a real session without guessing.
 record_codex_event_sample() {
     [ -s "$1" ] || return 0
-    sed -n '1,2p' -- "$1" 2>>"$DIAG_LOG" | while IFS= read -r line; do
+    # BSD sed has no `--` end-of-options token, so the path is passed directly.
+    sed -n '1,2p' "$1" 2>>"$DIAG_LOG" | while IFS= read -r line; do
         note "codex-event-sample-$(basename -- "$1")" "$line"
     done
 }
@@ -298,11 +355,13 @@ require_codex_native_edit() {
 
 # Prints the arguments object of the first tool call with the given name.
 #
-# Codex has carried call arguments under several item field names across
-# versions, so the extraction tries `arguments`, `input`, and a raw JSON
-# string form, and yields null when none is present.
+# The measured shape carries call arguments under `item.arguments`; the older
+# `input` and raw JSON string forms stay supported for drift, and the matcher
+# accepts the same dotted, underscored, and host-prefixed name spellings as
+# codex_tool_call_count.
 codex_first_tool_input() {
-    jq -s --arg tool "$2" '
+    tool_pattern=$(printf '%s' "$2" | sed 's/_/[._]/g')
+    jq -s --arg tool "$tool_pattern" '
         [.[]
          | (.item // .)
          | select(tostring
@@ -415,26 +474,35 @@ verify_l3() {
 }
 
 # Scenario L1: real edit/diagnostic/fix/diff/stop loop over Pyright.
-cp -- "$DRIVER_DIR/codex-prompts/l1.txt" "$DIAG_DIR/prompt-l1.txt"
-run_scenario l1 "$LEFT" "$DIAG_DIR/prompt-l1.txt" verify_l1 reset_fixture A_L1_SCENARIO
+if selected l1; then
+    cp -- "$DRIVER_DIR/codex-prompts/l1.txt" "$DIAG_DIR/prompt-l1.txt"
+    run_scenario l1 "$LEFT" "$DIAG_DIR/prompt-l1.txt" verify_l1 reset_fixture A_L1_SCENARIO
+fi
 
 # Scenario L1B: the composed diff of the finished loop in a fresh session.
-cp -- "$DRIVER_DIR/codex-prompts/l1b.txt" "$DIAG_DIR/prompt-l1b.txt"
-run_scenario l1b "$LEFT" "$DIAG_DIR/prompt-l1b.txt" verify_l1b reset_left_fixed A_L1B_SCENARIO
+if selected l1b; then
+    cp -- "$DRIVER_DIR/codex-prompts/l1b.txt" "$DIAG_DIR/prompt-l1b.txt"
+    run_scenario l1b "$LEFT" "$DIAG_DIR/prompt-l1b.txt" verify_l1b reset_left_fixed A_L1B_SCENARIO
+fi
 
 # Scenario L2: native fallback while inactive, then a stale edit with zero
 # writes. Retries restart from the post-L1 fixed state.
-reset_left_fixed "$LEFT"
-cp -- "$DRIVER_DIR/codex-prompts/l2.txt" "$DIAG_DIR/prompt-l2.txt"
-run_scenario l2 "$LEFT" "$DIAG_DIR/prompt-l2.txt" verify_l2 reset_left_fixed A_L2_SCENARIO
+if selected l2; then
+    reset_left_fixed "$LEFT"
+    cp -- "$DRIVER_DIR/codex-prompts/l2.txt" "$DIAG_DIR/prompt-l2.txt"
+    run_scenario l2 "$LEFT" "$DIAG_DIR/prompt-l2.txt" verify_l2 reset_left_fixed A_L2_SCENARIO
+fi
 
 # Scenario L3: real TypeScript semantic context through the accepted bundle.
-reset_left_native "$LEFT"
-cp -- "$DRIVER_DIR/codex-prompts/l3.txt" "$DIAG_DIR/prompt-l3.txt"
-run_scenario l3 "$LEFT" "$DIAG_DIR/prompt-l3.txt" verify_l3 reset_left_native A_L3_SCENARIO
+if selected l3; then
+    reset_left_native "$LEFT"
+    cp -- "$DRIVER_DIR/codex-prompts/l3.txt" "$DIAG_DIR/prompt-l3.txt"
+    run_scenario l3 "$LEFT" "$DIAG_DIR/prompt-l3.txt" verify_l3 reset_left_native A_L3_SCENARIO
+fi
 
 # Restart-safe telemetry: durable events survive the daemon restart of a fresh
 # session and both query and export read them back through the CLI.
+if selected l4; then
 TELEMETRY_DB=$OPERATOR_HOME/.agent-ide/telemetry/$LEFT_IDENTITY/state.sqlite
 [ -f "$TELEMETRY_DB" ] || fail A_TELEMETRY_DB_MISSING "no durable database before restart"
 before_rows=$("$BINARY" telemetry export --database "$TELEMETRY_DB" 2>>"$DIAG_LOG" | wc -l | tr -d ' ')
@@ -459,6 +527,7 @@ after_rows=$("$BINARY" telemetry export --database "$TELEMETRY_DB" 2>>"$DIAG_LOG
     || fail A_TELEMETRY_QUERY_EXIT "query exited nonzero"
 jq -e '.events | length >= 1' "$DIAG_DIR/telemetry-query.json" >/dev/null 2>&1 \
     || fail A_TELEMETRY_QUERY_ROWS "query returned no events"
+fi
 
 # Verifies the R5 divergent-worktree loop.
 verify_r5() {
@@ -477,8 +546,10 @@ verify_r5() {
 }
 
 # Scenario R5: the complete loop in the divergent right worktree.
-cp -- "$DRIVER_DIR/codex-prompts/r5.txt" "$DIAG_DIR/prompt-r5.txt"
-run_scenario r5 "$RIGHT" "$DIAG_DIR/prompt-r5.txt" verify_r5 reset_fixture A_R5_SCENARIO
+if selected r5; then
+    cp -- "$DRIVER_DIR/codex-prompts/r5.txt" "$DIAG_DIR/prompt-r5.txt"
+    run_scenario r5 "$RIGHT" "$DIAG_DIR/prompt-r5.txt" verify_r5 reset_fixture A_R5_SCENARIO
+fi
 
 # Verifies the R5 diff session in the divergent right worktree.
 verify_r5b() {
@@ -492,14 +563,23 @@ verify_r5b() {
 }
 
 # Scenario R5B: the composed diff of the right loop in a fresh session.
-cp -- "$DRIVER_DIR/codex-prompts/r5b.txt" "$DIAG_DIR/prompt-r5b.txt"
-run_scenario r5b "$RIGHT" "$DIAG_DIR/prompt-r5b.txt" verify_r5b reset_fixture A_R5B_SCENARIO
+if selected r5b; then
+    cp -- "$DRIVER_DIR/codex-prompts/r5b.txt" "$DIAG_DIR/prompt-r5b.txt"
+    run_scenario r5b "$RIGHT" "$DIAG_DIR/prompt-r5b.txt" verify_r5b reset_fixture A_R5B_SCENARIO
+fi
 
 # Compact projection holds across every captured session.
 for transcript in "$DIAG_DIR"/transcript-l*.jsonl "$DIAG_DIR"/transcript-r5*.jsonl; do
+    [ -f "$transcript" ] || continue
     require_codex_compact_replies "$transcript" A_COMPACT_REPLIES || fail A_COMPACT_REPLIES "$transcript"
 done
 
-write_pass_result
+# A filtered run is a diagnostic rerun and never emits the closed result
+# document; only the complete cell may claim every scenario real_pass.
+if [ -z "$ONLY" ]; then
+    write_pass_result
+else
+    note driver-filtered-run "$ONLY"
+fi
 note driver-complete codex
 exit 0
