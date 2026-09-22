@@ -15,7 +15,9 @@ Apply R1 and R2 to every numbered step's reply, including step 1.
    structured context result has a detail_ref field; remember that exact value
    as OLD_REF.
 3. Call ide.stop with {}.
-4. With your native Edit tool only, edit acceptance-fixture/fixture.py by
+4. Read acceptance-fixture/fixture.py once with your native Read tool (the one
+   exception to R5; the native Edit tool refuses unread files), then with your
+   native Edit tool only, edit acceptance-fixture/fixture.py by
    inserting exactly one new first line reading: # native acceptance marker
    Keep every existing line unchanged.
 5. Call ide.start with {"activation_id":"acceptance-left-2b"}. That reply may show an exact command: apply R1 then R2 to it.
