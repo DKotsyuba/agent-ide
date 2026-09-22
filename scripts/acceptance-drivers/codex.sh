@@ -222,7 +222,18 @@ SESSION_PATH="/usr/bin:/bin:/usr/sbin:/sbin:$(dirname -- "$CODEX")"
 # invoking agent is removed, so the route really exercises the operator's Codex
 # login instead of an enclosing wrapper. The complete JSONL event transcript
 # stays in the private diagnostic directory.
+# The edit ledger is durable per repository, so a retried scenario must never reuse
+# an earlier attempt's operation_id (it would answer conflicting_duplicate). Each
+# session gets its own suffix; verifiers never read the id.
+SESSION_SEQ=0
+# Called inside a command substitution (a subshell), so run_session advances
+# SESSION_SEQ before the call.
+session_prompt() {
+    sed "s/\"operation_id\":\"\([A-Za-z0-9-]*\)\"/\"operation_id\":\"\1-$$-$SESSION_SEQ\"/g" "$1"
+}
+
 run_session() {
+    SESSION_SEQ=$((SESSION_SEQ + 1))
     label=$1
     worktree=$2
     prompt_file=$3
@@ -237,7 +248,7 @@ run_session() {
         /usr/bin/perl -e 'alarm shift; exec @ARGV' "$SESSION_SECONDS" \
         "$CODEX" exec --json -C "$worktree" -s workspace-write \
             --skip-git-repo-check -m "$MODEL" "$HOOK_TRUST_FLAG" \
-            -o "$DIAG_DIR/last-$label.txt" "$(cat "$prompt_file")" \
+            -o "$DIAG_DIR/last-$label.txt" "$(session_prompt "$prompt_file")" \
         >"$transcript" 2>"$DIAG_DIR/session-$label.err") </dev/null &
     session_pid=$!
     (

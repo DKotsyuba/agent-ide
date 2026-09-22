@@ -169,7 +169,18 @@ reset_fixture() {
 # rejects as ambiguous, so only the candidate plugin hook may deliver binding
 # evidence. The complete
 # stream-json transcript stays in the private diagnostic directory.
+# The edit ledger is durable per repository, so a retried scenario must never reuse
+# an earlier attempt's operation_id (it would answer conflicting_duplicate). Each
+# session gets its own suffix; verifiers never read the id.
+SESSION_SEQ=0
+# Called inside a command substitution (a subshell), so run_session advances
+# SESSION_SEQ before the call.
+session_prompt() {
+    sed "s/\"operation_id\":\"\([A-Za-z0-9-]*\)\"/\"operation_id\":\"\1-$$-$SESSION_SEQ\"/g" "$1"
+}
+
 run_session() {
+    SESSION_SEQ=$((SESSION_SEQ + 1))
     label=$1
     worktree=$2
     prompt_file=$3
@@ -184,7 +195,7 @@ run_session() {
         -u CLAUDE_CODE_MESSAGING_TOKEN -u CLAUDE_CODE_SESSION_ID -u CLAUDE_PID \
         -u CLAUDE_EFFORT \
         /usr/bin/perl -e 'alarm shift; exec @ARGV' "$SESSION_SECONDS" \
-        "$CLAUDE" -p "$(cat "$prompt_file")" \
+        "$CLAUDE" -p "$(session_prompt "$prompt_file")" \
         --model "$MODEL" --output-format stream-json --verbose \
         --dangerously-skip-permissions \
         --strict-mcp-config --mcp-config "$MCP_CONFIG" --plugin-dir "$worktree" \
