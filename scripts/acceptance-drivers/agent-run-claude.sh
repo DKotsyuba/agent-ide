@@ -176,11 +176,19 @@ require_record_text() {
         || fail "$3" "transcript $1 lacks $2"
 }
 
+# The edit ledger is durable per repository, so a later run must never reuse an
+# earlier run's operation_id (it would answer conflicting_duplicate). Each run
+# suffixes every operation_id with this driver's PID, as the direct Claude
+# driver does per session; verifiers never read the id.
+task_prompt() {
+    sed "s/\"operation_id\":\"\([A-Za-z0-9-]*\)\"/\"operation_id\":\"\\1-$$\"/g" "$1"
+}
+
 prepare_worktree "$LEFT" "$LEFT_RUNTIME"
 prepare_worktree "$RIGHT" "$RIGHT_RUNTIME"
 
 # Agent L1: real edit/diagnostic/fix/diff/stop loop over Pyright.
-cp -- "$DRIVER_DIR/claude-prompts/l1.txt" "$DIAG_DIR/task-l1.txt"
+task_prompt "$DRIVER_DIR/claude-prompts/l1.txt" >"$DIAG_DIR/task-l1.txt"
 run_agent l1 "$LEFT" "$DIAG_DIR/task-l1.txt"
 require_answer_text l1 "LEFT_LOOP_OK" A_L1_FINAL
 printf 'def value() -> int:\n    return 0\n' >"$DIAG_DIR/expected-l1.py"
@@ -188,7 +196,7 @@ cmp -s "$LEFT/acceptance-fixture/fixture.py" "$DIAG_DIR/expected-l1.py" \
     || fail A_L1_FILE_CONTENT "left fixture.py is not the helper-edited content"
 
 # Agent L2: native fallback while inactive, then a stale edit with zero writes.
-cp -- "$DRIVER_DIR/claude-prompts/l2.txt" "$DIAG_DIR/task-l2.txt"
+task_prompt "$DRIVER_DIR/claude-prompts/l2.txt" >"$DIAG_DIR/task-l2.txt"
 run_agent l2 "$LEFT" "$DIAG_DIR/task-l2.txt"
 require_answer_text l2 "LEFT_FALLBACK_OK" A_L2_FINAL
 require_record_text l2 "stale_source" A_L2_STALE_OUTCOME
@@ -197,7 +205,7 @@ cmp -s "$LEFT/acceptance-fixture/fixture.py" "$DIAG_DIR/expected-l2.py" \
     || fail A_L2_ZERO_WRITE "left fixture.py does not prove the stale edit wrote nothing"
 
 # Agent L3: real TypeScript semantic context through the accepted bundle.
-cp -- "$DRIVER_DIR/claude-prompts/l3.txt" "$DIAG_DIR/task-l3.txt"
+task_prompt "$DRIVER_DIR/claude-prompts/l3.txt" >"$DIAG_DIR/task-l3.txt"
 run_agent l3 "$LEFT" "$DIAG_DIR/task-l3.txt"
 require_answer_text l3 "LEFT_TS_OK" A_L3_FINAL
 require_record_text l3 "mode: semantic" A_L3_SEMANTIC
@@ -207,14 +215,14 @@ TELEMETRY_DB=$OPERATOR_HOME/.agent-ide/telemetry/$LEFT_IDENTITY/state.sqlite
 [ -f "$TELEMETRY_DB" ] || fail A_TELEMETRY_DB_MISSING "no durable database before restart"
 before_rows=$("$BINARY" telemetry export --database "$TELEMETRY_DB" 2>>"$DIAG_LOG" | wc -l | tr -d ' ')
 [ "${before_rows:-0}" -ge 1 ] || fail A_TELEMETRY_PRE_RESTART_EMPTY "export before restart"
-cp -- "$DRIVER_DIR/claude-prompts/l4.txt" "$DIAG_DIR/task-l4.txt"
+task_prompt "$DRIVER_DIR/claude-prompts/l4.txt" >"$DIAG_DIR/task-l4.txt"
 run_agent l4 "$LEFT" "$DIAG_DIR/task-l4.txt"
 require_answer_text l4 "LEFT_RESTART_OK" A_L4_FINAL
 after_rows=$("$BINARY" telemetry export --database "$TELEMETRY_DB" 2>>"$DIAG_LOG" | wc -l | tr -d ' ')
 [ "$after_rows" -gt "$before_rows" ] || fail A_TELEMETRY_RESTART_LOST "no new rows after restart"
 
 # Agent R5: the complete loop in the divergent right worktree.
-cp -- "$DRIVER_DIR/claude-prompts/r5.txt" "$DIAG_DIR/task-r5.txt"
+task_prompt "$DRIVER_DIR/claude-prompts/r5.txt" >"$DIAG_DIR/task-r5.txt"
 run_agent r5 "$RIGHT" "$DIAG_DIR/task-r5.txt"
 require_answer_text r5 "RIGHT_LOOP_OK" A_R5_FINAL
 require_record_text r5 "right-python-bad" A_R5_PYRIGHT_MARKER
