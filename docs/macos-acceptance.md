@@ -142,16 +142,19 @@ documentation and evidence, not the tested product. The real-host matrix remains
 partially successful route is not a `real_pass`, and the runner marks every scenario `failed` when
 its strict driver withholds the exact complete result document.
 
-The committed drivers have since been refreshed for the current hosts (Claude Code 2.1.274,
-agent-run 0.12.4, launcher.json with the accepted `claude-r3-2026-09-14` TypeScript record; see
-the driver section above). The first passing run against those hosts is pending; the table below
-records the last executed cells, which ran on the earlier host versions shown.
+All four routes passed on one revision for release 0.3.13 (`3be73b5`), every scenario on its
+first attempt: Claude Code 2.1.280, Codex CLI 0.155.1 and agent-run 0.12.5 to Claude Code 2.1.280.
+Three environment facts were required and are now encoded in the drivers or release notes: the
+Claude plugin hook entry carries no `args` (Claude Code 2.1.280 runs such entries without a shell),
+Claude route sessions exclude user-level settings so an operator-registered hook cannot double the
+candidate hook, and the agent-run service is restarted after an install so it loads the new plugin.
 
 | Route | Public evidence | Result |
 |---|---|---|
-| Direct Codex CLI 0.154.0 | [JSON](evidence/macos-v0.2-direct-codex.json) | `failed` (Codex CLI 0.154.0): real Pyright edit/stale/native behavior and TypeScript semantic Context ran; the first Diff inspection completed, then a further driver inspection failed without preserving its closed code, so no complete host claim exists |
-| Direct Claude Code 2.1.267 | [JSON](evidence/macos-v0.2-direct-claude.json) | `failed` (Claude Code 2.1.267): authenticated helper-backed Pyright activity ran in both worktrees; a focused registered-source Diff returned `workspace_authority`, and TypeScript remained lexical because no Claude TypeScript record is accepted |
-| Installed agent-run 0.11.8 to Claude Code 2.1.267 | [JSON](evidence/macos-v0.2-agent-run-claude.json) | `failed` (agent-run 0.11.8 to Claude Code 2.1.267): both divergent worktrees completed the real Pyright/helper path, including stale zero-write and native fallback; Diff inspection returned `capacity`, and TypeScript remained lexical because the tested Claude launcher had no accepted provider, so the complete cell did not pass |
+| Product contract | [JSON](evidence/macos-v0.2-product.json) | `product_pass` |
+| Direct Codex CLI 0.155.1 | [JSON](evidence/macos-v0.2-direct-codex.json) | `real_pass` |
+| Direct Claude Code 2.1.280 | [JSON](evidence/macos-v0.2-direct-claude.json) | `real_pass` |
+| Installed agent-run 0.12.5 to Claude Code 2.1.280 | [JSON](evidence/macos-v0.2-agent-run-claude.json) | `real_pass` |
 
 The installed agent-run route is separate evidence and is not relabeled as direct Claude. Private
 driver prompts, local paths, credentials, transcripts, and host/run identifiers were retained only

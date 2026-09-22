@@ -1,6 +1,5 @@
 #!/bin/sh
-# Status: refreshed for the current hosts; first passing run pending; see
-# docs/macos-acceptance.md results table.
+# Status: real_pass on 3be73b5 (release 0.3.13); see docs/macos-acceptance.md.
 
 # Real-host driver for the installed agent-run to Claude acceptance route.
 #

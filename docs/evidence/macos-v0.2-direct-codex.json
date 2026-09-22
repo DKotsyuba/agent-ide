@@ -1,11 +1,11 @@
 {
   "schema": "agent-ide.macos-acceptance.v1",
-  "revision": "d88af079ac1e0c06d411208f513a1bfefeddf4b1",
+  "revision": "3be73b5af245811b33c4819359dd1b4fa5c46dad",
   "route": "codex",
-  "status": "failed",
-  "platform": {"os": "macos", "version": "26.6.2", "architecture": "arm64"},
-  "host": {"version": "codex-cli-0.154.0"},
-  "toolchains": {"go": "not_tested", "gopls": "not_tested", "rust": "not_tested", "rust_analyzer": "not_tested", "node": "not_tested", "pyright": "not_tested", "typescript_language_server": "not_tested", "typescript": "not_tested"},
-  "scenarios": {"edit_diagnostic_loop": "failed", "stale_edit_zero_write": "failed", "native_fallback": "failed", "telemetry_restart_query_export": "failed", "compact_content": "failed", "python_provider": "failed", "typescript_r3": "failed", "divergent_worktrees": "failed"},
+  "status": "real_pass",
+  "platform": {"os": "macos", "version": "27.0", "architecture": "arm64"},
+  "host": {"version": "codex-cli-0.155.1"},
+  "toolchains": {"go": "1.25.0", "gopls": "0.23.0", "rust": "1.98.1", "rust_analyzer": "1.98.1", "node": "24.4.0", "pyright": "1.1.413", "typescript_language_server": "6.0.0", "typescript": "5.9.3"},
+  "scenarios": {"edit_diagnostic_loop": "real_pass", "stale_edit_zero_write": "real_pass", "native_fallback": "real_pass", "telemetry_restart_query_export": "real_pass", "compact_content": "real_pass", "python_provider": "real_pass", "typescript_r3": "real_pass", "divergent_worktrees": "real_pass"},
   "privacy": {"source": false, "prompts": false, "credentials": false, "commands": false, "paths": false, "diagnostic_messages": false, "private_ids": false}
 }
