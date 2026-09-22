@@ -93,6 +93,31 @@ This interface deliberately carries no session, run, transcript, prompt, credent
 field. A driver can invoke direct Codex, direct Claude, or an externally installed agent-run to
 Claude without teaching this repository its private identifiers or changing agent-run source.
 
+### Direct Codex driver
+
+`scripts/acceptance-drivers/codex.sh` is the committed driver for `--route codex`. Status:
+work in progress — first live run pending, and it has produced no `real_pass` claim. It runs real
+bounded `codex exec --json -C <worktree> -s workspace-write --skip-git-repo-check -m <model>
+-o <last-message> "<prompt>"` sessions (with `--dangerously-bypass-hook-trust` only when the
+installed CLI documents that flag; approvals and sandbox are never bypassed) and writes the closed
+nine-line document only when every scenario passes on captured transcripts plus real filesystem and
+telemetry effects. Managed Codex binds `ide.start` directly from the MCP `_meta` attachment, so the
+prompts have no foreground helper step; a `pending` tool answer must be followed by `ide.inspect`
+with the returned `detail_ref`.
+
+Each run builds a private `CODEX_HOME` in a per-run temporary directory with only the candidate
+binary as the `agent-ide` MCP server (`mcp --launcher-template`), `default_tools_approval_mode =
+"never"` for that server, the candidate's own `codex-hooks print` fragment as `hooks.json`, and the
+operator's auth linked in place (the `file_link` pattern: a hard link to `~/.codex/auth.json`,
+symlink fallback; never copied, read, or printed). Every scenario session is attempted at most three
+times, and each retry first restores the exact fixture precondition.
+
+Optional knobs: `AGENT_IDE_ACCEPTANCE_BINARY`, `AGENT_IDE_ACCEPTANCE_CODEX`,
+`AGENT_IDE_ACCEPTANCE_LAUNCHER`, `AGENT_IDE_ACCEPTANCE_OPERATOR_HOME`,
+`AGENT_IDE_ACCEPTANCE_MODEL` (default `gpt-5.6-luna`),
+`AGENT_IDE_ACCEPTANCE_SESSION_SECONDS` (default 900), `AGENT_IDE_ACCEPTANCE_DIAG_LOG`, and
+`AGENT_IDE_ACCEPTANCE_DRY=1`, which prints the exact commands and writes nothing.
+
 ## Evidence boundary
 
 The output must satisfy

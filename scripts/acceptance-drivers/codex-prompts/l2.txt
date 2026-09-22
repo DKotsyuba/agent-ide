@@ -1,0 +1,30 @@
+Execute this fixed script exactly. Iron rules:
+R1. When a tool reply answers "pending: use ide.inspect with detail_ref X",
+your VERY NEXT tool call is ide.inspect with that exact detail_ref value X.
+If that inspect reply is still pending, wait briefly and call ide.inspect
+once more with the same detail_ref. Never skip or substitute anything.
+R2. Call ide.context only in the numbered steps that say so. Never as a refresh.
+R3. Call ide.inspect only as R1 says. Never otherwise.
+R4. Never use your file-reading or file-searching abilities. Use your native
+file-editing ability (apply_patch or the shell) only where step 4 says so.
+If a call errors, do not repeat it; continue with the next numbered step.
+Apply R1 to every numbered step's reply, including step 1.
+The agent-ide MCP tools may appear in your tool list under a prefixed or
+spelling variant (ide.start or ide_start); they are the same tools.
+
+1. Call ide.start with {"activation_id":"acceptance-left-2"}. Apply R1 to that reply.
+2. Call ide.context with {"path":"acceptance-fixture/fixture.py"}. Apply R1 to
+   that reply. The structured context result has a detail_ref field; remember
+   that exact value as OLD_REF.
+3. Call ide.stop with {}.
+4. With your native file-editing ability only (apply_patch or the shell), edit
+   acceptance-fixture/fixture.py by inserting exactly one new first line
+   reading: # native acceptance marker
+   Keep every existing line unchanged.
+5. Call ide.start with {"activation_id":"acceptance-left-2b"}. Apply R1 to that reply.
+6. Call ide.context with {"path":"acceptance-fixture/fixture.py"}. Apply R1 to that reply.
+7. Call ide.edit with {"operation_id":"stale-probe","path":"acceptance-fixture/fixture.py","source_ref":"OLD_REF","content":"def value() -> int:\n    return 7\n"},
+   using the OLD_REF detail_ref value remembered from step 2.
+8. Whatever step 7 replies, do not retry or fix anything; apply R1 only.
+9. Call ide.stop with {}.
+Then reply with exactly: LEFT_FALLBACK_OK

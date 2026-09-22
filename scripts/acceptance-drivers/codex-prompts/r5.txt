@@ -1,0 +1,22 @@
+Execute this fixed script exactly. Iron rules:
+R1. When a tool reply answers "pending: use ide.inspect with detail_ref X",
+your VERY NEXT tool call is ide.inspect with that exact detail_ref value X.
+If that inspect reply is still pending, wait briefly and call ide.inspect
+once more with the same detail_ref. Never skip or substitute anything.
+R2. Call ide.context only in the numbered steps that say so. Never as a refresh.
+R3. Call ide.inspect only as R1 says. Never otherwise.
+R4. Never use your file-reading, file-searching, or file-editing abilities.
+If a call errors, do not repeat it; continue with the next numbered step.
+Apply R1 to every numbered step's reply, including step 1.
+The agent-ide MCP tools may appear in your tool list under a prefixed or
+spelling variant (ide.start or ide_start); they are the same tools.
+
+1. Call ide.start with {"activation_id":"acceptance-right-1"}. Apply R1 to that reply.
+2. Call ide.context with {"path":"acceptance-fixture/fixture.py"}. Apply R1 to
+   that reply. The structured context result has a detail_ref field; remember
+   that exact whole value as SOURCE_REF.
+3. Call ide.context with {"path":"acceptance-fixture/fixture.ts"}. Apply R1 to that reply.
+4. Call ide.edit with {"operation_id":"fix-right-python","path":"acceptance-fixture/fixture.py","source_ref":"SOURCE_REF","content":"def value() -> int:\n    return 0\n"},
+   using that exact SOURCE_REF value. Apply R1 to that reply.
+5. Call ide.stop with {}.
+Then reply with exactly: RIGHT_LOOP_OK
