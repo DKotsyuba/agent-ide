@@ -155,6 +155,9 @@ run_agent() {
     "$AGENT_RUN" answer "$agent_id" >"$answer_file" 2>>"$DIAG_LOG" \
         || fail "E_${label}_ANSWER" "answer exited nonzero"
     [ -s "$answer_file" ] || fail "E_${label}_ANSWER_EMPTY" "empty answer"
+    "$AGENT_RUN" transcript --full --limit 1000 "$agent_id" \
+        >"$DIAG_DIR/transcript-$label.json" 2>>"$DIAG_LOG" \
+        || fail "E_${label}_TRANSCRIPT" "transcript exited nonzero"
     printf '%s %s\n' "$label" "$agent_id" >>"$DIAG_DIR/agent-ids.log"
 }
 
@@ -162,6 +165,15 @@ run_agent() {
 require_answer_text() {
     /usr/bin/grep -qF -- "$2" "$DIAG_DIR/answer-$1.txt" \
         || fail "$3" "answer $1 lacks $2"
+}
+
+# Requires the agent's stored transcript (tool results included) to contain one
+# literal token. The scripts force a fixed final reply, so tool outcomes such as
+# stale_source or the semantic mode line only ever appear in tool results, as on
+# the direct Claude route. Markers checked here never occur in the task prompts.
+require_record_text() {
+    /usr/bin/grep -qF -- "$2" "$DIAG_DIR/transcript-$1.json" \
+        || fail "$3" "transcript $1 lacks $2"
 }
 
 prepare_worktree "$LEFT" "$LEFT_RUNTIME"
@@ -179,7 +191,7 @@ cmp -s "$LEFT/acceptance-fixture/fixture.py" "$DIAG_DIR/expected-l1.py" \
 cp -- "$DRIVER_DIR/claude-prompts/l2.txt" "$DIAG_DIR/task-l2.txt"
 run_agent l2 "$LEFT" "$DIAG_DIR/task-l2.txt"
 require_answer_text l2 "LEFT_FALLBACK_OK" A_L2_FINAL
-require_answer_text l2 "stale" A_L2_STALE_OUTCOME
+require_record_text l2 "stale_source" A_L2_STALE_OUTCOME
 printf '# native acceptance marker\ndef value() -> int:\n    return 0\n' >"$DIAG_DIR/expected-l2.py"
 cmp -s "$LEFT/acceptance-fixture/fixture.py" "$DIAG_DIR/expected-l2.py" \
     || fail A_L2_ZERO_WRITE "left fixture.py does not prove the stale edit wrote nothing"
@@ -188,7 +200,7 @@ cmp -s "$LEFT/acceptance-fixture/fixture.py" "$DIAG_DIR/expected-l2.py" \
 cp -- "$DRIVER_DIR/claude-prompts/l3.txt" "$DIAG_DIR/task-l3.txt"
 run_agent l3 "$LEFT" "$DIAG_DIR/task-l3.txt"
 require_answer_text l3 "LEFT_TS_OK" A_L3_FINAL
-require_answer_text l3 "not assignable" A_L3_SEMANTIC
+require_record_text l3 "mode: semantic" A_L3_SEMANTIC
 
 # Restart-safe telemetry across a fresh agent's daemon generation.
 TELEMETRY_DB=$OPERATOR_HOME/.agent-ide/telemetry/$LEFT_IDENTITY/state.sqlite
@@ -205,8 +217,8 @@ after_rows=$("$BINARY" telemetry export --database "$TELEMETRY_DB" 2>>"$DIAG_LOG
 cp -- "$DRIVER_DIR/claude-prompts/r5.txt" "$DIAG_DIR/task-r5.txt"
 run_agent r5 "$RIGHT" "$DIAG_DIR/task-r5.txt"
 require_answer_text r5 "RIGHT_LOOP_OK" A_R5_FINAL
-require_answer_text r5 "right-python-bad" A_R5_PYRIGHT_MARKER
-require_answer_text r5 "right-typescript-bad" A_R5_TYPESCRIPT_MARKER
+require_record_text r5 "right-python-bad" A_R5_PYRIGHT_MARKER
+require_record_text r5 "right-typescript-bad" A_R5_TYPESCRIPT_MARKER
 if /usr/bin/grep -qF 'left-python-bad' "$DIAG_DIR/answer-r5.txt"; then
     fail A_R5_LEFT_LEAK "right answer leaked left worktree content"
 fi
