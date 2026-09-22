@@ -97,6 +97,11 @@ reported as a warning, not a stop. It never edits `~/.claude/settings.json`,
 operator should apply there, pointed at `<prefix>/share/agent-ide/plugin/current`. `--dry-run`
 prints every action it would take without writing anything.
 
+agent-run resolves `<prefix>/share/agent-ide/plugin/current` to its versioned directory once, when
+its service starts. After an install, restart the agent-run service when no agents are running;
+until then its Claude runtimes keep loading the previous plugin version (seen with 0.3.12 → 0.3.13,
+whose old hooks no longer ran under Claude Code 2.1.280).
+
 To roll back: restore the binary from its `<prefix>/bin/agent-ide.bak-<old-version-or-timestamp>`
 backup (written before the new binary replaces the old one, named from the old binary's own
 `--version` output when it prints one, else a UTC timestamp), and point `current` back at the

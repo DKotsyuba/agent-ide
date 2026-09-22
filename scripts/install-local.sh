@@ -184,3 +184,4 @@ printf '  %s codex-hooks print\n' "$installed_bin"
 printf 'then merge its two handlers into the existing PreToolUse/PostToolUse arrays of ~/.codex/hooks.json, preserving existing entries.\n'
 printf 'Review and trust both definitions in Codex itself (/hooks); untrusted hooks simply stay silent.\n'
 printf 'Never register the agent-ide handler twice: duplicate pre-events are rejected as replays. The product never writes ~/.codex.\n'
+printf 'agent-run resolves plugin/current once when its service starts: restart that service after this install, or its Claude runtimes keep loading the previous plugin version.\n'
