@@ -79,6 +79,8 @@ pub enum PublishError {
     Contended,
     /// A transient filesystem failure prevented publication; no partial record was left live.
     Unavailable,
+    /// The publisher was permanently retired by its teardown; publication is refused.
+    Retired,
 }
 
 /// Validated addressing of one managed Codex actor route (T29B §2).
@@ -259,13 +261,14 @@ impl Publication {
 /// The rendezvous root and runtime directory are fixed at construction (the root is injectable for
 /// tests; production callers pass [`default_root`]). Every successful [`publish`](Self::publish)
 /// retains the locked record descriptor, so dropping the publisher — or an explicit
-/// [`unpublish_all`](Self::unpublish_all) — retires discovery immediately, while an MCP crash
+/// [`retire`](Self::retire) — retires discovery immediately and permanently, while an MCP crash
 /// leaves only inert unlocked leftovers that a later publisher may prune.
 pub struct ManagedCodexPublisher {
     root: PathBuf,
     runtime_dir: PathBuf,
     attachment: String,
     publications: Vec<Publication>,
+    retired: bool,
 }
 
 impl ManagedCodexPublisher {
@@ -280,6 +283,7 @@ impl ManagedCodexPublisher {
             runtime_dir,
             attachment: attachment.into(),
             publications: Vec::new(),
+            retired: false,
         }
     }
 
@@ -291,8 +295,11 @@ impl ManagedCodexPublisher {
     /// discoverable. While holding that lock the publisher also removes validated but unlocked
     /// crash leftovers in its own route directory. Another publisher's live record is never
     /// touched, so overlapping publishers on one route deliberately make discovery ambiguous
-    /// rather than silently rerouting either session.
+    /// rather than silently rerouting either session. A retired publisher publishes nothing.
     pub fn publish(&mut self, identity: &CodexRouteIdentity) -> Result<(), PublishError> {
+        if self.retired {
+            return Err(PublishError::Retired);
+        }
         if !valid_attachment(&self.attachment) {
             return Err(PublishError::InvalidAttachment);
         }
@@ -374,6 +381,19 @@ impl ManagedCodexPublisher {
         for publication in self.publications.drain(..) {
             publication.unpublish();
         }
+    }
+
+    /// Permanently retires this publisher, then drains its records (T29B final review 3).
+    ///
+    /// Teardown calls this instead of — never in addition to — [`unpublish_all`](Self::unpublish_all):
+    /// the retired flag is set first, under the same publisher mutex every [`publish`](Self::publish)
+    /// attempt takes, so a queued publication racing the daemon-exit observer, and every later call,
+    /// is refused with [`PublishError::Retired`] and publishes nothing. A discoverable dead route
+    /// can therefore never reappear after teardown began. Retirement lasts for the publisher's
+    /// remaining lifetime; the route directories stay behind for a later process exactly as before.
+    pub fn retire(&mut self) {
+        self.retired = true;
+        self.unpublish_all();
     }
 }
 
@@ -1319,6 +1339,34 @@ mod tests {
         assert!(discover(&area.root(), &identity).is_none());
     }
 
+    /// Retirement is permanent (T29B final review 3): teardown's `retire` drains every record
+    /// before marking, and a queued or later publication — exactly what a further MCP call racing
+    /// the daemon-exit observer would attempt — is refused and publishes nothing discoverable.
+    #[test]
+    fn retired_publisher_publishes_nothing_and_stays_drained() {
+        let area = TestArea::new("retire");
+        let (mut publisher, _, identity) = publish_fixture(&area);
+        let root = area.root();
+        assert!(
+            discover(&root, &identity).is_some(),
+            "precondition: the record is discoverable before retirement"
+        );
+        publisher.retire();
+        assert!(discover(&root, &identity).is_none(), "record drained");
+        assert!(root.join(identity.digest()).is_dir(), "route dir stays");
+        // A queued or later publication of either the retired route or a fresh one is refused
+        // and leaves nothing discoverable — republication can never resurrect a dead route.
+        assert_eq!(publisher.publish(&identity), Err(PublishError::Retired));
+        assert!(discover(&root, &identity).is_none());
+        let other = fixture_identity("other");
+        assert_eq!(publisher.publish(&other), Err(PublishError::Retired));
+        assert!(discover(&root, &other).is_none());
+        // Retirement is permanent, including through the drop path.
+        drop(publisher);
+        assert!(discover(&root, &identity).is_none());
+        assert!(discover(&root, &other).is_none());
+    }
+
     #[test]
     fn two_live_publishers_are_ambiguous_until_one_exits() {
         let area = TestArea::new("ambiguity");
@@ -2008,5 +2056,68 @@ mod tests {
             );
         }
         drop(publisher);
+    }
+
+    /// The ownership predicates reject a foreign owner directly on a synthetic stat (T29B final
+    /// review 7): the full foreign-owner fixture needs root, but the predicate is the whole
+    /// decision, so a `uid != euid` status is rejected for directories and records alike, and
+    /// each remaining rule (type, exact mode including special bits, `nlink`) is pinned.
+    #[test]
+    fn ownership_predicates_reject_a_foreign_owner_in_a_synthetic_stat() {
+        let euid = unsafe { libc::geteuid() };
+        let mut status: libc::stat = unsafe { std::mem::zeroed() };
+        status.st_mode = libc::S_IFDIR | 0o700;
+        status.st_nlink = 1;
+        status.st_uid = euid;
+        assert!(is_owned_private_directory(&status));
+        assert!(
+            !is_owned_private_record(&status),
+            "a directory is no record"
+        );
+
+        // Exactly one rule flipped at a time must refuse.
+        status.st_uid = euid + 1;
+        assert!(!is_owned_private_directory(&status));
+        assert!(!is_owned_private_record(&status));
+        status.st_uid = euid;
+
+        for mode in [0o750, 0o777, 0o1700, 0o4700] {
+            status.st_mode = libc::S_IFDIR | mode;
+            assert!(
+                !is_owned_private_directory(&status),
+                "directory mode {mode:o} is not exactly 0o700"
+            );
+        }
+        status.st_mode = libc::S_IFREG | 0o600;
+        assert!(is_owned_private_record(&status));
+        assert!(!is_owned_private_directory(&status));
+        status.st_nlink = 2;
+        assert!(!is_owned_private_record(&status), "hard links are refused");
+        status.st_nlink = 1;
+        status.st_mode = libc::S_IFREG | 0o600 | libc::S_ISVTX;
+        assert!(
+            !is_owned_private_record(&status),
+            "special bits are refused, never masked"
+        );
+    }
+
+    /// The errno classification is a pure decision with only one meaningful input (T29B final
+    /// review 7): lock contention is the only `flock` failure that proves a publisher is live.
+    /// An environment where locks fail outright (`ENOLCK`, `EIO`) must read as failed, never as
+    /// "unlocked ⇒ stale", or every crash leftover would become eligible.
+    #[test]
+    fn only_lock_contention_errnos_establish_liveness() {
+        assert!(is_contention_errno(Some(libc::EWOULDBLOCK)));
+        assert!(is_contention_errno(Some(libc::EAGAIN)));
+        for errno in [
+            libc::ENOLCK,
+            libc::EIO,
+            libc::EDEADLK,
+            libc::EINVAL,
+            libc::EBADF,
+        ] {
+            assert!(!is_contention_errno(Some(errno)), "{errno}");
+        }
+        assert!(!is_contention_errno(None), "no errno is not contention");
     }
 }

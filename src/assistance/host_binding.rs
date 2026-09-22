@@ -767,6 +767,8 @@ impl HostBindingGuard {
             self.native_hints.insert(binding.clone());
             return BindingStatus::NativeObserved(binding);
         }
+        // Selected before the candidate's partial move out of `event`.
+        let self_mcp_post = super::problems::is_self_mcp_tool_name(event.tool_name.as_deref());
         let candidate = CandidateInvocation {
             host: event.host,
             actor_id: event.actor_id,
@@ -813,6 +815,14 @@ impl HostBindingGuard {
                         .cloned();
                     self.record_replay(&invocation, ReplayDisposition::Rejected)
                         .expect("the checked rejection scope has capacity");
+                    // A post naming this product's own MCP tool, paired with a still-buffered
+                    // pre, proves the MCP call was rejected before managed admission ever ran
+                    // (an admitted call consumes its pre and records completion): the call id is
+                    // recorded rejected above, and the post stays a silent rejection with no
+                    // native hint, epoch advance, check trigger, or plate (T29B final review 4).
+                    if self_mcp_post {
+                        return BindingStatus::Unavailable(BindingUnavailable::MissingInvocation);
+                    }
                     if let Some(binding) = binding {
                         self.native_hints.insert(binding.clone());
                         return BindingStatus::NativeObserved(binding);
@@ -1597,6 +1607,21 @@ mod tests {
         .expect("test hook is valid")
     }
 
+    /// Same, with the post-phase tool name the host relays for a real MCP tool call.
+    fn codex_hook_with_tool(phase: &str, actor: &str, call: &str, tool: &str) -> HookEvent {
+        parse_hook_event(
+            json!({
+                "hook_event_name": phase,
+                "session_id": actor,
+                "tool_use_id": call,
+                "tool_name": tool
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("test hook is valid")
+    }
+
     /// Direct managed Codex binding needs no hook, rejects replay, and isolates actors by channel.
     #[test]
     fn managed_codex_binding_is_direct_replay_safe_and_actor_isolated() {
@@ -1810,6 +1835,83 @@ mod tests {
         ));
         assert!(matches!(
             guard.observe_hook(codex_hook("PostToolUse", "actor-a", "call-5"), channel),
+            BindingStatus::NativeObserved(_)
+        ));
+    }
+
+    /// A self-MCP post pairing a still-buffered pre — a call rejected before managed admission —
+    /// is recorded rejected and stays silent with no native hint, while a genuine native pairing
+    /// on the same binding still observes (T29B final review 4).
+    #[test]
+    fn rejected_self_mcp_calls_never_become_native_observations() {
+        let mut guard = HostBindingGuard::default();
+        let channel = channel("rejected-self-channel");
+        let BindingStatus::Validated(started) = guard
+            .establish_managed_codex_start(codex_candidate("actor-a", "start"), channel.clone())
+        else {
+            panic!("managed start must bind directly");
+        };
+        // Pre buffered, then the MCP call is rejected before admission (invalid arguments never
+        // reach IPC): the pre stays buffered and no completion was ever recorded.
+        assert!(matches!(
+            guard.observe_hook(
+                codex_hook("PreToolUse", "actor-a", "call-9"),
+                channel.clone()
+            ),
+            BindingStatus::PreObserved
+        ));
+        // The post names this product's own MCP tool: a silent rejection, not NativeObserved.
+        assert!(matches!(
+            guard.observe_hook(
+                codex_hook_with_tool(
+                    "PostToolUse",
+                    "actor-a",
+                    "call-9",
+                    "mcp__agent_ide__context"
+                ),
+                channel.clone()
+            ),
+            BindingStatus::Unavailable(BindingUnavailable::MissingInvocation)
+        ));
+        // No native epoch advance: the active generation coalesced no change hint.
+        assert_eq!(
+            guard.take_native_change_hint(started.binding_ref()),
+            Ok(false)
+        );
+        // The rejected call id is permanent replay evidence for hooks and admission alike.
+        assert!(matches!(
+            guard.observe_hook(
+                codex_hook_with_tool(
+                    "PostToolUse",
+                    "actor-a",
+                    "call-9",
+                    "mcp__agent_ide__context"
+                ),
+                channel.clone()
+            ),
+            BindingStatus::Unavailable(BindingUnavailable::Mismatch)
+        ));
+        assert!(matches!(
+            guard.validate_managed_codex_active(
+                codex_candidate("actor-a", "call-9"),
+                channel.clone()
+            ),
+            BindingStatus::Unavailable(BindingUnavailable::Replay)
+        ));
+        // The hyphenated self spelling is equally excluded; a genuine native pairing on this
+        // binding still observes it.
+        assert!(matches!(
+            guard.observe_hook(
+                codex_hook("PreToolUse", "actor-a", "call-10"),
+                channel.clone()
+            ),
+            BindingStatus::PreObserved
+        ));
+        assert!(matches!(
+            guard.observe_hook(
+                codex_hook_with_tool("PostToolUse", "actor-a", "call-10", "Bash"),
+                channel
+            ),
             BindingStatus::NativeObserved(_)
         ));
     }

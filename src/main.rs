@@ -2241,10 +2241,11 @@ async fn serve_managed_stdio(
     };
     drop(lease);
     if let Some(publisher) = publisher {
+        // Permanent retirement: a queued publication racing this teardown publishes nothing.
         publisher
             .lock()
             .expect("managed codex publisher mutex")
-            .unpublish_all();
+            .retire();
     }
     if let Some(child) = child {
         terminate_owned_daemon(child).await;
@@ -2265,12 +2266,13 @@ async fn serve_managed_stdio(
 /// the exit observer can always retry its non-blocking attempt.
 type SharedChild = Arc<Mutex<tokio::process::Child>>;
 
-/// Retires the managed Codex publication once the owned daemon child exit is observed (T29B §2).
+/// Permanently retires the managed Codex publication once the owned daemon child exit is observed
+/// (T29B §2, final review 3).
 ///
 /// The daemon may exit on its own while its MCP process keeps serving; its records must then stop
-/// being discoverable. The child lock is taken only for the bounded synchronous probe, so the
-/// final owned teardown at MCP exit is never delayed; the publisher's own lock is quiet and never
-/// held elsewhere at that moment.
+/// being discoverable, and no later MCP call may re-publish a route to the dead daemon. The child
+/// lock is taken only for the bounded synchronous probe, so the final owned teardown at MCP exit
+/// is never delayed; the publisher's own lock is quiet and never held elsewhere at that moment.
 async fn unpublish_when_daemon_exits(child: SharedChild, publisher: SharedCodexPublisher) {
     loop {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2281,7 +2283,7 @@ async fn unpublish_when_daemon_exits(child: SharedChild, publisher: SharedCodexP
             publisher
                 .lock()
                 .expect("managed codex publisher mutex")
-                .unpublish_all();
+                .retire();
             return;
         }
     }

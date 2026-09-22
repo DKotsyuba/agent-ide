@@ -1062,6 +1062,27 @@ pub type ReestablishFn =
 /// held across bounded local filesystem work.
 pub type SharedCodexPublisher = Arc<std::sync::Mutex<ManagedCodexPublisher>>;
 
+/// Bounds how long dispatch waits for one route publication before continuing without it.
+const PUBLICATION_WAIT: Duration = Duration::from_millis(25);
+
+/// Test-only stall for the rendezvous filesystem paths, honored only when the product-test seam
+/// `AGENT_IDE_CODEX_RENDEZVOUS_STALL_MS` is set to a millisecond value (capped at one minute).
+///
+/// Both blocking rendezvous sites — the managed hook's route discovery and the MCP process's route
+/// publication — sleep for this long before touching the filesystem, so deadline regressions can
+/// inject a slow publisher or a stalled discovery without an artificially hostile filesystem.
+/// Only product tests set the variable; production never does, and the hook's own 250 ms total
+/// deadline and this module's [`PUBLICATION_WAIT`] bound the delay's observable effect either way.
+pub(crate) fn stall_rendezvous_for_test() {
+    let Some(milliseconds) = std::env::var_os("AGENT_IDE_CODEX_RENDEZVOUS_STALL_MS")
+        .and_then(|value| value.into_string().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return;
+    };
+    std::thread::sleep(Duration::from_millis(milliseconds.min(60_000)));
+}
+
 /// Shares one live `(runtime_dir, attachment)` pair across every clone of a [`StdioFacade`].
 ///
 /// A daemon this generation never owns (EYES-r2 §2) can exit while the MCP process keeps running
@@ -1213,8 +1234,10 @@ impl StdioFacade {
     /// session is `_meta["x-codex-turn-metadata"].session_id` and the actor is `_meta.threadId`
     /// (docs/host-probe.md, observed Codex field contract). Missing identity, an invalid identity,
     /// or any publication error skips publication silently and leaves the call path unchanged.
-    /// The bounded local filesystem work runs off the async executor, so dispatch never waits on
-    /// this process's own publication lock beyond that bounded operation.
+    /// The wait on the blocking filesystem work is bounded: a stalled root or a contended
+    /// publisher mutex abandons the wait after [`PUBLICATION_WAIT`] and dispatch continues, while
+    /// the detached blocking task finishes on its own — it holds the publisher mutex only for its
+    /// own duration — and a later call re-attempts the idempotent publication.
     async fn publish_codex_route(&self, meta: &Map<String, Value>) {
         let Some(publisher) = &self.publisher else {
             return;
@@ -1223,11 +1246,15 @@ impl StdioFacade {
             return;
         };
         let publisher = Arc::clone(publisher);
-        let _ = tokio::task::spawn_blocking(move || {
-            publisher
-                .lock()
-                .expect("managed codex publisher mutex")
-                .publish(&identity)
+        let _ = tokio::time::timeout(PUBLICATION_WAIT, async move {
+            let _ = tokio::task::spawn_blocking(move || {
+                stall_rendezvous_for_test();
+                publisher
+                    .lock()
+                    .expect("managed codex publisher mutex")
+                    .publish(&identity)
+            })
+            .await;
         })
         .await;
     }

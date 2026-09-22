@@ -120,6 +120,18 @@ impl Mcp {
         home: Option<&Path>,
         rendezvous_root: Option<&Path>,
     ) -> Self {
+        Self::start_managed_custom_with_env(template, candidate, home, rendezvous_root, None).await
+    }
+
+    /// Same, with one extra environment variable set for the MCP process (a test-only seam such
+    /// as the rendezvous stall).
+    async fn start_managed_custom_with_env(
+        template: &Path,
+        candidate: &Path,
+        home: Option<&Path>,
+        rendezvous_root: Option<&Path>,
+        seam: Option<(&str, &str)>,
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
         command
             .env("TOKIO_WORKER_THREADS", "1")
@@ -136,6 +148,9 @@ impl Mcp {
         }
         if let Some(rendezvous_root) = rendezvous_root {
             command.env("AGENT_IDE_CODEX_RENDEZVOUS_ROOT", rendezvous_root);
+        }
+        if let Some((key, value)) = seam {
+            command.env(key, value);
         }
         let mut child = command.spawn().unwrap();
         let mut mcp = Self {
@@ -1250,6 +1265,10 @@ async fn binary_managed_codex_hook_discovers_route_and_renders_feedback() {
 }
 
 /// Missing, ambiguous, stale, malformed, and unsupported-phase managed routes all stay silent.
+///
+/// The daemon fixture behind the route ANSWERS every submission with feedback, so the silence of
+/// the ambiguous and stale cases is attributable to discovery's refusal, never to a dead socket:
+/// a discovery that wrongly resolved either route would produce output and fail the test.
 #[tokio::test]
 async fn binary_managed_codex_hook_missing_ambiguous_and_stale_routes_are_silent() {
     let base = rendezvous_area("hook-silent");
@@ -1270,10 +1289,34 @@ async fn binary_managed_codex_hook_missing_ambiguous_and_stale_routes_are_silent
         "agent_id":"actor-1"});
     assert_managed_hook_silent(&managed_codex_hook(&root, &batch).await);
 
-    // Ambiguous route: two live publishers for one identity.
-    let (runtime_dir, _listener) = fixture_runtime(&base);
+    // One live answering daemon serves the fixture runtime for the remaining cases: any
+    // submission that got past discovery's checks would be answered, rendered, and printed.
+    let (runtime_dir, listener) = fixture_runtime(&base);
     let attachment = "a1b2c3d4".repeat(8);
     let identity = CodexRouteIdentity::new("root-session-1", "actor-1").unwrap();
+    let answerer = |listener: tokio::net::UnixListener| {
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let size = stream.read_u32().await.unwrap();
+                let mut body = vec![0; size as usize];
+                stream.read_exact(&mut body).await.unwrap();
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                let reply = serde_json::to_vec(&json!({
+                    "version": 2,
+                    "request_id": request["request_id"],
+                    "correlation_id": request["correlation_id"],
+                    "opaque_reply_json": {"state":"feedback","text":"wrong discovery would speak"}
+                }))
+                .unwrap();
+                stream.write_u32(reply.len() as u32).await.unwrap();
+                stream.write_all(&reply).await.unwrap();
+            }
+        })
+    };
+    let answering = answerer(listener);
+
+    // Ambiguous route: two live publishers for one identity, with the socket answering. Only
+    // the ambiguity refusal (never an unreachable socket) keeps the hook silent here.
     let mut first =
         ManagedCodexPublisher::new(root.clone(), runtime_dir.clone(), attachment.clone());
     let mut second = ManagedCodexPublisher::new(root.clone(), runtime_dir.clone(), attachment);
@@ -1281,12 +1324,36 @@ async fn binary_managed_codex_hook_missing_ambiguous_and_stale_routes_are_silent
     second.publish(&identity).unwrap();
     assert_managed_hook_silent(&managed_codex_hook(&root, &payload).await);
 
-    // Stale route: the daemon runtime is gone while the publication stays live.
+    // Stale route: the single remaining record still points at the original runtime directory,
+    // which is replaced at the same path with a fresh answering runtime — a fresh inode. A
+    // discovery that adopted the old record without re-verifying its device/inode would submit
+    // to the answering socket and produce output; correct discovery refuses the route instead.
     drop(second);
+    answering.abort();
     std::fs::remove_dir_all(&runtime_dir).unwrap();
+    let (replaced_dir, replaced_listener) = fixture_runtime(&base);
+    assert_eq!(replaced_dir, runtime_dir, "replacement at the same path");
+    let replaced_answering = answerer(replaced_listener);
     assert_managed_hook_silent(&managed_codex_hook(&root, &payload).await);
-
+    // The answerer is genuine: with the stale publisher gone, a record created against the
+    // replacement runtime delivers through it.
     drop(first);
+    let mut successor =
+        ManagedCodexPublisher::new(root.clone(), replaced_dir.clone(), "a1b2c3d4".repeat(8));
+    successor.publish(&identity).unwrap();
+    let answered = managed_codex_hook(&root, &payload).await;
+    assert!(
+        answered.status.success() && answered.stderr.is_empty(),
+        "{answered:?}"
+    );
+    assert_eq!(
+        managed_hook_context(&String::from_utf8(answered.stdout).unwrap()),
+        "wrong discovery would speak",
+        "precondition: the answering daemon really delivers"
+    );
+
+    successor.retire();
+    replaced_answering.abort();
     std::fs::remove_dir_all(base).unwrap();
 }
 
@@ -1341,6 +1408,61 @@ async fn binary_managed_codex_hook_stalled_daemon_returns_within_deadline() {
     );
     drop(publisher);
     drop(listener);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+/// A stalled filesystem lookup still exits within the deadline (T29B final review 1).
+///
+/// The test seam stalls root resolution and discovery for far longer than the 250 ms budget.
+/// Discovery runs on a detached thread whose result is abandoned — never joined — at the
+/// deadline, so the process itself must exit 0 with no output; a discovery left on the blocking
+/// pool would hold runtime shutdown past the ceiling and fail this test.
+#[tokio::test]
+async fn binary_managed_codex_hook_stalled_discovery_exits_within_the_deadline() {
+    let base = rendezvous_area("hook-stall-discovery");
+    let root = base.join("rendezvous");
+    // Warm the binary first: cold executable startup must not pollute the measured invocation.
+    // The warm invocation carries no stdin, so it exits silently the moment the payload is absent.
+    let mut warm = managed_codex_hook_process(&root, None);
+    drop(warm.stdin.take());
+    let warm_output = tokio::time::timeout(Duration::from_secs(2), warm.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_managed_hook_silent(&warm_output);
+
+    let payload = json!({"hook_event_name":"PostToolUse","session_id":"root-session-1",
+        "agent_id":"actor-1","tool_use_id":"call-1","tool_name":"Bash"});
+    let started = std::time::Instant::now();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
+    command
+        .env("TOKIO_WORKER_THREADS", "1")
+        .args(["codex-hook", "--managed"])
+        .env("AGENT_IDE_CODEX_RENDEZVOUS_ROOT", &root)
+        .env("AGENT_IDE_CODEX_RENDEZVOUS_STALL_MS", "5000")
+        .env_remove("AGENT_IDE_HOST_ATTACHMENT")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().unwrap();
+    let mut input = child.stdin.take().unwrap();
+    input
+        .write_all(payload.to_string().as_bytes())
+        .await
+        .unwrap();
+    input.shutdown().await.unwrap();
+    drop(input);
+    let output = tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        started.elapsed() < HOOK_EXIT_CEILING,
+        "a stalled discovery must not extend the exit past the hook deadline, took {:?}",
+        started.elapsed()
+    );
+    assert_managed_hook_silent(&output);
     std::fs::remove_dir_all(base).unwrap();
 }
 
@@ -2701,6 +2823,95 @@ async fn managed_codex_publishes_distinct_actor_routes_and_retires_them_on_shutd
     std::fs::remove_dir_all(base).unwrap();
 }
 
+/// Retirement is permanent when the owned daemon dies while the MCP process keeps serving
+/// (T29B final review 3): the daemon-exit observer retires the publication, and a further MCP
+/// call — whose dispatch would otherwise re-publish idempotently — must not re-create a
+/// discoverable record for the dead daemon.
+#[tokio::test]
+async fn managed_codex_daemon_exit_keeps_the_route_retired() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let fixture = ProductFixture::new(json!([]));
+    let base = rendezvous_area("daemon-exit-retire");
+    let root = base.join("rendezvous");
+    let before = managed_runtime_paths();
+    let mut mcp = Mcp::start_managed_with_rendezvous(&fixture.config, &fixture.root, &root).await;
+    let during = managed_runtime_paths();
+    let mut runtimes = during.difference(&before).cloned().collect::<Vec<_>>();
+    assert_eq!(runtimes.len(), 1, "{before:?} -> {during:?}");
+    let runtime_dir = runtimes.remove(0);
+    let state = fixture.state();
+    let actor = "managed-root";
+    let session = "root-session-a";
+    let mut next = 10;
+    let identity = CodexRouteIdentity::new(session, actor).unwrap();
+
+    let started = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        session,
+        "ide.start",
+        json!({"activation_id":"daemon-exit-start"}),
+        &state,
+    )
+    .await;
+    let started = settle_managed(&mut mcp, &mut next, actor, &state, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    assert!(discover(&root, &identity).is_some(), "route published");
+
+    // Kill the owned daemon outright; its runtime lock names the exact process to signal.
+    let holder = Command::new("/usr/sbin/lsof")
+        .args(["-t"])
+        .arg(runtime_dir.join("agent-ide.lock"))
+        .output()
+        .await
+        .unwrap();
+    let mut killed = false;
+    for pid in String::from_utf8_lossy(&holder.stdout).split_whitespace() {
+        if let Ok(pid) = pid.parse::<libc::pid_t>() {
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+            killed = true;
+        }
+    }
+    assert!(killed, "no daemon holds the owned runtime lock");
+
+    // The exit observer retires the publication; the record stops being discoverable.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while discover(&root, &identity).is_some() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the daemon-exit observer never retired the publication"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // A further MCP call still gets an honest reply and must not re-create a discoverable
+    // record for the dead daemon: publication is permanently retired.
+    next += 1;
+    let reply = mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.context",
+            "arguments":{"kind":"problems"},
+            "_meta":{"threadId":actor,"callId":format!("managed-{actor}-{next}"),
+            "x-codex-turn-metadata":{"session_id":session},"codex/sandbox-state-meta":state}}}),
+        )
+        .await;
+    assert_eq!(reply["result"]["isError"], true, "{reply}");
+    assert!(
+        reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("continue with native tools"),
+        "{reply}"
+    );
+    assert!(
+        discover(&root, &identity).is_none(),
+        "a further MCP call re-published a dead daemon's route"
+    );
+    mcp.close().await;
+    std::fs::remove_dir_all(base).unwrap();
+}
+
 /// A publication failure (unusable rendezvous root) never touches managed MCP replies.
 #[tokio::test]
 async fn managed_codex_publication_failure_leaves_replies_working() {
@@ -2745,6 +2956,72 @@ async fn managed_codex_publication_failure_leaves_replies_working() {
         "{settled}"
     );
     mcp.close().await;
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+/// A stalled publication never delays MCP dispatch (T29B final review 2).
+///
+/// The test seam holds this MCP process's route publication far longer than a normal call, so
+/// the publication wait must be bounded: the MCP reply still arrives within the normal deadline,
+/// the detached publish task finishes in the background afterwards, and teardown's retirement
+/// then leaves nothing discoverable.
+#[tokio::test]
+async fn managed_codex_stalled_publication_keeps_replies_bounded() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let fixture = ProductFixture::new(json!([]));
+    let base = rendezvous_area("publish-stall");
+    let root = base.join("rendezvous");
+    let mut mcp = Mcp::start_managed_custom_with_env(
+        &fixture.config,
+        &fixture.root,
+        None,
+        Some(&root),
+        Some(("AGENT_IDE_CODEX_RENDEZVOUS_STALL_MS", "6000")),
+    )
+    .await;
+    let state = fixture.state();
+    let actor = "managed-root";
+    let session = "root-session-a";
+    let identity = CodexRouteIdentity::new(session, actor).unwrap();
+    let next = 10;
+
+    // The very first valid call would publish before dispatch: with an unbounded publication
+    // wait this exchange could not finish inside its normal deadline.
+    let started = std::time::Instant::now();
+    let start = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        session,
+        "ide.start",
+        json!({"activation_id":"publish-stall-start"}),
+        &state,
+    )
+    .await;
+    assert_eq!(start["state"], "pending", "{start}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "a stalled publication delayed the MCP reply, took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        discover(&root, &identity).is_none(),
+        "the stalled publication has not completed yet"
+    );
+
+    // The detached publish task still finishes in the background.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while discover(&root, &identity).is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the background publication never completed"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Teardown retires the publication permanently.
+    mcp.close().await;
+    assert!(discover(&root, &identity).is_none(), "route retired");
     std::fs::remove_dir_all(base).unwrap();
 }
 
@@ -6576,6 +6853,44 @@ fn enable_fake_rust_checks(fixture: &ProductFixture, allowed_root: &Path) -> Pat
     enable_fake_rust_checks_holding(fixture, allowed_root, "")
 }
 
+/// The gate file a gate-held fake `cargo` waits on, outside the repository worktree so its
+/// creation never perturbs the scheduler's worktree-input fingerprint (T20B).
+const CHECKS_GATE: &str = "checks-gate";
+
+/// Hold command that blocks every fake check run at a barrier instead of assuming a wall-clock
+/// window: the test releases [`release_checks_gate`] only after the activation replies have
+/// settled, so the first result provably cannot be consumed by an earlier reply carrier.
+fn hold_checks_at_gate(fixture: &ProductFixture) -> String {
+    format!(
+        "while [ ! -f '{}' ]; do sleep 0.05; done",
+        fixture.base.join(CHECKS_GATE).display()
+    )
+}
+
+/// Releases the check barrier: every held fake `cargo` run completes and its result becomes due.
+fn release_checks_gate(fixture: &ProductFixture) {
+    std::fs::write(fixture.base.join(CHECKS_GATE), "go").unwrap();
+}
+
+/// Counts completed project-check telemetry rows in one daemon's own database; 0 when absent.
+async fn completed_check_count(database: &Path) -> usize {
+    let Ok(output) = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+        .args(["telemetry", "query", "--database"])
+        .arg(database)
+        .args(["--tag", "project_check_completed"])
+        .output()
+        .await
+    else {
+        return 0;
+    };
+    if !output.status.success() {
+        return 0;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .matches(r#""errors_bucket""#)
+        .count()
+}
+
 /// Same, with a shell command prepended to the fake `cargo` so a test can hold the first check
 /// in its running state long enough to observe a `checking (…)` plate (T22B).
 fn enable_fake_rust_checks_holding(
@@ -7131,8 +7446,10 @@ async fn await_eyes_codex_managed_root_plate(
 async fn eyes_codex_managed_native_post_delivers_plate_and_delta_without_ide_calls() {
     let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
     let fixture = ProductFixture::new(json!([]));
-    // The fake cargo holds its first run briefly so the activation reply cannot carry the result.
-    let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, "sleep 1");
+    // The fake cargo waits at the gate: the first result cannot become due until the test
+    // releases it, so no activation reply can ever consume it before a hook polls.
+    let home =
+        enable_fake_rust_checks_holding(&fixture, &fixture.base, &hold_checks_at_gate(&fixture));
     std::fs::write(fixture.root.join("problems.count"), "1").unwrap();
     let base = rendezvous_area("eyes-hooks");
     let root = base.join("rendezvous");
@@ -7155,6 +7472,8 @@ async fn eyes_codex_managed_native_post_delivers_plate_and_delta_without_ide_cal
     .await;
     let started = settle_managed(&mut mcp, &mut next, actor, &state, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
+    // Activation has settled: only now does the first result become due for a hook.
+    release_checks_gate(&fixture);
 
     // From here on every delivery happens through managed native hooks only.
     let first = await_eyes_codex_hook_plate(
@@ -7219,7 +7538,10 @@ async fn eyes_codex_managed_native_post_delivers_plate_and_delta_without_ide_cal
 async fn eyes_codex_reply_carrier_consumes_the_plate_before_the_native_hook() {
     let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
     let fixture = ProductFixture::new(json!([]));
-    let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, "sleep 1");
+    // Gate-held: the first result cannot be consumed by the activation reply; the reply poll
+    // below is the first carrier to run after the release.
+    let home =
+        enable_fake_rust_checks_holding(&fixture, &fixture.base, &hold_checks_at_gate(&fixture));
     std::fs::write(fixture.root.join("problems.count"), "1").unwrap();
     let base = rendezvous_area("eyes-reply-first");
     let root = base.join("rendezvous");
@@ -7242,6 +7564,7 @@ async fn eyes_codex_reply_carrier_consumes_the_plate_before_the_native_hook() {
     .await;
     let started = settle_managed(&mut mcp, &mut next, actor, &state, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
+    release_checks_gate(&fixture);
 
     let result = await_eyes_codex_managed_root_plate(
         &mut mcp,
@@ -7290,7 +7613,8 @@ async fn eyes_codex_reply_carrier_consumes_the_plate_before_the_native_hook() {
 async fn eyes_codex_concurrent_hook_and_reply_deliver_exactly_one_plate() {
     let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
     let fixture = ProductFixture::new(json!([]));
-    let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, "sleep 1");
+    let home =
+        enable_fake_rust_checks_holding(&fixture, &fixture.base, &hold_checks_at_gate(&fixture));
     std::fs::write(fixture.root.join("problems.count"), "1").unwrap();
     let base = rendezvous_area("eyes-concurrent");
     let root = base.join("rendezvous");
@@ -7313,6 +7637,9 @@ async fn eyes_codex_concurrent_hook_and_reply_deliver_exactly_one_plate() {
     .await;
     let started = settle_managed(&mut mcp, &mut next, actor, &state, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
+    // Activation has settled: releasing the gate is the synchronization point that makes the
+    // result due, so the concurrent race below starts from a deterministically undelivered plate.
+    release_checks_gate(&fixture);
 
     let expected = "<agent-ide>\nrust: 1 error, 0 warnings\n</agent-ide>";
     // Fire both carriers concurrently against the same binding fingerprint. While the held first
@@ -7391,7 +7718,8 @@ async fn eyes_codex_concurrent_hook_and_reply_deliver_exactly_one_plate() {
 async fn eyes_codex_parent_and_two_children_are_isolated_without_route_fallback() {
     let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
     let fixture = ProductFixture::new(json!([]));
-    let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, "sleep 1");
+    let home =
+        enable_fake_rust_checks_holding(&fixture, &fixture.base, &hold_checks_at_gate(&fixture));
     std::fs::write(fixture.root.join("problems.count"), "1").unwrap();
     let base = rendezvous_area("eyes-family");
     let root = base.join("rendezvous");
@@ -7450,6 +7778,9 @@ async fn eyes_codex_parent_and_two_children_are_isolated_without_route_fallback(
         assert_eq!(settled["kind"], "activation", "{settled}");
         child_mcps.push(mcp);
     }
+    // All three activations have settled while their checks stayed held: the release is the
+    // synchronization point that makes each first result due for its own actor's hook poll.
+    release_checks_gate(&fixture);
     let parent_identity = CodexRouteIdentity::new(session, parent).unwrap();
     assert!(discover(&root, &parent_identity).is_some(), "parent route");
     for child in children {
@@ -7524,7 +7855,8 @@ async fn eyes_codex_parent_and_two_children_are_isolated_without_route_fallback(
 async fn eyes_codex_two_sessions_on_one_repository_deliver_once_across_routes() {
     let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
     let fixture = ProductFixture::new(json!([]));
-    let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, "sleep 1");
+    let home =
+        enable_fake_rust_checks_holding(&fixture, &fixture.base, &hold_checks_at_gate(&fixture));
     std::fs::write(fixture.root.join("problems.count"), "1").unwrap();
     let base = rendezvous_area("eyes-sessions");
     let root = base.join("rendezvous");
@@ -7567,6 +7899,9 @@ async fn eyes_codex_two_sessions_on_one_repository_deliver_once_across_routes() 
     assert_ne!(route_a.digest(), route_b.digest(), "two distinct routes");
     assert!(discover(&root, &route_a).is_some());
     assert!(discover(&root, &route_b).is_some());
+    // Both lifecycle calls have settled while the check stayed held; the release makes the first
+    // result due for the hook carrier below, and no reply could have consumed it beforehand.
+    release_checks_gate(&fixture);
 
     // The delta needs the first result as its baseline first; the replies could not have carried
     // it (the held check was still running), so the hook carrier delivers it now.
@@ -7606,15 +7941,32 @@ async fn eyes_codex_two_sessions_on_one_repository_deliver_once_across_routes() 
 }
 
 /// Managed Codex hook lifecycles that must never speak: a post without its pre, the MCP call's
-/// own paired native hooks (which poison nothing), a late post after `ide.stop`, malformed and
-/// oversized payloads, and a stale publication after the MCP exited — all silent exit 0 (T29B §7).
+/// own paired native hooks in the real host order Pre → admission → Post, a call rejected before
+/// admission whose self-MCP post must stay silent, stop → restart → the old Post, malformed and
+/// oversized payloads, and a stale publication after the MCP exited — all silent exit 0 (T29B §7,
+/// final review 4/5). A due-plate positive control first proves the same fixture WOULD deliver on
+/// a valid native post, and the completed-check counter proves none of the silent lifecycles
+/// scheduled a check.
 #[tokio::test]
 async fn eyes_codex_managed_hook_lifecycles_stay_silent_without_delivery() {
     let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
     let fixture = ProductFixture::new(json!([]));
+    // Gate-held checks: the first result cannot be consumed by any activation reply.
+    let home =
+        enable_fake_rust_checks_holding(&fixture, &fixture.base, &hold_checks_at_gate(&fixture));
+    std::fs::write(fixture.root.join("problems.count"), "1").unwrap();
     let base = rendezvous_area("eyes-lifecycle");
     let root = base.join("rendezvous");
-    let mut mcp = Mcp::start_managed_with_rendezvous(&fixture.config, &fixture.root, &root).await;
+    let mut mcp =
+        Mcp::start_managed_custom(&fixture.config, &fixture.root, Some(&home), Some(&root)).await;
+    // The managed daemon records check telemetry in its persistent per-candidate store below the
+    // redirected home; this fixture's fresh home holds exactly one.
+    let mut stores = std::fs::read_dir(home.join(".agent-ide/telemetry"))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(stores.len(), 1, "{stores:?}");
+    let database = stores.remove(0).path().join("state.sqlite");
     let state = fixture.state();
     let session = "edge-session";
     let actor = "edge-actor";
@@ -7632,6 +7984,63 @@ async fn eyes_codex_managed_hook_lifecycles_stay_silent_without_delivery() {
     .await;
     let started = settle_managed(&mut mcp, &mut next, actor, &state, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
+    // Activation has settled; the release is the synchronization point that makes the first
+    // result due while nothing has consumed it yet.
+    release_checks_gate(&fixture);
+
+    // Positive control, part one: the activation check completed and its result is due.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while completed_check_count(&database).await < 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the activation check never completed"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // A call rejected BEFORE admission (invalid parameters never reach the daemon) leaves its
+    // pre buffered: its self-MCP post must be a silent rejection — no native observation, no
+    // check trigger, and no plate, even though one is due right now (T29B final review 4).
+    let rejected_call = "rejected-self-1";
+    let rejected_pre =
+        managed_native_phase(&root, session, actor, "PreToolUse", rejected_call, None).await;
+    assert_managed_hook_silent(&rejected_pre);
+    next += 1;
+    let invalid = mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.context",
+            "arguments":{},
+            "_meta":{"threadId":actor,"callId":rejected_call,
+            "x-codex-turn-metadata":{"session_id":session},"codex/sandbox-state-meta":state}}}),
+        )
+        .await;
+    assert_eq!(invalid["result"]["isError"], true, "{invalid}");
+    assert!(
+        invalid["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("invalid bounded parameters"),
+        "{invalid}"
+    );
+    let rejected_post = managed_native_phase(
+        &root,
+        session,
+        actor,
+        "PostToolUse",
+        rejected_call,
+        Some("mcp__agent-ide__context"),
+    )
+    .await;
+    assert_managed_hook_silent(&rejected_post);
+
+    // Positive control, part two: the same due plate IS delivered to a valid paired native post
+    // — the fixture would speak, so the rejected self post's silence above is meaningful.
+    let control = managed_native_post(&root, session, actor, "control-1", "Bash").await;
+    assert_eq!(
+        managed_hook_context(&control),
+        "<agent-ide>\nrust: 1 error, 0 warnings\n</agent-ide>",
+        "positive control: the fixture must deliver on a valid native post"
+    );
 
     // A post whose pre was never observed correlates to nothing and schedules nothing.
     let orphan = managed_native_phase(
@@ -7645,11 +8054,14 @@ async fn eyes_codex_managed_hook_lifecycles_stay_silent_without_delivery() {
     .await;
     assert_managed_hook_silent(&orphan);
 
-    // The MCP call's own paired native hooks stay silent: the call's admission consumed the
-    // pre phase and completed the call, so its pre replays and its post is a completed replay —
-    // and neither may trigger a check that would treat the call's own result as a foreign change.
+    // The MCP call's own paired native hooks stay silent in the REAL host order: the pre hook
+    // fires BEFORE the call, whose admission consumes it and records the call completed, so the
+    // post is a completed replay — and neither phase may trigger a check that would treat the
+    // call's own result as a foreign change.
     next += 1;
     let own_call = format!("managed-{actor}-{next}");
+    let own_pre = managed_native_phase(&root, session, actor, "PreToolUse", &own_call, None).await;
+    assert_managed_hook_silent(&own_pre);
     let reply = managed_root_call(
         &mut mcp,
         next,
@@ -7661,8 +8073,6 @@ async fn eyes_codex_managed_hook_lifecycles_stay_silent_without_delivery() {
     )
     .await;
     assert_eq!(reply["state"], "pending", "{reply}");
-    let own_pre = managed_native_phase(&root, session, actor, "PreToolUse", &own_call, None).await;
-    assert_managed_hook_silent(&own_pre);
     let own_post = managed_native_phase(
         &root,
         session,
@@ -7687,7 +8097,38 @@ async fn eyes_codex_managed_hook_lifecycles_stay_silent_without_delivery() {
     .await;
     assert_eq!(followup["state"], "pending", "{followup}");
 
-    // A late paired post after ide.stop is silent.
+    // The check counter proves none of the silent lifecycles above (and not the control post
+    // itself) scheduled a project check: the activation's one completed check is still all.
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            completed_check_count(&database).await,
+            1,
+            "a silent lifecycle scheduled a project check"
+        );
+    }
+
+    // A real native Pre→Post still works after the rejected self call: the edited check inputs
+    // rerun and the paired native post delivers the (+1) delta (T29B final review 4).
+    std::fs::write(fixture.root.join("problems.count"), "2").unwrap();
+    let delta = await_eyes_codex_hook_plate(
+        &root,
+        session,
+        actor,
+        "<agent-ide>\nrust: 2 errors (+1), 0 warnings\n</agent-ide>",
+        &mut next,
+    )
+    .await;
+    assert_eq!(
+        delta,
+        "<agent-ide>\nrust: 2 errors (+1), 0 warnings\n</agent-ide>"
+    );
+
+    // The post of a call whose pre predates ide.stop stays silent across a restart: the stop
+    // rejects the buffered pre, so the old post can neither settle nor attach to the fresh
+    // generation, and the fresh generation observes nothing (T29B final review 5).
+    let late_pre = managed_native_phase(&root, session, actor, "PreToolUse", "late-1", None).await;
+    assert_managed_hook_silent(&late_pre);
     next += 1;
     let stopped = managed_root_call(
         &mut mcp,
@@ -7700,11 +8141,25 @@ async fn eyes_codex_managed_hook_lifecycles_stay_silent_without_delivery() {
     )
     .await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
-    let late_pre = managed_native_phase(&root, session, actor, "PreToolUse", "late-1", None).await;
-    assert_managed_hook_silent(&late_pre);
     let late_post =
         managed_native_phase(&root, session, actor, "PostToolUse", "late-1", Some("Bash")).await;
     assert_managed_hook_silent(&late_post);
+    next += 1;
+    let restarted = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        session,
+        "ide.start",
+        json!({"activation_id":"edge-restart"}),
+        &state,
+    )
+    .await;
+    let restarted = settle_managed(&mut mcp, &mut next, actor, &state, restarted).await;
+    assert_eq!(restarted["kind"], "activation", "{restarted}");
+    let old_post =
+        managed_native_phase(&root, session, actor, "PostToolUse", "late-1", Some("Bash")).await;
+    assert_managed_hook_silent(&old_post);
 
     // Malformed (identity-less) and oversized payloads are discarded silently.
     let malformed = managed_codex_hook(
