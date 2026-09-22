@@ -74,7 +74,7 @@ print_codex_config() {
 [mcp_servers.agent-ide]
 command = "$BINARY"
 args = ["mcp", "--launcher-template", "$LAUNCHER"]
-default_tools_approval_mode = "never"
+default_tools_approval_mode = "approve"
 CONFIG
 }
 
