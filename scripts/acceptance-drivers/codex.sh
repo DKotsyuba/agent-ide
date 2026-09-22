@@ -426,8 +426,8 @@ def value() -> int:
 printf '%s' "$FIXED_PY" >"$DIAG_DIR/expected-l1.py"
 printf '%s' "$NATIVE_PY" >"$DIAG_DIR/expected-l2.py"
 
-# Restores the post-L1 left fixture state (Python file fixed by the edit loop).
-reset_left_fixed() {
+# Restores the fixed Python fixture after an edit-loop retry in either worktree.
+reset_fixed_python() {
     cat "$DIAG_DIR/expected-l1.py" >"$1/acceptance-fixture/fixture.py" \
         || fail E_FIXTURE_RESET "could not restore post-L1 state"
 }
@@ -495,15 +495,15 @@ fi
 # Scenario L1B: the composed diff of the finished loop in a fresh session.
 if selected l1b; then
     cp -- "$DRIVER_DIR/codex-prompts/l1b.txt" "$DIAG_DIR/prompt-l1b.txt"
-    run_scenario l1b "$LEFT" "$DIAG_DIR/prompt-l1b.txt" verify_l1b reset_left_fixed A_L1B_SCENARIO
+    run_scenario l1b "$LEFT" "$DIAG_DIR/prompt-l1b.txt" verify_l1b reset_fixed_python A_L1B_SCENARIO
 fi
 
 # Scenario L2: native fallback while inactive, then a stale edit with zero
 # writes. Retries restart from the post-L1 fixed state.
 if selected l2; then
-    reset_left_fixed "$LEFT"
+    reset_fixed_python "$LEFT"
     cp -- "$DRIVER_DIR/codex-prompts/l2.txt" "$DIAG_DIR/prompt-l2.txt"
-    run_scenario l2 "$LEFT" "$DIAG_DIR/prompt-l2.txt" verify_l2 reset_left_fixed A_L2_SCENARIO
+    run_scenario l2 "$LEFT" "$DIAG_DIR/prompt-l2.txt" verify_l2 reset_fixed_python A_L2_SCENARIO
 fi
 
 # Scenario L3: real TypeScript semantic context through the accepted bundle.
@@ -578,7 +578,7 @@ verify_r5b() {
 # Scenario R5B: the composed diff of the right loop in a fresh session.
 if selected r5b; then
     cp -- "$DRIVER_DIR/codex-prompts/r5b.txt" "$DIAG_DIR/prompt-r5b.txt"
-    run_scenario r5b "$RIGHT" "$DIAG_DIR/prompt-r5b.txt" verify_r5b reset_fixture A_R5B_SCENARIO
+    run_scenario r5b "$RIGHT" "$DIAG_DIR/prompt-r5b.txt" verify_r5b reset_fixed_python A_R5B_SCENARIO
 fi
 
 # Compact projection holds across every captured session.

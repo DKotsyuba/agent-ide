@@ -4110,7 +4110,9 @@ async fn inspection_loop(
     }
 }
 
-/// Delivers only a same-binding result after fresh durable authorization, with a final liveness check.
+/// Delivers only a same-binding result after fresh durable authorization and liveness checks.
+/// A completed Diff with recorded empty provenance contains no worktree paths and needs no
+/// read-path proof; other path-less details retain the whole-tree proof requirement.
 async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, request: Inspection) {
     let result = async {
         let active = shared.active(&request.binding)?;
@@ -4172,8 +4174,8 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 // T36B: this one proof point covers every downstream disclosure below — the
                 // already-composed first pages, the later expansions, the cached-context
                 // freshness reread, and `source_matches` — because each names only paths from
-                // `source` or the retained diff provenance. A detail that can name no path at
-                // all keeps the legacy whole-tree gate instead of an empty-path success.
+                // `source` or the retained diff provenance. A proven empty Diff discloses no
+                // worktree path or bytes; other path-less details keep the whole-tree gate.
                 let paths: Vec<&std::path::Path> = source
                     .as_ref()
                     .map(|source| source.path())
@@ -4197,7 +4199,15 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                         crate::execution::ReadScope::Path(path),
                     )
                 };
-                if paths.is_empty() {
+                if paths.is_empty()
+                    && !matches!(
+                        (&reply, &diff_provenance),
+                        (
+                            PeerReply::Complete { kind: ResultKind::Diff, .. },
+                            Some(provenance)
+                        ) if provenance.is_empty()
+                    )
+                {
                     validate_read_scope(
                         shared,
                         &request.binding,
@@ -6207,9 +6217,8 @@ mod stop_retry_tests {
             "a whole-page result must retain no continuation state"
         );
     }
-    /// Builds the managed read-scope sandbox state used by the consumer refusal tests: deny-free
-    /// (the accepted capture) or with one appended path deny naming `deny` relative to the cwd
-    /// (the genuinely narrower live state a v2 catalog admits through added-deny narrowing).
+    /// Builds a managed read-scope state: deny-free for catalog capture, or with one narrower
+    /// path or glob deny relative to the cwd for live read-proof tests.
     fn read_scope_managed_state(root: &std::path::Path, deny: Option<&str>) -> serde_json::Value {
         let mut state = serde_json::json!({
             "codexLinuxSandboxExe": null,
@@ -6226,9 +6235,11 @@ mod stop_retry_tests {
             state["permissionProfile"]["file_system"]["entries"]
                 .as_array_mut()
                 .unwrap()
-                .push(serde_json::json!(
-                    {"access":"deny","path":{"path":root.join(denied),"type":"path"}}
-                ));
+                .push(if denied.contains('*') {
+                    serde_json::json!({"access":"deny","path":{"pattern":root.join(denied),"type":"glob_pattern"}})
+                } else {
+                    serde_json::json!({"access":"deny","path":{"path":root.join(denied),"type":"path"}})
+                });
         }
         state
     }
@@ -6664,13 +6675,17 @@ mod stop_retry_tests {
     ) {
         let (invocation, clean) = read_scope_call(worker, None, actor, id);
         let binding = invocation.binding_ref().clone();
+        let common = std::process::Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(&worker.runtime)
+            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .output()
+            .unwrap();
+        assert!(common.status.success());
+        let common = PathBuf::from(String::from_utf8(common.stdout).unwrap().trim());
         let tree = worker
             .workspace
-            .resolve_worktree(
-                worker.runtime.clone(),
-                worker.runtime.clone(),
-                worker.runtime.join(".git"),
-            )
+            .resolve_worktree(worker.runtime.clone(), worker.runtime.clone(), common)
             .await
             .unwrap();
         let request = crate::workspace::authority::ActivationRequest::new(
@@ -6811,6 +6826,98 @@ mod stop_retry_tests {
             Some("read_scope:path_unproven"),
             "the refusal must name the exact closed condition, not a missing source"
         );
+    }
+
+    /// A right-hand linked worktree keeps its changed path through a managed head diff and
+    /// cached inspection, even when the live profile contains an unrelated deny glob.
+    #[tokio::test]
+    async fn linked_worktree_head_diff_inspects_with_deny_glob() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join("fixture.py"), "base\n").unwrap();
+        git_commit(&fixture.root, "base");
+        let left = fixture.base.join("left");
+        let right = fixture.base.join("right");
+        for (name, path) in [("left", &left), ("right", &right)] {
+            let output = std::process::Command::new("/usr/bin/git")
+                .arg("-C")
+                .arg(&fixture.root)
+                .args(["worktree", "add", "--quiet", "-b", name])
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::fs::write(right.join("fixture.py"), "right-python-bad\n").unwrap();
+        git_commit(&right, "right base");
+        std::fs::write(right.join("fixture.py"), "fixed\n").unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, right.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (binding, _, authority, target) =
+            activate_read_scope(&mut worker, "right-actor", "right-start").await;
+        let (invocation, observed) =
+            read_scope_call(&worker, Some("**/*.key"), "right-actor", "right-diff");
+        let (mut job, _cancel) = diff_job(&right, invocation, observed.clone(), "right-detail");
+        job.parameters["mode"] = serde_json::json!("head");
+        retain_detail(
+            &worker,
+            &binding,
+            "right-detail",
+            AssistanceTool::Diff,
+            &authority,
+        );
+        let (reply, captured_authority, source) = worker.diff(&mut job).await.unwrap();
+        let PeerReply::Complete { text, .. } = &reply else {
+            panic!("diff did not complete")
+        };
+        assert!(text.contains("right-python-bad"), "{text}");
+        worker
+            .shared
+            .complete("right-detail", reply, captured_authority, source, 0);
+        assert!(matches!(
+            inspect_detail(&worker, &binding, "right-detail", &observed, &target).await,
+            PeerReply::Complete {
+                kind: ResultKind::Diff,
+                ..
+            }
+        ));
+        std::fs::write(right.join("fixture.py"), "right-python-bad\n").unwrap();
+        let (invocation, observed) =
+            read_scope_call(&worker, Some("**/*.key"), "right-actor", "right-empty");
+        let (mut job, _cancel) =
+            diff_job(&right, invocation, observed.clone(), "right-empty-detail");
+        job.parameters["mode"] = serde_json::json!("head");
+        retain_detail(
+            &worker,
+            &binding,
+            "right-empty-detail",
+            AssistanceTool::Diff,
+            &authority,
+        );
+        let (reply, authority, source) = worker.diff(&mut job).await.unwrap();
+        assert_eq!(
+            worker.shared.ledger.lock().unwrap().details["right-empty-detail"]
+                .diff_provenance
+                .as_ref()
+                .unwrap()
+                .len(),
+            0
+        );
+        worker
+            .shared
+            .complete("right-empty-detail", reply, authority, source, 0);
+        assert!(matches!(
+            inspect_detail(&worker, &binding, "right-empty-detail", &observed, &target).await,
+            PeerReply::Complete {
+                kind: ResultKind::Diff,
+                ..
+            }
+        ));
     }
 
     /// An untracked file's NAME is rendered by cached Diff pages, so it is provenance too
