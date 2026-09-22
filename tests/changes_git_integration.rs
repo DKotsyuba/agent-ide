@@ -37,6 +37,11 @@ impl SnapshotRunner for CurrentRunner {
         self.inner.run(intent).await
     }
 
+    /// Test harness: delegates to the shared runner, which admits every fixture path.
+    async fn authorize_read_path(&mut self, _path: &Path) -> Result<(), GitError> {
+        Ok(())
+    }
+
     /// Returns the sealed observation only for its exact raw source path.
     async fn current_observation(
         &mut self,
@@ -1068,4 +1073,79 @@ async fn real_truncated_blob_evidence_is_not_complete() {
         intent.accept(completed.evidence),
         Err(GitError::IncompleteIdentity)
     );
+}
+
+/// One runner that refuses every path authorization, as an Execution owner must be able to
+/// when the live host profile denies a path (T36B). It forwards commands to the shared
+/// harness — capture legitimately learns the changed paths through sandboxed Git metadata
+/// commands first — while recording whether any scratch-writing intent ever ran.
+struct RefusingRunner {
+    /// Shared process harness running only the sandboxed Git metadata commands.
+    inner: Runner,
+    /// Count of intents that would have written captured bytes into a scratch file.
+    scratch_intents: usize,
+}
+
+impl SnapshotRunner for RefusingRunner {
+    /// Forwards the intent, counting any scratch-writing command that must never run.
+    async fn run(
+        &mut self,
+        intent: SnapshotIntent,
+    ) -> Result<agent_ide::execution::CapturedProcessEvidence, GitError> {
+        if intent.snapshot_directory().is_some() {
+            self.scratch_intents += 1;
+        }
+        self.inner.run(intent).await
+    }
+
+    /// Refuses every path, exactly like an unprovable path under a deny-bearing profile.
+    async fn authorize_read_path(&mut self, _path: &Path) -> Result<(), GitError> {
+        Err(GitError::UnsupportedSnapshot)
+    }
+}
+
+/// A refused path authorization fails the whole capture attempt before any native byte is
+/// read, so denied content can never reach a scratch file, a blob hash, or a cached page.
+#[tokio::test]
+async fn refused_path_authorization_fails_the_capture_before_any_native_read() {
+    let fixture = GitFixture::new();
+    fixture.write(b"main.txt", b"proven bytes\n");
+    fixture.git(["add", "."]);
+    fixture.git([
+        "-c",
+        "user.email=t36b@example",
+        "-c",
+        "user.name=t36b",
+        "commit",
+        "-m",
+        "base",
+    ]);
+    fixture.write(b"main.txt", b"changed proven bytes\n");
+    fixture.write(b"untracked.txt", b"untracked bytes\n");
+    for mode in [DiffMode::Head, DiffMode::Staged, DiffMode::Unstaged] {
+        let mut runner = RefusingRunner {
+            inner: Runner::default(),
+            scratch_intents: 0,
+        };
+        let result = collect_snapshot(
+            &authority_for(&fixture),
+            Path::new(GIT),
+            mode,
+            1,
+            "snapshot-operation",
+            BaselineContext::new("baseline", BaselineCoverage::Partial).unwrap(),
+            &mut runner,
+        )
+        .await;
+        assert_eq!(result, Err(GitError::UnsupportedSnapshot));
+        assert_eq!(
+            runner.scratch_intents, 0,
+            "no scratch-writing command may run once a path authorization is refused"
+        );
+        assert!(
+            runner.inner.directories.is_empty(),
+            "no scratch directory may even be created"
+        );
+        assert_eq!(runner.inner.comparisons, 0, "no private comparison may run");
+    }
 }

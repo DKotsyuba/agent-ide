@@ -40,8 +40,8 @@ pub(super) mod snapshots;
 
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, VecDeque},
-    path::Path,
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -128,6 +128,12 @@ struct Detail {
     context_page: Option<ContextPageState>,
     /// Same first-page semantics as `diff_page_fresh`, for `context_page`.
     context_page_fresh: bool,
+    /// Bounded set of every worktree path a completed managed Diff detail represents — each
+    /// delivered path plus its rename source — retained independently of the disposable
+    /// pagination state (T36B). Cached delivery must prove each of these paths under the live
+    /// cwd-bound profile before handing any composed page back; a diff detail missing this
+    /// provenance never falls through to an empty-path success.
+    diff_provenance: Option<BTreeSet<PathBuf>>,
 }
 
 /// Retained bounded state needed to resume one Context or Claude-Diff detail cursor from
@@ -269,6 +275,12 @@ impl ContextPageState {
 struct NativeFeedback {
     /// Exact source observation for daemon-managed feedback; absent for a helper-owned snapshot.
     source: Option<SourceObservation>,
+    /// Whether the capture ran under whole-tree read coverage (deny-free managed state or a
+    /// disabled host), the only case whose later hook delivery may still reread the source
+    /// natively (T36B). A fact captured under a per-path proof has no live profile state at
+    /// hook time to re-prove against, so its freshness reread would be an unauthorized native
+    /// read: such feedback is never delivered through the hook path.
+    whole_tree: bool,
     /// Bounded fact/evidence/action rendering; source text and diagnostics are excluded.
     text: String,
     /// Native lifecycle epoch at which the provider result was accepted.
@@ -615,6 +627,19 @@ impl Shared {
         }
         retained
     }
+    /// Retains the bounded per-path provenance of one completed managed Diff (T36B).
+    ///
+    /// Stored once at capture time, independently of the disposable pagination state, so every
+    /// later cached delivery of this detail — composed page or freshness reread — can prove
+    /// each represented path under the live profile.
+    fn set_diff_provenance(&self, reference: &str, provenance: BTreeSet<PathBuf>) {
+        if let Ok(mut ledger) = self.ledger.lock()
+            && let Some(detail) = ledger.details.get_mut(reference)
+        {
+            detail.diff_provenance = Some(provenance);
+        }
+    }
+
     /// Records that the caller already received the retained page-one reply, so the next
     /// `ide.inspect` advances instead of re-serving it (T16B).
     fn mark_context_page_delivered(&self, reference: &str) {
@@ -1514,9 +1539,16 @@ impl WorkerHandle {
             let mut ledger = self.shared.ledger.lock().ok()?;
             let current_epoch = ledger.native_epoch.get(&binding).copied().unwrap_or(0);
             let feedback = ledger.feedback.remove(&binding)?;
+            // T36B: the freshness reread is a native read. Only a fact captured under
+            // whole-tree coverage may reread its source here — the hook path has no live
+            // observed state to re-prove a per-path fact against, so such a fact is simply
+            // never delivered (already consumed, like a stale one).
             let feedback = (current_epoch > feedback.native_epoch
                 && !feedback.inline_delivered
-                && feedback.source.as_ref().is_none_or(source_matches))
+                && feedback
+                    .source
+                    .as_ref()
+                    .is_none_or(|source| feedback.whole_tree && source_matches(source)))
             .then_some(feedback)?;
             // A hook consumption counts toward the same dedup state as an inline submission: a
             // later, redundant Context job reproducing this exact unchanged issue must not
@@ -1627,6 +1659,7 @@ impl WorkerHandle {
                     diff_page_fresh: false,
                     context_page: None,
                     context_page_fresh: false,
+                    diff_provenance: None,
                 },
             );
         }
@@ -2759,6 +2792,9 @@ impl<'a> Worker<'a> {
                             // still only hold `Pending` until a later Inspect, or lose it to a
                             // deadline.
                             inline_delivered: false,
+                            // Helper-owned feedback carries no source observation, so the
+                            // flag can never gate a native reread; `true` is the honest value.
+                            whole_tree: true,
                             producer: job.reference.clone(),
                             identity,
                         },
@@ -2954,6 +2990,7 @@ impl<'a> Worker<'a> {
             target,
             &authority,
             method,
+            crate::execution::ReadScope::Path(&path),
         )?;
         // The source read ceiling is the v0.1 reader's own bound, not the launcher's discovery and
         // check-process output budget: `limits.output_bytes` sizes bounded command captures and is
@@ -3109,9 +3146,6 @@ impl<'a> Worker<'a> {
             Err(FailureCode::ProviderUnavailable)=>(lexical_context(&observed,&bytes,query,"accepted semantic provider is unavailable").map_err(|_|FailureCode::SourceUnavailable)?, None),
             Err(code)=>return Err(code),
         };
-        if !source_matches(&observed) {
-            return Err(FailureCode::SourceUnavailable);
-        }
         let epoch = self
             .shared
             .ledger
@@ -3129,6 +3163,22 @@ impl<'a> Worker<'a> {
         }
         let authority = self.authority(&binding).await?;
         self.shared.active(&binding)?;
+        // T36B: the semantic providers may have taken seconds; re-prove this exact source
+        // under the live cwd-bound profile before the freshness reread trusts it.
+        if let Some(observed_scope) = job.observed.as_ref() {
+            validate_read_scope(
+                &self.shared,
+                &binding,
+                observed_scope,
+                &job.target,
+                &authority,
+                errorlog_method(job.tool),
+                crate::execution::ReadScope::Path(observed.path()),
+            )?;
+        }
+        if !source_matches(&observed) {
+            return Err(FailureCode::SourceUnavailable);
+        }
         let mode = match &context.mode {
             ContextMode::Semantic => "semantic".to_owned(),
             ContextMode::Lexical { reason } => format!("lexical ({reason})"),
@@ -3232,6 +3282,12 @@ impl<'a> Worker<'a> {
                         // Computing this job's reply is not submitting it: the caller may still
                         // only hold `Pending` until a later Inspect, or lose it to a deadline.
                         inline_delivered: false,
+                        // Remember the capture-time read authority: only whole-tree coverage
+                        // lets a later hook delivery reread this source natively (T36B).
+                        whole_tree: job
+                            .observed
+                            .as_ref()
+                            .is_some_and(crate::execution::proves_whole_tree_read),
                         producer: job.reference.clone(),
                         identity,
                     },
@@ -3999,6 +4055,7 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
             diff_page_fresh,
             context_page,
             context_page_fresh,
+            diff_provenance,
         ) = {
             let ledger = shared.ledger.lock().map_err(|_| FailureCode::Internal)?;
             let detail = ledger
@@ -4022,6 +4079,7 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 detail.diff_page_fresh,
                 detail.context_page.clone(),
                 detail.context_page_fresh,
+                detail.diff_provenance.clone(),
             )
         };
         // Ownership of this exact reference is established above, so releasing its retained page is
@@ -4043,15 +4101,56 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
             // host-observed catalog/profile scope to recheck here — exactly as its own job-creation
             // path (`context_claude`/`diff_claude`) never calls this check either (T09B).
             if let Some(observed) = &request.observed {
-                validate_read_scope(
-                    shared,
-                    &request.binding,
-                    observed,
-                    &request.target,
-                    authority,
-                    crate::errorlog::Method::Inspect,
-                )
-                .map_err(invalidate)?;
+                // T36B: this one proof point covers every downstream disclosure below — the
+                // already-composed first pages, the later expansions, the cached-context
+                // freshness reread, and `source_matches` — because each names only paths from
+                // `source` or the retained diff provenance. A detail that can name no path at
+                // all keeps the legacy whole-tree gate instead of an empty-path success.
+                let paths: Vec<&std::path::Path> = source
+                    .as_ref()
+                    .map(|source| source.path())
+                    .into_iter()
+                    .chain(
+                        diff_provenance
+                            .as_ref()
+                            .map(|paths| paths.iter().map(PathBuf::as_path))
+                            .into_iter()
+                            .flatten(),
+                    )
+                    .collect();
+                let proof = |path: &std::path::Path| {
+                    validate_read_scope(
+                        shared,
+                        &request.binding,
+                        observed,
+                        &request.target,
+                        authority,
+                        crate::errorlog::Method::Inspect,
+                        crate::execution::ReadScope::Path(path),
+                    )
+                };
+                if paths.is_empty() {
+                    validate_read_scope(
+                        shared,
+                        &request.binding,
+                        observed,
+                        &request.target,
+                        authority,
+                        crate::errorlog::Method::Inspect,
+                        crate::execution::ReadScope::WholeTree,
+                    )
+                    .map_err(invalidate)?;
+                } else {
+                    for path in paths {
+                        proof(path).map_err(invalidate)?;
+                        // Cached disclosure adds the conservative lstat preflight: a symlink
+                        // component below the worktree root refuses disclosure of cached bytes.
+                        // The real guard for later reads stays the descriptor-relative
+                        // `O_NOFOLLOW` reader; a preflight can never secure a later read.
+                        symlink_disclosure_preflight(authority.worktree(), path)
+                            .map_err(invalidate)?;
+                    }
+                }
             }
         }
         if let Some(source) = source
@@ -4347,6 +4446,8 @@ fn diagnostics_reserve_known_edit_settlement_time() {
 }
 
 /// Intersects a current durable stamp and fresh invocation metadata before any native/cached source read.
+/// The caller supplies the [`crate::execution::ReadScope`] naming exactly what this read will
+/// touch: one proven path, or the whole tree when no narrower scope can be stated.
 fn validate_read_scope(
     shared: &Shared,
     binding: &BindingRef,
@@ -4354,6 +4455,7 @@ fn validate_read_scope(
     target: &LaunchTarget,
     authority: &AuthorityStamp,
     method: crate::errorlog::Method,
+    scope: crate::execution::ReadScope<'_>,
 ) -> Result<(), FailureCode> {
     let scoped = crate::execution::WorkspaceAuthority::from_workspace(
         authority.worktree().id(),
@@ -4368,6 +4470,7 @@ fn validate_read_scope(
         &scoped,
         &target.catalog,
         target.allow_disabled_host,
+        scope,
     )
     .map(|_| ())
     .map_err(|error| {
@@ -4433,6 +4536,32 @@ async fn capture_rejected_state(state_json: &serde_json::Value) -> String {
     }
 }
 
+/// Refuses any existing symlink component of one relative path below the worktree root (T36B).
+///
+/// This is a cached-disclosure preflight only — it cannot secure a later read against
+/// replacement races, which stays the descriptor-relative `O_NOFOLLOW` reader's job. The walk
+/// checks each existing prefix, stops at the first missing component (nothing deeper can
+/// exist, and a missing target discloses nothing), and treats every other inspection failure
+/// as unproven.
+fn symlink_disclosure_preflight(
+    worktree: &crate::workspace::authority::WorktreeRef,
+    path: &Path,
+) -> Result<(), FailureCode> {
+    let mut checked = worktree.worktree_path().to_path_buf();
+    for component in path.components() {
+        checked.push(component);
+        match std::fs::symlink_metadata(&checked) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(FailureCode::ExecutionProfile);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(FailureCode::ExecutionProfile),
+        }
+    }
+    Ok(())
+}
+
 /// Renders the closed read-scope detail for a failed workspace-read recheck (T24B).
 fn read_scope_detail(error: &crate::execution::RequestError) -> String {
     use crate::execution::RequestError;
@@ -4443,6 +4572,7 @@ fn read_scope_detail(error: &crate::execution::RequestError) -> String {
         RequestError::BindingMismatch => "read_scope:binding_mismatch",
         RequestError::ObservedStateUnavailable(_) => "read_scope:observed_state_unavailable",
         RequestError::SandboxCwdMismatch => "read_scope:sandbox_cwd_mismatch",
+        RequestError::ReadPathUnproven => "read_scope:path_unproven",
         _ => "read_scope:refused",
     }
     .to_owned()
@@ -4878,6 +5008,7 @@ mod stop_retry_tests {
                 diff_page_fresh: false,
                 context_page: None,
                 context_page_fresh: false,
+                diff_provenance: None,
             },
         );
 
@@ -4940,6 +5071,7 @@ mod stop_retry_tests {
                 diff_page_fresh: false,
                 context_page: None,
                 context_page_fresh: false,
+                diff_provenance: None,
             },
         );
         // Claude's foreground ticket path must admit the same successful Edit source detail that
@@ -5595,6 +5727,7 @@ mod stop_retry_tests {
                 diff_page_fresh: false,
                 context_page: None,
                 context_page_fresh: false,
+                diff_provenance: None,
             },
         );
         let (first_reply, authority, source) = worker.context(&mut job).await.unwrap();
@@ -5719,6 +5852,7 @@ mod stop_retry_tests {
                 diff_page_fresh: false,
                 context_page: None,
                 context_page_fresh: false,
+                diff_provenance: None,
             },
         );
         let (first_reply, authority, source) = worker.context(&mut job).await.unwrap();
@@ -5813,6 +5947,7 @@ mod stop_retry_tests {
                 diff_page_fresh: false,
                 context_page: None,
                 context_page_fresh: false,
+                diff_provenance: None,
             },
         );
         let Err(code) = worker.context(&mut job).await else {
@@ -5892,6 +6027,7 @@ mod stop_retry_tests {
                 diff_page_fresh: false,
                 context_page: None,
                 context_page_fresh: false,
+                diff_provenance: None,
             },
         );
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -5947,6 +6083,7 @@ mod stop_retry_tests {
                 diff_page_fresh: false,
                 context_page: None,
                 context_page_fresh: false,
+                diff_provenance: None,
             },
         );
         let (reply, _authority, _source) = worker.context(&mut job).await.unwrap();
@@ -6079,12 +6216,15 @@ mod stop_retry_tests {
     }
 
     /// Both native-read consumers (`observe` and `serve_inspection` cached delivery) share
-    /// `validate_read_scope`, and a deny-bearing state admitted through a narrower v2 shape
-    /// must be refused by that shared proof even at the same cwd (T35B-r finding 2). The
-    /// durable authority is granted through the real Workspace activation, so the consumers
-    /// run with a current stamp exactly as the managed start flow leaves behind.
+    /// `validate_read_scope`. Under T36B a deny-bearing state admitted through a narrower v2
+    /// shape reads natively exactly when the requested path proves under the live cwd-bound
+    /// shape: a proven path reads and a cached page whose provenance names only proven paths
+    /// delivers even after the policy narrows post-capture, while denied paths, denied-path
+    /// provenance, and provenance-free details refuse. The durable authority is granted
+    /// through the real Workspace activation, so the consumers run with a current stamp
+    /// exactly as the managed start flow leaves behind.
     #[tokio::test]
-    async fn read_scope_refuses_a_same_cwd_deny_bearing_state_for_both_consumers() {
+    async fn read_scope_proves_paths_per_path_for_both_consumers() {
         let fixture = Fixture::new();
         std::fs::write(fixture.root.join("main.rs"), "fn main() {}\n").unwrap();
         let store = fixture.store();
@@ -6126,11 +6266,24 @@ mod stop_retry_tests {
             &target,
             &authority,
             crate::errorlog::Method::Inspect,
+            crate::execution::ReadScope::Path(Path::new("main.rs")),
         )
         .unwrap();
-        // ...while the deny-bearing state — admitted by the v2 catalog as genuinely narrower —
-        // loses native reads at the same cwd.
+        // ...and under T36B the deny-bearing narrowed state — admitted by the v2 catalog —
+        // still reads a proven path at the same cwd...
         let (_, denied_observed) = read_scope_call(&worker, true, "read-scope-actor", "deny-call");
+        validate_read_scope(
+            &worker.shared,
+            &binding,
+            &denied_observed,
+            &target,
+            &authority,
+            crate::errorlog::Method::Inspect,
+            crate::execution::ReadScope::Path(Path::new("main.rs")),
+        )
+        .unwrap();
+        // ...while the denied subtree (the deny names `secret`, and ancestor-or-equal denies
+        // are unproven) refuses.
         assert!(matches!(
             validate_read_scope(
                 &worker.shared,
@@ -6139,49 +6292,229 @@ mod stop_retry_tests {
                 &target,
                 &authority,
                 crate::errorlog::Method::Inspect,
+                crate::execution::ReadScope::Path(Path::new("secret/key.txt")),
             ),
             Err(FailureCode::ExecutionProfile)
         ));
 
-        // Consumer 2 (the `serve_inspection` cached-delivery path): a retained result with a
-        // current authority is not delivered under the deny-bearing observation.
-        worker.shared.ledger.lock().unwrap().details.insert(
-            "read-scope-detail".into(),
-            Detail {
-                binding: binding.clone(),
-                reply: PeerReply::Pending {
-                    detail_ref: "read-scope-detail".into(),
-                    helper: None,
+        // Consumer 2 (the `serve_inspection` cached-delivery path): a detail whose retained
+        // provenance names only proven paths is delivered even after the policy narrows
+        // post-capture; provenance naming a denied path, or no path at all, is refused —
+        // never an empty-path success.
+        let deliver =
+            |worker: &Worker<'_>, reference: &str, provenance: Option<BTreeSet<PathBuf>>| {
+                worker.shared.ledger.lock().unwrap().details.insert(
+                    reference.to_owned(),
+                    Detail {
+                        binding: binding.clone(),
+                        reply: PeerReply::Pending {
+                            detail_ref: reference.to_owned(),
+                            helper: None,
+                        },
+                        selection: (AssistanceTool::Inspect, [0; 32]),
+                        authority: Some(authority.clone()),
+                        source: None,
+                        native_epoch: 0,
+                        diff_page: None,
+                        diff_page_fresh: false,
+                        context_page: None,
+                        context_page_fresh: false,
+                        diff_provenance: provenance,
+                    },
+                );
+            };
+        async fn inspect(
+            worker: &Worker<'_>,
+            binding: &BindingRef,
+            reference: &str,
+            observed: &ObservedSandboxState,
+            target: &LaunchTarget,
+        ) -> PeerReply {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            serve_inspection(
+                &worker.workspace,
+                &worker.shared,
+                Inspection {
+                    binding: binding.clone(),
+                    reference: reference.to_owned(),
+                    observed: Some(observed.clone()),
+                    target: target.clone(),
+                    expected: None,
+                    reply: reply_tx,
                 },
-                selection: (AssistanceTool::Inspect, [0; 32]),
-                authority: Some(authority),
-                source: None,
-                native_epoch: 0,
-                diff_page: None,
-                diff_page_fresh: false,
-                context_page: None,
-                context_page_fresh: false,
-            },
+            )
+            .await;
+            reply_rx.await.unwrap()
+        }
+        deliver(
+            &worker,
+            "read-scope-proven",
+            Some(BTreeSet::from([PathBuf::from("main.rs")])),
         );
-        let (reply_tx, reply_rx) = oneshot::channel();
-        serve_inspection(
-            &worker.workspace,
-            &worker.shared,
-            Inspection {
-                binding,
-                reference: "read-scope-detail".into(),
-                observed: Some(denied_observed),
-                target,
-                expected: None,
-                reply: reply_tx,
-            },
-        )
-        .await;
         assert!(matches!(
-            reply_rx.await.unwrap(),
+            inspect(
+                &worker,
+                &binding,
+                "read-scope-proven",
+                &denied_observed,
+                &target
+            )
+            .await,
+            PeerReply::Pending { .. }
+        ));
+        deliver(
+            &worker,
+            "read-scope-denied",
+            Some(BTreeSet::from([PathBuf::from("secret/key.txt")])),
+        );
+        assert!(matches!(
+            inspect(
+                &worker,
+                &binding,
+                "read-scope-denied",
+                &denied_observed,
+                &target
+            )
+            .await,
             PeerReply::Error {
                 code: FailureCode::ExecutionProfile
             }
+        ));
+        deliver(&worker, "read-scope-unproven", None);
+        assert!(matches!(
+            inspect(
+                &worker,
+                &binding,
+                "read-scope-unproven",
+                &denied_observed,
+                &target
+            )
+            .await,
+            PeerReply::Error {
+                code: FailureCode::ExecutionProfile
+            }
+        ));
+        // The whole-tree scope keeps its restrictive behavior: the deny-bearing state can
+        // never claim whole-tree coverage even though individual paths prove.
+        assert!(matches!(
+            validate_read_scope(
+                &worker.shared,
+                &binding,
+                &denied_observed,
+                &target,
+                &authority,
+                crate::errorlog::Method::Inspect,
+                crate::execution::ReadScope::WholeTree,
+            ),
+            Err(FailureCode::ExecutionProfile)
+        ));
+    }
+
+    /// Cached disclosure refuses a provenance path whose component is a symlink, while a
+    /// missing target stays deliverable: the preflight checks existing prefixes only (T36B).
+    /// The real no-follow guard for later reads remains the descriptor-relative reader.
+    #[tokio::test]
+    async fn cached_disclosure_preflights_symlink_components() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join("main.rs"), "fn main() {}\n").unwrap();
+        std::os::unix::fs::symlink("main.rs", fixture.root.join("link.rs")).unwrap();
+        std::fs::create_dir(fixture.root.join("sub")).unwrap();
+        std::os::unix::fs::symlink("main.rs", fixture.root.join("sub/link.rs")).unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (invocation, observed) = read_scope_call(&worker, false, "preflight-actor", "call-1");
+        let binding = invocation.binding_ref().clone();
+        let tree = worker
+            .workspace
+            .resolve_worktree(
+                fixture.root.clone(),
+                fixture.root.clone(),
+                fixture.root.join(".git"),
+            )
+            .await
+            .unwrap();
+        let request = crate::workspace::authority::ActivationRequest::new(
+            "preflight-activation",
+            invocation,
+            worker.shared.active(&binding).unwrap(),
+            tree,
+        )
+        .unwrap();
+        let receipt = worker.workspace.activate(request).await.unwrap();
+        worker.grants.insert(binding.clone(), receipt);
+        let authority = worker.authority(&binding).await.unwrap();
+        let target = read_scope_target(&fixture.root);
+        let deliver = |worker: &Worker<'_>, reference: &str, path: &str| {
+            worker.shared.ledger.lock().unwrap().details.insert(
+                reference.to_owned(),
+                Detail {
+                    binding: binding.clone(),
+                    reply: PeerReply::Pending {
+                        detail_ref: reference.to_owned(),
+                        helper: None,
+                    },
+                    selection: (AssistanceTool::Inspect, [0; 32]),
+                    authority: Some(authority.clone()),
+                    source: None,
+                    native_epoch: 0,
+                    diff_page: None,
+                    diff_page_fresh: false,
+                    context_page: None,
+                    context_page_fresh: false,
+                    diff_provenance: Some(BTreeSet::from([PathBuf::from(path)])),
+                },
+            );
+        };
+        async fn inspect(
+            worker: &Worker<'_>,
+            binding: &BindingRef,
+            reference: &str,
+            observed: &ObservedSandboxState,
+            target: &LaunchTarget,
+        ) -> PeerReply {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            serve_inspection(
+                &worker.workspace,
+                &worker.shared,
+                Inspection {
+                    binding: binding.clone(),
+                    reference: reference.to_owned(),
+                    observed: Some(observed.clone()),
+                    target: target.clone(),
+                    expected: None,
+                    reply: reply_tx,
+                },
+            )
+            .await;
+            reply_rx.await.unwrap()
+        }
+        deliver(&worker, "preflight-symlink", "link.rs");
+        assert!(matches!(
+            inspect(&worker, &binding, "preflight-symlink", &observed, &target).await,
+            PeerReply::Error {
+                code: FailureCode::ExecutionProfile
+            }
+        ));
+        deliver(&worker, "preflight-deep-symlink", "sub/link.rs");
+        assert!(matches!(
+            inspect(
+                &worker,
+                &binding,
+                "preflight-deep-symlink",
+                &observed,
+                &target
+            )
+            .await,
+            PeerReply::Error {
+                code: FailureCode::ExecutionProfile
+            }
+        ));
+        deliver(&worker, "preflight-missing", "removed.rs");
+        assert!(matches!(
+            inspect(&worker, &binding, "preflight-missing", &observed, &target).await,
+            PeerReply::Pending { .. }
         ));
     }
 }
@@ -6284,6 +6617,7 @@ mod feedback_dedup_tests {
                     text: "Fact: repeated".into(),
                     native_epoch: 0,
                     inline_delivered: false,
+                    whole_tree: true,
                     producer: "detail-2".into(),
                     identity: repeated,
                 }
@@ -6295,6 +6629,7 @@ mod feedback_dedup_tests {
                     text: "Fact: changed".into(),
                     native_epoch: 0,
                     inline_delivered: false,
+                    whole_tree: true,
                     producer: "detail-3".into(),
                     identity: identity("changed"),
                 }
@@ -6323,6 +6658,7 @@ mod feedback_dedup_tests {
                     text: "Fact: one bounded fact".into(),
                     native_epoch: 0,
                     inline_delivered: false,
+                    whole_tree: true,
                     producer: "detail-1".into(),
                     identity: identity("t1"),
                 },
@@ -6356,6 +6692,7 @@ mod feedback_dedup_tests {
                     text: "Fact: one bounded fact".into(),
                     native_epoch: 0,
                     inline_delivered: false,
+                    whole_tree: true,
                     producer: "detail-1".into(),
                     identity: identity("t2"),
                 },
@@ -6392,6 +6729,7 @@ mod feedback_dedup_tests {
                     text: "Fact: A's fact".into(),
                     native_epoch: 0,
                     inline_delivered: false,
+                    whole_tree: true,
                     producer: "detail-A".into(),
                     identity: identity("A"),
                 },
@@ -6403,6 +6741,7 @@ mod feedback_dedup_tests {
                     text: "Fact: B's fact".into(),
                     native_epoch: 0,
                     inline_delivered: false,
+                    whole_tree: true,
                     producer: "detail-B".into(),
                     identity: identity("B"),
                 },
@@ -6442,6 +6781,7 @@ mod feedback_dedup_tests {
                     text: "Fact: one bounded fact".into(),
                     native_epoch: 0,
                     inline_delivered: false,
+                    whole_tree: true,
                     producer: "detail-1".into(),
                     identity: identity("t3"),
                 },
@@ -6467,6 +6807,74 @@ mod feedback_dedup_tests {
         );
     }
 
+    /// A fact captured under a per-path read proof (whole_tree false) must never be delivered
+    /// through the hook path: its freshness reread would be an unauthorized native read, and
+    /// the hook path has no live observed state to re-prove against (T36B). The same fact
+    /// captured under whole-tree coverage keeps the exact-byte freshness reread and delivers.
+    #[tokio::test]
+    async fn per_path_feedback_never_rereads_natively_at_hook_delivery() {
+        let dir = std::env::temp_dir().join(format!("t36b-feedback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.rs"), "fn main() {}\n").unwrap();
+        // Darwin's /tmp is a symlink alias: the no-follow reader needs the canonical root.
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let worktree = crate::workspace::authority::WorktreeRef::from_discovery(
+            dir.clone(),
+            dir.clone(),
+            ".git".into(),
+            1,
+        )
+        .unwrap();
+        let source = SourceObservation::new(
+            worktree,
+            1,
+            1,
+            crate::workspace::observation::ObservationRef::new("source-1").unwrap(),
+            "main.rs".into(),
+            Some(crate::workspace::observation::SourceBytes::from_bytes(
+                b"fn main() {}\n",
+            )),
+            crate::workspace::observation::SourceRevision::new("revision-1").unwrap(),
+            crate::workspace::observation::SourceCoverage::Complete,
+            crate::workspace::observation::ObservedState::Present,
+        )
+        .unwrap();
+        for whole_tree in [true, false] {
+            let (bindings, binding) = active_binding();
+            let handle = handle(bindings);
+            {
+                let mut ledger = handle.shared.ledger.lock().unwrap();
+                ledger.feedback.insert(
+                    binding.clone(),
+                    NativeFeedback {
+                        source: Some(source.clone()),
+                        text: "Fact: one bounded fact".into(),
+                        native_epoch: 0,
+                        inline_delivered: false,
+                        whole_tree,
+                        producer: "detail-1".into(),
+                        identity: identity("t36b"),
+                    },
+                );
+            }
+            handle.native_hint(binding.clone());
+            let delivered = handle.take_current_feedback(binding).await;
+            if whole_tree {
+                assert!(
+                    delivered.is_some(),
+                    "whole-tree feedback keeps its freshness reread and delivers"
+                );
+            } else {
+                assert_eq!(
+                    delivered, None,
+                    "per-path feedback is never delivered without a live proof"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Repeated Context/Inspect retrieval of the same observation (the same native epoch) must
     /// not resurrect a fact this process already consumed via the hook channel: the single-slot
     /// remove in `take_current_feedback` is the identity, not a string comparison of raw text.
@@ -6483,6 +6891,7 @@ mod feedback_dedup_tests {
                     text: "Fact: one bounded fact".into(),
                     native_epoch: 0,
                     inline_delivered: false,
+                    whole_tree: true,
                     producer: "detail-1".into(),
                     identity: identity("t4"),
                 },
@@ -6576,6 +6985,10 @@ mod execution_profile_detail_tests {
         assert_eq!(
             read_scope_detail(&crate::execution::RequestError::SandboxCwdMismatch),
             "read_scope:sandbox_cwd_mismatch"
+        );
+        assert_eq!(
+            read_scope_detail(&crate::execution::RequestError::ReadPathUnproven),
+            "read_scope:path_unproven"
         );
         assert_eq!(
             read_scope_detail(&crate::execution::RequestError::ProgramDenied),

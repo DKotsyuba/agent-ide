@@ -658,6 +658,7 @@ fn current_read_admission_rejects_changed_profile_and_cwd_without_a_command() {
         &authority,
         &bound.catalog,
         true,
+        agent_ide::execution::ReadScope::WholeTree,
     )
     .unwrap();
     assert!(matches!(
@@ -666,7 +667,8 @@ fn current_read_admission_rejects_changed_profile_and_cwd_without_a_command() {
             bound.observed.clone(),
             &authority,
             &bound.catalog,
-            false
+            false,
+            agent_ide::execution::ReadScope::WholeTree,
         ),
         Err(RequestError::DisabledHostDenied)
     ));
@@ -686,7 +688,15 @@ fn current_read_admission_rejects_changed_profile_and_cwd_without_a_command() {
         )
         .unwrap();
         assert!(
-            validate_workspace_read(active, observed, &authority, &bound.catalog, true).is_err()
+            validate_workspace_read(
+                active,
+                observed,
+                &authority,
+                &bound.catalog,
+                true,
+                agent_ide::execution::ReadScope::WholeTree,
+            )
+            .is_err()
         );
     }
     bound.guard.stop_binding(&bound.binding).unwrap();

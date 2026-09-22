@@ -538,6 +538,17 @@ pub trait SnapshotRunner: Send {
         &mut self,
         intent: SnapshotIntent,
     ) -> impl std::future::Future<Output = Result<CapturedProcessEvidence, GitError>> + Send;
+    /// Proves one worktree-relative path may be read natively under the live host profile (T36B).
+    ///
+    /// Required and fallible with no permissive default: every collector integration routes
+    /// this through its Execution owner, so a path the live sandbox policy denies (or that
+    /// cannot be proven) refuses the whole capture attempt before any byte is read. The
+    /// collector calls it before each tracked-path capture (staged mode included), before
+    /// every consistency reread, and before untracked inspection.
+    fn authorize_read_path(
+        &mut self,
+        path: &Path,
+    ) -> impl std::future::Future<Output = Result<(), GitError>> + Send;
     /// Supplies a legacy unverified source hint, which the collector intentionally ignores.
     /// Implementations should use [`Self::current_observation`] after Workspace reconciliation.
     fn observation(
@@ -946,6 +957,7 @@ async fn capture_attempt<R: SnapshotRunner>(
         return Err(GitError::EvidenceTooLarge);
     }
     for entry in status.untracked() {
+        runner.authorize_read_path(entry.path()).await?;
         inspect_untracked(scope.worktree(), entry.path())?;
     }
     // Exact safe in-process reads cover every non-conflict union path, not only paths Git's stat
@@ -982,6 +994,8 @@ async fn capture_attempt<R: SnapshotRunner>(
             Some(authority) => runner.current_observation(authority, path).await,
             None => None,
         };
+        // T36B: the live per-path proof precedes every native capture, staged mode included.
+        runner.authorize_read_path(path).await?;
         let source =
             SnapshotSource::capture(scope.worktree(), scope.authority_epoch(), path, current)?;
         total_bytes += source.contents().len();
@@ -1160,12 +1174,15 @@ async fn capture_attempt<R: SnapshotRunner>(
     }
     // Exact safe reads cover every union path, not only paths Git's stat cache happened to mark dirty.
     for (path, source) in &sources {
+        // T36B: repeat authorization before the consistency reread, exactly as before capture.
+        runner.authorize_read_path(path).await?;
         let after = SnapshotSource::capture(scope.worktree(), scope.authority_epoch(), path, None)?;
         if after.read != source.read {
             return Err(GitError::UnstableSnapshot);
         }
     }
     for entry in status.untracked() {
+        runner.authorize_read_path(entry.path()).await?;
         inspect_untracked(scope.worktree(), entry.path())?;
     }
     if metadata(&scope, program, runner).await? != before {

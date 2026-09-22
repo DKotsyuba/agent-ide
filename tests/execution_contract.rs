@@ -1289,7 +1289,14 @@ fn native_read_accepts_an_inherited_cwd_only_under_a_recognized_read_all_profile
             true,
         )
         .unwrap();
-        execution::validate_workspace_read(active, observed, authority, &catalog, false)
+        execution::validate_workspace_read(
+            active,
+            observed,
+            authority,
+            &catalog,
+            false,
+            execution::ReadScope::WholeTree,
+        )
     };
     read(true, &authority).unwrap();
     assert_eq!(
@@ -1717,7 +1724,14 @@ fn native_read_refuses_a_same_cwd_deny_bearing_state() {
             true,
         )
         .unwrap();
-        execution::validate_workspace_read(active, observed, authority, &catalog, false)
+        execution::validate_workspace_read(
+            active,
+            observed,
+            authority,
+            &catalog,
+            false,
+            execution::ReadScope::WholeTree,
+        )
     };
     let authority = WorkspaceAuthority::from_workspace("t35b-read", "1", root.clone(), 1).unwrap();
     // The deny-free same-cwd state proves whole-tree read coverage and reads natively.

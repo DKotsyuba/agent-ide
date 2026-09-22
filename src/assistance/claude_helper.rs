@@ -1355,6 +1355,9 @@ async fn provider_context(
                 source.worktree().clone(),
                 source.worktree().worktree_path().join(source.path()),
                 &bundle,
+                // A Claude helper session has no host sandbox profile model, so there is
+                // nothing to prove per path; the Codex route supplies the live proof (T36B).
+                &|_| true,
             )
             .map_err(|_| FailureCode::ResolutionUnverified)?;
             let profile = TypeScriptProfile::new(
@@ -1368,7 +1371,7 @@ async fn provider_context(
                 .map_err(|_| FailureCode::WorkspaceAuthority)?;
             (
                 profile
-                    .command(&worktree)
+                    .command(&worktree, &|_| true)
                     .map_err(|_| FailureCode::ExecutionProfile)?,
                 ProviderSettings::TypeScript(profile.clone()),
                 None,
@@ -1461,10 +1464,10 @@ async fn provider_context(
     match status {
         Ok(status) => {
             *reaped += 1;
-            if typescript_profile
-                .as_ref()
-                .is_some_and(|profile| profile.verify_resolution().is_err())
-            {
+            if typescript_profile.as_ref().is_some_and(|profile| {
+                // No sandbox model on this route; see the observe-site note (T36B).
+                profile.verify_resolution(&|_| true).is_err()
+            }) {
                 return Err(FailureCode::ResolutionUnverified);
             }
             if !status.success() || operation.is_err() {
@@ -1676,6 +1679,14 @@ struct HelperSnapshotRunner {
 }
 
 impl crate::workspace::git::snapshot::SnapshotRunner for HelperSnapshotRunner {
+    /// Claude helper captures run without a host sandbox profile model, so every path is
+    /// provable here; the Codex product route supplies the live per-path proof (T36B).
+    async fn authorize_read_path(
+        &mut self,
+        _path: &Path,
+    ) -> Result<(), crate::workspace::git::GitError> {
+        Ok(())
+    }
     /// Runs one immutable intent and correlates its scratch lifecycle with actual wait evidence.
     async fn run(
         &mut self,
