@@ -1056,16 +1056,35 @@ fn rejected_listing_admits_only_bounded_regular_captures() {
 // design's acceptance matrix; each test states which design row it seals.
 // ---------------------------------------------------------------------------
 
-/// Reads one captured sandbox-state fixture by its exact file name.
-fn sandbox_fixture(name: &str) -> String {
-    std::fs::read_to_string(format!(
+/// Relocates a captured fixture into this process's temporary tree and creates its cwd.
+///
+/// Every original path under the developer's home or stability tree receives the same new
+/// prefix, preserving relative paths and deny/glob relationships. The exact-capture assertions
+/// below compare the relocated bytes because v2 capture identity intentionally binds the cwd.
+pub(crate) fn sandbox_fixture(name: &str) -> String {
+    let captured = std::fs::read_to_string(format!(
         concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/sandbox-states/{}.json"
         ),
         name.trim_end_matches(".json")
     ))
-    .unwrap()
+    .unwrap();
+    let root = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("agent-ide-test-fixtures-{}", std::process::id()));
+    let relocated = captured
+        .replace("/Users/pluto", root.join("home").to_str().unwrap())
+        .replace(
+            "/private/tmp/agent-ide-stability",
+            root.join("stability").to_str().unwrap(),
+        );
+    assert!(!relocated.contains("/Users/pluto"));
+    assert!(!relocated.contains("/private/tmp/agent-ide-stability"));
+    let value: serde_json::Value = serde_json::from_str(&relocated).unwrap();
+    let cwd = value["sandboxCwd"].as_str().unwrap();
+    std::fs::create_dir_all(cwd.strip_prefix("file://").unwrap_or(cwd)).unwrap();
+    relocated
 }
 
 /// Parses one captured sandbox-state fixture into a validated host state.
@@ -1738,10 +1757,7 @@ fn shape_digest_is_domain_separated_and_spelling_independent() {
     // A v2 record's captured-state identity is separately domain-separated and pins the cwd.
     let captured = super::captured_state_identity_v2(&compact);
     assert_ne!(captured, super::semantic_state_identity(&compact));
-    let moved = sandbox_fixture(FIXTURE_1ED).replace(
-        "file:///Users/pluto/projects/agent-pipline-compressor",
-        "file:///Users/pluto/projects/elsewhere",
-    );
+    let moved = sandbox_fixture(FIXTURE_1ED).replace("agent-pipline-compressor", "elsewhere");
     assert_ne!(
         captured,
         super::captured_state_identity_v2(&HostSandboxState::parse_json(&moved).unwrap()),

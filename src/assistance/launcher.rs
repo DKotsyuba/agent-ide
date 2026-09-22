@@ -1357,14 +1357,10 @@ fn startup_fingerprint_verification_is_cooperatively_cancellable() {
 fn launcher_accepts_v2_records_and_rejects_unknown_record_keys() {
     use crate::execution::D03ProfileEvidence;
     use serde_json::json;
-    let fixture = format!(
-        concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/sandbox-states/{}.json"
-        ),
-        "accepted-codex-managed-read-only-v1"
-    );
-    let state = HostSandboxState::parse_json(&std::fs::read_to_string(fixture).unwrap()).unwrap();
+    let state = HostSandboxState::parse_json(&crate::execution::linear_tests::sandbox_fixture(
+        "accepted-codex-managed-read-only-v1",
+    ))
+    .unwrap();
     let record = PersistedProfileRecord::from_execution_evidence_v2(
         "accepted-managed-readonly",
         1,
