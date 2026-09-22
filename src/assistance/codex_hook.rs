@@ -235,14 +235,15 @@ pub async fn run(runtime_dir: &Path, attachment: Option<String>, host_kind: Host
 /// Submits a caller-read bounded payload before the same absolute hook deadline expires.
 ///
 /// `None` reads stdin itself for legacy hooks; managed Claude supplies already-read bytes so its
-/// worktree can be resolved first. Invalid input, transport failures, and expiry fail open.
+/// worktree can be resolved first. Returns whether a valid event reached the daemon. Invalid
+/// input, transport failures, and expiry fail open with `false`.
 pub async fn run_with_payload(
     runtime_dir: &Path,
     attachment: Option<String>,
     host_kind: HostKind,
     payload: Option<Vec<u8>>,
     deadline: tokio::time::Instant,
-) {
+) -> bool {
     let fallback_attachment = attachment.clone();
     let valid_boundary = Arc::new(AtomicBool::new(false));
     let valid_for_hook = Arc::clone(&valid_boundary);
@@ -284,6 +285,13 @@ pub async fn run_with_payload(
     .flatten();
     let unavailable = matches!(hook, Some((_, HookIngressOutcome::Unavailable)))
         || (hook.is_none() && valid_boundary.load(Ordering::Acquire));
+    let submitted = matches!(
+        hook,
+        Some((
+            _,
+            HookIngressOutcome::Submitted | HookIngressOutcome::Feedback(_)
+        ))
+    );
     if unavailable && let Some(attachment) = fallback_attachment.as_deref() {
         let _ = report_native_fallback(runtime_dir, attachment);
     }
@@ -292,6 +300,7 @@ pub async fn run_with_payload(
     {
         println!("{output}");
     }
+    submitted
 }
 
 /// Runs one managed Codex hook: bounded stdin, private-route discovery, one submit, quiet failures.

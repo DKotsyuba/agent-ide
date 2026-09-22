@@ -1498,22 +1498,29 @@ fn claude_key_cache_path(candidate: &Path) -> std::io::Result<PathBuf> {
 /// can afford one bounded `git` probe at its own startup) leaves this hint for it. This is purely a
 /// hint: it carries no secret and grants no authority by itself, since [`read_claude_attachment`]
 /// independently re-validates any key read back from here against the runtime directory's own
-/// identity before anything is trusted. Failure is silent and never blocks managed startup.
+/// identity before anything is trusted. Replaces stale hints atomically so a newly started daemon
+/// and its first hook use the same key. Failure is silent and never blocks managed startup.
 fn write_claude_key_cache(candidate: &Path, key: &Path) {
     let Ok(cache) = claude_key_cache_path(candidate) else {
         return;
     };
-    let mut builder = fs::DirBuilder::new();
-    builder.mode(0o700);
-    if builder.create(&cache).is_err() && !cache.is_dir() {
+    if prepare_private_persistent_directory(&cache).is_err() {
         return;
     }
-    let _ = OpenOptions::new()
+    let Ok(nonce) = random_hex(8) else {
+        return;
+    };
+    let temporary = cache.join(format!("key-{nonce}"));
+    let written = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(cache.join(CLAUDE_KEY_CACHE_FILE))
+        .open(&temporary)
         .and_then(|mut file| file.write_all(key.as_os_str().as_bytes()));
+    if written.is_ok() {
+        let _ = fs::rename(&temporary, cache.join(CLAUDE_KEY_CACHE_FILE));
+    }
+    let _ = fs::remove_file(temporary);
 }
 
 /// Caches the daemon-minted candidate attachment in the existing private key-cache directory.
@@ -1820,7 +1827,8 @@ fn read_claude_attachment(key: &Path) -> std::io::Result<(PathBuf, String)> {
 /// Submits one argument-free managed Claude hook on the payload cwd's lease channel.
 ///
 /// The hook's inherited project environment can name another worktree of the same repository.
-/// Missing or malformed cwd, cached key, runtime, candidate attachment, or daemon returns silently.
+/// Missing or malformed cwd, cached key, runtime, candidate attachment, or daemon returns silently
+/// to Claude while recording a closed, path-free reason in the repository error log.
 /// Per EYES-r2 §3, this never spawns `git` itself and so never risks the existing bounded 250 ms
 /// total deadline on that account: the rendezvous key is only ever read from
 /// [`read_claude_key_cache`], a hint the owning MCP server left behind at its own startup. Once
@@ -1828,6 +1836,27 @@ fn read_claude_attachment(key: &Path) -> std::io::Result<(PathBuf, String)> {
 /// feedback rendering, and foreground-helper recognition remain unchanged.
 async fn run_managed_claude_hook() {
     let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+    let log_candidate = std::env::var_os("CLAUDE_PROJECT_DIR")
+        .map(PathBuf::from)
+        .and_then(|path| fs::canonicalize(path).ok())
+        .or_else(|| std::env::current_dir().ok());
+    if let Some(candidate) = log_candidate.as_deref() {
+        let key = common_dir_from_git_files(candidate)
+            .or_else(|| read_claude_key_cache(candidate))
+            .unwrap_or_else(|| candidate.to_owned());
+        agent_ide::errorlog::init_repository(&claude_rendezvous_identity(&key)[..16]);
+    }
+    let log = |detail| {
+        agent_ide::errorlog::record(
+            agent_ide::errorlog::Method::Hook,
+            agent_ide::errorlog::Outcome::Unavailable,
+            agent_ide::errorlog::Fields {
+                host: Some(HostKind::Claude),
+                detail: Some(detail),
+                ..Default::default()
+            },
+        );
+    };
     let (sender, receiver) = tokio::sync::oneshot::channel();
     if std::thread::Builder::new()
         .name("claude-hook-input".into())
@@ -1840,12 +1869,15 @@ async fn run_managed_claude_hook() {
         })
         .is_err()
     {
+        log("hook_no_cwd");
         return;
     }
     let Ok(Ok(Some(payload))) = tokio::time::timeout_at(deadline, receiver).await else {
+        log("hook_no_cwd");
         return;
     };
     if payload.len() > 64 * 1024 {
+        log("hook_no_cwd");
         return;
     }
     let Some(cwd) = serde_json::from_slice::<serde_json::Value>(&payload)
@@ -1854,31 +1886,39 @@ async fn run_managed_claude_hook() {
         .filter(|path| absolute_local_path(path))
         .and_then(|path| fs::canonicalize(path).ok())
     else {
+        log("hook_no_cwd");
         return;
     };
     let Some(project) = cwd
         .ancestors()
         .find(|path| read_claude_key_cache(path).is_some())
     else {
+        log("hook_no_key_cache");
         return;
     };
     let Some(key) = read_claude_key_cache(project) else {
+        log("hook_no_key_cache");
         return;
     };
     let Ok((runtime, _)) = read_claude_attachment(&key) else {
+        log("hook_no_rendezvous");
         return;
     };
     let Some(attachment) = read_claude_candidate_attachment(project) else {
+        log("hook_no_candidate_attachment");
         return;
     };
-    agent_ide::assistance::codex_hook::run_with_payload(
+    if !agent_ide::assistance::codex_hook::run_with_payload(
         &runtime,
         Some(attachment),
         HostKind::Claude,
         Some(payload),
         deadline,
     )
-    .await;
+    .await
+    {
+        log("hook_submit_refused:unavailable");
+    }
 }
 
 /// Dispatches one self-contained managed MCP generation to its host-specific lifecycle contract.

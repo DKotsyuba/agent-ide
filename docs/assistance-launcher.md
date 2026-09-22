@@ -247,8 +247,11 @@ Lifecycle: the first MCP server that finds no live daemon spawns one shared per-
 (runtime directory `/private/tmp/ai-r-<16 hex of the rendezvous key digest>`); later MCP servers of
 the same repository adopt it after validation, and an MCP exit never stops it. The hook path reads
 the repository key from the MCP-cached hint `/private/tmp/ai-k-<16 hex of the worktree path
-digest>` and never runs `git` itself. With zero open leases and no running check the daemon stops
-after `idle_timeout_s`, closes its socket, and removes its runtime directory; the caches remain.
+digest>` and never runs `git` itself. Each MCP startup atomically refreshes that hint before
+serving calls, so a stale hint cannot send the first hook to an earlier daemon generation.
+Unresolved managed hooks stay silent to Claude and record a closed, path-free error-log detail.
+With zero open leases and no running check the daemon stops after `idle_timeout_s`, closes its
+socket, and removes its runtime directory; the caches remain.
 
 Scheduling: triggers are a successful `ide.start`, Claude post hooks for `Edit`, `Write`,
 `MultiEdit`, `NotebookEdit`, and `Bash`, and a completed `ide.edit`. Per `(worktree, language)`,

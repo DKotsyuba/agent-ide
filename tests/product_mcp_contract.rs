@@ -175,7 +175,7 @@ impl Mcp {
             .env("CLAUDE_PROJECT_DIR", project)
             .env_remove("AGENT_IDE_HOST_ATTACHMENT")
             .env_remove("AGENT_IDE_MANAGED_CODEX_ATTACHMENT")
-            .args(["mcp", "--auto-launcher-template"])
+            .args(["mcp", "--claude-launcher-template"])
             .arg(template)
             .current_dir(project.parent().unwrap())
             .stdin(Stdio::piped())
@@ -3377,6 +3377,64 @@ async fn managed_claude_root_child_rendezvous_shared_daemon_survives_eof() {
         runtime.is_dir(),
         "the shared daemon must outlive its spawning MCP's own EOF"
     );
+}
+
+/// A fresh daemon started by its first non-root worktree pairs the real hook before the first MCP call.
+/// A stale cached key must be replaced before either worktree's full helper flow begins.
+#[tokio::test]
+async fn managed_claude_first_worktree_start_pairs_before_mcp_call() {
+    let fixture = ProductFixture::new_claude(json!([]));
+    let left = fixture.base.join("first-worktree");
+    let right = fixture.base.join("second-worktree");
+    fixture.git(&[
+        "worktree",
+        "add",
+        "--quiet",
+        "-b",
+        "first",
+        left.to_str().unwrap(),
+    ]);
+    fixture.git(&[
+        "worktree",
+        "add",
+        "--quiet",
+        "-b",
+        "second",
+        right.to_str().unwrap(),
+    ]);
+    let runtime = managed_claude_runtime_path(&left);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    assert!(!runtime.exists());
+    let cache = std::fs::canonicalize("/private/tmp").unwrap().join(format!(
+        "ai-k-{}",
+        &blake3::hash(left.as_os_str().as_bytes()).to_hex().as_str()[..16]
+    ));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&cache)
+        .unwrap();
+    std::fs::write(cache.join("key"), b"/private/tmp/stale-rendezvous-key").unwrap();
+    std::fs::set_permissions(cache.join("key"), std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    for (project, session) in [(&left, "first-session"), (&right, "second-session")] {
+        let mut mcp = Mcp::start_managed_claude(&fixture.config, project).await;
+        let mut next = 1;
+        let pending = managed_claude_call(
+            &mut mcp,
+            project,
+            next,
+            session,
+            None,
+            "ide.start",
+            json!({"activation_id":session}),
+        )
+        .await;
+        let started =
+            settle_managed_claude_start(&mut mcp, project, &mut next, session, None, &pending)
+                .await;
+        assert_eq!(started["kind"], "activation", "{started}");
+        mcp.close().await;
+    }
 }
 
 /// A removed worktree must not poison later activation in the same repository daemon.
