@@ -1,20 +1,32 @@
 #!/bin/sh
-# WORK IN PROGRESS: this driver is unfinished and committed as-is to carry the
-# work forward. The direct Claude route is partially debugged and has not yet
-# produced a real_pass host-cell result, so nothing may wire it into release
-# acceptance yet.
+# Status: refreshed for the current hosts; first passing run pending; see
+# docs/macos-acceptance.md results table.
 
 # Real-host driver for the installed agent-run to Claude acceptance route.
 #
 # The runner starts this executable with AGENT_IDE_ACCEPTANCE_ROUTE=
 # agent-run-claude, the two isolated fixture worktrees, and a fresh result
-# path. The driver starts real agents through the installed agent-run CLI on
-# its glm runtime (Claude Code with a GLM backend), which attaches the
-# externally installed agent-ide MCP and plugin from the operator's agent-run
-# configuration. Scenario verification uses the agents' stored answers, real
-# filesystem effects, and the durable telemetry database; the driver fails
-# closed before starting any agent when the installed MCP binary or launcher
-# template does not carry the candidate v0.2 surface.
+# path. The driver starts real agents through the installed agent-run 0.12.x
+# CLI. Its resident broker spawns the agent process, so environment variables
+# set on the start command line (AGENT_IDE_BIN, HOME) do NOT reach the agent:
+# the agent's Claude host, agent-ide MCP, and plugin come entirely from the
+# operator's ~/.agent-run/config.toml [mcp.agent_ide] entry (installed
+# /Users/pluto/.local/bin/agent-ide plus launcher.json). The driver therefore
+# fails closed before starting any agent unless the installed binary is
+# byte-identical to the release candidate. Scenario verification uses the
+# agents' stored answers, real filesystem effects, and the durable telemetry
+# database.
+#
+# Runtime decision: the route's intent is a real Claude host driven through
+# agent-run (host version token agent-run-0.12.4+claude-code-2.1.274), so the
+# defaults select the claude runtime with the sonnet model. The owner's
+# glm-5.3-flash delegation preference for code work stays available through the
+# runtime and model environment knobs below.
+#
+# `start --timeout` is legacy metadata only and does not stop execution; the
+# outer `perl alarm` is the only wall-clock bound. Setting
+# AGENT_IDE_ACCEPTANCE_DRY=1 prints the exact session command lines and exits 0
+# without running anything.
 #
 # Operator environment (all optional, defaults fit the release host):
 #   AGENT_IDE_ACCEPTANCE_BINARY         candidate agent-ide executable used for
@@ -22,16 +34,16 @@
 #                                       helpers; default
 #                                       <repo>/target/release/agent-ide.
 #   AGENT_IDE_ACCEPTANCE_AGENT_RUN      installed agent-run CLI; default
-#                                       /Users/pluto/.local/bin/agent-run.
+#                                       /Users/pluto/.agent-run/standalone/current/bin/agent-run.
 #   AGENT_IDE_ACCEPTANCE_AGENT_RUN_MCP_BINARY binary the agent-run mcp.agent_ide
 #                                       table executes; default
 #                                       /Users/pluto/.local/bin/agent-ide. It
-#                                       must be the release candidate; the
-#                                       driver refuses a binary that lacks the
-#                                       v0.2 Claude surface.
-#   AGENT_IDE_ACCEPTANCE_AGENT_RUN_RUNTIME  agent-run runtime name; default glm.
-#   AGENT_IDE_ACCEPTANCE_AGENT_RUN_MODEL    economical model id; default
-#                                       glm-5.3-flash.
+#                                       must be byte-identical to the release
+#                                       candidate; the driver refuses anything
+#                                       else with installed_binary_differs.
+#   AGENT_IDE_ACCEPTANCE_AGENT_RUN_RUNTIME  agent-run runtime name; default
+#                                       claude.
+#   AGENT_IDE_ACCEPTANCE_AGENT_RUN_MODEL    model id; default sonnet.
 #   AGENT_IDE_ACCEPTANCE_AGENT_RUN_PROFILE  agent-run profile; default
 #                                       implement.
 #   AGENT_IDE_ACCEPTANCE_LAUNCHER       launcher template the installed MCP
@@ -52,25 +64,43 @@ DRIVER_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 [ -n "${AGENT_IDE_ACCEPTANCE_RESULT:-}" ] || fail E_RESULT_PATH_MISSING
 
 BINARY=${AGENT_IDE_ACCEPTANCE_BINARY:-$DRIVER_ROOT/target/release/agent-ide}
-AGENT_RUN=${AGENT_IDE_ACCEPTANCE_AGENT_RUN:-/Users/pluto/.local/bin/agent-run}
+AGENT_RUN=${AGENT_IDE_ACCEPTANCE_AGENT_RUN:-/Users/pluto/.agent-run/standalone/current/bin/agent-run}
 MCP_BINARY=${AGENT_IDE_ACCEPTANCE_AGENT_RUN_MCP_BINARY:-/Users/pluto/.local/bin/agent-ide}
-RUNTIME=${AGENT_IDE_ACCEPTANCE_AGENT_RUN_RUNTIME:-glm}
-AR_MODEL=${AGENT_IDE_ACCEPTANCE_AGENT_RUN_MODEL:-glm-5.3-flash}
+RUNTIME=${AGENT_IDE_ACCEPTANCE_AGENT_RUN_RUNTIME:-claude}
+AR_MODEL=${AGENT_IDE_ACCEPTANCE_AGENT_RUN_MODEL:-sonnet}
 AR_PROFILE=${AGENT_IDE_ACCEPTANCE_AGENT_RUN_PROFILE:-implement}
 LAUNCHER=${AGENT_IDE_ACCEPTANCE_LAUNCHER:-/Users/pluto/.config/agent-ide/launcher.json}
 OPERATOR_HOME=${AGENT_IDE_ACCEPTANCE_OPERATOR_HOME:-/Users/pluto}
 SESSION_SECONDS=${AGENT_IDE_ACCEPTANCE_SESSION_SECONDS:-1800}
+
+# Dry run: print the exact session command lines and exit without running
+# anything. Contract variables only need to be set; no host is touched.
+if [ "${AGENT_IDE_ACCEPTANCE_DRY:-0}" = 1 ]; then
+    for scenario in l1:LEFT l2:LEFT l3:LEFT l4:LEFT r5:RIGHT; do
+        label=${scenario%%:*}
+        eval "worktree=\$AGENT_IDE_ACCEPTANCE_${scenario##*:}_WORKTREE"
+        printf '%s\n' "/usr/bin/perl -e 'alarm shift; exec @ARGV' $SESSION_SECONDS \
+$AGENT_RUN start --runtime $RUNTIME --model $AR_MODEL --profile $AR_PROFILE \
+--task \"\$(cat $DIAG_DIR/task-$label.txt)\" --workdir $worktree --write --wait \
+> $DIAG_DIR/start-$label.out 2> $DIAG_DIR/start-$label.err
+$AGENT_RUN answer \$agent_id > $DIAG_DIR/answer-$label.txt"
+    done
+    exit 0
+fi
 
 [ -x "$BINARY" ] || fail E_BINARY_MISSING "$BINARY"
 [ -x "$AGENT_RUN" ] || fail E_AGENT_RUN_MISSING "$AGENT_RUN"
 [ -x "$MCP_BINARY" ] || fail E_MCP_BINARY_MISSING "$MCP_BINARY"
 [ -r "$LAUNCHER" ] || fail E_LAUNCHER_MISSING "$LAUNCHER"
 
-# The route can only claim the candidate contract when the binary agent-run
-# executes actually carries the v0.2 Claude TypeScript record surface and the
-# launcher template declares that accepted record.
-/usr/bin/strings "$MCP_BINARY" | /usr/bin/grep -q 'claude-r3-2026-09-14' \
-    || fail E_MCP_BINARY_NOT_CANDIDATE "installed MCP binary predates the v0.2 surface"
+# The route can only claim the candidate contract when the binary the resident
+# broker actually executes is byte-identical to the release candidate, and the
+# launcher template declares the accepted Claude TypeScript record. Environment
+# set here cannot redirect the agent to the candidate, so a differing installed
+# binary fails the cell closed before any agent starts.
+cmp -s "$BINARY" "$MCP_BINARY" \
+    || fail installed_binary_differs \
+        "$MCP_BINARY is not byte-identical to the candidate $BINARY"
 /usr/bin/grep -q 'claude-r3-2026-09-14' "$LAUNCHER" \
     || fail E_LAUNCHER_NO_CLAUDE_TYPESCRIPT "launcher template lacks the accepted Claude TypeScript record"
 
@@ -93,21 +123,25 @@ prepare_worktree() {
         >"$1/.claude/settings.local.json" || fail E_SETTINGS_WRITE "$1"
 }
 
-# Runs one bounded agent-run agent and prints its final answer text.
+# Runs one wall-clock-bounded agent-run agent and collects its final answer.
 #
 # The first argument is a short label, the second the worktree, and the third
-# the task file. The label, worktree, and answer are appended to the private
-# diagnostic log; agent identifiers never enter public evidence.
+# the task file. No environment is attached to the start command: the resident
+# broker spawns the agent process, so CLI-level variables (AGENT_IDE_BIN, HOME)
+# never reach it — the agent runs with the broker's environment and the
+# operator's config.toml MCP entry. `--timeout` is legacy metadata only and is
+# deliberately omitted; the outer `perl alarm` is the wall-clock bound. The
+# label, worktree, and answer are appended to the private diagnostic log; agent
+# identifiers never enter public evidence.
 run_agent() {
     label=$1
     worktree=$2
     task_file=$3
     answer_file=$DIAG_DIR/answer-$label.txt
-    if AGENT_IDE_BIN="$MCP_BINARY" HOME="$OPERATOR_HOME" \
-        /usr/bin/perl -e 'alarm shift; exec @ARGV' "$SESSION_SECONDS" \
+    if /usr/bin/perl -e 'alarm shift; exec @ARGV' "$SESSION_SECONDS" \
         "$AGENT_RUN" start --runtime "$RUNTIME" --model "$AR_MODEL" \
         --profile "$AR_PROFILE" --task "$(cat "$task_file")" \
-        --workdir "$worktree" --write --wait --timeout "$SESSION_SECONDS" \
+        --workdir "$worktree" --write --wait \
         >"$DIAG_DIR/start-$label.out" 2>"$DIAG_DIR/start-$label.err"
     then
         note "agent-$label-started"

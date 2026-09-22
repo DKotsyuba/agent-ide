@@ -1,8 +1,6 @@
 #!/bin/sh
-# WORK IN PROGRESS: this driver is unfinished and committed as-is to carry the
-# work forward. The direct Claude route is partially debugged and has not yet
-# produced a real_pass host-cell result, so nothing may wire it into release
-# acceptance yet.
+# Status: refreshed for the current hosts; first passing run pending; see
+# docs/macos-acceptance.md results table.
 
 # Real-host driver for the direct Claude Code acceptance route.
 #
@@ -15,10 +13,17 @@
 # failing step records a closed code in the private diagnostic log and fails the
 # whole cell honestly.
 #
+# Turn bound: Claude Code 2.1.274 documents no flag that bounds agentic turns
+# (`--max-turns` and similar are gone from `claude --help`), so each session is
+# bounded only by the outer `perl alarm` wall clock below.
+#
 # Each scenario session is attempted up to three times because an economical
 # model occasionally drops a scripted helper step; every retry first restores
 # the exact fixture precondition, so an attempt always starts from the same
 # worktree state and a later attempt can never inherit a partial effect.
+#
+# Setting AGENT_IDE_ACCEPTANCE_DRY=1 prints the exact session command lines and
+# exits 0 without running anything.
 #
 # Operator environment (all optional, defaults fit the release host):
 #   AGENT_IDE_ACCEPTANCE_BINARY       candidate agent-ide executable;
@@ -28,8 +33,8 @@
 #   AGENT_IDE_ACCEPTANCE_MODEL        economical model alias; default haiku.
 #   AGENT_IDE_ACCEPTANCE_LAUNCHER     strict launcher template carrying both the
 #                                     Pyright and accepted TypeScript Claude
-#                                     records; default
-#                                     /Users/pluto/.config/agent-ide/launcher-v0.2.json.
+#                                     records (claude-r3-2026-09-14); default
+#                                     /Users/pluto/.config/agent-ide/launcher.json.
 #   AGENT_IDE_ACCEPTANCE_OPERATOR_HOME operator home with the existing Claude
 #                                     login; default /Users/pluto. Credentials
 #                                     are never copied, read, or printed.
@@ -52,9 +57,32 @@ MAX_ATTEMPTS=3
 BINARY=${AGENT_IDE_ACCEPTANCE_BINARY:-$DRIVER_ROOT/target/release/agent-ide}
 CLAUDE=${AGENT_IDE_ACCEPTANCE_CLAUDE:-/Users/pluto/.local/bin/claude}
 MODEL=${AGENT_IDE_ACCEPTANCE_MODEL:-haiku}
-LAUNCHER=${AGENT_IDE_ACCEPTANCE_LAUNCHER:-/Users/pluto/.config/agent-ide/launcher-v0.2.json}
+LAUNCHER=${AGENT_IDE_ACCEPTANCE_LAUNCHER:-/Users/pluto/.config/agent-ide/launcher.json}
 OPERATOR_HOME=${AGENT_IDE_ACCEPTANCE_OPERATOR_HOME:-/Users/pluto}
 SESSION_SECONDS=${AGENT_IDE_ACCEPTANCE_SESSION_SECONDS:-900}
+
+# Dry run: print the exact session command lines and exit without running
+# anything. Contract variables only need to be set; no host is touched.
+if [ "${AGENT_IDE_ACCEPTANCE_DRY:-0}" = 1 ]; then
+    for scenario in l1:LEFT l1b:LEFT l2:LEFT l3:LEFT l4:LEFT r5:RIGHT r5b:RIGHT; do
+        label=${scenario%%:*}
+        eval "worktree=\$AGENT_IDE_ACCEPTANCE_${scenario##*:}_WORKTREE"
+        printf '%s\n' "cd $worktree && HOME=$OPERATOR_HOME AGENT_IDE_BIN=$BINARY \
+CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0 PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+/usr/bin/env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL -u ANTHROPIC_API_KEY \
+-u ANTHROPIC_MODEL -u ANTHROPIC_SMALL_FAST_MODEL -u CLAUDECODE \
+-u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_EXECPATH \
+-u CLAUDE_CODE_MESSAGING_SOCKET -u CLAUDE_CODE_MESSAGING_TOKEN \
+-u CLAUDE_CODE_SESSION_ID -u CLAUDE_PID -u CLAUDE_EFFORT \
+/usr/bin/perl -e 'alarm shift; exec @ARGV' $SESSION_SECONDS \
+$CLAUDE -p \"\$(cat $DIAG_DIR/prompt-$label.txt)\" --model $MODEL \
+--output-format stream-json --verbose --dangerously-skip-permissions \
+--strict-mcp-config --mcp-config $DIAG_DIR/claude-mcp.json \
+--plugin-dir $worktree > $DIAG_DIR/transcript-$label.jsonl \
+2> $DIAG_DIR/session-$label.err"
+    done
+    exit 0
+fi
 
 [ -x "$BINARY" ] || fail E_BINARY_MISSING "$BINARY"
 [ -x "$CLAUDE" ] || fail E_CLAUDE_MISSING "$CLAUDE"
@@ -94,25 +122,23 @@ reset_fixture() {
         || fail E_FIXTURE_RESET "git checkout failed in $1"
 }
 
-# Runs one bounded `claude -p` session inside a worktree.
+# Runs one wall-clock-bounded `claude -p` session inside a worktree.
 #
 # The first argument is a short session label, the second the canonical
-# worktree, the third the prompt file, and the fourth the turn bound. The
-# session runs inside that worktree and inherits the operator's real home for
-# the existing OAuth login plus AGENT_IDE_BIN so the plugin hooks exec the
-# candidate binary. Every inherited authentication and nested-session variable
-# of the invoking agent is removed, so the route really exercises the operator's
-# Claude login instead of a wrapper backend. PATH is reduced to system
-# directories: an ambient `agent-ide` on PATH would let a second, stale host
-# hook register a duplicate pre-observation for the same tool call, which the
-# daemon correctly rejects as ambiguous, so only the candidate plugin hook may
-# deliver binding evidence. The complete stream-json transcript stays in the
-# private diagnostic directory.
+# worktree, and the third the prompt file. The session runs inside that worktree
+# and inherits the operator's real home for the existing OAuth login plus
+# AGENT_IDE_BIN so the plugin hooks exec the candidate binary. Every inherited
+# authentication and nested-session variable of the invoking agent is removed,
+# so the route really exercises the operator's Claude login instead of a wrapper
+# backend. PATH is reduced to system directories: an ambient `agent-ide` on PATH
+# would let a second, stale host hook register a duplicate pre-observation for
+# the same tool call, which the daemon correctly rejects as ambiguous, so only
+# the candidate plugin hook may deliver binding evidence. The complete
+# stream-json transcript stays in the private diagnostic directory.
 run_session() {
     label=$1
     worktree=$2
     prompt_file=$3
-    max_turns=$4
     transcript=$DIAG_DIR/transcript-$label.jsonl
     rm -f -- "$transcript"
     if (cd "$worktree" && HOME="$OPERATOR_HOME" AGENT_IDE_BIN="$BINARY" \
@@ -126,7 +152,7 @@ run_session() {
         /usr/bin/perl -e 'alarm shift; exec @ARGV' "$SESSION_SECONDS" \
         "$CLAUDE" -p "$(cat "$prompt_file")" \
         --model "$MODEL" --output-format stream-json --verbose \
-        --max-turns "$max_turns" --dangerously-skip-permissions \
+        --dangerously-skip-permissions \
         --strict-mcp-config --mcp-config "$MCP_CONFIG" --plugin-dir "$worktree" \
         >"$transcript" 2>"$DIAG_DIR/session-$label.err")
     then
@@ -141,20 +167,19 @@ run_session() {
 }
 
 # Repeats one scenario session until its verify function accepts or attempts
-# run out. The arguments are the label, worktree, prompt file, turn bound, the
-# verify function name, the reset function name, and the closed failure code.
+# run out. The arguments are the label, worktree, prompt file, verify function
+# name, reset function name, and the closed failure code.
 run_scenario() {
     label=$1
     worktree=$2
     prompt_file=$3
-    max_turns=$4
-    verify=$5
-    reset=$6
-    code=$7
+    verify=$4
+    reset=$5
+    code=$6
     attempt=1
     while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
         note "scenario-$label-attempt" "$attempt"
-        if run_session "$label" "$worktree" "$prompt_file" "$max_turns" \
+        if run_session "$label" "$worktree" "$prompt_file" \
             && "$verify"; then
             note "scenario-$label-passed" "attempt $attempt"
             return 0
@@ -264,22 +289,22 @@ verify_r5() {
 
 # Scenario L1: real edit/diagnostic/fix/diff/stop loop over Pyright.
 cp -- "$DRIVER_DIR/claude-prompts/l1.txt" "$DIAG_DIR/prompt-l1.txt"
-run_scenario l1 "$LEFT" "$DIAG_DIR/prompt-l1.txt" 40 verify_l1 reset_fixture A_L1_SCENARIO
+run_scenario l1 "$LEFT" "$DIAG_DIR/prompt-l1.txt" verify_l1 reset_fixture A_L1_SCENARIO
 
 # Scenario L1B: the composed diff of the finished loop in a fresh session.
 cp -- "$DRIVER_DIR/claude-prompts/l1b.txt" "$DIAG_DIR/prompt-l1b.txt"
-run_scenario l1b "$LEFT" "$DIAG_DIR/prompt-l1b.txt" 24 verify_l1b reset_left_fixed A_L1B_SCENARIO
+run_scenario l1b "$LEFT" "$DIAG_DIR/prompt-l1b.txt" verify_l1b reset_left_fixed A_L1B_SCENARIO
 
 # Scenario L2: native fallback while inactive, then a stale edit with zero
 # writes. Retries restart from the post-L1 fixed state.
 reset_left_fixed "$LEFT"
 cp -- "$DRIVER_DIR/claude-prompts/l2.txt" "$DIAG_DIR/prompt-l2.txt"
-run_scenario l2 "$LEFT" "$DIAG_DIR/prompt-l2.txt" 40 verify_l2 reset_left_fixed A_L2_SCENARIO
+run_scenario l2 "$LEFT" "$DIAG_DIR/prompt-l2.txt" verify_l2 reset_left_fixed A_L2_SCENARIO
 
 # Scenario L3: real TypeScript semantic context through the accepted bundle.
 reset_left_native "$LEFT"
 cp -- "$DRIVER_DIR/claude-prompts/l3.txt" "$DIAG_DIR/prompt-l3.txt"
-run_scenario l3 "$LEFT" "$DIAG_DIR/prompt-l3.txt" 24 verify_l3 reset_left_native A_L3_SCENARIO
+run_scenario l3 "$LEFT" "$DIAG_DIR/prompt-l3.txt" verify_l3 reset_left_native A_L3_SCENARIO
 
 # Restart-safe telemetry: durable events survive the daemon restart of a fresh
 # session and both query and export read them back through the CLI.
@@ -293,7 +318,7 @@ cp -- "$DRIVER_DIR/claude-prompts/l4.txt" "$DIAG_DIR/prompt-l4.txt"
 l4_attempt=1
 while [ "$l4_attempt" -le "$MAX_ATTEMPTS" ]; do
     note "scenario-l4-attempt" "$l4_attempt"
-    if run_session l4 "$LEFT" "$DIAG_DIR/prompt-l4.txt" 12 \
+    if run_session l4 "$LEFT" "$DIAG_DIR/prompt-l4.txt" \
         && require_transcript_text "$DIAG_DIR/transcript-l4.jsonl" "LEFT_RESTART_OK" A_L4_FINAL; then
         break
     fi
@@ -313,7 +338,7 @@ RIGHT_IDENTITY=$(project_identity "$BINARY" "$RIGHT") || fail E_RIGHT_IDENTITY
 RIGHT_RUNTIME=/private/tmp/ai-c-$(printf '%s' "$RIGHT_IDENTITY" | cut -c1-16)
 prepare_worktree "$RIGHT" "$RIGHT_RUNTIME"
 cp -- "$DRIVER_DIR/claude-prompts/r5.txt" "$DIAG_DIR/prompt-r5.txt"
-run_scenario r5 "$RIGHT" "$DIAG_DIR/prompt-r5.txt" 40 verify_r5 reset_fixture A_R5_SCENARIO
+run_scenario r5 "$RIGHT" "$DIAG_DIR/prompt-r5.txt" verify_r5 reset_fixture A_R5_SCENARIO
 
 # Verifies the R5 diff session in the divergent right worktree.
 verify_r5b() {
@@ -329,7 +354,7 @@ verify_r5b() {
 
 # Scenario R5B: the composed diff of the right loop in a fresh session.
 cp -- "$DRIVER_DIR/claude-prompts/r5b.txt" "$DIAG_DIR/prompt-r5b.txt"
-run_scenario r5b "$RIGHT" "$DIAG_DIR/prompt-r5b.txt" 24 verify_r5b reset_fixture A_R5B_SCENARIO
+run_scenario r5b "$RIGHT" "$DIAG_DIR/prompt-r5b.txt" verify_r5b reset_fixture A_R5B_SCENARIO
 
 # Compact projection holds across every captured session.
 for transcript in "$DIAG_DIR"/transcript-l*.jsonl "$DIAG_DIR"/transcript-r5*.jsonl; do
