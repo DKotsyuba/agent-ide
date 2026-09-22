@@ -12,6 +12,6 @@ The agent-ide MCP tools may appear in your tool list under a prefixed or
 spelling variant (ide.context or ide_context); they are the same tools.
 
 1. Call ide.start with {"activation_id":"acceptance-left-3"}. Apply R1 to that reply.
-2. Call ide.context with {"path":"acceptance-fixture/fixture.ts"}. Apply R1 to that reply.
+2. Call ide.context with {"path":"acceptance-fixture/fixture.ts","byte_offset":13}. Apply R1 to that reply.
 3. Call ide.stop with {}.
 Then reply with exactly: LEFT_TS_OK
