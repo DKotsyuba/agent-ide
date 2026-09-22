@@ -397,6 +397,9 @@ async fn execute(
         Ok(ClaimReply::Granted(job)) => *job,
         _ => return REFUSED,
     };
+    // The helper runs provider children on the daemon's behalf, so its provider failures would
+    // otherwise settle invisibly; init is first-call-wins and every write stays fail-open.
+    crate::errorlog::init(runtime_dir);
     let (outcome, children, discovery, payload) = perform(&job).await;
     let settled = children.settled();
     let result = HelperResult {
@@ -1393,6 +1396,10 @@ async fn provider_context(
     let mut child = match process.spawn() {
         Ok(child) => child,
         Err(_) => {
+            record_provider_unavailable(
+                job.operation,
+                &format!("provider_spawn_refused:{}", provider_tag(provider.language)),
+            );
             *spawned = spawned.saturating_sub(1);
             return Err(FailureCode::ProviderUnavailable);
         }
@@ -1400,11 +1407,14 @@ async fn provider_context(
     let (Some(mut input), Some(mut output)) = (child.stdout.take(), child.stdin.take()) else {
         let settled = child.kill().await.is_ok() && child.wait().await.is_ok();
         *reaped += u32::from(settled);
-        return Err(if settled {
-            FailureCode::ProviderUnavailable
-        } else {
-            FailureCode::Deadline
-        });
+        if settled {
+            record_provider_unavailable(
+                job.operation,
+                &format!("provider_spawn_refused:{}", provider_tag(provider.language)),
+            );
+            return Err(FailureCode::ProviderUnavailable);
+        }
+        return Err(FailureCode::Deadline);
     };
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {
@@ -1471,6 +1481,10 @@ async fn provider_context(
                 return Err(FailureCode::ResolutionUnverified);
             }
             if !status.success() || operation.is_err() {
+                record_provider_unavailable(
+                    job.operation,
+                    &format!("provider_child_exit:{}", provider_tag(provider.language)),
+                );
                 return Err(FailureCode::ProviderUnavailable);
             }
         }
@@ -1482,9 +1496,48 @@ async fn provider_context(
             return Err(FailureCode::Deadline);
         }
     }
-    operation
-        .map(Some)
-        .map_err(|_| FailureCode::ProviderUnavailable)
+    operation.map(Some).map_err(|_| {
+        record_provider_unavailable(
+            job.operation,
+            &format!(
+                "provider_session_failed:{}",
+                provider_tag(provider.language)
+            ),
+        );
+        FailureCode::ProviderUnavailable
+    })
+}
+
+/// Logs which accepted-provider child condition failed (T38B) right before it collapses into the
+/// coarse lexical `accepted semantic provider is unavailable` reply (T107 pattern). The `detail`
+/// names only the closed provider tag and the closed condition token — never a path, digest,
+/// command line, or OS error string.
+fn record_provider_unavailable(operation: HelperOperation, condition: &str) {
+    let method = match operation {
+        HelperOperation::Start => crate::errorlog::Method::Start,
+        HelperOperation::Context => crate::errorlog::Method::Context,
+        HelperOperation::Diff => crate::errorlog::Method::Diff,
+        HelperOperation::Edit => crate::errorlog::Method::Edit,
+    };
+    crate::errorlog::record(
+        method,
+        crate::errorlog::Outcome::Failed,
+        crate::errorlog::Fields {
+            reason: Some(crate::errorlog::ReasonCode::ProviderUnavailable),
+            detail: Some(condition),
+            ..Default::default()
+        },
+    );
+}
+
+/// Returns the closed provider tag used in provider-condition error-log details.
+fn provider_tag(language: HelperLanguage) -> &'static str {
+    match language {
+        HelperLanguage::Go => "go",
+        HelperLanguage::Rust => "rust",
+        HelperLanguage::Python => "python",
+        HelperLanguage::TypeScript => "typescript",
+    }
 }
 
 /// Truncates one helper result only at a UTF-8 boundary and marks the omission explicitly.

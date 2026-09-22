@@ -81,6 +81,14 @@ T24B: each `execution_profile` conversion site on the activation/read path also 
 and `read_scope:<variant>`. Only class names and closed variant names are ever recorded — never
 paths, sandbox-state JSON, digests, or OS error strings.
 
+T38B: a Claude foreground helper that settles a provider operation as `provider_unavailable` also
+logs its own `<method> failed provider_unavailable` event from the helper process (the helper
+initializes the same per-repository log from its runtime directory). Its `detail` names exactly
+which accepted-provider condition failed, from this closed vocabulary:
+`provider_spawn_refused:<go|rust|python|typescript>`, `provider_child_exit:<go|rust|python|
+typescript>`, and `provider_session_failed:<go|rust|python|typescript>`. Only these class names and
+closed provider tags are ever recorded — never paths, digests, commands, or OS error strings.
+
 ## Failure semantics
 
 Writing is fail-open and nonblocking: a missing or unwritable directory, a rotation failure, or a
