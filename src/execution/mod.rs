@@ -1130,6 +1130,8 @@ pub struct ControlledCommand {
     cwd: PathBuf,
     /// Exact environment entries after local cardinality validation; parent environment is cleared.
     env: BTreeMap<OsString, OsString>,
+    /// Optional already-open private input file; no repository path is passed as stdin.
+    stdin_file: Option<Arc<std::fs::File>>,
     /// Executable identity measured at declaration; construction fails closed without it.
     program_identity: ExecutableIdentity,
 }
@@ -1142,6 +1144,11 @@ impl PartialEq for ControlledCommand {
             && self.args == other.args
             && self.cwd == other.cwd
             && self.env == other.env
+            && match (&self.stdin_file, &other.stdin_file) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
             && self.program_identity == other.program_identity
     }
 }
@@ -1186,8 +1193,16 @@ impl ControlledCommand {
             args,
             cwd,
             env,
+            stdin_file: None,
             program_identity,
         })
+    }
+
+    /// Binds a private, already-open bounded input file to one peer-built command. Clones retain
+    /// the same descriptor; the owning snapshot intent keeps its 0700 directory until reap.
+    pub(crate) fn with_private_stdin(mut self, file: std::fs::File) -> Self {
+        self.stdin_file = Some(Arc::new(file));
+        self
     }
 
     /// Reports whether this command's construction-time program digest equals `expected`.
@@ -4092,7 +4107,9 @@ fn launch_child(
     }
     let mut process = build_command(command, sandbox, codex_executable, trampoline)?;
     process.stdout(Stdio::piped()).stderr(Stdio::piped());
-    if protocol {
+    if let Some(file) = &command.stdin_file {
+        process.stdin(Stdio::from(file.try_clone()?));
+    } else if protocol {
         process.stdin(Stdio::piped());
     }
     configure_process_group(&mut process);
@@ -4865,10 +4882,15 @@ pub async fn run_inherited_controlled_child(
     let mut process = command
         .inherited_process()
         .map_err(|_| InheritedChildFailure::NeverStarted)?;
-    process
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    process.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(file) = &command.stdin_file {
+        process.stdin(Stdio::from(
+            file.try_clone()
+                .map_err(|_| InheritedChildFailure::NeverStarted)?,
+        ));
+    } else {
+        process.stdin(Stdio::null());
+    }
     let generation = launch_generation().map_err(|_| InheritedChildFailure::NeverStarted)?;
     let mut child = process
         .spawn()

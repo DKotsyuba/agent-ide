@@ -890,6 +890,7 @@ impl Worker<'_> {
                 let failure = runner.failure;
                 let fallback = match &error {
                     GitError::UnsupportedSnapshotGit => FailureCode::UnsupportedGit,
+                    GitError::EvidenceTooLarge => FailureCode::Capacity,
                     _ => FailureCode::SourceUnavailable,
                 };
                 let detail = runner

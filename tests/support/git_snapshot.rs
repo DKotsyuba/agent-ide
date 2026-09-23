@@ -254,6 +254,10 @@ use std::{collections::BTreeSet, time::Duration};
 /// Actual Execution-owned local runner with controlled test-only disabled host evidence.
 #[derive(Default)]
 pub struct Runner {
+    /// Optional fixture Git wrapper; absent uses the installed Git binary.
+    pub program: Option<PathBuf>,
+    /// Optional per-stream cap for attribute queries, used to force bounded truncation.
+    pub attribute_output_cap: Option<usize>,
     /// All private directories observed while live, checked for cleanup after capture.
     pub directories: Vec<PathBuf>,
     /// Completed operations counted for deterministic before/after mutation injection.
@@ -264,6 +268,8 @@ pub struct Runner {
     pub mutate_once: bool,
     /// Number of observed blob commands, used to prove OID deduplication.
     pub blobs: usize,
+    /// Number of private no-filter hash batches, including worktree classification.
+    pub hashes: usize,
     /// Number of successful differences exits; these must not be classified as command failures.
     pub different: usize,
     /// Number of completed no-index comparisons, excluding private blob-hash verification.
@@ -296,6 +302,7 @@ impl SnapshotRunner for Runner {
     /// Admits and reaps the exact peer command; scratch remains owned through process completion.
     async fn run(&mut self, intent: SnapshotIntent) -> Result<CapturedProcessEvidence, GitError> {
         use std::os::unix::fs::PermissionsExt;
+        self.hashes += usize::from(intent.label() == "hash-object");
         if let Some(dir) = intent.snapshot_directory() {
             assert_eq!(
                 fs::metadata(dir).unwrap().permissions().mode() & 0o777,
@@ -311,8 +318,15 @@ impl SnapshotRunner for Runner {
         } else if format!("{:?}", intent.command()).contains("cat-file") {
             self.blobs += 1;
         }
-        let (child, mut admissions) =
-            launch_intent(&intent, Path::new(GIT), MAX_SNAPSHOT_BLOB_BYTES)?;
+        let (child, mut admissions) = launch_intent(
+            &intent,
+            self.program.as_deref().unwrap_or(Path::new(GIT)),
+            if intent.label() == "check-attr" {
+                self.attribute_output_cap.unwrap_or(MAX_SNAPSHOT_BLOB_BYTES)
+            } else {
+                MAX_SNAPSHOT_BLOB_BYTES
+            },
+        )?;
         let completed = child
             .reap(Duration::from_secs(5), Duration::from_secs(5))
             .await

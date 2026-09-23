@@ -6830,6 +6830,53 @@ mod stop_retry_tests {
         );
     }
 
+    /// The managed snapshot route reports capacity for both a metadata stream and a blob stream
+    /// above its configured 1 KiB child-output cap, preserving the closed failing stage.
+    #[tokio::test]
+    async fn diff_stream_caps_report_capacity_for_metadata_and_blob() {
+        for case in ["metadata", "blob"] {
+            let fixture = Fixture::new();
+            if case == "metadata" {
+                for n in 0..30 {
+                    std::fs::write(fixture.root.join(format!("file-{n:02}.txt")), "base\n")
+                        .unwrap();
+                }
+            } else {
+                std::fs::write(fixture.root.join("large.txt"), vec![b'a'; 4096]).unwrap();
+            }
+            git_commit(&fixture.root, "stream baseline");
+            if case == "blob" {
+                std::fs::write(fixture.root.join("large.txt"), vec![b'b'; 4096]).unwrap();
+            }
+            let store = fixture.store();
+            let workspace = DurableWorkspace::open(&store).await.unwrap();
+            let mut worker = worker(&store, workspace, fixture.root.clone());
+            worker.observations.install_schema().await.unwrap();
+            let (binding, _, authority, _) =
+                activate_read_scope(&mut worker, "stream-actor", "stream-start").await;
+            let (invocation, observed) =
+                read_scope_call(&worker, None, "stream-actor", "stream-diff-call");
+            let (mut job, _cancel) = diff_job(&fixture.root, invocation, observed, "stream-diff");
+            retain_detail(
+                &worker,
+                &binding,
+                "stream-diff",
+                AssistanceTool::Diff,
+                &authority,
+            );
+            assert_eq!(
+                worker.diff(&mut job).await.unwrap_err(),
+                FailureCode::Capacity,
+                "{case}"
+            );
+            assert_eq!(
+                job.failure_detail.as_deref(),
+                Some("diff:too_large"),
+                "{case}"
+            );
+        }
+    }
+
     /// A right-hand linked worktree keeps its changed path through a managed head diff and
     /// cached inspection, even when the live profile contains an unrelated deny glob.
     #[tokio::test]

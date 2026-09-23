@@ -241,6 +241,16 @@ pub enum GitReadQuery {
     HeadIdentity,
     /// Collects the complete NUL-delimited index state without writing a tree object.
     IndexState,
+    /// Lists index stat fingerprints without reading worktree content or running filters.
+    IndexStat,
+    /// Resolves the active worktree's index path for racy-entry timestamp checks.
+    IndexPath,
+    /// Reads the effective core.autocrlf value without evaluating worktree content.
+    AutoCrlf,
+    /// Reads the effective core.attributesFile value without evaluating worktree content.
+    AttributesFile,
+    /// Reads the effective core.eol value for text attribute interpretation.
+    CoreEol,
     /// Legacy non-executable HEAD patch tag; live HEAD mode uses the raw snapshot collector.
     HeadDiff,
     /// Legacy non-executable staged patch tag; live staged mode uses the raw snapshot collector.
@@ -257,9 +267,13 @@ impl GitReadQuery {
             | Self::HeadTree
             | Self::UntrackedPaths
             | Self::HeadIdentity
+            | Self::IndexPath
+            | Self::AutoCrlf
+            | Self::AttributesFile
+            | Self::CoreEol
             | Self::HeadDiff => DiffMode::Head,
             Self::IndexState | Self::StagedDiff => DiffMode::Staged,
-            Self::UnstagedDiff => DiffMode::Unstaged,
+            Self::IndexStat | Self::UnstagedDiff => DiffMode::Unstaged,
         }
     }
 }
@@ -892,6 +906,36 @@ fn read_args(query: GitReadQuery) -> Vec<OsString> {
             OsString::from("--stage"),
             OsString::from("-z"),
             OsString::from("--"),
+        ]),
+        GitReadQuery::IndexStat => args.extend([
+            OsString::from("ls-files"),
+            OsString::from("--debug"),
+            OsString::from("-z"),
+            OsString::from("--"),
+        ]),
+        GitReadQuery::IndexPath => args.extend([
+            OsString::from("rev-parse"),
+            OsString::from("--path-format=absolute"),
+            OsString::from("--git-path"),
+            OsString::from("index"),
+        ]),
+        GitReadQuery::AutoCrlf => args.extend([
+            OsString::from("config"),
+            OsString::from("--get"),
+            OsString::from("--default=false"),
+            OsString::from("core.autocrlf"),
+        ]),
+        GitReadQuery::AttributesFile => args.extend([
+            OsString::from("config"),
+            OsString::from("--get"),
+            OsString::from("--default=/dev/null"),
+            OsString::from("core.attributesFile"),
+        ]),
+        GitReadQuery::CoreEol => args.extend([
+            OsString::from("config"),
+            OsString::from("--get"),
+            OsString::from("--default=native"),
+            OsString::from("core.eol"),
         ]),
         GitReadQuery::Status
         | GitReadQuery::HeadDiff

@@ -1663,6 +1663,7 @@ async fn diff(
         spawned: 0,
         reaped: 0,
         failure: None,
+        stage: "capture",
     };
     let evidence = crate::workspace::git::snapshot::collect_snapshot_scoped(
         scope.clone(),
@@ -1678,13 +1679,35 @@ async fn diff(
     *reaped = reaped.saturating_add(runner.reaped);
     let evidence = match evidence {
         Ok(evidence) => evidence,
-        Err(_) => {
-            return (
-                HelperOutcome::Failed {
-                    code: runner.failure.unwrap_or(FailureCode::SourceUnavailable),
-                },
-                None,
+        Err(error) => {
+            let code = runner.failure.unwrap_or(match error {
+                crate::workspace::git::GitError::EvidenceTooLarge => FailureCode::Capacity,
+                crate::workspace::git::GitError::UnsupportedSnapshotGit => {
+                    FailureCode::UnsupportedGit
+                }
+                _ => FailureCode::SourceUnavailable,
+            });
+            let detail = format!(
+                "diff:snapshot:{}:{}",
+                runner.stage,
+                match error {
+                    crate::workspace::git::GitError::EvidenceTooLarge => "too_large",
+                    crate::workspace::git::GitError::UnstableSnapshot => "unstable",
+                    crate::workspace::git::GitError::UnsupportedSnapshot => "unsupported_entry",
+                    crate::workspace::git::GitError::UnsupportedSnapshotGit => "unsupported_git",
+                    _ => "failed",
+                }
             );
+            crate::errorlog::record(
+                crate::errorlog::Method::Diff,
+                crate::errorlog::Outcome::Failed,
+                crate::errorlog::Fields {
+                    reason: Some(code.into()),
+                    detail: Some(&detail),
+                    ..Default::default()
+                },
+            );
+            return (HelperOutcome::Failed { code }, None);
         }
     };
     if tokio::time::Instant::now() >= deadline {
@@ -1744,6 +1767,8 @@ struct HelperSnapshotRunner {
     reaped: u32,
     /// First product failure retained separately from Workspace parsing.
     failure: Option<FailureCode>,
+    /// Last fixed snapshot operation, used only in the closed failure log.
+    stage: &'static str,
 }
 
 impl crate::workspace::git::snapshot::SnapshotRunner for HelperSnapshotRunner {
@@ -1761,6 +1786,7 @@ impl crate::workspace::git::snapshot::SnapshotRunner for HelperSnapshotRunner {
         intent: crate::workspace::git::snapshot::SnapshotIntent,
     ) -> Result<crate::execution::CapturedProcessEvidence, crate::workspace::git::GitError> {
         use crate::{execution::InheritedChildFailure, workspace::git::GitError};
+        self.stage = intent.label();
         if self.spawned >= self.remaining_processes {
             self.failure = Some(FailureCode::Capacity);
             return Err(GitError::EvidenceTooLarge);
@@ -1908,19 +1934,13 @@ mod tests {
         (ledger, "detail-1".to_owned())
     }
 
-    /// A launched helper claims once, runs real Git children, reaps them, and settles its frame.
-    /// Proves the snapshot walk's child count no longer scales with tracked-path count (T27B).
-    ///
-    /// A real repository with more tracked paths than the old per-operation process ceiling used
-    /// to exhaust the helper's child budget mid-walk and fail every Claude Diff closed as
-    /// `capacity` without any write. This regression runs the real helper Diff over a worktree
-    /// with more than sixty-four tracked paths and shows even the small legacy budget completes
-    /// the whole walk — unchanged paths cost no per-path children since the batched no-filter
-    /// hash classification — so the budget and the snapshot bound can never silently diverge.
+    /// A real six-hundred-file helper Diff proves empty and then captures one changed path.
+    /// Only changed paths use source/blob children; a change set over the path cap fails closed.
     #[tokio::test]
     async fn diff_helper_completes_the_bounded_snapshot_walk_of_a_real_repository() {
         let candidate = worktree();
-        for index in 0..80 {
+        std::fs::write(candidate.join(".gitattributes"), "*.txt export-ignore\n").unwrap();
+        for index in 0..600 {
             std::fs::write(
                 candidate.join(format!("file-{index:03}.txt")),
                 format!("tracked content {index}\n"),
@@ -1958,7 +1978,6 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        std::fs::write(candidate.join("changed.txt"), "after\n").unwrap();
         let root_identity = crate::workspace::observation::native_directory_identity(
             &std::fs::File::open(&candidate).unwrap(),
         )
@@ -1992,16 +2011,22 @@ mod tests {
                 deadline_ms: 120_000,
             },
         };
-        // The small legacy budget now completes the same walk: classification is batched, so the
-        // child count stays far below the ceiling no matter how many tracked paths are unchanged.
-        let (outcome, small, _, _) = perform(&diff_job(64, 64 * 1024)).await;
+        let (clean, _, _, _) = perform(&diff_job(64, 1024 * 1024)).await;
+        let HelperOutcome::Complete { text } = clean else {
+            panic!("large clean helper diff must complete: {clean:?}");
+        };
+        assert!(text.contains("tracked: 0; untracked: 0"), "{text}");
+        std::fs::write(candidate.join("changed.txt"), "after\n").unwrap();
+        std::fs::write(candidate.join("new.txt"), "untracked\n").unwrap();
+        // The small legacy budget still completes a large tree with one changed path.
+        let (outcome, small, _, _) = perform(&diff_job(64, 1024 * 1024)).await;
         assert!(
             matches!(outcome, HelperOutcome::Complete { .. }),
             "the small legacy budget must complete the batched walk, saw {outcome:?}"
         );
         assert!(
             small.spawned <= 32,
-            "81 tracked paths must not cost per-path children, used {}",
+            "601 tracked paths must not cost per-path children, used {}",
             small.spawned
         );
         // The minted production ceilings complete the same walk and deliver a real diff.
@@ -2016,11 +2041,66 @@ mod tests {
         assert!(children.settled());
         assert!(
             children.spawned <= 32,
-            "81 tracked paths must not cost per-path children, used {}",
+            "601 tracked paths must not cost per-path children, used {}",
             children.spawned
         );
         assert!(text.contains("changed.txt"), "diff text: {text}");
+        assert!(text.contains("new.txt"), "diff text: {text}");
         assert!(matches!(payload, Some(HelperPayload::Diff { .. })));
+        let (metadata_cap, _, _, payload) = perform(&diff_job(1024, 1024)).await;
+        assert!(matches!(
+            metadata_cap,
+            HelperOutcome::Failed {
+                code: FailureCode::Capacity
+            }
+        ));
+        assert!(payload.is_none());
+        std::fs::write(candidate.join("large.txt"), vec![b'a'; 512 * 1024]).unwrap();
+        let status = std::process::Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(&candidate)
+            .args(["add", "--", "."])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = std::process::Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(&candidate)
+            .args([
+                "-c",
+                "user.name=helper",
+                "-c",
+                "user.email=helper@invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "large blob",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(candidate.join("large.txt"), vec![b'b'; 512 * 1024]).unwrap();
+        let (blob_cap, _, _, payload) = perform(&diff_job(1024, 128 * 1024)).await;
+        assert!(matches!(
+            blob_cap,
+            HelperOutcome::Failed {
+                code: FailureCode::Capacity
+            }
+        ));
+        assert!(payload.is_none());
+        for index in 0..257 {
+            std::fs::write(candidate.join(format!("file-{index:03}.txt")), "over cap\n").unwrap();
+        }
+        let (too_many, _, _, payload) = perform(&diff_job(1024, 1024 * 1024)).await;
+        assert!(matches!(
+            too_many,
+            HelperOutcome::Failed {
+                code: FailureCode::Capacity
+            }
+        ));
+        assert!(payload.is_none());
         let _ = std::fs::remove_dir_all(&candidate);
     }
 
