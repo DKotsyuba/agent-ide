@@ -109,6 +109,8 @@ pub enum ExecutionProfileCause {
     ReadSandboxCwdMismatch,
     /// The requested read path was not proven.
     ReadPathUnproven,
+    /// The managed host could not prove read coverage for the whole worktree.
+    ReadWholeTreeUnproven,
     /// Another fixed read-scope condition refused the operation.
     ReadRefused,
     /// Child process creation failed before a usable process existed.
@@ -141,6 +143,7 @@ impl ExecutionProfileCause {
             "read_scope:observed_state_unavailable" => Self::ReadObservedStateUnavailable,
             "read_scope:sandbox_cwd_mismatch" => Self::ReadSandboxCwdMismatch,
             "read_scope:path_unproven" => Self::ReadPathUnproven,
+            "read_scope:whole_tree_unproven" => Self::ReadWholeTreeUnproven,
             "read_scope:refused" => Self::ReadRefused,
             "spawn:io" => Self::SpawnIo,
             "spawn:request" => Self::SpawnRequest,
@@ -169,6 +172,7 @@ impl ExecutionProfileCause {
             Self::ReadObservedStateUnavailable => "read_scope:observed_state_unavailable",
             Self::ReadSandboxCwdMismatch => "read_scope:sandbox_cwd_mismatch",
             Self::ReadPathUnproven => "read_scope:path_unproven",
+            Self::ReadWholeTreeUnproven => "read_scope:whole_tree_unproven",
             Self::ReadRefused => "read_scope:refused",
             Self::SpawnIo => "spawn:io",
             Self::SpawnRequest => "spawn:request",

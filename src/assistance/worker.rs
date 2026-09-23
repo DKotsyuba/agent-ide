@@ -906,6 +906,22 @@ impl WorkerHandle {
         self.shared.project_feed.as_ref()
     }
 
+    /// Hides cached check results before a managed reply can carry a plate when the newly
+    /// observed host profile has no conservative whole-tree read grant. The worker later checks
+    /// the full binding, authority, and catalog before any check is scheduled.
+    pub fn restrict_project_feed(
+        &self,
+        binding: &BindingRef,
+        observed: Option<&ObservedSandboxState>,
+    ) {
+        if let (Some(feed), Some(observed)) = (&self.shared.project_feed, observed)
+            && !crate::execution::HostSandboxState::parse(Some(observed.state().as_json().clone()))
+                .is_ok_and(|state| state.declares_whole_tree_read())
+        {
+            feed.restrict(&binding.fingerprint());
+        }
+    }
+
     /// Returns the shared slot that holds the telemetry owner once startup has opened it.
     ///
     /// Lets callbacks created before startup (for example project check completion) record
@@ -925,13 +941,14 @@ impl WorkerHandle {
     pub async fn context_problems(
         &self,
         invocation: ValidatedInvocation,
+        observed: Option<ObservedSandboxState>,
         parameters: Value,
         attachment: &str,
     ) -> PeerReply {
         let (send, wait) = oneshot::channel();
         if let Err(code) = self.enqueue(
             invocation,
-            None,
+            observed,
             AssistanceTool::Context,
             parameters,
             attachment,
@@ -1504,6 +1521,7 @@ impl WorkerHandle {
         expected: Option<(AssistanceTool, [u8; 32])>,
         permit: mpsc::OwnedPermit<Inspection>,
     ) -> PeerReply {
+        self.restrict_project_feed(&binding, observed.as_ref());
         let (reply, wait) = oneshot::channel();
         permit.send(Inspection {
             binding,
@@ -1656,6 +1674,7 @@ impl WorkerHandle {
             .target(attachment)
             .ok_or(FailureCode::LauncherConfiguration)?;
         let binding = invocation.binding_ref().clone();
+        self.restrict_project_feed(&binding, observed.as_ref());
         let retain_detail = retains_detail(tool, &input);
         let mut ledger = self
             .shared
@@ -2172,11 +2191,26 @@ impl<'a> Worker<'a> {
                         ..
                     },
                     Some(authority),
-                ) if job.tool == AssistanceTool::Start => feed.activated(
-                    binding.fingerprint(),
-                    authority.worktree().worktree_path(),
-                    authority.worktree().git_common_dir(),
-                ),
+                ) if job.tool == AssistanceTool::Start => {
+                    let read_restricted = job.observed.as_ref().is_some_and(|observed| {
+                        validate_read_scope(
+                            &self.shared,
+                            &binding,
+                            observed,
+                            &job.target,
+                            authority,
+                            errorlog_method(job.tool),
+                            crate::execution::ReadScope::WholeTree,
+                        )
+                        .is_err()
+                    });
+                    feed.activated(
+                        binding.fingerprint(),
+                        authority.worktree().worktree_path(),
+                        authority.worktree().git_common_dir(),
+                        read_restricted,
+                    );
+                }
                 (PeerReply::Edit { result, .. }, _) if result.outcome.has_post_source() => {
                     feed.changed(&binding.fingerprint());
                 }
@@ -3385,20 +3419,52 @@ impl<'a> Worker<'a> {
             return Err(FailureCode::Deadline);
         }
         let authority = self.authority(binding).await?;
+        let read_restricted = job.observed.as_ref().is_some_and(|observed| {
+            validate_read_scope(
+                &self.shared,
+                binding,
+                observed,
+                &job.target,
+                &authority,
+                errorlog_method(job.tool),
+                crate::execution::ReadScope::WholeTree,
+            )
+            .is_err()
+        });
+        if read_restricted && let Some(feed) = &self.shared.project_feed {
+            feed.restrict(&binding.fingerprint());
+        }
+        let language = job
+            .parameters
+            .get("language")
+            .and_then(Value::as_str)
+            .and_then(parse_language);
+        let offset = job
+            .parameters
+            .get("offset")
+            .and_then(Value::as_u64)
+            .map_or(0, |offset| u32::try_from(offset).unwrap_or(u32::MAX));
         let text = match self.shared.problem_source.as_ref() {
             Some(source) => {
-                let snapshots = source.latest(authority.worktree().worktree_path());
-                let language = job
-                    .parameters
-                    .get("language")
-                    .and_then(Value::as_str)
-                    .and_then(parse_language);
-                let offset = job
-                    .parameters
-                    .get("offset")
-                    .and_then(Value::as_u64)
-                    .map_or(0, |offset| u32::try_from(offset).unwrap_or(u32::MAX));
-                let rechecks = source.rechecks(authority.worktree().worktree_path());
+                let restricted = read_restricted
+                    || self
+                        .shared
+                        .project_feed
+                        .as_ref()
+                        .is_some_and(|feed| feed.is_read_restricted(&binding.fingerprint()));
+                let snapshots = if restricted {
+                    self.shared
+                        .project_feed
+                        .as_ref()
+                        .map_or_else(Vec::new, |feed| feed.read_restricted_snapshots())
+                } else {
+                    source.latest(authority.worktree().worktree_path())
+                };
+                let rechecks = if restricted {
+                    Vec::new()
+                } else {
+                    source.rechecks(authority.worktree().worktree_path())
+                };
                 problems_text_with_rechecks(&snapshots, &rechecks, language, offset)
             }
             None => "checks disabled".to_owned(),
@@ -4685,6 +4751,7 @@ fn read_scope_detail(error: &crate::execution::RequestError) -> String {
         RequestError::ObservedStateUnavailable(_) => "read_scope:observed_state_unavailable",
         RequestError::SandboxCwdMismatch => "read_scope:sandbox_cwd_mismatch",
         RequestError::ReadPathUnproven => "read_scope:path_unproven",
+        RequestError::ReadWholeTreeUnproven => "read_scope:whole_tree_unproven",
         _ => "read_scope:refused",
     }
     .to_owned()
@@ -6410,7 +6477,9 @@ mod stop_retry_tests {
                 crate::execution::ReadScope::WholeTree,
             ),
             Err(ReadScopeRefusal {
-                code: FailureCode::ExecutionProfileCause(_),
+                code: FailureCode::ExecutionProfileCause(
+                    ExecutionProfileCause::ReadWholeTreeUnproven
+                ),
                 ..
             })
         ));
@@ -6444,6 +6513,113 @@ mod stop_retry_tests {
         assert_eq!(
             inspect_detail(&worker, &binding, "activation-detail", &observed, &target).await,
             reply
+        );
+    }
+
+    /// A real managed Start carrying a denied source glob activates Workspace but leaves project
+    /// checks unavailable: no fingerprint or checker runs, and Problems never returns a cached
+    /// diagnostic from the denied file.
+    #[tokio::test]
+    async fn production_start_with_denied_source_never_checks_or_discloses_it() {
+        let fixture = Fixture::new();
+        std::fs::write(
+            fixture.root.join("Cargo.toml"),
+            "[package]\nname='fixture'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        std::fs::write(fixture.root.join("secret.rs"), "private source\n").unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        let runner = Arc::new(crate::checks::runner::FakeRunner::default());
+        let fingerprints = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = fingerprints.clone();
+        let scheduler = crate::checks::scheduler::Scheduler::new(
+            vec![Arc::new(crate::checks::rust::RustChecker::new(
+                runner.clone(),
+                std::path::PathBuf::from("/usr"),
+                None,
+                Duration::from_secs(1),
+                None,
+            ))],
+            Duration::from_millis(1),
+            1,
+            fixture.base.join("cache"),
+        )
+        .with_fingerprint(Arc::new(move |_| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            Some(1)
+        }));
+        let feed = Arc::new(ProjectProblemFeed::new(
+            scheduler,
+            vec![fixture.root.clone()],
+            vec![Language::Rust],
+        ));
+        let shared = Arc::get_mut(&mut worker.shared).unwrap();
+        shared.problem_source = Some(feed.clone());
+        shared.project_feed = Some(feed.clone());
+        let (invocation, observed) = read_scope_call(
+            &worker,
+            Some("**/secret.rs"),
+            "denied-actor",
+            "denied-start",
+        );
+        let binding = invocation.binding_ref().clone();
+        let (_cancel_sender, cancel) = watch::channel(false);
+        worker
+            .perform(Job {
+                input: JobInput::Managed,
+                reference: "denied-start-detail".into(),
+                invocation,
+                observed: Some(observed),
+                tool: AssistanceTool::Start,
+                parameters: serde_json::json!({"activation_id":"denied-start"}),
+                target: read_scope_target(&fixture.root),
+                deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+                cancel,
+                stop_reply: None,
+                native_epoch: 0,
+                failure_detail: None,
+            })
+            .await;
+        assert!(worker.grants.contains_key(&binding));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!feed.is_busy());
+        assert_eq!(fingerprints.load(Ordering::Relaxed), 0);
+        assert!(runner.specs().is_empty());
+        assert!(
+            feed.next_block(&binding.fingerprint())
+                .unwrap()
+                .contains("read_restricted")
+        );
+
+        let (invocation, observed) = read_scope_call(
+            &worker,
+            Some("**/secret.rs"),
+            "denied-actor",
+            "denied-problems",
+        );
+        let (_cancel_sender, cancel) = watch::channel(false);
+        let mut job = Job {
+            input: JobInput::Managed,
+            reference: "denied-problems-detail".into(),
+            invocation,
+            observed: Some(observed),
+            tool: AssistanceTool::Context,
+            parameters: serde_json::json!({"kind":"problems","language":"rust"}),
+            target: read_scope_target(&fixture.root),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            cancel,
+            stop_reply: None,
+            native_epoch: 0,
+            failure_detail: None,
+        };
+        let (reply, _, _) = worker
+            .context_problems_job(&mut job, &binding)
+            .await
+            .unwrap();
+        assert!(
+            matches!(reply, PeerReply::Complete { text, .. } if text == "rust: unavailable:read_restricted")
         );
     }
 
@@ -7791,6 +7967,10 @@ mod execution_profile_detail_tests {
         assert_eq!(
             read_scope_detail(&crate::execution::RequestError::ReadPathUnproven),
             "read_scope:path_unproven"
+        );
+        assert_eq!(
+            read_scope_detail(&crate::execution::RequestError::ReadWholeTreeUnproven),
+            "read_scope:whole_tree_unproven"
         );
         assert_eq!(
             read_scope_detail(&crate::execution::RequestError::ProgramDenied),

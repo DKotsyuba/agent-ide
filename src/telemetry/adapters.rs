@@ -229,6 +229,9 @@ pub fn project_check(telemetry: &Telemetry, snapshot: &ProblemSnapshot) {
             CheckState::Partial => ProjectCheckState::Partial,
             CheckState::Checking => ProjectCheckState::Checking,
             CheckState::Unavailable(UnavailableReason::Disabled) => ProjectCheckState::Disabled,
+            CheckState::Unavailable(UnavailableReason::ReadRestricted) => {
+                ProjectCheckState::ReadRestricted
+            }
             CheckState::Unavailable(UnavailableReason::OutsideRoots) => {
                 ProjectCheckState::OutsideRoots
             }
