@@ -907,6 +907,65 @@ async fn real_pinned_safe_source_alias_is_ready() {
     assert_eq!(snapshot.state, CheckState::Ready, "{snapshot:?}");
 }
 
+/// Excluded file and directory aliases need no target probe; selecting either refuses the read.
+#[tokio::test]
+#[ignore = "requires the local pinned Node v24.4.0 and TypeScript 5.9.3"]
+async fn real_pinned_excluded_aliases_do_not_restrict() {
+    for kind in ["file", "directory"] {
+        let root = project(&format!("real-excluded-alias-{kind}"), "tsconfig.json");
+        std::fs::write(root.join("a.ts"), "const a: number = 'bad';\n").unwrap();
+        let denied = if kind == "file" {
+            let outside = root.with_extension("outside.ts");
+            std::fs::write(&outside, "export const outside = 1;\n").unwrap();
+            std::os::unix::fs::symlink(outside, root.join("ignored.ts")).unwrap();
+            ReadDeny::Path(PathBuf::from("/Users/pluto/.ssh"))
+        } else {
+            let hidden = root.join("hidden");
+            std::fs::create_dir_all(&hidden).unwrap();
+            std::fs::write(hidden.join("secret.ts"), "export const secret = 1;\n").unwrap();
+            std::os::unix::fs::symlink(&hidden, root.join("ignored")).unwrap();
+            ReadDeny::Path(hidden)
+        };
+        let excluded = if kind == "file" {
+            "ignored.ts"
+        } else {
+            "ignored/**"
+        };
+        let config = root.join("tsconfig.json");
+        std::fs::write(
+            &config,
+            format!(r#"{{"include":["**/*.ts"],"exclude":["{excluded}","hidden/**"]}}"#),
+        )
+        .unwrap();
+        let request = CheckRequest {
+            worktree: root.clone(),
+            cache_dir: root.join("cache"),
+            input_generation: 1,
+            read_denies: vec![denied],
+        };
+        let output = pinned_adapter_output(&request).await;
+        assert_eq!(
+            output.status,
+            Some(2),
+            "{kind}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let snapshot = parse_tsc_output(&output, &root, &config, &request.read_denies, 1, 0);
+        assert_eq!(snapshot.state, CheckState::Ready, "{kind}: {snapshot:?}");
+        assert_eq!((snapshot.errors, snapshot.warnings), (1, 0), "{kind}");
+        std::fs::write(
+            &config,
+            r#"{"include":["**/*.ts"],"exclude":["hidden/**"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            pinned_adapter_output(&request).await.status,
+            Some(77),
+            "{kind}"
+        );
+    }
+}
+
 /// A JavaScript root retains checkJs diagnostics with unrelated credential files present.
 #[tokio::test]
 #[ignore = "requires the local pinned Node v24.4.0 and TypeScript 5.9.3"]

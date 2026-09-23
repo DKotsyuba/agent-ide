@@ -309,9 +309,10 @@ pub struct ProblemSnapshot { pub language: Language, pub state: CheckState,
 - The adapter checks each compiler read and probe against host denies before touching the path,
   including symlink targets. TypeScript's file discovery uses its own `matchFiles` walker with
   guarded directory enumeration and explicit read-root admission, so refused reads cannot
-  disappear as absent files. Unrelated
-  `.env`, `.key`, and `.pem` files may exist; a compiler-selected denied input yields
-  `ReadRestricted`. Adapter write and delete operations are restricted to the private cache.
+  disappear as absent files. An alias excluded by TypeScript's own matcher is skipped before its
+  target is probed. Unrelated `.env`, `.key`, and `.pem` files may exist; a compiler-selected
+  denied input yields `ReadRestricted`. Adapter write and delete operations are restricted to the
+  private cache.
   Arbitrary diagnostic messages are redacted while path, severity and code remain. The runner's
   Seatbelt policy remains the host-enforced boundary, and the scheduler fences observed input
   generations; a transient edit that appears and disappears during one run is outside that fence.
