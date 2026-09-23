@@ -259,6 +259,8 @@ impl SnapshotIntent {
             GitReadQuery::UntrackedPaths => "ls-files-others",
             GitReadQuery::IndexStat => "ls-files-debug",
             GitReadQuery::IndexPath => "git-path-index",
+            GitReadQuery::AutoCrlf => "config-autocrlf",
+            GitReadQuery::AttributesFile => "config-attributes",
             GitReadQuery::Status
             | GitReadQuery::HeadDiff
             | GitReadQuery::StagedDiff
@@ -795,7 +797,7 @@ async fn metadata<R: SnapshotRunner>(
     scope: &GitScope,
     program: &Path,
     runner: &mut R,
-) -> Result<[Vec<u8>; 6], GitError> {
+) -> Result<[Vec<u8>; 8], GitError> {
     let mut result = std::array::from_fn(|_| Vec::new());
     for (slot, query) in [
         GitReadQuery::HeadIdentity,
@@ -804,6 +806,8 @@ async fn metadata<R: SnapshotRunner>(
         GitReadQuery::UntrackedPaths,
         GitReadQuery::IndexStat,
         GitReadQuery::IndexPath,
+        GitReadQuery::AutoCrlf,
+        GitReadQuery::AttributesFile,
     ]
     .into_iter()
     .enumerate()
@@ -1043,6 +1047,58 @@ async fn index_mtime<R: SnapshotRunner>(
     }
 }
 
+/// Proves one attribute-file metadata probe and caches its existence for this capture pass.
+/// Missing files cannot affect conversion; linked or special files fail closed.
+async fn attribute_file_exists<R: SnapshotRunner>(
+    scope: &GitScope,
+    path: &Path,
+    runner: &mut R,
+    cache: &mut BTreeMap<PathBuf, bool>,
+) -> Result<bool, GitError> {
+    if let Some(exists) = cache.get(path) {
+        return Ok(*exists);
+    }
+    runner.authorize_read_path(path).await?;
+    let exists =
+        match crate::workspace::observation::snapshot_source_metadata(scope.worktree(), path) {
+            Ok(_) => true,
+            Err(ObservationError::Missing) => false,
+            Err(ObservationError::RootIdentityChanged | ObservationError::RootUnavailable) => {
+                return Err(GitError::UnstableSnapshot);
+            }
+            Err(ObservationError::SymlinkEscape | ObservationError::NotRegularFile) => {
+                return Err(GitError::UnsupportedSnapshot);
+            }
+            Err(_) => return Err(GitError::SnapshotIo),
+        };
+    cache.insert(path.to_path_buf(), exists);
+    Ok(exists)
+}
+
+/// Returns whether repository or ancestor attributes may transform this path's worktree bytes.
+/// Tracked attribute files count even when missing locally because Git may use the index copy.
+/// ponytail: any applicable file forces raw capture; batch Git attribute resolution if this hits the byte cap.
+async fn path_has_attributes<R: SnapshotRunner>(
+    scope: &GitScope,
+    path: &Path,
+    tracked: &std::collections::BTreeSet<PathBuf>,
+    runner: &mut R,
+    cache: &mut BTreeMap<PathBuf, bool>,
+) -> Result<bool, GitError> {
+    if attribute_file_exists(scope, Path::new(".git/info/attributes"), runner, cache).await? {
+        return Ok(true);
+    }
+    for parent in path.ancestors().skip(1) {
+        let candidate = parent.join(".gitattributes");
+        if tracked.contains(&candidate)
+            || attribute_file_exists(scope, &candidate, runner, cache).await?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Assembles one generation from safe plumbing and exact raw file reads under aggregate budgets.
 /// Rename inference is deliberately absent: old/new raw identities are separate delete/add records.
 /// One selected changed path awaiting its blob fetch and private no-index comparison.
@@ -1089,8 +1145,11 @@ async fn capture_attempt<R: SnapshotRunner>(
         return Err(GitError::InvalidPorcelain);
     }
     // HEAD/index identities select staged paths. For otherwise identical paths, compare a
-    // no-follow native stat with Git's index fingerprint; only mismatches need source bytes.
+    // no-follow native stat with Git's index fingerprint. Stat equality skips byte capture only
+    // when conversion configuration and applicable attribute files cannot change raw bytes.
     let mut union = std::collections::BTreeSet::new();
+    let raw_config = before[6] == b"false\n" && before[7] == b"/dev/null\n";
+    let mut attributes = BTreeMap::new();
     for path in &tracked {
         let staged = head_entries.get(path) != index_entries.get(path);
         let changed = if staged {
@@ -1103,8 +1162,14 @@ async fn capture_attempt<R: SnapshotRunner>(
                     let index = index_entries[path]
                         .get(&0)
                         .expect("equal HEAD/index has stage zero");
-                    index_stats[path][0].needs_bytes(index_timestamp)
+                    if !raw_config
+                        || index_stats[path][0].needs_bytes(index_timestamp)
                         || !index_stats[path][0].matches(&metadata, index.mode)
+                    {
+                        true
+                    } else {
+                        path_has_attributes(&scope, path, &tracked, runner, &mut attributes).await?
+                    }
                 }
                 Err(ObservationError::RootIdentityChanged) => {
                     return Err(GitError::UnstableSnapshot);
@@ -1244,12 +1309,14 @@ async fn capture_attempt<R: SnapshotRunner>(
             .is_some_and(IndexStat::intent_to_add);
         // Git's default diff treats intent-to-add as absent from the staged side. Its
         // empty-blob OID is a placeholder, not content selected by the user.
-        let index = stages
-            .and_then(|entries| entries.get(&0))
-            .filter(|_| !intent_to_add);
+        let actual_index = stages.and_then(|entries| entries.get(&0));
         let source = &sources[&path];
+        let staged_index = actual_index.filter(|_| !intent_to_add);
+        // An existing i-t-a placeholder still supplies the deletion side when its worktree
+        // file disappeared; only a present worktree file treats that placeholder as absent.
+        let index = actual_index.filter(|_| !intent_to_add || source.read.is_none());
         let mode_w = source.read.as_ref().map_or(0, SourceRead::git_mode);
-        let x = match (head, index) {
+        let x = match (head, staged_index) {
             (None, Some(_)) => b'A',
             (Some(_), None) => b'D',
             (left, right) if left == right => b'.',
@@ -1310,7 +1377,7 @@ async fn capture_attempt<R: SnapshotRunner>(
             DiffMode::Head => (objects[0].clone(), None),
             DiffMode::Staged => (
                 objects[0].clone(),
-                Some(index.map(|entry| entry.oid.clone())),
+                Some(staged_index.map(|entry| entry.oid.clone())),
             ),
             DiffMode::Unstaged => (index.map(|entry| entry.oid.clone()), None),
         };
@@ -1396,6 +1463,7 @@ async fn capture_attempt<R: SnapshotRunner>(
     }
     // A clean path's stat must still match the same index fingerprint at the end of the
     // attempt; a concurrent edit of a skipped path retries instead of minting an empty diff.
+    let mut after_attributes = BTreeMap::new();
     for path in &clean {
         runner.authorize_read_path(path).await?;
         let metadata =
@@ -1406,6 +1474,7 @@ async fn capture_attempt<R: SnapshotRunner>(
             .expect("clean path has stage zero");
         if index_stats[path][0].needs_bytes(index_timestamp)
             || !index_stats[path][0].matches(&metadata, index.mode)
+            || path_has_attributes(&scope, path, &tracked, runner, &mut after_attributes).await?
         {
             return Err(GitError::UnstableSnapshot);
         }

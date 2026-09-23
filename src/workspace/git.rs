@@ -245,6 +245,10 @@ pub enum GitReadQuery {
     IndexStat,
     /// Resolves the active worktree's index path for racy-entry timestamp checks.
     IndexPath,
+    /// Reads the effective core.autocrlf value without evaluating worktree content.
+    AutoCrlf,
+    /// Reads the effective core.attributesFile value without evaluating worktree content.
+    AttributesFile,
     /// Legacy non-executable HEAD patch tag; live HEAD mode uses the raw snapshot collector.
     HeadDiff,
     /// Legacy non-executable staged patch tag; live staged mode uses the raw snapshot collector.
@@ -262,6 +266,8 @@ impl GitReadQuery {
             | Self::UntrackedPaths
             | Self::HeadIdentity
             | Self::IndexPath
+            | Self::AutoCrlf
+            | Self::AttributesFile
             | Self::HeadDiff => DiffMode::Head,
             Self::IndexState | Self::StagedDiff => DiffMode::Staged,
             Self::IndexStat | Self::UnstagedDiff => DiffMode::Unstaged,
@@ -909,6 +915,18 @@ fn read_args(query: GitReadQuery) -> Vec<OsString> {
             OsString::from("--path-format=absolute"),
             OsString::from("--git-path"),
             OsString::from("index"),
+        ]),
+        GitReadQuery::AutoCrlf => args.extend([
+            OsString::from("config"),
+            OsString::from("--get"),
+            OsString::from("--default=false"),
+            OsString::from("core.autocrlf"),
+        ]),
+        GitReadQuery::AttributesFile => args.extend([
+            OsString::from("config"),
+            OsString::from("--get"),
+            OsString::from("--default=/dev/null"),
+            OsString::from("core.attributesFile"),
         ]),
         GitReadQuery::Status
         | GitReadQuery::HeadDiff

@@ -1027,9 +1027,9 @@ async fn unchanged_paths_cost_no_per_path_blob_commands() {
     let snapshot = collect(&fixture, DiffMode::Unstaged, &mut runner)
         .await
         .unwrap();
-    // 12 metadata + 1 worktree hash + 1 cat-file + 1 blob verification + 1 comparison.
+    // 16 metadata + 1 worktree hash + 1 cat-file + 1 blob verification + 1 comparison.
     assert!(
-        runner.operations <= 16,
+        runner.operations <= 20,
         "sandboxed spawns must stay bounded, got {}",
         runner.operations
     );
@@ -1043,6 +1043,50 @@ async fn unchanged_paths_cost_no_per_path_blob_commands() {
     assert_eq!(snapshot.paths()[0].status().status(), Some(*b".M"));
     assert!(!snapshot.paths()[0].patch().is_empty());
     assert!(runner.directories.iter().all(|dir| !dir.exists()));
+}
+
+/// With equal cached stats, attributes and core.autocrlf force the same raw diff before/after touch.
+#[tokio::test]
+async fn converted_worktree_diff_is_stable_across_stat_only_touch() {
+    for conversion in ["attribute", "autocrlf"] {
+        let fixture = GitFixture::unborn();
+        fixture.git(["config", "user.email", "conversion@example.invalid"]);
+        fixture.git(["config", "user.name", "Conversion Fixture"]);
+        if conversion == "attribute" {
+            fixture.write(b".gitattributes", b"*.txt text eol=crlf\n");
+        } else {
+            fixture.git(["config", "core.autocrlf", "true"]);
+        }
+        fixture.write(b"converted.txt", b"line\n");
+        fixture.git(["add", "converted.txt"]);
+        fixture.git(["commit", "--quiet", "-m", "baseline"]);
+        fs::remove_file(fixture.root.join("converted.txt")).unwrap();
+        fixture.git(["checkout-index", "--force", "--", "converted.txt"]);
+        assert_eq!(
+            fs::read(fixture.root.join("converted.txt")).unwrap(),
+            b"line\r\n"
+        );
+        let program = matching_index_debug_git(&fixture, "converted.txt", 0, true);
+        let before = collect_with_git(&fixture, &program).await.unwrap();
+        assert_eq!(before.paths().len(), 1, "{conversion}");
+        assert_eq!(before.paths()[0].status().status(), Some(*b".M"));
+        let file = fs::File::options()
+            .write(true)
+            .open(fixture.root.join("converted.txt"))
+            .unwrap();
+        file.set_times(
+            fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(1)),
+        )
+        .unwrap();
+        let after = collect_with_git(&fixture, &program).await.unwrap();
+        assert_eq!(after.paths().len(), 1, "{conversion}");
+        assert_eq!(
+            after.paths()[0].status().status(),
+            before.paths()[0].status().status()
+        );
+        assert_eq!(after.paths()[0].patch(), before.paths()[0].patch());
+    }
 }
 
 /// Six hundred clean tracked paths consume metadata only; changed paths alone enter byte caps.
@@ -1237,6 +1281,33 @@ async fn missing_index_is_a_bracketed_empty_index() {
         "an appearing index must retry the capture"
     );
     assert_eq!(runner.comparisons, 1);
+    fs::remove_file(fixture.root.join(".git/index")).unwrap();
+    let root = fixture.root.clone();
+    let mut first = true;
+    let mut runner = Runner {
+        after_compare: Some(Box::new(move || {
+            if first {
+                first = false;
+                let output = std::process::Command::new(GIT)
+                    .env_clear()
+                    .arg("-C")
+                    .arg(&root)
+                    .args(["read-tree", "--empty"])
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+            }
+        })),
+        ..Runner::default()
+    };
+    let still_deleted = collect(&fixture, DiffMode::Staged, &mut runner)
+        .await
+        .unwrap();
+    assert_eq!(still_deleted.paths()[0].status().status(), Some(*b"D."));
+    assert_eq!(
+        runner.comparisons, 2,
+        "empty index appearance must trigger a retry"
+    );
 }
 
 /// Intent-to-add is absent from the staged side and an unstaged addition even for empty bytes.
@@ -1277,6 +1348,35 @@ async fn intent_to_add_is_unstaged_for_empty_and_nonempty_files() {
     }
     assert!(unstaged.paths()[0].patch().is_empty());
     assert!(!unstaged.paths()[1].patch().is_empty());
+}
+
+/// A removed intent-to-add file retains its index placeholder for unstaged deletion status.
+#[tokio::test]
+async fn deleted_intent_to_add_matches_porcelain_deletion() {
+    let fixture = GitFixture::unborn();
+    fixture.git(["config", "user.email", "ita@example.invalid"]);
+    fixture.git(["config", "user.name", "Intent Fixture"]);
+    fixture.write(b"base.txt", b"base\n");
+    fixture.git(["add", "base.txt"]);
+    fixture.git(["commit", "--quiet", "-m", "baseline"]);
+    fixture.write(b"new.txt", b"content\n");
+    fixture.git(["add", "-N", "new.txt"]);
+    fs::remove_file(fixture.root.join("new.txt")).unwrap();
+    let porcelain = String::from_utf8(fixture.git(["status", "--porcelain=v2"]).stdout).unwrap();
+    assert!(
+        porcelain
+            .lines()
+            .any(|line| line.starts_with("1 .D ") && line.ends_with(" new.txt"))
+    );
+    let staged = collect(&fixture, DiffMode::Staged, &mut Runner::default())
+        .await
+        .unwrap();
+    assert!(staged.paths().is_empty());
+    let unstaged = collect(&fixture, DiffMode::Unstaged, &mut Runner::default())
+        .await
+        .unwrap();
+    assert_eq!(unstaged.paths().len(), 1);
+    assert_eq!(unstaged.paths()[0].status().status(), Some(*b".D"));
 }
 
 /// Real truncated cat-file output is rejected despite successful exit and actual wait identity.
@@ -1323,6 +1423,82 @@ struct RefusingRunner {
     allowed_proofs: usize,
     /// Path proofs requested by the collector so far.
     proofs: usize,
+}
+
+/// Refuses the second proof of one exact path, isolating a final consistency probe.
+struct SecondProofRunner {
+    /// Real Execution-backed Git runner.
+    inner: Runner,
+    /// Exact worktree-relative path whose final proof is refused.
+    target: PathBuf,
+    /// Number of proofs requested for the target.
+    seen: usize,
+}
+
+impl SnapshotRunner for SecondProofRunner {
+    /// Runs fixed Git intents without changing their output or settlement.
+    async fn run(
+        &mut self,
+        intent: SnapshotIntent,
+    ) -> Result<agent_ide::execution::CapturedProcessEvidence, GitError> {
+        self.inner.run(intent).await
+    }
+
+    /// Allows the initial probe and refuses the final probe of the selected path.
+    async fn authorize_read_path(&mut self, path: &Path) -> Result<(), GitError> {
+        if path == self.target {
+            self.seen += 1;
+            if self.seen == 2 {
+                return Err(GitError::UnsupportedSnapshot);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Both clean-path and index final metadata probes require fresh path authorization.
+#[tokio::test]
+async fn final_metadata_probes_require_second_path_proof() {
+    let fixture = GitFixture::unborn();
+    fixture.git(["config", "user.email", "proof@example.invalid"]);
+    fixture.git(["config", "user.name", "Proof Fixture"]);
+    fixture.write(b"clean.txt", b"base\n");
+    fixture.git(["add", "clean.txt"]);
+    fixture.git(["commit", "--quiet", "-m", "baseline"]);
+    let source_mtime = fs::metadata(fixture.root.join("clean.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    fs::File::options()
+        .write(true)
+        .open(fixture.root.join(".git/index"))
+        .unwrap()
+        .set_times(
+            fs::FileTimes::new().set_modified(source_mtime + std::time::Duration::from_secs(2)),
+        )
+        .unwrap();
+    for target in ["clean.txt", ".git/index"] {
+        let mut runner = SecondProofRunner {
+            inner: Runner::default(),
+            target: PathBuf::from(target),
+            seen: 0,
+        };
+        assert_eq!(
+            collect_snapshot(
+                &authority_for(&fixture),
+                Path::new(GIT),
+                DiffMode::Head,
+                1,
+                "final-proof",
+                BaselineContext::new("baseline", BaselineCoverage::Partial).unwrap(),
+                &mut runner,
+            )
+            .await,
+            Err(GitError::UnsupportedSnapshot),
+            "{target}"
+        );
+        assert_eq!(runner.seen, 2, "{target}");
+    }
 }
 
 /// A clean tracked path still needs a live read proof before either native metadata probe.
@@ -1548,6 +1724,8 @@ async fn mixed_path_authorization_discloses_only_proven_bytes() {
     // fixture's own untracked entries (their names are authorized before any capture).
     let allowed = [
         ".git/index",
+        ".git/info/attributes",
+        ".gitattributes",
         "allowed.txt",
         "staged.txt",
         "unstaged.txt",
