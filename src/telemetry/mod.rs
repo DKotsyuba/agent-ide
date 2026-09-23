@@ -262,6 +262,8 @@ pub enum ProjectCheckState {
     Checking,
     /// Project checks were disabled.
     Disabled,
+    /// The host could not prove whole-project read access, so the check was not run.
+    ReadRestricted,
     /// The worktree was outside every allowed root.
     OutsideRoots,
     /// The configured tool was missing.

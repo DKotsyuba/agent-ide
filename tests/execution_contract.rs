@@ -1301,7 +1301,7 @@ fn native_read_accepts_an_inherited_cwd_only_under_a_recognized_read_all_profile
     read(true, &authority).unwrap();
     assert_eq!(
         read(false, &authority).unwrap_err(),
-        RequestError::SandboxCwdMismatch
+        RequestError::ReadWholeTreeUnproven
     );
     // A read-all profile is cwd-independent by construction, so a second Workspace-granted root is
     // served by the same state; the Workspace authority, not the cwd string, is what bounds it.
@@ -1692,8 +1692,8 @@ fn discovery_binds_the_trusted_candidate_to_the_sandbox_cwd() {
 
 /// A deny-bearing managed state keeps native reads and cached delivery unavailable even when
 /// its `sandboxCwd` already is the authorized root (T35B-r finding 2): admission through a
-/// narrower v2 shape never confers read authority, and the closed refusal is the existing
-/// `SandboxCwdMismatch` unavailability code. This is the shared proof both the observe path and
+/// narrower v2 shape never confers read authority, and the closed refusal is
+/// `ReadWholeTreeUnproven`. This is the shared proof both the observe path and
 /// the cached-delivery path require before any native or cached disclosure.
 #[test]
 fn native_read_refuses_a_same_cwd_deny_bearing_state() {
@@ -1762,6 +1762,6 @@ fn native_read_refuses_a_same_cwd_deny_bearing_state() {
     // The deny-bearing state — admitted — loses native reads at the same cwd.
     assert_eq!(
         read(managed(true), &authority).unwrap_err(),
-        RequestError::SandboxCwdMismatch
+        RequestError::ReadWholeTreeUnproven
     );
 }

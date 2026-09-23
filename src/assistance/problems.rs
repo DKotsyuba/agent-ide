@@ -108,6 +108,9 @@ struct BoundWorktree {
     repository_key: String,
     /// Whether the worktree was admitted under an allowed root; `false` renders `outside_roots`.
     admitted: bool,
+    /// A current host profile could not prove whole-tree read authority; no check or cached
+    /// diagnostic for this binding may be scheduled or disclosed.
+    read_restricted: bool,
 }
 
 /// Mutable feed wiring state, locked only for synchronous in-memory reads and writes.
@@ -217,17 +220,25 @@ impl ProjectProblemFeed {
         ))
     }
 
-    /// Records a successful `ide.start` for `binding` and schedules the initial warm check.
+    /// Records a successful `ide.start` for `binding` and schedules the initial warm check only
+    /// when the caller's current host profile proves whole-tree read access.
     ///
     /// `worktree` is Workspace's canonical worktree path and `repository_key` its canonical git
     /// common dir. A worktree outside every allowed root is recorded as not admitted — its
     /// snapshots then report `outside_roots` — and no check is scheduled. Replaces any previous
     /// record for the same binding; when the bound set is full an arbitrary other binding is
-    /// evicted first.
-    pub fn activated(&self, binding: [u8; 32], worktree: &Path, repository_key: &Path) {
+    /// evicted first. `read_restricted` suppresses scheduling and all cached diagnostics for
+    /// this binding without probing language presence or project files.
+    pub fn activated(
+        &self,
+        binding: [u8; 32],
+        worktree: &Path,
+        repository_key: &Path,
+        read_restricted: bool,
+    ) {
         let admitted = admit_worktree(&self.allowed_roots, worktree).is_ok();
         let repository_key = repository_key.to_string_lossy().into_owned();
-        if admitted {
+        if admitted && !read_restricted {
             self.scheduler.activate(&repository_key, worktree);
         }
         let Ok(mut state) = self.state.lock() else {
@@ -245,18 +256,56 @@ impl ProjectProblemFeed {
                 worktree: worktree.to_path_buf(),
                 repository_key,
                 admitted,
+                read_restricted,
             },
         );
     }
 
+    /// Permanently disables this binding's checks and cached diagnostics after a narrower host
+    /// profile is observed, cancelling any already queued or running check for its worktree. A
+    /// new Start binding is required to restore check availability for this caller.
+    pub fn restrict(&self, binding: &[u8; 32]) {
+        let worktree = self.state.lock().ok().and_then(|mut state| {
+            let bound = state.bindings.get_mut(binding)?;
+            if bound.read_restricted {
+                return None;
+            }
+            bound.read_restricted = true;
+            Some(bound.worktree.clone())
+        });
+        if let Some(worktree) = worktree {
+            self.scheduler.cancel_worktree(&worktree);
+        }
+    }
+
+    /// Reports whether this binding must receive only read-restricted status, not snapshots.
+    pub fn is_read_restricted(&self, binding: &[u8; 32]) -> bool {
+        self.state.lock().map_or(true, |state| {
+            state
+                .bindings
+                .get(binding)
+                .is_none_or(|bound| bound.read_restricted)
+        })
+    }
+
+    /// Returns one content-free unavailable result per configured language without probing files.
+    pub fn read_restricted_snapshots(&self) -> Vec<ProblemSnapshot> {
+        self.languages
+            .iter()
+            .map(|language| {
+                ProblemSnapshot::unavailable(*language, UnavailableReason::ReadRestricted, 0)
+            })
+            .collect()
+    }
+
     /// Schedules a check for `binding`'s admitted worktree after a native edit or `ide.edit`.
     ///
-    /// An unknown binding or a worktree outside the allowed roots schedules nothing.
+    /// An unknown or read-restricted binding, or a worktree outside the allowed roots, schedules
+    /// nothing.
     pub fn changed(&self, binding: &[u8; 32]) {
         let target = self.state.lock().ok().and_then(|state| {
             let bound = state.bindings.get(binding)?;
-            bound
-                .admitted
+            (bound.admitted && !bound.read_restricted)
                 .then(|| (bound.repository_key.clone(), bound.worktree.clone()))
         });
         if let Some((repository_key, worktree)) = target {
@@ -268,7 +317,8 @@ impl ProjectProblemFeed {
     ///
     /// Reads only in-memory snapshots and never waits for a running check. `None` means the
     /// binding is unknown, no language has a completed result yet, or the item set equals the
-    /// last block delivered to this binding for its worktree (EYES-r1 §6).
+    /// last block delivered to this binding for its worktree (EYES-r1 §6). Restricted bindings
+    /// receive only content-free unavailable language states.
     pub fn next_block(&self, binding: &[u8; 32]) -> Option<String> {
         self.next_block_when(binding, |_| true)
     }
@@ -292,8 +342,16 @@ impl ProjectProblemFeed {
             binding: hex(binding),
             worktree: bound.worktree.clone(),
         };
-        let snapshots = self.snapshots(&bound.worktree, bound.admitted);
-        let rechecks = self.rechecks_for(&bound.worktree);
+        let snapshots = if bound.read_restricted {
+            self.read_restricted_snapshots()
+        } else {
+            self.snapshots(&bound.worktree, bound.admitted)
+        };
+        let rechecks = if bound.read_restricted {
+            Vec::new()
+        } else {
+            self.rechecks_for(&bound.worktree)
+        };
         let block = state
             .feed
             .next_block_when(&key, &snapshots, &rechecks, fits)?;
@@ -439,7 +497,8 @@ pub fn parse_language(value: &str) -> Option<Language> {
 /// order. `offset` is the zero-based start into the combined, language-ordered problem list.
 /// Each selected language contributes one state line — `ready`/`partial` carry the full
 /// `errors`/`warnings` counts, while `checking` and `unavailable:<reason>` never render numeric
-/// counts, though an `unavailable` line with a carried [`ProblemSnapshot::detail`] appends it in
+/// counts; `ReadRestricted` uses `unavailable: read_restricted` exactly. An `unavailable` line
+/// with a carried [`ProblemSnapshot::detail`] appends it in
 /// parentheses — followed by up to [`PROBLEMS_PAGE_SIZE`] problem lines
 /// `path:line:column severity [code] message`. A snapshot that dropped problems to the
 /// [`MAX_PROBLEMS`] cap (T19B) adds one header line directly after its state line —
@@ -534,7 +593,8 @@ pub fn problems_text_with_rechecks(
 /// those must never render as numbers, so only `ready` and `partial` name counts. An
 /// `unavailable` snapshot carrying [`ProblemSnapshot::detail`] appends it in parentheses, stripped
 /// of control characters like every other untrusted checker text field; a snapshot with no detail
-/// renders exactly as before.
+/// renders exactly as before. `ReadRestricted` renders the content-free
+/// `unavailable: read_restricted` phrase and ignores any carried detail.
 fn state_line(snapshot: &ProblemSnapshot, recheck: Option<Recheck>) -> String {
     let language = snapshot.language.as_str();
     let counts = format!(
@@ -551,6 +611,9 @@ fn state_line(snapshot: &ProblemSnapshot, recheck: Option<Recheck>) -> String {
         CheckState::Ready => format!("{language}: ready; {counts}"),
         CheckState::Partial => format!("{language}: partial; {counts}"),
         CheckState::Checking => format!("{language}: checking (first check in this session)"),
+        CheckState::Unavailable(UnavailableReason::ReadRestricted) => {
+            format!("{language}: unavailable: read_restricted")
+        }
         CheckState::Unavailable(reason) => match &snapshot.detail {
             Some(detail) => format!(
                 "{language}: unavailable:{} ({})",
@@ -591,6 +654,7 @@ fn problem_line(problem: &Problem) -> String {
 fn unavailable_reason(reason: UnavailableReason) -> &'static str {
     match reason {
         UnavailableReason::Disabled => "disabled",
+        UnavailableReason::ReadRestricted => "read_restricted",
         UnavailableReason::OutsideRoots => "outside_roots",
         UnavailableReason::ToolMissing => "tool_missing",
         UnavailableReason::EnvMissing => "env_missing",
@@ -1122,12 +1186,12 @@ mod tests {
     async fn activation_over_an_older_snapshot_is_stale_until_the_recheck_lands() {
         let (feed, _problems, root) = scripted_feed("stale");
         let worktree = root.join("wt");
-        feed.activated([1; 32], &worktree, Path::new("repo"));
+        feed.activated([1; 32], &worktree, Path::new("repo"), false);
         settle().await;
         assert!(feed.rechecks(&worktree).is_empty());
         assert!(feed.next_block(&[1; 32]).is_some());
 
-        feed.activated([2; 32], &worktree, Path::new("repo"));
+        feed.activated([2; 32], &worktree, Path::new("repo"), false);
         let rechecks = feed.rechecks(&worktree);
         assert_eq!(rechecks, vec![(Language::Rust, Recheck::FirstCheck)]);
         assert_eq!(
@@ -1153,6 +1217,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A deny-bearing host never starts a checker or fingerprints files, and an older cached
+    /// diagnostic is replaced by a content-free unavailable status for that binding.
+    #[tokio::test(start_paused = true)]
+    async fn read_restricted_activation_never_checks_or_discloses_cached_problems() {
+        let (feed, problems, root) = scripted_feed("read-restricted");
+        let worktree = root.join("wt");
+        std::fs::write(worktree.join("secret.rs"), "private source\n").unwrap();
+        let restricted = [1; 32];
+        feed.activated(restricted, &worktree, Path::new("repo"), true);
+        settle().await;
+        assert!(!feed.scheduler.is_busy());
+        assert!(feed.scheduler.latest(&worktree).is_empty());
+        assert_eq!(
+            feed.next_block(&restricted),
+            plate("rust: unavailable: read_restricted")
+        );
+        feed.changed(&restricted);
+        settle().await;
+        assert!(feed.scheduler.latest(&worktree).is_empty());
+
+        problems.lock().unwrap().push(problem(
+            "secret.rs",
+            1,
+            1,
+            Severity::Error,
+            "private diagnostic",
+        ));
+        let allowed = [2; 32];
+        feed.activated(allowed, &worktree, Path::new("repo"), false);
+        settle().await;
+        assert!(
+            feed.scheduler.latest(&worktree)[0].problems[0]
+                .message
+                .contains("private diagnostic")
+        );
+        feed.changed(&allowed);
+        assert!(feed.scheduler.is_busy());
+        feed.restrict(&allowed);
+        assert!(!feed.scheduler.is_busy());
+        settle().await;
+        assert_eq!(
+            feed.next_block(&allowed),
+            plate("rust: unavailable: read_restricted")
+        );
+        assert_eq!(
+            problems_text_with_rechecks(&feed.read_restricted_snapshots(), &[], None, 0),
+            "rust: unavailable: read_restricted"
+        );
+        assert_eq!(feed.next_block(&restricted), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// T18B status plate over a whole session: a quiet session emits one plate per state change;
     /// an armed debounce timer alone (a possible no-op) emits nothing; a running check emits one
     /// `checking (…last result…)` plate and its result one more, with deltas; a no-op check
@@ -1162,7 +1278,7 @@ mod tests {
         let (feed, problems, root) = scripted_feed("t18b");
         let worktree = root.join("wt");
         let hook = [1; 32];
-        feed.activated(hook, &worktree, Path::new("repo"));
+        feed.activated(hook, &worktree, Path::new("repo"), false);
         assert_eq!(
             feed.next_block(&hook),
             plate("rust: checking (first check)")
@@ -1248,7 +1364,7 @@ mod tests {
         let (feed, _problems, root) = scripted_feed("t28b");
         let worktree = root.join("wt");
         let hook = [1; 32];
-        feed.activated(hook, &worktree, Path::new("repo"));
+        feed.activated(hook, &worktree, Path::new("repo"), false);
         let due = plate("rust: checking (first check)").unwrap();
         assert_eq!(
             feed.next_block_when(&hook, |_| false),

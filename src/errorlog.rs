@@ -444,6 +444,7 @@ impl From<UnavailableReason> for ReasonCode {
     fn from(value: UnavailableReason) -> Self {
         match value {
             UnavailableReason::Disabled => Self::ChecksDisabled,
+            UnavailableReason::ReadRestricted => Self::ExecutionProfile,
             UnavailableReason::OutsideRoots => Self::OutsideRoots,
             UnavailableReason::ToolMissing => Self::ToolMissing,
             UnavailableReason::EnvMissing => Self::EnvMissing,

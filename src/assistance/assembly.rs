@@ -1059,6 +1059,7 @@ impl ProductDispatcher {
                         }
                     });
                 };
+                worker.restrict_project_feed(invocation.binding_ref(), observed.as_ref());
                 if host == HostKind::Claude {
                     let established = method.method() == AssistanceMethod::Start;
                     return Some(match method.method() {
@@ -1162,6 +1163,7 @@ impl ProductDispatcher {
                             worker
                                 .context_problems(
                                     invocation,
+                                    None,
                                     call.parameters().clone(),
                                     method.opaque_attachment(),
                                 )
@@ -1266,6 +1268,7 @@ impl ProductDispatcher {
                         worker
                             .context_problems(
                                 invocation,
+                                observed,
                                 call.parameters().clone(),
                                 method.opaque_attachment(),
                             )

@@ -405,6 +405,7 @@ fn plural_noun<'a>(count: u32, singular: &'a str, plural: &'a str) -> &'a str {
 fn unavailable_text(reason: UnavailableReason) -> &'static str {
     match reason {
         UnavailableReason::Disabled => "checks disabled",
+        UnavailableReason::ReadRestricted => "unavailable: read_restricted",
         UnavailableReason::OutsideRoots => "outside allowed roots",
         UnavailableReason::ToolMissing => "tool not found",
         UnavailableReason::EnvMissing => "environment not found",

@@ -483,6 +483,14 @@ impl HostSandboxState {
         self.class == ProfileClass::Managed && grants_read_of_all_roots(&self.raw)
     }
 
+    /// Reports whether the live host itself declares whole-tree read coverage for a project
+    /// check: managed profiles need a recognized root grant and no denies; a disabled host has
+    /// no outer sandbox. Binding, Workspace authority, and catalog admission remain separate.
+    pub(crate) fn declares_whole_tree_read(&self) -> bool {
+        self.class == ProfileClass::Disabled
+            || (self.grants_read_of_all_roots() && !self.has_deny_entries())
+    }
+
     /// Serializes the complete original state for the Codex sandbox command.
     fn json_argument(&self) -> &str {
         &self.raw_json
@@ -1850,6 +1858,8 @@ pub enum RequestError {
     /// the conservative per-path read proof (T36B). Distinct from a cwd mismatch: the binding
     /// was sound, but grants, denies, or matcher ambiguity leave this path unprovable.
     ReadPathUnproven,
+    /// A managed state could not prove that every path in the worktree is readable.
+    ReadWholeTreeUnproven,
 }
 
 /// The read scope one workspace-read recheck must prove (T36B).
@@ -1904,8 +1914,7 @@ pub fn validate_workspace_read(
     scope: ReadScope<'_>,
 ) -> Result<ExecutionProfilePermit, RequestError> {
     let invocation = ValidatedHostInvocation::from_active_observation(active_use, observed)?;
-    let whole_tree =
-        invocation.sandbox.grants_read_of_all_roots() && !invocation.sandbox.has_deny_entries();
+    let whole_tree = invocation.sandbox.declares_whole_tree_read();
     let read_proven = match invocation.sandbox.class() {
         ProfileClass::Managed => match scope {
             ReadScope::WholeTree => whole_tree,
@@ -1916,11 +1925,12 @@ pub fn validate_workspace_read(
         ProfileClass::Disabled => invocation.sandbox.cwd() == authority.root(),
     };
     if !read_proven {
-        // The cwd-mismatch refusal stays distinct: it names the Disabled host's failed cwd
-        // equality and the unscoped whole-tree refusal, never a per-path proof outcome.
+        // Whole-tree refusal is not a cwd mismatch: a deny-bearing managed profile can have
+        // the exact workspace cwd while still lacking authority for every path.
         return Err(match (invocation.sandbox.class(), scope) {
             (ProfileClass::Managed, ReadScope::Path(_)) => RequestError::ReadPathUnproven,
-            _ => RequestError::SandboxCwdMismatch,
+            (ProfileClass::Managed, ReadScope::WholeTree) => RequestError::ReadWholeTreeUnproven,
+            (ProfileClass::Disabled, _) => RequestError::SandboxCwdMismatch,
         });
     }
     if invocation.sandbox.class() == ProfileClass::Disabled && !allow_explicit_disabled_host {

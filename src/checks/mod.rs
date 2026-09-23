@@ -111,6 +111,9 @@ pub enum UnavailableReason {
     /// or (T10B) this language is absent from the worktree per [`Language::is_present`]. Every
     /// renderer treats this reason as nothing rather than a fixed phrase (feed §6, problems §7).
     Disabled,
+    /// The caller's current sandbox cannot prove read access to the whole project, so no
+    /// fingerprint or checker may run and no cached diagnostic may be disclosed.
+    ReadRestricted,
     /// The worktree's canonical path is not under any configured allowed root.
     OutsideRoots,
     /// The configured language toolchain binary was not found.

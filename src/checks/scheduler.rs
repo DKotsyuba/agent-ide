@@ -259,6 +259,26 @@ impl Scheduler {
         self.trigger_inner(repository_key, worktree, true);
     }
 
+    /// Cancels this worktree's pending and running checks when its caller loses whole-tree read
+    /// authority. No cached result is deleted; the caller's feed separately hides it.
+    pub fn cancel_worktree(&self, worktree: &Path) {
+        let worktree = canonical_worktree(worktree);
+        let mut state = self.inner.lock_state();
+        if let Some(wt) = state.worktrees.get_mut(&worktree) {
+            wt.input_generation += 1;
+            for lang in wt.languages.values_mut() {
+                if let Some(timer) = lang.timer_abort.take() {
+                    timer.abort();
+                }
+                if let Some(run) = lang.run_abort.take() {
+                    run.abort();
+                }
+                lang.running = false;
+                lang.dirty = false;
+            }
+        }
+    }
+
     /// Shared body of [`Scheduler::trigger`] and [`Scheduler::activate`].
     fn trigger_inner(&self, repository_key: &str, worktree: &Path, activation: bool) {
         let worktree = canonical_worktree(worktree);
@@ -453,7 +473,7 @@ impl Inner {
     /// re-arms a timer whose firing owns the decision instead (this firing sees the newer timer
     /// or run on re-locking and stands down).
     async fn on_debounce_fire(inner: Arc<Self>, worktree: PathBuf, language: Language) {
-        let (force_run, skip_eligible, completed_fingerprint) = {
+        let (force_run, skip_eligible, completed_fingerprint, generation) = {
             let mut state = inner.lock_state();
             if state.shutting_down {
                 return;
@@ -473,6 +493,7 @@ impl Inner {
                 wt.activation_armed,
                 lang.skip_eligible,
                 lang.completed_fingerprint,
+                wt.input_generation,
             )
         };
         // Only a fingerprint that could actually cause a skip is worth computing; git may take
@@ -482,7 +503,7 @@ impl Inner {
         } else {
             None
         };
-        let should_run = {
+        {
             let mut state = inner.lock_state();
             if state.shutting_down {
                 return;
@@ -490,6 +511,9 @@ impl Inner {
             let Some(wt) = state.worktrees.get_mut(&worktree) else {
                 return;
             };
+            if wt.input_generation != generation {
+                return;
+            }
             if wt
                 .languages
                 .get(&language)
@@ -503,26 +527,17 @@ impl Inner {
                 return;
             };
             if !force_run && fingerprint.is_some() && completed_fingerprint == fingerprint {
-                false
+                return;
             } else {
                 lang.running = true;
-                true
             }
-        };
-        if !should_run {
-            return;
-        }
-        let handle = tokio::spawn(Inner::run_check_loop(
-            Arc::clone(&inner),
-            worktree.clone(),
-            language,
-        ));
-        let mut state = inner.lock_state();
-        if let Some(lang) = state
-            .worktrees
-            .get_mut(&worktree)
-            .and_then(|wt| wt.languages.get_mut(&language))
-        {
+            // Spawn and publish the abort handle under the same lock: a concurrent restriction
+            // can then cancel the task before its first source stat or checker dispatch.
+            let handle = tokio::spawn(Inner::run_check_loop(
+                Arc::clone(&inner),
+                worktree.clone(),
+                language,
+            ));
             lang.run_abort = Some(handle.abort_handle());
         }
     }
