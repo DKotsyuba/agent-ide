@@ -254,6 +254,8 @@ use std::{collections::BTreeSet, time::Duration};
 /// Actual Execution-owned local runner with controlled test-only disabled host evidence.
 #[derive(Default)]
 pub struct Runner {
+    /// Optional fixture Git wrapper; absent uses the installed Git binary.
+    pub program: Option<PathBuf>,
     /// All private directories observed while live, checked for cleanup after capture.
     pub directories: Vec<PathBuf>,
     /// Completed operations counted for deterministic before/after mutation injection.
@@ -311,8 +313,11 @@ impl SnapshotRunner for Runner {
         } else if format!("{:?}", intent.command()).contains("cat-file") {
             self.blobs += 1;
         }
-        let (child, mut admissions) =
-            launch_intent(&intent, Path::new(GIT), MAX_SNAPSHOT_BLOB_BYTES)?;
+        let (child, mut admissions) = launch_intent(
+            &intent,
+            self.program.as_deref().unwrap_or(Path::new(GIT)),
+            MAX_SNAPSHOT_BLOB_BYTES,
+        )?;
         let completed = child
             .reap(Duration::from_secs(5), Duration::from_secs(5))
             .await

@@ -16,7 +16,7 @@ use std::{
     collections::BTreeSet,
     ffi::OsString,
     fs,
-    os::unix::ffi::OsStrExt,
+    os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
 };
 use support::{GIT, GitFixture, Runner, authority_for, collect};
@@ -1103,7 +1103,64 @@ async fn large_repository_captures_changed_and_proven_empty_diffs() {
     );
 }
 
-/// A same-length rewrite at the index mtime is captured even when Git's stat cache is racy.
+/// Gives the collector an index-debug stat matching the current file while retaining Git's old
+/// blob OID. The test controls the index mtime: equal for racy capture, later for flag capture.
+fn matching_index_debug_git(fixture: &GitFixture, path: &str, flags: u64, later: bool) -> PathBuf {
+    let source = fs::metadata(fixture.root.join(path)).unwrap();
+    let index = fixture.git(["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+    let index = PathBuf::from(String::from_utf8(index.stdout).unwrap().trim());
+    let mtime = source.modified().unwrap();
+    fs::File::options()
+        .write(true)
+        .open(index)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(if later {
+            mtime + std::time::Duration::from_secs(10)
+        } else {
+            mtime
+        }))
+        .unwrap();
+    let debug = fixture.root.join(".git/forged-debug");
+    fs::write(
+        &debug,
+        format!(
+            "{path}\0  ctime: {}:{}\n  mtime: {}:{}\n  dev: {}\tino: {}\n  uid: {}\tgid: {}\n  size: {}\tflags: {flags:x}\n",
+            source.ctime(), source.ctime_nsec(), source.mtime(), source.mtime_nsec(),
+            source.dev() as u32, source.ino() as u32, source.uid(), source.gid(), source.size() as u32,
+        ),
+    )
+    .unwrap();
+    support::git_wrapper(
+        fixture,
+        "forged-stat-git",
+        &format!(
+            "case \" $* \" in *\" ls-files --debug \"*) exec /bin/cat {} ;; *) exec /usr/bin/git \"$@\" ;; esac",
+            debug.display(),
+        ),
+    )
+}
+
+/// Captures through the fixed Git wrapper while retaining the real Execution-backed runner.
+async fn collect_with_git(
+    fixture: &GitFixture,
+    program: &Path,
+) -> Result<agent_ide::workspace::git::snapshot::GitSnapshot, GitError> {
+    collect_snapshot(
+        &authority_for(fixture),
+        program,
+        DiffMode::Head,
+        1,
+        "forged-stat-check",
+        BaselineContext::new("baseline", BaselineCoverage::Partial).unwrap(),
+        &mut Runner {
+            program: Some(program.to_path_buf()),
+            ..Runner::default()
+        },
+    )
+    .await
+}
+
+/// An equal cached stat cannot hide a same-length rewrite at the index mtime.
 #[tokio::test]
 async fn racy_index_timestamp_still_reports_a_same_length_rewrite() {
     let fixture = GitFixture::unborn();
@@ -1112,24 +1169,14 @@ async fn racy_index_timestamp_still_reports_a_same_length_rewrite() {
     fixture.write(b"racy.txt", b"base\n");
     fixture.git(["add", "racy.txt"]);
     fixture.git(["commit", "--quiet", "-m", "baseline"]);
-    let index = fixture.git(["rev-parse", "--path-format=absolute", "--git-path", "index"]);
-    let index = PathBuf::from(String::from_utf8(index.stdout).unwrap().trim());
-    let mtime = fs::metadata(index).unwrap().modified().unwrap();
     fixture.write(b"racy.txt", b"next\n");
-    fs::File::options()
-        .write(true)
-        .open(fixture.root.join("racy.txt"))
-        .unwrap()
-        .set_times(fs::FileTimes::new().set_modified(mtime))
-        .unwrap();
-    let snapshot = collect(&fixture, DiffMode::Head, &mut Runner::default())
-        .await
-        .unwrap();
+    let program = matching_index_debug_git(&fixture, "racy.txt", 0, false);
+    let snapshot = collect_with_git(&fixture, &program).await.unwrap();
     assert_eq!(snapshot.paths().len(), 1);
     assert_eq!(snapshot.paths()[0].status().path(), Path::new("racy.txt"));
 }
 
-/// Git prints assume-unchanged plus skip-worktree flags in hex; both still receive byte capture.
+/// Git prints combined flags in hex, and the flag alone forces capture when the stat is equal.
 #[tokio::test]
 async fn combined_index_flags_do_not_hide_worktree_changes() {
     let fixture = GitFixture::unborn();
@@ -1140,16 +1187,96 @@ async fn combined_index_flags_do_not_hide_worktree_changes() {
     fixture.git(["commit", "--quiet", "-m", "baseline"]);
     fixture.git(["update-index", "--assume-unchanged", "flagged.txt"]);
     fixture.git(["update-index", "--skip-worktree", "flagged.txt"]);
-    let clean = collect(&fixture, DiffMode::Head, &mut Runner::default())
-        .await
-        .unwrap();
-    assert!(clean.paths().is_empty());
+    assert!(
+        String::from_utf8(fixture.git(["ls-files", "--debug"]).stdout)
+            .unwrap()
+            .contains("flags: 4000c000")
+    );
     fixture.write(b"flagged.txt", b"next\n");
-    let changed = collect(&fixture, DiffMode::Head, &mut Runner::default())
-        .await
-        .unwrap();
+    let program = matching_index_debug_git(&fixture, "flagged.txt", 0x4000c000, true);
+    let changed = collect_with_git(&fixture, &program).await.unwrap();
     assert_eq!(changed.paths().len(), 1);
     assert_eq!(changed.paths()[0].status().path(), Path::new("flagged.txt"));
+}
+
+/// A missing index is Git's empty staged side, so committed files are staged deletions.
+#[tokio::test]
+async fn missing_index_is_a_bracketed_empty_index() {
+    let fixture = GitFixture::unborn();
+    fixture.git(["config", "user.email", "missing@example.invalid"]);
+    fixture.git(["config", "user.name", "Missing Fixture"]);
+    fixture.write(b"tracked.txt", b"base\n");
+    fixture.git(["add", "tracked.txt"]);
+    fixture.git(["commit", "--quiet", "-m", "baseline"]);
+    fs::remove_file(fixture.root.join(".git/index")).unwrap();
+    let staged = collect(&fixture, DiffMode::Staged, &mut Runner::default())
+        .await
+        .unwrap();
+    assert_eq!(staged.paths().len(), 1);
+    assert_eq!(staged.paths()[0].status().status(), Some(*b"D."));
+    assert!(!fixture.root.join(".git/index").exists());
+    let root = fixture.root.clone();
+    let mut runner = Runner {
+        after_compare: Some(Box::new(move || {
+            let output = std::process::Command::new(GIT)
+                .env_clear()
+                .arg("-C")
+                .arg(&root)
+                .args(["add", "tracked.txt"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+        })),
+        ..Runner::default()
+    };
+    let refreshed = collect(&fixture, DiffMode::Staged, &mut runner)
+        .await
+        .unwrap();
+    assert!(
+        refreshed.paths().is_empty(),
+        "an appearing index must retry the capture"
+    );
+    assert_eq!(runner.comparisons, 1);
+}
+
+/// Intent-to-add is absent from the staged side and an unstaged addition even for empty bytes.
+#[tokio::test]
+async fn intent_to_add_is_unstaged_for_empty_and_nonempty_files() {
+    let fixture = GitFixture::unborn();
+    fixture.git(["config", "user.email", "ita@example.invalid"]);
+    fixture.git(["config", "user.name", "Intent Fixture"]);
+    fixture.write(b"base.txt", b"base\n");
+    fixture.git(["add", "base.txt"]);
+    fixture.git(["commit", "--quiet", "-m", "baseline"]);
+    fixture.write(b"empty.txt", b"");
+    fixture.write(b"nonempty.txt", b"content\n");
+    fixture.git(["add", "-N", "empty.txt", "nonempty.txt"]);
+    let porcelain = fixture.git(["status", "--porcelain=v2"]);
+    let porcelain = String::from_utf8(porcelain.stdout).unwrap();
+    assert!(
+        porcelain
+            .lines()
+            .any(|line| line.starts_with("1 .A ") && line.ends_with(" empty.txt"))
+    );
+    assert!(
+        porcelain
+            .lines()
+            .any(|line| line.starts_with("1 .A ") && line.ends_with(" nonempty.txt"))
+    );
+    let staged = collect(&fixture, DiffMode::Staged, &mut Runner::default())
+        .await
+        .unwrap();
+    assert!(staged.paths().is_empty());
+    let unstaged = collect(&fixture, DiffMode::Unstaged, &mut Runner::default())
+        .await
+        .unwrap();
+    assert_eq!(unstaged.paths().len(), 2);
+    for path in unstaged.paths() {
+        assert_eq!(path.status().status(), Some(*b".A"));
+        assert!(path.status().objects().unwrap()[1].is_none());
+    }
+    assert!(unstaged.paths()[0].patch().is_empty());
+    assert!(!unstaged.paths()[1].patch().is_empty());
 }
 
 /// Real truncated cat-file output is rejected despite successful exit and actual wait identity.
@@ -1230,6 +1357,61 @@ async fn clean_tree_refuses_unproven_metadata_path() {
         assert_eq!(runner.proofs, allowed_proofs + 1);
         assert_eq!(runner.scratch_intents, 0);
     }
+}
+
+/// Refusing the administrative index path prevents any native index timestamp probe.
+#[tokio::test]
+async fn index_probe_refuses_an_unproven_index_path() {
+    let fixture = GitFixture::unborn();
+    fixture.git(["config", "user.email", "index@example.invalid"]);
+    fixture.git(["config", "user.name", "Index Fixture"]);
+    fixture.write(b"clean.txt", b"base\n");
+    fixture.git(["add", "clean.txt"]);
+    fixture.git(["commit", "--quiet", "-m", "baseline"]);
+    let mut runner = MixedRunner {
+        inner: Runner::default(),
+        allowed: BTreeSet::from(["clean.txt".to_owned()]),
+        scratch_intents: 0,
+    };
+    assert_eq!(
+        collect_snapshot(
+            &authority_for(&fixture),
+            Path::new(GIT),
+            DiffMode::Head,
+            1,
+            "index-proof",
+            BaselineContext::new("baseline", BaselineCoverage::Partial).unwrap(),
+            &mut runner,
+        )
+        .await,
+        Err(GitError::UnsupportedSnapshot)
+    );
+    assert_eq!(runner.scratch_intents, 0);
+}
+
+/// A linked parent beneath the worktree cannot authorize native index metadata access.
+#[tokio::test]
+async fn index_probe_refuses_a_symlinked_parent() {
+    let fixture = GitFixture::unborn();
+    fixture.git(["config", "user.email", "index@example.invalid"]);
+    fixture.git(["config", "user.name", "Index Fixture"]);
+    fixture.write(b"clean.txt", b"base\n");
+    fixture.git(["add", "clean.txt"]);
+    fixture.git(["commit", "--quiet", "-m", "baseline"]);
+    fs::rename(fixture.root.join(".git"), fixture.root.join(".git-real")).unwrap();
+    std::os::unix::fs::symlink(".git-real", fixture.root.join(".git")).unwrap();
+    let program = support::git_wrapper(
+        &fixture,
+        "linked-index-git",
+        &format!(
+            "case \" $* \" in *\" rev-parse --path-format=absolute --git-path index \"*) printf '%s\\n' '{}' ;; *) exec /usr/bin/git \"$@\" ;; esac",
+            fixture.root.join(".git/index").display(),
+        ),
+    );
+    assert_eq!(
+        collect_with_git(&fixture, &program).await,
+        Err(GitError::UnsupportedSnapshot)
+    );
 }
 
 impl SnapshotRunner for RefusingRunner {
@@ -1365,6 +1547,7 @@ async fn mixed_path_authorization_discloses_only_proven_bytes() {
     // The proven set covers every fixture path except the refused one, including the
     // fixture's own untracked entries (their names are authorized before any capture).
     let allowed = [
+        ".git/index",
         "allowed.txt",
         "staged.txt",
         "unstaged.txt",

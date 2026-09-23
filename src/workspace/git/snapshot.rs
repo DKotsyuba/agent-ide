@@ -550,8 +550,8 @@ pub trait SnapshotRunner: Send {
     /// Required and fallible with no permissive default: every collector integration routes
     /// this through its Execution owner, so a path the live sandbox policy denies (or that
     /// cannot be proven) refuses the whole capture attempt before any byte is read. The
-    /// collector calls it before each native tracked-path metadata probe, each byte capture
-    /// (staged mode included), every consistency reread, and untracked inspection.
+    /// collector calls it before the in-root index and tracked-path metadata probes, each byte
+    /// capture (staged mode included), every consistency reread, and untracked inspection.
     fn authorize_read_path(
         &mut self,
         path: &Path,
@@ -925,10 +925,16 @@ impl IndexStat {
     }
 
     /// Git's racy timestamp rule: an entry at or after the index mtime needs a byte hash even
-    /// when every stat field matches. Nonzero flags also force capture rather than inheriting
-    /// Git's assume-unchanged or skip-worktree omission semantics.
-    fn needs_bytes(&self, index_mtime: (u64, u64)) -> bool {
-        self.flags != 0 || (self.values[2], self.values[3]) >= index_mtime
+    /// when every stat field matches. Unknown index mtime and nonzero flags also force capture
+    /// rather than inheriting Git's assume-unchanged or skip-worktree omission semantics.
+    fn needs_bytes(&self, index_mtime: Option<(u64, u64)>) -> bool {
+        self.flags != 0
+            || index_mtime.is_none_or(|timestamp| (self.values[2], self.values[3]) >= timestamp)
+    }
+
+    /// Intent-to-add entries are absent from the staged side despite their empty-blob OID.
+    fn intent_to_add(&self) -> bool {
+        self.flags & (1 << 29) != 0
     }
 }
 
@@ -1004,21 +1010,37 @@ fn parse_index_stats(bytes: &[u8]) -> Result<BTreeMap<PathBuf, Vec<IndexStat>>, 
     Ok(result)
 }
 
-/// Resolves and stats the fixed active index path without following a final symlink. Its mtime
-/// is bracketed like Git metadata so an index refresh during capture retries the attempt.
-fn index_mtime(bytes: &[u8]) -> Result<(u64, u64), GitError> {
+/// Proves and stats the active index under the worktree's verified no-follow root. A missing
+/// index is Git's empty index. A linked index outside that root has no host read proof here, so
+/// the caller hashes tracked paths instead of probing it. Both results are bracketed.
+async fn index_mtime<R: SnapshotRunner>(
+    bytes: &[u8],
+    scope: &GitScope,
+    runner: &mut R,
+) -> Result<Option<(u64, u64)>, GitError> {
     let path = super::parse_terminal_path(bytes)?;
     if !super::is_normal_absolute(&path) {
         return Err(GitError::InvalidPorcelain);
     }
-    let metadata = fs::symlink_metadata(path).map_err(|_| GitError::SnapshotIo)?;
-    if !metadata.is_file() {
-        return Err(GitError::UnsupportedSnapshot);
+    let Ok(relative) = path.strip_prefix(scope.worktree().worktree_path()) else {
+        // ponytail: linked indexes lack an admin-root read proof; hash all tracked paths until one exists.
+        return Ok(None);
+    };
+    runner.authorize_read_path(relative).await?;
+    match crate::workspace::observation::snapshot_source_metadata(scope.worktree(), relative) {
+        Ok(metadata) => Ok(Some((
+            metadata.mtime() as u32 as u64,
+            metadata.mtime_nsec() as u32 as u64,
+        ))),
+        Err(ObservationError::Missing) => Ok(None),
+        Err(ObservationError::RootIdentityChanged | ObservationError::RootUnavailable) => {
+            Err(GitError::UnstableSnapshot)
+        }
+        Err(ObservationError::SymlinkEscape | ObservationError::NotRegularFile) => {
+            Err(GitError::UnsupportedSnapshot)
+        }
+        Err(_) => Err(GitError::SnapshotIo),
     }
-    Ok((
-        metadata.mtime() as u32 as u64,
-        metadata.mtime_nsec() as u32 as u64,
-    ))
 }
 
 /// Assembles one generation from safe plumbing and exact raw file reads under aggregate budgets.
@@ -1056,7 +1078,7 @@ async fn capture_attempt<R: SnapshotRunner>(
         .cloned()
         .collect();
     let index_stats = parse_index_stats(&before[4])?;
-    let index_timestamp = index_mtime(&before[5])?;
+    let index_timestamp = index_mtime(&before[5], &scope, runner).await?;
     if index_stats.len() != index_entries.len()
         || index_stats.iter().any(|(path, stats)| {
             index_entries
@@ -1216,7 +1238,15 @@ async fn capture_attempt<R: SnapshotRunner>(
         if stages.is_some_and(|entries| !entries.contains_key(&0)) {
             continue;
         }
-        let index = stages.and_then(|entries| entries.get(&0));
+        let intent_to_add = index_stats
+            .get(&path)
+            .and_then(|stats| stats.first())
+            .is_some_and(IndexStat::intent_to_add);
+        // Git's default diff treats intent-to-add as absent from the staged side. Its
+        // empty-blob OID is a placeholder, not content selected by the user.
+        let index = stages
+            .and_then(|entries| entries.get(&0))
+            .filter(|_| !intent_to_add);
         let source = &sources[&path];
         let mode_w = source.read.as_ref().map_or(0, SourceRead::git_mode);
         let x = match (head, index) {
@@ -1226,6 +1256,7 @@ async fn capture_attempt<R: SnapshotRunner>(
             _ => b'M',
         };
         let y = match (index, &source.read) {
+            (None, Some(_)) if intent_to_add => b'A',
             (Some(_), None) => b'D',
             (Some(index), Some(_)) => {
                 if index.mode == mode_w
@@ -1386,7 +1417,7 @@ async fn capture_attempt<R: SnapshotRunner>(
     if metadata(&scope, program, runner).await? != before {
         return Err(GitError::UnstableSnapshot);
     }
-    if index_mtime(&before[5])? != index_timestamp {
+    if index_mtime(&before[5], &scope, runner).await? != index_timestamp {
         return Err(GitError::UnstableSnapshot);
     }
     let head = evidence_identity(b"workspace-git-head-v1", &before[0]);
@@ -1445,13 +1476,13 @@ mod batch_tests {
             values: [0, 0, 42, 0, 0, 0, 0, 0, 5],
             flags: 0,
         };
-        assert!(entry.needs_bytes((42, 0)));
-        assert!(entry.needs_bytes((41, 999)));
-        assert!(!entry.needs_bytes((42, 1)));
+        assert!(entry.needs_bytes(Some((42, 0))));
+        assert!(entry.needs_bytes(Some((41, 999))));
+        assert!(!entry.needs_bytes(Some((42, 1))));
         let (_, flags) =
             debug_pair(b"  size: 5\tflags: 4000c000", "  size: ", "\tflags: ", 16).unwrap();
         assert_eq!(flags, 0x4000c000);
-        assert!(IndexStat { flags, ..entry }.needs_bytes((43, 0)));
+        assert!(IndexStat { flags, ..entry }.needs_bytes(Some((43, 0))));
     }
 
     /// The planning estimate covers the real argument strings: fixed flags plus one canonical
