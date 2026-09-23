@@ -939,7 +939,8 @@ async fn collect_baseline(
 }
 
 /// Produces bounded source context inside the inherited sandbox, using lexical evidence when
-/// provider execution or project membership cannot be verified from the observed source.
+/// provider execution or project membership cannot be verified. Correlated unversioned TypeScript
+/// reports are provisional lower bounds; an empty push never proves the source clean.
 async fn context(
     job: &HelperJob,
     deadline: tokio::time::Instant,
@@ -1134,20 +1135,26 @@ async fn context(
             && diagnostics.freshness == Freshness::Provisional
             && diagnostics.source.as_ref() == Some(&context.source)
             && Some(diagnostics.generation) == context.generation
-            && diagnostics.document_version == context.document_version
-            && diagnostics
-                .document_version
-                .is_some_and(|version| version > 0))
+            && context.document_version.is_some_and(|version| version > 0)
+            && (diagnostics.document_version == context.document_version
+                || (diagnostics.document_version.is_none()
+                    && diagnostics.readiness
+                        == crate::intelligence::freshness::DiagnosticReadiness::Reported
+                    && !diagnostics.diagnostics.is_empty())))
         .then_some(diagnostics)
     });
     let feedback = diagnostics
         .as_ref()
         .filter(|diagnostics| !diagnostics.diagnostics.is_empty())
         .and_then(|diagnostics| {
+            let count = if diagnostics.document_version.is_none() {
+                format!("at least {}", diagnostics.diagnostics.len())
+            } else {
+                diagnostics.diagnostics.len().to_string()
+            };
             super::facade::FeedbackDelta::new(
                 format!(
-                    "Provider reported {} diagnostics for the exact source bytes observed by the Claude helper.",
-                    diagnostics.diagnostics.len()
+                    "Provider reported {count} diagnostics for the exact source bytes observed by the Claude helper."
                 ),
                 format!(
                     "source_digest={}; provider_generation={:?}; document_version={:?}",
@@ -1186,11 +1193,16 @@ async fn context(
                 .take(8)
                 .map(|diagnostic| diagnostic.message.chars().take(256).collect::<String>())
                 .collect::<Vec<_>>();
+            let count = if diagnostics.document_version.is_none() {
+                format!("at_least_{}", diagnostics.diagnostics.len())
+            } else {
+                diagnostics.diagnostics.len().to_string()
+            };
             format!(
                 "diagnostics_freshness: {:?}\ndiagnostic_readiness: {:?}\ndiagnostic_count: {}\ndiagnostics_truncated: {}\ndiagnostic_messages: {}\nfeedback_delta: {}",
                 diagnostics.freshness,
                 diagnostics.readiness,
-                diagnostics.diagnostics.len(),
+                count,
                 diagnostics.truncated || diagnostics.diagnostics.len() > messages.len(),
                 serde_json::to_string(&messages).unwrap_or_else(|_| "[]".into()),
                 feedback.as_deref().unwrap_or("none"),
@@ -1233,8 +1245,9 @@ async fn context(
 }
 
 /// Runs one accepted provider over exact helper-observed bytes and reaps it before returning.
-/// Pyright awaits matching versioned diagnostics under the inherited deadline; Go, Rust, and
-/// TypeScript retain their immediate snapshot, and TypeScript also rechecks its closed resolution.
+/// Pyright awaits versioned diagnostics; TypeScript briefly awaits a bound nonempty push while
+/// reserving shutdown time. Go and Rust retain immediate snapshots. TypeScript also rechecks its
+/// closed resolution before returning.
 async fn provider_context(
     job: &HelperJob,
     deadline: tokio::time::Instant,
@@ -1462,7 +1475,10 @@ async fn provider_context(
         },
         |mut session| async move {
             let context = session.context(source, bytes, query).await?;
-            if matches!(session.settings(), ProviderSettings::Pyright(_)) {
+            if matches!(
+                session.settings(),
+                ProviderSettings::Pyright(_) | ProviderSettings::TypeScript(_)
+            ) {
                 session.wait_for_matching_diagnostics().await;
             }
             let diagnostics = session.diagnostics();

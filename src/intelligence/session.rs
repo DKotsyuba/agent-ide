@@ -667,14 +667,23 @@ impl Session {
         self.state.lock().expect("session lock").diagnostics.clone()
     }
 
-    /// Waits under the request deadline for a versioned result or up to five seconds for a
-    /// nonempty report from this one-shot TypeScript open. Empty unversioned pushes and timeout
-    /// leave readiness unknown; semantic context already computed by the caller is unaffected.
+    /// Waits under the request deadline for a versioned result or up to two seconds for a
+    /// nonempty one-shot TypeScript report, reserving two seconds of session lifetime for shutdown
+    /// and EOF. Silence and empty unversioned pushes leave readiness unknown; semantic context
+    /// already computed by the caller is unaffected.
     pub(crate) async fn wait_for_matching_diagnostics(&self) {
+        let now = Instant::now();
+        let shutdown_reserve = Duration::from_secs(2);
+        if self.deadline.saturating_duration_since(now) <= shutdown_reserve {
+            return;
+        }
+        let deadline = self
+            .exchange_deadline()
+            .min(self.deadline - shutdown_reserve);
         let deadline = if matches!(self.settings, ProviderSettings::TypeScript(_)) {
-            (Instant::now() + Duration::from_secs(5)).min(self.exchange_deadline())
+            deadline.min(now + Duration::from_secs(2))
         } else {
-            self.exchange_deadline()
+            deadline
         };
         let _ = wait_for_matching_diagnostics(&self.state, deadline).await;
     }

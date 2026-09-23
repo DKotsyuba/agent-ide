@@ -4982,9 +4982,9 @@ async fn configured_product_acceptance_edit_diagnostics_telemetry_and_fallback()
 ///
 /// The ignored release check requires exact launcher-owned Node, bridge, `tsserver.js`, and loaded
 /// closure paths. Each extension must reach semantic definition/reference results through a fresh
-/// one-shot bridge; JS and TS also return a provisional lower bound for a real type error.
-/// Exact configured membership proves project selection, while graceful shutdown, EOF, zero exit,
-/// and direct-child reap are enforced by the production path before the next fixture may run.
+/// one-shot bridge; JS and TS return provisional lower bounds for type errors, while a clean TS
+/// source stays unknown. Exact membership proves project selection; graceful shutdown, EOF, zero
+/// exit, and direct-child reap are enforced before the next fixture may run.
 #[tokio::test]
 #[ignore = "requires exact AGENT_IDE_NODE, AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER and AGENT_IDE_TSSERVER environment"]
 async fn configured_product_returns_real_typescript_family_context_and_reaps() {
@@ -4992,7 +4992,7 @@ async fn configured_product_returns_real_typescript_family_context_and_reaps() {
     let fixture = ProductFixture::new(providers);
     std::fs::write(
         fixture.root.join("tsconfig.json"),
-        "{\"compilerOptions\":{\"types\":[],\"moduleResolution\":\"node10\",\"allowJs\":true,\"checkJs\":true},\"files\":[\"fixture.js\",\"fixture.jsx\",\"fixture.ts\",\"fixture.tsx\"]}\n",
+        "{\"compilerOptions\":{\"types\":[],\"moduleResolution\":\"node10\",\"allowJs\":true,\"checkJs\":true},\"files\":[\"fixture.js\",\"fixture.jsx\",\"fixture.ts\",\"fixture.tsx\",\"fixture_clean.ts\"]}\n",
     )
     .unwrap();
     let cases = [
@@ -5016,6 +5016,11 @@ async fn configured_product_returns_real_typescript_family_context_and_reaps() {
             "export function identity(input) { return input; }\nexport function Component(): JSX.Element { return <div />; }\nexport const view = <Component />;\n",
             "Component />",
         ),
+        (
+            "fixture_clean.ts",
+            "export const value: number = 42;\nexport const use: number = value;\n",
+            "value;",
+        ),
     ];
     for (path, source, _) in cases {
         std::fs::write(fixture.root.join(path), source).unwrap();
@@ -5027,6 +5032,7 @@ async fn configured_product_returns_real_typescript_family_context_and_reaps() {
         "fixture.jsx",
         "fixture.ts",
         "fixture.tsx",
+        "fixture_clean.ts",
         "tsconfig.json",
     ]);
     fixture.git(&["commit", "--quiet", "-m", "TypeScript fixtures"]);
@@ -5068,6 +5074,11 @@ async fn configured_product_returns_real_typescript_family_context_and_reaps() {
                 text.contains("diagnostic_count: at_least_"),
                 "{path}: {response}"
             );
+        } else if path == "fixture_clean.ts" {
+            assert!(
+                text.contains("diagnostic_count: unknown"),
+                "{path}: {response}"
+            );
         }
     }
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
@@ -5080,20 +5091,22 @@ async fn configured_product_returns_real_typescript_family_context_and_reaps() {
 /// Exercises the release-pinned TypeScript provider through Claude's foreground helper path.
 ///
 /// The ignored release check requires the exact accepted Node, bridge, `tsserver.js`, and closure
-/// environment paths. A helper-private `.ts` session must return semantic definition/reference
-/// evidence and complete its graceful shutdown before the helper reports all children reaped.
+/// environment paths. Helper-private `.ts` and `.js` sessions must return semantic locations and
+/// provisional type-error counts, then shut down before the helper reports all children reaped.
 #[tokio::test]
 #[ignore = "requires exact AGENT_IDE_NODE, AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER and AGENT_IDE_TSSERVER environment"]
 async fn configured_product_claude_helper_returns_real_typescript_semantic_context_and_reaps() {
     let fixture = ProductFixture::new_claude(json!([accepted_typescript_provider()]));
-    let source = "export const value: number = 42;\nexport const use: number = value;\n";
+    let source = "export const value: number = 42;\nexport const use: number = value;\nexport const broken: number = 'bad';\n";
+    let js_source = "// @checkJs\nexport const value = 42;\nexport const use = value;\n/** @type {number} */ export const broken = 'bad';\n";
     std::fs::write(fixture.root.join("fixture.ts"), source).unwrap();
+    std::fs::write(fixture.root.join("fixture.js"), js_source).unwrap();
     std::fs::write(
         fixture.root.join("tsconfig.json"),
-        "{\"compilerOptions\":{\"types\":[],\"moduleResolution\":\"node10\"},\"files\":[\"fixture.ts\"]}\n",
+        "{\"compilerOptions\":{\"types\":[],\"moduleResolution\":\"node10\",\"allowJs\":true,\"checkJs\":true},\"files\":[\"fixture.js\",\"fixture.ts\"]}\n",
     )
     .unwrap();
-    fixture.git(&["add", "--", "fixture.ts", "tsconfig.json"]);
+    fixture.git(&["add", "--", "fixture.ts", "fixture.js", "tsconfig.json"]);
     fixture.git(&["commit", "--quiet", "-m", "TypeScript Claude fixture"]);
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "claude-typescript").await;
@@ -5107,19 +5120,33 @@ async fn configured_product_claude_helper_returns_real_typescript_semantic_conte
     let (started, _) = actor.complete_claude_pending(&fixture, &started).await;
     assert_eq!(started["kind"], "activation", "{started}");
 
-    let context = actor
-        .call_claude(
-            &fixture,
-            "ide.context",
-            json!({"path":"fixture.ts","byte_offset":source.rfind("value;").unwrap()}),
-        )
-        .await;
-    let (context, _) = actor.complete_claude_pending(&fixture, &context).await;
-    assert_eq!(context["kind"], "context", "{context}");
-    let text = context["text"].as_str().unwrap();
-    assert!(text.contains("mode: semantic"), "{context}");
-    assert!(text.contains("definitions: [{"), "{context}");
-    assert!(text.contains("references: [{"), "{context}");
+    for (path, source) in [("fixture.ts", source), ("fixture.js", js_source)] {
+        let context = actor
+            .call_claude(
+                &fixture,
+                "ide.context",
+                json!({"path":path,"byte_offset":source.rfind("value;").unwrap()}),
+            )
+            .await;
+        let (context, _) = actor.complete_claude_pending(&fixture, &context).await;
+        assert_eq!(context["kind"], "context", "{path}: {context}");
+        let text = context["text"].as_str().unwrap();
+        assert!(text.contains("mode: semantic"), "{path}: {context}");
+        assert!(text.contains("definitions: [{"), "{path}: {context}");
+        assert!(text.contains("references: [{"), "{path}: {context}");
+        assert!(
+            text.contains("diagnostics_freshness: Provisional"),
+            "{path}: {context}"
+        );
+        assert!(
+            text.contains("diagnostic_readiness: Reported"),
+            "{path}: {context}"
+        );
+        assert!(
+            text.contains("diagnostic_count: at_least_"),
+            "{path}: {context}"
+        );
+    }
 
     let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");

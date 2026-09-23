@@ -139,17 +139,21 @@ Unknown notifications remain inert and unretained.
 
 `Session::diagnostics` returns a bounded push observation tied to this generation.
 Wrong URIs and stale document versions are discarded. Matching versioned pushes are
-provisional; unversioned pushes carry no source binding and remain provisional.
+provisional: an empty result can mark `Clean`, and a nonempty result marks `Reported`.
+Unversioned pushes normally carry no source binding. The v0.2 TypeScript one-shot
+exception binds only a nonempty push for the newly opened, unchanged document;
+it is `Reported` with a provisional lower-bound count, never proof of a complete result.
 Source changes and close clear diagnostic evidence. Invalidation clears source identity, document
-version, truncation, items and readiness. No document diagnostic pull is implemented, so diagnostic
-readiness remains `Unknown`, including empty pushes; Rust startup quiescence does not make a document clean.
+version, truncation, items and readiness. An empty unversioned push or silence remains `Unknown`;
+Rust startup quiescence does not make a document clean. No document diagnostic pull is implemented.
 The pure freshness/cache lifecycle remains available for future verified pull results.
 
 Assistance routes the public `ide.context` facade to this API with live
 authority/revocation cancellation. It presents diagnostics only when the Session snapshot's
-source binding, provider generation, and positive document version match the returned context,
-and labels the resulting feedback delta provisional. This module does not implement public tool
-dispatch, checks, source writes, Scope or a context compiler.
+source binding and provider generation match the returned context, and either a positive document
+version matches or the one-shot TypeScript report is nonempty and explicitly `Reported`.
+Unversioned counts are lower bounds; feedback remains provisional. This module does not implement
+public tool dispatch, checks, source writes, Scope or a context compiler.
 
 ## Profiles, isolation and caches
 

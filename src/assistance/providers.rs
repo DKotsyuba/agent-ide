@@ -1765,9 +1765,9 @@ fn remaining_options(job: &Job) -> SessionOptions {
     }
 }
 
-/// Runs the accepted settings handshake and one exact-source query. It waits until the inherited
-/// deadline for Pyright's versioned diagnostics and up to five seconds for a bound nonempty
-/// TypeScript report, then snapshots bounded evidence and performs graceful protocol shutdown.
+/// Runs the accepted settings handshake and one exact-source query. It waits for Pyright's
+/// versioned diagnostics until the inherited deadline minus shutdown reserve, or up to two
+/// seconds for a bound nonempty TypeScript report, then snapshots bounded evidence and shuts down.
 /// Other profiles preserve their immediate snapshot. Transport or protocol failures return
 /// `ProviderUnavailable`; the caller still owns and must reap the protocol child.
 #[allow(clippy::too_many_arguments)]
