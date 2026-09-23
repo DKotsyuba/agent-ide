@@ -296,6 +296,68 @@ async fn unversioned_typescript_diagnostics_require_unchanged_initial_open() {
     assert!(!wait_for_matching_diagnostics(&state, Instant::now()).await);
 }
 
+/// A clean document with no diagnostic push must leave time for shutdown and transport EOF.
+#[tokio::test]
+async fn missing_diagnostics_do_not_consume_shutdown_deadline() {
+    let (client, peer) = tokio::io::duplex(16384);
+    let (input, output) = tokio::io::split(client);
+    let (peer_input, peer_output) = tokio::io::split(peer);
+    let (server, _) = MainLoop::new_server(|client| {
+        let mut router = Router::new(client);
+        router.request::<request::Initialize, _>(|_, _| async {
+            Ok(lsp::InitializeResult {
+                capabilities: lsp::ServerCapabilities {
+                    text_document_sync: Some(lsp::TextDocumentSyncCapability::Kind(
+                        lsp::TextDocumentSyncKind::FULL,
+                    )),
+                    ..Default::default()
+                },
+                server_info: None,
+            })
+        });
+        router.request::<request::Shutdown, _>(|_, _| async { Ok(()) });
+        router.notification::<lsp::notification::Exit>(|_, _| ControlFlow::Break(Ok(())));
+        router.unhandled_notification(|_, _| ControlFlow::Continue(()));
+        router
+    });
+    let run = with_session(
+        input,
+        output,
+        tree(),
+        1,
+        ViewGeneration::default(),
+        gopls_settings(),
+        SessionOptions {
+            request_timeout: Duration::from_millis(600),
+            lifetime: Duration::from_millis(600),
+        },
+        |mut session| async move {
+            session
+                .context(
+                    &observation("package main", 1),
+                    b"package main",
+                    ContextQuery::File,
+                )
+                .await?;
+            session.wait_for_matching_diagnostics().await;
+            assert_eq!(
+                session.diagnostics().readiness,
+                DiagnosticReadiness::Unknown
+            );
+            session.shutdown().await
+        },
+    );
+    let (result, _) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(
+            run,
+            server.run_buffered(peer_input.compat(), peer_output.compat_write())
+        )
+    })
+    .await
+    .expect("mock server settles");
+    result.expect("diagnostic silence must preserve shutdown time");
+}
+
 /// Confirms an accepted versioned diagnostic callback wakes the bounded exact-document wait.
 #[tokio::test]
 async fn matching_diagnostics_notification_wakes_waiter() {
