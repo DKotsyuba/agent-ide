@@ -401,7 +401,9 @@ impl From<FailureCode> for ReasonCode {
         match value {
             FailureCode::LauncherConfiguration => Self::LauncherConfiguration,
             FailureCode::SandboxState => Self::SandboxState,
-            FailureCode::ExecutionProfile => Self::ExecutionProfile,
+            FailureCode::ExecutionProfile | FailureCode::ExecutionProfileCause(_) => {
+                Self::ExecutionProfile
+            }
             FailureCode::UnsupportedGit => Self::UnsupportedGit,
             FailureCode::WorkspaceActivation => Self::WorkspaceActivation,
             FailureCode::WorkspaceAuthority => Self::WorkspaceAuthority,

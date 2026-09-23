@@ -11,7 +11,7 @@ use super::{
     },
     launcher::{AcceptedProviderSettings, LaunchTarget, LauncherConfig},
     problems::{ProblemSource, ProjectProblemFeed, parse_language, problems_text_with_rechecks},
-    reply::{EditDiagnostics, FailureCode, PeerReply, ResultKind},
+    reply::{EditDiagnostics, ExecutionProfileCause, FailureCode, PeerReply, ResultKind},
 };
 use crate::telemetry::{
     AdmissionState, CancellationState, DescendantSettlement, OutputSizeClass, Telemetry,
@@ -2283,7 +2283,7 @@ impl<'a> Worker<'a> {
         )
         .map_err(|_| {
             record_execution_profile(errorlog_method(job.tool), "git_policy");
-            FailureCode::ExecutionProfile
+            FailureCode::ExecutionProfileCause(ExecutionProfileCause::GitPolicy)
         })?;
         let mut evidence = Vec::with_capacity(3);
         for query in [
@@ -2316,7 +2316,10 @@ impl<'a> Worker<'a> {
                         detail.push_str(&capture_rejected_state(observed.state().as_json()).await);
                     }
                     record_execution_profile(errorlog_method(job.tool), &detail);
-                    return Err(FailureCode::ExecutionProfile);
+                    let cause = ExecutionProfileCause::from_log_tag(&detail)
+                        .expect("discovery refusal has a closed execution-profile tag");
+                    job.failure_detail = Some(detail);
+                    return Err(FailureCode::ExecutionProfileCause(cause));
                 }
             };
             if *job.cancel.borrow() {
@@ -2386,7 +2389,7 @@ impl<'a> Worker<'a> {
         .map_err(|error| match error {
             crate::workspace::git::GitError::UnsupportedDiscoveryGit => {
                 record_execution_profile(errorlog_method(job.tool), "git_unsupported");
-                FailureCode::ExecutionProfile
+                FailureCode::ExecutionProfileCause(ExecutionProfileCause::GitUnsupported)
             }
             _ => FailureCode::WorkspaceActivation,
         })?;
@@ -2995,7 +2998,10 @@ impl<'a> Worker<'a> {
             self.uncertain.insert(binding.clone());
         }
         record_execution_profile(method, &detail);
-        FailureCode::ExecutionProfile
+        FailureCode::ExecutionProfileCause(
+            ExecutionProfileCause::from_log_tag(&detail)
+                .expect("spawn refusal has a closed execution-profile tag"),
+        )
     }
 
     /// Returns only a current boot-fenced stamp after a fresh binding consume.
@@ -4518,15 +4524,14 @@ fn diagnostics_reserve_known_edit_settlement_time() {
 /// A refused read-scope recheck: the closed public code plus the closed error-log detail
 /// (T36B-r), so callers that surface the refusal beyond the error log keep the exact condition.
 ///
-/// Produced only by [`validate_read_scope`], which has already written `detail` to the error log
-/// by the time an `ExecutionProfile` refusal is returned. Callers that only reply to the agent
-/// (fresh Context `observe`, cached delivery) keep `code` and drop `detail`; Diff capture copies
+/// Produced only by [`validate_read_scope`], which writes `detail` to the error log before
+/// returning. The code carries the same closed cause to agent replies; Diff capture also copies
 /// `detail` into the job's `failure_detail`.
 #[derive(Debug)]
 struct ReadScopeRefusal {
     /// The public failure code the reply carries: `WorkspaceAuthority` when the durable stamp
     /// cannot be restated, the binding's own liveness code when it is no longer active, and
-    /// `ExecutionProfile` for every workspace-read recheck refusal.
+    /// `ExecutionProfileCause` for every workspace-read recheck refusal.
     code: FailureCode,
     /// The closed, privacy-safe condition tag (for example `read_scope:path_unproven`,
     /// `workspace_authority`, `internal`); never a path, sandbox-state JSON or error text.
@@ -4571,7 +4576,10 @@ fn validate_read_scope(
         let detail = read_scope_detail(&error);
         record_execution_profile(method, &detail);
         ReadScopeRefusal {
-            code: FailureCode::ExecutionProfile,
+            code: FailureCode::ExecutionProfileCause(
+                ExecutionProfileCause::from_log_tag(&detail)
+                    .expect("read-scope refusal has a closed execution-profile tag"),
+            ),
             detail,
         }
     })
@@ -4706,8 +4714,7 @@ fn errorlog_method(tool: AssistanceTool) -> crate::errorlog::Method {
     }
 }
 
-/// Records one execution-profile refusal with its closed condition detail; best-effort like every
-/// error-log write, and always an addition: it never changes the returned failure code (T24B).
+/// Records one execution-profile refusal with its closed condition detail, best-effort.
 fn record_execution_profile(method: crate::errorlog::Method, detail: &str) {
     crate::errorlog::record(
         method,
@@ -6445,7 +6452,7 @@ mod stop_retry_tests {
                 crate::execution::ReadScope::Path(Path::new("secret/key.txt")),
             ),
             Err(ReadScopeRefusal {
-                code: FailureCode::ExecutionProfile,
+                code: FailureCode::ExecutionProfileCause(ExecutionProfileCause::ReadPathUnproven),
                 ..
             })
         ));
@@ -6507,7 +6514,7 @@ mod stop_retry_tests {
             )
             .await,
             PeerReply::Error {
-                code: FailureCode::ExecutionProfile
+                code: FailureCode::ExecutionProfileCause(ExecutionProfileCause::ReadPathUnproven)
             }
         ));
         deliver(&worker, "read-scope-unproven", None);
@@ -6521,7 +6528,7 @@ mod stop_retry_tests {
             )
             .await,
             PeerReply::Error {
-                code: FailureCode::ExecutionProfile
+                code: FailureCode::ExecutionProfileCause(_)
             }
         ));
         // The whole-tree scope keeps its restrictive behavior: the deny-bearing state can
@@ -6537,7 +6544,7 @@ mod stop_retry_tests {
                 crate::execution::ReadScope::WholeTree,
             ),
             Err(ReadScopeRefusal {
-                code: FailureCode::ExecutionProfile,
+                code: FailureCode::ExecutionProfileCause(_),
                 ..
             })
         ));
@@ -6812,7 +6819,10 @@ mod stop_retry_tests {
             &authority,
         );
         let error = worker.diff(&mut job).await.unwrap_err();
-        assert_eq!(error, FailureCode::ExecutionProfile);
+        assert_eq!(
+            error,
+            FailureCode::ExecutionProfileCause(ExecutionProfileCause::ReadPathUnproven)
+        );
         assert_eq!(
             job.failure_detail.as_deref(),
             Some("read_scope:path_unproven"),
@@ -6973,7 +6983,7 @@ mod stop_retry_tests {
         assert!(matches!(
             inspect_detail(&worker, &binding, "untracked-diff", &denied, &target).await,
             PeerReply::Error {
-                code: FailureCode::ExecutionProfile
+                code: FailureCode::ExecutionProfileCause(ExecutionProfileCause::ReadPathUnproven)
             }
         ));
     }
@@ -7053,7 +7063,7 @@ mod stop_retry_tests {
         assert!(matches!(
             inspect_detail(&worker, &binding, "cached-page", &denied, &target).await,
             PeerReply::Error {
-                code: FailureCode::ExecutionProfile
+                code: FailureCode::ExecutionProfileCause(ExecutionProfileCause::ReadPathUnproven)
             }
         ));
     }
@@ -7132,7 +7142,7 @@ mod stop_retry_tests {
         };
         assert!(text.contains(allowed.trim_end()), "{text}");
 
-        // The denied path is refused by `observe` before any read: public code only, no bytes.
+        // The denied path is refused by `observe` before any read: closed cause, no bytes.
         // `PeerReply`'s Debug is redacted, so the checks read its full serialized wire form.
         let denied_wire = serde_json::to_string(&retained("denied-context")).unwrap();
         assert!(
@@ -7143,7 +7153,9 @@ mod stop_retry_tests {
             matches!(
                 retained("denied-context"),
                 PeerReply::Error {
-                    code: FailureCode::ExecutionProfile
+                    code: FailureCode::ExecutionProfileCause(
+                        ExecutionProfileCause::ReadPathUnproven
+                    )
                 }
             ),
             "{denied_wire}"
@@ -7173,7 +7185,10 @@ mod stop_retry_tests {
             crate::execution::ReadScope::Path(Path::new("secret/key.txt")),
         )
         .unwrap_err();
-        assert_eq!(refusal.code, FailureCode::ExecutionProfile);
+        assert_eq!(
+            refusal.code,
+            FailureCode::ExecutionProfileCause(ExecutionProfileCause::ReadPathUnproven)
+        );
         assert_eq!(refusal.detail, "read_scope:path_unproven");
     }
 }

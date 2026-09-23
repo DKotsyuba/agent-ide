@@ -29,6 +29,8 @@ Edit presents the closed outcome, public path and only the references needed for
 
 Typed Error sets isError. `resolution_unverified` names the supported configured-project requirement and a later Context retry without claiming that a native tool can substitute for closed TypeScript resolution. Unavailable, pending, lifecycle, feedback and edit-result states do not become transport errors; each accepted typed reply has one compact content block, and unchanged structuredContent wherever the host-specific projection above includes it. Native fallback is named only when IDE work is unavailable, unsupported, declined or uncertain.
 
+An `execution_profile` refusal with a closed cause renders `error: execution_profile (<tag>); continue with native tools`, preserving the leading code. The tag is one of the fixed, path-free error-log details; for example, `host_disabled`. Refusals without a closed cause retain `error: execution_profile; continue with native tools`.
+
 ## Bounds and privacy
 
 The final serialized CallToolResult, not an intermediate reply, must fit the existing Assistance response ceiling; the renderer measures the exact carrier it is about to emit, so a Claude projection is measured without the structuredContent it omits. Only owner Complete text may shrink, at UTF-8 boundaries, while marking truncation. Closed identifiers, paths, outcomes, helper commands and references are not partially emitted.

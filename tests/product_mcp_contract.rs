@@ -2986,6 +2986,44 @@ async fn managed_codex_lease_keeps_daemon_alive_past_idle_timeout() {
     mcp.close().await;
 }
 
+/// A disabled host refused by launcher policy exposes only its existing closed cause to the model.
+#[tokio::test]
+async fn managed_codex_execution_profile_refusal_names_host_disabled() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let fixture = ProductFixture::new(json!([]));
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+    config["targets"][0]["allow_disabled_host"] = json!(false);
+    std::fs::write(&fixture.config, config.to_string()).unwrap();
+    let mut mcp = Mcp::start_managed(&fixture.config, &fixture.root).await;
+    let state = fixture.state();
+    let mut next = 10;
+    let mut reply = mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.start","arguments":{"activation_id":"refused"},"_meta":{"threadId":"disabled-host","callId":format!("disabled-host-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":state}}})).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while reply["result"]["structuredContent"]["state"] == "pending" {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "profile refusal did not settle"
+        );
+        let reference = reply["result"]["structuredContent"]["detail_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        next += 1;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        reply = mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.inspect","arguments":{"detail_ref":reference},"_meta":{"threadId":"disabled-host","callId":format!("disabled-host-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":state}}})).await;
+    }
+    assert_eq!(
+        reply["result"]["structuredContent"]["state"], "error",
+        "{reply}"
+    );
+    assert_eq!(
+        reply["result"]["content"][0]["text"],
+        "error: execution_profile (host_disabled); continue with native tools"
+    );
+    mcp.close().await;
+}
+
 /// A publication failure (unusable rendezvous root) never touches managed MCP replies.
 #[tokio::test]
 async fn managed_codex_publication_failure_leaves_replies_working() {

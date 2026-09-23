@@ -80,6 +80,8 @@ T24B: each `execution_profile` conversion site on the activation/read path also 
 `profile_digest_mismatch:<managed|disabled>`, `spawn:<process error variant>`, `git_unsupported`,
 and `read_scope:<variant>`. Only class names and closed variant names are ever recorded — never
 paths, sandbox-state JSON, digests, or OS error strings.
+The same closed cause appears in agent-facing `execution_profile` refusal text when available;
+capture file stems and other log-only suffixes never appear there.
 
 T38B: a Claude foreground helper that settles a provider operation as `provider_unavailable` also
 logs its own `<method> failed provider_unavailable` event from the helper process (the helper

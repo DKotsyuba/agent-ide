@@ -70,11 +70,19 @@ pub(crate) fn fits_with_status(reply: &PeerReply, status: &str, envelope: Envelo
 /// structured value.
 ///
 /// Serialization failure returns `None` regardless of `envelope`, so a value this renderer cannot
-/// faithfully represent never silently drops its structured copy. The projection performs no I/O,
-/// host inspection, diagnostics inference, or model call, and never places the serialized JSON in
-/// `content`.
+/// faithfully represent never silently drops its structured copy. A tagged execution-profile
+/// refusal keeps the public structured `code` string stable; the cause appears only in compact
+/// text. Projection performs no I/O, host inspection, diagnostics inference, or model call.
 fn project(reply: &PeerReply, status: Option<&str>, envelope: Envelope) -> Option<CallToolResult> {
-    let structured = serde_json::to_value(reply).ok()?;
+    let mut structured = serde_json::to_value(reply).ok()?;
+    if matches!(
+        reply,
+        PeerReply::Error {
+            code: FailureCode::ExecutionProfileCause(_)
+        }
+    ) {
+        structured["code"] = serde_json::Value::String("execution_profile".to_owned());
+    }
     let structured = match status {
         Some(status) => match structured {
             serde_json::Value::Object(mut fields) => {
@@ -159,12 +167,19 @@ fn render_text(reply: &PeerReply) -> String {
               refused helper ticket expires unclaimed); repeat the original ide.* call to get a \
               fresh one, or continue with native tools"
             .to_owned(),
+        PeerReply::Error {
+            code: FailureCode::ExecutionProfileCause(cause),
+        } => format!(
+            "error: execution_profile ({}); continue with native tools",
+            cause.tag()
+        ),
         PeerReply::Error { code } => format!(
             "error: {}; continue with native tools",
             match code {
                 FailureCode::LauncherConfiguration => "launcher_configuration",
                 FailureCode::SandboxState => "sandbox_state",
                 FailureCode::ExecutionProfile => "execution_profile",
+                FailureCode::ExecutionProfileCause(_) => unreachable!("handled above"),
                 FailureCode::UnsupportedGit => "unsupported_git",
                 FailureCode::WorkspaceActivation => "workspace_activation",
                 FailureCode::WorkspaceAuthority => "workspace_authority",
@@ -506,6 +521,31 @@ mod tests {
         assert!(text.starts_with("error: invalid_detail;"), "{text}");
         assert!(text.contains("repeat the original ide.* call"), "{text}");
         assert_eq!(expired.is_error, Some(true));
+    }
+
+    /// A closed profile cause appears after the stable code; capture suffixes and unknown tags
+    /// cannot be admitted into agent-facing text.
+    #[test]
+    fn execution_profile_cause_is_closed_and_actionable() {
+        use crate::assistance::reply::ExecutionProfileCause;
+        let cause = ExecutionProfileCause::from_log_tag("host_disabled; captured:deadbeef")
+            .expect("known cause");
+        let rendered = render(
+            PeerReply::Error {
+                code: FailureCode::ExecutionProfileCause(cause),
+            },
+            Envelope::WithStructured,
+        )
+        .unwrap();
+        assert_eq!(
+            text_of(&rendered),
+            "error: execution_profile (host_disabled); continue with native tools"
+        );
+        assert_eq!(
+            rendered.structured_content.unwrap()["code"],
+            "execution_profile"
+        );
+        assert!(ExecutionProfileCause::from_log_tag("host_disabled:/private/path").is_none());
     }
 
     /// Keeps unresolved TypeScript configuration actionable without claiming a native substitute.
