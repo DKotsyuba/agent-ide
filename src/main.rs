@@ -2580,14 +2580,23 @@ async fn serve_managed_stdio(
     lease: Option<Arc<Mutex<Option<UnixStream>>>>,
     publisher: Option<SharedCodexPublisher>,
 ) -> ExitCode {
-    let (served, signalled) = match serve_server(facade, stdio()).await {
-        Ok(service) => {
+    // Install signal handlers before `serve_server` can send its initialize reply. The host may
+    // signal us as soon as it receives that reply, before `serve_server` has returned here.
+    let termination = managed_termination_signal();
+    tokio::pin!(termination);
+    let service = tokio::select! {
+        result = serve_server(facade, stdio()) => Some(result),
+        () = &mut termination => None,
+    };
+    let (served, signalled) = match service {
+        Some(Ok(service)) => {
             tokio::select! {
                 result = service.waiting() => (result.is_ok(), false),
-                () = managed_termination_signal() => (true, true),
+                () = &mut termination => (true, true),
             }
         }
-        Err(_) => (false, false),
+        Some(Err(_)) => (false, false),
+        None => (true, true),
     };
     // A restart may be between runtime creation and child/lease installation. Wait for it (or
     // for cancellation to drop it) before retiring routes and tearing down the owned generation.
@@ -2674,18 +2683,23 @@ async fn unpublish_when_daemon_exits(
     }
 }
 
-/// Resolves after the first process SIGINT or SIGTERM; registration failure waits for stdio EOF.
-async fn managed_termination_signal() {
-    let (Ok(mut interrupt), Ok(mut terminate)) = (
+/// Registers SIGINT/SIGTERM immediately, then resolves after the first signal.
+///
+/// Registration failure leaves the returned future pending so stdio EOF remains the exit path.
+fn managed_termination_signal() -> impl std::future::Future<Output = ()> {
+    let signals = (
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()),
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()),
-    ) else {
-        std::future::pending::<()>().await;
-        return;
-    };
-    tokio::select! {
-        _ = interrupt.recv() => {}
-        _ = terminate.recv() => {}
+    );
+    async move {
+        let (Ok(mut interrupt), Ok(mut terminate)) = signals else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
     }
 }
 
