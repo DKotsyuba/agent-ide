@@ -1,5 +1,5 @@
 #!/bin/sh
-# Status: real_pass on 3be73b5 (release 0.3.13); see docs/macos-acceptance.md.
+# Status: real_pass on edaf281 (release 0.3.15); see docs/macos-acceptance.md.
 
 # Real-host driver for the installed agent-run to Claude acceptance route.
 #

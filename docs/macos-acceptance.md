@@ -142,8 +142,8 @@ documentation and evidence, not the tested product. The real-host matrix remains
 partially successful route is not a `real_pass`, and the runner marks every scenario `failed` when
 its strict driver withholds the exact complete result document.
 
-All four routes passed on one revision for release 0.3.13 (`3be73b5`), every scenario on its
-first attempt: Claude Code 2.1.280, Codex CLI 0.155.1 and agent-run 0.12.5 to Claude Code 2.1.280.
+All four routes passed on one revision for release 0.3.15 (`edaf281`): Claude Code 2.1.280,
+Codex CLI 0.155.1 and agent-run 0.12.6 to Claude Code 2.1.280.
 Three environment facts were required and are now encoded in the drivers or release notes: the
 Claude plugin hook entry carries no `args` (Claude Code 2.1.280 runs such entries without a shell),
 Claude route sessions exclude user-level settings so an operator-registered hook cannot double the
@@ -154,7 +154,7 @@ candidate hook, and the agent-run service is restarted after an install so it lo
 | Product contract | [JSON](evidence/macos-v0.2-product.json) | `product_pass` |
 | Direct Codex CLI 0.155.1 | [JSON](evidence/macos-v0.2-direct-codex.json) | `real_pass` |
 | Direct Claude Code 2.1.280 | [JSON](evidence/macos-v0.2-direct-claude.json) | `real_pass` |
-| Installed agent-run 0.12.5 to Claude Code 2.1.280 | [JSON](evidence/macos-v0.2-agent-run-claude.json) | `real_pass` |
+| Installed agent-run 0.12.6 to Claude Code 2.1.280 | [JSON](evidence/macos-v0.2-agent-run-claude.json) | `real_pass` |
 
 The installed agent-run route is separate evidence and is not relabeled as direct Claude. Private
 driver prompts, local paths, credentials, transcripts, and host/run identifiers were retained only

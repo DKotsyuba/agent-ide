@@ -3167,7 +3167,15 @@ async fn managed_codex_sigterm_without_restart_exits() {
         .await
         .expect("managed MCP ignored SIGTERM")
         .unwrap();
-    assert_eq!(managed_runtime_paths(), before);
+    // The owned daemon removes its runtime directory as it exits, which can trail the MCP's own
+    // exit on a loaded machine; wait for it with the same bound as the restart test.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while managed_runtime_paths() != before {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("SIGTERM left an owned runtime behind");
 }
 
 /// A live managed Codex MCP holds a lease, so an idle daemon survives its launcher timeout and
