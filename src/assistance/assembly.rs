@@ -282,10 +282,10 @@ impl ProductDispatcher {
             return error(FailureCode::LauncherConfiguration);
         };
         // An absent or unaccepted operator profile leaves the Claude path unavailable.
-        let Some(profile) = target.claude_profile else {
+        let Some(profile) = target.claude_profile.as_ref() else {
             return error(FailureCode::ExecutionProfile);
         };
-        if let Err(code) = ClaudeOperatorProfile::validate(&profile) {
+        if let Err(code) = ClaudeOperatorProfile::validate(profile) {
             return error(code);
         }
         let (Some(binary), Ok(runtime_dir)) = (&self.helper_binary, self.runtime_dir.lock()) else {
@@ -743,7 +743,9 @@ impl ProductDispatcher {
     /// Parses separated ingress and commits binding transitions before queue, inspection or stop I/O.
     ///
     /// `status` is written only when a terminal `ide.*` reply for a reply-delivered host (T28B)
-    /// carries the due status plate on top; the caller renders it ahead of the reply.
+    /// carries the due status plate on top; the caller renders it ahead of the reply. A native
+    /// hook has no current sandbox metadata, so it uses the binding feed's sticky restriction
+    /// state before triggering a check or releasing cached feedback.
     async fn handle(
         &self,
         request: &AssistanceDispatch,
@@ -909,7 +911,12 @@ impl ProductDispatcher {
                             if triggers_check && let Some(feed) = feed {
                                 feed.changed(&fingerprint);
                             }
-                            let feedback = worker.take_current_feedback(binding).await;
+                            let feedback =
+                                if feed.is_some_and(|feed| feed.is_read_restricted(&fingerprint)) {
+                                    None
+                                } else {
+                                    worker.take_current_feedback(binding).await
+                                };
                             // The block is taken from in-memory snapshots only. It is skipped, and
                             // stays due for a later hook, whenever it could not fit beside the
                             // feedback inside one bounded hook context.

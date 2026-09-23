@@ -128,11 +128,10 @@ struct Detail {
     context_page: Option<ContextPageState>,
     /// Same first-page semantics as `diff_page_fresh`, for `context_page`.
     context_page_fresh: bool,
-    /// Bounded set of every worktree path a completed managed Diff detail represents — each
-    /// delivered path plus its rename source — retained independently of the disposable
-    /// pagination state (T36B). Cached delivery must prove each of these paths under the live
-    /// cwd-bound profile before handing any composed page back; a diff detail missing this
-    /// provenance never falls through to an empty-path success.
+    /// Bounded paths a completed managed Diff or semantic Context detail represents: diff paths
+    /// and rename sources, or definition/reference paths. Cached delivery proves every path
+    /// under the live profile before releasing any composed page; missing diff provenance never
+    /// falls through to an empty-path success.
     diff_provenance: Option<BTreeSet<PathBuf>>,
 }
 
@@ -630,7 +629,7 @@ impl Shared {
         }
         retained
     }
-    /// Retains the bounded per-path provenance of one completed managed Diff (T36B).
+    /// Retains the bounded per-path provenance of one managed Diff or semantic Context.
     ///
     /// Stored once at capture time, independently of the disposable pagination state, so every
     /// later cached delivery of this detail — composed page or freshness reread — can prove
@@ -772,7 +771,7 @@ impl WorkerHandle {
     /// Registers a separate target for a host-selected Claude project without changing live peers.
     pub fn register_claude_candidate(&self, candidate: &Path) -> Option<String> {
         let template = self.shared.launcher.sole_target()?.clone();
-        template.claude_profile?;
+        template.claude_profile.as_ref()?;
         let resolved = std::fs::canonicalize(candidate).ok()?;
         if resolved != candidate {
             return None;
@@ -2194,18 +2193,26 @@ impl<'a> Worker<'a> {
                     },
                     Some(authority),
                 ) if job.tool == AssistanceTool::Start => {
-                    let read_restricted = job.observed.as_ref().is_some_and(|observed| {
-                        validate_read_scope(
-                            &self.shared,
-                            &binding,
-                            observed,
-                            &job.target,
-                            authority,
-                            errorlog_method(job.tool),
-                            crate::execution::ReadScope::WholeTree,
-                        )
-                        .is_err()
-                    });
+                    let read_restricted = job.observed.as_ref().map_or_else(
+                        || {
+                            job.target.claude_profile.as_ref().is_none_or(|profile| {
+                                !profile
+                                    .declares_whole_tree_read(authority.worktree().worktree_path())
+                            })
+                        },
+                        |observed| {
+                            validate_read_scope(
+                                &self.shared,
+                                &binding,
+                                observed,
+                                &job.target,
+                                authority,
+                                errorlog_method(job.tool),
+                                crate::execution::ReadScope::WholeTree,
+                            )
+                            .is_err()
+                        },
+                    );
                     feed.activated(
                         binding.fingerprint(),
                         authority.worktree().worktree_path(),
@@ -2670,6 +2677,7 @@ impl<'a> Worker<'a> {
         let profile = job
             .target
             .claude_profile
+            .as_ref()
             .ok_or(FailureCode::ExecutionProfile)?;
         let rights = profile.rights_identity()?;
         if let Err(code) =
@@ -3212,7 +3220,9 @@ impl<'a> Worker<'a> {
         }
     }
 
-    /// Returns current owner context with explicit semantic or lexical provenance and bounded source text.
+    /// Returns current owner context with explicit semantic or lexical provenance and bounded
+    /// source text. Managed semantic locations are proved per path and retained for later Inspect
+    /// reauthorization under the live profile.
     async fn context(
         &mut self,
         job: &mut Job,
@@ -3345,6 +3355,35 @@ impl<'a> Worker<'a> {
                 )
             },
         );
+        // Provider locations are part of the reply too: retain and prove every secondary path.
+        let mut provenance = BTreeSet::new();
+        for location in context
+            .definitions
+            .iter()
+            .flatten()
+            .chain(context.references.iter().flatten())
+        {
+            let absolute = location
+                .uri
+                .to_file_path()
+                .map_err(|_| FailureCode::SourceUnavailable)?;
+            let relative = absolute
+                .strip_prefix(authority.worktree().worktree_path())
+                .map_err(|_| FailureCode::SourceUnavailable)?;
+            if let Some(scope) = job.observed.as_ref() {
+                validate_read_scope(
+                    &self.shared,
+                    &binding,
+                    scope,
+                    &job.target,
+                    &authority,
+                    errorlog_method(job.tool),
+                    crate::execution::ReadScope::Path(relative),
+                )
+                .map_err(|refusal| refusal.code)?;
+            }
+            provenance.insert(relative.to_path_buf());
+        }
         let text = format!(
             "mode: {mode}\npath: {path}\nsource_state: {:?}\nsource_sequence: {}\nauthority_epoch: {}\ncoverage: complete registered path\nposition_encoding: {:?}\nprovider_generation: {:?}\ndocument_version: {:?}\n{diagnostic_text}\ndefinitions: {}\nreferences: {}\nlexical_matches: {}\n\n{}",
             observed.state(),
@@ -3403,6 +3442,7 @@ impl<'a> Worker<'a> {
             ContextPageState::new(text, body_start, context.truncated, ResultKind::Context)
                 .next(&job.reference)?;
         self.shared.set_context_page(&job.reference, context_page);
+        self.shared.set_diff_provenance(&job.reference, provenance);
         Ok((reply, Some(authority), Some(observed)))
     }
 
@@ -3411,9 +3451,10 @@ impl<'a> Worker<'a> {
     /// The worktree is the fresh durable authority's worktree — the same active-binding/authority
     /// lookup every other context use requires — and no source file is read and no observation is
     /// recorded. Without an attached source, or when the requested language is not configured,
-    /// the reply is the honest single line `checks disabled`. A Codex profile without current
-    /// whole-tree read proof returns only `unavailable: read_restricted` language states and never
-    /// consults cached problem snapshots. It carries no edit source reference.
+    /// the reply is the honest single line `checks disabled`. A Codex observation or accepted
+    /// Claude operator profile without whole-tree read proof returns only
+    /// `unavailable: read_restricted` language states and never consults cached problem snapshots.
+    /// It carries no edit source reference.
     async fn context_problems_job(
         &mut self,
         job: &mut Job,
@@ -3423,18 +3464,25 @@ impl<'a> Worker<'a> {
             return Err(FailureCode::Deadline);
         }
         let authority = self.authority(binding).await?;
-        let read_restricted = job.observed.as_ref().is_some_and(|observed| {
-            validate_read_scope(
-                &self.shared,
-                binding,
-                observed,
-                &job.target,
-                &authority,
-                errorlog_method(job.tool),
-                crate::execution::ReadScope::WholeTree,
-            )
-            .is_err()
-        });
+        let read_restricted = job.observed.as_ref().map_or_else(
+            || {
+                job.target.claude_profile.as_ref().is_none_or(|profile| {
+                    !profile.declares_whole_tree_read(authority.worktree().worktree_path())
+                })
+            },
+            |observed| {
+                validate_read_scope(
+                    &self.shared,
+                    binding,
+                    observed,
+                    &job.target,
+                    &authority,
+                    errorlog_method(job.tool),
+                    crate::execution::ReadScope::WholeTree,
+                )
+                .is_err()
+            },
+        );
         if read_restricted && let Some(feed) = &self.shared.project_feed {
             feed.restrict(&binding.fingerprint());
         }
@@ -4216,7 +4264,8 @@ async fn inspection_loop(
 /// Delivers only a same-binding result after fresh durable authorization and liveness checks.
 /// An Activation status or completed Diff with recorded empty provenance contains no worktree
 /// source paths or bytes and needs no read-path proof; other path-less details retain the
-/// whole-tree proof requirement.
+/// whole-tree proof requirement. A semantic Context also proves each retained definition and
+/// reference path, so a newly denied secondary file invalidates its cached page.
 async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, request: Inspection) {
     let result = async {
         let active = shared.active(&request.binding)?;
@@ -6556,9 +6605,9 @@ mod stop_retry_tests {
         );
     }
 
-    /// A real managed Start carrying a denied source glob activates Workspace but leaves project
-    /// checks unavailable: no fingerprint or checker runs, and Problems never returns a cached
-    /// diagnostic from the denied file.
+    /// A denied managed Start never checks or discloses diagnostics. After an unrestricted Start,
+    /// a narrowed managed observation also prevents a later metadata-free native edit from
+    /// scheduling a check or disclosing the old result.
     #[tokio::test]
     async fn production_start_with_denied_source_never_checks_or_discloses_it() {
         let fixture = Fixture::new();
@@ -6660,6 +6709,66 @@ mod stop_retry_tests {
             .unwrap();
         assert!(
             matches!(reply, PeerReply::Complete { text, .. } if text == "rust: unavailable: read_restricted")
+        );
+        worker
+            .shared
+            .bindings
+            .lock()
+            .unwrap()
+            .stop_binding(&binding)
+            .unwrap();
+        worker.revoke(&binding, "denied-stop").await.unwrap();
+        feed.forget(&binding.fingerprint());
+
+        // A second actor starts unrestricted, then a managed observation narrows its profile.
+        // A native post carries no metadata and must keep that binding restricted.
+        let (invocation, clean) = read_scope_call(&worker, None, "native-actor", "native-start");
+        let native_binding = invocation.binding_ref().clone();
+        let (_cancel_sender, cancel) = watch::channel(false);
+        worker
+            .perform(Job {
+                input: JobInput::Managed,
+                reference: "native-start-detail".into(),
+                invocation,
+                observed: Some(clean),
+                tool: AssistanceTool::Start,
+                parameters: serde_json::json!({"activation_id":"native-start"}),
+                target: read_scope_target(&fixture.root),
+                deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+                cancel,
+                stop_reply: None,
+                native_epoch: 0,
+                failure_detail: None,
+            })
+            .await;
+        assert!(!feed.is_read_restricted(&native_binding.fingerprint()));
+        let _ = feed.next_block(&native_binding.fingerprint());
+        let handle = WorkerHandle::new(
+            worker.shared.bindings.clone(),
+            worker.shared.launcher.clone(),
+            [0; 32],
+            worker.shared.admission.clone(),
+        )
+        .with_project_feed(feed.clone());
+        let (_, narrowed) = read_scope_call(
+            &worker,
+            Some("secret.rs"),
+            "native-actor",
+            "native-narrowing",
+        );
+        handle.restrict_project_feed(&native_binding, Some(&narrowed));
+        feed.changed(&native_binding.fingerprint());
+        assert!(!feed.is_busy());
+        assert_eq!(
+            feed.next_block(&native_binding.fingerprint()).as_deref(),
+            Some("<agent-ide>\nrust: unavailable: read_restricted\n</agent-ide>")
+        );
+        let before = runner.specs().len();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            runner.specs().len(),
+            before,
+            "native post must not run a check"
         );
     }
 
@@ -7429,6 +7538,7 @@ mod stop_retry_tests {
         // Well above any plausible single reply envelope, so the fixture composes a page two.
         let content = "let value = 1;\n".repeat(3800);
         std::fs::write(fixture.root.join("main.rs"), &content).unwrap();
+        std::fs::write(fixture.root.join("secret.rs"), "private\n").unwrap();
         let store = fixture.store();
         let workspace = DurableWorkspace::open(&store).await.unwrap();
         let mut worker = worker(&store, workspace, fixture.root.clone());
@@ -7465,7 +7575,7 @@ mod stop_retry_tests {
                 reply: first,
                 selection: (AssistanceTool::Context, [0; 32]),
                 authority: Some(authority.clone()),
-                source: Some(source),
+                source: Some(source.clone()),
                 native_epoch: 0,
                 diff_page: None,
                 diff_page_fresh: false,
@@ -7481,6 +7591,48 @@ mod stop_retry_tests {
             panic!("the accepted state must deliver the composed page")
         };
         assert!(text.contains("let value = 1;"), "{text}");
+
+        // The retained semantic page names another file even though its source remains readable.
+        let secret_uri = format!("file://{}", fixture.root.join("secret.rs").display());
+        let semantic_text =
+            format!("mode: semantic\ndefinitions: [{{\"uri\":\"{secret_uri}\"}}]\n\n{content}");
+        let semantic_body = semantic_text.len() - content.len();
+        let (semantic_reply, semantic_page) =
+            ContextPageState::new(semantic_text, semantic_body, false, ResultKind::Context)
+                .next("semantic-page")
+                .unwrap();
+        worker.shared.ledger.lock().unwrap().details.insert(
+            "semantic-page".to_owned(),
+            Detail {
+                binding: binding.clone(),
+                reply: semantic_reply,
+                selection: (AssistanceTool::Context, [0; 32]),
+                authority: Some(authority.clone()),
+                source: Some(source),
+                native_epoch: 0,
+                diff_page: None,
+                diff_page_fresh: false,
+                context_page: semantic_page,
+                context_page_fresh: true,
+                diff_provenance: Some(BTreeSet::from([PathBuf::from("secret.rs")])),
+            },
+        );
+        assert!(
+            matches!(inspect_detail(&worker, &binding, "semantic-page", &clean, &target).await,
+            PeerReply::Complete { text, .. } if text.contains(&secret_uri))
+        );
+        let (_, secret_denied) = read_scope_call(
+            &worker,
+            Some("secret.rs"),
+            "cached-page-actor",
+            "secret-narrowing",
+        );
+        assert!(matches!(
+            inspect_detail(&worker, &binding, "semantic-page", &secret_denied, &target).await,
+            PeerReply::Error {
+                code: FailureCode::ExecutionProfileCause(ExecutionProfileCause::ReadPathUnproven)
+            }
+        ));
 
         // Narrow the policy to deny the source: the next return refuses — the composed page
         // and every later page of it are withheld under the current binding state.

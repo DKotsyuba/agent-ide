@@ -7873,6 +7873,47 @@ async fn eyes_claude_post_hook_delivers_problem_block_and_delta() {
     assert!(home.join(".agent-ide/checks").is_dir());
 }
 
+/// A strict Claude profile whose read exclusion intersects the worktree never checks or reveals
+/// cached project diagnostics; the deny-free Claude fixture above retains normal checking.
+#[tokio::test]
+async fn eyes_claude_read_exclusion_reports_only_restricted_status() {
+    let fixture = ProductFixture::new_claude(json!([]));
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    std::fs::write(fixture.root.join("problems.count"), "7").unwrap();
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+    config["targets"][0]["claude_profile"]["read_denies"] = json!([fixture.root.join("secret.rs")]);
+    std::fs::write(&fixture.config, config.to_string()).unwrap();
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let (mut actor, status) = eyes_claude_actor(&fixture, "claude-restricted-eyes").await;
+    assert_eq!(
+        status,
+        "<agent-ide>\nrust: unavailable: read_restricted\n</agent-ide>"
+    );
+    assert_eq!(
+        eyes_problems(&mut actor, &fixture).await,
+        "rust: unavailable: read_restricted"
+    );
+    assert!(actor.claude_native_post(&fixture, "Edit").await.is_empty());
+    assert_eq!(
+        eyes_problems(&mut actor, &fixture).await,
+        "rust: unavailable: read_restricted"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        std::fs::read_dir(home.join(".agent-ide/checks"))
+            .unwrap()
+            .count(),
+        0,
+        "restricted profile must not create a check cache"
+    );
+    let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Reads the `ide.context` problems page for an active Codex actor, with its carried status plate.
 async fn eyes_codex_problems(
     actor: &mut ProductActor,

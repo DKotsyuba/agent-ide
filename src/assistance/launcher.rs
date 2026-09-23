@@ -938,7 +938,7 @@ impl LauncherConfig {
             // A declared Claude profile must be complete and strict before it is retained; a
             // weakened declaration is rejected outright rather than downgraded to "unavailable",
             // so an operator never believes a partially strict configuration was accepted.
-            if let Some(profile) = target.claude_profile
+            if let Some(profile) = target.claude_profile.as_ref()
                 && profile.validate().is_err()
             {
                 return Err(LauncherError::Rejected);

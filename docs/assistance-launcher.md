@@ -292,6 +292,13 @@ declared-but-weakened profile is rejected at load rather than silently downgrade
 never believes a partially strict configuration was accepted. `linux` is accepted by the schema but
 never satisfies validation; see `assistance-claude-worker.md`.
 
+Project checks use this accepted profile as their read authority. Optional `read_roots` is an
+array of absolute directory grants; when absent, the existing `scope_declared` assertion grants
+the project tree. `read_denies` defaults to an empty array of absolute path or glob exclusions.
+An explicit grant must contain the whole worktree, and any exclusion whose literal prefix can
+overlap that tree makes checks `unavailable: read_restricted`. Declare the host's actual read
+exclusions here, including hidden-file globs; an unprovable overlap is treated as restricted.
+
 On macOS, `scope_declared` also requires Claude's sandbox configuration to allow the exact
 `/private/tmp/ai-r-<repository-key-digest>/claude-helper.sock` path through
 `sandbox.network.allowUnixSockets`. Per EYES-r1 §2, this path is now keyed by the repository (its

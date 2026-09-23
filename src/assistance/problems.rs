@@ -221,7 +221,8 @@ impl ProjectProblemFeed {
     }
 
     /// Records a successful `ide.start` for `binding` and schedules the initial warm check only
-    /// when the caller's current host profile proves whole-tree read access.
+    /// when the current Codex observation or accepted Claude operator profile proves whole-tree
+    /// read access. Scheduling and binding insertion serialize with later restriction.
     ///
     /// `worktree` is Workspace's canonical worktree path and `repository_key` its canonical git
     /// common dir. A worktree outside every allowed root is recorded as not admitted — its
@@ -238,12 +239,12 @@ impl ProjectProblemFeed {
     ) {
         let admitted = admit_worktree(&self.allowed_roots, worktree).is_ok();
         let repository_key = repository_key.to_string_lossy().into_owned();
-        if admitted && !read_restricted {
-            self.scheduler.activate(&repository_key, worktree);
-        }
         let Ok(mut state) = self.state.lock() else {
             return;
         };
+        if admitted && !read_restricted {
+            self.scheduler.activate(&repository_key, worktree);
+        }
         if state.bindings.len() >= MAX_FEED_KEYS
             && !state.bindings.contains_key(&binding)
             && let Some(evicted) = state.bindings.keys().next().copied()
@@ -262,19 +263,19 @@ impl ProjectProblemFeed {
     }
 
     /// Permanently disables this binding's checks and cached diagnostics after a narrower host
-    /// profile is observed, cancelling any already queued or running check for its worktree. A
-    /// new Start binding is required to restore check availability for this caller.
+    /// profile is observed, cancelling any already queued or running check for its worktree. The
+    /// cancellation serializes with trigger admission under the binding lock. A new Start binding
+    /// is required to restore check availability for this caller.
     pub fn restrict(&self, binding: &[u8; 32]) {
-        let worktree = self.state.lock().ok().and_then(|mut state| {
-            let bound = state.bindings.get_mut(binding)?;
+        if let Ok(mut state) = self.state.lock() {
+            let Some(bound) = state.bindings.get_mut(binding) else {
+                return;
+            };
             if bound.read_restricted {
-                return None;
+                return;
             }
             bound.read_restricted = true;
-            Some(bound.worktree.clone())
-        });
-        if let Some(worktree) = worktree {
-            self.scheduler.cancel_worktree(&worktree);
+            self.scheduler.cancel_worktree(&bound.worktree);
         }
     }
 
@@ -303,13 +304,20 @@ impl ProjectProblemFeed {
     /// An unknown or read-restricted binding, or a worktree outside the allowed roots, schedules
     /// nothing.
     pub fn changed(&self, binding: &[u8; 32]) {
-        let target = self.state.lock().ok().and_then(|state| {
-            let bound = state.bindings.get(binding)?;
-            (bound.admitted && !bound.read_restricted)
-                .then(|| (bound.repository_key.clone(), bound.worktree.clone()))
-        });
-        if let Some((repository_key, worktree)) = target {
-            self.scheduler.trigger(&repository_key, &worktree);
+        self.changed_with(binding, || {});
+    }
+
+    /// Admits the trigger while holding the binding lock; `before_trigger` is a test seam for
+    /// proving a concurrent restriction cannot slip between the decision and scheduler call.
+    fn changed_with(&self, binding: &[u8; 32], before_trigger: impl FnOnce()) {
+        if let Ok(state) = self.state.lock()
+            && let Some(bound) = state.bindings.get(binding)
+            && bound.admitted
+            && !bound.read_restricted
+        {
+            before_trigger();
+            self.scheduler
+                .trigger(&bound.repository_key, &bound.worktree);
         }
     }
 
@@ -1256,6 +1264,10 @@ mod tests {
         assert!(feed.scheduler.is_busy());
         feed.restrict(&allowed);
         assert!(!feed.scheduler.is_busy());
+        // A later native post has no sandbox metadata and cannot revive the old check.
+        feed.changed(&allowed);
+        feed.changed(&[3; 32]);
+        assert!(!feed.scheduler.is_busy());
         settle().await;
         assert_eq!(
             feed.next_block(&allowed),
@@ -1266,6 +1278,52 @@ mod tests {
             "rust: unavailable: read_restricted"
         );
         assert_eq!(feed.next_block(&restricted), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A restriction arriving at the old decision/trigger gap waits for admission, then cancels it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restriction_serializes_with_check_admission() {
+        use std::sync::Barrier;
+        let (feed, _, root) = scripted_feed("admission-race");
+        let worktree = root.join("wt");
+        let binding = [9; 32];
+        feed.activated(binding, &worktree, Path::new("repo"), false);
+        feed.scheduler.cancel_worktree(&worktree);
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let handle = tokio::runtime::Handle::current();
+        std::thread::scope(|scope| {
+            let entered_check = Arc::clone(&entered);
+            let release_check = Arc::clone(&release);
+            let feed_ref = &feed;
+            let trigger = scope.spawn(move || {
+                let _runtime = handle.enter();
+                feed_ref.changed_with(&binding, || {
+                    entered_check.wait();
+                    release_check.wait();
+                });
+            });
+            entered.wait();
+            let (started, started_rx) = std::sync::mpsc::channel();
+            let (finished, finished_rx) = std::sync::mpsc::channel();
+            let feed_ref = &feed;
+            let restrict = scope.spawn(move || {
+                started.send(()).unwrap();
+                feed_ref.restrict(&binding);
+                finished.send(()).unwrap();
+            });
+            started_rx.recv().unwrap();
+            assert!(
+                finished_rx.try_recv().is_err(),
+                "restriction must await trigger admission"
+            );
+            release.wait();
+            trigger.join().unwrap();
+            restrict.join().unwrap();
+        });
+        assert!(feed.is_read_restricted(&binding));
+        assert!(!feed.scheduler.is_busy());
         let _ = std::fs::remove_dir_all(&root);
     }
 
