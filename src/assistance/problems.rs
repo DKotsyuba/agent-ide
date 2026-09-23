@@ -25,6 +25,7 @@ use crate::checks::{
     CheckState, Checker, Language, MAX_PROBLEMS, Problem, ProblemSnapshot, Recheck, Severity,
     UnavailableReason,
 };
+use crate::execution::seatbelt::ReadDeny;
 use crate::feed::{FeedKey, FeedState, MAX_FEED_KEYS};
 
 /// Checks run concurrently across the daemon (EYES-r1 §5).
@@ -108,9 +109,11 @@ struct BoundWorktree {
     repository_key: String,
     /// Whether the worktree was admitted under an allowed root; `false` renders `outside_roots`.
     admitted: bool,
-    /// A current host profile could not prove whole-tree read authority; no check or cached
+    /// A current host profile could not prove a supported check read policy; no check or cached
     /// diagnostic for this binding may be scheduled or disclosed.
     read_restricted: bool,
+    /// Read exclusions captured at activation for this binding's check replies.
+    read_denies: Vec<ReadDeny>,
 }
 
 /// Mutable feed wiring state, locked only for synchronous in-memory reads and writes.
@@ -222,9 +225,8 @@ impl ProjectProblemFeed {
         ))
     }
 
-    /// Records a successful `ide.start` for `binding` and schedules the initial warm check only
-    /// when the current Codex observation or accepted Claude operator profile proves whole-tree
-    /// read access. Scheduling and binding insertion serialize with later restriction.
+    /// Records a successful `ide.start` and schedules its initial warm check when the caller
+    /// supplied an accepted read policy. Scheduling serializes with later restriction.
     ///
     /// `worktree` is Workspace's canonical worktree path and `repository_key` its canonical git
     /// common dir. A worktree outside every allowed root is recorded as not admitted — its
@@ -239,6 +241,24 @@ impl ProjectProblemFeed {
         repository_key: &Path,
         read_restricted: bool,
     ) {
+        self.activated_with_denies(
+            binding,
+            worktree,
+            repository_key,
+            read_restricted,
+            Vec::new(),
+        );
+    }
+
+    /// Activates checks with the current host exclusions installed before any scheduler work.
+    pub fn activated_with_denies(
+        &self,
+        binding: [u8; 32],
+        worktree: &Path,
+        repository_key: &Path,
+        read_restricted: bool,
+        read_denies: Vec<ReadDeny>,
+    ) {
         let admitted = admit_worktree(&self.allowed_roots, worktree).is_ok();
         let repository_key = repository_key.to_string_lossy().into_owned();
         let Ok(mut state) = self.state.lock() else {
@@ -252,6 +272,7 @@ impl ProjectProblemFeed {
                 .get(&binding)
                 .is_some_and(|bound| bound.read_restricted);
         if admitted && !read_restricted {
+            self.scheduler.add_read_denies(worktree, &read_denies);
             self.scheduler.activate(&repository_key, worktree);
         }
         if state.bindings.len() >= MAX_FEED_KEYS
@@ -267,8 +288,33 @@ impl ProjectProblemFeed {
                 repository_key,
                 admitted,
                 read_restricted,
+                read_denies,
             },
         );
+    }
+
+    /// Keeps a binding available only while the current host profile has its activated denies.
+    pub fn accepts_read_denies(&self, binding: &[u8; 32], denies: &[ReadDeny]) -> bool {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| {
+                state
+                    .bindings
+                    .get(binding)
+                    .map(|bound| bound.read_denies == denies)
+            })
+            .unwrap_or(true)
+    }
+
+    /// Returns the activated worktree for a binding, or `None` before Start settles.
+    pub fn bound_worktree(&self, binding: &[u8; 32]) -> Option<PathBuf> {
+        self.state
+            .lock()
+            .ok()?
+            .bindings
+            .get(binding)
+            .map(|bound| bound.worktree.clone())
     }
 
     /// Permanently disables this binding's checks and cached diagnostics after a narrower host

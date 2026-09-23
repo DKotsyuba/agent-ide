@@ -10,6 +10,8 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -105,12 +107,16 @@ impl PythonChecker {
     /// points. This function performs no process execution and no writes; it is deterministic for
     /// a fixed filesystem state, which is what its unit tests rely on.
     pub fn pyright_spec(&self, request: &CheckRequest, interpreter: &Path) -> RunSpec {
-        let canonical_interpreter =
-            fs::canonicalize(interpreter).unwrap_or_else(|_| interpreter.to_path_buf());
+        let canonical_interpreter = if request.read_denies.is_empty() {
+            fs::canonicalize(interpreter).unwrap_or_else(|_| interpreter.to_path_buf())
+        } else {
+            resolved_link_target(interpreter, &request.read_denies)
+                .unwrap_or_else(|| interpreter.to_path_buf())
+        };
 
         let project = {
             let config = request.worktree.join(PYRIGHT_CONFIG_FILE);
-            if config.is_file() {
+            if allowed_config(&config, &request.read_denies) {
                 config
             } else {
                 request.worktree.clone()
@@ -154,6 +160,7 @@ impl PythonChecker {
                 PathBuf::from("/private/etc"),
             ],
             write_roots: vec![request.cache_dir.clone()],
+            read_denies: request.read_denies.clone(),
             timeout: self.timeout,
             max_output_bytes: MAX_OUTPUT_BYTES,
         }
@@ -168,14 +175,19 @@ impl Checker for PythonChecker {
     fn check(&self, request: CheckRequest) -> BoxFuture<'_, ProblemSnapshot> {
         Box::pin(async move {
             let generation = request.input_generation;
-            if !self.node.is_file() || !self.pyright_cli.is_file() {
+            if [&self.node, &self.pyright_cli]
+                .iter()
+                .any(|path| !allowed_file(path, &request.read_denies))
+            {
                 return ProblemSnapshot::unavailable(
                     Language::Python,
                     UnavailableReason::ToolMissing,
                     generation,
                 );
             }
-            let Some(interpreter) = resolve_interpreter(&request.worktree) else {
+            let Some(interpreter) =
+                resolve_interpreter_with_denies(&request.worktree, &request.read_denies)
+            else {
                 return ProblemSnapshot::unavailable(
                     Language::Python,
                     UnavailableReason::EnvMissing,
@@ -210,8 +222,14 @@ impl Checker for PythonChecker {
                 );
             }
             let duration_ms = started.elapsed().as_millis() as u64;
-            let mut snapshot =
-                parse_pyright_output(output.status, &output.stdout, generation, duration_ms);
+            let mut snapshot = parse_pyright_output_with_denies(
+                output.status,
+                &output.stdout,
+                generation,
+                duration_ms,
+                &request.worktree,
+                &request.read_denies,
+            );
             relativize_paths(&mut snapshot, &request.worktree);
             snapshot
         })
@@ -263,13 +281,27 @@ fn relativize_paths(snapshot: &mut ProblemSnapshot, worktree: &Path) {
 /// pyright (a missing environment must never produce the flood of unresolved-import errors that
 /// running pyright without a venv would report).
 pub fn resolve_interpreter(worktree: &Path) -> Option<PathBuf> {
-    if let Some((venv_path, venv)) = read_pyrightconfig_venv_keys(worktree) {
-        return existing_python(venv_interpreter_path(worktree, &venv_path, &venv));
+    resolve_interpreter_with_denies(worktree, &[])
+}
+
+/// Resolves the interpreter without probing any host-denied config or executable path.
+fn resolve_interpreter_with_denies(
+    worktree: &Path,
+    denies: &[crate::execution::seatbelt::ReadDeny],
+) -> Option<PathBuf> {
+    if [PYRIGHT_CONFIG_FILE, PYPROJECT_FILE]
+        .iter()
+        .any(|name| denies.iter().any(|deny| deny.matches(&worktree.join(name))))
+    {
+        return None;
     }
-    if let Some((venv_path, venv)) = read_pyproject_venv_keys(worktree) {
-        return existing_python(venv_interpreter_path(worktree, &venv_path, &venv));
+    if let Some((venv_path, venv)) = read_pyrightconfig_venv_keys(worktree, denies) {
+        return existing_python(venv_interpreter_path(worktree, &venv_path, &venv), denies);
     }
-    existing_python(worktree.join(".venv").join("bin").join("python"))
+    if let Some((venv_path, venv)) = read_pyproject_venv_keys(worktree, denies) {
+        return existing_python(venv_interpreter_path(worktree, &venv_path, &venv), denies);
+    }
+    existing_python(worktree.join(".venv").join("bin").join("python"), denies)
 }
 
 /// Joins `venvPath`/`venv` into the `bin/python` interpreter path they name.
@@ -286,14 +318,101 @@ fn venv_interpreter_path(worktree: &Path, venv_path: &str, venv: &str) -> PathBu
     base.join(venv).join("bin").join("python")
 }
 
-/// Returns `candidate` when it exists as a file (following symlinks, since venv interpreters are
-/// commonly symlinks into a base installation), otherwise `None`.
-fn existing_python(candidate: PathBuf) -> Option<PathBuf> {
-    if candidate.is_file() {
-        Some(candidate)
-    } else {
-        None
+/// Returns an existing interpreter outside host denies, including a bounded venv symlink chain
+/// when every hop is allowed; denied paths and symlinked parents return `None`.
+fn existing_python(
+    candidate: PathBuf,
+    denies: &[crate::execution::seatbelt::ReadDeny],
+) -> Option<PathBuf> {
+    allowed_file(&candidate, denies).then_some(candidate)
+}
+
+/// Follows at most 32 interpreter or tool links with no-follow metadata, proving each hop first.
+fn resolved_link_target(
+    path: &Path,
+    denies: &[crate::execution::seatbelt::ReadDeny],
+) -> Option<PathBuf> {
+    let mut current = path.to_path_buf();
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..32 {
+        if denied_interpreter_path(&current, denies) || !seen.insert(current.clone()) {
+            return None;
+        }
+        let metadata = fs::symlink_metadata(&current).ok()?;
+        if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&current).ok()?;
+            current = if target.is_absolute() {
+                target
+            } else {
+                current.parent()?.join(target)
+            };
+        } else {
+            return metadata.is_file().then_some(current);
+        }
     }
+    None
+}
+
+/// Accepts an existing regular file without following an unproved link under host read denies.
+fn allowed_file(path: &Path, denies: &[crate::execution::seatbelt::ReadDeny]) -> bool {
+    if denies.is_empty() {
+        path.is_file()
+    } else {
+        resolved_link_target(path, denies).is_some()
+    }
+}
+
+/// Accepts a project config only when its final component is a regular file, not a link.
+fn allowed_config(path: &Path, denies: &[crate::execution::seatbelt::ReadDeny]) -> bool {
+    if denies.is_empty() {
+        return path.is_file();
+    }
+    !denies.iter().any(|deny| deny.matches(path))
+        && fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
+/// Reads a project config through an `O_NOFOLLOW` descriptor under host read exclusions.
+fn read_config(path: &Path, denies: &[crate::execution::seatbelt::ReadDeny]) -> Option<String> {
+    if denies.is_empty() {
+        return fs::read_to_string(path).ok();
+    }
+    if !allowed_config(path, denies) {
+        return None;
+    }
+    let mut text = String::new();
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?
+        .read_to_string(&mut text)
+        .ok()?;
+    Some(text)
+}
+
+/// Rejects a denied interpreter path or a symlinked parent before any following `is_file` probe.
+fn denied_interpreter_path(path: &Path, denies: &[crate::execution::seatbelt::ReadDeny]) -> bool {
+    if denies.is_empty() {
+        return false;
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return true;
+    }
+    if denies.iter().any(|deny| deny.matches(path)) {
+        return true;
+    }
+    path.parent().is_none_or(|parent| {
+        parent.ancestors().any(|prefix| {
+            denies.iter().any(|deny| deny.matches(prefix))
+                || match std::fs::symlink_metadata(prefix) {
+                    Ok(metadata) => metadata.file_type().is_symlink(),
+                    Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+                }
+        })
+    })
 }
 
 /// The two keys of a pyright JSON config this checker reads; every other key is ignored.
@@ -309,9 +428,13 @@ struct PyrightConfigVenvKeys {
 
 /// Reads `venvPath`/`venv` from `<worktree>/pyrightconfig.json`.
 ///
-/// Returns `None` when the file is absent, is not valid JSON, or does not define both keys.
-fn read_pyrightconfig_venv_keys(worktree: &Path) -> Option<(String, String)> {
-    let text = fs::read_to_string(worktree.join(PYRIGHT_CONFIG_FILE)).ok()?;
+/// Under host denies the read uses `O_NOFOLLOW`; denied or linked configs, absent or invalid JSON,
+/// and configs without both keys return `None`.
+fn read_pyrightconfig_venv_keys(
+    worktree: &Path,
+    denies: &[crate::execution::seatbelt::ReadDeny],
+) -> Option<(String, String)> {
+    let text = read_config(&worktree.join(PYRIGHT_CONFIG_FILE), denies)?;
     let config: PyrightConfigVenvKeys = serde_json::from_str(&text).ok()?;
     match (config.venv_path, config.venv) {
         (Some(venv_path), Some(venv)) => Some((venv_path, venv)),
@@ -329,9 +452,13 @@ fn read_pyrightconfig_venv_keys(worktree: &Path) -> Option<(String, String)> {
 /// position — multi-line strings, arrays, inline tables, single-quoted strings, dotted keys,
 /// escaped characters — is not recognized as a value for that key, so a project that uses one of
 /// those forms for `venvPath`/`venv` is treated as not specifying them (falls through to the next
-/// resolution source) rather than being mis-parsed into a wrong path.
-fn read_pyproject_venv_keys(worktree: &Path) -> Option<(String, String)> {
-    let text = fs::read_to_string(worktree.join(PYPROJECT_FILE)).ok()?;
+/// resolution source) rather than being mis-parsed into a wrong path. Under host denies the read
+/// uses `O_NOFOLLOW` and refuses denied or linked config files.
+fn read_pyproject_venv_keys(
+    worktree: &Path,
+    denies: &[crate::execution::seatbelt::ReadDeny],
+) -> Option<(String, String)> {
+    let text = read_config(&worktree.join(PYPROJECT_FILE), denies)?;
     let mut in_target_section = false;
     let mut venv_path: Option<String> = None;
     let mut venv: Option<String> = None;
@@ -463,6 +590,25 @@ pub fn parse_pyright_output(
     input_generation: u64,
     duration_ms: u64,
 ) -> ProblemSnapshot {
+    parse_pyright_output_with_denies(
+        exit,
+        stdout,
+        input_generation,
+        duration_ms,
+        Path::new(""),
+        &[],
+    )
+}
+
+/// Parses a check report while discarding host-denied diagnostic paths before counting and cap.
+fn parse_pyright_output_with_denies(
+    exit: Option<i32>,
+    stdout: &[u8],
+    input_generation: u64,
+    duration_ms: u64,
+    worktree: &Path,
+    denies: &[crate::execution::seatbelt::ReadDeny],
+) -> ProblemSnapshot {
     if !matches!(exit, Some(0) | Some(1)) {
         return ProblemSnapshot::unavailable(
             Language::Python,
@@ -501,6 +647,9 @@ pub fn parse_pyright_output(
             }
             _ => continue,
         };
+        if !super::check_problem_path_allowed(worktree, &diagnostic.file, denies) {
+            continue;
+        }
         problems.push(Problem::new(
             diagnostic.file,
             diagnostic.range.start.line + 1,
@@ -526,4 +675,42 @@ pub fn parse_pyright_output(
         input_generation,
         duration_ms,
     )
+}
+
+#[cfg(test)]
+mod deny_tests {
+    use super::*;
+    use crate::execution::seatbelt::{CredentialGlob, ReadDeny};
+    use std::os::unix::fs::symlink;
+
+    /// A second interpreter link and symlinked project configs never follow into a denied file.
+    #[test]
+    fn deny_policy_checks_every_interpreter_hop_and_config_open() {
+        let root =
+            std::env::temp_dir().join(format!("agent-ide-python-deny-{}", std::process::id()));
+        std::fs::create_dir_all(root.join(".venv/bin")).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let secret = root.join("secret.key");
+        std::fs::write(&secret, "secret").unwrap();
+        symlink("python3", root.join(".venv/bin/python")).unwrap();
+        symlink(&secret, root.join(".venv/bin/python3")).unwrap();
+        symlink(&secret, root.join(PYRIGHT_CONFIG_FILE)).unwrap();
+        symlink(&secret, root.join(PYPROJECT_FILE)).unwrap();
+        let denies = [ReadDeny::Glob {
+            base: root.clone(),
+            suffix: CredentialGlob::Key,
+        }];
+        assert_eq!(resolve_interpreter_with_denies(&root, &denies), None);
+        assert_eq!(read_config(&root.join(PYRIGHT_CONFIG_FILE), &denies), None);
+        assert_eq!(read_config(&root.join(PYPROJECT_FILE), &denies), None);
+        std::fs::remove_file(root.join(".venv/bin/python3")).unwrap();
+        let allowed = root.join("python-real");
+        std::fs::write(&allowed, "allowed").unwrap();
+        symlink(&allowed, root.join(".venv/bin/python3")).unwrap();
+        assert_eq!(
+            resolve_interpreter_with_denies(&root, &denies),
+            Some(root.join(".venv/bin/python"))
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

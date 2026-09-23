@@ -168,10 +168,14 @@ impl RustChecker {
             ]
             .into_iter()
             .chain(self.developer_roots.iter().cloned())
-            .chain(ancestor_manifest_roots(&request.worktree))
-            .chain(git_exclude_root(&home))
+            .chain(ancestor_manifest_roots(
+                &request.worktree,
+                &request.read_denies,
+            ))
+            .chain(git_exclude_root(&home, &request.read_denies))
             .collect(),
             write_roots: vec![request.cache_dir.clone()],
+            read_denies: request.read_denies.clone(),
             timeout: self.timeout,
             max_output_bytes: MAX_OUTPUT_BYTES,
         }
@@ -188,13 +192,26 @@ impl RustChecker {
     }
 }
 
-/// Returns Cargo's standard Git excludes file as one read root when it exists. Cargo asks
+/// Returns Cargo's standard Git excludes file as one read root when it exists and is allowed.
+/// Cargo asks
 /// libgit2 for this file while fingerprinting packages with build scripts; denying that read
 /// aborts the check before it can emit diagnostics. Other home contents remain outside the
 /// confined profile.
-fn git_exclude_root(home: &Path) -> Option<PathBuf> {
+fn git_exclude_root(
+    home: &Path,
+    denies: &[crate::execution::seatbelt::ReadDeny],
+) -> Option<PathBuf> {
     let path = home.join(".config/git/ignore");
-    path.is_file().then_some(path)
+    check_file(&path, denies).then_some(path)
+}
+
+/// Tests an auxiliary file without following a symlink under a deny-bearing host profile.
+fn check_file(path: &Path, denies: &[crate::execution::seatbelt::ReadDeny]) -> bool {
+    if denies.is_empty() {
+        return path.is_file();
+    }
+    !denies.iter().any(|deny| deny.matches(path))
+        && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
 }
 
 /// Resolves the ancestor manifest and cargo-config files a confined `cargo check` needs to read
@@ -216,10 +233,13 @@ fn git_exclude_root(home: &Path) -> Option<PathBuf> {
 ///
 /// Only the ancestors of `worktree` are walked, not `worktree` itself (already covered by the
 /// worktree's own read root), starting from the canonical path (Seatbelt matches canonical
-/// paths) up to the filesystem root. Only files that exist are returned; ancestor directories
+/// paths) up to the filesystem root. Only existing allowed files are returned; ancestor directories
 /// themselves are never added as roots, keeping the added read access limited to the exact
 /// manifest and config files cargo consults.
-fn ancestor_manifest_roots(worktree: &Path) -> Vec<PathBuf> {
+fn ancestor_manifest_roots(
+    worktree: &Path,
+    denies: &[crate::execution::seatbelt::ReadDeny],
+) -> Vec<PathBuf> {
     let canonical = std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
     let mut ancestors = canonical.ancestors();
     ancestors.next();
@@ -227,7 +247,7 @@ fn ancestor_manifest_roots(worktree: &Path) -> Vec<PathBuf> {
     for ancestor in ancestors {
         for relative in ["Cargo.toml", ".cargo/config.toml", ".cargo/config"] {
             let candidate = ancestor.join(relative);
-            if candidate.is_file() {
+            if check_file(&candidate, denies) {
                 roots.push(candidate);
             }
         }
@@ -470,7 +490,7 @@ impl RustChecker {
     async fn run_check(&self, request: CheckRequest) -> ProblemSnapshot {
         let started = Instant::now();
         let cargo = self.toolchain_dir.join("bin").join("cargo");
-        if !cargo.is_file() {
+        if request.read_denies.iter().any(|deny| deny.matches(&cargo)) || !cargo.is_file() {
             return ProblemSnapshot::unavailable(
                 Language::Rust,
                 UnavailableReason::ToolMissing,
@@ -528,11 +548,13 @@ fn map_run_output(request: &CheckRequest, output: &RunOutput, duration_ms: u64) 
             request.input_generation,
         );
     }
-    parse_cargo_messages(
+    parse_cargo_messages_with_denies(
         &output.stdout,
         &output.stderr,
         request.input_generation,
         duration_ms,
+        &request.worktree,
+        &request.read_denies,
     )
 }
 
@@ -588,6 +610,25 @@ pub fn parse_cargo_messages(
     input_generation: u64,
     duration_ms: u64,
 ) -> ProblemSnapshot {
+    parse_cargo_messages_with_denies(
+        stdout,
+        stderr,
+        input_generation,
+        duration_ms,
+        Path::new(""),
+        &[],
+    )
+}
+
+/// Parses a check stream while discarding host-denied diagnostic paths before counting and cap.
+fn parse_cargo_messages_with_denies(
+    stdout: &[u8],
+    stderr: &[u8],
+    input_generation: u64,
+    duration_ms: u64,
+    worktree: &Path,
+    denies: &[crate::execution::seatbelt::ReadDeny],
+) -> ProblemSnapshot {
     let mut problems: Vec<Problem> = Vec::new();
     let mut message_packages: HashSet<String> = HashSet::new();
     let mut artifact_packages: HashSet<String> = HashSet::new();
@@ -610,7 +651,9 @@ pub fn parse_cargo_messages(
                     if first_error_message.is_none() && message.level == "error" {
                         first_error_message = Some(message.message.clone());
                     }
-                    if let Some(problem) = diagnostic_problem(&message) {
+                    if let Some(problem) = diagnostic_problem(&message)
+                        && super::check_problem_path_allowed(worktree, &problem.path, denies)
+                    {
                         problems.push(problem);
                     }
                 }
@@ -810,10 +853,10 @@ mod tests {
         let home =
             std::env::temp_dir().join(format!("agent-ide-git-exclude-{}", std::process::id()));
         let path = home.join(".config/git/ignore");
-        assert_eq!(git_exclude_root(&home), None);
+        assert_eq!(git_exclude_root(&home, &[]), None);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, b"target/\n").unwrap();
-        assert_eq!(git_exclude_root(&home), Some(path));
+        assert_eq!(git_exclude_root(&home, &[]), Some(path));
         fs::remove_dir_all(home).unwrap();
     }
 

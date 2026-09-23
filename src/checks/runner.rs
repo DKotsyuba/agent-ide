@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::BoxFuture;
-use crate::execution::seatbelt::{SeatbeltPolicy, run_confined};
+use crate::execution::seatbelt::{ReadDeny, SeatbeltPolicy, run_confined};
 
 /// One confined process invocation requested by a checker.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,6 +30,8 @@ pub struct RunSpec {
     pub read_roots: Vec<PathBuf>,
     /// Roots the process may read and write (private cache and temp directories).
     pub write_roots: Vec<PathBuf>,
+    /// Host read exclusions, intersected with all grants by Seatbelt.
+    pub read_denies: Vec<ReadDeny>,
     /// Wall-clock limit after which the whole process group is killed.
     pub timeout: Duration,
     /// Per-stream capture limit in bytes; longer output is truncated, never buffered.
@@ -69,6 +71,7 @@ impl ConfinedRunner for SeatbeltRunner {
             let policy = SeatbeltPolicy {
                 read_roots: spec.read_roots,
                 write_roots: spec.write_roots,
+                read_denies: spec.read_denies,
             };
             let output = run_confined(
                 &spec.program,
@@ -171,6 +174,7 @@ mod tests {
             env: vec![("PATH".to_owned(), "/usr/bin".to_owned())],
             read_roots: vec![PathBuf::from("/tmp")],
             write_roots: vec![],
+            read_denies: vec![],
             timeout: Duration::from_secs(1),
             max_output_bytes: 16,
         };
@@ -193,6 +197,7 @@ mod tests {
         std::fs::create_dir_all(&inside).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(inside.join("ok.txt"), "hello\n").unwrap();
+        std::fs::write(inside.join("secret.key"), "secret\n").unwrap();
         std::fs::write(outside.join("secret.txt"), "secret\n").unwrap();
         let spec = |target: PathBuf| RunSpec {
             program: PathBuf::from("/bin/cat"),
@@ -201,6 +206,7 @@ mod tests {
             env: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
             read_roots: vec![inside.clone()],
             write_roots: vec![],
+            read_denies: vec![],
             timeout: Duration::from_secs(10),
             max_output_bytes: 4096,
         };
@@ -217,6 +223,14 @@ mod tests {
         }
         assert_eq!(allowed.status, Some(0), "{allowed:?}");
         assert_eq!(allowed.stdout, b"hello\n");
+        let mut denied_glob = spec(inside.join("secret.key"));
+        denied_glob.read_denies = vec![ReadDeny::Glob {
+            base: inside.clone(),
+            suffix: crate::execution::seatbelt::CredentialGlob::Key,
+        }];
+        let denied_glob = SeatbeltRunner.run(denied_glob).await.unwrap();
+        assert_ne!(denied_glob.status, Some(0), "{denied_glob:?}");
+        assert!(denied_glob.stdout.is_empty(), "{denied_glob:?}");
         let denied = SeatbeltRunner
             .run(spec(outside.join("secret.txt")))
             .await

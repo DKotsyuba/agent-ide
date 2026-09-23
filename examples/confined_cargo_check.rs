@@ -105,6 +105,7 @@ async fn main() -> ExitCode {
         args.developer_dir.clone(),
     );
     let request = CheckRequest {
+        read_denies: Vec::new(),
         worktree: args.worktree,
         cache_dir: args.cache_dir,
         input_generation: 1,

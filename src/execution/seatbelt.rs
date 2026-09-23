@@ -15,7 +15,11 @@ use std::{
     time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
 use tokio::{process::Command, task::JoinHandle};
+
+use super::profile_shape::{Access, DenyRule, MissingPath, Selector};
+use super::{HostSandboxState, ProfileClass};
 
 /// Absolute path of the macOS Seatbelt launcher used for every confined spawn.
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
@@ -69,21 +73,168 @@ const PROFILE_PREAMBLE: &str = r#"(version 1)
 
 /// Declares the filesystem roots one confined check may read and write.
 ///
-/// Roots are additive to the fixed system allowances of every generated profile. Each root is
-/// rendered as one `subpath` filter; a root that cannot be represented as an SBPL string
-/// literal makes the whole profile unavailable instead of being silently narrowed or skipped.
+/// Roots are additive to fixed system allowances; host read denies override every grant.
+/// An unrepresentable root or deny makes the whole profile unavailable.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SeatbeltPolicy {
     /// Roots the check may read; the admitted worktree root belongs here.
     pub read_roots: Vec<PathBuf>,
     /// Roots the check may read and write; the check's private cache directory belongs here.
     pub write_roots: Vec<PathBuf>,
+    /// Host read exclusions, applied after checker grants.
+    pub read_denies: Vec<ReadDeny>,
 }
 
-/// Explains why a seatbelt policy cannot be rendered into a safe profile.
+/// A host read exclusion that the check runner can enforce and test before native reads.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ReadDeny {
+    /// A denied path and its descendants.
+    Path(PathBuf),
+    /// A credential glob rooted at `base`.
+    Glob {
+        base: PathBuf,
+        suffix: CredentialGlob,
+    },
+}
+
+/// The credential glob suffixes this check runner translates exactly.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum CredentialGlob {
+    /// `/**/*.key`.
+    Key,
+    /// `/**/*.pem`.
+    Pem,
+    /// `/**/.env`.
+    Env,
+    /// `/**/.env.*`.
+    EnvDot,
+}
+
+impl ReadDeny {
+    /// Reports a denied path with ASCII case-folded path and glob bases; non-ASCII ambiguity
+    /// fails closed before callers probe or disclose the path.
+    pub fn matches(&self, path: &Path) -> bool {
+        match self {
+            Self::Path(denied) => {
+                let (Some(path), Some(denied)) = (path.to_str(), denied.to_str()) else {
+                    return true;
+                };
+                if !path.is_ascii() || !denied.is_ascii() {
+                    return true;
+                }
+                Path::new(&path.to_ascii_lowercase()).starts_with(denied.to_ascii_lowercase())
+            }
+            Self::Glob { base, suffix } => {
+                let (Some(path), Some(base)) = (path.to_str(), base.to_str()) else {
+                    return true;
+                };
+                if !path.is_ascii() || !base.is_ascii() {
+                    return true;
+                }
+                let path = path.to_ascii_lowercase();
+                let base = base.to_ascii_lowercase();
+                Path::new(&path).strip_prefix(&base).is_ok_and(|relative| {
+                    relative.components().any(|component| {
+                        let Some(name) = component.as_os_str().to_str() else {
+                            return true;
+                        };
+                        if !name.is_ascii() {
+                            return true;
+                        }
+                        let name = name.to_ascii_lowercase();
+                        match suffix {
+                            CredentialGlob::Key => name.ends_with(".key"),
+                            CredentialGlob::Pem => name.ends_with(".pem"),
+                            CredentialGlob::Env => name == ".env",
+                            CredentialGlob::EnvDot => name.starts_with(".env."),
+                        }
+                    })
+                })
+            }
+        }
+    }
+}
+
+/// Derives the supported Codex read exclusions for a check at the state's own worktree cwd.
+/// Unsupported profiles and deny syntax return `None` and keep checks read restricted.
+pub fn host_read_denies(state: &HostSandboxState, worktree: &Path) -> Option<Vec<ReadDeny>> {
+    if state.class() == ProfileClass::Disabled {
+        return (state.cwd() == worktree).then(Vec::new);
+    }
+    let shape = state.shape_v2(worktree).ok()?;
+    if !matches!(
+        shape.rules.get(&Selector::Root),
+        Some((Access::Read | Access::Write, MissingPath::Absent))
+    ) {
+        return None;
+    }
+    shape
+        .denies
+        .iter()
+        .map(|deny| {
+            let selector_path = |selector: &Selector| match selector {
+                Selector::WorkspaceRelative(parts) => Some(
+                    parts
+                        .iter()
+                        .fold(worktree.to_path_buf(), |path, part| path.join(part)),
+                ),
+                Selector::Absolute(parts) => Some(
+                    parts
+                        .iter()
+                        .fold(PathBuf::from("/"), |path, part| path.join(part)),
+                ),
+                _ => None,
+            };
+            match deny {
+                DenyRule::Path(selector) => {
+                    let path = canonical_deny_path(&selector_path(selector)?)?;
+                    path.to_str()?.is_ascii().then_some(ReadDeny::Path(path))
+                }
+                DenyRule::Glob { base, pattern } => {
+                    let suffix = match pattern.as_str() {
+                        "/**/*.key" => CredentialGlob::Key,
+                        "/**/*.pem" => CredentialGlob::Pem,
+                        "/**/.env" => CredentialGlob::Env,
+                        "/**/.env.*" => CredentialGlob::EnvDot,
+                        _ => return None,
+                    };
+                    let base = selector_path(base)?;
+                    let base = std::fs::canonicalize(&base)
+                        .ok()
+                        .or_else(|| canonical_deny_path(&base))?;
+                    base.to_str()?
+                        .is_ascii()
+                        .then_some(ReadDeny::Glob { base, suffix })
+                }
+            }
+        })
+        .collect()
+}
+
+/// Canonicalizes only existing ancestors of a denied selector, never the denied path itself.
+fn canonical_deny_path(path: &Path) -> Option<PathBuf> {
+    let mut parent = path.parent()?;
+    let mut tail = vec![path.file_name()?.to_os_string()];
+    let canonical = loop {
+        match std::fs::canonicalize(parent) {
+            Ok(canonical) => break canonical,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+        tail.push(parent.file_name()?.to_os_string());
+        parent = parent.parent()?;
+    };
+    Some(
+        tail.iter()
+            .rev()
+            .fold(canonical, |path, component| path.join(component)),
+    )
+}
+
+/// Explains why a seatbelt policy path cannot be rendered into a safe profile.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SeatbeltProfileError {
-    /// The root has no safe single-line SBPL string-literal form: it is not representable as
+    /// A grant root or host deny has no safe single-line SBPL string-literal form: it is not representable as
     /// UTF-8, or it contains a newline character that would corrupt the profile grammar.
     UnrepresentableRoot {
         /// The rejected root path, kept for caller diagnostics.
@@ -112,12 +263,12 @@ impl std::error::Error for SeatbeltProfileError {}
 /// access to the fixed system paths, read-only access to every `SeatbeltPolicy::read_roots`
 /// entry, and read-write access to every `SeatbeltPolicy::write_roots` entry. Root paths are
 /// canonicalized when they exist (Seatbelt evaluates canonical paths) and escaped into safe SBPL
-/// string literals; a root that cannot be represented safely fails the whole render rather than
-/// weakening the profile.
+/// string literals. Host read denies are appended after grants; an unrepresentable path fails
+/// the whole render rather than weakening the profile.
 ///
 /// # Errors
 ///
-/// Returns `SeatbeltProfileError::UnrepresentableRoot` when any root has no safe literal form.
+/// Returns `SeatbeltProfileError::UnrepresentableRoot` when any grant or deny path lacks a safe literal form.
 pub fn render_profile(policy: &SeatbeltPolicy) -> Result<String, SeatbeltProfileError> {
     let mut profile = String::from(PROFILE_PREAMBLE);
     append_roots(&mut profile, "read-only", "file-read*", &policy.read_roots)?;
@@ -127,6 +278,42 @@ pub fn render_profile(policy: &SeatbeltPolicy) -> Result<String, SeatbeltProfile
         "file-read* file-write*",
         &policy.write_roots,
     )?;
+    for deny in &policy.read_denies {
+        match deny {
+            ReadDeny::Path(path) => profile.push_str(&format!(
+                "\n(deny file-read* (subpath \"{}\"))",
+                sbpl_path(path)?
+            )),
+            ReadDeny::Glob { base, suffix } => {
+                let suffix = match suffix {
+                    CredentialGlob::Key => "[^/]*\\.[kK][eE][yY]",
+                    CredentialGlob::Pem => "[^/]*\\.[pP][eE][mM]",
+                    CredentialGlob::Env => "\\.[eE][nN][vV]",
+                    CredentialGlob::EnvDot => "\\.[eE][nN][vV]\\.[^/]*",
+                };
+                let mut escaped = String::new();
+                for character in base.to_string_lossy().chars() {
+                    if character.is_ascii_alphabetic() {
+                        escaped.push_str(&format!(
+                            "[{}{}]",
+                            character.to_ascii_lowercase(),
+                            character.to_ascii_uppercase()
+                        ));
+                    } else {
+                        if ".+*?^$()[]{}|\\".contains(character) {
+                            escaped.push('\\');
+                        }
+                        escaped.push(character);
+                    }
+                }
+                let regex = format!("^{escaped}/([^/]+/)*{suffix}(/.*)?$");
+                profile.push_str(&format!(
+                    "\n(deny file-read* (regex \"{}\"))",
+                    sbpl_path(Path::new(&regex))?
+                ));
+            }
+        }
+    }
     Ok(profile)
 }
 
@@ -466,6 +653,85 @@ fn write_profile(profile: &str) -> io::Result<PathBuf> {
 mod tests {
     use super::*;
 
+    /// Proves the captured deny tags become check rules and an unknown glob fails closed.
+    #[test]
+    fn managed_host_denies_translate_only_supported_globs() {
+        let root =
+            std::env::temp_dir().join(format!("agent-ide-check-denies-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let mut state = serde_json::json!({
+            "permissionProfile":{"type":"managed","network":"restricted","file_system":{"type":"restricted","glob_scan_max_depth":8,"entries":[
+                {"access":"read","path":{"type":"special","value":{"kind":"root"}}},
+                {"access":"write","path":{"type":"path","path":root}},
+                {"access":"deny","path":{"type":"path","path":root.join("secrets")}},
+                {"access":"deny","path":{"type":"glob_pattern","pattern":root.join("**/*.key")}},
+                {"access":"deny","path":{"type":"glob_pattern","pattern":root.join("**/.env")}}
+            ]}},
+            "sandboxCwd":root,"codexLinuxSandboxExe":null,"useLegacyLandlock":false
+        });
+        let parsed = HostSandboxState::parse(Some(state.clone())).unwrap();
+        assert!(
+            parsed.shape_v2(&root).is_ok(),
+            "{:?}",
+            parsed.shape_v2(&root)
+        );
+        let denies = host_read_denies(&parsed, &root).unwrap();
+        assert_eq!(denies.len(), 3);
+        assert!(
+            denies
+                .iter()
+                .any(|deny| deny.matches(&root.join("nested/secret.key"))),
+            "{denies:?}"
+        );
+        assert!(
+            ReadDeny::Glob {
+                base: root.join("sub"),
+                suffix: CredentialGlob::Key
+            }
+            .matches(&root.join("SUB/secret.key"))
+        );
+        assert!(
+            denies
+                .iter()
+                .any(|deny| deny.matches(&root.join("nested/.env")))
+        );
+        assert!(
+            denies
+                .iter()
+                .any(|deny| deny.matches(&root.join("secrets/token.txt")))
+        );
+        assert!(
+            !denies
+                .iter()
+                .any(|deny| deny.matches(&root.join("main.py")))
+        );
+        let profile = render_profile(&SeatbeltPolicy {
+            read_roots: vec![root.clone()],
+            read_denies: denies,
+            ..SeatbeltPolicy::default()
+        })
+        .unwrap();
+        assert!(profile.contains("(deny file-read* (regex"));
+        assert!(profile.contains("(deny file-read* (subpath"));
+        state["permissionProfile"]["file_system"]["entries"][3]["path"]["pattern"] =
+            serde_json::json!(root.join("**/[ab].key"));
+        assert!(host_read_denies(&HostSandboxState::parse(Some(state)).unwrap(), &root).is_none());
+        let captured = include_str!("../../tests/fixtures/sandbox-states/84f07fac27b67d1d.json")
+            .replace("/Users/pluto/projects/agent-run", root.to_str().unwrap());
+        let captured = HostSandboxState::parse_json(&captured).unwrap();
+        let captured_denies = host_read_denies(&captured, &root).unwrap();
+        assert_eq!(captured_denies.len(), 33);
+        let captured_profile = render_profile(&SeatbeltPolicy {
+            read_roots: vec![root.clone()],
+            read_denies: captured_denies,
+            ..SeatbeltPolicy::default()
+        })
+        .unwrap();
+        assert_eq!(captured_profile.matches("(deny file-read*").count(), 33);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// Proves a root spelled through a symlink is rendered canonically: Seatbelt evaluates the
     /// canonical path, so `/var/...` roots would otherwise deny every read beneath them.
     #[cfg(target_os = "macos")]
@@ -474,6 +740,7 @@ mod tests {
         let policy = SeatbeltPolicy {
             read_roots: vec![PathBuf::from("/var/tmp")],
             write_roots: vec![PathBuf::from("/tmp")],
+            read_denies: Vec::new(),
         };
         let profile = render_profile(&policy).unwrap();
         assert!(
@@ -491,6 +758,7 @@ mod tests {
         let policy = SeatbeltPolicy {
             read_roots: vec![missing.clone()],
             write_roots: vec![],
+            read_denies: Vec::new(),
         };
         let profile = render_profile(&policy).unwrap();
         assert!(

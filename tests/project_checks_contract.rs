@@ -54,6 +54,7 @@ fn rust_request(root: &Path, with_lockfile: bool) -> CheckRequest {
         worktree,
         cache_dir: root.join("cache"),
         input_generation: 42,
+        read_denies: Vec::new(),
     }
 }
 
@@ -336,6 +337,7 @@ fn rust_cargo_check_spec_adds_ancestor_manifest_files_for_nested_worktree() {
         worktree: worktree.clone(),
         cache_dir: root.join("cache"),
         input_generation: 42,
+        read_denies: Vec::new(),
     };
     let checker = rust_checker(&root, FakeRunner::default());
     let spec = checker.cargo_check_spec(&request);

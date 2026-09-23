@@ -111,7 +111,7 @@ pub enum UnavailableReason {
     /// or (T10B) this language is absent from the worktree per [`Language::is_present`]. Every
     /// renderer treats this reason as nothing rather than a fixed phrase (feed §6, problems §7).
     Disabled,
-    /// The caller's current sandbox cannot prove read access to the whole project, so no
+    /// The caller's current sandbox cannot prove a supported check read policy, so no
     /// fingerprint or checker may run and no cached diagnostic may be disclosed.
     ReadRestricted,
     /// The worktree's canonical path is not under any configured allowed root.
@@ -381,6 +381,52 @@ pub struct CheckRequest {
     pub cache_dir: PathBuf,
     /// Workspace input generation that triggered this check.
     pub input_generation: u64,
+    /// Host read exclusions enforced by the checker and its confined child.
+    #[serde(default)]
+    pub read_denies: Vec<crate::execution::seatbelt::ReadDeny>,
+}
+
+/// Accepts only a normal, no-symlink worktree path outside host exclusions for checks.
+/// Empty exclusions preserve the historical parser treatment of tool-reported paths.
+pub fn check_problem_path_allowed(
+    worktree: &Path,
+    reported: &str,
+    denies: &[crate::execution::seatbelt::ReadDeny],
+) -> bool {
+    if denies.is_empty() {
+        return true;
+    }
+    let path = Path::new(reported);
+    let relative = if path.is_absolute() {
+        let Ok(relative) = path.strip_prefix(worktree) else {
+            return false;
+        };
+        relative
+    } else {
+        path
+    };
+    if relative.as_os_str().is_empty()
+        || !relative
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return false;
+    }
+    let absolute = worktree.join(relative);
+    if denies.iter().any(|deny| deny.matches(&absolute)) {
+        return false;
+    }
+    let mut prefix = worktree.to_path_buf();
+    for component in relative.components() {
+        prefix.push(component.as_os_str());
+        match std::fs::symlink_metadata(&prefix) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return false,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 /// Owned pinned future returned by [`Checker::check`].
@@ -474,6 +520,17 @@ impl Checker for FakeChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Case variants of a denied glob base are rejected before a diagnostic path is probed.
+    #[test]
+    fn denied_glob_base_case_variant_cannot_disclose_a_problem() {
+        let root = Path::new("/tmp/check-project");
+        let denies = [crate::execution::seatbelt::ReadDeny::Glob {
+            base: root.join("sub"),
+            suffix: crate::execution::seatbelt::CredentialGlob::Key,
+        }];
+        assert!(!check_problem_path_allowed(root, "SUB/secret.key", &denies));
+    }
 
     /// Builds one problem with a fixed code for compact test arrangements.
     fn problem(path: &str, line: u32, column: u32, severity: Severity, message: &str) -> Problem {
@@ -699,11 +756,13 @@ mod tests {
             worktree: PathBuf::from("/wt"),
             cache_dir: PathBuf::from("/cache"),
             input_generation: 3,
+            read_denies: Vec::new(),
         };
         let second = CheckRequest {
             worktree: PathBuf::from("/wt2"),
             cache_dir: PathBuf::from("/cache2"),
             input_generation: 4,
+            read_denies: Vec::new(),
         };
         let returned = checker.check(first.clone()).await;
         assert_eq!(returned, snapshot);
