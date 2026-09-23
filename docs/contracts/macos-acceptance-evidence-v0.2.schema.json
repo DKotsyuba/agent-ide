@@ -8,7 +8,7 @@
   "properties": {
     "schema": {"const": "agent-ide.macos-acceptance.v1"},
     "revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
-    "route": {"enum": ["product", "codex", "claude", "agent_run_claude"]},
+    "route": {"enum": ["product", "codex", "claude", "agent_run_claude", "agent_run_codex"]},
     "status": {"$ref": "#/$defs/status"},
     "platform": {
       "type": "object",

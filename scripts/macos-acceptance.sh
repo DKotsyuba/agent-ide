@@ -23,7 +23,7 @@ ACCEPTANCE_TYPESCRIPT_VERSION=not_tested
 # Prints the closed command-line interface. It performs no filesystem or process mutation.
 usage() {
     printf '%s\n' \
-        'usage: scripts/macos-acceptance.sh --evidence ABSOLUTE_PATH [--route product|codex|claude|agent-run-claude] [--driver ABSOLUTE_EXECUTABLE]'
+        'usage: scripts/macos-acceptance.sh --evidence ABSOLUTE_PATH [--route product|codex|claude|agent-run-claude|agent-run-codex] [--driver ABSOLUTE_EXECUTABLE]'
 }
 
 # Rejects an empty, oversized, or non-public token before it can enter JSON evidence.
@@ -258,6 +258,7 @@ case "$ACCEPTANCE_ROUTE" in
     codex) ACCEPTANCE_ROUTE_JSON=codex ;;
     claude) ACCEPTANCE_ROUTE_JSON=claude ;;
     agent-run-claude) ACCEPTANCE_ROUTE_JSON=agent_run_claude ;;
+    agent-run-codex) ACCEPTANCE_ROUTE_JSON=agent_run_codex ;;
     *) usage >&2; exit 2 ;;
 esac
 case "$ACCEPTANCE_EVIDENCE" in

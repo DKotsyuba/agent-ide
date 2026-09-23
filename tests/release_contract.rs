@@ -72,7 +72,7 @@ fn release_workflow_requires_complete_gates_before_publication() {
     assert!(!workflow.contains("continue-on-error"));
 }
 
-/// Pins the publication evidence gate to all four complete macOS arm64 candidate rows while
+/// Pins the publication evidence gate to all five complete macOS arm64 candidate rows while
 /// rejecting partial scenario values, untested toolchains, mixed revisions, and non-ancestors.
 #[test]
 fn release_evidence_gate_requires_the_complete_candidate_matrix() {
@@ -82,6 +82,7 @@ fn release_evidence_gate_requires_the_complete_candidate_matrix() {
         "macos-v0.2-direct-codex.json|codex|real_pass",
         "macos-v0.2-direct-claude.json|claude|real_pass",
         "macos-v0.2-agent-run-claude.json|agent_run_claude|real_pass",
+        "macos-v0.2-agent-run-codex.json|agent_run_codex|real_pass",
         ".platform.os == \"macos\"",
         ".platform.architecture == \"arm64\"",
         "([.scenarios[]] | all(. == $status))",

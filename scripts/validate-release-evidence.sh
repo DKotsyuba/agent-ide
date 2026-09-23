@@ -17,7 +17,8 @@ for RELEASE_REQUIREMENT in \
     'macos-v0.2-product.json|product|product_pass' \
     'macos-v0.2-direct-codex.json|codex|real_pass' \
     'macos-v0.2-direct-claude.json|claude|real_pass' \
-    'macos-v0.2-agent-run-claude.json|agent_run_claude|real_pass'
+    'macos-v0.2-agent-run-claude.json|agent_run_claude|real_pass' \
+    'macos-v0.2-agent-run-codex.json|agent_run_codex|real_pass'
 do
     RELEASE_FILE=${RELEASE_REQUIREMENT%%|*}
     RELEASE_REST=${RELEASE_REQUIREMENT#*|}

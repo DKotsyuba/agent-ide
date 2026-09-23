@@ -1,14 +1,14 @@
 #!/bin/sh
-# Status: real_pass on edaf281 (release 0.3.15); see docs/macos-acceptance.md.
+# Claude evidence exists for an earlier candidate; Codex live run pending.
 
-# Real-host driver for the installed agent-run to Claude acceptance route.
+# Real-host driver for installed agent-run to Claude and Codex acceptance routes.
 #
 # The runner starts this executable with AGENT_IDE_ACCEPTANCE_ROUTE=
-# agent-run-claude, the two isolated fixture worktrees, and a fresh result
+# agent-run-claude or agent-run-codex, two isolated fixture worktrees, and a fresh result
 # path. The driver starts real agents through the installed agent-run 0.12.x
 # CLI. Its resident broker spawns the agent process, so environment variables
 # set on the start command line (AGENT_IDE_BIN, HOME) do NOT reach the agent:
-# the agent's Claude host, agent-ide MCP, and plugin come entirely from the
+# the agent's host, agent-ide MCP, and plugin come entirely from the
 # operator's ~/.agent-run/config.toml [mcp.agent_ide] entry (installed
 # /Users/pluto/.local/bin/agent-ide plus launcher.json). The driver therefore
 # fails closed before starting any agent unless the installed binary is
@@ -16,11 +16,8 @@
 # agents' stored answers, real filesystem effects, and the durable telemetry
 # database.
 #
-# Runtime decision: the route's intent is a real Claude host driven through
-# agent-run (host version token agent-run-0.12.4+claude-code-2.1.274), so the
-# defaults select the claude runtime with the sonnet model. The owner's
-# glm-5.3-flash delegation preference for code work stays available through the
-# runtime and model environment knobs below.
+# The route selects its matching runtime and prompt family. Claude keeps Sonnet;
+# Codex uses the economical gpt-6-luna default and prompts without a helper.
 #
 # `start --timeout` is legacy metadata only and does not stop execution; the
 # outer `perl alarm` is the only wall-clock bound. Setting
@@ -40,9 +37,10 @@
 #                                       must be byte-identical to the release
 #                                       candidate; the driver refuses anything
 #                                       else with installed_binary_differs.
-#   AGENT_IDE_ACCEPTANCE_AGENT_RUN_RUNTIME  agent-run runtime name; default
-#                                       claude.
-#   AGENT_IDE_ACCEPTANCE_AGENT_RUN_MODEL    model id; default sonnet.
+#   AGENT_IDE_ACCEPTANCE_AGENT_RUN_RUNTIME  agent-run runtime name; Claude
+#                                       retains its override; Codex requires codex.
+#   AGENT_IDE_ACCEPTANCE_AGENT_RUN_MODEL    model id; default sonnet for Claude
+#                                       and gpt-6-luna for Codex.
 #   AGENT_IDE_ACCEPTANCE_AGENT_RUN_PROFILE  agent-run profile; default
 #                                       implement.
 #   AGENT_IDE_ACCEPTANCE_LAUNCHER       launcher template the installed MCP
@@ -57,7 +55,19 @@ set -eu
 DRIVER_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 . "$DRIVER_DIR/driver-common.sh"
 
-[ "${AGENT_IDE_ACCEPTANCE_ROUTE:-}" = agent-run-claude ] || fail E_ROUTE "route is not agent-run-claude"
+case "${AGENT_IDE_ACCEPTANCE_ROUTE:-}" in
+    agent-run-claude)
+        DEFAULT_RUNTIME=claude
+        DEFAULT_MODEL=sonnet
+        PROMPT_FAMILY=claude-prompts
+        ;;
+    agent-run-codex)
+        DEFAULT_RUNTIME=codex
+        DEFAULT_MODEL=gpt-6-luna
+        PROMPT_FAMILY=codex-prompts
+        ;;
+    *) fail E_ROUTE "unsupported agent-run route" ;;
+esac
 [ -n "${AGENT_IDE_ACCEPTANCE_LEFT_WORKTREE:-}" ] || fail E_LEFT_WORKTREE_MISSING
 [ -n "${AGENT_IDE_ACCEPTANCE_RIGHT_WORKTREE:-}" ] || fail E_RIGHT_WORKTREE_MISSING
 [ -n "${AGENT_IDE_ACCEPTANCE_RESULT:-}" ] || fail E_RESULT_PATH_MISSING
@@ -65,8 +75,10 @@ DRIVER_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 BINARY=${AGENT_IDE_ACCEPTANCE_BINARY:-$DRIVER_ROOT/target/release/agent-ide}
 AGENT_RUN=${AGENT_IDE_ACCEPTANCE_AGENT_RUN:-/Users/pluto/.agent-run/standalone/current/bin/agent-run}
 MCP_BINARY=${AGENT_IDE_ACCEPTANCE_AGENT_RUN_MCP_BINARY:-/Users/pluto/.local/bin/agent-ide}
-RUNTIME=${AGENT_IDE_ACCEPTANCE_AGENT_RUN_RUNTIME:-claude}
-AR_MODEL=${AGENT_IDE_ACCEPTANCE_AGENT_RUN_MODEL:-sonnet}
+RUNTIME=${AGENT_IDE_ACCEPTANCE_AGENT_RUN_RUNTIME:-$DEFAULT_RUNTIME}
+AR_MODEL=${AGENT_IDE_ACCEPTANCE_AGENT_RUN_MODEL:-$DEFAULT_MODEL}
+[ "$AGENT_IDE_ACCEPTANCE_ROUTE" != agent-run-codex ] || \
+    [ "$RUNTIME" = codex ] || fail E_RUNTIME "Codex route requires the codex runtime"
 AR_PROFILE=${AGENT_IDE_ACCEPTANCE_AGENT_RUN_PROFILE:-implement}
 LAUNCHER=${AGENT_IDE_ACCEPTANCE_LAUNCHER:-/Users/pluto/.config/agent-ide/launcher.json}
 OPERATOR_HOME=${AGENT_IDE_ACCEPTANCE_OPERATOR_HOME:-/Users/pluto}
@@ -75,7 +87,8 @@ SESSION_SECONDS=${AGENT_IDE_ACCEPTANCE_SESSION_SECONDS:-1800}
 # Dry run: print the exact session command lines and exit without running
 # anything. Contract variables only need to be set; no host is touched.
 if [ "${AGENT_IDE_ACCEPTANCE_DRY:-0}" = 1 ]; then
-    for scenario in l1:LEFT l2:LEFT l3:LEFT l4:LEFT r5:RIGHT; do
+    for scenario in l1:LEFT l1b:LEFT l2:LEFT l3:LEFT l4:LEFT r5:RIGHT r5b:RIGHT; do
+        case "$scenario:$AGENT_IDE_ACCEPTANCE_ROUTE" in *b:*:agent-run-claude) continue ;; esac
         label=${scenario%%:*}
         eval "worktree=\$AGENT_IDE_ACCEPTANCE_${scenario##*:}_WORKTREE"
         printf '%s\n' "/usr/bin/perl -e 'alarm shift; exec @ARGV' $SESSION_SECONDS \
@@ -100,16 +113,16 @@ fi
 cmp -s "$BINARY" "$MCP_BINARY" \
     || fail installed_binary_differs \
         "$MCP_BINARY is not byte-identical to the candidate $BINARY"
-/usr/bin/grep -q 'claude-r3-2026-09-14' "$LAUNCHER" \
-    || fail E_LAUNCHER_NO_CLAUDE_TYPESCRIPT "launcher template lacks the accepted Claude TypeScript record"
+if [ "$AGENT_IDE_ACCEPTANCE_ROUTE" = agent-run-claude ]; then
+    /usr/bin/grep -q 'claude-r3-2026-09-14' "$LAUNCHER" \
+        || fail E_LAUNCHER_NO_CLAUDE_TYPESCRIPT "launcher template lacks the accepted Claude TypeScript record"
+fi
 
 LEFT=$(canonical_dir "$AGENT_IDE_ACCEPTANCE_LEFT_WORKTREE") || fail E_LEFT_CANONICAL
 RIGHT=$(canonical_dir "$AGENT_IDE_ACCEPTANCE_RIGHT_WORKTREE") || fail E_RIGHT_CANONICAL
 LEFT_IDENTITY=$(project_identity "$BINARY" "$LEFT") || fail E_LEFT_IDENTITY
 [ "${#LEFT_IDENTITY}" = 64 ] || fail E_LEFT_IDENTITY_LENGTH
-LEFT_RUNTIME=/private/tmp/ai-c-$(printf '%s' "$LEFT_IDENTITY" | cut -c1-16)
 RIGHT_IDENTITY=$(project_identity "$BINARY" "$RIGHT") || fail E_RIGHT_IDENTITY
-RIGHT_RUNTIME=/private/tmp/ai-c-$(printf '%s' "$RIGHT_IDENTITY" | cut -c1-16)
 
 mkdir -p -- "$DIAG_DIR"
 
@@ -183,19 +196,32 @@ task_prompt() {
     sed "s/\"operation_id\":\"\([A-Za-z0-9-]*\)\"/\"operation_id\":\"\\1-$$\"/g" "$1"
 }
 
-prepare_worktree "$LEFT" "$LEFT_RUNTIME"
-prepare_worktree "$RIGHT" "$RIGHT_RUNTIME"
+if [ "$AGENT_IDE_ACCEPTANCE_ROUTE" = agent-run-claude ]; then
+    LEFT_RUNTIME=/private/tmp/ai-c-$(printf '%s' "$LEFT_IDENTITY" | cut -c1-16)
+    RIGHT_RUNTIME=/private/tmp/ai-c-$(printf '%s' "$RIGHT_IDENTITY" | cut -c1-16)
+    prepare_worktree "$LEFT" "$LEFT_RUNTIME"
+    prepare_worktree "$RIGHT" "$RIGHT_RUNTIME"
+fi
 
 # Agent L1: real edit/diagnostic/fix/diff/stop loop over Pyright.
-task_prompt "$DRIVER_DIR/claude-prompts/l1.txt" >"$DIAG_DIR/task-l1.txt"
+task_prompt "$DRIVER_DIR/$PROMPT_FAMILY/l1.txt" >"$DIAG_DIR/task-l1.txt"
 run_agent l1 "$LEFT" "$DIAG_DIR/task-l1.txt"
 require_answer_text l1 "LEFT_LOOP_OK" A_L1_FINAL
+if [ "$AGENT_IDE_ACCEPTANCE_ROUTE" = agent-run-codex ]; then
+    require_record_text l1 "not assignable" A_L1_PYRIGHT_SEMANTIC
+fi
 printf 'def value() -> int:\n    return 0\n' >"$DIAG_DIR/expected-l1.py"
 cmp -s "$LEFT/acceptance-fixture/fixture.py" "$DIAG_DIR/expected-l1.py" \
     || fail A_L1_FILE_CONTENT "left fixture.py is not the helper-edited content"
+if [ "$AGENT_IDE_ACCEPTANCE_ROUTE" = agent-run-codex ]; then
+    task_prompt "$DRIVER_DIR/$PROMPT_FAMILY/l1b.txt" >"$DIAG_DIR/task-l1b.txt"
+    run_agent l1b "$LEFT" "$DIAG_DIR/task-l1b.txt"
+    require_answer_text l1b "LEFT_DIFF_OK" A_L1B_FINAL
+    require_record_text l1b "left-python-bad" A_L1B_DIFF_CONTENT
+fi
 
 # Agent L2: native fallback while inactive, then a stale edit with zero writes.
-task_prompt "$DRIVER_DIR/claude-prompts/l2.txt" >"$DIAG_DIR/task-l2.txt"
+task_prompt "$DRIVER_DIR/$PROMPT_FAMILY/l2.txt" >"$DIAG_DIR/task-l2.txt"
 run_agent l2 "$LEFT" "$DIAG_DIR/task-l2.txt"
 require_answer_text l2 "LEFT_FALLBACK_OK" A_L2_FINAL
 require_record_text l2 "stale_source" A_L2_STALE_OUTCOME
@@ -204,7 +230,7 @@ cmp -s "$LEFT/acceptance-fixture/fixture.py" "$DIAG_DIR/expected-l2.py" \
     || fail A_L2_ZERO_WRITE "left fixture.py does not prove the stale edit wrote nothing"
 
 # Agent L3: real TypeScript semantic context through the accepted bundle.
-task_prompt "$DRIVER_DIR/claude-prompts/l3.txt" >"$DIAG_DIR/task-l3.txt"
+task_prompt "$DRIVER_DIR/$PROMPT_FAMILY/l3.txt" >"$DIAG_DIR/task-l3.txt"
 run_agent l3 "$LEFT" "$DIAG_DIR/task-l3.txt"
 require_answer_text l3 "LEFT_TS_OK" A_L3_FINAL
 require_record_text l3 "mode: semantic" A_L3_SEMANTIC
@@ -214,14 +240,14 @@ TELEMETRY_DB=$OPERATOR_HOME/.agent-ide/telemetry/$LEFT_IDENTITY/state.sqlite
 [ -f "$TELEMETRY_DB" ] || fail A_TELEMETRY_DB_MISSING "no durable database before restart"
 before_rows=$("$BINARY" telemetry export --database "$TELEMETRY_DB" 2>>"$DIAG_LOG" | wc -l | tr -d ' ')
 [ "${before_rows:-0}" -ge 1 ] || fail A_TELEMETRY_PRE_RESTART_EMPTY "export before restart"
-task_prompt "$DRIVER_DIR/claude-prompts/l4.txt" >"$DIAG_DIR/task-l4.txt"
+task_prompt "$DRIVER_DIR/$PROMPT_FAMILY/l4.txt" >"$DIAG_DIR/task-l4.txt"
 run_agent l4 "$LEFT" "$DIAG_DIR/task-l4.txt"
 require_answer_text l4 "LEFT_RESTART_OK" A_L4_FINAL
 after_rows=$("$BINARY" telemetry export --database "$TELEMETRY_DB" 2>>"$DIAG_LOG" | wc -l | tr -d ' ')
 [ "$after_rows" -gt "$before_rows" ] || fail A_TELEMETRY_RESTART_LOST "no new rows after restart"
 
 # Agent R5: the complete loop in the divergent right worktree.
-task_prompt "$DRIVER_DIR/claude-prompts/r5.txt" >"$DIAG_DIR/task-r5.txt"
+task_prompt "$DRIVER_DIR/$PROMPT_FAMILY/r5.txt" >"$DIAG_DIR/task-r5.txt"
 run_agent r5 "$RIGHT" "$DIAG_DIR/task-r5.txt"
 require_answer_text r5 "RIGHT_LOOP_OK" A_R5_FINAL
 require_record_text r5 "right-python-bad" A_R5_PYRIGHT_MARKER
@@ -233,7 +259,13 @@ cmp -s "$RIGHT/acceptance-fixture/fixture.py" "$DIAG_DIR/expected-l1.py" \
     || fail A_R5_FILE_CONTENT "right fixture.py is not the helper-edited content"
 cmp -s "$LEFT/acceptance-fixture/fixture.py" "$DIAG_DIR/expected-l2.py" \
     || fail A_R5_LEFT_ISOLATION "left fixture.py changed during the right agent"
+if [ "$AGENT_IDE_ACCEPTANCE_ROUTE" = agent-run-codex ]; then
+    task_prompt "$DRIVER_DIR/$PROMPT_FAMILY/r5b.txt" >"$DIAG_DIR/task-r5b.txt"
+    run_agent r5b "$RIGHT" "$DIAG_DIR/task-r5b.txt"
+    require_answer_text r5b "RIGHT_DIFF_OK" A_R5B_FINAL
+    require_record_text r5b "right-python-bad" A_R5B_DIFF_CONTENT
+fi
 
 write_pass_result
-note driver-complete agent-run-claude
+note driver-complete "$AGENT_IDE_ACCEPTANCE_ROUTE"
 exit 0

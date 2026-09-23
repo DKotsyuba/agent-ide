@@ -12,6 +12,16 @@ fn evidence_schema_is_closed_and_privacy_explicit() {
     ))
     .unwrap();
     assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(
+        schema["properties"]["route"]["enum"],
+        serde_json::json!([
+            "product",
+            "codex",
+            "claude",
+            "agent_run_claude",
+            "agent_run_codex"
+        ])
+    );
     let fields = schema["properties"]
         .as_object()
         .unwrap()
@@ -58,7 +68,13 @@ fn evidence_schema_is_closed_and_privacy_explicit() {
 #[test]
 fn runner_covers_all_cells_without_embedding_private_run_identifiers() {
     let runner = include_str!("../scripts/macos-acceptance.sh");
-    for route in ["product", "codex", "claude", "agent-run-claude"] {
+    for route in [
+        "product",
+        "codex",
+        "claude",
+        "agent-run-claude",
+        "agent-run-codex",
+    ] {
         assert!(runner.contains(route));
     }
     for gate in [
@@ -77,6 +93,28 @@ fn runner_covers_all_cells_without_embedding_private_run_identifiers() {
     assert!(runner.contains("ACCEPTANCE_MAX_EVIDENCE_BYTES=16384"));
     for forbidden in ["run_id", "session_id", "thread_id", "transcript"] {
         assert!(!runner.contains(forbidden));
+    }
+}
+
+/// Requires the agent-run Codex route to select real Codex and its helper-free prompts.
+#[test]
+fn agent_run_codex_driver_uses_the_codex_runtime_and_prompt_family() {
+    let driver = include_str!("../scripts/acceptance-drivers/agent-run-claude.sh");
+    let wrapper = include_str!("../scripts/acceptance-drivers/agent-run-codex.sh");
+    assert!(wrapper.contains("exec \"$DRIVER_DIR/agent-run-claude.sh\""));
+    for required in [
+        "agent-run-codex)",
+        "DEFAULT_RUNTIME=codex",
+        "DEFAULT_MODEL=gpt-6-luna",
+        "PROMPT_FAMILY=codex-prompts",
+        "task_prompt \"$DRIVER_DIR/$PROMPT_FAMILY/l1b.txt\"",
+        "task_prompt \"$DRIVER_DIR/$PROMPT_FAMILY/r5b.txt\"",
+        "if [ \"$AGENT_IDE_ACCEPTANCE_ROUTE\" = agent-run-claude ]; then",
+    ] {
+        assert!(
+            driver.contains(required),
+            "missing Codex route behavior: {required}"
+        );
     }
 }
 

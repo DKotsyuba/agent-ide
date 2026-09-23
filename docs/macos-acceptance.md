@@ -26,18 +26,18 @@ scripts/macos-acceptance.sh --route product --evidence /absolute/output/evidence
 
 ## Real host drivers
 
-The `codex`, `claude`, and `agent-run-claude` routes accept an optional absolute `--driver`
+The `codex`, `claude`, `agent-run-claude`, and `agent-run-codex` routes accept an optional absolute `--driver`
 executable. Without one, the runner creates bounded `not_tested` evidence and makes no host claim.
 With one, `AGENT_IDE_ACCEPTANCE_HOST_VERSION` must be a public version token — for the committed
-drivers that is `claude-code-2.1.274` (direct Claude) or `agent-run-0.12.4+claude-code-2.1.274`
-(agent-run to Claude). The driver is invoked with no arguments and receives only these environment
+drivers that is a token identifying the actual host version, such as `agent-run-0.12.6+codex-cli-0.155.1`
+for agent-run to Codex. The driver is invoked with no arguments and receives only these environment
 variables:
 
 - `AGENT_IDE_ACCEPTANCE_ROUTE`;
 - `AGENT_IDE_ACCEPTANCE_LEFT_WORKTREE` and `AGENT_IDE_ACCEPTANCE_RIGHT_WORKTREE`;
 - `AGENT_IDE_ACCEPTANCE_RESULT`.
 
-Setting `AGENT_IDE_ACCEPTANCE_DRY=1` makes either committed driver print the exact session command
+Setting `AGENT_IDE_ACCEPTANCE_DRY=1` makes a committed driver print the exact session command
 lines and exit 0 without running anything.
 
 The direct `claude` driver runs `claude -p` sessions in each fixture worktree against the candidate
@@ -55,8 +55,9 @@ The strict launcher template defaults to `/Users/pluto/.config/agent-ide/launche
 carries the merged Codex profiles, Pyright, and the accepted TypeScript r3 provider
 `claude-r3-2026-09-14`.
 
-The `agent-run-claude` driver starts real agents through the installed agent-run 0.12.4 resident
-broker and reads their final answers:
+The shared agent-run driver starts real agents through the installed agent-run resident broker
+and reads their final answers. Use `scripts/acceptance-drivers/agent-run-claude.sh` for
+`agent-run-claude`, or `scripts/acceptance-drivers/agent-run-codex.sh` for `agent-run-codex`:
 
 ```sh
 agent-run start --runtime claude --model sonnet --profile implement \
@@ -64,10 +65,10 @@ agent-run start --runtime claude --model sonnet --profile implement \
 agent-run answer <agent_id>
 ```
 
-The route's intent is a real Claude host driven through agent-run, so the defaults select the
-`claude` runtime with `sonnet`; the owner's `glm`/`glm-5.3-flash` code-work delegation stays
-available through `AGENT_IDE_ACCEPTANCE_AGENT_RUN_RUNTIME`/`_MODEL`. The resident broker spawns the
-agent process, so environment set on the start command line (`AGENT_IDE_BIN`, `HOME`) does not
+The route defaults to `claude` with `sonnet`, or requires `codex` with
+`gpt-6-luna`; the Claude route retains its optional runtime/model overrides.
+Codex uses `codex-prompts` and no Claude helper socket or project-local Claude
+settings. The resident broker spawns the agent process, so environment set on the start command line (`AGENT_IDE_BIN`, `HOME`) does not
 reach the agent: the agent's MCP comes from the operator's `~/.agent-run/config.toml`
 `[mcp.agent_ide]` entry. `start --timeout` is legacy metadata only and does not stop execution, so
 the outer `perl alarm` is the only wall-clock bound. Because the driver cannot redirect the agent
@@ -90,8 +91,8 @@ divergent_worktrees=real_pass
 ```
 
 This interface deliberately carries no session, run, transcript, prompt, credential, or command
-field. A driver can invoke direct Codex, direct Claude, or an externally installed agent-run to
-Claude without teaching this repository its private identifiers or changing agent-run source.
+field. The agent-run Codex route requires a complete live cell before it can emit `real_pass`;
+no Codex evidence is claimed by this implementation alone.
 
 ### Direct Codex driver
 
@@ -155,6 +156,11 @@ candidate hook, and the agent-run service is restarted after an install so it lo
 | Direct Codex CLI 0.155.1 | [JSON](evidence/macos-v0.2-direct-codex.json) | `real_pass` |
 | Direct Claude Code 2.1.280 | [JSON](evidence/macos-v0.2-direct-claude.json) | `real_pass` |
 | Installed agent-run 0.12.6 to Claude Code 2.1.280 | [JSON](evidence/macos-v0.2-agent-run-claude.json) | `real_pass` |
+| Installed agent-run to Codex | Pending live evidence | `not_tested` |
+
+The release evidence gate now requires `macos-v0.2-agent-run-codex.json` with route
+`agent_run_codex` and a complete `real_pass` cell at the same candidate revision. Until that
+live run passes, release publication is blocked.
 
 The installed agent-run route is separate evidence and is not relabeled as direct Claude. Private
 driver prompts, local paths, credentials, transcripts, and host/run identifiers were retained only
