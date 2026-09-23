@@ -4660,6 +4660,88 @@ async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
     daemon.wait().await.unwrap();
 }
 
+/// A managed Codex profile with the accepted credential-glob denies retains Pyright semantics
+/// and project check plates while a denied source path remains unavailable.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
+async fn configured_product_deny_globs_keep_pyright_semantics_and_checks() {
+    let fixture = ProductFixture::new(json!([accepted_pyright_provider(
+        "deny-glob-pyright-cache"
+    )]));
+    std::fs::write(
+        fixture.root.join("main.py"),
+        "def value() -> int:\n    return \"bad\"\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.root.join("secret.key"), "hidden\n").unwrap();
+    fixture.git(&["add", "--", "main.py", "secret.key"]);
+    fixture.git(&["commit", "--quiet", "-m", "deny-glob Python fixture"]);
+    let root = &fixture.root;
+    let entries = ["**/*.key", "**/*.pem", "**/.env", "**/.env.*"].map(|suffix| {
+        json!({
+            "access":"deny","path":{"type":"glob_pattern","pattern":root.join(suffix)}
+        })
+    });
+    let mut state = json!({
+        "permissionProfile":{"type":"managed","network":"restricted","file_system":{"type":"restricted","glob_scan_max_depth":8,"entries":[
+            {"access":"read","path":{"type":"special","value":{"kind":"root"}}},
+            {"access":"write","path":{"type":"path","path":root}},
+            {"access":"write","path":{"type":"special","value":{"kind":"slash_tmp"}}},
+            {"access":"write","path":{"type":"special","value":{"kind":"tmpdir"}}}
+        ]}},
+        "sandboxCwd":root,"codexLinuxSandboxExe":null,"useLegacyLandlock":false
+    });
+    state["permissionProfile"]["file_system"]["entries"]
+        .as_array_mut()
+        .unwrap()
+        .extend(entries);
+    fixture.write_managed_profile(&state);
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new_at(
+        &fixture,
+        "deny-glob-pyright",
+        "private-host-channel",
+        "session_id",
+        state,
+    )
+    .await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"deny-glob-start"}),
+        )
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let plate = carried_status(&started).expect("activation check plate");
+    assert!(
+        plate.starts_with("<agent-ide>\nrust:") && !plate.contains("read_restricted"),
+        "{plate}"
+    );
+    await_eyes_check_start(&home).await;
+    let context = actor
+        .call(&fixture, "ide.context", json!({"path":"main.py"}))
+        .await;
+    let context = actor.settle(&fixture, context).await;
+    let text = context["text"].as_str().unwrap();
+    assert!(
+        text.contains("mode: semantic") && text.contains("not assignable"),
+        "{context}"
+    );
+    let denied = actor
+        .call(&fixture, "ide.context", json!({"path":"secret.key"}))
+        .await;
+    let denied = actor.settle(&fixture, denied).await;
+    assert_eq!(denied["code"], "execution_profile", "{denied}");
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Exercises the integrated macOS product loop, stale-write fence, restart telemetry, and fallback.
 ///
 /// This ignored release gate uses the exact configured Pyright and Node files. It proves a known
@@ -5032,12 +5114,11 @@ async fn configured_product_claude_helper_returns_real_typescript_semantic_conte
     daemon.wait().await.unwrap();
 }
 
-/// A deny-glob Codex profile can prove the requested TypeScript path without authorizing a
-/// provider over the whole tree; an installed dependency tree also makes project membership
-/// unverifiable. Both cases retain editable lexical source and refuse a denied source path.
+/// A deny-glob Codex profile retains confined TypeScript semantics for proven paths; an
+/// installed dependency tree still makes project membership unverifiable.
 #[tokio::test]
 #[ignore = "requires the release-pinned Node and TypeScript bundle"]
-async fn configured_product_typescript_read_restriction_falls_back_to_lexical_context() {
+async fn configured_product_typescript_deny_globs_keep_confined_semantics() {
     let fixture = ProductFixture::new(json!([accepted_typescript_provider()]));
     let source = "export const value = 42;\nexport const useValue = value;\n";
     std::fs::create_dir_all(fixture.root.join("source/utils")).unwrap();
@@ -5068,12 +5149,12 @@ async fn configured_product_typescript_read_restriction_falls_back_to_lexical_co
         "sandboxCwd":fixture.root,
         "useLegacyLandlock":false
     });
-    fixture.write_managed_profile(&template);
     let mut restricted = template.clone();
     restricted["permissionProfile"]["file_system"]["entries"]
         .as_array_mut()
         .unwrap()
         .push(json!({"access":"deny","path":{"type":"glob_pattern","pattern":fixture.root.join("**/*.key")}}));
+    fixture.write_managed_profile(&restricted);
 
     let denied_state = restricted.clone();
     let mut daemon = fixture.daemon().await;
@@ -5082,7 +5163,7 @@ async fn configured_product_typescript_read_restriction_falls_back_to_lexical_co
         "typescript-restricted",
         "private-host-channel",
         "session_id",
-        restricted,
+        restricted.clone(),
     )
     .await;
     let started = actor
@@ -5099,17 +5180,7 @@ async fn configured_product_typescript_read_restriction_falls_back_to_lexical_co
     let context = actor.settle(&fixture, context).await;
     assert_eq!(context["kind"], "context", "{context}");
     assert!(
-        context["text"]
-            .as_str()
-            .unwrap()
-            .contains("mode: lexical (accepted semantic provider is unavailable: read_restricted)"),
-        "{context}"
-    );
-    assert!(
-        context["text"]
-            .as_str()
-            .unwrap()
-            .contains("lexical_matches: [{"),
+        context["text"].as_str().unwrap().contains("mode: semantic"),
         "{context}"
     );
     assert!(
@@ -5119,7 +5190,7 @@ async fn configured_product_typescript_read_restriction_falls_back_to_lexical_co
     assert!(context["detail_ref"].as_str().is_some(), "{context}");
 
     std::fs::create_dir_all(fixture.root.join("node_modules")).unwrap();
-    actor.state = template;
+    actor.state = restricted.clone();
     let membership = actor
         .call(
             &fixture,
@@ -8215,6 +8286,63 @@ async fn eyes_unrestricted_profiles_start_checks_and_deliver_plates() {
     );
     await_eyes_check_start(&codex_home).await;
     mcp.close().await;
+}
+
+/// The managed Codex credential-glob shape schedules checks and returns a due plate.
+#[tokio::test]
+async fn eyes_codex_deny_globs_keep_project_checks_available() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(fixture.root.join("secret.key"), "hidden\n").unwrap();
+    let root = &fixture.root;
+    let mut state = json!({
+        "permissionProfile":{"type":"managed","network":"restricted","file_system":{"type":"restricted","glob_scan_max_depth":8,"entries":[
+            {"access":"read","path":{"type":"special","value":{"kind":"root"}}},
+            {"access":"write","path":{"type":"path","path":root}},
+            {"access":"write","path":{"type":"special","value":{"kind":"slash_tmp"}}},
+            {"access":"write","path":{"type":"special","value":{"kind":"tmpdir"}}}
+        ]}},
+        "sandboxCwd":root,"codexLinuxSandboxExe":null,"useLegacyLandlock":false
+    });
+    for suffix in ["**/*.key", "**/*.pem", "**/.env", "**/.env.*"] {
+        state["permissionProfile"]["file_system"]["entries"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "access":"deny","path":{"type":"glob_pattern","pattern":root.join(suffix)}
+            }));
+    }
+    fixture.write_managed_profile(&state);
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new_at(
+        &fixture,
+        "codex-deny-checks",
+        "private-host-channel",
+        "session_id",
+        state,
+    )
+    .await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"codex-deny-checks"}),
+        )
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let plate = carried_status(&started).expect("activation carries a check plate");
+    assert!(
+        plate.starts_with("<agent-ide>\nrust:") && !plate.contains("read_restricted"),
+        "{plate}"
+    );
+    await_eyes_check_start(&home).await;
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
 }
 
 /// Missing or unsupported metadata on a validated managed binding revokes check delivery before

@@ -205,6 +205,7 @@ async fn python_checker_missing_tool_is_unavailable_tool_missing() {
         worktree: fixture("interpreter_venv"),
         cache_dir: unique_temp_dir("tool-missing"),
         input_generation: 1,
+        read_denies: Vec::new(),
     };
     let snapshot = checker.check(request).await;
     assert_eq!(
@@ -223,6 +224,7 @@ async fn python_checker_missing_interpreter_is_unavailable_env_missing() {
         worktree: worktree.clone(),
         cache_dir: unique_temp_dir("env-missing-cache"),
         input_generation: 3,
+        read_denies: Vec::new(),
     };
     let snapshot = checker.check(request).await;
     assert_eq!(
@@ -243,6 +245,7 @@ async fn python_checker_runner_error_is_unavailable_fatal() {
         worktree: fixture("interpreter_venv"),
         cache_dir: unique_temp_dir("runner-error"),
         input_generation: 4,
+        read_denies: Vec::new(),
     };
     let snapshot = checker.check(request).await;
     assert_eq!(
@@ -263,6 +266,7 @@ async fn python_checker_timed_out_run_is_unavailable_timeout() {
         worktree: fixture("interpreter_venv"),
         cache_dir: unique_temp_dir("timeout"),
         input_generation: 5,
+        read_denies: Vec::new(),
     };
     let snapshot = checker.check(request).await;
     assert_eq!(
@@ -283,6 +287,7 @@ async fn python_checker_ready_snapshot_counts_from_real_fixture_json_with_relati
         worktree: dir.clone(),
         cache_dir: unique_temp_dir("ready-counts"),
         input_generation: 9,
+        read_denies: Vec::new(),
     };
     let snapshot = checker.check(request).await;
     assert_eq!(snapshot.state, CheckState::Ready);
@@ -323,6 +328,7 @@ async fn python_checker_builds_exact_run_spec_for_default_venv_interpreter() {
         worktree: worktree.clone(),
         cache_dir: cache_dir.clone(),
         input_generation: 2,
+        read_denies: Vec::new(),
     };
 
     let snapshot = checker.check(request).await;
@@ -418,6 +424,7 @@ async fn python_checker_uses_pyrightconfig_json_as_project_when_present() {
         worktree: dir.clone(),
         cache_dir: cache_dir.clone(),
         input_generation: 1,
+        read_denies: Vec::new(),
     };
     let interpreter = fixture("interpreter_venv/.venv/bin/python");
     let spec = checker.pyright_spec(&request, &interpreter);
@@ -459,6 +466,7 @@ async fn python_checker_pythonpath_is_the_venv_symlink_not_its_canonical_base() 
         worktree: worktree.clone(),
         cache_dir: cache_dir.clone(),
         input_generation: 1,
+        read_denies: Vec::new(),
     };
     let interpreter = resolve_interpreter(&worktree).expect("uv venv interpreter resolved");
     assert_eq!(interpreter, venv_python);

@@ -98,6 +98,7 @@ impl Fixtures {
         SeatbeltPolicy {
             read_roots: vec![self.read_root.clone()],
             write_roots: vec![self.write_root.clone()],
+            read_denies: Vec::new(),
         }
     }
 }
@@ -435,6 +436,7 @@ fn profile_escapes_quotes_and_backslashes_in_roots() {
     let policy = SeatbeltPolicy {
         read_roots: vec![PathBuf::from("/tmp/quote\"dir\\dir")],
         write_roots: Vec::new(),
+        read_denies: Vec::new(),
     };
 
     let profile = render_profile(&policy).expect("escaped roots render");
@@ -451,12 +453,14 @@ fn profile_rejects_unrepresentable_roots() {
     let newline = SeatbeltPolicy {
         read_roots: vec![PathBuf::from("/tmp/line\nbreak")],
         write_roots: Vec::new(),
+        read_denies: Vec::new(),
     };
     assert!(render_profile(&newline).is_err());
 
     let carriage_return = SeatbeltPolicy {
         read_roots: Vec::new(),
         write_roots: vec![PathBuf::from("/tmp/line\rbreak")],
+        read_denies: Vec::new(),
     };
     assert!(render_profile(&carriage_return).is_err());
 
@@ -468,6 +472,7 @@ fn profile_rejects_unrepresentable_roots() {
                 b"/tmp/not-utf8-\xff".to_vec(),
             ))],
             write_roots: Vec::new(),
+            read_denies: Vec::new(),
         };
         assert!(render_profile(&policy).is_err());
     }

@@ -110,7 +110,7 @@ impl PythonChecker {
 
         let project = {
             let config = request.worktree.join(PYRIGHT_CONFIG_FILE);
-            if config.is_file() {
+            if !request.read_denies.iter().any(|deny| deny.matches(&config)) && config.is_file() {
                 config
             } else {
                 request.worktree.clone()
@@ -154,6 +154,7 @@ impl PythonChecker {
                 PathBuf::from("/private/etc"),
             ],
             write_roots: vec![request.cache_dir.clone()],
+            read_denies: request.read_denies.clone(),
             timeout: self.timeout,
             max_output_bytes: MAX_OUTPUT_BYTES,
         }
@@ -168,14 +169,18 @@ impl Checker for PythonChecker {
     fn check(&self, request: CheckRequest) -> BoxFuture<'_, ProblemSnapshot> {
         Box::pin(async move {
             let generation = request.input_generation;
-            if !self.node.is_file() || !self.pyright_cli.is_file() {
+            if [&self.node, &self.pyright_cli].iter().any(|path| {
+                request.read_denies.iter().any(|deny| deny.matches(path)) || !path.is_file()
+            }) {
                 return ProblemSnapshot::unavailable(
                     Language::Python,
                     UnavailableReason::ToolMissing,
                     generation,
                 );
             }
-            let Some(interpreter) = resolve_interpreter(&request.worktree) else {
+            let Some(interpreter) =
+                resolve_interpreter_with_denies(&request.worktree, &request.read_denies)
+            else {
                 return ProblemSnapshot::unavailable(
                     Language::Python,
                     UnavailableReason::EnvMissing,
@@ -210,8 +215,14 @@ impl Checker for PythonChecker {
                 );
             }
             let duration_ms = started.elapsed().as_millis() as u64;
-            let mut snapshot =
-                parse_pyright_output(output.status, &output.stdout, generation, duration_ms);
+            let mut snapshot = parse_pyright_output_with_denies(
+                output.status,
+                &output.stdout,
+                generation,
+                duration_ms,
+                &request.worktree,
+                &request.read_denies,
+            );
             relativize_paths(&mut snapshot, &request.worktree);
             snapshot
         })
@@ -263,13 +274,27 @@ fn relativize_paths(snapshot: &mut ProblemSnapshot, worktree: &Path) {
 /// pyright (a missing environment must never produce the flood of unresolved-import errors that
 /// running pyright without a venv would report).
 pub fn resolve_interpreter(worktree: &Path) -> Option<PathBuf> {
+    resolve_interpreter_with_denies(worktree, &[])
+}
+
+/// Resolves the interpreter without probing any host-denied config or executable path.
+fn resolve_interpreter_with_denies(
+    worktree: &Path,
+    denies: &[crate::execution::seatbelt::ReadDeny],
+) -> Option<PathBuf> {
+    if [PYRIGHT_CONFIG_FILE, PYPROJECT_FILE]
+        .iter()
+        .any(|name| denies.iter().any(|deny| deny.matches(&worktree.join(name))))
+    {
+        return None;
+    }
     if let Some((venv_path, venv)) = read_pyrightconfig_venv_keys(worktree) {
-        return existing_python(venv_interpreter_path(worktree, &venv_path, &venv));
+        return existing_python(venv_interpreter_path(worktree, &venv_path, &venv), denies);
     }
     if let Some((venv_path, venv)) = read_pyproject_venv_keys(worktree) {
-        return existing_python(venv_interpreter_path(worktree, &venv_path, &venv));
+        return existing_python(venv_interpreter_path(worktree, &venv_path, &venv), denies);
     }
-    existing_python(worktree.join(".venv").join("bin").join("python"))
+    existing_python(worktree.join(".venv").join("bin").join("python"), denies)
 }
 
 /// Joins `venvPath`/`venv` into the `bin/python` interpreter path they name.
@@ -286,14 +311,55 @@ fn venv_interpreter_path(worktree: &Path, venv_path: &str, venv: &str) -> PathBu
     base.join(venv).join("bin").join("python")
 }
 
-/// Returns `candidate` when it exists as a file (following symlinks, since venv interpreters are
-/// commonly symlinks into a base installation), otherwise `None`.
-fn existing_python(candidate: PathBuf) -> Option<PathBuf> {
+/// Returns an existing interpreter outside host denies, including a direct venv symlink when
+/// its target is allowed; denied paths and symlinked parents return `None`.
+fn existing_python(
+    candidate: PathBuf,
+    denies: &[crate::execution::seatbelt::ReadDeny],
+) -> Option<PathBuf> {
+    if denied_interpreter_path(&candidate, denies) {
+        return None;
+    }
+    if let Ok(target) = fs::read_link(&candidate) {
+        let target = if target.is_absolute() {
+            target
+        } else {
+            candidate.parent()?.join(target)
+        };
+        if denied_interpreter_path(&target, denies) {
+            return None;
+        }
+    }
     if candidate.is_file() {
         Some(candidate)
     } else {
         None
     }
+}
+
+/// Rejects a denied interpreter path or a symlinked parent before any following `is_file` probe.
+fn denied_interpreter_path(path: &Path, denies: &[crate::execution::seatbelt::ReadDeny]) -> bool {
+    if denies.is_empty() {
+        return false;
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return true;
+    }
+    if denies.iter().any(|deny| deny.matches(path)) {
+        return true;
+    }
+    path.parent().is_none_or(|parent| {
+        parent.ancestors().any(|prefix| {
+            denies.iter().any(|deny| deny.matches(prefix))
+                || match std::fs::symlink_metadata(prefix) {
+                    Ok(metadata) => metadata.file_type().is_symlink(),
+                    Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+                }
+        })
+    })
 }
 
 /// The two keys of a pyright JSON config this checker reads; every other key is ignored.
@@ -463,6 +529,25 @@ pub fn parse_pyright_output(
     input_generation: u64,
     duration_ms: u64,
 ) -> ProblemSnapshot {
+    parse_pyright_output_with_denies(
+        exit,
+        stdout,
+        input_generation,
+        duration_ms,
+        Path::new(""),
+        &[],
+    )
+}
+
+/// Parses a check report while discarding host-denied diagnostic paths before counting and cap.
+fn parse_pyright_output_with_denies(
+    exit: Option<i32>,
+    stdout: &[u8],
+    input_generation: u64,
+    duration_ms: u64,
+    worktree: &Path,
+    denies: &[crate::execution::seatbelt::ReadDeny],
+) -> ProblemSnapshot {
     if !matches!(exit, Some(0) | Some(1)) {
         return ProblemSnapshot::unavailable(
             Language::Python,
@@ -501,6 +586,9 @@ pub fn parse_pyright_output(
             }
             _ => continue,
         };
+        if !super::check_problem_path_allowed(worktree, &diagnostic.file, denies) {
+            continue;
+        }
         problems.push(Problem::new(
             diagnostic.file,
             diagnostic.range.start.line + 1,

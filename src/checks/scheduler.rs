@@ -30,6 +30,7 @@ use tokio::time::Instant;
 
 use super::fingerprint::git_worktree_fingerprint;
 use super::{CheckRequest, CheckState, Checker, Language, ProblemSnapshot, UnavailableReason};
+use crate::execution::seatbelt::ReadDeny;
 
 /// Name of the marker file written in each worktree-level cache directory, recording the
 /// worktree's canonical path so [`sweep_stale_caches`] can find directories to remove.
@@ -121,6 +122,8 @@ struct WorktreeState {
     activation_armed: bool,
     /// Outcome of this worktree's Rust `target/` clone decision, for [`Scheduler::rust_cache_clone_outcome`].
     rust_clone_outcome: RustCacheClone,
+    /// Strongest exclusions observed for any check on this worktree.
+    read_denies: Vec<ReadDeny>,
 }
 
 impl WorktreeState {
@@ -133,6 +136,7 @@ impl WorktreeState {
             languages: HashMap::new(),
             activation_armed: false,
             rust_clone_outcome: RustCacheClone::NotAttempted,
+            read_denies: Vec::new(),
         }
     }
 }
@@ -177,6 +181,39 @@ struct RepositoryState {
 }
 
 impl Scheduler {
+    /// Retains host read exclusions before activation; later profiles cannot weaken them.
+    /// A stronger policy cancels existing runs and cached snapshots for this worktree.
+    pub fn add_read_denies(&self, worktree: &Path, denies: &[ReadDeny]) {
+        let worktree = canonical_worktree(worktree);
+        let mut state = self.inner.lock_state();
+        let wt = state
+            .worktrees
+            .entry(worktree)
+            .or_insert_with(|| WorktreeState::new(""));
+        // ponytail: one union per worktree can underreport for a later wider host; use
+        // per-binding check keys only if independent same-worktree policies are needed.
+        let old_len = wt.read_denies.len();
+        for deny in denies {
+            if !wt.read_denies.contains(deny) {
+                wt.read_denies.push(deny.clone());
+            }
+        }
+        if wt.read_denies.len() != old_len {
+            wt.input_generation += 1;
+            for lang in wt.languages.values_mut() {
+                if let Some(timer) = lang.timer_abort.take() {
+                    timer.abort();
+                }
+                if let Some(run) = lang.run_abort.take() {
+                    run.abort();
+                }
+                lang.running = false;
+                lang.latest_snapshot = None;
+                lang.completed_fingerprint = None;
+                lang.skip_eligible = false;
+            }
+        }
+    }
     /// Builds a scheduler with no worktrees registered yet.
     ///
     /// `checkers` supplies one [`Checker`] per language the scheduler runs; a duplicate language
@@ -453,6 +490,13 @@ impl Scheduler {
 }
 
 impl Inner {
+    /// Returns the host exclusions retained for a worktree without touching its files.
+    fn read_denies(&self, worktree: &Path) -> Vec<ReadDeny> {
+        self.lock_state()
+            .worktrees
+            .get(worktree)
+            .map_or_else(Vec::new, |wt| wt.read_denies.clone())
+    }
     /// Locks [`Inner::state`], panicking only if a prior holder panicked while holding it.
     fn lock_state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state
@@ -622,6 +666,7 @@ impl Inner {
                 worktree: worktree.clone(),
                 cache_dir: cache_dir.clone(),
                 input_generation: generation,
+                read_denies: inner.read_denies(&worktree),
             };
             // Fingerprint at the START of the run (T20B), so an edit made while the check is in
             // flight is recorded as the completed run's baseline only if it happened before the
@@ -647,7 +692,9 @@ impl Inner {
                 },
             );
             let started = Instant::now();
-            let snapshot = checker.check(request).await;
+            let read_denies = request.read_denies.clone();
+            let mut snapshot = checker.check(request).await;
+            filter_denied_problems(&mut snapshot, &worktree, &read_denies);
             let duration = started.elapsed();
             drop(permit);
             if let Some(hook) = &inner.on_complete {
@@ -802,6 +849,9 @@ impl Inner {
     /// lock, on the blocking thread pool (the git-based implementation spawns a process and may
     /// take up to its own budget). A panicking or cancelled computation is `None`: unknown, run.
     async fn fingerprint_value(&self, worktree: &Path) -> Option<u64> {
+        if !self.read_denies(worktree).is_empty() {
+            return None;
+        }
         let fingerprint = Arc::clone(&self.fingerprint);
         let worktree = worktree.to_path_buf();
         tokio::task::spawn_blocking(move || fingerprint(&worktree))
@@ -983,8 +1033,33 @@ impl Inner {
     }
 }
 
-/// Resolves `worktree` to its canonical path, falling back to the given path unchanged when
-/// canonicalization fails (for example a worktree removed since it was last triggered).
+/// Removes denied or malformed diagnostic paths before a result enters the shared cache.
+/// Counts fall back to retained allowed paths only if a checker failed to filter before its cap.
+fn filter_denied_problems(snapshot: &mut ProblemSnapshot, worktree: &Path, denies: &[ReadDeny]) {
+    if denies.is_empty() {
+        return;
+    }
+    let before = snapshot.problems.len();
+    snapshot
+        .problems
+        .retain(|problem| super::check_problem_path_allowed(worktree, &problem.path, denies));
+    if snapshot.problems.len() != before {
+        snapshot.errors = snapshot
+            .problems
+            .iter()
+            .filter(|problem| problem.severity == super::Severity::Error)
+            .count() as u32;
+        snapshot.warnings = snapshot
+            .problems
+            .iter()
+            .filter(|problem| problem.severity == super::Severity::Warning)
+            .count() as u32;
+        snapshot.truncated = false;
+    }
+    snapshot.detail = None;
+}
+
+/// Resolves a worktree's stable key, retaining its supplied path if resolution fails.
 fn canonical_worktree(worktree: &Path) -> PathBuf {
     std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf())
 }
@@ -1061,4 +1136,65 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     let mut permissions = std::fs::metadata(dir)?.permissions();
     permissions.set_mode(0o700);
     std::fs::set_permissions(dir, permissions)
+}
+
+#[cfg(test)]
+mod deny_tests {
+    use super::*;
+    use crate::checks::{Problem, Severity};
+    use crate::execution::seatbelt::CredentialGlob;
+
+    /// A check result cannot disclose a denied path or count it in its cached plate.
+    #[test]
+    fn denied_check_diagnostics_are_removed_before_caching() {
+        let root = Path::new("/tmp/check-project");
+        let mut snapshot = ProblemSnapshot::from_problems(
+            Language::Python,
+            CheckState::Ready,
+            vec![
+                Problem::new("good.py".into(), 1, 1, Severity::Error, None, "good".into()),
+                Problem::new(
+                    "secret.key".into(),
+                    1,
+                    1,
+                    Severity::Error,
+                    None,
+                    "hidden".into(),
+                ),
+            ],
+            1,
+            1,
+        );
+        filter_denied_problems(
+            &mut snapshot,
+            root,
+            &[ReadDeny::Glob {
+                base: root.to_path_buf(),
+                suffix: CredentialGlob::Key,
+            }],
+        );
+        assert_eq!(snapshot.errors, 1);
+        assert_eq!(snapshot.problems.len(), 1);
+        assert_eq!(snapshot.problems[0].path, "good.py");
+    }
+
+    /// A deny-bearing worktree never invokes even an installed fingerprint callback.
+    #[tokio::test]
+    async fn deny_glob_skips_worktree_fingerprint() {
+        let root =
+            std::env::temp_dir().join(format!("agent-ide-deny-fingerprint-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let scheduler = Scheduler::new(Vec::new(), Duration::from_millis(1), 1, root.join("cache"))
+            .with_fingerprint(Arc::new(|_| panic!("denied worktree was fingerprinted")));
+        scheduler.add_read_denies(
+            &root,
+            &[ReadDeny::Glob {
+                base: root.clone(),
+                suffix: CredentialGlob::Key,
+            }],
+        );
+        assert_eq!(scheduler.inner.fingerprint_value(&root).await, None);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

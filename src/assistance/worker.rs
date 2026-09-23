@@ -905,19 +905,30 @@ impl WorkerHandle {
         self.shared.project_feed.as_ref()
     }
 
-    /// Hides cached check results before a managed reply can carry a plate when the newly
-    /// observed host profile has no conservative whole-tree read grant. The worker later checks
-    /// the full binding, authority, and catalog before any check is scheduled.
+    /// Hides cached check results before a managed reply can carry a plate when its host deny
+    /// policy cannot be translated or differs from this binding's activated check policy.
     pub fn restrict_project_feed(
         &self,
         binding: &BindingRef,
         observed: Option<&ObservedSandboxState>,
     ) {
-        if let (Some(feed), Some(observed)) = (&self.shared.project_feed, observed)
-            && !crate::execution::HostSandboxState::parse(Some(observed.state().as_json().clone()))
-                .is_ok_and(|state| state.declares_whole_tree_read())
-        {
-            feed.restrict(&binding.fingerprint());
+        if let (Some(feed), Some(observed)) = (&self.shared.project_feed, observed) {
+            let worktree = feed.bound_worktree(&binding.fingerprint());
+            let denies =
+                crate::execution::HostSandboxState::parse(Some(observed.state().as_json().clone()))
+                    .ok()
+                    .and_then(|state| {
+                        crate::execution::seatbelt::host_read_denies(
+                            &state,
+                            worktree.as_deref().unwrap_or(state.cwd()),
+                        )
+                    });
+            if denies
+                .as_ref()
+                .is_none_or(|denies| !feed.accepts_read_denies(&binding.fingerprint(), denies))
+            {
+                feed.restrict(&binding.fingerprint());
+            }
         }
     }
 
@@ -2193,6 +2204,16 @@ impl<'a> Worker<'a> {
                     },
                     Some(authority),
                 ) if job.tool == AssistanceTool::Start => {
+                    let check_denies = job.observed.as_ref().map(|observed| {
+                        check_read_denies(
+                            &self.shared,
+                            &binding,
+                            observed,
+                            &job.target,
+                            authority,
+                            errorlog_method(job.tool),
+                        )
+                    });
                     let read_restricted = job.observed.as_ref().map_or_else(
                         || {
                             job.target.claude_profile.as_ref().is_none_or(|profile| {
@@ -2200,24 +2221,14 @@ impl<'a> Worker<'a> {
                                     .declares_whole_tree_read(authority.worktree().worktree_path())
                             })
                         },
-                        |observed| {
-                            validate_read_scope(
-                                &self.shared,
-                                &binding,
-                                observed,
-                                &job.target,
-                                authority,
-                                errorlog_method(job.tool),
-                                crate::execution::ReadScope::WholeTree,
-                            )
-                            .is_err()
-                        },
+                        |_| check_denies.as_ref().is_none_or(Result::is_err),
                     );
-                    feed.activated(
+                    feed.activated_with_denies(
                         binding.fingerprint(),
                         authority.worktree().worktree_path(),
                         authority.worktree().git_common_dir(),
                         read_restricted,
+                        check_denies.and_then(Result::ok).unwrap_or_default(),
                     );
                 }
                 (PeerReply::Edit { result, .. }, _) if result.outcome.has_post_source() => {
@@ -3476,14 +3487,13 @@ impl<'a> Worker<'a> {
                 })
             },
             |observed| {
-                validate_read_scope(
+                check_read_denies(
                     &self.shared,
                     binding,
                     observed,
                     &job.target,
                     &authority,
                     errorlog_method(job.tool),
-                    crate::execution::ReadScope::WholeTree,
                 )
                 .is_err()
             },
@@ -4703,9 +4713,75 @@ struct ReadScopeRefusal {
     detail: String,
 }
 
-/// Intersects a current durable stamp and fresh invocation metadata before any native/cached source read.
-/// The caller supplies the [`crate::execution::ReadScope`] naming exactly what this read will
-/// touch: one proven path, or the whole tree when no narrower scope can be stated.
+/// Admits a check only when the current profile is accepted, every daemon-side project probe is
+/// readable, and all host denies can be enforced by the check Seatbelt profile.
+fn check_read_denies(
+    shared: &Shared,
+    binding: &BindingRef,
+    observed: &ObservedSandboxState,
+    target: &LaunchTarget,
+    authority: &AuthorityStamp,
+    method: crate::errorlog::Method,
+) -> Result<Vec<crate::execution::seatbelt::ReadDeny>, ReadScopeRefusal> {
+    for path in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "requirements.txt",
+        "Pipfile",
+        "pyrightconfig.json",
+        ".venv",
+        "venv",
+    ] {
+        validate_read_scope(
+            shared,
+            binding,
+            observed,
+            target,
+            authority,
+            method,
+            crate::execution::ReadScope::Path(Path::new(path)),
+        )?;
+        let candidate = authority.worktree().worktree_path().join(path);
+        match std::fs::symlink_metadata(candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ReadScopeRefusal {
+                    code: FailureCode::ExecutionProfileCause(
+                        ExecutionProfileCause::ReadWholeTreeUnproven,
+                    ),
+                    detail: "read_scope:whole_tree_unproven".to_owned(),
+                });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(ReadScopeRefusal {
+                    code: FailureCode::ExecutionProfileCause(
+                        ExecutionProfileCause::ReadWholeTreeUnproven,
+                    ),
+                    detail: "read_scope:whole_tree_unproven".to_owned(),
+                });
+            }
+        }
+    }
+    crate::execution::HostSandboxState::parse(Some(observed.state().as_json().clone()))
+        .ok()
+        .and_then(|state| {
+            crate::execution::seatbelt::host_read_denies(
+                &state,
+                authority.worktree().worktree_path(),
+            )
+        })
+        .ok_or(ReadScopeRefusal {
+            code: FailureCode::ExecutionProfileCause(ExecutionProfileCause::ReadWholeTreeUnproven),
+            detail: "read_scope:whole_tree_unproven".to_owned(),
+        })
+}
+
+/// Intersects a current durable stamp and fresh invocation metadata before a native read.
+/// The caller supplies the exact path or a whole-tree scope when no narrower scope exists.
 fn validate_read_scope(
     shared: &Shared,
     binding: &BindingRef,

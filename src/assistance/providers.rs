@@ -378,8 +378,9 @@ impl Worker<'_> {
         self.providers.binding_caches.contains_key(binding)
     }
 
-    /// Selects only an operator-configured language profile after proving whole-tree read authority;
-    /// absent profiles and read-restricted worktrees stay lexical without starting a provider.
+    /// Selects an accepted provider after proving the source path under the observed host profile.
+    /// Managed children replay that same profile, so its OS sandbox confines all provider reads;
+    /// absent profiles and unproven source paths stay lexical.
     pub(super) async fn semantic_context(
         &mut self,
         job: &mut Job,
@@ -414,7 +415,7 @@ impl Worker<'_> {
             &authority,
             &job.target.catalog,
             job.target.allow_disabled_host,
-            crate::execution::ReadScope::WholeTree,
+            crate::execution::ReadScope::Path(source.path()),
         )
         .map_err(|error| {
             FailureCode::ExecutionProfileCause(
