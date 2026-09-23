@@ -100,7 +100,7 @@ impl FeedState {
     ///
     /// The block is a status plate (T18B): it names each language's current state, process states
     /// included, and is (re)sent whenever the rendered status changes — never while it is
-    /// unchanged. Items render in fixed [`Language`] order (rust, python), skipping languages
+    /// unchanged. Items render in fixed [`Language`] order (rust, python, typescript), skipping languages
     /// absent from the worktree (T10B: `Unavailable(Disabled)`) and languages without any
     /// snapshot; the last snapshot of a language wins. A language in `rechecks` — or with a
     /// `Checking` snapshot — renders `checking (first check)` or `checking (files changed; last
@@ -260,12 +260,12 @@ impl FeedState {
 /// Several snapshots per language are allowed; the last one in `snapshots` wins, matching the
 /// scheduler's latest-completed-wins rule. A language with no snapshot is skipped. A language
 /// absent from the worktree (T10B: `Unavailable(Disabled)`) is skipped too — it renders as
-/// nothing rather than a fixed unavailable phrase, so a project that only has one of the two
-/// languages never mentions the other. A `Checking` snapshot or a [`Recheck::FirstCheck`] renders
+/// nothing rather than a fixed unavailable phrase, so a project with one present language never
+/// mentions the others. A `Checking` snapshot or a [`Recheck::FirstCheck`] renders
 /// as the first check of the session; a [`Recheck::FilesChanged`] keeps the last counts in view.
 fn build_items(snapshots: &[ProblemSnapshot], rechecks: &[(Language, Recheck)]) -> Vec<FeedItem> {
     let mut items = Vec::new();
-    for language in [Language::Rust, Language::Python] {
+    for language in [Language::Rust, Language::Python, Language::TypeScript] {
         let Some(snapshot) = snapshots.iter().rev().find(|s| s.language == language) else {
             continue;
         };
@@ -832,6 +832,69 @@ mod tests {
             .expect("changed state emits");
         assert!(block.contains("(+4294967295)"));
         assert!(block.len() <= MAX_BLOCK_BYTES);
+    }
+
+    /// Three present languages retain Rust/Python/TypeScript order and accurate changed counts.
+    ///
+    /// Small changes show exact deltas. With maximum counts the 256-byte cap drops delta suffixes
+    /// from all items, but each current count and the TypeScript item remain visible.
+    #[test]
+    fn three_languages_keep_order_deltas_and_counts_at_the_cap() {
+        let mut state = FeedState::default();
+        let hook = key("three-languages");
+        let initial = [
+            ready(Language::TypeScript, 0, 0),
+            ready(Language::Rust, 0, 0),
+            ready(Language::Python, 0, 0),
+        ];
+        state
+            .next_block(&hook, &initial, &[])
+            .expect("initial plate");
+        let changed = [
+            ready(Language::TypeScript, 3, 1),
+            ready(Language::Rust, 1, 2),
+            ready(Language::Python, 2, 3),
+        ];
+        let block = state
+            .next_block(&hook, &changed, &[])
+            .expect("changed plate");
+        assert!(block.len() <= MAX_BLOCK_BYTES);
+        let rust = block.find("rust: 1 error (+1), 2 warnings (+2)").unwrap();
+        let python = block
+            .find("python: 2 errors (+2), 3 warnings (+3)")
+            .unwrap();
+        let typescript = block
+            .find("typescript: 3 errors (+3), 1 warning (+1)")
+            .unwrap();
+        assert!(rust < python && python < typescript, "{block}");
+
+        let maximum = [
+            partial(Language::TypeScript, u32::MAX, u32::MAX),
+            partial(Language::Rust, u32::MAX, u32::MAX),
+            partial(Language::Python, u32::MAX, u32::MAX),
+        ];
+        let compact = state
+            .next_block(&hook, &maximum, &[])
+            .expect("bounded plate");
+        assert!(
+            compact.len() <= MAX_BLOCK_BYTES,
+            "{} bytes: {compact}",
+            compact.len()
+        );
+        let rust = compact
+            .find("rust: 4294967295 errors, 4294967295 warnings")
+            .unwrap();
+        let python = compact
+            .find("python: 4294967295 errors, 4294967295 warnings")
+            .unwrap();
+        let typescript = compact
+            .find("typescript: 4294967295 errors, 4294967295 warnings")
+            .unwrap();
+        assert!(rust < python && python < typescript, "{compact}");
+        assert!(
+            !compact.contains("(+"),
+            "compaction omits deltas rather than cutting one mid-number: {compact}"
+        );
     }
 
     #[test]

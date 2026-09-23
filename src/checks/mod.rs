@@ -9,6 +9,7 @@
 pub mod python;
 pub mod runner;
 pub mod rust;
+pub mod typescript;
 
 /// Cheap whole-worktree input fingerprint backing the scheduler's skip-unchanged rule (T20B).
 pub mod fingerprint;
@@ -40,7 +41,7 @@ pub const MAX_MESSAGE_CHARS: usize = 200;
 
 /// Language a project check runs for.
 ///
-/// The declaration order is the fixed feed order (Rust before Python); the derived ordering
+/// The declaration order is the fixed feed order (Rust, Python, TypeScript); the derived ordering
 /// relies on it.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum Language {
@@ -48,15 +49,18 @@ pub enum Language {
     Rust,
     /// Python checks (`pyright --outputjson …`).
     Python,
+    /// TypeScript or JavaScript checks through the pinned `tsc.js` CLI.
+    TypeScript,
 }
 
 impl Language {
     /// Canonical lowercase identifier used by the feed and `ide.context` problems kind:
-    /// `"rust"` or `"python"`.
+    /// `"rust"`, `"python"`, or `"typescript"`.
     pub fn as_str(self) -> &'static str {
         match self {
             Language::Rust => "rust",
             Language::Python => "python",
+            Language::TypeScript => "typescript",
         }
     }
 
@@ -65,7 +69,9 @@ impl Language {
     /// never mentioned. Rust is present iff `<worktree>/Cargo.toml` exists. Python is present iff
     /// the worktree root has any of `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt`,
     /// `Pipfile`, `pyrightconfig.json`, or a `.venv`/`venv` directory. This deliberately never
-    /// walks the tree for source files (for example `*.py`): presence is a handful of `stat`
+    /// walks the tree for source files (for example `*.py`). TypeScript is present only when a
+    /// root `tsconfig.json` or `jsconfig.json` entry exists, including a link that the checker
+    /// will reject as unprovable; `package.json` alone does not count. Presence is a handful of `stat`
     /// calls at the worktree root, cheap enough to re-evaluate on every trigger so a worktree that
     /// later gains a `Cargo.toml` starts being checked on its next trigger.
     pub fn is_present(self, worktree: &Path) -> bool {
@@ -77,6 +83,10 @@ impl Language {
                     .any(|name| worktree.join(name).exists())
                     || worktree.join(".venv").is_dir()
                     || worktree.join("venv").is_dir()
+            }
+            Language::TypeScript => {
+                std::fs::symlink_metadata(worktree.join("tsconfig.json")).is_ok()
+                    || std::fs::symlink_metadata(worktree.join("jsconfig.json")).is_ok()
             }
         }
     }

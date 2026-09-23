@@ -21,6 +21,7 @@ use crate::checks::python::PythonChecker;
 use crate::checks::runner::{ConfinedRunner, SeatbeltRunner};
 use crate::checks::rust::RustChecker;
 use crate::checks::scheduler::{CompletionHook, Scheduler, sweep_stale_caches};
+use crate::checks::typescript::TypeScriptChecker;
 use crate::checks::{
     CheckState, Checker, Language, MAX_PROBLEMS, Problem, ProblemSnapshot, Recheck, Severity,
     UnavailableReason,
@@ -83,7 +84,7 @@ const MAX_CODE_CHARS: usize = 64;
 /// Implementers must be usable from the daemon worker concurrently (`Send + Sync`) and must
 /// return promptly without running checks, executing processes, or blocking: the caller answers
 /// a bounded `ide.context` request from this lookup alone. The returned list holds at most one
-/// snapshot per configured language, in the fixed feed order (Rust before Python).
+/// snapshot per configured language, in Rust, Python, TypeScript feed order.
 pub trait ProblemSource: Send + Sync {
     /// Returns the latest completed snapshot per configured language for `worktree`.
     ///
@@ -193,6 +194,14 @@ impl ProjectProblemFeed {
                 runner.clone(),
                 python.node().to_path_buf(),
                 python.pyright_cli().to_path_buf(),
+                checks.check_timeout(),
+            )));
+        }
+        if let Some(typescript) = checks.typescript() {
+            checkers.push(Arc::new(TypeScriptChecker::new(
+                runner.clone(),
+                typescript.node().to_path_buf(),
+                typescript.tsc_cli().to_path_buf(),
                 checks.check_timeout(),
             )));
         }
@@ -547,12 +556,13 @@ fn hex(bytes: &[u8; 32]) -> String {
 
 /// Parses one closed `language` parameter value into its snapshot language.
 ///
-/// Accepts exactly `"rust"` or `"python"` — the values the context schema advertises; any other
+/// Accepts exactly `"rust"`, `"python"`, or `"typescript"`; any other
 /// value returns `None` for the caller to treat as a filter-less request or a validation error.
 pub fn parse_language(value: &str) -> Option<Language> {
     match value {
         "rust" => Some(Language::Rust),
         "python" => Some(Language::Python),
+        "typescript" => Some(Language::TypeScript),
         _ => None,
     }
 }
