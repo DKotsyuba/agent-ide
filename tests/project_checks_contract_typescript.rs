@@ -10,7 +10,7 @@ use agent_ide::checks::typescript::{TypeScriptChecker, parse_tsc_output};
 use agent_ide::checks::{
     CheckRequest, CheckState, Checker, Language, ProblemSnapshot, UnavailableReason,
 };
-use agent_ide::execution::seatbelt::ReadDeny;
+use agent_ide::execution::seatbelt::{CredentialGlob, ReadDeny};
 use agent_ide::feed::{FeedKey, FeedState};
 
 /// Creates a distinct disposable project root with the selected root config.
@@ -48,8 +48,10 @@ async fn clean_project_is_ready_zero() {
     let root = project("clean", "tsconfig.json");
     let source = root.join("a.ts");
     std::fs::write(&source, "const x: number = 1;\n").unwrap();
-    let node = root.join("node");
-    let cli = root.join("tsc.js");
+    let node = root.join("node-install/bin/node");
+    let cli = root.join("ts-install/lib/tsc.js");
+    std::fs::create_dir_all(node.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
     std::fs::write(&node, "node").unwrap();
     std::fs::write(&cli, "cli").unwrap();
     let runner = Arc::new(FakeRunner::new(vec![Ok(report(&[&source], "", 0))]));
@@ -74,8 +76,38 @@ async fn clean_project_is_ready_zero() {
     assert_eq!(specs.len(), 1);
     assert_eq!(specs[0].program, node);
     assert_eq!(specs[0].write_roots, vec![root.join("cache")]);
+    assert!(specs[0].read_roots.contains(&node));
+    assert!(!specs[0].read_roots.contains(&root.join("node-install")));
+    assert!(specs[0].read_roots.contains(&root.join("ts-install")));
     assert!(specs[0].args.contains(&"--noEmit".into()));
-    assert!(!specs[0].args.contains(&"--incremental".into()));
+    for option in [
+        "--incremental",
+        "--composite",
+        "--extendedDiagnostics",
+        "--explainFiles",
+        "--traceResolution",
+    ] {
+        assert!(
+            specs[0]
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == option && pair[1] == "false"),
+            "{option} must override project config"
+        );
+    }
+    let blocked = checker
+        .check(CheckRequest {
+            worktree: root.clone(),
+            cache_dir: root.join("cache"),
+            input_generation: 8,
+            read_denies: vec![ReadDeny::Path(root.join("ts-install/lib"))],
+        })
+        .await;
+    assert_eq!(
+        blocked.state,
+        CheckState::Unavailable(UnavailableReason::ReadRestricted)
+    );
+    assert_eq!(runner.specs().len(), 1);
 }
 
 /// TS and checkJs diagnostics retain their project-relative path, position, and TS code.
@@ -216,7 +248,7 @@ async fn denied_config_or_tool_is_unavailable() {
             root.join("tsconfig.json"),
             UnavailableReason::ReadRestricted,
         ),
-        (node.clone(), UnavailableReason::ToolMissing),
+        (node.clone(), UnavailableReason::ReadRestricted),
     ] {
         let runner = Arc::new(FakeRunner::default());
         let checker = TypeScriptChecker::new(
@@ -237,6 +269,121 @@ async fn denied_config_or_tool_is_unavailable() {
         );
         assert!(runner.specs().is_empty());
     }
+}
+
+/// A denied source subtree refuses execution even when an allowed sibling could type-check clean.
+#[tokio::test]
+async fn source_overlapping_path_deny_is_read_restricted() {
+    let root = project("source-deny", "tsconfig.json");
+    let source = root.join("src/hidden.ts");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, "const hidden = 1;\n").unwrap();
+    let node = root.join("node");
+    let cli = root.join("tsc.js");
+    std::fs::write(&node, "node").unwrap();
+    std::fs::write(&cli, "cli").unwrap();
+    let runner = Arc::new(FakeRunner::default());
+    let checker = TypeScriptChecker::new(runner.clone(), node, cli, Duration::from_secs(10));
+    let snapshot = checker
+        .check(CheckRequest {
+            worktree: root.clone(),
+            cache_dir: root.join("cache"),
+            input_generation: 1,
+            read_denies: vec![ReadDeny::Path(root.join("src"))],
+        })
+        .await;
+    assert_eq!(
+        snapshot.state,
+        CheckState::Unavailable(UnavailableReason::ReadRestricted)
+    );
+    assert!(runner.specs().is_empty());
+}
+
+/// A symlink into a nonintersecting host path deny prevents a false clean snapshot.
+#[tokio::test]
+async fn nonintersecting_path_deny_rejects_worktree_alias() {
+    let root = project("outside-deny-alias", "tsconfig.json");
+    std::fs::write(root.join("a.ts"), "const x: number = 1;\n").unwrap();
+    std::os::unix::fs::symlink("/Users/pluto/.ssh", root.join("private-link")).unwrap();
+    let node = root.join("node");
+    let cli = root.join("tsc.js");
+    std::fs::write(&node, "node").unwrap();
+    std::fs::write(&cli, "cli").unwrap();
+    let runner = Arc::new(FakeRunner::default());
+    let checker = TypeScriptChecker::new(runner.clone(), node, cli, Duration::from_secs(10));
+    let snapshot = checker
+        .check(CheckRequest {
+            worktree: root.clone(),
+            cache_dir: root.join("cache"),
+            input_generation: 1,
+            read_denies: vec![ReadDeny::Path(PathBuf::from("/Users/pluto/.ssh"))],
+        })
+        .await;
+    assert_eq!(
+        snapshot.state,
+        CheckState::Unavailable(UnavailableReason::ReadRestricted)
+    );
+    assert!(runner.specs().is_empty());
+}
+
+/// An empty credential glob remains usable, redacts messages, and rejects later matches or links.
+#[tokio::test]
+async fn credential_glob_preflight_and_message_redaction() {
+    let root = project("credential-glob", "tsconfig.json");
+    let source = root.join("a.ts");
+    std::fs::write(&source, "bad\n").unwrap();
+    let node = root.join("node-install/bin/node");
+    let cli = root.join("ts-install/lib/tsc.js");
+    std::fs::create_dir_all(node.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+    std::fs::write(&node, "node").unwrap();
+    std::fs::write(&cli, "cli").unwrap();
+    let runner = Arc::new(FakeRunner::new(vec![Ok(report(
+        &[&source],
+        &format!(
+            "a.ts(1,1): error TS2322: secret at {}/hidden.key\na.ts(1,1): error TS2322: distinct private text\n",
+            root.display()
+        ),
+        2,
+    ))]));
+    let checker = TypeScriptChecker::new(runner.clone(), node, cli, Duration::from_secs(10));
+    let request = CheckRequest {
+        worktree: root.clone(),
+        cache_dir: root.join("cache"),
+        input_generation: 1,
+        read_denies: vec![
+            ReadDeny::Path(PathBuf::from("/Users/pluto/.ssh")),
+            ReadDeny::Glob {
+                base: root.clone(),
+                suffix: CredentialGlob::Key,
+            },
+        ],
+    };
+    let snapshot = checker.check(request.clone()).await;
+    assert_eq!(snapshot.state, CheckState::Ready);
+    assert_eq!(
+        snapshot.errors, 2,
+        "redaction must preserve distinct diagnostic counts"
+    );
+    assert_eq!(snapshot.problems.len(), 2);
+    assert_eq!(snapshot.problems[0].path, "a.ts");
+    assert_eq!(snapshot.problems[0].code.as_deref(), Some("TS2322"));
+    assert_eq!(
+        snapshot.problems[0].message,
+        "[redacted by host read policy]"
+    );
+    std::fs::write(root.join("hidden.key"), "credential").unwrap();
+    assert_eq!(
+        checker.check(request.clone()).await.state,
+        CheckState::Unavailable(UnavailableReason::ReadRestricted)
+    );
+    std::fs::remove_file(root.join("hidden.key")).unwrap();
+    std::os::unix::fs::symlink("a.ts", root.join("source-link.ts")).unwrap();
+    assert_eq!(
+        checker.check(request).await.state,
+        CheckState::Unavailable(UnavailableReason::ReadRestricted)
+    );
+    assert_eq!(runner.specs().len(), 1);
 }
 
 /// A symlinked tsconfig defers to a regular jsconfig; a lone link never proves a project.
@@ -346,4 +493,82 @@ async fn real_confined_tsc_smoke() {
         .await;
     assert_eq!(snapshot.state, CheckState::Ready, "{snapshot:?}");
     assert_eq!((snapshot.errors, snapshot.warnings), (0, 0));
+}
+
+/// Replays a real pinned CLI report through admission with default-style credential denies.
+/// The CLI process runs directly to isolate parser and admission checks from sandbox availability.
+#[tokio::test]
+#[ignore = "requires the local pinned Node v24.4.0 and TypeScript 5.9.3"]
+async fn real_pinned_cli_with_default_style_denies() {
+    let root = project("real-default-denies", "tsconfig.json");
+    std::fs::write(root.join("tsconfig.json"), r#"{"compilerOptions":{"incremental":true,"composite":true,"extendedDiagnostics":true,"explainFiles":true,"traceResolution":true}}"#).unwrap();
+    std::fs::write(root.join("a.ts"), "const x: number = 1;\n").unwrap();
+    let node = PathBuf::from("/Users/pluto/.nvm/versions/node/v24.4.0/bin/node");
+    let cli = PathBuf::from(
+        "/Users/pluto/.nvm/versions/node/v24.4.0/lib/node_modules/typescript/lib/tsc.js",
+    );
+    let request = CheckRequest {
+        worktree: root.clone(),
+        cache_dir: root.join("cache"),
+        input_generation: 1,
+        read_denies: vec![
+            ReadDeny::Path(PathBuf::from("/Users/pluto/.ssh")),
+            ReadDeny::Glob {
+                base: root.clone(),
+                suffix: CredentialGlob::Key,
+            },
+            ReadDeny::Glob {
+                base: root.clone(),
+                suffix: CredentialGlob::Pem,
+            },
+            ReadDeny::Glob {
+                base: root.clone(),
+                suffix: CredentialGlob::Env,
+            },
+            ReadDeny::Glob {
+                base: root.clone(),
+                suffix: CredentialGlob::EnvDot,
+            },
+        ],
+    };
+    std::fs::create_dir_all(request.cache_dir.join("tmp")).unwrap();
+    let checker = TypeScriptChecker::new(
+        Arc::new(FakeRunner::default()),
+        node.clone(),
+        cli.clone(),
+        Duration::from_secs(30),
+    );
+    let spec = checker.run_spec(&request, &root.join("tsconfig.json"));
+    assert!(spec.read_roots.contains(&node));
+    assert!(!spec.read_roots.contains(&PathBuf::from("/private/etc")));
+    assert!(
+        !spec
+            .read_roots
+            .contains(&node.parent().unwrap().parent().unwrap().to_path_buf())
+    );
+    let process = std::process::Command::new(&spec.program)
+        .args(&spec.args)
+        .current_dir(&spec.cwd)
+        .env_clear()
+        .envs(spec.env.iter().map(|(key, value)| (key, value)))
+        .output()
+        .unwrap();
+    assert_eq!(
+        process.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&process.stdout)
+    );
+    assert!(!root.join("tsconfig.tsbuildinfo").exists());
+    let runner = Arc::new(FakeRunner::new(vec![Ok(RunOutput {
+        status: process.status.code(),
+        stdout: process.stdout,
+        stderr: process.stderr,
+        ..RunOutput::default()
+    })]));
+    let checker = TypeScriptChecker::new(runner.clone(), node, cli, Duration::from_secs(30));
+    let snapshot = checker.check(request).await;
+    assert_eq!(snapshot.state, CheckState::Ready, "{snapshot:?}");
+    assert_eq!((snapshot.errors, snapshot.warnings), (0, 0));
+    assert_eq!(runner.specs().len(), 1);
 }

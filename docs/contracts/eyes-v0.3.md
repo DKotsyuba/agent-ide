@@ -143,8 +143,8 @@ Every project check process is started through one spawn path:
   (Rust: `toolchain_dir`, `cargo_home`, the derived rustup home, the resolved or configured Apple
   developer directory and its `xcode_select_link`/`CommandLineTools` companions (T05B); Python:
   the node install root, the pyright package root, the venv root and the canonical base
-  interpreter prefix) and `/private/etc`, read+write of the check's private cache directory and a
-  private temp directory.
+  interpreter prefix; TypeScript: the Node executable and TypeScript package). `/private/etc` is
+  included in the fixed system grants. The check's private cache and temp directories are writable.
 - Rust ancestor manifest reads (T07B): before resolving a workspace, cargo walks every ancestor
   of the worktree looking for a `[workspace]` root, reading each ancestor's `Cargo.toml` and
   `.cargo/config.toml`/`.cargo/config` even when that ancestor is not a workspace root — the
@@ -294,13 +294,24 @@ pub struct ProblemSnapshot { pub language: Language, pub state: CheckState,
   A denied or unprovable config is unavailable. Nested-only configs and project-reference graphs
   are outside this check's coverage; a solution-style root with no own files is `NoFiles`.
 - The configured paths name pinned Node v24.4.0 and TypeScript 5.9.3. The CLI runs under the
-  existing network-denied confined runner; only its private check cache is writable. No incremental
-  flags are added. A project requiring a build or emit is not represented as a clean type check.
+  existing network-denied confined runner; only its private check cache is writable. Explicit
+  `--incremental false --composite false` prevent `tsbuildinfo` writes even when the root config
+  enables those options. `--extendedDiagnostics false --explainFiles false --traceResolution false`
+  preserve the bounded report format. A project requiring a build or emit is not represented as a
+  clean type check. The Node executable and TypeScript package have separate read grants; the
+  fixed Seatbelt profile already grants required system paths.
 - `Ready` requires an untruncated, fully parsed output with a complete diagnostics footer, a
   matching file list, normal exit status, and at least one listed file under the worktree.
   Diagnostics report `TS` codes and exact file, line, and column; file-less diagnostics attach to
   the chosen config at line 0. Malformed output, denied diagnostic paths, and abnormal exits are
   `Fatal`. JavaScript diagnostics require the project's own `checkJs` setting.
+- A path read-deny intersecting any checker read root makes the result `ReadRestricted` before
+  the CLI runs. With any host read deny, bounded preflight and post-run scans of every explicit
+  grant must find no matching entry, unreadable location, or symlink alias. The Node grant is a
+  single executable file, avoiding a scan of its large installation tree. Arbitrary diagnostic
+  messages are redacted while path, severity and code remain. The scans and CLI run are not an
+  atomic filesystem snapshot; the scheduler fences observed input generations, while transient
+  changes entirely between scans remain outside this guarantee.
 
 ## 5. Scheduling
 
