@@ -833,7 +833,7 @@ mod deny_tests {
         std::fs::create_dir_all(root.join("secret/inner")).unwrap();
         std::fs::write(root.join("secret/node"), "secret").unwrap();
         std::fs::create_dir_all(root.join("bin")).unwrap();
-        symlink(&root.join("secret/inner"), root.join("bin/sub")).unwrap();
+        symlink(root.join("secret/inner"), root.join("bin/sub")).unwrap();
         symlink("sub/../node", root.join("bin/node")).unwrap();
         let denies = [ReadDeny::Path(root.join("secret"))];
         assert_eq!(resolved_link_target(&root.join("bin/node"), &denies), None);

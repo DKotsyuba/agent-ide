@@ -363,8 +363,8 @@ impl PersistedProfileRecord {
             "d03_evidence": self.d03_evidence,
             "semantic_state": self.semantic_state,
         });
-        if self.shape_version.is_some() {
-            record["shape_version"] = Value::from(self.shape_version.unwrap());
+        if let Some(shape_version) = self.shape_version {
+            record["shape_version"] = Value::from(shape_version);
         }
         record.to_string()
     }

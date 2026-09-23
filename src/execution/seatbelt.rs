@@ -328,13 +328,13 @@ pub fn render_profile(policy: &SeatbeltPolicy) -> Result<String, SeatbeltProfile
                 // reads resolve elsewhere; deny the resolved target too so the deny cannot
                 // miss. A nonexistent (or dangling) final component resolves nowhere and
                 // adds no entry.
-                if let Ok(resolved) = std::fs::canonicalize(path) {
-                    if resolved != canonical {
-                        profile.push_str(&format!(
-                            "\n(deny file-read* (subpath \"{}\"))",
-                            sbpl_path(&resolved)?
-                        ));
-                    }
+                if let Ok(resolved) = std::fs::canonicalize(path)
+                    && resolved != canonical
+                {
+                    profile.push_str(&format!(
+                        "\n(deny file-read* (subpath \"{}\"))",
+                        sbpl_path(&resolved)?
+                    ));
                 }
             }
             ReadDeny::Glob { base, suffix } => {
