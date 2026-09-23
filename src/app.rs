@@ -655,10 +655,9 @@ async fn serve_accepted_connection(
                 Ok(None)
             }
             Some(2 | 3) => {
-                // A served v2/v3 Assistance call proves a live client session. A lease-free
-                // session (the managed Codex MCP owns its per-session daemon and holds no
-                // `ClientLease`) is visible only through these calls, so each one restarts the
-                // idle countdown instead of letting the daemon exit mid-conversation (T26B).
+                // A served v2/v3 Assistance call proves a live client session. For lease-free
+                // clients, each call restarts the idle countdown (T26B); managed MCPs also hold
+                // their own long-lived leases, so this activity update is harmless for them.
                 lease.mark_activity();
                 if let (Some(dispatcher), Some(limits)) = (dispatcher, transport_limits)
                     && let Ok(_permit) = permits.try_acquire_owned()

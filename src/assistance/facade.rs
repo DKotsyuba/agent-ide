@@ -1321,9 +1321,9 @@ impl StdioFacade {
     /// exactly once. A failed hook reports re-establishment failure; a still-unavailable retry
     /// reports transport unavailability. There is no retry loop.
     ///
-    /// The returned flag is true only when that retried dispatch actually ran (T08B): the new
-    /// daemon has no pre-hook observation for the call whose hook fired before it existed, so this
-    /// retried call's own outcome needs a retry hint even though the daemon itself is back.
+    /// The returned flag is true only when the target pair changed: a transient timeout against
+    /// the same live daemon must not claim it restarted. A replacement's first dispatch may need
+    /// the T08B binding-recovery hint because its earlier pre-hook observation is gone.
     async fn dispatch_with_reconnect(
         &self,
         tool: AssistanceTool,
@@ -1349,21 +1349,22 @@ impl StdioFacade {
         if !matches!(outcome, FacadeOutcome::Unavailable) {
             return (outcome, false);
         }
-        let Some((runtime_dir, attachment)) = (reconnect.reestablish)().await else {
+        let Some((new_runtime, new_attachment)) = (reconnect.reestablish)().await else {
             return (FacadeOutcome::ReestablishFailed, false);
         };
+        let replaced = new_runtime != runtime_dir || new_attachment != attachment;
         reconnect
-            .store(runtime_dir.clone(), attachment.clone())
+            .store(new_runtime.clone(), new_attachment.clone())
             .await;
-        let Some(host) = self.build_host(&attachment, context) else {
+        let Some(host) = self.build_host(&new_attachment, context) else {
             return (outcome, false);
         };
         self.publish_codex_route(&context.meta).await;
         let retried = self
             .facade
-            .dispatch_at(&runtime_dir, &host, tool, parameters)
+            .dispatch_at(&new_runtime, &host, tool, parameters)
             .await;
-        (retried, true)
+        (retried, replaced)
     }
 
     /// Validates model parameters before using separately supplied host metadata for finite IPC.
@@ -1396,7 +1397,7 @@ impl StdioFacade {
         };
         let message = match outcome {
             FacadeOutcome::Reply(reply, status) if reconnected => {
-                return render_reply_after_reconnect(reply, status.as_deref(), envelope);
+                return render_reply_after_reconnect(tool, reply, status.as_deref(), envelope);
             }
             FacadeOutcome::Reply(reply, status) => {
                 return render_reply_with_status(reply, status.as_deref(), envelope);
@@ -1466,19 +1467,23 @@ pub(super) fn render_reply_with_status(
 
 /// Stable text for [`render_reply_after_reconnect`]'s added `retry` field (T08B).
 const RECONNECT_RETRY_HINT: &str = "daemon restarted; repeat this call once";
+/// Recovery when a non-Start call reaches a replacement with no actor binding.
+const RECONNECT_START_HINT: &str =
+    "daemon restarted; call ide.start first, then repeat this call with fresh references";
 
-/// Renders exactly like [`render_reply`], except a host-binding-unavailable reply also tells the
-/// agent to repeat the call once (T08B).
+/// Renders like [`render_reply`], with a binding-recovery hint after a daemon replacement.
 ///
 /// After [`StdioFacade::dispatch_with_reconnect`] re-establishes a lost shared daemon mid call,
 /// that first retried dispatch has no pre-hook observation for the call whose hook fired before
 /// the new daemon existed ([`crate::assistance::host_binding::BindingUnavailable::MissingPre`]),
 /// so it reports the same host-binding-unavailable outcome an agent would otherwise see with no
-/// daemon at all. An agent may not retry on its own and would stay without the IDE, so this keeps
-/// the existing machine fields and adds a short stable `retry` hint instead. Every other reply
+/// daemon at all. A Start call can be repeated after its new pre-hook; every other tool first needs
+/// a fresh `ide.start` binding, and old detail/source references must be refreshed. This keeps
+/// the existing machine fields and adds a short stable `retry` hint. Every other reply
 /// following a reconnect (including a still-unavailable transport outcome, which never reaches
 /// this function) renders unchanged.
 fn render_reply_after_reconnect(
+    tool: AssistanceTool,
     reply: PeerReply,
     status: Option<&str>,
     envelope: content::Envelope,
@@ -1493,14 +1498,16 @@ fn render_reply_after_reconnect(
     if !is_host_binding_unavailable {
         return rendered;
     }
+    let hint = if tool == AssistanceTool::Start {
+        RECONNECT_RETRY_HINT
+    } else {
+        RECONNECT_START_HINT
+    };
     if let Some(Value::Object(fields)) = rendered.structured_content.as_mut() {
-        fields.insert(
-            "retry".to_owned(),
-            Value::String(RECONNECT_RETRY_HINT.to_owned()),
-        );
+        fields.insert("retry".to_owned(), Value::String(hint.to_owned()));
     }
     if let Some(ContentBlock::Text(text)) = rendered.content.first_mut() {
-        text.text = format!("{}; retry: {RECONNECT_RETRY_HINT}", text.text);
+        text.text = format!("{}; retry: {hint}", text.text);
     }
     rendered
 }
@@ -1571,11 +1578,12 @@ fn claude_envelope_never_carries_structured_content() {
     }
 }
 
-/// The T08B reconnect retry hint reaches the Claude host through `content` alone, since
-/// [`content::Envelope::TextOnly`] never populates `structuredContent` for it to be inserted into.
+/// Both reconnect recovery hints reach Claude through content alone; its envelope never populates
+/// `structuredContent` for either hint to be inserted into.
 #[test]
 fn claude_envelope_reconnect_retry_hint_survives_in_content_text() {
     let rendered = render_reply_after_reconnect(
+        AssistanceTool::Start,
         PeerReply::Unavailable {
             reason: crate::assistance::reply::MissingPeer::HostBinding,
         },
@@ -1587,6 +1595,19 @@ fn claude_envelope_reconnect_retry_hint_survives_in_content_text() {
         panic!("sole content block must be text");
     };
     assert!(text.text.contains(RECONNECT_RETRY_HINT), "{}", text.text);
+    let context = render_reply_after_reconnect(
+        AssistanceTool::Context,
+        PeerReply::Unavailable {
+            reason: crate::assistance::reply::MissingPeer::HostBinding,
+        },
+        None,
+        content::Envelope::TextOnly,
+    );
+    assert_eq!(context.structured_content, None);
+    let ContentBlock::Text(text) = &context.content[0] else {
+        panic!("sole content block must be text");
+    };
+    assert!(text.text.contains(RECONNECT_START_HINT), "{}", text.text);
 }
 
 #[tool_router]

@@ -2651,6 +2651,34 @@ fn managed_runtime_paths() -> std::collections::BTreeSet<PathBuf> {
         .collect()
 }
 
+/// Returns the exact managed daemon holding this runtime's lock, without process-name matching.
+async fn managed_daemon_pid(runtime: &Path) -> libc::pid_t {
+    let output = Command::new("/usr/sbin/lsof")
+        .arg("-t")
+        .arg(runtime.join("agent-ide.lock"))
+        .output()
+        .await
+        .unwrap();
+    let pids = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .map(|pid| pid.parse::<libc::pid_t>().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(pids.len(), 1, "one daemon must hold the runtime lock");
+    pids[0]
+}
+
+/// Resumes an exact test daemon even if an assertion aborts a transient-timeout scenario.
+struct PausedDaemon(libc::pid_t);
+
+impl Drop for PausedDaemon {
+    /// Clears a test's SIGSTOP without touching any other process.
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(self.0, libc::SIGCONT);
+        }
+    }
+}
+
 /// Proves managed Codex needs no hooks, observes native edits, isolates actors, and cleans on EOF.
 #[tokio::test]
 async fn managed_codex_smoke_and_eof_cleanup() {
@@ -2859,10 +2887,9 @@ async fn managed_codex_publishes_distinct_actor_routes_and_retires_them_on_shutd
     std::fs::remove_dir_all(base).unwrap();
 }
 
-/// A dead owned daemon retires its route promptly; the next call starts a fresh daemon and
-/// republishes the same actor route so native hooks can find it again.
+/// After a crash, Context reports the need for Start; Start restores the binding and native route.
 #[tokio::test]
-async fn managed_codex_daemon_exit_reestablishes_and_republishes_the_route() {
+async fn managed_codex_context_after_crash_requires_start_and_republishes_route() {
     let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
     let fixture = ProductFixture::new(json!([]));
     let base = rendezvous_area("daemon-exit-retire");
@@ -2894,20 +2921,8 @@ async fn managed_codex_daemon_exit_reestablishes_and_republishes_the_route() {
     assert!(discover(&root, &identity).is_some(), "route published");
 
     // Kill the owned daemon outright; its runtime lock names the exact process to signal.
-    let holder = Command::new("/usr/sbin/lsof")
-        .args(["-t"])
-        .arg(runtime_dir.join("agent-ide.lock"))
-        .output()
-        .await
-        .unwrap();
-    let mut killed = false;
-    for pid in String::from_utf8_lossy(&holder.stdout).split_whitespace() {
-        if let Ok(pid) = pid.parse::<libc::pid_t>() {
-            assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
-            killed = true;
-        }
-    }
-    assert!(killed, "no daemon holds the owned runtime lock");
+    let pid = managed_daemon_pid(&runtime_dir).await;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
 
     // The exit observer retires the publication; the record stops being discoverable.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -2919,9 +2934,43 @@ async fn managed_codex_daemon_exit_reestablishes_and_republishes_the_route() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // The next call restarts the owned daemon and restores this known route.
+    // Context triggers the restart, but its old actor binding died with the daemon. Repeating
+    // Context cannot recover until a new Start establishes a binding.
     next += 1;
     let reply = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        session,
+        "ide.context",
+        json!({"path":"tracked.txt"}),
+        &state,
+    )
+    .await;
+    assert_eq!(reply["state"], "unavailable", "{reply}");
+    assert_eq!(reply["reason"], "host_binding", "{reply}");
+    assert_eq!(
+        reply["retry"],
+        "daemon restarted; call ide.start first, then repeat this call with fresh references"
+    );
+    assert!(
+        discover(&root, &identity).is_some(),
+        "a re-established daemon needs its native-hook route"
+    );
+    next += 1;
+    let repeated = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        session,
+        "ide.context",
+        json!({"path":"tracked.txt"}),
+        &state,
+    )
+    .await;
+    assert_eq!(repeated["reason"], "host_binding", "{repeated}");
+    next += 1;
+    let started = managed_root_call(
         &mut mcp,
         next,
         actor,
@@ -2931,14 +2980,190 @@ async fn managed_codex_daemon_exit_reestablishes_and_republishes_the_route() {
         &state,
     )
     .await;
-    let reply = settle_managed(&mut mcp, &mut next, actor, &state, reply).await;
-    assert_eq!(reply["kind"], "activation", "{reply}");
-    assert!(
-        discover(&root, &identity).is_some(),
-        "a re-established daemon needs its native-hook route"
-    );
+    let started = settle_managed(&mut mcp, &mut next, actor, &state, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    next += 1;
+    let context = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        session,
+        "ide.context",
+        json!({"path":"tracked.txt"}),
+        &state,
+    )
+    .await;
+    let context = settle_managed(&mut mcp, &mut next, actor, &state, context).await;
+    assert_eq!(context["kind"], "context", "{context}");
     mcp.close().await;
     std::fs::remove_dir_all(base).unwrap();
+}
+
+/// A timed-out IPC call never destroys an alive owned daemon or its established actor binding.
+#[tokio::test]
+async fn managed_codex_transient_transport_timeout_keeps_daemon_and_binding() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let fixture = ProductFixture::new(json!([]));
+    let before = managed_runtime_paths();
+    let mut mcp = Mcp::start_managed(&fixture.config, &fixture.root).await;
+    let runtime = managed_runtime_paths()
+        .difference(&before)
+        .next()
+        .cloned()
+        .expect("managed daemon runtime");
+    let state = fixture.state();
+    let actor = "transient-timeout";
+    let mut next = 10;
+    let started = managed_call(
+        &mut mcp,
+        next,
+        actor,
+        "ide.start",
+        json!({"activation_id":"kept"}),
+        &state,
+    )
+    .await;
+    let started = settle_managed(&mut mcp, &mut next, actor, &state, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let pid = managed_daemon_pid(&runtime).await;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    let paused = PausedDaemon(pid);
+    next += 1;
+    let timed_out = tokio::time::timeout(
+        Duration::from_secs(4),
+        mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.context","arguments":{"path":"tracked.txt"},"_meta":{"threadId":actor,"callId":format!("managed-{actor}-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":state}}})),
+    ).await;
+    drop(paused);
+    let timed_out =
+        timed_out.expect("two bounded IPC attempts must return without killing the daemon");
+    assert_eq!(timed_out["result"]["isError"], true, "{timed_out}");
+    assert_eq!(
+        managed_daemon_pid(&runtime).await,
+        pid,
+        "transient IPC loss replaced the daemon"
+    );
+    next += 1;
+    let context = managed_call(
+        &mut mcp,
+        next,
+        actor,
+        "ide.context",
+        json!({"path":"tracked.txt"}),
+        &state,
+    )
+    .await;
+    let context = settle_managed(&mut mcp, &mut next, actor, &state, context).await;
+    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(managed_daemon_pid(&runtime).await, pid);
+    mcp.close().await;
+}
+
+/// SIGTERM during replacement startup reaps the pending child and its registered private runtime.
+#[tokio::test]
+async fn managed_codex_sigterm_during_restart_removes_pending_runtime() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let fixture = ProductFixture::new(json!([]));
+    let before = managed_runtime_paths();
+    let mut mcp = Mcp::start_managed_custom_with_env(
+        &fixture.config,
+        &fixture.root,
+        None,
+        None,
+        Some(("AGENT_IDE_MANAGED_CODEX_RESTART_STALL_MS", "3000")),
+    )
+    .await;
+    let old = managed_runtime_paths()
+        .difference(&before)
+        .next()
+        .cloned()
+        .expect("initial managed runtime");
+    let state = fixture.state();
+    let mut next = 10;
+    let started = managed_call(
+        &mut mcp,
+        next,
+        "restart-shutdown",
+        "ide.start",
+        json!({"activation_id":"before"}),
+        &state,
+    )
+    .await;
+    let started = settle_managed(&mut mcp, &mut next, "restart-shutdown", &state, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let pid = managed_daemon_pid(&old).await;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the owned daemon must exit before replacement begins");
+    next += 1;
+    mcp.send(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.start","arguments":{"activation_id":"restart"},"_meta":{"threadId":"restart-shutdown","callId":format!("restart-shutdown-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":state}}})).await;
+    let fresh = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            for path in managed_runtime_paths().difference(&before) {
+                if path != &old
+                    && agent_ide::app::doctor_report(path)
+                        .await
+                        .is_ok_and(|report| {
+                            matches!(report.status, agent_ide::app::DoctorStatus::Healthy { .. })
+                        })
+                {
+                    return path.clone();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let fresh_pid = match &fresh {
+        Ok(path) => Some(managed_daemon_pid(path).await),
+        Err(_) => None,
+    };
+    let mcp_pid = mcp.child.id().expect("managed MCP PID") as libc::pid_t;
+    assert_eq!(unsafe { libc::kill(mcp_pid, libc::SIGTERM) }, 0);
+    tokio::time::timeout(Duration::from_secs(20), mcp.child.wait())
+        .await
+        .expect("managed MCP must terminate during restart")
+        .unwrap();
+    let fresh = fresh.expect("replacement daemon never reached startup");
+    let fresh_pid = fresh_pid.expect("replacement daemon never held its runtime lock");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while managed_runtime_paths() != before {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("shutdown left an owned runtime behind");
+    assert!(
+        !fresh.exists(),
+        "pending replacement runtime survived shutdown"
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while unsafe { libc::kill(fresh_pid, 0) } == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("pending replacement daemon survived shutdown");
+}
+
+/// A managed MCP observes SIGTERM and cleans its owned daemon when no restart is active.
+#[tokio::test]
+async fn managed_codex_sigterm_without_restart_exits() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let fixture = ProductFixture::new(json!([]));
+    let before = managed_runtime_paths();
+    let mut mcp = Mcp::start_managed(&fixture.config, &fixture.root).await;
+    let pid = mcp.child.id().unwrap() as libc::pid_t;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    tokio::time::timeout(Duration::from_secs(10), mcp.child.wait())
+        .await
+        .expect("managed MCP ignored SIGTERM")
+        .unwrap();
+    assert_eq!(managed_runtime_paths(), before);
 }
 
 /// A live managed Codex MCP holds a lease, so an idle daemon survives its launcher timeout and

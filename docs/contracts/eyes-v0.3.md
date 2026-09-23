@@ -95,7 +95,9 @@ with the existing launcher configuration error.
   exit or crash, the next call starts one replacement owned daemon, opens a new lease, republishes
   its known native-hook actor routes against the new runtime and retries the call once. A failed
   restart reports daemon re-establishment failure; missing host metadata is reported separately.
-  MCP exit retires routes, terminates the current owned daemon and removes its private runtime.
+  A transport timeout while the exact owned child and runtime remain live does not replace them.
+  Replacement registers its private runtime before async startup, and MCP exit waits for any
+  replacement before retiring routes, terminating the child, and removing that runtime.
 - The existing per-call IPC (hook submit and the five assistance methods) is unchanged.
 - Client-side re-establishment: a Claude MCP server never caches a dead connection. Each tool call
   dispatches against the live `runtime_dir`/attachment pair it currently holds; if that dispatch
@@ -114,9 +116,11 @@ with the existing launcher configuration error.
   no pre-hook observation for the call whose own hook fired before that daemon existed, so it reports
   the ordinary `{"state":"unavailable","reason":"host_binding"}` outcome even though the daemon itself
   is back. Only for that specific retried dispatch, the reply adds a stable
-  `"retry":"daemon restarted; repeat this call once"` fact telling the agent to repeat the same call
-  once: as a `structuredContent` field and compact text on the Codex host, and as compact text alone
-  on the Claude host (agent-content-v0.2 §"Host-specific projection", T14B). Every other reply,
+  `"retry":"daemon restarted; repeat this call once"` fact for `ide.start`. For another method,
+  the hint tells the agent to call `ide.start` first and then repeat with fresh references: the
+  replacement has no actor binding, so repeating Context directly cannot recover. The hint is a
+  `structuredContent` field and compact text on Codex, and compact text alone on Claude
+  (agent-content-v0.2 §"Host-specific projection", T14B). Every other reply,
   including a still-unavailable retry, is unchanged.
 
 Success example: agents A and B in two worktrees of one repository call `ide.start`; one daemon

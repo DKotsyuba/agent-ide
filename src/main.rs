@@ -1183,7 +1183,9 @@ fn telemetry_filter(tag: &str) -> Result<Filter, AppError> {
 /// directory remains private to this one MCP process and is removed only after its exact daemon
 /// child is reaped. For Claude, the directory is shared by every worktree of one repository and is
 /// never removed by an MCP process; only its own generation-specific launcher/attachment files may
-/// be cleared, and only before a confirmed-dead generation is replaced.
+/// be cleared, and only before a confirmed-dead generation is replaced. Clones carry the same
+/// fenced identity; the managed Codex state owns the copy responsible for final removal.
+#[derive(Clone)]
 struct ManagedRuntime {
     /// Short absolute directory used by the owned daemon's Unix socket and private state.
     path: PathBuf,
@@ -1222,6 +1224,21 @@ impl ManagedRuntime {
             std::io::ErrorKind::AlreadyExists,
             "managed runtime collision limit reached",
         ))
+    }
+
+    /// Reports whether this path still names the private directory captured at creation.
+    ///
+    /// A missing or replaced path returns `false`; an indeterminate filesystem error is returned
+    /// to the caller, which must not treat it as proof that its owned daemon has died.
+    fn identity_matches(&self) -> std::io::Result<bool> {
+        match fs::symlink_metadata(&self.path) {
+            Ok(metadata) => Ok(!metadata.file_type().is_symlink()
+                && metadata.is_dir()
+                && metadata.dev() == self.device
+                && metadata.ino() == self.inode),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// Exclusively creates the one deterministic shared Claude runtime directory with mode `0700`.
@@ -1975,16 +1992,19 @@ async fn run_managed_codex_mcp(
                     .await;
             };
             let lease = Arc::new(Mutex::new(Some(lease)));
-            let runtime = Arc::new(Mutex::new(Some(runtime)));
-            let generation = Arc::new(AtomicU64::new(0));
+            let runtime = Arc::new(OwnedCodexRuntime {
+                restart: Mutex::new(()),
+                current: std::sync::Mutex::new(Some(runtime)),
+                generation: Arc::new(AtomicU64::new(0)),
+            });
             let reconnect = codex_reestablish_hook(
                 launcher_template,
                 candidate,
+                attachment.clone(),
                 Arc::clone(&child),
                 Arc::clone(&runtime),
                 Arc::clone(&lease),
                 publisher.clone(),
-                Arc::clone(&generation),
             );
             let facade = match &publisher {
                 Some(publisher) => StdioFacade::with_reestablishing_managed_codex(
@@ -1999,7 +2019,7 @@ async fn run_managed_codex_mcp(
             };
             let Some(facade) = facade else {
                 terminate_owned_daemon(child).await;
-                if let Some(runtime) = runtime.lock().await.take() {
+                if let Some(runtime) = runtime.current.lock().expect("owned runtime mutex").take() {
                     let _ = runtime.remove();
                 }
                 return serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None)
@@ -2009,7 +2029,7 @@ async fn run_managed_codex_mcp(
                 tokio::spawn(unpublish_when_daemon_exits(
                     Arc::clone(&child),
                     Arc::clone(publisher),
-                    generation,
+                    Arc::clone(&runtime.generation),
                     0,
                 ));
             }
@@ -2024,20 +2044,29 @@ async fn run_managed_codex_mcp(
 
 /// Restarts this MCP's owned Codex daemon once after transport loss, restoring its lease and hooks.
 ///
-/// The guard serializes concurrent calls; a healthy replacement is reused. The old generation is
-/// reaped before its fenced runtime is removed, and the publisher is rebound only after a fresh
-/// daemon and lease both exist. Failure leaves later calls free to try again.
+/// The guard serializes calls with shutdown. A transport fault preserves the exact live child and
+/// runtime; only a reaped child or replaced runtime is restarted. A fresh runtime enters teardown
+/// state before startup awaits, so cancellation cannot leave it behind.
 fn codex_reestablish_hook(
     launcher_template: PathBuf,
     candidate: PathBuf,
+    attachment: String,
     child: SharedChild,
-    runtime: Arc<Mutex<Option<ManagedRuntime>>>,
+    runtime: Arc<OwnedCodexRuntime>,
     lease: Arc<Mutex<Option<UnixStream>>>,
     publisher: Option<SharedCodexPublisher>,
-    generation: Arc<AtomicU64>,
 ) -> ReestablishFn {
-    let restart = Arc::new(Mutex::new(()));
-    let current = Arc::new(Mutex::new(None::<(PathBuf, String)>));
+    let current = Arc::new(Mutex::new(Some((
+        runtime
+            .current
+            .lock()
+            .expect("owned runtime mutex")
+            .as_ref()
+            .expect("managed Codex runtime exists at startup")
+            .path
+            .clone(),
+        attachment,
+    ))));
     Arc::new(move || {
         let launcher_template = launcher_template.clone();
         let candidate = candidate.clone();
@@ -2045,25 +2074,31 @@ fn codex_reestablish_hook(
         let runtime = Arc::clone(&runtime);
         let lease = Arc::clone(&lease);
         let publisher = publisher.clone();
-        let generation = Arc::clone(&generation);
-        let restart = Arc::clone(&restart);
         let current = Arc::clone(&current);
         Box::pin(async move {
-            let _guard = restart.lock().await;
-            if let Some(connection) = current.lock().await.clone()
-                && doctor_report(&connection.0)
-                    .await
-                    .is_ok_and(|report| matches!(report.status, DoctorStatus::Healthy { .. }))
-            {
-                return Some(connection);
+            let _guard = runtime.restart.lock().await;
+            if let Some(connection) = current.lock().await.clone() {
+                let exited = matches!(child.lock().await.try_wait(), Ok(Some(_)));
+                let foreign = runtime
+                    .current
+                    .lock()
+                    .expect("owned runtime mutex")
+                    .as_ref()
+                    .is_some_and(|owned| {
+                        owned.path != connection.0 || matches!(owned.identity_matches(), Ok(false))
+                    });
+                if !exited && !foreign {
+                    return Some(connection);
+                }
             }
             terminate_owned_daemon(Arc::clone(&child)).await;
             *lease.lock().await = None;
-            if let Some(old) = runtime.lock().await.take() {
+            if let Some(old) = runtime.current.lock().expect("owned runtime mutex").take() {
                 let _ = old.remove();
             }
             let fresh = ManagedRuntime::create().ok()?;
             let path = fresh.path.clone();
+            *runtime.current.lock().expect("owned runtime mutex") = Some(fresh.clone());
             let started = start_managed_daemon(
                 &fresh,
                 &launcher_template,
@@ -2073,34 +2108,45 @@ fn codex_reestablish_hook(
             )
             .await;
             let Ok((attachment, new_child)) = started else {
-                let _ = fresh.remove();
+                if let Some(fresh) = runtime.current.lock().expect("owned runtime mutex").take() {
+                    let _ = fresh.remove();
+                }
                 return None;
             };
-            let Some(connection) =
+            // Product test seam: hold a live replacement before its lease is acquired so SIGTERM
+            // can prove that cancellation still reaps the child and removes this registered runtime.
+            if let Some(milliseconds) = std::env::var("AGENT_IDE_MANAGED_CODEX_RESTART_STALL_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                tokio::time::sleep(Duration::from_millis(milliseconds.min(60_000))).await;
+            }
+            let Some(lease_connection) =
                 agent_ide::app::open_client_lease(&path, "managed-codex-mcp").await
             else {
                 terminate_owned_daemon(Arc::new(Mutex::new(new_child))).await;
-                let _ = fresh.remove();
+                if let Some(fresh) = runtime.current.lock().expect("owned runtime mutex").take() {
+                    let _ = fresh.remove();
+                }
                 return None;
             };
+            let target = (path, attachment);
+            *current.lock().await = Some(target.clone());
+            *lease.lock().await = Some(lease_connection);
             *child.lock().await = new_child;
-            *runtime.lock().await = Some(fresh);
-            *lease.lock().await = Some(connection);
             if let Some(publisher) = publisher {
                 let mut publisher_lock = publisher.lock().expect("managed codex publisher mutex");
-                let next = generation.fetch_add(1, Ordering::AcqRel) + 1;
-                publisher_lock.rebind(path.clone(), attachment.clone());
+                let next = runtime.generation.fetch_add(1, Ordering::AcqRel) + 1;
+                publisher_lock.rebind(target.0.clone(), target.1.clone());
                 drop(publisher_lock);
                 tokio::spawn(unpublish_when_daemon_exits(
                     Arc::clone(&child),
                     publisher,
-                    Arc::clone(&generation),
+                    Arc::clone(&runtime.generation),
                     next,
                 ));
             }
-            let connection = (path, attachment);
-            *current.lock().await = Some(connection.clone());
-            Some(connection)
+            Some(target)
         })
     })
 }
@@ -2519,21 +2565,30 @@ async fn health_check_owned_daemon(child: &mut tokio::process::Child, runtime: &
 /// reason, which is the client-side EOF that releases the daemon's lease count (EYES-r2 §2).
 /// `publisher` is the managed Codex route publisher (Codex only): its records are retired before
 /// the owned daemon is terminated and its runtime removed, on every exit path including signals.
+/// A signal exits the process after this cleanup because Tokio's stdin worker may remain blocked
+/// on an open host pipe even after the MCP service has been canceled.
 async fn serve_managed_stdio(
     facade: StdioFacade,
     child: Option<SharedChild>,
-    runtime: Option<Arc<Mutex<Option<ManagedRuntime>>>>,
+    runtime: Option<Arc<OwnedCodexRuntime>>,
     lease: Option<Arc<Mutex<Option<UnixStream>>>>,
     publisher: Option<SharedCodexPublisher>,
 ) -> ExitCode {
-    let served = match serve_server(facade, stdio()).await {
+    let (served, signalled) = match serve_server(facade, stdio()).await {
         Ok(service) => {
             tokio::select! {
-                result = service.waiting() => result.is_ok(),
-                () = managed_termination_signal() => true,
+                result = service.waiting() => (result.is_ok(), false),
+                () = managed_termination_signal() => (true, true),
             }
         }
-        Err(_) => false,
+        Err(_) => (false, false),
+    };
+    // A restart may be between runtime creation and child/lease installation. Wait for it (or
+    // for cancellation to drop it) before retiring routes and tearing down the owned generation.
+    let _restart = if let Some(runtime) = &runtime {
+        Some(runtime.restart.lock().await)
+    } else {
+        None
     };
     drop(lease);
     if let Some(publisher) = publisher {
@@ -2546,10 +2601,16 @@ async fn serve_managed_stdio(
     if let Some(child) = child {
         terminate_owned_daemon(child).await;
     }
-    if let Some(runtime) = runtime
-        && let Some(runtime) = runtime.lock().await.take()
+    if let Some(runtime) = runtime.as_ref()
+        && let Some(runtime) = runtime.current.lock().expect("owned runtime mutex").take()
     {
         let _ = runtime.remove();
+    }
+    if signalled {
+        // Tokio's stdio reader may still be blocked in a non-cancellable stdin read after an
+        // in-flight request. All owned resources are settled above; exit without waiting for that
+        // runtime worker, since the host may leave the MCP pipe open after SIGTERM.
+        std::process::exit(0);
     }
     if served {
         ExitCode::SUCCESS
@@ -2563,6 +2624,20 @@ async fn serve_managed_stdio(
 /// The lock is only ever held across bounded synchronous probes or the final terminate/reap, so
 /// the exit observer can always retry its non-blocking attempt.
 type SharedChild = Arc<Mutex<tokio::process::Child>>;
+
+/// Coordinates this MCP's owned runtime registration with restart and final teardown.
+///
+/// `restart` excludes teardown while a generation is being replaced. `current` uses a short
+/// synchronous lock so a newly created private directory is registered before any async await;
+/// its fenced removal remains the MCP's responsibility even if restart is canceled.
+struct OwnedCodexRuntime {
+    /// Serializes replacement with teardown without holding a filesystem lock across awaits.
+    restart: Mutex<()>,
+    /// Current fenced directory, including a pending replacement not yet serving calls.
+    current: std::sync::Mutex<Option<ManagedRuntime>>,
+    /// Fences each child-exit route observer against a later replacement generation.
+    generation: Arc<AtomicU64>,
+}
 
 /// Retires one managed Codex daemon generation's routes when its owned child exits.
 ///
