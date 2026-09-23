@@ -521,6 +521,17 @@ impl Checker for FakeChecker {
 mod tests {
     use super::*;
 
+    /// Case variants of a denied glob base are rejected before a diagnostic path is probed.
+    #[test]
+    fn denied_glob_base_case_variant_cannot_disclose_a_problem() {
+        let root = Path::new("/tmp/check-project");
+        let denies = [crate::execution::seatbelt::ReadDeny::Glob {
+            base: root.join("sub"),
+            suffix: crate::execution::seatbelt::CredentialGlob::Key,
+        }];
+        assert!(!check_problem_path_allowed(root, "SUB/secret.key", &denies));
+    }
+
     /// Builds one problem with a fixed code for compact test arrangements.
     fn problem(path: &str, line: u32, column: u32, severity: Severity, message: &str) -> Problem {
         Problem::new(

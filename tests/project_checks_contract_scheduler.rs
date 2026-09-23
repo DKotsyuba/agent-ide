@@ -7,6 +7,7 @@ use agent_ide::checks::scheduler::{FingerprintFn, RustCacheClone, Scheduler, swe
 use agent_ide::checks::{
     BoxFuture, CheckRequest, CheckState, Checker, Language, ProblemSnapshot, UnavailableReason,
 };
+use agent_ide::execution::seatbelt::ReadDeny;
 use std::collections::VecDeque;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -576,6 +577,64 @@ async fn scheduler_clones_rust_target_from_sibling_worktree_of_the_same_reposito
         }
         other => panic!("expected Cloned or a Failed fallback, got {other:?}"),
     }
+}
+
+/// Persistent caches and sibling Rust clones are isolated by the effective deny set.
+#[tokio::test(start_paused = true)]
+async fn scheduler_partitions_caches_and_clones_by_policy() {
+    let checker = RecordingChecker::new(Language::Rust);
+    let cache_root = scratch_dir("policy-cache");
+    let worktree_a = scratch_worktree("policy-worktree-a", Language::Rust);
+    let worktree_b = scratch_worktree("policy-worktree-b", Language::Rust);
+    let scheduler = Scheduler::new(
+        vec![Arc::new(checker.clone())],
+        Duration::from_millis(10),
+        2,
+        cache_root,
+    );
+    scheduler.add_read_denies(
+        &worktree_a,
+        &[ReadDeny::Path(PathBuf::from("/private/tmp/policy-a"))],
+    );
+    scheduler.trigger("shared-repo", &worktree_a);
+    advance(Duration::from_millis(30)).await;
+    assert_eq!(checker.calls().len(), 1);
+    let first_cache = checker.calls()[0].cache_dir.clone();
+    std::fs::create_dir_all(first_cache.join("target")).unwrap();
+    std::fs::write(first_cache.join("target/marker.txt"), "old policy").unwrap();
+
+    scheduler.add_read_denies(
+        &worktree_b,
+        &[ReadDeny::Path(PathBuf::from("/private/tmp/policy-b"))],
+    );
+    scheduler.trigger("shared-repo", &worktree_b);
+    advance(Duration::from_millis(30)).await;
+    assert_eq!(checker.calls().len(), 2);
+    let second_cache = checker.calls()[1].cache_dir.clone();
+    assert_ne!(
+        first_cache.parent().unwrap().file_name(),
+        second_cache.parent().unwrap().file_name()
+    );
+    assert_eq!(
+        scheduler.rust_cache_clone_outcome(&worktree_b),
+        RustCacheClone::SkippedNoSource
+    );
+    assert!(!second_cache.join("target/marker.txt").exists());
+
+    scheduler.add_read_denies(
+        &worktree_a,
+        &[ReadDeny::Path(PathBuf::from("/private/tmp/policy-b"))],
+    );
+    scheduler.trigger("shared-repo", &worktree_a);
+    advance(Duration::from_millis(30)).await;
+    assert_eq!(checker.calls().len(), 3);
+    let stricter_cache = checker.calls()[2].cache_dir.clone();
+    assert_ne!(first_cache, stricter_cache);
+    assert!(!stricter_cache.join("target/marker.txt").exists());
+    assert_eq!(
+        scheduler.rust_cache_clone_outcome(&worktree_a),
+        RustCacheClone::SkippedNoSource
+    );
 }
 
 /// A transient Fatal completion keeps the prior Ready snapshot; a durable Unavailable reason replaces it.

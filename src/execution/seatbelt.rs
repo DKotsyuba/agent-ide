@@ -111,7 +111,8 @@ pub enum CredentialGlob {
 }
 
 impl ReadDeny {
-    /// Reports a denied path, treating ambiguous non-ASCII names under a glob as denied.
+    /// Reports a denied path with ASCII case-folded path and glob bases; non-ASCII ambiguity
+    /// fails closed before callers probe or disclose the path.
     pub fn matches(&self, path: &Path) -> bool {
         match self {
             Self::Path(denied) => {
@@ -123,23 +124,33 @@ impl ReadDeny {
                 }
                 Path::new(&path.to_ascii_lowercase()).starts_with(denied.to_ascii_lowercase())
             }
-            Self::Glob { base, suffix } => path.strip_prefix(base).is_ok_and(|relative| {
-                relative.components().any(|component| {
-                    let Some(name) = component.as_os_str().to_str() else {
-                        return true;
-                    };
-                    if !name.is_ascii() {
-                        return true;
-                    }
-                    let name = name.to_ascii_lowercase();
-                    match suffix {
-                        CredentialGlob::Key => name.ends_with(".key"),
-                        CredentialGlob::Pem => name.ends_with(".pem"),
-                        CredentialGlob::Env => name == ".env",
-                        CredentialGlob::EnvDot => name.starts_with(".env."),
-                    }
+            Self::Glob { base, suffix } => {
+                let (Some(path), Some(base)) = (path.to_str(), base.to_str()) else {
+                    return true;
+                };
+                if !path.is_ascii() || !base.is_ascii() {
+                    return true;
+                }
+                let path = path.to_ascii_lowercase();
+                let base = base.to_ascii_lowercase();
+                Path::new(&path).strip_prefix(&base).is_ok_and(|relative| {
+                    relative.components().any(|component| {
+                        let Some(name) = component.as_os_str().to_str() else {
+                            return true;
+                        };
+                        if !name.is_ascii() {
+                            return true;
+                        }
+                        let name = name.to_ascii_lowercase();
+                        match suffix {
+                            CredentialGlob::Key => name.ends_with(".key"),
+                            CredentialGlob::Pem => name.ends_with(".pem"),
+                            CredentialGlob::Env => name == ".env",
+                            CredentialGlob::EnvDot => name.starts_with(".env."),
+                        }
+                    })
                 })
-            }),
+            }
         }
     }
 }
@@ -672,6 +683,13 @@ mod tests {
                 .iter()
                 .any(|deny| deny.matches(&root.join("nested/secret.key"))),
             "{denies:?}"
+        );
+        assert!(
+            ReadDeny::Glob {
+                base: root.join("sub"),
+                suffix: CredentialGlob::Key
+            }
+            .matches(&root.join("SUB/secret.key"))
         );
         assert!(
             denies

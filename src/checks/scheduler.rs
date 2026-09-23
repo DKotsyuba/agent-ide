@@ -77,17 +77,19 @@ struct Inner {
     cache_root: PathBuf,
     /// Mutable scheduling state, locked only for the duration of a synchronous read or write.
     state: Mutex<State>,
-    /// Optional observer called once with every snapshot a [`Checker`] run completes with.
+    /// Optional observer called for completions accepted under the current policy generation.
     on_complete: Option<CompletionHook>,
     /// Worktree input fingerprint consulted when a debounce fires for a pair whose last
     /// completed run was `Ready` (T20B); always called off the state lock.
     fingerprint: FingerprintFn,
+    /// Test barrier after checker completion and before publication takes the state lock.
+    #[cfg(test)]
+    before_publish: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// Observer of completed check runs, installed through [`Scheduler::with_completion_hook`].
 ///
-/// Called synchronously on the scheduler task right after a run completes and before the
-/// snapshot is stored, never while scheduler state is locked. It must return promptly and must
+/// Called synchronously after the policy-fenced publication lock is released. It must return promptly and must
 /// not call back into the scheduler.
 pub type CompletionHook = Arc<dyn Fn(&ProblemSnapshot) + Send + Sync>;
 
@@ -124,6 +126,10 @@ struct WorktreeState {
     rust_clone_outcome: RustCacheClone,
     /// Strongest exclusions observed for any check on this worktree.
     read_denies: Vec<ReadDeny>,
+    /// Incremented when the effective exclusions change; stale completions cannot publish.
+    policy_generation: u64,
+    /// Stable digest partitioning persistent caches by the effective exclusion set.
+    policy_digest: String,
 }
 
 impl WorktreeState {
@@ -137,6 +143,8 @@ impl WorktreeState {
             activation_armed: false,
             rust_clone_outcome: RustCacheClone::NotAttempted,
             read_denies: Vec::new(),
+            policy_generation: 0,
+            policy_digest: policy_digest(&[]),
         }
     }
 }
@@ -176,8 +184,8 @@ struct LanguageState {
 /// Per-repository state shared across sibling worktrees.
 #[derive(Default)]
 struct RepositoryState {
-    /// Cache directory of the most recently completed Rust check among this repository's worktrees.
-    most_recent_rust_cache_dir: Option<PathBuf>,
+    /// Latest completed Rust cache for each exact effective exclusion set.
+    most_recent_rust_cache_dir: HashMap<String, PathBuf>,
 }
 
 impl Scheduler {
@@ -200,6 +208,9 @@ impl Scheduler {
         }
         if wt.read_denies.len() != old_len {
             wt.input_generation += 1;
+            wt.policy_generation += 1;
+            wt.policy_digest = policy_digest(&wt.read_denies);
+            wt.rust_clone_outcome = RustCacheClone::NotAttempted;
             for lang in wt.languages.values_mut() {
                 if let Some(timer) = lang.timer_abort.take() {
                     timer.abort();
@@ -241,6 +252,8 @@ impl Scheduler {
                 state: Mutex::new(State::default()),
                 on_complete: None,
                 fingerprint: Arc::new(git_worktree_fingerprint),
+                #[cfg(test)]
+                before_publish: None,
             }),
         }
     }
@@ -261,8 +274,17 @@ impl Scheduler {
         self
     }
 
-    /// Installs `hook`, called with every snapshot a check run completes with (for example to
-    /// record telemetry), including completions later discarded by the storage guards.
+    /// Installs a test-only barrier at the exact completion/publication race boundary.
+    #[cfg(test)]
+    fn with_before_publish(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("new scheduler has one owner")
+            .before_publish = Some(hook);
+        self
+    }
+
+    /// Installs `hook` for every completion accepted under the current policy generation,
+    /// including transient outcomes suppressed by the prior-ready snapshot guard.
     ///
     /// Must be called on the freshly built scheduler before it is cloned or triggered.
     ///
@@ -497,6 +519,26 @@ impl Inner {
             .get(worktree)
             .map_or_else(Vec::new, |wt| wt.read_denies.clone())
     }
+
+    /// Captures one worktree's policy generation and persistent-cache partition together.
+    fn policy(&self, worktree: &Path) -> (u64, String) {
+        self.lock_state().worktrees.get(worktree).map_or_else(
+            || (0, policy_digest(&[])),
+            |wt| (wt.policy_generation, wt.policy_digest.clone()),
+        )
+    }
+
+    /// Captures request inputs only while the policy prepared for this run is still current.
+    fn check_inputs(
+        &self,
+        worktree: &Path,
+        policy_generation: u64,
+    ) -> Option<(u64, Vec<ReadDeny>)> {
+        let state = self.lock_state();
+        let wt = state.worktrees.get(worktree)?;
+        (wt.policy_generation == policy_generation)
+            .then(|| (wt.input_generation, wt.read_denies.clone()))
+    }
     /// Locks [`Inner::state`], panicking only if a prior holder panicked while holding it.
     fn lock_state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state
@@ -597,8 +639,8 @@ impl Inner {
     /// waits out any pending EYES-r2 cooldown (see [`Inner::cooldown_remaining`]), then prepares
     /// the cache directory (cloning Rust's `target/` on the worktree's first Rust check when
     /// possible), acquires the shared concurrency permit, dispatches the configured [`Checker`],
-    /// reports the completion to the optional [`CompletionHook`], stores the resulting snapshot
-    /// (subject to the generation and Fatal/Timeout guards in [`Inner::store_snapshot`]),
+    /// stores the resulting snapshot only if its policy generation is current (and subject to
+    /// the Fatal/Timeout guard), then reports accepted completion to [`CompletionHook`],
     /// records this completion's timing for the next iteration's cooldown, and records Rust
     /// cache completion for sibling worktrees. If the pair was marked dirty while this run was
     /// in flight, one more iteration follows with the latest `input_generation`; the [`Checker`]
@@ -608,17 +650,20 @@ impl Inner {
     async fn run_check_loop(inner: Arc<Self>, worktree: PathBuf, language: Language) {
         let mut dirty_rerun = false;
         loop {
+            let (policy_generation, policy_digest) = inner.policy(&worktree);
             if inner.is_shutting_down() {
-                inner.finish_run(&worktree, language, false);
+                inner.finish_run(&worktree, language, false, policy_generation);
                 return;
             }
             if !language.is_present(&worktree) {
                 let generation = inner.current_generation(&worktree);
                 let snapshot =
                     ProblemSnapshot::unavailable(language, UnavailableReason::Disabled, generation);
-                inner.store_snapshot(&worktree, snapshot);
-                inner.mark_run_ineligible(&worktree, language);
-                dirty_rerun = inner.finish_run(&worktree, language, true);
+                if !inner.store_snapshot(&worktree, snapshot, policy_generation) {
+                    return;
+                }
+                inner.mark_run_ineligible(&worktree, language, policy_generation);
+                dirty_rerun = inner.finish_run(&worktree, language, true, policy_generation);
                 if !dirty_rerun {
                     return;
                 }
@@ -630,8 +675,8 @@ impl Inner {
             // then not spawn a checker process at all.
             if dirty_rerun && inner.rerun_skip_candidate(&worktree, language) {
                 let fingerprint = inner.fingerprint_value(&worktree).await;
-                if inner.skip_dirty_rerun(&worktree, language, fingerprint) {
-                    inner.finish_run(&worktree, language, false);
+                if inner.skip_dirty_rerun(&worktree, language, fingerprint, policy_generation) {
+                    inner.finish_run(&worktree, language, false, policy_generation);
                     return;
                 }
             }
@@ -640,33 +685,38 @@ impl Inner {
                 tokio::time::sleep(cooldown).await;
             }
             if inner.is_shutting_down() {
-                inner.finish_run(&worktree, language, false);
+                inner.finish_run(&worktree, language, false, policy_generation);
                 return;
             }
-            let cache_dir = inner.prepare_cache_dir(&worktree, language).await;
+            let cache_dir = inner
+                .prepare_cache_dir(&worktree, language, &policy_digest, policy_generation)
+                .await;
             let permit = match Arc::clone(&inner.semaphore).acquire_owned().await {
                 Ok(permit) => permit,
                 Err(_closed) => {
-                    inner.finish_run(&worktree, language, false);
+                    inner.finish_run(&worktree, language, false, policy_generation);
                     return;
                 }
             };
             if inner.is_shutting_down() {
                 drop(permit);
-                inner.finish_run(&worktree, language, false);
+                inner.finish_run(&worktree, language, false, policy_generation);
                 return;
             }
             let Some(checker) = inner.checkers.get(&language).cloned() else {
                 drop(permit);
-                inner.finish_run(&worktree, language, false);
+                inner.finish_run(&worktree, language, false, policy_generation);
                 return;
             };
-            let generation = inner.current_generation(&worktree);
+            let Some((generation, read_denies)) = inner.check_inputs(&worktree, policy_generation)
+            else {
+                return;
+            };
             let request = CheckRequest {
                 worktree: worktree.clone(),
                 cache_dir: cache_dir.clone(),
                 input_generation: generation,
-                read_denies: inner.read_denies(&worktree),
+                read_denies,
             };
             // Fingerprint at the START of the run (T20B), so an edit made while the check is in
             // flight is recorded as the completed run's baseline only if it happened before the
@@ -677,6 +727,7 @@ impl Inner {
                 if let Some(lang) = state
                     .worktrees
                     .get_mut(&worktree)
+                    .filter(|wt| wt.policy_generation == policy_generation)
                     .and_then(|wt| wt.languages.get_mut(&language))
                 {
                     lang.run_start_fingerprint = run_start_fingerprint;
@@ -697,16 +748,33 @@ impl Inner {
             filter_denied_problems(&mut snapshot, &worktree, &read_denies);
             let duration = started.elapsed();
             drop(permit);
+            #[cfg(test)]
+            if let Some(before_publish) = &inner.before_publish {
+                before_publish();
+            }
+            let completed_state = snapshot.state.clone();
+            if !inner.store_snapshot(&worktree, snapshot.clone(), policy_generation) {
+                return;
+            }
+            inner.record_completion(
+                &worktree,
+                language,
+                duration,
+                &completed_state,
+                policy_generation,
+            );
+            if language == Language::Rust {
+                inner.record_completed_rust_cache(
+                    &worktree,
+                    &cache_dir,
+                    policy_generation,
+                    &policy_digest,
+                );
+            }
             if let Some(hook) = &inner.on_complete {
                 hook(&snapshot);
             }
-            let completed_state = snapshot.state.clone();
-            inner.store_snapshot(&worktree, snapshot);
-            inner.record_completion(&worktree, language, duration, &completed_state);
-            if language == Language::Rust {
-                inner.record_completed_rust_cache(&worktree, &cache_dir);
-            }
-            if !inner.finish_run(&worktree, language, true) {
+            if !inner.finish_run(&worktree, language, true, policy_generation) {
                 return;
             }
             dirty_rerun = true;
@@ -727,17 +795,20 @@ impl Inner {
     /// Applies the T20B skip to a dirty follow-up run (T28B): returns `true` when the current
     /// worktree input fingerprint still equals the last completed `Ready` run's baseline, in
     /// which case the pair stops running — no checker process, the stored snapshot stays
-    /// current — and a later changed-input trigger starts a fresh run.
+    /// current — and a later changed-input trigger starts a fresh run. A changed policy
+    /// generation leaves the newer policy's run state untouched.
     fn skip_dirty_rerun(
         &self,
         worktree: &Path,
         language: Language,
         fingerprint: Option<u64>,
+        policy_generation: u64,
     ) -> bool {
         let mut state = self.lock_state();
         let Some(lang) = state
             .worktrees
             .get_mut(worktree)
+            .filter(|wt| wt.policy_generation == policy_generation)
             .and_then(|wt| wt.languages.get_mut(&language))
         else {
             return false;
@@ -767,21 +838,29 @@ impl Inner {
             .unwrap_or(0)
     }
 
-    /// Stores `snapshot` as the latest result for its `(worktree, language)` pair, unless a
-    /// newer completion (by `input_generation`) is already stored, or `snapshot` is a transient
-    /// `Fatal`/`Timeout` failure (EYES-r2 §5) that would overwrite an existing usable
-    /// `Ready`/`Partial` result. Every other `Unavailable` reason still replaces the stored
+    /// Stores `snapshot` as the latest result for its `(worktree, language)` pair only while
+    /// `policy_generation` still matches under this publication lock. Returns `false` for a
+    /// stale policy and `true` for a current completion, including transient suppression. A
+    /// newer completion (by `input_generation`) is retained; a transient `Fatal`/`Timeout`
+    /// failure (EYES-r2 §5) does not overwrite an existing usable `Ready`/`Partial` result.
+    /// Every other `Unavailable` reason still replaces the stored
     /// result, since those describe a durable condition (disabled, outside roots, tool/env
     /// missing, or T12B's `NoFiles`, a project misconfiguration that stays true run after run)
     /// rather than one bad run.
-    fn store_snapshot(&self, worktree: &Path, snapshot: ProblemSnapshot) {
+    fn store_snapshot(
+        &self,
+        worktree: &Path,
+        snapshot: ProblemSnapshot,
+        policy_generation: u64,
+    ) -> bool {
         let mut state = self.lock_state();
         let Some(lang) = state
             .worktrees
             .get_mut(worktree)
+            .filter(|wt| wt.policy_generation == policy_generation)
             .and_then(|wt| wt.languages.get_mut(&snapshot.language))
         else {
-            return;
+            return false;
         };
         if is_transient_failure(&snapshot.state)
             && matches!(
@@ -791,7 +870,7 @@ impl Inner {
                 Some(CheckState::Ready) | Some(CheckState::Partial)
             )
         {
-            return;
+            return true;
         }
         if lang.latest_snapshot.is_none()
             || snapshot.input_generation >= lang.last_stored_generation
@@ -799,6 +878,7 @@ impl Inner {
             lang.last_stored_generation = snapshot.input_generation;
             lang.latest_snapshot = Some(snapshot);
         }
+        true
     }
 
     /// Records `duration` as the wall-clock time `(worktree, language)`'s most recently
@@ -807,18 +887,21 @@ impl Inner {
     /// skip-unchanged baseline (T20B). Only a `Ready` completion arms the skip rule: a `Partial`
     /// result still has incomplete coverage and every `Unavailable` outcome — transient failure
     /// or durable condition — must be re-checked on the next trigger, so any non-`Ready` state
-    /// (and the stale baseline with it) is dropped here.
+    /// (and the stale baseline with it) is dropped here. A changed policy generation rejects
+    /// this bookkeeping update.
     fn record_completion(
         &self,
         worktree: &Path,
         language: Language,
         duration: Duration,
         completed_state: &CheckState,
+        policy_generation: u64,
     ) {
         let mut state = self.lock_state();
         if let Some(lang) = state
             .worktrees
             .get_mut(worktree)
+            .filter(|wt| wt.policy_generation == policy_generation)
             .and_then(|wt| wt.languages.get_mut(&language))
         {
             lang.last_completion = Some(Instant::now());
@@ -831,12 +914,13 @@ impl Inner {
     /// Drops the skip-unchanged baseline for a `(worktree, language)` pair whose latest run
     /// completed without dispatching a checker (T20B: a language found absent stores
     /// `Unavailable(Disabled)` directly); the next trigger must not compare against an
-    /// out-of-date baseline.
-    fn mark_run_ineligible(&self, worktree: &Path, language: Language) {
+    /// out-of-date baseline. A changed policy generation leaves newer bookkeeping untouched.
+    fn mark_run_ineligible(&self, worktree: &Path, language: Language, policy_generation: u64) {
         let mut state = self.lock_state();
         if let Some(lang) = state
             .worktrees
             .get_mut(worktree)
+            .filter(|wt| wt.policy_generation == policy_generation)
             .and_then(|wt| wt.languages.get_mut(&language))
         {
             lang.run_start_fingerprint = None;
@@ -879,13 +963,20 @@ impl Inner {
         required.saturating_sub(last_completion.elapsed())
     }
 
-    /// Records `cache_dir` as `worktree`'s repository's most recently completed Rust cache
-    /// directory, for sibling worktrees' future clone attempts.
-    fn record_completed_rust_cache(&self, worktree: &Path, cache_dir: &Path) {
+    /// Records `cache_dir` for sibling Rust clones only under the same live policy generation
+    /// and digest; stale completions cannot seed a newer policy's cache.
+    fn record_completed_rust_cache(
+        &self,
+        worktree: &Path,
+        cache_dir: &Path,
+        policy_generation: u64,
+        policy_digest: &str,
+    ) {
         let mut state = self.lock_state();
         let Some(repository_key) = state
             .worktrees
             .get(worktree)
+            .filter(|wt| wt.policy_generation == policy_generation)
             .map(|wt| wt.repository_key.clone())
         else {
             return;
@@ -894,21 +985,29 @@ impl Inner {
             .repositories
             .entry(repository_key)
             .or_default()
-            .most_recent_rust_cache_dir = Some(cache_dir.to_path_buf());
+            .most_recent_rust_cache_dir
+            .insert(policy_digest.to_owned(), cache_dir.to_path_buf());
     }
 
-    /// Ends the current iteration of a `(worktree, language)` run loop and reports whether
-    /// another iteration should follow.
+    /// Ends the current iteration only for its policy generation and reports whether another
+    /// iteration should follow; an older task cannot clear a stricter policy's run state.
     ///
     /// Consumes a pending `dirty` flag into one more iteration when `allow_rerun` is set and the
     /// scheduler is not shutting down; otherwise clears `running`, `dirty`, and `run_abort` so the
     /// pair is idle again.
-    fn finish_run(&self, worktree: &Path, language: Language, allow_rerun: bool) -> bool {
+    fn finish_run(
+        &self,
+        worktree: &Path,
+        language: Language,
+        allow_rerun: bool,
+        policy_generation: u64,
+    ) -> bool {
         let mut state = self.lock_state();
         let shutting_down = state.shutting_down;
         let Some(lang) = state
             .worktrees
             .get_mut(worktree)
+            .filter(|wt| wt.policy_generation == policy_generation)
             .and_then(|wt| wt.languages.get_mut(&language))
         else {
             return false;
@@ -928,12 +1027,18 @@ impl Inner {
     /// check.
     ///
     /// The directory layout is `<cache_root>/<hash(repository_key)>/<hash(canonical
-    /// worktree)>/<language>` (EYES-r2 §5), so caches from different repositories never collide
+    /// worktree)>/<policy_digest>/<language>`, so caches from different policies never collide
     /// even if two unrelated worktrees hash to the same worktree-level segment by coincidence of
     /// path reuse. The first time a worktree's cache directory is created, a
     /// [`WORKTREE_MARKER_FILE_NAME`] file recording its canonical path is written alongside it,
     /// for [`sweep_stale_caches`] to later identify caches whose worktree no longer exists.
-    async fn prepare_cache_dir(&self, worktree: &Path, language: Language) -> PathBuf {
+    async fn prepare_cache_dir(
+        &self,
+        worktree: &Path,
+        language: Language,
+        policy_digest: &str,
+        policy_generation: u64,
+    ) -> PathBuf {
         let repository_key = self
             .lock_state()
             .worktrees
@@ -959,7 +1064,7 @@ impl Inner {
                 );
             }
         }
-        let dir = worktree_dir.join(language.as_str());
+        let dir = worktree_dir.join(policy_digest).join(language.as_str());
         let existed = dir.exists();
         if !existed && let Err(error) = create_private_dir(&dir) {
             eprintln!(
@@ -968,9 +1073,15 @@ impl Inner {
             );
         }
         if language == Language::Rust && !existed {
-            let outcome = self.try_clone_rust_cache(worktree, &dir).await;
+            let outcome = self
+                .try_clone_rust_cache(worktree, &dir, policy_digest)
+                .await;
             let mut state = self.lock_state();
-            if let Some(wt) = state.worktrees.get_mut(worktree) {
+            if let Some(wt) = state
+                .worktrees
+                .get_mut(worktree)
+                .filter(|wt| wt.policy_generation == policy_generation)
+            {
                 wt.rust_clone_outcome = outcome;
             }
         }
@@ -979,11 +1090,16 @@ impl Inner {
 
     /// Attempts an APFS copy-on-write clone of a sibling worktree's `target/` into `dst_dir`.
     ///
-    /// Looks up the most recently completed Rust cache directory recorded for `worktree`'s
-    /// repository; if none exists, or its `target/` is missing, the check proceeds cold. The
+    /// Looks up the most recently completed Rust cache for this repository and exact deny-policy
+    /// digest; if none exists, or its `target/` is missing, the check proceeds cold. The
     /// clone itself runs `/bin/cp -c -R <source>/target <dst_dir>/target`; any failure is logged
     /// and treated as a cold start rather than propagated.
-    async fn try_clone_rust_cache(&self, worktree: &Path, dst_dir: &Path) -> RustCacheClone {
+    async fn try_clone_rust_cache(
+        &self,
+        worktree: &Path,
+        dst_dir: &Path,
+        policy_digest: &str,
+    ) -> RustCacheClone {
         let repository_key = {
             let state = self.lock_state();
             state
@@ -999,7 +1115,12 @@ impl Inner {
             state
                 .repositories
                 .get(&repository_key)
-                .and_then(|repository| repository.most_recent_rust_cache_dir.clone())
+                .and_then(|repository| {
+                    repository
+                        .most_recent_rust_cache_dir
+                        .get(policy_digest)
+                        .cloned()
+                })
         };
         let Some(source_dir) = source_dir else {
             return RustCacheClone::SkippedNoSource;
@@ -1084,6 +1205,22 @@ fn hash16(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Hashes the sorted effective deny set for stable, policy-isolated persistent cache paths.
+fn policy_digest(denies: &[ReadDeny]) -> String {
+    let mut rules = denies
+        .iter()
+        .map(|deny| serde_json::to_vec(deny).expect("validated read deny serializes"))
+        .collect::<Vec<_>>();
+    rules.sort_unstable();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"agent-ide/check-policy/v1\0");
+    for rule in rules {
+        hasher.update(&(rule.len() as u64).to_le_bytes());
+        hasher.update(&rule);
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 /// Removes cache directories under `cache_root` whose worktree no longer exists on disk
 /// (EYES-r2 §5 follow-up), for a daemon to call periodically outside any live [`Scheduler`].
 ///
@@ -1141,8 +1278,10 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod deny_tests {
     use super::*;
-    use crate::checks::{Problem, Severity};
+    use crate::checks::{FakeChecker, Problem, Severity};
     use crate::execution::seatbelt::CredentialGlob;
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A check result cannot disclose a denied path or count it in its cached plate.
     #[test]
@@ -1195,6 +1334,52 @@ mod deny_tests {
             }],
         );
         assert_eq!(scheduler.inner.fingerprint_value(&root).await, None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A completion already past its checker cannot refill the cache after a stricter policy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn policy_change_drops_completion_waiting_at_publication() {
+        let root =
+            std::env::temp_dir().join(format!("agent-ide-policy-barrier-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        std::fs::write(root.join("pyproject.toml"), "[project]\nname='barrier'\n").unwrap();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let scheduler = Scheduler::new(
+            vec![Arc::new(FakeChecker::with_delay(
+                Language::Python,
+                ProblemSnapshot::checking(Language::Python, 1),
+                Duration::ZERO,
+            ))],
+            Duration::from_millis(1),
+            1,
+            root.join("cache"),
+        )
+        .with_before_publish({
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                entered.wait();
+                release.wait();
+            })
+        })
+        .with_completion_hook({
+            let completed = Arc::clone(&completed);
+            Arc::new(move |_| {
+                completed.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+        scheduler.activate("repo", &root);
+        entered.wait();
+        scheduler.add_read_denies(&root, &[ReadDeny::Path(root.join("secret.key"))]);
+        release.wait();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(scheduler.latest(&root).is_empty());
+        assert_eq!(completed.load(Ordering::SeqCst), 0);
+        scheduler.shutdown().await;
         let _ = std::fs::remove_dir_all(root);
     }
 }
