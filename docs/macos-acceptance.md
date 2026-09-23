@@ -73,7 +73,13 @@ reach the agent: the agent's MCP comes from the operator's `~/.agent-run/config.
 `[mcp.agent_ide]` entry. `start --timeout` is legacy metadata only and does not stop execution, so
 the outer `perl alarm` is the only wall-clock bound. Because the driver cannot redirect the agent
 to the candidate, it fails closed with `installed_binary_differs` unless the installed
-`/Users/pluto/.local/bin/agent-ide` is byte-identical to the candidate binary.
+`/Users/pluto/.local/bin/agent-ide` is byte-identical to the candidate binary. The Codex route
+also requires a matching accepted v3 visualization profile in the launcher before sessions start.
+Set `TMPDIR` to an existing writable directory covered by the launcher's `allowed_roots` before
+invoking the runner; for the current operator launcher, use `TMPDIR=/private/tmp/agent-ide-stability`.
+The Codex driver checks both fixture worktrees against those roots before starting an agent.
+For both agent-run routes, every captured Agent IDE tool reply must be a complete string result
+of at most 16 KiB; divergent-worktree transcripts must contain no left fixture marker.
 
 The driver must exercise the real host route and write exactly this ordered result to the result
 path:

@@ -107,7 +107,7 @@ fi
 
 # The route can only claim the candidate contract when the binary the resident
 # broker actually executes is byte-identical to the release candidate, and the
-# launcher template declares the accepted Claude TypeScript record. Environment
+# launcher template declares the accepted host profile. Environment
 # set here cannot redirect the agent to the candidate, so a differing installed
 # binary fails the cell closed before any agent starts.
 cmp -s "$BINARY" "$MCP_BINARY" \
@@ -116,10 +116,31 @@ cmp -s "$BINARY" "$MCP_BINARY" \
 if [ "$AGENT_IDE_ACCEPTANCE_ROUTE" = agent-run-claude ]; then
     /usr/bin/grep -q 'claude-r3-2026-09-14' "$LAUNCHER" \
         || fail E_LAUNCHER_NO_CLAUDE_TYPESCRIPT "launcher template lacks the accepted Claude TypeScript record"
+else
+    jq -e '
+        .version == 1 and any(.targets[];
+            .codex.identity as $codex
+            | any(.profiles[]?;
+                .record.shape_version == 3
+                and .record.configuration == "managed-visualization-family-v3"
+                and .record.transport == "codex-sandbox-state-json"
+                and .record.provider_binary == $codex
+                and (.record.profile_id | type == "string" and length > 0)
+                and (.sandbox_state | type == "object")))
+    ' "$LAUNCHER" >/dev/null 2>>"$DIAG_LOG" \
+        || fail E_LAUNCHER_NO_CODEX_V3 "launcher lacks a matching accepted Codex v3 profile"
 fi
 
 LEFT=$(canonical_dir "$AGENT_IDE_ACCEPTANCE_LEFT_WORKTREE") || fail E_LEFT_CANONICAL
 RIGHT=$(canonical_dir "$AGENT_IDE_ACCEPTANCE_RIGHT_WORKTREE") || fail E_RIGHT_CANONICAL
+if [ "$AGENT_IDE_ACCEPTANCE_ROUTE" = agent-run-codex ]; then
+    jq -e --arg left "$LEFT" --arg right "$RIGHT" '
+        . as $launcher | all([$left, $right][]; . as $path
+            | any($launcher.allowed_roots[]?; . as $root
+                | $path == $root or ($path | startswith($root + "/"))))
+    ' "$LAUNCHER" >/dev/null 2>>"$DIAG_LOG" \
+        || fail E_WORKTREE_OUTSIDE_LAUNCHER_ROOT "fixture worktrees are outside launcher allowed_roots"
+fi
 LEFT_IDENTITY=$(project_identity "$BINARY" "$LEFT") || fail E_LEFT_IDENTITY
 [ "${#LEFT_IDENTITY}" = 64 ] || fail E_LEFT_IDENTITY_LENGTH
 RIGHT_IDENTITY=$(project_identity "$BINARY" "$RIGHT") || fail E_RIGHT_IDENTITY
@@ -133,6 +154,27 @@ prepare_worktree() {
     jq -n --arg socket "$socket" \
         '{sandbox:{network:{allowUnixSockets:[$socket]}}}' \
         >"$1/.claude/settings.local.json" || fail E_SETTINGS_WRITE "$1"
+}
+
+# Requires one complete agent-run transcript to pair each Agent IDE call with a bounded text reply.
+#
+# Agent-run stores ordered messages with string content, unlike the direct-host JSONL transcripts.
+# The first argument is its private JSON path; the second is a closed failure code. Empty or
+# malformed transcripts, missing results, and replies above 16 KiB fail the whole host cell.
+require_agent_run_compact_replies() {
+    jq -e --argjson bound 16384 '
+        .complete == true and .next_cursor == null and (.messages | type == "array") and
+        ([.messages as $messages
+          | range(0; $messages | length) as $i
+          | select($messages[$i].role == "tool_call"
+              and (($messages[$i].name // "") | test("^mcp__agent[-_]ide__ide[._]")))
+          | $messages[$i + 1]] as $results
+         | ($results | length > 0)
+           and all($results[];
+               .role == "tool_result"
+               and (.content | type == "string" and utf8bytelength <= $bound)))
+    ' "$1" >/dev/null 2>>"$DIAG_LOG" \
+        || { note "$2" "missing, malformed, or oversized Agent IDE reply"; return 1; }
 }
 
 # Runs one wall-clock-bounded agent-run agent and collects its final answer.
@@ -170,6 +212,8 @@ run_agent() {
     "$AGENT_RUN" transcript --full --limit 1000 "$agent_id" \
         >"$DIAG_DIR/transcript-$label.json" 2>>"$DIAG_LOG" \
         || fail "E_${label}_TRANSCRIPT" "transcript exited nonzero"
+    require_agent_run_compact_replies "$DIAG_DIR/transcript-$label.json" "A_${label}_COMPACT_REPLIES" \
+        || fail "A_${label}_COMPACT_REPLIES" "agent $label has no bounded Agent IDE replies"
     printf '%s %s\n' "$label" "$agent_id" >>"$DIAG_DIR/agent-ids.log"
 }
 
@@ -252,9 +296,11 @@ run_agent r5 "$RIGHT" "$DIAG_DIR/task-r5.txt"
 require_answer_text r5 "RIGHT_LOOP_OK" A_R5_FINAL
 require_record_text r5 "right-python-bad" A_R5_PYRIGHT_MARKER
 require_record_text r5 "right-typescript-bad" A_R5_TYPESCRIPT_MARKER
-if /usr/bin/grep -qF 'left-python-bad' "$DIAG_DIR/answer-r5.txt"; then
-    fail A_R5_LEFT_LEAK "right answer leaked left worktree content"
-fi
+for marker in left-python-bad left-typescript-bad; do
+    if /usr/bin/grep -qF "$marker" "$DIAG_DIR/transcript-r5.json"; then
+        fail A_R5_LEFT_LEAK "right transcript leaked left worktree content"
+    fi
+done
 cmp -s "$RIGHT/acceptance-fixture/fixture.py" "$DIAG_DIR/expected-l1.py" \
     || fail A_R5_FILE_CONTENT "right fixture.py is not the helper-edited content"
 cmp -s "$LEFT/acceptance-fixture/fixture.py" "$DIAG_DIR/expected-l2.py" \
@@ -264,6 +310,11 @@ if [ "$AGENT_IDE_ACCEPTANCE_ROUTE" = agent-run-codex ]; then
     run_agent r5b "$RIGHT" "$DIAG_DIR/task-r5b.txt"
     require_answer_text r5b "RIGHT_DIFF_OK" A_R5B_FINAL
     require_record_text r5b "right-python-bad" A_R5B_DIFF_CONTENT
+    for marker in left-python-bad left-typescript-bad; do
+        if /usr/bin/grep -qF "$marker" "$DIAG_DIR/transcript-r5b.json"; then
+            fail A_R5B_LEFT_LEAK "right diff transcript leaked left worktree content"
+        fi
+    done
 fi
 
 write_pass_result
