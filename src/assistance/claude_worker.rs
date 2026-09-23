@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -159,7 +159,7 @@ fn helper_words(command: &str) -> Option<Vec<String>> {
 /// part of this path may report that the daemon observed inherited containment. Local controlled
 /// process fixtures likewise prove wiring and settlement only; real host containment acceptance is
 /// a separate live exercise against a real Claude host and is never implied by a passing fixture.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClaudeOperatorProfile {
     /// Operator states the host sandbox is enabled for this account and project.
@@ -172,6 +172,12 @@ pub struct ClaudeOperatorProfile {
     pub no_matching_excluded_commands: bool,
     /// Operator states the read/write/network/socket scope matches the documented helper needs.
     pub scope_declared: bool,
+    /// Optional explicit read grants; absence preserves the strict profile's declared project read.
+    #[serde(default)]
+    pub read_roots: Option<Vec<PathBuf>>,
+    /// Absolute path or glob exclusions from those grants; any possible worktree overlap restricts checks.
+    #[serde(default)]
+    pub read_denies: Vec<String>,
     /// Host platform this evidence was accepted on; only macOS is currently supported.
     pub platform: HelperPlatform,
 }
@@ -190,24 +196,62 @@ impl ClaudeOperatorProfile {
     /// Accepts only a complete strict macOS profile; every other shape is unavailable.
     ///
     /// Failure is reported as [`FailureCode::ExecutionProfile`] so a missing or weakened operator
-    /// declaration is never confused with a runtime provider or authority failure.
+    /// declaration is never confused with a runtime provider or authority failure. Read paths
+    /// must be absolute and lexically clean; a relative or parent-traversing exclusion is refused.
     pub fn validate(&self) -> Result<(), FailureCode> {
+        let clean = |path: &str| {
+            path.starts_with('/')
+                && !path.contains('\0')
+                && (path == "/"
+                    || !path[1..]
+                        .split('/')
+                        .any(|part| part.is_empty() || part == "." || part == ".."))
+        };
         let strict = self.enabled
             && self.fail_if_unavailable
             && !self.allow_unsandboxed_commands
             && self.no_matching_excluded_commands
             && self.scope_declared
-            && self.platform == HelperPlatform::MacOs;
+            && self.platform == HelperPlatform::MacOs
+            && self
+                .read_roots
+                .as_ref()
+                .is_none_or(|roots| roots.iter().all(|root| root.to_str().is_some_and(clean)))
+            && self.read_denies.iter().all(|deny| clean(deny));
         strict.then_some(()).ok_or(FailureCode::ExecutionProfile)
     }
 
-    /// Returns the canonical cache-rights identity for the one accepted strict profile.
+    /// Returns the canonical helper cache-rights identity for the accepted strict profile.
     ///
-    /// Validation must succeed first. The value names the complete fixed profile rather than any
-    /// model or hook field, so cache compatibility cannot be widened by an invocation.
+    /// Validation must succeed first. The value names the fixed helper execution contract rather
+    /// than model or hook input; check-only read declarations do not authorize helper caches.
     pub fn rights_identity(&self) -> Result<&'static str, FailureCode> {
         self.validate()?;
         Ok("claude-strict-macos-v1")
+    }
+
+    /// Proves a target's complete tree readable from the accepted operator assertion.
+    /// Explicit grants must contain the tree, and any deny whose literal prefix can overlap it
+    /// refuses the proof. Missing grants mean the legacy `scope_declared` project-wide grant.
+    pub fn declares_whole_tree_read(&self, worktree: &Path) -> bool {
+        self.validate().is_ok()
+            && self
+                .read_roots
+                .as_ref()
+                .is_none_or(|roots| roots.iter().any(|root| worktree.starts_with(root)))
+            && self.read_denies.iter().all(|deny| {
+                let literal = deny
+                    .find(['*', '?', '[', '{', '!', '\\'])
+                    .map_or(deny.as_str(), |end| &deny[..end]);
+                let prefix = if literal.len() == deny.len() {
+                    Path::new(literal)
+                } else if literal.ends_with('/') && literal != "/" {
+                    Path::new(literal.trim_end_matches('/'))
+                } else {
+                    Path::new(literal).parent().unwrap_or(Path::new("/"))
+                };
+                !worktree.starts_with(prefix) && !prefix.starts_with(worktree)
+            })
     }
 }
 
@@ -2447,29 +2491,58 @@ mod tests {
             allow_unsandboxed_commands: false,
             no_matching_excluded_commands: true,
             scope_declared: true,
+            read_roots: None,
+            read_denies: Vec::new(),
             platform: HelperPlatform::MacOs,
         };
         assert_eq!(strict.validate(), Ok(()));
         for weakened in [
             ClaudeOperatorProfile {
                 enabled: false,
-                ..strict
+                ..strict.clone()
             },
             ClaudeOperatorProfile {
                 allow_unsandboxed_commands: true,
-                ..strict
+                ..strict.clone()
             },
             ClaudeOperatorProfile {
                 fail_if_unavailable: false,
-                ..strict
+                ..strict.clone()
             },
             ClaudeOperatorProfile {
                 platform: HelperPlatform::Linux,
-                ..strict
+                ..strict.clone()
             },
         ] {
             assert_eq!(weakened.validate(), Err(FailureCode::ExecutionProfile));
         }
+    }
+
+    /// Whole-tree check authority follows the accepted Claude read grants and exclusions.
+    #[test]
+    fn claude_profile_limits_project_checks_to_whole_tree_read() {
+        let profile = ClaudeOperatorProfile {
+            enabled: true,
+            fail_if_unavailable: true,
+            allow_unsandboxed_commands: false,
+            no_matching_excluded_commands: true,
+            scope_declared: true,
+            read_roots: None,
+            read_denies: Vec::new(),
+            platform: HelperPlatform::MacOs,
+        };
+        let root = Path::new("/private/tmp/project");
+        assert!(profile.declares_whole_tree_read(root));
+        let mut limited = profile.clone();
+        limited.read_roots = Some(vec![PathBuf::from("/private/tmp/other")]);
+        assert!(!limited.declares_whole_tree_read(root));
+        limited.read_roots = Some(vec![PathBuf::from("/private/tmp")]);
+        limited.read_denies.push("/private/tmp/other/*.key".into());
+        assert!(limited.declares_whole_tree_read(root));
+        limited
+            .read_denies
+            .push("/private/tmp/project/secret/*.key".into());
+        assert!(!limited.declares_whole_tree_read(root));
     }
 
     /// The accepted Rust helper payload disables both switches and adds nothing else.
