@@ -18,6 +18,8 @@ use crate::execution::seatbelt::ReadDeny;
 
 /// Maximum bytes captured from either CLI stream; a larger report fails closed.
 const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+/// ponytail: Bound deny preflight work; larger trees stay unavailable until a cheaper source inventory exists.
+const MAX_POLICY_ENTRIES: usize = 100_000;
 /// Ordered footer labels emitted by pinned TypeScript 5.9.3 with `--diagnostics`.
 const FOOTER: [&str; 13] = [
     "Files",
@@ -68,15 +70,18 @@ impl TypeScriptChecker {
         }
     }
 
-    /// Describes one read-only CLI run with writes restricted to `request.cache_dir`.
+    /// Describes one CLI run with writes restricted to `request.cache_dir`.
     ///
     /// `config` is the already admitted regular root config; the caller must not pass a link.
+    /// The Node executable and separate TypeScript package are readable, even when they live in
+    /// different directory trees; system paths are already granted by Seatbelt. CLI flags override project options that would
+    /// write build metadata or replace the bounded diagnostics/file-list output format.
     pub fn run_spec(&self, request: &CheckRequest, config: &Path) -> RunSpec {
-        let node_root = self
-            .node
+        let typescript_root = self
+            .tsc_cli
             .parent()
             .and_then(Path::parent)
-            .unwrap_or(&self.node);
+            .unwrap_or(&self.tsc_cli);
         let tmp = request.cache_dir.join("tmp");
         RunSpec {
             program: self.node.clone(),
@@ -89,6 +94,16 @@ impl TypeScriptChecker {
                 OsString::from("--diagnostics"),
                 OsString::from("--listFiles"),
                 OsString::from("--noEmit"),
+                OsString::from("--incremental"),
+                OsString::from("false"),
+                OsString::from("--composite"),
+                OsString::from("false"),
+                OsString::from("--extendedDiagnostics"),
+                OsString::from("false"),
+                OsString::from("--explainFiles"),
+                OsString::from("false"),
+                OsString::from("--traceResolution"),
+                OsString::from("false"),
             ],
             cwd: request.worktree.clone(),
             env: vec![
@@ -112,8 +127,8 @@ impl TypeScriptChecker {
             ],
             read_roots: vec![
                 request.worktree.clone(),
-                node_root.to_path_buf(),
-                PathBuf::from("/private/etc"),
+                self.node.clone(),
+                typescript_root.to_path_buf(),
             ],
             write_roots: vec![request.cache_dir.clone()],
             read_denies: request.read_denies.clone(),
@@ -130,6 +145,8 @@ impl Checker for TypeScriptChecker {
     }
 
     /// Runs the selected root config and admits only a fully parsed, nontruncated CLI result.
+    /// A read exclusion touching any runner read root, or a credential glob with an unprovable
+    /// match-free inventory, yields `ReadRestricted` before execution or publication.
     fn check(&self, request: CheckRequest) -> BoxFuture<'_, ProblemSnapshot> {
         Box::pin(async move {
             let generation = request.input_generation;
@@ -140,6 +157,21 @@ impl Checker for TypeScriptChecker {
                     generation,
                 );
             };
+            if fs::create_dir_all(request.cache_dir.join("tmp")).is_err() {
+                return ProblemSnapshot::unavailable(
+                    Language::TypeScript,
+                    UnavailableReason::Fatal,
+                    generation,
+                );
+            }
+            let spec = self.run_spec(&request, &config);
+            if !read_policy_supported(&spec) {
+                return ProblemSnapshot::unavailable(
+                    Language::TypeScript,
+                    UnavailableReason::ReadRestricted,
+                    generation,
+                );
+            }
             if !regular_allowed(&self.node, &request.read_denies)
                 || !regular_allowed(&self.tsc_cli, &request.read_denies)
             {
@@ -149,15 +181,8 @@ impl Checker for TypeScriptChecker {
                     generation,
                 );
             }
-            if fs::create_dir_all(request.cache_dir.join("tmp")).is_err() {
-                return ProblemSnapshot::unavailable(
-                    Language::TypeScript,
-                    UnavailableReason::Fatal,
-                    generation,
-                );
-            }
             let started = Instant::now();
-            let output = match self.runner.run(self.run_spec(&request, &config)).await {
+            let output = match self.runner.run(spec.clone()).await {
                 Ok(output) => output,
                 Err(_) => {
                     return ProblemSnapshot::unavailable(
@@ -174,6 +199,13 @@ impl Checker for TypeScriptChecker {
                     generation,
                 );
             }
+            if !read_policy_supported(&spec) {
+                return ProblemSnapshot::unavailable(
+                    Language::TypeScript,
+                    UnavailableReason::ReadRestricted,
+                    generation,
+                );
+            }
             parse_tsc_output(
                 &output,
                 &request.worktree,
@@ -184,6 +216,91 @@ impl Checker for TypeScriptChecker {
             )
         })
     }
+}
+
+/// Proves that a host deny cannot hide an existing input in any readable runner root.
+///
+/// Path denies intersecting a read or write root always refuse the check. With any deny, every
+/// explicit grant is scanned twice: unreadable entries, links, a matching entry, or the bounded
+/// scan ceiling refuse publication, including aliases into denies outside the lexical roots.
+/// The filesystem can still change between the
+/// two scans; the scheduler's input-generation fence handles observed edits, not a transient edit
+/// that appears and disappears entirely during one run.
+fn read_policy_supported(spec: &RunSpec) -> bool {
+    if spec.read_denies.is_empty() {
+        return true;
+    }
+    let mut roots = spec.read_roots.iter().chain(&spec.write_roots);
+    if spec.read_denies.iter().any(|deny| match deny {
+        ReadDeny::Path(path) => roots.clone().any(|root| paths_overlap(path, root)),
+        ReadDeny::Glob { .. } => false,
+    }) {
+        return false;
+    }
+    roots.all(|root| no_denied_entries(root, &spec.read_denies))
+}
+
+/// Reports whether two absolute paths can share a descendant, ignoring ASCII case like Seatbelt.
+/// Non-ASCII or non-absolute paths are unprovable and conservatively overlap.
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    let (Some(left), Some(right)) = (left.to_str(), right.to_str()) else {
+        return true;
+    };
+    if !left.is_ascii()
+        || !right.is_ascii()
+        || !Path::new(left).is_absolute()
+        || !Path::new(right).is_absolute()
+    {
+        return true;
+    }
+    let left = left.to_ascii_lowercase();
+    let right = right.to_ascii_lowercase();
+    Path::new(&left).starts_with(&right) || Path::new(&right).starts_with(&left)
+}
+
+/// Scans one explicit grant without following links and rejects any deny match or alias.
+/// Missing, unreadable, link-bearing, or over-limit trees cannot prove the grant safe.
+fn no_denied_entries(root: &Path, denies: &[ReadDeny]) -> bool {
+    let mut directories = vec![root.to_path_buf()];
+    let mut seen = 0usize;
+    while let Some(directory) = directories.pop() {
+        if denies.iter().any(|deny| deny.matches(&directory))
+            || directory.ancestors().any(|part| {
+                !fs::symlink_metadata(part).is_ok_and(|metadata| !metadata.file_type().is_symlink())
+            })
+        {
+            return false;
+        }
+        if fs::symlink_metadata(&directory).is_ok_and(|metadata| metadata.is_file()) {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&directory) else {
+            return false;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return false;
+            };
+            seen += 1;
+            if seen > MAX_POLICY_ENTRIES {
+                return false;
+            }
+            let path = entry.path();
+            if denies.iter().any(|deny| deny.matches(&path)) {
+                return false;
+            }
+            let Ok(kind) = entry.file_type() else {
+                return false;
+            };
+            if kind.is_symlink() {
+                return false;
+            }
+            if kind.is_dir() {
+                directories.push(path);
+            }
+        }
+    }
+    true
 }
 
 /// Selects a regular root `tsconfig.json`, then a regular root `jsconfig.json`.
@@ -219,8 +336,10 @@ fn regular_allowed(path: &Path, denies: &[ReadDeny]) -> bool {
 /// Parses pinned `tsc --pretty false --diagnostics --listFiles --noEmit` output.
 ///
 /// Unknown lines, footer mismatch, denied diagnostic paths, inconsistent exit status, and
-/// truncation become `Fatal`. Zero analyzed worktree files become `NoFiles` even when the CLI
-/// reports a config diagnostic; no numeric zero is presented as a clean project result.
+/// truncation become `Fatal`. With any host read deny, arbitrary diagnostic message text is
+/// redacted after deduplication while admitted path, severity, and TS code remain; counts retain
+/// distinct diagnostics. Zero analyzed worktree files become `NoFiles` even with a config
+/// diagnostic, so no numeric zero is presented as a clean project result.
 pub fn parse_tsc_output(
     output: &RunOutput,
     worktree: &Path,
@@ -330,13 +449,19 @@ pub fn parse_tsc_output(
     if (output.status == Some(0)) != (errors == 0) {
         return fatal();
     }
-    ProblemSnapshot::from_problems(
+    let mut snapshot = ProblemSnapshot::from_problems(
         Language::TypeScript,
         CheckState::Ready,
         problems,
         generation,
         duration_ms,
-    )
+    );
+    if !denies.is_empty() {
+        for problem in &mut snapshot.problems {
+            problem.message = "[redacted by host read policy]".to_owned();
+        }
+    }
+    snapshot
 }
 
 /// Validates the numeric form of each pinned diagnostics footer value.
