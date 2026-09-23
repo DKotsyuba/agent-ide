@@ -220,13 +220,15 @@ impl ProjectProblemFeed {
         ))
     }
 
-    /// Records a successful `ide.start` for `binding` and schedules the initial warm check.
+    /// Records a successful `ide.start` for `binding` and schedules the initial warm check only
+    /// when the caller's current host profile proves whole-tree read access.
     ///
     /// `worktree` is Workspace's canonical worktree path and `repository_key` its canonical git
     /// common dir. A worktree outside every allowed root is recorded as not admitted — its
     /// snapshots then report `outside_roots` — and no check is scheduled. Replaces any previous
     /// record for the same binding; when the bound set is full an arbitrary other binding is
-    /// evicted first.
+    /// evicted first. `read_restricted` suppresses scheduling and all cached diagnostics for
+    /// this binding without probing language presence or project files.
     pub fn activated(
         &self,
         binding: [u8; 32],
@@ -298,7 +300,8 @@ impl ProjectProblemFeed {
 
     /// Schedules a check for `binding`'s admitted worktree after a native edit or `ide.edit`.
     ///
-    /// An unknown binding or a worktree outside the allowed roots schedules nothing.
+    /// An unknown or read-restricted binding, or a worktree outside the allowed roots, schedules
+    /// nothing.
     pub fn changed(&self, binding: &[u8; 32]) {
         let target = self.state.lock().ok().and_then(|state| {
             let bound = state.bindings.get(binding)?;
@@ -314,7 +317,8 @@ impl ProjectProblemFeed {
     ///
     /// Reads only in-memory snapshots and never waits for a running check. `None` means the
     /// binding is unknown, no language has a completed result yet, or the item set equals the
-    /// last block delivered to this binding for its worktree (EYES-r1 §6).
+    /// last block delivered to this binding for its worktree (EYES-r1 §6). Restricted bindings
+    /// receive only content-free unavailable language states.
     pub fn next_block(&self, binding: &[u8; 32]) -> Option<String> {
         self.next_block_when(binding, |_| true)
     }
@@ -493,7 +497,8 @@ pub fn parse_language(value: &str) -> Option<Language> {
 /// order. `offset` is the zero-based start into the combined, language-ordered problem list.
 /// Each selected language contributes one state line — `ready`/`partial` carry the full
 /// `errors`/`warnings` counts, while `checking` and `unavailable:<reason>` never render numeric
-/// counts, though an `unavailable` line with a carried [`ProblemSnapshot::detail`] appends it in
+/// counts; `ReadRestricted` uses `unavailable: read_restricted` exactly. An `unavailable` line
+/// with a carried [`ProblemSnapshot::detail`] appends it in
 /// parentheses — followed by up to [`PROBLEMS_PAGE_SIZE`] problem lines
 /// `path:line:column severity [code] message`. A snapshot that dropped problems to the
 /// [`MAX_PROBLEMS`] cap (T19B) adds one header line directly after its state line —
@@ -588,7 +593,8 @@ pub fn problems_text_with_rechecks(
 /// those must never render as numbers, so only `ready` and `partial` name counts. An
 /// `unavailable` snapshot carrying [`ProblemSnapshot::detail`] appends it in parentheses, stripped
 /// of control characters like every other untrusted checker text field; a snapshot with no detail
-/// renders exactly as before.
+/// renders exactly as before. `ReadRestricted` renders the content-free
+/// `unavailable: read_restricted` phrase and ignores any carried detail.
 fn state_line(snapshot: &ProblemSnapshot, recheck: Option<Recheck>) -> String {
     let language = snapshot.language.as_str();
     let counts = format!(
@@ -605,6 +611,9 @@ fn state_line(snapshot: &ProblemSnapshot, recheck: Option<Recheck>) -> String {
         CheckState::Ready => format!("{language}: ready; {counts}"),
         CheckState::Partial => format!("{language}: partial; {counts}"),
         CheckState::Checking => format!("{language}: checking (first check in this session)"),
+        CheckState::Unavailable(UnavailableReason::ReadRestricted) => {
+            format!("{language}: unavailable: read_restricted")
+        }
         CheckState::Unavailable(reason) => match &snapshot.detail {
             Some(detail) => format!(
                 "{language}: unavailable:{} ({})",
@@ -1254,7 +1263,7 @@ mod tests {
         );
         assert_eq!(
             problems_text_with_rechecks(&feed.read_restricted_snapshots(), &[], None, 0),
-            "rust: unavailable:read_restricted"
+            "rust: unavailable: read_restricted"
         );
         assert_eq!(feed.next_block(&restricted), None);
         let _ = std::fs::remove_dir_all(&root);

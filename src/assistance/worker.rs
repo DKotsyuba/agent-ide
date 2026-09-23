@@ -937,7 +937,8 @@ impl WorkerHandle {
     /// Claude foreground helper — because only the worker owns the durable authority and its
     /// authorized worktree. The caller waits on the job's bounded oneshot exactly like Stop; a
     /// lost wait still leaves the finished result retrievable through the retained detail
-    /// reference until the ledger evicts it.
+    /// reference until the ledger evicts it. A Codex `observed` state is rechecked before any
+    /// snapshot lookup; Claude passes `None` because its hook path has no host sandbox metadata.
     pub async fn context_problems(
         &self,
         invocation: ValidatedInvocation,
@@ -3409,7 +3410,9 @@ impl<'a> Worker<'a> {
     /// The worktree is the fresh durable authority's worktree — the same active-binding/authority
     /// lookup every other context use requires — and no source file is read and no observation is
     /// recorded. Without an attached source, or when the requested language is not configured,
-    /// the reply is the honest single line `checks disabled`.
+    /// the reply is the honest single line `checks disabled`. A Codex profile without current
+    /// whole-tree read proof returns only `unavailable: read_restricted` language states and never
+    /// consults cached problem snapshots.
     async fn context_problems_job(
         &mut self,
         job: &mut Job,
@@ -3490,7 +3493,8 @@ impl<'a> Worker<'a> {
     /// exact prepared receipt recovered after ambiguity returns unknown and is never dispatched
     /// again. Known effects are followed by source observation and a deadline-bounded provider
     /// diagnostic refresh attached to the same reply only when it matches that post-read source;
-    /// provider failure never changes a known filesystem outcome or implies cleanliness.
+    /// provider failure never changes a known filesystem outcome or implies cleanliness. The
+    /// current host must prove this path readable before Workspace opens it during preparation.
     async fn edit(
         &mut self,
         job: &mut Job,
@@ -3562,6 +3566,40 @@ impl<'a> Worker<'a> {
                     .await;
             }
         };
+        let path_readable = job.observed.as_ref().is_some_and(|observed| {
+            validate_read_scope(
+                &self.shared,
+                &binding,
+                observed,
+                &job.target,
+                &authority,
+                errorlog_method(job.tool),
+                crate::execution::ReadScope::Path(Path::new(&request.path)),
+            )
+            .is_ok()
+        });
+        if !path_readable {
+            let result = self
+                .settle_prepared_edit(
+                    prepared,
+                    &request,
+                    EditResult {
+                        operation_id: request.operation_id.clone(),
+                        path: request.path.clone(),
+                        outcome: ChangesEditOutcome::UnavailableBeforeDispatch,
+                        source_ref: None,
+                    },
+                )
+                .await;
+            return Ok((
+                PeerReply::Edit {
+                    result,
+                    diagnostics: EditDiagnostics::Unknown {},
+                },
+                Some(authority),
+                None,
+            ));
+        }
         let edit_source = match crate::workspace::edit::EditSourceRef::from_observation(&source) {
             Ok(source) => source,
             Err(outcome) => {
@@ -6619,7 +6657,98 @@ mod stop_retry_tests {
             .await
             .unwrap();
         assert!(
-            matches!(reply, PeerReply::Complete { text, .. } if text == "rust: unavailable:read_restricted")
+            matches!(reply, PeerReply::Complete { text, .. } if text == "rust: unavailable: read_restricted")
+        );
+    }
+
+    /// A source observed under an allowed profile cannot authorize a later Edit after the host
+    /// narrows its profile. The target becomes a symlink before Edit: reaching Workspace's target
+    /// read would return an unsafe-target outcome, so the unavailable result proves the read gate
+    /// ran first.
+    #[tokio::test]
+    async fn narrowed_edit_refuses_before_workspace_opens_the_old_context_path() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join("secret.rs"), "old\n").unwrap();
+        std::fs::write(fixture.root.join("outside.rs"), "outside\n").unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        worker.edits.install_schema().await.unwrap();
+        let (binding, _, _, target) =
+            activate_read_scope(&mut worker, "narrowed-edit-actor", "start").await;
+        let (invocation, observed) =
+            read_scope_call(&worker, None, "narrowed-edit-actor", "context");
+        let (_cancel_sender, cancel) = watch::channel(false);
+        let mut context = Job {
+            input: JobInput::Managed,
+            reference: "allowed-source".into(),
+            invocation,
+            observed: Some(observed),
+            tool: AssistanceTool::Context,
+            parameters: serde_json::json!({"path":"secret.rs"}),
+            target: target.clone(),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            cancel,
+            stop_reply: None,
+            native_epoch: 0,
+            failure_detail: None,
+        };
+        let (reply, authority, source) = worker.context(&mut context).await.unwrap();
+        worker.shared.ledger.lock().unwrap().details.insert(
+            context.reference.clone(),
+            Detail {
+                binding: binding.clone(),
+                reply,
+                selection: (AssistanceTool::Context, selection(&context.parameters)),
+                authority,
+                source,
+                native_epoch: 0,
+                diff_page: None,
+                diff_page_fresh: false,
+                context_page: None,
+                context_page_fresh: false,
+                diff_provenance: None,
+            },
+        );
+        std::fs::remove_file(fixture.root.join("secret.rs")).unwrap();
+        std::os::unix::fs::symlink("outside.rs", fixture.root.join("secret.rs")).unwrap();
+        let (invocation, observed) =
+            read_scope_call(&worker, Some("secret.rs"), "narrowed-edit-actor", "edit");
+        let (_cancel_sender, cancel) = watch::channel(false);
+        let mut edit = Job {
+            input: JobInput::Managed,
+            reference: "narrowed-edit".into(),
+            invocation,
+            observed: Some(observed),
+            tool: AssistanceTool::Edit,
+            parameters: serde_json::json!({
+                "operation_id":"narrowed-edit-operation",
+                "path":"secret.rs",
+                "source_ref":"allowed-source",
+                "content":"new\n"
+            }),
+            target,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            cancel,
+            stop_reply: None,
+            native_epoch: 0,
+            failure_detail: None,
+        };
+        let (reply, _, _) = worker.edit(&mut edit).await.unwrap();
+        assert!(matches!(
+            reply,
+            PeerReply::Edit {
+                result: EditResult {
+                    outcome: ChangesEditOutcome::UnavailableBeforeDispatch,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(
+            std::fs::read(fixture.root.join("outside.rs")).unwrap(),
+            b"outside\n"
         );
     }
 
