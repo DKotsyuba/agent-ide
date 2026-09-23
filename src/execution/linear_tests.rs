@@ -1829,7 +1829,7 @@ fn record_version_parsing_is_closed() {
     for refused in [
         {
             let mut refused = value.clone();
-            refused["shape_version"] = serde_json::json!(3);
+            refused["shape_version"] = serde_json::json!(4);
             refused
         },
         {

@@ -147,11 +147,22 @@ mechanism, the same positive selectors with access equal or reduced, every accep
 restriction still present, network equal or reduced, and the same glob expansion settings.
 Everything else is refused; unknown or unsupported state shapes never fall back to a looser
 comparison. Because outside write roots are preserved exactly in the shape, a new outside write
-selector (for example a visualization directory a host added) always requires re-acceptance, and
+selector requires re-acceptance unless it is the single reviewed v3 visualization leaf, and
 a state that grants write of the whole filesystem root is refused by every workspace-write
 template. The error log names the closed reason: `no_profile_for_class:<class>`,
 `profile_digest_mismatch:<class>` (v1-only catalogs), `shape_unsupported:<class>` (the live state
-derives no v2 shape), or `shape_not_narrower:<class>` (no accepted template proves it narrower).
+derives no applicable shape), or `shape_not_narrower:<class>` (no accepted template proves it narrower).
+
+An operator may explicitly mint `shape_version: 3` after a real D03 run for a managed state
+with one tested task leaf under an accepted `<path>/.codex/visualizations` namespace. The
+leaf must have `YYYY/MM/DD/<uuid>` components and all four matching credential-glob denials
+(`**/*.key`, `**/*.pem`, `**/.env`, `**/.env.*`). V3 admits a later leaf only under the same
+namespace with the same complete deny group. It compares all other authority using the v2
+proof; an extra root, ancestor or sibling visualization write, changed network policy, or
+missing deny refuses. The namespace must exist and no existing leaf-path component may be a
+symlink; restoration still works after the captured task leaf is removed. The live JSON is replayed
+unchanged, and v3 adds no daemon read authority. The UUID is a path grammar check, not an
+assumed Codex thread identity.
 
 When the daemon refuses a profile, it captures the raw observed state once per distinct digest
 under `~/.agent-ide/rejected-profiles/<16-hex>.json` (mode 0600 at creation; the directory is
@@ -175,11 +186,12 @@ sandbox mode:
 4. Run a real D03 experiment under that exact state, then mint the profile fragment:
    `agent-ide evidence record --sandbox-state <file> --profile-id <id> --revision <n>
    --provider-binary <v> --toolchain <v> --configuration <v> --trust <v> --transport <v>
-   --d03-evidence <id> [--shape-version <1|2>]` (the nine flags in this fixed order; the
+   --d03-evidence <id> [--shape-version <1|2|3>]` (the nine flags in this fixed order; the
    optional `--shape-version` flag trails them). The default is `2`: the shape-based record for
    supported managed captures. A capture whose state cannot support v2 (a `disabled` or
    unrecognized state) is refused rather than downgraded; pass `--shape-version 1` explicitly to
-   mint the legacy exact-digest record.
+   mint the legacy exact-digest record. Pass `--shape-version 3` only after the specific
+   visualization-family D03 probe passes for the accepted capture.
 5. Append the printed `{record, sandbox_state}` object to the target's `profiles` array and
    restart the daemon, or validate first with `agent-ide launcher check <config-file>`. Existing
    v1 records keep validating unchanged.

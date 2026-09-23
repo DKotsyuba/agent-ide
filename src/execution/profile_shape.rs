@@ -1,8 +1,9 @@
-//! Execution-private profile-shape v2 derivation and conservative narrowing proofs (T35B).
+//! Execution-private v2 shape proofs and opt-in v3 visualization-leaf admission.
 //!
 //! This module replaces the opaque v1 digest *comparison* for admitted managed Codex sandbox
 //! states with a closed, versioned semantic shape. It never rewrites replay JSON: every function
-//! here only reads the already-validated [`HostSandboxState`]. The design is deliberately
+//! here only reads the already-validated [`HostSandboxState`]. V3 additionally checks its one
+//! existing visualization directory for symlink redirection. The design is deliberately
 //! incomplete subtyping: `prove_narrower` implements exactly seven sufficient conditions and
 //! refuses everything else, so an unproven change is never admitted by a looser fallback.
 
@@ -15,12 +16,14 @@ use super::{HostSandboxState, ProfileClass, canonical_json};
 
 /// Domain separator prefixing every profile-shape v2 digest input (T35B).
 const SHAPE_DIGEST_DOMAIN: &[u8] = b"agent-ide/profile-shape/v2\0";
+/// Separate identity for the opt-in visualization-leaf family.
+const VISUALIZATION_DIGEST_DOMAIN: &[u8] = b"agent-ide/profile-shape/v3\0";
 
-/// Reports why one managed sandbox state has no derivable profile-shape v2 value (T35B).
+/// Reports why one managed sandbox state has no derivable v2 or v3 shape.
 ///
 /// The reason is one closed static description for operator diagnostics, never host-supplied
-/// text. An unsupported shape never falls back to a looser comparison: the state keeps replaying
-/// byte-for-byte and can only be admitted by a v1 template's exact legacy digest.
+/// text. An unsupported v2 shape can only use a v1 exact digest; an unsupported v3 shape cannot
+/// use the v3 family. Either way, the live JSON keeps replaying byte-for-byte.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct UnsupportedShape(pub(crate) &'static str);
 
@@ -395,6 +398,183 @@ impl ProfileShapeV2 {
         // 7. Glob expansion settings match exactly.
         self.glob_scan_max_depth == accepted.glob_scan_max_depth
     }
+}
+
+/// A v2 shape with exactly one reviewed visualization write leaf and its four denies removed.
+///
+/// The accepted record binds `namespace`; each live state must independently prove the same
+/// directory, strict date/task path, and complete deny group before v2 narrowing compares the
+/// remaining authority. The leaf itself is never added to daemon read proofs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProfileShapeV3 {
+    /// All authority except the one checked visualization leaf and its four matching denies.
+    base: ProfileShapeV2,
+    /// Canonical absolute namespace components accepted by the operator's v3 record.
+    namespace: Vec<String>,
+}
+
+impl ProfileShapeV3 {
+    /// Derives the narrow family from a managed capture or live state bound to `trusted_cwd`.
+    ///
+    /// Exactly one writable `<accepted>/.codex/visualizations/YYYY/MM/DD/<uuid>` path
+    /// must have no existing symlink component and carry all four credential glob denies.
+    /// Malformed or additional visualization grants, or extra denies inside the leaf, refuse.
+    pub(crate) fn derive(
+        state: &HostSandboxState,
+        trusted_cwd: &Path,
+    ) -> Result<Self, UnsupportedShape> {
+        let mut base = ProfileShapeV2::derive(state, trusted_cwd)?;
+        let leaves: Vec<_> = base
+            .rules
+            .iter()
+            .filter_map(|(selector, rule)| {
+                let Selector::Absolute(parts) = selector else {
+                    return None;
+                };
+                parts
+                    .windows(2)
+                    .any(|pair| pair == [".codex", "visualizations"])
+                    .then_some((parts.clone(), *rule))
+            })
+            .collect();
+        if leaves.len() != 1 {
+            return Err(UnsupportedShape("visualization leaf count"));
+        }
+        let (leaf, rule) = &leaves[0];
+        if leaf.len() < 7
+            || leaf[leaf.len() - 6] != ".codex"
+            || leaf[leaf.len() - 5] != "visualizations"
+            || *rule != (Access::Write, MissingPath::Absent)
+            || !valid_visualization_date(&leaf[leaf.len() - 4..leaf.len() - 1])
+            || !valid_task_id(&leaf[leaf.len() - 1])
+        {
+            return Err(UnsupportedShape("visualization leaf"));
+        }
+        let namespace = leaf[..leaf.len() - 4].to_vec();
+        let leaf_path = Path::new("/").join(leaf.join("/"));
+        let namespace_path = Path::new("/").join(namespace.join("/"));
+        if std::fs::canonicalize(&namespace_path).ok().as_deref() != Some(namespace_path.as_path())
+        {
+            return Err(UnsupportedShape("visualization namespace"));
+        }
+        let mut component = leaf_path.as_path();
+        while component != namespace_path {
+            match std::fs::symlink_metadata(component) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(UnsupportedShape("visualization symlink"));
+                }
+                Ok(metadata) if !metadata.is_dir() => {
+                    return Err(UnsupportedShape("visualization directory"));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(UnsupportedShape("visualization path")),
+            }
+            component = component
+                .parent()
+                .ok_or(UnsupportedShape("visualization path"))?;
+        }
+        let expected: BTreeSet<_> = ["/**/*.key", "/**/*.pem", "/**/.env", "/**/.env.*"]
+            .into_iter()
+            .map(|pattern| DenyRule::Glob {
+                base: Selector::Absolute(leaf.clone()),
+                pattern: pattern.to_owned(),
+            })
+            .collect();
+        if !expected.is_subset(&base.denies)
+            || base.denies.iter().any(|deny| match deny {
+                DenyRule::Path(Selector::Absolute(parts)) => parts.starts_with(leaf),
+                DenyRule::Glob {
+                    base: Selector::Absolute(parts),
+                    ..
+                } => parts.starts_with(leaf) && !expected.contains(deny),
+                _ => false,
+            })
+        {
+            return Err(UnsupportedShape("visualization denials"));
+        }
+        base.rules.remove(&Selector::Absolute(leaf.clone()));
+        base.denies.retain(|deny| !expected.contains(deny));
+        if base.rules.iter().any(|(selector, (access, _))| {
+            *access == Access::Write
+                && match selector {
+                    Selector::Absolute(parts) => {
+                        parts.starts_with(&namespace) || namespace.starts_with(parts)
+                    }
+                    Selector::Root => true,
+                    Selector::SlashTmp => {
+                        namespace_path.starts_with("/tmp")
+                            || namespace_path.starts_with("/private/tmp")
+                    }
+                    Selector::Tmpdir => std::fs::canonicalize(std::env::temp_dir())
+                        .ok()
+                        .is_some_and(|tmp| namespace_path.starts_with(tmp)),
+                    Selector::WorkspaceRelative(_) => false,
+                }
+        }) {
+            return Err(UnsupportedShape("visualization ancestor or sibling write"));
+        }
+        Ok(Self { base, namespace })
+    }
+
+    /// Returns the v3 domain-separated identity of the accepted namespace and remaining shape.
+    pub(crate) fn digest(&self) -> blake3::Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(VISUALIZATION_DIGEST_DOMAIN);
+        hasher.update(
+            canonical_json(&serde_json::json!({
+                "namespace": self.namespace,
+                "base": self.base.canonical(),
+            }))
+            .as_bytes(),
+        );
+        hasher.finalize()
+    }
+
+    /// Applies unchanged v2 narrowing after both states independently prove the leaf contract.
+    pub(crate) fn prove_narrower(&self, accepted: &Self) -> bool {
+        self.namespace == accepted.namespace && self.base.prove_narrower(&accepted.base)
+    }
+}
+
+/// Checks the strict numeric date segments of a visualization leaf.
+fn valid_visualization_date(parts: &[String]) -> bool {
+    if parts.len() != 3
+        || ![4, 2, 2]
+            .into_iter()
+            .zip(parts)
+            .all(|(len, part)| part.len() == len && part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return false;
+    }
+    let (Ok(year), Ok(month), Ok(day)) = (
+        parts[0].parse::<u16>(),
+        parts[1].parse::<u8>(),
+        parts[2].parse::<u8>(),
+    ) else {
+        return false;
+    };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let max_day = match month {
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        _ => return false,
+    };
+    year != 0 && (1..=max_day).contains(&day)
+}
+
+/// Checks the captured task-id spelling as a UUID; no thread identity is inferred from it.
+fn valid_task_id(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
 }
 
 /// Outcome of the conservative per-path native-read proof (T36B).
@@ -1070,6 +1250,188 @@ fn derive_entry(
         }
     }
     Ok(())
+}
+
+/// Exercises the opt-in family with disposable, sanitized sandbox states.
+#[cfg(test)]
+mod visualization_tests {
+    use super::*;
+    use crate::execution::{
+        D03ProfileEvidence, ExecutionProfileCatalog, ExecutionProfileTemplate,
+        PersistedProfileRecord,
+    };
+    use serde_json::{Value, json};
+
+    /// Creates two real leaf directories and one capture whose only outside write is the first.
+    fn fixture() -> (std::path::PathBuf, Value, String, String) {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "agent-ide-v3-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+        let namespace = root.join(".codex/visualizations");
+        let first = namespace.join("2026/09/23/11111111-1111-1111-1111-111111111111");
+        let second = namespace.join("2026/09/24/22222222-2222-2222-2222-222222222222");
+        std::fs::create_dir_all(root.join("work")).unwrap();
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let first = first.to_str().unwrap().to_owned();
+        let second = second.to_str().unwrap().to_owned();
+        let mut entries = vec![
+            json!({"access":"write","path":{"type":"path","path":root.join("work")}}),
+            json!({"access":"write","path":{"type":"path","path":first}}),
+        ];
+        for suffix in ["/**/*.key", "/**/*.pem", "/**/.env", "/**/.env.*"] {
+            entries.push(json!({"access":"deny","path":{"type":"glob_pattern","pattern":format!("{first}{suffix}")}}));
+        }
+        let value = json!({
+            "permissionProfile":{"type":"managed","network":"enabled","file_system":{"type":"restricted","entries":entries}},
+            "codexLinuxSandboxExe":null,
+            "sandboxCwd":root.join("work"),
+            "useLegacyLandlock":false,
+        });
+        (root, value, first, second)
+    }
+
+    /// Changes only the complete leaf and its four matching denies in a copied capture.
+    fn moved(value: &Value, first: &str, second: &str) -> Value {
+        serde_json::from_str(&value.to_string().replace(first, second)).unwrap()
+    }
+
+    /// Proves two distinct tasks share one v3 record while v2 and record restoration stay exact.
+    #[test]
+    fn two_visualization_leaves_share_only_v3_family() {
+        let (root, captured, first, second) = fixture();
+        let accepted = HostSandboxState::parse(Some(captured.clone())).unwrap();
+        let live = HostSandboxState::parse(Some(moved(&captured, &first, &second))).unwrap();
+        let v3 =
+            ExecutionProfileTemplate::from_execution_evidence_v3("visualization", 1, &accepted)
+                .unwrap();
+        let v2 =
+            ExecutionProfileTemplate::from_execution_evidence_v2("exact", 1, &accepted).unwrap();
+        let both =
+            ExecutionProfileCatalog::from_execution_evidence(vec![v3.clone(), v2.clone()]).unwrap();
+        assert_eq!(
+            both.permit(&accepted, accepted.cwd()).unwrap().template.id,
+            "exact"
+        );
+        assert!(
+            ExecutionProfileCatalog::from_execution_evidence(vec![v3])
+                .unwrap()
+                .permit(&live, live.cwd())
+                .is_ok()
+        );
+        assert!(
+            ExecutionProfileCatalog::from_execution_evidence(vec![v2])
+                .unwrap()
+                .permit(&live, live.cwd())
+                .is_err()
+        );
+        let record = PersistedProfileRecord::from_execution_evidence_versioned(
+            "visualization",
+            1,
+            D03ProfileEvidence {
+                provider_binary: "codex".into(),
+                toolchain: "toolchain".into(),
+                configuration: "default".into(),
+                trust: "local".into(),
+                transport: "managed".into(),
+                d03_evidence: "real-d03".into(),
+            },
+            &accepted,
+            3,
+        )
+        .unwrap();
+        assert_eq!(
+            PersistedProfileRecord::from_json(&record.to_json()).unwrap(),
+            record
+        );
+        assert!(record.matches_state(&accepted));
+        assert!(!record.matches_state(&live));
+        std::fs::remove_dir_all(&first).unwrap();
+        assert!(
+            record.matches_state(&accepted),
+            "the accepted task may have been cleaned up"
+        );
+        let catalog = ExecutionProfileCatalog::from_persisted_records(
+            vec![(record.clone(), accepted.clone())],
+            &[record],
+        )
+        .unwrap();
+        assert!(catalog.permit(&live, live.cwd()).is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Refuses malformed paths, omitted or changed denies, extra roots, and ancestor/sibling writes.
+    #[test]
+    fn visualization_family_refuses_extra_authority_or_incomplete_denials() {
+        let (root, captured, first, second) = fixture();
+        let mut cases = Vec::new();
+        cases.push(moved(&captured, &first, &format!("{second}/../bad")));
+        cases.push(moved(
+            &captured,
+            &first,
+            &second.replace("2026/09/24", "2026/02/30"),
+        ));
+        let mut missing = captured.clone();
+        missing["permissionProfile"]["file_system"]["entries"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        cases.push(missing);
+        let mut altered = captured.clone();
+        altered["permissionProfile"]["file_system"]["entries"][2]["path"]["pattern"] =
+            json!(format!("{first}/**/*.keys"));
+        cases.push(altered);
+        for extra in [
+            root.join(".codex/visualizations"),
+            std::path::PathBuf::from(&second),
+        ] {
+            let mut value = captured.clone();
+            value["permissionProfile"]["file_system"]["entries"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"access":"write","path":{"type":"path","path":extra}}));
+            cases.push(value);
+        }
+        let mut root_write = captured.clone();
+        root_write["permissionProfile"]["file_system"]["entries"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"access":"write","path":{"type":"special","value":{"kind":"root"}}}));
+        cases.push(root_write);
+        for value in cases {
+            let state = HostSandboxState::parse(Some(value)).unwrap();
+            assert!(state.shape_v3(state.cwd()).is_err());
+        }
+        let mut outside = captured.clone();
+        outside["permissionProfile"]["file_system"]["entries"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"access":"write","path":{"type":"path","path":root.join("outside")}}));
+        let accepted = HostSandboxState::parse(Some(captured)).unwrap();
+        let live = HostSandboxState::parse(Some(outside)).unwrap();
+        let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+            ExecutionProfileTemplate::from_execution_evidence_v3("visualization", 1, &accepted)
+                .unwrap(),
+        ])
+        .unwrap();
+        assert!(catalog.permit(&live, live.cwd()).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Refuses a leaf whose directory resolves outside the accepted namespace through a symlink.
+    #[test]
+    fn visualization_family_refuses_symlink_escape() {
+        let (root, captured, first, second) = fixture();
+        std::fs::remove_dir_all(&second).unwrap();
+        std::os::unix::fs::symlink(root.join("work"), &second).unwrap();
+        let live = HostSandboxState::parse(Some(moved(&captured, &first, &second))).unwrap();
+        assert!(live.shape_v3(live.cwd()).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 /// Focused unit tests for the conservative matcher and pattern splitter (T36B).
