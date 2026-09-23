@@ -8107,18 +8107,17 @@ async fn eyes_claude_post_hook_delivers_problem_block_and_delta() {
     assert!(home.join(".agent-ide/checks").is_dir());
 }
 
-/// A strict Claude profile whose read exclusion intersects the worktree never checks or reveals
-/// cached project diagnostics; the deny-free Claude fixture above retains normal checking.
+/// A strict Claude profile with an exclusion outside the worktree never checks or reveals cached
+/// project diagnostics; the deny-free product case below retains normal checking.
 #[tokio::test]
-async fn eyes_claude_read_exclusion_reports_only_restricted_status() {
+async fn eyes_claude_external_read_exclusion_reports_only_restricted_status() {
     let fixture = ProductFixture::new_claude(json!([]));
     let home = enable_fake_rust_checks(&fixture, &fixture.base);
     std::fs::write(fixture.root.join("problems.count"), "7").unwrap();
-    let alias = fixture.base.join("read-alias");
-    std::os::unix::fs::symlink(&fixture.root, &alias).unwrap();
     let mut config: Value =
         serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
-    config["targets"][0]["claude_profile"]["read_denies"] = json!([alias.join("secret.rs")]);
+    config["targets"][0]["claude_profile"]["read_denies"] =
+        json!([fixture.base.join("outside.rs")]);
     std::fs::write(&fixture.config, config.to_string()).unwrap();
     let mut daemon = fixture.daemon_with_home(Some(&home)).await;
     let (mut actor, status) = eyes_claude_actor(&fixture, "claude-restricted-eyes").await;

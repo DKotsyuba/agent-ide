@@ -295,11 +295,11 @@ never satisfies validation; see `assistance-claude-worker.md`.
 Project checks use this accepted profile as their read authority. Optional `read_roots` is an
 array of absolute directory grants; when absent, the existing `scope_declared` assertion grants
 the project tree. `read_denies` defaults to an empty array of absolute path or glob exclusions.
-An explicit grant must contain the whole worktree, and any exclusion whose filesystem-resolved
-literal prefix can overlap that tree makes checks `unavailable: read_restricted`. Existing aliases
-such as `/tmp` and `/private/tmp` resolve to the same path; an unresolved grant cannot establish
-coverage, and an unresolved exclusion restricts checks. Declare the host's actual read exclusions
-here, including hidden-file globs.
+An explicit grant must contain the whole worktree, and an unresolved grant cannot establish
+coverage. Any `read_denies` entry makes checks `unavailable: read_restricted`, even when it names
+a path outside the worktree: Rust and Python checks also read toolchains and package caches.
+Declare the host's actual read exclusions here, including hidden-file globs. With no exclusions,
+the existing project-check behavior remains available.
 
 On macOS, `scope_declared` also requires Claude's sandbox configuration to allow the exact
 `/private/tmp/ai-r-<repository-key-digest>/claude-helper.sock` path through
