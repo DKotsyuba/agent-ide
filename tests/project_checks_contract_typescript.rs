@@ -81,8 +81,6 @@ async fn clean_project_is_ready_zero() {
     assert!(specs[0].read_roots.contains(&root.join("ts-install")));
     assert!(specs[0].args.contains(&"--noEmit".into()));
     for option in [
-        "--incremental",
-        "--composite",
         "--extendedDiagnostics",
         "--explainFiles",
         "--traceResolution",
@@ -95,6 +93,11 @@ async fn clean_project_is_ready_zero() {
             "{option} must override project config"
         );
     }
+    assert!(!specs[0].args.contains(&"--incremental".into()));
+    assert!(!specs[0].args.contains(&"--composite".into()));
+    assert!(specs[0].args.windows(2).any(|pair| {
+        pair[0] == "--tsBuildInfoFile" && pair[1] == root.join("cache/check.tsbuildinfo")
+    }));
     let blocked = checker
         .check(CheckRequest {
             worktree: root.clone(),
@@ -108,6 +111,44 @@ async fn clean_project_is_ready_zero() {
         CheckState::Unavailable(UnavailableReason::ReadRestricted)
     );
     assert_eq!(runner.specs().len(), 1);
+}
+
+/// A poisoned adapter destination cannot redirect the private-cache write.
+#[tokio::test]
+async fn adapter_write_replaces_symlink_without_following_it() {
+    let root = project("adapter-symlink", "tsconfig.json");
+    let source = root.join("a.ts");
+    std::fs::write(&source, "export const a = 1;\n").unwrap();
+    let sentinel = root.join("sentinel.js");
+    std::fs::write(&sentinel, "untouched").unwrap();
+    let cache = root.join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::os::unix::fs::symlink(&sentinel, cache.join("typescript-check.js")).unwrap();
+    let node = root.join("node");
+    let cli = root.join("tsc.js");
+    std::fs::write(&node, "node").unwrap();
+    std::fs::write(&cli, "cli").unwrap();
+    let checker = TypeScriptChecker::new(
+        Arc::new(FakeRunner::new(vec![Ok(report(&[&source], "", 0))])),
+        node,
+        cli,
+        Duration::from_secs(10),
+    );
+    let snapshot = checker
+        .check(CheckRequest {
+            worktree: root.clone(),
+            cache_dir: cache.clone(),
+            input_generation: 1,
+            read_denies: Vec::new(),
+        })
+        .await;
+    assert_eq!(snapshot.state, CheckState::Ready);
+    assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "untouched");
+    assert!(
+        std::fs::symlink_metadata(cache.join("typescript-check.js"))
+            .unwrap()
+            .is_file()
+    );
 }
 
 /// TS and checkJs diagnostics retain their project-relative path, position, and TS code.
@@ -271,7 +312,7 @@ async fn denied_config_or_tool_is_unavailable() {
     }
 }
 
-/// A denied source subtree refuses execution even when an allowed sibling could type-check clean.
+/// A compiler refusal takes precedence over any partial output and maps to `ReadRestricted`.
 #[tokio::test]
 async fn source_overlapping_path_deny_is_read_restricted() {
     let root = project("source-deny", "tsconfig.json");
@@ -282,7 +323,17 @@ async fn source_overlapping_path_deny_is_read_restricted() {
     let cli = root.join("tsc.js");
     std::fs::write(&node, "node").unwrap();
     std::fs::write(&cli, "cli").unwrap();
-    let runner = Arc::new(FakeRunner::default());
+    let runner = Arc::new(FakeRunner::new(vec![
+        Ok(RunOutput {
+            status: Some(77),
+            ..RunOutput::default()
+        }),
+        Ok(RunOutput {
+            status: Some(77),
+            truncated: true,
+            ..RunOutput::default()
+        }),
+    ]));
     let checker = TypeScriptChecker::new(runner.clone(), node, cli, Duration::from_secs(10));
     let snapshot = checker
         .check(CheckRequest {
@@ -296,10 +347,22 @@ async fn source_overlapping_path_deny_is_read_restricted() {
         snapshot.state,
         CheckState::Unavailable(UnavailableReason::ReadRestricted)
     );
-    assert!(runner.specs().is_empty());
+    assert_eq!(runner.specs().len(), 1);
+    let truncated = checker
+        .check(CheckRequest {
+            worktree: root.clone(),
+            cache_dir: root.join("cache"),
+            input_generation: 2,
+            read_denies: vec![ReadDeny::Path(root.join("src"))],
+        })
+        .await;
+    assert_eq!(
+        truncated.state,
+        CheckState::Unavailable(UnavailableReason::Fatal)
+    );
 }
 
-/// A symlink into a nonintersecting host path deny prevents a false clean snapshot.
+/// A denied symlink target reported by the adapter cannot become a clean snapshot.
 #[tokio::test]
 async fn nonintersecting_path_deny_rejects_worktree_alias() {
     let root = project("outside-deny-alias", "tsconfig.json");
@@ -309,7 +372,10 @@ async fn nonintersecting_path_deny_rejects_worktree_alias() {
     let cli = root.join("tsc.js");
     std::fs::write(&node, "node").unwrap();
     std::fs::write(&cli, "cli").unwrap();
-    let runner = Arc::new(FakeRunner::default());
+    let runner = Arc::new(FakeRunner::new(vec![Ok(RunOutput {
+        status: Some(77),
+        ..RunOutput::default()
+    })]));
     let checker = TypeScriptChecker::new(runner.clone(), node, cli, Duration::from_secs(10));
     let snapshot = checker
         .check(CheckRequest {
@@ -323,12 +389,12 @@ async fn nonintersecting_path_deny_rejects_worktree_alias() {
         snapshot.state,
         CheckState::Unavailable(UnavailableReason::ReadRestricted)
     );
-    assert!(runner.specs().is_empty());
+    assert_eq!(runner.specs().len(), 1);
 }
 
-/// An empty credential glob remains usable, redacts messages, and rejects later matches or links.
+/// Existing irrelevant credentials and safe aliases remain usable; messages stay redacted.
 #[tokio::test]
-async fn credential_glob_preflight_and_message_redaction() {
+async fn credential_glob_messages_stay_redacted() {
     let root = project("credential-glob", "tsconfig.json");
     let source = root.join("a.ts");
     std::fs::write(&source, "bad\n").unwrap();
@@ -338,14 +404,19 @@ async fn credential_glob_preflight_and_message_redaction() {
     std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
     std::fs::write(&node, "node").unwrap();
     std::fs::write(&cli, "cli").unwrap();
-    let runner = Arc::new(FakeRunner::new(vec![Ok(report(
+    let output = report(
         &[&source],
         &format!(
             "a.ts(1,1): error TS2322: secret at {}/hidden.key\na.ts(1,1): error TS2322: distinct private text\n",
             root.display()
         ),
         2,
-    ))]));
+    );
+    let runner = Arc::new(FakeRunner::new(vec![
+        Ok(output.clone()),
+        Ok(output.clone()),
+        Ok(output),
+    ]));
     let checker = TypeScriptChecker::new(runner.clone(), node, cli, Duration::from_secs(10));
     let request = CheckRequest {
         worktree: root.clone(),
@@ -375,15 +446,12 @@ async fn credential_glob_preflight_and_message_redaction() {
     std::fs::write(root.join("hidden.key"), "credential").unwrap();
     assert_eq!(
         checker.check(request.clone()).await.state,
-        CheckState::Unavailable(UnavailableReason::ReadRestricted)
+        CheckState::Ready
     );
     std::fs::remove_file(root.join("hidden.key")).unwrap();
     std::os::unix::fs::symlink("a.ts", root.join("source-link.ts")).unwrap();
-    assert_eq!(
-        checker.check(request).await.state,
-        CheckState::Unavailable(UnavailableReason::ReadRestricted)
-    );
-    assert_eq!(runner.specs().len(), 1);
+    assert_eq!(checker.check(request).await.state, CheckState::Ready);
+    assert_eq!(runner.specs().len(), 3);
 }
 
 /// A symlinked tsconfig defers to a regular jsconfig; a lone link never proves a project.
@@ -469,12 +537,39 @@ fn presence_filter_and_feed_keep_three_language_order() {
     assert!(!old_block.contains("typescript:"));
 }
 
-/// Exercises the pinned CLI through the production Seatbelt runner on a clean root config.
+/// Exercises ordinary credentials, a safe package alias, and one denied extends under Seatbelt.
 #[tokio::test]
 #[ignore = "requires the local pinned Node/tsc files and macOS sandbox-exec"]
 async fn real_confined_tsc_smoke() {
     let root = project("confined", "tsconfig.json");
-    std::fs::write(root.join("a.ts"), "const x: number = 1;\n").unwrap();
+    std::fs::write(
+        root.join("a.ts"),
+        "import { x } from 'pkg'; export const a: number = x;\n",
+    )
+    .unwrap();
+    for name in [".env", "secret.key", "secret.pem"] {
+        std::fs::write(root.join(name), "credential").unwrap();
+    }
+    let package = root.join("node_modules/.pnpm/pkg/node_modules/pkg");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(package.join("index.d.ts"), "export const x: number;\n").unwrap();
+    std::os::unix::fs::symlink(".pnpm/pkg/node_modules/pkg", root.join("node_modules/pkg"))
+        .unwrap();
+    let denies = vec![
+        ReadDeny::Path(PathBuf::from("/Users/pluto/.ssh")),
+        ReadDeny::Glob {
+            base: root.clone(),
+            suffix: CredentialGlob::Env,
+        },
+        ReadDeny::Glob {
+            base: root.clone(),
+            suffix: CredentialGlob::Key,
+        },
+        ReadDeny::Glob {
+            base: root.clone(),
+            suffix: CredentialGlob::Pem,
+        },
+    ];
     let checker = TypeScriptChecker::new(
         Arc::new(SeatbeltRunner),
         PathBuf::from("/Users/pluto/.nvm/versions/node/v24.4.0/bin/node"),
@@ -488,11 +583,29 @@ async fn real_confined_tsc_smoke() {
             worktree: root.clone(),
             cache_dir: root.join("cache"),
             input_generation: 1,
-            read_denies: Vec::new(),
+            read_denies: denies.clone(),
         })
         .await;
     assert_eq!(snapshot.state, CheckState::Ready, "{snapshot:?}");
     assert_eq!((snapshot.errors, snapshot.warnings), (0, 0));
+    std::fs::write(
+        root.join("tsconfig.json"),
+        r#"{"extends":"./secret.key","files":["a.ts"]}"#,
+    )
+    .unwrap();
+    let denied = checker
+        .check(CheckRequest {
+            worktree: root.clone(),
+            cache_dir: root.join("cache"),
+            input_generation: 2,
+            read_denies: denies,
+        })
+        .await;
+    assert_eq!(
+        denied.state,
+        CheckState::Unavailable(UnavailableReason::ReadRestricted)
+    );
+    assert!(denied.problems.is_empty());
 }
 
 /// Replays a real pinned CLI report through admission with default-style credential denies.
@@ -502,7 +615,21 @@ async fn real_confined_tsc_smoke() {
 async fn real_pinned_cli_with_default_style_denies() {
     let root = project("real-default-denies", "tsconfig.json");
     std::fs::write(root.join("tsconfig.json"), r#"{"compilerOptions":{"incremental":true,"composite":true,"extendedDiagnostics":true,"explainFiles":true,"traceResolution":true}}"#).unwrap();
-    std::fs::write(root.join("a.ts"), "const x: number = 1;\n").unwrap();
+    std::fs::write(
+        root.join("a.ts"),
+        "import { x } from 'pkg'; export const a: number = x;\n",
+    )
+    .unwrap();
+    for name in [".env", "secret.key", "secret.pem", ".env.local"] {
+        std::fs::write(root.join(name), "credential").unwrap();
+    }
+    let package = root.join("node_modules/.pnpm/pkg/node_modules/pkg");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::create_dir_all(root.join("node_modules/.bin")).unwrap();
+    std::fs::write(package.join("index.d.ts"), "export const x: number;\n").unwrap();
+    std::os::unix::fs::symlink(".pnpm/pkg/node_modules/pkg", root.join("node_modules/pkg"))
+        .unwrap();
+    std::os::unix::fs::symlink("../pkg/index.d.ts", root.join("node_modules/.bin/pkg")).unwrap();
     let node = PathBuf::from("/Users/pluto/.nvm/versions/node/v24.4.0/bin/node");
     let cli = PathBuf::from(
         "/Users/pluto/.nvm/versions/node/v24.4.0/lib/node_modules/typescript/lib/tsc.js",
@@ -546,6 +673,8 @@ async fn real_pinned_cli_with_default_style_denies() {
             .read_roots
             .contains(&node.parent().unwrap().parent().unwrap().to_path_buf())
     );
+    // The checker embeds its first-party adapter in the private cache before execution.
+    let _ = checker.check(request.clone()).await;
     let process = std::process::Command::new(&spec.program)
         .args(&spec.args)
         .current_dir(&spec.cwd)
@@ -556,10 +685,12 @@ async fn real_pinned_cli_with_default_style_denies() {
     assert_eq!(
         process.status.code(),
         Some(0),
-        "{}",
-        String::from_utf8_lossy(&process.stdout)
+        "stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&process.stdout),
+        String::from_utf8_lossy(&process.stderr)
     );
     assert!(!root.join("tsconfig.tsbuildinfo").exists());
+    assert!(request.cache_dir.join("check.tsbuildinfo").exists());
     let runner = Arc::new(FakeRunner::new(vec![Ok(RunOutput {
         status: process.status.code(),
         stdout: process.stdout,
@@ -571,4 +702,246 @@ async fn real_pinned_cli_with_default_style_denies() {
     assert_eq!(snapshot.state, CheckState::Ready, "{snapshot:?}");
     assert_eq!((snapshot.errors, snapshot.warnings), (0, 0));
     assert_eq!(runner.specs().len(), 1);
+}
+
+/// Runs the embedded adapter directly with the pinned compiler after staging it through the checker.
+async fn pinned_adapter_output(request: &CheckRequest) -> RunOutput {
+    let node = PathBuf::from("/Users/pluto/.nvm/versions/node/v24.4.0/bin/node");
+    let cli = PathBuf::from(
+        "/Users/pluto/.nvm/versions/node/v24.4.0/lib/node_modules/typescript/lib/tsc.js",
+    );
+    let checker = TypeScriptChecker::new(
+        Arc::new(FakeRunner::default()),
+        node,
+        cli,
+        Duration::from_secs(30),
+    );
+    let _ = checker.check(request.clone()).await;
+    let config = if request.worktree.join("tsconfig.json").exists() {
+        request.worktree.join("tsconfig.json")
+    } else {
+        request.worktree.join("jsconfig.json")
+    };
+    let spec = checker.run_spec(request, &config);
+    let process = std::process::Command::new(&spec.program)
+        .args(&spec.args)
+        .current_dir(&spec.cwd)
+        .env_clear()
+        .envs(spec.env.iter().map(|(key, value)| (key, value)))
+        .output()
+        .unwrap();
+    RunOutput {
+        status: process.status.code(),
+        stdout: process.stdout,
+        stderr: process.stderr,
+        ..RunOutput::default()
+    }
+}
+
+/// Selected denied inputs and an alias outside all read grants fail without publishing text.
+#[tokio::test]
+#[ignore = "requires the local pinned Node v24.4.0 and TypeScript 5.9.3"]
+async fn real_pinned_denied_inputs_are_read_restricted() {
+    for case in ["extends", "source", "directory", "alias", "outside-grant"] {
+        let root = project(&format!("real-denied-{case}"), "tsconfig.json");
+        let source = root.join("a.ts");
+        std::fs::write(&source, "export const a: number = 1;\n").unwrap();
+        let denied = match case {
+            "extends" => {
+                std::fs::write(root.join("secret.key"), "{}").unwrap();
+                std::fs::write(
+                    root.join("tsconfig.json"),
+                    r#"{"extends":"./secret.key","files":["a.ts"]}"#,
+                )
+                .unwrap();
+                ReadDeny::Glob {
+                    base: root.clone(),
+                    suffix: CredentialGlob::Key,
+                }
+            }
+            "source" => {
+                std::fs::write(root.join("tsconfig.json"), r#"{"files":["a.ts"]}"#).unwrap();
+                ReadDeny::Path(source)
+            }
+            "directory" => {
+                let private = root.join("private");
+                std::fs::create_dir_all(&private).unwrap();
+                std::fs::write(private.join("hidden.ts"), "export const hidden = 1;\n").unwrap();
+                std::fs::write(
+                    root.join("tsconfig.json"),
+                    r#"{"include":["private/**/*.ts"]}"#,
+                )
+                .unwrap();
+                ReadDeny::Path(private)
+            }
+            "alias" => {
+                std::os::unix::fs::symlink("a.ts", root.join("alias.ts")).unwrap();
+                std::fs::write(root.join("tsconfig.json"), r#"{"files":["alias.ts"]}"#).unwrap();
+                ReadDeny::Path(source)
+            }
+            "outside-grant" => {
+                let outside = root.with_extension("outside.ts");
+                std::fs::write(&outside, "export const outside = 1;\n").unwrap();
+                std::os::unix::fs::symlink(outside, root.join("alias.ts")).unwrap();
+                std::fs::write(root.join("tsconfig.json"), r#"{"files":["alias.ts"]}"#).unwrap();
+                ReadDeny::Path(PathBuf::from("/Users/pluto/.ssh"))
+            }
+            _ => unreachable!(),
+        };
+        let request = CheckRequest {
+            worktree: root.clone(),
+            cache_dir: root.join("cache"),
+            input_generation: 1,
+            read_denies: vec![denied],
+        };
+        let output = pinned_adapter_output(&request).await;
+        assert_eq!(output.status, Some(77), "{case}");
+        let runner = Arc::new(FakeRunner::new(vec![Ok(output)]));
+        let checker = TypeScriptChecker::new(
+            runner,
+            PathBuf::from("/Users/pluto/.nvm/versions/node/v24.4.0/bin/node"),
+            PathBuf::from(
+                "/Users/pluto/.nvm/versions/node/v24.4.0/lib/node_modules/typescript/lib/tsc.js",
+            ),
+            Duration::from_secs(30),
+        );
+        let snapshot = checker.check(request).await;
+        assert_eq!(
+            snapshot.state,
+            CheckState::Unavailable(UnavailableReason::ReadRestricted),
+            "{case}"
+        );
+        assert!(snapshot.problems.is_empty(), "{case}");
+    }
+}
+
+/// Composite option errors match the pinned CLI while build metadata stays in the private cache.
+#[tokio::test]
+#[ignore = "requires the local pinned Node v24.4.0 and TypeScript 5.9.3"]
+async fn real_pinned_composite_diagnostics_match_cli() {
+    let root = project("real-composite", "tsconfig.json");
+    std::fs::write(
+        root.join("tsconfig.json"),
+        r#"{"compilerOptions":{"composite":true,"declaration":false},"files":["a.ts"]}"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("a.ts"), "export const a: number = 1;\n").unwrap();
+    let request = CheckRequest {
+        worktree: root.clone(),
+        cache_dir: root.join("cache"),
+        input_generation: 1,
+        read_denies: Vec::new(),
+    };
+    let adapted = pinned_adapter_output(&request).await;
+    let node = "/Users/pluto/.nvm/versions/node/v24.4.0/bin/node";
+    let cli = "/Users/pluto/.nvm/versions/node/v24.4.0/lib/node_modules/typescript/lib/tsc.js";
+    let baseline = std::process::Command::new(node)
+        .args([
+            cli,
+            "--project",
+            "tsconfig.json",
+            "--pretty",
+            "false",
+            "--diagnostics",
+            "--listFiles",
+            "--noEmit",
+            "--tsBuildInfoFile",
+        ])
+        .arg(request.cache_dir.join("baseline.tsbuildinfo"))
+        .args([
+            "--extendedDiagnostics",
+            "false",
+            "--explainFiles",
+            "false",
+            "--traceResolution",
+            "false",
+        ])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert_eq!(adapted.status, baseline.status.code());
+    let adapted_text = String::from_utf8_lossy(&adapted.stdout);
+    let baseline_text = String::from_utf8_lossy(&baseline.stdout);
+    let diagnostic = "error TS6304: Composite projects may not disable declaration emit.";
+    assert!(adapted_text.contains(diagnostic), "{adapted_text}");
+    assert!(baseline_text.contains(diagnostic), "{baseline_text}");
+    assert!(!root.join("tsconfig.tsbuildinfo").exists());
+}
+
+/// A selected source symlink whose target stays inside the grant remains a complete check.
+#[tokio::test]
+#[ignore = "requires the local pinned Node v24.4.0 and TypeScript 5.9.3"]
+async fn real_pinned_safe_source_alias_is_ready() {
+    let root = project("real-safe-alias", "tsconfig.json");
+    std::fs::write(root.join("tsconfig.json"), r#"{"files":["alias.ts"]}"#).unwrap();
+    let mut source = vec![0xff, 0xfe];
+    for unit in "export const a: number = 1;\n".encode_utf16() {
+        source.extend(unit.to_le_bytes());
+    }
+    std::fs::write(root.join("a.ts"), source).unwrap();
+    std::os::unix::fs::symlink("a.ts", root.join("alias.ts")).unwrap();
+    let request = CheckRequest {
+        worktree: root.clone(),
+        cache_dir: root.join("cache"),
+        input_generation: 1,
+        read_denies: vec![ReadDeny::Glob {
+            base: root.clone(),
+            suffix: CredentialGlob::Env,
+        }],
+    };
+    let output = pinned_adapter_output(&request).await;
+    assert_eq!(
+        output.status,
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let snapshot = parse_tsc_output(
+        &output,
+        &root,
+        &root.join("tsconfig.json"),
+        &request.read_denies,
+        1,
+        0,
+    );
+    assert_eq!(snapshot.state, CheckState::Ready, "{snapshot:?}");
+}
+
+/// A JavaScript root retains checkJs diagnostics with unrelated credential files present.
+#[tokio::test]
+#[ignore = "requires the local pinned Node v24.4.0 and TypeScript 5.9.3"]
+async fn real_pinned_jsconfig_reports_checkjs_errors() {
+    let root = project("real-js", "jsconfig.json");
+    std::fs::write(
+        root.join("jsconfig.json"),
+        r#"{"compilerOptions":{"checkJs":true},"files":["a.js"]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("a.js"),
+        "/** @type {number} */ const a = 'bad';\n",
+    )
+    .unwrap();
+    std::fs::write(root.join(".env"), "credential").unwrap();
+    let request = CheckRequest {
+        worktree: root.clone(),
+        cache_dir: root.join("cache"),
+        input_generation: 1,
+        read_denies: vec![ReadDeny::Glob {
+            base: root.clone(),
+            suffix: CredentialGlob::Env,
+        }],
+    };
+    let output = pinned_adapter_output(&request).await;
+    let snapshot = parse_tsc_output(
+        &output,
+        &root,
+        &root.join("jsconfig.json"),
+        &request.read_denies,
+        1,
+        0,
+    );
+    assert_eq!(snapshot.state, CheckState::Ready, "{snapshot:?}");
+    assert_eq!((snapshot.errors, snapshot.warnings), (1, 0));
+    assert_eq!(snapshot.problems[0].code.as_deref(), Some("TS2322"));
 }

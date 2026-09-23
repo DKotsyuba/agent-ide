@@ -288,30 +288,33 @@ pub struct ProblemSnapshot { pub language: Language, pub state: CheckState,
 - Project source is never executed. Pyright does start the interpreter to enumerate search paths,
   so interpreter start-up hooks (`sitecustomize`, `.pth`) run under the same confinement.
 
-### TypeScript/JavaScript (`node tsc.js --project <root config> --pretty false --diagnostics --listFiles --noEmit`)
+### TypeScript/JavaScript (`node <private adapter> --project <root config> --pretty false --diagnostics --listFiles --noEmit`)
 
 - Select a regular non-symlink root `tsconfig.json`, otherwise a regular root `jsconfig.json`.
   A denied or unprovable config is unavailable. Nested-only configs and project-reference graphs
   are outside this check's coverage; a solution-style root with no own files is `NoFiles`.
-- The configured paths name pinned Node v24.4.0 and TypeScript 5.9.3. The CLI runs under the
-  existing network-denied confined runner; only its private check cache is writable. Explicit
-  `--incremental false --composite false` prevent `tsbuildinfo` writes even when the root config
-  enables those options. `--extendedDiagnostics false --explainFiles false --traceResolution false`
-  preserve the bounded report format. A project requiring a build or emit is not represented as a
-  clean type check. The Node executable and TypeScript package have separate read grants; the
-  fixed Seatbelt profile already grants required system paths.
+- The configured paths name pinned Node v24.4.0 and TypeScript 5.9.3. A first-party adapter calls
+  that package's `executeCommandLine` with guarded filesystem methods under the existing
+  network-denied runner. `--tsBuildInfoFile <private cache>/check.tsbuildinfo` preserves the
+  project's `incremental` and `composite` diagnostics while keeping build metadata private;
+  `--noEmit` prevents project output. `--extendedDiagnostics false --explainFiles false
+  --traceResolution false` preserve the bounded report format. A project requiring a build or emit
+  is not represented as a clean type check. Node and TypeScript have separate read grants;
+  TypeScript's ancestor `node_modules` and `package.json` lookup paths receive narrow grants.
 - `Ready` requires an untruncated, fully parsed output with a complete diagnostics footer, a
   matching file list, normal exit status, and at least one listed file under the worktree.
   Diagnostics report `TS` codes and exact file, line, and column; file-less diagnostics attach to
   the chosen config at line 0. Malformed output, denied diagnostic paths, and abnormal exits are
   `Fatal`. JavaScript diagnostics require the project's own `checkJs` setting.
-- A path read-deny intersecting any checker read root makes the result `ReadRestricted` before
-  the CLI runs. With any host read deny, bounded preflight and post-run scans of every explicit
-  grant must find no matching entry, unreadable location, or symlink alias. The Node grant is a
-  single executable file, avoiding a scan of its large installation tree. Arbitrary diagnostic
-  messages are redacted while path, severity and code remain. The scans and CLI run are not an
-  atomic filesystem snapshot; the scheduler fences observed input generations, while transient
-  changes entirely between scans remain outside this guarantee.
+- The adapter checks each compiler read and probe against host denies before touching the path,
+  including symlink targets. TypeScript's file discovery uses its own `matchFiles` walker with
+  guarded directory enumeration and explicit read-root admission, so refused reads cannot
+  disappear as absent files. Unrelated
+  `.env`, `.key`, and `.pem` files may exist; a compiler-selected denied input yields
+  `ReadRestricted`. Adapter write and delete operations are restricted to the private cache.
+  Arbitrary diagnostic messages are redacted while path, severity and code remain. The runner's
+  Seatbelt policy remains the host-enforced boundary, and the scheduler fences observed input
+  generations; a transient edit that appears and disappears during one run is outside that fence.
 
 ## 5. Scheduling
 
