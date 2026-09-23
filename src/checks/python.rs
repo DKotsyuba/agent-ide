@@ -327,7 +327,8 @@ fn existing_python(
     allowed_file(&candidate, denies).then_some(candidate)
 }
 
-/// Follows at most 32 interpreter or tool links with no-follow metadata, proving each hop first.
+/// Follows at most 32 interpreter or tool links with no-follow metadata, proving each normalized
+/// hop first. Loops, denied paths, and unsafe relative targets return `None`.
 fn resolved_link_target(
     path: &Path,
     denies: &[crate::execution::seatbelt::ReadDeny],
@@ -341,16 +342,47 @@ fn resolved_link_target(
         let metadata = fs::symlink_metadata(&current).ok()?;
         if metadata.file_type().is_symlink() {
             let target = fs::read_link(&current).ok()?;
-            current = if target.is_absolute() {
-                target
-            } else {
-                current.parent()?.join(target)
-            };
+            current = lexical_link_target(&current, &target, denies)?;
         } else {
             return metadata.is_file().then_some(current);
         }
     }
     None
+}
+
+/// Resolves a link target lexically without following links; each `..` may remove only a real,
+/// allowed directory (never a symlink, denied path, or missing name), so normalization cannot hide
+/// a symlink or denied path from the next hop check. Returns the normalized absolute target, or
+/// `None` for a relative result, a Windows prefix, a link without a parent, or any component that
+/// cannot be proved — resolution fails closed.
+fn lexical_link_target(
+    link: &Path,
+    target: &Path,
+    denies: &[crate::execution::seatbelt::ReadDeny],
+) -> Option<PathBuf> {
+    let joined = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        link.parent()?.join(target)
+    };
+    let mut normalized = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            std::path::Component::RootDir => normalized.push("/"),
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(name) => normalized.push(name),
+            std::path::Component::ParentDir => {
+                if denied_interpreter_path(&normalized, denies)
+                    || !fs::symlink_metadata(&normalized).ok()?.is_dir()
+                    || !normalized.pop()
+                {
+                    return None;
+                }
+            }
+            std::path::Component::Prefix(_) => return None,
+        }
+    }
+    normalized.is_absolute().then_some(normalized)
 }
 
 /// Accepts an existing regular file without following an unproved link under host read denies.
@@ -711,6 +743,101 @@ mod deny_tests {
             resolve_interpreter_with_denies(&root, &denies),
             Some(root.join(".venv/bin/python"))
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Creates one fresh canonicalized fixture root for a relative-link test.
+    ///
+    /// Canonicalization moves the root onto the `/private` spelling of the system temp tree, so
+    /// the deny machinery's symlinked-ancestor rule never rejects these fixtures for the host's
+    /// `/var` -> `private/var` link instead of the property under test.
+    fn link_fixture_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "agent-ide-python-links-{}-{}",
+            std::process::id(),
+            label
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::canonicalize(root).unwrap()
+    }
+
+    /// A Homebrew-style relative link (`bin/node -> ../Cellar/node/<v>/bin/node`) resolves through
+    /// its `..` hop when every popped component is a real, allowed directory.
+    #[test]
+    fn deny_resolves_relative_homebrew_style_link_chain() {
+        let root = link_fixture_root("homebrew");
+        std::fs::create_dir_all(root.join("Cellar/node/1.2.3/bin")).unwrap();
+        std::fs::write(root.join("Cellar/node/1.2.3/bin/node"), "node").unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        symlink("../Cellar/node/1.2.3/bin/node", root.join("bin/node")).unwrap();
+        let denies = [ReadDeny::Glob {
+            base: root.clone(),
+            suffix: CredentialGlob::Key,
+        }];
+        assert_eq!(
+            resolved_link_target(&root.join("bin/node"), &denies),
+            Some(root.join("Cellar/node/1.2.3/bin/node"))
+        );
+        assert!(allowed_file(&root.join("bin/node"), &denies));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A relative link whose normalized target sits inside a denied directory, or whose `..` pops
+    /// a denied directory itself, never resolves: the deny cannot be normalized away.
+    #[test]
+    fn deny_rejects_relative_link_over_denied_hop() {
+        let root = link_fixture_root("denied-hop");
+        std::fs::create_dir_all(root.join("Cellar/node/1.2.3/bin")).unwrap();
+        std::fs::write(root.join("Cellar/node/1.2.3/bin/node"), "node").unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        symlink("../Cellar/node/1.2.3/bin/node", root.join("bin/node")).unwrap();
+        std::fs::create_dir_all(root.join("keys")).unwrap();
+        symlink("../keys/../node", root.join("bin/node2")).unwrap();
+        let denies = [
+            ReadDeny::Path(root.join("Cellar")),
+            ReadDeny::Path(root.join("keys")),
+        ];
+        assert_eq!(resolved_link_target(&root.join("bin/node"), &denies), None);
+        assert!(!allowed_file(&root.join("bin/node"), &denies));
+        assert_eq!(resolved_link_target(&root.join("bin/node2"), &denies), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A relative two-link loop (`python -> ../bin/python2 -> ../bin/python`) is rejected by the
+    /// seen-set instead of iterating until the hop budget runs out.
+    #[test]
+    fn deny_rejects_relative_link_loop() {
+        let root = link_fixture_root("loop");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        symlink("../bin/python2", root.join("bin/python")).unwrap();
+        symlink("../bin/python", root.join("bin/python2")).unwrap();
+        let denies = [ReadDeny::Glob {
+            base: root.clone(),
+            suffix: CredentialGlob::Key,
+        }];
+        assert_eq!(
+            resolved_link_target(&root.join("bin/python"), &denies),
+            None
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A `..` that would pop a symlinked directory is refused: physically the kernel resolves the
+    /// symlink first, so lexical normalization (`bin/sub/../node` -> `bin/node`) would hide the
+    /// symlink's real target — here a file under the denied `secret` tree — behind an allowed
+    /// lexical path. The symlinked `sub` is invisible to every later hop check, so only the pop
+    /// check can refuse it.
+    #[test]
+    fn deny_rejects_dotdot_popping_a_symlinked_directory() {
+        let root = link_fixture_root("symlink-dotdot");
+        std::fs::create_dir_all(root.join("secret/inner")).unwrap();
+        std::fs::write(root.join("secret/node"), "secret").unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        symlink(&root.join("secret/inner"), root.join("bin/sub")).unwrap();
+        symlink("sub/../node", root.join("bin/node")).unwrap();
+        let denies = [ReadDeny::Path(root.join("secret"))];
+        assert_eq!(resolved_link_target(&root.join("bin/node"), &denies), None);
+        assert!(!allowed_file(&root.join("bin/node"), &denies));
         let _ = std::fs::remove_dir_all(root);
     }
 }
