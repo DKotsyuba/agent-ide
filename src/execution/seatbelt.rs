@@ -212,6 +212,17 @@ pub fn host_read_denies(state: &HostSandboxState, worktree: &Path) -> Option<Vec
 }
 
 /// Canonicalizes only existing ancestors of a denied selector, never the denied path itself.
+///
+/// Returns the deepest existing ancestor canonicalized, with the remaining components —
+/// including the final one — joined back verbatim, so a deny keeps its no-follow spelling.
+/// Returns `None`, which makes callers fail closed, when the path has no parent or no final
+/// component (for example `/` itself or a path ending in `..`), or when canonicalizing an
+/// ancestor fails with an error other than "not found". This helper
+/// takes no position on relative paths: a relative input whose ancestor exists relative to the
+/// process working directory (for example `src/secret` with `src/` present) resolves against
+/// that directory, while one whose ancestors are all absent yields `None`. Callers must
+/// therefore reject relative inputs before normalizing — `render_profile` refuses any
+/// non-absolute deny — because the renderer's working directory is not the confined child's.
 fn canonical_deny_path(path: &Path) -> Option<PathBuf> {
     let mut parent = path.parent()?;
     let mut tail = vec![path.file_name()?.to_os_string()];
@@ -234,8 +245,10 @@ fn canonical_deny_path(path: &Path) -> Option<PathBuf> {
 /// Explains why a seatbelt policy path cannot be rendered into a safe profile.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SeatbeltProfileError {
-    /// A grant root or host deny has no safe single-line SBPL string-literal form: it is not representable as
-    /// UTF-8, or it contains a newline character that would corrupt the profile grammar.
+    /// A grant root or host deny has no safe single-line SBPL string-literal form: it is not
+    /// representable as UTF-8, it contains a newline character that would corrupt the profile
+    /// grammar, or it is a deny whose path cannot be normalized to the canonical form Seatbelt
+    /// evaluates.
     UnrepresentableRoot {
         /// The rejected root path, kept for caller diagnostics.
         path: PathBuf,
@@ -263,12 +276,19 @@ impl std::error::Error for SeatbeltProfileError {}
 /// access to the fixed system paths, read-only access to every `SeatbeltPolicy::read_roots`
 /// entry, and read-write access to every `SeatbeltPolicy::write_roots` entry. Root paths are
 /// canonicalized when they exist (Seatbelt evaluates canonical paths) and escaped into safe SBPL
-/// string literals. Host read denies are appended after grants; an unrepresentable path fails
-/// the whole render rather than weakening the profile.
+/// string literals. Host read denies are appended after grants and normalized the same way, so
+/// a deny spelled through a path alias (`/var/folders/...`, `/tmp/...`) still narrows the
+/// canonical paths Seatbelt evaluates; a path deny keeps its final component unresolved and,
+/// when that component itself resolves to a different canonical path (a symlink or alias),
+/// also denies the resolved target. Read denies must be absolute: a relative deny path or glob
+/// base fails the whole render, because normalizing it would anchor it to the renderer's
+/// working directory rather than the confined child's. A deny that cannot be normalized or
+/// represented fails the whole render rather than weakening the profile.
 ///
 /// # Errors
 ///
-/// Returns `SeatbeltProfileError::UnrepresentableRoot` when any grant or deny path lacks a safe literal form.
+/// Returns `SeatbeltProfileError::UnrepresentableRoot` when any grant or deny path lacks a safe
+/// literal form or cannot be normalized to the canonical form Seatbelt evaluates.
 pub fn render_profile(policy: &SeatbeltPolicy) -> Result<String, SeatbeltProfileError> {
     let mut profile = String::from(PROFILE_PREAMBLE);
     append_roots(&mut profile, "read-only", "file-read*", &policy.read_roots)?;
@@ -279,20 +299,66 @@ pub fn render_profile(policy: &SeatbeltPolicy) -> Result<String, SeatbeltProfile
         &policy.write_roots,
     )?;
     for deny in &policy.read_denies {
+        // Seatbelt evaluates canonical paths for denies exactly as it does for grant roots, so
+        // a deny spelled through an alias (`/var/folders/...`, `/tmp/...`) would never match
+        // and would silently stop narrowing access. Denies must also be absolute: a relative
+        // spelling would normalize against the daemon's working directory, which the confined
+        // child never shares, so the deny could anchor the wrong directory. A path deny keeps
+        // its final component unresolved (host semantics for denied paths); a deny that cannot
+        // be normalized at all fails the whole render instead of weakening the profile.
+        let deny_path = match deny {
+            ReadDeny::Path(path) => path.as_path(),
+            ReadDeny::Glob { base, .. } => base.as_path(),
+        };
+        if !deny_path.is_absolute() {
+            return Err(SeatbeltProfileError::UnrepresentableRoot {
+                path: deny_path.to_path_buf(),
+            });
+        }
         match deny {
-            ReadDeny::Path(path) => profile.push_str(&format!(
-                "\n(deny file-read* (subpath \"{}\"))",
-                sbpl_path(path)?
-            )),
+            ReadDeny::Path(path) => {
+                let canonical = canonical_deny_path(path).ok_or_else(|| {
+                    SeatbeltProfileError::UnrepresentableRoot { path: path.clone() }
+                })?;
+                profile.push_str(&format!(
+                    "\n(deny file-read* (subpath \"{}\"))",
+                    sbpl_path(&canonical)?
+                ));
+                // The preserved final component may itself be a symlink or path alias whose
+                // reads resolve elsewhere; deny the resolved target too so the deny cannot
+                // miss. A nonexistent (or dangling) final component resolves nowhere and
+                // adds no entry.
+                if let Ok(resolved) = std::fs::canonicalize(path) {
+                    if resolved != canonical {
+                        profile.push_str(&format!(
+                            "\n(deny file-read* (subpath \"{}\"))",
+                            sbpl_path(&resolved)?
+                        ));
+                    }
+                }
+            }
             ReadDeny::Glob { base, suffix } => {
+                let base = std::fs::canonicalize(base)
+                    .ok()
+                    .or_else(|| canonical_deny_path(base))
+                    .ok_or_else(|| SeatbeltProfileError::UnrepresentableRoot {
+                        path: base.clone(),
+                    })?;
                 let suffix = match suffix {
                     CredentialGlob::Key => "[^/]*\\.[kK][eE][yY]",
                     CredentialGlob::Pem => "[^/]*\\.[pP][eE][mM]",
                     CredentialGlob::Env => "\\.[eE][nN][vV]",
                     CredentialGlob::EnvDot => "\\.[eE][nN][vV]\\.[^/]*",
                 };
+                // Fail closed on a non-UTF-8 base: lossy conversion would render U+FFFD and
+                // produce a deny that silently misses the real path.
+                let raw =
+                    base.to_str()
+                        .ok_or_else(|| SeatbeltProfileError::UnrepresentableRoot {
+                            path: base.clone(),
+                        })?;
                 let mut escaped = String::new();
-                for character in base.to_string_lossy().chars() {
+                for character in raw.chars() {
                     if character.is_ascii_alphabetic() {
                         escaped.push_str(&format!(
                             "[{}{}]",
@@ -749,6 +815,109 @@ mod tests {
         );
         assert!(profile.contains("(subpath \"/private/tmp\")"), "{profile}");
         assert!(!profile.contains("(subpath \"/var/tmp\")"), "{profile}");
+    }
+
+    /// Proves a deny spelled through a path alias renders exactly like its canonical spelling
+    /// for both path denies and glob denies: Seatbelt evaluates canonical paths, so an
+    /// alias-spelled deny base would never match and a read deny could silently stop
+    /// narrowing access.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn render_profile_renders_alias_and_canonical_denies_identically() {
+        let policy = |base: &str| SeatbeltPolicy {
+            read_roots: vec![PathBuf::from(base)],
+            write_roots: Vec::new(),
+            read_denies: vec![
+                ReadDeny::Path(PathBuf::from(format!("{base}/denied"))),
+                ReadDeny::Glob {
+                    base: PathBuf::from(base),
+                    suffix: CredentialGlob::Key,
+                },
+            ],
+        };
+        let alias = render_profile(&policy("/var/tmp")).unwrap();
+        let canonical = render_profile(&policy("/private/var/tmp")).unwrap();
+        assert_eq!(
+            alias, canonical,
+            "alias-spelled denies must render identically to canonical denies"
+        );
+        assert!(
+            alias.contains("(deny file-read* (subpath \"/private/var/tmp/denied\"))"),
+            "{alias}"
+        );
+    }
+
+    /// Proves a glob deny base that is not valid UTF-8 refuses the whole render instead of
+    /// rendering a lossy U+FFFD regex that would silently deny nothing.
+    #[cfg(unix)]
+    #[test]
+    fn render_profile_rejects_non_utf8_glob_base() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let policy = SeatbeltPolicy {
+            read_denies: vec![ReadDeny::Glob {
+                base: PathBuf::from(OsString::from_vec(b"/tmp/non-utf8-\xff".to_vec())),
+                suffix: CredentialGlob::Key,
+            }],
+            ..SeatbeltPolicy::default()
+        };
+        assert!(matches!(
+            render_profile(&policy),
+            Err(SeatbeltProfileError::UnrepresentableRoot { .. })
+        ));
+    }
+
+    /// Proves relative deny paths and glob bases refuse the whole render instead of
+    /// normalizing against the daemon's working directory. `src/secret` deliberately has an
+    /// existing parent (`src/`) at the test working directory, so the refusal comes from the
+    /// absolute-path guard, not from normalization returning `None`.
+    #[test]
+    fn render_profile_rejects_relative_denies() {
+        let relative = PathBuf::from("src/secret");
+        let path = render_profile(&SeatbeltPolicy {
+            read_denies: vec![ReadDeny::Path(relative.clone())],
+            ..SeatbeltPolicy::default()
+        });
+        assert!(matches!(
+            path,
+            Err(SeatbeltProfileError::UnrepresentableRoot { .. })
+        ));
+        let glob = render_profile(&SeatbeltPolicy {
+            read_denies: vec![ReadDeny::Glob {
+                base: relative,
+                suffix: CredentialGlob::Key,
+            }],
+            ..SeatbeltPolicy::default()
+        });
+        assert!(matches!(
+            glob,
+            Err(SeatbeltProfileError::UnrepresentableRoot { .. })
+        ));
+    }
+
+    /// Proves a path deny whose final component is a path alias denies both the spelled
+    /// no-follow path and its resolved canonical target, while a plain directory deny keeps
+    /// rendering exactly one entry.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn render_profile_path_deny_covers_resolved_final_component() {
+        let alias = render_profile(&SeatbeltPolicy {
+            read_denies: vec![ReadDeny::Path(PathBuf::from("/tmp"))],
+            ..SeatbeltPolicy::default()
+        })
+        .unwrap();
+        assert!(
+            alias.contains(
+                "(deny file-read* (subpath \"/tmp\"))\n(deny file-read* (subpath \"/private/tmp\"))"
+            ),
+            "{alias}"
+        );
+        let plain = render_profile(&SeatbeltPolicy {
+            read_denies: vec![ReadDeny::Path(PathBuf::from("/private/tmp"))],
+            ..SeatbeltPolicy::default()
+        })
+        .unwrap();
+        assert_eq!(plain.matches("(deny file-read*").count(), 1, "{plain}");
     }
 
     /// Proves a root that does not exist yet is rendered as given instead of failing the render.
