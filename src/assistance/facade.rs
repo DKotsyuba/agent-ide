@@ -596,8 +596,12 @@ impl TrustedTransport {
 pub enum FacadeOutcome {
     /// Model arguments did not satisfy the selected tool schema; no IPC was attempted.
     InvalidParameters,
+    /// Trusted host attachment or per-call metadata was absent; no IPC was attempted.
+    MissingHostMetadata,
     /// The daemon, IPC, or typed peer result was unavailable; native host work remains unblocked.
     Unavailable,
+    /// Transport failed and this managed client could not re-establish a daemon.
+    ReestablishFailed,
     /// IPC accepted the envelope but no typed peer result was available for safe rendering.
     Incomplete,
     /// Typed peer result accepted from the daemon, with its optional carried status plate (T28B).
@@ -1053,19 +1057,18 @@ impl FeedbackLedger {
     }
 }
 
-/// Redoes the shared-daemon launch-or-adopt rendezvous the exact way MCP startup performs it.
+/// Re-establishes a managed daemon through its host-specific startup path.
 ///
-/// Returns the freshly reachable `(runtime_dir, attachment)` pair, or `None` if that rendezvous
-/// itself failed; the caller then reports the call unavailable exactly as it would have without
-/// ever attempting a reconnect.
+/// Returns a reachable `(runtime_dir, attachment)` pair, or `None` if restart or rendezvous fails;
+/// the caller then reports re-establishment failure without another retry.
 pub type ReestablishFn =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Option<(PathBuf, String)>> + Send>> + Send + Sync>;
 
 /// Shares one managed Codex publisher between the facade call path and MCP teardown (T29B §2).
 ///
 /// The facade publishes actor routes before dispatching valid managed Codex calls; the MCP process
-/// retires them at teardown and when its owned daemon exit is observed. The plain lock is only ever
-/// held across bounded local filesystem work.
+/// retires them at teardown and when its owned daemon exit is observed, then rebinds known routes
+/// if the daemon restarts. The plain lock is only ever held across bounded local filesystem work.
 pub type SharedCodexPublisher = Arc<std::sync::Mutex<ManagedCodexPublisher>>;
 
 /// Bounds how long dispatch waits for one route publication before continuing without it.
@@ -1091,10 +1094,8 @@ pub(crate) fn stall_rendezvous_for_test() {
 
 /// Shares one live `(runtime_dir, attachment)` pair across every clone of a [`StdioFacade`].
 ///
-/// A daemon this generation never owns (EYES-r2 §2) can exit while the MCP process keeps running
-/// (idle timeout, `SIGTERM`, a crash, or a binary upgrade). Rather than caching a connection that
-/// silently goes stale forever, every call reads the current pair and, on failure, re-runs
-/// `reestablish` once and stores its result here for itself and every later call.
+/// A managed daemon can exit while its MCP process keeps running. Every call reads the current
+/// pair and, on transport loss, re-runs `reestablish` once and stores its result for later calls.
 #[derive(Clone)]
 struct ManagedConnection {
     current: Arc<Mutex<(PathBuf, String)>>,
@@ -1142,7 +1143,7 @@ pub struct StdioFacade {
     ///
     /// Unused (always `None`) once `reconnect` is set, which tracks its own current attachment.
     attachment: Option<String>,
-    /// Live rendezvous target and re-establish hook for a shared daemon this facade does not own.
+    /// Live target and re-establish hook for a managed daemon that may be replaced.
     reconnect: Option<ManagedConnection>,
     /// Managed Codex publisher owned by this MCP process; publication stays best-effort and quiet.
     ///
@@ -1195,30 +1196,30 @@ impl StdioFacade {
         })
     }
 
-    /// Configures the managed Codex facade: fixed attachment plus this process's route publisher.
+    /// Configures managed Codex route publication and one retry after its owned daemon exits.
     ///
-    /// Identical bounds to [`Self::with_host_attachment`]. The publisher publishes actor routes
-    /// before dispatching valid calls (T29B §2) but never activates anything: every publication
-    /// failure, like every missing route identity, only skips publication.
-    pub fn with_managed_codex(
+    /// The reconnect hook replaces the daemon, its lease, and the publisher's route target before
+    /// this facade retries the interrupted call. Invalid attachments still refuse construction.
+    pub fn with_reestablishing_managed_codex(
         runtime_dir: PathBuf,
         attachment: String,
         publisher: SharedCodexPublisher,
+        reestablish: ReestablishFn,
     ) -> Option<Self> {
         TrustedTransport::from_host_ingress("validate", "validate", attachment.clone())?;
         Some(Self {
-            facade: AssistanceFacade::new(runtime_dir),
-            attachment: Some(attachment),
-            reconnect: None,
+            facade: AssistanceFacade::new(runtime_dir.clone()),
+            attachment: None,
+            reconnect: Some(ManagedConnection::new(runtime_dir, attachment, reestablish)),
             publisher: Some(publisher),
             router: Self::tool_router(),
         })
     }
 
-    /// Configures a bounded opaque attachment for a shared daemon this facade can re-establish.
+    /// Configures a bounded opaque attachment for a managed daemon this facade can re-establish.
     ///
     /// Identical bounds to [`Self::with_host_attachment`], plus `reestablish` is stored for later
-    /// calls to redo the launch-or-adopt rendezvous once a live connection is lost (EYES-r2 §2).
+    /// calls to restore a lost connection through the host's startup path.
     pub fn with_reestablishing_attachment(
         runtime_dir: PathBuf,
         attachment: String,
@@ -1311,14 +1312,14 @@ impl StdioFacade {
         }
     }
 
-    /// Dispatches one already-validated call, re-establishing a lost shared daemon exactly once.
+    /// Dispatches one already-validated call, re-establishing a lost managed daemon exactly once.
     ///
-    /// A facade without `reconnect` (Codex, plain `--runtime-dir`, or startup failure) dispatches
+    /// A facade without `reconnect` (plain `--runtime-dir` or startup failure) dispatches
     /// once, matching prior behaviour. A facade with `reconnect` additionally treats a transport
-    /// `Unavailable` outcome as "the shared daemon may be gone": it re-runs the same launch-or-adopt
-    /// rendezvous this facade started with, stores the refreshed pair for itself and every later
-    /// call, and retries this one call exactly once more. There is no retry loop: a still-unavailable
-    /// retry, or a failed rendezvous, returns the original outcome.
+    /// `Unavailable` outcome as "the daemon may be gone": it calls the host's restart or rendezvous
+    /// hook, stores the refreshed pair for itself and every later call, and retries this call
+    /// exactly once. A failed hook reports re-establishment failure; a still-unavailable retry
+    /// reports transport unavailability. There is no retry loop.
     ///
     /// The returned flag is true only when that retried dispatch actually ran (T08B): the new
     /// daemon has no pre-hook observation for the call whose hook fired before it existed, so this
@@ -1330,10 +1331,10 @@ impl StdioFacade {
         context: &RequestContext<RoleServer>,
     ) -> (FacadeOutcome, bool) {
         let Some((runtime_dir, attachment)) = self.current_connection().await else {
-            return (FacadeOutcome::Unavailable, false);
+            return (FacadeOutcome::MissingHostMetadata, false);
         };
         let Some(host) = self.build_host(&attachment, context) else {
-            return (FacadeOutcome::Unavailable, false);
+            return (FacadeOutcome::MissingHostMetadata, false);
         };
         // Managed Codex only: publish this process's route before the first dispatch of every
         // valid call. Idempotent, so retried calls after publication failure still publish.
@@ -1349,7 +1350,7 @@ impl StdioFacade {
             return (outcome, false);
         }
         let Some((runtime_dir, attachment)) = (reconnect.reestablish)().await else {
-            return (outcome, false);
+            return (FacadeOutcome::ReestablishFailed, false);
         };
         reconnect
             .store(runtime_dir.clone(), attachment.clone())
@@ -1357,6 +1358,7 @@ impl StdioFacade {
         let Some(host) = self.build_host(&attachment, context) else {
             return (outcome, false);
         };
+        self.publish_codex_route(&context.meta).await;
         let retried = self
             .facade
             .dispatch_at(&runtime_dir, &host, tool, parameters)
@@ -1402,8 +1404,14 @@ impl StdioFacade {
             FacadeOutcome::InvalidParameters => {
                 "invalid bounded parameters; inspect the tool schema"
             }
+            FacadeOutcome::MissingHostMetadata => {
+                "Assistance host metadata or attachment is unavailable; continue with native tools"
+            }
             FacadeOutcome::Unavailable => {
-                "Assistance host attachment or daemon is unavailable; continue with native tools"
+                "Assistance daemon transport is unavailable; continue with native tools"
+            }
+            FacadeOutcome::ReestablishFailed => {
+                "Assistance daemon exited; re-establish failed; continue with native tools"
             }
             FacadeOutcome::Incomplete => {
                 "typed Assistance peer result is unavailable; continue with native tools"

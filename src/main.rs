@@ -8,6 +8,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::{Component, Path, PathBuf};
 use std::process::{ExitCode, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use agent_ide::app::{
@@ -1936,11 +1937,10 @@ async fn run_managed_mcp(
     }
 }
 
-/// Starts, health-checks, serves, and tears down one exclusively owned managed Codex generation.
+/// Starts, health-checks, serves, and tears down a managed Codex MCP's owned daemon generations.
 ///
-/// Codex retains its pre-existing single-owner contract unchanged: one random private runtime is
-/// created per MCP process, one daemon child is started and owned by it, and both are torn down on
-/// stdio EOF, MCP cancellation, SIGINT, or SIGTERM.
+/// Codex owns one daemon and private runtime at a time. It holds a lease while serving and replaces
+/// a failed daemon on the next call; EOF or a termination signal tears down the current generation.
 async fn run_managed_codex_mcp(
     launcher_template: PathBuf,
     candidate: std::io::Result<PathBuf>,
@@ -1967,25 +1967,142 @@ async fn run_managed_codex_mcp(
         Ok((attachment, child)) => {
             let child = Arc::new(Mutex::new(child));
             let publisher = managed_codex_publisher(&runtime.path, &attachment);
-            let facade = match &publisher {
-                Some(publisher) => {
-                    StdioFacade::with_managed_codex(runtime_path, attachment, Arc::clone(publisher))
-                }
-                None => StdioFacade::with_host_attachment(runtime_path, attachment),
-            };
-            let Some(facade) = facade else {
+            let lease = agent_ide::app::open_client_lease(&runtime_path, "managed-codex-mcp").await;
+            let Some(lease) = lease else {
                 terminate_owned_daemon(child).await;
                 let _ = runtime.remove();
                 return serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None)
                     .await;
             };
-            serve_managed_stdio(facade, Some(child), Some(runtime), None, publisher).await
+            let lease = Arc::new(Mutex::new(Some(lease)));
+            let runtime = Arc::new(Mutex::new(Some(runtime)));
+            let generation = Arc::new(AtomicU64::new(0));
+            let reconnect = codex_reestablish_hook(
+                launcher_template,
+                candidate,
+                Arc::clone(&child),
+                Arc::clone(&runtime),
+                Arc::clone(&lease),
+                publisher.clone(),
+                Arc::clone(&generation),
+            );
+            let facade = match &publisher {
+                Some(publisher) => StdioFacade::with_reestablishing_managed_codex(
+                    runtime_path,
+                    attachment,
+                    Arc::clone(publisher),
+                    reconnect,
+                ),
+                None => {
+                    StdioFacade::with_reestablishing_attachment(runtime_path, attachment, reconnect)
+                }
+            };
+            let Some(facade) = facade else {
+                terminate_owned_daemon(child).await;
+                if let Some(runtime) = runtime.lock().await.take() {
+                    let _ = runtime.remove();
+                }
+                return serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None)
+                    .await;
+            };
+            if let Some(publisher) = &publisher {
+                tokio::spawn(unpublish_when_daemon_exits(
+                    Arc::clone(&child),
+                    Arc::clone(publisher),
+                    generation,
+                    0,
+                ));
+            }
+            serve_managed_stdio(facade, Some(child), Some(runtime), Some(lease), publisher).await
         }
         Err(_) => {
             let _ = runtime.remove();
             serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None).await
         }
     }
+}
+
+/// Restarts this MCP's owned Codex daemon once after transport loss, restoring its lease and hooks.
+///
+/// The guard serializes concurrent calls; a healthy replacement is reused. The old generation is
+/// reaped before its fenced runtime is removed, and the publisher is rebound only after a fresh
+/// daemon and lease both exist. Failure leaves later calls free to try again.
+fn codex_reestablish_hook(
+    launcher_template: PathBuf,
+    candidate: PathBuf,
+    child: SharedChild,
+    runtime: Arc<Mutex<Option<ManagedRuntime>>>,
+    lease: Arc<Mutex<Option<UnixStream>>>,
+    publisher: Option<SharedCodexPublisher>,
+    generation: Arc<AtomicU64>,
+) -> ReestablishFn {
+    let restart = Arc::new(Mutex::new(()));
+    let current = Arc::new(Mutex::new(None::<(PathBuf, String)>));
+    Arc::new(move || {
+        let launcher_template = launcher_template.clone();
+        let candidate = candidate.clone();
+        let child = Arc::clone(&child);
+        let runtime = Arc::clone(&runtime);
+        let lease = Arc::clone(&lease);
+        let publisher = publisher.clone();
+        let generation = Arc::clone(&generation);
+        let restart = Arc::clone(&restart);
+        let current = Arc::clone(&current);
+        Box::pin(async move {
+            let _guard = restart.lock().await;
+            if let Some(connection) = current.lock().await.clone()
+                && doctor_report(&connection.0)
+                    .await
+                    .is_ok_and(|report| matches!(report.status, DoctorStatus::Healthy { .. }))
+            {
+                return Some(connection);
+            }
+            terminate_owned_daemon(Arc::clone(&child)).await;
+            *lease.lock().await = None;
+            if let Some(old) = runtime.lock().await.take() {
+                let _ = old.remove();
+            }
+            let fresh = ManagedRuntime::create().ok()?;
+            let path = fresh.path.clone();
+            let started = start_managed_daemon(
+                &fresh,
+                &launcher_template,
+                &candidate,
+                &candidate,
+                ManagedHost::Codex,
+            )
+            .await;
+            let Ok((attachment, new_child)) = started else {
+                let _ = fresh.remove();
+                return None;
+            };
+            let Some(connection) =
+                agent_ide::app::open_client_lease(&path, "managed-codex-mcp").await
+            else {
+                terminate_owned_daemon(Arc::new(Mutex::new(new_child))).await;
+                let _ = fresh.remove();
+                return None;
+            };
+            *child.lock().await = new_child;
+            *runtime.lock().await = Some(fresh);
+            *lease.lock().await = Some(connection);
+            if let Some(publisher) = publisher {
+                let mut publisher_lock = publisher.lock().expect("managed codex publisher mutex");
+                let next = generation.fetch_add(1, Ordering::AcqRel) + 1;
+                publisher_lock.rebind(path.clone(), attachment.clone());
+                drop(publisher_lock);
+                tokio::spawn(unpublish_when_daemon_exits(
+                    Arc::clone(&child),
+                    publisher,
+                    Arc::clone(&generation),
+                    next,
+                ));
+            }
+            let connection = (path, attachment);
+            *current.lock().await = Some(connection.clone());
+            Some(connection)
+        })
+    })
 }
 
 /// Creates this MCP process's managed Codex rendezvous publisher, if a rendezvous root resolves.
@@ -2397,26 +2514,18 @@ async fn health_check_owned_daemon(child: &mut tokio::process::Child, runtime: &
 
 /// Serves one static MCP facade and always cleans up an optional owned daemon/runtime generation.
 ///
-/// `lease` is an optional held-open `ClientLease` connection (Claude only), refreshed in place by
-/// [`claude_reestablish_hook`] on every reconnect; it is dropped once serving ends, whatever the
+/// `lease` is an optional held-open `ClientLease` connection, refreshed in place by the managed
+/// host's re-establish hook; it is dropped once serving ends, whatever the
 /// reason, which is the client-side EOF that releases the daemon's lease count (EYES-r2 §2).
 /// `publisher` is the managed Codex route publisher (Codex only): its records are retired before
 /// the owned daemon is terminated and its runtime removed, on every exit path including signals.
 async fn serve_managed_stdio(
     facade: StdioFacade,
     child: Option<SharedChild>,
-    runtime: Option<ManagedRuntime>,
+    runtime: Option<Arc<Mutex<Option<ManagedRuntime>>>>,
     lease: Option<Arc<Mutex<Option<UnixStream>>>>,
     publisher: Option<SharedCodexPublisher>,
 ) -> ExitCode {
-    // If the owned daemon exits while the MCP keeps serving, hooks must stop discovering this
-    // process's records immediately instead of failing against a dead socket (T29B §2).
-    if let (Some(child), Some(publisher)) = (&child, &publisher) {
-        tokio::spawn(unpublish_when_daemon_exits(
-            Arc::clone(child),
-            Arc::clone(publisher),
-        ));
-    }
     let served = match serve_server(facade, stdio()).await {
         Ok(service) => {
             tokio::select! {
@@ -2437,7 +2546,9 @@ async fn serve_managed_stdio(
     if let Some(child) = child {
         terminate_owned_daemon(child).await;
     }
-    if let Some(runtime) = runtime {
+    if let Some(runtime) = runtime
+        && let Some(runtime) = runtime.lock().await.take()
+    {
         let _ = runtime.remove();
     }
     if served {
@@ -2453,24 +2564,30 @@ async fn serve_managed_stdio(
 /// the exit observer can always retry its non-blocking attempt.
 type SharedChild = Arc<Mutex<tokio::process::Child>>;
 
-/// Permanently retires the managed Codex publication once the owned daemon child exit is observed
-/// (T29B §2, final review 3).
+/// Retires one managed Codex daemon generation's routes when its owned child exits.
 ///
-/// The daemon may exit on its own while its MCP process keeps serving; its records must then stop
-/// being discoverable, and no later MCP call may re-publish a route to the dead daemon. The child
-/// lock is taken only for the bounded synchronous probe, so the final owned teardown at MCP exit
-/// is never delayed; the publisher's own lock is quiet and never held elsewhere at that moment.
-async fn unpublish_when_daemon_exits(child: SharedChild, publisher: SharedCodexPublisher) {
+/// A replacement generation increments `generation` while holding the publisher lock, so this
+/// observer cannot retire the replacement's routes after the reconnect hook republishes them.
+/// The child lock is taken only for a non-blocking probe; MCP teardown can still reap it.
+async fn unpublish_when_daemon_exits(
+    child: SharedChild,
+    publisher: SharedCodexPublisher,
+    generation: Arc<AtomicU64>,
+    expected: u64,
+) {
     loop {
         tokio::time::sleep(Duration::from_millis(50)).await;
+        if generation.load(Ordering::Acquire) != expected {
+            return;
+        }
         let Ok(mut child) = child.try_lock() else {
             continue;
         };
         if matches!(child.try_wait(), Ok(Some(_))) {
-            publisher
-                .lock()
-                .expect("managed codex publisher mutex")
-                .retire();
+            let mut publisher = publisher.lock().expect("managed codex publisher mutex");
+            if generation.load(Ordering::Acquire) == expected {
+                publisher.retire();
+            }
             return;
         }
     }
@@ -3262,6 +3379,8 @@ mod tests {
         tokio::spawn(unpublish_when_daemon_exits(
             Arc::clone(&child),
             Arc::clone(&shared_publisher),
+            Arc::new(AtomicU64::new(0)),
+            0,
         ));
         tokio::time::timeout(Duration::from_secs(5), async {
             let mut child = child.lock().await;

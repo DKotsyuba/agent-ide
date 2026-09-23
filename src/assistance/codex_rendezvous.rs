@@ -79,7 +79,7 @@ pub enum PublishError {
     Contended,
     /// A transient filesystem failure prevented publication; no partial record was left live.
     Unavailable,
-    /// The publisher was permanently retired by its teardown; publication is refused.
+    /// This daemon generation was retired; publication waits for a replacement rebind.
     Retired,
 }
 
@@ -258,16 +258,19 @@ impl Publication {
 
 /// Publishes and retires the actor routes of one managed Codex MCP process (T29B §2).
 ///
-/// The rendezvous root and runtime directory are fixed at construction (the root is injectable for
-/// tests; production callers pass [`default_root`]). Every successful [`publish`](Self::publish)
+/// The rendezvous root is fixed at construction (the root is injectable for tests; production
+/// callers pass [`default_root`]). A replacement daemon can update the runtime and attachment
+/// through [`Self::rebind`]. Every successful [`publish`](Self::publish)
 /// retains the locked record descriptor, so dropping the publisher — or an explicit
-/// [`retire`](Self::retire) — retires discovery immediately and permanently, while an MCP crash
-/// leaves only inert unlocked leftovers that a later publisher may prune.
+/// [`retire`](Self::retire) — retires discovery immediately. The owning MCP may rebind its known
+/// routes after replacing a failed daemon; an MCP crash leaves only inert unlocked leftovers.
 pub struct ManagedCodexPublisher {
     root: PathBuf,
     runtime_dir: PathBuf,
     attachment: String,
     publications: Vec<Publication>,
+    /// Routes to restore after this MCP replaces a failed owned daemon.
+    identities: Vec<CodexRouteIdentity>,
     retired: bool,
 }
 
@@ -283,6 +286,7 @@ impl ManagedCodexPublisher {
             runtime_dir,
             attachment: attachment.into(),
             publications: Vec::new(),
+            identities: Vec::new(),
             retired: false,
         }
     }
@@ -372,7 +376,24 @@ impl ManagedCodexPublisher {
             record,
             route_dir,
         });
+        if !self.identities.contains(identity) {
+            self.identities.push(identity.clone());
+        }
         Ok(())
+    }
+
+    /// Replaces a dead daemon's route target and republishes this MCP's known actors.
+    ///
+    /// The caller holds the publisher mutex while changing its generation; failed publications
+    /// remain retryable on the next actor call. Teardown's permanent retirement is separate.
+    pub fn rebind(&mut self, runtime_dir: PathBuf, attachment: String) {
+        self.unpublish_all();
+        self.runtime_dir = runtime_dir;
+        self.attachment = attachment;
+        self.retired = false;
+        for identity in self.identities.clone() {
+            let _ = self.publish(&identity);
+        }
     }
 
     /// Unpublishes every retained record: only the captured nonce files, never successors, and
@@ -383,14 +404,12 @@ impl ManagedCodexPublisher {
         }
     }
 
-    /// Permanently retires this publisher, then drains its records (T29B final review 3).
+    /// Retires the current daemon generation's records until an explicit [`Self::rebind`].
     ///
     /// Teardown calls this instead of — never in addition to — [`unpublish_all`](Self::unpublish_all):
     /// the retired flag is set first, under the same publisher mutex every [`publish`](Self::publish)
-    /// attempt takes, so a queued publication racing the daemon-exit observer, and every later call,
-    /// is refused with [`PublishError::Retired`] and publishes nothing. A discoverable dead route
-    /// can therefore never reappear after teardown began. Retirement lasts for the publisher's
-    /// remaining lifetime; the route directories stay behind for a later process exactly as before.
+    /// attempt takes, so queued publication against a dead daemon is refused. Rebinding happens
+    /// only after a replacement daemon and lease are live; the route directories remain reusable.
     pub fn retire(&mut self) {
         self.retired = true;
         self.unpublish_all();

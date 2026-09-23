@@ -606,7 +606,7 @@ async fn binary_routes_six_methods_to_typed_missing_peer_and_survives_daemon_los
         no_metadata["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("host attachment or daemon")
+            .contains("host metadata or attachment")
     );
     for (index, (name, arguments)) in [
         ("ide.start", json!({"activation_id":"activate"})),
@@ -655,7 +655,7 @@ async fn binary_routes_six_methods_to_typed_missing_peer_and_survives_daemon_los
         lost["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("host attachment or daemon")
+            .contains("daemon transport is unavailable")
     );
     mcp.close().await;
     std::fs::remove_dir_all(runtime).unwrap();
@@ -1006,7 +1006,7 @@ async fn binary_codex_hooks_bind_exact_parallel_actors_and_stop_before_workspace
         &root
             .exchange(host_call("root", "daemon-lost", "ide.start"))
             .await,
-        "host attachment or daemon",
+        "daemon transport is unavailable",
     );
     tokio::join!(root.close(), child.close());
     std::fs::remove_dir_all(runtime).unwrap();
@@ -2859,12 +2859,10 @@ async fn managed_codex_publishes_distinct_actor_routes_and_retires_them_on_shutd
     std::fs::remove_dir_all(base).unwrap();
 }
 
-/// Retirement is permanent when the owned daemon dies while the MCP process keeps serving
-/// (T29B final review 3): the daemon-exit observer retires the publication, and a further MCP
-/// call — whose dispatch would otherwise re-publish idempotently — must not re-create a
-/// discoverable record for the dead daemon.
+/// A dead owned daemon retires its route promptly; the next call starts a fresh daemon and
+/// republishes the same actor route so native hooks can find it again.
 #[tokio::test]
-async fn managed_codex_daemon_exit_keeps_the_route_retired() {
+async fn managed_codex_daemon_exit_reestablishes_and_republishes_the_route() {
     let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
     let fixture = ProductFixture::new(json!([]));
     let base = rendezvous_area("daemon-exit-retire");
@@ -2921,31 +2919,71 @@ async fn managed_codex_daemon_exit_keeps_the_route_retired() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // A further MCP call still gets an honest reply and must not re-create a discoverable
-    // record for the dead daemon: publication is permanently retired.
+    // The next call restarts the owned daemon and restores this known route.
     next += 1;
-    let reply = mcp
-        .exchange(
-            json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.context",
-            "arguments":{"kind":"problems"},
-            "_meta":{"threadId":actor,"callId":format!("managed-{actor}-{next}"),
-            "x-codex-turn-metadata":{"session_id":session},"codex/sandbox-state-meta":state}}}),
-        )
-        .await;
-    assert_eq!(reply["result"]["isError"], true, "{reply}");
+    let reply = managed_root_call(
+        &mut mcp,
+        next,
+        actor,
+        session,
+        "ide.start",
+        json!({"activation_id":"after-daemon-restart"}),
+        &state,
+    )
+    .await;
+    let reply = settle_managed(&mut mcp, &mut next, actor, &state, reply).await;
+    assert_eq!(reply["kind"], "activation", "{reply}");
     assert!(
-        reply["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("continue with native tools"),
-        "{reply}"
-    );
-    assert!(
-        discover(&root, &identity).is_none(),
-        "a further MCP call re-published a dead daemon's route"
+        discover(&root, &identity).is_some(),
+        "a re-established daemon needs its native-hook route"
     );
     mcp.close().await;
     std::fs::remove_dir_all(base).unwrap();
+}
+
+/// A live managed Codex MCP holds a lease, so an idle daemon survives its launcher timeout and
+/// still answers another activation after the session has made no calls for longer than 30 seconds.
+#[tokio::test]
+async fn managed_codex_lease_keeps_daemon_alive_past_idle_timeout() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let fixture = ProductFixture::new(json!([]));
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+    config["project_checks"] = json!({"idle_timeout_s":30});
+    std::fs::write(&fixture.config, config.to_string()).unwrap();
+    let mut mcp = Mcp::start_managed(&fixture.config, &fixture.root).await;
+    let state = fixture.state();
+    let actor = "managed-idle";
+    let mut next = 10;
+    let first = managed_call(
+        &mut mcp,
+        next,
+        actor,
+        "ide.start",
+        json!({"activation_id":"before-idle"}),
+        &state,
+    )
+    .await;
+    let first = settle_managed(&mut mcp, &mut next, actor, &state, first).await;
+    assert_eq!(first["kind"], "activation", "{first}");
+    tokio::time::sleep(Duration::from_secs(32)).await;
+    next += 1;
+    let stopped = managed_call(&mut mcp, next, actor, "ide.stop", json!({}), &state).await;
+    let stopped = settle_managed(&mut mcp, &mut next, actor, &state, stopped).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    next += 1;
+    let after = managed_call(
+        &mut mcp,
+        next,
+        actor,
+        "ide.start",
+        json!({"activation_id":"after-idle"}),
+        &state,
+    )
+    .await;
+    let after = settle_managed(&mut mcp, &mut next, actor, &state, after).await;
+    assert_eq!(after["kind"], "activation", "{after}");
+    mcp.close().await;
 }
 
 /// A publication failure (unusable rendezvous root) never touches managed MCP replies.

@@ -73,11 +73,9 @@ impl LeaseController {
 
     /// Reports one served client call, restarting the idle countdown from now (T26B).
     ///
-    /// A lease-free client session (the managed Codex MCP owns its per-session daemon outright and
-    /// holds no `ClientLease` at all) is visible to the daemon only through the calls it serves.
-    /// Every served Assistance call counts as activity, so a session that made a call within the
-    /// idle window is never idled out mid-conversation; a session that goes completely silent
-    /// still lets the daemon exit after exactly one full idle timeout, unchanged from EYES-r2 §2.
+    /// A lease-free client is visible only through calls it serves. Every served Assistance call
+    /// counts as activity, so a call restarts the idle window while no lease is open. Managed MCPs
+    /// hold leases for their lifetimes and suppress this countdown altogether.
     pub fn mark_activity(&self) {
         *self.0.became_idle_at.lock().unwrap() = Some(Instant::now());
         self.0.changed.notify_waiters();

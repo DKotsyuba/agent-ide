@@ -90,6 +90,12 @@ with the existing launcher configuration error.
 - Idle: when the lease count is 0 and no check is running, the daemon starts `idle_timeout_s`.
   A new lease cancels the timer. On expiry the daemon cancels checks, kills their process groups,
   closes the socket and removes its runtime directory.
+- A managed Codex MCP owns a private daemon and holds one `ClientLease` for its entire lifetime,
+  so the daemon does not idle out while the session is open. If transport is lost after a daemon
+  exit or crash, the next call starts one replacement owned daemon, opens a new lease, republishes
+  its known native-hook actor routes against the new runtime and retries the call once. A failed
+  restart reports daemon re-establishment failure; missing host metadata is reported separately.
+  MCP exit retires routes, terminates the current owned daemon and removes its private runtime.
 - The existing per-call IPC (hook submit and the five assistance methods) is unchanged.
 - Client-side re-establishment: a Claude MCP server never caches a dead connection. Each tool call
   dispatches against the live `runtime_dir`/attachment pair it currently holds; if that dispatch
