@@ -242,10 +242,7 @@ fn render_text(reply: &PeerReply) -> String {
             kind: ResultKind::Context,
             text,
             ..
-        } => format!(
-            "complete context: {text}\nNo edit source was observed; use ide.context \
-             with a path before ide.edit"
-        ),
+        } => format!("complete context: {text}"),
         PeerReply::Complete {
             kind: ResultKind::Diff,
             text,
@@ -326,7 +323,7 @@ fn render_edit(result: &EditResult, diagnostics: &EditDiagnostics) -> String {
             }
         }
         EditOutcome::StaleSource => format!(
-            "edit: {outcome}; path {}. No write occurred. The source_ref is incomplete or \
+            "edit: {outcome}; path {}. No write occurred. The source reference is incomplete or \
              unavailable for this binding, or the file content/presence changed since context; \
              a newer observation alone does not invalidate unchanged content. Use ide.context \
              before another edit, and read every page of a paged context (ide.inspect) first",
@@ -653,6 +650,7 @@ mod tests {
         assert!(text.contains("No write occurred"));
         assert!(text.contains("content/presence changed"));
         assert!(text.contains("newer observation alone does not invalidate"));
+        assert!(!text.contains("source_ref "));
     }
 
     /// Keeps exact truncated references in model text and omits unrelated structured field names.
@@ -708,9 +706,9 @@ mod tests {
         }
     }
 
-    /// A problems Context has no source observation and cannot advertise an edit reference.
+    /// A problems Context keeps its v0.2 text without advertising an edit reference.
     #[test]
-    fn context_without_source_directs_to_path_context() {
+    fn context_without_source_keeps_bare_content() {
         let rendered = render(
             PeerReply::Complete {
                 kind: ResultKind::Context,
@@ -723,9 +721,7 @@ mod tests {
         )
         .unwrap();
         let text = text_of(&rendered);
-        assert!(text.contains("No edit source was observed"));
-        assert!(text.contains("use ide.context with a path"));
-        assert!(!text.contains("source_ref "));
+        assert_eq!(text, "complete context: python: unavailable:env_missing");
     }
 
     /// Recommends inspection only for a typed retained continuation, never merely for a handle.
