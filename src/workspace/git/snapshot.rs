@@ -40,8 +40,11 @@ pub const MAX_SNAPSHOT_PATHS: usize = 256;
 pub const MAX_SNAPSHOT_PATH_BYTES: usize = 64 * 1024;
 /// Maximum bytes for one immutable blob or exact worktree source read.
 pub const MAX_SNAPSHOT_BLOB_BYTES: usize = 1024 * 1024;
-/// Maximum aggregate bytes of distinct blobs and worktree sources per attempt.
+/// Maximum aggregate retained changed-source and distinct comparison-blob bytes per attempt.
 pub const MAX_SNAPSHOT_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum transient source bytes read and hashed before unchanged candidates are discarded.
+/// ponytail: 64 MiB in-memory ceiling; stream source hashing if large converted trees need it.
+pub const MAX_SNAPSHOT_HASH_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum aggregate retained patch bytes across every path in one attempt.
 pub const MAX_SNAPSHOT_PATCH_BYTES: usize = 1024 * 1024;
 /// Target scratch-argv bytes of one batched `hash-object` command. Every managed sandbox replay
@@ -50,6 +53,17 @@ pub const MAX_SNAPSHOT_PATCH_BYTES: usize = 1024 * 1024;
 /// more bounded child. This is the packing goal only — the hard ceiling is
 /// [`crate::execution::MAX_PRODUCT_ARGV_BYTES`].
 const MAX_HASH_BATCH_ARGV_BYTES: usize = 4096;
+/// Input bytes per filter-free attribute query; six output triples per path remain below 1 MiB.
+const MAX_ATTR_BATCH_PATH_BYTES: usize = 4096;
+/// Conversion attributes whose set/value states can change raw worktree versus index bytes.
+const CONVERSION_ATTRIBUTES: [&str; 6] = [
+    "text",
+    "crlf",
+    "eol",
+    "ident",
+    "filter",
+    "working-tree-encoding",
+];
 /// Fixed non-path arguments every batched `hash-object` command starts with; the argv budget
 /// counts these exact strings plus one canonical scratch path per entry.
 const HASH_BATCH_FLAGS: [&str; 7] = [
@@ -261,6 +275,7 @@ impl SnapshotIntent {
             GitReadQuery::IndexPath => "git-path-index",
             GitReadQuery::AutoCrlf => "config-autocrlf",
             GitReadQuery::AttributesFile => "config-attributes",
+            GitReadQuery::CoreEol => "config-eol",
             GitReadQuery::Status
             | GitReadQuery::HeadDiff
             | GitReadQuery::StagedDiff
@@ -296,6 +311,58 @@ impl SnapshotIntent {
             directory: None,
             differences_allowed: false,
             label: "cat-file",
+        })
+    }
+
+    /// Evaluates fixed conversion attributes for a bounded batch of trusted raw paths. The
+    /// NUL-delimited path list is an already-open private stdin file, never shell text or argv.
+    fn attributes(scope: &GitScope, program: &Path, paths: &[PathBuf]) -> Result<Self, GitError> {
+        let directory = SnapshotDirectory::new(scope)?;
+        let mut input = Vec::new();
+        for path in paths {
+            if !crate::workspace::observation::valid_relative_path(path) {
+                return Err(GitError::InvalidPorcelain);
+            }
+            input.extend(path.as_os_str().as_bytes());
+            input.push(0);
+        }
+        if input.is_empty() || input.len() > MAX_ATTR_BATCH_PATH_BYTES {
+            return Err(GitError::EvidenceTooLarge);
+        }
+        directory.write("paths", &input)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(directory.path.join("paths"))
+            .map_err(|_| GitError::SnapshotIo)?;
+        let mut args: Vec<OsString> = [
+            "--no-pager",
+            "--no-lazy-fetch",
+            "-c",
+            "core.fsmonitor=false",
+            "check-attr",
+            "-z",
+            "--stdin",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        args.extend(CONVERSION_ATTRIBUTES.into_iter().map(Into::into));
+        let command = ControlledCommand::from_validated_peer(
+            CommandKind::Git,
+            program.to_path_buf(),
+            args,
+            scope.worktree().worktree_path().to_path_buf(),
+            safe_git_environment(),
+        )
+        .map_err(|_| GitError::InvalidGitProgram)?
+        .with_private_stdin(file);
+        Ok(Self {
+            scope: scope.clone(),
+            command,
+            directory: Some(directory),
+            differences_allowed: false,
+            label: "check-attr",
         })
     }
     /// Returns whether this intent is a no-index comparison rather than metadata/blob verification.
@@ -797,7 +864,7 @@ async fn metadata<R: SnapshotRunner>(
     scope: &GitScope,
     program: &Path,
     runner: &mut R,
-) -> Result<[Vec<u8>; 8], GitError> {
+) -> Result<[Vec<u8>; 9], GitError> {
     let mut result = std::array::from_fn(|_| Vec::new());
     for (slot, query) in [
         GitReadQuery::HeadIdentity,
@@ -808,6 +875,7 @@ async fn metadata<R: SnapshotRunner>(
         GitReadQuery::IndexPath,
         GitReadQuery::AutoCrlf,
         GitReadQuery::AttributesFile,
+        GitReadQuery::CoreEol,
     ]
     .into_iter()
     .enumerate()
@@ -1075,9 +1143,9 @@ async fn attribute_file_exists<R: SnapshotRunner>(
     Ok(exists)
 }
 
-/// Returns whether repository or ancestor attributes may transform this path's worktree bytes.
-/// Tracked attribute files count even when missing locally because Git may use the index copy.
-/// ponytail: any applicable file forces raw capture; batch Git attribute resolution if this hits the byte cap.
+/// Returns whether repository or ancestor attribute files may apply to this path and need a
+/// batched Git attribute query. Tracked files count even when missing locally because Git may
+/// use the index copy; every native probe receives a live read proof.
 async fn path_has_attributes<R: SnapshotRunner>(
     scope: &GitScope,
     path: &Path,
@@ -1090,13 +1158,94 @@ async fn path_has_attributes<R: SnapshotRunner>(
     }
     for parent in path.ancestors().skip(1) {
         let candidate = parent.join(".gitattributes");
-        if tracked.contains(&candidate)
-            || attribute_file_exists(scope, &candidate, runner, cache).await?
-        {
+        let present = attribute_file_exists(scope, &candidate, runner, cache).await?;
+        if present || tracked.contains(&candidate) {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// Parses exact NUL path/attribute/value triples in request order. Only set/value conversion
+/// attributes can alter raw bytes; `unset` and `unspecified` do not. `core.eol` matters only when
+/// `text`/`eol` is set, which already forces capture. `core.autocrlf` applies unless text is unset.
+fn parse_attribute_values(
+    output: &[u8],
+    paths: &[PathBuf],
+    auto_crlf: bool,
+) -> Result<Vec<bool>, GitError> {
+    if !output.ends_with(&[0]) {
+        return Err(GitError::InvalidPorcelain);
+    }
+    let fields: Vec<&[u8]> = output.split(|byte| *byte == 0).collect();
+    if fields.len() != paths.len() * CONVERSION_ATTRIBUTES.len() * 3 + 1 {
+        return Err(GitError::InvalidPorcelain);
+    }
+    let mut changed = Vec::with_capacity(paths.len());
+    let mut offset = 0;
+    for path in paths {
+        let mut conversion = false;
+        let mut text_unset = false;
+        let mut crlf_unset = false;
+        for (attribute, expected) in CONVERSION_ATTRIBUTES.iter().enumerate() {
+            let triple = &fields[offset..offset + 3];
+            if triple[0] != path.as_os_str().as_bytes() || triple[1] != expected.as_bytes() {
+                return Err(GitError::InvalidPorcelain);
+            }
+            let value = triple[2];
+            if attribute == 0 {
+                text_unset = value == b"unset";
+            } else if attribute == 1 {
+                crlf_unset = value == b"unset";
+            }
+            conversion |= value != b"unspecified" && value != b"unset";
+            offset += 3;
+        }
+        changed.push(conversion || (auto_crlf && !text_unset && !crlf_unset));
+    }
+    Ok(changed)
+}
+
+/// Runs bounded NUL-stdin batches through the same controlled Git runner as other snapshot
+/// intents, returning exact output for the final consistency bracket and per-path conversion.
+async fn check_attribute_batches<R: SnapshotRunner>(
+    scope: &GitScope,
+    program: &Path,
+    paths: &[PathBuf],
+    auto_crlf: bool,
+    runner: &mut R,
+) -> Result<(BTreeMap<PathBuf, bool>, Vec<Vec<u8>>), GitError> {
+    let mut values = BTreeMap::new();
+    let mut outputs = Vec::new();
+    let mut start = 0;
+    while start < paths.len() {
+        let mut end = start;
+        let mut bytes = 0;
+        while end < paths.len() {
+            let size = paths[end].as_os_str().as_bytes().len() + 1;
+            if size > MAX_ATTR_BATCH_PATH_BYTES {
+                return Err(GitError::EvidenceTooLarge);
+            }
+            if end > start && bytes + size > MAX_ATTR_BATCH_PATH_BYTES {
+                break;
+            }
+            bytes += size;
+            end += 1;
+        }
+        let batch = &paths[start..end];
+        let intent = SnapshotIntent::attributes(scope, program, batch)?;
+        let output = intent.accept(runner.run(intent.clone()).await?)?;
+        for (path, conversion) in batch
+            .iter()
+            .cloned()
+            .zip(parse_attribute_values(&output, batch, auto_crlf)?)
+        {
+            values.insert(path, conversion);
+        }
+        outputs.push(output);
+        start = end;
+    }
+    Ok((values, outputs))
 }
 
 /// Assembles one generation from safe plumbing and exact raw file reads under aggregate budgets.
@@ -1145,11 +1294,14 @@ async fn capture_attempt<R: SnapshotRunner>(
         return Err(GitError::InvalidPorcelain);
     }
     // HEAD/index identities select staged paths. For otherwise identical paths, compare a
-    // no-follow native stat with Git's index fingerprint. Stat equality skips byte capture only
-    // when conversion configuration and applicable attribute files cannot change raw bytes.
+    // no-follow native stat with Git's index fingerprint. A stat match skips byte capture only
+    // after bounded attribute resolution shows raw bytes cannot be converted.
     let mut union = std::collections::BTreeSet::new();
-    let raw_config = before[6] == b"false\n" && before[7] == b"/dev/null\n";
+    let auto_crlf = before[6] != b"false\n";
+    let configured_attributes = before[7] != b"/dev/null\n";
     let mut attributes = BTreeMap::new();
+    let mut attribute_sources = BTreeMap::new();
+    let mut attribute_paths = Vec::new();
     for path in &tracked {
         let staged = head_entries.get(path) != index_entries.get(path);
         let changed = if staged {
@@ -1162,13 +1314,19 @@ async fn capture_attempt<R: SnapshotRunner>(
                     let index = index_entries[path]
                         .get(&0)
                         .expect("equal HEAD/index has stage zero");
-                    if !raw_config
-                        || index_stats[path][0].needs_bytes(index_timestamp)
+                    if index_stats[path][0].needs_bytes(index_timestamp)
                         || !index_stats[path][0].matches(&metadata, index.mode)
                     {
                         true
                     } else {
-                        path_has_attributes(&scope, path, &tracked, runner, &mut attributes).await?
+                        let present =
+                            path_has_attributes(&scope, path, &tracked, runner, &mut attributes)
+                                .await?;
+                        attribute_sources.insert(path.clone(), present);
+                        if present || configured_attributes || auto_crlf {
+                            attribute_paths.push(path.clone());
+                        }
+                        false
                     }
                 }
                 Err(ObservationError::RootIdentityChanged) => {
@@ -1181,6 +1339,13 @@ async fn capture_attempt<R: SnapshotRunner>(
             union.insert(path.clone());
         }
     }
+    let (conversion, attribute_output) =
+        check_attribute_batches(&scope, program, &attribute_paths, auto_crlf, runner).await?;
+    union.extend(
+        conversion
+            .into_iter()
+            .filter_map(|(path, applies)| applies.then_some(path)),
+    );
     let clean: Vec<_> = tracked.difference(&union).cloned().collect();
     if !before[3].is_empty() && !before[3].ends_with(&[0]) {
         return Err(GitError::InvalidPorcelain);
@@ -1224,7 +1389,8 @@ async fn capture_attempt<R: SnapshotRunner>(
     // bytes are fetched later, only for sides a selected comparison actually needs.
     let mut paths = Vec::new();
     let mut sources = BTreeMap::new();
-    let mut total_bytes = 0usize;
+    let mut hashed_bytes = 0usize;
+    let mut retained_bytes = 0usize;
     let mut patch_bytes = 0usize;
     let mut working = blake3::Hasher::new();
     for path in &union {
@@ -1262,8 +1428,8 @@ async fn capture_attempt<R: SnapshotRunner>(
         runner.authorize_read_path(path).await?;
         let source =
             SnapshotSource::capture(scope.worktree(), scope.authority_epoch(), path, current)?;
-        total_bytes += source.contents().len();
-        if total_bytes > MAX_SNAPSHOT_TOTAL_BYTES {
+        hashed_bytes += source.contents().len();
+        if hashed_bytes > MAX_SNAPSHOT_HASH_BYTES {
             return Err(GitError::EvidenceTooLarge);
         }
         let mode_w = source.read.as_ref().map_or(0, SourceRead::git_mode);
@@ -1370,6 +1536,12 @@ async fn capture_attempt<R: SnapshotRunner>(
         if !selected {
             continue;
         }
+        if scope.mode() != DiffMode::Staged {
+            retained_bytes += source.contents().len();
+            if retained_bytes > MAX_SNAPSHOT_TOTAL_BYTES {
+                return Err(GitError::EvidenceTooLarge);
+            }
+        }
         status.tracked.push(entry.clone());
         // Left is always a committed/index side; right is a blob only for `Staged`, whose absent
         // side compares as empty bytes rather than the working-tree content.
@@ -1407,8 +1579,8 @@ async fn capture_attempt<R: SnapshotRunner>(
     for oid in needed {
         let intent = SnapshotIntent::blob(scope.clone(), program, &oid)?;
         let bytes = intent.accept(runner.run(intent.clone()).await?)?;
-        total_bytes += bytes.len();
-        if total_bytes > MAX_SNAPSHOT_TOTAL_BYTES {
+        retained_bytes += bytes.len();
+        if retained_bytes > MAX_SNAPSHOT_TOTAL_BYTES {
             return Err(GitError::EvidenceTooLarge);
         }
         fetched.push((oid.clone(), bytes.clone()));
@@ -1472,12 +1644,19 @@ async fn capture_attempt<R: SnapshotRunner>(
         let index = index_entries[path]
             .get(&0)
             .expect("clean path has stage zero");
+        let attrs =
+            path_has_attributes(&scope, path, &tracked, runner, &mut after_attributes).await?;
         if index_stats[path][0].needs_bytes(index_timestamp)
             || !index_stats[path][0].matches(&metadata, index.mode)
-            || path_has_attributes(&scope, path, &tracked, runner, &mut after_attributes).await?
+            || attribute_sources.get(path) != Some(&attrs)
         {
             return Err(GitError::UnstableSnapshot);
         }
+    }
+    let (_, after_attribute_output) =
+        check_attribute_batches(&scope, program, &attribute_paths, auto_crlf, runner).await?;
+    if after_attribute_output != attribute_output {
+        return Err(GitError::UnstableSnapshot);
     }
     for entry in status.untracked() {
         runner.authorize_read_path(entry.path()).await?;
@@ -1494,6 +1673,10 @@ async fn capture_attempt<R: SnapshotRunner>(
     for component in &before[1..] {
         working.update(&(component.len() as u64).to_le_bytes());
         working.update(component);
+    }
+    for output in &attribute_output {
+        working.update(&(output.len() as u64).to_le_bytes());
+        working.update(output);
     }
     let work = evidence_identity(
         b"workspace-git-raw-working-v1",

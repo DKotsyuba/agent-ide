@@ -1027,9 +1027,9 @@ async fn unchanged_paths_cost_no_per_path_blob_commands() {
     let snapshot = collect(&fixture, DiffMode::Unstaged, &mut runner)
         .await
         .unwrap();
-    // 16 metadata + 1 worktree hash + 1 cat-file + 1 blob verification + 1 comparison.
+    // 18 metadata + 1 worktree hash + 1 cat-file + 1 blob verification + 1 comparison.
     assert!(
-        runner.operations <= 20,
+        runner.operations <= 22,
         "sandboxed spawns must stay bounded, got {}",
         runner.operations
     );
@@ -1087,6 +1087,87 @@ async fn converted_worktree_diff_is_stable_across_stat_only_touch() {
         );
         assert_eq!(after.paths()[0].patch(), before.paths()[0].patch());
     }
+}
+
+/// Irrelevant root rules and a nonexistent configured file do not pull clean bulk into capture.
+#[tokio::test]
+async fn irrelevant_attributes_keep_a_large_repository_bounded_by_changes() {
+    let fixture = GitFixture::unborn();
+    fixture.git(["config", "user.email", "attributes@example.invalid"]);
+    fixture.git(["config", "user.name", "Attributes Fixture"]);
+    fixture.write(b".gitattributes", b"*.png binary\n*.png export-ignore\n");
+    fs::create_dir(fixture.root.join("nested")).unwrap();
+    fixture.write(b"nested/.gitattributes", b"*.txt text eol=crlf\n");
+    for n in 0..600 {
+        fixture.write(
+            format!("tracked-{n:03}.txt").as_bytes(),
+            &vec![b'x'; 16 * 1024],
+        );
+    }
+    fixture.write(b"large.png", &vec![b'p'; 2 * 1024 * 1024]);
+    fixture.git(["add", "."]);
+    fixture.git(["commit", "--quiet", "-m", "large baseline"]);
+    let mut runner = Runner::default();
+    let clean = collect(&fixture, DiffMode::Head, &mut runner)
+        .await
+        .unwrap();
+    assert!(clean.paths().is_empty());
+    assert_eq!(
+        runner.hashes, 0,
+        "nested text rules must not affect root files"
+    );
+    let missing = fixture.root.join("missing-attributes");
+    fixture.git_os([
+        OsString::from("config"),
+        OsString::from("core.attributesFile"),
+        missing.into_os_string(),
+    ]);
+    let mut runner = Runner::default();
+    let configured_clean = collect(&fixture, DiffMode::Head, &mut runner)
+        .await
+        .unwrap();
+    assert!(configured_clean.paths().is_empty());
+    assert_eq!(
+        runner.hashes, 0,
+        "a missing configured file cannot force hashing"
+    );
+    fixture.write(b"tracked-123.txt", b"changed\n");
+    let changed = collect(&fixture, DiffMode::Head, &mut Runner::default())
+        .await
+        .unwrap();
+    assert_eq!(changed.paths().len(), 1);
+    assert_eq!(
+        changed.paths()[0].status().path(),
+        Path::new("tracked-123.txt")
+    );
+}
+
+/// Only text rules force hashing: a large PNG is skipped, and unchanged hashed bytes exceed
+/// the retained 8 MiB diff budget without consuming it.
+#[tokio::test]
+async fn unchanged_attribute_hashes_do_not_consume_the_diff_budget() {
+    let fixture = GitFixture::unborn();
+    fixture.git(["config", "user.email", "attributes@example.invalid"]);
+    fixture.git(["config", "user.name", "Attributes Fixture"]);
+    fixture.write(b".gitattributes", b"*.txt text eol=crlf\n");
+    for n in 0..600 {
+        fixture.write(
+            format!("tracked-{n:03}.txt").as_bytes(),
+            &vec![b'x'; 16 * 1024],
+        );
+    }
+    fixture.write(b"large.png", &vec![b'p'; 2 * 1024 * 1024]);
+    fixture.git(["add", "."]);
+    fixture.git(["commit", "--quiet", "-m", "large baseline"]);
+    let mut runner = Runner::default();
+    let clean = collect(&fixture, DiffMode::Head, &mut runner)
+        .await
+        .unwrap();
+    assert!(clean.paths().is_empty());
+    assert!(
+        runner.hashes > 0,
+        "text rules must force worktree classification"
+    );
 }
 
 /// Six hundred clean tracked paths consume metadata only; changed paths alone enter byte caps.

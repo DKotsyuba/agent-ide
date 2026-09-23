@@ -6156,6 +6156,7 @@ async fn diff_oversized_single_hunk_reports_capacity_without_false_continuation(
 #[tokio::test]
 async fn codex_diff_large_repository_is_empty_then_changed_then_explicitly_capped() {
     let fixture = ProductFixture::new(json!([]));
+    std::fs::write(fixture.root.join(".gitattributes"), "*.txt export-ignore\n").unwrap();
     for index in 0..600 {
         std::fs::write(fixture.root.join(format!("bulk-{index:03}.txt")), "base\n").unwrap();
     }

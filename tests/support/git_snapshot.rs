@@ -266,6 +266,8 @@ pub struct Runner {
     pub mutate_once: bool,
     /// Number of observed blob commands, used to prove OID deduplication.
     pub blobs: usize,
+    /// Number of private no-filter hash batches, including worktree classification.
+    pub hashes: usize,
     /// Number of successful differences exits; these must not be classified as command failures.
     pub different: usize,
     /// Number of completed no-index comparisons, excluding private blob-hash verification.
@@ -298,6 +300,7 @@ impl SnapshotRunner for Runner {
     /// Admits and reaps the exact peer command; scratch remains owned through process completion.
     async fn run(&mut self, intent: SnapshotIntent) -> Result<CapturedProcessEvidence, GitError> {
         use std::os::unix::fs::PermissionsExt;
+        self.hashes += usize::from(intent.label() == "hash-object");
         if let Some(dir) = intent.snapshot_directory() {
             assert_eq!(
                 fs::metadata(dir).unwrap().permissions().mode() & 0o777,

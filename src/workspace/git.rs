@@ -249,6 +249,8 @@ pub enum GitReadQuery {
     AutoCrlf,
     /// Reads the effective core.attributesFile value without evaluating worktree content.
     AttributesFile,
+    /// Reads the effective core.eol value for text attribute interpretation.
+    CoreEol,
     /// Legacy non-executable HEAD patch tag; live HEAD mode uses the raw snapshot collector.
     HeadDiff,
     /// Legacy non-executable staged patch tag; live staged mode uses the raw snapshot collector.
@@ -268,6 +270,7 @@ impl GitReadQuery {
             | Self::IndexPath
             | Self::AutoCrlf
             | Self::AttributesFile
+            | Self::CoreEol
             | Self::HeadDiff => DiffMode::Head,
             Self::IndexState | Self::StagedDiff => DiffMode::Staged,
             Self::IndexStat | Self::UnstagedDiff => DiffMode::Unstaged,
@@ -927,6 +930,12 @@ fn read_args(query: GitReadQuery) -> Vec<OsString> {
             OsString::from("--get"),
             OsString::from("--default=/dev/null"),
             OsString::from("core.attributesFile"),
+        ]),
+        GitReadQuery::CoreEol => args.extend([
+            OsString::from("config"),
+            OsString::from("--get"),
+            OsString::from("--default=native"),
+            OsString::from("core.eol"),
         ]),
         GitReadQuery::Status
         | GitReadQuery::HeadDiff

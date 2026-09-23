@@ -1939,6 +1939,7 @@ mod tests {
     #[tokio::test]
     async fn diff_helper_completes_the_bounded_snapshot_walk_of_a_real_repository() {
         let candidate = worktree();
+        std::fs::write(candidate.join(".gitattributes"), "*.txt export-ignore\n").unwrap();
         for index in 0..600 {
             std::fs::write(
                 candidate.join(format!("file-{index:03}.txt")),
