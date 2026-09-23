@@ -28,7 +28,7 @@ use crate::assistance::host_binding::{
 
 mod profile_shape;
 
-use profile_shape::{ProfileShapeV2, UnsupportedShape};
+use profile_shape::{ProfileShapeV2, ProfileShapeV3, UnsupportedShape};
 
 /// Classifies the host permission profile whose complete state accompanies a request.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -60,8 +60,8 @@ pub const MAX_ACCEPTED_PROFILES: usize = 8;
 /// The versioned comparison data one accepted template carries (T35B).
 ///
 /// A template stores what its admission proof needs, not only a digest: v1 compares exact
-/// legacy digests, v2 compares the accepted rule structure through
-/// [`ProfileShapeV2::prove_narrower`]. The two generations are never mixed inside one proof.
+/// legacy digests, v2 compares the accepted rule structure, and v3 first proves one complete
+/// visualization-leaf group. Generations are never mixed inside one proof.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TemplateShape {
     /// Legacy exact-digest admission; behaviour is byte-for-byte unchanged (T35B).
@@ -73,6 +73,11 @@ enum TemplateShape {
     V2 {
         /// The complete accepted rule structure derived from the captured state.
         shape: ProfileShapeV2,
+    },
+    /// Opt-in task-specific visualization leaf family with unchanged v2 baseline proof.
+    V3 {
+        /// Captured family and accepted visualization namespace.
+        shape: ProfileShapeV3,
     },
 }
 
@@ -86,7 +91,7 @@ pub struct ExecutionProfileTemplate {
     /// Host profile class covered by this template.
     class: ProfileClass,
     /// Versioned comparison data; its digest is the template's identity, so two accepted
-    /// templates never share one (v1 and v2 digests are domain-separated).
+    /// templates never share one (each generation has a separate digest domain).
     shape: TemplateShape,
 }
 
@@ -105,8 +110,8 @@ pub struct ExecutionProfileCatalog {
 /// makes a changed profile executable.
 ///
 /// Records are versioned by `shape_version` (T35B): an absent field is the legacy v1 layout and
-/// keeps its exact digest algorithms and field set byte-for-byte; only the value `2` adds the
-/// field, stores the domain-separated shape digest in `permission_value`, and stores the
+/// keeps its exact digest algorithms and field set byte-for-byte; explicit `2` or `3` adds the
+/// field, stores its domain-separated shape digest in `permission_value`, and stores the
 /// domain-separated digest of the complete captured state in `semantic_state`. Any other value,
 /// an explicit `1`, or an unknown field fails closed; a v1 record is never silently upgraded or
 /// reinterpreted.
@@ -129,15 +134,15 @@ pub struct PersistedProfileRecord {
     /// Sandbox transport/mechanism identity observed by the D03 run.
     pub transport: String,
     /// V1: effective permission-value identity with only worktree-local path prefixes made
-    /// portable. V2: the domain-separated profile-shape digest of the captured state.
+    /// portable. V2/V3: the generation-specific profile-shape digest of the captured state.
     pub permission_value: String,
     /// Immutable D03 evidence identity for this tested record.
     pub d03_evidence: String,
     /// V1: semantic state identity with only worktree-local path prefixes made portable.
-    /// V2: the domain-separated canonical digest of the complete captured state, including its
+    /// V2/V3: the domain-separated canonical digest of the complete captured state, including its
     /// actual cwd and all restrictions.
     pub semantic_state: String,
-    /// `None` is the legacy v1 layout; `Some(2)` is the v2 layout. Nothing else may exist.
+    /// `None` is v1; `Some(2)` and `Some(3)` select the closed shape generations.
     shape_version: Option<u32>,
 }
 
@@ -203,7 +208,7 @@ impl PersistedProfileRecord {
         Self::from_execution_evidence_versioned(profile_id, revision, evidence, state, 2)
     }
 
-    /// Builds one versioned record; `shape_version` is `1` (legacy) or `2` only.
+    /// Builds one versioned record; `shape_version` is 1, 2, or opt-in visualization v3.
     pub fn from_execution_evidence_versioned(
         profile_id: impl Into<String>,
         revision: u32,
@@ -225,6 +230,16 @@ impl PersistedProfileRecord {
                     shape.digest().to_hex().to_string(),
                     captured_state_identity_v2(state),
                     Some(2),
+                )
+            }
+            3 => {
+                let shape = state
+                    .shape_v3(state.cwd())
+                    .map_err(|_| RequestError::ExecutionProfileDenied)?;
+                (
+                    shape.digest().to_hex().to_string(),
+                    captured_state_identity_v2(state),
+                    Some(3),
                 )
             }
             _ => return Err(RequestError::ExecutionProfileDenied),
@@ -264,9 +279,9 @@ impl PersistedProfileRecord {
     /// Validates an opaque durable record before Execution may use it to rebuild a catalog.
     ///
     /// This is the version-aware, closed record parser (T35B): the field set must be exactly the
-    /// eleven v1 identities, or exactly those plus `shape_version: 2`. Empty identities, zero
+    /// eleven v1 identities, or exactly those plus `shape_version: 2` or `3`. Empty identities, zero
     /// revisions, malformed JSON, unknown or missing fields, an explicit `shape_version: 1`
-    /// (a mixed layout: v1 records never carried the field), or any other version value are
+    /// (a mixed layout: v1 records never carried the field), or any unsupported version value are
     /// unavailable. Application only persists the returned JSON; permit minting stays in
     /// `ExecutionProfileCatalog`.
     pub fn from_json(json: &str) -> Result<Self, RequestError> {
@@ -278,10 +293,10 @@ impl PersistedProfileRecord {
         let shape_version = match object.get("shape_version") {
             None => None,
             Some(value) => {
-                if value.as_u64() != Some(2) {
+                if !matches!(value.as_u64(), Some(2 | 3)) {
                     return Err(RequestError::ExecutionProfileDenied);
                 }
-                Some(2)
+                Some(value.as_u64().unwrap() as u32)
             }
         };
         let expected_len = RECORD_IDENTITY_FIELDS.len() + usize::from(shape_version.is_some());
@@ -329,8 +344,7 @@ impl PersistedProfileRecord {
 
     /// Serializes this complete record in a stable field layout for Application's opaque store.
     ///
-    /// A v1 record emits exactly the legacy eleven fields; only a v2 record adds
-    /// `shape_version: 2`.
+    /// A v1 record emits exactly eleven fields; v2 and v3 add their shape version.
     pub fn to_json(&self) -> String {
         let mut record = serde_json::json!({
             "profile_id": self.profile_id,
@@ -346,14 +360,14 @@ impl PersistedProfileRecord {
             "semantic_state": self.semantic_state,
         });
         if self.shape_version.is_some() {
-            record["shape_version"] = Value::from(2);
+            record["shape_version"] = Value::from(self.shape_version.unwrap());
         }
         record.to_string()
     }
 
     /// Returns whether this durable record is exactly applicable to the supplied observed state.
     ///
-    /// v1 compares the legacy portable identities exactly. v2 verifies both of its new
+    /// v1 compares the legacy portable identities exactly. v2 and v3 verify both of their
     /// identities against the supplied capture: the domain-separated shape digest and the
     /// domain-separated digest of the complete captured state (T35B). Restoration uses exact
     /// evidence matching; subtyping is only ever applied later, between the accepted capture and
@@ -365,6 +379,13 @@ impl PersistedProfileRecord {
                     && self.permission_value == state.profile_digest().to_hex().to_string()
             }
             Some(2) => match state.shape_v2(state.cwd()) {
+                Ok(shape) => {
+                    self.semantic_state == captured_state_identity_v2(state)
+                        && self.permission_value == shape.digest().to_hex().to_string()
+                }
+                Err(_) => false,
+            },
+            Some(3) => match state.shape_v3(state.cwd()) {
                 Ok(shape) => {
                     self.semantic_state == captured_state_identity_v2(state)
                         && self.permission_value == shape.digest().to_hex().to_string()
@@ -520,6 +541,11 @@ impl HostSandboxState {
         ProfileShapeV2::derive(self, trusted_cwd)
     }
 
+    /// Derives the opt-in visualization family without changing v2 or daemon read proofs.
+    pub(crate) fn shape_v3(&self, trusted_cwd: &Path) -> Result<ProfileShapeV3, UnsupportedShape> {
+        ProfileShapeV3::derive(self, trusted_cwd)
+    }
+
     /// Proves one worktree-relative path readable under this state's live cwd-bound shape (T36B).
     ///
     /// The shape is derived against `trusted_cwd` — the authoritative worktree the read will
@@ -607,10 +633,31 @@ impl ExecutionProfileTemplate {
         })
     }
 
+    /// Defines one explicitly accepted v3 visualization family from its exact D03 capture.
+    pub fn from_execution_evidence_v3(
+        id: impl Into<String>,
+        version: u32,
+        state: &HostSandboxState,
+    ) -> Result<Self, RequestError> {
+        let id = id.into();
+        if id.is_empty() || version == 0 {
+            return Err(RequestError::ExecutionProfileDenied);
+        }
+        let shape = state
+            .shape_v3(state.cwd())
+            .map_err(|_| RequestError::ExecutionProfileDenied)?;
+        Ok(Self {
+            id,
+            version,
+            class: state.class,
+            shape: TemplateShape::V3 { shape },
+        })
+    }
+
     /// Builds this template from one version-aware persisted record and its captured state.
     ///
     /// `record.matches_state` has already verified both identities against `state`; this only
-    /// re-derives the comparison data the permit proof needs. A v2 record whose captured state
+    /// re-derives the comparison data the permit proof needs. A v2 or v3 record whose captured state
     /// no longer derives its shape is denied (fail closed), never downgraded to v1.
     fn from_record(
         record: &PersistedProfileRecord,
@@ -625,6 +672,11 @@ impl ExecutionProfileTemplate {
                     .shape_v2(state.cwd())
                     .map_err(|_| RequestError::ExecutionProfileDenied)?,
             },
+            Some(3) => TemplateShape::V3 {
+                shape: state
+                    .shape_v3(state.cwd())
+                    .map_err(|_| RequestError::ExecutionProfileDenied)?,
+            },
             Some(_) => return Err(RequestError::ExecutionProfileDenied),
         };
         Ok(Self {
@@ -637,12 +689,13 @@ impl ExecutionProfileTemplate {
 
     /// Returns the template's authority identity: two accepted templates never share one.
     ///
-    /// v1 and v2 digests are domain-separated, so a legacy digest and a shape digest can never
+    /// Version digests are domain-separated, so a legacy digest and a shape digest can never
     /// collide or be cross-compared by accident.
     fn identity(&self) -> blake3::Hash {
         match &self.shape {
             TemplateShape::V1 { profile_digest } => *profile_digest,
             TemplateShape::V2 { shape } => shape.digest(),
+            TemplateShape::V3 { shape } => shape.digest(),
         }
     }
 }
@@ -679,7 +732,7 @@ impl ExecutionProfileCatalog {
     /// `expected` comes from Execution-owned trusted configuration/evidence, never the durable
     /// store or a model request. The caller supplies each current D01-bound state; extra, missing,
     /// stale, corrupt, duplicate-digest, value-mismatched, unknown-version, or mixed-layout
-    /// records are unavailable. Records restore by exact evidence matching: a v2 record rebuilds
+    /// records are unavailable. Records restore by exact evidence matching: a shape record rebuilds
     /// the captured rule structure from its own stored capture, never by subtyping (T35B).
     pub fn from_persisted_records(
         records: Vec<(PersistedProfileRecord, HostSandboxState)>,
@@ -705,21 +758,21 @@ impl ExecutionProfileCatalog {
     /// the live state, matching one complete template and never combining grants (T25B, T35B).
     ///
     /// `trusted_cwd` is the trusted candidate or Workspace worktree the operation will actually
-    /// touch: a v2 candidate is derived with the portable cwd bound to it, so a live state whose
-    /// `sandboxCwd` is not this directory never derives a v2 shape here and can only be admitted
+    /// touch: v2/v3 candidates derive with the portable cwd bound to it, so a live state whose
+    /// `sandboxCwd` is not this directory never derives either shape here and can only be admitted
     /// by a v1 template's exact legacy digest (T35B-r).
     ///
     /// The decision is ordered and fail-closed:
     ///
     /// 1. no template for the class → [`RequestError::ExecutionProfileNoTemplate`];
-    /// 2. an exact v2 shape match is preferred;
+    /// 2. an exact v2 or v3 shape match is preferred;
     /// 3. otherwise a v1 template whose legacy digest equals the live state's keeps its
     ///    unchanged exact-digest admission;
-    /// 4. otherwise a v2 template proving the live shape a narrower authority admits, chosen
+    /// 4. otherwise a v2 or v3 template proving the live shape a narrower authority admits, chosen
     ///    deterministically by template identity;
     /// 5. no passing candidate refuses with the most specific closed reason: a live state that
-    ///    derives no v2 shape is [`RequestError::ExecutionProfileShapeUnsupported`], a state all
-    ///    v2 templates fail to prove narrower is
+    ///    derives no applicable shape is [`RequestError::ExecutionProfileShapeUnsupported`], a state all
+    ///    shape templates fail to prove narrower is
     ///    [`RequestError::ExecutionProfileShapeNotNarrower`], and a class with only v1 templates
     ///    whose digests all differ stays [`RequestError::ExecutionProfileDigestMismatch`].
     ///
@@ -737,10 +790,17 @@ impl ExecutionProfileCatalog {
             .ok_or(RequestError::ExecutionProfileNoTemplate(state.class))?;
         let live_digest = state.profile_digest();
         let live_shape = state.shape_v2(trusted_cwd).ok();
+        let live_v3 = class_templates
+            .iter()
+            .any(|template| matches!(&template.shape, TemplateShape::V3 { .. }))
+            .then(|| state.shape_v3(trusted_cwd).ok())
+            .flatten();
         let mut v1_match = None;
         let mut v2_exact = None;
+        let mut v3_exact = None;
         let mut v2_narrower: Vec<&ExecutionProfileTemplate> = Vec::new();
         let mut has_v2 = false;
+        let mut has_v3 = false;
         for template in class_templates {
             match &template.shape {
                 TemplateShape::V1 { profile_digest } => {
@@ -759,9 +819,20 @@ impl ExecutionProfileCatalog {
                         v2_narrower.push(template);
                     }
                 }
+                TemplateShape::V3 { shape } => {
+                    has_v3 = true;
+                    let Some(live) = &live_v3 else {
+                        continue;
+                    };
+                    if live == shape {
+                        v3_exact = Some(template);
+                    } else if live.prove_narrower(shape) {
+                        v2_narrower.push(template);
+                    }
+                }
             }
         }
-        let template = if let Some(template) = v2_exact {
+        let template = if let Some(template) = v2_exact.or(v3_exact) {
             template.clone()
         } else if let Some(template) = v1_match {
             template.clone()
@@ -770,13 +841,17 @@ impl ExecutionProfileCatalog {
             match v2_narrower.first() {
                 Some(template) => (*template).clone(),
                 None => {
-                    return Err(match (has_v2, live_shape.is_some()) {
-                        (false, _) => RequestError::ExecutionProfileDigestMismatch(state.class),
-                        (true, false) => {
-                            RequestError::ExecutionProfileShapeUnsupported(state.class)
-                        }
-                        (true, true) => RequestError::ExecutionProfileShapeNotNarrower(state.class),
-                    });
+                    return Err(
+                        match (has_v2 || has_v3, live_shape.is_some() || live_v3.is_some()) {
+                            (false, _) => RequestError::ExecutionProfileDigestMismatch(state.class),
+                            (true, false) => {
+                                RequestError::ExecutionProfileShapeUnsupported(state.class)
+                            }
+                            (true, true) => {
+                                RequestError::ExecutionProfileShapeNotNarrower(state.class)
+                            }
+                        },
+                    );
                 }
             }
         };
@@ -2020,9 +2095,24 @@ impl ValidatedExecutionRequest {
     /// Consumes a freshly checked active use immediately before an owned physical spawn.
     ///
     /// Requests constructed from an Assistance observation retain its binding generation so a
-    /// queue delay cannot convert pre-stop liveness into a later effect. Synthetic/test requests
-    /// have no active binding and reject no optional use.
+    /// queue delay cannot convert pre-stop liveness into a later effect. A v3 request also
+    /// rechecks its leaf path immediately before spawn so a queued symlink replacement
+    /// refuses. Synthetic/test requests have no active binding and reject no optional use.
     fn consume_spawn_use(&self, active_use: Option<ActiveBindingUse>) -> Result<(), RequestError> {
+        if let TemplateShape::V3 { shape } = &self.permit.template.shape {
+            let live = self
+                .invocation
+                .sandbox
+                .shape_v3(&self.authority.root)
+                .map_err(|_| {
+                    RequestError::ExecutionProfileShapeUnsupported(ProfileClass::Managed)
+                })?;
+            if !live.prove_narrower(shape) {
+                return Err(RequestError::ExecutionProfileShapeNotNarrower(
+                    ProfileClass::Managed,
+                ));
+            }
+        }
         match (&self.invocation.active_binding, active_use) {
             (Some(_), Some(active_use)) => self.invocation.consume_active_use(active_use),
             (Some(_), None) => Err(RequestError::MissingActiveBindingUse),

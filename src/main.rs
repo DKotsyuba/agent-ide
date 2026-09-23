@@ -359,10 +359,9 @@ fn read_sandbox_state(path: &std::path::Path) -> Result<HostSandboxState, AppErr
 /// reuses [`PersistedProfileRecord::from_execution_evidence_versioned`] and never starts a
 /// daemon, spawns a provider, or writes any file. `sandbox_state` names a file holding the exact
 /// captured `codex/sandbox-state-meta` envelope for the tested run; `evidence` carries the
-/// non-state D03 identities. `shape_version` is `2` (the default: the conservative shape-based
-/// record for supported managed captures) or `1` (the legacy exact-digest layout, requested
-/// explicitly). The returned JSON text is the exact shape a `profiles` entry in a launcher
-/// configuration expects. Returns
+/// non-state D03 identities. `shape_version` is `2` by default, `1` for legacy exact admission,
+/// or explicit `3` for a tested visualization-leaf family. The returned JSON has the shape a
+/// launcher configuration's `profiles` entry expects. Returns
 /// [`AppError::InvalidResponse`] for an unreadable/malformed sandbox-state file, a capture whose
 /// state cannot support the requested generation (a `disabled` or unrecognized state never
 /// silently becomes a v2 record), or evidence that the record constructor rejects (an empty
@@ -813,7 +812,7 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
         });
     }
     // `evidence record` has its own fixed nine-flag shape, in the exact declared order; no flag
-    // may be reordered, omitted, or repeated. One optional trailing `--shape-version <1|2>` flag
+    // may be reordered, omitted, or repeated. One optional trailing `--shape-version <1|2|3>` flag
     // selects the record generation; the default is the v2 shape-based layout (T35B), and the
     // legacy v1 layout must be requested explicitly.
     if let [mode, sub, rest @ ..] = arguments.as_slice()
@@ -825,6 +824,7 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
                 let version = match value.to_str() {
                     Some("1") => 1,
                     Some("2") => 2,
+                    Some("3") => 3,
                     _ => return Err(AppError::InvalidResponse),
                 };
                 (head, version)
@@ -2878,7 +2878,7 @@ mod tests {
         assert_eq!(stored, expected.to_string());
 
         // The default for a managed capture is v2; the flag only makes it explicit.
-        let parsed = command(args(&[
+        let record_args = [
             "evidence",
             "record",
             "--sandbox-state",
@@ -2899,12 +2899,21 @@ mod tests {
             "direct",
             "--d03-evidence",
             "accepted-d03",
-        ]))
-        .unwrap();
+        ];
+        let parsed = command(args(&record_args)).unwrap();
         let Command::EvidenceRecord { shape_version, .. } = parsed else {
             panic!("expected EvidenceRecord");
         };
         assert_eq!(shape_version, 2);
+        let mut v3_args = record_args.to_vec();
+        v3_args.extend(["--shape-version", "3"]);
+        assert!(matches!(
+            command(args(&v3_args)),
+            Ok(Command::EvidenceRecord {
+                shape_version: 3,
+                ..
+            })
+        ));
 
         // A disabled capture cannot support v2 and is refused instead of downgraded.
         std::fs::write(
@@ -2919,7 +2928,7 @@ mod tests {
         assert!(
             evidence_record(&sandbox_state, "accepted-disabled", 1, evidence.clone(), 1).is_ok()
         );
-        // Unknown generations refuse outright.
+        // A disabled capture cannot support the opt-in v3 family either.
         assert!(matches!(
             evidence_record(&sandbox_state, "accepted-disabled", 1, evidence.clone(), 3),
             Err(AppError::InvalidResponse)

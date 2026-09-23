@@ -922,7 +922,7 @@ impl LauncherConfig {
             for profile in target.profiles {
                 // Record-key and shape-version validation is Execution's version-aware closed
                 // parser: the launcher delegates the schema instead of pinning a field count,
-                // so v1 and v2 records are both validated by their own generation's rules (T35B).
+                // so all supported record generations use their own closed validation rules.
                 let record = PersistedProfileRecord::from_json(&profile.record.to_string())
                     .map_err(|_| LauncherError::Rejected)?;
                 let state = HostSandboxState::parse(Some(profile.sandbox_state))
@@ -1395,7 +1395,7 @@ fn launcher_accepts_v2_records_and_rejects_unknown_record_keys() {
         },
         {
             let mut refused = record_value.clone();
-            refused["shape_version"] = json!(3);
+            refused["shape_version"] = json!(4);
             refused
         },
         {
@@ -1407,4 +1407,48 @@ fn launcher_accepts_v2_records_and_rejects_unknown_record_keys() {
         let config = json!({"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[target(refused)]});
         assert!(LauncherConfig::parse(config.to_string().as_bytes()).is_err());
     }
+}
+
+/// A v3 record and its exact capture pass the same delegated launcher restoration path.
+#[test]
+fn launcher_accepts_visualization_family_record() {
+    use crate::execution::D03ProfileEvidence;
+    use serde_json::json;
+    let root = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("agent-ide-launcher-v3-{}", std::process::id()));
+    let leaf = root.join(".codex/visualizations/2026/09/23/11111111-1111-1111-1111-111111111111");
+    std::fs::create_dir_all(root.join("work")).unwrap();
+    std::fs::create_dir_all(&leaf).unwrap();
+    let mut entries = vec![
+        json!({"access":"write","path":{"type":"path","path":root.join("work")}}),
+        json!({"access":"write","path":{"type":"path","path":leaf}}),
+    ];
+    for suffix in ["/**/*.key", "/**/*.pem", "/**/.env", "/**/.env.*"] {
+        entries.push(json!({"access":"deny","path":{"type":"glob_pattern","pattern":format!("{}{suffix}", leaf.display())}}));
+    }
+    let state = HostSandboxState::parse(Some(json!({
+        "permissionProfile":{"type":"managed","network":"enabled","file_system":{"type":"restricted","entries":entries}},
+        "codexLinuxSandboxExe":null,"sandboxCwd":root.join("work"),"useLegacyLandlock":false
+    }))).unwrap();
+    let record = PersistedProfileRecord::from_execution_evidence_versioned(
+        "visualization",
+        1,
+        D03ProfileEvidence {
+            provider_binary: "codex".into(),
+            toolchain: "toolchain".into(),
+            configuration: "default".into(),
+            trust: "local".into(),
+            transport: "managed".into(),
+            d03_evidence: "d03".into(),
+        },
+        &state,
+        3,
+    )
+    .unwrap();
+    let executable =
+        json!({"path":"/private/tmp/accepted-program","identity":"codex","blake3":"0".repeat(64)});
+    let config = json!({"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[{"attachment":"visualization","candidate":root.join("work"),"git":executable,"codex":executable,"providers":[],"profiles":[{"record":serde_json::from_str::<Value>(&record.to_json()).unwrap(),"sandbox_state":serde_json::from_str::<Value>(state.sandbox_state_json()).unwrap()}],"allow_disabled_host":false}]});
+    assert!(LauncherConfig::parse(config.to_string().as_bytes()).is_ok());
+    std::fs::remove_dir_all(root).unwrap();
 }

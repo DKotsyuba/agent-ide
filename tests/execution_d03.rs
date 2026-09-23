@@ -5,8 +5,8 @@
 //! root-write profile cannot pass "outside all write roots is denied", and a network-enabled
 //! profile cannot reuse restricted-network evidence, so a reviewed profile-specific expectation
 //! manifest (allowed cwd/outside/temp writes, carve-outs, network behavior, rule-order and
-//! duplicate behavior) remains a documented follow-up; these tests are `#[ignore]`d by ordinary
-//! runs and were deliberately not rewritten in T35B.
+//! duplicate behavior) remains a documented follow-up. The focused v3 visualization probe
+//! below runs only with explicit native fixture inputs; ordinary runs leave it ignored.
 
 use agent_ide::{
     assistance::host_binding::{
@@ -253,6 +253,126 @@ async fn profile_specific_expectation_manifest_enforces_the_accepted_authority()
         "the profile-specific D03 expectation-manifest experiment is pending; \
          see the module note and docs/contracts/execution.md"
     );
+}
+
+/// Replays the exact supplied JSON through pinned Codex and probes the v3 leaf boundary.
+///
+/// The caller supplies an existing writable outside directory and pinned Codex executable;
+/// this ignored experiment creates only disposable children, reaps each within the D03 bound,
+/// and checks both positive and negative permissions before its own fixture cleanup.
+#[tokio::test]
+#[ignore = "requires AGENT_IDE_D03_STATE, AGENT_IDE_D03_CODEX, and AGENT_IDE_D03_DENIED_DIR"]
+async fn visualization_family_native_d03() {
+    let state_text = fs::read_to_string(required("AGENT_IDE_D03_STATE")).unwrap();
+    let state = HostSandboxState::parse_json(&state_text).unwrap();
+    assert_eq!(state.sandbox_state_json(), state_text);
+    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence_v3("visualization-d03", 1, &state)
+            .unwrap(),
+    ])
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&state_text).unwrap();
+    let leaf = value["permissionProfile"]["file_system"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| {
+            (entry["access"] == "write")
+                .then(|| entry["path"]["path"].as_str())
+                .flatten()
+        })
+        .find(|path| path.contains("/.codex/visualizations/"))
+        .map(PathBuf::from)
+        .unwrap();
+    let codex = PathBuf::from(required("AGENT_IDE_D03_CODEX"));
+    let outside_dir = PathBuf::from(required("AGENT_IDE_D03_DENIED_DIR"));
+    let sibling = test_path(leaf.parent().unwrap(), "sibling-dir");
+    fs::create_dir(&sibling).unwrap();
+    let touch = Path::new("/usr/bin/touch");
+    let cat = Path::new("/bin/cat");
+    let nc = Path::new("/usr/bin/nc");
+    for program in [touch, cat, nc] {
+        assert!(program.is_file(), "missing D03 helper {program:?}");
+    }
+    let worktree_write = test_path(Path::new(env!("CARGO_MANIFEST_DIR")), "worktree-write");
+    let leaf_write = test_path(&leaf, "leaf-write");
+    let sibling_write = test_path(&sibling, "sibling-write");
+    let outside_write = test_path(&outside_dir, "outside-write");
+    // Prove the negative target is writable by the unsandboxed fixture process first.
+    fs::write(&outside_write, b"baseline").unwrap();
+    fs::remove_file(&outside_write).unwrap();
+    for (label, target, expected) in [
+        ("worktree-write", &worktree_write, true),
+        ("leaf-write", &leaf_write, true),
+        ("sibling-write", &sibling_write, false),
+        ("outside-write", &outside_write, false),
+    ] {
+        let result = run_child(
+            &request(&state, &catalog, touch, target.clone()),
+            &codex,
+            label,
+        )
+        .await;
+        let written = target.is_file();
+        if written {
+            fs::remove_file(target).unwrap();
+        }
+        assert_eq!(
+            result.status().success(),
+            expected,
+            "{label} stderr: {:?}",
+            result.stderr().bytes
+        );
+        assert_eq!(written, expected, "{label} write result");
+    }
+    let credential = test_path(&leaf, "credential").with_extension("key");
+    let ordinary = test_path(&leaf, "ordinary").with_extension("txt");
+    fs::write(&credential, b"D03 sentinel").unwrap();
+    fs::write(&ordinary, b"D03 ordinary").unwrap();
+    for (label, target, expected) in [
+        ("credential-read", &credential, false),
+        ("ordinary-read", &ordinary, true),
+    ] {
+        let result = run_child(
+            &request(&state, &catalog, cat, target.clone()),
+            &codex,
+            label,
+        )
+        .await;
+        assert_eq!(
+            result.status().success(),
+            expected,
+            "{label} stderr: {:?}",
+            result.stderr().bytes
+        );
+    }
+    fs::remove_file(credential).unwrap();
+    fs::remove_file(ordinary).unwrap();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    let result = run_child(
+        &request_args(
+            &state,
+            &catalog,
+            nc,
+            vec![
+                "-z".into(),
+                "-w".into(),
+                "1".into(),
+                "127.0.0.1".into(),
+                port.into(),
+            ],
+        ),
+        &codex,
+        "network-enabled",
+    )
+    .await;
+    assert!(
+        result.status().success(),
+        "enabled network stderr: {:?}",
+        result.stderr().bytes
+    );
+    fs::remove_dir(sibling).unwrap();
 }
 
 /// Proves Codex accepts the captured sandbox JSON after semantic Value serialization, not only original spelling.
