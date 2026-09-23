@@ -331,15 +331,15 @@ pub struct ProviderCapabilities {
 /// Bounded diagnostic evidence correlated to the latest synchronized provider document.
 #[derive(Clone, Debug)]
 pub struct DiagnosticSnapshot {
-    /// Exact synchronized source binding, absent for unversioned provider pushes.
+    /// Synchronized source binding; an unversioned TypeScript push may carry provisional evidence.
     pub source: Option<SourceBinding>,
     /// Provider generation that received this message.
     pub generation: ViewGeneration,
-    /// Provider's published document version; absent means uncorrelated push.
+    /// Provider's published document version; absent on a bound TypeScript one-shot report.
     pub document_version: Option<i32>,
     /// Provisional for matching pushes, unknown for absence/invalidation; silence never implies clean.
     pub freshness: Freshness,
-    /// `Clean` or `Reported` only after a matching versioned provider notification.
+    /// `Clean` needs a matching version; TypeScript can report nonempty unversioned evidence.
     pub readiness: DiagnosticReadiness,
     /// At most 128 diagnostics from one accepted provider push.
     pub diagnostics: Vec<lsp::Diagnostic>,
@@ -355,6 +355,8 @@ struct Document {
     source: SourceBinding,
     /// Monotonic positive version within this session, including across file switches.
     version: i32,
+    /// An initial one-shot TypeScript open may bind a nonempty unversioned push until didChange.
+    accepts_unversioned_report: bool,
 }
 
 /// Shared router/session state; locked only for synchronous bounded updates, never across await.
@@ -369,7 +371,7 @@ struct State {
     settings: ProviderSettings,
     /// Current provider-specific status, independently observable by the initialize barrier.
     readiness: watch::Sender<ProviderReadiness>,
-    /// Monotonic notification revision advanced only for an accepted, versioned current-document push.
+    /// Monotonic revision for versioned pushes or a bound nonempty TypeScript push.
     diagnostic_revision: watch::Sender<u64>,
     /// Current document; only one exact file is retained.
     document: Option<Document>,
@@ -568,6 +570,13 @@ impl Session {
                 }]),
                 initialization_options: Some(self.settings.configuration()),
                 capabilities: lsp::ClientCapabilities {
+                    text_document: Some(lsp::TextDocumentClientCapabilities {
+                        publish_diagnostics: Some(lsp::PublishDiagnosticsClientCapabilities {
+                            related_information: Some(false),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
                     workspace: Some(lsp::WorkspaceClientCapabilities {
                         configuration: Some(true),
                         workspace_folders: Some(true),
@@ -587,7 +596,6 @@ impl Session {
                         ]),
                         ..Default::default()
                     }),
-                    ..Default::default()
                 },
                 ..Default::default()
             })
@@ -659,12 +667,16 @@ impl Session {
         self.state.lock().expect("session lock").diagnostics.clone()
     }
 
-    /// Waits under the current request deadline for the current document's first versioned
-    /// diagnostic result. TypeScript may omit a document version and therefore remain unknown; a
-    /// timeout also leaves diagnostic evidence unknown and does not
-    /// affect already-computed semantic context.
+    /// Waits under the request deadline for a versioned result or up to five seconds for a
+    /// nonempty report from this one-shot TypeScript open. Empty unversioned pushes and timeout
+    /// leave readiness unknown; semantic context already computed by the caller is unaffected.
     pub(crate) async fn wait_for_matching_diagnostics(&self) {
-        let _ = wait_for_matching_diagnostics(&self.state, self.exchange_deadline()).await;
+        let deadline = if matches!(self.settings, ProviderSettings::TypeScript(_)) {
+            (Instant::now() + Duration::from_secs(5)).min(self.exchange_deadline())
+        } else {
+            self.exchange_deadline()
+        };
+        let _ = wait_for_matching_diagnostics(&self.state, deadline).await;
     }
 
     /// Synchronizes exact observation bytes, then requests advertised definition/reference methods.
@@ -802,7 +814,7 @@ impl Session {
     /// Sends didOpen, full-document didChange, or close/open while retaining one exact document.
     /// Missing observations close the document and return `None`; present sources return their
     /// monotonic version. Every identity change clears diagnostic rows and resets readiness to
-    /// unknown until a matching versioned notification arrives. Requires advertised
+    /// unknown until matching provider evidence arrives. Requires advertised
     /// synchronization; source versions never reset.
     fn synchronize(
         &mut self,
@@ -871,11 +883,15 @@ impl Session {
             )
             .map_err(io::Error::other)?;
         }
-        if state
+        let changing_document = state
             .document
             .as_ref()
-            .is_some_and(|document| document.uri == uri)
-        {
+            .is_some_and(|document| document.uri == uri);
+        if changing_document {
+            // An unversioned push after didChange cannot identify which bytes it diagnosed.
+            if let Some(document) = &mut state.document {
+                document.accepts_unversioned_report = false;
+            }
             send_notification::<lsp::notification::DidChangeTextDocument>(
                 &self.server,
                 &mut self.budget,
@@ -914,6 +930,8 @@ impl Session {
             uri,
             source: binding,
             version,
+            accepts_unversioned_report: !changing_document
+                && matches!(self.settings, ProviderSettings::TypeScript(_)),
         });
         state.diagnostics.source = None;
         state.diagnostics.document_version = None;
@@ -989,10 +1007,9 @@ impl Session {
     }
 }
 
-/// Waits for the current document's exact versioned diagnostic snapshot without treating silence
-/// as clean readiness. The revision subscription is installed before the snapshot check, so
-/// accepted callback updates cannot be lost between checking state and waiting; deadline or stale
-/// pushes return `false` without changing session state.
+/// Waits for correlated versioned evidence or a bound nonempty TypeScript report. The revision
+/// subscription precedes the snapshot check so a callback cannot be lost; silence, an empty
+/// unversioned push, and stale pushes never establish readiness.
 async fn wait_for_matching_diagnostics(state: &Arc<Mutex<State>>, deadline: Instant) -> bool {
     let (source, version, mut revisions) = {
         let state = state.lock().expect("session lock");
@@ -1001,7 +1018,10 @@ async fn wait_for_matching_diagnostics(state: &Arc<Mutex<State>>, deadline: Inst
         };
         let revisions = state.diagnostic_revision.subscribe();
         if state.diagnostics.source.as_ref() == Some(&document.source)
-            && state.diagnostics.document_version == Some(document.version)
+            && (state.diagnostics.document_version == Some(document.version)
+                || (state.diagnostics.document_version.is_none()
+                    && state.diagnostics.readiness == DiagnosticReadiness::Reported
+                    && document.accepts_unversioned_report))
         {
             return true;
         }
@@ -1014,7 +1034,12 @@ async fn wait_for_matching_diagnostics(state: &Arc<Mutex<State>>, deadline: Inst
             }
             let state = state.lock().expect("session lock");
             if state.diagnostics.source.as_ref() == Some(&source)
-                && state.diagnostics.document_version == Some(version)
+                && (state.diagnostics.document_version == Some(version)
+                    || (state.diagnostics.document_version.is_none()
+                        && state.diagnostics.readiness == DiagnosticReadiness::Reported
+                        && state.document.as_ref().is_some_and(|document| {
+                            document.version == version && document.accepts_unversioned_report
+                        })))
             {
                 return true;
             }
@@ -1118,7 +1143,17 @@ fn client_router(state: Arc<Mutex<State>>) -> Router<Arc<Mutex<State>>> {
         {
             return ControlFlow::Continue(());
         }
-        let binding = params.version.map(|_| document.source.clone());
+        let unversioned_report = params.version.is_none()
+            && document.accepts_unversioned_report
+            && !params.diagnostics.is_empty();
+        if params.version.is_none()
+            && document.accepts_unversioned_report
+            && params.diagnostics.is_empty()
+        {
+            return ControlFlow::Continue(());
+        }
+        let binding =
+            (params.version.is_some() || unversioned_report).then(|| document.source.clone());
         let document_version = document.version;
         let readiness = if params.version == Some(document_version) {
             if params.diagnostics.is_empty() {
@@ -1126,6 +1161,8 @@ fn client_router(state: Arc<Mutex<State>>) -> Router<Arc<Mutex<State>>> {
             } else {
                 DiagnosticReadiness::Reported
             }
+        } else if unversioned_report {
+            DiagnosticReadiness::Reported
         } else {
             DiagnosticReadiness::Unknown
         };
@@ -1139,7 +1176,7 @@ fn client_router(state: Arc<Mutex<State>>) -> Router<Arc<Mutex<State>>> {
             .into_iter()
             .take(MAX_CONTEXT_ITEMS)
             .collect();
-        if params.version == Some(document_version) {
+        if params.version == Some(document_version) || unversioned_report {
             let revision = *state.diagnostic_revision.borrow();
             state
                 .diagnostic_revision

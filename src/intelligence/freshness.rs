@@ -32,9 +32,9 @@ pub enum Freshness {
 pub enum DiagnosticReadiness {
     /// A matching, versioned provider diagnostic result explicitly reported an empty set.
     Clean,
-    /// A matching, versioned provider diagnostic result reported at least one diagnostic.
+    /// A matching versioned result, or a bound nonempty one-shot TypeScript push, reported items.
     Reported,
-    /// No matching, versioned diagnostic result exists; absence is never interpreted as clean.
+    /// No correlated diagnostic result exists; silence and empty unversioned pushes are not clean.
     Unknown,
 }
 
