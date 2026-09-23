@@ -6,8 +6,9 @@ snapshot retention, feedback concatenation, unbound actors, telemetry scope, coo
 Claude-only scope of the shared rendezvous. Sections are otherwise unchanged.
 
 This contract defines the v0.3 MVP: a shared per-repository Agent IDE service that runs confined
-background project checks for Rust and Python and gives the active agent a compact problem-count
-block. macOS is the supported platform and both supported hosts receive the block: Claude Code in
+background project checks for Rust, Python, and root-config TypeScript/JavaScript and gives the
+active agent a compact problem-count block. macOS is the supported platform and both supported
+hosts receive the block: Claude Code in
 hook context, Codex (and any future host without hook delivery) at the top of its terminal `ide.*`
 replies (T28B). There is no split in the data itself — every host sees the same plate, emitted
 under the same rules; only the carrier differs. Linux is `not_tested`. Evidence for the design
@@ -33,7 +34,8 @@ top-level fields:
     "check_timeout_s": 300,
     "rust": { "toolchain_dir": "/abs/.rustup/toolchains/<name>", "cargo_home": "/abs/.cargo",
               "developer_dir": "/abs/Xcode.app/Contents/Developer" },
-    "python": { "node": "/abs/node", "pyright_cli": "/abs/pyright" }
+    "python": { "node": "/abs/node", "pyright_cli": "/abs/pyright" },
+    "typescript": { "node": "/abs/node-v24.4.0/bin/node", "tsc_cli": "/abs/typescript-5.9.3/lib/tsc.js" }
   }
 }
 ```
@@ -200,6 +202,8 @@ trigger, no daemon restart required.
 - Rust is present iff `<worktree>/Cargo.toml` exists.
 - Python is present iff the worktree root has any of `pyproject.toml`, `setup.py`, `setup.cfg`,
   `requirements.txt`, `Pipfile`, `pyrightconfig.json`, or a `.venv`/`venv` directory.
+- TypeScript/JavaScript is present only when the worktree root has `tsconfig.json` or
+  `jsconfig.json`; `package.json` alone does not enable it.
 
 An absent language spawns no confined process, creates no cache directory, and records no
 `ProjectCheckCompleted` telemetry (§8); the scheduler stores `Unavailable(Disabled)` for it
@@ -211,7 +215,7 @@ reserved for a language that *is* present but whose interpreter or environment c
 resolved (§4 Python).
 
 ```rust
-pub enum Language { Rust, Python }
+pub enum Language { Rust, Python, TypeScript }
 pub enum UnavailableReason { Disabled, OutsideRoots, ToolMissing, EnvMissing, NoFiles, Fatal, Timeout }
 pub enum CheckState {
     Ready,          // complete result for the configured scope
@@ -284,6 +288,20 @@ pub struct ProblemSnapshot { pub language: Language, pub state: CheckState,
 - Project source is never executed. Pyright does start the interpreter to enumerate search paths,
   so interpreter start-up hooks (`sitecustomize`, `.pth`) run under the same confinement.
 
+### TypeScript/JavaScript (`node tsc.js --project <root config> --pretty false --diagnostics --listFiles --noEmit`)
+
+- Select a regular non-symlink root `tsconfig.json`, otherwise a regular root `jsconfig.json`.
+  A denied or unprovable config is unavailable. Nested-only configs and project-reference graphs
+  are outside this check's coverage; a solution-style root with no own files is `NoFiles`.
+- The configured paths name pinned Node v24.4.0 and TypeScript 5.9.3. The CLI runs under the
+  existing network-denied confined runner; only its private check cache is writable. No incremental
+  flags are added. A project requiring a build or emit is not represented as a clean type check.
+- `Ready` requires an untruncated, fully parsed output with a complete diagnostics footer, a
+  matching file list, normal exit status, and at least one listed file under the worktree.
+  Diagnostics report `TS` codes and exact file, line, and column; file-less diagnostics attach to
+  the chosen config at line 0. Malformed output, denied diagnostic paths, and abnormal exits are
+  `Fatal`. JavaScript diagnostics require the project's own `checkJs` setting.
+
 ## 5. Scheduling
 
 - Triggers: successful `ide.start` (initial warm check), a native `PostToolUse`/`PostToolUseFailure`
@@ -339,7 +357,8 @@ pub struct ProblemSnapshot { pub language: Language, pub state: CheckState,
 ## 6. The `<agent-ide>` block
 
 The block is a **status plate** (T18B): it always tells the agent the current state of each
-configured **and present** (§4) language, in fixed order (rust, python), process states included,
+configured **and present** (§4) language, in fixed order (rust, python, typescript), process states
+included,
 and it is (re)sent whenever the rendered status changes — and only then. A mixed-stack worktree
 with both a `Cargo.toml` and a `pyproject.toml`:
 
@@ -424,7 +443,7 @@ rust: 3 errors (+2), 5 warnings | python: environment not found
 
 ## 7. `ide.context` with `kind: "problems"`
 
-Parameters: `{"kind": "problems", "language": "rust" | "python" (optional), "offset": u32 (optional)}`.
+Parameters: `{"kind": "problems", "language": "rust" | "python" | "typescript" (optional), "offset": u32 (optional)}`.
 `path` is not required for this kind; any other `kind` value or absent `kind` keeps v0.2 behaviour.
 Reply: per language the state, counts, and up to 20 problems from `offset`, each
 `path:line:column severity [code] message`, plus `next_offset` when more exist. Messages are

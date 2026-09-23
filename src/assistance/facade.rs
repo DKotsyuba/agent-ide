@@ -128,7 +128,7 @@ pub fn tool_schemas() -> [ToolSchema; 6] {
                     "byte_offset": {"type": "integer", "minimum": 0, "maximum": MAX_BYTE_OFFSET},
                     "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES},
                     "kind": {"type": "string", "enum": ["problems"]},
-                    "language": {"type": "string", "enum": ["rust", "python"]},
+                    "language": {"type": "string", "enum": ["rust", "python", "typescript"]},
                     "offset": {"type": "integer", "minimum": 0, "maximum": MAX_PROBLEM_OFFSET}
                 }
             }),
@@ -403,13 +403,12 @@ pub fn validate_call(
                 return Err(ParameterError::ContextTarget);
             }
             if problems {
-                if object
-                    .get("language")
-                    .is_some_and(|value| !matches!(value.as_str(), Some("rust" | "python")))
-                {
+                if object.get("language").is_some_and(|value| {
+                    !matches!(value.as_str(), Some("rust" | "python" | "typescript"))
+                }) {
                     return Err(invalid_field(
                         "language",
-                        FieldRule::OneOf("\"rust\" or \"python\""),
+                        FieldRule::OneOf("\"rust\", \"python\", or \"typescript\""),
                     ));
                 }
                 if object.get("offset").is_some_and(|value| {
@@ -1797,7 +1796,7 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             )
             .unwrap_err(),
             AssistanceTool::Context,
-            "invalid bounded parameters: \"language\" must be \"rust\" or \"python\"".to_string(),
+            "invalid bounded parameters: \"language\" must be \"rust\", \"python\", or \"typescript\"".to_string(),
         ),
         (
             validate_call(AssistanceTool::Context, json!({"path":"a.rs","offset":5})).unwrap_err(),
@@ -1856,6 +1855,18 @@ fn invalid_parameter_refusals_name_the_field_and_rule() {
         assert!(!message.contains('\n'), "refusal must stay single-line");
         assert!(message.len() < 256, "refusal must stay under 256 bytes");
     }
+}
+
+/// The context validator accepts the advertised TypeScript problems filter.
+#[test]
+fn typescript_problems_filter_is_admitted() {
+    assert!(
+        validate_call(
+            AssistanceTool::Context,
+            json!({"kind":"problems","language":"typescript"})
+        )
+        .is_ok()
+    );
 }
 
 /// The observed live failure (an absolute `ide.context` path) now explains the relative-path rule.

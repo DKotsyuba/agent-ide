@@ -223,6 +223,7 @@ pub fn project_check(telemetry: &Telemetry, snapshot: &ProblemSnapshot) {
         language: match snapshot.language {
             checks::Language::Rust => Language::Rust,
             checks::Language::Python => Language::Python,
+            checks::Language::TypeScript => Language::Typescript,
         },
         state: match snapshot.state {
             CheckState::Ready => ProjectCheckState::Ready,

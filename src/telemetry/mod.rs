@@ -237,7 +237,7 @@ pub enum Event {
     },
     /// Records one completed confined project check with bucketed counts only (EYES-r1 §8).
     ProjectCheckCompleted {
-        /// Checked language; only `rust` and `python` occur.
+        /// Checked language: `rust`, `python`, or `typescript`.
         language: Language,
         /// Closed state of the completed snapshot.
         state: ProjectCheckState,

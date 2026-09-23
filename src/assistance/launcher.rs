@@ -549,6 +549,32 @@ pub struct ProjectPythonChecksConfig {
     /// Absolute normalized Pyright CLI entry module executed by `node`.
     pyright_cli: PathBuf,
 }
+/// Accepted TypeScript CLI declaration for confined background project checks.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectTypeScriptChecksConfig {
+    /// Absolute normalized pinned Node executable.
+    node: PathBuf,
+    /// Absolute normalized pinned TypeScript `tsc.js` module.
+    tsc_cli: PathBuf,
+}
+impl ProjectTypeScriptChecksConfig {
+    /// Returns the declared Node executable path.
+    pub fn node(&self) -> &Path {
+        &self.node
+    }
+    /// Returns the declared TypeScript CLI module path.
+    pub fn tsc_cli(&self) -> &Path {
+        &self.tsc_cli
+    }
+    /// Rejects either tool path unless absolute and lexically normalized.
+    fn validate(&self) -> Result<(), LauncherError> {
+        if !absolute(&self.node) || !absolute(&self.tsc_cli) {
+            return Err(LauncherError::Rejected);
+        }
+        Ok(())
+    }
+}
 impl ProjectPythonChecksConfig {
     /// Returns the declared absolute Node executable path.
     pub fn node(&self) -> &Path {
@@ -589,6 +615,9 @@ pub struct ProjectChecksConfig {
     /// Python check toolchain declaration; `None` keeps Python unchecked.
     #[serde(default)]
     python: Option<ProjectPythonChecksConfig>,
+    /// TypeScript/JavaScript check toolchain declaration; `None` keeps it unchecked.
+    #[serde(default)]
+    typescript: Option<ProjectTypeScriptChecksConfig>,
 }
 impl ProjectChecksConfig {
     /// Returns the debounce window between a change and the check it triggers.
@@ -611,6 +640,10 @@ impl ProjectChecksConfig {
     pub fn python(&self) -> Option<&ProjectPythonChecksConfig> {
         self.python.as_ref()
     }
+    /// Returns the TypeScript declaration; `None` means it is never checked.
+    pub fn typescript(&self) -> Option<&ProjectTypeScriptChecksConfig> {
+        self.typescript.as_ref()
+    }
     /// Checks the contract timing ranges and every declared path before any check can run.
     fn validate(&self) -> Result<(), LauncherError> {
         if !(100..=10_000).contains(&self.debounce_ms)
@@ -624,6 +657,9 @@ impl ProjectChecksConfig {
         }
         if let Some(python) = &self.python {
             python.validate()?;
+        }
+        if let Some(typescript) = &self.typescript {
+            typescript.validate()?;
         }
         Ok(())
     }
@@ -1454,4 +1490,30 @@ fn launcher_accepts_visualization_family_record() {
     std::os::unix::fs::symlink(root.join("work"), root.join(".codex")).unwrap();
     assert!(LauncherConfig::parse(config.to_string().as_bytes()).is_ok());
     std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Optional TypeScript paths extend the closed checks schema without changing older declarations.
+#[test]
+fn project_checks_accept_optional_typescript_and_reject_non_normal_paths() {
+    use serde_json::json;
+    let old: ProjectChecksConfig = serde_json::from_value(
+        json!({"python": {"node": "/abs/node", "pyright_cli": "/abs/pyright"}}),
+    )
+    .unwrap();
+    assert!(old.typescript().is_none());
+    assert!(old.validate().is_ok());
+    let new: ProjectChecksConfig = serde_json::from_value(
+        json!({"typescript": {"node": "/abs/node", "tsc_cli": "/abs/typescript/lib/tsc.js"}}),
+    )
+    .unwrap();
+    assert_eq!(
+        new.typescript().unwrap().tsc_cli(),
+        Path::new("/abs/typescript/lib/tsc.js")
+    );
+    assert!(new.validate().is_ok());
+    let bad: ProjectChecksConfig = serde_json::from_value(
+        json!({"typescript": {"node": "/abs/../node", "tsc_cli": "/abs/tsc.js"}}),
+    )
+    .unwrap();
+    assert_eq!(bad.validate(), Err(LauncherError::Rejected));
 }

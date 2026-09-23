@@ -171,6 +171,7 @@ fn scratch_worktree(name: &str, language: Language) -> PathBuf {
     match language {
         Language::Rust => std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap(),
         Language::Python => std::fs::write(dir.join("pyproject.toml"), "").unwrap(),
+        Language::TypeScript => std::fs::write(dir.join("tsconfig.json"), "{}").unwrap(),
     }
     dir
 }
@@ -909,6 +910,49 @@ async fn scheduler_worktree_with_both_manifests_checks_both_languages() {
         latest
             .iter()
             .all(|snapshot| snapshot.state == CheckState::Ready)
+    );
+}
+
+/// A configured TypeScript checker runs for a root config, while package-only roots stay absent.
+#[tokio::test(start_paused = true)]
+async fn scheduler_typescript_presence_requires_root_config() {
+    let rust_checker = RecordingChecker::new(Language::Rust);
+    let python_checker = RecordingChecker::new(Language::Python);
+    let typescript_checker = RecordingChecker::new(Language::TypeScript);
+    let scheduler = Scheduler::new(
+        vec![
+            Arc::new(rust_checker.clone()),
+            Arc::new(python_checker.clone()),
+            Arc::new(typescript_checker.clone()),
+        ],
+        Duration::from_millis(10),
+        2,
+        scratch_dir("presence-typescript-cache"),
+    );
+    let configured = scratch_worktree("presence-typescript-configured", Language::TypeScript);
+    scheduler.trigger("repo", &configured);
+    settle(Duration::from_millis(60), Duration::from_millis(5)).await;
+    assert_eq!(typescript_checker.calls().len(), 1);
+    assert!(rust_checker.calls().is_empty());
+    assert!(python_checker.calls().is_empty());
+    let latest = scheduler.latest(&configured);
+    assert_eq!(
+        latest
+            .iter()
+            .map(|snapshot| snapshot.language)
+            .collect::<Vec<_>>(),
+        vec![Language::Rust, Language::Python, Language::TypeScript]
+    );
+    assert_eq!(latest[2].state, CheckState::Ready);
+
+    let package_only = scratch_dir("presence-typescript-package-only");
+    std::fs::write(package_only.join("package.json"), "{}").unwrap();
+    scheduler.trigger("repo", &package_only);
+    settle(Duration::from_millis(60), Duration::from_millis(5)).await;
+    assert_eq!(typescript_checker.calls().len(), 1);
+    assert_eq!(
+        scheduler.latest(&package_only)[2].state,
+        CheckState::Unavailable(UnavailableReason::Disabled)
     );
 }
 
