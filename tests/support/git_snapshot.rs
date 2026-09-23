@@ -256,6 +256,8 @@ use std::{collections::BTreeSet, time::Duration};
 pub struct Runner {
     /// Optional fixture Git wrapper; absent uses the installed Git binary.
     pub program: Option<PathBuf>,
+    /// Optional per-stream cap for attribute queries, used to force bounded truncation.
+    pub attribute_output_cap: Option<usize>,
     /// All private directories observed while live, checked for cleanup after capture.
     pub directories: Vec<PathBuf>,
     /// Completed operations counted for deterministic before/after mutation injection.
@@ -319,7 +321,11 @@ impl SnapshotRunner for Runner {
         let (child, mut admissions) = launch_intent(
             &intent,
             self.program.as_deref().unwrap_or(Path::new(GIT)),
-            MAX_SNAPSHOT_BLOB_BYTES,
+            if intent.label() == "check-attr" {
+                self.attribute_output_cap.unwrap_or(MAX_SNAPSHOT_BLOB_BYTES)
+            } else {
+                MAX_SNAPSHOT_BLOB_BYTES
+            },
         )?;
         let completed = child
             .reap(Duration::from_secs(5), Duration::from_secs(5))

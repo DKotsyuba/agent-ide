@@ -848,6 +848,7 @@ pub(crate) async fn collect_snapshot_scoped<R: SnapshotRunner>(
             generation,
             operation,
             baseline.clone(),
+            attempt != 0,
             runner,
         )
         .await
@@ -1166,9 +1167,9 @@ async fn path_has_attributes<R: SnapshotRunner>(
     Ok(false)
 }
 
-/// Parses exact NUL path/attribute/value triples in request order. Only set/value conversion
-/// attributes can alter raw bytes; `unset` and `unspecified` do not. `core.eol` matters only when
-/// `text`/`eol` is set, which already forces capture. `core.autocrlf` applies unless text is unset.
+/// Parses exact NUL path/attribute/value triples in request order. Only an exact `unspecified`
+/// value permits skipping: `unset` may be a literal filter name, so every other value forces
+/// capture. `core.eol` matters only when `text`/`eol` is set; `core.autocrlf` acts by default.
 fn parse_attribute_values(
     output: &[u8],
     paths: &[PathBuf],
@@ -1185,36 +1186,30 @@ fn parse_attribute_values(
     let mut offset = 0;
     for path in paths {
         let mut conversion = false;
-        let mut text_unset = false;
-        let mut crlf_unset = false;
-        for (attribute, expected) in CONVERSION_ATTRIBUTES.iter().enumerate() {
+        for expected in CONVERSION_ATTRIBUTES {
             let triple = &fields[offset..offset + 3];
             if triple[0] != path.as_os_str().as_bytes() || triple[1] != expected.as_bytes() {
                 return Err(GitError::InvalidPorcelain);
             }
             let value = triple[2];
-            if attribute == 0 {
-                text_unset = value == b"unset";
-            } else if attribute == 1 {
-                crlf_unset = value == b"unset";
-            }
-            conversion |= value != b"unspecified" && value != b"unset";
+            conversion |= value != b"unspecified";
             offset += 3;
         }
-        changed.push(conversion || (auto_crlf && !text_unset && !crlf_unset));
+        changed.push(conversion || auto_crlf);
     }
     Ok(changed)
 }
 
-/// Runs bounded NUL-stdin batches through the same controlled Git runner as other snapshot
-/// intents, returning exact output for the final consistency bracket and per-path conversion.
+/// Runs bounded NUL-stdin batches through the controlled Git runner. `None` means stderr,
+/// truncation, or malformed output made the whole attribute result untrusted; callers capture
+/// every prospective skipped path instead. Clean results retain output for the final bracket.
 async fn check_attribute_batches<R: SnapshotRunner>(
     scope: &GitScope,
     program: &Path,
     paths: &[PathBuf],
     auto_crlf: bool,
     runner: &mut R,
-) -> Result<(BTreeMap<PathBuf, bool>, Vec<Vec<u8>>), GitError> {
+) -> Result<Option<(BTreeMap<PathBuf, bool>, Vec<Vec<u8>>)>, GitError> {
     let mut values = BTreeMap::new();
     let mut outputs = Vec::new();
     let mut start = 0;
@@ -1234,18 +1229,32 @@ async fn check_attribute_batches<R: SnapshotRunner>(
         }
         let batch = &paths[start..end];
         let intent = SnapshotIntent::attributes(scope, program, batch)?;
-        let output = intent.accept(runner.run(intent.clone()).await?)?;
-        for (path, conversion) in batch
-            .iter()
-            .cloned()
-            .zip(parse_attribute_values(&output, batch, auto_crlf)?)
-        {
+        let evidence = runner.run(intent.clone()).await?;
+        let untrusted = !evidence.stderr().bytes.is_empty()
+            || evidence.stdout().truncated
+            || evidence.stderr().truncated
+            || !evidence.stdout().complete
+            || !evidence.stderr().complete;
+        let accepted = intent.accept(evidence);
+        if untrusted {
+            return Ok(None);
+        }
+        let output = match accepted {
+            Ok(output) => output,
+            Err(GitError::EvidenceTooLarge) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let parsed = match parse_attribute_values(&output, batch, auto_crlf) {
+            Ok(parsed) => parsed,
+            Err(_) => return Ok(None),
+        };
+        for (path, conversion) in batch.iter().cloned().zip(parsed) {
             values.insert(path, conversion);
         }
         outputs.push(output);
         start = end;
     }
-    Ok((values, outputs))
+    Ok(Some((values, outputs)))
 }
 
 /// Assembles one generation from safe plumbing and exact raw file reads under aggregate budgets.
@@ -1264,6 +1273,8 @@ struct PendingCompare {
     source: SnapshotSource,
 }
 
+/// Captures one metadata-bracketed generation; a retry conservatively hashes prospective skips
+/// so an attribute read refusal at the end of the first attempt cannot mint clean evidence.
 #[allow(clippy::too_many_arguments)]
 async fn capture_attempt<R: SnapshotRunner>(
     authority: Option<&AuthorityStamp>,
@@ -1272,6 +1283,7 @@ async fn capture_attempt<R: SnapshotRunner>(
     generation: u64,
     operation: &str,
     baseline: BaselineContext,
+    force_attributes: bool,
     runner: &mut R,
 ) -> Result<GitSnapshot, GitError> {
     let before = metadata(&scope, program, runner).await?;
@@ -1302,6 +1314,8 @@ async fn capture_attempt<R: SnapshotRunner>(
     let mut attributes = BTreeMap::new();
     let mut attribute_sources = BTreeMap::new();
     let mut attribute_paths = Vec::new();
+    let mut eligible_paths = Vec::new();
+    let mut attribute_untrusted = force_attributes;
     for path in &tracked {
         let staged = head_entries.get(path) != index_entries.get(path);
         let changed = if staged {
@@ -1319,14 +1333,35 @@ async fn capture_attempt<R: SnapshotRunner>(
                     {
                         true
                     } else {
-                        let present =
-                            path_has_attributes(&scope, path, &tracked, runner, &mut attributes)
-                                .await?;
-                        attribute_sources.insert(path.clone(), present);
-                        if present || configured_attributes || auto_crlf {
-                            attribute_paths.push(path.clone());
+                        eligible_paths.push(path.clone());
+                        if attribute_untrusted {
+                            true
+                        } else {
+                            match path_has_attributes(
+                                &scope,
+                                path,
+                                &tracked,
+                                runner,
+                                &mut attributes,
+                            )
+                            .await
+                            {
+                                Ok(present) => {
+                                    attribute_sources.insert(path.clone(), present);
+                                    if present || configured_attributes || auto_crlf {
+                                        attribute_paths.push(path.clone());
+                                    }
+                                    false
+                                }
+                                Err(GitError::UnstableSnapshot) => {
+                                    return Err(GitError::UnstableSnapshot);
+                                }
+                                Err(_) => {
+                                    attribute_untrusted = true;
+                                    true
+                                }
+                            }
                         }
-                        false
                     }
                 }
                 Err(ObservationError::RootIdentityChanged) => {
@@ -1339,13 +1374,22 @@ async fn capture_attempt<R: SnapshotRunner>(
             union.insert(path.clone());
         }
     }
-    let (conversion, attribute_output) =
-        check_attribute_batches(&scope, program, &attribute_paths, auto_crlf, runner).await?;
-    union.extend(
-        conversion
-            .into_iter()
-            .filter_map(|(path, applies)| applies.then_some(path)),
-    );
+    let checked = if attribute_untrusted {
+        None
+    } else {
+        check_attribute_batches(&scope, program, &attribute_paths, auto_crlf, runner).await?
+    };
+    let attribute_output = if let Some((conversion, output)) = checked {
+        union.extend(
+            conversion
+                .into_iter()
+                .filter_map(|(path, applies)| applies.then_some(path)),
+        );
+        Some(output)
+    } else {
+        union.extend(eligible_paths);
+        None
+    };
     let clean: Vec<_> = tracked.difference(&union).cloned().collect();
     if !before[3].is_empty() && !before[3].ends_with(&[0]) {
         return Err(GitError::InvalidPorcelain);
@@ -1644,8 +1688,9 @@ async fn capture_attempt<R: SnapshotRunner>(
         let index = index_entries[path]
             .get(&0)
             .expect("clean path has stage zero");
-        let attrs =
-            path_has_attributes(&scope, path, &tracked, runner, &mut after_attributes).await?;
+        let attrs = path_has_attributes(&scope, path, &tracked, runner, &mut after_attributes)
+            .await
+            .map_err(|_| GitError::UnstableSnapshot)?;
         if index_stats[path][0].needs_bytes(index_timestamp)
             || !index_stats[path][0].matches(&metadata, index.mode)
             || attribute_sources.get(path) != Some(&attrs)
@@ -1653,10 +1698,13 @@ async fn capture_attempt<R: SnapshotRunner>(
             return Err(GitError::UnstableSnapshot);
         }
     }
-    let (_, after_attribute_output) =
-        check_attribute_batches(&scope, program, &attribute_paths, auto_crlf, runner).await?;
-    if after_attribute_output != attribute_output {
-        return Err(GitError::UnstableSnapshot);
+    if let Some(expected) = &attribute_output {
+        let after = check_attribute_batches(&scope, program, &attribute_paths, auto_crlf, runner)
+            .await
+            .map_err(|_| GitError::UnstableSnapshot)?;
+        if after.as_ref().map(|(_, output)| output) != Some(expected) {
+            return Err(GitError::UnstableSnapshot);
+        }
     }
     for entry in status.untracked() {
         runner.authorize_read_path(entry.path()).await?;
@@ -1674,9 +1722,13 @@ async fn capture_attempt<R: SnapshotRunner>(
         working.update(&(component.len() as u64).to_le_bytes());
         working.update(component);
     }
-    for output in &attribute_output {
-        working.update(&(output.len() as u64).to_le_bytes());
-        working.update(output);
+    if let Some(outputs) = &attribute_output {
+        for output in outputs {
+            working.update(&(output.len() as u64).to_le_bytes());
+            working.update(output);
+        }
+    } else {
+        working.update(b"attribute-untrusted");
     }
     let work = evidence_identity(
         b"workspace-git-raw-working-v1",

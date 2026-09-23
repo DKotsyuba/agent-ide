@@ -1089,7 +1089,133 @@ async fn converted_worktree_diff_is_stable_across_stat_only_touch() {
     }
 }
 
-/// Irrelevant root rules and a nonexistent configured file do not pull clean bulk into capture.
+/// A literal filter named `unset` must not be mistaken for Git's disabled-attribute state.
+#[tokio::test]
+async fn literal_unset_filter_forces_raw_capture() {
+    let fixture = GitFixture::unborn();
+    fixture.git(["config", "user.email", "filter@example.invalid"]);
+    fixture.git(["config", "user.name", "Filter Fixture"]);
+    fixture.write(b".gitattributes", b"*.txt filter=unset\n");
+    fixture.git(["config", "filter.unset.clean", "/usr/bin/tr a-z A-Z"]);
+    fixture.write(b"file.txt", b"base\n");
+    fixture.git(["add", "file.txt"]);
+    fixture.git(["commit", "--quiet", "-m", "filtered baseline"]);
+    assert_eq!(fixture.git(["show", ":file.txt"]).stdout, b"BASE\n");
+    assert!(
+        String::from_utf8(fixture.git(["check-attr", "filter", "file.txt"]).stdout)
+            .unwrap()
+            .contains("filter: unset")
+    );
+    let program = matching_index_debug_git(&fixture, "file.txt", 0, true);
+    let snapshot = collect_with_git(&fixture, &program).await.unwrap();
+    assert_eq!(snapshot.paths().len(), 1);
+    assert_eq!(snapshot.paths()[0].status().status(), Some(*b".M"));
+}
+
+/// A warning plus `unspecified` is untrusted, so an unreadable attributes file forces capture.
+#[tokio::test]
+async fn unreadable_attribute_warning_forces_raw_capture() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = GitFixture::unborn();
+    fixture.git(["config", "user.email", "filter@example.invalid"]);
+    fixture.git(["config", "user.name", "Filter Fixture"]);
+    fixture.write(b"file.txt", b"base\n");
+    fixture.git(["add", "file.txt"]);
+    fixture.git(["commit", "--quiet", "-m", "baseline"]);
+    fixture.write(b"file.txt", b"next\n");
+    fixture.write(b".git/unreadable-attrs", b"*.txt text eol=crlf\n");
+    fs::set_permissions(
+        fixture.root.join(".git/unreadable-attrs"),
+        fs::Permissions::from_mode(0o0),
+    )
+    .unwrap();
+    fixture.git_os([
+        OsString::from("config"),
+        OsString::from("core.attributesFile"),
+        fixture.root.join(".git/unreadable-attrs").into_os_string(),
+    ]);
+    let warning = fixture.git(["check-attr", "text", "file.txt"]);
+    assert!(!warning.stderr.is_empty() && warning.status.success());
+    let program = matching_index_debug_git(&fixture, "file.txt", 0, true);
+    let snapshot = collect_with_git(&fixture, &program).await.unwrap();
+    assert_eq!(snapshot.paths().len(), 1);
+    assert_eq!(snapshot.paths()[0].status().status(), Some(*b".M"));
+}
+
+/// Truncated attribute output is untrusted and therefore falls back to source-byte capture.
+#[tokio::test]
+async fn truncated_attribute_output_forces_raw_capture() {
+    let fixture = GitFixture::unborn();
+    fixture.git(["config", "user.email", "filter@example.invalid"]);
+    fixture.git(["config", "user.name", "Filter Fixture"]);
+    fixture.write(b"file.txt", b"base\n");
+    fixture.git(["add", "file.txt"]);
+    fixture.git(["commit", "--quiet", "-m", "baseline"]);
+    fixture.write(b"file.txt", b"next\n");
+    fixture.write(b".gitattributes", b"*.txt export-ignore\n");
+    let program = matching_index_debug_git(&fixture, "file.txt", 0, true);
+    let mut runner = Runner {
+        program: Some(program.clone()),
+        attribute_output_cap: Some(64),
+        ..Runner::default()
+    };
+    let snapshot = collect_snapshot(
+        &authority_for(&fixture),
+        &program,
+        DiffMode::Head,
+        1,
+        "truncated-attributes",
+        BaselineContext::new("baseline", BaselineCoverage::Partial).unwrap(),
+        &mut runner,
+    )
+    .await
+    .unwrap();
+    assert_eq!(snapshot.paths().len(), 1);
+    assert_eq!(snapshot.paths()[0].status().status(), Some(*b".M"));
+}
+
+/// An unproven attribute source falls back to source bytes without reading that attribute file.
+#[tokio::test]
+async fn denied_attribute_read_proof_forces_raw_capture() {
+    let fixture = GitFixture::unborn();
+    fixture.git(["config", "user.email", "filter@example.invalid"]);
+    fixture.git(["config", "user.name", "Filter Fixture"]);
+    fixture.write(b"file.txt", b"base\n");
+    fixture.git(["add", "file.txt"]);
+    fixture.git(["commit", "--quiet", "-m", "baseline"]);
+    fixture.write(b"file.txt", b"next\n");
+    fixture.write(b".git/info/exclude", b".gitattributes\n");
+    fixture.write(b".gitattributes", b"*.txt text eol=crlf\n");
+    fixture.git(["check-ignore", ".gitattributes"]);
+    let program = matching_index_debug_git(&fixture, "file.txt", 0, true);
+    let mut runner = MixedRunner {
+        inner: Runner {
+            program: Some(program.clone()),
+            ..Runner::default()
+        },
+        allowed: BTreeSet::from([
+            ".git/index".to_owned(),
+            ".git/info/attributes".to_owned(),
+            "file.txt".to_owned(),
+        ]),
+        scratch_intents: 0,
+    };
+    let snapshot = collect_snapshot(
+        &authority_for(&fixture),
+        &program,
+        DiffMode::Head,
+        1,
+        "denied-attributes",
+        BaselineContext::new("baseline", BaselineCoverage::Partial).unwrap(),
+        &mut runner,
+    )
+    .await
+    .unwrap();
+    assert_eq!(snapshot.paths().len(), 1);
+    assert_eq!(snapshot.paths()[0].status().status(), Some(*b".M"));
+}
+
+/// PNG rules do not pull clean TXT bulk or an unrelated large file into capture.
 #[tokio::test]
 async fn irrelevant_attributes_keep_a_large_repository_bounded_by_changes() {
     let fixture = GitFixture::unborn();
@@ -1104,7 +1230,8 @@ async fn irrelevant_attributes_keep_a_large_repository_bounded_by_changes() {
             &vec![b'x'; 16 * 1024],
         );
     }
-    fixture.write(b"large.png", &vec![b'p'; 2 * 1024 * 1024]);
+    fixture.write(b"small.png", b"png\n");
+    fixture.write(b"large.bin", &vec![b'p'; 2 * 1024 * 1024]);
     fixture.git(["add", "."]);
     fixture.git(["commit", "--quiet", "-m", "large baseline"]);
     let mut runner = Runner::default();
@@ -1113,8 +1240,8 @@ async fn irrelevant_attributes_keep_a_large_repository_bounded_by_changes() {
         .unwrap();
     assert!(clean.paths().is_empty());
     assert_eq!(
-        runner.hashes, 0,
-        "nested text rules must not affect root files"
+        runner.hashes, 1,
+        "only the explicitly unset PNG needs hashing"
     );
     let missing = fixture.root.join("missing-attributes");
     fixture.git_os([
@@ -1128,8 +1255,8 @@ async fn irrelevant_attributes_keep_a_large_repository_bounded_by_changes() {
         .unwrap();
     assert!(configured_clean.paths().is_empty());
     assert_eq!(
-        runner.hashes, 0,
-        "a missing configured file cannot force hashing"
+        runner.hashes, 1,
+        "a missing configured file cannot force TXT hashing"
     );
     fixture.write(b"tracked-123.txt", b"changed\n");
     let changed = collect(&fixture, DiffMode::Head, &mut Runner::default())
@@ -1580,6 +1707,53 @@ async fn final_metadata_probes_require_second_path_proof() {
         );
         assert_eq!(runner.seen, 2, "{target}");
     }
+}
+
+/// A final attribute-file proof refusal retries with byte capture instead of returning clean.
+#[tokio::test]
+async fn final_attribute_proof_refusal_retries_with_forced_capture() {
+    let fixture = GitFixture::unborn();
+    fixture.git(["config", "user.email", "proof@example.invalid"]);
+    fixture.git(["config", "user.name", "Proof Fixture"]);
+    fixture.write(b"clean.txt", b"base\n");
+    fixture.git(["add", "clean.txt"]);
+    fixture.git(["commit", "--quiet", "-m", "baseline"]);
+    fixture.write(b".git/info/exclude", b".gitattributes\n");
+    fixture.write(b".gitattributes", b"*.txt export-ignore\n");
+    let source_mtime = fs::metadata(fixture.root.join("clean.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    fs::File::options()
+        .write(true)
+        .open(fixture.root.join(".git/index"))
+        .unwrap()
+        .set_times(
+            fs::FileTimes::new().set_modified(source_mtime + std::time::Duration::from_secs(2)),
+        )
+        .unwrap();
+    let mut runner = SecondProofRunner {
+        inner: Runner::default(),
+        target: PathBuf::from(".gitattributes"),
+        seen: 0,
+    };
+    let snapshot = collect_snapshot(
+        &authority_for(&fixture),
+        Path::new(GIT),
+        DiffMode::Head,
+        1,
+        "final-attribute-proof",
+        BaselineContext::new("baseline", BaselineCoverage::Partial).unwrap(),
+        &mut runner,
+    )
+    .await
+    .unwrap();
+    assert!(snapshot.paths().is_empty());
+    assert_eq!(runner.seen, 2);
+    assert!(
+        runner.inner.hashes > 0,
+        "retry must classify raw source bytes"
+    );
 }
 
 /// A clean tracked path still needs a live read proof before either native metadata probe.
