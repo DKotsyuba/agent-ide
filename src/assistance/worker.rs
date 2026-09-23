@@ -4109,8 +4109,9 @@ async fn inspection_loop(
 }
 
 /// Delivers only a same-binding result after fresh durable authorization and liveness checks.
-/// A completed Diff with recorded empty provenance contains no worktree paths and needs no
-/// read-path proof; other path-less details retain the whole-tree proof requirement.
+/// An Activation status or completed Diff with recorded empty provenance contains no worktree
+/// source paths or bytes and needs no read-path proof; other path-less details retain the
+/// whole-tree proof requirement.
 async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, request: Inspection) {
     let result = async {
         let active = shared.active(&request.binding)?;
@@ -4172,8 +4173,8 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 // T36B: this one proof point covers every downstream disclosure below — the
                 // already-composed first pages, the later expansions, the cached-context
                 // freshness reread, and `source_matches` — because each names only paths from
-                // `source` or the retained diff provenance. A proven empty Diff discloses no
-                // worktree path or bytes; other path-less details keep the whole-tree gate.
+                // `source` or the retained diff provenance. Activation status and a proven empty
+                // Diff disclose no source path or bytes; other path-less details keep the gate.
                 let paths: Vec<&std::path::Path> = source
                     .as_ref()
                     .map(|source| source.path())
@@ -4199,11 +4200,16 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 };
                 if paths.is_empty()
                     && !matches!(
+                        reply,
+                        PeerReply::Complete {
+                            kind: ResultKind::Activation,
+                            ..
+                        }
+                    )
+                    && !matches!(
                         (&reply, &diff_provenance),
-                        (
-                            PeerReply::Complete { kind: ResultKind::Diff, .. },
-                            Some(provenance)
-                        ) if provenance.is_empty()
+                        (PeerReply::Complete { kind: ResultKind::Diff, .. }, Some(provenance))
+                            if provenance.is_empty()
                     )
                 {
                     validate_read_scope(
@@ -6369,6 +6375,76 @@ mod stop_retry_tests {
         )
         .await;
         reply_rx.await.unwrap()
+    }
+
+    /// A managed Codex host can bind its sandbox cwd to the worktree and still carry deny globs.
+    /// Its pathless activation status is deliverable after durable authorization, while source
+    /// reads retain the per-path proof and the denied whole-tree scope stays unavailable.
+    #[tokio::test]
+    async fn activation_status_survives_a_same_cwd_host_with_deny_globs() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join("main.rs"), "fn main() {}\n").unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        let (binding, _, authority, target) =
+            activate_read_scope(&mut worker, "codex-actor", "activation").await;
+        let (_, observed) = read_scope_call(
+            &worker,
+            Some("**/*.key"),
+            "codex-actor",
+            "activation-inspect",
+        );
+        assert_eq!(
+            observed.state().as_json()["sandboxCwd"],
+            target.candidate.to_str().unwrap()
+        );
+        assert!(matches!(
+            validate_read_scope(
+                &worker.shared,
+                &binding,
+                &observed,
+                &target,
+                &authority,
+                crate::errorlog::Method::Inspect,
+                crate::execution::ReadScope::WholeTree,
+            ),
+            Err(ReadScopeRefusal {
+                code: FailureCode::ExecutionProfileCause(_),
+                ..
+            })
+        ));
+        validate_read_scope(
+            &worker.shared,
+            &binding,
+            &observed,
+            &target,
+            &authority,
+            crate::errorlog::Method::Inspect,
+            crate::execution::ReadScope::Path(Path::new("main.rs")),
+        )
+        .unwrap();
+        retain_detail(
+            &worker,
+            &binding,
+            "activation-detail",
+            AssistanceTool::Start,
+            &authority,
+        );
+        let reply = PeerReply::Complete {
+            kind: ResultKind::Activation,
+            text: "Workspace activated".into(),
+            detail_ref: Some("activation-detail".into()),
+            truncated: false,
+            continuation: false,
+        };
+        worker
+            .shared
+            .complete("activation-detail", reply.clone(), Some(authority), None, 0);
+        assert_eq!(
+            inspect_detail(&worker, &binding, "activation-detail", &observed, &target).await,
+            reply
+        );
     }
 
     /// Both native-read consumers (`observe` and `serve_inspection` cached delivery) share
