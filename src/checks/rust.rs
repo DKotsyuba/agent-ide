@@ -62,7 +62,8 @@ impl RustChecker {
     ///
     /// `toolchain_dir` is the toolchain root whose `bin/cargo` is executed; when the binary is
     /// missing, [`RustChecker::check`] reports [`UnavailableReason::ToolMissing`]. `cargo_home`
-    /// overrides the cargo home read root; `None` means `$HOME/.cargo`. `timeout` bounds each
+    /// selects the cargo home read root and `CARGO_HOME` environment value; `None` means
+    /// `$HOME/.cargo`. `timeout` bounds each
     /// cargo run; expiry yields [`UnavailableReason::Timeout`] (the runner kills the group).
     /// `developer_dir` is the operator-declared `project_checks.rust.developer_dir` override; when
     /// absent (or the override does not exist) it is resolved from `/usr/bin/xcode-select -p`,
@@ -99,16 +100,18 @@ impl RustChecker {
     /// outdated lockfile cannot be written and cargo's refusal maps to
     /// [`UnavailableReason::EnvMissing`] in [`RustChecker::check`]. The environment is
     /// rebuilt from the allowlist: `PATH` limited to toolchain bins plus the system dirs,
-    /// `HOME`, `TMPDIR`/`CARGO_TARGET_DIR` under the private cache, `CARGO_NET_OFFLINE=true`, and
+    /// `HOME`, explicit `CARGO_HOME`, `TMPDIR`/`CARGO_TARGET_DIR` under the private cache,
+    /// `CARGO_NET_OFFLINE=true`, and
     /// this checker's resolved linker-bypass environment (T06B): compiling still needs read
     /// access to the Apple developer directory for headers and libraries, but the link step of a
     /// build script (for example `blake3`'s) is pointed straight at the toolchain `clang` instead
     /// of `/usr/bin/cc`, because that `cc` is an `xcrun` shim that fails under this Seatbelt
     /// profile. Read roots cover the worktree, the toolchain, the
-    /// cargo home, the derived rustup home, `/private/etc` and this checker's resolved Apple
+    /// cargo home, the derived rustup home, the standard Git excludes file when present,
+    /// `/private/etc` and this checker's resolved Apple
     /// developer directory roots; the private cache is the only write root; each output stream is
-    /// capped at `MAX_OUTPUT_BYTES`. The construction is pure with respect to the process
-    /// environment: its only inputs are the checker configuration and `request`.
+    /// capped at `MAX_OUTPUT_BYTES`. Ambient Cargo variables are ignored; HOME follows the
+    /// configured `AGENT_IDE_HOME` override or the password database.
     pub fn cargo_check_spec(&self, request: &CheckRequest) -> RunSpec {
         let home = real_home();
         let cargo_home = self.effective_cargo_home(&home);
@@ -136,6 +139,10 @@ impl RustChecker {
                 ),
                 ("HOME".to_owned(), home.to_string_lossy().into_owned()),
                 (
+                    "CARGO_HOME".to_owned(),
+                    cargo_home.to_string_lossy().into_owned(),
+                ),
+                (
                     "TMPDIR".to_owned(),
                     request.cache_dir.join("tmp").to_string_lossy().into_owned(),
                 ),
@@ -162,6 +169,7 @@ impl RustChecker {
             .into_iter()
             .chain(self.developer_roots.iter().cloned())
             .chain(ancestor_manifest_roots(&request.worktree))
+            .chain(git_exclude_root(&home))
             .collect(),
             write_roots: vec![request.cache_dir.clone()],
             timeout: self.timeout,
@@ -178,6 +186,15 @@ impl RustChecker {
             .clone()
             .unwrap_or_else(|| home.join(".cargo"))
     }
+}
+
+/// Returns Cargo's standard Git excludes file as one read root when it exists. Cargo asks
+/// libgit2 for this file while fingerprinting packages with build scripts; denying that read
+/// aborts the check before it can emit diagnostics. Other home contents remain outside the
+/// confined profile.
+fn git_exclude_root(home: &Path) -> Option<PathBuf> {
+    let path = home.join(".config/git/ignore");
+    path.is_file().then_some(path)
 }
 
 /// Resolves the ancestor manifest and cargo-config files a confined `cargo check` needs to read
@@ -785,6 +802,20 @@ struct RustcSpan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Includes only an existing standard Git excludes file, allowing Cargo's build-script
+    /// fingerprint scan without admitting the surrounding home directory.
+    #[test]
+    fn git_exclude_root_is_exact_and_optional() {
+        let home =
+            std::env::temp_dir().join(format!("agent-ide-git-exclude-{}", std::process::id()));
+        let path = home.join(".config/git/ignore");
+        assert_eq!(git_exclude_root(&home), None);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"target/\n").unwrap();
+        assert_eq!(git_exclude_root(&home), Some(path));
+        fs::remove_dir_all(home).unwrap();
+    }
 
     /// Proves a versioned rustup toolchain name (`<version>-<triple>`) yields the matching
     /// `CARGO_TARGET_<TRIPLE>_LINKER` suffix.

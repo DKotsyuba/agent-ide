@@ -913,6 +913,7 @@ struct TreeEntry {
 }
 
 /// Parses terminal-NUL tree/index records without splitting raw paths on spaces or newlines.
+/// Regular files and opaque gitlinks are retained; callers skip only unchanged gitlinks.
 /// Index stages 1..3 remain explicit conflicts; duplicate or incompatible records fail closed.
 fn parse_entries(
     bytes: &[u8],
@@ -935,7 +936,7 @@ fn parse_entries(
             return Err(GitError::InvalidPorcelain);
         }
         let mode = super::parse_mode(fields[0])?;
-        if !matches!(mode, 0o100644 | 0o100755) {
+        if !matches!(mode, 0o100644 | 0o100755 | 0o160000) {
             return Err(GitError::UnsupportedSnapshot);
         }
         let (oid, stage) = if index {
@@ -944,7 +945,13 @@ fn parse_entries(
             }
             (fields[1], fields[2][0] - b'0')
         } else {
-            if fields[1] != b"blob" {
+            if fields[1]
+                != if mode == 0o160000 {
+                    &b"commit"[..]
+                } else {
+                    &b"blob"[..]
+                }
+            {
                 return Err(GitError::UnsupportedSnapshot);
             }
             (fields[2], 0)
@@ -1317,6 +1324,16 @@ async fn capture_attempt<R: SnapshotRunner>(
     let mut eligible_paths = Vec::new();
     let mut attribute_untrusted = force_attributes;
     for path in &tracked {
+        let head = head_entries.get(path).and_then(|stages| stages.get(&0));
+        let index = index_entries.get(path).and_then(|stages| stages.get(&0));
+        if head.is_some_and(|entry| entry.mode == 0o160000)
+            || index.is_some_and(|entry| entry.mode == 0o160000)
+        {
+            if head != index {
+                return Err(GitError::UnsupportedSnapshot);
+            }
+            continue;
+        }
         let staged = head_entries.get(path) != index_entries.get(path);
         let changed = if staged {
             true
@@ -1390,7 +1407,11 @@ async fn capture_attempt<R: SnapshotRunner>(
         union.extend(eligible_paths);
         None
     };
-    let clean: Vec<_> = tracked.difference(&union).cloned().collect();
+    let clean: Vec<_> = tracked
+        .difference(&union)
+        .filter(|path| index_entries[*path][&0].mode != 0o160000)
+        .cloned()
+        .collect();
     if !before[3].is_empty() && !before[3].ends_with(&[0]) {
         return Err(GitError::InvalidPorcelain);
     }

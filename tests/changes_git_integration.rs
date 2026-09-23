@@ -1269,6 +1269,53 @@ async fn irrelevant_attributes_keep_a_large_repository_bounded_by_changes() {
     );
 }
 
+/// Bat-shaped nested attributes, clean gitlinks, and more than 256 tracked files still yield
+/// exactly the changed regular file while conversion rules receive conservative byte capture.
+#[tokio::test]
+async fn nested_bat_attributes_and_clean_gitlinks_allow_large_snapshot() {
+    let fixture = GitFixture::unborn();
+    fixture.git(["config", "user.email", "attributes@example.invalid"]);
+    fixture.git(["config", "user.name", "Attributes Fixture"]);
+    for dir in [
+        "assets",
+        "diagnostics",
+        "tests",
+        "tests/examples",
+        "tests/snapshots",
+    ] {
+        fs::create_dir_all(fixture.root.join(dir)).unwrap();
+    }
+    fixture.write(b"assets/.gitattributes", b"* linguist-vendored\n");
+    fixture.write(b"diagnostics/.gitattributes", b"* linguist-vendored\n");
+    fixture.write(b"tests/.gitattributes", b"examples/** text=auto eol=lf\nsnapshots/** text=auto eol=lf\n*.bin binary\n*.patch -diff export-ignore\n");
+    for n in 0..300 {
+        fixture.write(
+            format!("tests/examples/file-{n:03}.txt").as_bytes(),
+            b"base\n",
+        );
+    }
+    fixture.write(b"tests/snapshots/data.bin", b"raw\n");
+    fixture.git(["add", "."]);
+    fixture.git(["commit", "--quiet", "-m", "baseline"]);
+    let head = String::from_utf8(fixture.git(["rev-parse", "HEAD"]).stdout).unwrap();
+    fixture.git_os([
+        "update-index".into(),
+        "--add".into(),
+        "--cacheinfo".into(),
+        format!("160000,{},assets/syntaxes/submodule", head.trim()).into(),
+    ]);
+    fixture.git(["commit", "--quiet", "-m", "gitlink"]);
+    fixture.write(b"tests/examples/file-123.txt", b"changed\n");
+    let snapshot = collect(&fixture, DiffMode::Unstaged, &mut Runner::default())
+        .await
+        .unwrap();
+    assert_eq!(snapshot.paths().len(), 1);
+    assert_eq!(
+        snapshot.paths()[0].status().path(),
+        Path::new("tests/examples/file-123.txt")
+    );
+}
+
 /// Only text rules force hashing: a large PNG is skipped, and unchanged hashed bytes exceed
 /// the retained 8 MiB diff budget without consuming it.
 #[tokio::test]
