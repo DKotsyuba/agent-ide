@@ -20,6 +20,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs,
+    io::Write,
     net::TcpListener,
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
@@ -314,8 +315,9 @@ async fn profile_specific_expectation_manifest_enforces_the_accepted_authority()
 /// Each input must be a real capture with a distinct existing UUID leaf under one namespace.
 /// Only state A probes a cwd write; state B validates its captured cwd without writing there.
 /// The outside directory must be writable to the fixture process but outside sandbox grants.
-/// All created paths are unique, tracked for unwind cleanup, and children are bounded by
-/// `run_child`; this test stays ignored until the operator supplies both captures and Codex.
+/// Direct-leaf and nested credential sentinels cover both glob depths. Created paths are tracked
+/// for unwind cleanup, and children are bounded by `run_child`; this test stays ignored until
+/// the operator supplies both captures and Codex.
 #[tokio::test]
 #[ignore = "requires AGENT_IDE_D03_STATE_A, AGENT_IDE_D03_STATE_B, AGENT_IDE_D03_CODEX, and AGENT_IDE_D03_DENIED_DIR"]
 async fn visualization_family_native_d03() {
@@ -429,6 +431,37 @@ async fn visualization_family_native_d03() {
             if allowed {
                 assert_eq!(result.stdout().bytes, b"D03 sentinel");
             }
+        }
+        let suffix = test_path(leaf, "direct-env");
+        let direct = [
+            test_path(leaf, "direct-key").with_extension("key"),
+            test_path(leaf, "direct-pem").with_extension("pem"),
+            leaf.join(".env"),
+            leaf.join(format!(
+                ".env.{}",
+                suffix.file_name().unwrap().to_string_lossy()
+            )),
+        ];
+        for target in direct {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)
+                .unwrap();
+            let target = cleanup.track(target);
+            file.write_all(b"D03 direct sentinel").unwrap();
+            drop(file);
+            let result = run_child(
+                &request(state, &catalog, cat, target.clone()),
+                &codex,
+                "direct-deny",
+            )
+            .await;
+            assert!(
+                !result.status().success(),
+                "task {index} direct credential {target:?}: {:?}",
+                result.stderr().bytes
+            );
         }
         let network = serde_json::from_str::<serde_json::Value>(state.sandbox_state_json())
             .unwrap()["permissionProfile"]["network"]
