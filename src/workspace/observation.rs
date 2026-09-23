@@ -658,6 +658,17 @@ pub(super) fn inspect_authorized_source_kind(
     open_authorized_regular_file(worktree, path, MAX_SOURCE_PATH_BYTES).map(|_| ())
 }
 
+/// Returns no-follow regular-file metadata for snapshot candidate discovery, without reading
+/// source bytes. The same root identity and component checks as source reads apply; a missing,
+/// linked, or special path remains an error for the collector to classify as a candidate.
+pub(crate) fn snapshot_source_metadata(
+    worktree: &WorktreeRef,
+    path: &Path,
+) -> Result<std::fs::Metadata, ObservationError> {
+    open_authorized_regular_file(worktree, path, MAX_SOURCE_PATH_BYTES)
+        .map(|(_, metadata)| metadata)
+}
+
 /// Opens a bounded raw relative regular file only after verifying the entire root and parent chain.
 /// Returns its owned descriptor and metadata together; special files are rejected before content reads.
 fn open_authorized_regular_file(

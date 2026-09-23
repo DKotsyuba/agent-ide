@@ -1027,9 +1027,9 @@ async fn unchanged_paths_cost_no_per_path_blob_commands() {
     let snapshot = collect(&fixture, DiffMode::Unstaged, &mut runner)
         .await
         .unwrap();
-    // 8 metadata + 1 batched worktree hash + 1 cat-file + 1 batched verify + 1 comparison.
+    // 10 metadata + 1 worktree hash + 1 cat-file + 1 blob verification + 1 comparison.
     assert!(
-        runner.operations <= 12,
+        runner.operations <= 14,
         "sandboxed spawns must stay bounded, got {}",
         runner.operations
     );
@@ -1043,6 +1043,64 @@ async fn unchanged_paths_cost_no_per_path_blob_commands() {
     assert_eq!(snapshot.paths()[0].status().status(), Some(*b".M"));
     assert!(!snapshot.paths()[0].patch().is_empty());
     assert!(runner.directories.iter().all(|dir| !dir.exists()));
+}
+
+/// Six hundred clean tracked paths consume metadata only; changed paths alone enter byte caps.
+#[tokio::test]
+async fn large_repository_captures_changed_and_proven_empty_diffs() {
+    let fixture = GitFixture::unborn();
+    fixture.git(["config", "user.email", "large@example.invalid"]);
+    fixture.git(["config", "user.name", "Large Fixture"]);
+    for n in 0..600 {
+        fixture.write(format!("tracked-{n:03}.txt").as_bytes(), b"base\n");
+    }
+    fixture.git(["add", "."]);
+    fixture.git(["commit", "--quiet", "-m", "large baseline"]);
+    let clean = collect(&fixture, DiffMode::Head, &mut Runner::default())
+        .await
+        .unwrap();
+    let clean_result = compose_diff(
+        clean.scope(),
+        clean.comparison(),
+        clean.clone(),
+        DiffSelectionBudget::default(),
+    );
+    assert_eq!(clean_result.state(), DiffResultState::Ready);
+    assert!(clean_result.tracked().is_empty());
+    for n in 0..300 {
+        fixture.write(format!("tracked-{n:03}.txt").as_bytes(), b"base\n");
+    }
+    let touched = collect(&fixture, DiffMode::Head, &mut Runner::default())
+        .await
+        .unwrap();
+    assert!(
+        touched.paths().is_empty(),
+        "stat-only touches are not changed paths"
+    );
+    fixture.write(b"tracked-123.txt", b"changed\n");
+    fixture.write(b"new.txt", b"untracked\n");
+    let mut runner = Runner::default();
+    let changed = collect(&fixture, DiffMode::Head, &mut runner)
+        .await
+        .unwrap();
+    let result = compose_diff(
+        changed.scope(),
+        changed.comparison(),
+        changed.clone(),
+        DiffSelectionBudget::default(),
+    );
+    assert_eq!(result.state(), DiffResultState::Ready);
+    assert_eq!(result.tracked().len(), 1);
+    assert_eq!(result.tracked()[0].path(), Path::new("tracked-123.txt"));
+    assert_eq!(result.untracked().len(), 1);
+    assert_eq!(runner.comparisons, 1);
+    for n in 0..257 {
+        fixture.write(format!("tracked-{n:03}.txt").as_bytes(), b"over cap\n");
+    }
+    assert_eq!(
+        collect(&fixture, DiffMode::Head, &mut Runner::default()).await,
+        Err(GitError::EvidenceTooLarge)
+    );
 }
 
 /// Real truncated cat-file output is rejected despite successful exit and actual wait identity.

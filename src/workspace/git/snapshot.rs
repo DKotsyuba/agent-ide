@@ -25,7 +25,7 @@ use std::{
     io::Write,
     os::unix::{
         ffi::OsStrExt,
-        fs::{DirBuilderExt, OpenOptionsExt},
+        fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
     sync::{
@@ -257,6 +257,7 @@ impl SnapshotIntent {
             GitReadQuery::IndexState => "ls-files-stage",
             GitReadQuery::HeadTree => "ls-tree",
             GitReadQuery::UntrackedPaths => "ls-files-others",
+            GitReadQuery::IndexStat => "ls-files-debug",
             GitReadQuery::Status
             | GitReadQuery::HeadDiff
             | GitReadQuery::StagedDiff
@@ -788,13 +789,14 @@ async fn metadata<R: SnapshotRunner>(
     scope: &GitScope,
     program: &Path,
     runner: &mut R,
-) -> Result<[Vec<u8>; 4], GitError> {
-    let mut result = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+) -> Result<[Vec<u8>; 5], GitError> {
+    let mut result = std::array::from_fn(|_| Vec::new());
     for (slot, query) in [
         GitReadQuery::HeadIdentity,
         GitReadQuery::IndexState,
         GitReadQuery::HeadTree,
         GitReadQuery::UntrackedPaths,
+        GitReadQuery::IndexStat,
     ]
     .into_iter()
     .enumerate()
@@ -882,6 +884,103 @@ fn parse_entries(
     Ok(entries)
 }
 
+/// Index stat fields used only to skip byte capture when the same regular file still occupies
+/// the path. Git object/mode identities, not these fields, determine the final diff status.
+struct IndexStat {
+    /// Git's 32-bit on-disk ctime, mtime, device, inode, owner, and size fields in fixed order.
+    values: [u64; 9],
+}
+
+impl IndexStat {
+    /// Compares Git's recorded ctime, mtime, device, inode, owner and size with a no-follow
+    /// descriptor. Any mismatch selects the path for the normal authorized byte capture.
+    fn matches(&self, metadata: &fs::Metadata, index_mode: u32) -> bool {
+        self.values
+            == [
+                metadata.ctime() as u32 as u64,
+                metadata.ctime_nsec() as u32 as u64,
+                metadata.mtime() as u32 as u64,
+                metadata.mtime_nsec() as u32 as u64,
+                metadata.dev() as u32 as u64,
+                metadata.ino() as u32 as u64,
+                metadata.uid() as u64,
+                metadata.gid() as u64,
+                metadata.size() as u32 as u64,
+            ]
+            && index_mode
+                == if metadata.permissions().mode() & 0o100 != 0 {
+                    0o100755
+                } else {
+                    0o100644
+                }
+    }
+}
+
+/// Parses two fixed decimal fields from one Git index-debug line; raw path bytes never enter here.
+fn debug_pair(line: &[u8], prefix: &str, separator: &str) -> Result<(u64, u64), GitError> {
+    let text = std::str::from_utf8(line).map_err(|_| GitError::InvalidPorcelain)?;
+    let text = text
+        .strip_prefix(prefix)
+        .ok_or(GitError::InvalidPorcelain)?;
+    let (left, right) = text
+        .split_once(separator)
+        .ok_or(GitError::InvalidPorcelain)?;
+    Ok((
+        left.parse().map_err(|_| GitError::InvalidPorcelain)?,
+        right.parse().map_err(|_| GitError::InvalidPorcelain)?,
+    ))
+}
+
+/// Parses one fixed debug line and advances past its LF; path newlines are handled separately.
+fn debug_line<'a>(bytes: &'a [u8], offset: &mut usize) -> Result<&'a [u8], GitError> {
+    let end = bytes[*offset..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .ok_or(GitError::InvalidPorcelain)?
+        + *offset;
+    let line = &bytes[*offset..end];
+    *offset = end + 1;
+    Ok(line)
+}
+
+/// Parses Git's fixed `ls-files --debug -z` records while preserving arbitrary raw path bytes.
+/// Stage duplicates are retained and later checked against the separately parsed index listing.
+fn parse_index_stats(bytes: &[u8]) -> Result<BTreeMap<PathBuf, Vec<IndexStat>>, GitError> {
+    let mut result: BTreeMap<PathBuf, Vec<IndexStat>> = BTreeMap::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let end = bytes[offset..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or(GitError::InvalidPorcelain)?
+            + offset;
+        let path = super::raw_path(&bytes[offset..end]);
+        if !crate::workspace::observation::valid_relative_path(&path) {
+            return Err(GitError::InvalidPorcelain);
+        }
+        offset = end + 1;
+        let ctime = debug_pair(debug_line(bytes, &mut offset)?, "  ctime: ", ":")?;
+        let mtime = debug_pair(debug_line(bytes, &mut offset)?, "  mtime: ", ":")?;
+        let dev_ino = debug_pair(debug_line(bytes, &mut offset)?, "  dev: ", "\tino: ")?;
+        let uid_gid = debug_pair(debug_line(bytes, &mut offset)?, "  uid: ", "\tgid: ")?;
+        let size_flags = debug_pair(debug_line(bytes, &mut offset)?, "  size: ", "\tflags: ")?;
+        result.entry(path).or_default().push(IndexStat {
+            values: [
+                ctime.0,
+                ctime.1,
+                mtime.0,
+                mtime.1,
+                dev_ino.0,
+                dev_ino.1,
+                uid_gid.0,
+                uid_gid.1,
+                size_flags.0,
+            ],
+        });
+    }
+    Ok(result)
+}
+
 /// Assembles one generation from safe plumbing and exact raw file reads under aggregate budgets.
 /// Rename inference is deliberately absent: old/new raw identities are separate delete/add records.
 /// One selected changed path awaiting its blob fetch and private no-index comparison.
@@ -911,11 +1010,47 @@ async fn capture_attempt<R: SnapshotRunner>(
     let before = metadata(&scope, program, runner).await?;
     let head_entries = parse_entries(&before[2], false)?;
     let index_entries = parse_entries(&before[1], true)?;
-    let union: std::collections::BTreeSet<_> = head_entries
+    let tracked: std::collections::BTreeSet<_> = head_entries
         .keys()
         .chain(index_entries.keys())
         .cloned()
         .collect();
+    let index_stats = parse_index_stats(&before[4])?;
+    if index_stats.len() != index_entries.len()
+        || index_stats.iter().any(|(path, stats)| {
+            index_entries
+                .get(path)
+                .is_none_or(|entries| entries.len() != stats.len())
+        })
+    {
+        return Err(GitError::InvalidPorcelain);
+    }
+    // HEAD/index identities select staged paths. For otherwise identical paths, compare a
+    // no-follow native stat with Git's index fingerprint; only mismatches need source bytes.
+    let mut union = std::collections::BTreeSet::new();
+    for path in &tracked {
+        let staged = head_entries.get(path) != index_entries.get(path);
+        let changed = if staged {
+            true
+        } else {
+            match crate::workspace::observation::snapshot_source_metadata(scope.worktree(), path) {
+                Ok(metadata) => {
+                    let index = index_entries[path]
+                        .get(&0)
+                        .expect("equal HEAD/index has stage zero");
+                    !index_stats[path][0].matches(&metadata, index.mode)
+                }
+                Err(ObservationError::RootIdentityChanged) => {
+                    return Err(GitError::UnstableSnapshot);
+                }
+                Err(_) => true,
+            }
+        };
+        if changed {
+            union.insert(path.clone());
+        }
+    }
+    let clean: Vec<_> = tracked.difference(&union).cloned().collect();
     if !before[3].is_empty() && !before[3].ends_with(&[0]) {
         return Err(GitError::InvalidPorcelain);
     }
@@ -941,28 +1076,21 @@ async fn capture_attempt<R: SnapshotRunner>(
             conflict_stages: Vec::new(),
         });
     }
-    if union.len() + status.untracked.len() > MAX_SNAPSHOT_PATHS
-        || union
-            .iter()
-            .map(|path| path.as_os_str().as_bytes().len())
-            .chain(
-                status
-                    .untracked
-                    .iter()
-                    .map(|entry| entry.path().as_os_str().as_bytes().len()),
-            )
-            .sum::<usize>()
-            > MAX_SNAPSHOT_PATH_BYTES
-    {
+    let mut changed_count = status.untracked.len();
+    let mut changed_path_bytes = status
+        .untracked
+        .iter()
+        .map(|entry| entry.path().as_os_str().as_bytes().len())
+        .sum::<usize>();
+    if changed_count > MAX_SNAPSHOT_PATHS || changed_path_bytes > MAX_SNAPSHOT_PATH_BYTES {
         return Err(GitError::EvidenceTooLarge);
     }
     for entry in status.untracked() {
         runner.authorize_read_path(entry.path()).await?;
         inspect_untracked(scope.worktree(), entry.path())?;
     }
-    // Exact safe in-process reads cover every non-conflict union path, not only paths Git's stat
-    // cache happened to mark dirty. Blob bytes are fetched later, only for sides a selected
-    // comparison actually needs.
+    // Exact safe in-process reads cover each candidate, including staged-only changes. Blob
+    // bytes are fetched later, only for sides a selected comparison actually needs.
     let mut paths = Vec::new();
     let mut sources = BTreeMap::new();
     let mut total_bytes = 0usize;
@@ -971,6 +1099,11 @@ async fn capture_attempt<R: SnapshotRunner>(
     for path in &union {
         let stages = index_entries.get(path);
         if stages.is_some_and(|entries| !entries.contains_key(&0)) {
+            changed_count += 1;
+            changed_path_bytes += path.as_os_str().as_bytes().len();
+            if changed_count > MAX_SNAPSHOT_PATHS || changed_path_bytes > MAX_SNAPSHOT_PATH_BYTES {
+                return Err(GitError::EvidenceTooLarge);
+            }
             status.conflicts.push(PathStatus {
                 kind: super::StatusKind::Unmerged,
                 path: path.clone(),
@@ -1063,6 +1196,11 @@ async fn capture_attempt<R: SnapshotRunner>(
         };
         if [x, y] == *b".." {
             continue;
+        }
+        changed_count += 1;
+        changed_path_bytes += path.as_os_str().as_bytes().len();
+        if changed_count > MAX_SNAPSHOT_PATHS || changed_path_bytes > MAX_SNAPSHOT_PATH_BYTES {
+            return Err(GitError::EvidenceTooLarge);
         }
         let modes = [
             head.map_or(0, |entry| entry.mode),
@@ -1172,12 +1310,25 @@ async fn capture_attempt<R: SnapshotRunner>(
             source: (scope.mode() != DiffMode::Staged).then_some(pending.source),
         });
     }
-    // Exact safe reads cover every union path, not only paths Git's stat cache happened to mark dirty.
+    // Every captured candidate is reread before the metadata bracket closes.
     for (path, source) in &sources {
         // T36B: repeat authorization before the consistency reread, exactly as before capture.
         runner.authorize_read_path(path).await?;
         let after = SnapshotSource::capture(scope.worktree(), scope.authority_epoch(), path, None)?;
         if after.read != source.read {
+            return Err(GitError::UnstableSnapshot);
+        }
+    }
+    // A clean path's stat must still match the same index fingerprint at the end of the
+    // attempt; a concurrent edit of a skipped path retries instead of minting an empty diff.
+    for path in &clean {
+        let metadata =
+            crate::workspace::observation::snapshot_source_metadata(scope.worktree(), path)
+                .map_err(|_| GitError::UnstableSnapshot)?;
+        let index = index_entries[path]
+            .get(&0)
+            .expect("clean path has stage zero");
+        if !index_stats[path][0].matches(&metadata, index.mode) {
             return Err(GitError::UnstableSnapshot);
         }
     }
@@ -1190,7 +1341,7 @@ async fn capture_attempt<R: SnapshotRunner>(
     }
     let head = evidence_identity(b"workspace-git-head-v1", &before[0]);
     let index = evidence_identity(b"workspace-git-index-v1", &before[1]);
-    for component in &before[1..=3] {
+    for component in &before[1..] {
         working.update(&(component.len() as u64).to_le_bytes());
         working.update(component);
     }

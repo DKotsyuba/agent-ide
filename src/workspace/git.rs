@@ -241,6 +241,8 @@ pub enum GitReadQuery {
     HeadIdentity,
     /// Collects the complete NUL-delimited index state without writing a tree object.
     IndexState,
+    /// Lists index stat fingerprints without reading worktree content or running filters.
+    IndexStat,
     /// Legacy non-executable HEAD patch tag; live HEAD mode uses the raw snapshot collector.
     HeadDiff,
     /// Legacy non-executable staged patch tag; live staged mode uses the raw snapshot collector.
@@ -259,7 +261,7 @@ impl GitReadQuery {
             | Self::HeadIdentity
             | Self::HeadDiff => DiffMode::Head,
             Self::IndexState | Self::StagedDiff => DiffMode::Staged,
-            Self::UnstagedDiff => DiffMode::Unstaged,
+            Self::IndexStat | Self::UnstagedDiff => DiffMode::Unstaged,
         }
     }
 }
@@ -890,6 +892,12 @@ fn read_args(query: GitReadQuery) -> Vec<OsString> {
         GitReadQuery::IndexState => args.extend([
             OsString::from("ls-files"),
             OsString::from("--stage"),
+            OsString::from("-z"),
+            OsString::from("--"),
+        ]),
+        GitReadQuery::IndexStat => args.extend([
+            OsString::from("ls-files"),
+            OsString::from("--debug"),
             OsString::from("-z"),
             OsString::from("--"),
         ]),

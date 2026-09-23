@@ -6152,6 +6152,63 @@ async fn diff_oversized_single_hunk_reports_capacity_without_false_continuation(
     daemon.wait().await.unwrap();
 }
 
+/// The shipping Codex route handles a large clean tree and charges only changed paths to the cap.
+#[tokio::test]
+async fn codex_diff_large_repository_is_empty_then_changed_then_explicitly_capped() {
+    let fixture = ProductFixture::new(json!([]));
+    for index in 0..600 {
+        std::fs::write(fixture.root.join(format!("bulk-{index:03}.txt")), "base\n").unwrap();
+    }
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "large baseline"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "product-root").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"start"}))
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let clean = actor
+        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let clean = actor.settle(&fixture, clean).await;
+    assert_eq!(clean["kind"], "diff", "{clean}");
+    assert!(
+        clean["text"]
+            .as_str()
+            .unwrap()
+            .contains("tracked: 0; untracked: 0")
+    );
+    std::fs::write(fixture.root.join("bulk-123.txt"), "changed\n").unwrap();
+    std::fs::write(fixture.root.join("new.txt"), "untracked\n").unwrap();
+    let changed = actor
+        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let changed = actor.settle(&fixture, changed).await;
+    assert_eq!(changed["kind"], "diff", "{changed}");
+    let text = changed["text"].as_str().unwrap();
+    assert!(
+        text.contains("bulk-123.txt") && text.contains("new.txt"),
+        "{text}"
+    );
+    for index in 0..257 {
+        std::fs::write(
+            fixture.root.join(format!("bulk-{index:03}.txt")),
+            "over cap\n",
+        )
+        .unwrap();
+    }
+    let capped = actor
+        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let capped = actor.settle(&fixture, capped).await;
+    assert_eq!(capped["code"], "capacity", "{capped}");
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Parses one page's `page N[ (last)]; bytes A-B of TOTAL[; status]` position marker (T16B).
 fn page_marker(text: &str) -> (usize, bool, usize, usize, usize) {
     let line = text.lines().next().unwrap_or_default();
