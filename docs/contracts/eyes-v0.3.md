@@ -156,11 +156,15 @@ Every project check process is started through one spawn path:
   through profile denial. Without this, the walk fails with `Operation not permitted` before
   cargo produces a single JSON event, reported as `Unavailable(Fatal)` with cargo's own
   `error: failed searching for potential workspace` as the snapshot detail (§4).
+- Cargo's build-script fingerprint scan reads the standard Git excludes file at
+  `$HOME/.config/git/ignore` when it exists. The Rust profile admits that exact file as a read
+  root; denying it makes Cargo abort before any compiler diagnostic or `build-finished` event.
 - Own process group; on cancel, timeout (`check_timeout_s`) or daemon shutdown the whole group is
   killed (SIGTERM, 2 s, SIGKILL) and reaped. No pattern-based kill of processes the daemon did not
   start.
-- Environment is rebuilt from an allowlist (PATH to toolchain bins, HOME, TMPDIR to the private
-  temp dir, CARGO_TARGET_DIR, CARGO_NET_OFFLINE=true, plus Rust's linker-bypass variables below);
+- Environment is rebuilt from an allowlist (PATH to toolchain bins, HOME, CARGO_HOME set to the
+  configured read root, TMPDIR to the private temp dir, CARGO_TARGET_DIR, CARGO_NET_OFFLINE=true,
+  plus Rust's linker-bypass variables below);
   ambient credentials are not passed.
 - Rust linker bypass (T06B): `/usr/bin/cc`, which every native build script's link step reaches by
   default, is Apple's `xcrun` shim — it writes an `xcrun_db` cache into the real Darwin user temp

@@ -189,6 +189,10 @@ fn rust_cargo_check_spec_matches_confined_contract() {
                 rust_home().to_string_lossy().into_owned()
             ),
             (
+                "CARGO_HOME".to_owned(),
+                rust_home().join(".cargo").to_string_lossy().into_owned()
+            ),
+            (
                 "TMPDIR".to_owned(),
                 root.join("cache")
                     .join("tmp")
@@ -266,6 +270,10 @@ fn rust_cargo_check_spec_honors_explicit_cargo_home() {
     );
     let spec = checker.cargo_check_spec(&request);
     assert_eq!(spec.read_roots[2], cargo_home);
+    assert!(spec.env.contains(&(
+        "CARGO_HOME".to_owned(),
+        root.join("custom-cargo").to_string_lossy().into_owned()
+    )));
     let _ = fs::remove_dir_all(&root);
 }
 
