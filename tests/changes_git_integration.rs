@@ -1316,6 +1316,126 @@ async fn nested_bat_attributes_and_clean_gitlinks_allow_large_snapshot() {
     );
 }
 
+/// A clean tracked link stays outside the changed-path budget, while target and type changes refuse.
+#[tokio::test]
+async fn unchanged_tracked_symlink_allows_large_diff_but_changes_refuse() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = GitFixture::unborn();
+    fixture.git(["config", "user.email", "symlink@example.invalid"]);
+    fixture.git(["config", "user.name", "Symlink Fixture"]);
+    for n in 0..300 {
+        fixture.write(format!("file-{n:03}.txt").as_bytes(), b"base\n");
+    }
+    let link = fixture.root.join("link.md");
+    symlink("file-001.txt", &link).unwrap();
+    fixture.git(["add", "."]);
+    fixture.git(["commit", "--quiet", "-m", "baseline"]);
+    fixture.write(b"file-123.txt", b"changed\n");
+    let snapshot = collect(&fixture, DiffMode::Unstaged, &mut Runner::default())
+        .await
+        .unwrap();
+    assert_eq!(snapshot.paths().len(), 1);
+    assert_eq!(
+        snapshot.paths()[0].status().path(),
+        Path::new("file-123.txt")
+    );
+    assert!(
+        snapshot.paths()[0]
+            .patch()
+            .windows(8)
+            .any(|part| part == b"+changed")
+    );
+
+    fs::remove_file(&link).unwrap();
+    symlink("file-002.txt", &link).unwrap();
+    assert_eq!(
+        collect(&fixture, DiffMode::Unstaged, &mut Runner::default()).await,
+        Err(GitError::UnsupportedSnapshot)
+    );
+    fs::remove_file(&link).unwrap();
+    fs::write(&link, b"file-001.txt").unwrap();
+    assert_eq!(
+        collect(&fixture, DiffMode::Unstaged, &mut Runner::default()).await,
+        Err(GitError::UnsupportedSnapshot)
+    );
+    fs::remove_file(&link).unwrap();
+    symlink("file-001.txt", &link).unwrap();
+    let regular = fixture.root.join("file-002.txt");
+    fs::remove_file(&regular).unwrap();
+    symlink("file-001.txt", &regular).unwrap();
+    assert_eq!(
+        collect(&fixture, DiffMode::Unstaged, &mut Runner::default()).await,
+        Err(GitError::UnsupportedSnapshot)
+    );
+}
+
+/// Replacing a link after its first proof cannot turn a skipped entry into a clean snapshot.
+#[tokio::test]
+async fn skipped_tracked_symlink_is_rechecked_before_snapshot_completion() {
+    use std::os::unix::fs::symlink;
+
+    /// Mutates the link immediately before the collector's second authorized read.
+    struct MutatingRunner {
+        /// Execution-backed Git command runner.
+        inner: Runner,
+        /// Test-owned link path changed after the first read.
+        link: PathBuf,
+        /// Number of read proofs observed for the tracked link.
+        reads: usize,
+    }
+
+    impl SnapshotRunner for MutatingRunner {
+        /// Delegates Git execution unchanged.
+        async fn run(
+            &mut self,
+            intent: SnapshotIntent,
+        ) -> Result<agent_ide::execution::CapturedProcessEvidence, GitError> {
+            self.inner.run(intent).await
+        }
+
+        /// Changes the target at the final proof, before its second no-follow read.
+        async fn authorize_read_path(&mut self, path: &Path) -> Result<(), GitError> {
+            if path == Path::new("link.md") {
+                self.reads += 1;
+                if self.reads == 2 {
+                    fs::remove_file(&self.link).unwrap();
+                    symlink("other.txt", &self.link).unwrap();
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let fixture = GitFixture::unborn();
+    fixture.git(["config", "user.email", "symlink@example.invalid"]);
+    fixture.git(["config", "user.name", "Symlink Fixture"]);
+    fixture.write(b"source.txt", b"base\n");
+    let link = fixture.root.join("link.md");
+    symlink("source.txt", &link).unwrap();
+    fixture.git(["add", "."]);
+    fixture.git(["commit", "--quiet", "-m", "baseline"]);
+    let mut runner = MutatingRunner {
+        inner: Runner::default(),
+        link,
+        reads: 0,
+    };
+    assert_eq!(
+        collect_snapshot(
+            &authority_for(&fixture),
+            Path::new(GIT),
+            DiffMode::Unstaged,
+            1,
+            "symlink-mutation",
+            BaselineContext::new("baseline", BaselineCoverage::Partial).unwrap(),
+            &mut runner,
+        )
+        .await,
+        Err(GitError::UnsupportedSnapshot)
+    );
+    assert!(runner.reads >= 3, "the retry must see the changed target");
+}
+
 /// Only text rules force hashing: a large PNG is skipped, and unchanged hashed bytes exceed
 /// the retained 8 MiB diff budget without consuming it.
 #[tokio::test]

@@ -20,12 +20,13 @@ use crate::{
 };
 use std::{
     collections::BTreeMap,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs::{self, DirBuilder, OpenOptions},
     io::Write,
     os::unix::{
         ffi::OsStrExt,
         fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+        io::{AsRawFd, FromRawFd},
     },
     path::{Path, PathBuf},
     sync::{
@@ -795,7 +796,7 @@ impl GitSnapshot {
 
 /// Captures each required side without Git filters, retries one unstable window, then returns stale.
 /// `generation` and `operation` are allocated by the caller; no partial result claims complete state.
-/// Symlinks, submodules, unborn HEAD, exceeded bounds and failed Execution evidence stay explicit errors.
+/// Changed symlinks, submodules, unborn HEAD, exceeded bounds and failed Execution evidence stay explicit errors.
 /// Equality brackets detect observed changes, not an atomic filesystem transaction or ABA mutations.
 #[allow(clippy::too_many_arguments)]
 pub async fn collect_snapshot<R: SnapshotRunner>(
@@ -903,17 +904,17 @@ async fn metadata<R: SnapshotRunner>(
     Ok(result)
 }
 
-/// One immutable regular-file entry from the committed tree or one index stage.
+/// One immutable regular-file, symlink, or gitlink entry from the tree or index.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TreeEntry {
-    /// Exact octal regular-file mode, independent of content identity.
+    /// Exact octal Git mode, independent of content identity.
     mode: u32,
     /// Full strict object name; absent entries are represented by Option outside this type.
     oid: GitObjectId,
 }
 
 /// Parses terminal-NUL tree/index records without splitting raw paths on spaces or newlines.
-/// Regular files and opaque gitlinks are retained; callers skip only unchanged gitlinks.
+/// Regular files, symlinks and opaque gitlinks are retained; callers prove unchanged symlinks.
 /// Index stages 1..3 remain explicit conflicts; duplicate or incompatible records fail closed.
 fn parse_entries(
     bytes: &[u8],
@@ -936,7 +937,7 @@ fn parse_entries(
             return Err(GitError::InvalidPorcelain);
         }
         let mode = super::parse_mode(fields[0])?;
-        if !matches!(mode, 0o100644 | 0o100755 | 0o160000) {
+        if !matches!(mode, 0o100644 | 0o100755 | 0o120000 | 0o160000) {
             return Err(GitError::UnsupportedSnapshot);
         }
         let (oid, stage) = if index {
@@ -1280,6 +1281,101 @@ struct PendingCompare {
     source: SnapshotSource,
 }
 
+/// Reads a tracked link's bounded raw target through a verified no-follow parent descriptor.
+/// The caller supplies live path authorization; missing or mutated entries retry, while type changes refuse.
+fn read_tracked_symlink(worktree: &WorktreeRef, path: &Path) -> Result<Vec<u8>, GitError> {
+    use crate::workspace::observation::{
+        native_directory_identity, open_directory, open_root_directory, valid_relative_path,
+    };
+
+    if !valid_relative_path(path) {
+        return Err(GitError::InvalidPorcelain);
+    }
+    let mut directory =
+        open_root_directory(worktree.worktree_path()).map_err(|_| GitError::UnstableSnapshot)?;
+    if worktree
+        .native_root_identity()
+        .is_some_and(|expected| native_directory_identity(&directory) != Ok(expected))
+    {
+        return Err(GitError::UnstableSnapshot);
+    }
+    let components: Vec<_> = path
+        .as_os_str()
+        .as_bytes()
+        .split(|byte| *byte == b'/')
+        .map(OsStr::from_bytes)
+        .collect();
+    for component in &components[..components.len() - 1] {
+        let fd = open_directory(directory.as_raw_fd(), component)
+            .map_err(|_| GitError::UnstableSnapshot)?;
+        // SAFETY: open_directory returned a new owned descriptor.
+        directory = unsafe { fs::File::from_raw_fd(fd) };
+    }
+    let mut name = components
+        .last()
+        .expect("validated path has a component")
+        .as_bytes()
+        .to_vec();
+    name.push(0);
+    let stat = || -> Result<libc::stat, GitError> {
+        // SAFETY: zeroed stat is filled by fstatat before any field is read.
+        let mut metadata = unsafe { std::mem::zeroed() };
+        // SAFETY: name is NUL-terminated and the parent descriptor remains open.
+        if unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name.as_ptr().cast(),
+                &mut metadata,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(GitError::UnstableSnapshot);
+        }
+        if metadata.st_mode & libc::S_IFMT != libc::S_IFLNK {
+            return Err(GitError::UnsupportedSnapshot);
+        }
+        Ok(metadata)
+    };
+    let before = stat()?;
+    let length = (before.st_size as usize)
+        .saturating_add(1)
+        .clamp(1, MAX_SNAPSHOT_BLOB_BYTES + 1);
+    let mut target = vec![0; length];
+    // SAFETY: name is NUL-terminated; target owns a writable buffer and the parent stays open.
+    let read = unsafe {
+        libc::readlinkat(
+            directory.as_raw_fd(),
+            name.as_ptr().cast(),
+            target.as_mut_ptr().cast(),
+            target.len(),
+        )
+    };
+    if read < 0 {
+        return Err(GitError::UnstableSnapshot);
+    }
+    if read as usize == target.len() {
+        return Err(if target.len() > MAX_SNAPSHOT_BLOB_BYTES {
+            GitError::EvidenceTooLarge
+        } else {
+            GitError::UnstableSnapshot
+        });
+    }
+    let after = stat()?;
+    let stable = before.st_dev == after.st_dev
+        && before.st_ino == after.st_ino
+        && before.st_size == after.st_size
+        && before.st_mtime == after.st_mtime
+        && before.st_mtime_nsec == after.st_mtime_nsec
+        && before.st_ctime == after.st_ctime
+        && before.st_ctime_nsec == after.st_ctime_nsec;
+    if !stable {
+        return Err(GitError::UnstableSnapshot);
+    }
+    target.truncate(read as usize);
+    Ok(target)
+}
+
 /// Captures one metadata-bracketed generation; a retry conservatively hashes prospective skips
 /// so an attribute read refusal at the end of the first attempt cannot mint clean evidence.
 #[allow(clippy::too_many_arguments)]
@@ -1322,6 +1418,8 @@ async fn capture_attempt<R: SnapshotRunner>(
     let mut attribute_sources = BTreeMap::new();
     let mut attribute_paths = Vec::new();
     let mut eligible_paths = Vec::new();
+    let mut symlinks = BTreeMap::new();
+    let mut symlink_bytes = 0usize;
     let mut attribute_untrusted = force_attributes;
     for path in &tracked {
         let head = head_entries.get(path).and_then(|stages| stages.get(&0));
@@ -1332,6 +1430,21 @@ async fn capture_attempt<R: SnapshotRunner>(
             if head != index {
                 return Err(GitError::UnsupportedSnapshot);
             }
+            continue;
+        }
+        if head.is_some_and(|entry| entry.mode == 0o120000)
+            || index.is_some_and(|entry| entry.mode == 0o120000)
+        {
+            if head != index {
+                return Err(GitError::UnsupportedSnapshot);
+            }
+            runner.authorize_read_path(path).await?;
+            let target = read_tracked_symlink(scope.worktree(), path)?;
+            symlink_bytes += target.len();
+            if symlink_bytes > MAX_SNAPSHOT_HASH_BYTES {
+                return Err(GitError::EvidenceTooLarge);
+            }
+            symlinks.insert(path.clone(), target);
             continue;
         }
         let staged = head_entries.get(path) != index_entries.get(path);
@@ -1391,6 +1504,19 @@ async fn capture_attempt<R: SnapshotRunner>(
             union.insert(path.clone());
         }
     }
+    if !symlinks.is_empty() {
+        let entries = symlinks
+            .values()
+            .enumerate()
+            .map(|(index, target)| (index, target.clone()))
+            .collect();
+        let hashes = batch_hashes(&scope, program, 's', entries, runner).await?;
+        for ((path, _), hash) in symlinks.iter().zip(hashes) {
+            if hash != index_entries[path][&0].oid {
+                return Err(GitError::UnsupportedSnapshot);
+            }
+        }
+    }
     let checked = if attribute_untrusted {
         None
     } else {
@@ -1409,7 +1535,7 @@ async fn capture_attempt<R: SnapshotRunner>(
     };
     let clean: Vec<_> = tracked
         .difference(&union)
-        .filter(|path| index_entries[*path][&0].mode != 0o160000)
+        .filter(|path| !matches!(index_entries[*path][&0].mode, 0o120000 | 0o160000))
         .cloned()
         .collect();
     if !before[3].is_empty() && !before[3].ends_with(&[0]) {
@@ -1454,7 +1580,7 @@ async fn capture_attempt<R: SnapshotRunner>(
     // bytes are fetched later, only for sides a selected comparison actually needs.
     let mut paths = Vec::new();
     let mut sources = BTreeMap::new();
-    let mut hashed_bytes = 0usize;
+    let mut hashed_bytes = symlink_bytes;
     let mut retained_bytes = 0usize;
     let mut patch_bytes = 0usize;
     let mut working = blake3::Hasher::new();
@@ -1695,6 +1821,12 @@ async fn capture_attempt<R: SnapshotRunner>(
         runner.authorize_read_path(path).await?;
         let after = SnapshotSource::capture(scope.worktree(), scope.authority_epoch(), path, None)?;
         if after.read != source.read {
+            return Err(GitError::UnstableSnapshot);
+        }
+    }
+    for (path, target) in &symlinks {
+        runner.authorize_read_path(path).await?;
+        if read_tracked_symlink(scope.worktree(), path)? != *target {
             return Err(GitError::UnstableSnapshot);
         }
     }
