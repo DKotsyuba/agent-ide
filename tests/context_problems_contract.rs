@@ -86,7 +86,7 @@ fn context_schema_advertises_bounded_problems_fields() {
     );
     assert_eq!(
         schema["properties"]["language"],
-        json!({"type":"string","enum":["rust","python"]})
+        json!({"type":"string","enum":["rust","python","typescript"]})
     );
     assert_eq!(schema["properties"]["offset"]["type"], "integer");
     assert_eq!(schema["properties"]["offset"]["minimum"], 0);
@@ -106,8 +106,15 @@ fn validation_accepts_problems_without_path_and_keeps_bounds_closed() {
         )
         .is_ok()
     );
+    assert!(
+        validate_call(
+            AssistanceTool::Context,
+            json!({"kind":"problems","language":"typescript"})
+        )
+        .is_ok()
+    );
     for invalid in [
-        json!({"kind":"problems","language":"typescript"}),
+        json!({"kind":"problems","language":"ruby"}),
         json!({"kind":"problems","offset":-2}),
         json!({"kind":"problems","offset":"0"}),
         json!({"kind":"problems","unknown":"field"}),
@@ -151,7 +158,7 @@ fn problem_source_is_object_safe_send_and_sync() {
     assert_eq!(concrete.queried(), vec![PathBuf::from("/wt")]);
     assert_eq!(PROBLEMS_PAGE_SIZE, 20);
     assert_eq!(parse_language("python"), Some(Language::Python));
-    assert_eq!(parse_language("typescript"), None);
+    assert_eq!(parse_language("typescript"), Some(Language::TypeScript));
 }
 
 /// Pages 45 fake problems 20 at a time with exact counts, ordering and next_offset markers.
