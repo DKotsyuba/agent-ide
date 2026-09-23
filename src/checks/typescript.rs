@@ -1,12 +1,14 @@
 //! Confined root-config TypeScript and JavaScript project checks.
 //!
-//! The pinned `tsc.js` CLI supplies diagnostics, a complete file list, and a diagnostics footer.
+//! The pinned TypeScript compiler supplies diagnostics, a complete file list, and a diagnostics footer.
 //! A snapshot is ready only when all three agree and at least one worktree file was analyzed.
 
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::runner::{ConfinedRunner, RunOutput, RunSpec};
@@ -18,8 +20,12 @@ use crate::execution::seatbelt::ReadDeny;
 
 /// Maximum bytes captured from either CLI stream; a larger report fails closed.
 const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
-/// ponytail: Bound deny preflight work; larger trees stay unavailable until a cheaper source inventory exists.
-const MAX_POLICY_ENTRIES: usize = 100_000;
+/// Adapter exit status reserved for a refused compiler read or filesystem probe.
+const READ_RESTRICTED_STATUS: i32 = 77;
+/// First-party adapter embedded into the private cache for each compiler run.
+const ADAPTER: &str = include_str!("typescript_adapter.js");
+/// Unique temporary adapter names within one daemon process.
+static ADAPTER_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Ordered footer labels emitted by pinned TypeScript 5.9.3 with `--diagnostics`.
 const FOOTER: [&str; 13] = [
     "Files",
@@ -74,8 +80,8 @@ impl TypeScriptChecker {
     ///
     /// `config` is the already admitted regular root config; the caller must not pass a link.
     /// The Node executable and separate TypeScript package are readable, even when they live in
-    /// different directory trees; system paths are already granted by Seatbelt. CLI flags override project options that would
-    /// write build metadata or replace the bounded diagnostics/file-list output format.
+    /// different directory trees. The adapter guards compiler filesystem calls; CLI flags direct
+    /// build metadata to the private cache without changing incremental or composite semantics.
     pub fn run_spec(&self, request: &CheckRequest, config: &Path) -> RunSpec {
         let typescript_root = self
             .tsc_cli
@@ -83,10 +89,24 @@ impl TypeScriptChecker {
             .and_then(Path::parent)
             .unwrap_or(&self.tsc_cli);
         let tmp = request.cache_dir.join("tmp");
+        let mut read_roots = vec![
+            request.worktree.clone(),
+            self.node.clone(),
+            typescript_root.to_path_buf(),
+            request.cache_dir.clone(),
+        ];
+        // TypeScript probes ancestor package boundaries and node_modules even without imports.
+        for parent in request.worktree.ancestors().skip(1) {
+            read_roots.push(parent.join("node_modules"));
+            read_roots.push(parent.join("package.json"));
+        }
         RunSpec {
             program: self.node.clone(),
             args: vec![
-                self.tsc_cli.clone().into_os_string(),
+                request
+                    .cache_dir
+                    .join("typescript-check.js")
+                    .into_os_string(),
                 OsString::from("--project"),
                 config.as_os_str().to_os_string(),
                 OsString::from("--pretty"),
@@ -94,10 +114,8 @@ impl TypeScriptChecker {
                 OsString::from("--diagnostics"),
                 OsString::from("--listFiles"),
                 OsString::from("--noEmit"),
-                OsString::from("--incremental"),
-                OsString::from("false"),
-                OsString::from("--composite"),
-                OsString::from("false"),
+                OsString::from("--tsBuildInfoFile"),
+                request.cache_dir.join("check.tsbuildinfo").into_os_string(),
                 OsString::from("--extendedDiagnostics"),
                 OsString::from("false"),
                 OsString::from("--explainFiles"),
@@ -124,12 +142,21 @@ impl TypeScriptChecker {
                         .unwrap_or_default(),
                 ),
                 ("TMPDIR".into(), tmp.display().to_string()),
+                ("CHECK_TSC_CLI".into(), self.tsc_cli.display().to_string()),
+                (
+                    "CHECK_CACHE".into(),
+                    request.cache_dir.display().to_string(),
+                ),
+                (
+                    "CHECK_READ_ROOTS".into(),
+                    serde_json::to_string(&read_roots).unwrap_or_default(),
+                ),
+                (
+                    "CHECK_READ_DENIES".into(),
+                    serde_json::to_string(&request.read_denies).unwrap_or_default(),
+                ),
             ],
-            read_roots: vec![
-                request.worktree.clone(),
-                self.node.clone(),
-                typescript_root.to_path_buf(),
-            ],
+            read_roots,
             write_roots: vec![request.cache_dir.clone()],
             read_denies: request.read_denies.clone(),
             timeout: self.timeout,
@@ -145,8 +172,8 @@ impl Checker for TypeScriptChecker {
     }
 
     /// Runs the selected root config and admits only a fully parsed, nontruncated CLI result.
-    /// A read exclusion touching any runner read root, or a credential glob with an unprovable
-    /// match-free inventory, yields `ReadRestricted` before execution or publication.
+    /// A compiler read refused by the adapter yields `ReadRestricted`, including probes that
+    /// TypeScript normally converts into absent files. All other malformed output fails closed.
     fn check(&self, request: CheckRequest) -> BoxFuture<'_, ProblemSnapshot> {
         Box::pin(async move {
             let generation = request.input_generation;
@@ -164,8 +191,18 @@ impl Checker for TypeScriptChecker {
                     generation,
                 );
             }
+            if stage_adapter(&request.cache_dir).is_err() {
+                return ProblemSnapshot::unavailable(
+                    Language::TypeScript,
+                    UnavailableReason::Fatal,
+                    generation,
+                );
+            }
             let spec = self.run_spec(&request, &config);
-            if !read_policy_supported(&spec) {
+            if [&self.node, &self.tsc_cli].iter().any(|tool| {
+                tool.ancestors()
+                    .any(|part| request.read_denies.iter().any(|deny| deny.matches(part)))
+            }) {
                 return ProblemSnapshot::unavailable(
                     Language::TypeScript,
                     UnavailableReason::ReadRestricted,
@@ -199,7 +236,14 @@ impl Checker for TypeScriptChecker {
                     generation,
                 );
             }
-            if !read_policy_supported(&spec) {
+            if output.truncated {
+                return ProblemSnapshot::unavailable(
+                    Language::TypeScript,
+                    UnavailableReason::Fatal,
+                    generation,
+                );
+            }
+            if output.status == Some(READ_RESTRICTED_STATUS) {
                 return ProblemSnapshot::unavailable(
                     Language::TypeScript,
                     UnavailableReason::ReadRestricted,
@@ -218,89 +262,27 @@ impl Checker for TypeScriptChecker {
     }
 }
 
-/// Proves that a host deny cannot hide an existing input in any readable runner root.
-///
-/// Path denies intersecting a read or write root always refuse the check. With any deny, every
-/// explicit grant is scanned twice: unreadable entries, links, a matching entry, or the bounded
-/// scan ceiling refuse publication, including aliases into denies outside the lexical roots.
-/// The filesystem can still change between the
-/// two scans; the scheduler's input-generation fence handles observed edits, not a transient edit
-/// that appears and disappears entirely during one run.
-fn read_policy_supported(spec: &RunSpec) -> bool {
-    if spec.read_denies.is_empty() {
-        return true;
+/// Atomically replace the private adapter without following a pre-existing final symlink.
+/// Each concurrent invocation writes identical embedded bytes through a unique new file.
+fn stage_adapter(cache_dir: &Path) -> io::Result<()> {
+    let temporary = cache_dir.join(format!(
+        ".typescript-check-{}-{}.tmp",
+        std::process::id(),
+        ADAPTER_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(ADAPTER.as_bytes())?;
+        drop(file);
+        fs::rename(&temporary, cache_dir.join("typescript-check.js"))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
-    let mut roots = spec.read_roots.iter().chain(&spec.write_roots);
-    if spec.read_denies.iter().any(|deny| match deny {
-        ReadDeny::Path(path) => roots.clone().any(|root| paths_overlap(path, root)),
-        ReadDeny::Glob { .. } => false,
-    }) {
-        return false;
-    }
-    roots.all(|root| no_denied_entries(root, &spec.read_denies))
-}
-
-/// Reports whether two absolute paths can share a descendant, ignoring ASCII case like Seatbelt.
-/// Non-ASCII or non-absolute paths are unprovable and conservatively overlap.
-fn paths_overlap(left: &Path, right: &Path) -> bool {
-    let (Some(left), Some(right)) = (left.to_str(), right.to_str()) else {
-        return true;
-    };
-    if !left.is_ascii()
-        || !right.is_ascii()
-        || !Path::new(left).is_absolute()
-        || !Path::new(right).is_absolute()
-    {
-        return true;
-    }
-    let left = left.to_ascii_lowercase();
-    let right = right.to_ascii_lowercase();
-    Path::new(&left).starts_with(&right) || Path::new(&right).starts_with(&left)
-}
-
-/// Scans one explicit grant without following links and rejects any deny match or alias.
-/// Missing, unreadable, link-bearing, or over-limit trees cannot prove the grant safe.
-fn no_denied_entries(root: &Path, denies: &[ReadDeny]) -> bool {
-    let mut directories = vec![root.to_path_buf()];
-    let mut seen = 0usize;
-    while let Some(directory) = directories.pop() {
-        if denies.iter().any(|deny| deny.matches(&directory))
-            || directory.ancestors().any(|part| {
-                !fs::symlink_metadata(part).is_ok_and(|metadata| !metadata.file_type().is_symlink())
-            })
-        {
-            return false;
-        }
-        if fs::symlink_metadata(&directory).is_ok_and(|metadata| metadata.is_file()) {
-            continue;
-        }
-        let Ok(entries) = fs::read_dir(&directory) else {
-            return false;
-        };
-        for entry in entries {
-            let Ok(entry) = entry else {
-                return false;
-            };
-            seen += 1;
-            if seen > MAX_POLICY_ENTRIES {
-                return false;
-            }
-            let path = entry.path();
-            if denies.iter().any(|deny| deny.matches(&path)) {
-                return false;
-            }
-            let Ok(kind) = entry.file_type() else {
-                return false;
-            };
-            if kind.is_symlink() {
-                return false;
-            }
-            if kind.is_dir() {
-                directories.push(path);
-            }
-        }
-    }
-    true
+    result
 }
 
 /// Selects a regular root `tsconfig.json`, then a regular root `jsconfig.json`.
@@ -331,6 +313,84 @@ fn regular_allowed(path: &Path, denies: &[ReadDeny]) -> bool {
         !denies.iter().any(|deny| deny.matches(prefix))
             && fs::symlink_metadata(prefix).is_ok_and(|metadata| !metadata.file_type().is_symlink())
     }) && fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
+/// Admits a compiler-reported worktree path, including aliases whose targets avoid host denies.
+/// The adapter already guarded the compiler read; this second check protects published paths.
+fn report_path_allowed(worktree: &Path, reported: &str, denies: &[ReadDeny]) -> bool {
+    if denies.is_empty() {
+        return true;
+    }
+    let path = Path::new(reported);
+    let relative = if path.is_absolute() {
+        let Ok(relative) = path.strip_prefix(worktree) else {
+            return false;
+        };
+        relative
+    } else {
+        path
+    };
+    if relative.as_os_str().is_empty()
+        || !relative
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return false;
+    }
+    let mut current = worktree.join(relative);
+    for _ in 0..40 {
+        if denies.iter().any(|deny| deny.matches(&current)) {
+            return false;
+        }
+        let mut prefix = PathBuf::from("/");
+        let mut alias = None;
+        for component in current.components() {
+            prefix.push(component.as_os_str());
+            if denies.iter().any(|deny| deny.matches(&prefix)) {
+                return false;
+            }
+            match fs::symlink_metadata(&prefix) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    alias = Some(prefix.clone());
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+                Err(_) => return false,
+            }
+        }
+        let Some(alias) = alias else {
+            return true;
+        };
+        let Ok(target) = fs::read_link(&alias) else {
+            return false;
+        };
+        let Ok(suffix) = current.strip_prefix(&alias) else {
+            return false;
+        };
+        let target = if target.is_absolute() {
+            target.join(suffix)
+        } else {
+            alias
+                .parent()
+                .unwrap_or(Path::new("/"))
+                .join(target)
+                .join(suffix)
+        };
+        let mut normalized = PathBuf::from("/");
+        for component in target.components() {
+            match component {
+                std::path::Component::RootDir | std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    normalized.pop();
+                }
+                std::path::Component::Normal(name) => normalized.push(name),
+                std::path::Component::Prefix(_) => return false,
+            }
+        }
+        current = normalized;
+    }
+    false
 }
 
 /// Parses pinned `tsc --pretty false --diagnostics --listFiles --noEmit` output.
@@ -372,7 +432,7 @@ pub fn parse_tsc_output(
     for line in text.lines() {
         if phase == 0 {
             if let Some(problem) = diagnostic(line, worktree, config) {
-                if !super::check_problem_path_allowed(worktree, &problem.path, denies) {
+                if !report_path_allowed(worktree, &problem.path, denies) {
                     return fatal();
                 }
                 problems.push(problem);
@@ -401,7 +461,7 @@ pub fn parse_tsc_output(
                 }
                 listed += 1;
                 if path.strip_prefix(worktree).is_ok() {
-                    if !super::check_problem_path_allowed(worktree, line, denies) {
+                    if !report_path_allowed(worktree, line, denies) {
                         return fatal();
                     }
                     project_file |= matches!(
