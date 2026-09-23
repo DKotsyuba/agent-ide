@@ -21,7 +21,7 @@ Because content is Claude's only carrier, it alone must state every fact an acce
 
 ## Closed guidance
 
-Activation points to ide.context. Current source Context presents bounded evidence and points to ide.edit with its exact source_ref (the same value as the reply's detail_ref) when available, or the native editor. A `kind: "problems"` Context has no source_ref and directs the agent to request path Context before editing. A truncated Context or Diff points to ide.inspect only when its typed `continuation` is true; a detail_ref alone is not evidence of another consumable page. Incomplete Context otherwise guides to edit/native work with that same source_ref when one exists, and incomplete Diff to stopping or safe native review. A reviewed Diff points to ide.stop. Stop confirms authority release.
+Activation points to ide.context. Current source Context presents bounded evidence and points to ide.edit with its exact source_ref (the same value as the reply's detail_ref) when available, or the native editor. A `kind: "problems"` Context has no source_ref and preserves the exact v0.2 problems text without edit guidance. A truncated Context or Diff points to ide.inspect only when its typed `continuation` is true; a detail_ref alone is not evidence of another consumable page. Incomplete Context otherwise guides to edit/native work with that same source_ref when one exists, and incomplete Diff to stopping or safe native review. A reviewed Diff points to ide.stop. Stop confirms authority release.
 
 Pending work preserves an exact helper command when present, requires foreground execution, and then names ide.inspect with the exact detail_ref. The helper and references are never silently shortened. An oversized pending result fails closed.
 

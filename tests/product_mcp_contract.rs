@@ -304,8 +304,9 @@ fn assert_claude_envelope(reply: &Value) -> &str {
 /// Reconstructs the compact-text facts a Claude-path test needs, mirroring
 /// [`agent_ide::assistance::content`]'s deterministic `render_text` formats (T14B): the server no
 /// longer sends `structuredContent` to Claude, so tests read the same facts the model itself
-/// receives instead of the typed JSON copy. Unset fields are simply absent from the returned
-/// object, matching `serde_json::Value`'s null-on-missing-key indexing.
+/// receives instead of the typed JSON copy. Only successful edits can advertise a post-read
+/// source reference; refusal prose is never parsed as one. Unset fields are simply absent from
+/// the returned object, matching `serde_json::Value`'s null-on-missing-key indexing.
 fn claude_fields(text: &str) -> Value {
     /// Returns the bounded token starting at `text`, ending at the first space, `;`, `\n`, `.` or
     /// the string end; every identifier this parser extracts (`reason`, `code`, `outcome`,
@@ -342,7 +343,9 @@ fn claude_fields(text: &str) -> Value {
     }
     if let Some(rest) = text.strip_prefix("edit: ") {
         let outcome = token(rest);
-        let source_ref = after(rest, "source_ref ");
+        let source_ref = matches!(outcome, "created" | "replaced" | "unchanged")
+            .then(|| after(rest, "source_ref "))
+            .flatten();
         return json!({
             "state":"edit",
             "result":{"outcome":outcome,"source_ref":source_ref},
@@ -2951,6 +2954,7 @@ async fn managed_context_problems_then_edit_tracks_content() {
     .await;
     let stale = settle_managed(&mut mcp, &mut next, actor, &state, stale).await;
     assert_eq!(stale["result"]["outcome"], "stale_source", "{stale}");
+    assert_eq!(stale["result"]["source_ref"], Value::Null, "{stale}");
     assert_eq!(
         std::fs::read(fixture.root.join("tracked.txt")).unwrap(),
         b"external\n"
@@ -6836,12 +6840,7 @@ async fn claude_context_problems_then_edit_keeps_unchanged_source() {
         .await;
     assert_eq!(problems["kind"], "context", "{problems}");
     assert_eq!(problems["detail_ref"], Value::Null, "{problems}");
-    assert!(
-        problems["text"]
-            .as_str()
-            .unwrap()
-            .contains("No edit source was observed")
-    );
+    assert_eq!(problems["text"], "checks disabled");
     actor.claude_native_post(&fixture, "Read").await;
     assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
 
@@ -6897,6 +6896,7 @@ async fn claude_context_problems_then_edit_keeps_unchanged_source() {
         .await;
     let (stale, _) = actor.complete_claude_pending(&fixture, &stale).await;
     assert_eq!(stale["result"]["outcome"], "stale_source", "{stale}");
+    assert_eq!(stale["result"]["source_ref"], Value::Null, "{stale}");
     assert_eq!(std::fs::read(&path).unwrap(), b"external\n");
 
     let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
