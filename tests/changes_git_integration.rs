@@ -1027,9 +1027,9 @@ async fn unchanged_paths_cost_no_per_path_blob_commands() {
     let snapshot = collect(&fixture, DiffMode::Unstaged, &mut runner)
         .await
         .unwrap();
-    // 10 metadata + 1 worktree hash + 1 cat-file + 1 blob verification + 1 comparison.
+    // 12 metadata + 1 worktree hash + 1 cat-file + 1 blob verification + 1 comparison.
     assert!(
-        runner.operations <= 14,
+        runner.operations <= 16,
         "sandboxed spawns must stay bounded, got {}",
         runner.operations
     );
@@ -1103,6 +1103,55 @@ async fn large_repository_captures_changed_and_proven_empty_diffs() {
     );
 }
 
+/// A same-length rewrite at the index mtime is captured even when Git's stat cache is racy.
+#[tokio::test]
+async fn racy_index_timestamp_still_reports_a_same_length_rewrite() {
+    let fixture = GitFixture::unborn();
+    fixture.git(["config", "user.email", "racy@example.invalid"]);
+    fixture.git(["config", "user.name", "Racy Fixture"]);
+    fixture.write(b"racy.txt", b"base\n");
+    fixture.git(["add", "racy.txt"]);
+    fixture.git(["commit", "--quiet", "-m", "baseline"]);
+    let index = fixture.git(["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+    let index = PathBuf::from(String::from_utf8(index.stdout).unwrap().trim());
+    let mtime = fs::metadata(index).unwrap().modified().unwrap();
+    fixture.write(b"racy.txt", b"next\n");
+    fs::File::options()
+        .write(true)
+        .open(fixture.root.join("racy.txt"))
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(mtime))
+        .unwrap();
+    let snapshot = collect(&fixture, DiffMode::Head, &mut Runner::default())
+        .await
+        .unwrap();
+    assert_eq!(snapshot.paths().len(), 1);
+    assert_eq!(snapshot.paths()[0].status().path(), Path::new("racy.txt"));
+}
+
+/// Git prints assume-unchanged plus skip-worktree flags in hex; both still receive byte capture.
+#[tokio::test]
+async fn combined_index_flags_do_not_hide_worktree_changes() {
+    let fixture = GitFixture::unborn();
+    fixture.git(["config", "user.email", "flags@example.invalid"]);
+    fixture.git(["config", "user.name", "Flags Fixture"]);
+    fixture.write(b"flagged.txt", b"base\n");
+    fixture.git(["add", "flagged.txt"]);
+    fixture.git(["commit", "--quiet", "-m", "baseline"]);
+    fixture.git(["update-index", "--assume-unchanged", "flagged.txt"]);
+    fixture.git(["update-index", "--skip-worktree", "flagged.txt"]);
+    let clean = collect(&fixture, DiffMode::Head, &mut Runner::default())
+        .await
+        .unwrap();
+    assert!(clean.paths().is_empty());
+    fixture.write(b"flagged.txt", b"next\n");
+    let changed = collect(&fixture, DiffMode::Head, &mut Runner::default())
+        .await
+        .unwrap();
+    assert_eq!(changed.paths().len(), 1);
+    assert_eq!(changed.paths()[0].status().path(), Path::new("flagged.txt"));
+}
+
 /// Real truncated cat-file output is rejected despite successful exit and actual wait identity.
 #[tokio::test]
 async fn real_truncated_blob_evidence_is_not_complete() {
@@ -1130,7 +1179,7 @@ async fn real_truncated_blob_evidence_is_not_complete() {
     admissions.release_reaped(completed.settlement).unwrap();
     assert_eq!(
         intent.accept(completed.evidence),
-        Err(GitError::IncompleteIdentity)
+        Err(GitError::EvidenceTooLarge)
     );
 }
 
@@ -1143,6 +1192,44 @@ struct RefusingRunner {
     inner: Runner,
     /// Count of intents that would have written captured bytes into a scratch file.
     scratch_intents: usize,
+    /// Number of initial path proofs permitted before the fixture refuses one.
+    allowed_proofs: usize,
+    /// Path proofs requested by the collector so far.
+    proofs: usize,
+}
+
+/// A clean tracked path still needs a live read proof before either native metadata probe.
+#[tokio::test]
+async fn clean_tree_refuses_unproven_metadata_path() {
+    let fixture = GitFixture::unborn();
+    fixture.git(["config", "user.email", "proof@example.invalid"]);
+    fixture.git(["config", "user.name", "Proof Fixture"]);
+    fixture.write(b"clean.txt", b"base\n");
+    fixture.git(["add", "clean.txt"]);
+    fixture.git(["commit", "--quiet", "-m", "baseline"]);
+    for allowed_proofs in [0, 1] {
+        let mut runner = RefusingRunner {
+            inner: Runner::default(),
+            scratch_intents: 0,
+            allowed_proofs,
+            proofs: 0,
+        };
+        assert_eq!(
+            collect_snapshot(
+                &authority_for(&fixture),
+                Path::new(GIT),
+                DiffMode::Head,
+                1,
+                "clean-proof",
+                BaselineContext::new("baseline", BaselineCoverage::Partial).unwrap(),
+                &mut runner,
+            )
+            .await,
+            Err(GitError::UnsupportedSnapshot)
+        );
+        assert_eq!(runner.proofs, allowed_proofs + 1);
+        assert_eq!(runner.scratch_intents, 0);
+    }
 }
 
 impl SnapshotRunner for RefusingRunner {
@@ -1157,9 +1244,14 @@ impl SnapshotRunner for RefusingRunner {
         self.inner.run(intent).await
     }
 
-    /// Refuses every path, exactly like an unprovable path under a deny-bearing profile.
+    /// Refuses after the configured count, like an unprovable path under a narrowed profile.
     async fn authorize_read_path(&mut self, _path: &Path) -> Result<(), GitError> {
-        Err(GitError::UnsupportedSnapshot)
+        self.proofs += 1;
+        if self.proofs > self.allowed_proofs {
+            Err(GitError::UnsupportedSnapshot)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -1185,6 +1277,8 @@ async fn refused_path_authorization_fails_the_capture_before_any_native_read() {
         let mut runner = RefusingRunner {
             inner: Runner::default(),
             scratch_intents: 0,
+            allowed_proofs: 0,
+            proofs: 0,
         };
         let result = collect_snapshot(
             &authority_for(&fixture),

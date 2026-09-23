@@ -258,6 +258,7 @@ impl SnapshotIntent {
             GitReadQuery::HeadTree => "ls-tree",
             GitReadQuery::UntrackedPaths => "ls-files-others",
             GitReadQuery::IndexStat => "ls-files-debug",
+            GitReadQuery::IndexPath => "git-path-index",
             GitReadQuery::Status
             | GitReadQuery::HeadDiff
             | GitReadQuery::StagedDiff
@@ -397,6 +398,16 @@ impl SnapshotIntent {
     /// Accepts only reaped, fully drained bounded output with the command's exact success exit set.
     pub fn accept(&self, result: CapturedProcessEvidence) -> Result<Vec<u8>, GitError> {
         self.acknowledge_reap(&result)?;
+        if result.cancellation().is_some() {
+            return Err(GitError::IncompleteIdentity);
+        }
+        if result.stdout().truncated
+            || result.stderr().truncated
+            || result.stdout().bytes.len() > MAX_SNAPSHOT_BLOB_BYTES
+            || result.stderr().bytes.len() > super::MAX_GIT_STDERR_BYTES
+        {
+            return Err(GitError::EvidenceTooLarge);
+        }
         if result.status().code() != Some(0)
             && result
                 .stderr()
@@ -411,13 +422,8 @@ impl SnapshotIntent {
         {
             return Err(GitError::UnsupportedSnapshotGit);
         }
-        if result.cancellation().is_some()
-            || result.stdout().truncated
-            || result.stderr().truncated
-            || !result.stdout().complete
+        if !result.stdout().complete
             || !result.stderr().complete
-            || result.stdout().bytes.len() > MAX_SNAPSHOT_BLOB_BYTES
-            || result.stderr().bytes.len() > super::MAX_GIT_STDERR_BYTES
             || !matches!(result.status().code(), Some(0))
                 && !(self.differences_allowed && result.status().code() == Some(1))
         {
@@ -544,8 +550,8 @@ pub trait SnapshotRunner: Send {
     /// Required and fallible with no permissive default: every collector integration routes
     /// this through its Execution owner, so a path the live sandbox policy denies (or that
     /// cannot be proven) refuses the whole capture attempt before any byte is read. The
-    /// collector calls it before each tracked-path capture (staged mode included), before
-    /// every consistency reread, and before untracked inspection.
+    /// collector calls it before each native tracked-path metadata probe, each byte capture
+    /// (staged mode included), every consistency reread, and untracked inspection.
     fn authorize_read_path(
         &mut self,
         path: &Path,
@@ -789,7 +795,7 @@ async fn metadata<R: SnapshotRunner>(
     scope: &GitScope,
     program: &Path,
     runner: &mut R,
-) -> Result<[Vec<u8>; 5], GitError> {
+) -> Result<[Vec<u8>; 6], GitError> {
     let mut result = std::array::from_fn(|_| Vec::new());
     for (slot, query) in [
         GitReadQuery::HeadIdentity,
@@ -797,6 +803,7 @@ async fn metadata<R: SnapshotRunner>(
         GitReadQuery::HeadTree,
         GitReadQuery::UntrackedPaths,
         GitReadQuery::IndexStat,
+        GitReadQuery::IndexPath,
     ]
     .into_iter()
     .enumerate()
@@ -889,6 +896,8 @@ fn parse_entries(
 struct IndexStat {
     /// Git's 32-bit on-disk ctime, mtime, device, inode, owner, and size fields in fixed order.
     values: [u64; 9],
+    /// Git's hexadecimal cache-entry flags; nonzero entries always receive byte capture.
+    flags: u64,
 }
 
 impl IndexStat {
@@ -914,10 +923,23 @@ impl IndexStat {
                     0o100644
                 }
     }
+
+    /// Git's racy timestamp rule: an entry at or after the index mtime needs a byte hash even
+    /// when every stat field matches. Nonzero flags also force capture rather than inheriting
+    /// Git's assume-unchanged or skip-worktree omission semantics.
+    fn needs_bytes(&self, index_mtime: (u64, u64)) -> bool {
+        self.flags != 0 || (self.values[2], self.values[3]) >= index_mtime
+    }
 }
 
-/// Parses two fixed decimal fields from one Git index-debug line; raw path bytes never enter here.
-fn debug_pair(line: &[u8], prefix: &str, separator: &str) -> Result<(u64, u64), GitError> {
+/// Parses two fixed numeric fields from one Git index-debug line; `right_radix` is 16 only for
+/// Git's hexadecimal flags and 10 for all timestamp/stat fields. Raw path bytes never enter here.
+fn debug_pair(
+    line: &[u8],
+    prefix: &str,
+    separator: &str,
+    right_radix: u32,
+) -> Result<(u64, u64), GitError> {
     let text = std::str::from_utf8(line).map_err(|_| GitError::InvalidPorcelain)?;
     let text = text
         .strip_prefix(prefix)
@@ -927,7 +949,7 @@ fn debug_pair(line: &[u8], prefix: &str, separator: &str) -> Result<(u64, u64), 
         .ok_or(GitError::InvalidPorcelain)?;
     Ok((
         left.parse().map_err(|_| GitError::InvalidPorcelain)?,
-        right.parse().map_err(|_| GitError::InvalidPorcelain)?,
+        u64::from_str_radix(right, right_radix).map_err(|_| GitError::InvalidPorcelain)?,
     ))
 }
 
@@ -959,11 +981,11 @@ fn parse_index_stats(bytes: &[u8]) -> Result<BTreeMap<PathBuf, Vec<IndexStat>>, 
             return Err(GitError::InvalidPorcelain);
         }
         offset = end + 1;
-        let ctime = debug_pair(debug_line(bytes, &mut offset)?, "  ctime: ", ":")?;
-        let mtime = debug_pair(debug_line(bytes, &mut offset)?, "  mtime: ", ":")?;
-        let dev_ino = debug_pair(debug_line(bytes, &mut offset)?, "  dev: ", "\tino: ")?;
-        let uid_gid = debug_pair(debug_line(bytes, &mut offset)?, "  uid: ", "\tgid: ")?;
-        let size_flags = debug_pair(debug_line(bytes, &mut offset)?, "  size: ", "\tflags: ")?;
+        let ctime = debug_pair(debug_line(bytes, &mut offset)?, "  ctime: ", ":", 10)?;
+        let mtime = debug_pair(debug_line(bytes, &mut offset)?, "  mtime: ", ":", 10)?;
+        let dev_ino = debug_pair(debug_line(bytes, &mut offset)?, "  dev: ", "\tino: ", 10)?;
+        let uid_gid = debug_pair(debug_line(bytes, &mut offset)?, "  uid: ", "\tgid: ", 10)?;
+        let size_flags = debug_pair(debug_line(bytes, &mut offset)?, "  size: ", "\tflags: ", 16)?;
         result.entry(path).or_default().push(IndexStat {
             values: [
                 ctime.0,
@@ -976,9 +998,27 @@ fn parse_index_stats(bytes: &[u8]) -> Result<BTreeMap<PathBuf, Vec<IndexStat>>, 
                 uid_gid.1,
                 size_flags.0,
             ],
+            flags: size_flags.1,
         });
     }
     Ok(result)
+}
+
+/// Resolves and stats the fixed active index path without following a final symlink. Its mtime
+/// is bracketed like Git metadata so an index refresh during capture retries the attempt.
+fn index_mtime(bytes: &[u8]) -> Result<(u64, u64), GitError> {
+    let path = super::parse_terminal_path(bytes)?;
+    if !super::is_normal_absolute(&path) {
+        return Err(GitError::InvalidPorcelain);
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|_| GitError::SnapshotIo)?;
+    if !metadata.is_file() {
+        return Err(GitError::UnsupportedSnapshot);
+    }
+    Ok((
+        metadata.mtime() as u32 as u64,
+        metadata.mtime_nsec() as u32 as u64,
+    ))
 }
 
 /// Assembles one generation from safe plumbing and exact raw file reads under aggregate budgets.
@@ -1016,6 +1056,7 @@ async fn capture_attempt<R: SnapshotRunner>(
         .cloned()
         .collect();
     let index_stats = parse_index_stats(&before[4])?;
+    let index_timestamp = index_mtime(&before[5])?;
     if index_stats.len() != index_entries.len()
         || index_stats.iter().any(|(path, stats)| {
             index_entries
@@ -1033,12 +1074,15 @@ async fn capture_attempt<R: SnapshotRunner>(
         let changed = if staged {
             true
         } else {
+            // T36B: native metadata opens need the same live path proof as source reads.
+            runner.authorize_read_path(path).await?;
             match crate::workspace::observation::snapshot_source_metadata(scope.worktree(), path) {
                 Ok(metadata) => {
                     let index = index_entries[path]
                         .get(&0)
                         .expect("equal HEAD/index has stage zero");
-                    !index_stats[path][0].matches(&metadata, index.mode)
+                    index_stats[path][0].needs_bytes(index_timestamp)
+                        || !index_stats[path][0].matches(&metadata, index.mode)
                 }
                 Err(ObservationError::RootIdentityChanged) => {
                     return Err(GitError::UnstableSnapshot);
@@ -1322,13 +1366,16 @@ async fn capture_attempt<R: SnapshotRunner>(
     // A clean path's stat must still match the same index fingerprint at the end of the
     // attempt; a concurrent edit of a skipped path retries instead of minting an empty diff.
     for path in &clean {
+        runner.authorize_read_path(path).await?;
         let metadata =
             crate::workspace::observation::snapshot_source_metadata(scope.worktree(), path)
                 .map_err(|_| GitError::UnstableSnapshot)?;
         let index = index_entries[path]
             .get(&0)
             .expect("clean path has stage zero");
-        if !index_stats[path][0].matches(&metadata, index.mode) {
+        if index_stats[path][0].needs_bytes(index_timestamp)
+            || !index_stats[path][0].matches(&metadata, index.mode)
+        {
             return Err(GitError::UnstableSnapshot);
         }
     }
@@ -1337,6 +1384,9 @@ async fn capture_attempt<R: SnapshotRunner>(
         inspect_untracked(scope.worktree(), entry.path())?;
     }
     if metadata(&scope, program, runner).await? != before {
+        return Err(GitError::UnstableSnapshot);
+    }
+    if index_mtime(&before[5])? != index_timestamp {
         return Err(GitError::UnstableSnapshot);
     }
     let head = evidence_identity(b"workspace-git-head-v1", &before[0]);
@@ -1383,10 +1433,26 @@ fn inspect_untracked(worktree: &WorktreeRef, path: &Path) -> Result<(), GitError
 #[cfg(test)]
 mod batch_tests {
     use super::{
-        GitError, MAX_HASH_BATCH_ARGV_BYTES, hash_batch_prefix_bytes, hash_batch_ranges,
-        parse_batch_hashes,
+        GitError, IndexStat, MAX_HASH_BATCH_ARGV_BYTES, debug_pair, hash_batch_prefix_bytes,
+        hash_batch_ranges, parse_batch_hashes,
     };
     use crate::workspace::git::GitObjectId;
+
+    /// Equality with the index mtime is racy, and Git's combined flags are hexadecimal.
+    #[test]
+    fn racy_index_entries_and_combined_hex_flags_require_byte_capture() {
+        let entry = IndexStat {
+            values: [0, 0, 42, 0, 0, 0, 0, 0, 5],
+            flags: 0,
+        };
+        assert!(entry.needs_bytes((42, 0)));
+        assert!(entry.needs_bytes((41, 999)));
+        assert!(!entry.needs_bytes((42, 1)));
+        let (_, flags) =
+            debug_pair(b"  size: 5\tflags: 4000c000", "  size: ", "\tflags: ", 16).unwrap();
+        assert_eq!(flags, 0x4000c000);
+        assert!(IndexStat { flags, ..entry }.needs_bytes((43, 0)));
+    }
 
     /// The planning estimate covers the real argument strings: fixed flags plus one canonical
     /// scratch path, never smaller than the unresolved temp directory it is derived from.

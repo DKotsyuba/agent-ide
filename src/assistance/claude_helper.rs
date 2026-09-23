@@ -2046,6 +2046,49 @@ mod tests {
         assert!(text.contains("changed.txt"), "diff text: {text}");
         assert!(text.contains("new.txt"), "diff text: {text}");
         assert!(matches!(payload, Some(HelperPayload::Diff { .. })));
+        let (metadata_cap, _, _, payload) = perform(&diff_job(1024, 1024)).await;
+        assert!(matches!(
+            metadata_cap,
+            HelperOutcome::Failed {
+                code: FailureCode::Capacity
+            }
+        ));
+        assert!(payload.is_none());
+        std::fs::write(candidate.join("large.txt"), vec![b'a'; 512 * 1024]).unwrap();
+        let status = std::process::Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(&candidate)
+            .args(["add", "--", "."])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = std::process::Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(&candidate)
+            .args([
+                "-c",
+                "user.name=helper",
+                "-c",
+                "user.email=helper@invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "large blob",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(candidate.join("large.txt"), vec![b'b'; 512 * 1024]).unwrap();
+        let (blob_cap, _, _, payload) = perform(&diff_job(1024, 128 * 1024)).await;
+        assert!(matches!(
+            blob_cap,
+            HelperOutcome::Failed {
+                code: FailureCode::Capacity
+            }
+        ));
+        assert!(payload.is_none());
         for index in 0..257 {
             std::fs::write(candidate.join(format!("file-{index:03}.txt")), "over cap\n").unwrap();
         }

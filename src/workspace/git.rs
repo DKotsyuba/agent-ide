@@ -243,6 +243,8 @@ pub enum GitReadQuery {
     IndexState,
     /// Lists index stat fingerprints without reading worktree content or running filters.
     IndexStat,
+    /// Resolves the active worktree's index path for racy-entry timestamp checks.
+    IndexPath,
     /// Legacy non-executable HEAD patch tag; live HEAD mode uses the raw snapshot collector.
     HeadDiff,
     /// Legacy non-executable staged patch tag; live staged mode uses the raw snapshot collector.
@@ -259,6 +261,7 @@ impl GitReadQuery {
             | Self::HeadTree
             | Self::UntrackedPaths
             | Self::HeadIdentity
+            | Self::IndexPath
             | Self::HeadDiff => DiffMode::Head,
             Self::IndexState | Self::StagedDiff => DiffMode::Staged,
             Self::IndexStat | Self::UnstagedDiff => DiffMode::Unstaged,
@@ -900,6 +903,12 @@ fn read_args(query: GitReadQuery) -> Vec<OsString> {
             OsString::from("--debug"),
             OsString::from("-z"),
             OsString::from("--"),
+        ]),
+        GitReadQuery::IndexPath => args.extend([
+            OsString::from("rev-parse"),
+            OsString::from("--path-format=absolute"),
+            OsString::from("--git-path"),
+            OsString::from("index"),
         ]),
         GitReadQuery::Status
         | GitReadQuery::HeadDiff
