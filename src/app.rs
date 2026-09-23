@@ -39,6 +39,8 @@ const MAX_REQUEST_ID_BYTES: usize = 128;
 const MAX_V1_FRAME_BYTES: usize = 64 * 1024;
 const MAX_V2_FRAME_BYTES: usize = 128 * 1024;
 const MAX_ASSISTANCE_JSON_BYTES: usize = 64 * 1024;
+/// Total connect, request, and acknowledgement budget when a Codex MCP opens its client lease.
+const CLIENT_LEASE_OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Reports whether a daemon answered the side-effect-free health request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -734,26 +736,32 @@ async fn serve_client_lease_handshake(
 
 /// Opens and acknowledges one long-lived `ClientLease` connection to a live daemon at `runtime_dir`.
 ///
-/// Returns `None` for any connect, framing, or correlation fault; the caller must fail open exactly
-/// like [`submit_hook_if_running`] and must not retry inline or use this as actor proof. The caller
-/// must hold the returned stream for its own entire lifetime and drop it only on its own exit: that
-/// drop is the client-side EOF that releases the daemon's lease count (EYES-r2 §2).
+/// Returns `None` for any connect, framing, correlation, or three-second handshake timeout; the
+/// caller must fail open exactly like [`submit_hook_if_running`] and must not retry inline or use
+/// this as actor proof. The caller must hold the returned stream for its entire lifetime; dropping
+/// it sends EOF and releases the daemon's lease count (EYES-r2 §2).
 pub async fn open_client_lease(
     runtime_dir: &Path,
     request_id: impl Into<String>,
 ) -> Option<UnixStream> {
-    let mut stream = UnixStream::connect(runtime_dir.join(SOCKET_NAME))
-        .await
-        .ok()?;
-    let request = transport::ClientLeaseRequest::new(request_id);
-    write_frame(&mut stream, &request, MAX_V1_FRAME_BYTES)
-        .await
-        .ok()?;
-    let ack: transport::ClientLeaseAck = read_frame(&mut stream, MAX_V1_FRAME_BYTES).await.ok()?;
-    (ack.version == transport::CLIENT_LEASE_WIRE_VERSION
-        && ack.status == "ok"
-        && ack.request_id == request.request_id)
-        .then_some(stream)
+    tokio::time::timeout(CLIENT_LEASE_OPEN_TIMEOUT, async move {
+        let mut stream = UnixStream::connect(runtime_dir.join(SOCKET_NAME))
+            .await
+            .ok()?;
+        let request = transport::ClientLeaseRequest::new(request_id);
+        write_frame(&mut stream, &request, MAX_V1_FRAME_BYTES)
+            .await
+            .ok()?;
+        let ack: transport::ClientLeaseAck =
+            read_frame(&mut stream, MAX_V1_FRAME_BYTES).await.ok()?;
+        (ack.version == transport::CLIENT_LEASE_WIRE_VERSION
+            && ack.status == "ok"
+            && ack.request_id == request.request_id)
+            .then_some(stream)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Opens a lease and registers one host-selected Claude worktree on the shared daemon.

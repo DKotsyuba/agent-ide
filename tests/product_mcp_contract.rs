@@ -3058,7 +3058,7 @@ async fn managed_codex_transient_transport_timeout_keeps_daemon_and_binding() {
     mcp.close().await;
 }
 
-/// SIGTERM during replacement startup reaps the pending child and its registered private runtime.
+/// SIGTERM while a replacement cannot acknowledge its lease still reaps the child and runtime.
 #[tokio::test]
 async fn managed_codex_sigterm_during_restart_removes_pending_runtime() {
     let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
@@ -3069,7 +3069,7 @@ async fn managed_codex_sigterm_during_restart_removes_pending_runtime() {
         &fixture.root,
         None,
         None,
-        Some(("AGENT_IDE_MANAGED_CODEX_RESTART_STALL_MS", "3000")),
+        Some(("AGENT_IDE_MANAGED_CODEX_RESTART_STALL_MS", "5000")),
     )
     .await;
     let old = managed_runtime_paths()
@@ -3104,13 +3104,7 @@ async fn managed_codex_sigterm_during_restart_removes_pending_runtime() {
     let fresh = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             for path in managed_runtime_paths().difference(&before) {
-                if path != &old
-                    && agent_ide::app::doctor_report(path)
-                        .await
-                        .is_ok_and(|report| {
-                            matches!(report.status, agent_ide::app::DoctorStatus::Healthy { .. })
-                        })
-                {
+                if path != &old && path.join("restart-lease-pending").is_file() {
                     return path.clone();
                 }
             }
@@ -3122,14 +3116,24 @@ async fn managed_codex_sigterm_during_restart_removes_pending_runtime() {
         Ok(path) => Some(managed_daemon_pid(path).await),
         Err(_) => None,
     };
+    let fresh_pid = fresh_pid.expect("replacement daemon never held its runtime lock");
+    assert_eq!(unsafe { libc::kill(fresh_pid, libc::SIGSTOP) }, 0);
+    let paused = PausedDaemon(fresh_pid);
+    // The marker is written before the five-second seam. Let that seam end while the daemon is
+    // stopped so the client blocks waiting for its lease acknowledgement when SIGTERM arrives.
+    tokio::time::sleep(Duration::from_millis(5200)).await;
+    assert!(
+        unsafe { libc::kill(fresh_pid, 0) } == 0,
+        "replacement exited before SIGTERM"
+    );
     let mcp_pid = mcp.child.id().expect("managed MCP PID") as libc::pid_t;
     assert_eq!(unsafe { libc::kill(mcp_pid, libc::SIGTERM) }, 0);
     tokio::time::timeout(Duration::from_secs(20), mcp.child.wait())
         .await
-        .expect("managed MCP must terminate during restart")
+        .expect("managed MCP must terminate despite a stalled lease acknowledgement")
         .unwrap();
+    drop(paused);
     let fresh = fresh.expect("replacement daemon never reached startup");
-    let fresh_pid = fresh_pid.expect("replacement daemon never held its runtime lock");
     tokio::time::timeout(Duration::from_secs(10), async {
         while managed_runtime_paths() != before {
             tokio::time::sleep(Duration::from_millis(20)).await;

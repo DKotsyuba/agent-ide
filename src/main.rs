@@ -2107,7 +2107,7 @@ fn codex_reestablish_hook(
                 ManagedHost::Codex,
             )
             .await;
-            let Ok((attachment, new_child)) = started else {
+            let Ok((attachment, mut new_child)) = started else {
                 if let Some(fresh) = runtime.current.lock().expect("owned runtime mutex").take() {
                     let _ = fresh.remove();
                 }
@@ -2119,12 +2119,18 @@ fn codex_reestablish_hook(
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
             {
+                // The marker makes this narrow test window observable after startup health has
+                // succeeded, before the lease request can reach the replacement daemon.
+                let _ = fs::write(path.join("restart-lease-pending"), []);
                 tokio::time::sleep(Duration::from_millis(milliseconds.min(60_000))).await;
             }
             let Some(lease_connection) =
                 agent_ide::app::open_client_lease(&path, "managed-codex-mcp").await
             else {
-                terminate_owned_daemon(Arc::new(Mutex::new(new_child))).await;
+                // No lease or actor work exists on this replacement; a stalled acknowledgement
+                // must be force-reaped before its fenced runtime is removed.
+                let _ = new_child.start_kill();
+                let _ = new_child.wait().await;
                 if let Some(fresh) = runtime.current.lock().expect("owned runtime mutex").take() {
                     let _ = fresh.remove();
                 }

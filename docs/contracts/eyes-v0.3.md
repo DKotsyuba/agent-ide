@@ -82,7 +82,9 @@ with the existing launcher configuration error.
 - Lease: each MCP server keeps one long-lived `ClientLease` connection open for its lifetime. Lease
   connections are exempt from `ipc.connection_deadline` and are admitted from their own bounded
   pool (32) that never consumes hook/assistance connection capacity. The daemon counts open lease
-  connections. EOF on a lease connection releases it immediately. A managed Claude MCP registers
+  connections. A managed Codex client's connect, request, and acknowledgement must finish within
+  three seconds; the held-open lease has no connection deadline. EOF releases a lease immediately.
+  A managed Claude MCP registers
   its own canonical candidate on that lease and receives a separate opaque attachment, including
   for the daemon's first worktree. The foreground helper and Workspace still
   validate Git identity and authority before activation. Missing candidates are removed from the
