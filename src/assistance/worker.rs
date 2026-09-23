@@ -3322,21 +3322,25 @@ impl<'a> Worker<'a> {
                 && diagnostics.freshness == crate::intelligence::freshness::Freshness::Provisional
                 && diagnostics.source.as_ref() == Some(&context.source)
                 && Some(diagnostics.generation) == context.generation
-                && diagnostics.document_version == context.document_version
-                && diagnostics
-                    .document_version
-                    .is_some_and(|version| version > 0))
+                && context.document_version.is_some_and(|version| version > 0)
+                && (diagnostics.document_version == context.document_version
+                    || (diagnostics.document_version.is_none()
+                        && diagnostics.readiness
+                            == crate::intelligence::freshness::DiagnosticReadiness::Reported
+                        && !diagnostics.diagnostics.is_empty())))
             .then_some(diagnostics)
         });
         let feedback = diagnostics
             .as_ref()
             .filter(|diagnostics| !diagnostics.diagnostics.is_empty())
             .map(|diagnostics| {
+                let count = if diagnostics.document_version.is_none() {
+                    format!("at least {}", diagnostics.diagnostics.len())
+                } else {
+                    diagnostics.diagnostics.len().to_string()
+                };
                 FeedbackDelta::new(
-                    format!(
-                        "Provider reported {} diagnostics for this exact source generation.",
-                        diagnostics.diagnostics.len()
-                    ),
+                    format!("Provider reported {count} diagnostics for this source generation."),
                     format!(
                         "source_sequence={}; provider_generation={:?}; document_version={:?}",
                         observed.sequence(),
@@ -3344,7 +3348,7 @@ impl<'a> Worker<'a> {
                         diagnostics.document_version
                     ),
                     "Review the bounded diagnostic messages in the latest context result.",
-                    "provisional push; exact source and positive provider version matched",
+                    "provisional push; source and generation matched; unversioned counts are lower bounds",
                     Some(job.reference.clone()),
                 )
                 .expect("fixed feedback envelope is bounded")
@@ -3361,11 +3365,16 @@ impl<'a> Worker<'a> {
                 let feedback = feedback
                     .as_ref()
                     .map_or_else(|| "none".to_owned(), FeedbackDelta::render);
+                let count = if diagnostics.document_version.is_none() {
+                    format!("at_least_{}", diagnostics.diagnostics.len())
+                } else {
+                    diagnostics.diagnostics.len().to_string()
+                };
                 format!(
                     "diagnostics_freshness: {:?}\ndiagnostic_readiness: {:?}\ndiagnostic_count: {}\ndiagnostics_truncated: {}\ndiagnostic_messages: {}\nfeedback_delta: {feedback}",
                     diagnostics.freshness,
                     diagnostics.readiness,
-                    diagnostics.diagnostics.len(),
+                    count,
                     diagnostics.truncated || diagnostics.diagnostics.len() > messages.len(),
                     serde_json::to_string(&messages).unwrap_or_else(|_| "[]".into()),
                 )

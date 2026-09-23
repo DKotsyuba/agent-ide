@@ -1765,11 +1765,11 @@ fn remaining_options(job: &Job) -> SessionOptions {
     }
 }
 
-/// Runs the accepted settings handshake and one exact-source query, waits only until the inherited
-/// deadline for Pyright's matching versioned diagnostics, snapshots bounded evidence, then performs
-/// graceful protocol shutdown. Other profiles preserve their immediate snapshot rather than
-/// waiting for a diagnostic fact their accepted protocol does not guarantee. Transport or protocol
-/// failures return `ProviderUnavailable`; the caller still owns and must reap the protocol child.
+/// Runs the accepted settings handshake and one exact-source query. It waits until the inherited
+/// deadline for Pyright's versioned diagnostics and up to five seconds for a bound nonempty
+/// TypeScript report, then snapshots bounded evidence and performs graceful protocol shutdown.
+/// Other profiles preserve their immediate snapshot. Transport or protocol failures return
+/// `ProviderUnavailable`; the caller still owns and must reap the protocol child.
 #[allow(clippy::too_many_arguments)]
 async fn session_operation<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin>(
     input: R,
@@ -1795,7 +1795,10 @@ async fn session_operation<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncW
         options,
         |mut session| async move {
             let context = session.context(&source, &bytes, query).await?;
-            if matches!(session.settings(), ProviderSettings::Pyright(_)) {
+            if matches!(
+                session.settings(),
+                ProviderSettings::Pyright(_) | ProviderSettings::TypeScript(_)
+            ) {
                 session.wait_for_matching_diagnostics().await;
             }
             let diagnostics = session.diagnostics();
@@ -1810,8 +1813,17 @@ async fn session_operation<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncW
     .map_err(|_| FailureCode::ProviderUnavailable);
     if let Some(telemetry) = telemetry {
         let diagnostics = match &result {
-            Ok(context) if context.diagnostics.diagnostics.is_empty() => DiagnosticState::Clean,
-            Ok(_) => DiagnosticState::Changed,
+            Ok(context) => match context.diagnostics.readiness {
+                crate::intelligence::freshness::DiagnosticReadiness::Clean => {
+                    DiagnosticState::Clean
+                }
+                crate::intelligence::freshness::DiagnosticReadiness::Reported => {
+                    DiagnosticState::Changed
+                }
+                crate::intelligence::freshness::DiagnosticReadiness::Unknown => {
+                    DiagnosticState::Unavailable
+                }
+            },
             Err(_) => DiagnosticState::Unavailable,
         };
         adapters::provider_summary(telemetry, language, CacheState::Unavailable, diagnostics);

@@ -4982,9 +4982,9 @@ async fn configured_product_acceptance_edit_diagnostics_telemetry_and_fallback()
 ///
 /// The ignored release check requires exact launcher-owned Node, bridge, `tsserver.js`, and loaded
 /// closure paths. Each extension must reach semantic definition/reference results through a fresh
-/// one-shot bridge; exact configured membership proves project selection, while graceful shutdown,
-/// EOF, zero exit, and direct-child reap are enforced by the production path before the next
-/// fixture may run.
+/// one-shot bridge; JS and TS also return a provisional lower bound for a real type error.
+/// Exact configured membership proves project selection, while graceful shutdown, EOF, zero exit,
+/// and direct-child reap are enforced by the production path before the next fixture may run.
 #[tokio::test]
 #[ignore = "requires exact AGENT_IDE_NODE, AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER and AGENT_IDE_TSSERVER environment"]
 async fn configured_product_returns_real_typescript_family_context_and_reaps() {
@@ -4992,24 +4992,24 @@ async fn configured_product_returns_real_typescript_family_context_and_reaps() {
     let fixture = ProductFixture::new(providers);
     std::fs::write(
         fixture.root.join("tsconfig.json"),
-        "{\"compilerOptions\":{\"types\":[],\"moduleResolution\":\"node10\",\"allowJs\":true},\"files\":[\"fixture.js\",\"fixture.jsx\",\"fixture.ts\",\"fixture.tsx\"]}\n",
+        "{\"compilerOptions\":{\"types\":[],\"moduleResolution\":\"node10\",\"allowJs\":true,\"checkJs\":true},\"files\":[\"fixture.js\",\"fixture.jsx\",\"fixture.ts\",\"fixture.tsx\"]}\n",
     )
     .unwrap();
     let cases = [
         (
+            "fixture.ts",
+            "export function identity(input) { return input; }\nexport const value: number = 42;\nexport const use: number = value;\nexport const broken: number = 'bad';\n",
+            "value;",
+        ),
+        (
             "fixture.js",
-            "export function identity(input) { return input; }\nexport const value = 42;\nexport const use = value;\n",
+            "// @checkJs\nexport function identity(input) { return input; }\nexport const value = 42;\nexport const use = value;\n/** @type {number} */ export const broken = 'bad';\n",
             "value;",
         ),
         (
             "fixture.jsx",
             "export function identity(input) { return input; }\nexport function Component() { return <div />; }\nexport const view = <Component />;\n",
             "Component />",
-        ),
-        (
-            "fixture.ts",
-            "export function identity(input) { return input; }\nexport const value: number = 42;\nexport const use: number = value;\n",
-            "value;",
         ),
         (
             "fixture.tsx",
@@ -5055,6 +5055,20 @@ async fn configured_product_returns_real_typescript_family_context_and_reaps() {
         assert!(text.contains("mode: semantic"), "{path}: {response}");
         assert!(text.contains("definitions: [{"), "{path}: {response}");
         assert!(text.contains("references: [{"), "{path}: {response}");
+        if matches!(path, "fixture.js" | "fixture.ts") {
+            assert!(
+                text.contains("diagnostics_freshness: Provisional"),
+                "{path}: {response}"
+            );
+            assert!(
+                text.contains("diagnostic_readiness: Reported"),
+                "{path}: {response}"
+            );
+            assert!(
+                text.contains("diagnostic_count: at_least_"),
+                "{path}: {response}"
+            );
+        }
     }
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");

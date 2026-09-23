@@ -185,6 +185,7 @@ fn diagnostic_state() -> Arc<Mutex<State>> {
             uri: context::observation_uri(&observed).unwrap(),
             source: SourceBinding::from_observation(&observed),
             version: 2,
+            accepts_unversioned_report: false,
         }),
         diagnostics: DiagnosticSnapshot {
             source: None,
@@ -200,6 +201,99 @@ fn diagnostic_state() -> Arc<Mutex<State>> {
             truncated: false,
         },
     }))
+}
+
+/// A one-shot TypeScript open ignores an empty syntax push, binds a later nonempty report, and
+/// refuses to rebind unversioned evidence after a full-document change to different bytes.
+#[tokio::test]
+async fn unversioned_typescript_diagnostics_require_unchanged_initial_open() {
+    let state = diagnostic_state();
+    state
+        .lock()
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .accepts_unversioned_report = true;
+    let mut router = client_router(state.clone());
+    let uri = context::observation_uri(&observation("package main", 1)).unwrap();
+    let empty = serde_json::from_value(
+        json!({"method":"textDocument/publishDiagnostics", "params":{"uri":uri,"diagnostics":[]}}),
+    )
+    .unwrap();
+    assert!(matches!(router.notify(empty), ControlFlow::Continue(())));
+    assert_eq!(
+        state.lock().unwrap().diagnostics.readiness,
+        DiagnosticReadiness::Unknown
+    );
+    assert!(!wait_for_matching_diagnostics(&state, Instant::now()).await);
+
+    let reported = serde_json::from_value(json!({"method":"textDocument/publishDiagnostics", "params":{"uri":uri,"diagnostics":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"severity":1,"code":2322,"message":"Type 'string' is not assignable to type 'number'."}]}})).unwrap();
+    assert!(matches!(router.notify(reported), ControlFlow::Continue(())));
+    assert!(wait_for_matching_diagnostics(&state, Instant::now()).await);
+    {
+        let state = state.lock().unwrap();
+        assert_eq!(state.diagnostics.readiness, DiagnosticReadiness::Reported);
+        assert_eq!(state.diagnostics.freshness, Freshness::Provisional);
+        assert_eq!(state.diagnostics.document_version, None);
+        assert_eq!(
+            state.diagnostics.source.as_ref(),
+            Some(&state.document.as_ref().unwrap().source)
+        );
+        assert_eq!(state.diagnostics.diagnostics.len(), 1);
+    }
+
+    // The real full-document didChange path advances identity and disables unversioned binding.
+    let (_driver, server) = MainLoop::new_client({
+        let state = state.clone();
+        move |_| client_router(state)
+    });
+    let mut session = Session {
+        server,
+        worktree: tree(),
+        epoch: 1,
+        generation: ViewGeneration::default(),
+        settings: gopls_settings(),
+        budget: OutboundBudget::default(),
+        state: state.clone(),
+        capabilities: Some(ProviderCapabilities {
+            advertised: lsp::ServerCapabilities {
+                text_document_sync: Some(lsp::TextDocumentSyncCapability::Kind(
+                    lsp::TextDocumentSyncKind::FULL,
+                )),
+                ..Default::default()
+            },
+            position_encoding: lsp::PositionEncodingKind::UTF16,
+            server_info: None,
+        }),
+        options: SessionOptions::default(),
+        deadline: Instant::now() + Duration::from_secs(1),
+        sequence: 1,
+        version: 2,
+    };
+    assert_eq!(
+        session
+            .synchronize(&observation("changed bytes", 2), "changed bytes")
+            .unwrap(),
+        Some(3)
+    );
+    assert!(
+        !state
+            .lock()
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .accepts_unversioned_report
+    );
+    assert_eq!(
+        state.lock().unwrap().diagnostics.readiness,
+        DiagnosticReadiness::Unknown
+    );
+    let late = serde_json::from_value(json!({"method":"textDocument/publishDiagnostics", "params":{"uri":uri,"diagnostics":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"code":2322,"message":"stale TS2322"}]}})).unwrap();
+    assert!(matches!(router.notify(late), ControlFlow::Continue(())));
+    assert!(state.lock().unwrap().diagnostics.source.is_none());
+    assert!(!wait_for_matching_diagnostics(&state, Instant::now()).await);
 }
 
 /// Confirms an accepted versioned diagnostic callback wakes the bounded exact-document wait.
@@ -551,6 +645,15 @@ async fn closed_settings_and_rust_status_barrier_match_the_actual_provider() {
         let (server, _) = MainLoop::new_server(move |client| {
             let mut router = Router::new(client);
             router.request::<request::Initialize, _>(move |client, params| {
+                assert_eq!(
+                    params
+                        .capabilities
+                        .text_document
+                        .as_ref()
+                        .and_then(|caps| caps.publish_diagnostics.as_ref())
+                        .and_then(|caps| caps.related_information),
+                    Some(false)
+                );
                 assert_eq!(
                     params
                         .capabilities
