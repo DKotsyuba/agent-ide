@@ -378,7 +378,8 @@ impl Worker<'_> {
         self.providers.binding_caches.contains_key(binding)
     }
 
-    /// Selects only an operator-configured language profile; absent profiles stay explicitly lexical.
+    /// Selects only an operator-configured language profile after proving whole-tree read authority;
+    /// absent profiles and read-restricted worktrees stay lexical without starting a provider.
     pub(super) async fn semantic_context(
         &mut self,
         job: &mut Job,
@@ -404,6 +405,23 @@ impl Worker<'_> {
         else {
             return Ok(None);
         };
+        let binding = job.invocation.binding_ref();
+        let authority = execution_authority(&self.authority(binding).await?)?;
+        let observed = job.observed.clone().ok_or(FailureCode::SandboxState)?;
+        crate::execution::validate_workspace_read(
+            self.shared.active(binding)?,
+            observed,
+            &authority,
+            &job.target.catalog,
+            job.target.allow_disabled_host,
+            crate::execution::ReadScope::WholeTree,
+        )
+        .map_err(|error| {
+            FailureCode::ExecutionProfileCause(
+                ExecutionProfileCause::from_log_tag(&read_scope_detail(&error))
+                    .expect("read-scope refusal has a closed execution-profile tag"),
+            )
+        })?;
         match required {
             AcceptedProviderSettings::GoplsDefaults => self
                 .go_context(job, &profile, source, bytes, query)

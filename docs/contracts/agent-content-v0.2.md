@@ -21,6 +21,8 @@ Because content is Claude's only carrier, it alone must state every fact an acce
 
 ## Closed guidance
 
+When a configured semantic provider cannot run or cannot verify TypeScript document membership, a path-proven Context uses the normal complete Context content with a lexical mode reason and an editable source reference. The renderer does not turn this Context into a typed error.
+
 Activation points to ide.context. Current source Context presents bounded evidence and points to ide.edit with its exact source_ref (the same value as the reply's detail_ref) when available, or the native editor. A `kind: "problems"` Context has no source_ref and preserves the exact v0.2 problems text without edit guidance. A truncated Context or Diff points to ide.inspect only when its typed `continuation` is true; a detail_ref alone is not evidence of another consumable page. Incomplete Context otherwise guides to edit/native work with that same source_ref when one exists, and incomplete Diff to stopping or safe native review. A reviewed Diff points to ide.stop. Stop confirms authority release.
 
 Pending work preserves an exact helper command when present, requires foreground execution, and then names ide.inspect with the exact detail_ref. The helper and references are never silently shortened. An oversized pending result fails closed.
@@ -29,7 +31,7 @@ Edit presents the closed outcome, public path and only the references needed for
 
 For `stale_source`, content states that no write occurred and distinguishes changed target content or presence from an incomplete or unavailable reference. It also states that a newer observation alone does not invalidate identical content. The closed Edit result does not encode a finer stale reason, so the text does not claim which condition occurred.
 
-Typed Error sets isError. `resolution_unverified` names the supported configured-project requirement and a later Context retry without claiming that a native tool can substitute for closed TypeScript resolution. Unavailable, pending, lifecycle, feedback and edit-result states do not become transport errors; each accepted typed reply has one compact content block, and unchanged structuredContent wherever the host-specific projection above includes it. Native fallback is named only when IDE work is unavailable, unsupported, declined or uncertain.
+Typed Error sets isError. A standalone `resolution_unverified` error names the supported configured-project requirement and a later Context retry without claiming that a native tool can substitute for closed TypeScript resolution. Path-proven Context answers use the lexical mode instead. Unavailable, pending, lifecycle, feedback and edit-result states do not become transport errors; each accepted typed reply has one compact content block, and unchanged structuredContent wherever the host-specific projection above includes it. Native fallback is named only when IDE work is unavailable, unsupported, declined or uncertain.
 
 An `execution_profile` refusal with a closed cause renders `error: execution_profile (<tag>); continue with native tools`, preserving the leading code. The tag is one of the fixed, path-free error-log details; for example, `host_disabled`. Refusals without a closed cause retain `error: execution_profile; continue with native tools`.
 

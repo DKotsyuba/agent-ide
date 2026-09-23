@@ -3212,7 +3212,8 @@ impl<'a> Worker<'a> {
         }
     }
 
-    /// Returns current owner context with explicit semantic or lexical provenance and bounded source text.
+    /// Returns path-proven source context, falling back to lexical evidence when an accepted provider
+    /// cannot run or cannot verify project resolution; source and freshness refusals remain errors.
     async fn context(
         &mut self,
         job: &mut Job,
@@ -3251,6 +3252,9 @@ impl<'a> Worker<'a> {
             Ok(Some(result))=>(result.context, Some(result.diagnostics)),
             Ok(None)=>(lexical_context(&observed,&bytes,query,"no accepted provider is configured for this source, or the registered path is missing").map_err(|_|FailureCode::SourceUnavailable)?, None),
             Err(FailureCode::ProviderUnavailable)=>(lexical_context(&observed,&bytes,query,"accepted semantic provider is unavailable").map_err(|_|FailureCode::SourceUnavailable)?, None),
+            Err(FailureCode::ResolutionUnverified)=>(lexical_context(&observed,&bytes,query,"semantic project resolution is unverified").map_err(|_|FailureCode::SourceUnavailable)?, None),
+            Err(FailureCode::ExecutionProfileCause(ExecutionProfileCause::ReadWholeTreeUnproven))=>(lexical_context(&observed,&bytes,query,"accepted semantic provider is unavailable: read_restricted").map_err(|_|FailureCode::SourceUnavailable)?, None),
+            Err(FailureCode::ExecutionProfile)=>(lexical_context(&observed,&bytes,query,"accepted semantic provider cannot run under the current execution profile").map_err(|_|FailureCode::SourceUnavailable)?, None),
             Err(code)=>return Err(code),
         };
         let epoch = self

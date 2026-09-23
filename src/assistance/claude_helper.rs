@@ -938,7 +938,8 @@ async fn collect_baseline(
     Ok(frames)
 }
 
-/// Produces bounded source context inside the inherited sandbox.
+/// Produces bounded source context inside the inherited sandbox, using lexical evidence when
+/// provider execution or project membership cannot be verified from the observed source.
 async fn context(
     job: &HelperJob,
     deadline: tokio::time::Instant,
@@ -1092,22 +1093,28 @@ async fn context(
                 );
             }
         },
-        Err(FailureCode::ProviderUnavailable) => match lexical_context(
-            &observation,
-            &bytes,
-            query,
-            "accepted semantic provider is unavailable",
-        ) {
-            Ok(context) => (context, None),
-            Err(_) => {
-                return (
-                    HelperOutcome::Failed {
-                        code: FailureCode::SourceUnavailable,
-                    },
-                    None,
-                );
+        Err(
+            code @ (FailureCode::ProviderUnavailable
+            | FailureCode::ResolutionUnverified
+            | FailureCode::ExecutionProfile),
+        ) => {
+            let reason = match code {
+                FailureCode::ProviderUnavailable => "accepted semantic provider is unavailable",
+                FailureCode::ResolutionUnverified => "semantic project resolution is unverified",
+                _ => "accepted semantic provider cannot run under the current execution profile",
+            };
+            match lexical_context(&observation, &bytes, query, reason) {
+                Ok(context) => (context, None),
+                Err(_) => {
+                    return (
+                        HelperOutcome::Failed {
+                            code: FailureCode::SourceUnavailable,
+                        },
+                        None,
+                    );
+                }
             }
-        },
+        }
         Err(code) => return (HelperOutcome::Failed { code }, None),
     };
     if tokio::time::Instant::now() >= deadline {

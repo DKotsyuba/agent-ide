@@ -2032,6 +2032,41 @@ impl ProductFixture {
         }
         std::fs::write(&self.config, config.to_string()).unwrap();
     }
+    /// Replaces the disabled-host profile with a managed template for a narrower live deny-glob state.
+    fn write_managed_profile(&self, template: &Value) {
+        use agent_ide::execution::{D03ProfileEvidence, HostSandboxState, PersistedProfileRecord};
+        let parsed = HostSandboxState::parse(Some(template.clone())).unwrap();
+        let record = PersistedProfileRecord::from_execution_evidence_v2(
+            "product-fixture-managed",
+            1,
+            D03ProfileEvidence {
+                provider_binary: "fixture-git".into(),
+                toolchain: "fixture-toolchain".into(),
+                configuration: "fixture-v1".into(),
+                trust: "explicit-test-only-managed".into(),
+                transport: "managed-fixture".into(),
+                d03_evidence: "fixture-only-not-host-certification".into(),
+            },
+            &parsed,
+        )
+        .unwrap();
+        let mut config: Value =
+            serde_json::from_slice(&std::fs::read(&self.config).unwrap()).unwrap();
+        config["targets"][0]["profiles"] = json!([{
+            "record": serde_json::from_str::<Value>(&record.to_json()).unwrap(),
+            "sandbox_state": template
+        }]);
+        let shim = self.base.join("codex-sandbox-shim");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\n[ \"$1\" = sandbox ] || exit 64\nshift 4\nexec \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+        config["targets"][0]["codex"] =
+            accepted_program(shim.to_str().unwrap(), "fixture-codex-shim");
+        std::fs::write(&self.config, config.to_string()).unwrap();
+    }
     /// Returns the current fixture's complete measured-state-shaped payload outside model arguments.
     fn state(&self) -> Value {
         json!({"permissionProfile":{"type":"disabled"},"codexLinuxSandboxExe":null,"sandboxCwd":self.root,"useLegacyLandlock":false})
@@ -4992,6 +5027,205 @@ async fn configured_product_claude_helper_returns_real_typescript_semantic_conte
 
     let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A deny-glob Codex profile can prove the requested TypeScript path without authorizing a
+/// provider over the whole tree; an installed dependency tree also makes project membership
+/// unverifiable. Both cases retain editable lexical source and refuse a denied source path.
+#[tokio::test]
+#[ignore = "requires the release-pinned Node and TypeScript bundle"]
+async fn configured_product_typescript_read_restriction_falls_back_to_lexical_context() {
+    let fixture = ProductFixture::new(json!([accepted_typescript_provider()]));
+    let source = "export const value = 42;\nexport const useValue = value;\n";
+    std::fs::create_dir_all(fixture.root.join("source/utils")).unwrap();
+    std::fs::write(fixture.root.join("source/utils/normalize.ts"), source).unwrap();
+    std::fs::write(
+        fixture.root.join("tsconfig.json"),
+        "{\"compilerOptions\":{\"types\":[],\"moduleResolution\":\"node10\"},\"files\":[\"source/utils/normalize.ts\"]}\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.root.join("secret.key"), "denied\n").unwrap();
+    fixture.git(&[
+        "add",
+        "--",
+        "source/utils/normalize.ts",
+        "tsconfig.json",
+        "secret.key",
+    ]);
+    fixture.git(&["commit", "--quiet", "-m", "TypeScript restricted fixture"]);
+
+    let template = json!({
+        "codexLinuxSandboxExe":null,
+        "permissionProfile":{"type":"managed","file_system":{"type":"restricted","entries":[
+            {"access":"read","path":{"type":"special","value":{"kind":"root"}}},
+            {"access":"write","path":{"type":"path","path":fixture.root}},
+            {"access":"write","path":{"type":"special","value":{"kind":"slash_tmp"}}},
+            {"access":"write","path":{"type":"special","value":{"kind":"tmpdir"}}}
+        ]},"network":"restricted"},
+        "sandboxCwd":fixture.root,
+        "useLegacyLandlock":false
+    });
+    fixture.write_managed_profile(&template);
+    let mut restricted = template.clone();
+    restricted["permissionProfile"]["file_system"]["entries"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"access":"deny","path":{"type":"glob_pattern","pattern":fixture.root.join("**/*.key")}}));
+
+    let denied_state = restricted.clone();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new_at(
+        &fixture,
+        "typescript-restricted",
+        "private-host-channel",
+        "session_id",
+        restricted,
+    )
+    .await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"typescript-restricted-start"}),
+        )
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    let context = actor.call(&fixture, "ide.context", json!({"path":"source/utils/normalize.ts","byte_offset":source.rfind("value;").unwrap()})).await;
+    let context = actor.settle(&fixture, context).await;
+    assert_eq!(context["kind"], "context", "{context}");
+    assert!(
+        context["text"]
+            .as_str()
+            .unwrap()
+            .contains("mode: lexical (accepted semantic provider is unavailable: read_restricted)"),
+        "{context}"
+    );
+    assert!(
+        context["text"]
+            .as_str()
+            .unwrap()
+            .contains("lexical_matches: [{"),
+        "{context}"
+    );
+    assert!(
+        context["text"].as_str().unwrap().contains(source),
+        "{context}"
+    );
+    assert!(context["detail_ref"].as_str().is_some(), "{context}");
+
+    std::fs::create_dir_all(fixture.root.join("node_modules")).unwrap();
+    actor.state = template;
+    let membership = actor
+        .call(
+            &fixture,
+            "ide.context",
+            json!({"path":"source/utils/normalize.ts"}),
+        )
+        .await;
+    let membership = actor.settle(&fixture, membership).await;
+    assert_eq!(membership["kind"], "context", "{membership}");
+    assert!(
+        membership["text"]
+            .as_str()
+            .unwrap()
+            .contains("mode: lexical (semantic project resolution is unverified)"),
+        "{membership}"
+    );
+    assert!(membership["detail_ref"].as_str().is_some(), "{membership}");
+
+    actor.state = denied_state;
+    let denied = actor
+        .call(&fixture, "ide.context", json!({"path":"secret.key"}))
+        .await;
+    let denied = actor.settle(&fixture, denied).await;
+    assert_eq!(denied["state"], "error", "{denied}");
+    assert_eq!(denied["code"], "execution_profile", "{denied}");
+    let edit = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"typescript-restricted-edit",
+                "path":"source/utils/normalize.ts",
+                "source_ref":context["detail_ref"],
+                "content":source.replace("42", "43")
+            }),
+        )
+        .await;
+    let edit = actor.settle(&fixture, edit).await;
+    assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Claude's foreground helper retains exact TypeScript source when its configured project does
+/// not contain the requested document, without launching the accepted semantic provider.
+#[tokio::test]
+#[ignore = "requires the release-pinned Node and TypeScript bundle"]
+async fn configured_product_claude_typescript_unverified_membership_falls_back_to_lexical_context()
+{
+    let fixture = ProductFixture::new_claude(json!([accepted_typescript_provider()]));
+    let source = "export const value = 42;\nexport const useValue = value;\n";
+    std::fs::write(fixture.root.join("fixture.ts"), source).unwrap();
+    std::fs::write(
+        fixture.root.join("tsconfig.json"),
+        "{\"compilerOptions\":{\"types\":[],\"moduleResolution\":\"node10\"},\"files\":[\"other.ts\"]}\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "fixture.ts", "tsconfig.json"]);
+    fixture.git(&[
+        "commit",
+        "--quiet",
+        "-m",
+        "TypeScript unverified membership fixture",
+    ]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "claude-typescript-unverified").await;
+    let started = actor
+        .call_claude(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"typescript-unverified-start"}),
+        )
+        .await;
+    let (started, _) = actor.complete_claude_pending(&fixture, &started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    let context = actor
+        .call_claude(
+            &fixture,
+            "ide.context",
+            json!({"path":"fixture.ts","byte_offset":source.rfind("value;").unwrap()}),
+        )
+        .await;
+    let (context, _) = actor.complete_claude_pending(&fixture, &context).await;
+    assert_eq!(context["kind"], "context", "{context}");
+    assert!(
+        context["text"]
+            .as_str()
+            .unwrap()
+            .contains("mode: lexical (semantic project resolution is unverified)"),
+        "{context}"
+    );
+    assert!(
+        context["text"]
+            .as_str()
+            .unwrap()
+            .contains("lexical_matches: [{"),
+        "{context}"
+    );
+    assert!(
+        context["text"].as_str().unwrap().contains(source),
+        "{context}"
+    );
+    assert!(context["detail_ref"].as_str().is_some(), "{context}");
+
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
