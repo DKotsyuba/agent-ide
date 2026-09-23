@@ -327,7 +327,8 @@ fn existing_python(
     allowed_file(&candidate, denies).then_some(candidate)
 }
 
-/// Follows at most 32 interpreter or tool links with no-follow metadata, proving each hop first.
+/// Follows at most 32 interpreter or tool links with no-follow metadata, proving each normalized
+/// hop first. Loops, denied paths, and unsafe relative targets return `None`.
 fn resolved_link_target(
     path: &Path,
     denies: &[crate::execution::seatbelt::ReadDeny],
@@ -341,16 +342,37 @@ fn resolved_link_target(
         let metadata = fs::symlink_metadata(&current).ok()?;
         if metadata.file_type().is_symlink() {
             let target = fs::read_link(&current).ok()?;
-            current = if target.is_absolute() {
-                target
-            } else {
-                current.parent()?.join(target)
-            };
+            current = lexical_link_target(&current, &target, denies)?;
         } else {
             return metadata.is_file().then_some(current);
         }
     }
     None
+}
+
+/// Resolves a link target without following links; each `..` may remove only an allowed real
+/// directory, so normalization cannot hide a symlink or denied path before the next hop check.
+fn lexical_link_target(
+    link: &Path,
+    target: &Path,
+    denies: &[crate::execution::seatbelt::ReadDeny],
+) -> Option<PathBuf> {
+    let joined = if target.is_absolute() { target.to_path_buf() } else { link.parent()?.join(target) };
+    let mut normalized = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            std::path::Component::RootDir => normalized.push("/"),
+            std::path::Component::CurDir => {},
+            std::path::Component::Normal(name) => normalized.push(name),
+            std::path::Component::ParentDir => {
+                if denied_interpreter_path(&normalized, denies)
+                    || !fs::symlink_metadata(&normalized).ok()?.is_dir()
+                    || !normalized.pop() { return None; }
+            }
+            std::path::Component::Prefix(_) => return None,
+        }
+    }
+    normalized.is_absolute().then_some(normalized)
 }
 
 /// Accepts an existing regular file without following an unproved link under host read denies.
