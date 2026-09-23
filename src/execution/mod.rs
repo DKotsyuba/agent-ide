@@ -209,6 +209,10 @@ impl PersistedProfileRecord {
     }
 
     /// Builds one versioned record; `shape_version` is 1, 2, or opt-in visualization v3.
+    ///
+    /// Minting v3 reads the current visualization namespace and leaf metadata and refuses
+    /// unsupported or redirected paths. Restoration later skips old visualization filesystem
+    /// checks while retaining the existing v2 cwd binding.
     pub fn from_execution_evidence_versioned(
         profile_id: impl Into<String>,
         revision: u32,
@@ -370,8 +374,8 @@ impl PersistedProfileRecord {
     /// v1 compares the legacy portable identities exactly. v2 and v3 verify both of their
     /// identities against the supplied capture: the domain-separated shape digest and the
     /// domain-separated digest of the complete captured state (T35B). Restoration uses exact
-    /// evidence matching; subtyping is only ever applied later, between the accepted capture and
-    /// a live state, inside `permit`.
+    /// evidence matching; v3 checks the captured visualization structure without requiring its
+    /// old namespace to still exist. Live filesystem checks occur later in `permit` and at spawn.
     pub fn matches_state(&self, state: &HostSandboxState) -> bool {
         match self.shape_version {
             None => {
@@ -385,7 +389,7 @@ impl PersistedProfileRecord {
                 }
                 Err(_) => false,
             },
-            Some(3) => match state.shape_v3(state.cwd()) {
+            Some(3) => match state.shape_v3_stored(state.cwd()) {
                 Ok(shape) => {
                     self.semantic_state == captured_state_identity_v2(state)
                         && self.permission_value == shape.digest().to_hex().to_string()
@@ -404,6 +408,30 @@ pub struct ExecutionProfilePermit {
     template: ExecutionProfileTemplate,
     /// Full-state digest retained only for operation evidence and later lookup correlation.
     state_digest: blake3::Hash,
+}
+
+impl ExecutionProfilePermit {
+    /// Rechecks a v3 live leaf and namespace against this exact accepted family before spawn.
+    ///
+    /// `trusted_cwd` is the same candidate used at permit admission. V1/v2 require no extra
+    /// filesystem access; malformed paths, a missing namespace, redirection, or widening refuse.
+    fn recheck_live_v3(
+        &self,
+        state: &HostSandboxState,
+        trusted_cwd: &Path,
+    ) -> Result<(), RequestError> {
+        if let TemplateShape::V3 { shape } = &self.template.shape {
+            let live = state.shape_v3(trusted_cwd).map_err(|_| {
+                RequestError::ExecutionProfileShapeUnsupported(ProfileClass::Managed)
+            })?;
+            if !live.prove_narrower(shape) {
+                return Err(RequestError::ExecutionProfileShapeNotNarrower(
+                    ProfileClass::Managed,
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Holds an entire host-provided sandbox state without expanding its roots or rewriting policy.
@@ -541,9 +569,20 @@ impl HostSandboxState {
         ProfileShapeV2::derive(self, trusted_cwd)
     }
 
-    /// Derives the opt-in visualization family without changing v2 or daemon read proofs.
+    /// Derives a live v3 family, checking current namespace and leaf filesystem metadata.
+    ///
+    /// Malformed structure, missing namespace, symlinks, or authority outside the family refuse;
+    /// this does not change v2 admission or daemon read proofs.
     pub(crate) fn shape_v3(&self, trusted_cwd: &Path) -> Result<ProfileShapeV3, UnsupportedShape> {
         ProfileShapeV3::derive(self, trusted_cwd)
+    }
+
+    /// Reconstructs only a stored v3 capture's structure; no old visualization path is opened.
+    pub(crate) fn shape_v3_stored(
+        &self,
+        trusted_cwd: &Path,
+    ) -> Result<ProfileShapeV3, UnsupportedShape> {
+        ProfileShapeV3::derive_stored(self, trusted_cwd)
     }
 
     /// Proves one worktree-relative path readable under this state's live cwd-bound shape (T36B).
@@ -634,6 +673,9 @@ impl ExecutionProfileTemplate {
     }
 
     /// Defines one explicitly accepted v3 visualization family from its exact D03 capture.
+    ///
+    /// The capture's live namespace and existing path components are checked before minting;
+    /// empty identity, zero version, or unsupported/unsafe profile states refuse.
     pub fn from_execution_evidence_v3(
         id: impl Into<String>,
         version: u32,
@@ -657,8 +699,8 @@ impl ExecutionProfileTemplate {
     /// Builds this template from one version-aware persisted record and its captured state.
     ///
     /// `record.matches_state` has already verified both identities against `state`; this only
-    /// re-derives the comparison data the permit proof needs. A v2 or v3 record whose captured state
-    /// no longer derives its shape is denied (fail closed), never downgraded to v1.
+    /// re-derives the comparison data the permit proof needs. V3 derives stored structure even
+    /// after its old visualization namespace is removed; malformed captures still refuse.
     fn from_record(
         record: &PersistedProfileRecord,
         state: &HostSandboxState,
@@ -674,7 +716,7 @@ impl ExecutionProfileTemplate {
             },
             Some(3) => TemplateShape::V3 {
                 shape: state
-                    .shape_v3(state.cwd())
+                    .shape_v3_stored(state.cwd())
                     .map_err(|_| RequestError::ExecutionProfileDenied)?,
             },
             Some(_) => return Err(RequestError::ExecutionProfileDenied),
@@ -1593,8 +1635,11 @@ pub struct CompletedGitDiscovery {
 }
 
 impl ValidatedGitDiscovery {
-    /// Returns an owned fixed-query handle after consuming fresh liveness at physical spawn.
-    /// The handle retains operation/query provenance and can be cancelled while a borrowed wait runs.
+    /// Returns an owned fixed-query handle after checking v3 paths and fresh liveness at spawn.
+    ///
+    /// The fixed `-C` candidate is rechecked against the same v3 family used at admission;
+    /// failure returns the unique no-child settlement with a closed request error. The handle
+    /// retains operation/query provenance and can be cancelled while a borrowed wait runs.
     pub fn spawn(
         self,
         lease: AdmissionLease,
@@ -1603,6 +1648,13 @@ impl ValidatedGitDiscovery {
     ) -> Result<OwnedGitDiscovery, ProcessError> {
         let started = std::time::Instant::now();
         let settlement = SpawnNeverStarted::ordinary(lease);
+        // validate_query fixes argv as `-C <candidate> <query>`; the candidate is the permit cwd.
+        if let Err(error) = self
+            .permit
+            .recheck_live_v3(&self.invocation.sandbox, Path::new(&self.command.args[1]))
+        {
+            return Err(settlement.error(ProcessError::Request(error)));
+        }
         if let Err(error) = self.invocation.consume_active_use(active_use) {
             return Err(settlement.error(ProcessError::Request(error)));
         }
@@ -2099,20 +2151,8 @@ impl ValidatedExecutionRequest {
     /// rechecks its leaf path immediately before spawn so a queued symlink replacement
     /// refuses. Synthetic/test requests have no active binding and reject no optional use.
     fn consume_spawn_use(&self, active_use: Option<ActiveBindingUse>) -> Result<(), RequestError> {
-        if let TemplateShape::V3 { shape } = &self.permit.template.shape {
-            let live = self
-                .invocation
-                .sandbox
-                .shape_v3(&self.authority.root)
-                .map_err(|_| {
-                    RequestError::ExecutionProfileShapeUnsupported(ProfileClass::Managed)
-                })?;
-            if !live.prove_narrower(shape) {
-                return Err(RequestError::ExecutionProfileShapeNotNarrower(
-                    ProfileClass::Managed,
-                ));
-            }
-        }
+        self.permit
+            .recheck_live_v3(&self.invocation.sandbox, &self.authority.root)?;
         match (&self.invocation.active_binding, active_use) {
             (Some(_), Some(active_use)) => self.invocation.consume_active_use(active_use),
             (Some(_), None) => Err(RequestError::MissingActiveBindingUse),

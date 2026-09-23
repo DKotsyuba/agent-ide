@@ -1449,6 +1449,9 @@ fn launcher_accepts_visualization_family_record() {
     let executable =
         json!({"path":"/private/tmp/accepted-program","identity":"codex","blake3":"0".repeat(64)});
     let config = json!({"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[{"attachment":"visualization","candidate":root.join("work"),"git":executable,"codex":executable,"providers":[],"profiles":[{"record":serde_json::from_str::<Value>(&record.to_json()).unwrap(),"sandbox_state":serde_json::from_str::<Value>(state.sandbox_state_json()).unwrap()}],"allow_disabled_host":false}]});
+    std::fs::remove_dir_all(root.join(".codex")).unwrap();
+    assert!(LauncherConfig::parse(config.to_string().as_bytes()).is_ok());
+    std::os::unix::fs::symlink(root.join("work"), root.join(".codex")).unwrap();
     assert!(LauncherConfig::parse(config.to_string().as_bytes()).is_ok());
     std::fs::remove_dir_all(root).unwrap();
 }

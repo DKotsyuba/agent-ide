@@ -159,10 +159,12 @@ leaf must have `YYYY/MM/DD/<uuid>` components and all four matching credential-g
 (`**/*.key`, `**/*.pem`, `**/.env`, `**/.env.*`). V3 admits a later leaf only under the same
 namespace with the same complete deny group. It compares all other authority using the v2
 proof; an extra root, ancestor or sibling visualization write, changed network policy, or
-missing deny refuses. The namespace must exist and no existing leaf-path component may be a
-symlink; restoration still works after the captured task leaf is removed. The live JSON is replayed
-unchanged, and v3 adds no daemon read authority. The UUID is a path grammar check, not an
-assumed Codex thread identity.
+missing deny refuses. The live namespace must exist and no existing leaf-path component may be a
+symlink; restoring the stored record does not require its old namespace or leaf to remain on disk.
+The live JSON is replayed unchanged, and v3 adds no daemon read authority. The UUID is a path
+grammar check, not an assumed Codex thread identity. A catalog permits only one v3 record per
+namespace and remaining shape because rotating the task leaf produces the same family digest;
+replace the prior record when accepting a new revision of that family.
 
 When the daemon refuses a profile, it captures the raw observed state once per distinct digest
 under `~/.agent-ide/rejected-profiles/<16-hex>.json` (mode 0600 at creation; the directory is

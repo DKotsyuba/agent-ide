@@ -2934,6 +2934,10 @@ mod tests {
             Err(AppError::InvalidResponse)
         ));
         assert!(matches!(
+            evidence_record(&sandbox_state, "accepted-disabled", 1, evidence.clone(), 4),
+            Err(AppError::InvalidResponse)
+        ));
+        assert!(matches!(
             command(args(&[
                 "evidence",
                 "record",
