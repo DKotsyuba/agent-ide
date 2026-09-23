@@ -11,7 +11,7 @@
 //! triggers to the check [`Scheduler`](crate::checks::scheduler::Scheduler), and renders the
 //! per-binding `<agent-ide>` block from in-memory state only.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -118,6 +118,8 @@ struct BoundWorktree {
 struct FeedWiring {
     /// Bound worktrees keyed by binding fingerprint; at most [`MAX_FEED_KEYS`] entries.
     bindings: HashMap<[u8; 32], BoundWorktree>,
+    /// Restrictions observed while Start is still pending; activation consumes them monotonically.
+    pending_restricted: HashSet<[u8; 32]>,
     /// Delivered-block state per `(binding, worktree)`.
     feed: FeedState,
 }
@@ -228,8 +230,8 @@ impl ProjectProblemFeed {
     /// common dir. A worktree outside every allowed root is recorded as not admitted — its
     /// snapshots then report `outside_roots` — and no check is scheduled. Replaces any previous
     /// record for the same binding; when the bound set is full an arbitrary other binding is
-    /// evicted first. `read_restricted` suppresses scheduling and all cached diagnostics for
-    /// this binding without probing language presence or project files.
+    /// evicted first. `read_restricted` or any restriction observed while Start was pending
+    /// suppresses scheduling and all cached diagnostics for this binding without probing files.
     pub fn activated(
         &self,
         binding: [u8; 32],
@@ -242,6 +244,13 @@ impl ProjectProblemFeed {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
+        let pending_restricted = state.pending_restricted.remove(&binding);
+        let read_restricted = read_restricted
+            || pending_restricted
+            || state
+                .bindings
+                .get(&binding)
+                .is_some_and(|bound| bound.read_restricted);
         if admitted && !read_restricted {
             self.scheduler.activate(&repository_key, worktree);
         }
@@ -263,12 +272,14 @@ impl ProjectProblemFeed {
     }
 
     /// Permanently disables this binding's checks and cached diagnostics after a narrower host
-    /// profile is observed, cancelling any already queued or running check for its worktree. The
-    /// cancellation serializes with trigger admission under the binding lock. A new Start binding
-    /// is required to restore check availability for this caller.
+    /// profile is observed, cancelling any already queued or running check for its worktree. A
+    /// restriction before activation is retained for that pending binding and wins over Start's
+    /// older observation. Cancellation serializes with trigger admission under the binding lock;
+    /// a new Start binding is required to restore check availability.
     pub fn restrict(&self, binding: &[u8; 32]) {
         if let Ok(mut state) = self.state.lock() {
             let Some(bound) = state.bindings.get_mut(binding) else {
+                state.pending_restricted.insert(*binding);
                 return;
             };
             if bound.read_restricted {
@@ -386,15 +397,16 @@ impl ProjectProblemFeed {
         Some(block)
     }
 
-    /// Drops `binding`'s worktree record and delivery state; called on `ide.stop`.
+    /// Drops `binding`'s pending restriction, worktree record, and delivery state on `ide.stop`.
     pub fn forget(&self, binding: &[u8; 32]) {
-        if let Ok(mut state) = self.state.lock()
-            && let Some(bound) = state.bindings.remove(binding)
-        {
-            state.feed.forget(&FeedKey {
-                binding: hex(binding),
-                worktree: bound.worktree,
-            });
+        if let Ok(mut state) = self.state.lock() {
+            state.pending_restricted.remove(binding);
+            if let Some(bound) = state.bindings.remove(binding) {
+                state.feed.forget(&FeedKey {
+                    binding: hex(binding),
+                    worktree: bound.worktree,
+                });
+            }
         }
     }
 
@@ -1279,6 +1291,38 @@ mod tests {
         );
         assert_eq!(feed.next_block(&restricted), None);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A narrowed observation between Start admission and feed activation wins over Start's
+    /// earlier clean profile; forgetting that binding permits a later clean generation.
+    #[tokio::test(start_paused = true)]
+    async fn pending_start_restriction_wins_at_activation() {
+        let (feed, _, root) = scripted_feed("pending-start-restriction");
+        let worktree = root.join("wt");
+        let binding = [7; 32];
+        feed.restrict(&binding);
+        feed.activated(binding, &worktree, Path::new("repo"), false);
+        feed.changed(&binding);
+        settle().await;
+        assert!(!feed.scheduler.is_busy());
+        assert!(feed.scheduler.latest(&worktree).is_empty());
+        assert_eq!(
+            feed.next_block(&binding),
+            plate("rust: unavailable: read_restricted")
+        );
+        feed.activated(binding, &worktree, Path::new("repo"), false);
+        assert!(
+            feed.is_read_restricted(&binding),
+            "a repeated clean Start must not widen the binding"
+        );
+        feed.forget(&binding);
+        feed.activated(binding, &worktree, Path::new("repo"), false);
+        settle().await;
+        assert_eq!(
+            feed.next_block(&binding),
+            plate("rust: 0 errors, 0 warnings")
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// A restriction arriving at the old decision/trigger gap waits for admission, then cancels it.

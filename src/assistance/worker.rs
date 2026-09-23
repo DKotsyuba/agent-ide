@@ -5815,21 +5815,21 @@ mod stop_retry_tests {
         }
     }
 
-    /// Runs one problems-kind context job through the real production context entry point.
+    /// Runs one problems-kind context job through the real production context entry point with
+    /// the fixture Codex binding's current accepted unrestricted observation.
     async fn run_problems_context(
         worker: &mut Worker<'_>,
         actor: &str,
         id: &str,
-        observed: Option<ObservedSandboxState>,
         parameters: serde_json::Value,
     ) -> PeerReply {
-        let (invocation, _) = production_call(worker, &worker.runtime, actor, id);
+        let (invocation, observed) = production_call(worker, &worker.runtime, actor, id);
         let (_cancel_sender, cancel) = watch::channel(false);
         let mut job = Job {
             input: JobInput::Managed,
             reference: format!("problems-{id}"),
             invocation,
-            observed,
+            observed: Some(observed),
             tool: AssistanceTool::Context,
             parameters,
             target: production_target(&worker.runtime),
@@ -5853,10 +5853,9 @@ mod stop_retry_tests {
         reply
     }
 
-    /// Proves the problems kind answers from the attached in-memory source against the authorized
-    /// worktree — without any sandbox observation, which Claude never has — and reports the honest
-    /// single disabled line when no source is attached. No helper, provider or source file is
-    /// involved on either path.
+    /// Proves the problems kind answers from the attached in-memory source under the fixture's
+    /// unrestricted Codex observation and reports the honest disabled line without a source.
+    /// No helper, provider, or source file is involved on either path.
     #[tokio::test]
     async fn context_problems_answers_from_source_and_reports_disabled_without_one() {
         let fixture = Fixture::new();
@@ -5871,7 +5870,6 @@ mod stop_retry_tests {
             &mut worker,
             "problems-actor",
             "problems-disabled",
-            None,
             serde_json::json!({"kind":"problems"}),
         )
         .await;
@@ -5903,7 +5901,6 @@ mod stop_retry_tests {
             &mut worker,
             "problems-actor",
             "problems-page",
-            None,
             serde_json::json!({"kind":"problems","language":"rust","offset":0}),
         )
         .await;

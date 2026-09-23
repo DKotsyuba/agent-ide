@@ -8114,9 +8114,11 @@ async fn eyes_claude_read_exclusion_reports_only_restricted_status() {
     let fixture = ProductFixture::new_claude(json!([]));
     let home = enable_fake_rust_checks(&fixture, &fixture.base);
     std::fs::write(fixture.root.join("problems.count"), "7").unwrap();
+    let alias = fixture.base.join("read-alias");
+    std::os::unix::fs::symlink(&fixture.root, &alias).unwrap();
     let mut config: Value =
         serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
-    config["targets"][0]["claude_profile"]["read_denies"] = json!([fixture.root.join("secret.rs")]);
+    config["targets"][0]["claude_profile"]["read_denies"] = json!([alias.join("secret.rs")]);
     std::fs::write(&fixture.config, config.to_string()).unwrap();
     let mut daemon = fixture.daemon_with_home(Some(&home)).await;
     let (mut actor, status) = eyes_claude_actor(&fixture, "claude-restricted-eyes").await;
@@ -8146,6 +8148,147 @@ async fn eyes_claude_read_exclusion_reports_only_restricted_status() {
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
+}
+
+/// Waits for a check's private worktree cache, which is created only when a scheduled run starts.
+async fn await_eyes_check_start(home: &Path) {
+    let cache = home.join(".agent-ide/checks");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if std::fs::read_dir(&cache).is_ok_and(|mut entries| entries.next().is_some()) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "project check never started"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Deny-free Claude and ordinary Codex starts still schedule real check attempts and deliver
+/// their first plates, independent of whether the outer test sandbox lets fake cargo complete.
+#[tokio::test]
+async fn eyes_unrestricted_profiles_start_checks_and_deliver_plates() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let claude = ProductFixture::new_claude(json!([]));
+    let claude_home = enable_fake_rust_checks(&claude, &claude.base);
+    let mut daemon = claude.daemon_with_home(Some(&claude_home)).await;
+    let (mut actor, plate) = eyes_claude_actor(&claude, "claude-unrestricted-eyes").await;
+    assert!(
+        plate.starts_with("<agent-ide>\nrust:") && !plate.contains("read_restricted"),
+        "{plate}"
+    );
+    await_eyes_check_start(&claude_home).await;
+    let stopped = actor.call_claude(&claude, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+
+    let codex = ProductFixture::new(json!([]));
+    let codex_home = enable_fake_rust_checks(&codex, &codex.base);
+    let mut mcp = Mcp::start_managed_with_home(&codex.config, &codex.root, Some(&codex_home)).await;
+    let mut next = 100;
+    let state = codex.state();
+    let started = managed_call(
+        &mut mcp,
+        next,
+        "codex-unrestricted-eyes",
+        "ide.start",
+        json!({"activation_id":"unrestricted-start"}),
+        &state,
+    )
+    .await;
+    let started = settle_managed(
+        &mut mcp,
+        &mut next,
+        "codex-unrestricted-eyes",
+        &state,
+        started,
+    )
+    .await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let plate = carried_status(&started).expect("Codex activation carries a status plate");
+    assert!(
+        plate.starts_with("<agent-ide>\nrust:") && !plate.contains("read_restricted"),
+        "{plate}"
+    );
+    await_eyes_check_start(&codex_home).await;
+    mcp.close().await;
+}
+
+/// Missing or unsupported metadata on a validated managed binding revokes check delivery before
+/// a later native post can trigger or disclose an older project result.
+#[tokio::test]
+async fn eyes_codex_unknown_metadata_restricts_following_native_post() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    for unsupported in [false, true] {
+        let fixture = ProductFixture::new(json!([]));
+        let home = enable_fake_rust_checks(&fixture, &fixture.base);
+        let base = rendezvous_area(if unsupported {
+            "unknown-state"
+        } else {
+            "missing-state"
+        });
+        let root = base.join("rendezvous");
+        let mut mcp =
+            Mcp::start_managed_custom(&fixture.config, &fixture.root, Some(&home), Some(&root))
+                .await;
+        let state = fixture.state();
+        let actor = "metadata-actor";
+        let session = "metadata-session";
+        let mut next = 100;
+        let started = managed_root_call(
+            &mut mcp,
+            next,
+            actor,
+            session,
+            "ide.start",
+            json!({"activation_id":"metadata-start"}),
+            &state,
+        )
+        .await;
+        let started = settle_managed(&mut mcp, &mut next, actor, &state, started).await;
+        assert_eq!(started["kind"], "activation", "{started}");
+        next += 1;
+        let mut meta = json!({
+            "threadId": actor,
+            "callId": format!("managed-{actor}-{next}"),
+            "x-codex-turn-metadata": {"session_id": session}
+        });
+        if unsupported {
+            meta["codex/sandbox-state-meta"] = json!({
+                "permissionProfile": {"type":"external"},
+                "codexLinuxSandboxExe": null,
+                "sandboxCwd": fixture.root,
+                "useLegacyLandlock": false
+            });
+        }
+        let unknown = mcp
+            .exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call",
+            "params":{"name":"ide.context","arguments":{"kind":"problems"},"_meta":meta}}))
+            .await;
+        assert_eq!(unknown["result"]["isError"], true, "{unknown}");
+        let hook = managed_native_post(
+            &root,
+            session,
+            actor,
+            if unsupported {
+                "native-unsupported"
+            } else {
+                "native-missing"
+            },
+            "Bash",
+        )
+        .await;
+        assert_eq!(
+            managed_hook_context(&hook),
+            "<agent-ide>\nrust: unavailable: read_restricted\n</agent-ide>"
+        );
+        mcp.close().await;
+        std::fs::remove_dir_all(base).unwrap();
+    }
 }
 
 /// Reads the `ide.context` problems page for an active Codex actor, with its carried status plate.

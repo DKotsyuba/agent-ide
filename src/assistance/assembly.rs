@@ -745,7 +745,8 @@ impl ProductDispatcher {
     /// `status` is written only when a terminal `ide.*` reply for a reply-delivered host (T28B)
     /// carries the due status plate on top; the caller renders it ahead of the reply. A native
     /// hook has no current sandbox metadata, so it uses the binding feed's sticky restriction
-    /// state before triggering a check or releasing cached feedback.
+    /// state before triggering a check or releasing cached feedback. Missing or unsupported
+    /// metadata on a validated Codex binding restricts that feed before an error is returned.
     async fn handle(
         &self,
         request: &AssistanceDispatch,
@@ -1016,38 +1017,39 @@ impl ProductDispatcher {
                         let active = bindings.consume_active(invocation.binding_ref()).ok()?;
                         // Claude never advertises or returns `codex/sandbox-state-meta`; establishing
                         // its correlation must never invent sandbox authority it was never given.
-                        let observed = match parse_observed_sandbox_state(
+                        let observed = parse_observed_sandbox_state(
                             meta,
                             &invocation,
                             &active,
                             host == HostKind::Codex,
-                        ) {
-                            Ok(observed) => observed,
-                            Err(_) => {
-                                if method.method() == AssistanceMethod::Start
-                                    && invocation.created_binding()
-                                {
-                                    let _ = bindings.stop_binding(invocation.binding_ref());
-                                }
-                                return Some(PeerReply::Error {
-                                    code: FailureCode::SandboxState,
-                                });
+                        )
+                        .ok()
+                        .filter(|observed| {
+                            crate::execution::HostSandboxState::parse(Some(
+                                observed.state().as_json().clone(),
+                            ))
+                            .is_ok()
+                        });
+                        let Some(observed) = observed else {
+                            let feed = self
+                                .worker
+                                .as_ref()
+                                .and_then(|worker| worker.project_feed());
+                            if let Some(feed) = feed {
+                                feed.restrict(&invocation.binding_ref().fingerprint());
                             }
-                        };
-                        if crate::execution::HostSandboxState::parse(Some(
-                            observed.state().as_json().clone(),
-                        ))
-                        .is_err()
-                        {
                             if method.method() == AssistanceMethod::Start
                                 && invocation.created_binding()
                             {
                                 let _ = bindings.stop_binding(invocation.binding_ref());
+                                if let Some(feed) = feed {
+                                    feed.forget(&invocation.binding_ref().fingerprint());
+                                }
                             }
                             return Some(PeerReply::Error {
                                 code: FailureCode::SandboxState,
                             });
-                        }
+                        };
                         (invocation, Some(observed))
                     }
                 };

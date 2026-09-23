@@ -231,14 +231,17 @@ impl ClaudeOperatorProfile {
     }
 
     /// Proves a target's complete tree readable from the accepted operator assertion.
-    /// Explicit grants must contain the tree, and any deny whose literal prefix can overlap it
-    /// refuses the proof. Missing grants mean the legacy `scope_declared` project-wide grant.
+    /// Explicit grants must contain the tree, and any deny whose resolved literal prefix can
+    /// overlap it refuses the proof. Unresolved paths also refuse. Missing grants mean the
+    /// legacy `scope_declared` project-wide grant.
     pub fn declares_whole_tree_read(&self, worktree: &Path) -> bool {
         self.validate().is_ok()
-            && self
-                .read_roots
-                .as_ref()
-                .is_none_or(|roots| roots.iter().any(|root| worktree.starts_with(root)))
+            && self.read_roots.as_ref().is_none_or(|roots| {
+                roots.iter().any(|root| {
+                    root.canonicalize()
+                        .is_ok_and(|canonical| worktree.starts_with(canonical))
+                })
+            })
             && self.read_denies.iter().all(|deny| {
                 let literal = deny
                     .find(['*', '?', '[', '{', '!', '\\'])
@@ -250,9 +253,30 @@ impl ClaudeOperatorProfile {
                 } else {
                     Path::new(literal).parent().unwrap_or(Path::new("/"))
                 };
-                !worktree.starts_with(prefix) && !prefix.starts_with(worktree)
+                let Some(prefix) = canonical_deny_prefix(prefix, literal.len() == deny.len())
+                else {
+                    return false;
+                };
+                !worktree.starts_with(&prefix) && !prefix.starts_with(worktree)
             })
     }
+}
+
+/// Resolves an exclusion's existing prefix through filesystem aliases before read proof.
+/// A missing exact leaf may use its existing canonical parent; a missing glob prefix, dangling
+/// symlink, inaccessible ancestor, or other unresolved path returns `None` and restricts checks.
+fn canonical_deny_prefix(path: &Path, exact: bool) -> Option<PathBuf> {
+    if let Ok(canonical) = path.canonicalize() {
+        return Some(canonical);
+    }
+    if !exact
+        || !path
+            .symlink_metadata()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return None;
+    }
+    Some(path.parent()?.canonicalize().ok()?.join(path.file_name()?))
 }
 
 /// Names the closed operations a Claude helper may be launched for.
@@ -2531,18 +2555,39 @@ mod tests {
             read_denies: Vec::new(),
             platform: HelperPlatform::MacOs,
         };
-        let root = Path::new("/private/tmp/project");
-        assert!(profile.declares_whole_tree_read(root));
+        let base =
+            Path::new("/private/tmp").join(format!("agent-ide-claude-read-{}", std::process::id()));
+        let root = base.join("project");
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::create_dir_all(base.join("other")).unwrap();
+        assert!(profile.declares_whole_tree_read(&root));
         let mut limited = profile.clone();
-        limited.read_roots = Some(vec![PathBuf::from("/private/tmp/other")]);
-        assert!(!limited.declares_whole_tree_read(root));
-        limited.read_roots = Some(vec![PathBuf::from("/private/tmp")]);
-        limited.read_denies.push("/private/tmp/other/*.key".into());
-        assert!(limited.declares_whole_tree_read(root));
+        limited.read_roots = Some(vec![base.join("other")]);
+        assert!(!limited.declares_whole_tree_read(&root));
+        limited.read_roots = Some(vec![base.clone()]);
         limited
             .read_denies
-            .push("/private/tmp/project/secret/*.key".into());
-        assert!(!limited.declares_whole_tree_read(root));
+            .push(format!("{}/*.key", base.join("other").display()));
+        assert!(limited.declares_whole_tree_read(&root));
+        limited
+            .read_denies
+            .push(format!("{}/*.key", root.join("secret").display()));
+        assert!(!limited.declares_whole_tree_read(&root));
+        limited.read_denies = vec![format!("{}/*.key", base.join("missing").display())];
+        assert!(!limited.declares_whole_tree_read(&root));
+        if Path::new("/tmp").canonicalize().unwrap() == Path::new("/private/tmp") {
+            limited.read_denies = vec![format!(
+                "/tmp/{}/project/secret.rs",
+                base.file_name().unwrap().to_string_lossy()
+            )];
+            assert!(!limited.declares_whole_tree_read(&root));
+            limited.read_denies = vec![format!(
+                "/tmp/{}/project/secret/*.key",
+                base.file_name().unwrap().to_string_lossy()
+            )];
+            assert!(!limited.declares_whole_tree_read(&root));
+        }
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     /// The accepted Rust helper payload disables both switches and adds nothing else.
