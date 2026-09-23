@@ -243,8 +243,8 @@ fn render_text(reply: &PeerReply) -> String {
             text,
             ..
         } => format!(
-            "complete context: {text}\nDiagnostics are exactly as reported; use ide.edit when \
-             available, otherwise use the native editor"
+            "complete context: {text}\nNo edit source was observed; use ide.context \
+             with a path before ide.edit"
         ),
         PeerReply::Complete {
             kind: ResultKind::Diff,
@@ -326,8 +326,10 @@ fn render_edit(result: &EditResult, diagnostics: &EditDiagnostics) -> String {
             }
         }
         EditOutcome::StaleSource => format!(
-            "edit: {outcome}; path {}. No write occurred; use ide.context before another edit, \
-             and read every page of a paged context (ide.inspect) first",
+            "edit: {outcome}; path {}. No write occurred. The source_ref is incomplete or \
+             unavailable for this binding, or the file content/presence changed since context; \
+             a newer observation alone does not invalidate unchanged content. Use ide.context \
+             before another edit, and read every page of a paged context (ide.inspect) first",
             result.path
         ),
         EditOutcome::ConflictingDuplicate => format!(
@@ -639,6 +641,20 @@ mod tests {
         }
     }
 
+    /// Names both content changes and unusable references without claiming which one occurred.
+    #[test]
+    fn stale_edit_text_explains_why_no_write_occurred() {
+        let reply = PeerReply::Edit {
+            result: edit_result(EditOutcome::StaleSource).unwrap(),
+            diagnostics: EditDiagnostics::Unknown {},
+        };
+        let rendered = render(reply, Envelope::TextOnly).unwrap();
+        let text = text_of(&rendered);
+        assert!(text.contains("No write occurred"));
+        assert!(text.contains("content/presence changed"));
+        assert!(text.contains("newer observation alone does not invalidate"));
+    }
+
     /// Keeps exact truncated references in model text and omits unrelated structured field names.
     ///
     /// Diff's `detail_ref` is only ever useful for a retained continuation (never for a later
@@ -690,6 +706,26 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    /// A problems Context has no source observation and cannot advertise an edit reference.
+    #[test]
+    fn context_without_source_directs_to_path_context() {
+        let rendered = render(
+            PeerReply::Complete {
+                kind: ResultKind::Context,
+                text: "python: unavailable:env_missing".into(),
+                detail_ref: None,
+                truncated: false,
+                continuation: false,
+            },
+            Envelope::TextOnly,
+        )
+        .unwrap();
+        let text = text_of(&rendered);
+        assert!(text.contains("No edit source was observed"));
+        assert!(text.contains("use ide.context with a path"));
+        assert!(!text.contains("source_ref "));
     }
 
     /// Recommends inspection only for a typed retained continuation, never merely for a handle.

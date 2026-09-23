@@ -2819,6 +2819,147 @@ async fn managed_codex_smoke_and_eof_cleanup() {
     assert_eq!(managed_runtime_paths(), before);
 }
 
+/// A problems lookup and unchanged re-observation keep an older Context edit ref usable;
+/// an actual byte change refuses the same operation without touching the target.
+#[tokio::test]
+async fn managed_context_problems_then_edit_tracks_content() {
+    let _guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let fixture = ProductFixture::new(json!([]));
+    let mut mcp = Mcp::start_managed(&fixture.config, &fixture.root).await;
+    let state = fixture.state();
+    let actor = "managed-stale-context";
+    let mut next = 10;
+    let start = managed_call(
+        &mut mcp,
+        next,
+        actor,
+        "ide.start",
+        json!({"activation_id":"start"}),
+        &state,
+    )
+    .await;
+    let start = settle_managed(&mut mcp, &mut next, actor, &state, start).await;
+    assert_eq!(start["kind"], "activation", "{start}");
+
+    next += 1;
+    let context = managed_call(
+        &mut mcp,
+        next,
+        actor,
+        "ide.context",
+        json!({"path":"tracked.txt"}),
+        &state,
+    )
+    .await;
+    let context = settle_managed(&mut mcp, &mut next, actor, &state, context).await;
+    assert_eq!(context["kind"], "context", "{context}");
+    next += 1;
+    let problems = managed_call(
+        &mut mcp,
+        next,
+        actor,
+        "ide.context",
+        json!({"kind":"problems"}),
+        &state,
+    )
+    .await;
+    assert_eq!(problems["kind"], "context", "{problems}");
+    assert_eq!(problems["detail_ref"], Value::Null, "{problems}");
+    assert_eq!(
+        std::fs::read(fixture.root.join("tracked.txt")).unwrap(),
+        b"worktree\n"
+    );
+    next += 1;
+    let edit = managed_call(
+        &mut mcp,
+        next,
+        actor,
+        "ide.edit",
+        json!({
+            "operation_id":"first-edit", "path":"tracked.txt",
+            "source_ref":context["detail_ref"], "content":"edited\n"
+        }),
+        &state,
+    )
+    .await;
+    let edit = settle_managed(&mut mcp, &mut next, actor, &state, edit).await;
+    assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
+
+    next += 1;
+    let older = managed_call(
+        &mut mcp,
+        next,
+        actor,
+        "ide.context",
+        json!({"path":"tracked.txt"}),
+        &state,
+    )
+    .await;
+    let older = settle_managed(&mut mcp, &mut next, actor, &state, older).await;
+    next += 1;
+    let newer = managed_call(
+        &mut mcp,
+        next,
+        actor,
+        "ide.context",
+        json!({"path":"tracked.txt"}),
+        &state,
+    )
+    .await;
+    let newer = settle_managed(&mut mcp, &mut next, actor, &state, newer).await;
+    assert_ne!(older["detail_ref"], newer["detail_ref"]);
+    next += 1;
+    let edit = managed_call(
+        &mut mcp,
+        next,
+        actor,
+        "ide.edit",
+        json!({
+            "operation_id":"after-reobserve", "path":"tracked.txt",
+            "source_ref":older["detail_ref"], "content":"edited again\n"
+        }),
+        &state,
+    )
+    .await;
+    let edit = settle_managed(&mut mcp, &mut next, actor, &state, edit).await;
+    assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
+
+    next += 1;
+    let context = managed_call(
+        &mut mcp,
+        next,
+        actor,
+        "ide.context",
+        json!({"path":"tracked.txt"}),
+        &state,
+    )
+    .await;
+    let context = settle_managed(&mut mcp, &mut next, actor, &state, context).await;
+    std::fs::write(fixture.root.join("tracked.txt"), "external\n").unwrap();
+    next += 1;
+    let stale = managed_call(
+        &mut mcp,
+        next,
+        actor,
+        "ide.edit",
+        json!({
+            "operation_id":"after-change", "path":"tracked.txt",
+            "source_ref":context["detail_ref"], "content":"must not write\n"
+        }),
+        &state,
+    )
+    .await;
+    let stale = settle_managed(&mut mcp, &mut next, actor, &state, stale).await;
+    assert_eq!(stale["result"]["outcome"], "stale_source", "{stale}");
+    assert_eq!(
+        std::fs::read(fixture.root.join("tracked.txt")).unwrap(),
+        b"external\n"
+    );
+    next += 1;
+    managed_call(&mut mcp, next, actor, "ide.stop", json!({}), &state).await;
+    mcp.close().await;
+}
+
 /// Managed Codex publishes distinct actor routes on first valid calls and retires them on clean
 /// shutdown, with the record pointing at exactly this MCP process's private runtime (T29B §2).
 #[tokio::test]
@@ -6658,6 +6799,105 @@ async fn claude_context_pagination_delivers_the_whole_source_across_repeated_ins
         .await;
     assert_eq!(again["text"].as_str().unwrap(), last_page, "{again}");
     assert_eq!(again["continuation"], false, "{again}");
+
+    let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Keeps a Claude Context ref across a problems lookup, native Read hint, and unchanged
+/// re-observation; a later byte change refuses the edit before it touches the target.
+/// The Python fixture is near the reported fastapi file size.
+#[tokio::test]
+async fn claude_context_problems_then_edit_keeps_unchanged_source() {
+    let fixture = ProductFixture::new_claude(json!([]));
+    std::fs::create_dir(fixture.root.join("fastapi")).unwrap();
+    let path = fixture.root.join("fastapi/utils.py");
+    let original = "value = 1\n".repeat(450);
+    std::fs::write(&path, &original).unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "claude-stale-context").await;
+    let start = actor
+        .call_claude(&fixture, "ide.start", json!({"activation_id":"start"}))
+        .await;
+    let (start, _) = actor.complete_claude_pending(&fixture, &start).await;
+    assert_eq!(start["kind"], "activation", "{start}");
+
+    let context = actor
+        .call_claude(&fixture, "ide.context", json!({"path":"fastapi/utils.py"}))
+        .await;
+    let (context, _) = actor.complete_claude_pending(&fixture, &context).await;
+    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["continuation"], false, "{context}");
+    let problems = actor
+        .call_claude(&fixture, "ide.context", json!({"kind":"problems"}))
+        .await;
+    assert_eq!(problems["kind"], "context", "{problems}");
+    assert_eq!(problems["detail_ref"], Value::Null, "{problems}");
+    assert!(
+        problems["text"]
+            .as_str()
+            .unwrap()
+            .contains("No edit source was observed")
+    );
+    actor.claude_native_post(&fixture, "Read").await;
+    assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+
+    let edit = actor
+        .call_claude(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"first-edit","path":"fastapi/utils.py",
+                "source_ref":context["detail_ref"],"content":"edited\n"}),
+        )
+        .await;
+    let (edit, _) = actor.complete_claude_pending(&fixture, &edit).await;
+    assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
+    assert_eq!(std::fs::read(&path).unwrap(), b"edited\n");
+
+    let older = actor
+        .call_claude(&fixture, "ide.context", json!({"path":"fastapi/utils.py"}))
+        .await;
+    let (older, _) = actor.complete_claude_pending(&fixture, &older).await;
+    let newer = actor
+        .call_claude(&fixture, "ide.context", json!({"path":"fastapi/utils.py"}))
+        .await;
+    let (newer, _) = actor.complete_claude_pending(&fixture, &newer).await;
+    assert_ne!(older["detail_ref"], newer["detail_ref"]);
+    let edit = actor
+        .call_claude(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"after-reobserve", "path":"fastapi/utils.py",
+                "source_ref":older["detail_ref"], "content":"edited again\n"
+            }),
+        )
+        .await;
+    let (edit, _) = actor.complete_claude_pending(&fixture, &edit).await;
+    assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
+    assert_eq!(std::fs::read(&path).unwrap(), b"edited again\n");
+
+    let context = actor
+        .call_claude(&fixture, "ide.context", json!({"path":"fastapi/utils.py"}))
+        .await;
+    let (context, _) = actor.complete_claude_pending(&fixture, &context).await;
+    std::fs::write(&path, "external\n").unwrap();
+    let stale = actor
+        .call_claude(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"after-change", "path":"fastapi/utils.py",
+                "source_ref":context["detail_ref"], "content":"must not write\n"
+            }),
+        )
+        .await;
+    let (stale, _) = actor.complete_claude_pending(&fixture, &stale).await;
+    assert_eq!(stale["result"]["outcome"], "stale_source", "{stale}");
+    assert_eq!(std::fs::read(&path).unwrap(), b"external\n");
 
     let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");

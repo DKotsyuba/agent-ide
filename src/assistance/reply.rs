@@ -184,7 +184,7 @@ impl ExecutionProfileCause {
 pub enum ResultKind {
     /// Durable Workspace activated and authorized the exact binding.
     Activation,
-    /// Intelligence returned context over current registered source bytes.
+    /// Intelligence returned source context or the project problems page.
     Context,
     /// Changes composed evidence for a current Workspace comparison scope.
     Diff,
@@ -354,7 +354,7 @@ pub enum PeerReply {
         kind: ResultKind,
         /// Text derived from owner facts, retaining explicit freshness and coverage caveats.
         text: String,
-        /// Same-binding retained detail reference, absent if no retained result exists.
+        /// Same-binding usable detail reference; absent for a problems page with no edit source.
         detail_ref: Option<String>,
         /// True when serialized-result budgeting omitted owner text.
         truncated: bool,

@@ -919,9 +919,8 @@ impl WorkerHandle {
     ///
     /// EYES-r2: the request runs as a bounded managed job inside the worker task — never as a
     /// Claude foreground helper — because only the worker owns the durable authority and its
-    /// authorized worktree. The caller waits on the job's bounded oneshot exactly like Stop; a
-    /// lost wait still leaves the finished result retrievable through the retained detail
-    /// reference until the ledger evicts it.
+    /// authorized worktree. The caller waits on the job's bounded oneshot exactly like Stop.
+    /// Its result never advertises an edit source reference because no source was observed.
     pub async fn context_problems(
         &self,
         invocation: ValidatedInvocation,
@@ -3375,7 +3374,7 @@ impl<'a> Worker<'a> {
     /// The worktree is the fresh durable authority's worktree — the same active-binding/authority
     /// lookup every other context use requires — and no source file is read and no observation is
     /// recorded. Without an attached source, or when the requested language is not configured,
-    /// the reply is the honest single line `checks disabled`.
+    /// the reply is the honest single line `checks disabled`. It carries no edit source reference.
     async fn context_problems_job(
         &mut self,
         job: &mut Job,
@@ -3408,7 +3407,7 @@ impl<'a> Worker<'a> {
             PeerReply::Complete {
                 kind: ResultKind::Context,
                 text,
-                detail_ref: Some(job.reference.clone()),
+                detail_ref: None,
                 truncated: false,
                 continuation: false,
             },
@@ -5678,6 +5677,7 @@ mod stop_retry_tests {
             reply,
             PeerReply::Complete {
                 kind: ResultKind::Context,
+                detail_ref: None,
                 ..
             }
         ));
