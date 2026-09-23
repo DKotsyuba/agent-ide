@@ -28,10 +28,10 @@ use std::{
 
 use execution::{
     Admission, AdmissionClass, AdmissionController, AdmissionLimits, CommandKind,
-    ControlledCommand, DiscoverWorktreeRequest, DiscoveryOperationRef, ExecutionProfileCatalog,
-    ExecutionProfileTemplate, GitDiscoveryPolicy, GitDiscoveryQuery, HostSandboxState,
-    LocalExecutionPolicy, OwnedChild, OwnerId, ValidatedExecutionRequest, ValidatedHostInvocation,
-    WorkspaceAuthority,
+    ControlledCommand, D03ProfileEvidence, DiscoverWorktreeRequest, DiscoveryOperationRef,
+    ExecutionProfileCatalog, ExecutionProfileTemplate, GitDiscoveryPolicy, GitDiscoveryQuery,
+    HostSandboxState, LocalExecutionPolicy, OwnedChild, OwnerId, PersistedProfileRecord,
+    ValidatedExecutionRequest, ValidatedHostInvocation, WorkspaceAuthority,
 };
 
 /// Returns one required D03 environment value or stops before any sandboxed child starts.
@@ -48,6 +48,60 @@ fn test_path(directory: &Path, label: &str) -> PathBuf {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ))
+}
+
+/// Owns unique D03 files and directories across assertions and panic unwinding.
+struct D03Files {
+    /// Unique fixture files removed first.
+    files: Vec<PathBuf>,
+    /// Unique fixture directories removed after their files.
+    dirs: Vec<PathBuf>,
+}
+
+impl D03Files {
+    /// Registers one unique file path and returns it unchanged before any write; performs no I/O.
+    fn track(&mut self, path: PathBuf) -> PathBuf {
+        self.files.push(path.clone());
+        path
+    }
+
+    /// Registers one unique directory and returns it unchanged before creation; performs no I/O.
+    fn directory(&mut self, path: PathBuf) -> PathBuf {
+        self.dirs.push(path.clone());
+        path
+    }
+}
+
+impl Drop for D03Files {
+    /// Attempts file removal before directory removal; cleanup errors are ignored during unwind.
+    fn drop(&mut self) {
+        for path in &self.files {
+            let _ = fs::remove_file(path);
+        }
+        for path in &self.dirs {
+            let _ = fs::remove_dir(path);
+        }
+    }
+}
+
+/// Returns the sole visualization write leaf from a captured state's unchanged JSON.
+///
+/// The D03 caller has already validated v3 structure; malformed fixture JSON panics before any
+/// sandboxed child starts. This function reads no filesystem paths.
+fn visualization_leaf(state: &HostSandboxState) -> PathBuf {
+    let value: serde_json::Value = serde_json::from_str(state.sandbox_state_json()).unwrap();
+    value["permissionProfile"]["file_system"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| {
+            (entry["access"] == "write")
+                .then(|| entry["path"]["path"].as_str())
+                .flatten()
+        })
+        .find(|path| path.contains("/.codex/visualizations/"))
+        .map(PathBuf::from)
+        .unwrap()
 }
 
 /// Creates a matching trusted candidate for the local real-discovery probe binding guard.
@@ -255,124 +309,158 @@ async fn profile_specific_expectation_manifest_enforces_the_accepted_authority()
     );
 }
 
-/// Replays the exact supplied JSON through pinned Codex and probes the v3 leaf boundary.
+/// Replays two exact captured states through pinned Codex under the first state's v3 record.
 ///
-/// The caller supplies an existing writable outside directory and pinned Codex executable;
-/// this ignored experiment creates only disposable children, reaps each within the D03 bound,
-/// and checks both positive and negative permissions before its own fixture cleanup.
+/// Each input must be a real capture with a distinct existing UUID leaf under one namespace.
+/// Only state A probes a cwd write; state B validates its captured cwd without writing there.
+/// The outside directory must be writable to the fixture process but outside sandbox grants.
+/// All created paths are unique, tracked for unwind cleanup, and children are bounded by
+/// `run_child`; this test stays ignored until the operator supplies both captures and Codex.
 #[tokio::test]
-#[ignore = "requires AGENT_IDE_D03_STATE, AGENT_IDE_D03_CODEX, and AGENT_IDE_D03_DENIED_DIR"]
+#[ignore = "requires AGENT_IDE_D03_STATE_A, AGENT_IDE_D03_STATE_B, AGENT_IDE_D03_CODEX, and AGENT_IDE_D03_DENIED_DIR"]
 async fn visualization_family_native_d03() {
-    let state_text = fs::read_to_string(required("AGENT_IDE_D03_STATE")).unwrap();
-    let state = HostSandboxState::parse_json(&state_text).unwrap();
-    assert_eq!(state.sandbox_state_json(), state_text);
-    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
-        ExecutionProfileTemplate::from_execution_evidence_v3("visualization-d03", 1, &state)
-            .unwrap(),
-    ])
+    let texts = [
+        fs::read_to_string(required("AGENT_IDE_D03_STATE_A")).unwrap(),
+        fs::read_to_string(required("AGENT_IDE_D03_STATE_B")).unwrap(),
+    ];
+    let states = texts
+        .each_ref()
+        .map(|text| HostSandboxState::parse_json(text).unwrap());
+    for (state, text) in states.iter().zip(&texts) {
+        assert_eq!(state.sandbox_state_json(), text);
+    }
+    let leaves = states.each_ref().map(visualization_leaf);
+    assert_ne!(leaves[0], leaves[1]);
+    assert_eq!(leaves[0].ancestors().nth(4), leaves[1].ancestors().nth(4));
+    for leaf in &leaves {
+        assert!(leaf.is_dir(), "missing captured task leaf: {leaf:?}");
+    }
+    let record = PersistedProfileRecord::from_execution_evidence_versioned(
+        "visualization-d03-probe",
+        1,
+        D03ProfileEvidence {
+            provider_binary: "pinned-codex-under-test".into(),
+            toolchain: "native-d03".into(),
+            configuration: "two-capture-probe".into(),
+            trust: "operator-fixture".into(),
+            transport: "managed".into(),
+            d03_evidence: "pending-native-result".into(),
+        },
+        &states[0],
+        3,
+    )
     .unwrap();
-    let value: serde_json::Value = serde_json::from_str(&state_text).unwrap();
-    let leaf = value["permissionProfile"]["file_system"]["entries"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|entry| {
-            (entry["access"] == "write")
-                .then(|| entry["path"]["path"].as_str())
-                .flatten()
-        })
-        .find(|path| path.contains("/.codex/visualizations/"))
-        .map(PathBuf::from)
-        .unwrap();
+    assert!(record.matches_state(&states[0]));
+    assert!(!record.matches_state(&states[1]));
+    let catalog = ExecutionProfileCatalog::from_persisted_records(
+        vec![(record.clone(), states[0].clone())],
+        &[record],
+    )
+    .unwrap();
     let codex = PathBuf::from(required("AGENT_IDE_D03_CODEX"));
     let outside_dir = PathBuf::from(required("AGENT_IDE_D03_DENIED_DIR"));
-    let sibling = test_path(leaf.parent().unwrap(), "sibling-dir");
-    fs::create_dir(&sibling).unwrap();
+    assert!(outside_dir.is_dir());
     let touch = Path::new("/usr/bin/touch");
     let cat = Path::new("/bin/cat");
     let nc = Path::new("/usr/bin/nc");
     for program in [touch, cat, nc] {
         assert!(program.is_file(), "missing D03 helper {program:?}");
     }
-    let worktree_write = test_path(Path::new(env!("CARGO_MANIFEST_DIR")), "worktree-write");
-    let leaf_write = test_path(&leaf, "leaf-write");
-    let sibling_write = test_path(&sibling, "sibling-write");
-    let outside_write = test_path(&outside_dir, "outside-write");
-    // Prove the negative target is writable by the unsandboxed fixture process first.
-    fs::write(&outside_write, b"baseline").unwrap();
-    fs::remove_file(&outside_write).unwrap();
-    for (label, target, expected) in [
-        ("worktree-write", &worktree_write, true),
-        ("leaf-write", &leaf_write, true),
-        ("sibling-write", &sibling_write, false),
-        ("outside-write", &outside_write, false),
-    ] {
-        let result = run_child(
-            &request(&state, &catalog, touch, target.clone()),
-            &codex,
-            label,
-        )
-        .await;
-        let written = target.is_file();
-        if written {
-            fs::remove_file(target).unwrap();
+    let mut cleanup = D03Files {
+        files: Vec::new(),
+        dirs: Vec::new(),
+    };
+    for (index, state) in states.iter().enumerate() {
+        let leaf = &leaves[index];
+        let peer = &leaves[1 - index];
+        let mut writes = vec![
+            ("leaf", leaf.as_path(), true),
+            ("peer-leaf", peer.as_path(), false),
+            ("parent", leaf.parent().unwrap(), false),
+            ("outside", outside_dir.as_path(), false),
+        ];
+        if index == 0 {
+            writes.insert(0, ("cwd", state.cwd(), true));
+        } else {
+            // Request validation binds the second permit to its exact cwd; no child is spawned.
+            let _ = request_args(state, &catalog, touch, Vec::new());
         }
-        assert_eq!(
-            result.status().success(),
-            expected,
-            "{label} stderr: {:?}",
-            result.stderr().bytes
-        );
-        assert_eq!(written, expected, "{label} write result");
-    }
-    let credential = test_path(&leaf, "credential").with_extension("key");
-    let ordinary = test_path(&leaf, "ordinary").with_extension("txt");
-    fs::write(&credential, b"D03 sentinel").unwrap();
-    fs::write(&ordinary, b"D03 ordinary").unwrap();
-    for (label, target, expected) in [
-        ("credential-read", &credential, false),
-        ("ordinary-read", &ordinary, true),
-    ] {
+        for (label, directory, allowed) in writes {
+            let target = test_path(directory, label);
+            assert!(!target.exists(), "D03 target already exists: {target:?}");
+            let target = cleanup.track(target);
+            if !allowed {
+                fs::write(&target, b"host baseline").unwrap();
+                fs::remove_file(&target).unwrap();
+            }
+            let result = run_child(
+                &request(state, &catalog, touch, target.clone()),
+                &codex,
+                label,
+            )
+            .await;
+            assert_eq!(
+                result.status().success(),
+                allowed,
+                "task {index} {label}: {:?}",
+                result.stderr().bytes
+            );
+            assert_eq!(target.is_file(), allowed, "task {index} {label} write");
+        }
+        let probe = cleanup.directory(test_path(leaf, "credential-probes"));
+        fs::create_dir(&probe).unwrap();
+        for filename in [
+            "sentinel.key",
+            "sentinel.pem",
+            ".env",
+            ".env.test",
+            "ordinary.txt",
+        ] {
+            let target = cleanup.track(probe.join(filename));
+            fs::write(&target, b"D03 sentinel").unwrap();
+            let result = run_child(&request(state, &catalog, cat, target), &codex, filename).await;
+            let allowed = filename == "ordinary.txt";
+            assert_eq!(
+                result.status().success(),
+                allowed,
+                "task {index} {filename}: {:?}",
+                result.stderr().bytes
+            );
+            if allowed {
+                assert_eq!(result.stdout().bytes, b"D03 sentinel");
+            }
+        }
+        let network = serde_json::from_str::<serde_json::Value>(state.sandbox_state_json())
+            .unwrap()["permissionProfile"]["network"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port().to_string();
         let result = run_child(
-            &request(&state, &catalog, cat, target.clone()),
+            &request_args(
+                state,
+                &catalog,
+                nc,
+                vec![
+                    "-z".into(),
+                    "-w".into(),
+                    "1".into(),
+                    "127.0.0.1".into(),
+                    port.into(),
+                ],
+            ),
             &codex,
-            label,
+            "network",
         )
         .await;
         assert_eq!(
             result.status().success(),
-            expected,
-            "{label} stderr: {:?}",
+            network == "enabled",
+            "task {index} network: {:?}",
             result.stderr().bytes
         );
     }
-    fs::remove_file(credential).unwrap();
-    fs::remove_file(ordinary).unwrap();
-    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let port = listener.local_addr().unwrap().port().to_string();
-    let result = run_child(
-        &request_args(
-            &state,
-            &catalog,
-            nc,
-            vec![
-                "-z".into(),
-                "-w".into(),
-                "1".into(),
-                "127.0.0.1".into(),
-                port.into(),
-            ],
-        ),
-        &codex,
-        "network-enabled",
-    )
-    .await;
-    assert!(
-        result.status().success(),
-        "enabled network stderr: {:?}",
-        result.stderr().bytes
-    );
-    fs::remove_dir(sibling).unwrap();
 }
 
 /// Proves Codex accepts the captured sandbox JSON after semantic Value serialization, not only original spelling.

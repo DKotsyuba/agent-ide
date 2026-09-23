@@ -402,26 +402,51 @@ impl ProfileShapeV2 {
 
 /// A v2 shape with exactly one reviewed visualization write leaf and its four denies removed.
 ///
-/// The accepted record binds `namespace`; each live state must independently prove the same
+/// The accepted record binds `namespace`; each live state must independently prove its current
 /// directory, strict date/task path, and complete deny group before v2 narrowing compares the
 /// remaining authority. The leaf itself is never added to daemon read proofs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProfileShapeV3 {
     /// All authority except the one checked visualization leaf and its four matching denies.
     base: ProfileShapeV2,
-    /// Canonical absolute namespace components accepted by the operator's v3 record.
+    /// Strict absolute namespace components accepted by the operator's v3 record.
     namespace: Vec<String>,
 }
 
 impl ProfileShapeV3 {
-    /// Derives the narrow family from a managed capture or live state bound to `trusted_cwd`.
+    /// Derives the narrow family from a live state bound to `trusted_cwd`.
     ///
     /// Exactly one writable `<accepted>/.codex/visualizations/YYYY/MM/DD/<uuid>` path
     /// must have no existing symlink component and carry all four credential glob denies.
-    /// Malformed or additional visualization grants, or extra denies inside the leaf, refuse.
+    /// Filesystem failure, malformed or additional visualization grants, and extra denies inside
+    /// the leaf refuse; this read-only check runs at permit and immediately before spawn.
     pub(crate) fn derive(
         state: &HostSandboxState,
         trusted_cwd: &Path,
+    ) -> Result<Self, UnsupportedShape> {
+        Self::derive_inner(state, trusted_cwd, true)
+    }
+
+    /// Reconstructs a stored accepted capture without consulting its former visualization path.
+    ///
+    /// The complete captured-state digest pins this old JSON; the remaining v2 cwd binding is
+    /// unchanged. Only a live permit or spawn checks the current namespace and leaf filesystem.
+    pub(crate) fn derive_stored(
+        state: &HostSandboxState,
+        trusted_cwd: &Path,
+    ) -> Result<Self, UnsupportedShape> {
+        Self::derive_inner(state, trusted_cwd, false)
+    }
+
+    /// Parses common v3 structure with `check_live_path` selecting live filesystem validation.
+    ///
+    /// Stored captures skip only visualization filesystem checks; strict v2 cwd binding and all
+    /// structural grant/deny rejection conditions remain. Live derivation also rejects missing or
+    /// redirected namespace paths, symlinked existing leaf components, and non-directory entries.
+    fn derive_inner(
+        state: &HostSandboxState,
+        trusted_cwd: &Path,
+        check_live_path: bool,
     ) -> Result<Self, UnsupportedShape> {
         let mut base = ProfileShapeV2::derive(state, trusted_cwd)?;
         let leaves: Vec<_> = base
@@ -453,26 +478,29 @@ impl ProfileShapeV3 {
         let namespace = leaf[..leaf.len() - 4].to_vec();
         let leaf_path = Path::new("/").join(leaf.join("/"));
         let namespace_path = Path::new("/").join(namespace.join("/"));
-        if std::fs::canonicalize(&namespace_path).ok().as_deref() != Some(namespace_path.as_path())
-        {
-            return Err(UnsupportedShape("visualization namespace"));
-        }
-        let mut component = leaf_path.as_path();
-        while component != namespace_path {
-            match std::fs::symlink_metadata(component) {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
-                    return Err(UnsupportedShape("visualization symlink"));
-                }
-                Ok(metadata) if !metadata.is_dir() => {
-                    return Err(UnsupportedShape("visualization directory"));
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return Err(UnsupportedShape("visualization path")),
+        if check_live_path {
+            if std::fs::canonicalize(&namespace_path).ok().as_deref()
+                != Some(namespace_path.as_path())
+            {
+                return Err(UnsupportedShape("visualization namespace"));
             }
-            component = component
-                .parent()
-                .ok_or(UnsupportedShape("visualization path"))?;
+            let mut component = leaf_path.as_path();
+            while component != namespace_path {
+                match std::fs::symlink_metadata(component) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(UnsupportedShape("visualization symlink"));
+                    }
+                    Ok(metadata) if !metadata.is_dir() => {
+                        return Err(UnsupportedShape("visualization directory"));
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return Err(UnsupportedShape("visualization path")),
+                }
+                component = component
+                    .parent()
+                    .ok_or(UnsupportedShape("visualization path"))?;
+            }
         }
         let expected: BTreeSet<_> = ["/**/*.key", "/**/*.pem", "/**/.env", "/**/.env.*"]
             .into_iter()
@@ -506,9 +534,12 @@ impl ProfileShapeV3 {
                         namespace_path.starts_with("/tmp")
                             || namespace_path.starts_with("/private/tmp")
                     }
-                    Selector::Tmpdir => std::fs::canonicalize(std::env::temp_dir())
-                        .ok()
-                        .is_some_and(|tmp| namespace_path.starts_with(tmp)),
+                    Selector::Tmpdir => {
+                        check_live_path
+                            && std::fs::canonicalize(std::env::temp_dir())
+                                .ok()
+                                .is_some_and(|tmp| namespace_path.starts_with(tmp))
+                    }
                     Selector::WorkspaceRelative(_) => false,
                 }
         }) {
@@ -531,7 +562,7 @@ impl ProfileShapeV3 {
         hasher.finalize()
     }
 
-    /// Applies unchanged v2 narrowing after both states independently prove the leaf contract.
+    /// Applies unchanged v2 narrowing after the stored structure and live leaf checks succeed.
     pub(crate) fn prove_narrower(&self, accepted: &Self) -> bool {
         self.namespace == accepted.namespace && self.base.prove_narrower(&accepted.base)
     }
@@ -1317,6 +1348,11 @@ mod visualization_tests {
             both.permit(&accepted, accepted.cwd()).unwrap().template.id,
             "exact"
         );
+        let rotated =
+            ExecutionProfileTemplate::from_execution_evidence_v3("rotated", 2, &live).unwrap();
+        assert!(
+            ExecutionProfileCatalog::from_execution_evidence(vec![v3.clone(), rotated]).is_err()
+        );
         assert!(
             ExecutionProfileCatalog::from_execution_evidence(vec![v3])
                 .unwrap()
@@ -1350,17 +1386,25 @@ mod visualization_tests {
         );
         assert!(record.matches_state(&accepted));
         assert!(!record.matches_state(&live));
-        std::fs::remove_dir_all(&first).unwrap();
+        std::fs::remove_dir_all(root.join(".codex")).unwrap();
         assert!(
             record.matches_state(&accepted),
-            "the accepted task may have been cleaned up"
+            "the accepted namespace may have been cleaned up"
         );
         let catalog = ExecutionProfileCatalog::from_persisted_records(
             vec![(record.clone(), accepted.clone())],
             &[record],
         )
         .unwrap();
-        assert!(catalog.permit(&live, live.cwd()).is_ok());
+        assert!(catalog.permit(&live, live.cwd()).is_err());
+        std::os::unix::fs::symlink(root.join("work"), root.join(".codex")).unwrap();
+        assert!(catalog.permit(&live, live.cwd()).is_err());
+        std::fs::remove_file(root.join(".codex")).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let permit = catalog.permit(&live, live.cwd()).unwrap();
+        std::fs::remove_dir_all(root.join(".codex")).unwrap();
+        std::os::unix::fs::symlink(root.join("work"), root.join(".codex")).unwrap();
+        assert!(permit.recheck_live_v3(&live, live.cwd()).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1402,6 +1446,12 @@ mod visualization_tests {
             .unwrap()
             .push(json!({"access":"write","path":{"type":"special","value":{"kind":"root"}}}));
         cases.push(root_write);
+        let mut ancestor_write = captured.clone();
+        ancestor_write["permissionProfile"]["file_system"]["entries"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"access":"write","path":{"type":"path","path":root.join(".codex")}}));
+        cases.push(ancestor_write);
         for value in cases {
             let state = HostSandboxState::parse(Some(value)).unwrap();
             assert!(state.shape_v3(state.cwd()).is_err());

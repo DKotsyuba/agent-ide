@@ -28,10 +28,19 @@ the accepted namespace in a separate digest, and applies the v2 proof to every r
 network mode, mechanism, and glob setting. Each live state independently proves its leaf and
 denials; malformed paths, symlink redirection in existing path components, ancestor or sibling
 visualization writes, missing or altered matching denials, and added outside grants refuse. The
-complete captured-state digest
-pins restoration to the accepted JSON even after its former task leaf is removed; the exact live
+complete captured-state digest pins restoration to the accepted JSON after its former namespace
+or leaf is removed; only live permit and spawn inspect current visualization paths. The exact live
 JSON is replayed unchanged. Daemon read proofs continue to derive v2 from the live state and
 gain no authority from v3. The UUID path segment is not treated as a Codex thread identity.
+Two captures differing only in task leaf have one v3 family digest, so a catalog accepts one
+record per namespace and remaining shape; rotating that family replaces its prior record.
+The ignored native `visualization_family_native_d03` probe requires two actual capture files
+(`AGENT_IDE_D03_STATE_A` and `_B`), a pinned Codex path (`AGENT_IDE_D03_CODEX`), and a disposable
+outside directory (`AGENT_IDE_D03_DENIED_DIR`). Compiling or listing that ignored test is not D03
+acceptance; the operator must run it with both captured states and inspect its child results. It
+probes a cwd write only for state A. State B's permit is bound to its captured cwd during request
+validation without a cwd write; both states probe their leaf writes, peer/parent/outside denials,
+credential reads, neighboring reads, and network behavior.
 
 Application persists opaque record bytes only. Execution accepts a restored profile record only when it exactly matches an Execution-owned expected D03 evidence record from trusted configuration/evidence, and its semantic complete-state identity matches the current observed state. The expected record includes stable profile identity/revision plus provider-binary, toolchain, configuration, trust, transport, permission-value, and immutable D03-evidence identities. Unknown, corrupt, extra, missing, duplicate-digest, revision-zero, or value-mismatched records are unavailable. A matching name or permission shape never restores a permit, and Application cannot mint one. The catalog holds at most eight accepted profiles, and a template's identity is its profile digest, so several accepted profiles may cover one host profile class (T25B): a read-only and a workspace-write Codex sandbox can both be accepted.
 
