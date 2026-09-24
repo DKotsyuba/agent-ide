@@ -966,6 +966,81 @@ async fn real_pinned_excluded_aliases_do_not_restrict() {
     }
 }
 
+/// Irrelevant aliases stay outside TypeScript's source search; selected aliases remain restricted.
+#[tokio::test]
+#[ignore = "requires the local pinned Node v24.4.0 and TypeScript 5.9.3"]
+async fn real_pinned_irrelevant_aliases_do_not_restrict() {
+    let root = project("real-irrelevant-aliases", "tsconfig.json");
+    let config = root.join("tsconfig.json");
+    std::fs::write(&config, r#"{"include":["a.ts"]}"#).unwrap();
+    std::fs::write(root.join("a.ts"), "const a: number = 'bad';\n").unwrap();
+    let outside_env = root.with_extension("outside.env");
+    let outside_image = root.with_extension("outside.png");
+    std::fs::write(&outside_env, "credential").unwrap();
+    std::fs::write(&outside_image, "image").unwrap();
+    std::fs::create_dir_all(root.join("assets")).unwrap();
+    std::os::unix::fs::symlink(&outside_env, root.join(".env")).unwrap();
+    std::os::unix::fs::symlink(&outside_image, root.join("assets/logo.png")).unwrap();
+    let request = CheckRequest {
+        worktree: root.clone(),
+        cache_dir: root.join("cache"),
+        input_generation: 1,
+        read_denies: vec![ReadDeny::Glob {
+            base: root.clone(),
+            suffix: CredentialGlob::Env,
+        }],
+    };
+    let output = pinned_adapter_output(&request).await;
+    assert_eq!(output.status, Some(2));
+    let snapshot = parse_tsc_output(&output, &root, &config, &request.read_denies, 1, 0);
+    assert_eq!(snapshot.state, CheckState::Ready, "{snapshot:?}");
+    assert_eq!((snapshot.errors, snapshot.warnings), (1, 0));
+    std::os::unix::fs::symlink(&outside_image, root.join("selected.ts")).unwrap();
+    std::fs::write(&config, r#"{"include":["a.ts","selected.ts"]}"#).unwrap();
+    assert_eq!(pinned_adapter_output(&request).await.status, Some(77));
+    std::fs::remove_file(root.join("selected.ts")).unwrap();
+    std::fs::remove_file(root.join("assets/logo.png")).unwrap();
+    assert!(
+        std::process::Command::new("/usr/bin/mkfifo")
+            .arg(root.join("named.ts"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(&config, r#"{"include":["**/*.ts"]}"#).unwrap();
+    let broad = pinned_adapter_output(&request).await;
+    assert_eq!(broad.status, Some(2));
+    let snapshot = parse_tsc_output(&broad, &root, &config, &request.read_denies, 1, 0);
+    assert_eq!((snapshot.errors, snapshot.warnings), (1, 0));
+    // With a broad include, this name could be a directory containing TS sources.
+    std::os::unix::fs::symlink(&outside_image, root.join("assets/logo.png")).unwrap();
+    assert_eq!(pinned_adapter_output(&request).await.status, Some(77));
+}
+
+/// A root-based credential glob still excludes a selected `.env` config extension.
+#[tokio::test]
+#[ignore = "requires the local pinned Node v24.4.0 and TypeScript 5.9.3"]
+async fn real_pinned_root_credential_glob_restricts() {
+    let root = project("real-root-glob", "tsconfig.json");
+    std::fs::write(
+        root.join("tsconfig.json"),
+        r#"{"extends":"./.env","files":["a.ts"]}"#,
+    )
+    .unwrap();
+    std::fs::write(root.join(".env"), "{}").unwrap();
+    std::fs::write(root.join("a.ts"), "export const a: number = 1;\n").unwrap();
+    let request = CheckRequest {
+        worktree: root.clone(),
+        cache_dir: root.join("cache"),
+        input_generation: 1,
+        read_denies: vec![ReadDeny::Glob {
+            base: PathBuf::from("/"),
+            suffix: CredentialGlob::Env,
+        }],
+    };
+    assert_eq!(pinned_adapter_output(&request).await.status, Some(77));
+}
+
 /// A JavaScript root retains checkJs diagnostics with unrelated credential files present.
 #[tokio::test]
 #[ignore = "requires the local pinned Node v24.4.0 and TypeScript 5.9.3"]

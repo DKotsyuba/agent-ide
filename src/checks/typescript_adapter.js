@@ -22,7 +22,8 @@ try {
   ts = require(path.join(path.dirname(cli), "typescript.js"));
   if (ts.version !== "5.9.3" || typeof ts.executeCommandLine !== "function" ||
       typeof ts.matchFiles !== "function" || typeof ts.getFileMatcherPatterns !== "function" ||
-      typeof ts.getRegexFromPattern !== "function") throw new Error("unsupported compiler");
+      typeof ts.getRegexFromPattern !== "function" ||
+      typeof ts.fileExtensionIsOneOf !== "function") throw new Error("unsupported compiler");
 } catch { process.exit(1); }
 /** @type {typeof ts.sys.readFile} Pinned decoder, including BOM and UTF-16 handling. */
 const originalReadFile = ts.sys.readFile.bind(ts.sys);
@@ -42,10 +43,10 @@ function denied(value) {
   return denies.some((rule) => {
     if (rule.Path !== undefined) {
       const root = path.resolve(rule.Path).toLowerCase();
-      return candidate === root || candidate.startsWith(root + path.sep);
+      return root === path.sep || candidate === root || candidate.startsWith(root + path.sep);
     }
     const root = path.resolve(rule.Glob.base).toLowerCase();
-    if (candidate !== root && !candidate.startsWith(root + path.sep)) return false;
+    if (root !== path.sep && candidate !== root && !candidate.startsWith(root + path.sep)) return false;
     const parts = path.relative(root, candidate).split(path.sep);
     return parts.some((name) => {
       switch (rule.Glob.suffix) {
@@ -119,12 +120,13 @@ function failed(error) {
 
 /**
  * Enumerate one directory for TypeScript's exported matchFiles walker.
- * Names alone are not reads of their contents; excluded aliases need no target probe.
+ * Names alone are not reads of their contents; aliases that can match neither a source file
+ * nor a traversed directory need no target probe. An ambiguous name stays guarded.
  * @param {string} directory Directory selected by TypeScript's include/exclude matcher.
- * @param {RegExp | undefined} excluded The pinned matchFiles exclusion regex, when present.
+ * @param {{excluded?: RegExp, files?: RegExp[], directories?: RegExp, extensions?: string[]} | undefined} matcher Pinned matchFiles predicates; absent for getDirectories.
  * @returns {{files: string[], directories: string[]}} Immediate child names by kind.
  */
-function entries(directory, excluded) {
+function entries(directory, matcher) {
   const resolved = allowed(directory);
   if (!resolved) return { files: [], directories: [] };
   let children;
@@ -136,8 +138,14 @@ function entries(directory, excluded) {
     if (child.isFile()) files.push(child.name);
     else if (child.isDirectory()) directories.push(child.name);
     else if (child.isSymbolicLink()) {
-      // matchFiles discards this name for either kind, so its target is irrelevant.
-      if (excluded && excluded.test(path.resolve(directory, child.name))) continue;
+      const name = path.resolve(directory, child.name);
+      if (matcher) {
+        if (matcher.excluded?.test(name)) continue;
+        const possibleFile = (!matcher.extensions || ts.fileExtensionIsOneOf(name, matcher.extensions)) &&
+          (!matcher.files || matcher.files.some((regex) => regex.test(name)));
+        const possibleDirectory = !matcher.directories || matcher.directories.test(name);
+        if (!possibleFile && !possibleDirectory) continue;
+      }
       const target = allowed(path.join(directory, child.name));
       if (!target) continue;
       try {
@@ -145,7 +153,8 @@ function entries(directory, excluded) {
         if (meta.isDirectory()) directories.push(child.name);
         else if (meta.isFile()) files.push(child.name);
       } catch (error) { failed(error); }
-    } else readRestricted = true;
+    } else if (!child.isFIFO() && !child.isSocket() &&
+               !child.isBlockDevice() && !child.isCharacterDevice()) readRestricted = true;
   }
   return { files, directories };
 }
@@ -210,12 +219,19 @@ const system = Object.assign(ts.sys, {
    * @returns {string[]} Files matched by TypeScript's own traversal semantics.
    */
   readDirectory(root, extensions, excludes, includes, depth) {
-    const pattern = ts.getFileMatcherPatterns(root, excludes, includes,
-      ts.sys.useCaseSensitiveFileNames, process.cwd()).excludePattern;
-    const excluded = pattern && ts.getRegexFromPattern(pattern, ts.sys.useCaseSensitiveFileNames);
+    const patterns = ts.getFileMatcherPatterns(root, excludes, includes,
+      ts.sys.useCaseSensitiveFileNames, process.cwd());
+    /** @param {string | undefined} pattern Pinned matcher pattern. @returns {RegExp | undefined} Compiled predicate or absence. */
+    const regex = (pattern) => pattern && ts.getRegexFromPattern(pattern, ts.sys.useCaseSensitiveFileNames);
+    const matcher = {
+      excluded: regex(patterns.excludePattern),
+      files: patterns.includeFilePatterns?.map(regex),
+      directories: regex(patterns.includeDirectoryPattern),
+      extensions,
+    };
     return ts.matchFiles(root, extensions, excludes, includes,
       ts.sys.useCaseSensitiveFileNames, process.cwd(), depth,
-      (directory) => entries(directory, excluded), system.realpath);
+      (directory) => entries(directory, matcher), system.realpath);
   },
   /** @param {string} file Alias path. @returns {string} Resolved path, or original after refusal. */
   realpath(file) { return allowed(file) || file; },
