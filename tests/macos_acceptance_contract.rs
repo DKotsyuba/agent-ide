@@ -96,15 +96,19 @@ fn runner_covers_all_cells_without_embedding_private_run_identifiers() {
     }
 }
 
-/// Requires the agent-run Codex route to select real Codex and its helper-free prompts.
+/// Requires both agent-run routes to use schema-2 providers and Codex's helper-free prompts.
 #[test]
-fn agent_run_codex_driver_uses_the_codex_runtime_and_prompt_family() {
+fn agent_run_drivers_use_route_matched_schema_two_providers() {
     let driver = include_str!("../scripts/acceptance-drivers/agent-run-claude.sh");
     let wrapper = include_str!("../scripts/acceptance-drivers/agent-run-codex.sh");
     assert!(wrapper.contains("exec \"$DRIVER_DIR/agent-run-claude.sh\""));
     for required in [
         "agent-run-codex)",
-        "DEFAULT_RUNTIME=codex",
+        "DEFAULT_PROVIDER=claude",
+        "DEFAULT_PROVIDER=codex",
+        "start --provider $PROVIDER",
+        "start --provider \"$PROVIDER\"",
+        "[ \"$PROVIDER\" = \"$DEFAULT_PROVIDER\" ]",
         "DEFAULT_MODEL=gpt-6-luna",
         "PROMPT_FAMILY=codex-prompts",
         "task_prompt \"$DRIVER_DIR/$PROMPT_FAMILY/l1b.txt\"",
@@ -124,6 +128,7 @@ fn agent_run_codex_driver_uses_the_codex_runtime_and_prompt_family() {
             "missing Codex route behavior: {required}"
         );
     }
+    assert!(!driver.contains("start --runtime"));
 }
 
 /// Ensures every fallible toolchain check propagates failure from route-guarded shell functions.

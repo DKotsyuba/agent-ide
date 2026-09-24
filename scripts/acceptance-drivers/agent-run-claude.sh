@@ -5,7 +5,7 @@
 #
 # The runner starts this executable with AGENT_IDE_ACCEPTANCE_ROUTE=
 # agent-run-claude or agent-run-codex, two isolated fixture worktrees, and a fresh result
-# path. The driver starts real agents through the installed agent-run 0.12.x
+# path. The driver starts real agents through the installed agent-run 0.14.x
 # CLI. Its resident broker spawns the agent process, so environment variables
 # set on the start command line (AGENT_IDE_BIN, HOME) do NOT reach the agent:
 # the agent's host, agent-ide MCP, and plugin come entirely from the
@@ -16,11 +16,11 @@
 # agents' stored answers, real filesystem effects, and the durable telemetry
 # database.
 #
-# The route selects its matching runtime and prompt family. Claude keeps Sonnet;
+# The route selects its matching provider and prompt family. Claude keeps Sonnet;
 # Codex uses the economical gpt-6-luna default and prompts without a helper.
 #
-# `start --timeout` is legacy metadata only and does not stop execution; the
-# outer `perl alarm` is the only wall-clock bound. Setting
+# The outer `perl alarm` bounds each start call independently of agent-run's
+# own timeout setting. Setting
 # AGENT_IDE_ACCEPTANCE_DRY=1 prints the exact session command lines and exits 0
 # without running anything.
 #
@@ -37,8 +37,8 @@
 #                                       must be byte-identical to the release
 #                                       candidate; the driver refuses anything
 #                                       else with installed_binary_differs.
-#   AGENT_IDE_ACCEPTANCE_AGENT_RUN_RUNTIME  agent-run runtime name; Claude
-#                                       retains its override; Codex requires codex.
+#   AGENT_IDE_ACCEPTANCE_AGENT_RUN_PROVIDER agent-run schema-2 provider id;
+#                                       must match the route (claude or codex).
 #   AGENT_IDE_ACCEPTANCE_AGENT_RUN_MODEL    model id; default sonnet for Claude
 #                                       and gpt-6-luna for Codex.
 #   AGENT_IDE_ACCEPTANCE_AGENT_RUN_PROFILE  agent-run profile; default
@@ -57,12 +57,12 @@ DRIVER_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 case "${AGENT_IDE_ACCEPTANCE_ROUTE:-}" in
     agent-run-claude)
-        DEFAULT_RUNTIME=claude
+        DEFAULT_PROVIDER=claude
         DEFAULT_MODEL=sonnet
         PROMPT_FAMILY=claude-prompts
         ;;
     agent-run-codex)
-        DEFAULT_RUNTIME=codex
+        DEFAULT_PROVIDER=codex
         DEFAULT_MODEL=gpt-6-luna
         PROMPT_FAMILY=codex-prompts
         ;;
@@ -75,10 +75,11 @@ esac
 BINARY=${AGENT_IDE_ACCEPTANCE_BINARY:-$DRIVER_ROOT/target/release/agent-ide}
 AGENT_RUN=${AGENT_IDE_ACCEPTANCE_AGENT_RUN:-/Users/pluto/.agent-run/standalone/current/bin/agent-run}
 MCP_BINARY=${AGENT_IDE_ACCEPTANCE_AGENT_RUN_MCP_BINARY:-/Users/pluto/.local/bin/agent-ide}
-RUNTIME=${AGENT_IDE_ACCEPTANCE_AGENT_RUN_RUNTIME:-$DEFAULT_RUNTIME}
+PROVIDER=${AGENT_IDE_ACCEPTANCE_AGENT_RUN_PROVIDER:-$DEFAULT_PROVIDER}
 AR_MODEL=${AGENT_IDE_ACCEPTANCE_AGENT_RUN_MODEL:-$DEFAULT_MODEL}
-[ "$AGENT_IDE_ACCEPTANCE_ROUTE" != agent-run-codex ] || \
-    [ "$RUNTIME" = codex ] || fail E_RUNTIME "Codex route requires the codex runtime"
+[ -z "${AGENT_IDE_ACCEPTANCE_AGENT_RUN_RUNTIME:-}" ] \
+    || fail E_RUNTIME_OPTION_UNSUPPORTED "use AGENT_IDE_ACCEPTANCE_AGENT_RUN_PROVIDER"
+[ "$PROVIDER" = "$DEFAULT_PROVIDER" ] || fail E_PROVIDER "provider does not match route"
 AR_PROFILE=${AGENT_IDE_ACCEPTANCE_AGENT_RUN_PROFILE:-implement}
 LAUNCHER=${AGENT_IDE_ACCEPTANCE_LAUNCHER:-/Users/pluto/.config/agent-ide/launcher.json}
 OPERATOR_HOME=${AGENT_IDE_ACCEPTANCE_OPERATOR_HOME:-/Users/pluto}
@@ -92,7 +93,7 @@ if [ "${AGENT_IDE_ACCEPTANCE_DRY:-0}" = 1 ]; then
         label=${scenario%%:*}
         eval "worktree=\$AGENT_IDE_ACCEPTANCE_${scenario##*:}_WORKTREE"
         printf '%s\n' "/usr/bin/perl -e 'alarm shift; exec @ARGV' $SESSION_SECONDS \
-$AGENT_RUN start --runtime $RUNTIME --model $AR_MODEL --profile $AR_PROFILE \
+$AGENT_RUN start --provider $PROVIDER --model $AR_MODEL --profile $AR_PROFILE \
 --task \"\$(cat $DIAG_DIR/task-$label.txt)\" --workdir $worktree --write --wait \
 > $DIAG_DIR/start-$label.out 2> $DIAG_DIR/start-$label.err
 $AGENT_RUN answer \$agent_id > $DIAG_DIR/answer-$label.txt"
@@ -183,17 +184,16 @@ require_agent_run_compact_replies() {
 # the task file. No environment is attached to the start command: the resident
 # broker spawns the agent process, so CLI-level variables (AGENT_IDE_BIN, HOME)
 # never reach it — the agent runs with the broker's environment and the
-# operator's config.toml MCP entry. `--timeout` is legacy metadata only and is
-# deliberately omitted; the outer `perl alarm` is the wall-clock bound. The
-# label, worktree, and answer are appended to the private diagnostic log; agent
-# identifiers never enter public evidence.
+# operator's config.toml MCP entry. The outer `perl alarm` remains the
+# per-start wall-clock bound. The label, worktree, and answer are appended to
+# the private diagnostic log; agent identifiers never enter public evidence.
 run_agent() {
     label=$1
     worktree=$2
     task_file=$3
     answer_file=$DIAG_DIR/answer-$label.txt
     if /usr/bin/perl -e 'alarm shift; exec @ARGV' "$SESSION_SECONDS" \
-        "$AGENT_RUN" start --runtime "$RUNTIME" --model "$AR_MODEL" \
+        "$AGENT_RUN" start --provider "$PROVIDER" --model "$AR_MODEL" \
         --profile "$AR_PROFILE" --task "$(cat "$task_file")" \
         --workdir "$worktree" --write --wait \
         >"$DIAG_DIR/start-$label.out" 2>"$DIAG_DIR/start-$label.err"

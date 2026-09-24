@@ -29,7 +29,7 @@ scripts/macos-acceptance.sh --route product --evidence /absolute/output/evidence
 The `codex`, `claude`, `agent-run-claude`, and `agent-run-codex` routes accept an optional absolute `--driver`
 executable. Without one, the runner creates bounded `not_tested` evidence and makes no host claim.
 With one, `AGENT_IDE_ACCEPTANCE_HOST_VERSION` must be a public version token — for the committed
-drivers that is a token identifying the actual host version, such as `agent-run-0.12.6+codex-cli-0.155.1`
+drivers that is a token identifying the actual host version, such as `agent-run-0.14.0+codex-cli-0.156.1`
 for agent-run to Codex. The driver is invoked with no arguments and receives only these environment
 variables:
 
@@ -60,18 +60,20 @@ and reads their final answers. Use `scripts/acceptance-drivers/agent-run-claude.
 `agent-run-claude`, or `scripts/acceptance-drivers/agent-run-codex.sh` for `agent-run-codex`:
 
 ```sh
-agent-run start --runtime claude --model sonnet --profile implement \
+agent-run start --provider claude --model sonnet --profile implement \
   --task "$(cat <task>)" --workdir <worktree> --write --wait
 agent-run answer <agent_id>
 ```
 
-The route defaults to `claude` with `sonnet`, or requires `codex` with
-`gpt-6-luna`; the Claude route retains its optional runtime/model overrides.
+The route requires the matching schema-2 provider: `claude` with default model `sonnet`, or
+`codex` with default model `gpt-6-luna`. Either route may override its model, but a provider
+override must still match the route. The old `AGENT_IDE_ACCEPTANCE_AGENT_RUN_RUNTIME` setting
+is rejected; use `AGENT_IDE_ACCEPTANCE_AGENT_RUN_PROVIDER`.
 Codex uses `codex-prompts` and no Claude helper socket or project-local Claude
 settings. The resident broker spawns the agent process, so environment set on the start command line (`AGENT_IDE_BIN`, `HOME`) does not
 reach the agent: the agent's MCP comes from the operator's `~/.agent-run/config.toml`
-`[mcp.agent_ide]` entry. `start --timeout` is legacy metadata only and does not stop execution, so
-the outer `perl alarm` is the only wall-clock bound. Because the driver cannot redirect the agent
+`[mcp.agent_ide]` entry. The outer `perl alarm` bounds each start call independently of agent-run's
+own timeout setting. Because the driver cannot redirect the agent
 to the candidate, it fails closed with `installed_binary_differs` unless the installed
 `/Users/pluto/.local/bin/agent-ide` is byte-identical to the candidate binary. The Codex route
 also requires a matching accepted v3 visualization profile in the launcher before sessions start.
