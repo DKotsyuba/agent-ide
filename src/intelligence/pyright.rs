@@ -383,10 +383,8 @@ impl PyrightProtocolChild {
 mod tests {
     use super::*;
     use crate::execution::{
-        AdmissionLimits, ExecutionProfileCatalog, ExecutionProfileTemplate, HostSandboxState,
-        LocalExecutionPolicy, ProviderLeaseLimits, ValidatedHostInvocation,
+        AdmissionLimits, LocalExecutionPolicy, ProviderLeaseLimits, ValidatedHostInvocation,
     };
-    use serde_json::json;
     use std::collections::BTreeSet;
 
     /// Builds a canonical worktree/authority pair for fixed-profile command construction tests.
@@ -445,17 +443,6 @@ mod tests {
     /// Builds a valid provider request whose command is inert because script verification fails first.
     fn request(authority: &WorkspaceAuthority) -> ValidatedExecutionRequest {
         let root = std::env::temp_dir();
-        let sandbox = HostSandboxState::parse(Some(json!({
-            "permissionProfile":{"type":"disabled"},
-            "codexLinuxSandboxExe":null,
-            "sandboxCwd":root.clone(),
-            "useLegacyLandlock":false
-        })))
-        .unwrap();
-        let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
-            ExecutionProfileTemplate::from_execution_evidence("pyright-test", 1, &sandbox).unwrap(),
-        ])
-        .unwrap();
         let command = ControlledCommand::from_validated_peer(
             CommandKind::Provider,
             "/usr/bin/true".into(),
@@ -465,17 +452,11 @@ mod tests {
         )
         .unwrap();
         ValidatedExecutionRequest::validate(
-            ValidatedHostInvocation::from_verified_binding("pyright-test", sandbox).unwrap(),
+            ValidatedHostInvocation::from_verified_binding("pyright-test").unwrap(),
             authority.clone(),
             command,
-            &LocalExecutionPolicy::new(
-                BTreeSet::from([PathBuf::from("/usr/bin/true")]),
-                4096,
-                16,
-                true,
-            )
-            .unwrap(),
-            &catalog,
+            &LocalExecutionPolicy::new(BTreeSet::from([PathBuf::from("/usr/bin/true")]), 4096, 16)
+                .unwrap(),
         )
         .unwrap()
     }

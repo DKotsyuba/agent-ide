@@ -2,14 +2,12 @@
 
 use agent_ide::{
     assistance::host_binding::{
-        ActiveBindingUse, BindingRef, BindingStatus, HostBindingGuard, ObservedSandboxState,
-        ValidatedInvocation, parse_candidate, parse_channel_session, parse_hook_event,
-        parse_observed_sandbox_state,
+        ActiveBindingUse, BindingRef, BindingStatus, HostBindingGuard, ValidatedInvocation,
+        parse_candidate, parse_channel_session, parse_hook_event,
     },
     execution::{
-        ControlledCommand, ExecutionProfileCatalog, ExecutionProfileTemplate, HostSandboxState,
-        LocalExecutionPolicy, ValidatedExecutionRequest, ValidatedHostInvocation,
-        WorkspaceAuthority,
+        ControlledCommand, LocalExecutionPolicy, ValidatedExecutionRequest,
+        ValidatedHostInvocation, WorkspaceAuthority,
     },
 };
 use serde_json::json;
@@ -25,13 +23,9 @@ pub struct BoundRequest {
     pub guard: HostBindingGuard,
     /// Opaque binding identity used to consume/revoke liveness.
     pub binding: BindingRef,
-    /// Immutable observed host state for fixed discovery fixtures.
-    pub observed: ObservedSandboxState,
-    /// Exact disabled-host test profile catalog; local policy explicitly accepts this fixture.
-    pub catalog: ExecutionProfileCatalog,
 }
 impl BoundRequest {
-    /// Validates exact authority/command under a matched pre-hook and observed disabled host state.
+    /// Validates exact authority and command under the test's matched host-binding pre-hook.
     pub fn new(
         label: &str,
         authority: WorkspaceAuthority,
@@ -57,37 +51,19 @@ impl BoundRequest {
         };
         let binding = invocation.binding_ref().clone();
         let active = guard.consume_active(&binding).unwrap();
-        let raw = json!({"permissionProfile":{"type":"disabled"},"codexLinuxSandboxExe":null,"sandboxCwd":authority.root(),"useLegacyLandlock":false});
-        let observed = parse_observed_sandbox_state(
-            json!({"codex/sandbox-state-meta":raw}).as_object().unwrap(),
-            &invocation,
-            &active,
-            true,
-        )
-        .unwrap();
-        let sandbox = HostSandboxState::parse(Some(observed.state().as_json().clone())).unwrap();
-        let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
-            ExecutionProfileTemplate::from_execution_evidence("provider-contract", 1, &sandbox)
-                .unwrap(),
-        ])
-        .unwrap();
         let policy =
-            LocalExecutionPolicy::new(BTreeSet::from([program.to_path_buf()]), 65536, 16, true)
-                .unwrap();
+            LocalExecutionPolicy::new(BTreeSet::from([program.to_path_buf()]), 65536, 16).unwrap();
         let request = ValidatedExecutionRequest::validate(
-            ValidatedHostInvocation::from_active_observation(active, observed.clone()).unwrap(),
+            ValidatedHostInvocation::from_active_use(active),
             authority,
             command,
             &policy,
-            &catalog,
         )
         .unwrap();
         Self {
             request,
             guard,
             binding,
-            observed,
-            catalog,
             invocation,
         }
     }
