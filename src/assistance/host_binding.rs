@@ -1,7 +1,7 @@
 //! Explicit Codex and Claude host validation for MCP invocation and native hook lifecycles.
 //!
 //! A parsed candidate is not an authority claim. A matching trusted `PreToolUse` yields a
-//! [`ValidatedInvocation`] before MCP result delivery; later `PostToolUse` is settlement
+//! `ValidatedInvocation` before MCP result delivery; later `PostToolUse` is settlement
 //! evidence. Consumers still decide whether the host transport and execution profile prove
 //! the authority they require.
 

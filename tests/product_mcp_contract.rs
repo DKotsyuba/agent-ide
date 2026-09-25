@@ -878,6 +878,20 @@ fn host_call(actor: &str, call: &str, name: &str) -> Value {
         "x-codex-turn-metadata":{"private":"not-retained"},"codex/sandbox-state-meta":{"permissionProfile":{"type":"disabled"},"codexLinuxSandboxExe":null,"sandboxCwd":"/private/tmp","useLegacyLandlock":false}}}})
 }
 
+/// The Cargo home the analyzer inherits: the operator's own registry when it exists, otherwise
+/// the private namespace copy, exactly as `RustProfile::command` resolves it.
+fn operator_cargo_home(namespace: &Path) -> PathBuf {
+    std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join(".cargo"))
+                .filter(|path| path.is_dir())
+        })
+        .unwrap_or_else(|| namespace.join("cargo"))
+}
+
 /// Checks a closed host boundary response and proves private launch/input fields were not rendered.
 fn boundary(response: &Value, expected: &str) {
     let text = response["result"]["content"][0]["text"].as_str().unwrap();
@@ -5978,7 +5992,7 @@ async fn configured_product_sigterm_reaps_in_flight_rust_only_provider() {
             .lines()
             .collect::<Vec<_>>(),
         vec![
-            namespaces[0].join("cargo").to_str().unwrap(),
+            operator_cargo_home(&namespaces[0]).to_str().unwrap(),
             namespaces[0].join("target").to_str().unwrap(),
             namespaces[0].join("tmp").to_str().unwrap(),
             "stable",
