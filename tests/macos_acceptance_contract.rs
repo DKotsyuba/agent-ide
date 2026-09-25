@@ -81,13 +81,18 @@ fn runner_covers_all_cells_without_embedding_private_run_identifiers() {
         "configured_product_acceptance_edit_diagnostics_telemetry_and_fallback",
         "configured_product_returns_real_typescript_family_context_and_reaps",
         "configured_product_returns_real_pyright_semantic_context_and_reaps",
-        "configured_product_returns_real_go_and_rust_semantic_context",
-        "configured_product_isolates_go_across_two_divergent_worktree_actors",
+        "configured_product_rust_resolves_definition_across_a_crate_boundary",
+        "configured_product_isolates_typescript_across_two_divergent_worktree_actors",
         "configured_product_claude_helper_returns_real_pyright_semantic_context_diff_and_stop",
         "configured_product_claude_helper_returns_real_typescript_semantic_context_and_reaps",
     ] {
         assert!(runner.contains(gate));
     }
+    // Go and gopls are outside the release scope: the runner neither requires nor executes them
+    // and their toolchain evidence rows stay honestly `not_tested`.
+    assert!(runner.contains("ACCEPTANCE_GO_VERSION=not_tested"));
+    assert!(runner.contains("ACCEPTANCE_GOPLS_VERSION=not_tested"));
+    assert!(!runner.contains("AGENT_IDE_GO"));
     assert!(runner.contains("worktree add --quiet --detach \"$ACCEPTANCE_LEFT\""));
     assert!(runner.contains("worktree add --quiet --detach \"$ACCEPTANCE_RIGHT\""));
     assert!(runner.contains("ACCEPTANCE_MAX_EVIDENCE_BYTES=16384"));
@@ -131,7 +136,8 @@ fn agent_run_drivers_use_route_matched_schema_two_providers() {
     assert!(!driver.contains("start --runtime"));
 }
 
-/// Ensures every fallible toolchain check propagates failure from route-guarded shell functions.
+/// Ensures every fallible toolchain check for the accepted Rust, Python, and TypeScript/JavaScript
+/// toolchains propagates failure from route-guarded shell functions.
 #[test]
 fn toolchain_checks_return_explicitly_inside_guarded_routes() {
     let runner = include_str!("../scripts/macos-acceptance.sh");
@@ -151,7 +157,7 @@ fn toolchain_checks_return_explicitly_inside_guarded_routes() {
                 || line.starts_with("[ \"$(")
         })
         .collect::<Vec<_>>();
-    assert_eq!(checks.len(), 14, "{checks:?}");
+    assert_eq!(checks.len(), 12, "{checks:?}");
     assert!(
         checks.iter().all(|line| line.ends_with("|| return 1")),
         "{checks:?}"

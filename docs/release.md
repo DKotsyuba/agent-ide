@@ -123,9 +123,17 @@ recent last), or with `--summary` grouped `(level, method, outcome, reason)` cou
 ## Publication gate
 
 The release workflow repeats formatting, locked workspace tests, Clippy, rustdoc, the complete
-product acceptance route, and the release build on macOS arm64. Publication additionally requires
+product acceptance route, and the release build on macOS arm64. The accepted release languages are
+Rust, Python, and TypeScript/JavaScript; Go and gopls are outside the release scope. No Go
+toolchain is installed, the workspace gate skips exactly the three real-gopls toolchain contracts
+(`real_gopls_production_context_tracks_exact_observed_bytes`,
+`shared_gopls_isolates_divergent_worktrees_and_detaches_one_view`, and
+`dropping_live_gopls_owner_closes_its_owned_listener`) by name while running every other
+workspace test, and the runner records `go` and `gopls` evidence as `not_tested`. Publication
+additionally requires
 the checked-in product, direct Codex, direct Claude, and installed agent-run-to-Claude evidence to
 name one ancestor candidate revision. Every host scenario must be `real_pass`, the product
-scenarios must be `product_pass`, and all rows must carry the accepted toolchain versions and
-closed privacy fields. Missing drivers, `failed`, `not_tested`, mixed revisions, partial scenarios,
+scenarios must be `product_pass`, and all rows must carry the accepted language toolchain versions
+with `go` and `gopls` pinned to `not_tested` and closed privacy fields. Missing drivers, `failed`,
+`not_tested` outside the go/gopls rows, mixed revisions, partial scenarios,
 and Linux evidence all block publication.

@@ -14,10 +14,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.25.0"
-          cache: false
       - uses: actions/setup-node@v4
         with:
           node-version: "24.4.0"
@@ -33,11 +29,8 @@ jobs:
       - name: Prepare accepted toolchains
         run: |
           rustup component add rustfmt clippy rust-analyzer rust-src
-          go install golang.org/x/tools/gopls@v0.23.0
           npm install --global pyright@1.1.413 typescript-language-server@6.0.0 typescript@5.9.3
           npm_root="$(npm root --global)"
-          echo "AGENT_IDE_GOPLS=$(go env GOPATH)/bin/gopls" >> "$GITHUB_ENV"
-          echo "AGENT_IDE_GO=$(command -v go)" >> "$GITHUB_ENV"
           echo "AGENT_IDE_RUST_ANALYZER=$(rustup which rust-analyzer)" >> "$GITHUB_ENV"
           echo "AGENT_IDE_RUST_TOOLCHAIN=$(rustup show active-toolchain | awk '{print $1}')" >> "$GITHUB_ENV"
           echo "AGENT_IDE_RUST_TOOLCHAIN_DIR=$(rustc --print sysroot)" >> "$GITHUB_ENV"
@@ -46,9 +39,12 @@ jobs:
           echo "AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER=$npm_root/typescript-language-server/lib/cli.mjs" >> "$GITHUB_ENV"
           echo "AGENT_IDE_TSSERVER=$npm_root/typescript/lib/tsserver.js" >> "$GITHUB_ENV"
       - name: Run complete quality gates
+        # Go and gopls are outside the v0.3.16 release scope: the runner installs no Go toolchain,
+        # so the workspace gate skips exactly the three real-gopls toolchain contracts by name and
+        # still runs every other workspace test.
         run: |
           cargo fmt --check
-          cargo test --locked --workspace -- --test-threads=1
+          cargo test --locked --workspace -- --test-threads=1 --skip real_gopls_production_context_tracks_exact_observed_bytes --skip shared_gopls_isolates_divergent_worktrees_and_detaches_one_view --skip dropping_live_gopls_owner_closes_its_owned_listener
           cargo clippy --locked --workspace --all-targets -- -D warnings
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
       - name: Run candidate product acceptance

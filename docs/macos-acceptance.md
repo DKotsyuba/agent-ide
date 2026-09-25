@@ -4,14 +4,18 @@
 worktrees at the exact tested revision, commits different Python and TypeScript diagnostic fixtures
 in each, runs the selected cell, and removes only those runner-owned worktrees at exit.
 
-The default `product` route runs the locked real-provider product gates for Go/gopls, Rust,
-Python/Pyright, Node/TypeScript r3, the edit/diagnostic/fix/diff/stop loop, stale-edit zero-write,
-native fallback, compact MCP projection, telemetry restart/query/export, the Claude foreground
-helper for Pyright and TypeScript, and divergent-worktree isolation. Every toolchain path and
-version check returns explicitly inside the route guard, so a later successful check cannot mask
-an earlier failure. Supply all of these absolute environment paths:
+The default `product` route runs the locked real-provider product gates for the accepted release
+languages — Rust/rust-analyzer, Python/Pyright, Node/TypeScript r3 — plus the edit/diagnostic/fix/
+diff/stop loop, stale-edit zero-write, native fallback, compact MCP projection, telemetry
+restart/query/export, and the Claude foreground helper for Pyright and TypeScript. Go and gopls
+are outside the release scope: the runner neither requires nor executes them, their toolchain
+evidence stays `not_tested`, and the two locked Go/gopls provider gates are excluded. The Rust
+gate is the existing cross-crate rust-analyzer proof; `divergent_worktrees` is proven by the
+locked real TypeScript cross-worktree isolation gate, by the runner's verified divergent fixture
+worktrees, and by the exact real-host driver document. Every toolchain
+path and version check returns explicitly inside the route guard, so a later successful check
+cannot mask an earlier failure. Supply all of these absolute environment paths:
 
-- `AGENT_IDE_GO` and `AGENT_IDE_GOPLS` for Go 1.25.x and gopls 0.23.0;
 - `AGENT_IDE_RUST_ANALYZER`, `AGENT_IDE_RUST_TOOLCHAIN`, and
   `AGENT_IDE_RUST_TOOLCHAIN_DIR` for the accepted Rust 1.98.1 toolchain;
 - `AGENT_IDE_NODE` and `AGENT_IDE_PYRIGHT` for Node 24.4.0 and Pyright 1.1.413;
@@ -134,8 +138,9 @@ The output must satisfy
 and is capped at 16 KiB. It contains only the project revision, closed route/status values, public
 platform and tool versions, eight closed scenario outcomes, and explicit false privacy fields. It
 contains no filesystem path, source, prompt, credential, command, diagnostic message, transcript,
-or private run identifier. `product_pass` records a shipping product/provider gate, while
-`real_pass` is reserved for a supplied real-host driver.
+or private run identifier. The `go` and `gopls` toolchain rows always read `not_tested`; the
+release evidence gate rejects any version there. `product_pass` records a shipping
+product/provider gate, while `real_pass` is reserved for a supplied real-host driver.
 
 Non-macOS execution emits `not_tested` evidence and does not create worktrees or claim support.
 Linux therefore remains explicitly `not_tested` until a separate real Linux acceptance contract is

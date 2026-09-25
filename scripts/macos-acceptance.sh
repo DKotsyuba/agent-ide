@@ -113,11 +113,11 @@ create_fixture() {
 
 # Verifies every exact external tool path and version consumed by the product gates.
 #
-# Inputs are the documented `AGENT_IDE_*` environment paths. The function executes only fixed
+# Inputs are the documented `AGENT_IDE_*` environment paths for the accepted release languages
+# Rust, Python, and TypeScript/JavaScript; Go and gopls are outside the release scope, are never
+# executed or required, and their evidence stays `not_tested`. The function executes only fixed
 # version queries and returns nonzero on any mismatch; paths and command output never enter evidence.
 verify_toolchains() {
-    : "${AGENT_IDE_GO:?AGENT_IDE_GO is required}"
-    : "${AGENT_IDE_GOPLS:?AGENT_IDE_GOPLS is required}"
     : "${AGENT_IDE_RUST_ANALYZER:?AGENT_IDE_RUST_ANALYZER is required}"
     : "${AGENT_IDE_RUST_TOOLCHAIN:?AGENT_IDE_RUST_TOOLCHAIN is required}"
     : "${AGENT_IDE_RUST_TOOLCHAIN_DIR:?AGENT_IDE_RUST_TOOLCHAIN_DIR is required}"
@@ -126,8 +126,6 @@ verify_toolchains() {
     : "${AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER:?AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER is required}"
     : "${AGENT_IDE_TSSERVER:?AGENT_IDE_TSSERVER is required}"
 
-    require_file AGENT_IDE_GO "$AGENT_IDE_GO" executable || return 1
-    require_file AGENT_IDE_GOPLS "$AGENT_IDE_GOPLS" executable || return 1
     require_file AGENT_IDE_RUST_ANALYZER "$AGENT_IDE_RUST_ANALYZER" executable || return 1
     require_directory AGENT_IDE_RUST_TOOLCHAIN_DIR "$AGENT_IDE_RUST_TOOLCHAIN_DIR" || return 1
     require_file AGENT_IDE_NODE "$AGENT_IDE_NODE" executable || return 1
@@ -137,8 +135,6 @@ verify_toolchains() {
     require_file rustc "$AGENT_IDE_RUST_TOOLCHAIN_DIR/bin/rustc" executable || return 1
     require_file cargo "$AGENT_IDE_RUST_TOOLCHAIN_DIR/bin/cargo" executable || return 1
 
-    case "$("$AGENT_IDE_GO" version)" in *' go1.25.'*' darwin/arm64') ;; *) return 1 ;; esac
-    case "$("$AGENT_IDE_GOPLS" version)" in *'gopls v0.23.0'*) ;; *) return 1 ;; esac
     case "$("$AGENT_IDE_RUST_ANALYZER" --version)" in 'rust-analyzer 1.98.1 '*) ;; *) return 1 ;; esac
     case "$("$AGENT_IDE_RUST_TOOLCHAIN_DIR/bin/rustc" --version)" in 'rustc 1.98.1 '*) ;; *) return 1 ;; esac
     [ "$("$AGENT_IDE_NODE" --version)" = v24.4.0 ] || return 1
@@ -146,8 +142,6 @@ verify_toolchains() {
     ACCEPTANCE_PYRIGHT_CLI=$(dirname "$AGENT_IDE_PYRIGHT")/pyright
     require_file pyright "$ACCEPTANCE_PYRIGHT_CLI" executable || return 1
     [ "$("$ACCEPTANCE_PYRIGHT_CLI" --version)" = 'pyright 1.1.413' ] || return 1
-    ACCEPTANCE_GO_VERSION=1.25.0
-    ACCEPTANCE_GOPLS_VERSION=0.23.0
     ACCEPTANCE_RUST_VERSION=1.98.1
     ACCEPTANCE_RUST_ANALYZER_VERSION=1.98.1
     ACCEPTANCE_NODE_VERSION=24.4.0
@@ -156,13 +150,17 @@ verify_toolchains() {
     ACCEPTANCE_TYPESCRIPT_VERSION=5.9.3
 }
 
-# Runs the focused product gates that collectively cover every acceptance evidence field.
+# Runs the focused product gates that collectively cover every accepted-language evidence field.
 #
 # Tests inherit only caller-selected exact tool paths. Each command is fixed, serial, and locked;
 # a first failure returns nonzero without converting partial coverage into a passing evidence row.
+# The Rust gate is the existing cross-crate rust-analyzer proof; the two locked Go/gopls provider
+# gates are excluded with the language. `divergent_worktrees` is proven by the locked real
+# TypeScript cross-worktree isolation gate, by this runner's verified divergent fixture worktrees,
+# and by the exact real-host driver document.
 run_product_gates() {
-    cargo test --locked --test product_mcp_contract configured_product_returns_real_go_and_rust_semantic_context -- --ignored --nocapture --test-threads=1 || return 1
-    cargo test --locked --test product_mcp_contract configured_product_isolates_go_across_two_divergent_worktree_actors -- --ignored --nocapture --test-threads=1 || return 1
+    cargo test --locked --test product_mcp_contract configured_product_rust_resolves_definition_across_a_crate_boundary -- --ignored --nocapture --test-threads=1 || return 1
+    cargo test --locked --test product_mcp_contract configured_product_isolates_typescript_across_two_divergent_worktree_actors -- --ignored --nocapture --test-threads=1 || return 1
     cargo test --locked --test product_mcp_contract configured_product_returns_real_typescript_family_context_and_reaps -- --ignored --nocapture --test-threads=1 || return 1
     cargo test --locked --test product_mcp_contract configured_product_returns_real_pyright_semantic_context_and_reaps -- --ignored --nocapture --test-threads=1 || return 1
     cargo test --locked --test product_mcp_contract configured_product_acceptance_edit_diagnostics_telemetry_and_fallback -- --ignored --nocapture --test-threads=1 || return 1

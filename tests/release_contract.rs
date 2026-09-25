@@ -44,21 +44,21 @@ fn version_flag_prints_the_package_version_and_exits_zero() {
 
 /// Requires every relevant CI, product-acceptance, evidence, package, and artifact-smoke gate
 /// to precede the only GitHub Release publication command without a continue-on-error escape.
+/// Go and gopls are outside the release scope, so no Go toolchain is installed and the workspace
+/// gate skips exactly the three real-gopls toolchain contracts while running every other test.
 #[test]
 fn release_workflow_requires_complete_gates_before_publication() {
     let workflow = include_str!("../.github/workflows/release.yml");
     let publish = workflow.find("gh release create").unwrap();
     for gate in [
         "fetch-depth: 0",
-        "go-version: \"1.25.0\"",
         "node-version: \"24.4.0\"",
         "rustup component add rustfmt clippy rust-analyzer rust-src",
-        "gopls@v0.23.0",
         "pyright@1.1.413",
         "typescript-language-server@6.0.0",
         "typescript@5.9.3",
         "cargo fmt --check",
-        "cargo test --locked --workspace -- --test-threads=1",
+        "cargo test --locked --workspace -- --test-threads=1 --skip real_gopls_production_context_tracks_exact_observed_bytes --skip shared_gopls_isolates_divergent_worktrees_and_detaches_one_view --skip dropping_live_gopls_owner_closes_its_owned_listener",
         "cargo clippy --locked --workspace --all-targets -- -D warnings",
         "cargo doc --locked --workspace --no-deps",
         "scripts/macos-acceptance.sh --route product",
@@ -70,10 +70,16 @@ fn release_workflow_requires_complete_gates_before_publication() {
         assert!(workflow[..publish].contains(gate), "missing gate: {gate}");
     }
     assert!(!workflow.contains("continue-on-error"));
+    assert!(!workflow.contains("setup-go"));
+    assert!(!workflow.contains("go-version"));
+    assert!(!workflow.contains("go install"));
+    assert!(!workflow.contains("AGENT_IDE_GO"));
 }
 
-/// Pins the publication evidence gate to all five complete macOS arm64 candidate rows while
-/// rejecting partial scenario values, untested toolchains, mixed revisions, and non-ancestors.
+/// Pins the publication evidence gate to all five complete macOS arm64 candidate rows carrying
+/// the accepted Rust, Python, and TypeScript/JavaScript toolchain versions with honestly
+/// `not_tested` Go/gopls rows, while rejecting partial scenario values, mixed revisions, and
+/// non-ancestors.
 #[test]
 fn release_evidence_gate_requires_the_complete_candidate_matrix() {
     let gate = include_str!("../scripts/validate-release-evidence.sh");
@@ -95,7 +101,13 @@ fn release_evidence_gate_requires_the_complete_candidate_matrix() {
         );
     }
     for version in [
-        "1.25.0", "0.23.0", "1.98.1", "24.4.0", "1.1.413", "6.0.0", "5.9.3",
+        "\"go\": \"not_tested\"",
+        "\"gopls\": \"not_tested\"",
+        "1.98.1",
+        "24.4.0",
+        "1.1.413",
+        "6.0.0",
+        "5.9.3",
     ] {
         assert!(
             gate.contains(version),

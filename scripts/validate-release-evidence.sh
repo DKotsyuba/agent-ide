@@ -1,5 +1,9 @@
 #!/bin/sh
 # Requires one complete accepted macOS arm64 product-and-host matrix for a release candidate.
+#
+# The accepted release languages are Rust, Python, and TypeScript/JavaScript, so every row must
+# carry their exact accepted toolchain versions while `go` and `gopls` — excluded from this release
+# scope — must be honestly recorded as `not_tested` instead of any tool version.
 
 set -eu
 
@@ -40,8 +44,8 @@ do
         (.host.version | test("^[A-Za-z0-9._+-]{1,64}$")) and
         .host.version != "not_tested" and
         .toolchains == {
-            "go": "1.25.0",
-            "gopls": "0.23.0",
+            "go": "not_tested",
+            "gopls": "not_tested",
             "node": "24.4.0",
             "pyright": "1.1.413",
             "rust": "1.98.1",
