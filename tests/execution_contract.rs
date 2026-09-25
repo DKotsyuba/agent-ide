@@ -1893,6 +1893,12 @@ fn managed_git_metadata_guard_covers_linked_temp_v1_and_child_tmpdir() {
         RequestError::GitMetadataWriteOverlap,
         "the cwd write can mutate common metadata through its pre-existing hardlink"
     );
+    assert_eq!(
+        validate(&ordinary, &common, true, None).unwrap_err(),
+        RequestError::GitMetadataWriteOverlap,
+        "an exact v1 record cannot bypass the hardlink scan"
+    );
+    fs::remove_file(&hardlink).unwrap();
     linked_git_metadata(&root, &unsafe_common);
     assert_eq!(
         validate(&ordinary, &unsafe_common, false, None).unwrap_err(),
@@ -1904,6 +1910,10 @@ fn managed_git_metadata_guard_covers_linked_temp_v1_and_child_tmpdir() {
         "an exact v1 digest cannot bypass live metadata protection"
     );
     linked_git_metadata(&root, &common);
+    assert!(
+        validate(&ordinary, &common, false, None).is_ok(),
+        "a clean, disjoint same-device checkout remains usable"
+    );
     let child_tmpdir = state(true, None);
     assert!(validate(&child_tmpdir, &common, false, None).is_ok());
     assert_eq!(
@@ -1913,10 +1923,9 @@ fn managed_git_metadata_guard_covers_linked_temp_v1_and_child_tmpdir() {
     );
     let safe_file = root.join("safe-file");
     fs::write(&safe_file, b"fixture").unwrap();
-    assert_eq!(
-        validate(&state(false, Some(&safe_file)), &common, false, None).unwrap_err(),
-        RequestError::GitMetadataWriteOverlap,
-        "a same-device file selector can itself be a hardlink to Git metadata"
+    assert!(
+        validate(&state(false, Some(&safe_file)), &common, false, None).is_ok(),
+        "an unrelated regular-file write selector remains usable"
     );
     #[cfg(target_os = "macos")]
     {

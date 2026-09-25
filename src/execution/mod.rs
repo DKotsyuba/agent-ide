@@ -2228,6 +2228,7 @@ fn guard_git_metadata(
     {
         return Err(denied);
     }
+    let mut shared_device_write = false;
     for (selector, (access, _)) in &shape.rules {
         if *access != Access::Write {
             continue;
@@ -2243,14 +2244,51 @@ fn guard_git_metadata(
             },
         };
         let writable = canonicalize_write_root(&raw).ok_or_else(|| denied.clone())?;
-        if native_device(&writable).ok_or_else(|| denied.clone())? == common_device
-            || native_path_contains(common, &writable).ok_or_else(|| denied.clone())?
+        shared_device_write |=
+            native_device(&writable).ok_or_else(|| denied.clone())? == common_device;
+        if native_path_contains(common, &writable).ok_or_else(|| denied.clone())?
             || native_path_contains(&writable, common).ok_or_else(|| denied.clone())?
         {
             return Err(denied);
         }
     }
+    if shared_device_write && !git_metadata_has_single_links(common) {
+        return Err(denied);
+    }
     Ok(())
+}
+
+/// Rejects pre-existing hardlink aliases to regular Git metadata before a same-device spawn.
+///
+/// The scan is bounded and repeated at spawn; it assumes no concurrent same-user mutation of Git
+/// metadata throughout scanning and launch. Unsupported entry types,
+/// symlinks, unreadable entries, or more than 100,000 entries fail closed.
+fn git_metadata_has_single_links(common: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut directories = vec![common.to_path_buf()];
+    let mut seen = 0usize;
+    while let Some(directory) = directories.pop() {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return false;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else { return false };
+            seen += 1;
+            if seen > 100_000 {
+                return false;
+            }
+            let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+                return false;
+            };
+            if metadata.is_dir() {
+                directories.push(entry.path());
+            } else if !metadata.is_file() || metadata.nlink() != 1 {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Returns the nearest existing object's device for a write path, including a missing suffix.
