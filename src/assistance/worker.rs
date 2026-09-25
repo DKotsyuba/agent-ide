@@ -6467,16 +6467,13 @@ mod stop_retry_tests {
             "a whole-page result must retain no continuation state"
         );
     }
-    /// Builds a managed read-scope state: deny-free for catalog capture, or with one narrower
-    /// path or glob deny relative to the cwd for live read-proof tests.
+    /// Builds a read-only managed state for Git snapshot and read-proof tests, with an optional
+    /// narrower path or glob deny relative to the cwd. Snapshot children need no write grant.
     fn read_scope_managed_state(root: &std::path::Path, deny: Option<&str>) -> serde_json::Value {
         let mut state = serde_json::json!({
             "codexLinuxSandboxExe": null,
             "permissionProfile": {"type":"managed","file_system":{"entries":[
-                {"access":"read","path":{"type":"special","value":{"kind":"root"}}},
-                {"access":"write","path":{"path":root,"type":"path"}},
-                {"access":"write","path":{"type":"special","value":{"kind":"slash_tmp"}}},
-                {"access":"write","path":{"type":"special","value":{"kind":"tmpdir"}}}
+                {"access":"read","path":{"type":"special","value":{"kind":"root"}}}
             ],"type":"restricted"},"network":"restricted"},
             "sandboxCwd":root,
             "useLegacyLandlock":false
