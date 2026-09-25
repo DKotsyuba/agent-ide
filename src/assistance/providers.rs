@@ -1734,10 +1734,11 @@ async fn reap_owned_backend(
 fn execution_authority(
     authority: &AuthorityStamp,
 ) -> Result<crate::execution::WorkspaceAuthority, FailureCode> {
-    crate::execution::WorkspaceAuthority::from_workspace(
+    crate::execution::WorkspaceAuthority::from_workspace_with_git_common_dir(
         authority.worktree().id(),
         authority.worktree().incarnation().to_string(),
         authority.worktree().worktree_path().to_path_buf(),
+        authority.worktree().git_common_dir().to_path_buf(),
         authority.epoch(),
     )
     .map_err(|_| FailureCode::WorkspaceAuthority)

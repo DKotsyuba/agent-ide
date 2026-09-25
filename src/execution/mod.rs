@@ -25,10 +25,11 @@ use tokio::{
 use crate::assistance::host_binding::{
     ActiveBindingUse, ObservedSandboxState, SANDBOX_STATE_FIELDS, SandboxStateProvenance,
 };
+use crate::workspace::git::discovery::validate_current_git_metadata;
 
 mod profile_shape;
 
-use profile_shape::{ProfileShapeV2, ProfileShapeV3, UnsupportedShape};
+use profile_shape::{Access, ProfileShapeV2, ProfileShapeV3, Selector, UnsupportedShape};
 
 /// Classifies the host permission profile whose complete state accompanies a request.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1185,12 +1186,17 @@ pub struct WorkspaceAuthority {
     incarnation: String,
     /// Canonical root whose ownership and lifecycle Workspace has already validated.
     root: PathBuf,
+    /// Workspace-verified canonical common Git directory, including linked-worktree metadata.
+    git_common_dir: Option<PathBuf>,
     /// Monotonic Workspace authority epoch that rejects stale effects at peer boundaries.
     epoch: u64,
 }
 
 impl WorkspaceAuthority {
-    /// Creates the narrow authority token after Workspace has checked ownership and lifecycle.
+    /// Creates an authority token without Git metadata for disabled-host or test-only work.
+    ///
+    /// Managed execution refuses this token. Product callers use
+    /// `from_workspace_with_git_common_dir` with durable Workspace identity instead.
     pub fn from_workspace(
         worktree_id: impl Into<String>,
         incarnation: impl Into<String>,
@@ -1205,14 +1211,38 @@ impl WorkspaceAuthority {
         Ok(Self {
             worktree_id,
             incarnation,
+            git_common_dir: None,
             root,
             epoch,
         })
     }
 
+    /// Carries Workspace's already-verified canonical common Git directory into Execution.
+    ///
+    /// The directory and its `.git` backpointers are rechecked at managed admission and spawn.
+    pub fn from_workspace_with_git_common_dir(
+        worktree_id: impl Into<String>,
+        incarnation: impl Into<String>,
+        root: PathBuf,
+        git_common_dir: PathBuf,
+        epoch: u64,
+    ) -> Result<Self, RequestError> {
+        let mut authority = Self::from_workspace(worktree_id, incarnation, root, epoch)?;
+        if !is_normal_absolute(&git_common_dir) {
+            return Err(RequestError::InvalidWorktree);
+        }
+        authority.git_common_dir = Some(git_common_dir);
+        Ok(authority)
+    }
+
     /// Returns the canonical worktree root supplied by Workspace.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Returns the canonical common Git directory supplied by Workspace, if present.
+    pub fn git_common_dir(&self) -> Option<&Path> {
+        self.git_common_dir.as_deref()
     }
 
     /// Returns the opaque worktree identity supplied by Workspace.
@@ -1987,6 +2017,8 @@ pub enum RequestError {
     ReadPathUnproven,
     /// A managed state could not prove that every path in the worktree is readable.
     ReadWholeTreeUnproven,
+    /// Managed write authority may reach Git's common administrative directory.
+    GitMetadataWriteOverlap,
 }
 
 /// The read scope one workspace-read recheck must prove (T36B).
@@ -2120,6 +2152,7 @@ impl ValidatedExecutionRequest {
         // The Workspace worktree is the trusted directory this child will run in: a v2
         // candidate binds the portable sandbox-cwd authority to it (T35B-r).
         let permit = catalog.permit(&invocation.sandbox, &authority.root)?;
+        guard_git_metadata(&invocation.sandbox, &authority, &command)?;
         Ok(Self {
             invocation,
             authority,
@@ -2153,12 +2186,139 @@ impl ValidatedExecutionRequest {
     fn consume_spawn_use(&self, active_use: Option<ActiveBindingUse>) -> Result<(), RequestError> {
         self.permit
             .recheck_live_v3(&self.invocation.sandbox, &self.authority.root)?;
+        guard_git_metadata(&self.invocation.sandbox, &self.authority, &self.command)?;
         match (&self.invocation.active_binding, active_use) {
             (Some(_), Some(active_use)) => self.invocation.consume_active_use(active_use),
             (Some(_), None) => Err(RequestError::MissingActiveBindingUse),
             (None, _) => Ok(()),
         }
     }
+}
+
+/// Refuses managed execution whenever a live write selector can reach shared Git metadata.
+///
+/// The closed v2 parser is used for every permit generation, including exact-digest v1. This
+/// check reads the child's effective `TMPDIR` from its controlled environment; `env_clear`
+/// makes an absent value an inactive selector. It runs at validation and immediately before
+/// spawn so a queued symlink replacement cannot widen writes.
+fn guard_git_metadata(
+    sandbox: &HostSandboxState,
+    authority: &WorkspaceAuthority,
+    command: &ControlledCommand,
+) -> Result<(), RequestError> {
+    if sandbox.class != ProfileClass::Managed {
+        return Ok(());
+    }
+    let denied = RequestError::GitMetadataWriteOverlap;
+    let common = authority.git_common_dir().ok_or(denied.clone())?;
+    if validate_current_git_metadata(authority.root(), common).is_err() {
+        return Err(denied);
+    }
+    let common_device = native_device(common).ok_or_else(|| denied.clone())?;
+    let shape = sandbox
+        .shape_v2(sandbox.cwd())
+        .map_err(|_| RequestError::GitMetadataWriteOverlap)?;
+    let child_tmpdir = command
+        .env
+        .get(&OsString::from("TMPDIR"))
+        .map(PathBuf::from);
+    if child_tmpdir
+        .as_ref()
+        .is_some_and(|path| !is_normal_absolute(path))
+    {
+        return Err(denied);
+    }
+    for (selector, (access, _)) in &shape.rules {
+        if *access != Access::Write {
+            continue;
+        }
+        let raw = match selector {
+            Selector::WorkspaceRelative(parts) => sandbox.cwd().join(parts.join("/")),
+            Selector::Absolute(parts) => Path::new("/").join(parts.join("/")),
+            Selector::Root => PathBuf::from("/"),
+            Selector::SlashTmp => PathBuf::from("/tmp"),
+            Selector::Tmpdir => match &child_tmpdir {
+                Some(path) => path.clone(),
+                None => continue,
+            },
+        };
+        let writable = canonicalize_write_root(&raw).ok_or_else(|| denied.clone())?;
+        if native_device(&writable).ok_or_else(|| denied.clone())? == common_device
+            || native_path_contains(common, &writable).ok_or_else(|| denied.clone())?
+            || native_path_contains(&writable, common).ok_or_else(|| denied.clone())?
+        {
+            return Err(denied);
+        }
+    }
+    Ok(())
+}
+
+/// Returns the nearest existing object's device for a write path, including a missing suffix.
+///
+/// A same-device write could reach Git metadata through an existing hardlink, even when its
+/// lexical path and every directory ancestor are disjoint from the common directory.
+fn native_device(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    for prefix in path.ancestors() {
+        match std::fs::metadata(prefix) {
+            Ok(metadata) => return Some(metadata.dev()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// Resolves an existing write root or its nearest existing ancestor without following future paths.
+///
+/// A missing suffix is retained literally; the guard repeats this resolution before spawn, so
+/// a symlink introduced while queued is observed then. Existing regular files are valid exact
+/// write targets; only a missing suffix below a non-directory ancestor fails closed.
+fn canonicalize_write_root(path: &Path) -> Option<PathBuf> {
+    let mut existing = path;
+    let mut suffix = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                suffix.push(existing.file_name()?.to_os_string());
+                existing = existing.parent()?;
+            }
+            Err(_) => return None,
+        }
+    }
+    let mut canonical = std::fs::canonicalize(existing).ok()?;
+    if !suffix.is_empty() && !canonical.is_dir() {
+        return None;
+    }
+    for component in suffix.into_iter().rev() {
+        canonical.push(component);
+    }
+    Some(canonical)
+}
+
+/// Checks native ancestry across symlinks and macOS firmlinks using device/inode identity.
+///
+/// `ancestor` may be a missing write target: then it cannot contain an existing descendant.
+/// Every existing descendant prefix must be stat-able; an uncertain prefix refuses the guard.
+fn native_path_contains(ancestor: &Path, descendant: &Path) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let target = match std::fs::metadata(ancestor) {
+        Ok(metadata) => (metadata.dev(), metadata.ino()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Some(false),
+        Err(_) => return None,
+    };
+    for prefix in descendant.ancestors() {
+        match std::fs::metadata(prefix) {
+            Ok(metadata) if (metadata.dev(), metadata.ino()) == target => return Some(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    Some(false)
 }
 
 /// Names an owner whose queued and running work receives an independent ceiling.

@@ -4800,10 +4800,11 @@ fn validate_read_scope(
     method: crate::errorlog::Method,
     scope: crate::execution::ReadScope<'_>,
 ) -> Result<(), ReadScopeRefusal> {
-    let scoped = crate::execution::WorkspaceAuthority::from_workspace(
+    let scoped = crate::execution::WorkspaceAuthority::from_workspace_with_git_common_dir(
         authority.worktree().id(),
         authority.worktree().incarnation().to_string(),
         authority.worktree().worktree_path().to_path_buf(),
+        authority.worktree().git_common_dir().to_path_buf(),
         authority.epoch(),
     )
     .map_err(|_| ReadScopeRefusal {
@@ -4857,6 +4858,7 @@ fn execution_profile_detail(error: &crate::execution::RequestError) -> Option<St
         RequestError::ExecutionProfileShapeNotNarrower(class) => {
             format!("shape_not_narrower:{}", profile_class_tag(*class))
         }
+        RequestError::GitMetadataWriteOverlap => "git_metadata_write_overlap".to_owned(),
         RequestError::DisabledHostDenied => "host_disabled".to_owned(),
         _ => return None,
     })

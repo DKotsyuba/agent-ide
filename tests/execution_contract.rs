@@ -43,6 +43,19 @@ fn worktree() -> PathBuf {
     root
 }
 
+/// Writes a disposable linked Git identity cycle for the guard's native topology check.
+fn linked_git_metadata(root: &Path, common: &Path) {
+    let admin = common.join("worktrees/guard");
+    fs::create_dir_all(&admin).unwrap();
+    fs::write(root.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+    fs::write(admin.join("commondir"), format!("{}\n", common.display())).unwrap();
+    fs::write(
+        admin.join("gitdir"),
+        format!("{}\n", root.join(".git").display()),
+    )
+    .unwrap();
+}
+
 /// Builds the complete disabled host state needed for controlled unit-only child launches.
 fn disabled_state(root: &Path) -> HostSandboxState {
     HostSandboxState::parse(Some(json!({
@@ -218,6 +231,8 @@ fn active_observation_becomes_a_validated_execution_invocation() {
 /// Proves a request originating from Assistance cannot launch after a queue delay without a fresh use.
 #[tokio::test]
 async fn observed_request_rejects_missing_fresh_use_at_spawn() {
+    let root = fs::canonicalize(worktree()).unwrap();
+    fs::create_dir(root.join(".git")).unwrap();
     let mut guard = HostBindingGuard::default();
     let channel = channel();
     assert!(matches!(
@@ -233,9 +248,9 @@ async fn observed_request_rejects_missing_fresh_use_at_spawn() {
     let observed = parse_observed_sandbox_state(
         json!({
             "codex/sandbox-state-meta": {
-                "permissionProfile": {"type": "managed", "file_system": {}, "network": "restricted"},
+                "permissionProfile": {"type": "managed", "file_system": {"type":"restricted","entries":[]}, "network": "restricted"},
                 "codexLinuxSandboxExe": null,
-                "sandboxCwd": "file:///private/tmp",
+                "sandboxCwd": format!("file://{}", root.display()),
                 "useLegacyLandlock": false
             }
         })
@@ -253,10 +268,11 @@ async fn observed_request_rejects_missing_fresh_use_at_spawn() {
     .unwrap();
     let execution =
         execution::ValidatedHostInvocation::from_active_observation(active, observed).unwrap();
-    let authority = WorkspaceAuthority::from_workspace(
+    let authority = WorkspaceAuthority::from_workspace_with_git_common_dir(
         "worktree",
         "incarnation",
-        PathBuf::from("/private/tmp"),
+        root.clone(),
+        root.join(".git"),
         1,
     )
     .unwrap();
@@ -264,7 +280,7 @@ async fn observed_request_rejects_missing_fresh_use_at_spawn() {
         CommandKind::Job,
         PathBuf::from("/usr/bin/true"),
         Vec::new(),
-        PathBuf::from("/private/tmp"),
+        root.clone(),
         BTreeMap::new(),
     )
     .unwrap();
@@ -301,6 +317,7 @@ async fn observed_request_rejects_missing_fresh_use_at_spawn() {
         ),
         Err(execution::ProcessError::NeverStarted {cause,..}) if matches!(*cause,execution::ProcessError::Request(execution::RequestError::MissingActiveBindingUse))
     ));
+    fs::remove_dir_all(root).unwrap();
 }
 
 /// Proves pre-authority discovery is accepted only from a consumed observed binding and fixed Git policy.
@@ -1063,7 +1080,7 @@ async fn dropping_owned_children_and_reap_futures_kills_without_freeing_uncertai
     borrowed.wait().await.unwrap();
 }
 
-/// Returns the real captured default Codex managed state under `cwd`, optionally made unrecognized.
+/// Returns a read-only managed state under `cwd`, optionally made unrecognized.
 ///
 /// `recognized == false` replaces the root entry's access with `none`, which is exactly the shape
 /// that may subtract read authority and must therefore keep strict sandbox-cwd equality.
@@ -1075,8 +1092,6 @@ fn inherited_managed_state(cwd: &Path, recognized: bool) -> serde_json::Value {
                 "entries": [
                     {"access": if recognized {"read"} else {"none"},
                      "path":{"type":"special","value":{"kind":"root"}}},
-                    {"access":"write","path":{"path": cwd, "type":"path"}},
-                    {"access":"write","path":{"type":"special","value":{"kind":"slash_tmp"}}},
                     {"access":"read","missing_path_behavior":"skip",
                      "path":{"path": cwd.join(".git"), "type":"path"}}
                 ],
@@ -1121,10 +1136,17 @@ fn inherited_invocation(
 /// only with an accepted `/usr/bin/env` trampoline.
 #[test]
 fn inherited_sandbox_cwd_validates_only_for_a_recognized_read_all_profile_with_a_trampoline() {
-    let root = worktree();
+    let root = fs::canonicalize(worktree()).unwrap();
+    fs::create_dir(root.join(".git")).unwrap();
     let inherited = worktree();
-    let authority =
-        WorkspaceAuthority::from_workspace("inherited-worktree", "1", root.clone(), 7).unwrap();
+    let authority = WorkspaceAuthority::from_workspace_with_git_common_dir(
+        "inherited-worktree",
+        "1",
+        root.clone(),
+        root.join(".git"),
+        7,
+    )
+    .unwrap();
     let command = || {
         ControlledCommand::from_validated_peer(
             CommandKind::Job,
@@ -1451,7 +1473,8 @@ fn t35b_fixture(name: &str) -> String {
     assert!(!relocated.contains("/private/tmp/agent-ide-stability"));
     let value: serde_json::Value = serde_json::from_str(&relocated).unwrap();
     let cwd = value["sandboxCwd"].as_str().unwrap();
-    fs::create_dir_all(cwd.strip_prefix("file://").unwrap_or(cwd)).unwrap();
+    let cwd = Path::new(cwd.strip_prefix("file://").unwrap_or(cwd));
+    fs::create_dir_all(cwd.join(".git")).unwrap();
     relocated
 }
 
@@ -1471,10 +1494,12 @@ fn t35b_validate(
 ) -> Result<ValidatedExecutionRequest, RequestError> {
     let invocation =
         ValidatedHostInvocation::from_verified_binding("t35b-contract", live.clone()).unwrap();
-    let authority = WorkspaceAuthority::from_workspace(
+    let root = fs::canonicalize(live.cwd()).unwrap();
+    let authority = WorkspaceAuthority::from_workspace_with_git_common_dir(
         "t35b-worktree",
         "t35b-incarnation",
-        live.cwd().to_path_buf(),
+        root.clone(),
+        root.join(".git"),
         1,
     )
     .unwrap();
@@ -1482,7 +1507,7 @@ fn t35b_validate(
         CommandKind::Job,
         PathBuf::from("/usr/bin/true"),
         vec![],
-        live.cwd().to_path_buf(),
+        root,
         BTreeMap::new(),
     )
     .unwrap();
@@ -1509,9 +1534,9 @@ fn t35b_v2_catalog(template: &str) -> ExecutionProfileCatalog {
     .unwrap()
 }
 
-/// The design's fixture acceptance matrix, proven through the full request-validation path.
+/// The shape matrix remains ordered before the live Git metadata check on synthetic fixtures.
 #[test]
-fn profile_shape_v2_admits_the_captured_matrix_through_request_validation() {
+fn profile_shape_v2_matrix_precedes_git_metadata_guard() {
     let workspace_write = "1ed43a00ce845709.json";
     let read_only = "accepted-codex-managed-read-only-v1.json";
     let catalog = t35b_v2_catalog(workspace_write);
@@ -1520,9 +1545,10 @@ fn profile_shape_v2_admits_the_captured_matrix_through_request_validation() {
         "555ebcab7e884d62.json",
         "b8a736675faa7cba.json",
     ] {
-        assert!(
-            t35b_validate(&t35b_state(admitted), &catalog).is_ok(),
-            "the workspace-write template must admit {admitted}"
+        assert_eq!(
+            t35b_validate(&t35b_state(admitted), &catalog).unwrap_err(),
+            RequestError::GitMetadataWriteOverlap,
+            "the matching {admitted} shape reaches the new guard"
         );
     }
     for refused in ["c9ea07ed289773b3.json", "fd37241d7322ebc3.json"] {
@@ -1577,13 +1603,16 @@ fn v2_records_restore_exactly_and_replay_json_is_unchanged() {
         &expected,
     )
     .unwrap();
-    // The live narrower states mint permits through the restored catalog.
+    // The live narrower states pass the restored catalog and reach the Git metadata guard.
     for admitted in [
         "1ed43a00ce845709.json",
         "555ebcab7e884d62.json",
         "b8a736675faa7cba.json",
     ] {
-        assert!(t35b_validate(&t35b_state(admitted), &catalog).is_ok());
+        assert_eq!(
+            t35b_validate(&t35b_state(admitted), &catalog).unwrap_err(),
+            RequestError::GitMetadataWriteOverlap
+        );
     }
     // A v1 record for the same capture restores by the legacy exact-digest rules.
     let legacy = PersistedProfileRecord::from_execution_evidence(
@@ -1764,4 +1793,331 @@ fn native_read_refuses_a_same_cwd_deny_bearing_state() {
         read(managed(true), &authority).unwrap_err(),
         RequestError::ReadWholeTreeUnproven
     );
+}
+
+/// Exercises the live Git metadata guard independently of portable template matching.
+#[test]
+fn managed_git_metadata_guard_covers_linked_temp_v1_and_child_tmpdir() {
+    let home = fs::canonicalize(std::env::var_os("HOME").unwrap()).unwrap();
+    let root = home.join(format!(
+        ".agent-ide-git-root-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id(),
+    ));
+    fs::create_dir(&root).unwrap();
+    let common = home.join(format!(
+        "agent-ide-git-common-{}-{}",
+        std::process::id(),
+        root.file_name().unwrap().to_string_lossy(),
+    ));
+    fs::create_dir(&common).unwrap();
+    let common = fs::canonicalize(common).unwrap();
+    linked_git_metadata(&root, &common);
+    let metadata_file = common.join("hardlink-source");
+    fs::write(&metadata_file, b"disposable metadata").unwrap();
+    let hardlink = root.join("precreated-hardlink");
+    fs::hard_link(&metadata_file, &hardlink).unwrap();
+    let unsafe_common = PathBuf::from("/tmp").join(format!(
+        "agent-ide-git-metadata-{}-{}",
+        std::process::id(),
+        root.file_name().unwrap().to_string_lossy(),
+    ));
+    fs::create_dir(&unsafe_common).unwrap();
+    let unsafe_common = fs::canonicalize(unsafe_common).unwrap();
+    let state = |tmpdir_only: bool, extra_write: Option<&Path>| {
+        let mut entries = vec![
+            json!({"access":"read","path":{"type":"special","value":{"kind":"root"}}}),
+            json!({"access":"write","path":{"type":"special","value":{"kind":
+                if tmpdir_only {"tmpdir"} else {"slash_tmp"}}}}),
+        ];
+        if !tmpdir_only {
+            entries.push(json!({"access":"write","path":{"type":"path","path":root}}));
+        }
+        if let Some(path) = extra_write {
+            entries.push(json!({"access":"write","path":{"type":"path","path":path}}));
+        }
+        HostSandboxState::parse(Some(json!({
+            "permissionProfile":{"type":"managed","network":"restricted",
+                "file_system":{"type":"restricted","entries":entries}},
+            "sandboxCwd":root,"codexLinuxSandboxExe":null,"useLegacyLandlock":false
+        })))
+        .unwrap()
+    };
+    let validate = |state: &HostSandboxState, common: &Path, v1: bool, tmpdir: Option<&Path>| {
+        let template = if v1 {
+            ExecutionProfileTemplate::from_execution_evidence("git-metadata-v1", 1, state).unwrap()
+        } else {
+            ExecutionProfileTemplate::from_execution_evidence_v2("git-metadata-v2", 1, state)
+                .unwrap()
+        };
+        let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![template]).unwrap();
+        let authority = WorkspaceAuthority::from_workspace_with_git_common_dir(
+            "linked",
+            "1",
+            root.clone(),
+            common.to_path_buf(),
+            1,
+        )
+        .unwrap();
+        let mut env = BTreeMap::new();
+        if let Some(tmpdir) = tmpdir {
+            env.insert(OsString::from("TMPDIR"), tmpdir.as_os_str().to_os_string());
+        }
+        let command = ControlledCommand::from_validated_peer(
+            CommandKind::Job,
+            PathBuf::from("/usr/bin/true"),
+            vec![],
+            root.clone(),
+            env,
+        )
+        .unwrap();
+        let policy = LocalExecutionPolicy::new(
+            BTreeSet::from([PathBuf::from("/usr/bin/true")]),
+            4096,
+            1,
+            false,
+        )
+        .unwrap();
+        ValidatedExecutionRequest::validate(
+            ValidatedHostInvocation::from_verified_binding("linked", state.clone()).unwrap(),
+            authority,
+            command,
+            &policy,
+            &catalog,
+        )
+    };
+
+    let ordinary = state(false, None);
+    assert_eq!(
+        validate(&ordinary, &common, false, None).unwrap_err(),
+        RequestError::GitMetadataWriteOverlap,
+        "the cwd write can mutate common metadata through its pre-existing hardlink"
+    );
+    linked_git_metadata(&root, &unsafe_common);
+    assert_eq!(
+        validate(&ordinary, &unsafe_common, false, None).unwrap_err(),
+        RequestError::GitMetadataWriteOverlap
+    );
+    assert_eq!(
+        validate(&ordinary, &unsafe_common, true, None).unwrap_err(),
+        RequestError::GitMetadataWriteOverlap,
+        "an exact v1 digest cannot bypass live metadata protection"
+    );
+    linked_git_metadata(&root, &common);
+    let child_tmpdir = state(true, None);
+    assert!(validate(&child_tmpdir, &common, false, None).is_ok());
+    assert_eq!(
+        validate(&child_tmpdir, &common, false, common.parent()).unwrap_err(),
+        RequestError::GitMetadataWriteOverlap,
+        "the child TMPDIR supplied in command.env is an effective write root"
+    );
+    let safe_file = root.join("safe-file");
+    fs::write(&safe_file, b"fixture").unwrap();
+    assert_eq!(
+        validate(&state(false, Some(&safe_file)), &common, false, None).unwrap_err(),
+        RequestError::GitMetadataWriteOverlap,
+        "a same-device file selector can itself be a hardlink to Git metadata"
+    );
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let alias = Path::new("/System/Volumes/Data").join(common.strip_prefix("/").unwrap());
+        let original = fs::metadata(&common).unwrap();
+        let alternate = fs::metadata(&alias).unwrap();
+        assert_eq!(
+            (original.dev(), original.ino()),
+            (alternate.dev(), alternate.ino()),
+            "the test must use a real firmlink alias of its disposable common Gitdir"
+        );
+        for write in [
+            alias.clone(),
+            alias.parent().unwrap().to_path_buf(),
+            alias.join("worktrees/guard"),
+        ] {
+            assert_eq!(
+                validate(&state(false, Some(&write)), &common, false, None).unwrap_err(),
+                RequestError::GitMetadataWriteOverlap,
+                "firmlink alias must not reopen common Git metadata: {write:?}"
+            );
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(unsafe_common).unwrap();
+    fs::remove_dir_all(common).unwrap();
+}
+
+/// A queued `.git` backpointer retargeting is observed before any child starts.
+#[test]
+fn managed_git_metadata_guard_rechecks_queued_git_pointer_topology() {
+    let root = fs::canonicalize(worktree()).unwrap();
+    let common = fs::canonicalize(worktree()).unwrap();
+    linked_git_metadata(&root, &common);
+    let state = HostSandboxState::parse(Some(json!({
+        "permissionProfile":{"type":"managed","network":"restricted",
+            "file_system":{"type":"restricted","entries":[
+                {"access":"read","path":{"type":"special","value":{"kind":"root"}}}
+            ]}},
+        "sandboxCwd":root,"codexLinuxSandboxExe":null,"useLegacyLandlock":false
+    })))
+    .unwrap();
+    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+        ExecutionProfileTemplate::from_execution_evidence_v2("queued-git", 1, &state).unwrap(),
+    ])
+    .unwrap();
+    let authority = WorkspaceAuthority::from_workspace_with_git_common_dir(
+        "queued",
+        "1",
+        root.clone(),
+        common.clone(),
+        1,
+    )
+    .unwrap();
+    let command = ControlledCommand::from_validated_peer(
+        CommandKind::Job,
+        PathBuf::from("/usr/bin/true"),
+        vec![],
+        root.clone(),
+        BTreeMap::new(),
+    )
+    .unwrap();
+    let policy = LocalExecutionPolicy::new(
+        BTreeSet::from([PathBuf::from("/usr/bin/true")]),
+        4096,
+        0,
+        false,
+    )
+    .unwrap();
+    let request = ValidatedExecutionRequest::validate(
+        ValidatedHostInvocation::from_verified_binding("queued", state).unwrap(),
+        authority,
+        command,
+        &policy,
+        &catalog,
+    )
+    .unwrap();
+    let retargeted_common = fs::canonicalize(worktree()).unwrap();
+    linked_git_metadata(&root, &retargeted_common);
+    let mut admission = AdmissionController::new(AdmissionLimits {
+        total_running: 1,
+        per_owner_running: 1,
+        per_owner_queued: 1,
+        total_queued: 1,
+        interactive_burst: 1,
+    })
+    .unwrap();
+    let Admission::Granted(lease) = admission.submit(
+        OwnerId::new("queued-git-pointer").unwrap(),
+        AdmissionClass::Interactive,
+    ) else {
+        panic!("lease unavailable")
+    };
+    assert!(matches!(
+        execution::OwnedChild::spawn_captured(&request, lease, None, Path::new("/usr/bin/true"), 1),
+        Err(execution::ProcessError::NeverStarted { cause, .. })
+            if matches!(*cause, execution::ProcessError::Request(RequestError::GitMetadataWriteOverlap))
+    ));
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(common).unwrap();
+    fs::remove_dir_all(retargeted_common).unwrap();
+}
+
+/// A standalone `.git` read rule cannot prevent writes through same-device hardlinks.
+#[test]
+fn managed_git_metadata_guard_refuses_standalone_same_device_writes() {
+    use std::os::unix::fs::symlink;
+
+    let root = fs::canonicalize(worktree()).unwrap();
+    let common = root.join(".git");
+    fs::create_dir(&common).unwrap();
+    symlink(".git", root.join("alias")).unwrap();
+    let validate =
+        |reopen: bool, alias_write: bool, read_git: bool, root_write: bool, read_first: bool| {
+            let mut entries = vec![
+                json!({"access":if root_write {"write"} else {"read"},
+                "path":{"type":"special","value":{"kind":"root"}}}),
+                json!({"access":"write","path":{"type":"path","path":root}}),
+            ];
+            if read_git {
+                let rule = json!({"access":"read","missing_path_behavior":"skip",
+                "path":{"type":"path","path":common}});
+                if read_first {
+                    entries.insert(0, rule.clone());
+                    entries.push(rule);
+                } else {
+                    entries.push(rule);
+                }
+            }
+            if reopen {
+                entries.push(json!({"access":"write","path":{"type":"path",
+                "path":common.join("objects")}}));
+            }
+            if alias_write {
+                entries.push(json!({"access":"write","path":{"type":"path",
+                "path":root.join("alias")}}));
+            }
+            let state = HostSandboxState::parse(Some(json!({
+                "permissionProfile":{"type":"managed","network":"restricted",
+                    "file_system":{"type":"restricted","entries":entries}},
+                "sandboxCwd":root,"codexLinuxSandboxExe":null,"useLegacyLandlock":false
+            })))
+            .unwrap();
+            let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+                ExecutionProfileTemplate::from_execution_evidence_v2("standalone", 1, &state)
+                    .unwrap(),
+            ])
+            .unwrap();
+            let authority = WorkspaceAuthority::from_workspace_with_git_common_dir(
+                "standalone",
+                "1",
+                root.clone(),
+                common.clone(),
+                1,
+            )
+            .unwrap();
+            let command = ControlledCommand::from_validated_peer(
+                CommandKind::Job,
+                PathBuf::from("/usr/bin/true"),
+                vec![],
+                root.clone(),
+                BTreeMap::new(),
+            )
+            .unwrap();
+            let policy = LocalExecutionPolicy::new(
+                BTreeSet::from([PathBuf::from("/usr/bin/true")]),
+                4096,
+                0,
+                false,
+            )
+            .unwrap();
+            ValidatedExecutionRequest::validate(
+                ValidatedHostInvocation::from_verified_binding("standalone", state).unwrap(),
+                authority,
+                command,
+                &policy,
+                &catalog,
+            )
+        };
+    assert_eq!(
+        validate(false, false, true, false, false).unwrap_err(),
+        RequestError::GitMetadataWriteOverlap
+    );
+    assert_eq!(
+        validate(false, false, true, true, true).unwrap_err(),
+        RequestError::GitMetadataWriteOverlap,
+        "the exact .git read rule does not cover hardlink aliases"
+    );
+    assert_eq!(
+        validate(false, false, false, false, false).unwrap_err(),
+        RequestError::GitMetadataWriteOverlap
+    );
+    assert_eq!(
+        validate(true, false, true, false, false).unwrap_err(),
+        RequestError::GitMetadataWriteOverlap
+    );
+    assert_eq!(
+        validate(false, true, true, true, true).unwrap_err(),
+        RequestError::GitMetadataWriteOverlap
+    );
+    fs::remove_dir_all(root).unwrap();
 }

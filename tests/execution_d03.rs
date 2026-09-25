@@ -51,6 +51,22 @@ fn test_path(directory: &Path, label: &str) -> PathBuf {
     ))
 }
 
+/// Reads the tested checkout's canonical common or per-worktree administrative directory.
+fn git_directory(cwd: &Path, query: &str) -> PathBuf {
+    let output = std::process::Command::new("/usr/bin/git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--path-format=absolute", query])
+        .env_clear()
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Git identity query failed: {query}"
+    );
+    fs::canonicalize(String::from_utf8(output.stdout).unwrap().trim()).unwrap()
+}
+
 /// Owns unique D03 files and directories across assertions and panic unwinding.
 struct D03Files {
     /// Unique fixture files removed first.
@@ -152,10 +168,11 @@ fn request_args(
 ) -> ValidatedExecutionRequest {
     let invocation =
         ValidatedHostInvocation::from_verified_binding("d03-fixture", state.clone()).unwrap();
-    let authority = WorkspaceAuthority::from_workspace(
+    let authority = WorkspaceAuthority::from_workspace_with_git_common_dir(
         "d03-worktree",
         "d03-incarnation",
         state.cwd().to_path_buf(),
+        git_directory(state.cwd(), "--git-common-dir"),
         1,
     )
     .unwrap();
@@ -205,7 +222,7 @@ async fn run_child(
     result.evidence
 }
 
-/// Proves the captured profile permits its fixture, refuses an approved outside target and `.git`, and reaps children.
+/// Proves the capture's cwd write while common and linked administrative Git writes are denied.
 #[tokio::test]
 #[ignore = "requires AGENT_IDE_D03_STATE, AGENT_IDE_D03_DENIED_DIR, and AGENT_IDE_D03_CODEX"]
 async fn captured_managed_profile_enforces_fixture_boundaries() {
@@ -224,11 +241,10 @@ async fn captured_managed_profile_enforces_fixture_boundaries() {
         &PathBuf::from(required("AGENT_IDE_D03_DENIED_DIR")),
         "outside",
     );
-    let denied_git = test_path(&state.cwd().join(".git"), "git");
-    assert!(
-        state.cwd().join(".git").is_dir(),
-        "captured fixture has no .git directory"
-    );
+    let common = git_directory(state.cwd(), "--git-common-dir");
+    let admin = git_directory(state.cwd(), "--absolute-git-dir");
+    let denied_git = test_path(&common, "git-common");
+    let denied_admin = (admin != common).then(|| test_path(&admin, "git-admin"));
 
     let allowed_result = run_child(
         &request(&state, &catalog, touch, allowed.clone()),
@@ -244,7 +260,11 @@ async fn captured_managed_profile_enforces_fixture_boundaries() {
     assert!(allowed.is_file(), "allowed fixture write did not occur");
     fs::remove_file(&allowed).unwrap();
 
-    for (label, target) in [("outside", denied), ("git", denied_git)] {
+    let mut denied_targets = vec![("outside", denied), ("git-common", denied_git)];
+    if let Some(admin) = denied_admin {
+        denied_targets.push(("git-admin", admin));
+    }
+    for (label, target) in denied_targets {
         let result = run_child(
             &request(&state, &catalog, touch, target.clone()),
             &codex,
@@ -381,6 +401,12 @@ async fn visualization_family_native_d03() {
             ("parent", leaf.parent().unwrap(), false),
             ("outside", outside_dir.as_path(), false),
         ];
+        let common = git_directory(state.cwd(), "--git-common-dir");
+        let admin = git_directory(state.cwd(), "--absolute-git-dir");
+        writes.push(("git-common", &common, false));
+        if admin != common {
+            writes.push(("git-admin", &admin, false));
+        }
         if index == 0 {
             writes.insert(0, ("cwd", state.cwd(), true));
         } else {
@@ -391,7 +417,7 @@ async fn visualization_family_native_d03() {
             let target = test_path(directory, label);
             assert!(!target.exists(), "D03 target already exists: {target:?}");
             let target = cleanup.track(target);
-            if !allowed {
+            if !allowed && !label.starts_with("git-") {
                 fs::write(&target, b"host baseline").unwrap();
                 fs::remove_file(&target).unwrap();
             }

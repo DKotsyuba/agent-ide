@@ -191,13 +191,38 @@ pub fn validate_native_identity(
     let (common_dir, common_identity) =
         real_directory(&parsed.common).map_err(|_| GitError::InvalidDiscovery)?;
     validate_listing(&parsed.listing, &root)?;
+    validate_administrative_identity(&root, &common_dir, common_identity)?;
+    Ok(DiscoveredWorktree { root, common_dir })
+}
+
+/// Rechecks one already-discovered root/common pair against its live `.git` backpointers.
+///
+/// Execution calls this before managed admission and again before spawn. It refuses redirected,
+/// missing, or inconsistent standalone and linked metadata without running Git or trusting a
+/// stored common-directory path alone.
+pub fn validate_current_git_metadata(root: &Path, common: &Path) -> Result<(), GitError> {
+    let (real_root, _) = real_directory(root).map_err(|_| GitError::InvalidDiscovery)?;
+    let (real_common, common_identity) =
+        real_directory(common).map_err(|_| GitError::InvalidDiscovery)?;
+    if real_root != root || real_common != common {
+        return Err(GitError::InvalidDiscovery);
+    }
+    validate_administrative_identity(root, common, common_identity)
+}
+
+/// Checks the standalone directory or linked gitfile/admin/commondir/gitdir identity cycle.
+fn validate_administrative_identity(
+    root: &Path,
+    common_dir: &Path,
+    common_identity: [u8; 16],
+) -> Result<(), GitError> {
     let dot_git = root.join(".git");
     if let Ok((directory, identity)) = real_directory(&dot_git) {
         if directory != common_dir || identity != common_identity {
             return Err(GitError::InvalidDiscovery);
         }
     } else {
-        let gitfile = administrative_file(&root, &common_dir, ".git")?;
+        let gitfile = administrative_file(root, common_dir, ".git")?;
         let raw_admin = gitfile
             .strip_prefix(b"gitdir: ")
             .ok_or(GitError::InvalidDiscovery)?;
@@ -211,7 +236,7 @@ pub fn validate_native_identity(
         if admin.parent() != Some(common_dir.join("worktrees").as_path()) {
             return Err(GitError::InvalidDiscovery);
         }
-        let shared = parse_terminal_path(&administrative_file(&admin, &common_dir, "commondir")?)?;
+        let shared = parse_terminal_path(&administrative_file(&admin, common_dir, "commondir")?)?;
         let shared = if shared.is_absolute() {
             shared
         } else {
@@ -222,8 +247,7 @@ pub fn validate_native_identity(
         if resolved != common_dir || identity != common_identity {
             return Err(GitError::InvalidDiscovery);
         }
-        let backpointer =
-            parse_terminal_path(&administrative_file(&admin, &common_dir, "gitdir")?)?;
+        let backpointer = parse_terminal_path(&administrative_file(&admin, common_dir, "gitdir")?)?;
         let backpointer = if backpointer.is_absolute() {
             backpointer
         } else {
@@ -235,11 +259,11 @@ pub fn validate_native_identity(
         let (back_root, _) =
             real_directory(backpointer.parent().ok_or(GitError::InvalidDiscovery)?)
                 .map_err(|_| GitError::InvalidDiscovery)?;
-        if back_root != root || administrative_file(&root, &common_dir, ".git")? != gitfile {
+        if back_root != root || administrative_file(root, common_dir, ".git")? != gitfile {
             return Err(GitError::InvalidDiscovery);
         }
     }
-    Ok(DiscoveredWorktree { root, common_dir })
+    Ok(())
 }
 
 /// Reads only a named bounded administrative file through the existing no-follow Workspace reader.

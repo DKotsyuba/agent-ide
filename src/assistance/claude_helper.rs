@@ -1280,10 +1280,11 @@ async fn provider_context(
     if *spawned >= job.budgets.processes {
         return Err(FailureCode::Capacity);
     }
-    let authority = WorkspaceAuthority::from_workspace(
+    let authority = WorkspaceAuthority::from_workspace_with_git_common_dir(
         source.worktree().id(),
         source.worktree().incarnation().to_string(),
         source.worktree().worktree_path().to_path_buf(),
+        source.worktree().git_common_dir().to_path_buf(),
         source.authority_epoch(),
     )
     .map_err(|_| FailureCode::WorkspaceAuthority)?;

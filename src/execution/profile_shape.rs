@@ -1288,10 +1288,12 @@ fn derive_entry(
 mod visualization_tests {
     use super::*;
     use crate::execution::{
-        D03ProfileEvidence, ExecutionProfileCatalog, ExecutionProfileTemplate,
-        PersistedProfileRecord,
+        CommandKind, ControlledCommand, D03ProfileEvidence, ExecutionProfileCatalog,
+        ExecutionProfileTemplate, LocalExecutionPolicy, PersistedProfileRecord, RequestError,
+        ValidatedExecutionRequest, ValidatedHostInvocation, WorkspaceAuthority,
     };
     use serde_json::{Value, json};
+    use std::collections::{BTreeMap, BTreeSet};
 
     /// Creates two real leaf directories and one capture whose only outside write is the first.
     fn fixture() -> (std::path::PathBuf, Value, String, String) {
@@ -1329,6 +1331,60 @@ mod visualization_tests {
     /// Changes only the complete leaf and its four matching denies in a copied capture.
     fn moved(value: &Value, first: &str, second: &str) -> Value {
         serde_json::from_str(&value.to_string().replace(first, second)).unwrap()
+    }
+
+    /// Keeps a v3 visualization leaf from becoming a write route into linked Git metadata.
+    #[test]
+    fn visualization_leaf_cannot_cover_linked_common_git_directory() {
+        let (root, captured, first, _) = fixture();
+        let common = std::path::PathBuf::from(&first).join("git-common");
+        let admin = common.join("worktrees/guard");
+        std::fs::create_dir_all(&admin).unwrap();
+        let cwd = root.join("work");
+        std::fs::write(cwd.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        std::fs::write(admin.join("commondir"), format!("{}\n", common.display())).unwrap();
+        std::fs::write(
+            admin.join("gitdir"),
+            format!("{}\n", cwd.join(".git").display()),
+        )
+        .unwrap();
+        let state = HostSandboxState::parse(Some(captured)).unwrap();
+        let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
+            ExecutionProfileTemplate::from_execution_evidence_v3("visualization", 1, &state)
+                .unwrap(),
+        ])
+        .unwrap();
+        let authority = WorkspaceAuthority::from_workspace_with_git_common_dir(
+            "v3",
+            "1",
+            cwd.clone(),
+            common,
+            1,
+        )
+        .unwrap();
+        let command = ControlledCommand::from_validated_peer(
+            CommandKind::Job,
+            "/usr/bin/true".into(),
+            vec![],
+            cwd,
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let policy =
+            LocalExecutionPolicy::new(BTreeSet::from(["/usr/bin/true".into()]), 4096, 0, false)
+                .unwrap();
+        assert_eq!(
+            ValidatedExecutionRequest::validate(
+                ValidatedHostInvocation::from_verified_binding("v3", state).unwrap(),
+                authority,
+                command,
+                &policy,
+                &catalog,
+            )
+            .unwrap_err(),
+            RequestError::GitMetadataWriteOverlap
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// Proves two distinct tasks share one v3 record while v2 and record restoration stay exact.

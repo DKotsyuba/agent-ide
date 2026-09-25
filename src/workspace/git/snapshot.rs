@@ -251,10 +251,11 @@ impl SnapshotIntent {
     }
     /// Converts this operation's original scope to the existing Execution authority token.
     pub fn execution_authority(&self) -> Result<WorkspaceAuthority, GitError> {
-        WorkspaceAuthority::from_workspace(
+        WorkspaceAuthority::from_workspace_with_git_common_dir(
             self.scope.worktree().id(),
             self.scope.worktree().incarnation().to_string(),
             self.scope.worktree().worktree_path().to_path_buf(),
+            self.scope.worktree().git_common_dir().to_path_buf(),
             self.scope.authority_epoch(),
         )
         .map_err(|_| GitError::IncompleteIdentity)

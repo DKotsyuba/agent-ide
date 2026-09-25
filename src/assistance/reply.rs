@@ -95,6 +95,8 @@ pub enum ExecutionProfileCause {
     ShapeNotNarrowerManaged,
     /// The disabled shape is not narrower than its template.
     ShapeNotNarrowerDisabled,
+    /// A managed write root can reach the workspace's common Git metadata.
+    GitMetadataWriteOverlap,
     /// Git execution policy could not be built.
     GitPolicy,
     /// The Git discovery query was refused.
@@ -136,6 +138,7 @@ impl ExecutionProfileCause {
             "shape_unsupported:disabled" => Self::ShapeUnsupportedDisabled,
             "shape_not_narrower:managed" => Self::ShapeNotNarrowerManaged,
             "shape_not_narrower:disabled" => Self::ShapeNotNarrowerDisabled,
+            "git_metadata_write_overlap" => Self::GitMetadataWriteOverlap,
             "git_policy" => Self::GitPolicy,
             "query_policy" => Self::QueryPolicy,
             "git_unsupported" => Self::GitUnsupported,
@@ -165,6 +168,7 @@ impl ExecutionProfileCause {
             Self::ShapeUnsupportedDisabled => "shape_unsupported:disabled",
             Self::ShapeNotNarrowerManaged => "shape_not_narrower:managed",
             Self::ShapeNotNarrowerDisabled => "shape_not_narrower:disabled",
+            Self::GitMetadataWriteOverlap => "git_metadata_write_overlap",
             Self::GitPolicy => "git_policy",
             Self::QueryPolicy => "query_policy",
             Self::GitUnsupported => "git_unsupported",

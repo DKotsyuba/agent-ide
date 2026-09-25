@@ -778,10 +778,11 @@ impl Worker<'_> {
             job.observed.clone().ok_or(FailureCode::SandboxState)?,
         )
         .map_err(|_| FailureCode::SandboxState)?;
-        let authority = WorkspaceAuthority::from_workspace(
+        let authority = WorkspaceAuthority::from_workspace_with_git_common_dir(
             authority.worktree().id(),
             authority.worktree().incarnation().to_string(),
             authority.worktree().worktree_path().to_path_buf(),
+            authority.worktree().git_common_dir().to_path_buf(),
             authority.epoch(),
         )
         .map_err(|_| FailureCode::WorkspaceAuthority)?;
