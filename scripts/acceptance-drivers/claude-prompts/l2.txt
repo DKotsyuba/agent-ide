@@ -6,14 +6,14 @@ R2. After that Bash command completes, call ide.inspect with the detail_ref the
 reply mentioned, exactly once.
 R3. Call ide.context only in the numbered steps that say so. Never as a refresh.
 R4. Call ide.inspect only as R2 says. Never otherwise.
-R5. Never use Read, Grep, or Glob. If a call errors, do not repeat it; continue
-with the next numbered step.
+R5. Never use Read, Grep, or Glob. Do not repeat an errored ide.* call.
+If ide.inspect stays pending after a refused Bash helper, rerun that exact helper once.
 Apply R1 and R2 to every numbered step's reply, including step 1.
 
 1. Call ide.start with {"activation_id":"acceptance-left-2"}. That reply may show an exact command: apply R1 then R2 to it.
-2. Call ide.context with {"path":"acceptance-fixture/fixture.py"}. That reply may show an exact command: apply R1 then R2 to it. The
-   structured context result has a detail_ref field; remember that exact value
-   as OLD_REF.
+2. Call ide.context with {"path":"acceptance-fixture/fixture.py"}. That reply may show an exact command: apply R1 then R2 to it. Remember
+   the exact source_ref printed by the completed ide.inspect context result as OLD_REF,
+   not the pending helper's detail_ref.
 3. Call ide.stop with {}.
 4. Read acceptance-fixture/fixture.py once with your native Read tool (the one
    exception to R5; the native Edit tool refuses unread files), then with your
@@ -23,7 +23,7 @@ Apply R1 and R2 to every numbered step's reply, including step 1.
 5. Call ide.start with {"activation_id":"acceptance-left-2b"}. That reply may show an exact command: apply R1 then R2 to it.
 6. Call ide.context with {"path":"acceptance-fixture/fixture.py"}. That reply may show an exact command: apply R1 then R2 to it.
 7. Call ide.edit with {"operation_id":"stale-probe","path":"acceptance-fixture/fixture.py","source_ref":"OLD_REF","content":"def value() -> int:\n    return 7\n"},
-   using the OLD_REF detail_ref value remembered from step 2.
+   using the OLD_REF source_ref value remembered from step 2.
 8. Whatever step 7 replies, do not retry or fix anything; follow its R1/R2 only
    if it shows a Bash command.
 9. Call ide.stop with {}.
