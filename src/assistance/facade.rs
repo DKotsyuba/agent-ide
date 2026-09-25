@@ -32,7 +32,7 @@ use crate::{
         codex_rendezvous::{CodexRouteIdentity, ManagedCodexPublisher},
         content,
         host_binding::{
-            HookEvent, HookLaunch, HookPhase, HostBindingGuard, HostKind, parse_candidate,
+            HookEvent, HookPhase, HostBindingGuard, HostKind, parse_candidate,
             parse_claude_call_id, parse_hook_event, parse_host_kind,
         },
         reply::{MAX_FEEDBACK_BYTES, MissingPeer, PeerReply, ResultKind},
@@ -803,14 +803,6 @@ pub async fn submit_hook_event(
         "call_id": event.optional_call_id(),
         "session_id": event.session_id(),
         "agent_type": event.agent_type(),
-        // Present only for a Claude shell pre-hook. The daemon compares these bytes against a
-        // command it generated itself and discards them otherwise; no other tool's arguments,
-        // and no other field of this one, ever reach the transport.
-        "launch_command": event.launch().map(HookLaunch::command),
-        "launch_background": event.launch().map(HookLaunch::run_in_background),
-        // Explicit post failure only; a post that carried no marker relays false, which means
-        // "no failure was reported", not "success was proven".
-        "failed": event.failed(),
         // Post phases of either host: the bare native tool name that selects project-check triggers.
         "tool_name": event.tool_name(),
     });
@@ -1576,7 +1568,6 @@ fn claude_envelope_never_carries_structured_content() {
         PeerReply::HostStopped {},
         PeerReply::Pending {
             detail_ref: "detail-queued".into(),
-            helper: Some("agent-ide claude-helper --claim detail-queued".into()),
         },
         PeerReply::Complete {
             kind: ResultKind::Activation,

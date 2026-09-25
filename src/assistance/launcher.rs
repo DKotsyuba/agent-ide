@@ -1,6 +1,5 @@
 //! Restart-only trusted launcher configuration, separate from host metadata and model arguments.
 
-use super::claude_worker::ClaudeOperatorProfile;
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
@@ -687,12 +686,9 @@ struct RawTarget {
     _profiles: Vec<Value>,
     #[serde(default, rename = "allow_disabled_host")]
     _allow_disabled_host: bool,
-    /// Operator-declared strict Claude configuration; absent leaves Claude execution unavailable.
-    ///
-    /// Codex targets omit this field entirely and keep their existing behaviour and configuration
-    /// unchanged. It is never inferred from a host observation, a permission mode or process state.
-    #[serde(default)]
-    claude_profile: Option<ClaudeOperatorProfile>,
+    /// Retired Claude helper profile; accepted and ignored so older files keep loading.
+    #[serde(default, rename = "claude_profile")]
+    _claude_profile: Option<Value>,
 }
 
 /// Decodes only the versioned, closed launcher schema.
@@ -722,11 +718,6 @@ pub struct LaunchTarget {
     pub git: AcceptedExecutable,
     /// Accepted closed provider profiles for this candidate.
     pub providers: Vec<ProviderLaunch>,
-    /// Validated strict Claude operator profile; `None` keeps Claude execution unavailable.
-    ///
-    /// Presence is required before any Claude helper may be minted for this target. Its absence is
-    /// never a fallback to unrestricted execution and never affects the Codex path on this target.
-    pub claude_profile: Option<ClaudeOperatorProfile>,
 }
 
 /// Immutable attachment map owned by one daemon generation; Debug always redacts its contents.
@@ -917,19 +908,10 @@ impl LauncherConfig {
                     _ => {}
                 }
             }
-            // A declared Claude profile must be complete and strict before it is retained; a
-            // weakened declaration is rejected outright rather than downgraded to "unavailable",
-            // so an operator never believes a partially strict configuration was accepted.
-            if let Some(profile) = target.claude_profile.as_ref()
-                && profile.validate().is_err()
-            {
-                return Err(LauncherError::Rejected);
-            }
             let launch = LaunchTarget {
                 candidate: target.candidate,
                 git: target.git,
                 providers: target.providers,
-                claude_profile: target.claude_profile,
             };
             if targets.insert(target.attachment, launch).is_some() {
                 return Err(LauncherError::Rejected);
@@ -1393,6 +1375,9 @@ fn startup_fingerprint_verification_is_cooperatively_cancellable() {
         Err(LauncherError::Cancelled)
     );
 }
+
+/// Accepts an optional TypeScript checker and rejects non-normal checker paths.
+#[test]
 fn project_checks_accept_optional_typescript_and_reject_non_normal_paths() {
     use serde_json::json;
     let old: ProjectChecksConfig = serde_json::from_value(

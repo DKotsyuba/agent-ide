@@ -89,9 +89,9 @@ pub enum ToolOutcome {
     Incomplete,
     /// The operation was explicitly stopped or cancelled.
     Cancelled,
-    /// The peer answered `pending`: a Claude foreground-helper round trip is required. Distinct
-    /// from [`ToolOutcome::Incomplete`] because a normal pending/helper/inspect round trip is not
-    /// itself a failure (T107).
+    /// The peer answered `pending`: an `ide.inspect` round trip is required. Distinct from
+    /// [`ToolOutcome::Incomplete`] because a normal pending/inspect round trip is not itself a
+    /// failure (T107).
     Pending,
 }
 

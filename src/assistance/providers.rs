@@ -299,26 +299,6 @@ impl Worker<'_> {
         Ok(())
     }
 
-    /// Resolves each configured provider's already-retained worktree namespace for Claude jobs.
-    ///
-    /// Paths come from live `CacheLifecycle` entries and the same rights-aware key used during
-    /// retention; launcher labels and caller input are never exposed as filesystem locations.
-    pub(super) fn helper_cache_namespaces(
-        &self,
-        binding: &BindingRef,
-        authority: &AuthorityStamp,
-        launches: &[ProviderLaunch],
-    ) -> Result<Vec<(AcceptedProviderSettings, String)>, FailureCode> {
-        launches
-            .iter()
-            .map(|launch| {
-                let trust = effective_trust(launch);
-                self.provider_cache_namespace(binding, authority, launch, &trust)
-                    .map(|path| (launch.settings, path))
-            })
-            .collect()
-    }
-
     /// Quiesces the stopped actor's cache owners without deleting their worktree namespaces.
     ///
     /// A shared native namespace key is instead reference-counted: it becomes quiescent only once

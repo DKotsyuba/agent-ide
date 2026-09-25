@@ -2,8 +2,8 @@
 
 use agent_ide::{
     assistance::host_binding::{
-        ActiveBindingUse, BindingRef, BindingStatus, HostBindingGuard, ValidatedInvocation,
-        parse_candidate, parse_channel_session, parse_hook_event,
+        ActiveBindingUse, BindingRef, BindingStatus, HostBindingGuard, parse_candidate,
+        parse_channel_session, parse_hook_event,
     },
     execution::{
         ControlledCommand, LocalExecutionPolicy, ValidatedExecutionRequest,
@@ -15,8 +15,6 @@ use std::{collections::BTreeSet, path::Path};
 
 /// Owns genuine Assistance-derived scope while requiring a fresh consume for each physical test spawn.
 pub struct BoundRequest {
-    /// Exact validated invocation used to correlate current metadata in read-admission tests.
-    pub invocation: ValidatedInvocation,
     /// Execution request retaining the exact active binding generation.
     pub request: ValidatedExecutionRequest,
     /// Live test guard, never replaced by a cached ActiveBindingUse.
@@ -64,7 +62,6 @@ impl BoundRequest {
             request,
             guard,
             binding,
-            invocation,
         }
     }
 

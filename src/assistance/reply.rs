@@ -7,11 +7,6 @@ use serde::{Deserialize, Serialize};
 pub const MAX_REPLY_BYTES: usize = 64 * 1024;
 /// Maximum model-visible feedback text returned to a native host hook.
 pub const MAX_FEEDBACK_BYTES: usize = 4 * 1024;
-/// Maximum complete foreground-helper instruction carried on a pending reply.
-///
-/// The instruction is never trimmed, so this bound is a hard admission gate: an operation whose
-/// exact command would not fit is refused rather than answered with an unusable partial command.
-pub const MAX_HELPER_INSTRUCTION_BYTES: usize = 8 * 1024;
 /// Leaves room for fixed MCP content and protocol wrapper fields.
 pub(crate) const MCP_RESERVE: usize = 1024;
 
@@ -278,15 +273,6 @@ pub enum PeerReply {
     Pending {
         /// Opaque reference usable only under the same live binding.
         detail_ref: String,
-        /// Complete exact command the model must run before inspecting, for hosts that execute
-        /// their own operation in a foreground helper.
-        ///
-        /// Absent for every daemon-executed operation, so the Codex envelope is byte-identical to
-        /// its previous form. When present it is never trimmed: `PeerReply::shrink_text` refuses
-        /// to shrink a pending reply, so an over-budget instruction fails closed instead of being
-        /// silently cut into a command the launch recognizer could never match.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        helper: Option<String>,
     },
     /// Closed failure without provider, OS or host payloads.
     Error {
@@ -305,8 +291,8 @@ pub enum PeerReply {
         truncated: bool,
         /// True only when the referenced result retains another consumable page for `ide.inspect`.
         ///
-        /// A detail reference alone is not a continuation: retained Context and helper-composed
-        /// Diff results may be inspectable but cannot yield new evidence. Missing from an older
+        /// A detail reference alone is not a continuation: retained Context and Diff results may
+        /// be inspectable but cannot yield new evidence. Missing from an older
         /// envelope decodes as `false`, preserving the safe non-looping default.
         #[serde(default)]
         continuation: bool,
@@ -418,10 +404,6 @@ impl PeerReply {
             return false;
         }
         if matches!(self, Self::Feedback { text } if text.is_empty() || text.len() > MAX_FEEDBACK_BYTES)
-        {
-            return false;
-        }
-        if matches!(self, Self::Pending { helper: Some(helper), .. } if helper.is_empty() || helper.len() > MAX_HELPER_INSTRUCTION_BYTES || helper.chars().any(char::is_control))
         {
             return false;
         }

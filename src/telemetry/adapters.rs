@@ -351,21 +351,19 @@ mod tests {
         );
     }
 
-    /// Proves a legitimate `pending` (helper required) round trip is its own outcome, distinct
+    /// Proves a legitimate `pending` (inspect required) round trip is its own outcome, distinct
     /// from a real `incomplete` failure, so the two are no longer indistinguishable in counts.
     #[test]
     fn pending_reply_is_its_own_outcome_not_incomplete() {
         assert_eq!(
             reply_outcome(&PeerReply::Pending {
                 detail_ref: "detail".to_owned(),
-                helper: None,
             }),
             ToolOutcome::Pending
         );
         assert_eq!(
             errorlog_outcome(&PeerReply::Pending {
                 detail_ref: "detail".to_owned(),
-                helper: None,
             }),
             crate::errorlog::Outcome::Pending
         );

@@ -161,32 +161,14 @@ async fn main() -> ExitCode {
         }
         Ok(Command::ClaudeRendezvous { project_dir }) => {
             match claude_rendezvous_paths(&project_dir).await {
-                Ok((runtime_dir, helper_socket)) => {
+                Ok(runtime_dir) => {
                     println!("runtime_dir={}", runtime_dir.display());
-                    println!("helper_socket={}", helper_socket.display());
                     ExitCode::SUCCESS
                 }
                 Err(error) => {
                     eprintln!("agent-ide: {error}");
                     ExitCode::from(2)
                 }
-            }
-        }
-        Ok(Command::ClaudeWorker {
-            runtime_dir,
-            attachment,
-            detail_ref,
-        }) => {
-            let claimed = agent_ide::assistance::claude_helper::run(
-                &runtime_dir,
-                Some(attachment),
-                Some(detail_ref),
-            )
-            .await;
-            if claimed {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
             }
         }
         Ok(Command::Doctor { runtime_dir }) => match doctor_report(&runtime_dir).await {
@@ -421,18 +403,6 @@ enum Command {
         /// Existing daemon endpoint directory; never created by the hook command.
         runtime_dir: PathBuf,
     },
-    /// Runs one bounded foreground Claude helper operation and exits.
-    ///
-    /// Launched by the model through its ordinary shell tool, so every child it starts inherits
-    /// the host's own sandbox. It creates no runtime state and never autostarts a daemon.
-    ClaudeWorker {
-        /// Existing daemon endpoint directory; never created by the helper command.
-        runtime_dir: PathBuf,
-        /// Opaque private transport attachment the operation was minted on.
-        attachment: String,
-        /// Action-scoped single-use handle this helper was launched to claim.
-        detail_ref: String,
-    },
     /// Queries an existing daemon without creating a directory or daemon process.
     Doctor { runtime_dir: PathBuf },
     /// Emits one `{path, identity, blake3}` accepted-executable fragment for a measured file.
@@ -537,9 +507,7 @@ commands:
   codex-hook --managed                    Codex native hook, managed route discovery
   codex-hooks print                       print the managed Codex hooks.json fragment
   claude-hook [--runtime-dir <dir>]       Claude native hook
-  claude-worker --runtime-dir <dir> --attachment <id> --detail-ref <ref>
-                                          Claude foreground helper
-  claude-rendezvous <project-dir>         print the Claude runtime and helper socket paths
+  claude-rendezvous <project-dir>         print the Claude shared daemon runtime path
   errors [--repo <path>] [--all] [--summary] [--since <minutes>] [--limit <n>]
                                           read the error log
   evidence executable --identity <id> <path>
@@ -558,7 +526,6 @@ const SUBCOMMANDS: &[&str] = &[
     "codex-hook",
     "codex-hooks",
     "claude-hook",
-    "claude-worker",
     "claude-rendezvous",
     "errors",
     "evidence",
@@ -596,35 +563,6 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
     {
         return Ok(Command::ClaudeRendezvous {
             project_dir: PathBuf::from(project_dir),
-        });
-    }
-    // The helper command has its own fixed longer shape; every other mode keeps the exact
-    // three-argument form it already had, so no existing invocation changes meaning.
-    if let [
-        mode,
-        runtime_flag,
-        runtime_dir,
-        attachment_flag,
-        attachment,
-        detail_flag,
-        detail_ref,
-    ] = arguments.as_slice()
-        && mode == "claude-worker"
-    {
-        if runtime_flag != "--runtime-dir"
-            || attachment_flag != "--attachment"
-            || detail_flag != "--detail-ref"
-        {
-            return Err(AppError::InvalidResponse);
-        }
-        let (Some(attachment), Some(detail_ref)) = (attachment.to_str(), detail_ref.to_str())
-        else {
-            return Err(AppError::InvalidResponse);
-        };
-        return Ok(Command::ClaudeWorker {
-            runtime_dir: PathBuf::from(runtime_dir),
-            attachment: attachment.to_owned(),
-            detail_ref: detail_ref.to_owned(),
         });
     }
     // `evidence executable` measures one file; the identity flag always precedes the bare path.
@@ -1482,7 +1420,7 @@ fn claude_runtime_path(key: &Path) -> std::io::Result<PathBuf> {
 /// relative and is canonicalized first; nothing is created, read, or removed under the reported
 /// paths. Returns an error when the directory is missing or not a directory, or when
 /// `/private/tmp` cannot be resolved; the caller reports any error with exit code 2.
-async fn claude_rendezvous_paths(project_dir: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
+async fn claude_rendezvous_paths(project_dir: &Path) -> std::io::Result<PathBuf> {
     if !fs::symlink_metadata(project_dir).is_ok_and(|metadata| metadata.is_dir()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -1491,9 +1429,7 @@ async fn claude_rendezvous_paths(project_dir: &Path) -> std::io::Result<(PathBuf
     }
     let candidate = fs::canonicalize(project_dir)?;
     let key = claude_rendezvous_key(&candidate).await;
-    let runtime = claude_runtime_path(&key)?;
-    let socket = runtime.join(agent_ide::assistance::claude_helper::HELPER_SOCKET);
-    Ok((runtime, socket))
+    claude_runtime_path(&key)
 }
 
 /// Returns whether a string is exactly one generated 32-byte lowercase hexadecimal attachment.
@@ -2224,13 +2160,6 @@ async fn start_managed_daemon(
     let (launcher, bytes) =
         LauncherConfig::bind_one_candidate(launcher_template, &attachment, candidate)
             .map_err(|_| StartDaemonError::Other)?;
-    if host == ManagedHost::Claude
-        && launcher
-            .target(&attachment)
-            .is_none_or(|target| target.claude_profile.is_none())
-    {
-        return Err(StartDaemonError::Other);
-    }
     launcher.verify().map_err(|_| StartDaemonError::Other)?;
     let launcher_path = match runtime.write_launcher(&bytes) {
         Ok(path) => path,
@@ -2816,14 +2745,9 @@ mod tests {
             &worktree.to_string_lossy(),
         ]);
 
-        let (repo_runtime, repo_socket) = claude_rendezvous_paths(&repo).await.unwrap();
-        let (worktree_runtime, worktree_socket) = claude_rendezvous_paths(&worktree).await.unwrap();
+        let repo_runtime = claude_rendezvous_paths(&repo).await.unwrap();
+        let worktree_runtime = claude_rendezvous_paths(&worktree).await.unwrap();
         assert_eq!(repo_runtime, worktree_runtime);
-        assert_eq!(worktree_socket, repo_socket);
-        assert_eq!(
-            repo_socket,
-            repo_runtime.join(agent_ide::assistance::claude_helper::HELPER_SOCKET)
-        );
         // The shortened suffix is the shared key digest's sixteen-hex-character prefix, not any
         // candidate-specific path digest.
         let key = claude_rendezvous_key(&fs::canonicalize(&repo).unwrap()).await;

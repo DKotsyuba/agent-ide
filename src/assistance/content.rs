@@ -247,7 +247,6 @@ mod tests {
             PeerReply::HostStopped {},
             PeerReply::Pending {
                 detail_ref: "detail-queued".into(),
-                helper: None,
             },
             PeerReply::Error {
                 code: FailureCode::Capacity,
@@ -299,45 +298,9 @@ mod tests {
         }
     }
 
-    /// Preserves the helper and detail reference exactly while retaining foreground ordering.
+    /// An expired or unknown detail says to repeat the original call.
     #[test]
-    fn pending_helper_and_reference_are_exact() {
-        let helper = "helper --argument='🦀 value'";
-        let detail_ref = "exact-detail-reference";
-        let rendered = render(
-            PeerReply::Pending {
-                detail_ref: detail_ref.into(),
-                helper: Some(helper.into()),
-            },
-            Envelope::WithStructured,
-        )
-        .unwrap();
-        let text = text_of(&rendered);
-        assert!(text.contains(helper) && text.contains(detail_ref));
-        assert!(text.find(helper).unwrap() < text.find("ide.inspect").unwrap());
-    }
-
-    /// A pending helper instruction says the command must stand alone and how an un-run ticket
-    /// looks, and an expired or unknown detail says to repeat the original call.
-    #[test]
-    fn pending_helper_and_expired_detail_explain_the_recovery() {
-        let pending = render(
-            PeerReply::Pending {
-                detail_ref: "detail-1".into(),
-                helper: Some("agent-ide claude-worker --detail-ref detail-1".into()),
-            },
-            Envelope::TextOnly,
-        )
-        .unwrap();
-        let text = text_of(&pending);
-        assert!(
-            text.contains("agent-ide claude-worker --detail-ref detail-1"),
-            "{text}"
-        );
-        assert!(text.contains("only command of one Bash call"), "{text}");
-        assert!(text.contains("has not been run yet"), "{text}");
-        assert!(text.contains("refused"), "{text}");
-
+    fn expired_detail_explains_the_recovery() {
         let expired = render(
             PeerReply::Error {
                 code: FailureCode::InvalidDetail,

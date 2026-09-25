@@ -404,7 +404,7 @@ pub fn launch_intent(
         intent.command()?,
         &policy,
     )
-    .unwrap();
+    .map_err(|_| GitError::UnsupportedSnapshot)?;
     let mut admissions = AdmissionController::new(AdmissionLimits {
         total_running: 1,
         per_owner_running: 1,
@@ -419,13 +419,8 @@ pub fn launch_intent(
     ) else {
         panic!("bounded runner is admitted")
     };
-    let mut child = OwnedChild::spawn_captured(
-        &request,
-        lease,
-        None,
-        output_cap,
-    )
-    .map_err(|_| GitError::IncompleteIdentity)?;
+    let mut child = OwnedChild::spawn_captured(&request, lease, None, output_cap)
+        .map_err(|_| GitError::IncompleteIdentity)?;
     if intent.snapshot_directory().is_some() {
         intent.bind_process(
             child

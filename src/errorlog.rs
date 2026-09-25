@@ -63,8 +63,6 @@ pub enum Method {
     Stop,
     /// A native pre/post hook observation.
     Hook,
-    /// A Claude foreground helper claim attempt.
-    HelperClaim,
     /// A confined background project check.
     Check,
     /// Daemon process lifecycle (start, stop, idle exit, client lease open/close).
@@ -86,7 +84,6 @@ impl Method {
             Self::Inspect => "inspect",
             Self::Stop => "stop",
             Self::Hook => "hook",
-            Self::HelperClaim => "helper_claim",
             Self::Check => "check",
             Self::Daemon => "daemon",
             Self::Client => "client",
