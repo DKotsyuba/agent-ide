@@ -356,10 +356,14 @@ forbid_text() {
     forbid_transcript_text "$1" "$2" "$3"
 }
 
-# Requires one native Codex file edit (patch apply or file-change item).
+# Requires one native Codex file edit: a patch apply or file-change item, or a
+# successful shell command naming the fixture file, since the L2 prompt allows
+# either apply_patch or the shell.
 require_codex_native_edit() {
-    matched=$(jq -s '[.[] | tostring
-        | select(test("\"file_change\"|apply_patch"))] | length' "$1" 2>>"$DIAG_LOG")
+    matched=$(jq -s '[.[] | select((tostring | test("\"file_change\"|apply_patch"))
+        or ((.item.type? == "command_execution") and (.item.exit_code? == 0)
+            and ((.item.command? // "") | contains("acceptance-fixture/fixture.py"))))]
+        | length' "$1" 2>>"$DIAG_LOG")
     [ "${matched:-0}" -ge 1 ] || {
         note "$2" "no native codex file edit in $(basename -- "$1")"
         record_codex_event_sample "$1"
