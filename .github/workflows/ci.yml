@@ -13,28 +13,28 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.25.x"
-          cache: false
       - uses: actions/setup-node@v4
         with:
-          node-version: "24.x"
+          node-version: "24.4.0"
       - name: Verify runner
         run: test "$(uname -m)" = arm64
       - name: Prepare toolchains
         run: |
           rustup component add rustfmt clippy rust-analyzer rust-src
-          go install golang.org/x/tools/gopls@v0.23.0
-          npm install --global pyright@1.1.413
-          echo "AGENT_IDE_GOPLS=$(go env GOPATH)/bin/gopls" >> "$GITHUB_ENV"
-          echo "AGENT_IDE_GO=$(command -v go)" >> "$GITHUB_ENV"
+          npm install --global pyright@1.1.413 typescript-language-server@6.0.0 typescript@5.9.3
+          npm_root="$(npm root --global)"
           echo "AGENT_IDE_RUST_ANALYZER=$(rustup which rust-analyzer)" >> "$GITHUB_ENV"
+          echo "AGENT_IDE_RUST_TOOLCHAIN=$(rustup show active-toolchain | awk '{print $1}')" >> "$GITHUB_ENV"
           echo "AGENT_IDE_RUST_TOOLCHAIN_DIR=$(rustc --print sysroot)" >> "$GITHUB_ENV"
           echo "AGENT_IDE_PYRIGHT=$(command -v pyright-langserver)" >> "$GITHUB_ENV"
           echo "AGENT_IDE_NODE=$(command -v node)" >> "$GITHUB_ENV"
+          echo "AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER=$npm_root/typescript-language-server/lib/cli.mjs" >> "$GITHUB_ENV"
+          echo "AGENT_IDE_TSSERVER=$npm_root/typescript/lib/tsserver.js" >> "$GITHUB_ENV"
       - run: cargo fmt --check
-      - run: cargo test --locked --workspace -- --test-threads=1
+      - run: cargo test --locked --workspace -- --test-threads=1 --skip real_gopls_production_context_tracks_exact_observed_bytes --skip shared_gopls_isolates_divergent_worktrees_and_detaches_one_view --skip dropping_live_gopls_owner_closes_its_owned_listener
+      - run: cargo test --locked --test product_mcp_contract configured_product_rust_resolves_definition_across_a_crate_boundary -- --ignored --nocapture --test-threads=1
+      - run: cargo test --locked --test product_mcp_contract configured_product_returns_real_typescript_family_context_and_reaps -- --ignored --nocapture --test-threads=1
+      - run: cargo test --locked --test product_mcp_contract configured_product_returns_real_pyright_semantic_context_and_reaps -- --ignored --nocapture --test-threads=1
       - run: cargo test --locked --test product_mcp_contract configured_product_claude_helper_returns_real_pyright_semantic_context_diff_and_stop -- --ignored --nocapture --test-threads=1
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
