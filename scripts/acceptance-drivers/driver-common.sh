@@ -2,15 +2,15 @@
 # Status: refreshed for the current hosts; first passing run pending; see
 # docs/macos-acceptance.md results table.
 
-# Shared helpers for the committed real-host acceptance drivers.
+# Shared functions for the committed real-host acceptance drivers.
 #
 # A driver is executed by scripts/macos-acceptance.sh with no arguments and only
 # the AGENT_IDE_ACCEPTANCE_ROUTE, AGENT_IDE_ACCEPTANCE_LEFT_WORKTREE,
 # AGENT_IDE_ACCEPTANCE_RIGHT_WORKTREE, and AGENT_IDE_ACCEPTANCE_RESULT
-# environment settings. Every helper keeps the public contract closed: the only
-# public success output is the exact nine-line host-cell result document, and
-# every failure is recorded as a closed code in a private diagnostic log that
-# never enters evidence.
+# environment settings. Every function keeps the public contract closed: the
+# only public success output is the exact nine-line host-cell result document,
+# and every failure is recorded as a closed code in a private diagnostic log
+# that never enters evidence.
 
 # Absolute repository root that contains this driver directory.
 DRIVER_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
@@ -52,7 +52,7 @@ canonical_dir() {
 # The first argument is the tested candidate `agent-ide` executable and the
 # second the canonical worktree path. The product derives this identity as
 # BLAKE3 of the raw canonical path bytes, so the driver measures a temporary
-# file holding exactly those bytes with the same `evidence executable` helper
+# file holding exactly those bytes with the same `evidence executable` command
 # the operator uses. Prints nothing and returns nonzero when measurement fails.
 project_identity() {
     identity_tmp=$DIAG_DIR/.path-bytes.$$
@@ -130,20 +130,4 @@ require_compact_replies() {
         | .[] | select(.type == "text") | (.text | length) | select(. > $bound)
         ] | length' "$1" 2>>"$DIAG_LOG")
     [ "${oversized:-1}" -eq 0 ] || { note "$2" "oversized reply text"; return 1; }
-}
-
-# Requires one Bash helper launch to be the immediately next tool use.
-#
-# The Claude foreground helper must be claimed with no native tool post between
-# the minting reply and the launch, so the transcript must show the Bash call as
-# the next tool use event. The first argument is the transcript, the second the
-# minting tool name whose reply mints the helper, and the third a closed code.
-require_helper_immediately_after() {
-    ordered=$(jq -s -r '[.[] | select(.type == "assistant")
-        | .message.content[]? | select(.type == "tool_use") | .name] | join(",")' \
-        "$1" 2>>"$DIAG_LOG")
-    case ",$ordered," in
-        *",$2,Bash,"*) ;;
-        *) note "$3" "Bash helper not immediately after $2 in $(basename -- "$1")"; return 1 ;;
-    esac
 }

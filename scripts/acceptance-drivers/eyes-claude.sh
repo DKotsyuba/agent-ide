@@ -84,7 +84,7 @@ rendezvous_runtime_dir() {
 # One placeholder target (`bind_one_candidate` overwrites its `attachment`/`candidate` per session,
 # EYES-r2 §1); this driver never exercises the v0.2 Go/TypeScript providers. `operation_ms` is generously
 # above the v0.2 unit-test default (1000 ms): a real model needs several real seconds between a
-# `Pending` reply and its own follow-up Bash launch, and the whole foreground-helper ticket expires
+# `pending` reply and its own follow-up `ide.inspect` call, and the whole pending ticket expires
 # at `operation_ms` after mint (`src/assistance/assembly.rs`).
 write_launcher_template() {
     template=$1
@@ -141,21 +141,8 @@ json.dump({'mcpServers': {'agent-ide': {'type': 'stdio', 'command': binary,
     'args': ['mcp', '--claude-launcher-template', launcher]}}}, open(out, 'w'))
 " "$BINARY" "$LAUNCHER" "$MCP_CONFIG"
 
-# Writes the per-repository sandbox settings file allowing exactly that repo's helper socket.
-write_settings() {
-    repo=$1
-    out=$2
-    runtime=$(rendezvous_runtime_dir "$repo")
-    python3 -c "
-import json, sys
-socket, out = sys.argv[1:3]
-json.dump({'sandbox': {'network': {'allowUnixSockets': [socket]}}}, open(out, 'w'))
-" "$runtime/claude-helper.sock" "$out"
-    printf '%s' "$runtime"
-}
-
 # ---------------------------------------------------------------------------
-# Fixture helpers.
+# Fixture setup.
 # ---------------------------------------------------------------------------
 
 # Copies one tracked fixture tree into a fresh disposable git repository.
@@ -187,7 +174,6 @@ run_claude_session() {
     worktree=$2
     prompt=$3
     max_turns=$4
-    settings=$5
     result=$WORKDIR/result-$label.json
     note "session-$label-start" "$worktree"
     ( cd "$worktree" \
@@ -201,7 +187,7 @@ run_claude_session() {
            "$CLAUDE" -p "$(cat "$prompt")" \
              --model "$MODEL" --output-format json --max-turns "$max_turns" \
              --dangerously-skip-permissions --strict-mcp-config --mcp-config "$MCP_CONFIG" \
-             --settings "$settings" --plugin-dir "$DRIVER_ROOT" \
+             --plugin-dir "$DRIVER_ROOT" \
     ) >"$result" 2>"$WORKDIR/stderr-$label.log"
     status=$?
     note "session-$label-exit" "$status"
@@ -220,16 +206,13 @@ session_result_text() {
 scenario_rust() {
     repo=$WORKDIR/rust1
     copy_fixture_repo "$FIXTURES/rust-workspace" "$repo"
-    settings=$WORKDIR/settings-rust1.json
-    write_settings "$repo" "$settings" >/dev/null
     prompt=$WORKDIR/prompt-rust.txt
     cat >"$prompt" <<'EOF'
 Work inside this Rust cargo workspace. Follow these steps in order and do not skip any.
 IMPORTANT: do not call ide.context or any other ide.* tool between step 3 and step 6 - use only
 Bash and your native Edit tool in that range.
-1. Call the ide.start tool with no extra arguments. If its reply is pending with a helper command,
-   run that exact helper command with Bash in the foreground (copy it byte for byte, do not edit
-   it), then call ide.inspect with the same detail_ref to get the final outcome.
+1. Call the ide.start tool with no extra arguments. If its reply is pending, call ide.inspect with
+   the same detail_ref to get the final outcome.
 2. Run Bash: sleep 3
 3. Using your native Edit tool (not any ide.* tool), edit crates/a/src/lib.rs so `combine` takes
    three i32 parameters (x, y, z) and returns their sum, instead of two. Do not open or edit
@@ -250,7 +233,7 @@ PROBLEMS: <the crates/b problem line(s) ide.context returned, or NONE>
 NOOP_BLOCK: <exact <agent-ide> block text from step 7, or NONE>
 TOOLS_CALLED: <comma separated list of every tool name you called, in order>
 EOF
-    run_claude_session rust "$repo" "$prompt" 30 "$settings"
+    run_claude_session rust "$repo" "$prompt" 30
     session_result_text rust
 }
 
@@ -262,16 +245,13 @@ scenario_python_venv() {
     copy_fixture_repo "$FIXTURES/python-pkg" "$repo"
     ( cd "$repo" && "$OPERATOR_HOME/.local/bin/uv" venv --managed-python --python 3.14 .venv \
         >>"$DIAG_LOG" 2>&1 ) || fail E_UV_VENV "$repo"
-    settings=$WORKDIR/settings-py-venv.json
-    write_settings "$repo" "$settings" >/dev/null
     prompt=$WORKDIR/prompt-py-venv.txt
     cat >"$prompt" <<'EOF'
 Work inside this Python package, which has a real .venv already created. Follow these
 steps in order and do not skip any. IMPORTANT: do not call ide.context or any other ide.* tool
 between step 3 and step 6 - use only Bash and your native Edit tool in that range.
-1. Call the ide.start tool with no extra arguments. If its reply is pending with a helper command,
-   run that exact helper command with Bash in the foreground (copy it byte for byte), then call
-   ide.inspect with the same detail_ref to get the final outcome.
+1. Call the ide.start tool with no extra arguments. If its reply is pending, call ide.inspect with
+   the same detail_ref to get the final outcome.
 2. Run Bash: sleep 3
 3. Using your native Edit tool (not any ide.* tool), edit pkg/a.py so `combine` takes three int
    parameters (x, y, z) and returns their sum, instead of two. Do not open or edit pkg/b.py.
@@ -291,7 +271,7 @@ PROBLEMS: <the pkg/b.py problem line(s) ide.context returned, or NONE>
 NOOP_BLOCK: <exact <agent-ide> block text from step 7, or NONE>
 TOOLS_CALLED: <comma separated list of every tool name you called, in order>
 EOF
-    run_claude_session py-venv "$repo" "$prompt" 30 "$settings"
+    run_claude_session py-venv "$repo" "$prompt" 30
     session_result_text py-venv
 }
 
@@ -299,19 +279,16 @@ scenario_python_noenv() {
     repo=$WORKDIR/py-venv
     [ -d "$repo" ] || fail E_PY_NOENV_PRECONDITION "run scenario python-venv first"
     rm -rf "$repo/.venv"
-    settings=$WORKDIR/settings-py-venv.json
-    [ -f "$settings" ] || write_settings "$repo" "$settings" >/dev/null
     prompt=$WORKDIR/prompt-py-noenv.txt
     cat >"$prompt" <<'EOF'
-Call the ide.start tool with no extra arguments. If its reply is pending with a helper command, run
-that exact helper command with Bash in the foreground (copy it byte for byte), then call ide.inspect
-with the same detail_ref. Then run Bash: sleep 3. Then run Bash: echo settle. Then call ide.context
+Call the ide.start tool with no extra arguments. If its reply is pending, call ide.inspect with the
+same detail_ref. Then run Bash: sleep 3. Then run Bash: echo settle. Then call ide.context
 with {"kind":"problems","language":"python"}.
 Finally, reply with exactly these two lines and nothing else:
 START: <ide.start/ide.inspect final outcome text, or ERROR: <what failed>>
 PROBLEMS: <the exact python state/text ide.context returned>
 EOF
-    run_claude_session py-noenv "$repo" "$prompt" 20 "$settings"
+    run_claude_session py-noenv "$repo" "$prompt" 20
     session_result_text py-noenv
 }
 
@@ -324,19 +301,16 @@ scenario_worktree_a() {
     wt_a=$WORKDIR/rust-wt-a
     rm -rf "$wt_a"
     ( cd "$origin" && /usr/bin/git worktree add -q -b wt-a "$wt_a" ) || fail E_WORKTREE_A
-    settings=$WORKDIR/settings-rust-wt.json
-    write_settings "$origin" "$settings" >/dev/null
     prompt=$WORKDIR/prompt-wt-a.txt
     cat >"$prompt" <<'EOF'
-Call the ide.start tool with no extra arguments. If its reply is pending with a helper command, run
-that exact helper command with Bash in the foreground (copy it byte for byte), then call ide.inspect
-with the same detail_ref. Then run Bash: sleep 4. Then call ide.context with {"kind":"problems"} and
+Call the ide.start tool with no extra arguments. If its reply is pending, call ide.inspect with the
+same detail_ref. Then run Bash: sleep 4. Then call ide.context with {"kind":"problems"} and
 note how long the rust check took (duration_ms, or similar) if reported.
 Finally, reply with exactly these two lines and nothing else:
 START: <ide.start/ide.inspect final outcome text, or ERROR: <what failed>>
 PROBLEMS: <the exact text ide.context returned, including any duration/timing fields>
 EOF
-    run_claude_session wt-a "$wt_a" "$prompt" 20 "$settings"
+    run_claude_session wt-a "$wt_a" "$prompt" 20
     session_result_text wt-a
 }
 
@@ -346,19 +320,16 @@ scenario_worktree_b() {
     wt_b=$WORKDIR/rust-wt-b
     rm -rf "$wt_b"
     ( cd "$origin" && /usr/bin/git worktree add -q -b wt-b "$wt_b" ) || fail E_WORKTREE_B
-    settings=$WORKDIR/settings-rust-wt.json
-    [ -f "$settings" ] || write_settings "$origin" "$settings" >/dev/null
     prompt=$WORKDIR/prompt-wt-b.txt
     cat >"$prompt" <<'EOF'
-Call the ide.start tool with no extra arguments. If its reply is pending with a helper command, run
-that exact helper command with Bash in the foreground (copy it byte for byte), then call ide.inspect
-with the same detail_ref. Then run Bash: sleep 4. Then call ide.context with {"kind":"problems"} and
+Call the ide.start tool with no extra arguments. If its reply is pending, call ide.inspect with the
+same detail_ref. Then run Bash: sleep 4. Then call ide.context with {"kind":"problems"} and
 note how long the rust check took (duration_ms, or similar) if reported.
 Finally, reply with exactly these two lines and nothing else:
 START: <ide.start/ide.inspect final outcome text, or ERROR: <what failed>>
 PROBLEMS: <the exact text ide.context returned, including any duration/timing fields>
 EOF
-    run_claude_session wt-b "$wt_b" "$prompt" 20 "$settings"
+    run_claude_session wt-b "$wt_b" "$prompt" 20
     session_result_text wt-b
 }
 
@@ -390,18 +361,15 @@ scenario_idle() {
 scenario_confinement() {
     outside=/private/tmp/aiv3-acc-outside-$$
     copy_fixture_repo "$FIXTURES/rust-workspace" "$outside"
-    settings=$WORKDIR/settings-outside.json
-    write_settings "$outside" "$settings" >/dev/null
     prompt=$WORKDIR/prompt-outside.txt
     cat >"$prompt" <<'EOF'
-Call the ide.start tool with no extra arguments. If its reply is pending with a helper command, run
-that exact helper command with Bash in the foreground (copy it byte for byte), then call ide.inspect
-with the same detail_ref. Then run Bash: sleep 3. Then call ide.context with {"kind":"problems"}.
+Call the ide.start tool with no extra arguments. If its reply is pending, call ide.inspect with the
+same detail_ref. Then run Bash: sleep 3. Then call ide.context with {"kind":"problems"}.
 Finally, reply with exactly these two lines and nothing else:
 START: <ide.start/ide.inspect final outcome text, or ERROR: <what failed>>
 PROBLEMS: <the exact text ide.context returned>
 EOF
-    run_claude_session outside "$outside" "$prompt" 20 "$settings"
+    run_claude_session outside "$outside" "$prompt" 20
     session_result_text outside
     rm -rf "$outside"
 }
