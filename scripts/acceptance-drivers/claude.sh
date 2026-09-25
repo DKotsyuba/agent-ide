@@ -366,7 +366,12 @@ fi
 # Restart-safe telemetry: durable events survive the daemon restart of a fresh
 # session and both query and export read them back through the CLI.
 if selected l4; then
-    TELEMETRY_DB=$OPERATOR_HOME/.agent-ide/telemetry/$LEFT_IDENTITY/state.sqlite
+    # An earlier worktree may own this repository's shared daemon and telemetry database.
+    telemetry_candidate=$(jq -er '.targets[0].candidate | select(type == "string" and startswith("/"))' "$LEFT_RUNTIME/launcher.json") \
+        || fail E_TELEMETRY_CANDIDATE
+    telemetry_identity=$(project_identity "$BINARY" "$telemetry_candidate") \
+        || fail E_TELEMETRY_IDENTITY
+    TELEMETRY_DB=$OPERATOR_HOME/.agent-ide/telemetry/$telemetry_identity/state.sqlite
     [ -f "$TELEMETRY_DB" ] || fail A_TELEMETRY_DB_MISSING "no durable database before restart"
     before_rows=$("$BINARY" telemetry export --database "$TELEMETRY_DB" 2>>"$DIAG_LOG" | wc -l | tr -d ' ')
     [ "${before_rows:-0}" -ge 1 ] || fail A_TELEMETRY_PRE_RESTART_EMPTY "export before restart"

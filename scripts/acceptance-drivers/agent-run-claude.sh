@@ -241,8 +241,9 @@ task_prompt() {
 }
 
 if [ "$AGENT_IDE_ACCEPTANCE_ROUTE" = agent-run-claude ]; then
-    LEFT_RUNTIME=/private/tmp/ai-c-$(printf '%s' "$LEFT_IDENTITY" | cut -c1-16)
-    RIGHT_RUNTIME=/private/tmp/ai-c-$(printf '%s' "$RIGHT_IDENTITY" | cut -c1-16)
+    LEFT_RUNTIME=$("$BINARY" claude-rendezvous "$LEFT" | sed -n 's/^runtime_dir=//p')
+    RIGHT_RUNTIME=$("$BINARY" claude-rendezvous "$RIGHT" | sed -n 's/^runtime_dir=//p')
+    [ -n "$LEFT_RUNTIME" ] && [ -n "$RIGHT_RUNTIME" ] || fail E_CLAUDE_RUNTIME
     prepare_worktree "$LEFT" "$LEFT_RUNTIME"
     prepare_worktree "$RIGHT" "$RIGHT_RUNTIME"
 fi
@@ -280,7 +281,15 @@ require_answer_text l3 "LEFT_TS_OK" A_L3_FINAL
 require_record_text l3 "mode: semantic" A_L3_SEMANTIC
 
 # Restart-safe telemetry across a fresh agent's daemon generation.
-TELEMETRY_DB=$OPERATOR_HOME/.agent-ide/telemetry/$LEFT_IDENTITY/state.sqlite
+if [ "$AGENT_IDE_ACCEPTANCE_ROUTE" = agent-run-claude ]; then
+    telemetry_candidate=$(jq -er '.targets[0].candidate | select(type == "string" and startswith("/"))' "$LEFT_RUNTIME/launcher.json") \
+        || fail E_TELEMETRY_CANDIDATE
+    telemetry_identity=$(project_identity "$BINARY" "$telemetry_candidate") \
+        || fail E_TELEMETRY_IDENTITY
+    TELEMETRY_DB=$OPERATOR_HOME/.agent-ide/telemetry/$telemetry_identity/state.sqlite
+else
+    TELEMETRY_DB=$OPERATOR_HOME/.agent-ide/telemetry/$LEFT_IDENTITY/state.sqlite
+fi
 [ -f "$TELEMETRY_DB" ] || fail A_TELEMETRY_DB_MISSING "no durable database before restart"
 before_rows=$("$BINARY" telemetry export --database "$TELEMETRY_DB" 2>>"$DIAG_LOG" | wc -l | tr -d ' ')
 [ "${before_rows:-0}" -ge 1 ] || fail A_TELEMETRY_PRE_RESTART_EMPTY "export before restart"
