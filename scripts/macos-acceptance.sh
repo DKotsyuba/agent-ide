@@ -152,20 +152,27 @@ verify_toolchains() {
 
 # Runs the focused product gates that collectively cover every accepted-language evidence field.
 #
-# Tests inherit only caller-selected exact tool paths. Each command is fixed, serial, and locked;
-# a first failure returns nonzero without converting partial coverage into a passing evidence row.
+# Tests inherit only caller-selected exact tool paths. The preflight refuses a missing or renamed
+# test: Cargo returns success for a filtered run with zero matches. Each command is fixed, serial,
+# and locked; a first failure cannot become a passing evidence row.
 # The Rust gate is the existing cross-crate rust-analyzer proof; the two locked Go/gopls provider
 # gates are excluded with the language. `divergent_worktrees` is proven by the locked real
 # TypeScript cross-worktree isolation gate, by this runner's verified divergent fixture worktrees,
 # and by the exact real-host driver document.
 run_product_gates() {
-    cargo test --locked --test product_mcp_contract configured_product_rust_resolves_definition_across_a_crate_boundary -- --ignored --nocapture --test-threads=1 || return 1
-    cargo test --locked --test product_mcp_contract configured_product_isolates_typescript_across_two_divergent_worktree_actors -- --ignored --nocapture --test-threads=1 || return 1
-    cargo test --locked --test product_mcp_contract configured_product_returns_real_typescript_family_context_and_reaps -- --ignored --nocapture --test-threads=1 || return 1
-    cargo test --locked --test product_mcp_contract configured_product_returns_real_pyright_semantic_context_and_reaps -- --ignored --nocapture --test-threads=1 || return 1
-    cargo test --locked --test product_mcp_contract configured_product_acceptance_edit_diagnostics_telemetry_and_fallback -- --ignored --nocapture --test-threads=1 || return 1
-    cargo test --locked --test product_mcp_contract configured_product_claude_helper_returns_real_pyright_semantic_context_diff_and_stop -- --ignored --nocapture --test-threads=1 || return 1
-    cargo test --locked --test product_mcp_contract configured_product_claude_helper_returns_real_typescript_semantic_context_and_reaps -- --ignored --nocapture --test-threads=1 || return 1
+    ACCEPTANCE_TEST_LIST=$(cargo test --locked --test product_mcp_contract -- --list) || return 1
+    for ACCEPTANCE_GATE in \
+        configured_product_rust_resolves_definition_across_a_crate_boundary \
+        configured_product_isolates_typescript_across_two_divergent_worktree_actors \
+        configured_product_returns_real_typescript_family_context_and_reaps \
+        configured_product_returns_real_pyright_semantic_context_and_reaps \
+        configured_product_acceptance_edit_diagnostics_telemetry_and_fallback \
+        configured_product_claude_helper_returns_real_pyright_semantic_context_diff_and_stop \
+        configured_product_claude_helper_returns_real_typescript_semantic_context_and_reaps
+    do
+        printf '%s\n' "$ACCEPTANCE_TEST_LIST" | grep -Fxq "$ACCEPTANCE_GATE: test" || return 1
+        cargo test --locked --test product_mcp_contract "$ACCEPTANCE_GATE" -- --ignored --exact --nocapture --test-threads=1 || return 1
+    done
     verify_toolchains || return 1
 }
 
