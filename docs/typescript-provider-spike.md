@@ -45,15 +45,15 @@ record, and the distinct Codex and Claude prefixes cannot substitute for each ot
 prove arbitrary descendant settlement at runtime nor claim that a process group contains every
 descendant.
 
-## Claude foreground-host spike
+## Historical Claude host spike
 
-Claude Code 2.1.267 ran the same pinned stdio bridge in a foreground Bash operation under its
+Claude Code 2.1.267 ran the same pinned stdio bridge in a foreground Bash operation in the historical spike under its
 normal strict macOS sandbox and normal authenticated profile. The exchange returned a semantic
 definition, two references, and a nonempty diagnostic publication, then completed `shutdown`,
 `exit`, EOF, and bridge exit zero. An observer outside the sandbox captured the bridge and direct
 `tsserver.js` PID plus Darwin start-time identities before shutdown and confirmed both exact
 identities absent afterward. The observer did not widen the sandbox or grant process-table access
-inside it. The production helper gate separately reconstructed the bundle from the accepted Claude
+inside it. The production host gate separately reconstructed the bundle from the accepted Claude
 launcher frame, returned semantic TypeScript Context, and reported every direct child reaped.
 
 ## Shipping product fixture
@@ -70,6 +70,6 @@ files under one exact `tsconfig.json` containing `types=[]`, `moduleResolution=n
 `allowJs=true` each returned semantic definitions and references through separate exclusive
 one-shot sessions. Every operation completed the strict graceful session result before the direct
 bridge child was released. A separate `.ts` fixture completed the same semantic Context and
-normal-shutdown path inside the Claude foreground helper. This covers the TypeScript Context and
+normal-shutdown path inside the Claude daemon. This covers the TypeScript Context and
 normal-shutdown subset only; it does not complete the broader v0.2 edit, telemetry, fallback, or
 multi-worktree acceptance matrix.

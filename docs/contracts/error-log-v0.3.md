@@ -7,7 +7,7 @@ Revision: ERRORLOG-r2. Provider: `errorlog`. Direct consumers: Assistance, Check
 
 [Telemetry](telemetry-v0.2.md) stays a bucketed, restart-only, durable, closed-vocabulary count of
 what happened; it deliberately has no per-event detail and no free-form field. The error log exists
-because telemetry alone cannot tell a normal Claude pending/helper/inspect round trip apart from a
+because telemetry alone cannot tell a normal Claude pending/inspect round trip apart from a
 real failure, cannot say *why* a real failure happened, and cannot follow one agent operation across
 several calls. It is a separate, plain, rotated append-only file rather than SQLite so it can be
 read with no daemon running and with none of telemetry's exclusive-writer or migration machinery.
@@ -44,7 +44,7 @@ opts into `info` as well.
 ## Closed vocabulary
 
 Every field is one of: an RFC 3339 UTC timestamp; a closed `level` tag; a closed `method` tag
-(`start`, `context`, `diff`, `edit`, `inspect`, `stop`, `hook`, `helper_claim`, `check`, `daemon`,
+(`start`, `context`, `diff`, `edit`, `inspect`, `stop`, `hook`, `check`, `daemon`,
 `client`, `feed`); a closed `outcome` tag; an optional closed `reason` tag, which is always the most
 specific existing enum variant at the point of failure (for example `BindingUnavailable::MissingPre`,
 `FailureCode::InvalidDetail`, or `UnavailableReason::Fatal`, rendered
@@ -53,10 +53,10 @@ specific existing enum variant at the point of failure (for example `BindingUnav
 `detail` string of at most 160 bytes; and an optional `duration_ms`.
 
 `correlation` is the call id / `detail_ref` / activation id the daemon already has for one
-operation, so one agent action (hook -> mint -> helper claim -> settle -> inspect) can be followed
+operation, so one agent action (hook -> mint -> settle -> inspect) can be followed
 across its several log lines by that one opaque id; it is never source text.
 
-`detail` is never source text, file contents, a diff, a helper command line, a prompt, an
+`detail` is never source text, file contents, a diff, a command line, a prompt, an
 environment value, or an arbitrary OS error string. It is only an opaque id already known to the
 model, existing already-sanitized checker text (`checks::ProblemSnapshot::detail`, itself capped at
 160 bytes), or (for a completed check with no such text) a fixed `errors=<n> warnings=<n>` count
@@ -89,14 +89,6 @@ are ever recorded — never paths or OS error strings. The same closed cause app
 agent-facing `execution_profile` refusal text. An activation whose root, discovered worktree
 root or Git common directory is not below a configured allowed root is refused with reason
 `outside_allowed_roots`; the log never names the path.
-
-T38B: a Claude foreground helper that settles a provider operation as `provider_unavailable` also
-logs its own `<method> failed provider_unavailable` event from the helper process (the helper
-initializes the same per-repository log from its runtime directory). Its `detail` names exactly
-which accepted-provider condition failed, from this closed vocabulary:
-`provider_spawn_refused:<go|rust|python|typescript>`, `provider_child_exit:<go|rust|python|
-typescript>`, and `provider_session_failed:<go|rust|python|typescript>`. Only these class names and
-closed provider tags are ever recorded — never paths, digests, commands, or OS error strings.
 
 ## Failure semantics
 

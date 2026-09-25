@@ -34,7 +34,6 @@ The closed version-one JSON shape is:
         "blake3": "64-hex-digit-accepted-executable-digest"
       },
       "providers": [],
-      "claude_profile": null
     }
   ],
   "allowed_roots": ["/absolute/projects"]
@@ -57,14 +56,11 @@ Go executable as `toolchain` and absent/null `cargo_version` and `rustc_version`
 `rust_cache_priming_disabled_v1` requires a nonempty rustup toolchain selector plus accepted
 nonempty `cargo_version` and `rustc_version` identities. Arbitrary settings objects and
 duplicate language/settings entries are rejected.
-`pyright_defaults_v1` supports Codex and Claude foreground helpers and requires `node` as an accepted executable object whose
+`pyright_defaults_v1` supports Codex and Claude and requires `node` as an accepted executable object whose
 identity exactly matches `toolchain`, with all Rust executable/version fields absent/null. The
 configured Node program runs the accepted absolute `pyright-langserver` script directly; only
 Node's parent directory and the private temporary directory are retained in its environment.
-Claude reconstructs the fixed profile from only these launcher-accepted script and Node paths,
-identities, and BLAKE3 digests, then rechecks the script before the inherited-process Node
-recheck at spawn. This does not change the five MCP tools; helper protocol revision 3 fences
-mixed binaries.
+The daemon rechecks accepted script and Node identities at spawn.
 `typescript_defaults_v1` requires accepted `node` and bridge executable objects plus a
 `typescript` object containing `bridge_bytes`, the exact bridge and TypeScript versions, an
 accepted `tsserver` file (`path`, `blake3`, and `bytes`), a sorted nonempty `closure` of files in
@@ -76,17 +72,14 @@ must also be exactly 24.4.0, 6.0.0, and 5.9.3, and the compiled record fixes the
 bridge, `tsserver.js`, and complete closure byte identities rather than trusting those labels alone.
 The separate Claude cell accepts only
 `macos-26.6.2-node-24.4.0-tls-6.0.0-ts-5.9.3-claude-r3-2026-09-14:<bundle-digest>`.
-Its suffix is the same exact declared-bundle digest as the Codex record, while its distinct prefix
-records independent host acceptance. The field may remain null for a Codex-only target; any
-non-null copied or mismatched record rejects the launcher. Every member is remeasured at startup
+Its suffix is the same exact declared-bundle digest as the Codex record, while its distinct prefix records independent host acceptance. Every member is remeasured at startup
 and immediately before its one-shot child starts.
 `cache_namespace` is a bounded compatibility label, not a filesystem path or
 authority grant. Assistance combines it with the verified durable worktree and
 accepted provider identities to retain a private directory, then supplies only
 that derived directory through the provider's cleared environment. Configuration
 cannot select `HOME` or another writable host path.
-Claude helpers receive the same retained worktree directory after durable Start, but each
-provider process is one-shot and reaped with the helper. Directory retention does not claim a
+Claude provider processes run one-shot in the daemon and are reaped there Directory retention does not claim a
 surviving backend or proven warm opaque provider index.
 
 Limits are explicit: 1–64 queued operations, 1–128 retained details, 1–300000 ms per
@@ -98,8 +91,7 @@ The fourth provider is the immutable `TypeScriptProviderBundleV1` in
 [TYPESCRIPT-r3](contracts/intelligence-v0.2.md). It accepts only an explicit accepted Node,
 bridge, TypeScript closure, and `tsserver.path`; it has no ambient npm/plugin/network discovery.
 Codex and Claude require their separate exact bundle-bound compiled release records. Claude runs
-the closed frame only through its claimed foreground helper; a null Claude record keeps that host
-unavailable without affecting Codex. This is restart-only configuration and never enables a syntax
+the closed frame only through the daemon; a null Claude record keeps that host unavailable without affecting Codex. This is restart-only configuration and never enables a syntax
 server or automatic typing acquisition.
 
 For a configured TypeScript-family document, the observed ancestor `tsconfig.json` or `jsconfig.json`
@@ -216,53 +208,3 @@ change; unavailable states render fixed text (`checks disabled`, `outside allowe
 `{"kind":"problems","language"?,"offset"?}` returns counts and up to 20 problems per call with
 `next_offset`. One `ProjectCheckCompleted` telemetry event (bucketed counts, no paths or messages)
 extends the TELEMETRY-r1 event scope.
-
-## Optional strict Claude operator profile
-
-A target may declare `claude_profile`. Omit it, or set it to `null`, for a Codex-only target: the
-existing configuration and behaviour are unchanged, and Claude execution simply remains
-unavailable for that target.
-
-```json
-"claude_profile": {
-  "enabled": true,
-  "fail_if_unavailable": true,
-  "allow_unsandboxed_commands": false,
-  "no_matching_excluded_commands": true,
-  "scope_declared": true,
-  "platform": "mac_os"
-}
-```
-
-Every field is an operator statement about the host configuration the daemon is trusted to assume;
-none is measured, inferred or mutated by the daemon. A declared profile must be complete and
-strict — `enabled` and `fail_if_unavailable` true, `allow_unsandboxed_commands` false,
-`no_matching_excluded_commands` and `scope_declared` true, and `platform` `mac_os`. A
-declared-but-weakened profile is rejected at load rather than silently downgraded, so an operator
-never believes a partially strict configuration was accepted. `linux` is accepted by the schema but
-never satisfies validation; see `assistance-claude-worker.md`.
-
-Project checks use this accepted profile as their read authority. Optional `read_roots` is an
-array of absolute directory grants; when absent, the existing `scope_declared` assertion grants
-the project tree. `read_denies` defaults to an empty array of absolute path or glob exclusions.
-An explicit grant must contain the whole worktree, and an unresolved grant cannot establish
-coverage. Any `read_denies` entry makes checks `unavailable: read_restricted`, even when it names
-a path outside the worktree: Rust and Python checks also read toolchains and package caches.
-Declare the host's actual read exclusions here, including hidden-file globs. With no exclusions,
-the existing project-check behavior remains available.
-
-On macOS, `scope_declared` also requires Claude's sandbox configuration to allow the exact
-`/private/tmp/ai-r-<repository-key-digest>/claude-helper.sock` path through
-`sandbox.network.allowUnixSockets`. Per EYES-r1 §2, this path is now keyed by the repository (its
-canonical git common directory, or the project root itself outside a git repository), so it is
-shared by every worktree of one repository rather than distinct per worktree. The pending helper
-command exposes the exact runtime directory without disclosing the attachment. Current Claude Code
-does not expand a wildcard in this allowlist, so the operator must add the exact path to
-project-local settings before the next session.
-`allowAllUnixSockets` is outside this strict profile because it grants access to unrelated host
-sockets.
-
-To compute both exact paths for a repository in advance, run
-`agent-ide claude-rendezvous /absolute/path/to/project`: it prints the shared `runtime_dir=` and
-`helper_socket=` paths using the same derivation as the managed MCP server and hook, and creates
-no runtime state.

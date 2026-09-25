@@ -79,7 +79,7 @@ with the existing launcher configuration error.
   adoption check: directory owned by the effective uid, mode 0700, not a symlink, dev/inode
   re-validated after open, lock held, socket answering. This supersedes the v0.2 rule that an
   existing runtime path is never adopted; the operator `allowUnixSockets` entry moves to
-  `/private/tmp/ai-r-<hash>/claude-helper.sock`. An MCP server exiting never terminates or removes
+  `/private/tmp/ai-r-<hash>`. An MCP server exiting never terminates or removes
   a daemon it adopted or spawned.
 - Lease: each MCP server keeps one long-lived `ClientLease` connection open for its lifetime. Lease
   connections are exempt from `ipc.connection_deadline` and are admitted from their own bounded
@@ -88,7 +88,7 @@ with the existing launcher configuration error.
   three seconds; the held-open lease has no connection deadline. EOF releases a lease immediately.
   A managed Claude MCP registers
   its own canonical candidate on that lease and receives a separate opaque attachment, including
-  for the daemon's first worktree. The foreground helper and Workspace still
+  for the daemon's first worktree. The daemon and Workspace still
   validate Git identity and authority before activation. Missing candidates are removed from the
   daemon's additional target map; they cannot redirect another worktree's attachment.
 - Idle: when the lease count is 0 and no check is running, the daemon starts `idle_timeout_s`.
@@ -333,7 +333,7 @@ pub struct ProblemSnapshot { pub language: Language, pub state: CheckState,
 - Trigger predicate (`triggers_check`, T29B §4): Claude keeps the exact
   `Edit`/`Write`/`MultiEdit`/`NotebookEdit`/`Bash` writer allowlist. Codex has no certified writer
   allowlist, so every paired native `PostToolUse` triggers — except this product's own MCP tool
-  names beginning `mcp__agent_ide__` or `mcp__agent-ide__`, whose results the helper just produced
+  names beginning `mcp__agent_ide__` or `mcp__agent-ide__`, whose results the MCP call just produced
   and whose paired native post must stay silent (the managed admission records the call as
   completed, so its own post is a replay and neither triggers a check nor delivers a plate).
   Other servers' MCP tools are deliberately never excluded because they may edit files; a missing
@@ -445,7 +445,7 @@ rust: 3 errors (+2), 5 warnings | python: environment not found
   delivered happens when the hook response is produced (at most once; a lost hook response is not
   retried). When the v0.2 one-shot native feedback is eligible in the same hook response, the block
   is prepended and both are concatenated once within `MAX_FEEDBACK_BYTES`; each is marked delivered
-  independently. A due plate is also delivered on a foreground helper's own `Bash` post hook after
+  independently. A due plate is also delivered on a daemon's own `Bash` post hook after
   its settlement, and on the `PostToolUse` of the Claude MCP tool whose invocation settled (T22B);
   neither triggers a recheck nor advances the native epoch. Claude `ide.*` replies never carry the
   plate, even while one is due.
@@ -487,7 +487,7 @@ the state line are computed before the cap, so only the list is cut. A truncated
 message ends in `…` (T19B). No
 new tool and no new `AssistanceMethod`. The problems kind is answered from the daemon's in-memory
 snapshots for the caller's bound worktree on every host; it is never dispatched to the Claude
-foreground helper and needs no provider.
+daemon and needs no provider.
 
 A language absent from the worktree (T10B: `Unavailable(Disabled)`, §4) contributes no state line
 and no problems at all — omitted exactly as it is from the `<agent-ide>` block, never rendered as
