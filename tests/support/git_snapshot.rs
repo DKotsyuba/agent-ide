@@ -221,7 +221,7 @@ pub fn authority_for(fixture: &GitFixture) -> agent_ide::workspace::authority::A
     let worktree = WorktreeRef::from_discovery(
         fixture.root.clone(),
         fixture.root.clone(),
-        PathBuf::from(".git"),
+        fixture.root.join(".git"),
         1,
     )
     .expect("fixture worktree is valid");
