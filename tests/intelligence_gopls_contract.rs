@@ -16,9 +16,10 @@ use std::{
 use agent_ide::{
     execution::{
         Admission, AdmissionClass, AdmissionController, AdmissionLease, AdmissionLimits,
-        DirectChildReap, LocalExecutionPolicy, OwnedChild, OwnedProtocolChild, OwnerId, ProviderBackendKind,
-        ProviderLeaseAdmission, ProviderLeaseError, ProviderLeaseLimits, ProviderLeaseRegistry,
-        ProviderViewLease, ValidatedExecutionRequest, ValidatedHostInvocation, WorkspaceAuthority,
+        DirectChildReap, LocalExecutionPolicy, OwnedChild, OwnedProtocolChild, OwnerId,
+        ProviderBackendKind, ProviderLeaseAdmission, ProviderLeaseError, ProviderLeaseLimits,
+        ProviderLeaseRegistry, ProviderViewLease, ValidatedExecutionRequest,
+        ValidatedHostInvocation, WorkspaceAuthority,
     },
     intelligence::gopls::{GoplsProfile, SharedGopls, WorktreeRef},
 };
@@ -510,14 +511,7 @@ async fn gopls_spawns_require_exact_registry_authority() {
             .take_forwarder_spawn_lease(&mut admission, view, &forwarder_request, process)
             .unwrap();
         let error = shared
-            .open_view(
-                worktree.clone(),
-                1,
-                &wrong,
-                capability,
-                None,
-                64,
-            )
+            .open_view(worktree.clone(), 1, &wrong, capability, None, 64)
             .err()
             .expect("forwarder authority mismatch must fail");
         let agent_ide::execution::ProcessError::NeverStarted { cause, settlement } = error else {

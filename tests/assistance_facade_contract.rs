@@ -65,7 +65,10 @@ fn discovery_is_static_and_contains_exactly_six_current_methods() {
             .iter()
             .all(|schema| schema.input_schema["additionalProperties"] == false)
     );
-    let start = schemas.iter().find(|schema| schema.name == "ide.start").unwrap();
+    let start = schemas
+        .iter()
+        .find(|schema| schema.name == "ide.start")
+        .unwrap();
     assert!(start.input_schema["properties"]["root"].is_object());
 }
 
@@ -111,8 +114,20 @@ fn published_schemas_are_plain_objects_without_composition_keywords() {
 #[test]
 fn validation_rejects_unknown_identity_and_requires_stable_operation_and_detail_ids() {
     assert!(validate_call(AssistanceTool::Start, json!({"activation_id":"activate-1"})).is_ok());
-    assert!(validate_call(AssistanceTool::Start, json!({"activation_id":"activate-1","root":"/tmp/project"})).is_ok());
-    assert!(validate_call(AssistanceTool::Start, json!({"activation_id":"activate-1","root":"relative/project"})).is_err());
+    assert!(
+        validate_call(
+            AssistanceTool::Start,
+            json!({"activation_id":"activate-1","root":"/tmp/project"})
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_call(
+            AssistanceTool::Start,
+            json!({"activation_id":"activate-1","root":"relative/project"})
+        )
+        .is_err()
+    );
     assert!(validate_call(AssistanceTool::Inspect, json!({"detail_ref":"detail-1"})).is_ok());
     assert!(validate_call(AssistanceTool::Start, json!({"actor_id":"forged"})).is_err());
     assert!(validate_call(AssistanceTool::Stop, json!({"authority":"forged"})).is_err());

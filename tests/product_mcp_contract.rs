@@ -4192,7 +4192,8 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
 #[tokio::test]
 async fn configured_product_start_enforces_allowed_roots_and_accepts_root_argument() {
     let outside = ProductFixture::new(json!([]));
-    let mut config: Value = serde_json::from_slice(&std::fs::read(&outside.config).unwrap()).unwrap();
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&outside.config).unwrap()).unwrap();
     config["allowed_roots"] = json!([]);
     std::fs::write(&outside.config, config.to_string()).unwrap();
     let mut daemon = outside.daemon().await;
@@ -4540,9 +4541,7 @@ async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
 async fn configured_product_pyright_semantics_and_checks() {
-    let fixture = ProductFixture::new(json!([accepted_pyright_provider(
-        "pyright-check-cache"
-    )]));
+    let fixture = ProductFixture::new(json!([accepted_pyright_provider("pyright-check-cache")]));
     std::fs::write(
         fixture.root.join("main.py"),
         "def value() -> int:\n    return \"bad\"\n",
@@ -4571,10 +4570,7 @@ async fn configured_product_pyright_semantics_and_checks() {
     let started = actor.settle(&fixture, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
     let plate = carried_status(&started).expect("activation check plate");
-    assert!(
-        plate.starts_with("<agent-ide>\nrust:"),
-        "{plate}"
-    );
+    assert!(plate.starts_with("<agent-ide>\nrust:"), "{plate}");
     await_eyes_check_start(&home).await;
     let context = actor
         .call(&fixture, "ide.context", json!({"path":"main.py"}))
@@ -5161,12 +5157,7 @@ async fn configured_product_typescript_membership_falls_back_after_dependencies_
         "{\"compilerOptions\":{\"types\":[],\"moduleResolution\":\"node10\"},\"files\":[\"source/utils/normalize.ts\"]}\n",
     )
     .unwrap();
-    fixture.git(&[
-        "add",
-        "--",
-        "source/utils/normalize.ts",
-        "tsconfig.json",
-    ]);
+    fixture.git(&["add", "--", "source/utils/normalize.ts", "tsconfig.json"]);
     fixture.git(&["commit", "--quiet", "-m", "TypeScript fixture"]);
     let restricted = fixture.state();
     let mut daemon = fixture.daemon().await;
@@ -8118,10 +8109,7 @@ async fn eyes_admitted_starts_schedule_project_checks() {
     let claude_home = enable_fake_rust_checks(&claude, &claude.base);
     let mut daemon = claude.daemon_with_home(Some(&claude_home)).await;
     let (mut actor, plate) = eyes_claude_actor(&claude, "claude-unrestricted-eyes").await;
-    assert!(
-        plate.starts_with("<agent-ide>\nrust:"),
-        "{plate}"
-    );
+    assert!(plate.starts_with("<agent-ide>\nrust:"), "{plate}");
     await_eyes_check_start(&claude_home).await;
     let stopped = actor.call_claude(&claude, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
@@ -8153,10 +8141,7 @@ async fn eyes_admitted_starts_schedule_project_checks() {
     .await;
     assert_eq!(started["kind"], "activation", "{started}");
     let plate = carried_status(&started).expect("Codex activation carries a status plate");
-    assert!(
-        plate.starts_with("<agent-ide>\nrust:"),
-        "{plate}"
-    );
+    assert!(plate.starts_with("<agent-ide>\nrust:"), "{plate}");
     await_eyes_check_start(&codex_home).await;
     mcp.close().await;
 }
@@ -8187,10 +8172,7 @@ async fn eyes_codex_legacy_sandbox_metadata_keeps_project_checks_available() {
     let started = actor.settle(&fixture, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
     let plate = carried_status(&started).expect("activation carries a check plate");
-    assert!(
-        plate.starts_with("<agent-ide>\nrust:"),
-        "{plate}"
-    );
+    assert!(plate.starts_with("<agent-ide>\nrust:"), "{plate}");
     await_eyes_check_start(&home).await;
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");

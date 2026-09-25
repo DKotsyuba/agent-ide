@@ -379,9 +379,7 @@ async fn discovery_can_be_cancelled_without_losing_query_or_release_evidence() {
         Admission::Granted(lease) => lease,
         _ => panic!("discovery slot"),
     };
-    let mut child = request
-        .spawn(lease, bound.fresh())
-        .unwrap();
+    let mut child = request.spawn(lease, bound.fresh()).unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
         while !fixture.0.join("discovery-ready").exists() {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -511,16 +509,11 @@ async fn settled_snapshot(
         _ => panic!("previous snapshot retained a reservation"),
     };
     let active = bound.fresh();
-    let completed = OwnedChild::spawn_captured(
-        &bound.request,
-        lease,
-        Some(active),
-        128,
-    )
-    .unwrap()
-    .reap(Duration::from_secs(1), Duration::from_secs(1))
-    .await
-    .unwrap();
+    let completed = OwnedChild::spawn_captured(&bound.request, lease, Some(active), 128)
+        .unwrap()
+        .reap(Duration::from_secs(1), Duration::from_secs(1))
+        .await
+        .unwrap();
     admission.release_reaped(completed.settlement).unwrap();
     completed.evidence
 }
@@ -596,12 +589,7 @@ async fn definite_no_child_settlement_is_not_repeatable() {
         _ => panic!("slot"),
     };
     fs::remove_file(program).unwrap();
-    let (_, first) = never_started(
-        request
-            .spawn(lease, bound.fresh())
-            .err()
-            .unwrap(),
-    );
+    let (_, first) = never_started(request.spawn(lease, bound.fresh()).err().unwrap());
     assert_eq!(admission.running_count(), 1);
     admission.settle_never_started(first).unwrap();
     assert_eq!(admission.running_count(), 0);
@@ -650,13 +638,8 @@ async fn captured_wait_identity_is_bound_to_the_exact_child() {
             panic!()
         };
         let active = bound.fresh();
-        let mut child = OwnedChild::spawn_captured(
-            &bound.request,
-            lease,
-            Some(active),
-            64,
-        )
-        .unwrap();
+        let mut child =
+            OwnedChild::spawn_captured(&bound.request, lease, Some(active), 64).unwrap();
         identities.push(child.take_process_identity().unwrap());
         assert!(child.take_process_identity().is_none());
         completed.push(
