@@ -569,8 +569,12 @@ impl Writer {
             options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
         let mut file = options.open(&path)?;
-        file.write_all(line)?;
-        file.write_all(b"\n")
+        // One write per record: daemon and client processes append to the same file, and a
+        // separate newline write lets another process land between a record and its newline.
+        let mut record = Vec::with_capacity(line.len() + 1);
+        record.extend_from_slice(line);
+        record.push(b'\n');
+        file.write_all(&record)
     }
 }
 
@@ -946,6 +950,28 @@ mod tests {
                 0o700
             );
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Independent writers stand in for the daemon and client processes sharing one file: no
+    /// record may be split from its newline by another writer's record.
+    #[test]
+    fn concurrent_writers_never_join_two_records_on_one_line() {
+        let dir = temp_dir("concurrent");
+        let line = br#"{"ts":"1970-01-01T00:00:00Z","method":"hook","outcome":"unavailable"}"#;
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let writer = Writer::new(dir.clone());
+                scope.spawn(move || {
+                    for _ in 0..500 {
+                        writer.append(line);
+                    }
+                });
+            }
+        });
+        let contents = fs::read_to_string(dir.join(LOG_FILE_NAME)).unwrap();
+        assert_eq!(contents.lines().count(), 2000);
+        assert!(contents.lines().all(|record| record.as_bytes() == line));
         let _ = fs::remove_dir_all(&dir);
     }
 
