@@ -63,14 +63,15 @@ pub(crate) fn is_self_mcp_tool_name(tool_name: Option<&str>) -> bool {
 /// entries are its read-only file tools. Only exact names are listed; every other name, including
 /// any MCP tool of another server, stays a possible writer.
 const INERT_CODEX_TOOLS: [&str; 2] = ["clocksleep", "clockcurr_time"];
+/// Claude's read-only file tools; see [`INERT_CODEX_TOOLS`] for the exact-name rule.
 const INERT_CLAUDE_TOOLS: [&str; 3] = ["Read", "Grep", "Glob"];
 
 /// Reports whether one native post may have changed the worktree, so it must advance the binding's
 /// native epoch (invalidating retained Context/Diff results) and may schedule a check.
 ///
-/// A missing or unrecognized name counts as a possible writer; only [`INERT_CODEX_TOOLS`] /
-/// [`INERT_CLAUDE_TOOLS`] are excluded, so waiting or reading between `ide.*` calls never discards
-/// a result the agent has not retrieved yet.
+/// A missing or unrecognized name counts as a possible writer; only the exact per-host inert names
+/// are excluded, so waiting or reading between `ide.*` calls never discards a result the agent has
+/// not retrieved yet.
 pub fn may_write(host: HostKind, tool_name: Option<&str>) -> bool {
     let inert: &[&str] = match host {
         HostKind::Claude => &INERT_CLAUDE_TOOLS,
