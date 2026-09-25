@@ -1,7 +1,6 @@
 use agent_ide::assistance::host_binding::{
     BindingStatus, BindingUnavailable, ChannelSessionRef, HookPhase, HostBindingGuard, HostKind,
-    SandboxStateProvenance, parse_candidate, parse_channel_session, parse_claude_hook_event,
-    parse_hook_event, parse_observed_sandbox_state,
+    parse_candidate, parse_channel_session, parse_claude_hook_event, parse_hook_event,
 };
 use serde_json::json;
 
@@ -190,60 +189,6 @@ fn stop_revokes_old_refs_and_later_explicit_start_gets_a_fresh_generation() {
     assert!(matches!(
         guard.check_active(restarted.binding_ref()),
         Err(BindingUnavailable::InactiveBinding)
-    ));
-}
-
-#[test]
-fn observed_sandbox_state_requires_active_use_and_preserves_nested_object() {
-    let mut guard = HostBindingGuard::default();
-    let channel = channel("channel-a");
-    assert!(matches!(
-        guard.observe_hook(
-            hook("PreToolUse", "session_id", "actor", "call"),
-            channel.clone(),
-        ),
-        BindingStatus::PreObserved
-    ));
-    let BindingStatus::Validated(invocation) =
-        guard.establish_start(candidate("actor", "call"), channel)
-    else {
-        panic!("explicit start must validate");
-    };
-    let active_use = guard.consume_active(invocation.binding_ref()).unwrap();
-    let observed = parse_observed_sandbox_state(
-        json!({
-            "codex/sandbox-state-meta": {
-                "permissionProfile": "managed",
-                "codexLinuxSandboxExe": { "opaque": true },
-                "sandboxCwd": "/private/tmp/fixture",
-                "useLegacyLandlock": false,
-                "nested": { "preserved": [1, 2, 3] },
-            }
-        })
-        .as_object()
-        .unwrap(),
-        &invocation,
-        &active_use,
-        true,
-    )
-    .unwrap();
-    assert_eq!(observed.actor_id(), "actor");
-    assert_eq!(observed.call_id(), "call");
-    assert_eq!(observed.binding_ref(), invocation.binding_ref());
-    assert_eq!(
-        observed.provenance(),
-        SandboxStateProvenance::AdvertisedAndReturned
-    );
-    assert_eq!(observed.state().as_json()["nested"]["preserved"][2], 3);
-    assert!(!format!("{observed:?}").contains("preserved"));
-    assert!(matches!(
-        parse_observed_sandbox_state(
-            json!({}).as_object().unwrap(),
-            &invocation,
-            &active_use,
-            false,
-        ),
-        Err(BindingUnavailable::CapabilityNotAdvertised)
     ));
 }
 

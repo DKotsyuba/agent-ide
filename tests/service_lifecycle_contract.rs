@@ -177,42 +177,16 @@ fn write_launcher_template_with_idle_timeout_s(
     candidate: &Path,
     idle_timeout_s: Option<u64>,
 ) -> PathBuf {
-    use agent_ide::execution::{D03ProfileEvidence, HostSandboxState, PersistedProfileRecord};
-    let sandbox_state = json!({
-        "permissionProfile": {"type": "disabled"},
-        "codexLinuxSandboxExe": null,
-        "sandboxCwd": candidate,
-        "useLegacyLandlock": false
-    });
-    let state = HostSandboxState::parse(Some(sandbox_state.clone())).unwrap();
-    let record = PersistedProfileRecord::from_execution_evidence(
-        "service-lifecycle-fixture-disabled",
-        1,
-        D03ProfileEvidence {
-            provider_binary: "fixture-git".into(),
-            toolchain: "fixture-toolchain".into(),
-            configuration: "fixture-v1".into(),
-            trust: "explicit-test-only-disabled".into(),
-            transport: "direct-fixture".into(),
-            d03_evidence: "fixture-only-not-host-certification".into(),
-        },
-        &state,
-    )
-    .unwrap();
+    let allowed_root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
     let mut config = json!({
         "version": 1,
         "limits": {"queued": 16, "details": 64, "operation_ms": 120000, "output_bytes": 1048576},
+        "allowed_roots": [allowed_root],
         "targets": [{
             "attachment": "private-host-channel",
             "candidate": candidate,
             "git": accepted_program("/usr/bin/git", "fixture-git"),
-            "codex": accepted_program("/usr/bin/true", "unused-disabled-wrapper"),
             "providers": [],
-            "profiles": [{
-                "record": serde_json::from_str::<Value>(&record.to_json()).unwrap(),
-                "sandbox_state": sandbox_state
-            }],
-            "allow_disabled_host": true,
             "claude_profile": {
                 "enabled": true,
                 "fail_if_unavailable": true,

@@ -664,34 +664,6 @@ async fn binary_routes_six_methods_to_typed_missing_peer_and_survives_daemon_los
     std::fs::remove_dir_all(runtime).unwrap();
 }
 
-/// Starts a disposable daemon, waiting for its real Unix endpoint under a bounded test deadline.
-async fn daemon(runtime: &Path) -> Child {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
-        .args(["daemon", "--runtime-dir"])
-        .arg(runtime)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if UnixStream::connect(runtime.join("agent-ide.sock"))
-                .await
-                .is_ok()
-            {
-                break;
-            }
-            assert!(child.try_wait().unwrap().is_none());
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    child
-}
-
 /// Starts the real hook process; callers own stdin closure and bounded completion checks.
 fn hook_process(runtime: &Path, attachment: Option<&str>) -> Child {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
@@ -935,8 +907,9 @@ fn boundary(response: &Value, expected: &str) {
 /// Proves parallel root/child calls with identical arguments and call IDs remain actor-scoped through stop.
 #[tokio::test]
 async fn binary_codex_hooks_bind_exact_parallel_actors_and_stop_before_workspace() {
-    let runtime = runtime();
-    let mut daemon = daemon(&runtime).await;
+    let fixture = ProductFixture::new(json!([]));
+    let runtime = fixture.runtime.clone();
+    let mut daemon = fixture.daemon().await;
     let (mut root, mut child) = tokio::join!(
         Mcp::start(&runtime, Some("private-host-channel")),
         Mcp::start(&runtime, Some("private-host-channel"))
@@ -947,7 +920,7 @@ async fn binary_codex_hooks_bind_exact_parallel_actors_and_stop_before_workspace
         root.exchange(host_call("root", "only-root", "ide.start")),
         child.exchange(host_call("child", "only-root", "ide.start"))
     );
-    boundary(&root_reply, "workspace_activation");
+    boundary(&root_reply, "pending");
     boundary(&child_reply, "host_binding");
     hook(&runtime, "PostToolUse", "session_id", "root", "only-root").await;
     // Both actors supply their own exact lifecycle, with identical call/JSON-RPC correlations.
@@ -959,8 +932,8 @@ async fn binary_codex_hooks_bind_exact_parallel_actors_and_stop_before_workspace
         root.exchange(host_call("root", "parallel", "ide.start")),
         child.exchange(host_call("child", "parallel", "ide.start"))
     );
-    boundary(&root_reply, "workspace_activation");
-    boundary(&child_reply, "workspace_activation");
+    boundary(&root_reply, "pending");
+    boundary(&child_reply, "pending");
     tokio::join!(
         hook(&runtime, "PostToolUse", "session_id", "root", "parallel"),
         hook(&runtime, "PostToolUse", "agent_id", "child", "parallel")
@@ -986,13 +959,13 @@ async fn binary_codex_hooks_bind_exact_parallel_actors_and_stop_before_workspace
         child.exchange(host_call("child", "after-stop", "ide.context"))
     );
     boundary(&root_reply, "host_binding");
-    boundary(&child_reply, "workspace_activation");
+    boundary(&child_reply, "pending");
     hook(&runtime, "PreToolUse", "session_id", "root", "restart").await;
     boundary(
         &root
             .exchange(host_call("root", "restart", "ide.start"))
             .await,
-        "workspace_activation",
+        "pending",
     );
     // Duplicate and premature post observations cannot be repaired by a subsequent MCP call.
     for (call, second_phase) in [("duplicate", "PreToolUse"), ("early-post", "PostToolUse")] {
@@ -1692,8 +1665,9 @@ async fn post_ack(runtime: &Path, actor: &str, call: &str) -> Value {
 /// Active ordinary-tool hook lifecycles produce bounded recheck hints, including failed commands.
 #[tokio::test]
 async fn binary_active_native_hooks_accept_edits_deletes_renames_and_failed_commands() {
-    let runtime = runtime();
-    let mut daemon = daemon(&runtime).await;
+    let fixture = ProductFixture::new(json!([]));
+    let runtime = fixture.runtime.clone();
+    let mut daemon = fixture.daemon().await;
     let mut mcp = Mcp::start(&runtime, Some("private-host-channel")).await;
     hook(&runtime, "PreToolUse", "session_id", "actor", "inactive").await;
     assert_eq!(
@@ -1703,7 +1677,7 @@ async fn binary_active_native_hooks_accept_edits_deletes_renames_and_failed_comm
     hook(&runtime, "PreToolUse", "session_id", "actor", "start").await;
     boundary(
         &mcp.exchange(host_call("actor", "start", "ide.start")).await,
-        "workspace_activation",
+        "pending",
     );
     assert_eq!(
         post_ack(&runtime, "actor", "start").await["state"],
@@ -1763,9 +1737,9 @@ async fn binary_active_native_hooks_accept_edits_deletes_renames_and_failed_comm
     std::fs::remove_dir_all(runtime).unwrap();
 }
 
-/// Preserves measured nested sandbox fields through real MCP ingress and renders a bounded pending envelope.
+/// Ignores removed sandbox metadata while rendering a bounded pending envelope.
 #[tokio::test]
-async fn binary_preserves_sandbox_metadata_and_renders_closed_pending() {
+async fn binary_ignores_sandbox_metadata_and_renders_closed_pending() {
     use tokio::net::UnixListener;
     let runtime = runtime();
     std::fs::create_dir(&runtime).unwrap();
@@ -1781,10 +1755,7 @@ async fn binary_preserves_sandbox_metadata_and_renders_closed_pending() {
         let mut bytes = vec![0; size as usize];
         stream.read_exact(&mut bytes).await.unwrap();
         let frame: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            frame["params_json"]["host_meta"]["codex/sandbox-state-meta"],
-            state
-        );
+        assert!(frame["params_json"]["host_meta"]["codex/sandbox-state-meta"].is_null());
         assert_eq!(
             frame["params_json"]["parameters"],
             json!({"activation_id":"same-activation"})
@@ -1911,7 +1882,7 @@ async fn configured_daemon_opens_workspace_once_after_exclusive_lock() {
     std::fs::remove_file(config).unwrap();
 }
 
-/// Owns a configured product daemon's private Git worktree and accepted test-only disabled profile.
+/// Owns a configured product daemon's private Git worktree and admitted temporary root.
 struct ProductFixture {
     /// Unique private parent removed only after this fixture's daemon has exited.
     base: PathBuf,
@@ -2018,68 +1989,13 @@ impl ProductFixture {
             .unwrap();
         assert!(output.status.success(), "fixture Git failed");
     }
-    /// Writes only synthetic fixture acceptance records; this is not live Codex/D03 certification.
-    ///
-    /// `claude_profile` is `None` for every existing Codex-shaped fixture, keeping their emitted
-    /// config byte-for-byte free of the new field; a Claude fixture supplies the strict test-only
-    /// operator profile asserted by
-    /// [`agent_ide::assistance::claude_worker::ClaudeOperatorProfile::validate`].
+    /// Writes launcher configuration admitting the fixture parent and selected providers.
+    /// A Claude fixture also supplies the strict operator profile required by Claude targets.
     fn write_config(&self, providers: Value, claude_profile: Option<Value>) {
-        use agent_ide::execution::{D03ProfileEvidence, HostSandboxState, PersistedProfileRecord};
-        let state = HostSandboxState::parse(Some(self.state())).unwrap();
-        let record = PersistedProfileRecord::from_execution_evidence(
-            "product-fixture-disabled",
-            1,
-            D03ProfileEvidence {
-                provider_binary: "fixture-git".into(),
-                toolchain: "fixture-toolchain".into(),
-                configuration: "fixture-v1".into(),
-                trust: "explicit-test-only-disabled".into(),
-                transport: "direct-fixture".into(),
-                d03_evidence: "fixture-only-not-host-certification".into(),
-            },
-            &state,
-        )
-        .unwrap();
-        let mut config = json!({"version":1,"limits":{"queued":16,"details":64,"operation_ms":120000,"output_bytes":1048576},"targets":[{"attachment":"private-host-channel","candidate":self.root,"git":accepted_program("/usr/bin/git","fixture-git"),"codex":accepted_program("/usr/bin/true","unused-disabled-wrapper"),"providers":providers,"profiles":[{"record":serde_json::from_str::<Value>(&record.to_json()).unwrap(),"sandbox_state":self.state()}],"allow_disabled_host":true}]});
+        let mut config = json!({"version":1,"limits":{"queued":16,"details":64,"operation_ms":120000,"output_bytes":1048576},"allowed_roots":[self.base],"targets":[{"attachment":"private-host-channel","candidate":self.root,"git":accepted_program("/usr/bin/git","fixture-git"),"providers":providers}]});
         if let Some(claude_profile) = claude_profile {
             config["targets"][0]["claude_profile"] = claude_profile;
         }
-        std::fs::write(&self.config, config.to_string()).unwrap();
-    }
-    /// Replaces the disabled-host profile with a managed template for a narrower live deny-glob state.
-    fn write_managed_profile(&self, template: &Value) {
-        use agent_ide::execution::{D03ProfileEvidence, HostSandboxState, PersistedProfileRecord};
-        let parsed = HostSandboxState::parse(Some(template.clone())).unwrap();
-        let record = PersistedProfileRecord::from_execution_evidence_v2(
-            "product-fixture-managed",
-            1,
-            D03ProfileEvidence {
-                provider_binary: "fixture-git".into(),
-                toolchain: "fixture-toolchain".into(),
-                configuration: "fixture-v1".into(),
-                trust: "explicit-test-only-managed".into(),
-                transport: "managed-fixture".into(),
-                d03_evidence: "fixture-only-not-host-certification".into(),
-            },
-            &parsed,
-        )
-        .unwrap();
-        let mut config: Value =
-            serde_json::from_slice(&std::fs::read(&self.config).unwrap()).unwrap();
-        config["targets"][0]["profiles"] = json!([{
-            "record": serde_json::from_str::<Value>(&record.to_json()).unwrap(),
-            "sandbox_state": template
-        }]);
-        let shim = self.base.join("codex-sandbox-shim");
-        std::fs::write(
-            &shim,
-            "#!/bin/sh\n[ \"$1\" = sandbox ] || exit 64\nshift 4\nexec \"$@\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
-        config["targets"][0]["codex"] =
-            accepted_program(shim.to_str().unwrap(), "fixture-codex-shim");
         std::fs::write(&self.config, config.to_string()).unwrap();
     }
     /// Returns the current fixture's complete measured-state-shaped payload outside model arguments.
@@ -3431,44 +3347,6 @@ async fn managed_codex_lease_keeps_daemon_alive_past_idle_timeout() {
     mcp.close().await;
 }
 
-/// A disabled host refused by launcher policy exposes only its existing closed cause to the model.
-#[tokio::test]
-async fn managed_codex_execution_profile_refusal_names_host_disabled() {
-    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
-    let fixture = ProductFixture::new(json!([]));
-    let mut config: Value =
-        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
-    config["targets"][0]["allow_disabled_host"] = json!(false);
-    std::fs::write(&fixture.config, config.to_string()).unwrap();
-    let mut mcp = Mcp::start_managed(&fixture.config, &fixture.root).await;
-    let state = fixture.state();
-    let mut next = 10;
-    let mut reply = mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.start","arguments":{"activation_id":"refused"},"_meta":{"threadId":"disabled-host","callId":format!("disabled-host-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":state}}})).await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while reply["result"]["structuredContent"]["state"] == "pending" {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "profile refusal did not settle"
-        );
-        let reference = reply["result"]["structuredContent"]["detail_ref"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        next += 1;
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        reply = mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.inspect","arguments":{"detail_ref":reference},"_meta":{"threadId":"disabled-host","callId":format!("disabled-host-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":state}}})).await;
-    }
-    assert_eq!(
-        reply["result"]["structuredContent"]["state"], "error",
-        "{reply}"
-    );
-    assert_eq!(
-        reply["result"]["content"][0]["text"],
-        "error: execution_profile (host_disabled); continue with native tools"
-    );
-    mcp.close().await;
-}
-
 /// A publication failure (unusable rendezvous root) never touches managed MCP replies.
 #[tokio::test]
 async fn managed_codex_publication_failure_leaves_replies_working() {
@@ -4154,63 +4032,6 @@ async fn managed_claude_hook_relies_on_its_cached_key_not_a_live_git_probe() {
     mcp.close().await;
 }
 
-/// A reused Start with unusable sandbox metadata is refused without disturbing the live binding.
-///
-/// The dispatcher stops a binding a failing Start *created*, which is right for a first call: no
-/// generation may survive metadata it could not validate. The regression is the second case. Once
-/// an actor is already active, the same actor's later Start reuses that existing generation, so
-/// tearing it down on a metadata failure would revoke live authority the model never gave up. Here
-/// the refused reuse must leave the original binding and its Workspace generation fully usable.
-#[tokio::test]
-async fn configured_product_refuses_a_reused_start_with_unusable_sandbox_metadata() {
-    let fixture = ProductFixture::new(json!([]));
-    let mut daemon = fixture.daemon().await;
-    let mut actor = ProductActor::new(&fixture, "sandbox-reuse-root").await;
-    let started = actor
-        .call(
-            &fixture,
-            "ide.start",
-            json!({"activation_id":"first-start"}),
-        )
-        .await;
-    let started = actor.settle(&fixture, started).await;
-    assert_eq!(started["kind"], "activation", "{started}");
-
-    // The same live actor reuses its binding and this time carries unusable measured state.
-    let valid = std::mem::replace(&mut actor.state, json!({"permissionProfile":null}));
-    let refused = actor
-        .call(
-            &fixture,
-            "ide.start",
-            json!({"activation_id":"invalid-metadata"}),
-        )
-        .await;
-    assert_eq!(
-        refused["code"], "sandbox_state",
-        "a Start whose measured host state cannot be validated must be refused: {refused}"
-    );
-
-    // The original generation is untouched: it still reads source and still stops cleanly.
-    actor.state = valid;
-    let live = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"src/lib.rs","byte_offset":0}),
-        )
-        .await;
-    let live = actor.settle(&fixture, live).await;
-    assert_eq!(
-        live["kind"], "context",
-        "the refused reuse must not revoke the live binding: {live}"
-    );
-    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
-    assert_eq!(stopped["kind"], "stop", "{stopped}");
-    actor.mcp.close().await;
-    daemon.kill().await.unwrap();
-    daemon.wait().await.unwrap();
-}
-
 /// Bounded host binding generations one daemon retains, mirroring `host_binding::MAX_BINDINGS`.
 const MAX_HOST_BINDINGS: usize = 64;
 
@@ -4343,13 +4164,6 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
     );
     assert!(context["text"].as_str().unwrap().contains("pub fn value"));
     let old_context = context["detail_ref"].as_str().unwrap().to_owned();
-    actor.state["useLegacyLandlock"] = json!(true);
-    let denied = actor
-        .call(&fixture, "ide.inspect", json!({"detail_ref":old_context}))
-        .await;
-    assert_eq!(denied["code"], "execution_profile");
-    actor.state["useLegacyLandlock"] = json!(false);
-
     // Registers a real durable observation for the exact path the diff snapshot below also
     // covers, so the product worker's `ProductSnapshotRunner::current_observation` must load and
     // confirm it from the durable store during the diff capture that follows, not merely accept
@@ -4461,6 +4275,43 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
     daemon.wait().await.unwrap();
 }
 
+/// Rejects an empty root policy and accepts an explicit start root below an admitted root.
+#[tokio::test]
+async fn configured_product_start_enforces_allowed_roots_and_accepts_root_argument() {
+    let outside = ProductFixture::new(json!([]));
+    let mut config: Value = serde_json::from_slice(&std::fs::read(&outside.config).unwrap()).unwrap();
+    config["allowed_roots"] = json!([]);
+    std::fs::write(&outside.config, config.to_string()).unwrap();
+    let mut daemon = outside.daemon().await;
+    let mut actor = ProductActor::new(&outside, "outside-roots").await;
+    let refused = actor
+        .call(&outside, "ide.start", json!({"activation_id":"outside"}))
+        .await;
+    let refused = actor.settle(&outside, refused).await;
+    assert_eq!(refused["code"], "outside_allowed_roots", "{refused}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+
+    let allowed = ProductFixture::new(json!([]));
+    let mut daemon = allowed.daemon().await;
+    let mut actor = ProductActor::new(&allowed, "explicit-root").await;
+    let started = actor
+        .call(
+            &allowed,
+            "ide.start",
+            json!({"activation_id":"explicit-root","root":allowed.root.join("src")}),
+        )
+        .await;
+    let started = actor.settle(&allowed, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let stopped = actor.call(&allowed, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Holds SQLite's real write lock while a shipping Start needs durable activation, proving the
 /// frontend fails closed without delaying the independent host hook or ordinary native command.
 #[tokio::test]
@@ -4534,6 +4385,7 @@ async fn configured_product_stop_reclaims_only_its_binding_details() {
     peer_target["attachment"] = json!("private-child-channel");
     peer_target["candidate"] = json!(peer.root);
     config["targets"].as_array_mut().unwrap().push(peer_target);
+    config["allowed_roots"] = json!([fixture.base, peer.base]);
     std::fs::write(&fixture.config, config.to_string()).unwrap();
     let mut daemon = fixture.daemon().await;
     let mut first = ProductActor::new(&fixture, "capacity-first").await;
@@ -4774,43 +4626,23 @@ async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
 /// and project check plates while a denied source path remains unavailable.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
-async fn configured_product_deny_globs_keep_pyright_semantics_and_checks() {
+async fn configured_product_pyright_semantics_and_checks() {
     let fixture = ProductFixture::new(json!([accepted_pyright_provider(
-        "deny-glob-pyright-cache"
+        "pyright-check-cache"
     )]));
     std::fs::write(
         fixture.root.join("main.py"),
         "def value() -> int:\n    return \"bad\"\n",
     )
     .unwrap();
-    std::fs::write(fixture.root.join("secret.key"), "hidden\n").unwrap();
-    fixture.git(&["add", "--", "main.py", "secret.key"]);
-    fixture.git(&["commit", "--quiet", "-m", "deny-glob Python fixture"]);
-    let root = &fixture.root;
-    let entries = ["**/*.key", "**/*.pem", "**/.env", "**/.env.*"].map(|suffix| {
-        json!({
-            "access":"deny","path":{"type":"glob_pattern","pattern":root.join(suffix)}
-        })
-    });
-    let mut state = json!({
-        "permissionProfile":{"type":"managed","network":"restricted","file_system":{"type":"restricted","glob_scan_max_depth":8,"entries":[
-            {"access":"read","path":{"type":"special","value":{"kind":"root"}}},
-            {"access":"write","path":{"type":"path","path":root}},
-            {"access":"write","path":{"type":"special","value":{"kind":"slash_tmp"}}},
-            {"access":"write","path":{"type":"special","value":{"kind":"tmpdir"}}}
-        ]}},
-        "sandboxCwd":root,"codexLinuxSandboxExe":null,"useLegacyLandlock":false
-    });
-    state["permissionProfile"]["file_system"]["entries"]
-        .as_array_mut()
-        .unwrap()
-        .extend(entries);
-    fixture.write_managed_profile(&state);
+    fixture.git(&["add", "--", "main.py"]);
+    fixture.git(&["commit", "--quiet", "-m", "Python fixture"]);
+    let state = fixture.state();
     let home = enable_fake_rust_checks(&fixture, &fixture.base);
     let mut daemon = fixture.daemon_with_home(Some(&home)).await;
     let mut actor = ProductActor::new_at(
         &fixture,
-        "deny-glob-pyright",
+        "pyright-checks",
         "private-host-channel",
         "session_id",
         state,
@@ -4820,14 +4652,14 @@ async fn configured_product_deny_globs_keep_pyright_semantics_and_checks() {
         .call(
             &fixture,
             "ide.start",
-            json!({"activation_id":"deny-glob-start"}),
+            json!({"activation_id":"pyright-start"}),
         )
         .await;
     let started = actor.settle(&fixture, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
     let plate = carried_status(&started).expect("activation check plate");
     assert!(
-        plate.starts_with("<agent-ide>\nrust:") && !plate.contains("read_restricted"),
+        plate.starts_with("<agent-ide>\nrust:"),
         "{plate}"
     );
     await_eyes_check_start(&home).await;
@@ -4840,11 +4672,6 @@ async fn configured_product_deny_globs_keep_pyright_semantics_and_checks() {
         text.contains("mode: semantic") && text.contains("not assignable"),
         "{context}"
     );
-    let denied = actor
-        .call(&fixture, "ide.context", json!({"path":"secret.key"}))
-        .await;
-    let denied = actor.settle(&fixture, denied).await;
-    assert_eq!(denied["code"], "execution_profile", "{denied}");
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     actor.mcp.close().await;
@@ -5407,11 +5234,10 @@ async fn configured_product_claude_helper_returns_real_typescript_semantic_conte
     daemon.wait().await.unwrap();
 }
 
-/// A deny-glob Codex profile retains confined TypeScript semantics for proven paths; an
-/// installed dependency tree still makes project membership unverifiable.
+/// TypeScript project membership falls back to lexical context when dependencies are installed.
 #[tokio::test]
 #[ignore = "requires the release-pinned Node and TypeScript bundle"]
-async fn configured_product_typescript_deny_globs_keep_confined_semantics() {
+async fn configured_product_typescript_membership_falls_back_after_dependencies_install() {
     let fixture = ProductFixture::new(json!([accepted_typescript_provider()]));
     let source = "export const value = 42;\nexport const useValue = value;\n";
     std::fs::create_dir_all(fixture.root.join("source/utils")).unwrap();
@@ -5421,35 +5247,14 @@ async fn configured_product_typescript_deny_globs_keep_confined_semantics() {
         "{\"compilerOptions\":{\"types\":[],\"moduleResolution\":\"node10\"},\"files\":[\"source/utils/normalize.ts\"]}\n",
     )
     .unwrap();
-    std::fs::write(fixture.root.join("secret.key"), "denied\n").unwrap();
     fixture.git(&[
         "add",
         "--",
         "source/utils/normalize.ts",
         "tsconfig.json",
-        "secret.key",
     ]);
-    fixture.git(&["commit", "--quiet", "-m", "TypeScript restricted fixture"]);
-
-    let template = json!({
-        "codexLinuxSandboxExe":null,
-        "permissionProfile":{"type":"managed","file_system":{"type":"restricted","entries":[
-            {"access":"read","path":{"type":"special","value":{"kind":"root"}}},
-            {"access":"write","path":{"type":"path","path":fixture.root}},
-            {"access":"write","path":{"type":"special","value":{"kind":"slash_tmp"}}},
-            {"access":"write","path":{"type":"special","value":{"kind":"tmpdir"}}}
-        ]},"network":"restricted"},
-        "sandboxCwd":fixture.root,
-        "useLegacyLandlock":false
-    });
-    let mut restricted = template.clone();
-    restricted["permissionProfile"]["file_system"]["entries"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!({"access":"deny","path":{"type":"glob_pattern","pattern":fixture.root.join("**/*.key")}}));
-    fixture.write_managed_profile(&restricted);
-
-    let denied_state = restricted.clone();
+    fixture.git(&["commit", "--quiet", "-m", "TypeScript fixture"]);
+    let restricted = fixture.state();
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new_at(
         &fixture,
@@ -5502,19 +5307,12 @@ async fn configured_product_typescript_deny_globs_keep_confined_semantics() {
     );
     assert!(membership["detail_ref"].as_str().is_some(), "{membership}");
 
-    actor.state = denied_state;
-    let denied = actor
-        .call(&fixture, "ide.context", json!({"path":"secret.key"}))
-        .await;
-    let denied = actor.settle(&fixture, denied).await;
-    assert_eq!(denied["state"], "error", "{denied}");
-    assert_eq!(denied["code"], "execution_profile", "{denied}");
     let edit = actor
         .call(
             &fixture,
             "ide.edit",
             json!({
-                "operation_id":"typescript-restricted-edit",
+                "operation_id":"typescript-edit",
                 "path":"source/utils/normalize.ts",
                 "source_ref":context["detail_ref"],
                 "content":source.replace("42", "43")
@@ -8471,48 +8269,6 @@ async fn eyes_claude_post_hook_delivers_problem_block_and_delta() {
     assert!(home.join(".agent-ide/checks").is_dir());
 }
 
-/// A strict Claude profile with an exclusion outside the worktree never checks or reveals cached
-/// project diagnostics; the deny-free product case below retains normal checking.
-#[tokio::test]
-async fn eyes_claude_external_read_exclusion_reports_only_restricted_status() {
-    let fixture = ProductFixture::new_claude(json!([]));
-    let home = enable_fake_rust_checks(&fixture, &fixture.base);
-    std::fs::write(fixture.root.join("problems.count"), "7").unwrap();
-    let mut config: Value =
-        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
-    config["targets"][0]["claude_profile"]["read_denies"] =
-        json!([fixture.base.join("outside.rs")]);
-    std::fs::write(&fixture.config, config.to_string()).unwrap();
-    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
-    let (mut actor, status) = eyes_claude_actor(&fixture, "claude-restricted-eyes").await;
-    assert_eq!(
-        status,
-        "<agent-ide>\nrust: unavailable: read_restricted\n</agent-ide>"
-    );
-    assert_eq!(
-        eyes_problems(&mut actor, &fixture).await,
-        "rust: unavailable: read_restricted"
-    );
-    assert!(actor.claude_native_post(&fixture, "Edit").await.is_empty());
-    assert_eq!(
-        eyes_problems(&mut actor, &fixture).await,
-        "rust: unavailable: read_restricted"
-    );
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(
-        std::fs::read_dir(home.join(".agent-ide/checks"))
-            .unwrap()
-            .count(),
-        0,
-        "restricted profile must not create a check cache"
-    );
-    let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
-    assert_eq!(stopped["kind"], "stop", "{stopped}");
-    actor.mcp.close().await;
-    daemon.kill().await.unwrap();
-    daemon.wait().await.unwrap();
-}
-
 /// Waits for a check's private worktree cache, which is created only when a scheduled run starts.
 async fn await_eyes_check_start(home: &Path) {
     let cache = home.join(".agent-ide/checks");
@@ -8529,17 +8285,17 @@ async fn await_eyes_check_start(home: &Path) {
     }
 }
 
-/// Deny-free Claude and ordinary Codex starts still schedule real check attempts and deliver
+/// Admitted Claude and ordinary Codex starts schedule real check attempts and deliver
 /// their first plates, independent of whether the outer test sandbox lets fake cargo complete.
 #[tokio::test]
-async fn eyes_unrestricted_profiles_start_checks_and_deliver_plates() {
+async fn eyes_admitted_starts_schedule_project_checks() {
     let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
     let claude = ProductFixture::new_claude(json!([]));
     let claude_home = enable_fake_rust_checks(&claude, &claude.base);
     let mut daemon = claude.daemon_with_home(Some(&claude_home)).await;
     let (mut actor, plate) = eyes_claude_actor(&claude, "claude-unrestricted-eyes").await;
     assert!(
-        plate.starts_with("<agent-ide>\nrust:") && !plate.contains("read_restricted"),
+        plate.starts_with("<agent-ide>\nrust:"),
         "{plate}"
     );
     await_eyes_check_start(&claude_home).await;
@@ -8574,43 +8330,24 @@ async fn eyes_unrestricted_profiles_start_checks_and_deliver_plates() {
     assert_eq!(started["kind"], "activation", "{started}");
     let plate = carried_status(&started).expect("Codex activation carries a status plate");
     assert!(
-        plate.starts_with("<agent-ide>\nrust:") && !plate.contains("read_restricted"),
+        plate.starts_with("<agent-ide>\nrust:"),
         "{plate}"
     );
     await_eyes_check_start(&codex_home).await;
     mcp.close().await;
 }
 
-/// The managed Codex credential-glob shape schedules checks and returns a due plate.
+/// Legacy sandbox metadata has no effect on project-check admission.
 #[tokio::test]
-async fn eyes_codex_deny_globs_keep_project_checks_available() {
+async fn eyes_codex_legacy_sandbox_metadata_keeps_project_checks_available() {
     let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
     let fixture = ProductFixture::new(json!([]));
-    std::fs::write(fixture.root.join("secret.key"), "hidden\n").unwrap();
-    let root = &fixture.root;
-    let mut state = json!({
-        "permissionProfile":{"type":"managed","network":"restricted","file_system":{"type":"restricted","glob_scan_max_depth":8,"entries":[
-            {"access":"read","path":{"type":"special","value":{"kind":"root"}}},
-            {"access":"write","path":{"type":"path","path":root}},
-            {"access":"write","path":{"type":"special","value":{"kind":"slash_tmp"}}},
-            {"access":"write","path":{"type":"special","value":{"kind":"tmpdir"}}}
-        ]}},
-        "sandboxCwd":root,"codexLinuxSandboxExe":null,"useLegacyLandlock":false
-    });
-    for suffix in ["**/*.key", "**/*.pem", "**/.env", "**/.env.*"] {
-        state["permissionProfile"]["file_system"]["entries"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({
-                "access":"deny","path":{"type":"glob_pattern","pattern":root.join(suffix)}
-            }));
-    }
-    fixture.write_managed_profile(&state);
+    let state = fixture.state();
     let home = enable_fake_rust_checks(&fixture, &fixture.base);
     let mut daemon = fixture.daemon_with_home(Some(&home)).await;
     let mut actor = ProductActor::new_at(
         &fixture,
-        "codex-deny-checks",
+        "codex-checks",
         "private-host-channel",
         "session_id",
         state,
@@ -8627,7 +8364,7 @@ async fn eyes_codex_deny_globs_keep_project_checks_available() {
     assert_eq!(started["kind"], "activation", "{started}");
     let plate = carried_status(&started).expect("activation carries a check plate");
     assert!(
-        plate.starts_with("<agent-ide>\nrust:") && !plate.contains("read_restricted"),
+        plate.starts_with("<agent-ide>\nrust:"),
         "{plate}"
     );
     await_eyes_check_start(&home).await;
@@ -8636,79 +8373,6 @@ async fn eyes_codex_deny_globs_keep_project_checks_available() {
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
-}
-
-/// Missing or unsupported metadata on a validated managed binding revokes check delivery before
-/// a later native post can trigger or disclose an older project result.
-#[tokio::test]
-async fn eyes_codex_unknown_metadata_restricts_following_native_post() {
-    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
-    for unsupported in [false, true] {
-        let fixture = ProductFixture::new(json!([]));
-        let home = enable_fake_rust_checks(&fixture, &fixture.base);
-        let base = rendezvous_area(if unsupported {
-            "unknown-state"
-        } else {
-            "missing-state"
-        });
-        let root = base.join("rendezvous");
-        let mut mcp =
-            Mcp::start_managed_custom(&fixture.config, &fixture.root, Some(&home), Some(&root))
-                .await;
-        let state = fixture.state();
-        let actor = "metadata-actor";
-        let session = "metadata-session";
-        let mut next = 100;
-        let started = managed_root_call(
-            &mut mcp,
-            next,
-            actor,
-            session,
-            "ide.start",
-            json!({"activation_id":"metadata-start"}),
-            &state,
-        )
-        .await;
-        let started = settle_managed(&mut mcp, &mut next, actor, &state, started).await;
-        assert_eq!(started["kind"], "activation", "{started}");
-        next += 1;
-        let mut meta = json!({
-            "threadId": actor,
-            "callId": format!("managed-{actor}-{next}"),
-            "x-codex-turn-metadata": {"session_id": session}
-        });
-        if unsupported {
-            meta["codex/sandbox-state-meta"] = json!({
-                "permissionProfile": {"type":"external"},
-                "codexLinuxSandboxExe": null,
-                "sandboxCwd": fixture.root,
-                "useLegacyLandlock": false
-            });
-        }
-        let unknown = mcp
-            .exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call",
-            "params":{"name":"ide.context","arguments":{"kind":"problems"},"_meta":meta}}))
-            .await;
-        assert_eq!(unknown["result"]["isError"], true, "{unknown}");
-        let hook = managed_native_post(
-            &root,
-            session,
-            actor,
-            if unsupported {
-                "native-unsupported"
-            } else {
-                "native-missing"
-            },
-            "Bash",
-        )
-        .await;
-        assert_eq!(
-            managed_hook_context(&hook),
-            "<agent-ide>\nrust: unavailable: read_restricted\n</agent-ide>"
-        );
-        mcp.close().await;
-        std::fs::remove_dir_all(base).unwrap();
-    }
 }
 
 /// Reads the `ide.context` problems page for an active Codex actor, with its carried status plate.
@@ -9968,40 +9632,6 @@ async fn eyes_claude_helper_post_delivers_due_first_check_plate_once() {
 
     let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
-    actor.mcp.close().await;
-    daemon.kill().await.unwrap();
-    daemon.wait().await.unwrap();
-}
-
-/// A worktree outside every allowed root schedules no check and reports `outside allowed roots`.
-#[tokio::test]
-async fn eyes_outside_roots_reports_unavailable_without_checking() {
-    let fixture = ProductFixture::new_claude(json!([]));
-    let elsewhere = fixture.base.join("elsewhere");
-    std::fs::create_dir_all(&elsewhere).unwrap();
-    let home = enable_fake_rust_checks(&fixture, &elsewhere);
-    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
-    let (mut actor, block) = eyes_claude_actor(&fixture, "claude-eyes-outside").await;
-
-    // No check can ever complete here, so the one due plate already arrived on the activation
-    // inspect call's own post hook (T22B) and the next native post must not repeat it.
-    assert_eq!(
-        block,
-        "<agent-ide>\nrust: outside allowed roots\n</agent-ide>"
-    );
-    assert!(actor.claude_native_post(&fixture, "Read").await.is_empty());
-    assert_eq!(
-        eyes_problems(&mut actor, &fixture).await,
-        "rust: unavailable:outside_roots"
-    );
-    assert!(
-        !home
-            .join(".agent-ide/checks")
-            .read_dir()
-            .is_ok_and(|mut entries| entries.next().is_some()),
-        "no check cache may be created for an outside worktree"
-    );
-
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();

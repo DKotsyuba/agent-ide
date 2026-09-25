@@ -16,8 +16,7 @@ use std::{
 use agent_ide::{
     execution::{
         Admission, AdmissionClass, AdmissionController, AdmissionLease, AdmissionLimits,
-        DirectChildReap, ExecutionProfileCatalog, ExecutionProfileTemplate, HostSandboxState,
-        LocalExecutionPolicy, OwnedChild, OwnedProtocolChild, OwnerId, ProviderBackendKind,
+        DirectChildReap, LocalExecutionPolicy, OwnedChild, OwnedProtocolChild, OwnerId, ProviderBackendKind,
         ProviderLeaseAdmission, ProviderLeaseError, ProviderLeaseLimits, ProviderLeaseRegistry,
         ProviderViewLease, ValidatedExecutionRequest, ValidatedHostInvocation, WorkspaceAuthority,
     },
@@ -32,7 +31,7 @@ use async_lsp::{
     },
     router::Router,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::sync::{Barrier, Notify, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -128,33 +127,20 @@ fn provider_view(
     }
 }
 
-/// Constructs disabled-host Execution evidence for an already profile-declared provider command.
+/// Validates an admitted provider command for the fixture authority.
 fn request(
     authority: WorkspaceAuthority,
     command: agent_ide::execution::ControlledCommand,
     program: &Path,
 ) -> ValidatedExecutionRequest {
-    let root = authority.root().to_path_buf();
-    let sandbox = HostSandboxState::parse(Some(json!({
-        "permissionProfile": {"type": "disabled"},
-        "codexLinuxSandboxExe": null,
-        "sandboxCwd": root,
-    })))
-    .expect("test disabled host state is valid");
-    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
-        ExecutionProfileTemplate::from_execution_evidence("gopls-contract", 1, &sandbox)
-            .expect("test profile is valid"),
-    ])
-    .expect("one test profile is valid");
-    let policy = LocalExecutionPolicy::new(BTreeSet::from([program.to_path_buf()]), 4096, 8, true)
+    let policy = LocalExecutionPolicy::new(BTreeSet::from([program.to_path_buf()]), 4096, 8)
         .expect("test policy is valid");
     ValidatedExecutionRequest::validate(
-        ValidatedHostInvocation::from_verified_binding("gopls-contract", sandbox)
+        ValidatedHostInvocation::from_verified_binding("gopls-contract")
             .expect("test invocation is valid"),
         authority,
         command,
         &policy,
-        &catalog,
     )
     .expect("controlled gopls request is valid")
 }
@@ -348,7 +334,6 @@ async fn remote_sessions(
         &request,
         registry.take_spawn_lease(view).unwrap(),
         None,
-        Path::new("/unused"),
         4096,
     )
     .map_err(execution_error)?;
@@ -470,7 +455,6 @@ async fn gopls_spawns_require_exact_registry_authority() {
             &wrong,
             registry.take_spawn_lease(view).unwrap(),
             None,
-            Path::new("/unused"),
             64,
         )
         .err()
@@ -501,7 +485,6 @@ async fn gopls_spawns_require_exact_registry_authority() {
         &listener_request,
         registry.take_spawn_lease(listener_view).unwrap(),
         None,
-        Path::new("/unused"),
         64,
     )
     .unwrap();
@@ -533,7 +516,6 @@ async fn gopls_spawns_require_exact_registry_authority() {
                 &wrong,
                 capability,
                 None,
-                Path::new("/unused"),
                 64,
             )
             .err()
@@ -621,7 +603,6 @@ async fn shared_gopls_isolates_divergent_worktrees_and_detaches_one_view() {
         &listener_bound.request,
         registry.take_spawn_lease(left_registry_view).unwrap(),
         Some(listener_active),
-        Path::new("/unused"),
         4096,
     )
     .expect("Execution starts one listener");
@@ -692,7 +673,6 @@ async fn shared_gopls_isolates_divergent_worktrees_and_detaches_one_view() {
             &left_bound.request,
             left_capability,
             Some(left_active),
-            Path::new("/unused"),
             4096,
         )
         .unwrap();
@@ -704,7 +684,6 @@ async fn shared_gopls_isolates_divergent_worktrees_and_detaches_one_view() {
             &right_bound.request,
             right_capability,
             Some(right_active),
-            Path::new("/unused"),
             4096,
         )
         .unwrap();
@@ -887,7 +866,6 @@ async fn dropping_live_gopls_owner_closes_its_owned_listener() {
         &bound.request,
         registry.take_spawn_lease(view).unwrap(),
         Some(active),
-        Path::new("/unused"),
         4096,
     )
     .unwrap();

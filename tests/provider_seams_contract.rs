@@ -173,7 +173,6 @@ async fn provider_pre_spawn_failures_settle_once_without_reap_fiction() {
             request,
             registry.take_spawn_lease(view).unwrap(),
             use_now,
-            Path::new("/unused"),
             64,
         )
         .err()
@@ -238,7 +237,6 @@ async fn protocol_cancellation_fences_promotion_until_direct_child_reap() {
         &bound.request,
         registry.take_spawn_lease(view).unwrap(),
         Some(active),
-        Path::new("/unused"),
         64,
     )
     .unwrap();
@@ -329,7 +327,6 @@ async fn hung_protocol_wait_is_bounded_and_keeps_accounting_uncertain() {
         &bound.request,
         registry.take_spawn_lease(view).unwrap(),
         Some(active),
-        Path::new("/unused"),
         64,
     )
     .unwrap();
@@ -363,17 +360,15 @@ async fn discovery_can_be_cancelled_without_losing_query_or_release_evidence() {
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
     let mut bound = fixture.command("discovery", &script, vec![]);
     let operation = DiscoveryOperationRef::new("discovery-operation").unwrap();
-    let request = DiscoverWorktreeRequest::from_active_observation(
+    let request = DiscoverWorktreeRequest::from_active_use(
         bound.fresh(),
-        bound.observed.clone(),
         fixture.0.clone().into_os_string(),
         operation.clone(),
     )
     .unwrap()
     .validate_query(
         GitDiscoveryQuery::ShowTopLevel,
-        &GitDiscoveryPolicy::new(script, 128, true).unwrap(),
-        &bound.catalog,
+        &GitDiscoveryPolicy::new(script, 128).unwrap(),
     )
     .unwrap();
     let (mut admission, _) = controllers(1);
@@ -385,7 +380,7 @@ async fn discovery_can_be_cancelled_without_losing_query_or_release_evidence() {
         _ => panic!("discovery slot"),
     };
     let mut child = request
-        .spawn(lease, bound.fresh(), Path::new("/unused"))
+        .spawn(lease, bound.fresh())
         .unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
         while !fixture.0.join("discovery-ready").exists() {
@@ -455,7 +450,6 @@ async fn gopls_wrappers_forward_fresh_binding_uses() {
         &listener.request,
         registry.take_spawn_lease(view).unwrap(),
         Some(active),
-        Path::new("/unused"),
         64,
     )
     .unwrap();
@@ -483,7 +477,6 @@ async fn gopls_wrappers_forward_fresh_binding_uses() {
             &forwarder.request,
             capability,
             Some(active),
-            Path::new("/unused"),
             64,
         )
         .unwrap();
@@ -522,7 +515,6 @@ async fn settled_snapshot(
         &bound.request,
         lease,
         Some(active),
-        Path::new("/unused"),
         128,
     )
     .unwrap()
@@ -584,17 +576,15 @@ async fn definite_no_child_settlement_is_not_repeatable() {
     fs::set_permissions(&program_path, fs::Permissions::from_mode(0o700)).unwrap();
     let program = program_path.as_path();
     let mut bound = fixture.command("no-discovery", program, vec![]);
-    let request = DiscoverWorktreeRequest::from_active_observation(
+    let request = DiscoverWorktreeRequest::from_active_use(
         bound.fresh(),
-        bound.observed.clone(),
         fixture.0.clone().into_os_string(),
         DiscoveryOperationRef::new("no-child").unwrap(),
     )
     .unwrap()
     .validate_query(
         GitDiscoveryQuery::GitCommonDir,
-        &GitDiscoveryPolicy::new(program.to_path_buf(), 128, true).unwrap(),
-        &bound.catalog,
+        &GitDiscoveryPolicy::new(program.to_path_buf(), 128).unwrap(),
     )
     .unwrap();
     let (mut admission, _) = controllers(1);
@@ -608,7 +598,7 @@ async fn definite_no_child_settlement_is_not_repeatable() {
     fs::remove_file(program).unwrap();
     let (_, first) = never_started(
         request
-            .spawn(lease, bound.fresh(), Path::new("/unused"))
+            .spawn(lease, bound.fresh())
             .err()
             .unwrap(),
     );
@@ -644,65 +634,6 @@ fn opaque_reservations_include_their_controller_identity() {
     );
 }
 
-/// Native reads and cached delivery recheck changed host permissions even when the binding stays live.
-#[test]
-fn current_read_admission_rejects_changed_profile_and_cwd_without_a_command() {
-    use agent_ide::assistance::host_binding::parse_observed_sandbox_state;
-    use serde_json::json;
-    let fixture = Fixture::new();
-    let mut bound = fixture.command("native-read", Path::new("/usr/bin/true"), vec![]);
-    let authority = bound.request.authority().clone();
-    validate_workspace_read(
-        bound.fresh(),
-        bound.observed.clone(),
-        &authority,
-        &bound.catalog,
-        true,
-        agent_ide::execution::ReadScope::WholeTree,
-    )
-    .unwrap();
-    assert!(matches!(
-        validate_workspace_read(
-            bound.fresh(),
-            bound.observed.clone(),
-            &authority,
-            &bound.catalog,
-            false,
-            agent_ide::execution::ReadScope::WholeTree,
-        ),
-        Err(RequestError::DisabledHostDenied)
-    ));
-    for changed_cwd in [false, true] {
-        let mut raw = bound.observed.state().as_json().clone();
-        if changed_cwd {
-            raw["sandboxCwd"] = json!(fixture.0.join("other"));
-        } else {
-            raw["permissionProfile"]["changed-permission"] = json!(true);
-        }
-        let active = bound.fresh();
-        let observed = parse_observed_sandbox_state(
-            json!({"codex/sandbox-state-meta":raw}).as_object().unwrap(),
-            &bound.invocation,
-            &active,
-            true,
-        )
-        .unwrap();
-        assert!(
-            validate_workspace_read(
-                active,
-                observed,
-                &authority,
-                &bound.catalog,
-                true,
-                agent_ide::execution::ReadScope::WholeTree,
-            )
-            .is_err()
-        );
-    }
-    bound.guard.stop_binding(&bound.binding).unwrap();
-    assert!(bound.guard.consume_active(&bound.binding).is_err());
-}
-
 /// Actual wait identity can release only the exact armed child, while checked fixture data cannot forge it.
 #[tokio::test]
 async fn captured_wait_identity_is_bound_to_the_exact_child() {
@@ -723,7 +654,6 @@ async fn captured_wait_identity_is_bound_to_the_exact_child() {
             &bound.request,
             lease,
             Some(active),
-            Path::new("/unused"),
             64,
         )
         .unwrap();
@@ -787,7 +717,6 @@ async fn provider_spawn_rejects_executable_replacement_before_child_creation() {
         &bound.request,
         registry.take_spawn_lease(view).unwrap(),
         Some(active),
-        Path::new("/unused"),
         64,
     )
     .err()
