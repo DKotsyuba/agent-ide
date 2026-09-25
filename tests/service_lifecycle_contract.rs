@@ -162,9 +162,8 @@ fn lock_holder_count(runtime: &Path) -> usize {
 /// Writes one minimal valid Claude launcher template accepting `candidate`, and returns its path.
 ///
 /// This is wiring proof only: it satisfies [`agent_ide::assistance::launcher::LauncherConfig`]
-/// verification and the strict test-only
-/// [`agent_ide::assistance::claude_worker::ClaudeOperatorProfile::validate`] contract so the daemon
-/// reaches its health-checkable serving state; it never exercises real Codex/D03 certification.
+/// verification so the daemon reaches its health-checkable serving state; it never exercises real
+/// Codex/D03 certification.
 fn write_launcher_template(candidate: &Path) -> PathBuf {
     write_launcher_template_with_idle_timeout_s(candidate, None)
 }
@@ -186,15 +185,7 @@ fn write_launcher_template_with_idle_timeout_s(
             "attachment": "private-host-channel",
             "candidate": candidate,
             "git": accepted_program("/usr/bin/git", "fixture-git"),
-            "providers": [],
-            "claude_profile": {
-                "enabled": true,
-                "fail_if_unavailable": true,
-                "allow_unsandboxed_commands": false,
-                "no_matching_excluded_commands": true,
-                "scope_declared": true,
-                "platform": "mac_os"
-            }
+            "providers": []
         }]
     });
     if let Some(idle_timeout_s) = idle_timeout_s {
@@ -500,14 +491,13 @@ async fn call_ide_start(mcp: &mut Mcp, id: u64, activation_id: &str) -> Value {
 
 /// Runs a real managed Claude hook whose payload cwd identifies `worktree`, even when the
 /// inherited project environment identifies another worktree of the same repository.
-/// `phase` and `id` identify the native event for `session`; `command` selects a Bash launch
-/// instead of an MCP call. The child must exit successfully within two seconds.
+/// `phase` and `id` identify the MCP call's hook event for `session`. The child must exit
+/// successfully within two seconds.
 async fn worktree_hook(
     inherited_project: &Path,
     worktree: &Path,
     phase: &str,
     id: u64,
-    command: Option<&str>,
     session: &str,
 ) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
@@ -522,9 +512,7 @@ async fn worktree_hook(
         .unwrap();
     let payload = json!({"hook_event_name":phase,"session_id":session,
         "tool_use_id":format!("call-{id}"),
-        "tool_name":if command.is_some() { "Bash" } else { "mcp__agent-ide__ide_start" },
-        "tool_input":command.map(|command| json!({"command":command})),
-        "tool_response":{"success":true},"cwd":worktree});
+        "tool_name":"mcp__agent-ide__ide_start","tool_response":{"success":true},"cwd":worktree});
     child
         .stdin
         .take()
@@ -543,8 +531,11 @@ async fn worktree_hook(
     );
 }
 
-/// Completes `pending` for `session` on `worktree` through its exact Bash hook, real helper, and
-/// inspect call. `id` reserves distinct call IDs for the launch and inspection; both must finish.
+/// Settles `pending` for `session` on `worktree` through hook-paired `ide.inspect` calls.
+///
+/// Every poll wraps one inspect call on `mcp` in the worktree's real Pre/Post hooks under call id
+/// `id + 10`, `id + 20`, …, so flows whose `id`s differ in the last digit never collide. The start
+/// must complete within 30 seconds.
 async fn worktree_start_flow(
     mcp: &mut Mcp,
     inherited_project: &Path,
@@ -553,100 +544,48 @@ async fn worktree_start_flow(
     session: &str,
     pending: Value,
 ) {
-    let text = pending["result"]["content"][0]["text"].as_str().unwrap();
+    let mut text = pending["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     assert!(
         text.starts_with("pending:"),
         "{} {pending}",
         worktree.display()
     );
-    let helper = text.split_once('\n').unwrap().1.split_once('\n').unwrap().0;
-    let detail_ref = text
-        .split("detail_ref ")
-        .nth(1)
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap();
-    let cache = std::fs::canonicalize("/private/tmp").unwrap().join(format!(
-        "ai-k-{}",
-        &blake3::hash(worktree.as_os_str().as_bytes())
-            .to_hex()
-            .as_str()[..16]
-    ));
-    let hook_attachment = std::fs::read_to_string(cache.join("candidate-attachment")).unwrap();
-    assert!(
-        helper.contains(&hook_attachment),
-        "{} {helper}",
-        worktree.display()
-    );
-
-    worktree_hook(
-        inherited_project,
-        worktree,
-        "PreToolUse",
-        id + 10,
-        Some(helper),
-        session,
-    )
-    .await;
-    let output = tokio::time::timeout(
-        Duration::from_secs(90),
-        Command::new("/bin/sh").arg("-c").arg(helper).output(),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert!(
-        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("complete"),
-        "{} helper: {} {}",
-        worktree.display(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    worktree_hook(
-        inherited_project,
-        worktree,
-        "PostToolUse",
-        id + 10,
-        Some(helper),
-        session,
-    )
-    .await;
-
-    worktree_hook(
-        inherited_project,
-        worktree,
-        "PreToolUse",
-        id + 20,
-        None,
-        session,
-    )
-    .await;
-    let inspected = mcp
-        .exchange(json!({"jsonrpc":"2.0","id":id + 20,
-        "method":"tools/call","params":{"name":"ide.inspect",
-        "arguments":{"detail_ref":detail_ref},
-        "_meta":{"claudecode/toolUseId":format!("call-{}", id + 20)}}}))
-        .await;
-    worktree_hook(
-        inherited_project,
-        worktree,
-        "PostToolUse",
-        id + 20,
-        None,
-        session,
-    )
-    .await;
-    assert!(
-        inspected["result"]["content"][0]["text"]
+    let detail_ref = text.split("detail_ref ").nth(1).unwrap().to_owned();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut call = id;
+    while text.starts_with("pending:") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{} did not settle: {text}",
+            worktree.display()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        call += 10;
+        worktree_hook(inherited_project, worktree, "PreToolUse", call, session).await;
+        let inspected = mcp
+            .exchange(json!({"jsonrpc":"2.0","id":call,
+            "method":"tools/call","params":{"name":"ide.inspect",
+            "arguments":{"detail_ref":detail_ref},
+            "_meta":{"claudecode/toolUseId":format!("call-{call}")}}}))
+            .await;
+        worktree_hook(inherited_project, worktree, "PostToolUse", call, session).await;
+        text = inspected["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("complete"),
-        "{inspected}"
+            .to_owned();
+    }
+    assert!(
+        text.starts_with("complete"),
+        "{} {text}",
+        worktree.display()
     );
 }
 
-/// Both worktrees' real hooks and helpers must share each managed MCP lease's channel.
+/// Both worktrees' real hooks must pair with each managed MCP lease's own channel: every start and
+/// inspect call is correlated, so each worktree's start settles to a completed activation.
 #[tokio::test]
 async fn managed_claude_hooks_pair_with_second_worktree_lease() {
     let repo = init_repo();
@@ -660,31 +599,12 @@ async fn managed_claude_hooks_pair_with_second_worktree_lease() {
     let mut second = Mcp::start(&right_template, &right).await;
     wait_for_healthy_locked_daemon(&runtime).await;
 
-    worktree_hook(
-        &repo,
-        &first_worktree,
-        "PreToolUse",
-        2,
-        None,
-        "left-session",
-    )
-    .await;
+    worktree_hook(&repo, &first_worktree, "PreToolUse", 2, "left-session").await;
     let left_pending = call_ide_start(&mut left, 2, "left").await;
-    worktree_hook(
-        &repo,
-        &first_worktree,
-        "PostToolUse",
-        2,
-        None,
-        "left-session",
-    )
-    .await;
-    worktree_hook(&repo, &right, "PreToolUse", 3, None, "right-session").await;
+    worktree_hook(&repo, &first_worktree, "PostToolUse", 2, "left-session").await;
+    worktree_hook(&repo, &right, "PreToolUse", 3, "right-session").await;
     let right_pending = call_ide_start(&mut second, 3, "right").await;
-    worktree_hook(&repo, &right, "PostToolUse", 3, None, "right-session").await;
-    let shared_attachment = std::fs::read_to_string(runtime.join("attachment")).unwrap();
-    let shared_attachment = shared_attachment.split_whitespace().nth(1).unwrap();
-    let left_helper = left_pending.to_string();
+    worktree_hook(&repo, &right, "PostToolUse", 3, "right-session").await;
     tokio::join!(
         worktree_start_flow(
             &mut left,
@@ -702,10 +622,6 @@ async fn managed_claude_hooks_pair_with_second_worktree_lease() {
             "right-session",
             right_pending
         ),
-    );
-    assert!(
-        !left_helper.contains(shared_attachment),
-        "first worktree helper must use its lease attachment: {left_helper}"
     );
 
     left.close().await;
@@ -1082,9 +998,7 @@ async fn exchange_hook_submit(runtime: &Path, request_id: &str) -> Value {
         "opaque_attachment": "private-host-channel",
         "method": "assistance.hook_submit",
         "sanitized_observation_json": {"host": "codex", "phase": "pre", "actor_id": "actor",
-            "call_id": request_id, "session_id": null, "agent_type": null,
-            "launch_command": null, "launch_background": null, "failed": false,
-            "tool_name": null}
+            "call_id": request_id, "session_id": null, "agent_type": null, "tool_name": null}
     });
     let body = serde_json::to_vec(&request).unwrap();
     stream

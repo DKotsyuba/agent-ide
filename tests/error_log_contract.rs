@@ -235,7 +235,6 @@ fn help_and_unknown_subcommands_print_usage() {
             "mcp",
             "daemon",
             "claude-hook",
-            "claude-worker",
             "claude-rendezvous",
             "errors",
             "--version",
