@@ -33,7 +33,9 @@ For `stale_source`, content states that no write occurred and distinguishes chan
 
 Typed Error sets isError. A standalone `resolution_unverified` error names the supported configured-project requirement and a later Context retry without claiming that a native tool can substitute for closed TypeScript resolution. Path-proven Context answers use the lexical mode instead. Unavailable, pending, lifecycle, feedback and edit-result states do not become transport errors; each accepted typed reply has one compact content block, and unchanged structuredContent wherever the host-specific projection above includes it. Native fallback is named only when IDE work is unavailable, unsupported, declined or uncertain.
 
-An `execution_profile` refusal with a closed cause renders `error: execution_profile (<tag>); continue with native tools`, preserving the leading code. The tag is one of the fixed, path-free error-log details; for example, `host_disabled`. Refusals without a closed cause retain `error: execution_profile; continue with native tools`.
+An `execution_profile` refusal with a closed cause renders `error: execution_profile (<tag>); continue with native tools`, preserving the leading code. The tag is one of the fixed, path-free error-log details; for example, `query_policy`. Refusals without a closed cause retain `error: execution_profile; continue with native tools`.
+
+An `outside_allowed_roots` error renders `error: outside_allowed_roots; the working directory is not below any configured allowed root; start the IDE in an allowed directory or add this one to allowed_roots, otherwise continue with native tools`, never naming the path.
 
 ## Bounds and privacy
 

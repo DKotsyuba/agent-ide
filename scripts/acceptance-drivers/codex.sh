@@ -47,9 +47,9 @@
 #                                     <repo>/target/release/agent-ide.
 #   AGENT_IDE_ACCEPTANCE_CODEX        real Codex CLI; default
 #                                     /Users/pluto/.nvm/versions/node/v24.4.0/bin/codex.
-#   AGENT_IDE_ACCEPTANCE_LAUNCHER     strict launcher template carrying both
-#                                     Codex sandbox profiles and the accepted
-#                                     Pyright and TypeScript r3 providers;
+#   AGENT_IDE_ACCEPTANCE_LAUNCHER     launcher template carrying `allowed_roots`
+#                                     that contain the fixture worktrees and the
+#                                     accepted Pyright and TypeScript r3 providers;
 #                                     default /Users/pluto/.config/agent-ide/launcher.json.
 #   AGENT_IDE_ACCEPTANCE_OPERATOR_HOME operator home holding the authenticated
 #                                     ~/.codex/auth.json; default /Users/pluto.

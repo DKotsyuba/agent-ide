@@ -33,8 +33,12 @@ instead of parsing the compact text as a second response schema.
 
 ## Workflow
 
-1. `ide.start` once per actor per worktree. Do not call it again for later
-   edits in the same worktree.
+1. `ide.start` once per actor per worktree, optionally with `"root": "/absolute/dir"`
+   to name the working directory (default: the host's project directory). The root, the
+   Git worktree it belongs to and that worktree's Git directory must all lie inside the
+   operator's configured `allowed_roots`; `outside_allowed_roots` means start the IDE in
+   an allowed directory (or ask the operator to extend the list) and otherwise continue
+   with native tools. Do not call it again for later edits in the same worktree.
 2. `ide.context` before each relevant edit, using a workspace-relative path.
    Include `byte_offset` when definitions or references are needed; omitting it
    requests complete lexical source context only.

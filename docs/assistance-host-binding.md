@@ -23,13 +23,15 @@ The v0.1 five MCP methods use one additional finite request/reply operation, `as
 
 Assistance exposes `check_active(BindingRef)` and `consume_active(BindingRef) -> ActiveBindingUse`. `ActiveBindingUse` is opaque, revocable liveness evidence, not Workspace authority or an Execution permit. `stop` and `consume_active` serialize at Assistance's liveness boundary: a consume linearized after stop fails. A consume before stop can complete its already admitted local step, but Workspace must persist the `BindingRef` with every provisional grant and require an active check/consume before grant use. Stop invalidates that generation and Workspace revokes or refuses each tagged grant, so no grant published after revocation is usable.
 
-## Proposed sandbox observation
+## No sandbox observation
 
-`ObservedSandboxState` is a separate invocation-correlated value containing actor ID, call ID, `BindingRef`, `AdvertisedAndReturned` provenance, and one bounded opaque host-state object. Its parser requires the advertised `codex/sandbox-state-meta` capability, a matching active validated invocation plus its `ActiveBindingUse`, and all four source-proven outer field names: `permissionProfile`, `codexLinuxSandboxExe`, `sandboxCwd`, and `useLegacyLandlock`. It preserves the full nested host object opaquely; missing capability, missing/invalid state, or mismatched binding is `Unavailable`. Field types remain uncommitted until the controlled capture succeeds.
-
-Execution r5 is accepted on these terms: every discovery and post-authority admission receives `ActiveBindingUse` from `consume_active(observed.binding)` for the same opaque `BindingRef` and generation, or invokes that exact consume operation itself. A bare `BindingRef` is insufficient because it can race stop. The admission also requires `ObservedSandboxState` and its own D03/local policy gate; it preserves `sandboxCwd` and limits itself to its fixed read-only Git queries. The observation is neither a physical permit, operator evidence, profile selection, nor sandbox-enforcement proof. Execution owns the separate operator-supplied profile catalog, verification evidence, and effect permits; it may compare the host observation with its own policy but cannot derive configuration, evidence, or enforcement from it.
-
-This validation proves only that the supported host metadata and native hook lifecycle agreed for one invocation. It does not cryptographically attest the host transport, grant authority, or prove sandbox enforcement.
+The daemon reads no host sandbox state. Earlier revisions correlated a `codex/sandbox-state-meta`
+object to each invocation and replayed it for owned children; that layer is removed. Execution
+receives only the consumed `ActiveBindingUse` for the same opaque `BindingRef` and generation,
+and the only path policy is the launcher `allowed_roots` list applied by Assistance at activation.
+Host binding proves only that the supported host metadata and native hook lifecycle agreed for
+one invocation; it does not cryptographically attest the host transport, grant authority, or
+prove sandbox enforcement.
 
 ## Product MCP boundary
 
@@ -160,9 +162,8 @@ correlated terminal hook, so neither settles a pending call.
 Claude Code uses the separate explicit `claude-hook` mode and its documented `session_id`,
 optional `agent_id`, and optional `agent_type` fields. The placeholder-only example is
 [`docs/examples/claude-settings.json`](examples/claude-settings.json). Claude hook ingress is
-implemented, but Claude MCP calls do not claim Codex sandbox evidence. Without a separately proven
-execution profile, provider children remain fail closed; `permission_mode` is never mapped to OS
-authority. Already-authorized product state may still return safe current source feedback.
+implemented; `permission_mode` is never mapped to OS authority, and the same `allowed_roots`
+policy applies as on Codex.
 
 The hook command reads at most 64 KiB plus one overflow byte and uses a separate **250 ms
 total deadline** for stdin, parsing, connect, dispatch and reply. An open stdin pipe cannot
@@ -186,17 +187,16 @@ including echoed hook correlations; it cannot be used to print attachment or pay
 
 The MCP ingress obtains `threadId`, `callId` and the presence of the supported
 `x-codex-turn-metadata` object from rmcp `RequestContext.meta`, separately from model
-arguments. It advertises `codex/sandbox-state-meta` and preserves that complete measured
-object alongside selected actor/call fields and an empty turn-support marker; arbitrary
-turn object contents are discarded. After exact binding, Assistance validates the
-correlated sandbox observation and Execution's supported profile shape. Assistance owns the opaque method parameter envelope
+arguments. It forwards only the selected actor/call fields and an empty turn-support marker;
+arbitrary turn object contents are discarded, and no sandbox metadata is requested or
+retained. Assistance owns the opaque method parameter envelope
 `{"parameters":...,"host_meta":...}`; Application only frames it. The MCP request ID
 and exact call ID remain finite transport request/correlation values. All matching is by
 **attachment + actor + call**, never argument equality, timing, CWD, PID or parent identity.
 
 In managed Codex mode, `ide.start` creates its binding directly from trusted MCP
-`_meta.threadId`, `_meta.callId`, and advertised/returned `codex/sandbox-state-meta` on the fresh
-process-private attachment. Tool arguments cannot supply actor, candidate, or sandbox state.
+`_meta.threadId` and `_meta.callId` on the fresh process-private attachment. Tool arguments
+cannot supply the actor; the optional `root` argument is admitted against `allowed_roots`.
 New Context and Diff captures request the existing registered-path reconciliation before capture;
 the same methods carrying `detail_ref` are retrieval and do not invalidate that retained detail.
 Inspect applies the same current-byte/stale-detail fencing and queues reconciliation for the next
@@ -211,7 +211,7 @@ hint only for an already active binding. This applies equally to successful and 
 commands: actor/call/phase are sufficient triggers; command text, paths and tool results
 are never trusted as effects. `take_native_change_hint` consumes that bounded hint after
 a fresh liveness check. The worker invalidates old detail immediately, then reconciles only
-registered paths when the next MCP invocation supplies a current sandbox observation.
+registered paths on the next MCP invocation.
 Duplicate pre-hooks, premature post-hooks and MCP-before-pre ordering reject that
 invocation for subsequent MCP validation in the remaining daemon lifetime; late hooks cannot repair it. Explicit stop revokes the
 exact binding and rejects its pending pre-hooks before any Workspace handoff could occur.
@@ -244,7 +244,7 @@ is not proof of binding or model-context delivery.
 
 This adapter relies on the trusted launcher and the existing private local daemon endpoint;
 it does not cryptographically authenticate local processes or attest sandbox enforcement.
-Physical execution requires trusted configured profile evidence and a fresh spawn use.
+Physical execution requires an admitted worktree and a fresh spawn use.
 Configured product fixtures exercise `start → context`, `start → diff` and `stop` through
 the shipping CLI/MCP boundary. Host-shaped fixtures also exercise parent/subagent parsing,
 closed output JSON, stale suppression, malformed input and daemon loss. They do not establish
@@ -307,7 +307,7 @@ fixed, filter-free Git metadata reads. A stored v0.1 baseline is reported as par
 unverified joint window; a capture failure leaves activation usable but reports baseline coverage
 as unknown. Exact activation retries reuse committed facts.
 
-Source context reads one registered relative path under current sandbox and durable authority.
+Source context reads one registered relative path under durable authority.
 Optional accepted Go/Rust profiles supply semantic results over those exact bytes; absent or
 unavailable providers return explicit lexical context. Go worktrees whose canonical
 effective-rights identity matches share one accounted listener, one shared native cache namespace

@@ -126,10 +126,11 @@ blocks native tools or turn completion.
 
 `agent-ide -v`, `-V`, `--version`, and `version` print `agent-ide <version>` and exit 0 without starting or contacting a daemon.
 
-Version 0.1.3 makes captured managed sandbox profiles portable across equivalent
-worktrees without changing raw execution state or the original five v0.1 methods. It also
-includes the offline installation helpers `agent-ide evidence executable`,
-`agent-ide evidence record`, and `agent-ide launcher check`. The bundled
+The IDE's only path policy is the launcher `allowed_roots` list: `ide.start` (optionally with
+an absolute `root`) is admitted when the working directory, its Git worktree and its Git
+directory lie inside a configured root, and refused with `outside_allowed_roots` otherwise. No
+host sandbox is replayed and no sandbox profile is ever accepted or captured. The offline
+installation helpers are `agent-ide evidence executable` and `agent-ide launcher check`. The bundled
 `skills/agent-ide` workflow directs coding agents through start, context, the
 supported `ide.edit` path when offered, refreshed context, diff, and stop.
 Native host editing remains available when `ide.edit` is inactive, unavailable,

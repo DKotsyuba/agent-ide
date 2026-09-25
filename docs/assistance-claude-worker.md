@@ -1,10 +1,11 @@
 # Claude foreground helper
 
-Claude Code never supplies the measured sandbox metadata Codex returns in
-`codex/sandbox-state-meta`, and its native tool lifecycle offers no long-lived process the
-daemon may borrow. A Claude operation therefore does not run inside the daemon. It runs in a
-short **foreground `Bash` helper** that the model launches itself, so the helper inherits the
-host's own real sandbox instead of a sandbox the daemon claims to have measured.
+A Claude operation does not run inside the daemon today. It runs in a short **foreground
+`Bash` helper** that the model launches itself, so the helper inherits the host's own sandbox.
+This route predates the `allowed_roots` policy (see [assistance-launcher](assistance-launcher.md));
+the same activation gate applies to the worktree and Git directory the helper discovers, and the
+optional `ide.start` `root` argument is not yet forwarded to the helper, which discovers from the
+target `candidate`. Moving Claude onto the daemon's own route is planned.
 
 The daemon performs **no Git, source-file, provider or process effect for a Claude operation**. For
 Edit it first prepares the Changes receipt durably, then mints correlation, hands out one closed

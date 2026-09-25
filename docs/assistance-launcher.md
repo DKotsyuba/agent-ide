@@ -3,7 +3,15 @@
 Set `AGENT_IDE_LAUNCHER_CONFIG` only in the daemon launch environment. The daemon reads
 that file once under a 64 KiB limit. Changes take effect only after restart. It must be
 maintained by the trusted launcher/operator, separately from MCP arguments and hook data.
-A target path or sandbox observation is never itself Workspace authority.
+A target path is never itself Workspace authority.
+
+The IDE's only path policy is the top-level `allowed_roots` list: `ide.start` admits its working
+directory (the optional `root` parameter, else the target `candidate`), the discovered Git
+worktree root and the Git common directory only when each lies below a configured root, and
+refuses with `outside_allowed_roots` otherwise (an empty list refuses every activation). Every
+absolute path a provider resolves outside the worktree passes the same containment check. The
+IDE replays no host sandbox and keeps no list of accepted sandbox profiles; its own child
+processes (language servers, Git, project checks) run as ordinary processes of the daemon's user.
 
 The closed version-one JSON shape is:
 
@@ -25,45 +33,23 @@ The closed version-one JSON shape is:
         "identity": "accepted-binary-identity",
         "blake3": "64-hex-digit-accepted-executable-digest"
       },
-      "codex": {
-        "path": "/absolute/codex",
-        "identity": "accepted-wrapper-identity",
-        "blake3": "64-hex-digit-accepted-executable-digest"
-      },
-      "cwd_trampoline": null,
       "providers": [],
-      "profiles": [
-        {
-          "record": {"Execution-owned": "complete accepted PersistedProfileRecord"},
-          "sandbox_state": {"Execution-owned": "exact supporting measured state"}
-        }
-      ],
-      "allow_disabled_host": false,
       "claude_profile": null
     }
-  ]
+  ],
+  "allowed_roots": ["/absolute/projects"]
 }
 ```
 
-The descriptive digest/profile placeholders above must be replaced by actual accepted
-execution evidence; they are deliberately invalid configuration values. Configuration
-loading does not fabricate D03 evidence. Complete profile records are parsed by Execution
-and must match the accompanying accepted state before rebuilding its catalog. A current
-invocation still needs its own exact host-correlated state and fresh binding liveness.
+The digest placeholder above must be replaced by the actual measured executable (`agent-ide
+evidence executable --identity <id> <path>`); it is a deliberately invalid configuration value.
 Each distinct configured executable fingerprint is checked once in a cancellable blocking
 startup task before the worker becomes ready. Selected executable bytes must remain
 immutable for that daemon boot; changes require restart and fresh verification.
 
-`cwd_trampoline` is optional and defaults to absent. Its only accepted `path` is
-`/usr/bin/env`; any other path is rejected rather than accepted as a wrapper script. Declare it
-only when this target's worktree differs from the `sandboxCwd` a managed host reports — a native
-child inherits its parent's `sandboxCwd`, so the utility is then run as
-`env -C <worktree> <program> <args>` *inside* the unchanged `codex sandbox` argv. The replayed
-sandbox state is never rewritten and no permission is widened: the wrapping is admitted only when
-the observed managed profile already grants read of the whole filesystem root. Its fingerprint is
-verified at startup like every other configured executable and rechecked immediately before spawn.
-Absent, a differing worktree simply stays unavailable, and same-cwd argv is unchanged. The
-contract is supported on macOS; other platforms report the case unavailable.
+Configurations written for 0.3.16 and earlier may still carry `codex`, `cwd_trampoline`,
+`profiles`, and `allow_disabled_host` on a target; they are accepted and ignored, because no
+host sandbox is replayed any more. New configurations should omit them.
 
 Each optional provider has `executable` in the same shape as `git`, a closed `settings`
 value, `toolchain`, `trust`, and `cache_namespace`. `gopls_defaults` requires an absolute
@@ -105,10 +91,8 @@ surviving backend or proven warm opaque provider index.
 
 Limits are explicit: 1–64 queued operations, 1–128 retained details, 1–300000 ms per
 operation, and 1–1048576 retained bytes per output stream. There are at most 64 distinct
-attachment mappings, four provider languages per target and eight accepted Execution
-profiles across the two supported profile classes. Duplicate attachment mappings, unknown
-fields, invalid limits, relative paths, malformed executable digests, duplicate profile
-digests, and mismatched profile evidence are rejected.
+attachment mappings and four provider languages per target. Duplicate attachment mappings,
+unknown fields, invalid limits, relative paths, and malformed executable digests are rejected.
 
 The fourth provider is the immutable `TypeScriptProviderBundleV1` in
 [TYPESCRIPT-r3](contracts/intelligence-v0.2.md). It accepts only an explicit accepted Node,
@@ -134,87 +118,31 @@ inferred or scanned.
 Configuration contains private attachment and evidence values. Diagnostic formatting
 redacts the configuration; it must never be rendered in model-facing tool results.
 
-## Accepting a new Codex sandbox mode
+## Allowed roots (the only path policy)
 
-A Codex host is admitted only when a live sandbox state is authorized by an operator-accepted
-profile. A read-only and a workspace-write Codex sandbox are both class `managed`, so several
-profiles of one class may be needed; a target may list up to eight profiles whose identities all
-differ. Records are versioned by `shape_version` (T35B): an absent field is the legacy v1
-layout, whose exact-digest admission is unchanged byte-for-byte and never silently upgraded, and
-`shape_version: 2` carries the conservative shape-based admission: a live state is admitted when
-one accepted template proves it a *narrower authority* than the accepted capture — the same
-mechanism, the same positive selectors with access equal or reduced, every accepted deny
-restriction still present, network equal or reduced, and the same glob expansion settings.
-Everything else is refused; unknown or unsupported state shapes never fall back to a looser
-comparison. Because outside write roots are preserved exactly in the shape, a new outside write
-selector requires re-acceptance unless it is the single reviewed v3 visualization leaf, and
-a state that grants write of the whole filesystem root is refused by every workspace-write
-template. The error log names the closed reason: `no_profile_for_class:<class>`,
-`profile_digest_mismatch:<class>` (v1-only catalogs), `shape_unsupported:<class>` (the live state
-derives no applicable shape), or `shape_not_narrower:<class>` (no accepted template proves it narrower).
+`allowed_roots` is the complete permission model of the IDE. It is host-neutral: Codex in any
+sandbox mode, Codex through agent-run or the desktop application, and Claude Code all pass the
+same check, and a host upgrade or a changed sandbox mode changes nothing. The daemon never reads
+`codex/sandbox-state-meta`, and there is nothing to accept, capture, or re-mint.
 
-An operator may explicitly mint `shape_version: 3` after a real D03 run for a managed state
-with one tested task leaf under an accepted `<path>/.codex/visualizations` namespace. The
-leaf must have `YYYY/MM/DD/<uuid>` components and all four matching credential-glob denials
-(`**/*.key`, `**/*.pem`, `**/.env`, `**/.env.*`). V3 admits a later leaf only under the same
-namespace with the same complete deny group. It compares all other authority using the v2
-proof; an extra root, ancestor or sibling visualization write, changed network policy, or
-missing deny refuses. The live namespace must exist and no existing leaf-path component may be a
-symlink; restoring the stored record does not require its old namespace or leaf to remain on disk.
-The live JSON is replayed unchanged, and v3 adds no daemon read authority. The UUID is a path
-grammar check, not an assumed Codex thread identity. A catalog permits only one v3 record per
-namespace and remaining shape because rotating the task leaf produces the same family digest;
-replace the prior record when accepting a new revision of that family.
+- `ide.start` resolves its working directory — the optional absolute `root` argument, else the
+  target `candidate` — with `std::fs::canonicalize` and requires it to be equal to or below one
+  canonicalized configured root. The canonical spelling is what Git discovery then runs in.
+- After discovery, the Git worktree root (Git may resolve a candidate to a repository above it)
+  and the Git common directory (a linked worktree's `.git` may point elsewhere) must both lie
+  below a configured root; neither implicitly authorizes the other location.
+- Provider resolution inputs outside the worktree (ancestor `tsconfig.json`, `node_modules`,
+  dependencies) are admitted with `admit_path`: a path that does not exist yet is judged by its
+  deepest existing ancestor plus the remaining components; relative paths and `.`/`..` segments
+  are refused.
+- Any failure, and an empty `allowed_roots`, answers `error: outside_allowed_roots` with the hint
+  to start the IDE in an allowed directory or extend the list. The error log records the same
+  `outside_allowed_roots` reason.
 
-When the daemon refuses a profile, it captures the raw observed state once per distinct digest
-under `~/.agent-ide/rejected-profiles/<16-hex>.json` (mode 0600 at creation; the directory is
-created 0700; the 16-capture limit is a soft cap — concurrent daemons can transiently exceed it).
-The capture is skipped silently when the directory is a symlink, is not owned by the current
-user, or carries group/other permission bits; the error-log detail then reads
-`profile_digest_mismatch:managed; capture_skipped:io`. No capture is ever written for an
-observed state that carries any top-level field beyond the four documented
-`codex/sandbox-state-meta` fields (`permissionProfile`, `codexLinuxSandboxExe`, `sandboxCwd`,
-`useLegacyLandlock`): the digest covers unknown fields, so a filtered copy would be useless and
-the raw state is treated as unreviewable — the detail reads `capture_skipped:unknown_fields`.
-Otherwise the detail names the capture stem (`shape_not_narrower:managed;
-captured:<16-hex>`). To accept the new
-sandbox mode:
-
-1. Run the host once against this worktree so the daemon observes and refuses its sandbox state.
-2. `agent-ide evidence rejected` — lists each capture as `name class sandbox-cwd mtime`.
-3. Review the file `~/.agent-ide/rejected-profiles/<name>.json`. It is the exact
-   `codex/sandbox-state-meta` envelope the host advertised; check its actual outside grants,
-   network mode, and restrictions — those are the authority you are about to accept.
-4. Run a real D03 experiment under that exact state, then mint the profile fragment:
-   `agent-ide evidence record --sandbox-state <file> --profile-id <id> --revision <n>
-   --provider-binary <v> --toolchain <v> --configuration <v> --trust <v> --transport <v>
-   --d03-evidence <id> [--shape-version <1|2|3>]` (the nine flags in this fixed order; the
-   optional `--shape-version` flag trails them). The default is `2`: the shape-based record for
-   supported managed captures. A capture whose state cannot support v2 (a `disabled` or
-   unrecognized state) is refused rather than downgraded; pass `--shape-version 1` explicitly to
-   mint the legacy exact-digest record. Pass `--shape-version 3` only after the specific
-   visualization-family D03 probe passes for the accepted capture.
-5. Append the printed `{record, sandbox_state}` object to the target's `profiles` array and
-   restart the daemon, or validate first with `agent-ide launcher check <config-file>`. Existing
-   v1 records keep validating unchanged.
-
-Known limitation (updated by T36B): shape v2 changes admission, and native reads are no longer
-all-or-nothing. Since the T36B per-path read proof, native context/diff reads and cached result
-delivery also work on deny-bearing states — including credential-glob captures admitted for
-managed execution — for every path the live cwd-bound shape proves: `observe` proves its exact
-source, diff proves each tracked path, reread, and untracked inspection before reading, and
-cached delivery proves every represented path before disclosing anything. Paths a deny can
-reach (or that the conservative matcher cannot reason about) still refuse with
-`read_scope:path_unproven`, and whole-tree scope keeps the restrictive deny-free behavior.
-D03's current fixed acceptance expectations describe the legacy workspace-write profile.
-
-Managed Codex can protect Git metadata in its own command sandbox without including that
-restriction in `codex/sandbox-state-meta`. Replaying such JSON with `codex sandbox
---sandbox-state-json` can then permit writes into `.git`; a linked worktree's `.git` pointer
-also does not by itself protect the resolved Git directory. Do not enroll a profile for
-process execution until native probes prove Git-metadata write denial for both standalone
-and linked worktrees. Do not relax shape matching or enroll a capture to work around a
-failed probe.
+What the list does not do: it does not confine the language servers' or Git's own reads, and it
+does not stop a child from writing where the daemon's user may write. That is deliberate — the
+agent already has its own shell, so a second sandbox around the IDE protected nothing and only
+made the IDE refuse.
 
 ## Confined project checks (EYES-r2)
 
@@ -223,8 +151,8 @@ follow the same rules as every other field: restart-only, validated at load, and
 configuration is rejected on any malformed value.
 
 - `allowed_roots`: 0..=16 absolute, normalized directory roots (no `..`, no trailing `/`); the
-  product default is an empty list. A worktree is admitted when its canonical path is equal to or
-  below a canonicalized root; otherwise every language state is `outside allowed roots`.
+  same list gates activation (above). A worktree is admitted for checks when its canonical path is
+  equal to or below a canonicalized root; otherwise every language state is `outside allowed roots`.
 - `project_checks`: optional timing and language declarations. Presence together with a nonempty
   `allowed_roots` enables the feed; absence, or empty roots, keeps v0.2 behaviour unchanged.
   - `debounce_ms` 100..=10000 (default 1500), `idle_timeout_s` 30..=3600 (default 300),

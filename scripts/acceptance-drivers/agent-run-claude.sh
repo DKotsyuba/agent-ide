@@ -117,19 +117,6 @@ cmp -s "$BINARY" "$MCP_BINARY" \
 if [ "$AGENT_IDE_ACCEPTANCE_ROUTE" = agent-run-claude ]; then
     /usr/bin/grep -q 'claude-r3-2026-09-14' "$LAUNCHER" \
         || fail E_LAUNCHER_NO_CLAUDE_TYPESCRIPT "launcher template lacks the accepted Claude TypeScript record"
-else
-    jq -e '
-        .version == 1 and any(.targets[];
-            .codex.identity as $codex
-            | any(.profiles[]?;
-                .record.shape_version == 3
-                and .record.configuration == "managed-visualization-family-v3"
-                and .record.transport == "codex-sandbox-state-json"
-                and .record.provider_binary == $codex
-                and (.record.profile_id | type == "string" and length > 0)
-                and (.sandbox_state | type == "object")))
-    ' "$LAUNCHER" >/dev/null 2>>"$DIAG_LOG" \
-        || fail E_LAUNCHER_NO_CODEX_V3 "launcher lacks a matching accepted Codex v3 profile"
 fi
 
 LEFT=$(canonical_dir "$AGENT_IDE_ACCEPTANCE_LEFT_WORKTREE") || fail E_LEFT_CANONICAL

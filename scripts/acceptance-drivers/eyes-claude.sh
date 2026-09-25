@@ -79,45 +79,23 @@ rendezvous_runtime_dir() {
     printf '/private/tmp/ai-r-%s' "$(printf '%s' "$identity" | cut -c1-16)"
 }
 
-# Writes one temporary sandbox-state envelope file used only to mint an `allow_disabled_host`
-# launcher-target profile; it carries no real host trust and is never read by the daemon at runtime.
-write_sandbox_state() {
-    cat >"$1" <<'JSON'
-{"permissionProfile": {"type": "disabled"}, "codexLinuxSandboxExe": null, "sandboxCwd": "/private/tmp", "useLegacyLandlock": false}
-JSON
-}
-
 # Writes the shared `--claude-launcher-template` every scenario session uses.
 #
 # One placeholder target (`bind_one_candidate` overwrites its `attachment`/`candidate` per session,
-# EYES-r2 §1); `allow_disabled_host: true` accepts it without live Execution provider evidence,
-# since this driver never exercises the v0.2 Go/TypeScript providers. `operation_ms` is generously
+# EYES-r2 §1); this driver never exercises the v0.2 Go/TypeScript providers. `operation_ms` is generously
 # above the v0.2 unit-test default (1000 ms): a real model needs several real seconds between a
 # `Pending` reply and its own follow-up Bash launch, and the whole foreground-helper ticket expires
 # at `operation_ms` after mint (`src/assistance/assembly.rs`).
 write_launcher_template() {
     template=$1
     allowed_root=$2
-    sandbox_state=$WORKDIR/sandbox-state.json
-    write_sandbox_state "$sandbox_state"
     git_ev=$("$BINARY" evidence executable --identity accepted-git /usr/bin/git) \
         || fail E_EVIDENCE_GIT
-    codex_path=$(command -v codex || true)
-    [ -n "$codex_path" ] || fail E_CODEX_MISSING "codex not found on PATH"
-    codex_ev=$("$BINARY" evidence executable --identity accepted-codex "$codex_path") \
-        || fail E_EVIDENCE_CODEX
-    record=$("$BINARY" evidence record --sandbox-state "$sandbox_state" \
-        --profile-id fixture-disabled --revision 1 \
-        --provider-binary accepted-git --toolchain toolchain --configuration default \
-        --trust fixture-disabled --transport direct --d03-evidence accepted-d03) \
-        || fail E_EVIDENCE_RECORD
-    python3 - "$template" "$allowed_root" "$git_ev" "$codex_ev" "$record" \
+    python3 - "$template" "$allowed_root" "$git_ev" \
         "$RUST_TOOLCHAIN_DIR" "$NODE" "$PYRIGHT_CLI" <<'PYEOF'
 import json, sys
-out_path, allowed_root, git_ev, codex_ev, record, rust_dir, node, pyright_cli = sys.argv[1:9]
+out_path, allowed_root, git_ev, rust_dir, node, pyright_cli = sys.argv[1:7]
 git_ev = json.loads(git_ev)
-codex_ev = json.loads(codex_ev)
-record = json.loads(record)
 config = {
     "version": 1,
     "limits": {"queued": 4, "details": 8, "operation_ms": 120000, "output_bytes": 4096},
@@ -126,10 +104,7 @@ config = {
             "attachment": "placeholder-attachment",
             "candidate": "/placeholder/candidate",
             "git": git_ev,
-            "codex": codex_ev,
             "providers": [],
-            "profiles": [record],
-            "allow_disabled_host": True,
             "claude_profile": {
                 "enabled": True,
                 "fail_if_unavailable": True,
