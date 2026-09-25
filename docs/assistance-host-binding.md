@@ -171,6 +171,9 @@ JSON, malformed or ambiguous identity, transport loss and timeout all exit succe
 without stdout or stderr. It performs one connect-only submission, with no retry,
 autostart, workspace scan or LSP work. Configure the command as written; malformed CLI
 syntax is a command configuration error, not a hook payload result.
+The private error log separates input-thread startup, read, deadline, size, and cwd
+failures with closed `hook_input_*` or `hook_no_cwd` details and an elapsed millisecond
+count; it never stores the hook payload.
 
 Hook parsing rejects duplicate known JSON keys and retains only explicit host, phase, bounded
 identity, and optional call ID. Codex root events require `session_id`; native child events carry

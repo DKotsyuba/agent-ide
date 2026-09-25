@@ -3657,6 +3657,67 @@ async fn managed_claude_hook_missing_or_corrupt_attachment_is_silent() {
     std::fs::remove_dir_all(runtime).unwrap();
 }
 
+/// An open stdin and an oversized Claude hook payload produce distinct closed timing evidence.
+#[tokio::test]
+async fn managed_claude_hook_distinguishes_input_timeout_and_oversize() {
+    let home = runtime();
+    let project = home.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let project = std::fs::canonicalize(project).unwrap();
+    let launch = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
+        command
+            .arg("claude-hook")
+            .env("AGENT_IDE_HOME", &home)
+            .env("CLAUDE_PROJECT_DIR", &project)
+            .current_dir(&project)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        command.spawn().unwrap()
+    };
+
+    let mut stalled = launch();
+    let open_input = stalled.stdin.take().unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(2), stalled.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_managed_hook_silent(&output);
+    drop(open_input);
+
+    let mut oversized = launch();
+    let mut input = oversized.stdin.take().unwrap();
+    input.write_all(&vec![b'x'; 64 * 1024 + 1]).await.unwrap();
+    input.shutdown().await.unwrap();
+    drop(input);
+    let output = oversized.wait_with_output().await.unwrap();
+    assert_managed_hook_silent(&output);
+
+    let digest = blake3::hash(project.as_os_str().as_bytes())
+        .to_hex()
+        .to_string();
+    let log = home
+        .join(".agent-ide/logs")
+        .join(&digest[..16])
+        .join("events.jsonl");
+    let events = std::fs::read_to_string(log).unwrap();
+    let events: Vec<Value> = events
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    for detail in ["hook_input_timeout", "hook_input_oversize"] {
+        let event = events
+            .iter()
+            .find(|event| event["detail"] == detail)
+            .unwrap_or_else(|| panic!("missing closed hook detail {detail}"));
+        assert!(event["duration_ms"].as_u64().is_some());
+    }
+    std::fs::remove_dir_all(home).unwrap();
+}
+
 /// Missing templates and templates without strict Claude evidence stay bounded and disconnected.
 #[tokio::test]
 async fn managed_claude_startup_requires_template_and_strict_profile() {

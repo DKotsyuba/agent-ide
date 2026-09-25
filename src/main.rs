@@ -1851,9 +1851,11 @@ fn read_claude_attachment(key: &Path) -> std::io::Result<(PathBuf, String)> {
 /// total deadline on that account: the rendezvous key is only ever read from
 /// [`read_claude_key_cache`], a hint the owning MCP server left behind at its own startup. Once
 /// validated, the existing bounded Claude parser, sanitized transport, exact lifecycle correlation,
-/// feedback rendering, and foreground-helper recognition remain unchanged.
+/// feedback rendering, and foreground-helper recognition remain unchanged. Closed input failure
+/// details distinguish thread startup, timeout, read, size, and cwd failures without logging input.
 async fn run_managed_claude_hook() {
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_millis(250);
     let log_candidate = std::env::var_os("CLAUDE_PROJECT_DIR")
         .map(PathBuf::from)
         .and_then(|path| fs::canonicalize(path).ok())
@@ -1871,6 +1873,7 @@ async fn run_managed_claude_hook() {
             agent_ide::errorlog::Fields {
                 host: Some(HostKind::Claude),
                 detail: Some(detail),
+                duration_ms: Some(u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX)),
                 ..Default::default()
             },
         );
@@ -1887,15 +1890,22 @@ async fn run_managed_claude_hook() {
         })
         .is_err()
     {
-        log("hook_no_cwd");
+        log("hook_input_spawn");
         return;
     }
-    let Ok(Ok(Some(payload))) = tokio::time::timeout_at(deadline, receiver).await else {
-        log("hook_no_cwd");
-        return;
+    let payload = match tokio::time::timeout_at(deadline, receiver).await {
+        Ok(Ok(Some(payload))) => payload,
+        Err(_) => {
+            log("hook_input_timeout");
+            return;
+        }
+        _ => {
+            log("hook_input_read");
+            return;
+        }
     };
     if payload.len() > 64 * 1024 {
-        log("hook_no_cwd");
+        log("hook_input_oversize");
         return;
     }
     let Some(cwd) = serde_json::from_slice::<serde_json::Value>(&payload)
