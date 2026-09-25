@@ -356,7 +356,7 @@ mod tests {
     #[test]
     fn execution_profile_cause_is_closed_and_actionable() {
         use crate::assistance::reply::ExecutionProfileCause;
-        let cause = ExecutionProfileCause::from_log_tag("host_disabled; captured:deadbeef")
+        let cause = ExecutionProfileCause::from_log_tag("spawn:io; captured:deadbeef")
             .expect("known cause");
         let rendered = render(
             PeerReply::Error {
@@ -367,13 +367,13 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&rendered),
-            "error: execution_profile (host_disabled); continue with native tools"
+            "error: execution_profile (spawn:io); continue with native tools"
         );
         assert_eq!(
             rendered.structured_content.unwrap()["code"],
             "execution_profile"
         );
-        assert!(ExecutionProfileCause::from_log_tag("host_disabled:/private/path").is_none());
+        assert!(ExecutionProfileCause::from_log_tag("spawn:io:/private/path").is_none());
     }
 
     /// Keeps unresolved TypeScript configuration actionable without claiming a native substitute.

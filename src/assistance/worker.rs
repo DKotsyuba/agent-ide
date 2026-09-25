@@ -4636,10 +4636,9 @@ mod stop_retry_tests {
         },
         assistance::host_binding::{
             BindingStatus, parse_candidate, parse_channel_session, parse_claude_hook_event,
-            parse_hook_event, parse_observed_sandbox_state,
+            parse_hook_event,
         },
         checks::{CheckState, Language, Problem, ProblemSnapshot, Severity},
-        execution::{D03ProfileEvidence, HostSandboxState, PersistedProfileRecord},
         intelligence::freshness::{CacheIdentity, CacheLifecycle},
     };
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4695,13 +4694,8 @@ mod stop_retry_tests {
         }
     }
 
-    /// Creates one current host binding and matching disabled sandbox observation for a real start.
-    fn production_call(
-        worker: &Worker<'_>,
-        cwd: &std::path::Path,
-        actor: &str,
-        id: &str,
-    ) -> (ValidatedInvocation, ObservedSandboxState) {
+    /// Creates one current host binding for a managed job.
+    fn production_call(worker: &Worker<'_>, actor: &str, id: &str) -> ValidatedInvocation {
         let mut guard = worker.shared.bindings.lock().unwrap();
         let channel = parse_channel_session(b"stop-retry").unwrap();
         let hook = parse_hook_event(
@@ -4723,43 +4717,11 @@ mod stop_retry_tests {
         let BindingStatus::Validated(invocation) = guard.establish_start(candidate, channel) else {
             panic!("fixture binding must validate")
         };
-        let active = guard.consume_active(invocation.binding_ref()).unwrap();
-        let state = serde_json::json!({
-            "permissionProfile":{"type":"disabled"},
-            "codexLinuxSandboxExe":null,
-            "sandboxCwd":cwd,
-            "useLegacyLandlock":false
-        });
-        let meta = serde_json::json!({"codex/sandbox-state-meta":state});
-        let observed =
-            parse_observed_sandbox_state(meta.as_object().unwrap(), &invocation, &active, true)
-                .unwrap();
-        (invocation, observed)
+        invocation
     }
 
-    /// Builds the closed disabled-host launcher consumed by production-shaped worker tests.
+    /// Builds the fixture launcher with the worktree's temporary base as its allowed root.
     fn production_launcher(root: &std::path::Path) -> LauncherConfig {
-        let state = HostSandboxState::parse(Some(serde_json::json!({
-            "permissionProfile":{"type":"disabled"},
-            "codexLinuxSandboxExe":null,
-            "sandboxCwd":root,
-            "useLegacyLandlock":false
-        })))
-        .unwrap();
-        let record = PersistedProfileRecord::from_execution_evidence(
-            "stop-retry-disabled",
-            1,
-            D03ProfileEvidence {
-                provider_binary: "fixture-git".into(),
-                toolchain: "fixture-toolchain".into(),
-                configuration: "default".into(),
-                trust: "fixture-local".into(),
-                transport: "direct".into(),
-                d03_evidence: "fixture-d03".into(),
-            },
-            &state,
-        )
-        .unwrap();
         let git = std::path::Path::new("/usr/bin/git");
         let executable = serde_json::json!({
             "path":git,
@@ -4769,20 +4731,18 @@ mod stop_retry_tests {
         let config = serde_json::json!({
             "version":1,
             "limits":{"queued":8,"details":8,"operation_ms":5000,"output_bytes":1024},
+            "allowed_roots":[root.parent().unwrap()],
             "targets":[{
                 "attachment":"stop-retry",
                 "candidate":root,
                 "git":executable,
-                "codex":executable,
-                "providers":[],
-                "profiles":[{"record":serde_json::from_str::<serde_json::Value>(&record.to_json()).unwrap(),"sandbox_state":serde_json::from_str::<serde_json::Value>(state.sandbox_state_json()).unwrap()}],
-                "allow_disabled_host":true
+                "providers":[]
             }]
         });
         LauncherConfig::parse(config.to_string().as_bytes()).unwrap()
     }
 
-    /// Returns the exact configured target selected by the production-shaped fixture attachment.
+    /// Returns the target selected by the fixture's trusted launcher attachment.
     fn production_target(root: &std::path::Path) -> LaunchTarget {
         production_launcher(root)
             .target("stop-retry")
@@ -4796,14 +4756,13 @@ mod stop_retry_tests {
         actor: &str,
         id: &str,
     ) -> (BindingRef, StartReceipt) {
-        let (invocation, observed) = production_call(worker, &worker.runtime, actor, id);
+        let invocation = production_call(worker, actor, id);
         let binding = invocation.binding_ref().clone();
         let (_cancel_sender, cancel) = watch::channel(false);
         let mut job = Job {
             input: JobInput::Managed,
             reference: format!("production-{id}"),
             invocation,
-            observed: Some(observed),
             tool: AssistanceTool::Start,
             parameters: serde_json::json!({"activation_id":id}),
             target: production_target(&worker.runtime),
@@ -4816,6 +4775,59 @@ mod stop_retry_tests {
         worker.activate(&mut job).await.unwrap();
         let receipt = worker.grants.get(&binding).cloned().unwrap();
         (binding, receipt)
+    }
+
+    /// Activation rejects an out-of-root override and accepts an explicit in-root override.
+    #[tokio::test]
+    async fn activation_enforces_allowed_roots_and_accepts_root_parameter() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+
+        let mut outside = start_job(
+            &worker,
+            "outside-actor",
+            "outside-start",
+            serde_json::json!({"activation_id":"outside","root":"/private/tmp"}),
+        );
+        assert!(matches!(
+            worker.activate(&mut outside).await,
+            Err(FailureCode::OutsideAllowedRoots)
+        ));
+
+        let mut inside = start_job(
+            &worker,
+            "inside-actor",
+            "inside-start",
+            serde_json::json!({"activation_id":"inside","root":fixture.root}),
+        );
+        worker.activate(&mut inside).await.unwrap();
+    }
+
+    /// Builds a direct managed Start job for the fixture's trusted launcher target.
+    fn start_job(
+        worker: &Worker<'_>,
+        actor: &str,
+        call: &str,
+        parameters: serde_json::Value,
+    ) -> Job {
+        let invocation = production_call(worker, actor, call);
+        let (_cancel_sender, cancel) = watch::channel(false);
+        Job {
+            input: JobInput::Managed,
+            reference: format!("start-{call}"),
+            invocation,
+            tool: AssistanceTool::Start,
+            parameters,
+            target: production_target(&worker.runtime),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            cancel,
+            stop_reply: None,
+            native_epoch: 0,
+            failure_detail: None,
+        }
     }
 
     /// Builds a Worker with real Store, binding and admission state for activation/revoke checks.
@@ -4838,9 +4850,13 @@ mod stop_retry_tests {
         output_bytes: usize,
     ) -> Worker<'a> {
         let launcher = LauncherConfig::parse(
-            format!(
-                r#"{{"version":1,"limits":{{"queued":8,"details":8,"operation_ms":5000,"output_bytes":{output_bytes}}},"targets":[]}}"#
-            )
+            serde_json::json!({
+                "version":1,
+                "limits":{"queued":8,"details":8,"operation_ms":5000,"output_bytes":output_bytes},
+                "allowed_roots":[runtime.parent().unwrap()],
+                "targets":[]
+            })
+            .to_string()
             .as_bytes(),
         )
         .unwrap();
@@ -4890,14 +4906,12 @@ mod stop_retry_tests {
         worker.edits.install_schema().await.unwrap();
         let (binding, _) = production_start(&mut worker, "edit-actor", "edit-start").await;
 
-        let (invocation, observed) =
-            production_call(&worker, &fixture.root, "edit-actor", "edit-context");
+        let invocation = production_call(&worker, "edit-actor", "edit-context");
         let (_cancel_sender, cancel) = watch::channel(false);
         let mut context_job = Job {
             input: JobInput::Managed,
             reference: "context-source".into(),
             invocation,
-            observed: Some(observed),
             tool: AssistanceTool::Context,
             parameters: serde_json::json!({"path":"main.rs"}),
             target: production_target(&fixture.root),
@@ -4925,14 +4939,12 @@ mod stop_retry_tests {
             },
         );
 
-        let (invocation, observed) =
-            production_call(&worker, &fixture.root, "edit-actor", "edit-call");
+        let invocation = production_call(&worker, "edit-actor", "edit-call");
         let (_cancel_sender, cancel) = watch::channel(false);
         let mut edit_job = Job {
             input: JobInput::Managed,
             reference: "edit-result".into(),
             invocation,
-            observed: Some(observed),
             tool: AssistanceTool::Edit,
             parameters: serde_json::json!({
                 "operation_id":"operation-1",
@@ -5005,7 +5017,6 @@ mod stop_retry_tests {
             input: JobInput::ClaudeEditPrepare,
             reference: "claude-chain-prepare".into(),
             invocation: edit_job.invocation.clone(),
-            observed: None,
             tool: AssistanceTool::Edit,
             parameters: serde_json::json!({
                 "operation_id":"claude-chain-1",
@@ -5097,8 +5108,7 @@ mod stop_retry_tests {
         else {
             panic!("fixture request must prepare once");
         };
-        let (invocation, _) =
-            production_call(&worker, &fixture.root, "different-binding", "edit-call");
+        let invocation = production_call(&worker, "different-binding", "edit-call");
         let binding = invocation.binding_ref().clone();
         worker.prepared_edits.insert(
             (binding, request.operation_id.clone()),
@@ -5114,7 +5124,6 @@ mod stop_retry_tests {
             ))),
             reference: "stop-cleanup".into(),
             invocation,
-            observed: None,
             tool: AssistanceTool::Edit,
             parameters: serde_json::to_value(&request).unwrap(),
             target: production_target(&fixture.root),
@@ -5269,7 +5278,7 @@ mod stop_retry_tests {
         worker.observations.install_schema().await.unwrap();
         worker.edits.install_schema().await.unwrap();
         let (binding, _) = production_start(&mut worker, "stop-actor", "stop-start").await;
-        let (invocation, _) = production_call(&worker, &fixture.root, "stop-actor", "stop-call");
+        let invocation = production_call(&worker, "stop-actor", "stop-call");
         {
             let mut guard = worker.shared.bindings.lock().unwrap();
             guard.begin_stop(invocation.binding_ref()).unwrap();
@@ -5293,7 +5302,6 @@ mod stop_retry_tests {
             input: JobInput::ClaudeStopEdit(Box::new(settled_claude_edit(binding))),
             reference: "stop-known-job".into(),
             invocation,
-            observed: None,
             tool: AssistanceTool::Edit,
             parameters: serde_json::to_value(&request).unwrap(),
             target: production_target(&fixture.root),
@@ -5463,13 +5471,12 @@ mod stop_retry_tests {
         id: &str,
         parameters: serde_json::Value,
     ) -> PeerReply {
-        let (invocation, observed) = production_call(worker, &worker.runtime, actor, id);
+        let invocation = production_call(worker, actor, id);
         let (_cancel_sender, cancel) = watch::channel(false);
         let mut job = Job {
             input: JobInput::Managed,
             reference: format!("problems-{id}"),
             invocation,
-            observed: Some(observed),
             tool: AssistanceTool::Context,
             parameters,
             target: production_target(&worker.runtime),
@@ -5562,7 +5569,6 @@ mod stop_retry_tests {
     fn context_job(
         root: &std::path::Path,
         invocation: ValidatedInvocation,
-        observed: ObservedSandboxState,
     ) -> (Job, watch::Sender<bool>) {
         let (cancel_sender, cancel) = watch::channel(false);
         (
@@ -5570,7 +5576,6 @@ mod stop_retry_tests {
                 input: JobInput::Managed,
                 reference: "continuation-detail".into(),
                 invocation,
-                observed: Some(observed),
                 tool: AssistanceTool::Context,
                 parameters: serde_json::json!({"path":"main.rs"}),
                 target: production_target(root),
@@ -5612,13 +5617,8 @@ mod stop_retry_tests {
         let (binding, _) =
             production_start(&mut worker, "continuation-actor", "continuation-start").await;
 
-        let (invocation, observed) = production_call(
-            &worker,
-            &fixture.root,
-            "continuation-actor",
-            "continuation-call",
-        );
-        let (mut job, _cancel_sender) = context_job(&fixture.root, invocation, observed.clone());
+        let invocation = production_call(&worker, "continuation-actor", "continuation-call");
+        let (mut job, _cancel_sender) = context_job(&fixture.root, invocation);
 
         // Pre-insert the placeholder detail exactly as `enqueue` would: `context()`'s own
         // `set_context_page` call only mutates an *already retained* detail, matching production.
@@ -5672,8 +5672,6 @@ mod stop_retry_tests {
                 Inspection {
                     binding: binding.clone(),
                     reference: job.reference.clone(),
-                    observed: Some(observed.clone()),
-                    target: production_target(&fixture.root),
                     expected: None,
                     reply: reply_tx,
                 },
@@ -5744,9 +5742,8 @@ mod stop_retry_tests {
         let mut worker = worker(&store, workspace, fixture.root.clone());
         worker.observations.install_schema().await.unwrap();
         let (binding, _) = production_start(&mut worker, "large-actor", "large-start").await;
-        let (invocation, observed) =
-            production_call(&worker, &fixture.root, "large-actor", "large-call");
-        let (mut job, _cancel_sender) = context_job(&fixture.root, invocation, observed.clone());
+        let invocation = production_call(&worker, "large-actor", "large-call");
+        let (mut job, _cancel_sender) = context_job(&fixture.root, invocation);
         worker.shared.ledger.lock().unwrap().details.insert(
             job.reference.clone(),
             Detail {
@@ -5788,8 +5785,6 @@ mod stop_retry_tests {
                 Inspection {
                     binding: binding.clone(),
                     reference: job.reference.clone(),
-                    observed: Some(observed.clone()),
-                    target: production_target(&fixture.root),
                     expected: None,
                     reply: reply_tx,
                 },
@@ -5839,9 +5834,8 @@ mod stop_retry_tests {
         let mut worker = worker(&store, workspace, fixture.root.clone());
         worker.observations.install_schema().await.unwrap();
         let (binding, _) = production_start(&mut worker, "huge-actor", "huge-start").await;
-        let (invocation, observed) =
-            production_call(&worker, &fixture.root, "huge-actor", "huge-call");
-        let (mut job, _cancel_sender) = context_job(&fixture.root, invocation, observed);
+        let invocation = production_call(&worker, "huge-actor", "huge-call");
+        let (mut job, _cancel_sender) = context_job(&fixture.root, invocation);
         worker.shared.ledger.lock().unwrap().details.insert(
             job.reference.clone(),
             Detail {
@@ -5885,8 +5879,7 @@ mod stop_retry_tests {
         let mut worker = worker(&store, workspace, fixture.root.clone());
         worker.observations.install_schema().await.unwrap();
         let (binding, _) = production_start(&mut worker, "stale-actor", "stale-start").await;
-        let (_invocation, observed) =
-            production_call(&worker, &fixture.root, "stale-actor", "stale-call");
+        let _invocation = production_call(&worker, "stale-actor", "stale-call");
 
         // No reference was ever retained under this or any other binding.
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -5896,8 +5889,6 @@ mod stop_retry_tests {
             Inspection {
                 binding: binding.clone(),
                 reference: "never-retained".into(),
-                observed: Some(observed.clone()),
-                target: production_target(&fixture.root),
                 expected: None,
                 reply: reply_tx,
             },
@@ -5913,8 +5904,7 @@ mod stop_retry_tests {
         // A reference retained under a genuinely *different* binding (a distinct actor, since
         // `establish_start` reuses the existing generation for a repeated actor) must not be
         // reachable either.
-        let (other_invocation, other_observed) =
-            production_call(&worker, &fixture.root, "foreign-actor", "other-call");
+        let other_invocation = production_call(&worker, "foreign-actor", "other-call");
         let other_binding = other_invocation.binding_ref().clone();
         worker.shared.ledger.lock().unwrap().details.insert(
             "foreign-detail".into(),
@@ -5948,8 +5938,6 @@ mod stop_retry_tests {
             Inspection {
                 binding,
                 reference: "foreign-detail".into(),
-                observed: Some(other_observed),
-                target: production_target(&fixture.root),
                 expected: None,
                 reply: reply_tx,
             },
@@ -5975,9 +5963,8 @@ mod stop_retry_tests {
         let mut worker = worker(&store, workspace, fixture.root.clone());
         worker.observations.install_schema().await.unwrap();
         let (binding, _) = production_start(&mut worker, "small-actor", "small-start").await;
-        let (invocation, observed) =
-            production_call(&worker, &fixture.root, "small-actor", "small-call");
-        let (mut job, _cancel_sender) = context_job(&fixture.root, invocation, observed);
+        let invocation = production_call(&worker, "small-actor", "small-call");
+        let (mut job, _cancel_sender) = context_job(&fixture.root, invocation);
         worker.shared.ledger.lock().unwrap().details.insert(
             job.reference.clone(),
             Detail {
@@ -6020,752 +6007,6 @@ mod stop_retry_tests {
             "a whole-page result must retain no continuation state"
         );
     }
-    /// Builds a read-only managed state for Git snapshot and read-proof tests, with an optional
-    /// narrower path or glob deny relative to the cwd. Snapshot children need no write grant.
-    fn read_scope_managed_state(root: &std::path::Path, deny: Option<&str>) -> serde_json::Value {
-        let mut state = serde_json::json!({
-            "codexLinuxSandboxExe": null,
-            "permissionProfile": {"type":"managed","file_system":{"entries":[
-                {"access":"read","path":{"type":"special","value":{"kind":"root"}}}
-            ],"type":"restricted"},"network":"restricted"},
-            "sandboxCwd":root,
-            "useLegacyLandlock":false
-        });
-        if let Some(denied) = deny {
-            state["permissionProfile"]["file_system"]["entries"]
-                .as_array_mut()
-                .unwrap()
-                .push(if denied.contains('*') {
-                    serde_json::json!({"access":"deny","path":{"pattern":root.join(denied),"type":"glob_pattern"}})
-                } else {
-                    serde_json::json!({"access":"deny","path":{"path":root.join(denied),"type":"path"}})
-                });
-        }
-        state
-    }
-
-    /// Builds the managed launcher whose v2 catalog admits the deny-bearing narrowed state.
-    ///
-    /// The pinned `codex` executable is a tiny fixture shim (written beside the worktree, so
-    /// the repository never sees it) that drops the `sandbox --sandbox-state-json <json> --`
-    /// wrapper arguments and execs the wrapped command in place. Tests that only validate
-    /// scopes never spawn through it; tests that capture Diff do, without needing a real
-    /// Codex binary.
-    fn read_scope_target(root: &std::path::Path) -> LaunchTarget {
-        let clean = HostSandboxState::parse(Some(read_scope_managed_state(root, None))).unwrap();
-        let record = PersistedProfileRecord::from_execution_evidence_v2(
-            "read-scope-managed",
-            1,
-            D03ProfileEvidence {
-                provider_binary: "fixture-git".into(),
-                toolchain: "fixture-toolchain".into(),
-                configuration: "default".into(),
-                trust: "fixture-local".into(),
-                transport: "managed".into(),
-                d03_evidence: "fixture-d03".into(),
-            },
-            &clean,
-        )
-        .unwrap();
-        let git = std::path::Path::new("/usr/bin/git");
-        let executable = serde_json::json!({
-            "path":git,
-            "identity":"fixture-git",
-            "blake3":blake3::hash(&std::fs::read(git).unwrap()).to_hex().to_string()
-        });
-        let shim = root.parent().unwrap().join("codex-sandbox-shim");
-        std::fs::write(
-            &shim,
-            "#!/bin/sh\n[ \"$1\" = sandbox ] || exit 64\nshift 4\nexec \"$@\"\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let codex = serde_json::json!({
-            "path":shim,
-            "identity":"fixture-codex-shim",
-            "blake3":blake3::hash(&std::fs::read(&shim).unwrap()).to_hex().to_string()
-        });
-        let config = serde_json::json!({
-            "version":1,
-            "limits":{"queued":8,"details":8,"operation_ms":5000,"output_bytes":1024},
-            "targets":[{
-                "attachment":"stop-retry",
-                "candidate":root,
-                "git":executable,
-                "codex":codex,
-                "providers":[],
-                "profiles":[{"record":serde_json::from_str::<serde_json::Value>(&record.to_json()).unwrap(),"sandbox_state":serde_json::from_str::<serde_json::Value>(clean.sandbox_state_json()).unwrap()}],
-                "allow_disabled_host":false
-            }]
-        });
-        LauncherConfig::parse(config.to_string().as_bytes())
-            .unwrap()
-            .target("stop-retry")
-            .unwrap()
-            .clone()
-    }
-
-    /// Creates one current host binding and a managed (deny-free or deny-bearing) observation.
-    fn read_scope_call(
-        worker: &Worker<'_>,
-        deny: Option<&str>,
-        actor: &str,
-        id: &str,
-    ) -> (ValidatedInvocation, ObservedSandboxState) {
-        let mut guard = worker.shared.bindings.lock().unwrap();
-        let channel = parse_channel_session(b"stop-retry").unwrap();
-        let hook = parse_hook_event(
-            serde_json::json!({"hook_event_name":"PreToolUse","session_id":actor,"tool_use_id":id})
-                .to_string()
-                .as_bytes(),
-        )
-        .unwrap();
-        assert!(matches!(
-            guard.observe_hook(hook, channel.clone()),
-            BindingStatus::PreObserved
-        ));
-        let candidate = parse_candidate(
-            serde_json::json!({"threadId":actor,"callId":id,"x-codex-turn-metadata":{"turn":"stop-retry"}})
-                .as_object()
-                .unwrap(),
-        )
-        .unwrap();
-        let BindingStatus::Validated(invocation) = guard.establish_start(candidate, channel) else {
-            panic!("fixture binding must validate")
-        };
-        let active = guard.consume_active(invocation.binding_ref()).unwrap();
-        let meta = serde_json::json!({
-            "codex/sandbox-state-meta": read_scope_managed_state(&worker.runtime, deny)
-        });
-        let observed =
-            parse_observed_sandbox_state(meta.as_object().unwrap(), &invocation, &active, true)
-                .unwrap();
-        (invocation, observed)
-    }
-
-    /// Runs one real `serve_inspection` for a retained detail and returns the caller's reply.
-    async fn inspect_detail(
-        worker: &Worker<'_>,
-        binding: &BindingRef,
-        reference: &str,
-        observed: &ObservedSandboxState,
-        target: &LaunchTarget,
-    ) -> PeerReply {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        serve_inspection(
-            &worker.workspace,
-            &worker.shared,
-            Inspection {
-                binding: binding.clone(),
-                reference: reference.to_owned(),
-                observed: Some(observed.clone()),
-                target: target.clone(),
-                expected: None,
-                reply: reply_tx,
-            },
-        )
-        .await;
-        reply_rx.await.unwrap()
-    }
-
-    /// A managed Codex host can bind its sandbox cwd to the worktree and still carry deny globs.
-    /// Its pathless activation status is deliverable after durable authorization, while source
-    /// reads retain the per-path proof and the denied whole-tree scope stays unavailable.
-    #[tokio::test]
-    async fn activation_status_survives_a_same_cwd_host_with_deny_globs() {
-        let fixture = Fixture::new();
-        std::fs::write(fixture.root.join("main.rs"), "fn main() {}\n").unwrap();
-        let store = fixture.store();
-        let workspace = DurableWorkspace::open(&store).await.unwrap();
-        let mut worker = worker(&store, workspace, fixture.root.clone());
-        let (binding, _, authority, target) =
-            activate_read_scope(&mut worker, "codex-actor", "activation").await;
-        let (_, observed) = read_scope_call(
-            &worker,
-            Some("**/*.key"),
-            "codex-actor",
-            "activation-inspect",
-        );
-        assert_eq!(
-            observed.state().as_json()["sandboxCwd"],
-            target.candidate.to_str().unwrap()
-        );
-        assert!(matches!(
-            validate_read_scope(
-                &worker.shared,
-                &binding,
-                &observed,
-                &target,
-                &authority,
-                crate::errorlog::Method::Inspect,
-                crate::execution::ReadScope::WholeTree,
-            ),
-            Err(ReadScopeRefusal {
-                code: FailureCode::ExecutionProfileCause(
-                    ExecutionProfileCause::ReadWholeTreeUnproven
-                ),
-                ..
-            })
-        ));
-        validate_read_scope(
-            &worker.shared,
-            &binding,
-            &observed,
-            &target,
-            &authority,
-            crate::errorlog::Method::Inspect,
-            crate::execution::ReadScope::Path(Path::new("main.rs")),
-        )
-        .unwrap();
-        retain_detail(
-            &worker,
-            &binding,
-            "activation-detail",
-            AssistanceTool::Start,
-            &authority,
-        );
-        let reply = PeerReply::Complete {
-            kind: ResultKind::Activation,
-            text: "Workspace activated".into(),
-            detail_ref: Some("activation-detail".into()),
-            truncated: false,
-            continuation: false,
-        };
-        worker
-            .shared
-            .complete("activation-detail", reply.clone(), Some(authority), None, 0);
-        assert_eq!(
-            inspect_detail(&worker, &binding, "activation-detail", &observed, &target).await,
-            reply
-        );
-    }
-
-    /// A denied managed Start never checks or discloses diagnostics. After an unrestricted Start,
-    /// a narrowed managed observation also prevents a later metadata-free native edit from
-    /// scheduling a check or disclosing the old result.
-    #[tokio::test]
-    async fn production_start_with_denied_source_never_checks_or_discloses_it() {
-        let fixture = Fixture::new();
-        std::fs::write(
-            fixture.root.join("Cargo.toml"),
-            "[package]\nname='fixture'\nversion='0.1.0'\n",
-        )
-        .unwrap();
-        std::fs::write(fixture.root.join("secret.rs"), "private source\n").unwrap();
-        let store = fixture.store();
-        let workspace = DurableWorkspace::open(&store).await.unwrap();
-        let mut worker = worker(&store, workspace, fixture.root.clone());
-        let runner = Arc::new(crate::checks::runner::FakeRunner::default());
-        let fingerprints = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = fingerprints.clone();
-        let scheduler = crate::checks::scheduler::Scheduler::new(
-            vec![Arc::new(crate::checks::rust::RustChecker::new(
-                runner.clone(),
-                std::path::PathBuf::from("/usr"),
-                None,
-                Duration::from_secs(1),
-                None,
-            ))],
-            Duration::from_millis(1),
-            1,
-            fixture.base.join("cache"),
-        )
-        .with_fingerprint(Arc::new(move |_| {
-            counter.fetch_add(1, Ordering::Relaxed);
-            Some(1)
-        }));
-        let feed = Arc::new(ProjectProblemFeed::new(
-            scheduler,
-            vec![fixture.root.clone()],
-            vec![Language::Rust],
-        ));
-        let shared = Arc::get_mut(&mut worker.shared).unwrap();
-        shared.problem_source = Some(feed.clone());
-        shared.project_feed = Some(feed.clone());
-        let (invocation, observed) = read_scope_call(
-            &worker,
-            Some("**/secret.rs"),
-            "denied-actor",
-            "denied-start",
-        );
-        let binding = invocation.binding_ref().clone();
-        let (_cancel_sender, cancel) = watch::channel(false);
-        worker
-            .perform(Job {
-                input: JobInput::Managed,
-                reference: "denied-start-detail".into(),
-                invocation,
-                observed: Some(observed),
-                tool: AssistanceTool::Start,
-                parameters: serde_json::json!({"activation_id":"denied-start"}),
-                target: read_scope_target(&fixture.root),
-                deadline: tokio::time::Instant::now() + Duration::from_secs(5),
-                cancel,
-                stop_reply: None,
-                native_epoch: 0,
-                failure_detail: None,
-            })
-            .await;
-        assert!(worker.grants.contains_key(&binding));
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(!feed.is_busy());
-        assert_eq!(fingerprints.load(Ordering::Relaxed), 0);
-        assert!(runner.specs().is_empty());
-        assert!(
-            feed.next_block(&binding.fingerprint())
-                .unwrap()
-                .contains("read_restricted")
-        );
-
-        let (invocation, observed) = read_scope_call(
-            &worker,
-            Some("**/secret.rs"),
-            "denied-actor",
-            "denied-problems",
-        );
-        let (_cancel_sender, cancel) = watch::channel(false);
-        let mut job = Job {
-            input: JobInput::Managed,
-            reference: "denied-problems-detail".into(),
-            invocation,
-            observed: Some(observed),
-            tool: AssistanceTool::Context,
-            parameters: serde_json::json!({"kind":"problems","language":"rust"}),
-            target: read_scope_target(&fixture.root),
-            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
-            cancel,
-            stop_reply: None,
-            native_epoch: 0,
-            failure_detail: None,
-        };
-        let (reply, _, _) = worker
-            .context_problems_job(&mut job, &binding)
-            .await
-            .unwrap();
-        assert!(
-            matches!(reply, PeerReply::Complete { text, .. } if text == "rust: unavailable: read_restricted")
-        );
-        worker
-            .shared
-            .bindings
-            .lock()
-            .unwrap()
-            .stop_binding(&binding)
-            .unwrap();
-        worker.revoke(&binding, "denied-stop").await.unwrap();
-        feed.forget(&binding.fingerprint());
-
-        // A second actor starts unrestricted, then a managed observation narrows its profile.
-        // A native post carries no metadata and must keep that binding restricted.
-        let (invocation, clean) = read_scope_call(&worker, None, "native-actor", "native-start");
-        let native_binding = invocation.binding_ref().clone();
-        let (_cancel_sender, cancel) = watch::channel(false);
-        worker
-            .perform(Job {
-                input: JobInput::Managed,
-                reference: "native-start-detail".into(),
-                invocation,
-                observed: Some(clean),
-                tool: AssistanceTool::Start,
-                parameters: serde_json::json!({"activation_id":"native-start"}),
-                target: read_scope_target(&fixture.root),
-                deadline: tokio::time::Instant::now() + Duration::from_secs(5),
-                cancel,
-                stop_reply: None,
-                native_epoch: 0,
-                failure_detail: None,
-            })
-            .await;
-        assert!(!feed.is_read_restricted(&native_binding.fingerprint()));
-        let _ = feed.next_block(&native_binding.fingerprint());
-        let handle = WorkerHandle::new(
-            worker.shared.bindings.clone(),
-            worker.shared.launcher.clone(),
-            [0; 32],
-            worker.shared.admission.clone(),
-        )
-        .with_project_feed(feed.clone());
-        let (_, narrowed) = read_scope_call(
-            &worker,
-            Some("secret.rs"),
-            "native-actor",
-            "native-narrowing",
-        );
-        handle.restrict_project_feed(&native_binding, Some(&narrowed));
-        feed.changed(&native_binding.fingerprint());
-        assert!(!feed.is_busy());
-        assert_eq!(
-            feed.next_block(&native_binding.fingerprint()).as_deref(),
-            Some("<agent-ide>\nrust: unavailable: read_restricted\n</agent-ide>")
-        );
-        let before = runner.specs().len();
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert_eq!(
-            runner.specs().len(),
-            before,
-            "native post must not run a check"
-        );
-    }
-
-    /// A source observed under an allowed profile cannot authorize a later Edit after the host
-    /// narrows its profile. The target becomes a symlink before Edit: reaching Workspace's target
-    /// read would return an unsafe-target outcome, so the unavailable result proves the read gate
-    /// ran first.
-    #[tokio::test]
-    async fn narrowed_edit_refuses_before_workspace_opens_the_old_context_path() {
-        let fixture = Fixture::new();
-        std::fs::write(fixture.root.join("secret.rs"), "old\n").unwrap();
-        std::fs::write(fixture.root.join("outside.rs"), "outside\n").unwrap();
-        let store = fixture.store();
-        let workspace = DurableWorkspace::open(&store).await.unwrap();
-        let mut worker = worker(&store, workspace, fixture.root.clone());
-        worker.observations.install_schema().await.unwrap();
-        worker.edits.install_schema().await.unwrap();
-        let (binding, _, _, target) =
-            activate_read_scope(&mut worker, "narrowed-edit-actor", "start").await;
-        let (invocation, observed) =
-            read_scope_call(&worker, None, "narrowed-edit-actor", "context");
-        let (_cancel_sender, cancel) = watch::channel(false);
-        let mut context = Job {
-            input: JobInput::Managed,
-            reference: "allowed-source".into(),
-            invocation,
-            observed: Some(observed),
-            tool: AssistanceTool::Context,
-            parameters: serde_json::json!({"path":"secret.rs"}),
-            target: target.clone(),
-            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
-            cancel,
-            stop_reply: None,
-            native_epoch: 0,
-            failure_detail: None,
-        };
-        let (reply, authority, source) = worker.context(&mut context).await.unwrap();
-        worker.shared.ledger.lock().unwrap().details.insert(
-            context.reference.clone(),
-            Detail {
-                binding: binding.clone(),
-                reply,
-                selection: (AssistanceTool::Context, selection(&context.parameters)),
-                authority,
-                source,
-                native_epoch: 0,
-                diff_page: None,
-                diff_page_fresh: false,
-                context_page: None,
-                context_page_fresh: false,
-                diff_provenance: None,
-            },
-        );
-        std::fs::remove_file(fixture.root.join("secret.rs")).unwrap();
-        std::os::unix::fs::symlink("outside.rs", fixture.root.join("secret.rs")).unwrap();
-        let (invocation, observed) =
-            read_scope_call(&worker, Some("secret.rs"), "narrowed-edit-actor", "edit");
-        let (_cancel_sender, cancel) = watch::channel(false);
-        let mut edit = Job {
-            input: JobInput::Managed,
-            reference: "narrowed-edit".into(),
-            invocation,
-            observed: Some(observed),
-            tool: AssistanceTool::Edit,
-            parameters: serde_json::json!({
-                "operation_id":"narrowed-edit-operation",
-                "path":"secret.rs",
-                "source_ref":"allowed-source",
-                "content":"new\n"
-            }),
-            target,
-            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
-            cancel,
-            stop_reply: None,
-            native_epoch: 0,
-            failure_detail: None,
-        };
-        let (reply, _, _) = worker.edit(&mut edit).await.unwrap();
-        assert!(matches!(
-            reply,
-            PeerReply::Edit {
-                result: EditResult {
-                    outcome: ChangesEditOutcome::UnavailableBeforeDispatch,
-                    ..
-                },
-                ..
-            }
-        ));
-        assert_eq!(
-            std::fs::read(fixture.root.join("outside.rs")).unwrap(),
-            b"outside\n"
-        );
-    }
-
-    /// Both native-read consumers (`observe` and `serve_inspection` cached delivery) share
-    /// `validate_read_scope`. Under T36B a deny-bearing state admitted through a narrower v2
-    /// shape reads natively exactly when the requested path proves under the live cwd-bound
-    /// shape: a proven path reads and a cached page whose provenance names only proven paths
-    /// delivers even after the policy narrows post-capture, while denied paths, denied-path
-    /// provenance, and provenance-free details refuse. The durable authority is granted
-    /// through the real Workspace activation, so the consumers run with a current stamp
-    /// exactly as the managed start flow leaves behind.
-    #[tokio::test]
-    async fn read_scope_proves_paths_per_path_for_both_consumers() {
-        let fixture = Fixture::new();
-        std::fs::write(fixture.root.join("main.rs"), "fn main() {}\n").unwrap();
-        let store = fixture.store();
-        let workspace = DurableWorkspace::open(&store).await.unwrap();
-        let mut worker = worker(&store, workspace, fixture.root.clone());
-        worker.observations.install_schema().await.unwrap();
-
-        // One live binding with the accepted deny-free capture, and its durable authority.
-        let (invocation, clean_observed) =
-            read_scope_call(&worker, None, "read-scope-actor", "call-1");
-        let binding = invocation.binding_ref().clone();
-        let tree = worker
-            .workspace
-            .resolve_worktree(
-                fixture.root.clone(),
-                fixture.root.clone(),
-                fixture.root.join(".git"),
-            )
-            .await
-            .unwrap();
-        let request = crate::workspace::authority::ActivationRequest::new(
-            "read-scope-activation",
-            invocation,
-            worker.shared.active(&binding).unwrap(),
-            tree,
-        )
-        .unwrap();
-        let receipt = worker.workspace.activate(request).await.unwrap();
-        worker.grants.insert(binding.clone(), receipt);
-        let authority = worker.authority(&binding).await.unwrap();
-        let target = read_scope_target(&fixture.root);
-
-        // Consumer 1 (the `observe` native read path): the deny-free same-cwd state proves
-        // whole-tree read coverage and reads natively...
-        validate_read_scope(
-            &worker.shared,
-            &binding,
-            &clean_observed,
-            &target,
-            &authority,
-            crate::errorlog::Method::Inspect,
-            crate::execution::ReadScope::Path(Path::new("main.rs")),
-        )
-        .unwrap();
-        // ...and under T36B the deny-bearing narrowed state — admitted by the v2 catalog —
-        // still reads a proven path at the same cwd...
-        let (_, denied_observed) =
-            read_scope_call(&worker, Some("secret"), "read-scope-actor", "deny-call");
-        validate_read_scope(
-            &worker.shared,
-            &binding,
-            &denied_observed,
-            &target,
-            &authority,
-            crate::errorlog::Method::Inspect,
-            crate::execution::ReadScope::Path(Path::new("main.rs")),
-        )
-        .unwrap();
-        // ...while the denied subtree (the deny names `secret`, and ancestor-or-equal denies
-        // are unproven) refuses.
-        assert!(matches!(
-            validate_read_scope(
-                &worker.shared,
-                &binding,
-                &denied_observed,
-                &target,
-                &authority,
-                crate::errorlog::Method::Inspect,
-                crate::execution::ReadScope::Path(Path::new("secret/key.txt")),
-            ),
-            Err(ReadScopeRefusal {
-                code: FailureCode::ExecutionProfileCause(ExecutionProfileCause::ReadPathUnproven),
-                ..
-            })
-        ));
-
-        // Consumer 2 (the `serve_inspection` cached-delivery path): a detail whose retained
-        // provenance names only proven paths is delivered even after the policy narrows
-        // post-capture; provenance naming a denied path, or no path at all, is refused —
-        // never an empty-path success.
-        let deliver =
-            |worker: &Worker<'_>, reference: &str, provenance: Option<BTreeSet<PathBuf>>| {
-                worker.shared.ledger.lock().unwrap().details.insert(
-                    reference.to_owned(),
-                    Detail {
-                        binding: binding.clone(),
-                        reply: PeerReply::Pending {
-                            detail_ref: reference.to_owned(),
-                            helper: None,
-                        },
-                        selection: (AssistanceTool::Inspect, [0; 32]),
-                        authority: Some(authority.clone()),
-                        source: None,
-                        native_epoch: 0,
-                        diff_page: None,
-                        diff_page_fresh: false,
-                        context_page: None,
-                        context_page_fresh: false,
-                        diff_provenance: provenance,
-                    },
-                );
-            };
-        deliver(
-            &worker,
-            "read-scope-proven",
-            Some(BTreeSet::from([PathBuf::from("main.rs")])),
-        );
-        assert!(matches!(
-            inspect_detail(
-                &worker,
-                &binding,
-                "read-scope-proven",
-                &denied_observed,
-                &target
-            )
-            .await,
-            PeerReply::Pending { .. }
-        ));
-        deliver(
-            &worker,
-            "read-scope-denied",
-            Some(BTreeSet::from([PathBuf::from("secret/key.txt")])),
-        );
-        assert!(matches!(
-            inspect_detail(
-                &worker,
-                &binding,
-                "read-scope-denied",
-                &denied_observed,
-                &target
-            )
-            .await,
-            PeerReply::Error {
-                code: FailureCode::ExecutionProfileCause(ExecutionProfileCause::ReadPathUnproven)
-            }
-        ));
-        deliver(&worker, "read-scope-unproven", None);
-        assert!(matches!(
-            inspect_detail(
-                &worker,
-                &binding,
-                "read-scope-unproven",
-                &denied_observed,
-                &target
-            )
-            .await,
-            PeerReply::Error {
-                code: FailureCode::ExecutionProfileCause(_)
-            }
-        ));
-        // The whole-tree scope keeps its restrictive behavior: the deny-bearing state can
-        // never claim whole-tree coverage even though individual paths prove.
-        assert!(matches!(
-            validate_read_scope(
-                &worker.shared,
-                &binding,
-                &denied_observed,
-                &target,
-                &authority,
-                crate::errorlog::Method::Inspect,
-                crate::execution::ReadScope::WholeTree,
-            ),
-            Err(ReadScopeRefusal {
-                code: FailureCode::ExecutionProfileCause(_),
-                ..
-            })
-        ));
-    }
-
-    /// Cached disclosure refuses a provenance path whose component is a symlink, while a
-    /// missing target stays deliverable: the preflight checks existing prefixes only (T36B).
-    /// The real no-follow guard for later reads remains the descriptor-relative reader.
-    #[tokio::test]
-    async fn cached_disclosure_preflights_symlink_components() {
-        let fixture = Fixture::new();
-        std::fs::write(fixture.root.join("main.rs"), "fn main() {}\n").unwrap();
-        std::os::unix::fs::symlink("main.rs", fixture.root.join("link.rs")).unwrap();
-        std::fs::create_dir(fixture.root.join("sub")).unwrap();
-        std::os::unix::fs::symlink("main.rs", fixture.root.join("sub/link.rs")).unwrap();
-        let store = fixture.store();
-        let workspace = DurableWorkspace::open(&store).await.unwrap();
-        let mut worker = worker(&store, workspace, fixture.root.clone());
-        worker.observations.install_schema().await.unwrap();
-        let (invocation, observed) = read_scope_call(&worker, None, "preflight-actor", "call-1");
-        let binding = invocation.binding_ref().clone();
-        let tree = worker
-            .workspace
-            .resolve_worktree(
-                fixture.root.clone(),
-                fixture.root.clone(),
-                fixture.root.join(".git"),
-            )
-            .await
-            .unwrap();
-        let request = crate::workspace::authority::ActivationRequest::new(
-            "preflight-activation",
-            invocation,
-            worker.shared.active(&binding).unwrap(),
-            tree,
-        )
-        .unwrap();
-        let receipt = worker.workspace.activate(request).await.unwrap();
-        worker.grants.insert(binding.clone(), receipt);
-        let authority = worker.authority(&binding).await.unwrap();
-        let target = read_scope_target(&fixture.root);
-        let deliver = |worker: &Worker<'_>, reference: &str, path: &str| {
-            worker.shared.ledger.lock().unwrap().details.insert(
-                reference.to_owned(),
-                Detail {
-                    binding: binding.clone(),
-                    reply: PeerReply::Pending {
-                        detail_ref: reference.to_owned(),
-                        helper: None,
-                    },
-                    selection: (AssistanceTool::Inspect, [0; 32]),
-                    authority: Some(authority.clone()),
-                    source: None,
-                    native_epoch: 0,
-                    diff_page: None,
-                    diff_page_fresh: false,
-                    context_page: None,
-                    context_page_fresh: false,
-                    diff_provenance: Some(BTreeSet::from([PathBuf::from(path)])),
-                },
-            );
-        };
-        deliver(&worker, "preflight-symlink", "link.rs");
-        assert!(matches!(
-            inspect_detail(&worker, &binding, "preflight-symlink", &observed, &target).await,
-            PeerReply::Error {
-                code: FailureCode::ExecutionProfile
-            }
-        ));
-        deliver(&worker, "preflight-deep-symlink", "sub/link.rs");
-        assert!(matches!(
-            inspect_detail(
-                &worker,
-                &binding,
-                "preflight-deep-symlink",
-                &observed,
-                &target
-            )
-            .await,
-            PeerReply::Error {
-                code: FailureCode::ExecutionProfile
-            }
-        ));
-        deliver(&worker, "preflight-missing", "removed.rs");
-        assert!(matches!(
-            inspect_detail(&worker, &binding, "preflight-missing", &observed, &target).await,
-            PeerReply::Pending { .. }
-        ));
-    }
-
     /// Stages and commits the fixture worktree with a fixed identity so HEAD exists for
     /// managed Diff captures.
     fn git_commit(root: &std::path::Path, message: &str) {
@@ -6790,46 +6031,15 @@ mod stop_retry_tests {
         run(&["commit", "--quiet", "-m", message]);
     }
 
-    /// Establishes one activated managed binding from the accepted deny-free capture and
-    /// returns everything the capture/inspection tests need: binding, clean observation,
-    /// durable authority and the configured target.
-    async fn activate_read_scope(
+    /// Activates the fixture worktree and returns its binding and durable authority.
+    async fn activate_worktree(
         worker: &mut Worker<'_>,
         actor: &str,
         id: &str,
-    ) -> (
-        BindingRef,
-        ObservedSandboxState,
-        AuthorityStamp,
-        LaunchTarget,
-    ) {
-        let (invocation, clean) = read_scope_call(worker, None, actor, id);
-        let binding = invocation.binding_ref().clone();
-        let common = std::process::Command::new("/usr/bin/git")
-            .arg("-C")
-            .arg(&worker.runtime)
-            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-            .output()
-            .unwrap();
-        assert!(common.status.success());
-        let common = PathBuf::from(String::from_utf8(common.stdout).unwrap().trim());
-        let tree = worker
-            .workspace
-            .resolve_worktree(worker.runtime.clone(), worker.runtime.clone(), common)
-            .await
-            .unwrap();
-        let request = crate::workspace::authority::ActivationRequest::new(
-            format!("activation-{id}"),
-            invocation,
-            worker.shared.active(&binding).unwrap(),
-            tree,
-        )
-        .unwrap();
-        let receipt = worker.workspace.activate(request).await.unwrap();
-        worker.grants.insert(binding.clone(), receipt);
+    ) -> (BindingRef, AuthorityStamp) {
+        let (binding, _) = production_start(worker, actor, id).await;
         let authority = worker.authority(&binding).await.unwrap();
-        let target = read_scope_target(&worker.runtime);
-        (binding, clean, authority, target)
+        (binding, authority)
     }
 
     /// Inserts the placeholder detail exactly as `enqueue` would, so a capture's own
@@ -6864,9 +6074,8 @@ mod stop_retry_tests {
 
     /// Builds an unstaged managed Diff job over the fixture worktree.
     fn diff_job(
-        root: &std::path::Path,
+        _root: &std::path::Path,
         invocation: ValidatedInvocation,
-        observed: ObservedSandboxState,
         reference: &str,
     ) -> (Job, watch::Sender<bool>) {
         let (cancel_sender, cancel) = watch::channel(false);
@@ -6875,10 +6084,9 @@ mod stop_retry_tests {
                 input: JobInput::Managed,
                 reference: reference.to_owned(),
                 invocation,
-                observed: Some(observed),
                 tool: AssistanceTool::Diff,
                 parameters: serde_json::json!({"mode":"unstaged"}),
-                target: read_scope_target(root),
+                target: production_target(_root),
                 deadline: tokio::time::Instant::now() + Duration::from_secs(5),
                 cancel,
                 stop_reply: None,
@@ -6888,81 +6096,6 @@ mod stop_retry_tests {
             cancel_sender,
         )
     }
-
-    /// A per-path proof refusal during a real capture keeps the public `execution_profile`
-    /// code and names the closed `read_scope:path_unproven` condition (T36B-r, review
-    /// finding 4): the identical capture succeeds under the accepted deny-free state, so the
-    /// deny — never a missing source — is what failed it. The review's counterexample is a
-    /// tracked `secret/key.txt` under root-read plus a `secret` deny.
-    #[tokio::test]
-    async fn diff_capture_proof_refusal_keeps_execution_profile_code() {
-        let fixture = Fixture::new();
-        std::fs::create_dir_all(fixture.root.join("secret")).unwrap();
-        std::fs::write(fixture.root.join("secret/key.txt"), "base\n").unwrap();
-        git_commit(&fixture.root, "base");
-        std::fs::write(fixture.root.join("secret/key.txt"), "changed\n").unwrap();
-        let store = fixture.store();
-        let workspace = DurableWorkspace::open(&store).await.unwrap();
-        let mut worker = worker(&store, workspace, fixture.root.clone());
-        worker.observations.install_schema().await.unwrap();
-        let (binding, _clean, authority, _target) =
-            activate_read_scope(&mut worker, "diff-refusal-actor", "diff-refusal-start").await;
-
-        // Positive control: the deny-free accepted capture reads the tracked path and renders.
-        let (invocation, observed) =
-            read_scope_call(&worker, None, "diff-refusal-actor", "clean-diff-call");
-        let (mut job, _cancel) = diff_job(&fixture.root, invocation, observed, "clean-diff");
-        retain_detail(
-            &worker,
-            &binding,
-            "clean-diff",
-            AssistanceTool::Diff,
-            &authority,
-        );
-        let (reply, _, _) = worker.diff(&mut job).await.unwrap_or_else(|error| {
-            panic!(
-                "the deny-free capture must succeed: {error:?} / {:?}",
-                job.failure_detail
-            )
-        });
-        assert!(matches!(
-            reply,
-            PeerReply::Complete {
-                kind: ResultKind::Diff,
-                ..
-            }
-        ));
-
-        // The narrowed deny-bearing state refuses the same capture with the public
-        // execution_profile code and the closed per-path refusal detail.
-        let (invocation, denied) = read_scope_call(
-            &worker,
-            Some("secret"),
-            "diff-refusal-actor",
-            "denied-diff-call",
-        );
-        let (mut job, _cancel) = diff_job(&fixture.root, invocation, denied, "denied-diff");
-        retain_detail(
-            &worker,
-            &binding,
-            "denied-diff",
-            AssistanceTool::Diff,
-            &authority,
-        );
-        let error = worker.diff(&mut job).await.unwrap_err();
-        assert_eq!(
-            error,
-            FailureCode::ExecutionProfileCause(ExecutionProfileCause::ReadPathUnproven)
-        );
-        assert_eq!(
-            job.failure_detail.as_deref(),
-            Some("read_scope:path_unproven"),
-            "the refusal must name the exact closed condition, not a missing source"
-        );
-    }
-
-    /// The managed snapshot route reports capacity for both a metadata stream and a blob stream
-    /// above its configured 1 KiB child-output cap, preserving the closed failing stage.
     #[tokio::test]
     async fn diff_stream_caps_report_capacity_for_metadata_and_blob() {
         for case in ["metadata", "blob"] {
@@ -6983,11 +6116,10 @@ mod stop_retry_tests {
             let workspace = DurableWorkspace::open(&store).await.unwrap();
             let mut worker = worker(&store, workspace, fixture.root.clone());
             worker.observations.install_schema().await.unwrap();
-            let (binding, _, authority, _) =
-                activate_read_scope(&mut worker, "stream-actor", "stream-start").await;
-            let (invocation, observed) =
-                read_scope_call(&worker, None, "stream-actor", "stream-diff-call");
-            let (mut job, _cancel) = diff_job(&fixture.root, invocation, observed, "stream-diff");
+            let (binding, authority) =
+                activate_worktree(&mut worker, "stream-actor", "stream-start").await;
+            let invocation = production_call(&worker, "stream-actor", "stream-diff-call");
+            let (mut job, _cancel) = diff_job(&fixture.root, invocation, "stream-diff");
             retain_detail(
                 &worker,
                 &binding,
@@ -7007,416 +6139,9 @@ mod stop_retry_tests {
             );
         }
     }
-
-    /// A right-hand linked worktree keeps its changed path through a managed head diff and
-    /// cached inspection, even when the live profile contains an unrelated deny glob.
-    #[tokio::test]
-    async fn linked_worktree_head_diff_inspects_with_deny_glob() {
-        let fixture = Fixture::new();
-        std::fs::write(fixture.root.join("fixture.py"), "base\n").unwrap();
-        git_commit(&fixture.root, "base");
-        let left = fixture.base.join("left");
-        let right = fixture.base.join("right");
-        for (name, path) in [("left", &left), ("right", &right)] {
-            let output = std::process::Command::new("/usr/bin/git")
-                .arg("-C")
-                .arg(&fixture.root)
-                .args(["worktree", "add", "--quiet", "-b", name])
-                .arg(path)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        std::fs::write(right.join("fixture.py"), "right-python-bad\n").unwrap();
-        git_commit(&right, "right base");
-        std::fs::write(right.join("fixture.py"), "fixed\n").unwrap();
-        let store = fixture.store();
-        let workspace = DurableWorkspace::open(&store).await.unwrap();
-        let mut worker = worker(&store, workspace, right.clone());
-        worker.observations.install_schema().await.unwrap();
-        let (binding, _, authority, target) =
-            activate_read_scope(&mut worker, "right-actor", "right-start").await;
-        let (invocation, observed) =
-            read_scope_call(&worker, Some("**/*.key"), "right-actor", "right-diff");
-        let (mut job, _cancel) = diff_job(&right, invocation, observed.clone(), "right-detail");
-        job.parameters["mode"] = serde_json::json!("head");
-        retain_detail(
-            &worker,
-            &binding,
-            "right-detail",
-            AssistanceTool::Diff,
-            &authority,
-        );
-        let (reply, captured_authority, source) = worker.diff(&mut job).await.unwrap();
-        let PeerReply::Complete { text, .. } = &reply else {
-            panic!("diff did not complete")
-        };
-        assert!(text.contains("right-python-bad"), "{text}");
-        worker
-            .shared
-            .complete("right-detail", reply, captured_authority, source, 0);
-        assert!(matches!(
-            inspect_detail(&worker, &binding, "right-detail", &observed, &target).await,
-            PeerReply::Complete {
-                kind: ResultKind::Diff,
-                ..
-            }
-        ));
-        std::fs::write(right.join("fixture.py"), "right-python-bad\n").unwrap();
-        let (invocation, observed) =
-            read_scope_call(&worker, Some("**/*.key"), "right-actor", "right-empty");
-        let (mut job, _cancel) =
-            diff_job(&right, invocation, observed.clone(), "right-empty-detail");
-        job.parameters["mode"] = serde_json::json!("head");
-        retain_detail(
-            &worker,
-            &binding,
-            "right-empty-detail",
-            AssistanceTool::Diff,
-            &authority,
-        );
-        let (reply, authority, source) = worker.diff(&mut job).await.unwrap();
-        assert_eq!(
-            worker.shared.ledger.lock().unwrap().details["right-empty-detail"]
-                .diff_provenance
-                .as_ref()
-                .unwrap()
-                .len(),
-            0
-        );
-        worker
-            .shared
-            .complete("right-empty-detail", reply, authority, source, 0);
-        assert!(matches!(
-            inspect_detail(&worker, &binding, "right-empty-detail", &observed, &target).await,
-            PeerReply::Complete {
-                kind: ResultKind::Diff,
-                ..
-            }
-        ));
-    }
-
-    /// An untracked file's NAME is rendered by cached Diff pages, so it is provenance too
-    /// (T36B-r, review finding 3): a capture with an untracked `.env` records it alongside
-    /// the tracked change, cached delivery under the accepted state delivers, and narrowing
-    /// the policy to deny `.env` refuses the same cached page instead of disclosing the name.
-    #[tokio::test]
-    async fn cached_diff_provenance_covers_untracked_names() {
-        let fixture = Fixture::new();
-        std::fs::write(fixture.root.join("main.rs"), "fn main() {}\n").unwrap();
-        git_commit(&fixture.root, "base");
-        std::fs::write(fixture.root.join("main.rs"), "fn changed() {}\n").unwrap();
-        std::fs::write(fixture.root.join(".env"), "SECRET=1\n").unwrap();
-        let store = fixture.store();
-        let workspace = DurableWorkspace::open(&store).await.unwrap();
-        let mut worker = worker(&store, workspace, fixture.root.clone());
-        worker.observations.install_schema().await.unwrap();
-        let (binding, clean, authority, target) =
-            activate_read_scope(&mut worker, "untracked-actor", "untracked-start").await;
-        let (invocation, observed) =
-            read_scope_call(&worker, None, "untracked-actor", "untracked-call");
-        let (mut job, _cancel) = diff_job(&fixture.root, invocation, observed, "untracked-diff");
-        retain_detail(
-            &worker,
-            &binding,
-            "untracked-diff",
-            AssistanceTool::Diff,
-            &authority,
-        );
-        let (reply, authority, source) = worker.diff(&mut job).await.unwrap();
-        worker
-            .shared
-            .complete("untracked-diff", reply.clone(), authority, source, 0);
-        // The untracked name joined the retained provenance next to the tracked change.
-        let provenance = worker
-            .shared
-            .ledger
-            .lock()
-            .unwrap()
-            .details
-            .get("untracked-diff")
-            .unwrap()
-            .diff_provenance
-            .clone()
-            .unwrap();
-        assert!(
-            provenance.contains(Path::new(".env")) && provenance.contains(Path::new("main.rs")),
-            "provenance must cover rendered untracked names: {provenance:?}"
-        );
-        // Under the accepted state the cached page delivers...
-        assert!(matches!(
-            inspect_detail(&worker, &binding, "untracked-diff", &clean, &target).await,
-            PeerReply::Complete {
-                kind: ResultKind::Diff,
-                ..
-            }
-        ));
-        // ...and after the policy narrows to deny `.env`, the same cached page refuses.
-        let (_, denied) =
-            read_scope_call(&worker, Some(".env"), "untracked-actor", "narrowed-call");
-        assert!(matches!(
-            inspect_detail(&worker, &binding, "untracked-diff", &denied, &target).await,
-            PeerReply::Error {
-                code: FailureCode::ExecutionProfileCause(ExecutionProfileCause::ReadPathUnproven)
-            }
-        ));
-    }
-
-    /// Cached Context delivery proves the exact source before handing back an already-composed
-    /// page or advancing to the next composed one (T36B-r, review finding 5): under the
-    /// accepted state the real composed first page carries the real source bytes, and after
-    /// the policy narrows to deny the source, the next return refuses instead of disclosing
-    /// the retained bytes of a completed page.
-    #[tokio::test]
-    async fn cached_context_page_refuses_after_policy_narrowing() {
-        let fixture = Fixture::new();
-        // Well above any plausible single reply envelope, so the fixture composes a page two.
-        let content = "let value = 1;\n".repeat(3800);
-        std::fs::write(fixture.root.join("main.rs"), &content).unwrap();
-        std::fs::write(fixture.root.join("secret.rs"), "private\n").unwrap();
-        let store = fixture.store();
-        let workspace = DurableWorkspace::open(&store).await.unwrap();
-        let mut worker = worker(&store, workspace, fixture.root.clone());
-        worker.observations.install_schema().await.unwrap();
-        let (binding, clean, authority, target) =
-            activate_read_scope(&mut worker, "cached-page-actor", "cached-page-start").await;
-        let source = SourceObservation::new(
-            authority.worktree().clone(),
-            authority.epoch(),
-            1,
-            crate::workspace::observation::ObservationRef::new("cached-page-source").unwrap(),
-            "main.rs".into(),
-            Some(crate::workspace::observation::SourceBytes::from_bytes(
-                content.as_bytes(),
-            )),
-            crate::workspace::observation::SourceRevision::new("cached-page-revision").unwrap(),
-            crate::workspace::observation::SourceCoverage::Complete,
-            crate::workspace::observation::ObservedState::Present,
-        )
-        .unwrap();
-        let header = "mode: lexical\npath: main.rs\nsource_sequence: 1\n\n";
-        let text = format!("{header}{content}");
-        let body_start = text.len() - content.len();
-        let page = ContextPageState::new(text, body_start, false, ResultKind::Context);
-        let (first, next) = page.next("cached-page").unwrap();
-        assert!(
-            next.is_some(),
-            "fixture text must compose more than one page"
-        );
-        worker.shared.ledger.lock().unwrap().details.insert(
-            "cached-page".to_owned(),
-            Detail {
-                binding: binding.clone(),
-                reply: first,
-                selection: (AssistanceTool::Context, [0; 32]),
-                authority: Some(authority.clone()),
-                source: Some(source.clone()),
-                native_epoch: 0,
-                diff_page: None,
-                diff_page_fresh: false,
-                context_page: next,
-                context_page_fresh: true,
-                diff_provenance: None,
-            },
-        );
-        // Under the accepted state the completed cached page delivers with real source bytes.
-        let PeerReply::Complete { text, .. } =
-            inspect_detail(&worker, &binding, "cached-page", &clean, &target).await
-        else {
-            panic!("the accepted state must deliver the composed page")
-        };
-        assert!(text.contains("let value = 1;"), "{text}");
-
-        // The retained semantic page names another file even though its source remains readable.
-        let secret_uri = format!("file://{}", fixture.root.join("secret.rs").display());
-        let semantic_text =
-            format!("mode: semantic\ndefinitions: [{{\"uri\":\"{secret_uri}\"}}]\n\n{content}");
-        let semantic_body = semantic_text.len() - content.len();
-        let (semantic_reply, semantic_page) =
-            ContextPageState::new(semantic_text, semantic_body, false, ResultKind::Context)
-                .next("semantic-page")
-                .unwrap();
-        worker.shared.ledger.lock().unwrap().details.insert(
-            "semantic-page".to_owned(),
-            Detail {
-                binding: binding.clone(),
-                reply: semantic_reply,
-                selection: (AssistanceTool::Context, [0; 32]),
-                authority: Some(authority.clone()),
-                source: Some(source),
-                native_epoch: 0,
-                diff_page: None,
-                diff_page_fresh: false,
-                context_page: semantic_page,
-                context_page_fresh: true,
-                diff_provenance: Some(BTreeSet::from([PathBuf::from("secret.rs")])),
-            },
-        );
-        assert!(
-            matches!(inspect_detail(&worker, &binding, "semantic-page", &clean, &target).await,
-            PeerReply::Complete { text, .. } if text.contains(&secret_uri))
-        );
-        let (_, secret_denied) = read_scope_call(
-            &worker,
-            Some("secret.rs"),
-            "cached-page-actor",
-            "secret-narrowing",
-        );
-        assert!(matches!(
-            inspect_detail(&worker, &binding, "semantic-page", &secret_denied, &target).await,
-            PeerReply::Error {
-                code: FailureCode::ExecutionProfileCause(ExecutionProfileCause::ReadPathUnproven)
-            }
-        ));
-
-        // Narrow the policy to deny the source: the next return refuses — the composed page
-        // and every later page of it are withheld under the current binding state.
-        let (_, denied) = read_scope_call(
-            &worker,
-            Some("main.rs"),
-            "cached-page-actor",
-            "narrowed-call",
-        );
-        assert!(matches!(
-            inspect_detail(&worker, &binding, "cached-page", &denied, &target).await,
-            PeerReply::Error {
-                code: FailureCode::ExecutionProfileCause(ExecutionProfileCause::ReadPathUnproven)
-            }
-        ));
-    }
-
-    /// A fresh `ide.context {"path": ...}` job runs through the real `perform` -> `context` ->
-    /// `observe` read-proof guard (T36B-r follow-up): under one live deny-bearing managed state
-    /// (root read plus a `secret` path deny), the proven `src/main.py` returns its source bytes,
-    /// while `secret/key.txt` is refused with the public `execution_profile` code, none of its
-    /// bytes reach the retained reply, and it is never read into the registered path set. The
-    /// Context path keeps only the public code on the reply; the closed
-    /// `read_scope:path_unproven` detail it logs is asserted through the same guard call on
-    /// identical inputs. Removing `observe`'s guard makes this test fail on the registered set
-    /// (the later post-read re-proof in `context` still withholds the reply bytes).
-    #[tokio::test]
-    async fn fresh_context_read_refuses_denied_path_through_observe() {
-        let fixture = Fixture::new();
-        let allowed = "print('allowed-context-marker')\n";
-        let secret = "SECRET-CONTEXT-TOKEN-7f3a\n";
-        std::fs::create_dir_all(fixture.root.join("src")).unwrap();
-        std::fs::create_dir_all(fixture.root.join("secret")).unwrap();
-        std::fs::write(fixture.root.join("src/main.py"), allowed).unwrap();
-        std::fs::write(fixture.root.join("secret/key.txt"), secret).unwrap();
-        let store = fixture.store();
-        let workspace = DurableWorkspace::open(&store).await.unwrap();
-        let mut worker = worker(&store, workspace, fixture.root.clone());
-        worker.observations.install_schema().await.unwrap();
-        let (binding, _clean, authority, target) =
-            activate_read_scope(&mut worker, "fresh-context-actor", "fresh-context-start").await;
-
-        for (reference, path) in [
-            ("allowed-context", "src/main.py"),
-            ("denied-context", "secret/key.txt"),
-        ] {
-            let (invocation, denied) = read_scope_call(
-                &worker,
-                Some("secret"),
-                "fresh-context-actor",
-                &format!("{reference}-call"),
-            );
-            let (mut job, _cancel) = diff_job(&fixture.root, invocation, denied, reference);
-            job.tool = AssistanceTool::Context;
-            job.parameters = serde_json::json!({ "path": path });
-            retain_detail(
-                &worker,
-                &binding,
-                reference,
-                AssistanceTool::Context,
-                &authority,
-            );
-            worker.perform(job).await;
-        }
-        let retained = |reference: &str| {
-            worker
-                .shared
-                .ledger
-                .lock()
-                .unwrap()
-                .details
-                .get(reference)
-                .unwrap()
-                .reply
-                .clone()
-        };
-
-        // The proven path reads natively and the reply carries its real source bytes.
-        let PeerReply::Complete {
-            kind: ResultKind::Context,
-            text,
-            ..
-        } = retained("allowed-context")
-        else {
-            panic!(
-                "the proven path must read: {:?}",
-                retained("allowed-context")
-            )
-        };
-        assert!(text.contains(allowed.trim_end()), "{text}");
-
-        // The denied path is refused by `observe` before any read: closed cause, no bytes.
-        // `PeerReply`'s Debug is redacted, so the checks read its full serialized wire form.
-        let denied_wire = serde_json::to_string(&retained("denied-context")).unwrap();
-        assert!(
-            !denied_wire.contains("SECRET-CONTEXT-TOKEN"),
-            "the denied source must appear nowhere in the reply: {denied_wire}"
-        );
-        assert!(
-            matches!(
-                retained("denied-context"),
-                PeerReply::Error {
-                    code: FailureCode::ExecutionProfileCause(
-                        ExecutionProfileCause::ReadPathUnproven
-                    )
-                }
-            ),
-            "{denied_wire}"
-        );
-        // `context` re-proves after the read, so the reply alone cannot tell whether `observe`
-        // read first: only `observe`'s own guard keeps the denied file unread and unregistered
-        // (a registered path is re-read on every later native-change hint).
-        let registered = worker.registered.get(&binding).cloned().unwrap_or_default();
-        assert!(
-            registered.contains(Path::new("src/main.py"))
-                && !registered.contains(Path::new("secret/key.txt")),
-            "only the proven path may be read and registered: {registered:?}"
-        );
-        let (_, denied) = read_scope_call(
-            &worker,
-            Some("secret"),
-            "fresh-context-actor",
-            "detail-call",
-        );
-        let refusal = validate_read_scope(
-            &worker.shared,
-            &binding,
-            &denied,
-            &target,
-            &authority,
-            errorlog_method(AssistanceTool::Context),
-            crate::execution::ReadScope::Path(Path::new("secret/key.txt")),
-        )
-        .unwrap_err();
-        assert_eq!(
-            refusal.code,
-            FailureCode::ExecutionProfileCause(ExecutionProfileCause::ReadPathUnproven)
-        );
-        assert_eq!(refusal.detail, "read_scope:path_unproven");
-    }
 }
 
-/// Cross-channel feedback dedup: a fact is consumed on submission to a real caller, never on the
-/// producing job merely finishing. These tests exercise `NativeFeedback`, `take_current_feedback`
-/// and `Shared::mark_feedback_inline_delivered` directly, without a durable Workspace/provider.
+/// Cross-channel feedback delivery is tracked directly without a durable Workspace or provider.
 #[cfg(test)]
 mod feedback_dedup_tests {
     use super::*;
@@ -7812,119 +6537,5 @@ mod feedback_dedup_tests {
             .shared
             .mark_feedback_inline_delivered(&binding, "detail-1", &reply);
         assert_eq!(handle.take_current_feedback(binding).await, None);
-    }
-}
-
-/// T24B: the closed detail vocabulary names exactly which execution-profile condition failed.
-#[cfg(test)]
-mod execution_profile_detail_tests {
-    use super::*;
-
-    /// The no-template condition carries the observed class, matching the accepted catalog's
-    /// own closed class tags.
-    #[test]
-    fn no_template_names_the_observed_class() {
-        let error = crate::execution::RequestError::ExecutionProfileNoTemplate(
-            crate::execution::ProfileClass::Managed,
-        );
-        assert_eq!(
-            execution_profile_detail(&error).as_deref(),
-            Some("no_profile_for_class:managed")
-        );
-    }
-
-    /// The digest-mismatch condition is distinguishable from no-template and carries the class.
-    #[test]
-    fn digest_mismatch_names_the_observed_class() {
-        let error = crate::execution::RequestError::ExecutionProfileDigestMismatch(
-            crate::execution::ProfileClass::Disabled,
-        );
-        assert_eq!(
-            execution_profile_detail(&error).as_deref(),
-            Some("profile_digest_mismatch:disabled")
-        );
-    }
-
-    /// T35B: the two shape-refusal conditions use their own closed detail values so the error
-    /// log distinguishes an unsupported live shape from one no accepted template proves narrower.
-    #[test]
-    fn shape_refusals_name_the_observed_class() {
-        for (error, expected) in [
-            (
-                crate::execution::RequestError::ExecutionProfileShapeUnsupported(
-                    crate::execution::ProfileClass::Managed,
-                ),
-                "shape_unsupported:managed",
-            ),
-            (
-                crate::execution::RequestError::ExecutionProfileShapeNotNarrower(
-                    crate::execution::ProfileClass::Managed,
-                ),
-                "shape_not_narrower:managed",
-            ),
-        ] {
-            assert_eq!(execution_profile_detail(&error).as_deref(), Some(expected));
-        }
-    }
-
-    /// A disabled host, a spawn failure, and a read-scope refusal each use their closed tag,
-    /// never the underlying error or OS text.
-    #[test]
-    fn host_spawn_and_read_scope_conditions_use_closed_variant_tags() {
-        assert_eq!(
-            execution_profile_detail(&crate::execution::RequestError::DisabledHostDenied)
-                .as_deref(),
-            Some("host_disabled")
-        );
-        assert_eq!(
-            spawn_detail(&crate::execution::ProcessError::Io(std::io::Error::other(
-                "os text discarded"
-            ))),
-            "spawn:io"
-        );
-        assert_eq!(
-            read_scope_detail(&crate::execution::RequestError::SandboxCwdMismatch),
-            "read_scope:sandbox_cwd_mismatch"
-        );
-        assert_eq!(
-            read_scope_detail(&crate::execution::RequestError::ReadPathUnproven),
-            "read_scope:path_unproven"
-        );
-        assert_eq!(
-            read_scope_detail(&crate::execution::RequestError::ReadWholeTreeUnproven),
-            "read_scope:whole_tree_unproven"
-        );
-        assert_eq!(
-            read_scope_detail(&crate::execution::RequestError::ProgramDenied),
-            "read_scope:refused"
-        );
-    }
-
-    /// The recorded line itself carries the closed reason and the condition detail.
-    #[test]
-    fn recorded_line_carries_reason_and_condition_detail() {
-        let line = crate::errorlog::build_line(
-            crate::errorlog::Method::Start,
-            crate::errorlog::Outcome::Failed,
-            crate::errorlog::Fields {
-                reason: Some(crate::errorlog::ReasonCode::ExecutionProfile),
-                detail: Some(
-                    &execution_profile_detail(
-                        &crate::execution::RequestError::ExecutionProfileNoTemplate(
-                            crate::execution::ProfileClass::Managed,
-                        ),
-                    )
-                    .unwrap(),
-                ),
-                ..Default::default()
-            },
-            0,
-        );
-        let event = crate::errorlog::parse_line(std::str::from_utf8(&line).unwrap()).unwrap();
-        assert_eq!(event.reason.as_deref(), Some("execution_profile"));
-        assert_eq!(
-            event.detail.as_deref(),
-            Some("no_profile_for_class:managed")
-        );
     }
 }

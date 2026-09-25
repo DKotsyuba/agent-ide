@@ -1759,9 +1759,9 @@ mod tests {
     };
     use crate::execution::{
         Admission, AdmissionClass, AdmissionController, AdmissionLimits, BackendRelease,
-        ControlledCommand, ExecutionProfileCatalog, ExecutionProfileTemplate, HostSandboxState,
-        LocalExecutionPolicy, OwnerId, ProviderBackendKind, ProviderLeaseAdmission,
-        ProviderViewLease, ValidatedExecutionRequest, ValidatedHostInvocation, WorkspaceAuthority,
+        ControlledCommand, LocalExecutionPolicy, OwnerId, ProviderBackendKind,
+        ProviderLeaseAdmission, ProviderViewLease, ValidatedExecutionRequest,
+        ValidatedHostInvocation, WorkspaceAuthority,
     };
     use crate::intelligence::gopls::{GoplsProfile, SharedGopls};
     use crate::workspace::authority::WorktreeRef;
@@ -1803,20 +1803,8 @@ mod tests {
         authority: &WorkspaceAuthority,
         command: ControlledCommand,
     ) -> ValidatedExecutionRequest {
-        let root = std::env::temp_dir();
-        let sandbox = HostSandboxState::parse(Some(json!({
-            "permissionProfile":{"type":"disabled"},
-            "codexLinuxSandboxExe":null,
-            "sandboxCwd":root,
-            "useLegacyLandlock":false
-        })))
-        .unwrap();
-        let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
-            ExecutionProfileTemplate::from_execution_evidence(label, 1, &sandbox).unwrap(),
-        ])
-        .unwrap();
         ValidatedExecutionRequest::validate(
-            ValidatedHostInvocation::from_verified_binding(label, sandbox).unwrap(),
+            ValidatedHostInvocation::from_verified_binding(label).unwrap(),
             authority.clone(),
             command,
             &LocalExecutionPolicy::new(
@@ -1826,7 +1814,6 @@ mod tests {
                 true,
             )
             .unwrap(),
-            &catalog,
         )
         .unwrap()
     }
