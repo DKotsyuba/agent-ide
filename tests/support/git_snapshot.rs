@@ -235,8 +235,8 @@ pub fn authority_for(fixture: &GitFixture) -> agent_ide::workspace::authority::A
 use agent_ide::{
     execution::{
         Admission, AdmissionClass, AdmissionController, AdmissionLimits, CapturedProcessEvidence,
-        ExecutionProfileCatalog, ExecutionProfileTemplate, HostSandboxState, LocalExecutionPolicy,
-        OwnedChild, OwnerId, ValidatedExecutionRequest, ValidatedHostInvocation,
+        LocalExecutionPolicy, OwnedChild, OwnerId, ValidatedExecutionRequest,
+        ValidatedHostInvocation,
     },
     workspace::{
         authority::AuthorityStamp,
@@ -395,30 +395,15 @@ pub fn launch_intent(
     output_cap: usize,
 ) -> Result<(OwnedChild, AdmissionController), GitError> {
     let root = intent.scope().worktree().worktree_path();
-    let state = HostSandboxState::parse(Some(
-        json!({"permissionProfile":{"type":"disabled"}, "codexLinuxSandboxExe":null,
-        "sandboxCwd":root, "useLegacyLandlock":false}),
-    ))
-    .unwrap();
-    let profiles = ExecutionProfileCatalog::from_execution_evidence(vec![
-        ExecutionProfileTemplate::from_execution_evidence("snapshot-test", 1, &state).unwrap(),
-    ])
-    .unwrap();
-    let invocation =
-        ValidatedHostInvocation::from_verified_binding("snapshot-test", state).unwrap();
-    let policy = LocalExecutionPolicy::new(
-        BTreeSet::from([allowed_program.to_path_buf()]),
-        8192,
-        16,
-        true,
-    )
-    .unwrap();
+    let invocation = ValidatedHostInvocation::from_verified_binding("snapshot-test").unwrap();
+    let policy =
+        LocalExecutionPolicy::new(BTreeSet::from([allowed_program.to_path_buf()]), 8192, 16)
+            .unwrap();
     let request = ValidatedExecutionRequest::validate(
         invocation,
         intent.execution_authority()?,
         intent.command()?,
         &policy,
-        &profiles,
     )
     .unwrap();
     let mut admissions = AdmissionController::new(AdmissionLimits {

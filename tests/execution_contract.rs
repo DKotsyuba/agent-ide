@@ -1,10 +1,20 @@
-//! Contract checks for the unassembled Execution module.
+//! Contract checks for execution admission, leases, and owned process lifecycle.
 
 use agent_ide::workspace::authority::{
     ActivationRequest, AuthorityRegistry, StopBindingHandoff, WorktreeRef,
 };
 use agent_ide::{assistance, execution};
-
+use assistance::host_binding::{
+    BindingStatus, ChannelSessionRef, HostBindingGuard, parse_candidate, parse_channel_session,
+    parse_hook_event,
+};
+use execution::{
+    Admission, AdmissionClass, AdmissionController, AdmissionLimits, BorrowedEndpoint, CommandKind,
+    ControlledCommand, EndpointOwnership, LocalExecutionPolicy, OwnerId, ProviderBackendKind,
+    ProviderLeaseAdmission, ProviderLeaseLimits, ProviderLeaseRegistry, ValidatedExecutionRequest,
+    ValidatedHostInvocation, WorkspaceAuthority,
+};
+use serde_json::json;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
@@ -13,25 +23,9 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
-
-use assistance::host_binding::{
-    BindingStatus, ChannelSessionRef, HostBindingGuard, parse_candidate, parse_channel_session,
-    parse_hook_event, parse_observed_sandbox_state,
-};
-use execution::ControlledTrampoline;
-use execution::{
-    Admission, AdmissionClass, AdmissionController, AdmissionLimits, BorrowedEndpoint, CommandKind,
-    ControlledCommand, D03ProfileEvidence, DiscoverWorktreeRequest, DiscoveryOperationRef,
-    EndpointOwnership, ExecutionProfileCatalog, ExecutionProfileTemplate, GitDiscoveryPolicy,
-    GitDiscoveryQuery, HostSandboxState, LocalExecutionPolicy, OwnerId, PersistedProfileRecord,
-    ProfileClass, ProviderBackendKind, ProviderLeaseAdmission, ProviderLeaseLimits,
-    ProviderLeaseRegistry, RequestError, SandboxStateError, ValidatedExecutionRequest,
-    ValidatedHostInvocation, WorkspaceAuthority,
-};
-use serde_json::json;
 use tokio::io::AsyncReadExt;
 
-/// Allocates unique, disposable execution worktrees without reusing existing user content.
+/// Allocates a unique disposable worktree for process lifecycle tests.
 fn worktree() -> PathBuf {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let root = std::env::temp_dir().join(format!(
@@ -43,31 +37,7 @@ fn worktree() -> PathBuf {
     root
 }
 
-/// Writes a disposable linked Git identity cycle for the guard's native topology check.
-fn linked_git_metadata(root: &Path, common: &Path) {
-    let admin = common.join("worktrees/guard");
-    fs::create_dir_all(&admin).unwrap();
-    fs::write(root.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
-    fs::write(admin.join("commondir"), format!("{}\n", common.display())).unwrap();
-    fs::write(
-        admin.join("gitdir"),
-        format!("{}\n", root.join(".git").display()),
-    )
-    .unwrap();
-}
-
-/// Builds the complete disabled host state needed for controlled unit-only child launches.
-fn disabled_state(root: &Path) -> HostSandboxState {
-    HostSandboxState::parse(Some(json!({
-        "permissionProfile": {"type": "disabled"},
-        "codexLinuxSandboxExe": null,
-        "sandboxCwd": root,
-        "useLegacyLandlock": false
-    })))
-    .unwrap()
-}
-
-/// Supplies finite view ceilings for provider-lease contract scenarios.
+/// Supplies finite provider-view ceilings for lease contract scenarios.
 fn lease_limits(total_views: usize, per_backend_views: usize) -> ProviderLeaseLimits {
     ProviderLeaseLimits {
         total_views,
@@ -75,20 +45,14 @@ fn lease_limits(total_views: usize, per_backend_views: usize) -> ProviderLeaseLi
     }
 }
 
-/// Builds a request whose argv/profile data is fixed by this test rather than model text.
+/// Builds a direct job request for a fixed native shell script.
 fn request(root: &Path, script: &str) -> ValidatedExecutionRequest {
     request_kind(root, script, CommandKind::Job)
 }
 
-/// Builds the declared direct or provider command category for a fixed native test script.
+/// Builds a direct or provider request for a fixed native shell script.
 fn request_kind(root: &Path, script: &str, kind: CommandKind) -> ValidatedExecutionRequest {
-    let sandbox = disabled_state(root);
-    let profiles = ExecutionProfileCatalog::from_execution_evidence(vec![
-        ExecutionProfileTemplate::from_execution_evidence("disabled-contract-case", 1, &sandbox)
-            .unwrap(),
-    ])
-    .unwrap();
-    let invocation = ValidatedHostInvocation::from_verified_binding("bound-test", sandbox).unwrap();
+    let invocation = ValidatedHostInvocation::from_verified_binding("bound-test").unwrap();
     let authority =
         WorkspaceAuthority::from_workspace("test-worktree", "1", root.to_path_buf(), 7).unwrap();
     let command = ControlledCommand::from_validated_peer(
@@ -100,21 +64,16 @@ fn request_kind(root: &Path, script: &str, kind: CommandKind) -> ValidatedExecut
     )
     .unwrap();
     let policy =
-        LocalExecutionPolicy::new(BTreeSet::from([PathBuf::from("/bin/sh")]), 4096, 4, true)
-            .unwrap();
-    ValidatedExecutionRequest::validate(invocation, authority, command, &policy, &profiles).unwrap()
+        LocalExecutionPolicy::new(BTreeSet::from([PathBuf::from("/bin/sh")]), 4096, 4).unwrap();
+    ValidatedExecutionRequest::validate(invocation, authority, command, &policy).unwrap()
 }
 
 /// Creates a trusted host candidate with the metadata fields Assistance validates.
 fn candidate(actor: &str, call: &str) -> assistance::host_binding::CandidateInvocation {
     parse_candidate(
-        json!({
-            "threadId": actor,
-            "callId": call,
-            "x-codex-turn-metadata": {"turn": "bounded"}
-        })
-        .as_object()
-        .unwrap(),
+        json!({"threadId":actor,"callId":call,"x-codex-turn-metadata":{"turn":"bounded"}})
+            .as_object()
+            .unwrap(),
     )
     .unwrap()
 }
@@ -122,178 +81,93 @@ fn candidate(actor: &str, call: &str) -> assistance::host_binding::CandidateInvo
 /// Creates the matching native pre-hook event required to establish a binding generation.
 fn pre_hook(actor: &str, call: &str) -> assistance::host_binding::HookEvent {
     parse_hook_event(
-        json!({
-            "hook_event_name": "PreToolUse",
-            "session_id": actor,
-            "tool_use_id": call
-        })
-        .to_string()
-        .as_bytes(),
+        json!({"hook_event_name":"PreToolUse","session_id":actor,"tool_use_id":call})
+            .to_string()
+            .as_bytes(),
     )
     .unwrap()
 }
 
-/// Creates a bounded trusted channel identifier for the host-binding guard.
+/// Creates a bounded trusted channel identifier for host-binding tests.
 fn channel() -> ChannelSessionRef {
     parse_channel_session(b"execution-contract-channel").unwrap()
 }
 
-/// Checks that opaque profile classification never treats missing or external state as executable.
+/// Validates the fixed Git discovery query and rejects a relative candidate before spawn.
 #[test]
-fn opaque_state_rejects_missing_and_external_profiles() {
-    assert_eq!(
-        HostSandboxState::parse(None),
-        Err(SandboxStateError::Missing)
-    );
-    assert_eq!(
-        HostSandboxState::parse(Some(json!({
-            "permissionProfile": {"type": "external"},
-            "sandboxCwd": "/private/tmp"
-        }))),
-        Err(SandboxStateError::ExternalUnsupported)
-    );
-    assert_eq!(
-        HostSandboxState::parse(Some(json!({
-            "permissionProfile": {
-                "type": "managed",
-                "file_system": {"type": "read"},
-                "network": false,
-                "workspace_roots": ["/one", "/two"]
-            },
-            "sandboxCwd": "/one"
-        }))),
-        Err(SandboxStateError::UnsupportedProfile)
-    );
-    let managed = HostSandboxState::parse(Some(json!({
-        "permissionProfile": {"type": "managed", "file_system": {"type": "read"}, "network": false},
-        "codexLinuxSandboxExe": null,
-        "sandboxCwd": "/private/tmp",
-        "useLegacyLandlock": false
-    })))
-    .unwrap();
-    assert_eq!(managed.class(), ProfileClass::Managed);
-    let uri = HostSandboxState::parse(Some(json!({
-        "permissionProfile": {"type": "managed", "file_system": {"type": "read"}, "network": false},
-        "codexLinuxSandboxExe": null,
-        "sandboxCwd": "file:///private/tmp",
-        "useLegacyLandlock": false
-    })))
-    .unwrap();
-    assert_eq!(uri.sandbox_cwd(), "file:///private/tmp");
-    assert_eq!(uri.cwd(), Path::new("/private/tmp"));
-    let raw_json = "{\n  \"permissionProfile\": {\"type\": \"disabled\"},\n  \"sandboxCwd\": \"/private/tmp\"\n}";
-    assert_eq!(
-        HostSandboxState::parse_json(raw_json)
-            .unwrap()
-            .sandbox_state_json(),
-        raw_json
-    );
-}
-
-/// Proves an Execution admission accepts only Assistance-consumed liveness paired with its state.
-#[test]
-fn active_observation_becomes_a_validated_execution_invocation() {
+fn discovery_validates_fixed_query_and_candidate_path() {
     let mut guard = HostBindingGuard::default();
     let channel = channel();
     assert!(matches!(
-        guard.observe_hook(pre_hook("actor", "call"), channel.clone()),
+        guard.observe_hook(pre_hook("discover", "query"), channel.clone()),
         BindingStatus::PreObserved
     ));
     let BindingStatus::Validated(invocation) =
-        guard.establish_start(candidate("actor", "call"), channel)
+        guard.establish_start(candidate("discover", "query"), channel)
     else {
-        panic!("explicit start must establish the binding");
+        panic!("expected validated binding");
     };
     let active = guard.consume_active(invocation.binding_ref()).unwrap();
-    let observed = parse_observed_sandbox_state(
-        json!({
-            "codex/sandbox-state-meta": {
-                "permissionProfile": {"type": "managed", "file_system": {}, "network": "restricted"},
-                "codexLinuxSandboxExe": null,
-                "sandboxCwd": "file:///private/tmp",
-                "useLegacyLandlock": false,
-                "unknown_nested_field": {"preserved": true}
-            }
-        })
-        .as_object()
-        .unwrap(),
-        &invocation,
-        &active,
-        true,
+    let policy = execution::GitDiscoveryPolicy::new(PathBuf::from("/usr/bin/git"), 1024).unwrap();
+    let query = execution::DiscoverWorktreeRequest::from_active_use(
+        active,
+        OsString::from("/private/tmp/candidate"),
+        execution::DiscoveryOperationRef::new("discover-test").unwrap(),
     )
     .unwrap();
-    let execution =
-        execution::ValidatedHostInvocation::from_active_observation(active, observed).unwrap();
-    assert_eq!(execution.sandbox().class(), ProfileClass::Managed);
-    assert_eq!(execution.sandbox().cwd(), Path::new("/private/tmp"));
+    assert!(
+        query
+            .validate_query(execution::GitDiscoveryQuery::ShowTopLevel, &policy)
+            .is_ok()
+    );
+
+    let active = guard.consume_active(invocation.binding_ref()).unwrap();
+    let relative = execution::DiscoverWorktreeRequest::from_active_use(
+        active,
+        OsString::from("relative"),
+        execution::DiscoveryOperationRef::new("discover-relative").unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        relative.validate_query(execution::GitDiscoveryQuery::ShowTopLevel, &policy),
+        Err(execution::RequestError::InvalidCommandPath)
+    ));
 }
 
-/// Proves a request originating from Assistance cannot launch after a queue delay without a fresh use.
+/// Requires fresh Assistance liveness at spawn when validation retained an active binding.
 #[tokio::test]
-async fn observed_request_rejects_missing_fresh_use_at_spawn() {
-    let root = fs::canonicalize(worktree()).unwrap();
-    fs::create_dir(root.join(".git")).unwrap();
+async fn active_request_without_fresh_spawn_use_never_starts() {
+    let root = worktree();
     let mut guard = HostBindingGuard::default();
     let channel = channel();
     assert!(matches!(
-        guard.observe_hook(pre_hook("actor", "call"), channel.clone()),
+        guard.observe_hook(pre_hook("spawn", "missing-use"), channel.clone()),
         BindingStatus::PreObserved
     ));
     let BindingStatus::Validated(invocation) =
-        guard.establish_start(candidate("actor", "call"), channel)
+        guard.establish_start(candidate("spawn", "missing-use"), channel)
     else {
-        panic!("explicit start must validate");
+        panic!("expected validated binding");
     };
     let active = guard.consume_active(invocation.binding_ref()).unwrap();
-    let observed = parse_observed_sandbox_state(
-        json!({
-            "codex/sandbox-state-meta": {
-                "permissionProfile": {"type": "managed", "file_system": {"type":"restricted","entries":[]}, "network": "restricted"},
-                "codexLinuxSandboxExe": null,
-                "sandboxCwd": format!("file://{}", root.display()),
-                "useLegacyLandlock": false
-            }
-        })
-        .as_object()
-        .unwrap(),
-        &invocation,
-        &active,
-        true,
-    )
-    .unwrap();
-    let state = HostSandboxState::parse(Some(observed.state().as_json().clone())).unwrap();
-    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
-        ExecutionProfileTemplate::from_execution_evidence("managed", 1, &state).unwrap(),
-    ])
-    .unwrap();
-    let execution =
-        execution::ValidatedHostInvocation::from_active_observation(active, observed).unwrap();
-    let authority = WorkspaceAuthority::from_workspace_with_git_common_dir(
-        "worktree",
-        "incarnation",
-        root.clone(),
-        root.join(".git"),
-        1,
-    )
-    .unwrap();
     let command = ControlledCommand::from_validated_peer(
         CommandKind::Job,
-        PathBuf::from("/usr/bin/true"),
-        Vec::new(),
+        PathBuf::from("/bin/sh"),
+        vec![OsString::from("-c"), OsString::from("true")],
         root.clone(),
         BTreeMap::new(),
     )
     .unwrap();
-    let policy = LocalExecutionPolicy::new(
-        BTreeSet::from([PathBuf::from("/usr/bin/true")]),
-        1,
-        0,
-        false,
+    let authority = WorkspaceAuthority::from_workspace("active-use", "1", root.clone(), 1).unwrap();
+    let policy =
+        LocalExecutionPolicy::new(BTreeSet::from([PathBuf::from("/bin/sh")]), 4096, 4).unwrap();
+    let request = ValidatedExecutionRequest::validate(
+        ValidatedHostInvocation::from_active_use(active),
+        authority,
+        command,
+        &policy,
     )
     .unwrap();
-    let request =
-        ValidatedExecutionRequest::validate(execution, authority, command, &policy, &catalog)
-            .unwrap();
     let mut admission = AdmissionController::new(AdmissionLimits {
         total_running: 1,
         per_owner_running: 1,
@@ -302,73 +176,131 @@ async fn observed_request_rejects_missing_fresh_use_at_spawn() {
         interactive_burst: 1,
     })
     .unwrap();
-    let lease = match admission.submit(OwnerId::new("owner").unwrap(), AdmissionClass::Interactive)
-    {
-        Admission::Granted(lease) => lease,
-        outcome => panic!("unexpected admission: {outcome:?}"),
+    let Admission::Granted(lease) = admission.submit(
+        OwnerId::new("active-use").unwrap(),
+        AdmissionClass::Interactive,
+    ) else {
+        panic!("fixture admission must succeed");
+    };
+    let execution::ProcessError::NeverStarted { cause, settlement } =
+        execution::OwnedChild::spawn_captured(&request, lease, None, 64)
+            .err()
+            .unwrap()
+    else {
+        panic!("missing active use must fail before child spawn");
     };
     assert!(matches!(
-        execution::OwnedChild::spawn_captured(
-            &request,
-            lease,
-            None,
-            Path::new("/usr/bin/codex"),
-            1
+        *cause,
+        execution::ProcessError::Request(execution::RequestError::MissingActiveBindingUse)
+    ));
+    admission.settle_never_started(settlement).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Enforces the execution layer's local program, cwd, argv, and environment ceilings.
+#[test]
+fn request_validation_enforces_local_ceilings() {
+    let root = worktree();
+    let invocation = || ValidatedHostInvocation::from_verified_binding("local-ceilings").unwrap();
+    let authority =
+        || WorkspaceAuthority::from_workspace("ceiling-test", "1", root.clone(), 1).unwrap();
+    let command = |cwd: PathBuf, args: Vec<OsString>, env: BTreeMap<OsString, OsString>| {
+        ControlledCommand::from_validated_peer(
+            CommandKind::Job,
+            PathBuf::from("/bin/sh"),
+            args,
+            cwd,
+            env,
+        )
+        .unwrap()
+    };
+    let policy = |programs, argv, env| LocalExecutionPolicy::new(programs, argv, env).unwrap();
+
+    assert!(matches!(
+        ValidatedExecutionRequest::validate(
+            invocation(),
+            authority(),
+            command(root.clone(), Vec::new(), BTreeMap::new()),
+            &policy(BTreeSet::new(), 16, 1)
         ),
-        Err(execution::ProcessError::NeverStarted {cause,..}) if matches!(*cause,execution::ProcessError::Request(execution::RequestError::MissingActiveBindingUse))
+        Err(execution::RequestError::ProgramDenied)
+    ));
+    assert!(matches!(
+        ValidatedExecutionRequest::validate(
+            invocation(),
+            authority(),
+            command(root.join("other"), Vec::new(), BTreeMap::new()),
+            &policy(BTreeSet::from([PathBuf::from("/bin/sh")]), 16, 1)
+        ),
+        Err(execution::RequestError::WorktreeDenied)
+    ));
+    assert!(matches!(
+        ValidatedExecutionRequest::validate(
+            invocation(),
+            authority(),
+            command(
+                root.clone(),
+                vec![OsString::from("long-argument")],
+                BTreeMap::new()
+            ),
+            &policy(BTreeSet::from([PathBuf::from("/bin/sh")]), 2, 1)
+        ),
+        Err(execution::RequestError::ArgvTooLarge)
+    ));
+    assert!(matches!(
+        ValidatedExecutionRequest::validate(
+            invocation(),
+            authority(),
+            command(
+                root.clone(),
+                Vec::new(),
+                BTreeMap::from([
+                    (OsString::from("A"), OsString::from("1")),
+                    (OsString::from("B"), OsString::from("2"))
+                ])
+            ),
+            &policy(BTreeSet::from([PathBuf::from("/bin/sh")]), 16, 1)
+        ),
+        Err(execution::RequestError::EnvironmentTooLarge)
     ));
     fs::remove_dir_all(root).unwrap();
 }
 
-/// Proves pre-authority discovery is accepted only from a consumed observed binding and fixed Git policy.
+/// Rejects a Git request whose worktree `.git` backpointer no longer matches Workspace authority.
 #[test]
-fn discovery_request_is_catalog_gated_before_authority_exists() {
-    let mut guard = HostBindingGuard::default();
-    let channel = channel();
+fn git_request_rejects_changed_metadata_backpointer() {
+    let root = worktree();
+    let common = root.join("common");
+    fs::create_dir(&common).unwrap();
+    fs::write(root.join(".git"), "gitdir: /missing/admin\n").unwrap();
+    let authority = WorkspaceAuthority::from_workspace_with_git_common_dir(
+        "git-metadata",
+        "1",
+        root.clone(),
+        common,
+        1,
+    )
+    .unwrap();
+    let command = ControlledCommand::from_validated_peer(
+        CommandKind::Git,
+        PathBuf::from("/usr/bin/git"),
+        Vec::new(),
+        root.clone(),
+        BTreeMap::new(),
+    )
+    .unwrap();
+    let policy =
+        LocalExecutionPolicy::new(BTreeSet::from([PathBuf::from("/usr/bin/git")]), 16, 1).unwrap();
     assert!(matches!(
-        guard.observe_hook(pre_hook("actor", "call"), channel.clone()),
-        BindingStatus::PreObserved
+        ValidatedExecutionRequest::validate(
+            ValidatedHostInvocation::from_verified_binding("git-metadata").unwrap(),
+            authority,
+            command,
+            &policy,
+        ),
+        Err(execution::RequestError::GitMetadataInvalid)
     ));
-    let BindingStatus::Validated(invocation) =
-        guard.establish_start(candidate("actor", "call"), channel)
-    else {
-        panic!("explicit start must validate");
-    };
-    let active = guard.consume_active(invocation.binding_ref()).unwrap();
-    let observed = parse_observed_sandbox_state(
-        json!({
-            "codex/sandbox-state-meta": {
-                "permissionProfile": {"type": "managed", "file_system": {}, "network": "restricted"},
-                "codexLinuxSandboxExe": null,
-                "sandboxCwd": "file:///private/tmp",
-                "useLegacyLandlock": false
-            }
-        })
-        .as_object()
-        .unwrap(),
-        &invocation,
-        &active,
-        true,
-    )
-    .unwrap();
-    let state = HostSandboxState::parse(Some(observed.state().as_json().clone())).unwrap();
-    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
-        ExecutionProfileTemplate::from_execution_evidence("managed", 1, &state).unwrap(),
-    ])
-    .unwrap();
-    let request = DiscoverWorktreeRequest::from_active_observation(
-        active,
-        observed,
-        OsString::from("/private/tmp/candidate\n"),
-        DiscoveryOperationRef::new("discover-1").unwrap(),
-    )
-    .unwrap();
-    let policy = GitDiscoveryPolicy::new(PathBuf::from("/usr/bin/git"), 1024, false).unwrap();
-    assert!(
-        request
-            .validate_query(GitDiscoveryQuery::ShowTopLevel, &policy, &catalog)
-            .is_ok()
-    );
+    fs::remove_dir_all(root).unwrap();
 }
 
 /// Proves bounded class preference and owner rotation without granting queued work a hidden slot.
@@ -403,69 +335,6 @@ fn admission_bounds_and_fairness_are_centralized() {
     assert!(!admission.contains_ticket(b_ticket));
     assert_eq!(admission.running_count(), 1);
 }
-
-/// Proves corrupt durable profile records cannot restore a permit and value changes refuse replay.
-#[test]
-fn persisted_catalog_requires_complete_matching_d03_evidence() {
-    let state = disabled_state(Path::new("/private/tmp"));
-    let record = PersistedProfileRecord::from_execution_evidence(
-        "disabled-d03",
-        1,
-        D03ProfileEvidence {
-            provider_binary: "codex-sha".into(),
-            toolchain: "toolchain-sha".into(),
-            configuration: "config-sha".into(),
-            trust: "trusted".into(),
-            transport: "direct".into(),
-            d03_evidence: "d03-run".into(),
-        },
-        &state,
-    )
-    .unwrap();
-    let loaded = PersistedProfileRecord::from_json(&record.to_json()).unwrap();
-    assert!(
-        ExecutionProfileCatalog::from_persisted_records(
-            vec![(loaded, state.clone())],
-            std::slice::from_ref(&record),
-        )
-        .is_ok()
-    );
-    assert!(PersistedProfileRecord::from_json("{\"profile_id\":\"only\"}").is_err());
-    let changed = HostSandboxState::parse(Some(json!({
-        "permissionProfile": {"type": "disabled"},
-        "codexLinuxSandboxExe": null,
-        "sandboxCwd": "/private/tmp",
-        "useLegacyLandlock": false,
-        "changed_semantic_value": true
-    })))
-    .unwrap();
-    assert!(
-        ExecutionProfileCatalog::from_persisted_records(
-            vec![(record.clone(), changed)],
-            std::slice::from_ref(&record)
-        )
-        .is_err()
-    );
-    let fabricated = PersistedProfileRecord::from_execution_evidence(
-        "fabricated",
-        1,
-        D03ProfileEvidence {
-            provider_binary: "fake".into(),
-            toolchain: "fake".into(),
-            configuration: "fake".into(),
-            trust: "fake".into(),
-            transport: "fake".into(),
-            d03_evidence: "fake".into(),
-        },
-        &state,
-    )
-    .unwrap();
-    assert!(
-        ExecutionProfileCatalog::from_persisted_records(vec![(fabricated, state)], &[record])
-            .is_err()
-    );
-}
-
 /// Proves compatible views share one heavy reservation while exclusive and queued requests do not.
 #[test]
 fn provider_leases_share_only_compatible_owned_backends() {
@@ -773,17 +642,11 @@ async fn captured_streams_are_bounded_but_drained() {
         Admission::Granted(lease) => lease,
         outcome => panic!("unexpected admission: {outcome:?}"),
     };
-    let result = execution::OwnedChild::spawn_captured(
-        &request,
-        lease,
-        None,
-        Path::new("/usr/bin/codex"),
-        3,
-    )
-    .unwrap()
-    .reap(Duration::from_secs(1), Duration::from_secs(1))
-    .await
-    .unwrap();
+    let result = execution::OwnedChild::spawn_captured(&request, lease, None, 3)
+        .unwrap()
+        .reap(Duration::from_secs(1), Duration::from_secs(1))
+        .await
+        .unwrap();
     assert!(result.evidence.status().success());
     assert_eq!(result.evidence.stdout().bytes, b"abc");
     assert_eq!(result.evidence.stderr().bytes, b"123");
@@ -818,17 +681,11 @@ async fn cancellation_reports_reap_without_claiming_descendants() {
         Admission::Granted(lease) => lease,
         outcome => panic!("unexpected admission: {outcome:?}"),
     };
-    let result = execution::OwnedChild::spawn_captured(
-        &request,
-        lease,
-        None,
-        Path::new("/usr/bin/codex"),
-        64,
-    )
-    .unwrap()
-    .cancel_and_reap(Duration::from_millis(100), Duration::from_secs(1))
-    .await
-    .unwrap();
+    let result = execution::OwnedChild::spawn_captured(&request, lease, None, 64)
+        .unwrap()
+        .cancel_and_reap(Duration::from_millis(100), Duration::from_secs(1))
+        .await
+        .unwrap();
     assert!(result.evidence.cancellation().unwrap().term_requested);
     assert_eq!(
         result.evidence.descendants(),
@@ -874,14 +731,9 @@ async fn protocol_stdout_has_one_owner_and_borrowed_endpoints_cannot_be_killed()
         outcome => panic!("unexpected admission: {outcome:?}"),
     };
     let capability = registry.take_spawn_lease(view).unwrap();
-    let mut child = execution::OwnedProtocolChild::spawn_from_provider_lease(
-        &request,
-        capability,
-        None,
-        Path::new("/usr/bin/codex"),
-        64,
-    )
-    .unwrap();
+    let mut child =
+        execution::OwnedProtocolChild::spawn_from_provider_lease(&request, capability, None, 64)
+            .unwrap();
     let mut protocol = String::new();
     child.stdout.read_to_string(&mut protocol).await.unwrap();
     let reaped = child.reap(Duration::from_secs(1)).await.unwrap();
@@ -967,14 +819,7 @@ async fn dropping_owned_children_and_reap_futures_kills_without_freeing_uncertai
         let cleanup;
         let mut group_member = None;
         if mode < 3 {
-            let child = execution::OwnedChild::spawn_captured(
-                &request,
-                lease,
-                None,
-                Path::new("/usr/bin/codex"),
-                64,
-            )
-            .unwrap();
+            let child = execution::OwnedChild::spawn_captured(&request, lease, None, 64).unwrap();
             cleanup = child_cleanup(&root).await;
             if mode == 0 {
                 // A test-owned direct child joins the group, so its exit can be reaped without
@@ -1015,14 +860,7 @@ async fn dropping_owned_children_and_reap_futures_kills_without_freeing_uncertai
                 }
             }
         } else {
-            let child = execution::OwnedProtocolChild::spawn(
-                &request,
-                lease,
-                None,
-                Path::new("/usr/bin/codex"),
-                64,
-            )
-            .unwrap();
+            let child = execution::OwnedProtocolChild::spawn(&request, lease, None, 64).unwrap();
             cleanup = child_cleanup(&root).await;
             if mode == 3 {
                 drop(child);
@@ -1078,1055 +916,4 @@ async fn dropping_owned_children_and_reap_futures_kills_without_freeing_uncertai
     }
     borrowed.kill().await.unwrap();
     borrowed.wait().await.unwrap();
-}
-
-/// Returns a read-only managed state under `cwd`, optionally made unrecognized.
-///
-/// `recognized == false` replaces the root entry's access with `none`, which is exactly the shape
-/// that may subtract read authority and must therefore keep strict sandbox-cwd equality.
-fn inherited_managed_state(cwd: &Path, recognized: bool) -> serde_json::Value {
-    json!({
-        "codexLinuxSandboxExe": null,
-        "permissionProfile": {
-            "file_system": {
-                "entries": [
-                    {"access": if recognized {"read"} else {"none"},
-                     "path":{"type":"special","value":{"kind":"root"}}},
-                    {"access":"read","missing_path_behavior":"skip",
-                     "path":{"path": cwd.join(".git"), "type":"path"}}
-                ],
-                "type": "restricted"
-            },
-            "network": "enabled",
-            "type": "managed"
-        },
-        "sandboxCwd": cwd,
-        "useLegacyLandlock": false
-    })
-}
-
-/// Seals the platform `/usr/bin/env` against its own current bytes, as an operator would declare
-/// them, or returns `None` where this contract is unavailable or the file cannot be read.
-fn accepted_env_trampoline() -> Option<ControlledTrampoline> {
-    let declared = blake3::hash(&fs::read("/usr/bin/env").ok()?)
-        .to_hex()
-        .to_string();
-    ControlledTrampoline::accept(PathBuf::from("/usr/bin/env"), &declared).ok()
-}
-
-/// Builds a managed invocation for `sandbox_cwd` plus its matching Execution-owned catalog.
-fn inherited_invocation(
-    sandbox_cwd: &Path,
-    recognized: bool,
-) -> (ValidatedHostInvocation, ExecutionProfileCatalog) {
-    let state =
-        HostSandboxState::parse(Some(inherited_managed_state(sandbox_cwd, recognized))).unwrap();
-    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
-        ExecutionProfileTemplate::from_execution_evidence("inherited-cwd-case", 1, &state).unwrap(),
-    ])
-    .unwrap();
-    (
-        ValidatedHostInvocation::from_verified_binding("inherited-bound", state).unwrap(),
-        catalog,
-    )
-}
-
-/// A native child inherits its parent's `sandboxCwd`, so a separate operator worktree must still
-/// validate — but only under a profile that already grants read of the whole filesystem root, and
-/// only with an accepted `/usr/bin/env` trampoline.
-#[test]
-fn inherited_sandbox_cwd_validates_only_for_a_recognized_read_all_profile_with_a_trampoline() {
-    let root = fs::canonicalize(worktree()).unwrap();
-    fs::create_dir(root.join(".git")).unwrap();
-    let inherited = worktree();
-    let authority = WorkspaceAuthority::from_workspace_with_git_common_dir(
-        "inherited-worktree",
-        "1",
-        root.clone(),
-        root.join(".git"),
-        7,
-    )
-    .unwrap();
-    let command = || {
-        ControlledCommand::from_validated_peer(
-            CommandKind::Job,
-            PathBuf::from("/usr/bin/true"),
-            vec![OsString::from("--version")],
-            root.clone(),
-            BTreeMap::new(),
-        )
-        .unwrap()
-    };
-    let programs = || BTreeSet::from([PathBuf::from("/usr/bin/true")]);
-    let plain = LocalExecutionPolicy::new(programs(), 4096, 4, false).unwrap();
-
-    // An unrecognized profile keeps the original strict equality even with a trampoline available.
-    let (invocation, catalog) = inherited_invocation(&inherited, false);
-    assert_eq!(
-        ValidatedExecutionRequest::validate(
-            invocation,
-            authority.clone(),
-            command(),
-            &plain,
-            &catalog
-        )
-        .unwrap_err(),
-        RequestError::SandboxCwdMismatch
-    );
-
-    // A recognized profile without an accepted trampoline is unavailable, never silently allowed.
-    let (invocation, catalog) = inherited_invocation(&inherited, true);
-    assert_eq!(
-        ValidatedExecutionRequest::validate(
-            invocation,
-            authority.clone(),
-            command(),
-            &plain,
-            &catalog
-        )
-        .unwrap_err(),
-        RequestError::TrampolineUnavailable
-    );
-
-    // A command outside the authoritative worktree still fails first, trampoline or not.
-    let (invocation, catalog) = inherited_invocation(&inherited, true);
-    let elsewhere = ControlledCommand::from_validated_peer(
-        CommandKind::Job,
-        PathBuf::from("/usr/bin/true"),
-        Vec::new(),
-        inherited.clone(),
-        BTreeMap::new(),
-    )
-    .unwrap();
-    assert_eq!(
-        ValidatedExecutionRequest::validate(
-            invocation,
-            authority.clone(),
-            elsewhere,
-            &plain,
-            &catalog
-        )
-        .unwrap_err(),
-        RequestError::WorktreeDenied
-    );
-
-    let Some(trampoline) = accepted_env_trampoline() else {
-        return;
-    };
-    let accepted =
-        LocalExecutionPolicy::with_env_trampoline(programs(), 4096, 4, false, trampoline.clone())
-            .unwrap();
-
-    // The recognized profile plus an accepted trampoline is the one admitted combination, and the
-    // replayed state keeps its exact original bytes.
-    let (invocation, catalog) = inherited_invocation(&inherited, true);
-    let raw = invocation.sandbox().sandbox_state_json().to_owned();
-    let request = ValidatedExecutionRequest::validate(
-        invocation,
-        authority.clone(),
-        command(),
-        &accepted,
-        &catalog,
-    )
-    .unwrap();
-    assert_eq!(request.kind(), CommandKind::Job);
-    assert_eq!(request.authority().root(), root.as_path());
-    assert_eq!(
-        raw,
-        inherited_managed_state(&inherited, true).to_string(),
-        "sandboxCwd is never rewritten toward the target worktree"
-    );
-
-    // A catalog whose access mode differs still refuses the otherwise portable profile. The
-    // managed class has a template, so the refusal names the digest mismatch (T24B), not a
-    // missing class template.
-    let (invocation, _) = inherited_invocation(&inherited, true);
-    let (_, foreign) = inherited_invocation(&worktree(), false);
-    assert_eq!(
-        ValidatedExecutionRequest::validate(
-            invocation,
-            authority.clone(),
-            command(),
-            &accepted,
-            &foreign
-        )
-        .unwrap_err(),
-        RequestError::ExecutionProfileDigestMismatch(ProfileClass::Managed)
-    );
-
-    // The added `-C <root> <program>` bytes count against the local argv ceiling.
-    let tight = LocalExecutionPolicy::with_env_trampoline(
-        programs(),
-        "--version".len() + 1,
-        4,
-        false,
-        trampoline,
-    )
-    .unwrap();
-    let (invocation, catalog) = inherited_invocation(&inherited, true);
-    assert_eq!(
-        ValidatedExecutionRequest::validate(invocation, authority, command(), &tight, &catalog)
-            .unwrap_err(),
-        RequestError::ArgvTooLarge
-    );
-}
-
-/// A durable-authorized native read accepts the inherited parent cwd only under the same
-/// recognized read-all profile, and never accepts a changed authority or an unrecognized one.
-#[test]
-fn native_read_accepts_an_inherited_cwd_only_under_a_recognized_read_all_profile() {
-    let root = worktree();
-    let inherited = worktree();
-    let authority =
-        WorkspaceAuthority::from_workspace("inherited-read", "1", root.clone(), 3).unwrap();
-    let read = |recognized: bool, authority: &WorkspaceAuthority| {
-        let mut guard = HostBindingGuard::default();
-        let channel = channel();
-        assert!(matches!(
-            guard.observe_hook(pre_hook("actor", "call"), channel.clone()),
-            BindingStatus::PreObserved
-        ));
-        let BindingStatus::Validated(invocation) =
-            guard.establish_start(candidate("actor", "call"), channel)
-        else {
-            panic!("explicit start must establish the binding");
-        };
-        let active = guard.consume_active(invocation.binding_ref()).unwrap();
-        let state = inherited_managed_state(&inherited, recognized);
-        let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
-            ExecutionProfileTemplate::from_execution_evidence(
-                "inherited-read-case",
-                1,
-                &HostSandboxState::parse(Some(state.clone())).unwrap(),
-            )
-            .unwrap(),
-        ])
-        .unwrap();
-        let observed = parse_observed_sandbox_state(
-            json!({"codex/sandbox-state-meta": state})
-                .as_object()
-                .unwrap(),
-            &invocation,
-            &active,
-            true,
-        )
-        .unwrap();
-        execution::validate_workspace_read(
-            active,
-            observed,
-            authority,
-            &catalog,
-            false,
-            execution::ReadScope::WholeTree,
-        )
-    };
-    read(true, &authority).unwrap();
-    assert_eq!(
-        read(false, &authority).unwrap_err(),
-        RequestError::ReadWholeTreeUnproven
-    );
-    // A read-all profile is cwd-independent by construction, so a second Workspace-granted root is
-    // served by the same state; the Workspace authority, not the cwd string, is what bounds it.
-    let other = WorkspaceAuthority::from_workspace("other-read", "1", worktree(), 3).unwrap();
-    read(true, &other).unwrap();
-}
-
-/// Proves physically that a real accepted Codex sandbox plus `/usr/bin/env` runs the utility in a
-/// separate operator worktree, and that an inaccessible target never executes the marker.
-///
-/// Ignored by default: it spawns the operator's real `codex` binary and must run from an outer,
-/// already-approved unsandboxed runner, because macOS refuses a nested `sandbox_apply`. Supply
-/// `AGENT_IDE_PHYSICAL_CODEX` (absolute accepted `codex` path) and `AGENT_IDE_PHYSICAL_STATE`
-/// (file holding the captured default `codex/sandbox-state-meta` JSON, whose `sandboxCwd` is the
-/// inherited parent directory and whose profile grants read of `/`). Both absent, the test skips.
-#[tokio::test]
-#[ignore = "spawns the operator's real Codex binary; needs an outer unsandboxed runner"]
-async fn physical_inherited_cwd_runs_the_marker_only_in_an_accessible_target_worktree() {
-    let (Ok(codex), Ok(state_path)) = (
-        std::env::var("AGENT_IDE_PHYSICAL_CODEX"),
-        std::env::var("AGENT_IDE_PHYSICAL_STATE"),
-    ) else {
-        eprintln!("skipped: AGENT_IDE_PHYSICAL_CODEX/AGENT_IDE_PHYSICAL_STATE are unset");
-        return;
-    };
-    let raw = fs::read_to_string(&state_path).unwrap();
-    let state = HostSandboxState::parse_json(raw.trim()).unwrap();
-    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
-        ExecutionProfileTemplate::from_execution_evidence("physical-inherited", 1, &state).unwrap(),
-    ])
-    .unwrap();
-    let trampoline = accepted_env_trampoline().expect("an accepted /usr/bin/env declaration");
-    let policy = LocalExecutionPolicy::with_env_trampoline(
-        BTreeSet::from([PathBuf::from("/bin/pwd")]),
-        4096,
-        0,
-        false,
-        trampoline,
-    )
-    .unwrap();
-
-    // `target` is a plain temporary directory standing in for a separate operator worktree — this
-    // check is about the launch boundary, not Git discovery — and `missing` is removed before the
-    // spawn so the marker cannot be produced from an inaccessible directory. Both are canonicalized
-    // first: Workspace only ever holds a canonical root, and on a default macOS `TMPDIR` the
-    // symlinked `/var/folders/...` form would otherwise disagree with the real path the child
-    // prints.
-    let target = fs::canonicalize(worktree()).unwrap();
-    let missing = fs::canonicalize(worktree()).unwrap();
-    fs::remove_dir(&missing).unwrap();
-    for (root, expected) in [(target.clone(), true), (missing.clone(), false)] {
-        let authority =
-            WorkspaceAuthority::from_workspace("physical-worktree", "1", root.clone(), 1).unwrap();
-        let command = ControlledCommand::from_validated_peer(
-            CommandKind::Job,
-            PathBuf::from("/bin/pwd"),
-            Vec::new(),
-            root.clone(),
-            BTreeMap::new(),
-        )
-        .unwrap();
-        let invocation =
-            ValidatedHostInvocation::from_verified_binding("physical-bound", state.clone())
-                .unwrap();
-        assert_ne!(
-            state.cwd(),
-            root.as_path(),
-            "the captured state must describe the inherited parent cwd, not the target worktree"
-        );
-        let request =
-            ValidatedExecutionRequest::validate(invocation, authority, command, &policy, &catalog)
-                .unwrap();
-        let mut admission = AdmissionController::new(AdmissionLimits {
-            total_running: 1,
-            per_owner_running: 1,
-            per_owner_queued: 1,
-            total_queued: 1,
-            interactive_burst: 1,
-        })
-        .unwrap();
-        let Admission::Granted(lease) = admission.submit(
-            OwnerId::new("physical").unwrap(),
-            AdmissionClass::Interactive,
-        ) else {
-            panic!("physical spawn must be admitted");
-        };
-        let child = execution::OwnedChild::spawn_captured(
-            &request,
-            lease,
-            None,
-            Path::new(&codex),
-            64 * 1024,
-        );
-        let marker = root.to_string_lossy().to_string();
-        match child {
-            Ok(child) => {
-                let captured = child
-                    .reap(Duration::from_secs(30), Duration::from_secs(30))
-                    .await
-                    .unwrap();
-                let stdout = String::from_utf8_lossy(&captured.evidence.stdout().bytes).to_string();
-                assert_eq!(
-                    stdout.trim() == marker,
-                    expected,
-                    "target worktree marker presence must match accessibility: {stdout:?}"
-                );
-            }
-            Err(error) => assert!(
-                !expected,
-                "an accessible target must physically launch, got {error:?}"
-            ),
-        }
-    }
-    fs::remove_dir_all(target).unwrap();
-}
-
-// ---------------------------------------------------------------------------
-// T35B: profile-shape v2 end-to-end contract over the nine captured sandbox
-// states, through the same public validation path a managed request uses.
-// ---------------------------------------------------------------------------
-
-/// Reads one captured sandbox-state fixture, relocated into this process's temporary tree.
-///
-/// The captures carry the capturing machine's paths, and v2 binds the cwd by realpath, so every
-/// path under the developer's home or stability tree gets one new prefix (relative structure and
-/// deny/glob relationships unchanged) and the relocated cwd is created, as the library tests do
-/// (T41B).
-fn t35b_fixture(name: &str) -> String {
-    let captured = fs::read_to_string(format!(
-        concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/sandbox-states/{}.json"
-        ),
-        name.trim_end_matches(".json")
-    ))
-    .unwrap();
-    let root = fs::canonicalize(std::env::temp_dir())
-        .unwrap()
-        .join(format!("agent-ide-test-fixtures-{}", std::process::id()));
-    let relocated = captured
-        .replace("/Users/pluto", root.join("home").to_str().unwrap())
-        .replace(
-            "/private/tmp/agent-ide-stability",
-            root.join("stability").to_str().unwrap(),
-        );
-    assert!(!relocated.contains("/Users/pluto"));
-    assert!(!relocated.contains("/private/tmp/agent-ide-stability"));
-    let value: serde_json::Value = serde_json::from_str(&relocated).unwrap();
-    let cwd = value["sandboxCwd"].as_str().unwrap();
-    let cwd = Path::new(cwd.strip_prefix("file://").unwrap_or(cwd));
-    fs::create_dir_all(cwd.join(".git")).unwrap();
-    relocated
-}
-
-/// Parses one captured sandbox-state fixture into a validated host state.
-fn t35b_state(name: &str) -> HostSandboxState {
-    HostSandboxState::parse_json(&t35b_fixture(name)).unwrap()
-}
-
-/// Validates one full controlled request for the live state against one catalog.
-///
-/// This is the exact public path a managed request takes: the profile permit is minted inside
-/// `ValidatedExecutionRequest::validate`, so every admission and refusal below is observable
-/// without any spawn.
-fn t35b_validate(
-    live: &HostSandboxState,
-    catalog: &ExecutionProfileCatalog,
-) -> Result<ValidatedExecutionRequest, RequestError> {
-    let invocation =
-        ValidatedHostInvocation::from_verified_binding("t35b-contract", live.clone()).unwrap();
-    let root = fs::canonicalize(live.cwd()).unwrap();
-    let authority = WorkspaceAuthority::from_workspace_with_git_common_dir(
-        "t35b-worktree",
-        "t35b-incarnation",
-        root.clone(),
-        root.join(".git"),
-        1,
-    )
-    .unwrap();
-    let command = ControlledCommand::from_validated_peer(
-        CommandKind::Job,
-        PathBuf::from("/usr/bin/true"),
-        vec![],
-        root,
-        BTreeMap::new(),
-    )
-    .unwrap();
-    let policy = LocalExecutionPolicy::new(
-        BTreeSet::from([PathBuf::from("/usr/bin/true")]),
-        4096,
-        0,
-        false,
-    )
-    .unwrap();
-    ValidatedExecutionRequest::validate(invocation, authority, command, &policy, catalog)
-}
-
-/// Builds a v2 catalog carrying exactly one accepted fixture template.
-fn t35b_v2_catalog(template: &str) -> ExecutionProfileCatalog {
-    ExecutionProfileCatalog::from_execution_evidence(vec![
-        ExecutionProfileTemplate::from_execution_evidence_v2(
-            "t35b-template",
-            1,
-            &t35b_state(template),
-        )
-        .unwrap(),
-    ])
-    .unwrap()
-}
-
-/// The shape matrix remains ordered before the live Git metadata check on synthetic fixtures.
-#[test]
-fn profile_shape_v2_matrix_precedes_git_metadata_guard() {
-    let workspace_write = "1ed43a00ce845709.json";
-    let read_only = "accepted-codex-managed-read-only-v1.json";
-    let catalog = t35b_v2_catalog(workspace_write);
-    for admitted in [
-        "1ed43a00ce845709.json",
-        "555ebcab7e884d62.json",
-        "b8a736675faa7cba.json",
-    ] {
-        assert_eq!(
-            t35b_validate(&t35b_state(admitted), &catalog).unwrap_err(),
-            RequestError::GitMetadataWriteOverlap,
-            "the matching {admitted} shape reaches the new guard"
-        );
-    }
-    for refused in ["c9ea07ed289773b3.json", "fd37241d7322ebc3.json"] {
-        assert!(matches!(
-            t35b_validate(&t35b_state(refused), &catalog),
-            Err(RequestError::ExecutionProfileShapeNotNarrower(
-                ProfileClass::Managed
-            ))
-        ));
-    }
-    // The root-write capture is refused by every workspace-write template.
-    for template in [
-        workspace_write,
-        "accepted-codex-managed-workspace-write-v1.json",
-    ] {
-        assert!(matches!(
-            t35b_validate(
-                &t35b_state("84f07fac27b67d1d.json"),
-                &t35b_v2_catalog(template)
-            ),
-            Err(RequestError::ExecutionProfileShapeNotNarrower(_))
-        ));
-    }
-    // The read-only template admits the equivalent live read-only state.
-    let read_only_catalog = t35b_v2_catalog(read_only);
-    assert!(t35b_validate(&t35b_state("728b26d824d0d380.json"), &read_only_catalog).is_ok());
-}
-
-/// A v2 record restores its catalog only against its own capture, and the replayed sandbox JSON
-/// stays byte-for-byte identical through every derivation and permit attempt.
-#[test]
-fn v2_records_restore_exactly_and_replay_json_is_unchanged() {
-    let captured_text = t35b_fixture("1ed43a00ce845709.json");
-    let captured = HostSandboxState::parse_json(&captured_text).unwrap();
-    let record = PersistedProfileRecord::from_execution_evidence_v2(
-        "t35b-managed-write",
-        1,
-        D03ProfileEvidence {
-            provider_binary: "codex".into(),
-            toolchain: "toolchain".into(),
-            configuration: "default".into(),
-            trust: "accepted-local".into(),
-            transport: "managed".into(),
-            d03_evidence: "d03-run".into(),
-        },
-        &captured,
-    )
-    .unwrap();
-    let expected = vec![record.clone()];
-    let catalog = ExecutionProfileCatalog::from_persisted_records(
-        vec![(record, captured.clone())],
-        &expected,
-    )
-    .unwrap();
-    // The live narrower states pass the restored catalog and reach the Git metadata guard.
-    for admitted in [
-        "1ed43a00ce845709.json",
-        "555ebcab7e884d62.json",
-        "b8a736675faa7cba.json",
-    ] {
-        assert_eq!(
-            t35b_validate(&t35b_state(admitted), &catalog).unwrap_err(),
-            RequestError::GitMetadataWriteOverlap
-        );
-    }
-    // A v1 record for the same capture restores by the legacy exact-digest rules.
-    let legacy = PersistedProfileRecord::from_execution_evidence(
-        "legacy-managed-write",
-        1,
-        D03ProfileEvidence {
-            provider_binary: "codex".into(),
-            toolchain: "toolchain".into(),
-            configuration: "default".into(),
-            trust: "accepted-local".into(),
-            transport: "managed".into(),
-            d03_evidence: "d03-run".into(),
-        },
-        &captured,
-    )
-    .unwrap();
-    assert!(PersistedProfileRecord::from_json(&legacy.to_json()).is_ok());
-    // Nothing above rewrote the replay argument.
-    assert_eq!(captured.sandbox_state_json(), captured_text);
-    assert_eq!(
-        t35b_state("1ed43a00ce845709.json").sandbox_state_json(),
-        captured_text
-    );
-}
-
-// ---------------------------------------------------------------------------
-// T35B-r: discovery binds the trusted candidate to the portable sandbox cwd,
-// and native reads require an independent live read proof even at the same cwd.
-// ---------------------------------------------------------------------------
-
-/// Fixed Git discovery binds the raw candidate as the trusted directory: with a v2 template,
-/// a candidate other than the observed state's own `sandboxCwd` never derives a v2 shape and
-/// refuses with the typed unsupported reason, while the matching candidate admits (T35B-r
-/// finding 3). A v1-only catalog is untouched by the binding, exactly as before.
-#[test]
-fn discovery_binds_the_trusted_candidate_to_the_sandbox_cwd() {
-    // The binding canonicalizes both sides through the filesystem (T37B), so the capture's cwd
-    // must exist exactly as a live capture's would.
-    std::fs::create_dir_all("/private/tmp/t35b-discovery").unwrap();
-    let managed = json!({
-        "codexLinuxSandboxExe": null,
-        "permissionProfile": {"type":"managed","file_system":{"entries":[
-            {"access":"read","path":{"type":"special","value":{"kind":"root"}}},
-            {"access":"write","path":{"path":"/private/tmp/t35b-discovery","type":"path"}}
-        ],"type":"restricted"},"network":"restricted"},
-        "sandboxCwd": "/private/tmp/t35b-discovery",
-        "useLegacyLandlock": false
-    });
-    let state = HostSandboxState::parse(Some(managed.clone())).unwrap();
-    let v2_catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
-        ExecutionProfileTemplate::from_execution_evidence_v2("t35b-discovery", 1, &state).unwrap(),
-    ])
-    .unwrap();
-    let v1_catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
-        ExecutionProfileTemplate::from_execution_evidence("t35b-discovery-v1", 1, &state).unwrap(),
-    ])
-    .unwrap();
-    let discovery = |candidate_path: &str, catalog: &ExecutionProfileCatalog| {
-        let mut guard = HostBindingGuard::default();
-        let channel = channel();
-        assert!(matches!(
-            guard.observe_hook(pre_hook("discover-actor", "discover-call"), channel.clone()),
-            BindingStatus::PreObserved
-        ));
-        let BindingStatus::Validated(invocation) =
-            guard.establish_start(candidate("discover-actor", "discover-call"), channel)
-        else {
-            panic!("explicit start must validate");
-        };
-        let active = guard.consume_active(invocation.binding_ref()).unwrap();
-        let observed = parse_observed_sandbox_state(
-            json!({"codex/sandbox-state-meta": managed})
-                .as_object()
-                .unwrap(),
-            &invocation,
-            &active,
-            true,
-        )
-        .unwrap();
-        DiscoverWorktreeRequest::from_active_observation(
-            active,
-            observed,
-            OsString::from(candidate_path),
-            DiscoveryOperationRef::new("t35b-discovery").unwrap(),
-        )
-        .unwrap()
-        .validate_query(
-            GitDiscoveryQuery::ShowTopLevel,
-            &GitDiscoveryPolicy::new(PathBuf::from("/usr/bin/git"), 1024, false).unwrap(),
-            catalog,
-        )
-    };
-    // The candidate matching the state's own sandboxCwd admits through the v2 template...
-    assert!(
-        discovery("/private/tmp/t35b-discovery", &v2_catalog).is_ok(),
-        "a bound candidate must admit"
-    );
-    // ...a relocated candidate never derives a v2 shape and refuses...
-    assert!(matches!(
-        discovery("/secrets/project", &v2_catalog).unwrap_err(),
-        RequestError::ExecutionProfileShapeUnsupported(ProfileClass::Managed)
-    ));
-    // ...and the legacy v1 catalog is unchanged: the exact digest still admits any candidate.
-    assert!(discovery("/secrets/project", &v1_catalog).is_ok());
-}
-
-/// A deny-bearing managed state keeps native reads and cached delivery unavailable even when
-/// its `sandboxCwd` already is the authorized root (T35B-r finding 2): admission through a
-/// narrower v2 shape never confers read authority, and the closed refusal is
-/// `ReadWholeTreeUnproven`. This is the shared proof both the observe path and
-/// the cached-delivery path require before any native or cached disclosure.
-#[test]
-fn native_read_refuses_a_same_cwd_deny_bearing_state() {
-    let root = worktree();
-    let managed = |deny: bool| {
-        let mut state = json!({
-            "codexLinuxSandboxExe": null,
-            "permissionProfile": {"type":"managed","file_system":{"entries":[
-                {"access":"read","path":{"type":"special","value":{"kind":"root"}}},
-                {"access":"write","path":{"path": root, "type":"path"}},
-                {"access":"write","path":{"type":"special","value":{"kind":"slash_tmp"}}},
-                {"access":"write","path":{"type":"special","value":{"kind":"tmpdir"}}}
-            ],"type":"restricted"},"network":"restricted"},
-            "sandboxCwd": root,
-            "useLegacyLandlock": false
-        });
-        if deny {
-            state["permissionProfile"]["file_system"]["entries"]
-                .as_array_mut()
-                .unwrap()
-                .push(json!({"access":"deny","path":{"path": root.join("secret"), "type":"path"}}));
-        }
-        state
-    };
-    // The v2 template is minted from the deny-free capture, so the deny-bearing live state is
-    // genuinely narrower and its admission succeeds — the premise of the bypass.
-    let clean = HostSandboxState::parse(Some(managed(false))).unwrap();
-    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
-        ExecutionProfileTemplate::from_execution_evidence_v2("t35b-read", 1, &clean).unwrap(),
-    ])
-    .unwrap();
-    let read = |state: serde_json::Value, authority: &WorkspaceAuthority| {
-        let mut guard = HostBindingGuard::default();
-        let channel = channel();
-        assert!(matches!(
-            guard.observe_hook(pre_hook("read-actor", "read-call"), channel.clone()),
-            BindingStatus::PreObserved
-        ));
-        let BindingStatus::Validated(invocation) =
-            guard.establish_start(candidate("read-actor", "read-call"), channel)
-        else {
-            panic!("explicit start must establish the binding");
-        };
-        let active = guard.consume_active(invocation.binding_ref()).unwrap();
-        let observed = parse_observed_sandbox_state(
-            json!({"codex/sandbox-state-meta": state})
-                .as_object()
-                .unwrap(),
-            &invocation,
-            &active,
-            true,
-        )
-        .unwrap();
-        execution::validate_workspace_read(
-            active,
-            observed,
-            authority,
-            &catalog,
-            false,
-            execution::ReadScope::WholeTree,
-        )
-    };
-    let authority = WorkspaceAuthority::from_workspace("t35b-read", "1", root.clone(), 1).unwrap();
-    // The deny-free same-cwd state proves whole-tree read coverage and reads natively.
-    read(managed(false), &authority).unwrap();
-    // The deny-bearing state — admitted — loses native reads at the same cwd.
-    assert_eq!(
-        read(managed(true), &authority).unwrap_err(),
-        RequestError::ReadWholeTreeUnproven
-    );
-}
-
-/// Exercises the live Git metadata guard independently of portable template matching.
-#[test]
-fn managed_git_metadata_guard_covers_linked_temp_v1_and_child_tmpdir() {
-    let home = fs::canonicalize(std::env::var_os("HOME").unwrap()).unwrap();
-    let root = home.join(format!(
-        ".agent-ide-git-root-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id(),
-    ));
-    fs::create_dir(&root).unwrap();
-    let common = home.join(format!(
-        "agent-ide-git-common-{}-{}",
-        std::process::id(),
-        root.file_name().unwrap().to_string_lossy(),
-    ));
-    fs::create_dir(&common).unwrap();
-    let common = fs::canonicalize(common).unwrap();
-    linked_git_metadata(&root, &common);
-    let metadata_file = common.join("hardlink-source");
-    fs::write(&metadata_file, b"disposable metadata").unwrap();
-    let hardlink = root.join("precreated-hardlink");
-    fs::hard_link(&metadata_file, &hardlink).unwrap();
-    let unsafe_common = PathBuf::from("/tmp").join(format!(
-        "agent-ide-git-metadata-{}-{}",
-        std::process::id(),
-        root.file_name().unwrap().to_string_lossy(),
-    ));
-    fs::create_dir(&unsafe_common).unwrap();
-    let unsafe_common = fs::canonicalize(unsafe_common).unwrap();
-    let state = |tmpdir_only: bool, extra_write: Option<&Path>| {
-        let mut entries = vec![
-            json!({"access":"read","path":{"type":"special","value":{"kind":"root"}}}),
-            json!({"access":"write","path":{"type":"special","value":{"kind":
-                if tmpdir_only {"tmpdir"} else {"slash_tmp"}}}}),
-        ];
-        if !tmpdir_only {
-            entries.push(json!({"access":"write","path":{"type":"path","path":root}}));
-        }
-        if let Some(path) = extra_write {
-            entries.push(json!({"access":"write","path":{"type":"path","path":path}}));
-        }
-        HostSandboxState::parse(Some(json!({
-            "permissionProfile":{"type":"managed","network":"restricted",
-                "file_system":{"type":"restricted","entries":entries}},
-            "sandboxCwd":root,"codexLinuxSandboxExe":null,"useLegacyLandlock":false
-        })))
-        .unwrap()
-    };
-    let validate = |state: &HostSandboxState, common: &Path, v1: bool, tmpdir: Option<&Path>| {
-        let template = if v1 {
-            ExecutionProfileTemplate::from_execution_evidence("git-metadata-v1", 1, state).unwrap()
-        } else {
-            ExecutionProfileTemplate::from_execution_evidence_v2("git-metadata-v2", 1, state)
-                .unwrap()
-        };
-        let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![template]).unwrap();
-        let authority = WorkspaceAuthority::from_workspace_with_git_common_dir(
-            "linked",
-            "1",
-            root.clone(),
-            common.to_path_buf(),
-            1,
-        )
-        .unwrap();
-        let mut env = BTreeMap::new();
-        if let Some(tmpdir) = tmpdir {
-            env.insert(OsString::from("TMPDIR"), tmpdir.as_os_str().to_os_string());
-        }
-        let command = ControlledCommand::from_validated_peer(
-            CommandKind::Job,
-            PathBuf::from("/usr/bin/true"),
-            vec![],
-            root.clone(),
-            env,
-        )
-        .unwrap();
-        let policy = LocalExecutionPolicy::new(
-            BTreeSet::from([PathBuf::from("/usr/bin/true")]),
-            4096,
-            1,
-            false,
-        )
-        .unwrap();
-        ValidatedExecutionRequest::validate(
-            ValidatedHostInvocation::from_verified_binding("linked", state.clone()).unwrap(),
-            authority,
-            command,
-            &policy,
-            &catalog,
-        )
-    };
-
-    let ordinary = state(false, None);
-    assert_eq!(
-        validate(&ordinary, &common, false, None).unwrap_err(),
-        RequestError::GitMetadataWriteOverlap,
-        "the cwd write can mutate common metadata through its pre-existing hardlink"
-    );
-    assert_eq!(
-        validate(&ordinary, &common, true, None).unwrap_err(),
-        RequestError::GitMetadataWriteOverlap,
-        "an exact v1 record cannot bypass the hardlink scan"
-    );
-    fs::remove_file(&hardlink).unwrap();
-    linked_git_metadata(&root, &unsafe_common);
-    assert_eq!(
-        validate(&ordinary, &unsafe_common, false, None).unwrap_err(),
-        RequestError::GitMetadataWriteOverlap
-    );
-    assert_eq!(
-        validate(&ordinary, &unsafe_common, true, None).unwrap_err(),
-        RequestError::GitMetadataWriteOverlap,
-        "an exact v1 digest cannot bypass live metadata protection"
-    );
-    linked_git_metadata(&root, &common);
-    assert!(
-        validate(&ordinary, &common, false, None).is_ok(),
-        "a clean, disjoint same-device checkout remains usable"
-    );
-    let child_tmpdir = state(true, None);
-    assert!(validate(&child_tmpdir, &common, false, None).is_ok());
-    assert_eq!(
-        validate(&child_tmpdir, &common, false, common.parent()).unwrap_err(),
-        RequestError::GitMetadataWriteOverlap,
-        "the child TMPDIR supplied in command.env is an effective write root"
-    );
-    let safe_file = root.join("safe-file");
-    fs::write(&safe_file, b"fixture").unwrap();
-    assert!(
-        validate(&state(false, Some(&safe_file)), &common, false, None).is_ok(),
-        "an unrelated regular-file write selector remains usable"
-    );
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::unix::fs::MetadataExt;
-
-        let alias = Path::new("/System/Volumes/Data").join(common.strip_prefix("/").unwrap());
-        let original = fs::metadata(&common).unwrap();
-        let alternate = fs::metadata(&alias).unwrap();
-        assert_eq!(
-            (original.dev(), original.ino()),
-            (alternate.dev(), alternate.ino()),
-            "the test must use a real firmlink alias of its disposable common Gitdir"
-        );
-        for write in [
-            alias.clone(),
-            alias.parent().unwrap().to_path_buf(),
-            alias.join("worktrees/guard"),
-        ] {
-            assert_eq!(
-                validate(&state(false, Some(&write)), &common, false, None).unwrap_err(),
-                RequestError::GitMetadataWriteOverlap,
-                "firmlink alias must not reopen common Git metadata: {write:?}"
-            );
-        }
-    }
-    fs::remove_dir_all(root).unwrap();
-    fs::remove_dir_all(unsafe_common).unwrap();
-    fs::remove_dir_all(common).unwrap();
-}
-
-/// A queued `.git` backpointer retargeting is observed before any child starts.
-#[test]
-fn managed_git_metadata_guard_rechecks_queued_git_pointer_topology() {
-    let root = fs::canonicalize(worktree()).unwrap();
-    let common = fs::canonicalize(worktree()).unwrap();
-    linked_git_metadata(&root, &common);
-    let state = HostSandboxState::parse(Some(json!({
-        "permissionProfile":{"type":"managed","network":"restricted",
-            "file_system":{"type":"restricted","entries":[
-                {"access":"read","path":{"type":"special","value":{"kind":"root"}}}
-            ]}},
-        "sandboxCwd":root,"codexLinuxSandboxExe":null,"useLegacyLandlock":false
-    })))
-    .unwrap();
-    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
-        ExecutionProfileTemplate::from_execution_evidence_v2("queued-git", 1, &state).unwrap(),
-    ])
-    .unwrap();
-    let authority = WorkspaceAuthority::from_workspace_with_git_common_dir(
-        "queued",
-        "1",
-        root.clone(),
-        common.clone(),
-        1,
-    )
-    .unwrap();
-    let command = ControlledCommand::from_validated_peer(
-        CommandKind::Job,
-        PathBuf::from("/usr/bin/true"),
-        vec![],
-        root.clone(),
-        BTreeMap::new(),
-    )
-    .unwrap();
-    let policy = LocalExecutionPolicy::new(
-        BTreeSet::from([PathBuf::from("/usr/bin/true")]),
-        4096,
-        0,
-        false,
-    )
-    .unwrap();
-    let request = ValidatedExecutionRequest::validate(
-        ValidatedHostInvocation::from_verified_binding("queued", state).unwrap(),
-        authority,
-        command,
-        &policy,
-        &catalog,
-    )
-    .unwrap();
-    let retargeted_common = fs::canonicalize(worktree()).unwrap();
-    linked_git_metadata(&root, &retargeted_common);
-    let mut admission = AdmissionController::new(AdmissionLimits {
-        total_running: 1,
-        per_owner_running: 1,
-        per_owner_queued: 1,
-        total_queued: 1,
-        interactive_burst: 1,
-    })
-    .unwrap();
-    let Admission::Granted(lease) = admission.submit(
-        OwnerId::new("queued-git-pointer").unwrap(),
-        AdmissionClass::Interactive,
-    ) else {
-        panic!("lease unavailable")
-    };
-    assert!(matches!(
-        execution::OwnedChild::spawn_captured(&request, lease, None, Path::new("/usr/bin/true"), 1),
-        Err(execution::ProcessError::NeverStarted { cause, .. })
-            if matches!(*cause, execution::ProcessError::Request(RequestError::GitMetadataWriteOverlap))
-    ));
-    fs::remove_dir_all(root).unwrap();
-    fs::remove_dir_all(common).unwrap();
-    fs::remove_dir_all(retargeted_common).unwrap();
-}
-
-/// A standalone `.git` read rule cannot prevent writes through same-device hardlinks.
-#[test]
-fn managed_git_metadata_guard_refuses_standalone_same_device_writes() {
-    use std::os::unix::fs::symlink;
-
-    let root = fs::canonicalize(worktree()).unwrap();
-    let common = root.join(".git");
-    fs::create_dir(&common).unwrap();
-    symlink(".git", root.join("alias")).unwrap();
-    let validate =
-        |reopen: bool, alias_write: bool, read_git: bool, root_write: bool, read_first: bool| {
-            let mut entries = vec![
-                json!({"access":if root_write {"write"} else {"read"},
-                "path":{"type":"special","value":{"kind":"root"}}}),
-                json!({"access":"write","path":{"type":"path","path":root}}),
-            ];
-            if read_git {
-                let rule = json!({"access":"read","missing_path_behavior":"skip",
-                "path":{"type":"path","path":common}});
-                if read_first {
-                    entries.insert(0, rule.clone());
-                    entries.push(rule);
-                } else {
-                    entries.push(rule);
-                }
-            }
-            if reopen {
-                entries.push(json!({"access":"write","path":{"type":"path",
-                "path":common.join("objects")}}));
-            }
-            if alias_write {
-                entries.push(json!({"access":"write","path":{"type":"path",
-                "path":root.join("alias")}}));
-            }
-            let state = HostSandboxState::parse(Some(json!({
-                "permissionProfile":{"type":"managed","network":"restricted",
-                    "file_system":{"type":"restricted","entries":entries}},
-                "sandboxCwd":root,"codexLinuxSandboxExe":null,"useLegacyLandlock":false
-            })))
-            .unwrap();
-            let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
-                ExecutionProfileTemplate::from_execution_evidence_v2("standalone", 1, &state)
-                    .unwrap(),
-            ])
-            .unwrap();
-            let authority = WorkspaceAuthority::from_workspace_with_git_common_dir(
-                "standalone",
-                "1",
-                root.clone(),
-                common.clone(),
-                1,
-            )
-            .unwrap();
-            let command = ControlledCommand::from_validated_peer(
-                CommandKind::Job,
-                PathBuf::from("/usr/bin/true"),
-                vec![],
-                root.clone(),
-                BTreeMap::new(),
-            )
-            .unwrap();
-            let policy = LocalExecutionPolicy::new(
-                BTreeSet::from([PathBuf::from("/usr/bin/true")]),
-                4096,
-                0,
-                false,
-            )
-            .unwrap();
-            ValidatedExecutionRequest::validate(
-                ValidatedHostInvocation::from_verified_binding("standalone", state).unwrap(),
-                authority,
-                command,
-                &policy,
-                &catalog,
-            )
-        };
-    assert_eq!(
-        validate(false, false, true, false, false).unwrap_err(),
-        RequestError::GitMetadataWriteOverlap
-    );
-    assert_eq!(
-        validate(false, false, true, true, true).unwrap_err(),
-        RequestError::GitMetadataWriteOverlap,
-        "the exact .git read rule does not cover hardlink aliases"
-    );
-    assert_eq!(
-        validate(false, false, false, false, false).unwrap_err(),
-        RequestError::GitMetadataWriteOverlap
-    );
-    assert_eq!(
-        validate(true, false, true, false, false).unwrap_err(),
-        RequestError::GitMetadataWriteOverlap
-    );
-    assert_eq!(
-        validate(false, true, true, true, true).unwrap_err(),
-        RequestError::GitMetadataWriteOverlap
-    );
-    fs::remove_dir_all(root).unwrap();
 }

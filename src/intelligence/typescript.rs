@@ -1173,8 +1173,7 @@ fn closed_module_resolution(options: &serde_json::Map<String, serde_json::Value>
 mod tests {
     use super::*;
     use crate::execution::{
-        AdmissionLimits, ExecutionProfileCatalog, ExecutionProfileTemplate, HostSandboxState,
-        LocalExecutionPolicy, ProviderLeaseLimits, ValidatedExecutionRequest,
+        AdmissionLimits, LocalExecutionPolicy, ProviderLeaseLimits, ValidatedExecutionRequest,
         ValidatedHostInvocation,
     };
     use std::{collections::BTreeSet, os::unix::fs::PermissionsExt};
@@ -1321,25 +1320,12 @@ mod tests {
         worktree: &TypeScriptWorktree,
         program: PathBuf,
     ) -> ValidatedExecutionRequest {
-        let sandbox = HostSandboxState::parse(Some(serde_json::json!({
-            "permissionProfile":{"type":"disabled"},
-            "codexLinuxSandboxExe":null,
-            "sandboxCwd":worktree.authority().root(),
-            "useLegacyLandlock":false
-        })))
-        .unwrap();
-        let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
-            ExecutionProfileTemplate::from_execution_evidence("typescript-test", 1, &sandbox)
-                .unwrap(),
-        ])
-        .unwrap();
-        let policy = LocalExecutionPolicy::new(BTreeSet::from([program]), 4096, 16, true).unwrap();
+        let policy = LocalExecutionPolicy::new(BTreeSet::from([program]), 4096, 16).unwrap();
         ValidatedExecutionRequest::validate(
-            ValidatedHostInvocation::from_verified_binding("typescript-test", sandbox).unwrap(),
+            ValidatedHostInvocation::from_verified_binding("typescript-test").unwrap(),
             worktree.authority().clone(),
             profile.command(worktree, &|_| true).unwrap(),
             &policy,
-            &catalog,
         )
         .unwrap()
     }
