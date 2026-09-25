@@ -948,7 +948,7 @@ async fn binary_codex_hooks_bind_exact_parallel_actors_and_stop_before_workspace
     hook(&runtime, "PreToolUse", "session_id", "root", "stop").await;
     let stopped = root.exchange(host_call("root", "stop", "ide.stop")).await;
     assert_compact_envelope(&stopped);
-    boundary(&stopped, "host_stopped");
+    boundary(&stopped, "Assistance stopped");
     hook(&runtime, "PostToolUse", "session_id", "root", "stop").await;
     tokio::join!(
         hook(&runtime, "PreToolUse", "session_id", "root", "after-stop"),
@@ -1140,8 +1140,7 @@ async fn binary_codex_hook_hung_daemon_deadline_sends_only_selected_fields() {
         assert_eq!(
             frame["sanitized_observation_json"],
             json!({"host":"codex","phase":"pre","actor_id":"child","call_id":"hung",
-                "session_id":null,"agent_type":null,"launch_command":null,"launch_background":null,"failed":false,
-                "tool_name":null})
+                "session_id":null,"agent_type":null,"tool_name":null})
         );
         let wire = String::from_utf8(bytes).unwrap();
         for private in [
@@ -1641,7 +1640,7 @@ async fn post_ack(runtime: &Path, actor: &str, call: &str) -> Value {
         "private-host-channel",
         OpaqueJson::from_value(
             &json!({"host":"codex","phase":"post","actor_id":actor,"call_id":call,
-                "session_id":null,"agent_type":null,"launch_command":null,"launch_background":null,"failed":false}),
+                "session_id":null,"agent_type":null}),
             1024,
         )
         .unwrap(),
@@ -1717,7 +1716,7 @@ async fn binary_active_native_hooks_accept_edits_deletes_renames_and_failed_comm
     hook(&runtime, "PreToolUse", "session_id", "actor", "stop").await;
     boundary(
         &mcp.exchange(host_call("actor", "stop", "ide.stop")).await,
-        "host_stopped",
+        "Assistance stopped",
     );
     hook(
         &runtime,
