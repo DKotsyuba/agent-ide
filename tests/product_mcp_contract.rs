@@ -2073,7 +2073,13 @@ impl ProductFixture {
     }
     /// Starts one configured shipping daemon and waits only for its real private endpoint.
     async fn daemon(&self) -> Child {
-        self.daemon_with_home(None).await
+        self.spawn_configured_daemon(None, false, Duration::from_secs(5))
+            .await
+    }
+    /// Starts a configured daemon with a caller-selected bound for cold multi-profile startup.
+    async fn daemon_with_startup_timeout(&self, startup_timeout: Duration) -> Child {
+        self.spawn_configured_daemon(None, false, startup_timeout)
+            .await
     }
     /// Starts the configured daemon with durable telemetry captured at [`Self::telemetry`].
     ///
@@ -2081,19 +2087,26 @@ impl ProductFixture {
     /// `AGENT_IDE_TELEMETRY_DATABASE` override — exactly what the managed launcher selects — makes
     /// sanitized telemetry queryable and exportable after a restart.
     async fn daemon_with_durable_telemetry(&self) -> Child {
-        self.spawn_configured_daemon(None, true).await
+        self.spawn_configured_daemon(None, true, Duration::from_secs(5))
+            .await
     }
     /// Starts the configured daemon, optionally with its home (`AGENT_IDE_HOME`, which the product
     /// resolves instead of `$HOME`) redirected into the fixture so its project check caches never
     /// touch the real home directory. Without one it inherits the test-wide `AGENT_IDE_HOME`.
     async fn daemon_with_home(&self, home: Option<&Path>) -> Child {
-        self.spawn_configured_daemon(home, false).await
+        self.spawn_configured_daemon(home, false, Duration::from_secs(5))
+            .await
     }
     /// Starts one configured shipping daemon and waits only for its real private endpoint.
     ///
     /// `durable_telemetry` selects the absolute `AGENT_IDE_TELEMETRY_DATABASE` override exactly as
     /// the managed launcher does, keeping capture alive when shutdown removes the runtime directory.
-    async fn spawn_configured_daemon(&self, home: Option<&Path>, durable_telemetry: bool) -> Child {
+    async fn spawn_configured_daemon(
+        &self,
+        home: Option<&Path>,
+        durable_telemetry: bool,
+        startup_timeout: Duration,
+    ) -> Child {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
         if let Some(home) = home {
             command.env(agent_ide::userhome::HOME_OVERRIDE_ENV, home);
@@ -2111,7 +2124,7 @@ impl ProductFixture {
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(startup_timeout, async {
             loop {
                 if UnixStream::connect(self.runtime.join("agent-ide.sock"))
                     .await
@@ -5145,6 +5158,148 @@ async fn configured_product_returns_real_typescript_family_context_and_reaps() {
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Keeps real TypeScript semantic sessions and diagnostics isolated across divergent worktree actors.
+///
+/// The ignored release check needs the exact accepted Node, bridge, and `tsserver.js` paths. Both
+/// actors start concurrently against distinct source trees; stopping the root view must leave the
+/// child's clean semantic view usable.
+#[tokio::test]
+#[ignore = "requires exact AGENT_IDE_NODE, AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER and AGENT_IDE_TSSERVER environment"]
+async fn configured_product_isolates_typescript_across_two_divergent_worktree_actors() {
+    let fixture = ProductFixture::new(json!([accepted_typescript_provider()]));
+    let root_source = "export const rootValue: number = 7;\nexport const rootUse: number = rootValue;\nexport const rootBroken: number = 'root diagnostic marker';\n";
+    let child_source = "export const childValue: string = 'child-only';\nexport const childUse: string = childValue;\n";
+    std::fs::write(fixture.root.join("fixture.ts"), root_source).unwrap();
+    std::fs::write(
+        fixture.root.join("tsconfig.json"),
+        "{\"compilerOptions\":{\"types\":[],\"moduleResolution\":\"node10\"},\"files\":[\"fixture.ts\"]}\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "fixture.ts", "tsconfig.json"]);
+    fixture.git(&["commit", "--quiet", "-m", "root TypeScript fixture"]);
+
+    let child_root = fixture.base.join("child");
+    std::fs::create_dir(&child_root).unwrap();
+    std::fs::write(child_root.join("fixture.ts"), child_source).unwrap();
+    std::fs::write(
+        child_root.join("tsconfig.json"),
+        "{\"compilerOptions\":{\"types\":[],\"moduleResolution\":\"node10\"},\"files\":[\"fixture.ts\"]}\n",
+    )
+    .unwrap();
+    let child_git = |args: &[&str]| {
+        let output = std::process::Command::new("/usr/bin/git")
+            .env_clear()
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .arg("-C")
+            .arg(&child_root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "child fixture Git failed");
+    };
+    child_git(&["init", "--quiet"]);
+    child_git(&["config", "user.email", "fixture@example.invalid"]);
+    child_git(&["config", "user.name", "Fixture"]);
+    child_git(&["add", "--", "."]);
+    child_git(&["commit", "--quiet", "-m", "child TypeScript fixture"]);
+
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+    let mut child_target = config["targets"][0].clone();
+    child_target["attachment"] = json!("private-child-channel");
+    child_target["candidate"] = json!(child_root);
+    config["targets"].as_array_mut().unwrap().push(child_target);
+    std::fs::write(&fixture.config, config.to_string()).unwrap();
+
+    let mut daemon = fixture
+        .daemon_with_startup_timeout(Duration::from_secs(30))
+        .await;
+    let mut root = ProductActor::new(&fixture, "typescript-root-view").await;
+    let mut child_state = fixture.state();
+    child_state["sandboxCwd"] = json!(child_root);
+    let mut child = ProductActor::new_at(
+        &fixture,
+        "typescript-child-view",
+        "private-child-channel",
+        "agent_id",
+        child_state,
+    )
+    .await;
+    let (root_start, child_start) = tokio::join!(
+        root.call(&fixture, "ide.start", json!({"activation_id":"same-start"})),
+        child.call(&fixture, "ide.start", json!({"activation_id":"same-start"}))
+    );
+    let (root_start, child_start) = tokio::join!(
+        root.settle(&fixture, root_start),
+        child.settle(&fixture, child_start)
+    );
+    assert_eq!(root_start["kind"], "activation", "{root_start}");
+    assert_eq!(child_start["kind"], "activation", "{child_start}");
+
+    let root_offset = root_source.rfind("rootValue;").unwrap();
+    let child_offset = child_source.rfind("childValue;").unwrap();
+    let (root_context, child_context) = tokio::join!(
+        root.call(
+            &fixture,
+            "ide.context",
+            json!({"path":"fixture.ts","byte_offset":root_offset})
+        ),
+        child.call(
+            &fixture,
+            "ide.context",
+            json!({"path":"fixture.ts","byte_offset":child_offset})
+        )
+    );
+    let (root_context, child_context) = tokio::join!(
+        root.settle(&fixture, root_context),
+        child.settle(&fixture, child_context)
+    );
+    assert_eq!(root_context["kind"], "context", "{root_context}");
+    assert_eq!(child_context["kind"], "context", "{child_context}");
+    let root_text = root_context["text"].as_str().unwrap();
+    let child_text = child_context["text"].as_str().unwrap();
+    assert!(root_text.contains("mode: semantic"), "{root_context}");
+    assert!(child_text.contains("mode: semantic"), "{child_context}");
+    assert!(root_text.contains("definitions: [{") && root_text.contains("references: [{"));
+    assert!(child_text.contains("definitions: [{") && child_text.contains("references: [{"));
+    assert!(root_text.contains("rootValue") && root_text.contains("root diagnostic marker"));
+    assert!(!root_text.contains("child-only"));
+    assert!(
+        root_text.contains("diagnostic_count: at_least_"),
+        "{root_context}"
+    );
+    assert!(child_text.contains("childValue") && child_text.contains("child-only"));
+    assert!(!child_text.contains("root diagnostic marker"));
+    assert!(
+        child_text.contains("diagnostic_count: unknown"),
+        "{child_context}"
+    );
+
+    let stopped = root.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    let child_live = child
+        .call(
+            &fixture,
+            "ide.context",
+            json!({"path":"fixture.ts","byte_offset":child_offset}),
+        )
+        .await;
+    let child_live = child.settle(&fixture, child_live).await;
+    let child_live_text = child_live["text"].as_str().unwrap();
+    assert!(child_live_text.contains("mode: semantic"), "{child_live}");
+    assert!(child_live_text.contains("child-only"), "{child_live}");
+    assert!(
+        child_live_text.contains("diagnostic_count: unknown"),
+        "{child_live}"
+    );
+    let stopped = child.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    tokio::join!(root.mcp.close(), child.mcp.close());
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
 }
