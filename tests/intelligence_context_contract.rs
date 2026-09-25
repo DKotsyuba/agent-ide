@@ -7,8 +7,7 @@ use agent_ide::{
     },
     execution::{
         AdmissionClass, AdmissionController, AdmissionLimits, BackendRelease, CommandKind,
-        ControlledCommand, ExecutionProfileCatalog, ExecutionProfileTemplate, HostSandboxState,
-        LocalExecutionPolicy, OwnedProtocolChild, OwnerId, ProviderBackendKind,
+        ControlledCommand, LocalExecutionPolicy, OwnedProtocolChild, OwnerId, ProviderBackendKind,
         ProviderLeaseAdmission, ProviderLeaseLimits, ProviderLeaseRegistry,
         ValidatedExecutionRequest, ValidatedHostInvocation, WorkspaceAuthority,
     },
@@ -25,7 +24,6 @@ use agent_ide::{
         store::{ObservationAdmission, ObservationDraft, WorkspaceStore},
     },
 };
-use serde_json::json;
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
@@ -167,17 +165,11 @@ async fn real_gopls_production_context_tracks_exact_observed_bytes() {
         ]),
     )
     .unwrap();
-    let sandbox = HostSandboxState::parse(Some(json!({"permissionProfile":{"type":"disabled"},"codexLinuxSandboxExe":null,"sandboxCwd":fixture.root}))).unwrap();
-    let catalog = ExecutionProfileCatalog::from_execution_evidence(vec![
-        ExecutionProfileTemplate::from_execution_evidence("context-test", 1, &sandbox).unwrap(),
-    ])
-    .unwrap();
     let request = ValidatedExecutionRequest::validate(
-        ValidatedHostInvocation::from_verified_binding("context-test", sandbox).unwrap(),
+        ValidatedHostInvocation::from_verified_binding("context-test").unwrap(),
         authority,
         command,
-        &LocalExecutionPolicy::new(BTreeSet::from([gopls]), 4096, 4, true).unwrap(),
-        &catalog,
+        &LocalExecutionPolicy::new(BTreeSet::from([gopls]), 4096, 4).unwrap(),
     )
     .unwrap();
     let mut admission = AdmissionController::new(AdmissionLimits {
@@ -207,7 +199,6 @@ async fn real_gopls_production_context_tracks_exact_observed_bytes() {
         &request,
         registry.take_spawn_lease(view).unwrap(),
         None,
-        &PathBuf::from("/unused"),
         4096,
     )
     .unwrap();

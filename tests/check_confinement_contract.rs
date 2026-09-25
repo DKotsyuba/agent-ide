@@ -1,7 +1,6 @@
 //! Launcher configuration and worktree root admission contract checks for confined project checks.
 
 use agent_ide::assistance::launcher::{LauncherConfig, RootAdmissionError, admit_worktree};
-use agent_ide::execution::{D03ProfileEvidence, HostSandboxState, PersistedProfileRecord};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -21,44 +20,6 @@ fn scratch(name: &str) -> PathBuf {
     root
 }
 
-/// Builds the disabled-host sandbox state JSON of one trusted launcher target.
-fn disabled_state() -> Value {
-    let state = HostSandboxState::parse(Some(json!({
-        "permissionProfile": {"type": "disabled"},
-        "codexLinuxSandboxExe": null,
-        "sandboxCwd": "/private/tmp",
-        "useLegacyLandlock": false
-    })))
-    .unwrap();
-    serde_json::from_str(state.sandbox_state_json()).unwrap()
-}
-
-/// Builds the accepted Execution profile record JSON for one trusted disabled-host target.
-fn accepted_record() -> Value {
-    let state = HostSandboxState::parse(Some(json!({
-        "permissionProfile": {"type": "disabled"},
-        "codexLinuxSandboxExe": null,
-        "sandboxCwd": "/private/tmp",
-        "useLegacyLandlock": false
-    })))
-    .unwrap();
-    let record = PersistedProfileRecord::from_execution_evidence(
-        "accepted-disabled",
-        1,
-        D03ProfileEvidence {
-            provider_binary: "accepted-git".into(),
-            toolchain: "toolchain".into(),
-            configuration: "default".into(),
-            trust: "accepted-local".into(),
-            transport: "direct".into(),
-            d03_evidence: "accepted-d03".into(),
-        },
-        &state,
-    )
-    .unwrap();
-    serde_json::from_str(&record.to_json()).unwrap()
-}
-
 /// Builds a valid v0.2 launcher configuration with exactly one trusted target and no v0.3 fields.
 fn v02_config() -> Value {
     let executable = json!({
@@ -72,7 +33,7 @@ fn v02_config() -> Value {
         "git": executable.clone(),
         "codex": executable,
         "providers": [],
-        "profiles": [{"record": accepted_record(), "sandbox_state": disabled_state()}],
+        "profiles": [{"record": {"legacy": true}, "sandbox_state": {"ignored": true}}],
         "allow_disabled_host": true
     });
     json!({

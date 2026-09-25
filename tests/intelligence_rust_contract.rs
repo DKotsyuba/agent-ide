@@ -478,7 +478,6 @@ async fn real_rust_analyzer_is_exclusive_across_divergent_worktrees() {
         &mut registry,
         first.lease(),
         Some(first_active),
-        Path::new("/usr/bin/true"),
         8192,
     )
     .unwrap();
@@ -524,7 +523,6 @@ async fn real_rust_analyzer_is_exclusive_across_divergent_worktrees() {
         &mut registry,
         second.lease(),
         Some(second_active),
-        Path::new("/usr/bin/true"),
         8192,
     )
     .unwrap();
@@ -634,7 +632,6 @@ async fn real_rust_production_session_uses_exact_profile_and_barrier() {
         &mut registry,
         view.lease(),
         Some(active),
-        Path::new("/unused"),
         8192,
     )
     .unwrap();
