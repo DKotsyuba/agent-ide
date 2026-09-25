@@ -116,7 +116,10 @@ pub fn tool_schemas() -> [ToolSchema; 6] {
             json!({
                 "type": "object", "additionalProperties": false,
                 "required": ["activation_id"],
-                "properties": {"activation_id": {"type": "string", "minLength": 1, "maxLength": MAX_ACTIVATION_ID_BYTES}}
+                "properties": {
+                    "activation_id": {"type": "string", "minLength": 1, "maxLength": MAX_ACTIVATION_ID_BYTES},
+                    "root": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "Absolute working directory to activate; defaults to the host's project directory. Must lie below a configured allowed root."}
+                }
             }),
         ),
         schema(
@@ -211,6 +214,8 @@ pub enum FieldRule {
     Required,
     /// The value must be a bounded nonempty string.
     NonEmptyString,
+    /// The value must be an absolute path without empty, `.` or `..` segments.
+    AbsolutePath,
     /// The value must be a string; an empty one is allowed.
     String,
     /// The string exceeds its method-specific byte limit.
@@ -235,6 +240,9 @@ impl FieldRule {
         match self {
             Self::Required => "is required".to_string(),
             Self::NonEmptyString => "must be a non-empty string".to_string(),
+            Self::AbsolutePath => {
+                "must be an absolute path without empty, \".\" or \"..\" segments".to_string()
+            }
             Self::String => "must be a string".to_string(),
             Self::TooLong(limit) => format!("is longer than {limit} bytes"),
             Self::RelativePath => {
@@ -289,7 +297,7 @@ const CONTEXT_TARGET_MESSAGE: &str =
 /// Returns the closed allowed field list for one logical tool.
 fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
     match tool {
-        AssistanceTool::Start => &["activation_id"],
+        AssistanceTool::Start => &["activation_id", "root"],
         AssistanceTool::Context => &[
             "path",
             "byte_offset",
@@ -388,6 +396,16 @@ pub fn validate_call(
     match tool {
         AssistanceTool::Start => {
             required_string(object, "activation_id", MAX_ACTIVATION_ID_BYTES)?;
+            optional_string(object, "root", MAX_RELATIVE_PATH_BYTES)?;
+            if let Some(root) = object.get("root").and_then(Value::as_str)
+                && (!root.starts_with('/')
+                    || root
+                        .split('/')
+                        .skip(1)
+                        .any(|segment| matches!(segment, "" | "." | "..")))
+            {
+                return Err(invalid_field("root", FieldRule::AbsolutePath));
+            }
         }
         AssistanceTool::Context => {
             let problems = match object.get("kind") {

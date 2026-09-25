@@ -2229,7 +2229,10 @@ impl<'a> Worker<'a> {
             }
         }
     }
-    /// Runs only the fixed catalog-admitted discovery commands, settling each child before parsing.
+    /// Runs only the fixed discovery commands, settling each child before parsing.
+    ///
+    /// The activation root (the model's `root` or the launcher candidate) and the discovered Git
+    /// worktree root and common directory must all lie below a configured allowed root.
     async fn activate(
         &mut self,
         job: &mut Job,
@@ -2238,6 +2241,7 @@ impl<'a> Worker<'a> {
             DiscoverWorktreeRequest, DiscoveryOperationRef, GitDiscoveryPolicy, GitDiscoveryQuery,
         };
         let binding = job.invocation.binding_ref().clone();
+        let candidate = activation_root(job, self.shared.launcher.allowed_roots())?;
         let operation = DiscoveryOperationRef::new(format!("discover-{}", job.reference))
             .map_err(|_| FailureCode::Internal)?;
         let policy = GitDiscoveryPolicy::new(
@@ -2256,7 +2260,7 @@ impl<'a> Worker<'a> {
         ] {
             let request = DiscoverWorktreeRequest::from_active_use(
                 self.shared.active(&binding)?,
-                job.target.candidate.clone().into_os_string(),
+                candidate.clone().into_os_string(),
                 operation.clone(),
             )
             .map_err(|_| FailureCode::Internal)?;
@@ -2329,18 +2333,20 @@ impl<'a> Worker<'a> {
             self.shared.active(&binding)?;
             evidence.push(completed.evidence);
         }
-        let discovered = crate::workspace::git::discovery::validate_discovery(
-            &job.target.candidate,
-            &operation,
-            &evidence,
-        )
-        .map_err(|error| match error {
-            crate::workspace::git::GitError::UnsupportedDiscoveryGit => {
-                record_execution_profile(errorlog_method(job.tool), "git_unsupported");
-                FailureCode::ExecutionProfileCause(ExecutionProfileCause::GitUnsupported)
-            }
-            _ => FailureCode::WorkspaceActivation,
-        })?;
+        let discovered =
+            crate::workspace::git::discovery::validate_discovery(&candidate, &operation, &evidence)
+                .map_err(|error| match error {
+                    crate::workspace::git::GitError::UnsupportedDiscoveryGit => {
+                        record_execution_profile(errorlog_method(job.tool), "git_unsupported");
+                        FailureCode::ExecutionProfileCause(ExecutionProfileCause::GitUnsupported)
+                    }
+                    _ => FailureCode::WorkspaceActivation,
+                })?;
+        admit_discovered(
+            self.shared.launcher.allowed_roots(),
+            discovered.root(),
+            discovered.common_dir(),
+        )?;
         self.shared.active(&binding)?;
         let tree = self
             .workspace
@@ -2511,6 +2517,7 @@ impl<'a> Worker<'a> {
                 })?;
         let listing = parsed.listing().to_vec();
         let (top, common) = (parsed.top().to_path_buf(), parsed.common().to_path_buf());
+        admit_discovered(self.shared.launcher.allowed_roots(), &top, &common)?;
         self.shared.active(&binding)?;
         let tree = self
             .workspace
@@ -4424,6 +4431,37 @@ fn diagnostics_reserve_known_edit_settlement_time() {
     let deadline = now + EDIT_SETTLEMENT_RESERVE + Duration::from_millis(50);
     assert!(edit_diagnostic_deadline(deadline).is_some());
     assert!(edit_diagnostic_deadline(now + Duration::from_millis(1)).is_none());
+}
+
+/// Resolves the directory an activation works from and admits it against `allowed_roots`.
+///
+/// The model's `root` parameter wins over the launcher candidate. The result is the canonical
+/// path, so discovery and every later comparison use one spelling. An empty `allowed_roots`, a
+/// root outside every configured entry, or an unresolvable root refuses activation.
+fn activation_root(job: &Job, allowed_roots: &[PathBuf]) -> Result<PathBuf, FailureCode> {
+    let requested = job
+        .parameters
+        .get("root")
+        .and_then(Value::as_str)
+        .map_or_else(|| job.target.candidate.clone(), PathBuf::from);
+    crate::assistance::launcher::admit_worktree(allowed_roots, &requested)
+        .map_err(|_| FailureCode::OutsideAllowedRoots)
+}
+
+/// Refuses a discovered Git worktree root or common directory outside every allowed root.
+///
+/// Git may resolve a candidate to a repository above it, or a linked worktree to a common
+/// directory elsewhere; neither implicitly authorizes the other location.
+fn admit_discovered(
+    allowed_roots: &[PathBuf],
+    root: &Path,
+    common: &Path,
+) -> Result<(), FailureCode> {
+    for path in [root, common] {
+        crate::assistance::launcher::admit_worktree(allowed_roots, path)
+            .map_err(|_| FailureCode::OutsideAllowedRoots)?;
+    }
+    Ok(())
 }
 
 /// Refuses any existing symlink component of one relative path below the worktree root (T36B).

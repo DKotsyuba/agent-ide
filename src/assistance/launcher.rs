@@ -1073,19 +1073,106 @@ pub fn admit_worktree(
     }
     let canonical_worktree =
         std::fs::canonicalize(worktree).map_err(|_| RootAdmissionError::Unresolvable)?;
+    contained_by_root(allowed_roots, canonical_worktree)
+}
+
+/// Admits one absolute path that may not exist yet against the configured allowed roots.
+///
+/// The deepest existing ancestor is canonicalized and the remaining components are appended
+/// verbatim, so a file the IDE is about to create or probe is judged by where it would land.
+/// Relative paths and `.`/`..` segments are refused as unresolvable. Returns the resolved path.
+pub fn admit_path(allowed_roots: &[PathBuf], path: &Path) -> Result<PathBuf, RootAdmissionError> {
+    if allowed_roots.is_empty() {
+        return Err(RootAdmissionError::NoRoots);
+    }
+    if !absolute(path) {
+        return Err(RootAdmissionError::Unresolvable);
+    }
+    let mut existing = path;
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let canonical = loop {
+        match std::fs::canonicalize(existing) {
+            Ok(canonical) => break canonical,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                tail.push(
+                    existing
+                        .file_name()
+                        .ok_or(RootAdmissionError::Unresolvable)?
+                        .to_os_string(),
+                );
+                existing = existing.parent().ok_or(RootAdmissionError::Unresolvable)?;
+            }
+            Err(_) => return Err(RootAdmissionError::Unresolvable),
+        }
+    };
+    let resolved = tail
+        .iter()
+        .rev()
+        .fold(canonical, |path, component| path.join(component));
+    contained_by_root(allowed_roots, resolved)
+}
+
+/// Returns `canonical` when it is equal to or below one resolvable configured root.
+///
+/// A root that cannot be resolved is treated as non-matching rather than aborting admission, so
+/// one broken declaration never hides a different, valid root. `Path::starts_with` compares whole
+/// components, so a longer sibling sharing the root's string prefix is never contained.
+fn contained_by_root(
+    allowed_roots: &[PathBuf],
+    canonical: PathBuf,
+) -> Result<PathBuf, RootAdmissionError> {
     for root in allowed_roots {
         let Ok(canonical_root) = std::fs::canonicalize(root) else {
-            // A root that cannot be resolved is treated as non-matching rather than aborting
-            // admission, so one broken declaration never hides a different, valid root.
             continue;
         };
-        // `Path::starts_with` compares whole components, so a longer sibling sharing the root's
-        // string prefix is never contained.
-        if canonical_worktree.starts_with(&canonical_root) {
-            return Ok(canonical_worktree);
+        if canonical.starts_with(&canonical_root) {
+            return Ok(canonical);
         }
     }
     Err(RootAdmissionError::OutsideRoots)
+}
+
+#[cfg(test)]
+mod path_admission_tests {
+    use super::{RootAdmissionError, admit_path, admit_worktree};
+    use std::path::PathBuf;
+
+    /// A missing file below an allowed root resolves to its would-be location; escapes refuse.
+    #[test]
+    fn admit_path_resolves_missing_targets_and_refuses_escapes() {
+        let base = std::env::temp_dir().join(format!("agent-ide-admit-{}", std::process::id()));
+        let root = base.join("root");
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::create_dir_all(base.join("other")).unwrap();
+        let roots = vec![root.clone()];
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+
+        assert_eq!(
+            admit_path(&roots, &root.join("nested/absent/tsconfig.json")).unwrap(),
+            canonical_root.join("nested/absent/tsconfig.json")
+        );
+        assert_eq!(
+            admit_worktree(&roots, &root.join("nested")).unwrap(),
+            canonical_root.join("nested")
+        );
+        assert_eq!(
+            admit_path(&roots, &base.join("other/file")).unwrap_err(),
+            RootAdmissionError::OutsideRoots
+        );
+        assert_eq!(
+            admit_path(&roots, &root.join("nested/../../other")).unwrap_err(),
+            RootAdmissionError::Unresolvable
+        );
+        assert_eq!(
+            admit_path(&roots, &PathBuf::from("relative/file")).unwrap_err(),
+            RootAdmissionError::Unresolvable
+        );
+        assert_eq!(
+            admit_path(&[], &root.join("x")).unwrap_err(),
+            RootAdmissionError::NoRoots
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
 
 /// Accepts bounded nonempty identity strings without control bytes.

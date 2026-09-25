@@ -31,6 +31,9 @@ pub enum MissingPeer {
 pub enum FailureCode {
     /// Trusted attachment mapping is missing or rejected.
     LauncherConfiguration,
+    /// The activation root, its discovered Git worktree root or its Git common directory is not
+    /// below any configured `allowed_roots` entry, or no allowed root is configured.
+    OutsideAllowedRoots,
     /// Accepted executable/profile evidence does not authorize this operation.
     ExecutionProfile,
     /// Execution-profile refusal with one fixed, privacy-safe cause.

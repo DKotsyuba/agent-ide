@@ -234,6 +234,8 @@ pub enum ReasonCode {
     // `assistance::reply::FailureCode`.
     /// [`FailureCode::LauncherConfiguration`].
     LauncherConfiguration,
+    /// [`FailureCode::OutsideAllowedRoots`].
+    OutsideAllowedRoots,
     /// [`FailureCode::ExecutionProfile`].
     ExecutionProfile,
     /// [`FailureCode::UnsupportedGit`].
@@ -322,6 +324,7 @@ impl ReasonCode {
             Self::Replay => "replay",
             Self::CapacityExceeded => "capacity_exceeded",
             Self::LauncherConfiguration => "launcher_configuration",
+            Self::OutsideAllowedRoots => "outside_allowed_roots",
             Self::ExecutionProfile => "execution_profile",
             Self::UnsupportedGit => "unsupported_git",
             Self::WorkspaceActivation => "workspace_activation",
@@ -381,6 +384,7 @@ impl From<FailureCode> for ReasonCode {
     fn from(value: FailureCode) -> Self {
         match value {
             FailureCode::LauncherConfiguration => Self::LauncherConfiguration,
+            FailureCode::OutsideAllowedRoots => Self::OutsideAllowedRoots,
             FailureCode::ExecutionProfile | FailureCode::ExecutionProfileCause(_) => {
                 Self::ExecutionProfile
             }

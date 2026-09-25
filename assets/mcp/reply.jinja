@@ -50,6 +50,8 @@ error: resolution_unverified; establish a supported configured project with exac
 error: source_too_large; source is {{ code.source_too_large.size }} bytes, exceeding the {{ code.source_too_large.ceiling }} byte read ceiling; continue with native tools
 {%- elif code == "invalid_detail" -%}
 error: invalid_detail; this detail_ref is unknown or has expired (an un-run or refused helper ticket expires unclaimed); repeat the original ide.* call to get a fresh one, or continue with native tools
+{%- elif code == "outside_allowed_roots" -%}
+error: outside_allowed_roots; the working directory is not below any configured allowed root; start the IDE in an allowed directory or add this one to allowed_roots, otherwise continue with native tools
 {%- elif code == "execution_profile" and cause_tag is defined -%}
 error: execution_profile ({{ cause_tag }}); continue with native tools
 {%- else -%}

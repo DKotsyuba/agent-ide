@@ -442,9 +442,11 @@ impl Worker<'_> {
         let bundle = launch
             .typescript_bundle()
             .map_err(|_| FailureCode::ExecutionProfile)?;
-        // Resolution inputs are auxiliary native reads below the admitted worktree; the
-        // allowed-roots gate for ancestors outside it lands with the new path policy.
-        let path_proof = |_path: &Path| true;
+        // Resolution inputs are auxiliary native reads: ancestor configs and dependencies may
+        // sit outside the worktree, so each candidate is admitted against the allowed roots.
+        let roots = self.shared.launcher.allowed_roots().to_vec();
+        let path_proof =
+            move |path: &Path| crate::assistance::launcher::admit_path(&roots, path).is_ok();
         let resolution = ProjectResolutionInputsV1::observe(
             authority.worktree().clone(),
             authority.worktree().worktree_path().join(source.path()),
