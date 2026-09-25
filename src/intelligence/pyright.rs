@@ -538,7 +538,6 @@ mod tests {
                 &mut admission,
                 view.lease(),
                 None,
-                Path::new("/unused"),
                 64,
             ),
             Err(PyrightProfileError::InvalidProfile)

@@ -198,7 +198,6 @@ async fn abnormal_typescript_cleanup_waits_full_grace_before_kill_and_reap() {
         &provider,
         registry.take_spawn_lease(view).unwrap(),
         None,
-        Path::new("/unused"),
         64,
     )
     .unwrap();

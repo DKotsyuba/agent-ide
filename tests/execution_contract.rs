@@ -221,7 +221,7 @@ fn request_validation_enforces_local_ceilings() {
             invocation(),
             authority(),
             command(root.clone(), Vec::new(), BTreeMap::new()),
-            &policy(BTreeSet::new(), 16, 1)
+            &policy(BTreeSet::from([PathBuf::from("/bin/ls")]), 16, 1)
         ),
         Err(execution::RequestError::ProgramDenied)
     ));
