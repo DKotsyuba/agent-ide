@@ -1815,13 +1815,8 @@ mod tests {
             ValidatedHostInvocation::from_verified_binding(label).unwrap(),
             authority.clone(),
             command,
-            &LocalExecutionPolicy::new(
-                BTreeSet::from([PathBuf::from("/usr/bin/true")]),
-                4096,
-                16,
-                true,
-            )
-            .unwrap(),
+            &LocalExecutionPolicy::new(BTreeSet::from([PathBuf::from("/usr/bin/true")]), 4096, 16)
+                .unwrap(),
         )
         .unwrap()
     }
@@ -1902,7 +1897,6 @@ mod tests {
             &listener_request,
             providers.registry.take_spawn_lease(view).unwrap(),
             None,
-            Path::new("/unused"),
             64,
         )
         .unwrap();
@@ -1978,7 +1972,6 @@ mod tests {
                 &forwarder_request,
                 forwarder_capability,
                 None,
-                Path::new("/unused"),
                 64,
             )
             .unwrap();

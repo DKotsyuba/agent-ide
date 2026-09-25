@@ -4786,7 +4786,7 @@ mod stop_retry_tests {
         let mut worker = worker(&store, workspace, fixture.root.clone());
         worker.observations.install_schema().await.unwrap();
 
-        let mut outside = start_job(
+        let (mut outside, _outside_cancel) = start_job(
             &worker,
             "outside-actor",
             "outside-start",
@@ -4797,7 +4797,7 @@ mod stop_retry_tests {
             Err(FailureCode::OutsideAllowedRoots)
         ));
 
-        let mut inside = start_job(
+        let (mut inside, _inside_cancel) = start_job(
             &worker,
             "inside-actor",
             "inside-start",
@@ -4807,15 +4807,18 @@ mod stop_retry_tests {
     }
 
     /// Builds a direct managed Start job for the fixture's trusted launcher target.
+    ///
+    /// The cancellation sender is returned so the caller keeps it alive: a dropped sender makes
+    /// the job's `cancel.changed()` resolve at once, which activation reads as an interruption.
     fn start_job(
         worker: &Worker<'_>,
         actor: &str,
         call: &str,
         parameters: serde_json::Value,
-    ) -> Job {
+    ) -> (Job, watch::Sender<bool>) {
         let invocation = production_call(worker, actor, call);
-        let (_cancel_sender, cancel) = watch::channel(false);
-        Job {
+        let (cancel_sender, cancel) = watch::channel(false);
+        let job = Job {
             input: JobInput::Managed,
             reference: format!("start-{call}"),
             invocation,
@@ -4827,7 +4830,8 @@ mod stop_retry_tests {
             stop_reply: None,
             native_epoch: 0,
             failure_detail: None,
-        }
+        };
+        (job, cancel_sender)
     }
 
     /// Builds a Worker with real Store, binding and admission state for activation/revoke checks.

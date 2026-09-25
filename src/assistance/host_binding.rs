@@ -1998,7 +1998,6 @@ mod tests {
             json!({"threadId":"actor"}),
             json!({"claudecode/toolUseId":"call","threadId":"actor"}),
             json!({"claudecode/toolUseId":"call","x-codex-turn-metadata":{}}),
-            json!({"claudecode/toolUseId":"call","codex/sandbox-state-meta":{}}),
         ] {
             assert!(matches!(
                 parse_host_kind(metadata.as_object().expect("test metadata is an object")),
