@@ -179,6 +179,7 @@ run_agent() {
     worktree=$2
     task_file=$3
     answer_file=$DIAG_DIR/answer-$label.txt
+    started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     if /usr/bin/perl -e 'alarm shift; exec @ARGV' "$SESSION_SECONDS" \
         "$AGENT_RUN" start --provider "$PROVIDER" --model "$AR_MODEL" \
         --profile "$AR_PROFILE" --task "$(cat "$task_file")" \
@@ -199,9 +200,39 @@ run_agent() {
     "$AGENT_RUN" transcript --full --limit 1000 "$agent_id" \
         >"$DIAG_DIR/transcript-$label.json" 2>>"$DIAG_LOG" \
         || fail "E_${label}_TRANSCRIPT" "transcript exited nonzero"
-    require_agent_run_compact_replies "$DIAG_DIR/transcript-$label.json" "A_${label}_COMPACT_REPLIES" \
-        || fail "A_${label}_COMPACT_REPLIES" "agent $label has no bounded Agent IDE replies"
+    if require_agent_run_compact_replies "$DIAG_DIR/transcript-$label.json" "A_${label}_COMPACT_REPLIES"; then
+        :
+    elif [ "$PROVIDER" = codex ]; then
+        # agent-run exports a Codex transcript without tool rows (only the assistant stream), so
+        # the Codex cell proves each Agent IDE round trip through the daemon's own journal for this
+        # fixture repository instead: the activation and the stop must have completed after the
+        # agent started. The bounded-reply size check is not reproducible from the journal; the
+        # diagnostic log records that this cell is journal-backed.
+        require_ide_journal_activity "$worktree" "$started_at" "$label"
+    else
+        fail "A_${label}_COMPACT_REPLIES" "agent $label has no bounded Agent IDE replies"
+    fi
     printf '%s %s\n' "$label" "$agent_id" >>"$DIAG_DIR/agent-ids.log"
+}
+
+# Requires the daemon journal for the fixture repository to record a completed activation and a
+# completed stop at or after `since` (an RFC 3339 UTC instant). Used only where the host transcript
+# carries no tool rows; the journal names no reply bytes, so this proves the round trips, not
+# their size.
+require_ide_journal_activity() {
+    worktree=$1
+    since=$2
+    label=$3
+    journal=$DIAG_DIR/ide-journal-$label.txt
+    "$BINARY" errors --repo "$worktree" --all --since 30 --limit 400 >"$journal" 2>>"$DIAG_LOG" \
+        || fail "E_${label}_JOURNAL" "errors reader exited nonzero"
+    for method in start stop; do
+        awk -v since="$since" -v method="$method" \
+            '$1 >= since && $3 == method && $4 == "completed" { found = 1 } END { exit !found }' \
+            "$journal" \
+            || fail "A_${label}_JOURNAL_${method}" "journal has no completed $method after $since"
+    done
+    note "agent-$label-journal-backed" "transcript carried no tool rows; daemon journal proves the round trips"
 }
 
 # Requires the agent's final answer to contain one literal token.

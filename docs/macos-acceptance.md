@@ -103,8 +103,11 @@ divergent_worktrees=real_pass
 ```
 
 This interface deliberately carries no session, run, transcript, prompt, credential, or command
-field. The agent-run Codex route requires a complete live cell before it can emit `real_pass`;
-no Codex evidence is claimed by this implementation alone.
+field. The agent-run Codex route requires a complete live cell before it can emit `real_pass`.
+agent-run exports a Codex transcript without tool rows (only the assistant stream), so that cell
+proves each Agent IDE round trip through the daemon's own journal for the fixture repository — a
+completed activation and stop after the agent started — instead of the bounded-reply transcript
+check the Claude cell uses; the diagnostic log marks such cells `journal-backed`.
 
 ### Direct Codex driver
 
