@@ -234,7 +234,12 @@ Closed daemon outcomes are:
 
 The MCP facade renders only the corresponding closed method outcomes. Without trusted
 configuration, stop reports host binding revocation and other methods direct the model to native tools. Unknown
-states or extra fields cannot become successful peer results. Hook transport submission
+states or extra fields cannot become successful peer results. The one compact model-facing
+text block is projected from the complete serialized reply by the static build-embedded
+MiniJinja template `assets/mcp/reply.jinja` (`src/assistance/content.rs`), with strict
+undefined behavior so a missing fact fails the render closed, auto-escaping off because the
+carrier is plain text, and untrusted reply text bound only as template data — never as
+template source. Hook transport submission
 is not proof of binding or model-context delivery.
 
 This adapter relies on the trusted launcher and the existing private local daemon endpoint;

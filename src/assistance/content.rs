@@ -1,11 +1,15 @@
 //! Deterministic compact model content projected from validated Assistance replies.
 
+use std::sync::OnceLock;
+
+use minijinja::{AutoEscape, Environment, UndefinedBehavior};
 use rmcp::model::{CallToolResult, ContentBlock};
 
-use super::reply::{
-    EditDiagnostics, FailureCode, MAX_REPLY_BYTES, MCP_RESERVE, MissingPeer, PeerReply, ResultKind,
-};
-use crate::changes::edit::{EditOutcome, EditResult};
+use super::reply::{FailureCode, MAX_REPLY_BYTES, MCP_RESERVE, PeerReply};
+
+/// Build-embedded MiniJinja source projecting every closed [`PeerReply`] state into its compact
+/// model-facing text; the template owns the presentation so Rust code never formats reply text.
+const REPLY_TEMPLATE: &str = include_str!("../../assets/mcp/reply.jinja");
 
 /// Selects whether a projected [`CallToolResult`] also carries the duplicate typed
 /// `structuredContent` copy alongside the compact `content` text block.
@@ -69,20 +73,27 @@ pub(crate) fn fits_with_status(reply: &PeerReply, status: &str, envelope: Envelo
 /// Projects one unchanged reply into compact content plus, per `envelope`, the complete typed
 /// structured value.
 ///
-/// Serialization failure returns `None` regardless of `envelope`, so a value this renderer cannot
-/// faithfully represent never silently drops its structured copy. A tagged execution-profile
-/// refusal keeps the public structured `code` string stable; the cause appears only in compact
-/// text. Projection performs no I/O, host inspection, diagnostics inference, or model call.
+/// Serialization or template failure returns `None` regardless of `envelope`, so a value this
+/// renderer cannot faithfully represent never silently drops its structured copy. A tagged
+/// execution-profile refusal keeps the public structured `code` string stable; the closed cause
+/// tag is passed to the template only, so it appears solely in compact text. Projection performs
+/// no I/O, host inspection, diagnostics inference, or model call.
 fn project(reply: &PeerReply, status: Option<&str>, envelope: Envelope) -> Option<CallToolResult> {
     let mut structured = serde_json::to_value(reply).ok()?;
-    if matches!(
-        reply,
+    let cause_tag = match reply {
         PeerReply::Error {
-            code: FailureCode::ExecutionProfileCause(_)
-        }
-    ) {
-        structured["code"] = serde_json::Value::String("execution_profile".to_owned());
+            code: FailureCode::ExecutionProfileCause(cause),
+        } => Some(cause.tag()),
+        _ => None,
+    };
+    let mut context = structured.clone();
+    if let Some(tag) = cause_tag {
+        let public = serde_json::Value::String("execution_profile".to_owned());
+        structured["code"] = public.clone();
+        context["code"] = public;
+        context["cause_tag"] = serde_json::Value::String(tag.to_owned());
     }
+    let reply_text = render_text(&context)?;
     let structured = match status {
         Some(status) => match structured {
             serde_json::Value::Object(mut fields) => {
@@ -99,8 +110,8 @@ fn project(reply: &PeerReply, status: Option<&str>, envelope: Envelope) -> Optio
         None => structured,
     };
     let text = match status {
-        Some(status) => format!("{status}\n{}", render_text(reply)),
-        None => render_text(reply),
+        Some(status) => format!("{status}\n{reply_text}"),
+        None => reply_text,
     };
     let content = vec![ContentBlock::text(text)];
     let mut rendered = if matches!(reply, PeerReply::Error { .. }) {
@@ -115,244 +126,41 @@ fn project(reply: &PeerReply, status: Option<&str>, envelope: Envelope) -> Optio
     Some(rendered)
 }
 
-/// Returns deterministic decision-facing text for one validated reply without serializing it.
+/// Returns the shared compile-time template environment for every MCP text projection.
 ///
-/// The text begins with the closed reply state, preserves exact pending commands and live detail
-/// references, and names no host metadata, telemetry, provider errors, or inferred diagnostics.
-fn render_text(reply: &PeerReply) -> String {
-    match reply {
-        PeerReply::Unavailable { reason } => format!(
-            "unavailable: {}; continue with native tools",
-            match reason {
-                MissingPeer::HostBinding => "host_binding",
-                MissingPeer::WorkspaceActivation => "workspace_activation",
-            }
-        ),
-        PeerReply::HookObserved {} => "hook_observed: native pre-hook retained".to_owned(),
-        PeerReply::HookSettled {} => "hook_settled: validated invocation settled".to_owned(),
-        PeerReply::NativeHookObserved {} => {
-            "native_hook_observed: registered-path reconciliation requested".to_owned()
-        }
-        PeerReply::Feedback { text } => format!("feedback: {text}"),
-        PeerReply::HostStopped {} => {
-            "host_stopped: host binding released; no workspace authority was created".to_owned()
-        }
-        PeerReply::Pending {
-            detail_ref,
-            helper: Some(helper),
-        } => format!(
-            "pending: run exactly this command with Bash in the foreground, with no editing, \
-             wrapping, or appended arguments:\n{helper}\nRun it as the only command of one Bash \
-             call (no prefix such as \"date;\"). If ide.inspect answers pending again, the helper \
-             has not been run yet, or it was run in a modified form and was refused; run the \
-             command above exactly. After it completes, use ide.inspect with detail_ref \
-             {detail_ref}; do not inspect before completion"
-        ),
-        PeerReply::Pending {
-            detail_ref,
-            helper: None,
-        } => format!("pending: use ide.inspect with detail_ref {detail_ref}"),
-        PeerReply::Error {
-            code: FailureCode::ResolutionUnverified,
-        } => "error: resolution_unverified; establish a supported configured project with exact document membership, then retry ide.context".to_owned(),
-        PeerReply::Error {
-            code: FailureCode::SourceTooLarge { size, ceiling },
-        } => format!(
-            "error: source_too_large; source is {size} bytes, exceeding the {ceiling} byte read \
-             ceiling; continue with native tools"
-        ),
-        PeerReply::Error {
-            code: FailureCode::InvalidDetail,
-        } => "error: invalid_detail; this detail_ref is unknown or has expired (an un-run or \
-              refused helper ticket expires unclaimed); repeat the original ide.* call to get a \
-              fresh one, or continue with native tools"
-            .to_owned(),
-        PeerReply::Error {
-            code: FailureCode::ExecutionProfileCause(cause),
-        } => format!(
-            "error: execution_profile ({}); continue with native tools",
-            cause.tag()
-        ),
-        PeerReply::Error { code } => format!(
-            "error: {}; continue with native tools",
-            match code {
-                FailureCode::LauncherConfiguration => "launcher_configuration",
-                FailureCode::SandboxState => "sandbox_state",
-                FailureCode::ExecutionProfile => "execution_profile",
-                FailureCode::ExecutionProfileCause(_) => unreachable!("handled above"),
-                FailureCode::UnsupportedGit => "unsupported_git",
-                FailureCode::WorkspaceActivation => "workspace_activation",
-                FailureCode::WorkspaceAuthority => "workspace_authority",
-                FailureCode::ProviderUnavailable => "provider_unavailable",
-                FailureCode::ResolutionUnverified => unreachable!("handled above"),
-                FailureCode::Cancelled => "cancelled",
-                FailureCode::Deadline => "deadline",
-                FailureCode::Capacity => "capacity",
-                FailureCode::InvalidDetail => unreachable!("handled above"),
-                FailureCode::SourceUnavailable => "source_unavailable",
-                FailureCode::SourceTooLarge { .. } => unreachable!("handled above"),
-                FailureCode::Conflict => "conflict",
-                FailureCode::Internal => "internal",
-            }
-        ),
-        PeerReply::Complete {
-            kind: ResultKind::Activation,
-            text,
-            ..
-        } => format!("complete activation: {text}\nNext: use ide.context"),
-        PeerReply::Complete {
-            kind: ResultKind::Context,
-            text,
-            detail_ref: Some(detail_ref),
-            truncated: true,
-            continuation: true,
-        } => format!(
-            "complete context: {text}\nOutput is truncated; use ide.inspect with detail_ref \
-             {detail_ref} before editing"
-        ),
-        PeerReply::Complete {
-            kind: ResultKind::Context,
-            text,
-            detail_ref: Some(detail_ref),
-            truncated: true,
-            ..
-        } => format!(
-            "complete context: {text}\nOutput is incomplete; use ide.edit with source_ref \
-             {detail_ref} when available, otherwise use the native editor"
-        ),
-        PeerReply::Complete {
-            kind: ResultKind::Context,
-            text,
-            truncated: true,
-            ..
-        } => format!(
-            "complete context: {text}\nOutput is incomplete; use ide.edit when available, \
-             otherwise use the native editor"
-        ),
-        PeerReply::Complete {
-            kind: ResultKind::Context,
-            text,
-            detail_ref: Some(detail_ref),
-            ..
-        } => format!(
-            "complete context: {text}\nDiagnostics are exactly as reported; use ide.edit with \
-             source_ref {detail_ref} when available, otherwise use the native editor"
-        ),
-        PeerReply::Complete {
-            kind: ResultKind::Context,
-            text,
-            ..
-        } => format!("complete context: {text}"),
-        PeerReply::Complete {
-            kind: ResultKind::Diff,
-            text,
-            detail_ref: Some(detail_ref),
-            truncated: true,
-            continuation: true,
-        } => format!(
-            "complete diff: {text}\nOutput is truncated; use ide.inspect with detail_ref \
-             {detail_ref}"
-        ),
-        PeerReply::Complete {
-            kind: ResultKind::Diff,
-            text,
-            truncated: true,
-            ..
-        } => format!(
-            "complete diff: {text}\nOutput is incomplete; stop or review the available hunks \
-             safely with native tools"
-        ),
-        PeerReply::Complete {
-            kind: ResultKind::Diff,
-            text,
-            ..
-        } => format!("complete diff: {text}\nNext: use ide.stop"),
-        PeerReply::Complete {
-            kind: ResultKind::Stop,
-            text,
-            ..
-        } => format!(
-            "complete stop: {text}\nWorkspace authority is released; native edits remain on disk"
-        ),
-        PeerReply::Edit {
-            result,
-            diagnostics,
-        } => render_edit(result, diagnostics),
-    }
+/// Undefined behavior is strict, so a template reading a field the closed reply shape does not
+/// carry for that state fails the render instead of silently omitting a fact, and auto-escaping
+/// stays off because the carrier is plain text rather than a markup document. The environment is
+/// built exactly once; [`REPLY_TEMPLATE`] is embedded at build time and its every branch is
+/// exercised by this module's tests, so construction failure is a programmatic bug.
+fn environment() -> &'static Environment<'static> {
+    static ENVIRONMENT: OnceLock<Environment<'static>> = OnceLock::new();
+    ENVIRONMENT.get_or_init(|| {
+        let mut environment = Environment::new();
+        environment.set_undefined_behavior(UndefinedBehavior::Strict);
+        environment.set_auto_escape_callback(|_| AutoEscape::None);
+        environment
+            .add_template("reply.jinja", REPLY_TEMPLATE)
+            .expect("embedded reply template parses");
+        environment
+    })
 }
 
-/// Renders one validated edit outcome and its exact-generation diagnostic projection.
+/// Returns deterministic decision-facing text for one serialized validated reply.
 ///
-/// The compact text retains the public path, successful post-read source reference, reported
-/// messages, and exactly one safe next action. Operation identifiers remain only in structured
-/// content because they are not needed for that decision. This function performs no inference:
-/// unknown diagnostics remain unknown, and only a validated pending detail recommends inspection.
-fn render_edit(result: &EditResult, diagnostics: &EditDiagnostics) -> String {
-    let outcome = result.outcome.as_str();
-    match result.outcome {
-        EditOutcome::Created | EditOutcome::Replaced | EditOutcome::Unchanged => {
-            let source_ref = result.source_ref.as_deref().unwrap_or("unavailable");
-            match diagnostics {
-                EditDiagnostics::CurrentReported {
-                    messages,
-                    delta,
-                    truncated,
-                } => format!(
-                    "edit: {outcome}; path {}; source_ref {source_ref}; diagnostics: \
-                     current_reported ({delta}){}\n{}\nNext: use ide.edit with source_ref \
-                     {source_ref}",
-                    result.path,
-                    if *truncated { " [truncated]" } else { "" },
-                    messages.join("\n")
-                ),
-                EditDiagnostics::CurrentClean {} => format!(
-                    "edit: {outcome}; path {}; source_ref {source_ref}; diagnostics: \
-                     current_clean. Next: use ide.diff",
-                    result.path
-                ),
-                EditDiagnostics::Unknown {} => format!(
-                    "edit: {outcome}; path {}; source_ref {source_ref}; diagnostics: unknown. \
-                     Next: use ide.context",
-                    result.path
-                ),
-                EditDiagnostics::Pending { detail_ref } => format!(
-                    "edit: {outcome}; path {}; source_ref {source_ref}; diagnostics: pending. \
-                     Next: use ide.inspect with detail_ref {detail_ref}",
-                    result.path
-                ),
-            }
-        }
-        EditOutcome::StaleSource => format!(
-            "edit: {outcome}; path {}. No write occurred. The source reference is incomplete or \
-             unavailable for this binding, or the file content/presence changed since context; \
-             a newer observation alone does not invalidate unchanged content. Use ide.context \
-             before another edit, and read every page of a paged context (ide.inspect) first",
-            result.path
-        ),
-        EditOutcome::ConflictingDuplicate => format!(
-            "edit: {outcome}; path {}. No write occurred; use ide.context to inspect the target \
-             before a new operation_id",
-            result.path
-        ),
-        EditOutcome::UnsafeTarget => format!(
-            "edit: {outcome}; path {}. No write occurred; continue with native tools",
-            result.path
-        ),
-        EditOutcome::CancelledNoEffect
-        | EditOutcome::DeadlineNoEffect
-        | EditOutcome::CapacityNoEffect => {
-            format!("edit: {outcome}; path {}. No write occurred", result.path)
-        }
-        EditOutcome::OutcomeUnknown => format!(
-            "edit: {outcome}; path {}. Inspect this target with native tools before any later \
-             mutation; do not replay this operation",
-            result.path
-        ),
-        EditOutcome::UnavailableBeforeDispatch => format!(
-            "edit: {outcome}; path {}. No write was dispatched; continue with native tools",
-            result.path
-        ),
-    }
+/// `context` is the complete serialized [`PeerReply`] value, plus `cause_tag` for a tagged
+/// execution-profile refusal. The static template begins with the closed reply state, preserves
+/// exact pending commands and live detail references, and names no host metadata, telemetry,
+/// provider errors, or inferred diagnostics. Untrusted reply text is bound strictly as data;
+/// template sources are static build assets only. A strict-undefined, serialization, or empty
+/// projection returns `None`, failing closed without partial text for future reply variants.
+fn render_text(context: &serde_json::Value) -> Option<String> {
+    environment()
+        .get_template("reply.jinja")
+        .ok()?
+        .render(minijinja::Value::from_serialize(context))
+        .ok()
+        .filter(|text| !text.is_empty())
 }
 
 /// Returns whether the serialized final MCP carrier stays below the Assistance reply ceiling.
@@ -363,7 +171,8 @@ pub(crate) fn call_tool_result_fits(rendered: &CallToolResult) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::changes::edit::EditReceiptError;
+    use crate::assistance::reply::{EditDiagnostics, MissingPeer, ResultKind};
+    use crate::changes::edit::{EditOutcome, EditReceiptError, EditResult};
 
     /// Renders with no carried status plate, the projection every reply had before T28B.
     fn render(reply: PeerReply, envelope: Envelope) -> Option<CallToolResult> {
@@ -399,6 +208,26 @@ mod tests {
             )
             .expect("fixed successful edit result"),
             diagnostics,
+        }
+    }
+
+    /// Refuses future reply variants instead of emitting an empty success-shaped MCP page.
+    #[test]
+    fn unknown_template_branches_fail_closed() {
+        for context in [
+            serde_json::json!({"state": "future"}),
+            serde_json::json!({
+                "state": "edit",
+                "result": {"outcome": "future", "path": "src/lib.rs"},
+                "diagnostics": {"state": "unknown"}
+            }),
+            serde_json::json!({
+                "state": "edit",
+                "result": {"outcome": "replaced", "path": "src/lib.rs", "source_ref": "ref"},
+                "diagnostics": {"state": "future"}
+            }),
+        ] {
+            assert!(render_text(&context).is_none());
         }
     }
 

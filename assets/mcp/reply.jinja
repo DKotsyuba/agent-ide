@@ -1,0 +1,119 @@
+{#-
+Projects one serialized Assistance `PeerReply` (tagged by `state`) into the exact deterministic
+compact model-facing text the MCP facade has always emitted. The context is the complete
+serialized reply, plus `cause_tag` only for a tagged execution-profile refusal whose structured
+copy keeps the stable public `code`.
+
+Contract:
+- Byte-identical to the retired manual formatter; tests in `src/assistance/content.rs` assert
+  exact wording, ordering, references, and the serialized reply budget.
+- Every reference must be defined for the state branch that reads it (strict undefined fails
+  the render instead of silently dropping a fact): `result.source_ref` is present for every
+  success outcome because `EditResult::new` enforces it, `detail_ref` serializes as `null`
+  rather than being omitted, and `helper` is the only omitted-when-absent field.
+- Untrusted reply text (`helper`, `text`, `messages`, refs) is bound as data only; it is never
+  template source and auto-escaping stays off because the carrier is plain text.
+- Whitespace discipline: every block tag carries both trim modifiers and all lines are
+  flush-left, so the only newlines in the output are the intentional ones.
+-#}
+{%- if state == "unavailable" -%}
+unavailable: {{ reason }}; continue with native tools
+{%- endif -%}
+{%- if state == "hook_observed" -%}
+hook_observed: native pre-hook retained
+{%- endif -%}
+{%- if state == "hook_settled" -%}
+hook_settled: validated invocation settled
+{%- endif -%}
+{%- if state == "native_hook_observed" -%}
+native_hook_observed: registered-path reconciliation requested
+{%- endif -%}
+{%- if state == "feedback" -%}
+feedback: {{ text }}
+{%- endif -%}
+{%- if state == "host_stopped" -%}
+host_stopped: host binding released; no workspace authority was created
+{%- endif -%}
+{%- if state == "pending" -%}
+{%- if helper is defined -%}
+pending: run exactly this command with Bash in the foreground, with no editing, wrapping, or appended arguments:
+{{ helper }}
+Run it as the only command of one Bash call (no prefix such as "date;"). If ide.inspect answers pending again, the helper has not been run yet, or it was run in a modified form and was refused; run the command above exactly. After it completes, use ide.inspect with detail_ref {{ detail_ref }}; do not inspect before completion
+{%- else -%}
+pending: use ide.inspect with detail_ref {{ detail_ref }}
+{%- endif -%}
+{%- endif -%}
+{%- if state == "error" -%}
+{%- if code == "resolution_unverified" -%}
+error: resolution_unverified; establish a supported configured project with exact document membership, then retry ide.context
+{%- elif code is mapping -%}
+error: source_too_large; source is {{ code.source_too_large.size }} bytes, exceeding the {{ code.source_too_large.ceiling }} byte read ceiling; continue with native tools
+{%- elif code == "invalid_detail" -%}
+error: invalid_detail; this detail_ref is unknown or has expired (an un-run or refused helper ticket expires unclaimed); repeat the original ide.* call to get a fresh one, or continue with native tools
+{%- elif code == "execution_profile" and cause_tag is defined -%}
+error: execution_profile ({{ cause_tag }}); continue with native tools
+{%- else -%}
+error: {{ code }}; continue with native tools
+{%- endif -%}
+{%- endif -%}
+{%- if state == "complete" and kind == "activation" -%}
+complete activation: {{ text }}
+Next: use ide.context
+{%- endif -%}
+{%- if state == "complete" and kind == "context" -%}
+complete context: {{ text }}
+{%- if truncated and detail_ref and continuation -%}
+Output is truncated; use ide.inspect with detail_ref {{ detail_ref }} before editing
+{%- elif truncated and detail_ref -%}
+Output is incomplete; use ide.edit with source_ref {{ detail_ref }} when available, otherwise use the native editor
+{%- elif truncated -%}
+Output is incomplete; use ide.edit when available, otherwise use the native editor
+{%- elif detail_ref -%}
+Diagnostics are exactly as reported; use ide.edit with source_ref {{ detail_ref }} when available, otherwise use the native editor
+{%- endif -%}
+{%- endif -%}
+{%- if state == "complete" and kind == "diff" -%}
+complete diff: {{ text }}
+{%- if truncated and detail_ref and continuation -%}
+Output is truncated; use ide.inspect with detail_ref {{ detail_ref }}
+{%- elif truncated -%}
+Output is incomplete; stop or review the available hunks safely with native tools
+{%- else -%}
+Next: use ide.stop
+{%- endif -%}
+{%- endif -%}
+{%- if state == "complete" and kind == "stop" -%}
+complete stop: {{ text }}
+Workspace authority is released; native edits remain on disk
+{%- endif -%}
+{%- if state == "edit" and result.outcome in ("created", "replaced", "unchanged") -%}
+{%- if diagnostics.state == "current_reported" -%}
+edit: {{ result.outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: current_reported ({{ diagnostics.delta }}){{ " [truncated]" if diagnostics.truncated else "" }}
+{{ diagnostics.messages|join("\n") }}
+Next: use ide.edit with source_ref {{ result.source_ref }}
+{%- elif diagnostics.state == "current_clean" -%}
+edit: {{ result.outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: current_clean. Next: use ide.diff
+{%- elif diagnostics.state == "unknown" -%}
+edit: {{ result.outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: unknown. Next: use ide.context
+{%- elif diagnostics.state == "pending" -%}
+edit: {{ result.outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: pending. Next: use ide.inspect with detail_ref {{ diagnostics.detail_ref }}
+{%- endif -%}
+{%- endif -%}
+{%- if state == "edit" and result.outcome == "stale_source" -%}
+edit: stale_source; path {{ result.path }}. No write occurred. The source reference is incomplete or unavailable for this binding, or the file content/presence changed since context; a newer observation alone does not invalidate unchanged content. Use ide.context before another edit, and read every page of a paged context (ide.inspect) first
+{%- endif -%}
+{%- if state == "edit" and result.outcome == "conflicting_duplicate" -%}
+edit: conflicting_duplicate; path {{ result.path }}. No write occurred; use ide.context to inspect the target before a new operation_id
+{%- endif -%}
+{%- if state == "edit" and result.outcome == "unsafe_target" -%}
+edit: unsafe_target; path {{ result.path }}. No write occurred; continue with native tools
+{%- endif -%}
+{%- if state == "edit" and result.outcome in ("cancelled_no_effect", "deadline_no_effect", "capacity_no_effect") -%}
+edit: {{ result.outcome }}; path {{ result.path }}. No write occurred
+{%- endif -%}
+{%- if state == "edit" and result.outcome == "outcome_unknown" -%}
+edit: outcome_unknown; path {{ result.path }}. Inspect this target with native tools before any later mutation; do not replay this operation
+{%- endif -%}
+{%- if state == "edit" and result.outcome == "unavailable_before_dispatch" -%}
+edit: unavailable_before_dispatch; path {{ result.path }}. No write was dispatched; continue with native tools
+{%- endif -%}
