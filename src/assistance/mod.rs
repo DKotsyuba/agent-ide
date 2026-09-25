@@ -12,6 +12,7 @@ pub(crate) mod content;
 /// Connects bounded daemon host correlation to closed peer-boundary outcomes.
 pub mod assembly;
 
+/// Correlates exact Codex and Claude host identity from native hooks and MCP call metadata.
 pub mod host_binding;
 
 /// Exposes the bounded fail-open native Codex and Claude hook command modes.

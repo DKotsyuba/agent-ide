@@ -653,7 +653,8 @@ fn managed_rust_settings_disable_proc_macro_expansion() {
     );
 }
 
-/// Negotiates exact gopls/Rust settings and refuses wrong Rust identity or an incomplete/unhealthy barrier.
+/// Negotiates exact gopls/Rust settings and refuses wrong Rust identity, a non-quiescent barrier and a
+/// quiescent workspace error; a quiescent warning (failed build scripts) stays usable.
 #[tokio::test]
 async fn closed_settings_and_rust_status_barrier_match_the_actual_provider() {
     for (settings, name, version, health, quiescent, success) in [
@@ -679,6 +680,14 @@ async fn closed_settings_and_rust_status_barrier_match_the_actual_provider() {
             "rust-analyzer",
             "contract-1",
             "warning",
+            true,
+            true,
+        ),
+        (
+            rust_settings(),
+            "rust-analyzer",
+            "contract-1",
+            "error",
             true,
             false,
         ),
@@ -789,6 +798,7 @@ async fn closed_settings_and_rust_status_barrier_match_the_actual_provider() {
                     .notify::<RustServerStatus>(RustStatus {
                         health: match health {
                             "ok" => RustHealth::Ok,
+                            "error" => RustHealth::Error,
                             _ => RustHealth::Warning,
                         },
                         quiescent,

@@ -107,37 +107,67 @@ impl RustProfile {
             .ok_or(RustProfileError::InvalidProfile)
     }
 
-    /// Returns the worktree-bound stdio command with the selected toolchain and private cache paths.
-    /// No ambient environment is inherited: `CARGO`/`RUSTC` name the exact operator-verified
-    /// executables directly so tool discovery never depends on an inherited `PATH`, and Cargo
-    /// artifacts/temporary files stay in the verified namespace without granting a broader home
-    /// directory.
+    /// Returns the worktree-bound stdio command with the selected toolchain and the same
+    /// environment a human editor gives rust-analyzer: `CARGO`/`RUSTC` name the exact
+    /// operator-verified executables, `PATH` lets build scripts find the system linker, the
+    /// operator's own Cargo home serves the registry so nothing is downloaded twice, and only the
+    /// build artifacts and temporary files stay in the private namespace.
     pub fn command(&self, worktree: &RustWorktree) -> Result<ControlledCommand, RustProfileError> {
+        let mut path = OsString::new();
+        for directory in [
+            self.cargo.parent(),
+            self.binary.parent(),
+            Some(Path::new("/usr/bin")),
+            Some(Path::new("/bin")),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !path.is_empty() {
+                path.push(":");
+            }
+            path.push(directory);
+        }
+        let home = std::env::var_os("HOME").filter(|value| !value.is_empty());
+        let cargo_home = std::env::var_os("CARGO_HOME")
+            .filter(|value| Path::new(value).is_dir())
+            .or_else(|| {
+                home.as_ref()
+                    .map(|home| Path::new(home).join(".cargo").into_os_string())
+                    .filter(|value| Path::new(value).is_dir())
+            })
+            .unwrap_or_else(|| {
+                Path::new(&self.cache_namespace)
+                    .join("cargo")
+                    .into_os_string()
+            });
+        let mut environment = BTreeMap::from([
+            (OsString::from("PATH"), path),
+            (
+                OsString::from("RUSTUP_TOOLCHAIN"),
+                OsString::from(&self.rustup_toolchain),
+            ),
+            (OsString::from("CARGO"), OsString::from(&self.cargo)),
+            (OsString::from("RUSTC"), OsString::from(&self.rustc)),
+            (OsString::from("CARGO_HOME"), cargo_home),
+            (
+                OsString::from("CARGO_TARGET_DIR"),
+                OsString::from(Path::new(&self.cache_namespace).join("target")),
+            ),
+            (
+                OsString::from("TMPDIR"),
+                OsString::from(Path::new(&self.cache_namespace).join("tmp")),
+            ),
+        ]);
+        if let Some(home) = home {
+            environment.insert(OsString::from("HOME"), home);
+        }
         ControlledCommand::from_validated_peer(
             CommandKind::Provider,
             self.binary.clone(),
             Vec::new(),
             worktree.worktree.worktree_path().to_path_buf(),
-            BTreeMap::from([
-                (
-                    OsString::from("RUSTUP_TOOLCHAIN"),
-                    OsString::from(&self.rustup_toolchain),
-                ),
-                (OsString::from("CARGO"), OsString::from(&self.cargo)),
-                (OsString::from("RUSTC"), OsString::from(&self.rustc)),
-                (
-                    OsString::from("CARGO_HOME"),
-                    OsString::from(Path::new(&self.cache_namespace).join("cargo")),
-                ),
-                (
-                    OsString::from("CARGO_TARGET_DIR"),
-                    OsString::from(Path::new(&self.cache_namespace).join("target")),
-                ),
-                (
-                    OsString::from("TMPDIR"),
-                    OsString::from(Path::new(&self.cache_namespace).join("tmp")),
-                ),
-            ]),
+            environment,
         )
         .map_err(|_| RustProfileError::InvalidProfile)
     }

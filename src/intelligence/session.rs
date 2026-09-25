@@ -209,14 +209,24 @@ pub struct ProviderReadiness(ReadinessState);
 enum ReadinessState {
     /// No exact accepted provider-specific status barrier is available.
     Unknown,
-    /// This Rust transport reported both health=ok and quiescent=true.
+    /// This Rust transport reported quiescent=true with health ok or warning. A warning (for
+    /// example failed build scripts of some packages) degrades results but the analyzer answers
+    /// definition and reference requests, exactly as it does for a human editor.
     RustHealthyQuiescent,
+    /// This Rust transport reported quiescent=true with health=error: the workspace failed to
+    /// load, so waiting any longer cannot make semantic operations available.
+    RustWorkspaceError,
 }
 
 impl ProviderReadiness {
-    /// Returns whether the trusted Rust status route observed healthy quiescence for this generation.
+    /// Returns whether the trusted Rust status route observed usable quiescence for this generation.
     pub const fn is_rust_healthy_quiescent(self) -> bool {
         matches!(self.0, ReadinessState::RustHealthyQuiescent)
+    }
+
+    /// Returns whether the trusted Rust status route reported a quiescent workspace error.
+    pub const fn is_rust_workspace_error(self) -> bool {
+        matches!(self.0, ReadinessState::RustWorkspaceError)
     }
 
     /// Returns whether no accepted provider-specific readiness proof is currently retained.
@@ -230,6 +240,9 @@ const UNKNOWN_READINESS: ProviderReadiness = ProviderReadiness(ReadinessState::U
 /// Readiness value minted only by the accepted Rust status notification callback.
 const RUST_HEALTHY_QUIESCENT: ProviderReadiness =
     ProviderReadiness(ReadinessState::RustHealthyQuiescent);
+/// Readiness value minted when the accepted Rust status reports a quiescent workspace error.
+const RUST_WORKSPACE_ERROR: ProviderReadiness =
+    ProviderReadiness(ReadinessState::RustWorkspaceError);
 
 /// Exact rust-analyzer status notification accepted by the versioned profile.
 enum RustServerStatus {}
@@ -255,9 +268,9 @@ struct RustStatus {
 enum RustHealth {
     /// Workspace health is reported as successful.
     Ok,
-    /// Provider reports a warning; it cannot satisfy the ready barrier.
+    /// Provider reports a warning (for example failed build scripts); still usable when quiescent.
     Warning,
-    /// Provider reports an error; it cannot satisfy the ready barrier.
+    /// Provider reports an error: the workspace did not load, semantic operations stay unavailable.
     Error,
 }
 
@@ -624,7 +637,8 @@ impl Session {
         Ok(())
     }
 
-    /// Waits under the request deadline for exact Rust health/quiescence; transport loss cannot satisfy it.
+    /// Waits under the request deadline for Rust quiescence; transport loss cannot satisfy it and a
+    /// quiescent workspace error fails at once instead of burning the whole deadline.
     async fn wait_for_readiness(&mut self) -> io::Result<()> {
         let mut ready = self
             .state
@@ -637,8 +651,12 @@ impl Session {
                 if !self.state.lock().expect("session lock").active {
                     return Err(io::Error::other("provider generation unavailable"));
                 }
-                if ready.borrow_and_update().is_rust_healthy_quiescent() {
+                let readiness = *ready.borrow_and_update();
+                if readiness.is_rust_healthy_quiescent() {
                     return Ok(());
+                }
+                if readiness.is_rust_workspace_error() {
+                    return Err(io::Error::other("Rust workspace failed to load"));
                 }
                 ready.changed().await.map_err(io::Error::other)?;
             }
@@ -1198,10 +1216,10 @@ fn client_router(state: Arc<Mutex<State>>) -> Router<Arc<Mutex<State>>> {
         if state.active && matches!(&state.settings, ProviderSettings::Rust(_)) {
             state
                 .readiness
-                .send_replace(if status.health == RustHealth::Ok && status.quiescent {
-                    RUST_HEALTHY_QUIESCENT
-                } else {
-                    UNKNOWN_READINESS
+                .send_replace(match (status.quiescent, status.health) {
+                    (true, RustHealth::Ok | RustHealth::Warning) => RUST_HEALTHY_QUIESCENT,
+                    (true, RustHealth::Error) => RUST_WORKSPACE_ERROR,
+                    (false, _) => UNKNOWN_READINESS,
                 });
         }
         ControlFlow::Continue(())
