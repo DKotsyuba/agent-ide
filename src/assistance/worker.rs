@@ -6,9 +6,7 @@ use super::{
     },
     content,
     facade::{AssistanceTool, FeedbackDelta, render_reply},
-    host_binding::{
-        ActiveBindingUse, BindingRef, HostBindingGuard, ObservedSandboxState, ValidatedInvocation,
-    },
+    host_binding::{ActiveBindingUse, BindingRef, HostBindingGuard, ValidatedInvocation},
     launcher::{AcceptedProviderSettings, LaunchTarget, LauncherConfig},
     problems::{ProblemSource, ProjectProblemFeed, parse_language, problems_text_with_rechecks},
     reply::{EditDiagnostics, ExecutionProfileCause, FailureCode, PeerReply, ResultKind},
@@ -79,8 +77,6 @@ struct Job {
     reference: String,
     /// Validated host invocation for this exact operation.
     invocation: ValidatedInvocation,
-    /// Matching measured sandbox state; stop has no new physical admission from this state.
-    observed: Option<ObservedSandboxState>,
     /// Closed current tool operation.
     tool: AssistanceTool,
     /// Closed validated model parameters, containing no target/profile/authority information.
@@ -421,13 +417,6 @@ struct Inspection {
     binding: BindingRef,
     /// Opaque result handle supplied by the model; it does not confer ownership.
     reference: String,
-    /// Current host-correlated sandbox metadata, never a cached prior permission observation.
-    /// Absent only for a Claude-originated reference (T09B): Claude never reports
-    /// `codex/sandbox-state-meta`, so there is no host-observed catalog/profile scope to recheck,
-    /// exactly as its own job-creation path never calls `validate_read_scope` either.
-    observed: Option<ObservedSandboxState>,
-    /// Exact trusted attachment target used for current read-scope validation.
-    target: LaunchTarget,
     /// Optional owner/path constraint for method-specific detail retrieval.
     expected: Option<(AssistanceTool, [u8; 32])>,
     /// Finite IPC caller waiting for the current authorized result.
@@ -905,33 +894,6 @@ impl WorkerHandle {
         self.shared.project_feed.as_ref()
     }
 
-    /// Hides cached check results before a managed reply can carry a plate when its host deny
-    /// policy cannot be translated or differs from this binding's activated check policy.
-    pub fn restrict_project_feed(
-        &self,
-        binding: &BindingRef,
-        observed: Option<&ObservedSandboxState>,
-    ) {
-        if let (Some(feed), Some(observed)) = (&self.shared.project_feed, observed) {
-            let worktree = feed.bound_worktree(&binding.fingerprint());
-            let denies =
-                crate::execution::HostSandboxState::parse(Some(observed.state().as_json().clone()))
-                    .ok()
-                    .and_then(|state| {
-                        crate::execution::seatbelt::host_read_denies(
-                            &state,
-                            worktree.as_deref().unwrap_or(state.cwd()),
-                        )
-                    });
-            if denies
-                .as_ref()
-                .is_none_or(|denies| !feed.accepts_read_denies(&binding.fingerprint(), denies))
-            {
-                feed.restrict(&binding.fingerprint());
-            }
-        }
-    }
-
     /// Returns the shared slot that holds the telemetry owner once startup has opened it.
     ///
     /// Lets callbacks created before startup (for example project check completion) record
@@ -953,14 +915,12 @@ impl WorkerHandle {
     pub async fn context_problems(
         &self,
         invocation: ValidatedInvocation,
-        observed: Option<ObservedSandboxState>,
         parameters: Value,
         attachment: &str,
     ) -> PeerReply {
         let (send, wait) = oneshot::channel();
         if let Err(code) = self.enqueue(
             invocation,
-            observed,
             AssistanceTool::Context,
             parameters,
             attachment,
@@ -1163,38 +1123,25 @@ impl WorkerHandle {
     pub async fn submit(
         &self,
         invocation: ValidatedInvocation,
-        observed: Option<ObservedSandboxState>,
         tool: AssistanceTool,
         parameters: Value,
         attachment: &str,
     ) -> PeerReply {
         let binding = invocation.binding_ref().clone();
-        let Some(current) = observed.clone() else {
-            return PeerReply::Error {
-                code: FailureCode::SandboxState,
-            };
-        };
         let expected = Some((tool, selection(&parameters)));
         if let Some(reference) = parameters.get("detail_ref").and_then(Value::as_str) {
             return self
-                .inspect(
-                    binding,
-                    reference.to_owned(),
-                    Some(current),
-                    attachment,
-                    expected,
-                )
+                .inspect(binding, reference.to_owned(), attachment, expected)
                 .await;
         }
-        let Some(target) = self.target(attachment) else {
+        if self.target(attachment).is_none() {
             return PeerReply::Error {
                 code: FailureCode::LauncherConfiguration,
             };
-        };
+        }
         match admit_initial_inspection(&self.inspect, || {
             self.enqueue(
                 invocation,
-                observed,
                 tool,
                 parameters,
                 attachment,
@@ -1203,7 +1150,7 @@ impl WorkerHandle {
             )
         }) {
             Ok((reference, permit)) => {
-                self.inspect_reserved(binding, reference, Some(current), target, expected, permit)
+                self.inspect_reserved(binding, reference, expected, permit)
                     .await
             }
             Err(code) => PeerReply::Error { code },
@@ -1247,7 +1194,6 @@ impl WorkerHandle {
         let (send, wait) = oneshot::channel();
         if let Err(code) = self.enqueue(
             invocation,
-            None,
             AssistanceTool::Stop,
             serde_json::json!({}),
             attachment,
@@ -1303,7 +1249,6 @@ impl WorkerHandle {
         let (send, wait) = oneshot::channel();
         if let Err(code) = self.enqueue(
             invocation,
-            None,
             tool,
             parameters,
             attachment,
@@ -1352,7 +1297,6 @@ impl WorkerHandle {
         if self
             .enqueue(
                 invocation,
-                None,
                 AssistanceTool::Edit,
                 parameters,
                 attachment,
@@ -1398,7 +1342,6 @@ impl WorkerHandle {
         let (send, wait) = oneshot::channel();
         if let Err(code) = self.enqueue(
             invocation,
-            None,
             AssistanceTool::Edit,
             parameters,
             attachment,
@@ -1439,7 +1382,6 @@ impl WorkerHandle {
         let (send, wait) = oneshot::channel();
         if let Err(code) = self.enqueue(
             invocation,
-            None,
             AssistanceTool::Edit,
             parameters,
             attachment,
@@ -1498,28 +1440,24 @@ impl WorkerHandle {
             .map_or_else(|| Some(detail.reply.clone()), |()| None)
     }
 
-    /// Asks the sole worker for a same-binding, current-profile, durably authorized result.
-    ///
-    /// `observed` is `None` only for a Claude-originated reference, which has no host-reported
-    /// sandbox catalog/profile scope to recheck (T09B).
+    /// Asks the sole worker for a same-binding, durably authorized result.
     pub async fn inspect(
         &self,
         binding: BindingRef,
         reference: String,
-        observed: Option<ObservedSandboxState>,
         attachment: &str,
         expected: Option<(AssistanceTool, [u8; 32])>,
     ) -> PeerReply {
-        let Some(target) = self.target(attachment) else {
+        if self.target(attachment).is_none() {
             return PeerReply::Error {
                 code: FailureCode::LauncherConfiguration,
             };
-        };
+        }
         let permit = match reserve_inspection(&self.inspect) {
             Ok(permit) => permit,
             Err(code) => return PeerReply::Error { code },
         };
-        self.inspect_reserved(binding, reference, observed, target, expected, permit)
+        self.inspect_reserved(binding, reference, expected, permit)
             .await
     }
 
@@ -1528,18 +1466,13 @@ impl WorkerHandle {
         &self,
         binding: BindingRef,
         reference: String,
-        observed: Option<ObservedSandboxState>,
-        target: LaunchTarget,
         expected: Option<(AssistanceTool, [u8; 32])>,
         permit: mpsc::OwnedPermit<Inspection>,
     ) -> PeerReply {
-        self.restrict_project_feed(&binding, observed.as_ref());
         let (reply, wait) = oneshot::channel();
         permit.send(Inspection {
             binding,
             reference,
-            observed,
-            target,
             expected,
             reply,
         });
@@ -1659,7 +1592,6 @@ impl WorkerHandle {
     fn enqueue(
         &self,
         invocation: ValidatedInvocation,
-        observed: Option<ObservedSandboxState>,
         tool: AssistanceTool,
         parameters: Value,
         attachment: &str,
@@ -1686,7 +1618,6 @@ impl WorkerHandle {
             .target(attachment)
             .ok_or(FailureCode::LauncherConfiguration)?;
         let binding = invocation.binding_ref().clone();
-        self.restrict_project_feed(&binding, observed.as_ref());
         let retain_detail = retains_detail(tool, &input);
         let mut ledger = self
             .shared
@@ -1760,7 +1691,6 @@ impl WorkerHandle {
             input,
             reference: reference.clone(),
             invocation,
-            observed,
             tool,
             parameters,
             target,
@@ -2204,31 +2134,12 @@ impl<'a> Worker<'a> {
                     },
                     Some(authority),
                 ) if job.tool == AssistanceTool::Start => {
-                    let check_denies = job.observed.as_ref().map(|observed| {
-                        check_read_denies(
-                            &self.shared,
-                            &binding,
-                            observed,
-                            &job.target,
-                            authority,
-                            errorlog_method(job.tool),
-                        )
-                    });
-                    let read_restricted = job.observed.as_ref().map_or_else(
-                        || {
-                            job.target.claude_profile.as_ref().is_none_or(|profile| {
-                                !profile
-                                    .declares_whole_tree_read(authority.worktree().worktree_path())
-                            })
-                        },
-                        |_| check_denies.as_ref().is_none_or(Result::is_err),
-                    );
                     feed.activated_with_denies(
                         binding.fingerprint(),
                         authority.worktree().worktree_path(),
                         authority.worktree().git_common_dir(),
-                        read_restricted,
-                        check_denies.and_then(Result::ok).unwrap_or_default(),
+                        false,
+                        Vec::new(),
                     );
                 }
                 (PeerReply::Edit { result, .. }, _) if result.outcome.has_post_source() => {
@@ -2327,13 +2238,11 @@ impl<'a> Worker<'a> {
             DiscoverWorktreeRequest, DiscoveryOperationRef, GitDiscoveryPolicy, GitDiscoveryQuery,
         };
         let binding = job.invocation.binding_ref().clone();
-        let observed = job.observed.clone().ok_or(FailureCode::SandboxState)?;
         let operation = DiscoveryOperationRef::new(format!("discover-{}", job.reference))
             .map_err(|_| FailureCode::Internal)?;
         let policy = GitDiscoveryPolicy::new(
             job.target.git.path.clone(),
             self.shared.launcher.limits.output_bytes,
-            job.target.allow_disabled_host,
         )
         .map_err(|_| {
             record_execution_profile(errorlog_method(job.tool), "git_policy");
@@ -2345,35 +2254,20 @@ impl<'a> Worker<'a> {
             GitDiscoveryQuery::GitCommonDir,
             GitDiscoveryQuery::WorktreeListPorcelainZ,
         ] {
-            let request = DiscoverWorktreeRequest::from_active_observation(
+            let request = DiscoverWorktreeRequest::from_active_use(
                 self.shared.active(&binding)?,
-                observed.clone(),
                 job.target.candidate.clone().into_os_string(),
                 operation.clone(),
             )
-            .map_err(|_| FailureCode::SandboxState)?;
-            let request = match request.validate_query(query, &policy, &job.target.catalog) {
+            .map_err(|_| FailureCode::Internal)?;
+            let request = match request.validate_query(query, &policy) {
                 Ok(request) => request,
-                Err(error) => {
-                    let mut detail = execution_profile_detail(&error)
-                        .unwrap_or_else(|| "query_policy".to_owned());
-                    // A refused profile is captured once for operator review (T25B); the capture
-                    // runs off-thread under a hard deadline and its outcome never changes this
-                    // reply.
-                    if matches!(
-                        error,
-                        crate::execution::RequestError::ExecutionProfileNoTemplate(_)
-                            | crate::execution::RequestError::ExecutionProfileDigestMismatch(_)
-                            | crate::execution::RequestError::ExecutionProfileShapeUnsupported(_)
-                            | crate::execution::RequestError::ExecutionProfileShapeNotNarrower(_)
-                    ) {
-                        detail.push_str(&capture_rejected_state(observed.state().as_json()).await);
-                    }
-                    record_execution_profile(errorlog_method(job.tool), &detail);
-                    let cause = ExecutionProfileCause::from_log_tag(&detail)
-                        .expect("discovery refusal has a closed execution-profile tag");
-                    job.failure_detail = Some(detail);
-                    return Err(FailureCode::ExecutionProfileCause(cause));
+                Err(_) => {
+                    record_execution_profile(errorlog_method(job.tool), "query_policy");
+                    job.failure_detail = Some("query_policy".to_owned());
+                    return Err(FailureCode::ExecutionProfileCause(
+                        ExecutionProfileCause::QueryPolicy,
+                    ));
                 }
             };
             if *job.cancel.borrow() {
@@ -2384,7 +2278,7 @@ impl<'a> Worker<'a> {
             }
             let active = self.shared.active(&binding)?;
             let lease = self.admit(&binding)?;
-            let mut child = match request.spawn(lease, active, &job.target.codex.path) {
+            let mut child = match request.spawn(lease, active) {
                 Ok(child) => child,
                 Err(error) => {
                     return Err(self.spawn_failure(error, &binding, errorlog_method(job.tool)));
@@ -2515,19 +2409,10 @@ impl<'a> Worker<'a> {
             .capture_activation_baseline(job, &authority, &activation_operation)
             .await;
         let launches = job.target.providers.clone();
-        let managed_sandbox = providers::managed_sandbox_from_job(job);
-        let rights = providers::effective_rights_from_job(job)?;
         // A second concurrent actor on the same physical worktree cannot share a single-owner
         // namespace: fail its activation with the finite reason and roll its own grant back, so the
         // actor that already owns the cache keeps running and can hand off after it stops.
-        if let Err(code) = self.retain_worktree_caches(
-            &binding,
-            &authority,
-            &launches,
-            managed_sandbox,
-            true,
-            &rights,
-        ) {
+        if let Err(code) = self.retain_worktree_caches(&binding, &authority, &launches, true) {
             if let Ok(mut guard) = self.shared.bindings.lock() {
                 let _ = guard.stop_binding(&binding);
             }
@@ -2685,21 +2570,16 @@ impl<'a> Worker<'a> {
             }
         };
         let launches = job.target.providers.clone();
-        let profile = job
-            .target
-            .claude_profile
-            .as_ref()
-            .ok_or(FailureCode::ExecutionProfile)?;
-        let rights = profile.rights_identity()?;
-        if let Err(code) =
-            self.retain_worktree_caches(&binding, &authority, &launches, true, false, rights)
-        {
+        if job.target.claude_profile.is_none() {
+            return Err(FailureCode::ExecutionProfile);
+        }
+        if let Err(code) = self.retain_worktree_caches(&binding, &authority, &launches, false) {
             if let Ok(mut guard) = self.shared.bindings.lock() {
                 let _ = guard.stop_binding(&binding);
             }
             return Err(self.settle_revocation(&binding).await.err().unwrap_or(code));
         }
-        let caches = self.helper_cache_namespaces(&binding, &authority, &launches, rights)?;
+        let caches = self.helper_cache_namespaces(&binding, &authority, &launches)?;
         let baseline = self
             .capture_claude_baseline(&binding, &authority, &activation_operation, baseline)
             .await;
@@ -3096,9 +2976,6 @@ impl<'a> Worker<'a> {
         &mut self,
         binding: &BindingRef,
         path: std::path::PathBuf,
-        observed_scope: &ObservedSandboxState,
-        target: &LaunchTarget,
-        method: crate::errorlog::Method,
     ) -> Result<(SourceObservation, Vec<u8>), FailureCode> {
         use crate::workspace::{
             observation::{
@@ -3108,16 +2985,6 @@ impl<'a> Worker<'a> {
             store::{ObservationAdmission, ObservationDraft},
         };
         let authority = self.authority(binding).await?;
-        validate_read_scope(
-            &self.shared,
-            binding,
-            observed_scope,
-            target,
-            &authority,
-            method,
-            crate::execution::ReadScope::Path(&path),
-        )
-        .map_err(|refusal| refusal.code)?;
         // The source read ceiling is the v0.1 reader's own bound, not the launcher's discovery and
         // check-process output budget: `limits.output_bytes` sizes bounded command captures and is
         // far smaller than a source file may legitimately be.
@@ -3204,9 +3071,6 @@ impl<'a> Worker<'a> {
     /// Hooks themselves never provide new read authority or authorize a scope from tool payload text.
     async fn reconcile_hints(&mut self, job: &Job) {
         let binding = job.invocation.binding_ref();
-        let Some(scope) = &job.observed else {
-            return;
-        };
         let hinted = self
             .shared
             .bindings
@@ -3220,11 +3084,7 @@ impl<'a> Worker<'a> {
                 if *job.cancel.borrow() || tokio::time::Instant::now() >= job.deadline {
                     break;
                 }
-                if self
-                    .observe(binding, path, scope, &job.target, errorlog_method(job.tool))
-                    .await
-                    .is_err()
-                {
+                if self.observe(binding, path).await.is_err() {
                     break;
                 }
             }
@@ -3249,15 +3109,7 @@ impl<'a> Worker<'a> {
             .as_str()
             .ok_or(FailureCode::SourceUnavailable)?
             .to_owned();
-        let (observed, bytes) = self
-            .observe(
-                &binding,
-                path.clone().into(),
-                job.observed.as_ref().ok_or(FailureCode::SandboxState)?,
-                &job.target,
-                errorlog_method(job.tool),
-            )
-            .await?;
+        let (observed, bytes) = self.observe(&binding, path.clone().into()).await?;
         let query = job
             .parameters
             .get("byte_offset")
@@ -3275,7 +3127,6 @@ impl<'a> Worker<'a> {
             Ok(None)=>(lexical_context(&observed,&bytes,query,"no accepted provider is configured for this source, or the registered path is missing").map_err(|_|FailureCode::SourceUnavailable)?, None),
             Err(FailureCode::ProviderUnavailable)=>(lexical_context(&observed,&bytes,query,"accepted semantic provider is unavailable").map_err(|_|FailureCode::SourceUnavailable)?, None),
             Err(FailureCode::ResolutionUnverified)=>(lexical_context(&observed,&bytes,query,"semantic project resolution is unverified").map_err(|_|FailureCode::SourceUnavailable)?, None),
-            Err(FailureCode::ExecutionProfileCause(ExecutionProfileCause::ReadWholeTreeUnproven))=>(lexical_context(&observed,&bytes,query,"accepted semantic provider is unavailable: read_restricted").map_err(|_|FailureCode::SourceUnavailable)?, None),
             Err(FailureCode::ExecutionProfile)=>(lexical_context(&observed,&bytes,query,"accepted semantic provider cannot run under the current execution profile").map_err(|_|FailureCode::SourceUnavailable)?, None),
             Err(code)=>return Err(code),
         };
@@ -3296,20 +3147,6 @@ impl<'a> Worker<'a> {
         }
         let authority = self.authority(&binding).await?;
         self.shared.active(&binding)?;
-        // T36B: the semantic providers may have taken seconds; re-prove this exact source
-        // under the live cwd-bound profile before the freshness reread trusts it.
-        if let Some(observed_scope) = job.observed.as_ref() {
-            validate_read_scope(
-                &self.shared,
-                &binding,
-                observed_scope,
-                &job.target,
-                &authority,
-                errorlog_method(job.tool),
-                crate::execution::ReadScope::Path(observed.path()),
-            )
-            .map_err(|refusal| refusal.code)?;
-        }
         if !source_matches(&observed) {
             return Err(FailureCode::SourceUnavailable);
         }
@@ -3395,18 +3232,6 @@ impl<'a> Worker<'a> {
             let relative = absolute
                 .strip_prefix(authority.worktree().worktree_path())
                 .map_err(|_| FailureCode::SourceUnavailable)?;
-            if let Some(scope) = job.observed.as_ref() {
-                validate_read_scope(
-                    &self.shared,
-                    &binding,
-                    scope,
-                    &job.target,
-                    &authority,
-                    errorlog_method(job.tool),
-                    crate::execution::ReadScope::Path(relative),
-                )
-                .map_err(|refusal| refusal.code)?;
-            }
             provenance.insert(relative.to_path_buf());
         }
         let text = format!(
@@ -3489,27 +3314,6 @@ impl<'a> Worker<'a> {
             return Err(FailureCode::Deadline);
         }
         let authority = self.authority(binding).await?;
-        let read_restricted = job.observed.as_ref().map_or_else(
-            || {
-                job.target.claude_profile.as_ref().is_none_or(|profile| {
-                    !profile.declares_whole_tree_read(authority.worktree().worktree_path())
-                })
-            },
-            |observed| {
-                check_read_denies(
-                    &self.shared,
-                    binding,
-                    observed,
-                    &job.target,
-                    &authority,
-                    errorlog_method(job.tool),
-                )
-                .is_err()
-            },
-        );
-        if read_restricted && let Some(feed) = &self.shared.project_feed {
-            feed.restrict(&binding.fingerprint());
-        }
         let language = job
             .parameters
             .get("language")
@@ -3522,12 +3326,11 @@ impl<'a> Worker<'a> {
             .map_or(0, |offset| u32::try_from(offset).unwrap_or(u32::MAX));
         let text = match self.shared.problem_source.as_ref() {
             Some(source) => {
-                let restricted = read_restricted
-                    || self
-                        .shared
-                        .project_feed
-                        .as_ref()
-                        .is_some_and(|feed| feed.is_read_restricted(&binding.fingerprint()));
+                let restricted = self
+                    .shared
+                    .project_feed
+                    .as_ref()
+                    .is_some_and(|feed| feed.is_read_restricted(&binding.fingerprint()));
                 let snapshots = if restricted {
                     self.shared
                         .project_feed
@@ -3639,40 +3442,6 @@ impl<'a> Worker<'a> {
                     .await;
             }
         };
-        let path_readable = job.observed.as_ref().is_some_and(|observed| {
-            validate_read_scope(
-                &self.shared,
-                &binding,
-                observed,
-                &job.target,
-                &authority,
-                errorlog_method(job.tool),
-                crate::execution::ReadScope::Path(Path::new(&request.path)),
-            )
-            .is_ok()
-        });
-        if !path_readable {
-            let result = self
-                .settle_prepared_edit(
-                    prepared,
-                    &request,
-                    EditResult {
-                        operation_id: request.operation_id.clone(),
-                        path: request.path.clone(),
-                        outcome: ChangesEditOutcome::UnavailableBeforeDispatch,
-                        source_ref: None,
-                    },
-                )
-                .await;
-            return Ok((
-                PeerReply::Edit {
-                    result,
-                    diagnostics: EditDiagnostics::Unknown {},
-                },
-                Some(authority),
-                None,
-            ));
-        }
         let edit_source = match crate::workspace::edit::EditSourceRef::from_observation(&source) {
             Ok(source) => source,
             Err(outcome) => {
@@ -3747,17 +3516,8 @@ impl<'a> Worker<'a> {
             | crate::workspace::edit::EditOutcome::Unchanged(read) => Some(read),
             _ => None,
         };
-        let (refreshed, diagnostics) = if known && job.observed.is_some() {
-            match self
-                .observe(
-                    &binding,
-                    request.path.clone().into(),
-                    job.observed.as_ref().expect("checked present"),
-                    &job.target,
-                    errorlog_method(job.tool),
-                )
-                .await
-            {
+        let (refreshed, diagnostics) = if known {
+            match self.observe(&binding, request.path.clone().into()).await {
                 Ok((observed, bytes)) => {
                     let current_epoch = self
                         .shared
@@ -4344,73 +4104,23 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 .authorize(authority, &active)
                 .await
                 .map_err(|_| invalidate(FailureCode::WorkspaceAuthority))?;
-            // Claude never reports `codex/sandbox-state-meta`, so a Claude-originated detail has no
-            // host-observed catalog/profile scope to recheck here — exactly as its own job-creation
-            // path (`context_claude`/`diff_claude`) never calls this check either (T09B).
-            if let Some(observed) = &request.observed {
-                // T36B: this one proof point covers every downstream disclosure below — the
-                // already-composed first pages, the later expansions, the cached-context
-                // freshness reread, and `source_matches` — because each names only paths from
-                // `source` or the retained diff provenance. Activation status and a proven empty
-                // Diff disclose no source path or bytes; other path-less details keep the gate.
-                let paths: Vec<&std::path::Path> = source
-                    .as_ref()
-                    .map(|source| source.path())
-                    .into_iter()
-                    .chain(
-                        diff_provenance
-                            .as_ref()
-                            .map(|paths| paths.iter().map(PathBuf::as_path))
-                            .into_iter()
-                            .flatten(),
-                    )
-                    .collect();
-                let proof = |path: &std::path::Path| {
-                    validate_read_scope(
-                        shared,
-                        &request.binding,
-                        observed,
-                        &request.target,
-                        authority,
-                        crate::errorlog::Method::Inspect,
-                        crate::execution::ReadScope::Path(path),
-                    )
-                };
-                if paths.is_empty()
-                    && !matches!(
-                        reply,
-                        PeerReply::Complete {
-                            kind: ResultKind::Activation,
-                            ..
-                        }
-                    )
-                    && !matches!(
-                        (&reply, &diff_provenance),
-                        (PeerReply::Complete { kind: ResultKind::Diff, .. }, Some(provenance))
-                            if provenance.is_empty()
-                    )
-                {
-                    validate_read_scope(
-                        shared,
-                        &request.binding,
-                        observed,
-                        &request.target,
-                        authority,
-                        crate::errorlog::Method::Inspect,
-                        crate::execution::ReadScope::WholeTree,
-                    )
-                    .map_err(|refusal| invalidate(refusal.code))?;
-                } else {
-                    for path in paths {
-                        proof(path).map_err(|refusal| invalidate(refusal.code))?;
-                        // Cached disclosure adds the conservative lstat preflight: a symlink
-                        // component below the worktree root refuses disclosure of cached bytes.
-                        // The real guard for later reads stays the descriptor-relative
-                        // `O_NOFOLLOW` reader; a preflight can never secure a later read.
-                        symlink_disclosure_preflight(authority.worktree(), path)
-                            .map_err(invalidate)?;
-                    }
-                }
+            // Cached disclosure adds the conservative lstat preflight: a symlink component below
+            // the worktree root refuses disclosure of cached bytes. The real guard for later reads
+            // stays the descriptor-relative `O_NOFOLLOW` reader; a preflight can never secure a
+            // later read.
+            for path in source
+                .as_ref()
+                .map(|source| source.path())
+                .into_iter()
+                .chain(
+                    diff_provenance
+                        .as_ref()
+                        .map(|paths| paths.iter().map(PathBuf::as_path))
+                        .into_iter()
+                        .flatten(),
+                )
+            {
+                symlink_disclosure_preflight(authority.worktree(), path).map_err(invalidate)?;
             }
         }
         if let Some(source) = source
@@ -4716,195 +4426,6 @@ fn diagnostics_reserve_known_edit_settlement_time() {
     assert!(edit_diagnostic_deadline(now + Duration::from_millis(1)).is_none());
 }
 
-/// A refused read-scope recheck: the closed public code plus the closed error-log detail
-/// (T36B-r), so callers that surface the refusal beyond the error log keep the exact condition.
-///
-/// Produced only by [`validate_read_scope`], which writes `detail` to the error log before
-/// returning. The code carries the same closed cause to agent replies; Diff capture also copies
-/// `detail` into the job's `failure_detail`.
-#[derive(Debug)]
-struct ReadScopeRefusal {
-    /// The public failure code the reply carries: `WorkspaceAuthority` when the durable stamp
-    /// cannot be restated, the binding's own liveness code when it is no longer active, and
-    /// `ExecutionProfileCause` for every workspace-read recheck refusal.
-    code: FailureCode,
-    /// The closed, privacy-safe condition tag (for example `read_scope:path_unproven`,
-    /// `workspace_authority`, `internal`); never a path, sandbox-state JSON or error text.
-    detail: String,
-}
-
-/// Admits a check only when the current profile is accepted, every daemon-side project probe is
-/// readable, and all host denies can be enforced by the check Seatbelt profile.
-fn check_read_denies(
-    shared: &Shared,
-    binding: &BindingRef,
-    observed: &ObservedSandboxState,
-    target: &LaunchTarget,
-    authority: &AuthorityStamp,
-    method: crate::errorlog::Method,
-) -> Result<Vec<crate::execution::seatbelt::ReadDeny>, ReadScopeRefusal> {
-    for path in [
-        "Cargo.toml",
-        "Cargo.lock",
-        "pyproject.toml",
-        "setup.py",
-        "setup.cfg",
-        "requirements.txt",
-        "Pipfile",
-        "pyrightconfig.json",
-        ".venv",
-        "venv",
-    ] {
-        validate_read_scope(
-            shared,
-            binding,
-            observed,
-            target,
-            authority,
-            method,
-            crate::execution::ReadScope::Path(Path::new(path)),
-        )?;
-        let candidate = authority.worktree().worktree_path().join(path);
-        match std::fs::symlink_metadata(candidate) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(ReadScopeRefusal {
-                    code: FailureCode::ExecutionProfileCause(
-                        ExecutionProfileCause::ReadWholeTreeUnproven,
-                    ),
-                    detail: "read_scope:whole_tree_unproven".to_owned(),
-                });
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => {
-                return Err(ReadScopeRefusal {
-                    code: FailureCode::ExecutionProfileCause(
-                        ExecutionProfileCause::ReadWholeTreeUnproven,
-                    ),
-                    detail: "read_scope:whole_tree_unproven".to_owned(),
-                });
-            }
-        }
-    }
-    crate::execution::HostSandboxState::parse(Some(observed.state().as_json().clone()))
-        .ok()
-        .and_then(|state| {
-            crate::execution::seatbelt::host_read_denies(
-                &state,
-                authority.worktree().worktree_path(),
-            )
-        })
-        .ok_or(ReadScopeRefusal {
-            code: FailureCode::ExecutionProfileCause(ExecutionProfileCause::ReadWholeTreeUnproven),
-            detail: "read_scope:whole_tree_unproven".to_owned(),
-        })
-}
-
-/// Intersects a current durable stamp and fresh invocation metadata before a native read.
-/// The caller supplies the exact path or a whole-tree scope when no narrower scope exists.
-fn validate_read_scope(
-    shared: &Shared,
-    binding: &BindingRef,
-    observed: &ObservedSandboxState,
-    target: &LaunchTarget,
-    authority: &AuthorityStamp,
-    method: crate::errorlog::Method,
-    scope: crate::execution::ReadScope<'_>,
-) -> Result<(), ReadScopeRefusal> {
-    let scoped = crate::execution::WorkspaceAuthority::from_workspace_with_git_common_dir(
-        authority.worktree().id(),
-        authority.worktree().incarnation().to_string(),
-        authority.worktree().worktree_path().to_path_buf(),
-        authority.worktree().git_common_dir().to_path_buf(),
-        authority.epoch(),
-    )
-    .map_err(|_| ReadScopeRefusal {
-        code: FailureCode::WorkspaceAuthority,
-        detail: "workspace_authority".to_owned(),
-    })?;
-    crate::execution::validate_workspace_read(
-        shared.active(binding).map_err(|code| ReadScopeRefusal {
-            code,
-            detail: "internal".to_owned(),
-        })?,
-        observed.clone(),
-        &scoped,
-        &target.catalog,
-        target.allow_disabled_host,
-        scope,
-    )
-    .map(|_| ())
-    .map_err(|error| {
-        let detail = read_scope_detail(&error);
-        record_execution_profile(method, &detail);
-        ReadScopeRefusal {
-            code: FailureCode::ExecutionProfileCause(
-                ExecutionProfileCause::from_log_tag(&detail)
-                    .expect("read-scope refusal has a closed execution-profile tag"),
-            ),
-            detail,
-        }
-    })
-}
-
-/// Renders the closed error-log detail naming which execution-profile condition failed (T24B).
-///
-/// Only closed class and variant names are ever rendered — never paths, sandbox-state JSON,
-/// profile digests, or error strings — and the tag is shared verbatim by the agent-facing
-/// policy text in `content.rs` documentation. The caller may append one bounded
-/// `; captured:<16-hex>` file stem naming a rejected-profile capture (T25B); the prefix the
-/// agent-facing text matches stays unchanged.
-fn execution_profile_detail(error: &crate::execution::RequestError) -> Option<String> {
-    use crate::execution::RequestError;
-    Some(match error {
-        RequestError::ExecutionProfileNoTemplate(class) => {
-            format!("no_profile_for_class:{}", profile_class_tag(*class))
-        }
-        RequestError::ExecutionProfileDigestMismatch(class) => {
-            format!("profile_digest_mismatch:{}", profile_class_tag(*class))
-        }
-        RequestError::ExecutionProfileShapeUnsupported(class) => {
-            format!("shape_unsupported:{}", profile_class_tag(*class))
-        }
-        RequestError::ExecutionProfileShapeNotNarrower(class) => {
-            format!("shape_not_narrower:{}", profile_class_tag(*class))
-        }
-        RequestError::GitMetadataWriteOverlap => "git_metadata_write_overlap".to_owned(),
-        RequestError::DisabledHostDenied => "host_disabled".to_owned(),
-        _ => return None,
-    })
-}
-
-/// Renders the closed lowercase tag for one observed host profile class.
-fn profile_class_tag(class: crate::execution::ProfileClass) -> &'static str {
-    match class {
-        crate::execution::ProfileClass::Managed => "managed",
-        crate::execution::ProfileClass::Disabled => "disabled",
-    }
-}
-
-/// The hard wall-clock ceiling for one rejected-state capture attempt (T25B).
-const REJECTED_CAPTURE_DEADLINE: Duration = Duration::from_secs(2);
-
-/// Runs one rejected-state capture off the worker thread and returns its error-log suffix (T25B).
-///
-/// The capture blocks on the filesystem, so it runs in `spawn_blocking` under a two-second
-/// timeout; a timeout, panic, or join failure degrades to `; capture_skipped:io` and the refusal
-/// reply is identical in every outcome — only this error-log annotation differs.
-async fn capture_rejected_state(state_json: &serde_json::Value) -> String {
-    let state_json = state_json.clone();
-    let task = tokio::task::spawn_blocking(move || {
-        crate::execution::capture_rejected_profile(&state_json)
-    });
-    match tokio::time::timeout(REJECTED_CAPTURE_DEADLINE, task).await {
-        Ok(Ok(crate::execution::RejectedCapture::Captured(stem))) => format!("; captured:{stem}"),
-        Ok(Ok(crate::execution::RejectedCapture::UnknownFields)) => {
-            "; capture_skipped:unknown_fields".to_owned()
-        }
-        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => "; capture_skipped:io".to_owned(),
-    }
-}
-
 /// Refuses any existing symlink component of one relative path below the worktree root (T36B).
 ///
 /// This is a cached-disclosure preflight only — it cannot secure a later read against
@@ -4929,23 +4450,6 @@ fn symlink_disclosure_preflight(
         }
     }
     Ok(())
-}
-
-/// Renders the closed read-scope detail for a failed workspace-read recheck (T24B).
-fn read_scope_detail(error: &crate::execution::RequestError) -> String {
-    use crate::execution::RequestError;
-    if let Some(profile) = execution_profile_detail(error) {
-        return profile;
-    }
-    match error {
-        RequestError::BindingMismatch => "read_scope:binding_mismatch",
-        RequestError::ObservedStateUnavailable(_) => "read_scope:observed_state_unavailable",
-        RequestError::SandboxCwdMismatch => "read_scope:sandbox_cwd_mismatch",
-        RequestError::ReadPathUnproven => "read_scope:path_unproven",
-        RequestError::ReadWholeTreeUnproven => "read_scope:whole_tree_unproven",
-        _ => "read_scope:refused",
-    }
-    .to_owned()
 }
 
 /// Names one owned-child launch failure by its closed [`crate::execution::ProcessError`] variant

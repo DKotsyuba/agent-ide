@@ -226,14 +226,6 @@ pub enum ReasonCode {
     MissingInvocation,
     /// [`BindingUnavailable::InactiveBinding`].
     InactiveBinding,
-    /// [`BindingUnavailable::CapabilityNotAdvertised`].
-    CapabilityNotAdvertised,
-    /// [`BindingUnavailable::MissingSandboxState`].
-    MissingSandboxState,
-    /// [`BindingUnavailable::InvalidSandboxState`].
-    InvalidSandboxState,
-    /// [`BindingUnavailable::BindingUseMismatch`].
-    BindingUseMismatch,
     /// [`BindingUnavailable::Replay`].
     Replay,
     /// [`BindingUnavailable::CapacityExceeded`].
@@ -242,8 +234,6 @@ pub enum ReasonCode {
     // `assistance::reply::FailureCode`.
     /// [`FailureCode::LauncherConfiguration`].
     LauncherConfiguration,
-    /// [`FailureCode::SandboxState`].
-    SandboxState,
     /// [`FailureCode::ExecutionProfile`].
     ExecutionProfile,
     /// [`FailureCode::UnsupportedGit`].
@@ -329,14 +319,9 @@ impl ReasonCode {
             Self::MissingPre => "missing_pre",
             Self::MissingInvocation => "missing_invocation",
             Self::InactiveBinding => "inactive_binding",
-            Self::CapabilityNotAdvertised => "capability_not_advertised",
-            Self::MissingSandboxState => "missing_sandbox_state",
-            Self::InvalidSandboxState => "invalid_sandbox_state",
-            Self::BindingUseMismatch => "binding_use_mismatch",
             Self::Replay => "replay",
             Self::CapacityExceeded => "capacity_exceeded",
             Self::LauncherConfiguration => "launcher_configuration",
-            Self::SandboxState => "sandbox_state",
             Self::ExecutionProfile => "execution_profile",
             Self::UnsupportedGit => "unsupported_git",
             Self::WorkspaceActivation => "workspace_activation",
@@ -386,10 +371,6 @@ impl From<BindingUnavailable> for ReasonCode {
             BindingUnavailable::MissingPre => Self::MissingPre,
             BindingUnavailable::MissingInvocation => Self::MissingInvocation,
             BindingUnavailable::InactiveBinding => Self::InactiveBinding,
-            BindingUnavailable::CapabilityNotAdvertised => Self::CapabilityNotAdvertised,
-            BindingUnavailable::MissingSandboxState => Self::MissingSandboxState,
-            BindingUnavailable::InvalidSandboxState => Self::InvalidSandboxState,
-            BindingUnavailable::BindingUseMismatch => Self::BindingUseMismatch,
             BindingUnavailable::Replay => Self::Replay,
             BindingUnavailable::CapacityExceeded => Self::CapacityExceeded,
         }
@@ -400,7 +381,6 @@ impl From<FailureCode> for ReasonCode {
     fn from(value: FailureCode) -> Self {
         match value {
             FailureCode::LauncherConfiguration => Self::LauncherConfiguration,
-            FailureCode::SandboxState => Self::SandboxState,
             FailureCode::ExecutionProfile | FailureCode::ExecutionProfileCause(_) => {
                 Self::ExecutionProfile
             }

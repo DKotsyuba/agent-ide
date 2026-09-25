@@ -18,9 +18,6 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tokio::{process::Command, task::JoinHandle};
 
-use super::profile_shape::{Access, DenyRule, MissingPath, Selector};
-use super::{HostSandboxState, ProfileClass};
-
 /// Absolute path of the macOS Seatbelt launcher used for every confined spawn.
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
@@ -153,62 +150,6 @@ impl ReadDeny {
             }
         }
     }
-}
-
-/// Derives the supported Codex read exclusions for a check at the state's own worktree cwd.
-/// Unsupported profiles and deny syntax return `None` and keep checks read restricted.
-pub fn host_read_denies(state: &HostSandboxState, worktree: &Path) -> Option<Vec<ReadDeny>> {
-    if state.class() == ProfileClass::Disabled {
-        return (state.cwd() == worktree).then(Vec::new);
-    }
-    let shape = state.shape_v2(worktree).ok()?;
-    if !matches!(
-        shape.rules.get(&Selector::Root),
-        Some((Access::Read | Access::Write, MissingPath::Absent))
-    ) {
-        return None;
-    }
-    shape
-        .denies
-        .iter()
-        .map(|deny| {
-            let selector_path = |selector: &Selector| match selector {
-                Selector::WorkspaceRelative(parts) => Some(
-                    parts
-                        .iter()
-                        .fold(worktree.to_path_buf(), |path, part| path.join(part)),
-                ),
-                Selector::Absolute(parts) => Some(
-                    parts
-                        .iter()
-                        .fold(PathBuf::from("/"), |path, part| path.join(part)),
-                ),
-                _ => None,
-            };
-            match deny {
-                DenyRule::Path(selector) => {
-                    let path = canonical_deny_path(&selector_path(selector)?)?;
-                    path.to_str()?.is_ascii().then_some(ReadDeny::Path(path))
-                }
-                DenyRule::Glob { base, pattern } => {
-                    let suffix = match pattern.as_str() {
-                        "/**/*.key" => CredentialGlob::Key,
-                        "/**/*.pem" => CredentialGlob::Pem,
-                        "/**/.env" => CredentialGlob::Env,
-                        "/**/.env.*" => CredentialGlob::EnvDot,
-                        _ => return None,
-                    };
-                    let base = selector_path(base)?;
-                    let base = std::fs::canonicalize(&base)
-                        .ok()
-                        .or_else(|| canonical_deny_path(&base))?;
-                    base.to_str()?
-                        .is_ascii()
-                        .then_some(ReadDeny::Glob { base, suffix })
-                }
-            }
-        })
-        .collect()
 }
 
 /// Canonicalizes only existing ancestors of a denied selector, never the denied path itself.

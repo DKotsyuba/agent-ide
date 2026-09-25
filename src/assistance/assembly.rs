@@ -11,7 +11,7 @@ use super::{
     host_binding::{
         BindingStatus, HookPhase, HostBindingGuard, HostKind, ValidatedInvocation, parse_candidate,
         parse_channel_session, parse_claude_call_id, parse_claude_hook_event, parse_hook_event,
-        parse_host_kind, parse_observed_sandbox_state,
+        parse_host_kind,
     },
     launcher::{AcceptedProviderSettings, LaunchTarget, LauncherConfig},
     problems::{ProjectProblemFeed, may_write, triggers_check},
@@ -480,7 +480,6 @@ impl ProductDispatcher {
             .inspect(
                 invocation.binding_ref().clone(),
                 detail_ref.to_owned(),
-                None,
                 attachment,
                 None,
             )
@@ -984,7 +983,7 @@ impl ProductDispatcher {
                     return None;
                 }
                 let channel = self.channel(method.opaque_attachment())?;
-                let (invocation, observed) = {
+                let invocation = {
                     let mut bindings = self.bindings.lock().ok()?;
                     let status = match host {
                         HostKind::Codex => {
@@ -1022,56 +1021,18 @@ impl ProductDispatcher {
                     };
                     if method.method() == AssistanceMethod::Stop && host != HostKind::Claude {
                         bindings.stop_binding(invocation.binding_ref()).ok()?;
-                        (invocation, None)
                     } else if host == HostKind::Claude {
-                        // Claude never advertises or returns `codex/sandbox-state-meta`. Instead
-                        // of inventing sandbox authority it was never given, this operation runs
-                        // in a foreground helper that inherits the host's own real sandbox.
+                        // Claude operations run in a foreground helper that inherits the host's
+                        // own sandbox; the daemon only records the binding's liveness here.
                         if method.method() == AssistanceMethod::Stop {
                             bindings.begin_stop(invocation.binding_ref()).ok()?;
                         } else {
                             bindings.consume_active(invocation.binding_ref()).ok()?;
                         }
-                        (invocation, None)
                     } else {
-                        let active = bindings.consume_active(invocation.binding_ref()).ok()?;
-                        // Claude never advertises or returns `codex/sandbox-state-meta`; establishing
-                        // its correlation must never invent sandbox authority it was never given.
-                        let observed = parse_observed_sandbox_state(
-                            meta,
-                            &invocation,
-                            &active,
-                            host == HostKind::Codex,
-                        )
-                        .ok()
-                        .filter(|observed| {
-                            crate::execution::HostSandboxState::parse(Some(
-                                observed.state().as_json().clone(),
-                            ))
-                            .is_ok()
-                        });
-                        let Some(observed) = observed else {
-                            let feed = self
-                                .worker
-                                .as_ref()
-                                .and_then(|worker| worker.project_feed());
-                            if let Some(feed) = feed {
-                                feed.restrict(&invocation.binding_ref().fingerprint());
-                            }
-                            if method.method() == AssistanceMethod::Start
-                                && invocation.created_binding()
-                            {
-                                let _ = bindings.stop_binding(invocation.binding_ref());
-                                if let Some(feed) = feed {
-                                    feed.forget(&invocation.binding_ref().fingerprint());
-                                }
-                            }
-                            return Some(PeerReply::Error {
-                                code: FailureCode::SandboxState,
-                            });
-                        };
-                        (invocation, Some(observed))
+                        bindings.consume_active(invocation.binding_ref()).ok()?;
                     }
+                    invocation
                 };
                 let Some(worker) = &self.worker else {
                     if host == HostKind::Claude
@@ -1088,7 +1049,6 @@ impl ProductDispatcher {
                         }
                     });
                 };
-                worker.restrict_project_feed(invocation.binding_ref(), observed.as_ref());
                 if host == HostKind::Claude {
                     let established = method.method() == AssistanceMethod::Start;
                     return Some(match method.method() {
@@ -1192,7 +1152,6 @@ impl ProductDispatcher {
                             worker
                                 .context_problems(
                                     invocation,
-                                    None,
                                     call.parameters().clone(),
                                     method.opaque_attachment(),
                                 )
@@ -1285,7 +1244,6 @@ impl ProductDispatcher {
                             .inspect(
                                 invocation.binding_ref().clone(),
                                 call.parameters()["detail_ref"].as_str()?.to_owned(),
-                                Some(observed?),
                                 method.opaque_attachment(),
                                 None,
                             )
@@ -1297,7 +1255,6 @@ impl ProductDispatcher {
                         worker
                             .context_problems(
                                 invocation,
-                                observed,
                                 call.parameters().clone(),
                                 method.opaque_attachment(),
                             )
@@ -1307,7 +1264,6 @@ impl ProductDispatcher {
                         worker
                             .submit(
                                 invocation,
-                                observed,
                                 tool,
                                 call.parameters().clone(),
                                 method.opaque_attachment(),

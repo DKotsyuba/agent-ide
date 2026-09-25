@@ -22,9 +22,6 @@ use agent_ide::assistance::{
     host_binding::HostKind,
     launcher::{AcceptedExecutable, LauncherConfig},
 };
-use agent_ide::execution::{
-    D03ProfileEvidence, HostSandboxState, PersistedProfileRecord, ProfileClass,
-};
 use agent_ide::{
     app::store::Store,
     telemetry::{Filter, Telemetry, TelemetryConfig},
@@ -204,37 +201,6 @@ async fn main() -> ExitCode {
             }
             Err(error) => fail(error),
         },
-        Ok(Command::EvidenceRecord {
-            sandbox_state,
-            profile_id,
-            revision,
-            provider_binary,
-            toolchain,
-            configuration,
-            trust,
-            transport,
-            d03_evidence,
-            shape_version,
-        }) => match evidence_record(
-            &sandbox_state,
-            &profile_id,
-            revision,
-            D03ProfileEvidence {
-                provider_binary,
-                toolchain,
-                configuration,
-                trust,
-                transport,
-                d03_evidence,
-            },
-            shape_version,
-        ) {
-            Ok(fragment) => {
-                println!("{fragment}");
-                ExitCode::SUCCESS
-            }
-            Err(error) => fail(error),
-        },
         Ok(Command::EvidenceExecutable { identity, path }) => {
             match evidence_executable(&identity, path) {
                 Ok(fragment) => {
@@ -251,10 +217,6 @@ async fn main() -> ExitCode {
             }
             Err(error) => fail(error),
         },
-        Ok(Command::EvidenceRejected) => {
-            evidence_rejected();
-            ExitCode::SUCCESS
-        }
         Ok(Command::TelemetryQuery {
             database,
             filter,
@@ -333,62 +295,6 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Reads bounded sandbox-state JSON from `path` without inferring or widening its authority.
-///
-/// `path` must contain the exact object a host would advertise on `codex/sandbox-state-meta`.
-/// Returns [`AppError::InvalidResponse`] if the file cannot be read or the envelope is malformed
-/// or names an unsupported profile.
-fn read_sandbox_state(path: &std::path::Path) -> Result<HostSandboxState, AppError> {
-    const MAX_SANDBOX_STATE_BYTES: u64 = 64 * 1024;
-    let mut raw = String::new();
-    std::fs::File::open(path)
-        .and_then(|file| {
-            file.take(MAX_SANDBOX_STATE_BYTES + 1)
-                .read_to_string(&mut raw)
-        })
-        .map_err(|_| AppError::InvalidResponse)?;
-    if raw.len() as u64 > MAX_SANDBOX_STATE_BYTES {
-        return Err(AppError::InvalidResponse);
-    }
-    HostSandboxState::parse_json(&raw).map_err(|_| AppError::InvalidResponse)
-}
-
-/// Builds the exact `{record, sandbox_state}` launcher-profile fragment for one verified D03 run.
-///
-/// This is a pure offline helper for an operator preparing a launcher configuration file: it
-/// reuses [`PersistedProfileRecord::from_execution_evidence_versioned`] and never starts a
-/// daemon, spawns a provider, or writes any file. `sandbox_state` names a file holding the exact
-/// captured `codex/sandbox-state-meta` envelope for the tested run; `evidence` carries the
-/// non-state D03 identities. `shape_version` is `2` by default, `1` for legacy exact admission,
-/// or explicit `3` for a tested visualization-leaf family. The returned JSON has the shape a
-/// launcher configuration's `profiles` entry expects. Returns
-/// [`AppError::InvalidResponse`] for an unreadable/malformed sandbox-state file, a capture whose
-/// state cannot support the requested generation (a `disabled` or unrecognized state never
-/// silently becomes a v2 record), or evidence that the record constructor rejects (an empty
-/// identity or zero revision).
-fn evidence_record(
-    sandbox_state: &std::path::Path,
-    profile_id: &str,
-    revision: u32,
-    evidence: D03ProfileEvidence,
-    shape_version: u32,
-) -> Result<String, AppError> {
-    let state = read_sandbox_state(sandbox_state)?;
-    let record = PersistedProfileRecord::from_execution_evidence_versioned(
-        profile_id,
-        revision,
-        evidence,
-        &state,
-        shape_version,
-    )
-    .map_err(|_| AppError::InvalidResponse)?;
-    let record_value: serde_json::Value =
-        serde_json::from_str(&record.to_json()).map_err(|_| AppError::InvalidResponse)?;
-    let sandbox_value: serde_json::Value =
-        serde_json::from_str(state.sandbox_state_json()).map_err(|_| AppError::InvalidResponse)?;
-    Ok(serde_json::json!({ "record": record_value, "sandbox_state": sandbox_value }).to_string())
-}
-
 /// Builds one `{path, identity, blake3}` accepted-executable fragment by measuring `path`'s bytes.
 ///
 /// This is a pure offline helper for an operator preparing a launcher configuration file: it
@@ -405,47 +311,6 @@ fn evidence_executable(identity: &str, path: PathBuf) -> Result<String, AppError
         "blake3": executable.blake3,
     })
     .to_string())
-}
-
-/// Renders one state-derived string as a single bounded, control-free operator field (T25B).
-///
-/// Captured values come from the host, so control characters and non-printables are escaped
-/// (`char::escape_default`) and the field is capped at [`MAX_RENDERED_FIELD_CHARS`] characters:
-/// every listed entry stays exactly one line and cannot smuggle terminal escapes into operator
-/// review.
-fn escaped_field(value: &str) -> String {
-    const MAX_RENDERED_FIELD_CHARS: usize = 256;
-    value
-        .chars()
-        .take(MAX_RENDERED_FIELD_CHARS)
-        .flat_map(char::escape_default)
-        .collect()
-}
-
-/// Prints one line per captured rejected sandbox state below the real user home (T25B).
-///
-/// Each line is `name class sandbox-cwd mtime`, where `name` is the 16-hex capture stem an
-/// operator joins with `~/.agent-ide/rejected-profiles/<name>.json` and `mtime` uses the error
-/// log's RFC 3339 UTC form. The state-derived `sandbox-cwd` is rendered through
-/// [`escaped_field`]. A missing or unreadable capture is skipped; the command still succeeds.
-fn evidence_rejected() {
-    for capture in agent_ide::execution::list_rejected_profiles() {
-        let class = match capture.class {
-            ProfileClass::Managed => "managed",
-            ProfileClass::Disabled => "disabled",
-        };
-        let mtime = capture
-            .modified
-            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|elapsed| elapsed.as_secs())
-            .map(agent_ide::errorlog::format_rfc3339)
-            .unwrap_or_else(|| "-".to_owned());
-        println!(
-            "{} {class} {} {mtime}",
-            capture.name,
-            escaped_field(&capture.sandbox_cwd)
-        );
-    }
 }
 
 /// Loads and verifies one launcher configuration's accepted executables without a running daemon.
@@ -570,32 +435,6 @@ enum Command {
     },
     /// Queries an existing daemon without creating a directory or daemon process.
     Doctor { runtime_dir: PathBuf },
-    /// Emits one `{record, sandbox_state}` launcher-profile fragment from verified D03 evidence.
-    ///
-    /// Pure offline evidence-formatting; creates no runtime state and never starts a daemon.
-    EvidenceRecord {
-        /// File holding the exact captured `codex/sandbox-state-meta` envelope for the tested run.
-        sandbox_state: PathBuf,
-        /// Stable Execution-owned profile-template identity for this record.
-        profile_id: String,
-        /// Monotonic Execution-owned template revision; must be nonzero.
-        revision: u32,
-        /// Exact provider binary identity observed by the D03 run.
-        provider_binary: String,
-        /// Exact toolchain identity observed by the D03 run.
-        toolchain: String,
-        /// Effective provider configuration identity observed by the D03 run.
-        configuration: String,
-        /// Effective trust decision identity observed by the D03 run.
-        trust: String,
-        /// Sandbox transport/mechanism identity observed by the D03 run.
-        transport: String,
-        /// Immutable D03 evidence identity for this tested record.
-        d03_evidence: String,
-        /// Record generation: `2` (default) mints the shape-based v2 layout for supported
-        /// managed captures; `1` explicitly mints the legacy v1 exact-digest layout.
-        shape_version: u32,
-    },
     /// Emits one `{path, identity, blake3}` accepted-executable fragment for a measured file.
     ///
     /// Pure offline evidence-formatting; creates no runtime state and never launches `path`.
@@ -610,10 +449,6 @@ enum Command {
         /// Launcher configuration file to load and verify.
         path: PathBuf,
     },
-    /// Lists captured rejected sandbox states below the real home for operator review (T25B).
-    ///
-    /// Pure offline listing; creates no runtime state and never starts a daemon.
-    EvidenceRejected,
     /// Prints one deterministic bounded telemetry page from an operator-selected local database.
     TelemetryQuery {
         /// Existing local SQLite database owned through Application's Store thread.
@@ -679,25 +514,6 @@ fn auto_managed_candidate(
     }
 }
 
-/// Matches `pairs` against the exact ordered `--flag value` sequence in `expected`.
-///
-/// Returns each value as `&str` in `expected`'s order, or `None` for a wrong element count, a
-/// flag out of order or misspelled, or a value that is not valid UTF-8.
-fn ordered_flags<'a>(pairs: &'a [OsString], expected: &[&str]) -> Option<Vec<&'a str>> {
-    if pairs.len() != expected.len() * 2 {
-        return None;
-    }
-    expected
-        .iter()
-        .enumerate()
-        .map(|(index, flag)| {
-            (pairs[index * 2] == *flag)
-                .then(|| pairs[index * 2 + 1].to_str())
-                .flatten()
-        })
-        .collect()
-}
-
 /// Matches the exact one-argument version spellings, handled before any other mode.
 fn is_version_request(arguments: &[OsString]) -> bool {
     matches!(
@@ -726,8 +542,8 @@ commands:
   claude-rendezvous <project-dir>         print the Claude runtime and helper socket paths
   errors [--repo <path>] [--all] [--summary] [--since <minutes>] [--limit <n>]
                                           read the error log
-  evidence record|executable ...          launcher evidence fragments
-  evidence rejected                       list captured rejected sandbox states
+  evidence executable --identity <id> <path>
+                                          accepted-executable launcher fragment
   launcher check <file>                   validate a launcher configuration
   telemetry query|export --database <file> [--tag <tag>] [--cursor <n>]
   -v, --version, version                  print the version
@@ -811,57 +627,6 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
             detail_ref: detail_ref.to_owned(),
         });
     }
-    // `evidence record` has its own fixed nine-flag shape, in the exact declared order; no flag
-    // may be reordered, omitted, or repeated. One optional trailing `--shape-version <1|2|3>` flag
-    // selects the record generation; the default is the v2 shape-based layout (T35B), and the
-    // legacy v1 layout must be requested explicitly.
-    if let [mode, sub, rest @ ..] = arguments.as_slice()
-        && mode == "evidence"
-        && sub == "record"
-    {
-        let (rest, shape_version) = match rest {
-            [head @ .., flag, value] if flag == "--shape-version" => {
-                let version = match value.to_str() {
-                    Some("1") => 1,
-                    Some("2") => 2,
-                    Some("3") => 3,
-                    _ => return Err(AppError::InvalidResponse),
-                };
-                (head, version)
-            }
-            _ => (rest, 2),
-        };
-        let values = ordered_flags(
-            rest,
-            &[
-                "--sandbox-state",
-                "--profile-id",
-                "--revision",
-                "--provider-binary",
-                "--toolchain",
-                "--configuration",
-                "--trust",
-                "--transport",
-                "--d03-evidence",
-            ],
-        )
-        .ok_or(AppError::InvalidResponse)?;
-        let revision = values[2]
-            .parse::<u32>()
-            .map_err(|_| AppError::InvalidResponse)?;
-        return Ok(Command::EvidenceRecord {
-            sandbox_state: PathBuf::from(values[0]),
-            profile_id: values[1].to_owned(),
-            revision,
-            provider_binary: values[3].to_owned(),
-            toolchain: values[4].to_owned(),
-            configuration: values[5].to_owned(),
-            trust: values[6].to_owned(),
-            transport: values[7].to_owned(),
-            d03_evidence: values[8].to_owned(),
-            shape_version,
-        });
-    }
     // `evidence executable` measures one file; the identity flag always precedes the bare path.
     if let [mode, sub, identity_flag, identity, path] = arguments.as_slice()
         && mode == "evidence"
@@ -877,13 +642,6 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
             identity: identity.to_owned(),
             path: PathBuf::from(path),
         });
-    }
-    // `evidence rejected` lists captured rejected sandbox states; it takes no flag at all.
-    if let [mode, sub] = arguments.as_slice()
-        && mode == "evidence"
-        && sub == "rejected"
-    {
-        return Ok(Command::EvidenceRejected);
     }
     // `errors` accepts its flags in any order, unlike every other mode above.
     if let [mode, rest @ ..] = arguments.as_slice()

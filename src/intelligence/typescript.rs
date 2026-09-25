@@ -689,7 +689,6 @@ impl TypeScriptProtocolChild {
         admission: &mut AdmissionController,
         view: ProviderViewLease,
         active_use: Option<ActiveBindingUse>,
-        codex_executable: &Path,
         output_cap: usize,
         path_proof: &ResolutionPathProof<'_>,
     ) -> Result<Self, TypeScriptProfileError> {
@@ -715,15 +714,9 @@ impl TypeScriptProtocolChild {
                 },
             ));
         }
-        OwnedProtocolChild::spawn_from_provider_lease(
-            request,
-            capability,
-            active_use,
-            codex_executable,
-            output_cap,
-        )
-        .map(|child| Self { child })
-        .map_err(TypeScriptProfileError::Process)
+        OwnedProtocolChild::spawn_from_provider_lease(request, capability, active_use, output_cap)
+            .map(|child| Self { child })
+            .map_err(TypeScriptProfileError::Process)
     }
 
     /// Borrows the sole stdout reader and stdin writer for the bounded LSP session.

@@ -332,7 +332,6 @@ impl PyrightProtocolChild {
         admission: &mut AdmissionController,
         view: ProviderViewLease,
         active_use: Option<ActiveBindingUse>,
-        codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, PyrightProfileError> {
         if profile.verify_script().is_err() {
@@ -352,15 +351,9 @@ impl PyrightProtocolChild {
                 settlement: capability.cancel(),
             }));
         }
-        OwnedProtocolChild::spawn_from_provider_lease(
-            request,
-            capability,
-            active_use,
-            codex_executable,
-            output_cap,
-        )
-        .map(|child| Self { child })
-        .map_err(PyrightProfileError::Process)
+        OwnedProtocolChild::spawn_from_provider_lease(request, capability, active_use, output_cap)
+            .map(|child| Self { child })
+            .map_err(PyrightProfileError::Process)
     }
 
     /// Borrows the sole stdout reader and stdin writer for the bounded session exchange.

@@ -498,7 +498,6 @@ impl RustProtocolChild {
         registry: &mut ProviderLeaseRegistry,
         view: ProviderViewLease,
         active_use: Option<ActiveBindingUse>,
-        codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, RustProfileError> {
         let capability = registry
@@ -513,15 +512,9 @@ impl RustProtocolChild {
             }));
         }
 
-        OwnedProtocolChild::spawn_from_provider_lease(
-            request,
-            capability,
-            active_use,
-            codex_executable,
-            output_cap,
-        )
-        .map(|child| Self { child })
-        .map_err(RustProfileError::Process)
+        OwnedProtocolChild::spawn_from_provider_lease(request, capability, active_use, output_cap)
+            .map(|child| Self { child })
+            .map_err(RustProfileError::Process)
     }
 
     /// Returns the sole stdin writer owned by this protocol lifecycle.

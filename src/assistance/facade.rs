@@ -1277,10 +1277,7 @@ impl StdioFacade {
         let (call_id, selected) = match parse_host_kind(&context.meta).ok()? {
             HostKind::Codex => {
                 let candidate = parse_candidate(&context.meta).ok()?;
-                let mut selected = json!({"threadId":candidate.actor_id(),"callId":candidate.call_id(),"x-codex-turn-metadata":{}});
-                if let Some(state) = context.meta.get("codex/sandbox-state-meta") {
-                    selected["codex/sandbox-state-meta"] = state.clone();
-                }
+                let selected = json!({"threadId":candidate.actor_id(),"callId":candidate.call_id(),"x-codex-turn-metadata":{}});
                 (candidate.call_id().to_owned(), selected)
             }
             HostKind::Claude => {
@@ -1691,14 +1688,11 @@ fn debug_redacts_trusted_transport_and_host_metadata() {
 
 #[rmcp::tool_handler(router = self.router)]
 impl rmcp::ServerHandler for StdioFacade {
-    /// Requests the measured Codex sandbox-state envelope without claiming its authority.
+    /// Advertises only the tool surface; no host sandbox metadata is requested.
     fn get_info(&self) -> rmcp::model::ServerInfo {
-        let mut experimental = rmcp::model::ExperimentalCapabilities::new();
-        experimental.insert("codex/sandbox-state-meta".into(), Default::default());
         rmcp::model::ServerInfo::new(
             rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
-                .enable_experimental_with(experimental)
                 .build(),
         )
     }

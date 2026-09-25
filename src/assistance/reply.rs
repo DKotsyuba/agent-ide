@@ -31,8 +31,6 @@ pub enum MissingPeer {
 pub enum FailureCode {
     /// Trusted attachment mapping is missing or rejected.
     LauncherConfiguration,
-    /// Required measured Codex sandbox metadata is absent or invalid.
-    SandboxState,
     /// Accepted executable/profile evidence does not authorize this operation.
     ExecutionProfile,
     /// Execution-profile refusal with one fixed, privacy-safe cause.
@@ -77,44 +75,12 @@ pub enum FailureCode {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionProfileCause {
-    /// The disabled host was not admitted by launcher policy.
-    HostDisabled,
-    /// No managed profile matches the observed state.
-    NoProfileManaged,
-    /// No disabled profile matches the observed state.
-    NoProfileDisabled,
-    /// The managed profile digest differs.
-    DigestMismatchManaged,
-    /// The disabled profile digest differs.
-    DigestMismatchDisabled,
-    /// The managed shape is unsupported.
-    ShapeUnsupportedManaged,
-    /// The disabled shape is unsupported.
-    ShapeUnsupportedDisabled,
-    /// The managed shape is not narrower than its template.
-    ShapeNotNarrowerManaged,
-    /// The disabled shape is not narrower than its template.
-    ShapeNotNarrowerDisabled,
-    /// A managed write root can reach the workspace's common Git metadata.
-    GitMetadataWriteOverlap,
     /// Git execution policy could not be built.
     GitPolicy,
     /// The Git discovery query was refused.
     QueryPolicy,
     /// The accepted Git binary lacked a required operation.
     GitUnsupported,
-    /// The read binding differs from the active one.
-    ReadBindingMismatch,
-    /// The observed read profile was unavailable.
-    ReadObservedStateUnavailable,
-    /// The read sandbox cwd differs from its workspace.
-    ReadSandboxCwdMismatch,
-    /// The requested read path was not proven.
-    ReadPathUnproven,
-    /// The managed host could not prove read coverage for the whole worktree.
-    ReadWholeTreeUnproven,
-    /// Another fixed read-scope condition refused the operation.
-    ReadRefused,
     /// Child process creation failed before a usable process existed.
     SpawnIo,
     /// The process request failed validation.
@@ -126,28 +92,12 @@ pub enum ExecutionProfileCause {
 }
 
 impl ExecutionProfileCause {
-    /// Converts only exact closed log tags into agent-visible causes; capture suffixes are excluded.
+    /// Converts only exact closed log tags into agent-visible causes.
     pub fn from_log_tag(tag: &str) -> Option<Self> {
         Some(match tag.split(';').next()?.trim() {
-            "host_disabled" => Self::HostDisabled,
-            "no_profile_for_class:managed" => Self::NoProfileManaged,
-            "no_profile_for_class:disabled" => Self::NoProfileDisabled,
-            "profile_digest_mismatch:managed" => Self::DigestMismatchManaged,
-            "profile_digest_mismatch:disabled" => Self::DigestMismatchDisabled,
-            "shape_unsupported:managed" => Self::ShapeUnsupportedManaged,
-            "shape_unsupported:disabled" => Self::ShapeUnsupportedDisabled,
-            "shape_not_narrower:managed" => Self::ShapeNotNarrowerManaged,
-            "shape_not_narrower:disabled" => Self::ShapeNotNarrowerDisabled,
-            "git_metadata_write_overlap" => Self::GitMetadataWriteOverlap,
             "git_policy" => Self::GitPolicy,
             "query_policy" => Self::QueryPolicy,
             "git_unsupported" => Self::GitUnsupported,
-            "read_scope:binding_mismatch" => Self::ReadBindingMismatch,
-            "read_scope:observed_state_unavailable" => Self::ReadObservedStateUnavailable,
-            "read_scope:sandbox_cwd_mismatch" => Self::ReadSandboxCwdMismatch,
-            "read_scope:path_unproven" => Self::ReadPathUnproven,
-            "read_scope:whole_tree_unproven" => Self::ReadWholeTreeUnproven,
-            "read_scope:refused" => Self::ReadRefused,
             "spawn:io" => Self::SpawnIo,
             "spawn:request" => Self::SpawnRequest,
             "spawn:protocol_stdout_reserved" => Self::SpawnProtocolStdoutReserved,
@@ -159,25 +109,9 @@ impl ExecutionProfileCause {
     /// Returns the exact existing closed log tag for this refusal.
     pub const fn tag(self) -> &'static str {
         match self {
-            Self::HostDisabled => "host_disabled",
-            Self::NoProfileManaged => "no_profile_for_class:managed",
-            Self::NoProfileDisabled => "no_profile_for_class:disabled",
-            Self::DigestMismatchManaged => "profile_digest_mismatch:managed",
-            Self::DigestMismatchDisabled => "profile_digest_mismatch:disabled",
-            Self::ShapeUnsupportedManaged => "shape_unsupported:managed",
-            Self::ShapeUnsupportedDisabled => "shape_unsupported:disabled",
-            Self::ShapeNotNarrowerManaged => "shape_not_narrower:managed",
-            Self::ShapeNotNarrowerDisabled => "shape_not_narrower:disabled",
-            Self::GitMetadataWriteOverlap => "git_metadata_write_overlap",
             Self::GitPolicy => "git_policy",
             Self::QueryPolicy => "query_policy",
             Self::GitUnsupported => "git_unsupported",
-            Self::ReadBindingMismatch => "read_scope:binding_mismatch",
-            Self::ReadObservedStateUnavailable => "read_scope:observed_state_unavailable",
-            Self::ReadSandboxCwdMismatch => "read_scope:sandbox_cwd_mismatch",
-            Self::ReadPathUnproven => "read_scope:path_unproven",
-            Self::ReadWholeTreeUnproven => "read_scope:whole_tree_unproven",
-            Self::ReadRefused => "read_scope:refused",
             Self::SpawnIo => "spawn:io",
             Self::SpawnRequest => "spawn:request",
             Self::SpawnProtocolStdoutReserved => "spawn:protocol_stdout_reserved",

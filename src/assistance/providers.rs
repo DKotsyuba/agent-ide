@@ -225,9 +225,7 @@ impl Worker<'_> {
         binding: &BindingRef,
         authority: &AuthorityStamp,
         launches: &[ProviderLaunch],
-        managed_sandbox: bool,
         shared_go: bool,
-        rights: &str,
     ) -> Result<(), FailureCode> {
         let root = CacheRoot::prepare(self.runtime.join("cache"))
             .map_err(|_| FailureCode::ProviderUnavailable)?;
@@ -239,8 +237,8 @@ impl Worker<'_> {
         let mut plan = Vec::with_capacity(launches.len() * 2);
         for launch in launches {
             let settings = provider_cache_settings(launch.settings);
-            let configuration = effective_configuration(launch.settings, managed_sandbox);
-            let trust = effective_trust(launch, rights);
+            let configuration = effective_configuration(launch.settings);
+            let trust = effective_trust(launch);
             plan.push(CacheRequest {
                 key: provider_cache_key(&worktree_state, launch, settings, &trust),
                 identity: CacheIdentity::new(
@@ -310,12 +308,11 @@ impl Worker<'_> {
         binding: &BindingRef,
         authority: &AuthorityStamp,
         launches: &[ProviderLaunch],
-        rights: &str,
     ) -> Result<Vec<(AcceptedProviderSettings, String)>, FailureCode> {
         launches
             .iter()
             .map(|launch| {
-                let trust = effective_trust(launch, rights);
+                let trust = effective_trust(launch);
                 self.provider_cache_namespace(binding, authority, launch, &trust)
                     .map(|path| (launch.settings, path))
             })
@@ -406,23 +403,6 @@ impl Worker<'_> {
         else {
             return Ok(None);
         };
-        let binding = job.invocation.binding_ref();
-        let authority = execution_authority(&self.authority(binding).await?)?;
-        let observed = job.observed.clone().ok_or(FailureCode::SandboxState)?;
-        crate::execution::validate_workspace_read(
-            self.shared.active(binding)?,
-            observed,
-            &authority,
-            &job.target.catalog,
-            job.target.allow_disabled_host,
-            crate::execution::ReadScope::Path(source.path()),
-        )
-        .map_err(|error| {
-            FailureCode::ExecutionProfileCause(
-                ExecutionProfileCause::from_log_tag(&read_scope_detail(&error))
-                    .expect("read-scope refusal has a closed execution-profile tag"),
-            )
-        })?;
         match required {
             AcceptedProviderSettings::GoplsDefaults => self
                 .go_context(job, &profile, source, bytes, query)
@@ -462,29 +442,9 @@ impl Worker<'_> {
         let bundle = launch
             .typescript_bundle()
             .map_err(|_| FailureCode::ExecutionProfile)?;
-        // T36B: the resolution inputs are auxiliary native reads — proving the requested
-        // source never authorizes them — so every candidate is proven per path under the
-        // live cwd-bound profile before Workspace touches it.
-        let shared = self.shared.clone();
-        let observed = job.observed.clone();
-        let target = job.target.clone();
-        let stamp = authority.clone();
-        let proof_binding = binding.clone();
-        let method = errorlog_method(job.tool);
-        let path_proof = move |path: &Path| {
-            observed.as_ref().is_some_and(|observed| {
-                validate_read_scope(
-                    &shared,
-                    &proof_binding,
-                    observed,
-                    &target,
-                    &stamp,
-                    method,
-                    crate::execution::ReadScope::Path(path),
-                )
-                .is_ok()
-            })
-        };
+        // Resolution inputs are auxiliary native reads below the admitted worktree; the
+        // allowed-roots gate for ancestors outside it lands with the new path policy.
+        let path_proof = |_path: &Path| true;
         let resolution = ProjectResolutionInputsV1::observe(
             authority.worktree().clone(),
             authority.worktree().worktree_path().join(source.path()),
@@ -554,7 +514,6 @@ impl Worker<'_> {
                 &mut admission,
                 view.lease(),
                 Some(active),
-                &job.target.codex.path,
                 self.shared.launcher.limits.output_bytes,
                 &path_proof,
             )
@@ -757,7 +716,6 @@ impl Worker<'_> {
                 &mut admission,
                 view.lease(),
                 Some(active),
-                &job.target.codex.path,
                 self.shared.launcher.limits.output_bytes,
             )
         };
@@ -835,7 +793,6 @@ impl Worker<'_> {
         let authority = self.authority(&binding).await?;
         let cache_namespace =
             self.provider_cache_namespace(&binding, &authority, launch, &launch.trust)?;
-        let managed_sandbox = managed_sandbox_from_job(job);
         let profile = RustProfile::new(RustProfileIdentity {
             binary: launch.executable.path.clone(),
             rust_analyzer_version: launch.executable.identity.clone(),
@@ -860,7 +817,7 @@ impl Worker<'_> {
                 .clone()
                 .ok_or(FailureCode::ExecutionProfile)?,
             rustup_toolchain: launch.toolchain.clone(),
-            configuration: effective_configuration(launch.settings, managed_sandbox).into(),
+            configuration: effective_configuration(launch.settings).into(),
             trust: launch.trust.clone(),
             transport: "stdio-v1".into(),
             cache_namespace,
@@ -912,7 +869,6 @@ impl Worker<'_> {
             &mut self.providers.registry,
             view.lease(),
             Some(active),
-            &job.target.codex.path,
             self.shared.launcher.limits.output_bytes,
         ) {
             Ok(child) => child,
@@ -990,7 +946,7 @@ impl Worker<'_> {
         let generation = self.providers.next()?;
         let binding = job.invocation.binding_ref().clone();
         let authority = self.authority(&binding).await?;
-        let trust = effective_trust(launch, &effective_rights_from_job(job)?);
+        let trust = effective_trust(launch);
         let worktree_namespace =
             self.provider_cache_namespace(&binding, &authority, launch, &trust)?;
         let shared_namespace = self.provider_shared_cache_namespace(&binding, launch, &trust)?;
@@ -1078,7 +1034,6 @@ impl Worker<'_> {
                     &request,
                     capability,
                     Some(active),
-                    &job.target.codex.path,
                     self.shared.launcher.limits.output_bytes,
                 ) {
                     Ok(listener) => listener,
@@ -1207,7 +1162,6 @@ impl Worker<'_> {
             &request,
             capability,
             Some(active),
-            &job.target.codex.path,
             self.shared.launcher.limits.output_bytes,
         ) {
             Ok(view) => view,
@@ -1576,30 +1530,14 @@ fn provider_cache_settings(settings: AcceptedProviderSettings) -> &'static str {
     }
 }
 
-/// Returns the exact initialization configuration identity a provider command will use, so the
-/// retained `CacheIdentity` never claims compatibility across a managed/non-managed sandbox change
-/// it never actually observed. `gopls` has no managed variant and keeps its one fixed identity.
-fn effective_configuration(
-    settings: AcceptedProviderSettings,
-    managed_sandbox: bool,
-) -> &'static str {
+/// Returns the exact initialization configuration identity a provider command will use.
+fn effective_configuration(settings: AcceptedProviderSettings) -> &'static str {
     match settings {
         AcceptedProviderSettings::GoplsDefaults => "gopls-defaults-v1",
-        AcceptedProviderSettings::RustCachePrimingDisabledV1 if managed_sandbox => {
-            "cache-priming-and-proc-macro-disabled-v1"
-        }
         AcceptedProviderSettings::RustCachePrimingDisabledV1 => "cache-priming-disabled-v1",
         AcceptedProviderSettings::PyrightDefaultsV1 => "pyright-defaults-v1",
         AcceptedProviderSettings::TypeScriptDefaultsV1 => "typescript-defaults-v1",
     }
-}
-
-/// Returns whether the job's observed sandbox permission profile is the managed Claude profile.
-pub(super) fn managed_sandbox_from_job(job: &Job) -> bool {
-    job.observed
-        .as_ref()
-        .and_then(|observed| observed.state().as_json()["permissionProfile"]["type"].as_str())
-        == Some("managed")
 }
 
 /// Fixed compatibility-identity marker used only by the shared native namespace.
@@ -1609,32 +1547,10 @@ pub(super) fn managed_sandbox_from_job(job: &Job) -> bool {
 /// through it, to the same one heavy `gopls` listener.
 pub(super) const SHARED_NATIVE_CACHE_STATE: &str = "shared-native-v1";
 
-/// Returns the one canonical effective-rights identity used by the cache key, the `CacheIdentity`,
-/// the `GoplsProfile` compatibility key, and the shared refcount.
-///
-/// `gopls` backends are shared, so their identity binds the launch trust to the effective rights
-/// the observed sandbox state actually grants (see `HostSandboxState::effective_rights_identity`);
-/// an exclusive Rust view keeps its launch trust unchanged. Deriving all four from this one value
-/// is what prevents a partially normalized hash from admitting an actor to a listener whose cache
-/// key it does not actually match.
-fn effective_trust(launch: &ProviderLaunch, rights: &str) -> String {
-    match launch.settings {
-        AcceptedProviderSettings::GoplsDefaults => format!("{}|{}", launch.trust, rights),
-        AcceptedProviderSettings::RustCachePrimingDisabledV1 => launch.trust.clone(),
-        AcceptedProviderSettings::PyrightDefaultsV1 => launch.trust.clone(),
-        AcceptedProviderSettings::TypeScriptDefaultsV1 => launch.trust.clone(),
-    }
-}
-
-/// Returns the job's canonical effective-rights identity, or the finite missing-state failure.
-pub(super) fn effective_rights_from_job(job: &Job) -> Result<String, FailureCode> {
-    Ok(crate::execution::effective_rights_identity(
-        job.observed
-            .as_ref()
-            .ok_or(FailureCode::SandboxState)?
-            .state()
-            .as_json(),
-    ))
+/// Returns the one canonical trust identity used by the cache key, the `CacheIdentity`, the
+/// `GoplsProfile` compatibility key, and the shared refcount.
+fn effective_trust(launch: &ProviderLaunch) -> String {
+    launch.trust.clone()
 }
 
 /// Derives one opaque namespace component from durable worktree and accepted provider identities.

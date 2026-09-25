@@ -1,20 +1,19 @@
 //! Admission and owned-child supervision for controlled Agent IDE effects.
 //!
-//! This module deliberately accepts only peer-validated authority and controlled commands. It
-//! preserves a managed Codex sandbox state as opaque JSON and refuses profiles whose filesystem
-//! authority cannot be replayed exactly.
+//! This module deliberately accepts only peer-validated authority and controlled commands. Owned
+//! children run as ordinary processes of the daemon's user: the IDE's only path policy is the
+//! configured `allowed_roots` list, which Assistance enforces before a request reaches here.
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::OsString,
-    io::{self, Read, Write},
+    io::{self, Read},
     path::{Component, Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
-use serde_json::Value;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::{Child, ChildStdin, ChildStdout, Command},
@@ -22,1136 +21,48 @@ use tokio::{
     time::timeout,
 };
 
-use crate::assistance::host_binding::{
-    ActiveBindingUse, ObservedSandboxState, SANDBOX_STATE_FIELDS, SandboxStateProvenance,
-};
+use crate::assistance::host_binding::{ActiveBindingUse, BindingRef};
 use crate::workspace::git::discovery::validate_current_git_metadata;
-
-mod profile_shape;
-
-use profile_shape::{Access, ProfileShapeV2, ProfileShapeV3, Selector, UnsupportedShape};
-
-/// Classifies the host permission profile whose complete state accompanies a request.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum ProfileClass {
-    /// A managed profile is replayed by `codex sandbox --sandbox-state-json`.
-    Managed,
-    /// A disabled profile has no outer sandbox and requires explicit local acceptance.
-    Disabled,
-}
-
-/// Reports why opaque host sandbox state cannot authorize an owned child.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SandboxStateError {
-    /// The host did not provide the experimental state payload.
-    Missing,
-    /// The payload is not an object with the required fields.
-    Malformed,
-    /// An external profile has no concrete filesystem scope to replay.
-    ExternalUnsupported,
-    /// The profile class is not one Execution knows how to preserve.
-    UnsupportedProfile,
-    /// The supplied sandbox cwd is neither an absolute path nor a supported local file URI.
-    UnsupportedCwd,
-}
-
-/// Maximum accepted profiles in one catalog across every host profile class (T25B).
-pub const MAX_ACCEPTED_PROFILES: usize = 8;
-
-/// The versioned comparison data one accepted template carries (T35B).
-///
-/// A template stores what its admission proof needs, not only a digest: v1 compares exact
-/// legacy digests, v2 compares the accepted rule structure, and v3 first proves one complete
-/// visualization-leaf group. Generations are never mixed inside one proof.
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum TemplateShape {
-    /// Legacy exact-digest admission; behaviour is byte-for-byte unchanged (T35B).
-    V1 {
-        /// The worktree-portable legacy profile digest; the template's v1 identity.
-        profile_digest: blake3::Hash,
-    },
-    /// Conservative shape-based admission via the seven sufficient narrowing conditions.
-    V2 {
-        /// The complete accepted rule structure derived from the captured state.
-        shape: ProfileShapeV2,
-    },
-    /// Opt-in task-specific visualization leaf family with unchanged v2 baseline proof.
-    V3 {
-        /// Captured family and accepted visualization namespace.
-        shape: ProfileShapeV3,
-    },
-}
-
-/// Names the tested host mechanism/profile class that Execution supports across worktrees.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExecutionProfileTemplate {
-    /// Stable Execution-owned profile name, never an invocation input.
-    id: String,
-    /// Execution-owned revision of the tested mechanism and profile shape.
-    version: u32,
-    /// Host profile class covered by this template.
-    class: ProfileClass,
-    /// Versioned comparison data; its digest is the template's identity, so two accepted
-    /// templates never share one (each generation has a separate digest domain).
-    shape: TemplateShape,
-}
-
-/// Holds Execution-owned templates whose real evidence permits physical effects.
-#[derive(Clone, Debug)]
-pub struct ExecutionProfileCatalog {
-    /// Up to [`MAX_ACCEPTED_PROFILES`] tested templates; several may share one class (T25B).
-    templates: BTreeMap<ProfileClass, Vec<ExecutionProfileTemplate>>,
-}
-
-/// Is the durable, Execution-owned record that Application may store without interpreting it.
-///
-/// Every identity is an opaque, nonempty value supplied by the verified Execution evidence
-/// pipeline.  The record deliberately stores the semantic state digest alongside its separate
-/// provider/toolchain/config/trust/transport identities: matching a template name alone never
-/// makes a changed profile executable.
-///
-/// Records are versioned by `shape_version` (T35B): an absent field is the legacy v1 layout and
-/// keeps its exact digest algorithms and field set byte-for-byte; explicit `2` or `3` adds the
-/// field, stores its domain-separated shape digest in `permission_value`, and stores the
-/// domain-separated digest of the complete captured state in `semantic_state`. Any other value,
-/// an explicit `1`, or an unknown field fails closed; a v1 record is never silently upgraded or
-/// reinterpreted.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PersistedProfileRecord {
-    /// Stable profile-template identity selected by Execution code.
-    pub profile_id: String,
-    /// Monotonic Execution-owned template revision.
-    pub revision: u32,
-    /// Supported host class recorded with the evidence; unknown values are unavailable.
-    pub class: ProfileClass,
-    /// Exact provider binary identity observed by the D03 run.
-    pub provider_binary: String,
-    /// Exact toolchain identity observed by the D03 run.
-    pub toolchain: String,
-    /// Effective provider configuration identity observed by the D03 run.
-    pub configuration: String,
-    /// Effective trust decision identity observed by the D03 run.
-    pub trust: String,
-    /// Sandbox transport/mechanism identity observed by the D03 run.
-    pub transport: String,
-    /// V1: effective permission-value identity with only worktree-local path prefixes made
-    /// portable. V2/V3: the generation-specific profile-shape digest of the captured state.
-    pub permission_value: String,
-    /// Immutable D03 evidence identity for this tested record.
-    pub d03_evidence: String,
-    /// V1: semantic state identity with only worktree-local path prefixes made portable.
-    /// V2/V3: the domain-separated canonical digest of the complete captured state, including its
-    /// actual cwd and all restrictions.
-    pub semantic_state: String,
-    /// `None` is v1; `Some(2)` and `Some(3)` select the closed shape generations.
-    shape_version: Option<u32>,
-}
-
-/// The record's eleven v1 identity fields, in the v1 JSON layout order.
-const RECORD_IDENTITY_FIELDS: &[&str] = &[
-    "profile_id",
-    "revision",
-    "class",
-    "provider_binary",
-    "toolchain",
-    "configuration",
-    "trust",
-    "transport",
-    "permission_value",
-    "d03_evidence",
-    "semantic_state",
-];
-
-/// Carries the non-state identities captured by one verified D03 profile experiment.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct D03ProfileEvidence {
-    /// Exact provider binary identity from the experiment.
-    pub provider_binary: String,
-    /// Exact toolchain identity from the experiment.
-    pub toolchain: String,
-    /// Effective provider configuration identity from the experiment.
-    pub configuration: String,
-    /// Effective local trust identity from the experiment.
-    pub trust: String,
-    /// Sandbox transport identity from the experiment.
-    pub transport: String,
-    /// Immutable D03 result identity from the experiment.
-    pub d03_evidence: String,
-}
-
-impl PersistedProfileRecord {
-    /// Creates a complete record from one verified D03 result and the exact observed host state.
-    ///
-    /// Each supplied identity must be nonempty and comes from the Execution verification path,
-    /// never from a model request or a persisted record being replayed. This constructor mints
-    /// the legacy v1 layout; see [`PersistedProfileRecord::from_execution_evidence_versioned`].
-    pub fn from_execution_evidence(
-        profile_id: impl Into<String>,
-        revision: u32,
-        evidence: D03ProfileEvidence,
-        state: &HostSandboxState,
-    ) -> Result<Self, RequestError> {
-        Self::from_execution_evidence_versioned(profile_id, revision, evidence, state, 1)
-    }
-
-    /// Creates a v2 record from one verified D03 result and the exact captured state (T35B).
-    ///
-    /// `permission_value` becomes the domain-separated profile-shape digest and
-    /// `semantic_state` the separately domain-separated canonical digest of the complete
-    /// captured state, including its actual cwd and all restrictions. The state must derive a
-    /// supported profile-shape v2 value; unsupported shapes are denied instead of downgraded.
-    pub fn from_execution_evidence_v2(
-        profile_id: impl Into<String>,
-        revision: u32,
-        evidence: D03ProfileEvidence,
-        state: &HostSandboxState,
-    ) -> Result<Self, RequestError> {
-        Self::from_execution_evidence_versioned(profile_id, revision, evidence, state, 2)
-    }
-
-    /// Builds one versioned record; `shape_version` is 1, 2, or opt-in visualization v3.
-    ///
-    /// Minting v3 reads the current visualization namespace and leaf metadata and refuses
-    /// unsupported or redirected paths. Restoration later skips old visualization filesystem
-    /// checks while retaining the existing v2 cwd binding.
-    pub fn from_execution_evidence_versioned(
-        profile_id: impl Into<String>,
-        revision: u32,
-        evidence: D03ProfileEvidence,
-        state: &HostSandboxState,
-        shape_version: u32,
-    ) -> Result<Self, RequestError> {
-        let (permission_value, semantic_state, shape_version) = match shape_version {
-            1 => (
-                state.profile_digest().to_hex().to_string(),
-                semantic_state_identity(state),
-                None,
-            ),
-            2 => {
-                let shape = state
-                    .shape_v2(state.cwd())
-                    .map_err(|_| RequestError::ExecutionProfileDenied)?;
-                (
-                    shape.digest().to_hex().to_string(),
-                    captured_state_identity_v2(state),
-                    Some(2),
-                )
-            }
-            3 => {
-                let shape = state
-                    .shape_v3(state.cwd())
-                    .map_err(|_| RequestError::ExecutionProfileDenied)?;
-                (
-                    shape.digest().to_hex().to_string(),
-                    captured_state_identity_v2(state),
-                    Some(3),
-                )
-            }
-            _ => return Err(RequestError::ExecutionProfileDenied),
-        };
-        let record = Self {
-            profile_id: profile_id.into(),
-            revision,
-            class: state.class(),
-            provider_binary: evidence.provider_binary,
-            toolchain: evidence.toolchain,
-            configuration: evidence.configuration,
-            trust: evidence.trust,
-            transport: evidence.transport,
-            permission_value,
-            d03_evidence: evidence.d03_evidence,
-            semantic_state,
-            shape_version,
-        };
-        (record.revision != 0
-            && [
-                &record.profile_id,
-                &record.provider_binary,
-                &record.toolchain,
-                &record.configuration,
-                &record.trust,
-                &record.transport,
-                &record.permission_value,
-                &record.d03_evidence,
-                &record.semantic_state,
-            ]
-            .iter()
-            .all(|value| !value.is_empty()))
-        .then_some(record)
-        .ok_or(RequestError::ExecutionProfileDenied)
-    }
-
-    /// Validates an opaque durable record before Execution may use it to rebuild a catalog.
-    ///
-    /// This is the version-aware, closed record parser (T35B): the field set must be exactly the
-    /// eleven v1 identities, or exactly those plus `shape_version: 2` or `3`. Empty identities, zero
-    /// revisions, malformed JSON, unknown or missing fields, an explicit `shape_version: 1`
-    /// (a mixed layout: v1 records never carried the field), or any unsupported version value are
-    /// unavailable. Application only persists the returned JSON; permit minting stays in
-    /// `ExecutionProfileCatalog`.
-    pub fn from_json(json: &str) -> Result<Self, RequestError> {
-        let value: Value =
-            serde_json::from_str(json).map_err(|_| RequestError::ExecutionProfileDenied)?;
-        let object = value
-            .as_object()
-            .ok_or(RequestError::ExecutionProfileDenied)?;
-        let shape_version = match object.get("shape_version") {
-            None => None,
-            Some(value) => {
-                if !matches!(value.as_u64(), Some(2 | 3)) {
-                    return Err(RequestError::ExecutionProfileDenied);
-                }
-                Some(value.as_u64().unwrap() as u32)
-            }
-        };
-        let expected_len = RECORD_IDENTITY_FIELDS.len() + usize::from(shape_version.is_some());
-        if object.len() != expected_len
-            || !object
-                .keys()
-                .all(|key| RECORD_IDENTITY_FIELDS.contains(&key.as_str()) || key == "shape_version")
-        {
-            return Err(RequestError::ExecutionProfileDenied);
-        }
-        let string = |name: &str| {
-            object
-                .get(name)
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-                .ok_or(RequestError::ExecutionProfileDenied)
-        };
-        let revision = object
-            .get("revision")
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-            .filter(|value| *value != 0)
-            .ok_or(RequestError::ExecutionProfileDenied)?;
-        let class = match object.get("class").and_then(Value::as_str) {
-            Some("managed") => ProfileClass::Managed,
-            Some("disabled") => ProfileClass::Disabled,
-            _ => return Err(RequestError::ExecutionProfileDenied),
-        };
-        Ok(Self {
-            profile_id: string("profile_id")?,
-            revision,
-            class,
-            provider_binary: string("provider_binary")?,
-            toolchain: string("toolchain")?,
-            configuration: string("configuration")?,
-            trust: string("trust")?,
-            transport: string("transport")?,
-            permission_value: string("permission_value")?,
-            d03_evidence: string("d03_evidence")?,
-            semantic_state: string("semantic_state")?,
-            shape_version,
-        })
-    }
-
-    /// Serializes this complete record in a stable field layout for Application's opaque store.
-    ///
-    /// A v1 record emits exactly eleven fields; v2 and v3 add their shape version.
-    pub fn to_json(&self) -> String {
-        let mut record = serde_json::json!({
-            "profile_id": self.profile_id,
-            "revision": self.revision,
-            "class": match self.class { ProfileClass::Managed => "managed", ProfileClass::Disabled => "disabled" },
-            "provider_binary": self.provider_binary,
-            "toolchain": self.toolchain,
-            "configuration": self.configuration,
-            "trust": self.trust,
-            "transport": self.transport,
-            "permission_value": self.permission_value,
-            "d03_evidence": self.d03_evidence,
-            "semantic_state": self.semantic_state,
-        });
-        if let Some(shape_version) = self.shape_version {
-            record["shape_version"] = Value::from(shape_version);
-        }
-        record.to_string()
-    }
-
-    /// Returns whether this durable record is exactly applicable to the supplied observed state.
-    ///
-    /// v1 compares the legacy portable identities exactly. v2 and v3 verify both of their
-    /// identities against the supplied capture: the domain-separated shape digest and the
-    /// domain-separated digest of the complete captured state (T35B). Restoration uses exact
-    /// evidence matching; v3 checks the captured visualization structure without requiring its
-    /// old namespace to still exist. Live filesystem checks occur later in `permit` and at spawn.
-    pub fn matches_state(&self, state: &HostSandboxState) -> bool {
-        match self.shape_version {
-            None => {
-                self.semantic_state == semantic_state_identity(state)
-                    && self.permission_value == state.profile_digest().to_hex().to_string()
-            }
-            Some(2) => match state.shape_v2(state.cwd()) {
-                Ok(shape) => {
-                    self.semantic_state == captured_state_identity_v2(state)
-                        && self.permission_value == shape.digest().to_hex().to_string()
-                }
-                Err(_) => false,
-            },
-            Some(3) => match state.shape_v3_stored(state.cwd()) {
-                Ok(shape) => {
-                    self.semantic_state == captured_state_identity_v2(state)
-                        && self.permission_value == shape.digest().to_hex().to_string()
-                }
-                Err(_) => false,
-            },
-            Some(_) => false,
-        }
-    }
-}
-
-/// Correlates one invocation's full opaque state with its supporting profile template.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExecutionProfilePermit {
-    /// Tested template that authorizes this class of execution, not a fixture directory.
-    template: ExecutionProfileTemplate,
-    /// Full-state digest retained only for operation evidence and later lookup correlation.
-    state_digest: blake3::Hash,
-}
-
-impl ExecutionProfilePermit {
-    /// Rechecks a v3 live leaf and namespace against this exact accepted family before spawn.
-    ///
-    /// `trusted_cwd` is the same candidate used at permit admission. V1/v2 require no extra
-    /// filesystem access; malformed paths, a missing namespace, redirection, or widening refuse.
-    fn recheck_live_v3(
-        &self,
-        state: &HostSandboxState,
-        trusted_cwd: &Path,
-    ) -> Result<(), RequestError> {
-        if let TemplateShape::V3 { shape } = &self.template.shape {
-            let live = state.shape_v3(trusted_cwd).map_err(|_| {
-                RequestError::ExecutionProfileShapeUnsupported(ProfileClass::Managed)
-            })?;
-            if !live.prove_narrower(shape) {
-                return Err(RequestError::ExecutionProfileShapeNotNarrower(
-                    ProfileClass::Managed,
-                ));
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Holds an entire host-provided sandbox state without expanding its roots or rewriting policy.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HostSandboxState {
-    /// Parsed state copy used only for validation and profile-shape comparison.
-    raw: Value,
-    /// Original JSON text retained byte-for-byte for the managed Codex sandbox argument.
-    raw_json: String,
-    /// Accepted high-level profile class derived from the state envelope.
-    class: ProfileClass,
-    /// Exact host-selected sandbox cwd retained unchanged inside `raw` for Codex replay.
-    sandbox_cwd: String,
-    /// Local filesystem cwd derived only for `Command::current_dir`, never written back to `raw`.
-    cwd: PathBuf,
-}
-
-impl HostSandboxState {
-    /// Validates the envelope shape while retaining the supplied state for exact replay.
-    ///
-    /// `raw` must be the complete value advertised by `codex/sandbox-state-meta`; a missing,
-    /// external, proxy, or unknown profile is rejected. This function does not infer authority
-    /// from a path or expand special path syntax.
-    pub fn parse(raw: Option<Value>) -> Result<Self, SandboxStateError> {
-        let raw = raw.ok_or(SandboxStateError::Missing)?;
-        let raw_json = raw.to_string();
-        Self::parse_value(raw, raw_json)
-    }
-
-    /// Parses captured JSON while retaining its exact original bytes for sandbox replay.
-    pub fn parse_json(raw_json: &str) -> Result<Self, SandboxStateError> {
-        let raw = serde_json::from_str(raw_json).map_err(|_| SandboxStateError::Malformed)?;
-        Self::parse_value(raw, raw_json.to_owned())
-    }
-
-    /// Validates one parsed state while associating it with the exact JSON argument to replay.
-    fn parse_value(raw: Value, raw_json: String) -> Result<Self, SandboxStateError> {
-        let object = raw.as_object().ok_or(SandboxStateError::Malformed)?;
-        let permission_profile = object
-            .get("permissionProfile")
-            .and_then(Value::as_object)
-            .ok_or(SandboxStateError::Malformed)?;
-        let profile_type = permission_profile
-            .get("type")
-            .and_then(Value::as_str)
-            .ok_or(SandboxStateError::Malformed)?;
-        let sandbox_cwd = object
-            .get("sandboxCwd")
-            .and_then(Value::as_str)
-            .filter(|cwd| !cwd.is_empty())
-            .map(str::to_owned)
-            .ok_or(SandboxStateError::Malformed)?;
-        let cwd = local_sandbox_cwd(&sandbox_cwd)?;
-        let class = match profile_type {
-            "managed"
-                if permission_profile.contains_key("file_system")
-                    && permission_profile.contains_key("network")
-                    && !has_multiple_roots(permission_profile) =>
-            {
-                ProfileClass::Managed
-            }
-            "managed" => return Err(SandboxStateError::UnsupportedProfile),
-            "disabled" => ProfileClass::Disabled,
-            "external" => return Err(SandboxStateError::ExternalUnsupported),
-            _ => return Err(SandboxStateError::UnsupportedProfile),
-        };
-        Ok(Self {
-            raw,
-            raw_json,
-            class,
-            sandbox_cwd,
-            cwd,
-        })
-    }
-
-    /// Returns the accepted profile class.
-    pub const fn class(&self) -> ProfileClass {
-        self.class
-    }
-
-    /// Returns the local path used as the child cwd while leaving the raw sandbox URI unchanged.
-    pub fn cwd(&self) -> &Path {
-        &self.cwd
-    }
-
-    /// Returns the exact host-provided cwd representation retained inside the replayed state.
-    pub fn sandbox_cwd(&self) -> &str {
-        &self.sandbox_cwd
-    }
-
-    /// Reports whether this exact state already grants read access to the whole filesystem root.
-    ///
-    /// Only a `managed` class whose own `permissionProfile.file_system` is a recognized closed
-    /// restricted profile qualifies; see [`grants_read_of_all_roots`] for the recognized shape.
-    /// This is a read-authority classification of the replayed state, never a widening of it: the
-    /// raw JSON is untouched and no path is resolved, expanded, or added.
-    fn grants_read_of_all_roots(&self) -> bool {
-        self.class == ProfileClass::Managed && grants_read_of_all_roots(&self.raw)
-    }
-
-    /// Reports whether the live host itself declares whole-tree read coverage for a project
-    /// check: managed profiles need a recognized root grant and no denies; a disabled host has
-    /// no outer sandbox. Binding, Workspace authority, and catalog admission remain separate.
-    pub(crate) fn declares_whole_tree_read(&self) -> bool {
-        self.class == ProfileClass::Disabled
-            || (self.grants_read_of_all_roots() && !self.has_deny_entries())
-    }
-
-    /// Serializes the complete original state for the Codex sandbox command.
-    fn json_argument(&self) -> &str {
-        &self.raw_json
-    }
-
-    /// Returns the exact captured JSON argument retained for managed Codex sandbox replay.
-    pub fn sandbox_state_json(&self) -> &str {
-        &self.raw_json
-    }
-
-    /// Returns a profile digest retaining all permissions except equivalent worktree path prefixes.
-    fn profile_digest(&self) -> blake3::Hash {
-        blake3::hash(profile_template_value(self).to_string().as_bytes())
-    }
-
-    /// Derives the closed profile-shape v2 value of this state, or reports why none exists (T35B).
-    ///
-    /// `trusted_cwd` is the trusted candidate or Workspace worktree the operation will actually
-    /// touch: derivation binds the portable cwd-derived authority to it and refuses any state
-    /// whose `sandboxCwd` is a different directory (T35B-r). Restoration- and minting-side
-    /// callers pass the captured state's own cwd, which is self-consistent by construction. The
-    /// derivation is a read-only closed parse of the raw state; the replay JSON is never
-    /// rewritten and nothing is normalized on the host's behalf. An unsupported-shape state
-    /// keeps replaying byte-for-byte and can then only be admitted by a legacy v1 template's
-    /// exact digest — never by a looser fallback.
-    pub(crate) fn shape_v2(&self, trusted_cwd: &Path) -> Result<ProfileShapeV2, UnsupportedShape> {
-        ProfileShapeV2::derive(self, trusted_cwd)
-    }
-
-    /// Derives a live v3 family, checking current namespace and leaf filesystem metadata.
-    ///
-    /// Malformed structure, missing namespace, symlinks, or authority outside the family refuse;
-    /// this does not change v2 admission or daemon read proofs.
-    pub(crate) fn shape_v3(&self, trusted_cwd: &Path) -> Result<ProfileShapeV3, UnsupportedShape> {
-        ProfileShapeV3::derive(self, trusted_cwd)
-    }
-
-    /// Reconstructs only a stored v3 capture's structure; no old visualization path is opened.
-    pub(crate) fn shape_v3_stored(
-        &self,
-        trusted_cwd: &Path,
-    ) -> Result<ProfileShapeV3, UnsupportedShape> {
-        ProfileShapeV3::derive_stored(self, trusted_cwd)
-    }
-
-    /// Proves one worktree-relative path readable under this state's live cwd-bound shape (T36B).
-    ///
-    /// The shape is derived against `trusted_cwd` — the authoritative worktree the read will
-    /// touch — so a state whose `sandboxCwd` is a different directory refuses derivation and
-    /// reports the conservative `Unproven` outcome here like any other unprovable path.
-    /// This is a pure permission proof of the already-validated state: no filesystem I/O, no
-    /// admission change, and no widening of the replayed state.
-    pub(crate) fn proves_read_path(&self, trusted_cwd: &Path, relative_path: &Path) -> bool {
-        match self.shape_v2(trusted_cwd) {
-            Ok(shape) => {
-                profile_shape::read_proof(&shape, trusted_cwd, relative_path)
-                    == profile_shape::ReadProof::Proven
-            }
-            Err(_) => false,
-        }
-    }
-
-    /// Reports whether any filesystem entry of the replayed profile denies access (T35B-r).
-    ///
-    /// Every `deny` entry counts, whatever its selector: a deny-bearing state keeps native reads
-    /// and cached delivery unavailable, because whole-tree read coverage cannot be proven for a
-    /// state whose own entries subtract from its grants.
-    fn has_deny_entries(&self) -> bool {
-        self.raw
-            .get("permissionProfile")
-            .and_then(|profile| profile.get("file_system"))
-            .and_then(|file_system| file_system.get("entries"))
-            .and_then(Value::as_array)
-            .is_some_and(|entries| {
-                entries
-                    .iter()
-                    .any(|entry| entry.get("access").and_then(Value::as_str) == Some("deny"))
-            })
-    }
-}
-
-impl ExecutionProfileTemplate {
-    /// Defines a nonempty, tested Execution profile template and its owned revision.
-    ///
-    /// This constructor mints the legacy v1 exact-digest template; behaviour is unchanged.
-    /// See [`ExecutionProfileTemplate::from_execution_evidence_v2`] for the conservative
-    /// shape-based generation (T35B).
-    pub fn from_execution_evidence(
-        id: impl Into<String>,
-        version: u32,
-        state: &HostSandboxState,
-    ) -> Result<Self, RequestError> {
-        let id = id.into();
-        if id.is_empty() || version == 0 {
-            return Err(RequestError::ExecutionProfileDenied);
-        }
-        Ok(Self {
-            id,
-            version,
-            class: state.class,
-            shape: TemplateShape::V1 {
-                profile_digest: state.profile_digest(),
-            },
-        })
-    }
-
-    /// Defines a v2 template carrying the captured state's derived rule structure (T35B).
-    ///
-    /// The state must derive a supported v2 shape; an unsupported shape is denied
-    /// outright instead of being stored as a looser comparison. The template's identity is the
-    /// domain-separated shape digest, so a v2 and a v1 template over the same state remain two
-    /// distinct accepted identities.
-    pub fn from_execution_evidence_v2(
-        id: impl Into<String>,
-        version: u32,
-        state: &HostSandboxState,
-    ) -> Result<Self, RequestError> {
-        let id = id.into();
-        if id.is_empty() || version == 0 {
-            return Err(RequestError::ExecutionProfileDenied);
-        }
-        let shape = state
-            .shape_v2(state.cwd())
-            .map_err(|_| RequestError::ExecutionProfileDenied)?;
-        Ok(Self {
-            id,
-            version,
-            class: state.class,
-            shape: TemplateShape::V2 { shape },
-        })
-    }
-
-    /// Defines one explicitly accepted v3 visualization family from its exact D03 capture.
-    ///
-    /// The capture's live namespace and existing path components are checked before minting;
-    /// empty identity, zero version, or unsupported/unsafe profile states refuse.
-    pub fn from_execution_evidence_v3(
-        id: impl Into<String>,
-        version: u32,
-        state: &HostSandboxState,
-    ) -> Result<Self, RequestError> {
-        let id = id.into();
-        if id.is_empty() || version == 0 {
-            return Err(RequestError::ExecutionProfileDenied);
-        }
-        let shape = state
-            .shape_v3(state.cwd())
-            .map_err(|_| RequestError::ExecutionProfileDenied)?;
-        Ok(Self {
-            id,
-            version,
-            class: state.class,
-            shape: TemplateShape::V3 { shape },
-        })
-    }
-
-    /// Builds this template from one version-aware persisted record and its captured state.
-    ///
-    /// `record.matches_state` has already verified both identities against `state`; this only
-    /// re-derives the comparison data the permit proof needs. V3 derives stored structure even
-    /// after its old visualization namespace is removed; malformed captures still refuse.
-    fn from_record(
-        record: &PersistedProfileRecord,
-        state: &HostSandboxState,
-    ) -> Result<Self, RequestError> {
-        let shape = match record.shape_version {
-            None => TemplateShape::V1 {
-                profile_digest: state.profile_digest(),
-            },
-            Some(2) => TemplateShape::V2 {
-                shape: state
-                    .shape_v2(state.cwd())
-                    .map_err(|_| RequestError::ExecutionProfileDenied)?,
-            },
-            Some(3) => TemplateShape::V3 {
-                shape: state
-                    .shape_v3_stored(state.cwd())
-                    .map_err(|_| RequestError::ExecutionProfileDenied)?,
-            },
-            Some(_) => return Err(RequestError::ExecutionProfileDenied),
-        };
-        Ok(Self {
-            id: record.profile_id.clone(),
-            version: record.revision,
-            class: record.class,
-            shape,
-        })
-    }
-
-    /// Returns the template's authority identity: two accepted templates never share one.
-    ///
-    /// Version digests are domain-separated, so a legacy digest and a shape digest can never
-    /// collide or be cross-compared by accident.
-    fn identity(&self) -> blake3::Hash {
-        match &self.shape {
-            TemplateShape::V1 { profile_digest } => *profile_digest,
-            TemplateShape::V2 { shape } => shape.digest(),
-            TemplateShape::V3 { shape } => shape.digest(),
-        }
-    }
-}
-
-impl ExecutionProfileCatalog {
-    /// Builds the catalog from Execution-accepted D03 or disabled-host evidence, not Application policy.
-    ///
-    /// The catalog accepts at most [`MAX_ACCEPTED_PROFILES`] templates, and several templates may
-    /// cover one profile class (T25B): a read-only and a workspace-write managed state can both be
-    /// accepted. A template's identity is its `profile_digest`, so an exact duplicate digest is
-    /// denied exactly as before; admitting it twice would add no tested evidence.
-    pub fn from_execution_evidence(
-        templates: Vec<ExecutionProfileTemplate>,
-    ) -> Result<Self, RequestError> {
-        if templates.len() > MAX_ACCEPTED_PROFILES {
-            return Err(RequestError::ExecutionProfileDenied);
-        }
-        let mut entries: BTreeMap<ProfileClass, Vec<ExecutionProfileTemplate>> = BTreeMap::new();
-        for template in templates {
-            if entries
-                .values()
-                .flatten()
-                .any(|accepted| accepted.identity() == template.identity())
-            {
-                return Err(RequestError::ExecutionProfileDenied);
-            }
-            entries.entry(template.class).or_default().push(template);
-        }
-        Ok(Self { templates: entries })
-    }
-
-    /// Rebuilds a usable catalog only from records matching trusted expected D03 evidence.
-    ///
-    /// `expected` comes from Execution-owned trusted configuration/evidence, never the durable
-    /// store or a model request. The caller supplies each current D01-bound state; extra, missing,
-    /// stale, corrupt, duplicate-digest, value-mismatched, unknown-version, or mixed-layout
-    /// records are unavailable. Records restore by exact evidence matching: a shape record rebuilds
-    /// the captured rule structure from its own stored capture, never by subtyping (T35B).
-    pub fn from_persisted_records(
-        records: Vec<(PersistedProfileRecord, HostSandboxState)>,
-        expected: &[PersistedProfileRecord],
-    ) -> Result<Self, RequestError> {
-        if records.len() != expected.len() || records.len() > MAX_ACCEPTED_PROFILES {
-            return Err(RequestError::ExecutionProfileDenied);
-        }
-        let mut templates = Vec::with_capacity(records.len());
-        for (record, state) in records {
-            if !expected.contains(&record)
-                || record.class != state.class()
-                || !record.matches_state(&state)
-            {
-                return Err(RequestError::ExecutionProfileDenied);
-            }
-            templates.push(ExecutionProfileTemplate::from_record(&record, &state)?);
-        }
-        Self::from_execution_evidence(templates)
-    }
-
-    /// Mints an Execution-owned permit when one accepted template of the observed class admits
-    /// the live state, matching one complete template and never combining grants (T25B, T35B).
-    ///
-    /// `trusted_cwd` is the trusted candidate or Workspace worktree the operation will actually
-    /// touch: v2/v3 candidates derive with the portable cwd bound to it, so a live state whose
-    /// `sandboxCwd` is not this directory never derives either shape here and can only be admitted
-    /// by a v1 template's exact legacy digest (T35B-r).
-    ///
-    /// The decision is ordered and fail-closed:
-    ///
-    /// 1. no template for the class → [`RequestError::ExecutionProfileNoTemplate`];
-    /// 2. an exact v2 or v3 shape match is preferred;
-    /// 3. otherwise a v1 template whose legacy digest equals the live state's keeps its
-    ///    unchanged exact-digest admission;
-    /// 4. otherwise a v2 or v3 template proving the live shape a narrower authority admits, chosen
-    ///    deterministically by template identity;
-    /// 5. no passing candidate refuses with the most specific closed reason: a live state that
-    ///    derives no applicable shape is [`RequestError::ExecutionProfileShapeUnsupported`], a state all
-    ///    shape templates fail to prove narrower is
-    ///    [`RequestError::ExecutionProfileShapeNotNarrower`], and a class with only v1 templates
-    ///    whose digests all differ stays [`RequestError::ExecutionProfileDigestMismatch`].
-    ///
-    /// Unsupported semantics never fall back to a looser comparison, and the permit keeps the
-    /// live raw-state correlation digest: it establishes *which* exact state ran, never subset
-    /// containment.
-    fn permit(
-        &self,
-        state: &HostSandboxState,
-        trusted_cwd: &Path,
-    ) -> Result<ExecutionProfilePermit, RequestError> {
-        let class_templates = self
-            .templates
-            .get(&state.class)
-            .ok_or(RequestError::ExecutionProfileNoTemplate(state.class))?;
-        let live_digest = state.profile_digest();
-        let live_shape = state.shape_v2(trusted_cwd).ok();
-        let live_v3 = class_templates
-            .iter()
-            .any(|template| matches!(&template.shape, TemplateShape::V3 { .. }))
-            .then(|| state.shape_v3(trusted_cwd).ok())
-            .flatten();
-        let mut v1_match = None;
-        let mut v2_exact = None;
-        let mut v3_exact = None;
-        let mut v2_narrower: Vec<&ExecutionProfileTemplate> = Vec::new();
-        let mut has_v2 = false;
-        let mut has_v3 = false;
-        for template in class_templates {
-            match &template.shape {
-                TemplateShape::V1 { profile_digest } => {
-                    if *profile_digest == live_digest {
-                        v1_match = Some(template);
-                    }
-                }
-                TemplateShape::V2 { shape } => {
-                    has_v2 = true;
-                    let Some(live) = &live_shape else {
-                        continue;
-                    };
-                    if *live == *shape {
-                        v2_exact = Some(template);
-                    } else if live.prove_narrower(shape) {
-                        v2_narrower.push(template);
-                    }
-                }
-                TemplateShape::V3 { shape } => {
-                    has_v3 = true;
-                    let Some(live) = &live_v3 else {
-                        continue;
-                    };
-                    if live == shape {
-                        v3_exact = Some(template);
-                    } else if live.prove_narrower(shape) {
-                        v2_narrower.push(template);
-                    }
-                }
-            }
-        }
-        let template = if let Some(template) = v2_exact.or(v3_exact) {
-            template.clone()
-        } else if let Some(template) = v1_match {
-            template.clone()
-        } else {
-            v2_narrower.sort_by_key(|template| (template.id.clone(), template.version));
-            match v2_narrower.first() {
-                Some(template) => (*template).clone(),
-                None => {
-                    return Err(
-                        match (has_v2 || has_v3, live_shape.is_some() || live_v3.is_some()) {
-                            (false, _) => RequestError::ExecutionProfileDigestMismatch(state.class),
-                            (true, false) => {
-                                RequestError::ExecutionProfileShapeUnsupported(state.class)
-                            }
-                            (true, true) => {
-                                RequestError::ExecutionProfileShapeNotNarrower(state.class)
-                            }
-                        },
-                    );
-                }
-            }
-        };
-        Ok(ExecutionProfilePermit {
-            template,
-            state_digest: blake3::hash(state.json_argument().as_bytes()),
-        })
-    }
-}
-
-/// Directory below the real `.agent-ide` home holding captured rejected sandbox states (T25B).
-pub const REJECTED_PROFILES_DIR: &str = "rejected-profiles";
-
-/// Soft cap on captured rejected sandbox states retained for operator review (T25B).
-///
-/// There is no locking: concurrent daemons on one machine can transiently exceed this cap. The
-/// check is best-effort housekeeping, never a security boundary.
-const MAX_REJECTED_PROFILES: usize = 16;
-
-/// Maximum captured rejected-state JSON bytes, matching `evidence record --sandbox-state` (T25B).
-const MAX_REJECTED_STATE_BYTES: usize = 64 * 1024;
-
-/// Outcome of one best-effort rejected-state capture attempt (T25B).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RejectedCapture {
-    /// A new private capture file was written; the stem is its 16-hex file name.
-    Captured(String),
-    /// The state carried a top-level field outside the documented envelope; nothing was written.
-    UnknownFields,
-    /// Any other silent skip (unsafe directory, soft cap, existing file, I/O); nothing was written.
-    Unavailable,
-}
-
-/// One captured rejected host sandbox state offered for operator review (T25B).
-#[derive(Clone, Debug)]
-pub struct RejectedProfileCapture {
-    /// 16-hex file-name stem, the first half of the state's profile digest.
-    pub name: String,
-    /// Profile class parsed back from the captured state.
-    pub class: ProfileClass,
-    /// Exact `sandboxCwd` value retained inside the captured state.
-    pub sandbox_cwd: String,
-    /// File modification time, when the filesystem reports one.
-    pub modified: Option<std::time::SystemTime>,
-}
-
-/// Captures one rejected observed sandbox state for operator review; best-effort, never authorizing.
-///
-/// The file holds the exact bounded JSON envelope `agent-ide evidence record --sandbox-state`
-/// reads, written private (mode 0600 at creation, `O_NOFOLLOW`) below the real user home under
-/// [`REJECTED_PROFILES_DIR`]. The directory is created private (0700) at birth and is used only
-/// when `symlink_metadata` confirms a real directory owned by the current uid with no group/other
-/// permission bits; an existing directory is never chmod'ed. A capture is refused with
-/// [`RejectedCapture::UnknownFields`] for any state carrying a top-level field outside the
-/// documented sandbox-state envelope: the profile digest covers unknown fields, so a filtered
-/// copy would be useless and the unfiltered state could carry secrets. An existing capture is
-/// never overwritten and every failure is silent: a capture never changes an admission reply or
-/// becomes an authority input.
-pub fn capture_rejected_profile(state_json: &Value) -> RejectedCapture {
-    let Some(home) = crate::userhome::user_home() else {
-        return RejectedCapture::Unavailable;
-    };
-    capture_rejected_profile_in(&home, state_json)
-}
-
-/// [`capture_rejected_profile`] below an explicit home; the seam exists only for tests.
-pub(crate) fn capture_rejected_profile_in(home: &Path, state_json: &Value) -> RejectedCapture {
-    let Ok(state) = HostSandboxState::parse(Some(state_json.clone())) else {
-        return RejectedCapture::Unavailable;
-    };
-    if !state_json.as_object().is_some_and(|object| {
-        object
-            .keys()
-            .all(|key| SANDBOX_STATE_FIELDS.contains(&key.as_str()))
-    }) {
-        return RejectedCapture::UnknownFields;
-    }
-    let json = state_json.to_string();
-    if json.len() > MAX_REJECTED_STATE_BYTES {
-        return RejectedCapture::Unavailable;
-    }
-    let dir = home.join(".agent-ide").join(REJECTED_PROFILES_DIR);
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        builder.mode(0o700);
-    }
-    if builder.create(&dir).is_err() {
-        return RejectedCapture::Unavailable;
-    }
-    #[cfg(unix)]
-    if !usable_private_directory(&dir) {
-        return RejectedCapture::Unavailable;
-    }
-    if std::fs::read_dir(&dir).is_ok_and(|entries| entries.count() >= MAX_REJECTED_PROFILES) {
-        return RejectedCapture::Unavailable;
-    }
-    let hex = state.profile_digest().to_hex().to_string();
-    let stem = hex[..16].to_owned();
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    }
-    let Ok(mut file) = options.open(dir.join(format!("{stem}.json"))) else {
-        return RejectedCapture::Unavailable;
-    };
-    if file.write_all(json.as_bytes()).is_err() {
-        return RejectedCapture::Unavailable;
-    }
-    RejectedCapture::Captured(stem)
-}
-
-/// Reports whether `dir` is a real, privately owned directory fit for captures (T25B).
-///
-/// `symlink_metadata` never follows links, so a symlinked directory fails `is_dir`; a directory
-/// this process does not own, or one readable or writable by group or other, is equally refused.
-#[cfg(unix)]
-fn usable_private_directory(dir: &Path) -> bool {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    match std::fs::symlink_metadata(dir) {
-        Ok(metadata) => {
-            // SAFETY: `getuid` merely reports the calling thread's real uid.
-            metadata.is_dir()
-                && metadata.uid() == unsafe { libc::getuid() }
-                && metadata.permissions().mode() & 0o077 == 0
-        }
-        Err(_) => false,
-    }
-}
-
-/// Lists the captured rejected sandbox states below the real user home, ordered by name (T25B).
-///
-/// Only strictly well-formed captures are listed: a name of exactly 16 lowercase hex digits plus
-/// `.json`, a regular file of at most 64 KiB opened `O_NOFOLLOW`, and parseable JSON. Symlinks,
-/// special files, oversized or foreign entries are ignored silently, and at most 16 entries are
-/// returned.
-pub fn list_rejected_profiles() -> Vec<RejectedProfileCapture> {
-    let Some(home) = crate::userhome::user_home() else {
-        return Vec::new();
-    };
-    list_rejected_profiles_in(&home)
-}
-
-/// [`list_rejected_profiles`] below an explicit home; the seam exists only for tests.
-pub(crate) fn list_rejected_profiles_in(home: &Path) -> Vec<RejectedProfileCapture> {
-    let Ok(entries) = std::fs::read_dir(home.join(".agent-ide").join(REJECTED_PROFILES_DIR)) else {
-        return Vec::new();
-    };
-    let mut captures = Vec::new();
-    for entry in entries.flatten() {
-        let Some(capture) = parse_rejected_entry(&entry) else {
-            continue;
-        };
-        captures.push(capture);
-    }
-    captures.sort_by(|first, second| first.name.cmp(&second.name));
-    captures.truncate(MAX_REJECTED_PROFILES);
-    captures
-}
-
-/// Reads one directory entry as a well-formed rejected-state capture, or [`None`] to skip it.
-fn parse_rejected_entry(entry: &std::fs::DirEntry) -> Option<RejectedProfileCapture> {
-    let file_name = entry.file_name();
-    let name = file_name.to_str()?.strip_suffix(".json")?;
-    // Capture stems are always the lowercase hex prefix of a profile digest.
-    if name.len() != 16
-        || !name
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-    {
-        return None;
-    }
-    // Symlink metadata never follows links: symlinks and special files fail `is_file`.
-    let metadata = std::fs::symlink_metadata(entry.path()).ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_REJECTED_STATE_BYTES as u64 {
-        return None;
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let file = options.open(entry.path()).ok()?;
-    let mut bytes = Vec::new();
-    let mut bounded = file.take(MAX_REJECTED_STATE_BYTES as u64 + 1);
-    bounded.read_to_end(&mut bytes).ok()?;
-    if bytes.len() > MAX_REJECTED_STATE_BYTES {
-        return None;
-    }
-    let state = HostSandboxState::parse_json(std::str::from_utf8(&bytes).ok()?).ok()?;
-    Some(RejectedProfileCapture {
-        name: name.to_owned(),
-        class: state.class(),
-        sandbox_cwd: state.sandbox_cwd().to_owned(),
-        modified: metadata.modified().ok(),
-    })
-}
 
 /// Identifies a host invocation already proven by Assistance's host-binding adapter.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedHostInvocation {
     /// Opaque Assistance-validated association between actor, invocation, and host channel.
     binding: String,
-    /// Complete host sandbox state associated with that specific binding.
-    sandbox: HostSandboxState,
     /// Assistance binding that requires a fresh consume before a delayed owned spawn.
-    active_binding: Option<crate::assistance::host_binding::BindingRef>,
+    active_binding: Option<BindingRef>,
 }
 
 impl ValidatedHostInvocation {
     /// Creates a token for a nonempty binding that Assistance has already validated.
     ///
     /// Construction carries no independent host proof: Assistance must reject unverified
-    /// hook/MCP pairs before creating this token.
-    pub fn from_verified_binding(
-        binding: impl Into<String>,
-        sandbox: HostSandboxState,
-    ) -> Result<Self, RequestError> {
+    /// hook/MCP pairs before creating this token. Synthetic/test invocations have no Assistance
+    /// binding and need no fresh use at spawn.
+    pub fn from_verified_binding(binding: impl Into<String>) -> Result<Self, RequestError> {
         let binding = binding.into();
         if binding.is_empty() {
             return Err(RequestError::MissingBinding);
         }
         Ok(Self {
             binding,
-            sandbox,
             active_binding: None,
         })
     }
 
-    /// Admits one consumed active use and its matching observed state into Execution.
+    /// Admits one consumed active use into Execution.
     ///
     /// The use is consumed at this boundary: it proves a fresh liveness check before this local
-    /// step begins, but cannot become durable authority. Execution retains every semantic JSON
-    /// field from the opaque observation for its own bounded profile parser.
-    pub fn from_active_observation(
-        active_use: ActiveBindingUse,
-        observed: ObservedSandboxState,
-    ) -> Result<Self, RequestError> {
-        if active_use.binding_ref() != observed.binding_ref()
-            || observed.provenance() != SandboxStateProvenance::AdvertisedAndReturned
-        {
-            return Err(RequestError::BindingMismatch);
+    /// step begins, but cannot become durable authority. A later owned spawn must present another
+    /// use for the same immutable generation.
+    pub fn from_active_use(active_use: ActiveBindingUse) -> Self {
+        let binding = active_use.binding_ref().clone();
+        Self {
+            binding: blake3::Hash::from_bytes(binding.fingerprint())
+                .to_hex()
+                .to_string(),
+            active_binding: Some(binding),
         }
-        let sandbox = HostSandboxState::parse(Some(observed.state().as_json().clone()))
-            .map_err(RequestError::ObservedStateUnavailable)?;
-        Ok(Self {
-            binding: observed.call_id().to_owned(),
-            sandbox,
-            active_binding: Some(observed.binding_ref().clone()),
-        })
     }
 
     /// Returns the stable, opaque binding identifier for operation evidence.
@@ -1159,15 +70,10 @@ impl ValidatedHostInvocation {
         &self.binding
     }
 
-    /// Returns the validated sandbox state associated with this invocation.
-    pub fn sandbox(&self) -> &HostSandboxState {
-        &self.sandbox
-    }
-
     /// Consumes a freshly checked binding use for an immediate owned child spawn.
     ///
     /// Synthetic/test invocations have no Assistance binding and need no use. An invocation from
-    /// observed host state requires a use for the same immutable generation, preventing queue
+    /// an Assistance use requires a use for the same immutable generation, preventing queue
     /// delay from authorizing a post-stop effect.
     fn consume_active_use(&self, active_use: ActiveBindingUse) -> Result<(), RequestError> {
         match &self.active_binding {
@@ -1414,7 +320,7 @@ pub enum GitDiscoveryQuery {
     WorktreeListPorcelainZ,
 }
 
-/// Holds the fresh observed binding/state and raw candidate path for pre-authority Git discovery.
+/// Holds the fresh binding use and raw candidate path for pre-authority Git discovery.
 #[derive(Clone, Debug)]
 pub struct DiscoverWorktreeRequest {
     /// Invocation that consumed current Assistance liveness and retained the matching generation.
@@ -1426,13 +332,12 @@ pub struct DiscoverWorktreeRequest {
 }
 
 impl DiscoverWorktreeRequest {
-    /// Accepts a fresh Assistance use, its correlated observed state, raw candidate path, and operation ref.
+    /// Accepts a fresh Assistance use, the raw candidate path, and the operation ref.
     ///
     /// This constructor has no WorkspaceAuthority output and never normalizes `candidate_cwd`.
     /// A later queued execution must present another fresh use to `run` before a child can launch.
-    pub fn from_active_observation(
+    pub fn from_active_use(
         active_use: ActiveBindingUse,
-        observed: ObservedSandboxState,
         candidate_cwd: OsString,
         operation: DiscoveryOperationRef,
     ) -> Result<Self, RequestError> {
@@ -1440,26 +345,20 @@ impl DiscoverWorktreeRequest {
             return Err(RequestError::InvalidDiscoveryCandidate);
         }
         Ok(Self {
-            invocation: ValidatedHostInvocation::from_active_observation(active_use, observed)?,
+            invocation: ValidatedHostInvocation::from_active_use(active_use),
             candidate_cwd,
             operation,
         })
     }
 
-    /// Validates exactly one fixed Git query under Execution's tested profile catalog and local policy.
+    /// Validates exactly one fixed Git query under local discovery policy.
     pub fn validate_query(
         self,
         query: GitDiscoveryQuery,
         policy: &GitDiscoveryPolicy,
-        catalog: &ExecutionProfileCatalog,
     ) -> Result<ValidatedGitDiscovery, RequestError> {
         if !is_normal_absolute(&policy.git_program) || policy.output_cap == 0 {
             return Err(RequestError::InvalidDiscoveryPolicy);
-        }
-        if self.invocation.sandbox.class == ProfileClass::Disabled
-            && !policy.allow_explicit_disabled_host
-        {
-            return Err(RequestError::DisabledHostDenied);
         }
         let mut args = vec![OsString::from("-C"), self.candidate_cwd.clone()];
         match query {
@@ -1485,23 +384,20 @@ impl DiscoverWorktreeRequest {
                 ]);
             }
         }
+        // The raw candidate is the directory this discovery actually runs in; a relative or
+        // non-normal candidate fails command construction closed.
         let command = ControlledCommand::from_validated_peer(
             CommandKind::Git,
             policy.git_program.clone(),
             args,
-            self.invocation.sandbox.cwd().to_path_buf(),
+            PathBuf::from(&self.candidate_cwd),
             BTreeMap::new(),
         )?;
-        // The raw candidate is the trusted directory this discovery will actually run in: a v2
-        // candidate binds the portable sandbox-cwd authority to it, so discovery with a
-        // candidate other than the state's own `sandboxCwd` never derives a v2 shape (T35B-r).
-        let permit = catalog.permit(&self.invocation.sandbox, Path::new(&self.candidate_cwd))?;
         Ok(ValidatedGitDiscovery {
             invocation: self.invocation,
             command,
             operation: self.operation,
             query,
-            permit,
             output_cap: policy.output_cap,
         })
     }
@@ -1514,17 +410,11 @@ pub struct GitDiscoveryPolicy {
     git_program: PathBuf,
     /// Bounded retained bytes for each stdout/stderr stream while both pipes continue draining.
     output_cap: usize,
-    /// Whether a separately accepted explicit disabled host profile may perform this read-only operation.
-    allow_explicit_disabled_host: bool,
 }
 
 impl GitDiscoveryPolicy {
     /// Creates a fixed discovery policy after rejecting an invalid executable or zero output budget.
-    pub fn new(
-        git_program: PathBuf,
-        output_cap: usize,
-        allow_explicit_disabled_host: bool,
-    ) -> Result<Self, RequestError> {
+    pub fn new(git_program: PathBuf, output_cap: usize) -> Result<Self, RequestError> {
         if !is_normal_absolute(&git_program)
             || output_cap == 0
             || output_cap > MAX_GIT_DISCOVERY_BYTES
@@ -1534,12 +424,11 @@ impl GitDiscoveryPolicy {
         Ok(Self {
             git_program,
             output_cap,
-            allow_explicit_disabled_host,
         })
     }
 }
 
-/// Carries a catalog-admitted fixed Git discovery until a fresh active use permits its owned spawn.
+/// Carries a validated fixed Git discovery until a fresh active use permits its owned spawn.
 /// One validated attempt cannot be cloned to repeat-mint no-child settlement:
 /// ```compile_fail
 /// use agent_ide::execution::ValidatedGitDiscovery;
@@ -1555,8 +444,6 @@ pub struct ValidatedGitDiscovery {
     operation: DiscoveryOperationRef,
     /// Fixed query kind whose output remains raw.
     query: GitDiscoveryQuery,
-    /// Execution profile evidence associated with this operation.
-    permit: ExecutionProfilePermit,
     /// Fixed per-stream retained-output cap from local discovery policy.
     output_cap: usize,
 }
@@ -1665,43 +552,26 @@ pub struct CompletedGitDiscovery {
 }
 
 impl ValidatedGitDiscovery {
-    /// Returns an owned fixed-query handle after checking v3 paths and fresh liveness at spawn.
+    /// Returns an owned fixed-query handle after checking fresh liveness at spawn.
     ///
-    /// The fixed `-C` candidate is rechecked against the same v3 family used at admission;
-    /// failure returns the unique no-child settlement with a closed request error. The handle
+    /// Failure returns the unique no-child settlement with a closed request error. The handle
     /// retains operation/query provenance and can be cancelled while a borrowed wait runs.
     pub fn spawn(
         self,
         lease: AdmissionLease,
         active_use: ActiveBindingUse,
-        codex_executable: &Path,
     ) -> Result<OwnedGitDiscovery, ProcessError> {
         let started = std::time::Instant::now();
         let settlement = SpawnNeverStarted::ordinary(lease);
-        // validate_query fixes argv as `-C <candidate> <query>`; the candidate is the permit cwd.
-        if let Err(error) = self
-            .permit
-            .recheck_live_v3(&self.invocation.sandbox, Path::new(&self.command.args[1]))
-        {
-            return Err(settlement.error(ProcessError::Request(error)));
-        }
         if let Err(error) = self.invocation.consume_active_use(active_use) {
             return Err(settlement.error(ProcessError::Request(error)));
         }
-        let process = OwnedChild::spawn_parts(
-            &self.command,
-            &self.invocation.sandbox,
-            settlement,
-            codex_executable,
-            None,
-            self.output_cap,
-        )?;
+        let process = OwnedChild::spawn_parts(&self.command, settlement, self.output_cap)?;
         Ok(OwnedGitDiscovery {
             process,
             operation: self.operation,
             query: self.query,
             started,
-            _permit: self.permit,
         })
     }
 }
@@ -1716,8 +586,6 @@ pub struct OwnedGitDiscovery {
     query: GitDiscoveryQuery,
     /// Monotonic start instant for elapsed evidence.
     started: std::time::Instant,
-    /// Catalog evidence retained through physical execution.
-    _permit: ExecutionProfilePermit,
 }
 impl OwnedGitDiscovery {
     /// Borrows the child for a bounded wait; cancelling this wait retains the owning handle.
@@ -1783,164 +651,27 @@ fn discovery_result(
     }
 }
 
-/// The only trampoline program this contract accepts; an arbitrary script is never accepted.
-const TRAMPOLINE_PROGRAM: &str = "/usr/bin/env";
-
-/// Carries the operator-accepted `/usr/bin/env` used to run a validated command in the
-/// authoritative worktree while the host sandbox state is replayed byte-for-byte.
-///
-/// The trampoline exists for exactly one case: a managed host whose `sandboxCwd` is the parent's
-/// inherited directory rather than this worktree. `codex sandbox` sets the child cwd from that
-/// state, so the utility is wrapped as `env -C <authority root> <program> <args>` *inside* the
-/// unchanged sandbox argv. It grants nothing: the sandbox policy, its raw JSON, and the program
-/// allowlist are all unchanged, and `env` execs the same child, so process, group, and lease
-/// accounting still describe one direct child.
-///
-/// Acceptance is pinned to the operator's own declaration, never to whatever bytes happen to be on
-/// disk when a request is built: the measured digest must equal the declared BLAKE3 accepted at
-/// configuration load, and only then is the measured object identity sealed. That sealed identity
-/// is rechecked immediately before spawn, so an executable replaced at any point — before or after
-/// acceptance — fails closed with [`RequestError::ExecutableUnavailable`] instead of being
-/// re-sealed as trusted and launched.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ControlledTrampoline {
-    /// Absolute accepted trampoline path; always exactly [`TRAMPOLINE_PROGRAM`].
-    path: PathBuf,
-    /// Executable object and byte identity measured when the operator's declaration was accepted.
-    identity: ExecutableIdentity,
-}
-
-impl ControlledTrampoline {
-    /// Seals one operator-declared trampoline against the exact digest that declaration accepted.
-    ///
-    /// `path` must be exactly `/usr/bin/env`; `declared_blake3` is the operator's configured
-    /// hexadecimal BLAKE3 of that executable, the same value verified once at daemon startup. The
-    /// bytes are measured here and compared with it, so a build that happens later in the daemon's
-    /// life can never adopt a changed executable as a new baseline.
-    ///
-    /// Returns [`RequestError::TrampolineUnavailable`] for any other path and on every platform
-    /// other than macOS, where this contract's `env -C` behaviour and the nested-sandbox
-    /// constraints were actually established; Linux acceptance is deliberately not offered rather
-    /// than assumed. Returns [`RequestError::ExecutableUnavailable`] when the path is not one
-    /// stable readable regular executable object, or when its measured bytes do not match
-    /// `declared_blake3`.
-    pub fn accept(path: PathBuf, declared_blake3: &str) -> Result<Self, RequestError> {
-        if path != Path::new(TRAMPOLINE_PROGRAM) || !cfg!(target_os = "macos") {
-            return Err(RequestError::TrampolineUnavailable);
-        }
-        let identity = executable_identity(&path)?;
-        if !identity
-            .digest
-            .to_hex()
-            .as_str()
-            .eq_ignore_ascii_case(declared_blake3)
-        {
-            return Err(RequestError::ExecutableUnavailable);
-        }
-        Ok(Self { path, identity })
-    }
-
-    /// Returns the accepted path after rechecking that the executable object is byte-unchanged.
-    ///
-    /// The comparison is against the identity sealed at acceptance, which itself had to match the
-    /// operator's declared digest. Returns [`RequestError::ExecutableUnavailable`] when the object
-    /// or its bytes changed since then, so a swapped trampoline can never be executed.
-    fn verified_path(&self) -> Result<&Path, RequestError> {
-        if executable_identity(&self.path)? != self.identity {
-            return Err(RequestError::ExecutableUnavailable);
-        }
-        Ok(&self.path)
-    }
-
-    /// Rejects a program path BSD `env` would consume as an environment assignment.
-    ///
-    /// `env` treats its first non-flag argument containing `=` as `NAME=VALUE` rather than the
-    /// utility to exec, so such a program is refused before spawn instead of silently launching a
-    /// different process.
-    fn accepts_program(program: &Path) -> Result<(), RequestError> {
-        if program.as_os_str().as_encoded_bytes().contains(&b'=') {
-            return Err(RequestError::TrampolineProgramRejected);
-        }
-        Ok(())
-    }
-
-    /// Returns the extra argv bytes this trampoline adds, so local ceilings still bound the spawn.
-    fn additional_argv_bytes(command: &ControlledCommand) -> usize {
-        os_bytes(&OsString::from("-C"))
-            + os_bytes(&command.cwd.clone().into_os_string())
-            + os_bytes(&command.program.clone().into_os_string())
-    }
-}
-
 /// Product argv ceiling handed to [`LocalExecutionPolicy`]: the bound snapshot batch planners
 /// must fail closed against, so the ceiling lives here once instead of a duplicated literal.
 pub const MAX_PRODUCT_ARGV_BYTES: usize = 64 * 1024;
 
-/// Applies local ceilings to already validated peer input without widening host permissions.
+/// Applies local ceilings to already validated peer input.
 #[derive(Clone, Debug)]
 pub struct LocalExecutionPolicy {
-    /// Absolute executable paths permitted by local policy after host/scope intersection.
+    /// Absolute executable paths permitted by local policy.
     allowed_programs: BTreeSet<PathBuf>,
     /// Maximum platform-byte size of all argv values, excluding executable path.
     max_argv_bytes: usize,
     /// Maximum number of explicitly forwarded environment entries.
     max_environment_entries: usize,
-    /// Whether this policy explicitly permits a host that declared no outer sandbox.
-    allow_explicit_disabled_host: bool,
-    /// Operator-accepted `env` trampoline; `None` leaves a differing sandbox cwd unavailable.
-    trampoline: Option<ControlledTrampoline>,
 }
 
 impl LocalExecutionPolicy {
     /// Creates a policy whose program allowlist and numeric limits are independently validated.
-    ///
-    /// The resulting policy has no trampoline, so a command whose worktree differs from the host's
-    /// own `sandboxCwd` remains rejected; use [`LocalExecutionPolicy::with_env_trampoline`] to
-    /// accept one.
     pub fn new(
         allowed_programs: BTreeSet<PathBuf>,
         max_argv_bytes: usize,
         max_environment_entries: usize,
-        allow_explicit_disabled_host: bool,
-    ) -> Result<Self, RequestError> {
-        Self::build(
-            allowed_programs,
-            max_argv_bytes,
-            max_environment_entries,
-            allow_explicit_disabled_host,
-            None,
-        )
-    }
-
-    /// Creates a policy that may additionally run a validated command in an authoritative worktree
-    /// other than the managed host's own `sandboxCwd`, through `trampoline`.
-    ///
-    /// The trampoline is used only when the observed managed profile already grants read of `/`;
-    /// it never relaxes the program allowlist, the worktree authority check, or the replayed
-    /// sandbox state.
-    pub fn with_env_trampoline(
-        allowed_programs: BTreeSet<PathBuf>,
-        max_argv_bytes: usize,
-        max_environment_entries: usize,
-        allow_explicit_disabled_host: bool,
-        trampoline: ControlledTrampoline,
-    ) -> Result<Self, RequestError> {
-        Self::build(
-            allowed_programs,
-            max_argv_bytes,
-            max_environment_entries,
-            allow_explicit_disabled_host,
-            Some(trampoline),
-        )
-    }
-
-    /// Validates the shared ceilings both constructors require.
-    fn build(
-        allowed_programs: BTreeSet<PathBuf>,
-        max_argv_bytes: usize,
-        max_environment_entries: usize,
-        allow_explicit_disabled_host: bool,
-        trampoline: Option<ControlledTrampoline>,
     ) -> Result<Self, RequestError> {
         if allowed_programs.is_empty() || max_argv_bytes == 0 {
             return Err(RequestError::InvalidPolicy);
@@ -1949,8 +680,6 @@ impl LocalExecutionPolicy {
             allowed_programs,
             max_argv_bytes,
             max_environment_entries,
-            allow_explicit_disabled_host,
-            trampoline,
         })
     }
 }
@@ -1972,30 +701,10 @@ pub enum RequestError {
     ProgramDenied,
     /// The command cwd is not the current authoritative worktree.
     WorktreeDenied,
-    /// The sandbox's cwd would be changed rather than preserved.
-    SandboxCwdMismatch,
     /// The argv exceeds the local byte ceiling.
     ArgvTooLarge,
     /// The environment exceeds the local entry ceiling.
     EnvironmentTooLarge,
-    /// A disabled host sandbox was not explicitly accepted by local policy.
-    DisabledHostDenied,
-    /// Execution has no accepted template for this host profile class or shape.
-    ExecutionProfileDenied,
-    /// Execution has no accepted template for the observed host profile class (T24B).
-    ExecutionProfileNoTemplate(ProfileClass),
-    /// The observed profile digest differs from every accepted template for this class (T24B).
-    ExecutionProfileDigestMismatch(ProfileClass),
-    /// The live managed state derives no profile-shape v2 value, so no accepted v2 template
-    /// could even evaluate it; only a v1 template's exact legacy digest could admit it (T35B).
-    ExecutionProfileShapeUnsupported(ProfileClass),
-    /// The live state derives a v2 shape but no accepted template proves it a narrower authority
-    /// under the seven sufficient conditions, and no v1 digest matched (T35B).
-    ExecutionProfileShapeNotNarrower(ProfileClass),
-    /// The consumed active binding does not match the observed sandbox-state generation.
-    BindingMismatch,
-    /// The observed host state cannot satisfy Execution's bounded parser.
-    ObservedStateUnavailable(SandboxStateError),
     /// A delayed owned spawn did not present a newly consumed matching active binding use.
     MissingActiveBindingUse,
     /// Workspace supplied an empty discovery operation reference.
@@ -2006,115 +715,32 @@ pub enum RequestError {
     InvalidDiscoveryPolicy,
     /// Fixed-query fixture/capture metadata is oversized or contradicts its exit/drain evidence.
     InvalidDiscoveryEvidence,
-    /// A differing-cwd managed launch has no operator-accepted `/usr/bin/env` trampoline, or this
-    /// platform is not one where the trampoline contract is supported.
-    TrampolineUnavailable,
-    /// A trampolined program path would be misread by BSD `env` as an environment assignment.
-    TrampolineProgramRejected,
-    /// A managed state without whole-tree read coverage could not prove one exact path under
-    /// the conservative per-path read proof (T36B). Distinct from a cwd mismatch: the binding
-    /// was sound, but grants, denies, or matcher ambiguity leave this path unprovable.
-    ReadPathUnproven,
-    /// A managed state could not prove that every path in the worktree is readable.
-    ReadWholeTreeUnproven,
-    /// Managed write authority may reach Git's common administrative directory.
-    GitMetadataWriteOverlap,
-}
-
-/// The read scope one workspace-read recheck must prove (T36B).
-///
-/// `Path` names one exact worktree-relative path whose native read or cached disclosure is
-/// being authorized; `WholeTree` is the legacy restrictive behavior for callers that cannot
-/// name every path they may touch.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReadScope<'a> {
-    /// Prove this exact worktree-relative path under the live cwd-bound shape.
-    Path(&'a Path),
-    /// Prove whole-tree read authority; deny-bearing managed states always refuse.
-    WholeTree,
+    /// The worktree's live `.git` backpointers no longer describe the discovered repository.
+    GitMetadataInvalid,
 }
 
 /// Couples the only inputs permitted to reach an owned operating-system spawn.
 #[derive(Clone, Debug)]
 pub struct ValidatedExecutionRequest {
-    /// Host binding whose class must match an Execution-owned profile template.
+    /// Host binding whose fresh liveness use is rechecked before a delayed owned spawn.
     invocation: ValidatedHostInvocation,
     /// Workspace ownership token constraining this child to one current worktree epoch.
     authority: WorkspaceAuthority,
-    /// Execution-minted profile permit carrying a per-invocation correlation digest.
-    permit: ExecutionProfilePermit,
     /// Fully controlled executable invocation ready for admission and later owned spawn.
     command: ControlledCommand,
-    /// Accepted `env` trampoline retained only when the worktree differs from the host sandbox cwd.
-    trampoline: Option<ControlledTrampoline>,
-}
-
-/// Rechecks current host state for a durable-authorized Workspace read or cached-result delivery.
-/// Consumes fresh binding liveness, requires the accepted current profile, and applies local
-/// disabled-host policy without fabricating a command, child, or new Workspace grant.
-///
-/// A managed state must independently prove read authority of the live state, even when its
-/// `sandboxCwd` already is this worktree root (T35B-r): admission through a narrower v2 shape
-/// must never confer read authority. [`ReadScope::WholeTree`] keeps the restrictive T35B
-/// behavior — the recognized whole-root read grant AND no deny entries at all (path or glob).
-/// [`ReadScope::Path`] first tries that same deny-free fast path (it skips only policy
-/// matching, never containment or no-follow enforcement) and otherwise derives the live
-/// cwd-bound shape v2 and requires the conservative per-path read proof (T36B): the
-/// derivation already refuses any state whose `sandboxCwd` is not the authoritative root, so
-/// a relocated grant cannot vouch for this directory. A disabled host keeps the legacy strict
-/// cwd equality. Nothing else is relaxed: a stale binding, a mismatched authority, or an
-/// unaccepted profile still fails, and no permission is rewritten or widened.
-pub fn validate_workspace_read(
-    active_use: ActiveBindingUse,
-    observed: ObservedSandboxState,
-    authority: &WorkspaceAuthority,
-    catalog: &ExecutionProfileCatalog,
-    allow_explicit_disabled_host: bool,
-    scope: ReadScope<'_>,
-) -> Result<ExecutionProfilePermit, RequestError> {
-    let invocation = ValidatedHostInvocation::from_active_observation(active_use, observed)?;
-    let whole_tree = invocation.sandbox.declares_whole_tree_read();
-    let read_proven = match invocation.sandbox.class() {
-        ProfileClass::Managed => match scope {
-            ReadScope::WholeTree => whole_tree,
-            ReadScope::Path(path) => {
-                whole_tree || invocation.sandbox.proves_read_path(authority.root(), path)
-            }
-        },
-        ProfileClass::Disabled => invocation.sandbox.cwd() == authority.root(),
-    };
-    if !read_proven {
-        // Whole-tree refusal is not a cwd mismatch: a deny-bearing managed profile can have
-        // the exact workspace cwd while still lacking authority for every path.
-        return Err(match (invocation.sandbox.class(), scope) {
-            (ProfileClass::Managed, ReadScope::Path(_)) => RequestError::ReadPathUnproven,
-            (ProfileClass::Managed, ReadScope::WholeTree) => RequestError::ReadWholeTreeUnproven,
-            (ProfileClass::Disabled, _) => RequestError::SandboxCwdMismatch,
-        });
-    }
-    if invocation.sandbox.class() == ProfileClass::Disabled && !allow_explicit_disabled_host {
-        return Err(RequestError::DisabledHostDenied);
-    }
-    catalog.permit(&invocation.sandbox, authority.root())
 }
 
 impl ValidatedExecutionRequest {
-    /// Intersects host state, local policy, and Workspace authority before an admission request.
+    /// Intersects local policy and Workspace authority before an admission request.
     ///
-    /// The command always runs in the current authoritative worktree. When the managed host's own
-    /// `sandboxCwd` is a different inherited directory, that is accepted only when the observed
-    /// state already grants read of the whole filesystem root and the policy carries an accepted
-    /// `env` trampoline; the request then retains that trampoline so the spawn can enter the
-    /// worktree inside the unchanged sandbox argv. Without such a profile the cwd must match
-    /// exactly ([`RequestError::SandboxCwdMismatch`]); with such a profile but no accepted
-    /// trampoline the request is unavailable ([`RequestError::TrampolineUnavailable`]). The extra
-    /// trampoline argv bytes count against `policy.max_argv_bytes`.
+    /// The command always runs in the current authoritative worktree. A Git command additionally
+    /// requires the worktree's live `.git` backpointers to still describe the discovered
+    /// repository, so a queued operation never silently reads a different one.
     pub fn validate(
         invocation: ValidatedHostInvocation,
         authority: WorkspaceAuthority,
         command: ControlledCommand,
         policy: &LocalExecutionPolicy,
-        catalog: &ExecutionProfileCatalog,
     ) -> Result<Self, RequestError> {
         if !policy.allowed_programs.contains(&command.program) {
             return Err(RequestError::ProgramDenied);
@@ -2122,43 +748,17 @@ impl ValidatedExecutionRequest {
         if command.cwd != authority.root {
             return Err(RequestError::WorktreeDenied);
         }
-        let trampoline = if command.cwd == invocation.sandbox.cwd {
-            None
-        } else if invocation.sandbox.grants_read_of_all_roots() {
-            let trampoline = policy
-                .trampoline
-                .clone()
-                .ok_or(RequestError::TrampolineUnavailable)?;
-            ControlledTrampoline::accepts_program(&command.program)?;
-            Some(trampoline)
-        } else {
-            return Err(RequestError::SandboxCwdMismatch);
-        };
-        let argv_bytes = command.args.iter().map(os_bytes).sum::<usize>()
-            + trampoline
-                .as_ref()
-                .map_or(0, |_| ControlledTrampoline::additional_argv_bytes(&command));
-        if argv_bytes > policy.max_argv_bytes {
+        if command.args.iter().map(os_bytes).sum::<usize>() > policy.max_argv_bytes {
             return Err(RequestError::ArgvTooLarge);
         }
         if command.env.len() > policy.max_environment_entries {
             return Err(RequestError::EnvironmentTooLarge);
         }
-        if invocation.sandbox.class == ProfileClass::Disabled
-            && !policy.allow_explicit_disabled_host
-        {
-            return Err(RequestError::DisabledHostDenied);
-        }
-        // The Workspace worktree is the trusted directory this child will run in: a v2
-        // candidate binds the portable sandbox-cwd authority to it (T35B-r).
-        let permit = catalog.permit(&invocation.sandbox, &authority.root)?;
-        guard_git_metadata(&invocation.sandbox, &authority, &command)?;
+        git_metadata_current(&authority, &command)?;
         Ok(Self {
             invocation,
             authority,
-            permit,
             command,
-            trampoline,
         })
     }
 
@@ -2172,21 +772,14 @@ impl ValidatedExecutionRequest {
         &self.authority
     }
 
-    /// Returns the Execution-minted profile permit retained as operation evidence after admission.
-    pub fn profile_permit(&self) -> &ExecutionProfilePermit {
-        &self.permit
-    }
-
     /// Consumes a freshly checked active use immediately before an owned physical spawn.
     ///
-    /// Requests constructed from an Assistance observation retain its binding generation so a
-    /// queue delay cannot convert pre-stop liveness into a later effect. A v3 request also
-    /// rechecks its leaf path immediately before spawn so a queued symlink replacement
-    /// refuses. Synthetic/test requests have no active binding and reject no optional use.
+    /// Requests constructed from an Assistance use retain its binding generation so a queue
+    /// delay cannot convert pre-stop liveness into a later effect; a Git command also rechecks
+    /// the live `.git` backpointers immediately before spawn. Synthetic/test requests have no
+    /// active binding and reject no optional use.
     fn consume_spawn_use(&self, active_use: Option<ActiveBindingUse>) -> Result<(), RequestError> {
-        self.permit
-            .recheck_live_v3(&self.invocation.sandbox, &self.authority.root)?;
-        guard_git_metadata(&self.invocation.sandbox, &self.authority, &self.command)?;
+        git_metadata_current(&self.authority, &self.command)?;
         match (&self.invocation.active_binding, active_use) {
             (Some(_), Some(active_use)) => self.invocation.consume_active_use(active_use),
             (Some(_), None) => Err(RequestError::MissingActiveBindingUse),
@@ -2195,168 +788,20 @@ impl ValidatedExecutionRequest {
     }
 }
 
-/// Refuses managed execution whenever a live write selector can reach shared Git metadata.
+/// Rechecks a Git command's worktree against its live `.git` backpointers.
 ///
-/// The closed v2 parser is used for every permit generation, including exact-digest v1. This
-/// check reads the child's effective `TMPDIR` from its controlled environment; `env_clear`
-/// makes an absent value an inactive selector. It runs at validation and immediately before
-/// spawn so a queued symlink replacement cannot widen writes.
-fn guard_git_metadata(
-    sandbox: &HostSandboxState,
+/// Workspace validated the `.git` -> admin -> common cycle at discovery; this repeats that check
+/// at validation and immediately before spawn so a queued Git operation never silently reads a
+/// different repository after `.git` changed. Provider and job commands run no Git and skip it.
+fn git_metadata_current(
     authority: &WorkspaceAuthority,
     command: &ControlledCommand,
 ) -> Result<(), RequestError> {
-    if sandbox.class != ProfileClass::Managed {
-        return Ok(());
+    match (command.kind, authority.git_common_dir()) {
+        (CommandKind::Git, Some(common)) => validate_current_git_metadata(&authority.root, common)
+            .map_err(|_| RequestError::GitMetadataInvalid),
+        _ => Ok(()),
     }
-    let denied = RequestError::GitMetadataWriteOverlap;
-    let common = authority.git_common_dir().ok_or(denied.clone())?;
-    if validate_current_git_metadata(authority.root(), common).is_err() {
-        return Err(denied);
-    }
-    let common_device = native_device(common).ok_or_else(|| denied.clone())?;
-    let shape = sandbox
-        .shape_v2(sandbox.cwd())
-        .map_err(|_| RequestError::GitMetadataWriteOverlap)?;
-    let child_tmpdir = command
-        .env
-        .get(&OsString::from("TMPDIR"))
-        .map(PathBuf::from);
-    if child_tmpdir
-        .as_ref()
-        .is_some_and(|path| !is_normal_absolute(path))
-    {
-        return Err(denied);
-    }
-    let mut shared_device_write = false;
-    for (selector, (access, _)) in &shape.rules {
-        if *access != Access::Write {
-            continue;
-        }
-        let raw = match selector {
-            Selector::WorkspaceRelative(parts) => sandbox.cwd().join(parts.join("/")),
-            Selector::Absolute(parts) => Path::new("/").join(parts.join("/")),
-            Selector::Root => PathBuf::from("/"),
-            Selector::SlashTmp => PathBuf::from("/tmp"),
-            Selector::Tmpdir => match &child_tmpdir {
-                Some(path) => path.clone(),
-                None => continue,
-            },
-        };
-        let writable = canonicalize_write_root(&raw).ok_or_else(|| denied.clone())?;
-        shared_device_write |=
-            native_device(&writable).ok_or_else(|| denied.clone())? == common_device;
-        if native_path_contains(common, &writable).ok_or_else(|| denied.clone())?
-            || native_path_contains(&writable, common).ok_or_else(|| denied.clone())?
-        {
-            return Err(denied);
-        }
-    }
-    if shared_device_write && !git_metadata_has_single_links(common) {
-        return Err(denied);
-    }
-    Ok(())
-}
-
-/// Rejects pre-existing hardlink aliases to regular Git metadata before a same-device spawn.
-///
-/// The scan is bounded and repeated at spawn; it assumes no concurrent same-user mutation of Git
-/// metadata throughout scanning and launch. Unsupported entry types,
-/// symlinks, unreadable entries, or more than 100,000 entries fail closed.
-fn git_metadata_has_single_links(common: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    let mut directories = vec![common.to_path_buf()];
-    let mut seen = 0usize;
-    while let Some(directory) = directories.pop() {
-        let Ok(entries) = std::fs::read_dir(directory) else {
-            return false;
-        };
-        for entry in entries {
-            let Ok(entry) = entry else { return false };
-            seen += 1;
-            if seen > 100_000 {
-                return false;
-            }
-            let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
-                return false;
-            };
-            if metadata.is_dir() {
-                directories.push(entry.path());
-            } else if !metadata.is_file() || metadata.nlink() != 1 {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-/// Returns the nearest existing object's device for a write path, including a missing suffix.
-///
-/// A same-device write could reach Git metadata through an existing hardlink, even when its
-/// lexical path and every directory ancestor are disjoint from the common directory.
-fn native_device(path: &Path) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt;
-
-    for prefix in path.ancestors() {
-        match std::fs::metadata(prefix) {
-            Ok(metadata) => return Some(metadata.dev()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => return None,
-        }
-    }
-    None
-}
-
-/// Resolves an existing write root or its nearest existing ancestor without following future paths.
-///
-/// A missing suffix is retained literally; the guard repeats this resolution before spawn, so
-/// a symlink introduced while queued is observed then. Existing regular files are valid exact
-/// write targets; only a missing suffix below a non-directory ancestor fails closed.
-fn canonicalize_write_root(path: &Path) -> Option<PathBuf> {
-    let mut existing = path;
-    let mut suffix = Vec::new();
-    loop {
-        match std::fs::symlink_metadata(existing) {
-            Ok(_) => break,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                suffix.push(existing.file_name()?.to_os_string());
-                existing = existing.parent()?;
-            }
-            Err(_) => return None,
-        }
-    }
-    let mut canonical = std::fs::canonicalize(existing).ok()?;
-    if !suffix.is_empty() && !canonical.is_dir() {
-        return None;
-    }
-    for component in suffix.into_iter().rev() {
-        canonical.push(component);
-    }
-    Some(canonical)
-}
-
-/// Checks native ancestry across symlinks and macOS firmlinks using device/inode identity.
-///
-/// `ancestor` may be a missing write target: then it cannot contain an existing descendant.
-/// Every existing descendant prefix must be stat-able; an uncertain prefix refuses the guard.
-fn native_path_contains(ancestor: &Path, descendant: &Path) -> Option<bool> {
-    use std::os::unix::fs::MetadataExt;
-
-    let target = match std::fs::metadata(ancestor) {
-        Ok(metadata) => (metadata.dev(), metadata.ino()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Some(false),
-        Err(_) => return None,
-    };
-    for prefix in descendant.ancestors() {
-        match std::fs::metadata(prefix) {
-            Ok(metadata) if (metadata.dev(), metadata.ino()) == target => return Some(true),
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => return None,
-        }
-    }
-    Some(false)
 }
 
 /// Names an owner whose queued and running work receives an independent ceiling.
@@ -3942,7 +2387,6 @@ impl OwnedChild {
         request: &ValidatedExecutionRequest,
         capability: ProviderSpawnLease,
         active_use: Option<ActiveBindingUse>,
-        codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
         if let Err(error) = capability.validate_request(request) {
@@ -3952,14 +2396,7 @@ impl OwnedChild {
         if let Err(error) = request.consume_spawn_use(active_use) {
             return Err(settlement.error(ProcessError::Request(error)));
         }
-        Self::spawn_parts(
-            &request.command,
-            &request.invocation.sandbox,
-            settlement,
-            codex_executable,
-            request.trampoline.as_ref(),
-            output_cap,
-        )
+        Self::spawn_parts(&request.command, settlement, output_cap)
     }
 
     /// Consumes a direct Git/job reservation; provider commands require a typed registry capability.
@@ -3968,7 +2405,6 @@ impl OwnedChild {
         request: &ValidatedExecutionRequest,
         lease: AdmissionLease,
         active_use: Option<ActiveBindingUse>,
-        codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
         let settlement = SpawnNeverStarted::ordinary(lease);
@@ -3978,34 +2414,16 @@ impl OwnedChild {
         if let Err(error) = request.consume_spawn_use(active_use) {
             return Err(settlement.error(ProcessError::Request(error)));
         }
-        Self::spawn_parts(
-            &request.command,
-            &request.invocation.sandbox,
-            settlement,
-            codex_executable,
-            request.trampoline.as_ref(),
-            output_cap,
-        )
+        Self::spawn_parts(&request.command, settlement, output_cap)
     }
 
     /// Launches from one linear reservation, returning it only on definite pre-child failure.
     fn spawn_parts(
         command: &ControlledCommand,
-        sandbox: &HostSandboxState,
         settlement: SpawnNeverStarted,
-        codex_executable: &Path,
-        trampoline: Option<&ControlledTrampoline>,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
-        let (mut child, identity) = match launch_child(
-            command,
-            sandbox,
-            &settlement,
-            codex_executable,
-            trampoline,
-            output_cap,
-            false,
-        ) {
+        let (mut child, identity) = match launch_child(command, &settlement, output_cap, false) {
             Ok(child) => child,
             Err(error) => return Err(settlement.error(error)),
         };
@@ -4179,7 +2597,6 @@ impl OwnedProtocolChild {
         request: &ValidatedExecutionRequest,
         capability: ProviderSpawnLease,
         active_use: Option<ActiveBindingUse>,
-        codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
         if let Err(error) = capability.validate_request(request) {
@@ -4189,7 +2606,7 @@ impl OwnedProtocolChild {
         if let Err(error) = request.consume_spawn_use(active_use) {
             return Err(settlement.error(ProcessError::Request(error)));
         }
-        Self::spawn_parts(request, settlement, codex_executable, output_cap)
+        Self::spawn_parts(request, settlement, output_cap)
     }
 
     /// Starts one forwarder using its distinct process slot and exact registry-view authority.
@@ -4198,16 +2615,9 @@ impl OwnedProtocolChild {
         request: &ValidatedExecutionRequest,
         capability: ProviderForwarderSpawnLease,
         active_use: Option<ActiveBindingUse>,
-        codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
-        Self::spawn_from_provider_lease(
-            request,
-            capability.spawn,
-            active_use,
-            codex_executable,
-            output_cap,
-        )
+        Self::spawn_from_provider_lease(request, capability.spawn, active_use, output_cap)
     }
 
     /// Consumes a direct Git/job reservation with exclusive protocol stdout; raw providers are refused.
@@ -4215,7 +2625,6 @@ impl OwnedProtocolChild {
         request: &ValidatedExecutionRequest,
         lease: AdmissionLease,
         active_use: Option<ActiveBindingUse>,
-        codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
         let settlement = SpawnNeverStarted::ordinary(lease);
@@ -4225,28 +2634,20 @@ impl OwnedProtocolChild {
         if let Err(error) = request.consume_spawn_use(active_use) {
             return Err(settlement.error(ProcessError::Request(error)));
         }
-        Self::spawn_parts(request, settlement, codex_executable, output_cap)
+        Self::spawn_parts(request, settlement, output_cap)
     }
 
     /// Launches one typed or direct reservation while retaining its target and exact child identity.
     fn spawn_parts(
         request: &ValidatedExecutionRequest,
         settlement: SpawnNeverStarted,
-        codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
-        let (mut child, identity) = match launch_child(
-            &request.command,
-            &request.invocation.sandbox,
-            &settlement,
-            codex_executable,
-            request.trampoline.as_ref(),
-            output_cap,
-            true,
-        ) {
-            Ok(child) => child,
-            Err(error) => return Err(settlement.error(error)),
-        };
+        let (mut child, identity) =
+            match launch_child(&request.command, &settlement, output_cap, true) {
+                Ok(child) => child,
+                Err(error) => return Err(settlement.error(error)),
+            };
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = tokio::spawn(drain(
@@ -4411,10 +2812,7 @@ fn provider_capability_required() -> ProcessError {
 /// Serializes provider revocation through physical spawn and records that exact direct child once.
 fn launch_child(
     command: &ControlledCommand,
-    sandbox: &HostSandboxState,
     settlement: &SpawnNeverStarted,
-    codex_executable: &Path,
-    trampoline: Option<&ControlledTrampoline>,
     output_cap: usize,
     protocol: bool,
 ) -> Result<(Child, ProcessIdentityData), ProcessError> {
@@ -4443,7 +2841,7 @@ fn launch_child(
     {
         return Err(ProcessError::Request(RequestError::ExecutableUnavailable));
     }
-    let mut process = build_command(command, sandbox, codex_executable, trampoline)?;
+    let mut process = build_command(command);
     process.stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(file) = &command.stdin_file {
         process.stdin(Stdio::from(file.try_clone()?));
@@ -4566,76 +2964,15 @@ impl BorrowedEndpoint {
     }
 }
 
-/// Constructs a direct or sandbox-wrapped command entirely from validated typed inputs.
-///
-/// Managed Codex wrappers receive their own directory plus only explicitly configured search roots
-/// as `PATH`; an absolute provider program never contributes its directory implicitly.
-///
-/// `trampoline` is `Some` only for a managed request whose authoritative worktree differs from the
-/// host's own `sandboxCwd` (see [`ValidatedExecutionRequest::validate`]). The sandbox argv and its
-/// replayed state are identical in both cases; the trampoline only inserts
-/// `/usr/bin/env -C <worktree>` before the validated program, because `codex sandbox` otherwise
-/// overrides the child cwd with `sandboxCwd`. A same-cwd managed command therefore produces
-/// byte-identical argv to before this contract existed. A disabled profile never receives a
-/// trampoline and ignores one.
-///
-/// Returns [`RequestError::ExecutableUnavailable`] through [`ProcessError::Request`] when the
-/// accepted trampoline's bytes changed since acceptance.
-fn build_command(
-    command: &ControlledCommand,
-    sandbox: &HostSandboxState,
-    codex_executable: &Path,
-    trampoline: Option<&ControlledTrampoline>,
-) -> Result<Command, ProcessError> {
-    let mut process = match sandbox.class {
-        ProfileClass::Managed => {
-            let mut sandbox_command = Command::new(codex_executable);
-            sandbox_command
-                .arg("sandbox")
-                .arg("--sandbox-state-json")
-                .arg(sandbox.json_argument())
-                .arg("--");
-            if let Some(trampoline) = trampoline {
-                let path = trampoline.verified_path().map_err(ProcessError::Request)?;
-                ControlledTrampoline::accepts_program(&command.program)
-                    .map_err(ProcessError::Request)?;
-                sandbox_command.arg(path).arg("-C").arg(&command.cwd);
-            }
-            sandbox_command.arg(&command.program);
-            sandbox_command
-        }
-        ProfileClass::Disabled => Command::new(&command.program),
-    };
-    process.args(&command.args);
+/// Builds the owned child's process: the exact program, argv, cwd, and cleared environment.
+fn build_command(command: &ControlledCommand) -> Command {
+    let mut process = Command::new(&command.program);
     process
+        .args(&command.args)
         .current_dir(&command.cwd)
         .env_clear()
         .envs(&command.env);
-    if sandbox.class == ProfileClass::Managed {
-        let parent = codex_executable
-            .parent()
-            .filter(|path| path.is_absolute())
-            .ok_or_else(|| {
-                ProcessError::Io(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "managed Codex executable must have an absolute parent directory",
-                ))
-            })?;
-        let mut search = vec![parent.to_path_buf()];
-        if let Some(configured) = command.env.get(&OsString::from("PATH")) {
-            search.extend(std::env::split_paths(configured));
-        }
-        process.env(
-            "PATH",
-            std::env::join_paths(search).map_err(|_| {
-                ProcessError::Io(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "managed executable search path is invalid",
-                ))
-            })?,
-        );
-    }
-    Ok(process)
+    process
 }
 
 /// Opens and hashes one regular executable, binding later launch to the same path object and bytes.
@@ -4772,369 +3109,6 @@ fn os_bytes(value: &OsString) -> usize {
     #[cfg(not(unix))]
     {
         value.to_string_lossy().len()
-    }
-}
-
-/// Projects a sandbox state into a worktree-portable profile template.
-///
-/// The sandbox cwd must be a supported local absolute path. Its template value becomes the stable
-/// `<workspace-cwd>` marker, as does the prefix of every ordinary filesystem path entry equal to
-/// or below that cwd; each descendant suffix is retained. Sibling and outside paths, special-path
-/// entries, access modes, network policy, unknown fields, and the caller's original value remain
-/// unchanged. `state` has already passed [`HostSandboxState`] validation, so its local cwd is
-/// absolute and free of current- or parent-directory components.
-fn profile_template_value(state: &HostSandboxState) -> Value {
-    let mut template = state.raw.clone();
-    let Some(object) = template.as_object_mut() else {
-        return template;
-    };
-    object.insert("sandboxCwd".into(), Value::String("<workspace-cwd>".into()));
-    if let Some(entries) = object
-        .get_mut("permissionProfile")
-        .and_then(|profile| profile.get_mut("file_system"))
-        .and_then(|file_system| file_system.get_mut("entries"))
-        .and_then(Value::as_array_mut)
-    {
-        for entry in entries {
-            let Some(path) = entry.get_mut("path").and_then(Value::as_object_mut) else {
-                continue;
-            };
-            if path.get("type").and_then(Value::as_str) != Some("path") {
-                continue;
-            }
-            let Some(raw_path) = path.get("path").and_then(Value::as_str).map(str::to_owned) else {
-                continue;
-            };
-            let entry_path = Path::new(&raw_path);
-            let Ok(suffix) = entry_path.strip_prefix(&state.cwd) else {
-                continue;
-            };
-            if !is_normal_absolute(entry_path) {
-                continue;
-            }
-            path.insert(
-                "path".into(),
-                Value::String(
-                    Path::new("<workspace-cwd>")
-                        .join(suffix)
-                        .to_string_lossy()
-                        .into_owned(),
-                ),
-            );
-        }
-    }
-    template
-}
-
-/// Hashes the worktree-portable semantic host state without relying on whitespace or key order.
-fn semantic_state_identity(state: &HostSandboxState) -> String {
-    blake3::hash(canonical_json(&profile_template_value(state)).as_bytes())
-        .to_hex()
-        .to_string()
-}
-
-/// Hashes the complete captured state for a v2 record's `semantic_state` identity (T35B).
-///
-/// `BLAKE3("agent-ide/captured-state/v2\0" || canonical_json(raw))`: domain-separated from every
-/// other digest in this module, key-order and whitespace independent, and deliberately *not*
-/// worktree-portable — it pins the capture itself, cwd included, so a v2 record is only ever
-/// restored against its own reviewed evidence while shape portability lives in the shape digest.
-fn captured_state_identity_v2(state: &HostSandboxState) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"agent-ide/captured-state/v2\0");
-    hasher.update(canonical_json(&state.raw).as_bytes());
-    hasher.finalize().to_hex().to_string()
-}
-
-/// Produces a key-order-independent JSON representation while retaining every value and array order.
-fn canonical_json(value: &Value) -> String {
-    match value {
-        Value::Object(object) => {
-            let mut fields: Vec<_> = object.iter().collect();
-            fields.sort_unstable_by_key(|(key, _)| *key);
-            let body = fields
-                .into_iter()
-                .map(|(key, value)| {
-                    format!("{}:{}", Value::String(key.clone()), canonical_json(value))
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("{{{body}}}")
-        }
-        Value::Array(values) => format!(
-            "[{}]",
-            values
-                .iter()
-                .map(canonical_json)
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        _ => value.to_string(),
-    }
-}
-
-/// Recognizes the one closed managed filesystem profile that already grants read access to `/`.
-///
-/// `raw` is a complete host sandbox state. The profile qualifies only when every part of its
-/// `permissionProfile` value is understood here:
-///
-/// * the profile holds exactly the three known managed keys `type`, `file_system`, and `network`;
-///   an unknown profile-level key may carry a permission this build cannot interpret, so it
-///   disqualifies recognition even though the opaque state still parses and replays normally;
-/// * `file_system` holds exactly `type` and `entries`, and `type` is `restricted`;
-/// * every entry holds only `access`, `path`, and the optional `missing_path_behavior`, whose only
-///   accepted value is `skip`;
-/// * every `access` is `read` or `write` — an `access` of `none`, or any other value, disqualifies
-///   the whole profile because it can subtract from an otherwise total read grant;
-/// * every `path` is either `{"type":"path","path":<normal absolute path>}` or
-///   `{"type":"special","value":{"kind":<root|slash_tmp|tmpdir>}}`; a relative or cwd-derived path
-///   and any unknown key, type, or special kind disqualify the profile;
-/// * at least one `read` entry grants the `root` special path, which is the total read grant itself.
-///
-/// Any unrecognized shape returns `false`, which keeps the strict sandbox-cwd equality in force.
-/// This classifier answers one question about declared read authority; it is deliberately not a
-/// general permissions evaluator, and it never decides write, network, or execution authority.
-fn grants_read_of_all_roots(raw: &Value) -> bool {
-    let Some(profile) = raw.get("permissionProfile").and_then(Value::as_object) else {
-        return false;
-    };
-    // The envelope itself must be closed, not merely its filesystem section: a profile-level key
-    // this build has never seen may carry a permission that subtracts from the declared read
-    // grant, so an unknown key disqualifies the whole recognition. Opaque parsing and replay
-    // elsewhere still accept and preserve such a state untouched; only this read-scope
-    // recognizer is strict, and it reads neither `type` nor `network` as authority.
-    if profile.len() != 3
-        || profile
-            .keys()
-            .any(|key| !matches!(key.as_str(), "type" | "file_system" | "network"))
-    {
-        return false;
-    }
-    let Some(file_system) = profile.get("file_system").and_then(Value::as_object) else {
-        return false;
-    };
-    if file_system.len() != 2
-        || file_system.get("type").and_then(Value::as_str) != Some("restricted")
-    {
-        return false;
-    }
-    let Some(entries) = file_system.get("entries").and_then(Value::as_array) else {
-        return false;
-    };
-    let mut root_granted = false;
-    for entry in entries {
-        let Some(entry) = entry.as_object() else {
-            return false;
-        };
-        if entry
-            .keys()
-            .any(|key| !matches!(key.as_str(), "access" | "path" | "missing_path_behavior"))
-        {
-            return false;
-        }
-        if let Some(behavior) = entry.get("missing_path_behavior")
-            && behavior.as_str() != Some("skip")
-        {
-            return false;
-        }
-        let Some(access) = entry.get("access").and_then(Value::as_str) else {
-            return false;
-        };
-        if !matches!(access, "read" | "write") {
-            return false;
-        }
-        let Some(path) = entry.get("path").and_then(Value::as_object) else {
-            return false;
-        };
-        if path.len() != 2 {
-            return false;
-        }
-        match path.get("type").and_then(Value::as_str) {
-            Some("path") => {
-                let Some(value) = path.get("path").and_then(Value::as_str) else {
-                    return false;
-                };
-                if !is_normal_absolute(Path::new(value)) {
-                    return false;
-                }
-            }
-            Some("special") => {
-                let Some(special) = path.get("value").and_then(Value::as_object) else {
-                    return false;
-                };
-                if special.len() != 1 {
-                    return false;
-                }
-                match special.get("kind").and_then(Value::as_str) {
-                    Some("root") if access == "read" => root_granted = true,
-                    Some("root") => {}
-                    Some("slash_tmp" | "tmpdir") => {}
-                    _ => return false,
-                }
-            }
-            _ => return false,
-        }
-    }
-    root_granted
-}
-
-/// Detects unsupported multi-root profile fields without resolving or expanding any root path.
-fn has_multiple_roots(value: &serde_json::Map<String, Value>) -> bool {
-    value.iter().any(|(key, value)| {
-        (key == "roots" || key.ends_with("_roots"))
-            && value.as_array().is_some_and(|roots| roots.len() > 1)
-    })
-}
-
-/// Returns the canonical effective-rights identity two actors must match to share one provider
-/// backend, its native cache namespace, and its refcount.
-///
-/// The identity covers the whole observed state, never a hand-picked subset, and drops
-/// `sandboxCwd` only once the rights the state actually grants are proven equal without it:
-///
-/// * a `disabled` profile applies no cwd-derived filesystem restriction, so its rights are already
-///   cwd-independent and the cwd is omitted;
-/// * a `managed` profile omits the cwd only when every declared root (`roots`/`*_roots`) resolves
-///   to a *normal absolute* path — a cwd-relative root is resolved against this state's own
-///   absolute sandbox cwd first, so the identity describes absolute rights rather than a relative
-///   policy string;
-/// * every other state — a managed profile that declares no root at all, an unknown or
-///   unparseable envelope, an unsupported cwd, or a root shape this function cannot walk — keeps
-///   `sandboxCwd` in the digest.
-///
-/// That last case is deliberately fail-closed: an identical relative policy under a different cwd
-/// then yields a *different* identity and is never shared, and no sandbox policy is ever broadened
-/// to make two actors match.
-pub fn effective_rights_identity(state: &Value) -> String {
-    let mut canonical = state.clone();
-    if let Some(object) = canonical.as_object_mut() {
-        let profile_type = object
-            .get("permissionProfile")
-            .and_then(Value::as_object)
-            .and_then(|profile| profile.get("type"))
-            .and_then(Value::as_str);
-        let cwd = object
-            .get("sandboxCwd")
-            .and_then(Value::as_str)
-            .and_then(|cwd| local_sandbox_cwd(cwd).ok());
-        let shareable = match (profile_type, cwd) {
-            (Some("disabled"), _) => true,
-            (Some("managed"), Some(cwd)) => object
-                .get("permissionProfile")
-                .and_then(|profile| {
-                    let mut proven = false;
-                    let normalized = normalize_rights_roots(profile, &cwd, 0, &mut proven)?;
-                    proven.then_some(normalized)
-                })
-                .is_some_and(|normalized| {
-                    object.insert("permissionProfile".into(), normalized);
-                    true
-                }),
-            _ => false,
-        };
-        if shareable {
-            object.remove("sandboxCwd");
-        }
-    }
-    blake3::hash(canonical.to_string().as_bytes())
-        .to_hex()
-        .to_string()
-}
-
-/// Bounds the permission-profile nesting this module is willing to claim it understands.
-const MAX_RIGHTS_DEPTH: usize = 8;
-
-/// Rewrites every declared sandbox root to its effective absolute path, or refuses the whole value.
-///
-/// Returns `None` as soon as any part of the profile cannot be proven: a root key whose value is
-/// not an array of strings, a root that does not resolve to a normal absolute path, or nesting
-/// deeper than `MAX_RIGHTS_DEPTH`. `proven` is set once at least one root was actually normalized,
-/// so a managed profile that declares no root at all is never treated as cwd-independent.
-fn normalize_rights_roots(
-    value: &Value,
-    cwd: &Path,
-    depth: usize,
-    proven: &mut bool,
-) -> Option<Value> {
-    if depth > MAX_RIGHTS_DEPTH {
-        return None;
-    }
-    match value {
-        Value::Object(object) => {
-            let mut normalized = serde_json::Map::with_capacity(object.len());
-            for (key, child) in object {
-                if key == "roots" || key.ends_with("_roots") {
-                    let roots = child.as_array()?;
-                    let mut absolute = Vec::with_capacity(roots.len());
-                    for root in roots {
-                        absolute.push(Value::String(absolute_rights_root(root.as_str()?, cwd)?));
-                    }
-                    if !absolute.is_empty() {
-                        *proven = true;
-                    }
-                    normalized.insert(key.clone(), Value::Array(absolute));
-                } else if key == "type" || key == "network" || key == "file_system" {
-                    normalized.insert(
-                        key.clone(),
-                        normalize_rights_roots(child, cwd, depth + 1, proven)?,
-                    );
-                } else {
-                    // An unrecognized key may hide cwd-dependent data (e.g. `entries[].path`) this
-                    // module does not understand how to normalize; refuse rather than pass it through
-                    // unproven, which would let an unrelated `*_roots` key wrongly mark the state
-                    // cwd-independent while this field silently keeps its relative meaning.
-                    return None;
-                }
-            }
-            Some(Value::Object(normalized))
-        }
-        Value::Array(items) => items
-            .iter()
-            .map(|item| normalize_rights_roots(item, cwd, depth + 1, proven))
-            .collect::<Option<Vec<_>>>()
-            .map(Value::Array),
-        other => Some(other.clone()),
-    }
-}
-
-/// Resolves one declared root against this state's absolute sandbox cwd without widening it.
-///
-/// An already-absolute root is kept, a relative root is joined onto `cwd`, and the result is
-/// accepted only when it is a normal absolute path, so `..` traversal or an unsupported `file://`
-/// spelling refuses the identity instead of inventing a broader right.
-fn absolute_rights_root(raw: &str, cwd: &Path) -> Option<String> {
-    let path = if let Some(path) = raw.strip_prefix("file://") {
-        if path.contains('%') || !path.starts_with('/') {
-            return None;
-        }
-        PathBuf::from(path)
-    } else {
-        PathBuf::from(raw)
-    };
-    let resolved = if path.is_absolute() {
-        path
-    } else {
-        cwd.join(path)
-    };
-    is_normal_absolute(&resolved)
-        .then(|| resolved.to_str().map(str::to_owned))
-        .flatten()
-}
-
-/// Derives a local process cwd from a host cwd without modifying the opaque sandbox state.
-fn local_sandbox_cwd(raw: &str) -> Result<PathBuf, SandboxStateError> {
-    let path = if let Some(path) = raw.strip_prefix("file://") {
-        if path.contains('%') || !path.starts_with('/') {
-            return Err(SandboxStateError::UnsupportedCwd);
-        }
-        PathBuf::from(path)
-    } else {
-        PathBuf::from(raw)
-    };
-    if is_normal_absolute(&path) {
-        Ok(path)
-    } else {
-        Err(SandboxStateError::UnsupportedCwd)
     }
 }
 

@@ -4,8 +4,8 @@ use super::*;
 use crate::{
     assistance::content,
     execution::{
-        CapturedProcessEvidence, ControlledCommand, ControlledTrampoline, LocalExecutionPolicy,
-        OwnedChild, ValidatedExecutionRequest, ValidatedHostInvocation, WorkspaceAuthority,
+        CapturedProcessEvidence, ControlledCommand, LocalExecutionPolicy, OwnedChild,
+        ValidatedExecutionRequest, ValidatedHostInvocation, WorkspaceAuthority,
     },
     workspace::{
         authority::AuthorityStamp,
@@ -45,37 +45,10 @@ impl SnapshotRunner for ProductSnapshotRunner<'_, '_> {
             }
         }
     }
-    /// Proves one worktree-relative path readable under the live cwd-bound profile (T36B).
-    ///
-    /// This is the required Execution-backed boundary of [`SnapshotRunner`]: a denied or
-    /// otherwise unprovable path fails the capture attempt before any native byte is read,
-    /// so denied content can never reach a scratch file, a blob hash, or a cached page.
-    /// The refusal keeps the public `execution_profile` code and its closed
-    /// `read_scope:` condition (T36B-r) instead of degrading to a missing-source error.
-    async fn authorize_read_path(&mut self, path: &Path) -> Result<(), GitError> {
-        // The managed `diff` entry point has already required `observed` before any capture.
-        let observed = self
-            .job
-            .observed
-            .as_ref()
-            .ok_or(GitError::UnsupportedSnapshot)?;
-        let binding = self.job.invocation.binding_ref().clone();
-        validate_read_scope(
-            &self.worker.shared,
-            &binding,
-            observed,
-            &self.job.target,
-            &self.authority,
-            errorlog_method(self.job.tool),
-            crate::execution::ReadScope::Path(path),
-        )
-        .map_err(|refusal| {
-            // T36B-r: a per-path proof refusal is an execution-profile failure, never a
-            // missing source: preserve the public code and name the exact closed condition.
-            self.failure = Some(refusal.code);
-            self.detail = Some(refusal.detail);
-            GitError::UnsupportedSnapshot
-        })
+    /// Every snapshot path is worktree-relative below the worktree admitted at activation, so no
+    /// per-path proof is needed; the descriptor-relative reader still refuses escapes.
+    async fn authorize_read_path(&mut self, _path: &Path) -> Result<(), GitError> {
+        Ok(())
     }
     /// Correlates this exact path with its current durable revision/sequence, when one exists.
     /// Never fabricates a token: an absent row, a store error, or a binding that stopped being
@@ -162,7 +135,6 @@ impl ProductSnapshotRunner<'_, '_> {
             &request,
             lease,
             Some(active),
-            &self.job.target.codex.path,
             self.worker.shared.launcher.limits.output_bytes,
         ) {
             Ok(child) => child,
@@ -264,7 +236,6 @@ fn git_failure_detail(
             FailureCode::Deadline => "diff:deadline".to_owned(),
             FailureCode::Capacity => "diff:capacity".to_owned(),
             FailureCode::WorkspaceAuthority => "diff:authority".to_owned(),
-            FailureCode::SandboxState => "diff:sandbox_state".to_owned(),
             FailureCode::ExecutionProfile => "diff:execution_profile".to_owned(),
             FailureCode::Internal => "diff:internal".to_owned(),
             _ => format!("diff:execution:{stage}"),
@@ -672,7 +643,6 @@ impl Worker<'_> {
                 &request,
                 lease,
                 Some(active),
-                &job.target.codex.path,
                 self.shared.launcher.limits.output_bytes,
             ) {
                 Ok(child) => child,
@@ -773,11 +743,7 @@ impl Worker<'_> {
         ) {
             return Err(code);
         }
-        let invocation = ValidatedHostInvocation::from_active_observation(
-            self.shared.active(binding)?,
-            job.observed.clone().ok_or(FailureCode::SandboxState)?,
-        )
-        .map_err(|_| FailureCode::SandboxState)?;
+        let invocation = ValidatedHostInvocation::from_active_use(self.shared.active(binding)?);
         let authority = WorkspaceAuthority::from_workspace_with_git_common_dir(
             authority.worktree().id(),
             authority.worktree().incarnation().to_string(),
@@ -786,43 +752,14 @@ impl Worker<'_> {
             authority.epoch(),
         )
         .map_err(|_| FailureCode::WorkspaceAuthority)?;
-        // An operator-declared `env` trampoline is the only way a command may run in this
-        // worktree while the managed host still reports its own inherited `sandboxCwd`; its
-        // absence simply leaves that case unavailable. The seal is pinned to the digest the
-        // operator declared and startup verified, so a per-request build cannot re-baseline an
-        // executable that changed after the daemon became ready.
-        let trampoline = job
-            .target
-            .cwd_trampoline
-            .as_ref()
-            .map(|accepted| ControlledTrampoline::accept(accepted.path.clone(), &accepted.blake3))
-            .transpose()
-            .map_err(|_| FailureCode::ExecutionProfile)?;
-        let programs = BTreeSet::from([program.path.clone()]);
-        let policy = match trampoline {
-            Some(trampoline) => LocalExecutionPolicy::with_env_trampoline(
-                programs,
-                crate::execution::MAX_PRODUCT_ARGV_BYTES,
-                16,
-                job.target.allow_disabled_host,
-                trampoline,
-            ),
-            None => LocalExecutionPolicy::new(
-                programs,
-                crate::execution::MAX_PRODUCT_ARGV_BYTES,
-                16,
-                job.target.allow_disabled_host,
-            ),
-        }
-        .map_err(|_| FailureCode::ExecutionProfile)?;
-        ValidatedExecutionRequest::validate(
-            invocation,
-            authority,
-            command,
-            &policy,
-            &job.target.catalog,
+        let policy = LocalExecutionPolicy::new(
+            BTreeSet::from([program.path.clone()]),
+            crate::execution::MAX_PRODUCT_ARGV_BYTES,
+            16,
         )
-        .map_err(|_| FailureCode::ExecutionProfile)
+        .map_err(|_| FailureCode::ExecutionProfile)?;
+        ValidatedExecutionRequest::validate(invocation, authority, command, &policy)
+            .map_err(|_| FailureCode::ExecutionProfile)
     }
 
     /// Captures one mode through safe raw Git peers and renders only Changes-owned snapshot evidence.

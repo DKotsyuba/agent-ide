@@ -1,7 +1,6 @@
 //! Restart-only trusted launcher configuration, separate from host metadata and model arguments.
 
 use super::claude_worker::ClaudeOperatorProfile;
-use crate::execution::{ExecutionProfileCatalog, HostSandboxState, PersistedProfileRecord};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
@@ -665,16 +664,6 @@ impl ProjectChecksConfig {
     }
 }
 
-/// Trusted raw Execution evidence loaded from the launcher, never from an invocation or stored reply.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AcceptedProfile {
-    /// Execution-owned serialized accepted profile record.
-    record: Value,
-    /// Exact state captured for that accepted record; current invocation state is checked separately.
-    sandbox_state: Value,
-}
-
 /// One raw attachment mapping; a vector permits detecting duplicate attachments instead of overwriting.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -685,22 +674,19 @@ struct RawTarget {
     candidate: PathBuf,
     /// Accepted Git executable for fixed Workspace discovery and read-only queries.
     git: AcceptedExecutable,
-    /// Accepted Codex wrapper executable used for managed sandbox replay.
-    codex: AcceptedExecutable,
-    /// Operator-declared `/usr/bin/env` trampoline; absent leaves a differing worktree unavailable.
-    ///
-    /// Present only to run a validated command in this target's worktree when the managed host's
-    /// own `sandboxCwd` is an inherited parent directory. Its path must be exactly `/usr/bin/env`;
-    /// an arbitrary script is rejected, and the field is never inferred from a host observation.
-    #[serde(default)]
-    cwd_trampoline: Option<AcceptedExecutable>,
+    /// Legacy 0.3.16 fields accepted for compatibility and ignored: the IDE no longer replays a
+    /// host sandbox, so it needs no Codex wrapper, `env` trampoline, accepted profiles, or
+    /// disabled-host acceptance.
+    #[serde(default, rename = "codex")]
+    _codex: Option<Value>,
+    #[serde(default, rename = "cwd_trampoline")]
+    _cwd_trampoline: Option<Value>,
     /// At most the two current language profiles; duplicate settings/languages are rejected.
     providers: Vec<ProviderLaunch>,
-    /// Trusted Execution records and exact evidence states, at most
-    /// [`crate::execution::MAX_ACCEPTED_PROFILES`] whose digests must all differ (T25B).
-    profiles: Vec<AcceptedProfile>,
-    /// Explicit policy acceptance for an observed disabled host; false never weakens sandboxing.
-    allow_disabled_host: bool,
+    #[serde(default, rename = "profiles")]
+    _profiles: Vec<Value>,
+    #[serde(default, rename = "allow_disabled_host")]
+    _allow_disabled_host: bool,
     /// Operator-declared strict Claude configuration; absent leaves Claude execution unavailable.
     ///
     /// Codex targets omit this field entirely and keep their existing behaviour and configuration
@@ -734,20 +720,8 @@ pub struct LaunchTarget {
     pub candidate: PathBuf,
     /// Trusted accepted Git program identity.
     pub git: AcceptedExecutable,
-    /// Trusted accepted Codex sandbox wrapper identity.
-    pub codex: AcceptedExecutable,
-    /// Validated `/usr/bin/env` trampoline; `None` keeps a differing sandbox cwd unavailable.
-    ///
-    /// Presence is required before a command may run in this target's worktree while the managed
-    /// host reports a different inherited `sandboxCwd`. It widens no sandbox policy and is never a
-    /// fallback to unrestricted execution.
-    pub cwd_trampoline: Option<AcceptedExecutable>,
     /// Accepted closed provider profiles for this candidate.
     pub providers: Vec<ProviderLaunch>,
-    /// Execution-minted catalog reconstructed only from trusted matching profile evidence.
-    pub catalog: ExecutionProfileCatalog,
-    /// Explicit trusted policy for disabled host observations.
-    pub allow_disabled_host: bool,
     /// Validated strict Claude operator profile; `None` keeps Claude execution unavailable.
     ///
     /// Presence is required before any Claude helper may be minted for this target. Its absence is
@@ -861,22 +835,11 @@ impl LauncherConfig {
             if !identifier(&target.attachment)
                 || target.attachment.len() > 128
                 || !absolute(&target.candidate)
-                || target.profiles.is_empty()
-                || target.profiles.len() > crate::execution::MAX_ACCEPTED_PROFILES
                 || target.providers.len() > 4
             {
                 return Err(LauncherError::Rejected);
             }
             target.git.validate()?;
-            target.codex.validate()?;
-            // The trampoline contract accepts exactly one program: a declaration naming any other
-            // path is rejected outright rather than accepted as an arbitrary wrapper script.
-            if let Some(trampoline) = &target.cwd_trampoline {
-                trampoline.validate()?;
-                if trampoline.path != Path::new("/usr/bin/env") {
-                    return Err(LauncherError::Rejected);
-                }
-            }
             let mut provider_kinds = Vec::new();
             for provider in &target.providers {
                 provider.executable.validate()?;
@@ -954,23 +917,6 @@ impl LauncherConfig {
                     _ => {}
                 }
             }
-            let mut records = Vec::new();
-            for profile in target.profiles {
-                // Record-key and shape-version validation is Execution's version-aware closed
-                // parser: the launcher delegates the schema instead of pinning a field count,
-                // so all supported record generations use their own closed validation rules.
-                let record = PersistedProfileRecord::from_json(&profile.record.to_string())
-                    .map_err(|_| LauncherError::Rejected)?;
-                let state = HostSandboxState::parse(Some(profile.sandbox_state))
-                    .map_err(|_| LauncherError::Rejected)?;
-                records.push((record, state));
-            }
-            let expected = records
-                .iter()
-                .map(|(record, _)| record.clone())
-                .collect::<Vec<_>>();
-            let catalog = ExecutionProfileCatalog::from_persisted_records(records, &expected)
-                .map_err(|_| LauncherError::Rejected)?;
             // A declared Claude profile must be complete and strict before it is retained; a
             // weakened declaration is rejected outright rather than downgraded to "unavailable",
             // so an operator never believes a partially strict configuration was accepted.
@@ -982,11 +928,7 @@ impl LauncherConfig {
             let launch = LaunchTarget {
                 candidate: target.candidate,
                 git: target.git,
-                codex: target.codex,
-                cwd_trampoline: target.cwd_trampoline,
                 providers: target.providers,
-                catalog,
-                allow_disabled_host: target.allow_disabled_host,
                 claude_profile: target.claude_profile,
             };
             if targets.insert(target.attachment, launch).is_some() {
@@ -1009,8 +951,6 @@ impl LauncherConfig {
         let mut programs: BTreeMap<&Path, &AcceptedExecutable> = BTreeMap::new();
         for target in self.targets.values() {
             for program in std::iter::once(&target.git)
-                .chain(std::iter::once(&target.codex))
-                .chain(target.cwd_trampoline.iter())
                 .chain(target.providers.iter().map(|provider| &provider.executable))
                 .chain(
                     target

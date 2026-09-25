@@ -226,7 +226,6 @@ impl SharedGopls {
         listener_request: &ValidatedExecutionRequest,
         listener_lease: ProviderSpawnLease,
         active_use: Option<ActiveBindingUse>,
-        codex_executable: &Path,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
         if listener_lease.backend() != profile.compatibility_key() {
@@ -243,7 +242,6 @@ impl SharedGopls {
                 listener_request,
                 listener_lease,
                 active_use,
-                codex_executable,
                 output_cap,
             )?,
             compatibility_key: profile.compatibility_key(),
@@ -283,7 +281,6 @@ impl SharedGopls {
         forwarder_request: &ValidatedExecutionRequest,
         forwarder_lease: ProviderForwarderSpawnLease,
         active_use: Option<ActiveBindingUse>,
-        codex_executable: &Path,
         output_cap: usize,
     ) -> Result<GoplsView, ProcessError> {
         let authority = forwarder_request.authority();
@@ -314,7 +311,6 @@ impl SharedGopls {
             forwarder_request,
             forwarder_lease,
             active_use,
-            codex_executable,
             output_cap,
         )?;
         self.views.insert(
