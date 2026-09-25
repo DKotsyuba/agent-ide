@@ -14,7 +14,7 @@ use super::{
         parse_host_kind, parse_observed_sandbox_state,
     },
     launcher::{AcceptedProviderSettings, LaunchTarget, LauncherConfig},
-    problems::{ProjectProblemFeed, triggers_check},
+    problems::{ProjectProblemFeed, may_write, triggers_check},
     reply::FailureCode,
     worker::WorkerHandle,
 };
@@ -861,6 +861,9 @@ impl ProductDispatcher {
                 // silent carrier: everything still due reaches the next native post or reply
                 // exactly once (T29B §5).
                 let settled_plate = hook_post && !event.host().feed_delivery().allows_replies();
+                // Waiting or reading between `ide.*` calls must not discard a result the agent has
+                // not retrieved yet; only a possible writer advances the native epoch.
+                let advances_epoch = may_write(event.host(), event.tool_name());
                 // Kept for the journal line that names what advanced a native epoch.
                 let hint_cause = format!(
                     "native_hint phase={:?} tool={}",
@@ -912,16 +915,18 @@ impl ProductDispatcher {
                             return Some(PeerReply::NativeHookObserved {});
                         }
                         if let Some(worker) = &self.worker {
-                            worker.native_hint(binding.clone());
-                            errorlog::record(
-                                errorlog::Method::Hook,
-                                errorlog::Outcome::Completed,
-                                errorlog::Fields {
-                                    correlation: call_id.as_deref(),
-                                    detail: Some(&hint_cause),
-                                    ..Default::default()
-                                },
-                            );
+                            if advances_epoch {
+                                worker.native_hint(binding.clone());
+                                errorlog::record(
+                                    errorlog::Method::Hook,
+                                    errorlog::Outcome::Completed,
+                                    errorlog::Fields {
+                                        correlation: call_id.as_deref(),
+                                        detail: Some(&hint_cause),
+                                        ..Default::default()
+                                    },
+                                );
+                            }
                             let fingerprint = binding.fingerprint();
                             let feed = worker.project_feed().filter(|_| hook_post);
                             if triggers_check && let Some(feed) = feed {

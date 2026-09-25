@@ -341,6 +341,13 @@ pub struct ProblemSnapshot { pub language: Language, pub state: CheckState,
   writer allowlist; the T20B skip bounds the repeated-check cost (broad triggering is inexpensive
   in the common case, not universally free). Codex plate delivery is evaluated on every paired
   native post even when the event does not trigger a check.
+- Inert native tools (`may_write`): a paired native post advances the binding's native epoch —
+  which permanently refuses a retained, not yet retrieved `ide.context`/`ide.diff` result as
+  `source_unavailable` — unless its exact `tool_name` is a tool that cannot change the worktree:
+  Codex `clocksleep`/`clockcurr_time` (the built-in `clock.sleep`/`clock.curr_time` a model uses
+  while waiting on a pending result) and Claude `Read`/`Grep`/`Glob`. Codex also schedules no check
+  for them. Every other name, a missing name, a batch post, and any other server's MCP tool still
+  counts as a possible writer.
 - Per `(worktree, language)`: debounce `debounce_ms` after the last trigger; at most one running
   check; a trigger during a run marks it dirty and one more run follows (latest wins), and that
   follow-up run is subject to the same T20B skip-unchanged rule — with inputs unchanged from the

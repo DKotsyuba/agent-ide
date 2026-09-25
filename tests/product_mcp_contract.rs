@@ -770,9 +770,24 @@ async fn managed_claude_hook(project: Option<&Path>, payload: Value) -> std::pro
 
 /// Submits native-shaped hook JSON through the executable and requires silent fail-open completion.
 async fn hook(runtime: &Path, phase: &str, field: &str, actor: &str, call: &str) {
-    let payload = json!({"hook_event_name":phase,field:actor,"tool_use_id":call,
+    named_hook(runtime, phase, field, actor, call, None).await;
+}
+
+/// Sends one Codex hook like [`hook`], optionally naming the native tool it reports.
+async fn named_hook(
+    runtime: &Path,
+    phase: &str,
+    field: &str,
+    actor: &str,
+    call: &str,
+    tool: Option<&str>,
+) {
+    let mut payload = json!({"hook_event_name":phase,field:actor,"tool_use_id":call,
         "tool_input":{"secret":"must-never-leave-hook"},"tool_response":"private-output",
         "cwd":"private-cwd","transcript_path":"private-transcript"});
+    if let Some(tool) = tool {
+        payload["tool_name"] = json!(tool);
+    }
     let mut child = hook_process(runtime, Some("private-host-channel"));
     let mut input = child.stdin.take().unwrap();
     input
@@ -4379,6 +4394,23 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
         )
         .await;
     assert_eq!(wrong_mode["code"], "invalid_detail");
+    // A model waiting between `ide.*` calls (Codex `clock.sleep`) changes nothing on disk, so its
+    // native post must not discard the retained diff; the writer post below still does.
+    for phase in ["PreToolUse", "PostToolUse"] {
+        named_hook(
+            &fixture.runtime,
+            phase,
+            "session_id",
+            actor.actor,
+            "native-wait",
+            Some("clocksleep"),
+        )
+        .await;
+    }
+    let kept = actor
+        .call(&fixture, "ide.inspect", json!({"detail_ref":diff_ref}))
+        .await;
+    assert_eq!(kept["kind"], "diff", "{kept}");
     std::fs::write(fixture.root.join("src/lib.rs"), "pub fn changed() {}\n").unwrap();
     hook(
         &fixture.runtime,
@@ -4400,6 +4432,10 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
         .call(&fixture, "ide.inspect", json!({"detail_ref":old_context}))
         .await;
     assert_eq!(stale["code"], "source_unavailable");
+    let stale_diff = actor
+        .call(&fixture, "ide.inspect", json!({"detail_ref":diff_ref}))
+        .await;
+    assert_eq!(stale_diff["code"], "source_unavailable", "{stale_diff}");
     let latest = actor
         .call(&fixture, "ide.context", json!({"path":"src/lib.rs"}))
         .await;

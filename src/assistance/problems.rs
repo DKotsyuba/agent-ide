@@ -56,17 +56,40 @@ pub(crate) fn is_self_mcp_tool_name(tool_name: Option<&str>) -> bool {
     })
 }
 
+/// Exact native tool names that cannot change the worktree, per host.
+///
+/// Codex reports namespaced built-ins with the namespace prefixed and no separator: a model
+/// waiting on a pending `ide.*` result calls `clock.sleep`, which arrives as `clocksleep`. Claude's
+/// entries are its read-only file tools. Only exact names are listed; every other name, including
+/// any MCP tool of another server, stays a possible writer.
+const INERT_CODEX_TOOLS: [&str; 2] = ["clocksleep", "clockcurr_time"];
+const INERT_CLAUDE_TOOLS: [&str; 3] = ["Read", "Grep", "Glob"];
+
+/// Reports whether one native post may have changed the worktree, so it must advance the binding's
+/// native epoch (invalidating retained Context/Diff results) and may schedule a check.
+///
+/// A missing or unrecognized name counts as a possible writer; only [`INERT_CODEX_TOOLS`] /
+/// [`INERT_CLAUDE_TOOLS`] are excluded, so waiting or reading between `ide.*` calls never discards
+/// a result the agent has not retrieved yet.
+pub fn may_write(host: HostKind, tool_name: Option<&str>) -> bool {
+    let inert: &[&str] = match host {
+        HostKind::Claude => &INERT_CLAUDE_TOOLS,
+        HostKind::Codex => &INERT_CODEX_TOOLS,
+    };
+    !tool_name.is_some_and(|name| inert.contains(&name))
+}
+
 /// Decides whether one settled native post phase schedules a project check (T29B §4).
 ///
 /// Claude keeps the exact [`CHECK_TRIGGER_TOOLS`] writer allowlist. Codex has no certified writer
-/// allowlist yet, so every paired post triggers except this product's own MCP tool names; other
-/// servers' MCP tools are deliberately never excluded because they may edit files. A missing or
-/// unrecognized name triggers conservatively — an unchanged-status post still stays silent, and
-/// T20B eligibility bounds the repeated-check cost.
+/// allowlist yet, so every paired post triggers except this product's own MCP tool names and the
+/// inert built-ins of [`may_write`]; other servers' MCP tools are deliberately never excluded
+/// because they may edit files. A missing or unrecognized name triggers conservatively — an
+/// unchanged-status post still stays silent, and T20B eligibility bounds the repeated-check cost.
 pub fn triggers_check(host: HostKind, tool_name: Option<&str>) -> bool {
     match host {
         HostKind::Claude => tool_name.is_some_and(|name| CHECK_TRIGGER_TOOLS.contains(&name)),
-        HostKind::Codex => !is_self_mcp_tool_name(tool_name),
+        HostKind::Codex => !is_self_mcp_tool_name(tool_name) && may_write(host, tool_name),
     }
 }
 
@@ -817,6 +840,33 @@ mod tests {
         assert!(!past.contains("next_offset"));
     }
 
+    /// Only exact inert names are excluded from native-epoch advances; unknown and missing names,
+    /// writers, and other servers' MCP tools still count as possible writers on both hosts.
+    #[test]
+    fn only_exact_inert_tools_skip_native_epoch_advance() {
+        for name in ["clocksleep", "clockcurr_time"] {
+            assert!(!may_write(HostKind::Codex, Some(name)), "{name}");
+            assert!(may_write(HostKind::Claude, Some(name)), "{name}");
+        }
+        for name in ["Read", "Grep", "Glob"] {
+            assert!(!may_write(HostKind::Claude, Some(name)), "{name}");
+            assert!(may_write(HostKind::Codex, Some(name)), "{name}");
+        }
+        for host in [HostKind::Claude, HostKind::Codex] {
+            for name in [
+                "Bash",
+                "Edit",
+                "apply_patch",
+                "exec_command",
+                "clock",
+                "mcp__x__read",
+            ] {
+                assert!(may_write(host, Some(name)), "{name}");
+            }
+            assert!(may_write(host, None));
+        }
+    }
+
     /// Host-specific check triggers (T29B §4): Claude keeps its exact writer allowlist while
     /// Codex triggers conservatively on every name except this product's own MCP tools.
     #[test]
@@ -836,6 +886,9 @@ mod tests {
             Some("mcp__other-server__write")
         ));
         assert!(triggers_check(HostKind::Codex, None));
+        // Codex's clock built-ins never write, so waiting on a pending result triggers nothing.
+        assert!(!triggers_check(HostKind::Codex, Some("clocksleep")));
+        assert!(!triggers_check(HostKind::Codex, Some("clockcurr_time")));
         // Only this product's own MCP tool names are excluded, in both spellings.
         assert!(!triggers_check(
             HostKind::Codex,
