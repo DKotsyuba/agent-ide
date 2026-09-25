@@ -24,12 +24,9 @@ because deferred MCP tools may be omitted there. If discovery is absent, returns
 no matching tools, or a discovered tool fails, continue with the fail-open rule
 below. Do not repeat discovery in a loop.
 
-Each accepted reply carries one compact decision-facing text block that alone states every fact
-needed for the next action — state, `detail_ref`, `helper`, `continuation`, `retry`, Edit outcome
-and `source_ref`. On Claude, that text is the only carrier: Claude hands `structuredContent`
-straight to its model instead of `content`, so the managed Claude MCP never sends it. On a host
-that does expose `structuredContent`, treat that complete typed result as the source of truth
-instead of parsing the compact text as a second response schema.
+Each accepted reply carries one compact decision-facing text block that states every fact needed
+for the next action — state, `detail_ref`, `continuation`, `retry`, Edit outcome and `source_ref`.
+When a reply is `pending`, call `ide.inspect` with its `detail_ref` to retrieve the result.
 
 ## Workflow
 
@@ -93,19 +90,10 @@ claim exact Clean only after a completed configured project check.
 or `checks disabled` mean the feed has no counts for that language — never treat them as a clean
 result.
 
-## Pending replies and the Claude foreground helper
+## Pending replies
 
-A `Pending` reply may carry an exact `helper` command. On Claude, run that
-command yourself with the Bash tool in the foreground
-(`run_in_background` must stay `false`), without editing, wrapping, or
-appending to it. Call `ide.inspect` only after that command has completed —
-never before, and never construct the helper command yourself. The helper must be the ONLY command
-in its Bash call (no `date;` prefix or other wrapper); take timestamps in a separate call.
-
-If that exact helper reports `unavailable` under Claude's strict macOS sandbox, report the exact
-`/private/tmp/ai-c-…/claude-helper.sock` path derived from its `--runtime-dir` argument. The operator
-must add that one path to `sandbox.network.allowUnixSockets` in project-local settings before a new
-Claude session; never suggest `allowAllUnixSockets`.
+Both Codex and Claude call the IDE tool directly. When a reply is `pending`, call `ide.inspect`
+with the given `detail_ref`; never run a helper command.
 
 ## Independence and fallback
 

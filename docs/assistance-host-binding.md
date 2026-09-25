@@ -35,6 +35,14 @@ prove sandbox enforcement.
 
 ## Product MCP boundary
 
+### Claude route
+
+Claude uses the same daemon route as Codex: MCP calls reach the daemon and the worker executes
+the operation. Claude identity is correlated by `claudecode/toolUseId` against the native hook
+pre-observation. `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, and `PermissionDenied` hooks
+advance the native epoch and invalidate stale source references; inert tools do not. The managed
+Claude shared daemon remains one daemon per repository, with hooks rendezvousing to it.
+
 `agent-ide mcp --launcher-template ABSOLUTE_PATH` is the standard self-contained Codex entrypoint.
 It serves exactly `ide.start`, `ide.context`, `ide.diff`, `ide.inspect`, and `ide.stop` over stdio.
 At startup it captures the subprocess current directory once, creates one fresh private runtime,
@@ -58,10 +66,9 @@ Per EYES-r1 §2/EYES-r2, the MCP creates that directory only when no live lock h
 existing directory whose lock is held and whose health endpoint answers is instead explicitly
 validated (owner, mode `0700`, non-symlink, device/inode re-checked from an open file descriptor)
 and adopted, never repaired or removed. The owner binds the template's sole target to the captured
-project and a fresh random attachment, requires that target's existing strict Claude operator
-profile, writes the bound launcher and project-bound attachment record with mode `0600`, then
+project and a fresh random attachment, writes the bound launcher and project-bound attachment record with mode `0600`, then
 starts and health-checks the daemon through the existing legacy Claude route. It serves the v0.1
-five tools and, when the claimed foreground-helper gate succeeds, the v0.2 `edit` tool. Per
+five tools and the v0.2 `edit` tool. Per
 EYES-r1 §2, this MCP never owns that daemon's lifetime: stdio EOF, cancellation, SIGINT, or SIGTERM
 end this one MCP process only, leaving an adopted or spawned daemon running for the next MCP of the
 same repository to find.
@@ -72,10 +79,7 @@ to the nearest worktree with a private candidate cache, then validates the share
 attachment file's owner, exact modes, shape, and full repository digest. It reads that worktree's
 daemon-minted lease attachment from the private cache and reuses the existing Claude parser and
 connect-only transport. Missing
-or corrupt state is silent fail-open. Root and child lifecycle identity, permission denial,
-failed-tool settlement and feedback output are unchanged. Foreground-helper recognition requires
-the exact command, actor, and lease attachment that minted the ticket; the helper claim checks that
-same attachment before releasing work.
+or corrupt state is silent fail-open. Root and child lifecycle identity, permission denial, failed-tool settlement and feedback output are unchanged.
 The installed binary and launcher template remain machine-specific values in normal Claude MCP
 configuration; they are not embedded in the plugin manifest.
 

@@ -8,7 +8,7 @@ A coding actor explicitly activates assistance for its own Git worktree. The ini
 
 Activation is actor-specific. Native subagents do not inherit it. The host adapter must prove the relation between the actor, MCP invocation, and hook/delivery channel; model arguments, working directory, timing, parent IDs, and peer user identity alone are insufficient proof. A failed or unavailable IDE must leave native tools and turn completion usable. Hooks have independently enforced deadlines and never wait for compiler warmup.
 
-The real provider loop covers shared Go/gopls, a bounded exclusive Rust profile, and a bounded exclusive Pyright profile for Codex and Claude Python (`.py` and `.pyi`) on macOS. Pyright is always one worktree-isolated stdio child with fixed configuration; Claude runs it only in a foreground helper under the helper's existing strict sandbox contract. Intelligence chooses the provider topology; Execution admits and supervises physical processes and forwarders. Unsupported sharing stays explicitly unsupported. A shared daemon must not gain authority beyond the host's verified execution profile. Where enforcement is unproven, affected execution is unavailable.
+The real provider loop covers shared Go/gopls, a bounded exclusive Rust profile, and a bounded exclusive Pyright profile for Codex and Claude Python (`.py` and `.pyi`) on macOS. Pyright is always one worktree-isolated stdio child with fixed configuration; Claude runs it through the shared daemon route. Intelligence chooses the provider topology; Execution admits and supervises physical processes and forwarders. Unsupported sharing stays explicitly unsupported. A shared daemon must not gain authority beyond the host's verified execution profile. Where enforcement is unproven, affected execution is unavailable.
 
 ### Responsibilities
 
@@ -43,9 +43,9 @@ The target platforms are Linux and macOS. Current v0.1 acceptance runs real Code
 | macOS 26.6.2, Codex CLI 0.154.0, Rust/rust-analyzer 1.98.1 | `real_pass` for the managed product/provider contract; live model CLI cell `not_tested` |
 | macOS, Codex CLI, Python/Pyright 1.1.413 | `real_pass` for the bounded product/provider contract |
 | macOS 26.6.2, Codex, Node 24.4.0 / TypeScript Language Server 6.0.0 / TypeScript 5.9.3 | `real_pass`: real JS, JSX, TS and TSX semantic Context plus release-pinned normal shutdown |
-| macOS 26.6.2, Claude Code 2.1.267, Node 24.4.0 / TypeScript Language Server 6.0.0 / TypeScript 5.9.3 | `real_pass`: strict foreground-host semantic/diagnostic spike plus release-pinned normal shutdown and product helper Context |
-| macOS 26.6.2, Claude Code 2.1.267, Go/gopls 0.23.0 | `real_pass`: foreground helper, native-edit diagnostic, Diff, Stop and parallel actor isolation |
-| macOS 26.6.2, Claude Code 2.1.267, Rust/rust-analyzer 1.98.1 | `real_pass`: foreground helper semantic context, native-edit diagnostic, Diff and Stop |
+| macOS 26.6.2, Claude Code 2.1.267, Node 24.4.0 / TypeScript Language Server 6.0.0 / TypeScript 5.9.3 | `real_pass`: historical semantic/diagnostic spike plus release-pinned normal shutdown and product Context |
+| macOS 26.6.2, Claude Code 2.1.267, Go/gopls 0.23.0 | `real_pass`: daemon route, native-edit diagnostic, Diff, Stop and parallel actor isolation |
+| macOS 26.6.2, Claude Code 2.1.267, Rust/rust-analyzer 1.98.1 | `real_pass`: daemon semantic context, native-edit diagnostic, Diff and Stop |
 | macOS, Claude Code, Python/Pyright | `product_covered`; real host containment remains separately verified |
 | Linux, both hosts/providers | `not_tested`; outside the current Mac-only release gate |
 
@@ -113,8 +113,8 @@ not enter them.
 | macOS route | Required real evidence | Status |
 |---|---|---|
 | Direct Codex | `start -> context -> edit -> diagnostic -> fix -> diff -> stop`; stale edit has zero writes; native fallback; restart-safe telemetry query/export; divergent worktrees | `failed` on macOS 26.6.2 with Codex CLI 0.154.0: Pyright edit/stale/native behavior and TypeScript semantic Context ran; one Diff inspection completed before a further driver inspection failed without preserving its closed code |
-| Direct Claude | The same scenario through the claimed foreground helper, including TypeScript only after its spike; stale edit has zero writes; native fallback; restart-safe telemetry; divergent worktrees | `failed` on Claude Code 2.1.267: normal OAuth was available after removing the synthetic-home isolation; helper-backed Pyright ran in both worktrees, but Diff returned `workspace_authority` and TypeScript remained lexical pending its separate host record |
-| Installed external agent-run-to-Claude | The same end-to-end route, with its external attachment treated as an adapter rather than identity authority; stale edit has zero writes; native fallback; restart-safe telemetry; divergent worktrees | `failed` on agent-run 0.11.8 to Claude Code 2.1.267: both divergent Pyright/helper paths ran, Diff inspection returned `capacity`, and the tested Claude launcher had no accepted TypeScript provider |
+| Direct Claude | The same scenario through the daemon route, including TypeScript only after its spike; stale edit has zero writes; native fallback; restart-safe telemetry; divergent worktrees | `failed` on Claude Code 2.1.267: normal OAuth was available after removing the synthetic-home isolation; daemon Pyright ran in both worktrees, but Diff returned `workspace_authority` and TypeScript remained lexical pending its separate host record |
+| Installed external agent-run-to-Claude | The same end-to-end route, with its external attachment treated as an adapter rather than identity authority; stale edit has zero writes; native fallback; restart-safe telemetry; divergent worktrees | `failed` on agent-run 0.11.8 to Claude Code 2.1.267: both divergent Pyright paths ran, Diff inspection returned `capacity`, and the tested Claude launcher had no accepted TypeScript provider |
 | Linux, all routes | No v0.2 host/provider acceptance claim | `not_tested` |
 
 This increment does not add a remote analytics service, dashboard, arbitrary shell

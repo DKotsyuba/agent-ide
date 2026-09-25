@@ -5,7 +5,7 @@ An explicitly activated coding companion for Codex and Claude Code on macOS arm6
 Status: the binary assembles the six-tool MCP surface, exact Codex hook-to-MCP binding,
 explicit Codex/Claude native ingress, bounded hook context output, durable Workspace activation,
 source context, safe Git comparisons and owned provider cleanup. Host-shaped process tests exercise
-Claude foreground-helper activation, stale-safe Edit, Go/Rust Context, Diff and emitted additional context.
+Claude daemon activation, stale-safe Edit, Go/Rust Context, Diff and emitted additional context.
 Live macOS checks cover Claude Go/Rust and parallel native actors with sequential handoff,
 plus Codex Go context/edit/diff/stop and parent/native-child isolation across distinct worktree
 roots. Complete delivery accounting and the remaining roadmap acceptance checks are still open.
@@ -48,7 +48,7 @@ manifest cannot safely supply the machine-specific template path, so it remains 
 Legacy `agent-ide mcp --runtime-dir PATH` remains connect-only and compatible with separately
 started `agent-ide daemon --runtime-dir PATH` instances.
 
-Claude uses the same standard MCP configuration mechanism, with an explicit managed-Claude flag.
+Claude uses the same standard MCP configuration mechanism as Codex.
 Keep both absolute, machine-specific paths in the host's normal MCP configuration rather than the
 plugin manifest:
 
@@ -69,21 +69,11 @@ plugin-local command requires `AGENT_IDE_BIN` to be the same absolute executable
 MCP and delegates to that exact installed binary's `claude-hook`. It never searches `PATH`, so a
 binary update cannot split MCP and hook versions. That argument-free mode finds the active project rendezvous
 solely from Claude's absolute `CLAUDE_PROJECT_DIR`. The managed MCP requires the template's one
-target to carry the strict Claude operator profile documented below. It exclusively owns a
+target. It exclusively owns a
 deterministic private runtime for that project, so a second MCP stays disconnected until the owner
 exits and removes it.
 
-With Claude sandboxing enabled on macOS, `sandbox.network.allowUnixSockets` must contain the exact
-`/private/tmp/ai-r-<hash>/claude-helper.sock` path. Since v0.3 the runtime directory is keyed by the
-repository rather than one project digest: `<hash>` is the first 16 hex digits of the BLAKE3 digest
-of the canonical git common directory (`git -C <project> rev-parse --path-format=absolute
---git-common-dir`, symlinks resolved), or of the canonical project directory outside a repository,
-so one allowlist entry serves every worktree of one repository. The pending helper command shows the
-exact runtime directory in its `--runtime-dir` argument whenever a helper reports `unavailable`.
-Current Claude Code does not expand a wildcard for this socket allowlist; add that exact path to the
-project's local settings before the next session, and do not enable `allowAllUnixSockets` for
-Agent IDE. `agent-ide claude-rendezvous /absolute/path/to/project` prints the exact
-`runtime_dir=` and `helper_socket=` paths for a repository without creating any runtime state.
+`agent-ide claude-rendezvous /absolute/path/to/project` prints the repository runtime directory without creating runtime state.
 
 The separate launcher environment variable `AGENT_IDE_HOST_ATTACHMENT` enables
 connect-only routing when supported host request metadata is also present. It is an
@@ -151,7 +141,7 @@ Stopping a coder releases its analysis leases and retains its worktree's cache d
 
 Go worktrees split their cache in two. Each worktree keeps a private namespace holding its own `GOCACHE`/`GOMODCACHE`/`GOTMPDIR`, delivered per LSP view rather than as process environment, so a view without one fails closed instead of reading another worktree's build state. Compatible worktrees additionally share one backend-scoped native namespace holding gopls' own on-disk filecache and the listener's temporary directory: gopls binds that filecache once per process, so sharing it is what lets divergent worktrees run on a single physical listener with one forwarder each. Compatibility is one canonical effective-rights identity — provider, settings, toolchain, and the rights the observed sandbox state actually grants; cwd-relative sandbox roots are resolved to absolute rights first, and any policy whose rights cannot be proven equal is never shared. The shared namespace is reference-counted, so it survives a partial stop while any sharing worktree is still live, and both namespaces persist across stop and handoff. gopls manages the contents of its shared native namespace itself and may evict them at any time; that eviction is a cache miss, never a loss of IDE-owned worktree state.
 
-Pyright v0.1.1 supports Codex and Claude Python (`.py` and `.pyi`). Configure its closed `pyright_defaults_v1` provider with accepted absolute `pyright-langserver` and `node` executable objects, and set `toolchain` to the accepted Node identity. The launcher invokes that exact Node executable with the absolute Pyright script and `--stdio`; Claude does so only in its foreground helper, using the same accepted paths, identities, and BLAKE3 digests. The six-tool MCP surface keeps wire v2 for the original five methods and uses wire v3 for `ide.edit`.
+Pyright v0.1.1 supports Codex and Claude Python (`.py` and `.pyi`). Configure its closed `pyright_defaults_v1` provider with accepted absolute `pyright-langserver` and `node` executable objects, and set `toolchain` to the accepted Node identity. The launcher invokes that exact Node executable with the absolute Pyright script and `--stdio`; The daemon uses the same accepted paths, identities, and BLAKE3 digests. The six-tool MCP surface keeps wire v2 for the original five methods and uses wire v3 for `ide.edit`.
 
 The v0.2 TypeScript increment supports Codex and Claude semantic Context for `.js`, `.jsx`, `.ts`,
 and `.tsx` on their separate accepted macOS release cells. Configure `typescript_defaults_v1` with
@@ -164,4 +154,4 @@ documented in the [launcher contract](docs/assistance-launcher.md). That config 
 bounded normalized relative path; `include`, `exclude`, `outDir`, `declarationDir`, and dependency
 graphs are unsupported. Each operation is exclusive and one-shot; normal
 success requires graceful shutdown, protocol EOF, zero bridge exit, and direct-child reap without
-TERM/KILL. Claude runs the same profile only in its claimed foreground helper.
+TERM/KILL. Claude runs the same profile through the daemon.
