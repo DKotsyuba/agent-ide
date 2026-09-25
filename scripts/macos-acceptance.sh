@@ -170,8 +170,8 @@ run_product_gates() {
         configured_product_returns_real_typescript_family_context_and_reaps \
         configured_product_returns_real_pyright_semantic_context_and_reaps \
         configured_product_acceptance_edit_diagnostics_telemetry_and_fallback \
-        configured_product_claude_helper_returns_real_pyright_semantic_context_diff_and_stop \
-        configured_product_claude_helper_returns_real_typescript_semantic_context_and_reaps
+        configured_product_claude_returns_real_pyright_semantic_context_diff_and_stop \
+        configured_product_claude_returns_real_typescript_semantic_context_and_reaps
     do
         printf '%s\n' "$ACCEPTANCE_TEST_LIST" | grep -Fxq "$ACCEPTANCE_GATE: test" || return 1
         cargo test --locked --test product_mcp_contract "$ACCEPTANCE_GATE" -- --ignored --exact --nocapture --test-threads=1 || return 1

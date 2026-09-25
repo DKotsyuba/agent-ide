@@ -17,9 +17,9 @@ spelling variant (ide.start or ide_start); they are the same tools.
    that reply. The structured context result has a detail_ref field; remember
    that exact value as OLD_REF.
 3. Call ide.stop with {}.
-4. With your native file-editing ability only (apply_patch or the shell), edit
-   acceptance-fixture/fixture.py by inserting exactly one new first line
-   reading: # native acceptance marker
+4. With your native file-editing ability only (apply_patch, the shell, or the
+   Edit tool after its required Read), edit acceptance-fixture/fixture.py by
+   inserting exactly one new first line reading: # native acceptance marker
    Keep every existing line unchanged.
 5. Call ide.start with {"activation_id":"acceptance-left-2b"}. Apply R1 to that reply.
 6. Call ide.context with {"path":"acceptance-fixture/fixture.py"}. Apply R1 to that reply.

@@ -83,8 +83,8 @@ fn runner_covers_all_cells_without_embedding_private_run_identifiers() {
         "configured_product_returns_real_pyright_semantic_context_and_reaps",
         "configured_product_rust_resolves_definition_across_a_crate_boundary",
         "configured_product_isolates_typescript_across_two_divergent_worktree_actors",
-        "configured_product_claude_helper_returns_real_pyright_semantic_context_diff_and_stop",
-        "configured_product_claude_helper_returns_real_typescript_semantic_context_and_reaps",
+        "configured_product_claude_returns_real_pyright_semantic_context_diff_and_stop",
+        "configured_product_claude_returns_real_typescript_semantic_context_and_reaps",
     ] {
         assert!(runner.contains(gate));
     }
@@ -101,7 +101,7 @@ fn runner_covers_all_cells_without_embedding_private_run_identifiers() {
     }
 }
 
-/// Requires both agent-run routes to use schema-2 providers and Codex's helper-free prompts.
+/// Requires both agent-run routes to use schema-2 providers and the shared host-neutral prompt family.
 #[test]
 fn agent_run_drivers_use_route_matched_schema_two_providers() {
     let driver = include_str!("../scripts/acceptance-drivers/agent-run-claude.sh");
@@ -115,7 +115,7 @@ fn agent_run_drivers_use_route_matched_schema_two_providers() {
         "start --provider \"$PROVIDER\"",
         "[ \"$PROVIDER\" = \"$DEFAULT_PROVIDER\" ]",
         "DEFAULT_MODEL=gpt-6-luna",
-        "PROMPT_FAMILY=codex-prompts",
+        "PROMPT_FAMILY=prompts",
         "task_prompt \"$DRIVER_DIR/$PROMPT_FAMILY/l1b.txt\"",
         "task_prompt \"$DRIVER_DIR/$PROMPT_FAMILY/r5b.txt\"",
         "if [ \"$AGENT_IDE_ACCEPTANCE_ROUTE\" = agent-run-claude ]; then",

@@ -7,7 +7,7 @@ in each, runs the selected cell, and removes only those runner-owned worktrees a
 The default `product` route runs the locked real-provider product gates for the accepted release
 languages — Rust/rust-analyzer, Python/Pyright, Node/TypeScript r3 — plus the edit/diagnostic/fix/
 diff/stop loop, stale-edit zero-write, native fallback, compact MCP projection, telemetry
-restart/query/export, and the Claude foreground helper for Pyright and TypeScript. Go and gopls
+restart/query/export, and the Claude Pyright and TypeScript gate. Go and gopls
 are outside the release scope: the runner neither requires nor executes them, their toolchain
 evidence stays `not_tested`, and the two locked Go/gopls provider gates are excluded. The Rust
 gate is the existing cross-crate rust-analyzer proof; `divergent_worktrees` is proven by the
@@ -55,6 +55,9 @@ claude -p "$(cat <prompt>)" --model haiku --output-format stream-json --verbose 
 
 Claude Code 2.1.274 documents no flag that bounds agentic turns (`--max-turns` is gone from
 `claude --help`), so each session is bounded only by the driver's outer `perl alarm` wall clock.
+The candidate's plugin hook binds `ide.start` the same way the Codex `_meta` attachment does, so
+a `pending` tool answer is likewise followed only by `ide.inspect` with the returned `detail_ref`;
+neither host has a separate foreground command step.
 The strict launcher template defaults to `/Users/pluto/.config/agent-ide/launcher.json`, which
 carries the merged Codex profiles, Pyright, and the accepted TypeScript r3 provider
 `claude-r3-2026-09-14`.
@@ -73,8 +76,8 @@ The route requires the matching schema-2 provider: `claude` with default model `
 `codex` with default model `gpt-6-luna`. Either route may override its model, but a provider
 override must still match the route. The old `AGENT_IDE_ACCEPTANCE_AGENT_RUN_RUNTIME` setting
 is rejected; use `AGENT_IDE_ACCEPTANCE_AGENT_RUN_PROVIDER`.
-Codex uses `codex-prompts` and no Claude helper socket or project-local Claude
-settings. The resident broker spawns the agent process, so environment set on the start command line (`AGENT_IDE_BIN`, `HOME`) does not
+Both routes read prompts from the shared `scripts/acceptance-drivers/prompts/` family and write
+no project-local Claude settings. The resident broker spawns the agent process, so environment set on the start command line (`AGENT_IDE_BIN`, `HOME`) does not
 reach the agent: the agent's MCP comes from the operator's `~/.agent-run/config.toml`
 `[mcp.agent_ide]` entry. The outer `perl alarm` bounds each start call independently of agent-run's
 own timeout setting. Because the driver cannot redirect the agent
@@ -187,10 +190,10 @@ The earlier direct-Claude login result was false: the host inherited a per-run s
 Claude resolved an empty isolated profile instead of the operator's normal authorized profile.
 Changing outer sandbox permissions did not change that result; restoring the normal login home did,
 with the existing OAuth read in place and no credential copied or emitted. Direct Claude then reached
-the candidate MCP and foreground-helper route. This environment correction changes the row from
+the candidate MCP and its plugin-hook route. This environment correction changes the row from
 `not_tested` to a real `failed` result; it does not turn the incomplete cell into `real_pass`.
 
-The remaining failures do not justify a product change in this task. The locked Claude helper gate
+The remaining failures do not justify a product change in this task. The locked Claude gate
 passes real Pyright Context and Diff, while the live direct-Claude Diff failure is
 `workspace_authority`. The agent-run Diff failure is the distinct closed `capacity` result. The
 accepted TypeScript r3 provider `claude-r3-2026-09-14` has since been compiled and merged into the

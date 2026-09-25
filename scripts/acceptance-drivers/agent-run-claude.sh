@@ -16,8 +16,9 @@
 # agents' stored answers, real filesystem effects, and the durable telemetry
 # database.
 #
-# The route selects its matching provider and prompt family. Claude keeps Sonnet;
-# Codex uses the economical gpt-6-luna default and prompts without a helper.
+# The route selects its matching provider and model. Claude keeps Sonnet; Codex
+# uses the economical gpt-6-luna default. Both share the same host-neutral
+# prompt family.
 #
 # The outer `perl alarm` bounds each start call independently of agent-run's
 # own timeout setting. Setting
@@ -27,7 +28,7 @@
 # Operator environment (all optional, defaults fit the release host):
 #   AGENT_IDE_ACCEPTANCE_BINARY         candidate agent-ide executable used for
 #                                       identity, telemetry, and evidence
-#                                       helpers; default
+#                                       support; default
 #                                       <repo>/target/release/agent-ide.
 #   AGENT_IDE_ACCEPTANCE_AGENT_RUN      installed agent-run CLI; default
 #                                       /Users/pluto/.agent-run/standalone/current/bin/agent-run.
@@ -59,15 +60,15 @@ case "${AGENT_IDE_ACCEPTANCE_ROUTE:-}" in
     agent-run-claude)
         DEFAULT_PROVIDER=claude
         DEFAULT_MODEL=sonnet
-        PROMPT_FAMILY=claude-prompts
         ;;
     agent-run-codex)
         DEFAULT_PROVIDER=codex
         DEFAULT_MODEL=gpt-6-luna
-        PROMPT_FAMILY=codex-prompts
         ;;
     *) fail E_ROUTE "unsupported agent-run route" ;;
 esac
+# Host-neutral acceptance prompt family shared with every other driver.
+PROMPT_FAMILY=prompts
 [ -n "${AGENT_IDE_ACCEPTANCE_LEFT_WORKTREE:-}" ] || fail E_LEFT_WORKTREE_MISSING
 [ -n "${AGENT_IDE_ACCEPTANCE_RIGHT_WORKTREE:-}" ] || fail E_RIGHT_WORKTREE_MISSING
 [ -n "${AGENT_IDE_ACCEPTANCE_RESULT:-}" ] || fail E_RESULT_PATH_MISSING
@@ -134,15 +135,6 @@ LEFT_IDENTITY=$(project_identity "$BINARY" "$LEFT") || fail E_LEFT_IDENTITY
 RIGHT_IDENTITY=$(project_identity "$BINARY" "$RIGHT") || fail E_RIGHT_IDENTITY
 
 mkdir -p -- "$DIAG_DIR"
-
-# Prepares the project-local sandbox socket allowance for one worktree.
-prepare_worktree() {
-    socket=$2/claude-helper.sock
-    mkdir -p -- "$1/.claude" || fail E_SETTINGS_DIR "$1"
-    jq -n --arg socket "$socket" \
-        '{sandbox:{network:{allowUnixSockets:[$socket]}}}' \
-        >"$1/.claude/settings.local.json" || fail E_SETTINGS_WRITE "$1"
-}
 
 # Requires one complete agent-run transcript to pair each Agent IDE call with a bounded text reply.
 #
@@ -276,8 +268,6 @@ if [ "$AGENT_IDE_ACCEPTANCE_ROUTE" = agent-run-claude ]; then
     LEFT_RUNTIME=$("$BINARY" claude-rendezvous "$LEFT" | sed -n 's/^runtime_dir=//p')
     RIGHT_RUNTIME=$("$BINARY" claude-rendezvous "$RIGHT" | sed -n 's/^runtime_dir=//p')
     [ -n "$LEFT_RUNTIME" ] && [ -n "$RIGHT_RUNTIME" ] || fail E_CLAUDE_RUNTIME
-    prepare_worktree "$LEFT" "$LEFT_RUNTIME"
-    prepare_worktree "$RIGHT" "$RIGHT_RUNTIME"
 fi
 
 # Agent L1: real edit/diagnostic/fix/diff/stop loop over Pyright.
@@ -289,7 +279,7 @@ if [ "$AGENT_IDE_ACCEPTANCE_ROUTE" = agent-run-codex ]; then
 fi
 printf 'def value() -> int:\n    return 0\n' >"$DIAG_DIR/expected-l1.py"
 cmp -s "$LEFT/acceptance-fixture/fixture.py" "$DIAG_DIR/expected-l1.py" \
-    || fail A_L1_FILE_CONTENT "left fixture.py is not the helper-edited content"
+    || fail A_L1_FILE_CONTENT "left fixture.py is not the expected edited content"
 if [ "$AGENT_IDE_ACCEPTANCE_ROUTE" = agent-run-codex ]; then
     task_prompt "$DRIVER_DIR/$PROMPT_FAMILY/l1b.txt" >"$DIAG_DIR/task-l1b.txt"
     run_agent l1b "$LEFT" "$DIAG_DIR/task-l1b.txt"
@@ -302,9 +292,19 @@ task_prompt "$DRIVER_DIR/$PROMPT_FAMILY/l2.txt" >"$DIAG_DIR/task-l2.txt"
 run_agent l2 "$LEFT" "$DIAG_DIR/task-l2.txt"
 require_answer_text l2 "LEFT_FALLBACK_OK" A_L2_FINAL
 require_record_text l2 "stale_source" A_L2_STALE_OUTCOME
-printf '# native acceptance marker\ndef value() -> int:\n    return 0\n' >"$DIAG_DIR/expected-l2.py"
-cmp -s "$LEFT/acceptance-fixture/fixture.py" "$DIAG_DIR/expected-l2.py" \
-    || fail A_L2_ZERO_WRITE "left fixture.py does not prove the stale edit wrote nothing"
+# A byte-exact compare against a fixed expectation is too strict: a native tool (for
+# example BSD `sed -i '' '1i\...'`) may insert the marker line with different trailing
+# whitespace than an idealized rendering while still writing zero IDE bytes. Three
+# content checks prove the same fact without pinning the native tool's exact formatting.
+left_py=$LEFT/acceptance-fixture/fixture.py
+[ "$(sed -n '1p' "$left_py")" = "# native acceptance marker" ] \
+    || fail A_L2_ZERO_WRITE "left fixture.py does not start with the native marker"
+grep -qF "return 0" "$left_py" \
+    || fail A_L2_ZERO_WRITE "left fixture.py lost the fixed return"
+if grep -qF "return 7" "$left_py"; then
+    fail A_L2_ZERO_WRITE "left fixture.py absorbed the stale edit's return 7"
+fi
+cp -- "$left_py" "$DIAG_DIR/left-after-l2.py" || fail A_L2_ZERO_WRITE "could not snapshot left fixture"
 
 # Agent L3: real TypeScript semantic context through the accepted bundle.
 task_prompt "$DRIVER_DIR/$PROMPT_FAMILY/l3.txt" >"$DIAG_DIR/task-l3.txt"
@@ -343,8 +343,8 @@ for marker in left-python-bad left-typescript-bad; do
     fi
 done
 cmp -s "$RIGHT/acceptance-fixture/fixture.py" "$DIAG_DIR/expected-l1.py" \
-    || fail A_R5_FILE_CONTENT "right fixture.py is not the helper-edited content"
-cmp -s "$LEFT/acceptance-fixture/fixture.py" "$DIAG_DIR/expected-l2.py" \
+    || fail A_R5_FILE_CONTENT "right fixture.py is not the expected edited content"
+cmp -s "$LEFT/acceptance-fixture/fixture.py" "$DIAG_DIR/left-after-l2.py" \
     || fail A_R5_LEFT_ISOLATION "left fixture.py changed during the right agent"
 if [ "$AGENT_IDE_ACCEPTANCE_ROUTE" = agent-run-codex ]; then
     task_prompt "$DRIVER_DIR/$PROMPT_FAMILY/r5b.txt" >"$DIAG_DIR/task-r5b.txt"
