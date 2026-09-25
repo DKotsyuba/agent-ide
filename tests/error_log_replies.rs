@@ -40,6 +40,7 @@ async fn typed_failures_and_check_starts_are_logged_without_telemetry() {
             AssistanceTool::Inspect,
             &PeerReply::Error { code },
             Duration::from_millis(3),
+            Some("requested-ref"),
         );
     }
     let logged = errorlog::read_events(&dir);
@@ -53,6 +54,11 @@ async fn typed_failures_and_check_starts_are_logged_without_telemetry() {
         "each reply is logged exactly once"
     );
     assert_eq!(logged[0].outcome, "failed");
+    assert_eq!(
+        logged[0].correlation.as_deref(),
+        Some("requested-ref"),
+        "an error reply is correlated by the detail_ref it was asked for"
+    );
 
     // A scheduler dispatch logs `check started` before the check runs.
     let root = std::env::temp_dir()

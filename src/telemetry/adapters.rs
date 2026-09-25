@@ -81,13 +81,21 @@ fn reply_method(tool: AssistanceTool, reply: &PeerReply) -> ToolMethod {
 /// depend on the durable telemetry sink: that sink is absent whenever its lock is contended or its
 /// initialization failed (for example while a replaced daemon generation is still shutting down),
 /// and the error log is exactly what is needed then.
-pub fn log_tool_reply(tool: AssistanceTool, reply: &PeerReply, elapsed: Duration) {
+///
+/// `requested` is the call's own `detail_ref`, used when the reply carries none (every error), so
+/// a failed retrieval still names the operation it failed.
+pub fn log_tool_reply(
+    tool: AssistanceTool,
+    reply: &PeerReply,
+    elapsed: Duration,
+    requested: Option<&str>,
+) {
     crate::errorlog::record(
         errorlog_method(reply_method(tool, reply)),
         errorlog_outcome(reply),
         crate::errorlog::Fields {
             reason: reply_reason(reply),
-            correlation: reply_correlation(reply),
+            correlation: reply_correlation(reply).or(requested),
             duration_ms: elapsed.as_millis().try_into().ok(),
             ..Default::default()
         },

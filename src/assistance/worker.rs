@@ -4434,6 +4434,17 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
             .unwrap_or(0)
             != native_epoch
         {
+            // Same wire code as a changed source; the journal names which fence fired.
+            crate::errorlog::record(
+                crate::errorlog::Method::Inspect,
+                crate::errorlog::Outcome::Failed,
+                crate::errorlog::Fields {
+                    reason: Some(FailureCode::SourceUnavailable.into()),
+                    correlation: Some(request.reference.as_str()),
+                    detail: Some("native_epoch_advanced"),
+                    ..Default::default()
+                },
+            );
             return Err(invalidate(FailureCode::SourceUnavailable));
         }
         let active = shared.active(&request.binding)?;

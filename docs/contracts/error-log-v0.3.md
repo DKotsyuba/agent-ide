@@ -73,6 +73,14 @@ provider_unavailable`), an oversize reply envelope (`client failed oversize_enve
 emitted `<agent-ide>` feed block (`feed completed`, `detail` = `languages=<list> bytes=<n>`, no
 text).
 
+A reply without its own `detail_ref` (every error) is correlated by the `detail_ref` the call
+passed, so a failed retrieval names the result it asked for. A native hook that advances a
+binding's native epoch logs `hook completed` with the hook's call id as `correlation` and `detail`
+= `native_hint phase=<Post|PostFailure|PostBatch> tool=<host tool name or ->`. An `ide.inspect`
+refused because that epoch advanced after its Context/Diff result was captured logs an extra
+`inspect failed source_unavailable` with `detail` = `native_epoch_advanced`, distinguishing it from
+the other `source_unavailable` causes that share the same reply.
+
 T24B: each `execution_profile` conversion site on the activation/read path also logs its own
 `<method> failed execution_profile` event (in addition to the dispatcher's reply event) whose
 `detail` names exactly which condition failed, from this closed vocabulary: `git_policy`,

@@ -861,6 +861,12 @@ impl ProductDispatcher {
                 // silent carrier: everything still due reaches the next native post or reply
                 // exactly once (T29B §5).
                 let settled_plate = hook_post && !event.host().feed_delivery().allows_replies();
+                // Kept for the journal line that names what advanced a native epoch.
+                let hint_cause = format!(
+                    "native_hint phase={:?} tool={}",
+                    event.phase(),
+                    event.tool_name().unwrap_or("-")
+                );
                 let status = self.bindings.lock().ok()?.observe_hook(event, channel);
                 match status {
                     BindingStatus::PreObserved => Some(PeerReply::HookObserved {}),
@@ -907,6 +913,15 @@ impl ProductDispatcher {
                         }
                         if let Some(worker) = &self.worker {
                             worker.native_hint(binding.clone());
+                            errorlog::record(
+                                errorlog::Method::Hook,
+                                errorlog::Outcome::Completed,
+                                errorlog::Fields {
+                                    correlation: call_id.as_deref(),
+                                    detail: Some(&hint_cause),
+                                    ..Default::default()
+                                },
+                            );
                             let fingerprint = binding.fingerprint();
                             let feed = worker.project_feed().filter(|_| hook_post);
                             if triggers_check && let Some(feed) = feed {
@@ -1431,7 +1446,20 @@ impl AssistanceDispatcher for ProductDispatcher {
                     AssistanceMethod::HookSubmit => None,
                 };
                 if let Some(tool) = tool {
-                    adapters::log_tool_reply(tool, &result, started.elapsed());
+                    let requested = serde_json::from_str::<Value>(method.params_json().as_str())
+                        .ok()
+                        .and_then(|envelope| {
+                            envelope
+                                .pointer("/parameters/detail_ref")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        });
+                    adapters::log_tool_reply(
+                        tool,
+                        &result,
+                        started.elapsed(),
+                        requested.as_deref(),
+                    );
                     if let Some(telemetry) = self.worker.as_ref().and_then(WorkerHandle::telemetry)
                     {
                         adapters::tool_reply(
