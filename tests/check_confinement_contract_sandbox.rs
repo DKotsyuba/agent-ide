@@ -350,7 +350,7 @@ async fn dropping_future_kills_whole_process_tree() {
     });
 
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !pid_file.exists() {
+    while !pid_file.exists() || recorded_pids(&pid_file).len() < 2 {
         assert!(Instant::now() < deadline, "confined tree did not start");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
