@@ -1202,28 +1202,12 @@ fn allowed_root(path: &Path) -> bool {
     absolute(path) && !path.as_os_str().as_encoded_bytes().ends_with(b"/")
 }
 
-/// Validates trusted mapping/evidence/limits and refuses ambiguous mappings or unknown settings.
+/// Validates trusted mappings and limits and refuses ambiguous mappings or unknown settings.
 #[test]
 fn launcher_mapping_is_closed_bounded_and_restart_only() {
-    use crate::execution::D03ProfileEvidence;
     use serde_json::json;
-    let state = HostSandboxState::parse(Some(json!({"permissionProfile":{"type":"disabled"},"codexLinuxSandboxExe":null,"sandboxCwd":"/private/tmp","useLegacyLandlock":false}))).unwrap();
-    let record = PersistedProfileRecord::from_execution_evidence(
-        "accepted-disabled",
-        1,
-        D03ProfileEvidence {
-            provider_binary: "accepted-git".into(),
-            toolchain: "toolchain".into(),
-            configuration: "default".into(),
-            trust: "accepted-local".into(),
-            transport: "direct".into(),
-            d03_evidence: "accepted-d03".into(),
-        },
-        &state,
-    )
-    .unwrap();
     let executable = json!({"path":"/private/tmp/accepted-program","identity":"accepted-git","blake3":"0".repeat(64)});
-    let target = json!({"attachment":"private-attachment","candidate":"/private/tmp/worktree","git":executable,"codex":executable,"providers":[],"profiles":[{"record":serde_json::from_str::<Value>(&record.to_json()).unwrap(),"sandbox_state":serde_json::from_str::<Value>(state.sandbox_state_json()).unwrap()}],"allow_disabled_host":true});
+    let target = json!({"attachment":"private-attachment","candidate":"/private/tmp/worktree","git":executable,"codex":executable,"providers":[],"profiles":[],"allow_disabled_host":true});
     let config = json!({"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[target.clone()]});
     let loaded = LauncherConfig::parse(config.to_string().as_bytes()).unwrap();
     assert_eq!(
@@ -1263,9 +1247,9 @@ fn launcher_mapping_is_closed_bounded_and_restart_only() {
     let mut invalid = config.clone();
     invalid["limits"]["queued"] = json!(65);
     assert!(LauncherConfig::parse(invalid.to_string().as_bytes()).is_err());
-    let mut invalid = config;
-    invalid["targets"][0]["profiles"][0]["record"]["semantic_state"] = json!("forged");
-    assert!(LauncherConfig::parse(invalid.to_string().as_bytes()).is_err());
+    let mut legacy = config.clone();
+    legacy["targets"][0]["profiles"] = json!([{"arbitrary":true}]);
+    assert!(LauncherConfig::parse(legacy.to_string().as_bytes()).is_ok());
 
     let provider = |settings: &str| json!({"executable":executable,"settings":settings,"toolchain":"accepted-git","node":executable,"cargo":null,"cargo_version":null,"rustc":null,"rustc_version":null,"trust":"accepted-local","cache_namespace":"pyright-cache"});
     let mut python_target = target.clone();
@@ -1340,6 +1324,18 @@ fn launcher_mapping_is_closed_bounded_and_restart_only() {
     assert!(LauncherConfig::parse(json!({"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[python_target]}).to_string().as_bytes()).is_err());
 }
 
+/// Legacy host execution fields remain accepted but do not appear in the launch target.
+#[test]
+fn launcher_ignores_legacy_execution_fields() {
+    let config = LauncherConfig::parse(
+        br#"{"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[{"attachment":"legacy","candidate":"/private/tmp/worktree","git":{"path":"/usr/bin/git","identity":"git","blake3":"0000000000000000000000000000000000000000000000000000000000000000"},"codex":{"path":"/usr/bin/codex"},"cwd_trampoline":"/usr/bin/env","profiles":[{"ignored":true}],"allow_disabled_host":true,"providers":[]}]}"#,
+    )
+    .unwrap();
+    let target = config.target("legacy").unwrap();
+    assert_eq!(target.candidate, PathBuf::from("/private/tmp/worktree"));
+    assert!(target.providers.is_empty());
+}
+
 /// Detects a changed executable without launching it or consulting cwd/environment identities.
 #[test]
 fn accepted_executable_requires_exact_current_bytes() {
@@ -1362,7 +1358,6 @@ fn accepted_executable_requires_exact_current_bytes() {
 /// without starting a daemon.
 #[test]
 fn launcher_verify_checks_current_executable_bytes_without_a_daemon() {
-    use crate::execution::D03ProfileEvidence;
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
     let path =
@@ -1371,22 +1366,7 @@ fn launcher_verify_checks_current_executable_bytes_without_a_daemon() {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     let executable = AcceptedExecutable::from_path(path.clone(), "accepted-git").unwrap();
     let executable_json = json!({"path": executable.path, "identity": executable.identity, "blake3": executable.blake3});
-    let state = HostSandboxState::parse(Some(json!({"permissionProfile":{"type":"disabled"},"codexLinuxSandboxExe":null,"sandboxCwd":"/private/tmp","useLegacyLandlock":false}))).unwrap();
-    let record = PersistedProfileRecord::from_execution_evidence(
-        "accepted-disabled",
-        1,
-        D03ProfileEvidence {
-            provider_binary: "accepted-git".into(),
-            toolchain: "toolchain".into(),
-            configuration: "default".into(),
-            trust: "accepted-local".into(),
-            transport: "direct".into(),
-            d03_evidence: "accepted-d03".into(),
-        },
-        &state,
-    )
-    .unwrap();
-    let target = json!({"attachment":"verify-attachment","candidate":"/private/tmp/worktree","git":executable_json,"codex":executable_json,"providers":[],"profiles":[{"record":serde_json::from_str::<Value>(&record.to_json()).unwrap(),"sandbox_state":serde_json::from_str::<Value>(state.sandbox_state_json()).unwrap()}],"allow_disabled_host":true});
+    let target = json!({"attachment":"verify-attachment","candidate":"/private/tmp/worktree","git":executable_json,"providers":[]});
     let config = LauncherConfig::parse(
         json!({"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[target]})
             .to_string()
@@ -1413,114 +1393,6 @@ fn startup_fingerprint_verification_is_cooperatively_cancellable() {
         Err(LauncherError::Cancelled)
     );
 }
-
-/// T35B: a v2 record restores through the delegated version-aware parser, and an unknown record
-/// key or shape-version value is rejected by the same parser instead of a pinned field count.
-#[test]
-fn launcher_accepts_v2_records_and_rejects_unknown_record_keys() {
-    use crate::execution::D03ProfileEvidence;
-    use serde_json::json;
-    let state = HostSandboxState::parse_json(&crate::execution::linear_tests::sandbox_fixture(
-        "accepted-codex-managed-read-only-v1",
-    ))
-    .unwrap();
-    let record = PersistedProfileRecord::from_execution_evidence_v2(
-        "accepted-managed-readonly",
-        1,
-        D03ProfileEvidence {
-            provider_binary: "accepted-codex".into(),
-            toolchain: "toolchain".into(),
-            configuration: "default".into(),
-            trust: "accepted-local".into(),
-            transport: "managed".into(),
-            d03_evidence: "accepted-d03".into(),
-        },
-        &state,
-    )
-    .unwrap();
-    let executable = json!({"path":"/private/tmp/accepted-program","identity":"accepted-codex","blake3":"0".repeat(64)});
-    let target = |record_value: Value| json!({"attachment":"t35b-attachment","candidate":"/private/tmp/worktree","git":executable,"codex":executable,"providers":[],"profiles":[{"record":record_value,"sandbox_state":serde_json::from_str::<Value>(state.sandbox_state_json()).unwrap()}],"allow_disabled_host":false});
-    // The twelve-field v2 record parses through the delegated closed parser.
-    let record_value: Value = serde_json::from_str(&record.to_json()).unwrap();
-    let config = json!({"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[target(record_value.clone())]});
-    assert!(LauncherConfig::parse(config.to_string().as_bytes()).is_ok());
-    // Any extra record key, a downgraded version, or a forged digest is unavailable.
-    for refused in [
-        {
-            let mut refused = record_value.clone();
-            refused["unknown_field"] = json!(1);
-            refused
-        },
-        {
-            let mut refused = record_value.clone();
-            refused["shape_version"] = json!(1);
-            refused
-        },
-        {
-            let mut refused = record_value.clone();
-            refused["shape_version"] = json!(4);
-            refused
-        },
-        {
-            let mut refused = record_value.clone();
-            refused["permission_value"] = json!("0".repeat(64));
-            refused
-        },
-    ] {
-        let config = json!({"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[target(refused)]});
-        assert!(LauncherConfig::parse(config.to_string().as_bytes()).is_err());
-    }
-}
-
-/// A v3 record and its exact capture pass the same delegated launcher restoration path.
-#[test]
-fn launcher_accepts_visualization_family_record() {
-    use crate::execution::D03ProfileEvidence;
-    use serde_json::json;
-    let root = std::fs::canonicalize(std::env::temp_dir())
-        .unwrap()
-        .join(format!("agent-ide-launcher-v3-{}", std::process::id()));
-    let leaf = root.join(".codex/visualizations/2026/09/23/11111111-1111-1111-1111-111111111111");
-    std::fs::create_dir_all(root.join("work")).unwrap();
-    std::fs::create_dir_all(&leaf).unwrap();
-    let mut entries = vec![
-        json!({"access":"write","path":{"type":"path","path":root.join("work")}}),
-        json!({"access":"write","path":{"type":"path","path":leaf}}),
-    ];
-    for suffix in ["/**/*.key", "/**/*.pem", "/**/.env", "/**/.env.*"] {
-        entries.push(json!({"access":"deny","path":{"type":"glob_pattern","pattern":format!("{}{suffix}", leaf.display())}}));
-    }
-    let state = HostSandboxState::parse(Some(json!({
-        "permissionProfile":{"type":"managed","network":"enabled","file_system":{"type":"restricted","entries":entries}},
-        "codexLinuxSandboxExe":null,"sandboxCwd":root.join("work"),"useLegacyLandlock":false
-    }))).unwrap();
-    let record = PersistedProfileRecord::from_execution_evidence_versioned(
-        "visualization",
-        1,
-        D03ProfileEvidence {
-            provider_binary: "codex".into(),
-            toolchain: "toolchain".into(),
-            configuration: "default".into(),
-            trust: "local".into(),
-            transport: "managed".into(),
-            d03_evidence: "d03".into(),
-        },
-        &state,
-        3,
-    )
-    .unwrap();
-    let executable =
-        json!({"path":"/private/tmp/accepted-program","identity":"codex","blake3":"0".repeat(64)});
-    let config = json!({"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[{"attachment":"visualization","candidate":root.join("work"),"git":executable,"codex":executable,"providers":[],"profiles":[{"record":serde_json::from_str::<Value>(&record.to_json()).unwrap(),"sandbox_state":serde_json::from_str::<Value>(state.sandbox_state_json()).unwrap()}],"allow_disabled_host":false}]});
-    std::fs::remove_dir_all(root.join(".codex")).unwrap();
-    assert!(LauncherConfig::parse(config.to_string().as_bytes()).is_ok());
-    std::os::unix::fs::symlink(root.join("work"), root.join(".codex")).unwrap();
-    assert!(LauncherConfig::parse(config.to_string().as_bytes()).is_ok());
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-/// Optional TypeScript paths extend the closed checks schema without changing older declarations.
-#[test]
 fn project_checks_accept_optional_typescript_and_reject_non_normal_paths() {
     use serde_json::json;
     let old: ProjectChecksConfig = serde_json::from_value(

@@ -1512,13 +1512,9 @@ async fn host_shaped_mixed_metadata_is_unavailable_at_daemon_ingress() {
     assert_eq!(dispatcher.handle(&request, &mut None).await, None);
 }
 
-/// Proves a Claude start reaches no Workspace and invents no sandbox authority for itself.
-///
-/// Claude never returns `codex/sandbox-state-meta`. Correlation still succeeds, but the operation
-/// is never executed daemon-side: without a configured worker and accepted operator profile it is
-/// explicitly unavailable rather than being admitted on fabricated sandbox evidence.
+/// A correlated Claude request remains unavailable when this dispatcher has no configured worker.
 #[tokio::test]
-async fn host_shaped_claude_start_never_reaches_workspace_without_sandbox_authority() {
+async fn claude_start_without_worker_is_unavailable_after_correlation() {
     use crate::app::transport::{HookSubmit, MethodDispatch, OpaqueJson};
 
     let dispatcher = ProductDispatcher::default();
@@ -1612,10 +1608,7 @@ async fn host_shaped_claude_start_never_reaches_workspace_without_sandbox_author
         )
         .expect("test method dispatch is valid"),
     );
-    // A follow-up Claude operation on the same attachment is routed to the foreground helper, which
-    // has no worker here, so it reports the same honest unavailability the refused Start did. What
-    // matters is that it is never a grant and never reaches Workspace: no binding, authority or
-    // helper ticket survived the sandbox-authority refusal above.
+    // A follow-up Claude operation on the same attachment also has no worker to handle it.
     assert_eq!(
         dispatcher.handle(&next_method, &mut None).await,
         Some(PeerReply::Unavailable {
@@ -1627,29 +1620,6 @@ async fn host_shaped_claude_start_never_reaches_workspace_without_sandbox_author
 /// Builds a configured Claude dispatcher and one active start invocation for the mint/Stop race.
 #[cfg(test)]
 fn claude_race_fixture() -> (ProductDispatcher, ValidatedInvocation) {
-    use crate::execution::{D03ProfileEvidence, HostSandboxState, PersistedProfileRecord};
-
-    let sandbox = HostSandboxState::parse(Some(json!({
-        "permissionProfile":{"type":"disabled"},
-        "codexLinuxSandboxExe":null,
-        "sandboxCwd":"/private/tmp",
-        "useLegacyLandlock":false
-    })))
-    .unwrap();
-    let record = PersistedProfileRecord::from_execution_evidence(
-        "race-profile",
-        1,
-        D03ProfileEvidence {
-            provider_binary: "race-git".into(),
-            toolchain: "race-toolchain".into(),
-            configuration: "default".into(),
-            trust: "race-local".into(),
-            transport: "direct".into(),
-            d03_evidence: "race-d03".into(),
-        },
-        &sandbox,
-    )
-    .unwrap();
     let git = "/usr/bin/git";
     let executable = json!({
         "path":git,
@@ -1660,17 +1630,12 @@ fn claude_race_fixture() -> (ProductDispatcher, ValidatedInvocation) {
         json!({
             "version":1,
             "limits":{"queued":8,"details":8,"operation_ms":1000,"output_bytes":4096},
+            "allowed_roots":["/private/tmp"],
             "targets":[{
                 "attachment":"race-attachment",
                 "candidate":"/private/tmp/race-worktree",
                 "git":executable,
-                "codex":executable,
                 "providers":[],
-                "profiles":[{
-                    "record":serde_json::from_str::<Value>(&record.to_json()).unwrap(),
-                    "sandbox_state":serde_json::from_str::<Value>(sandbox.sandbox_state_json()).unwrap()
-                }],
-                "allow_disabled_host":true,
                 "claude_profile":{
                     "enabled":true,
                     "fail_if_unavailable":true,
@@ -1823,29 +1788,6 @@ async fn claude_problems_context_short_circuits_before_helper_mint() {
 /// short-circuit test, mirroring [`claude_race_fixture`] for the Codex host contract.
 #[cfg(test)]
 fn codex_problems_fixture() -> (ProductDispatcher, super::host_binding::BindingRef, String) {
-    use crate::execution::{D03ProfileEvidence, HostSandboxState, PersistedProfileRecord};
-
-    let sandbox = HostSandboxState::parse(Some(json!({
-        "permissionProfile":{"type":"disabled"},
-        "codexLinuxSandboxExe":null,
-        "sandboxCwd":"/private/tmp",
-        "useLegacyLandlock":false
-    })))
-    .unwrap();
-    let record = PersistedProfileRecord::from_execution_evidence(
-        "codex-profile",
-        1,
-        D03ProfileEvidence {
-            provider_binary: "codex-git".into(),
-            toolchain: "codex-toolchain".into(),
-            configuration: "default".into(),
-            trust: "codex-local".into(),
-            transport: "direct".into(),
-            d03_evidence: "codex-d03".into(),
-        },
-        &sandbox,
-    )
-    .unwrap();
     let git = "/usr/bin/git";
     let executable = json!({
         "path":git,
@@ -1856,17 +1798,12 @@ fn codex_problems_fixture() -> (ProductDispatcher, super::host_binding::BindingR
         json!({
             "version":1,
             "limits":{"queued":8,"details":8,"operation_ms":1000,"output_bytes":4096},
+            "allowed_roots":["/private/tmp"],
             "targets":[{
                 "attachment":"codex-attachment",
                 "candidate":"/private/tmp/codex-worktree",
                 "git":executable,
-                "codex":executable,
-                "providers":[],
-                "profiles":[{
-                    "record":serde_json::from_str::<Value>(&record.to_json()).unwrap(),
-                    "sandbox_state":serde_json::from_str::<Value>(sandbox.sandbox_state_json()).unwrap()
-                }],
-                "allow_disabled_host":true
+                "providers":[]
             }]
         })
         .to_string()

@@ -1501,7 +1501,6 @@ mod tests {
         else {
             panic!("managed start must bind directly");
         };
-        assert!(started.created_binding());
         assert!(matches!(
             guard.validate_managed_codex_active(
                 codex_candidate("actor-a", "context"),

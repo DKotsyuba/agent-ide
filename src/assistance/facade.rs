@@ -1728,7 +1728,7 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             )
             .unwrap_err(),
             AssistanceTool::Start,
-            "invalid bounded parameters: unknown field \"actor_id\"; allowed: activation_id"
+            "invalid bounded parameters: unknown field \"actor_id\"; allowed: activation_id, root"
                 .to_string(),
         ),
         (
@@ -1856,6 +1856,27 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
                 .to_string(),
         ),
     ]
+}
+
+/// Start accepts only absolute, normalized optional working-directory roots.
+#[test]
+fn start_root_must_be_absolute_and_normalized() {
+    for root in ["relative", "/tmp/../outside", "/tmp//work"] {
+        assert!(
+            validate_call(
+                AssistanceTool::Start,
+                json!({"activation_id":"a","root":root})
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        validate_call(
+            AssistanceTool::Start,
+            json!({"activation_id":"a","root":"/private/tmp/work"})
+        )
+        .is_ok()
+    );
 }
 
 /// Every T21B refusal names the exact parameter to fix, stays single-line, and stays bounded.
