@@ -208,6 +208,14 @@ reach (or that the conservative matcher cannot reason about) still refuse with
 `read_scope:path_unproven`, and whole-tree scope keeps the restrictive deny-free behavior.
 D03's current fixed acceptance expectations describe the legacy workspace-write profile.
 
+Managed Codex can protect Git metadata in its own command sandbox without including that
+restriction in `codex/sandbox-state-meta`. Replaying such JSON with `codex sandbox
+--sandbox-state-json` can then permit writes into `.git`; a linked worktree's `.git` pointer
+also does not by itself protect the resolved Git directory. Do not enroll a profile for
+process execution until native probes prove Git-metadata write denial for both standalone
+and linked worktrees. Do not relax shape matching or enroll a capture to work around a
+failed probe.
+
 ## Confined project checks (EYES-r2)
 
 Two optional top-level fields extend the configuration for the v0.3 project problem feed. They
