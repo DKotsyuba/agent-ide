@@ -139,6 +139,9 @@ verify_toolchains() {
     case "$("$AGENT_IDE_RUST_TOOLCHAIN_DIR/bin/rustc" --version)" in 'rustc 1.98.1 '*) ;; *) return 1 ;; esac
     [ "$("$AGENT_IDE_NODE" --version)" = v24.4.0 ] || return 1
     [ "$("$AGENT_IDE_NODE" "$AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER" --version)" = 6.0.0 ] || return 1
+    ACCEPTANCE_TYPESCRIPT_PACKAGE=$(dirname "$(dirname "$AGENT_IDE_TSSERVER")")/package.json
+    require_file typescript "$ACCEPTANCE_TYPESCRIPT_PACKAGE" readable || return 1
+    [ "$(jq -r '.version' "$ACCEPTANCE_TYPESCRIPT_PACKAGE")" = 5.9.3 ] || return 1
     ACCEPTANCE_PYRIGHT_CLI=$(dirname "$AGENT_IDE_PYRIGHT")/pyright
     require_file pyright "$ACCEPTANCE_PYRIGHT_CLI" executable || return 1
     [ "$("$ACCEPTANCE_PYRIGHT_CLI" --version)" = 'pyright 1.1.413' ] || return 1

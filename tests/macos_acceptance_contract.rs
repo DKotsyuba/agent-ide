@@ -157,7 +157,7 @@ fn toolchain_checks_return_explicitly_inside_guarded_routes() {
                 || line.starts_with("[ \"$(")
         })
         .collect::<Vec<_>>();
-    assert_eq!(checks.len(), 12, "{checks:?}");
+    assert_eq!(checks.len(), 14, "{checks:?}");
     assert!(
         checks.iter().all(|line| line.ends_with("|| return 1")),
         "{checks:?}"
