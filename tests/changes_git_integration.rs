@@ -1988,6 +1988,10 @@ async fn index_probe_refuses_an_unproven_index_path() {
 }
 
 /// A linked parent beneath the worktree cannot authorize native index metadata access.
+///
+/// `.git` itself stays a real directory, because a symlinked `.git` is already refused at the Git
+/// execution boundary before any probe runs; only the index path Git reports crosses a linked
+/// parent, so the refusal comes from the index probe itself.
 #[tokio::test]
 async fn index_probe_refuses_a_symlinked_parent() {
     let fixture = GitFixture::unborn();
@@ -1996,14 +2000,13 @@ async fn index_probe_refuses_a_symlinked_parent() {
     fixture.write(b"clean.txt", b"base\n");
     fixture.git(["add", "clean.txt"]);
     fixture.git(["commit", "--quiet", "-m", "baseline"]);
-    fs::rename(fixture.root.join(".git"), fixture.root.join(".git-real")).unwrap();
-    std::os::unix::fs::symlink(".git-real", fixture.root.join(".git")).unwrap();
+    std::os::unix::fs::symlink(".", fixture.root.join(".git/linked")).unwrap();
     let program = support::git_wrapper(
         &fixture,
         "linked-index-git",
         &format!(
             "case \" $* \" in *\" rev-parse --path-format=absolute --git-path index \"*) printf '%s\\n' '{}' ;; *) exec /usr/bin/git \"$@\" ;; esac",
-            fixture.root.join(".git/index").display(),
+            fixture.root.join(".git/linked/index").display(),
         ),
     );
     assert_eq!(
