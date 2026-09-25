@@ -1,7 +1,7 @@
 #!/bin/sh
 # Status: sessions start live and complete the scripted tool loop (measured
 # 2026-09-22 against codex-cli 0.155.1), but no host-cell real_pass exists yet:
-# the default operator launcher's accepted codex-managed workspace-write record
+# the default operator launcher's accepted codex-managed profile record
 # predates the installed CLI, so the managed host refuses ide.start with the
 # closed `execution_profile` code until the operator re-mints that record.
 #
@@ -102,15 +102,18 @@ MODEL=${AGENT_IDE_ACCEPTANCE_MODEL:-gpt-5.6-luna}
 SESSION_SECONDS=${AGENT_IDE_ACCEPTANCE_SESSION_SECONDS:-900}
 DRY=${AGENT_IDE_ACCEPTANCE_DRY:-0}
 
-# Prints the exact `config.toml` the private CODEX_HOME receives: only the
-# agent-ide MCP server, with tool approval disabled for it. One source of truth
+# Prints the exact `config.toml` the private CODEX_HOME receives: the built-in
+# `:workspace` permission profile and agent-ide MCP server. One source of truth
 # for the live run and the dry printout.
 print_codex_config() {
     cat <<CONFIG
+default_permissions = ":workspace"
+
 [mcp_servers.agent-ide]
 command = "$BINARY"
 args = ["mcp", "--launcher-template", "$LAUNCHER"]
 default_tools_approval_mode = "approve"
+startup_timeout_sec = 120.0
 CONFIG
 }
 
@@ -124,13 +127,13 @@ if [ "$DRY" = 1 ]; then
     printf '%s\n' "# ln $OPERATOR_HOME/.codex/auth.json <codex-home>/auth.json  # file_link, never read or printed"
     printf '%s\n' "# $CODEX exec --help | grep -q -- --dangerously-bypass-hook-trust  # else fail hook_trust_flag_missing"
     for label in l1 l1b l2 l3 l4; do
-        printf 'cd "%s" && CODEX_HOME="<codex-home>" HOME="%s" PATH="/usr/bin:/bin:/usr/sbin:/sbin:%s" /usr/bin/perl -e '"'"'alarm shift; exec @ARGV'"'"' %s "%s" exec --json -C "%s" -s workspace-write --skip-git-repo-check -m "%s" -o "<diag>/last-%s.txt" "$(cat "%s/%s.txt")" > "<diag>/transcript-%s.jsonl" 2> "<diag>/session-%s.err"\n' \
+        printf 'cd "%s" && CODEX_HOME="<codex-home>" HOME="%s" PATH="/usr/bin:/bin:/usr/sbin:/sbin:%s" /usr/bin/perl -e '"'"'alarm shift; exec @ARGV'"'"' %s "%s" exec --json -C "%s" --skip-git-repo-check -m "%s" -o "<diag>/last-%s.txt" "$(cat "%s/%s.txt")" > "<diag>/transcript-%s.jsonl" 2> "<diag>/session-%s.err"\n' \
             "$AGENT_IDE_ACCEPTANCE_LEFT_WORKTREE" "$OPERATOR_HOME" "$(dirname -- "$CODEX")" \
             "$SESSION_SECONDS" "$CODEX" "$AGENT_IDE_ACCEPTANCE_LEFT_WORKTREE" \
             "$MODEL" "$label" "$DRIVER_DIR/codex-prompts" "$label" "$label" "$label"
     done
     for label in r5 r5b; do
-        printf 'cd "%s" && CODEX_HOME="<codex-home>" HOME="%s" PATH="/usr/bin:/bin:/usr/sbin:/sbin:%s" /usr/bin/perl -e '"'"'alarm shift; exec @ARGV'"'"' %s "%s" exec --json -C "%s" -s workspace-write --skip-git-repo-check -m "%s" -o "<diag>/last-%s.txt" "$(cat "%s/%s.txt")" > "<diag>/transcript-%s.jsonl" 2> "<diag>/session-%s.err"\n' \
+        printf 'cd "%s" && CODEX_HOME="<codex-home>" HOME="%s" PATH="/usr/bin:/bin:/usr/sbin:/sbin:%s" /usr/bin/perl -e '"'"'alarm shift; exec @ARGV'"'"' %s "%s" exec --json -C "%s" --skip-git-repo-check -m "%s" -o "<diag>/last-%s.txt" "$(cat "%s/%s.txt")" > "<diag>/transcript-%s.jsonl" 2> "<diag>/session-%s.err"\n' \
             "$AGENT_IDE_ACCEPTANCE_RIGHT_WORKTREE" "$OPERATOR_HOME" "$(dirname -- "$CODEX")" \
             "$SESSION_SECONDS" "$CODEX" "$AGENT_IDE_ACCEPTANCE_RIGHT_WORKTREE" \
             "$MODEL" "$label" "$DRIVER_DIR/codex-prompts" "$label" "$label" "$label"
@@ -191,9 +194,9 @@ ln "$OPERATOR_HOME/.codex/auth.json" "$CODEX_HOME_DIR/auth.json" 2>>"$DIAG_LOG" 
 # session runs. A private CODEX_HOME has no trusted hook hashes, so hook trust
 # is bypassed for this invocation only when the installed CLI documents the
 # flag; otherwise the driver fails closed. Approvals and sandbox are NEVER
-# bypassed: sessions run under -s workspace-write.
+# bypassed: sessions use the private home's named `:workspace` profile.
 CODEX_HELP=$("$CODEX" exec --help 2>>"$DIAG_LOG") || fail E_CODEX_HELP
-for flag in --json -C -s --skip-git-repo-check -m -o --dangerously-bypass-hook-trust; do
+for flag in --json -C --skip-git-repo-check -m -o --dangerously-bypass-hook-trust; do
     printf '%s\n' "$CODEX_HELP" | grep -q -- "$flag" \
         || fail E_CODEX_FLAG "$flag is not documented by codex exec --help"
 done
@@ -246,7 +249,7 @@ run_session() {
         -u AGENT_IDE_BIN -u AGENT_IDE_HOST_ATTACHMENT \
         -u AGENT_IDE_CODEX_RENDEZVOUS_ROOT \
         /usr/bin/perl -e 'alarm shift; exec @ARGV' "$SESSION_SECONDS" \
-        "$CODEX" exec --json -C "$worktree" -s workspace-write \
+        "$CODEX" exec --json -C "$worktree" \
             --skip-git-repo-check -m "$MODEL" "$HOOK_TRUST_FLAG" \
             -o "$DIAG_DIR/last-$label.txt" "$(session_prompt "$prompt_file")" \
         >"$transcript" 2>"$DIAG_DIR/session-$label.err") </dev/null &

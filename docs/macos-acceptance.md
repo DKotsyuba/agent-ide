@@ -110,9 +110,10 @@ no Codex evidence is claimed by this implementation alone.
 
 `scripts/acceptance-drivers/codex.sh` is the committed driver for `--route codex`. Status:
 work in progress — first live run pending, and it has produced no `real_pass` claim. It runs real
-bounded `codex exec --json -C <worktree> -s workspace-write --skip-git-repo-check -m <model>
+bounded `codex exec --json -C <worktree> --skip-git-repo-check -m <model>
 -o <last-message> "<prompt>"` sessions (with `--dangerously-bypass-hook-trust` only when the
-installed CLI documents that flag; approvals and sandbox are never bypassed) and writes the closed
+installed CLI documents that flag; approvals and sandbox are never bypassed). Its private Codex
+home selects the built-in `:workspace` permission profile. The driver writes the closed
 nine-line document only when every scenario passes on captured transcripts plus real filesystem and
 telemetry effects. Managed Codex binds `ide.start` directly from the MCP `_meta` attachment, so the
 prompts have no foreground helper step; a `pending` tool answer must be followed by `ide.inspect`

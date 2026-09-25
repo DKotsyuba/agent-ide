@@ -136,6 +136,15 @@ fn agent_run_drivers_use_route_matched_schema_two_providers() {
     assert!(!driver.contains("start --runtime"));
 }
 
+/// Keeps direct Codex acceptance on the captured named workspace profile rather than the
+/// legacy workspace-write override, which omits the explicit Git metadata read restriction.
+#[test]
+fn direct_codex_driver_uses_named_workspace_profile() {
+    let driver = include_str!("../scripts/acceptance-drivers/codex.sh");
+    assert!(driver.contains("default_permissions = \":workspace\""));
+    assert!(!driver.contains("-s workspace-write"));
+}
+
 /// Ensures every fallible toolchain check for the accepted Rust, Python, and TypeScript/JavaScript
 /// toolchains propagates failure from route-guarded shell functions.
 #[test]
