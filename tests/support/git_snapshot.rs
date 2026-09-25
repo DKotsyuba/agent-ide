@@ -394,7 +394,6 @@ pub fn launch_intent(
     allowed_program: &Path,
     output_cap: usize,
 ) -> Result<(OwnedChild, AdmissionController), GitError> {
-    let root = intent.scope().worktree().worktree_path();
     let invocation = ValidatedHostInvocation::from_verified_binding("snapshot-test").unwrap();
     let policy =
         LocalExecutionPolicy::new(BTreeSet::from([allowed_program.to_path_buf()]), 8192, 16)
@@ -424,7 +423,6 @@ pub fn launch_intent(
         &request,
         lease,
         None,
-        Path::new("/usr/bin/false"),
         output_cap,
     )
     .map_err(|_| GitError::IncompleteIdentity)?;
