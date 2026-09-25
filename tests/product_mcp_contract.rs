@@ -329,17 +329,7 @@ fn claude_fields(text: &str) -> Value {
         return json!({"state":"error","code":token(rest)});
     }
     if let Some(rest) = text.strip_prefix("pending: ") {
-        let helper = rest
-            .strip_prefix(
-                "run exactly this command with Bash in the foreground, with no editing, \
-                 wrapping, or appended arguments:\n",
-            )
-            .and_then(|rest| rest.split('\n').next());
-        return json!({
-            "state":"pending",
-            "detail_ref":after(rest, "detail_ref "),
-            "helper":helper,
-        });
+        return json!({"state":"pending","detail_ref":after(rest, "detail_ref ")});
     }
     if let Some(rest) = text.strip_prefix("edit: ") {
         let outcome = token(rest);
@@ -683,7 +673,7 @@ fn hook_process(runtime: &Path, attachment: Option<&str>) -> Child {
     command.spawn().unwrap()
 }
 
-/// Starts the real Claude hook mode with the same bounded environment as the Codex helper.
+/// Starts the real Claude hook mode with the same bounded environment as [`hook_process`].
 fn claude_hook_process(runtime: &Path, attachment: Option<&str>) -> Child {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
     command.env("TOKIO_WORKER_THREADS", "1");
@@ -1952,27 +1942,7 @@ impl ProductFixture {
         std::fs::write(fixture.root.join("tracked.txt"), "index\n").unwrap();
         fixture.git(&["add", "--", "tracked.txt"]);
         std::fs::write(fixture.root.join("tracked.txt"), "worktree\n").unwrap();
-        fixture.write_config(providers, None);
-        fixture
-    }
-    /// Creates the same fixture, additionally accepting a strict test-only Claude operator profile.
-    ///
-    /// This is wiring proof only: it asserts the daemon-side
-    /// [`agent_ide::assistance::claude_worker::ClaudeOperatorProfile::validate`] contract, never a
-    /// real Claude host's actual sandbox enforcement.
-    fn new_claude(providers: Value) -> Self {
-        let fixture = Self::new(providers.clone());
-        fixture.write_config(
-            providers,
-            Some(json!({
-                "enabled": true,
-                "fail_if_unavailable": true,
-                "allow_unsandboxed_commands": false,
-                "no_matching_excluded_commands": true,
-                "scope_declared": true,
-                "platform": "mac_os"
-            })),
-        );
+        fixture.write_config(providers);
         fixture
     }
     /// Runs fixed local fixture setup with all user/system Git configuration excluded.
@@ -1989,12 +1959,10 @@ impl ProductFixture {
         assert!(output.status.success(), "fixture Git failed");
     }
     /// Writes launcher configuration admitting the fixture parent and selected providers.
-    /// A Claude fixture also supplies the strict operator profile required by Claude targets.
-    fn write_config(&self, providers: Value, claude_profile: Option<Value>) {
-        let mut config = json!({"version":1,"limits":{"queued":16,"details":64,"operation_ms":120000,"output_bytes":1048576},"allowed_roots":[self.base],"targets":[{"attachment":"private-host-channel","candidate":self.root,"git":accepted_program("/usr/bin/git","fixture-git"),"providers":providers}]});
-        if let Some(claude_profile) = claude_profile {
-            config["targets"][0]["claude_profile"] = claude_profile;
-        }
+    ///
+    /// The one target serves Codex and Claude actors alike; a Claude target needs no profile.
+    fn write_config(&self, providers: Value) {
+        let config = json!({"version":1,"limits":{"queued":16,"details":64,"operation_ms":120000,"output_bytes":1048576},"allowed_roots":[self.base],"targets":[{"attachment":"private-host-channel","candidate":self.root,"git":accepted_program("/usr/bin/git","fixture-git"),"providers":providers}]});
         std::fs::write(&self.config, config.to_string()).unwrap();
     }
     /// Returns the current fixture's complete measured-state-shaped payload outside model arguments.
@@ -2276,13 +2244,28 @@ impl ProductActor {
             .unwrap()
             .unwrap()
     }
-    /// Runs exact Pre→MCP→Post through the real Claude hook and Claude tool-use metadata shape.
+    /// Runs exact Pre→MCP→Post through the real Claude hook and Claude tool-use metadata shape,
+    /// requiring the post hook to stay silent.
     async fn call_claude(
         &mut self,
         fixture: &ProductFixture,
         name: &str,
         arguments: Value,
     ) -> Value {
+        let (reply, post) = self.call_claude_with_post(fixture, name, arguments).await;
+        assert!(post.is_empty(), "{}", String::from_utf8_lossy(&post));
+        reply
+    }
+    /// Same as [`Self::call_claude`], but returns the call's own post-hook stdout instead of
+    /// requiring it empty: a status plate that became due before that post rides it (T22B).
+    ///
+    /// The pre-hook must stay silent and both hook processes must exit cleanly.
+    async fn call_claude_with_post(
+        &mut self,
+        fixture: &ProductFixture,
+        name: &str,
+        arguments: Value,
+    ) -> (Value, Vec<u8>) {
         self.next += 1;
         let call = format!("call-{}", self.next);
         self.claude_lifecycle(fixture, "PreToolUse", &call).await;
@@ -2293,8 +2276,11 @@ impl ProductActor {
                 "name":name,"arguments":arguments,"_meta":{"claudecode/toolUseId":call}}}),
             )
             .await;
-        self.claude_lifecycle(fixture, "PostToolUse", &call).await;
-        claude_fields(assert_claude_envelope(&reply))
+        let post = self
+            .claude_lifecycle_output(fixture, "PostToolUse", &call)
+            .await;
+        assert!(post.status.success() && post.stderr.is_empty());
+        (claude_fields(assert_claude_envelope(&reply)), post.stdout)
     }
     /// Runs one native Claude tool's Pre/Post hooks and returns the post hook's stdout.
     ///
@@ -2326,102 +2312,49 @@ impl ProductActor {
         }
         post
     }
-    /// Arms and runs the exact foreground helper named by a pending reply.
+    /// Retrieves a Claude operation's result through hook-paired `ide.inspect` calls.
     ///
-    /// Sends the `Bash` pre-hook that makes the launch recognizable, runs the helper to delivery,
-    /// and returns `(detail_ref, launch_call)` with the helper's own `Bash` post hook left for the
-    /// caller, which may want to inspect or withhold it (T22B).
-    async fn run_claude_pending(
-        &self,
-        fixture: &ProductFixture,
-        pending: &Value,
-    ) -> (String, String) {
-        assert_eq!(pending["state"], "pending", "{pending}");
-        let detail_ref = pending["detail_ref"].as_str().unwrap().to_owned();
-        let helper = pending["helper"].as_str().unwrap().to_owned();
-        let launch_call = format!("bash-launch-{detail_ref}");
-        let mut arm = claude_hook_process(&fixture.runtime, Some(self.attachment));
-        arm.stdin
-            .take()
-            .unwrap()
-            .write_all(
-                json!({"hook_event_name":"PreToolUse","session_id":self.actor,
-                    "tool_use_id":launch_call,"tool_name":"Bash",
-                    "tool_input":{"command":helper}})
-                .to_string()
-                .as_bytes(),
-            )
+    /// Equivalent to [`Self::settle_claude_via`] polling `ide.inspect` with only the pending
+    /// `detail_ref`.
+    async fn settle_claude(&mut self, fixture: &ProductFixture, reply: Value) -> (Value, Vec<u8>) {
+        self.settle_claude_via(fixture, reply, "ide.inspect", json!({}))
             .await
-            .unwrap();
-        let armed = arm.wait_with_output().await.unwrap();
-        assert!(armed.status.success() && armed.stdout.is_empty() && armed.stderr.is_empty());
-        let helper_output = tokio::time::timeout(
-            Duration::from_secs(90),
-            Command::new("/bin/sh").arg("-c").arg(&helper).output(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(
-            helper_output.status.success(),
-            "helper failed: {}",
-            String::from_utf8_lossy(&helper_output.stderr)
-        );
-        (detail_ref, launch_call)
     }
-    /// Runs the exact foreground helper named by a pending reply and returns its owned handle.
+    /// Polls a pending Claude reply until the daemon-executed operation settles.
     ///
-    /// The helper's own `Bash` post hook is sent and asserted silent; a caller that expects model
-    /// context there must use [`Self::run_claude_pending`] and send the post itself (T22B).
-    async fn launch_claude_pending(&self, fixture: &ProductFixture, pending: &Value) -> String {
-        let (detail_ref, launch_call) = self.run_claude_pending(fixture, pending).await;
-        let mut post = claude_hook_process(&fixture.runtime, Some(self.attachment));
-        post.stdin
-            .take()
-            .unwrap()
-            .write_all(
-                json!({"hook_event_name":"PostToolUse","session_id":self.actor,
-                    "tool_use_id":launch_call,"tool_response":{"success":true}})
-                .to_string()
-                .as_bytes(),
-            )
-            .await
-            .unwrap();
-        let post = post.wait_with_output().await.unwrap();
-        assert!(post.status.success() && post.stdout.is_empty() && post.stderr.is_empty());
-        detail_ref
-    }
-    /// Runs the exact foreground helper named by a pending reply, then inspects its settled result.
-    ///
-    /// Returns the structured result and the inspect call's post-hook stdout. Start/Diff produce an
-    /// empty hook output unless a status plate is due there (T22B); Context may produce the actual
-    /// bounded `additionalContext` delta.
-    async fn complete_claude_pending(
+    /// Every poll is one ordinary [`Self::call_claude_with_post`] of `name` with `arguments` plus
+    /// the pending `detail_ref`, under the same capped backoff and poll ceiling as
+    /// [`Self::settle`]; a reply that is not `pending` is returned at once. Returns the settled
+    /// reply and every poll's post-hook stdout concatenated: empty, or the rendered model context
+    /// of a status plate that became due while the result was retrieved (T22B). Panics when the
+    /// operation outlives the poll ceiling.
+    async fn settle_claude_via(
         &mut self,
         fixture: &ProductFixture,
-        pending: &Value,
+        mut reply: Value,
+        name: &str,
+        mut arguments: Value,
     ) -> (Value, Vec<u8>) {
-        let detail_ref = self.launch_claude_pending(fixture, pending).await;
-        self.next += 1;
-        let inspect_call = format!("call-{}", self.next);
-        self.claude_lifecycle(fixture, "PreToolUse", &inspect_call)
-            .await;
-        let reply = self
-            .mcp
-            .exchange(
-                json!({"jsonrpc":"2.0","id":self.next,"method":"tools/call","params":{
-                "name":"ide.inspect","arguments":{"detail_ref":detail_ref},
-                "_meta":{"claudecode/toolUseId":inspect_call}}}),
-            )
-            .await;
-        let feedback = self
-            .claude_lifecycle_output(fixture, "PostToolUse", &inspect_call)
-            .await;
-        assert!(feedback.status.success() && feedback.stderr.is_empty());
-        (
-            claude_fields(assert_claude_envelope(&reply)),
-            feedback.stdout,
-        )
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
+        let mut polls = 0;
+        let mut delay = PRODUCT_SETTLE_INITIAL_DELAY;
+        let mut posts = Vec::new();
+        while reply["state"] == "pending" {
+            assert!(
+                tokio::time::Instant::now() < deadline && polls < PRODUCT_SETTLE_MAX_POLLS,
+                "Claude operation did not settle: {reply}"
+            );
+            arguments["detail_ref"] = reply["detail_ref"].clone();
+            tokio::time::sleep(delay).await;
+            polls += 1;
+            let (next, post) = self
+                .call_claude_with_post(fixture, name, arguments.clone())
+                .await;
+            posts.extend(post);
+            reply = next;
+            delay = delay.saturating_mul(2).min(PRODUCT_SETTLE_MAX_DELAY);
+        }
+        (reply, posts)
     }
     /// Runs exact Pre→MCP→Post with current host state separated from bounded model arguments.
     async fn call(&mut self, fixture: &ProductFixture, name: &str, arguments: Value) -> Value {
@@ -2568,7 +2501,11 @@ async fn managed_claude_call(
     claude_fields(assert_claude_envelope(&reply))
 }
 
-/// Executes and settles one pending managed Claude start through the ordinary foreground helper.
+/// Polls one pending managed Claude start through hook-paired `ide.inspect` calls until it settles.
+///
+/// The shared daemon executes the start itself; every poll is one ordinary [`managed_claude_call`]
+/// for the same root or child actor under the next `next` id. A reply that is not `pending` is
+/// returned unchanged, and a start still pending after 30 seconds panics.
 async fn settle_managed_claude_start(
     mcp: &mut Mcp,
     project: &Path,
@@ -2577,45 +2514,28 @@ async fn settle_managed_claude_start(
     agent: Option<&str>,
     pending: &Value,
 ) -> Value {
-    assert_eq!(pending["state"], "pending", "{pending}");
-    let helper = pending["helper"].as_str().unwrap();
-    let detail_ref = pending["detail_ref"].as_str().unwrap();
-    let launch_call = format!("managed-claude-bash-{next}");
-    let mut pre = managed_claude_event("PreToolUse", session, agent, &launch_call);
-    pre["tool_name"] = Value::String("Bash".into());
-    pre["tool_input"] = json!({"command":helper});
-    let armed = managed_claude_hook(Some(project), pre).await;
-    assert!(armed.status.success() && armed.stdout.is_empty() && armed.stderr.is_empty());
-
-    let output = tokio::time::timeout(
-        Duration::from_secs(90),
-        Command::new("/bin/sh").arg("-c").arg(helper).output(),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert!(
-        output.status.success(),
-        "managed helper failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let mut post = managed_claude_event("PostToolUse", session, agent, &launch_call);
-    post["tool_response"] = json!({"success":true});
-    let settled = managed_claude_hook(Some(project), post).await;
-    assert!(settled.status.success() && settled.stdout.is_empty() && settled.stderr.is_empty());
-
-    *next += 1;
-    managed_claude_call(
-        mcp,
-        project,
-        *next,
-        session,
-        agent,
-        "ide.inspect",
-        json!({"detail_ref":detail_ref}),
-    )
-    .await
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut reply = pending.clone();
+    while reply["state"] == "pending" {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "managed Claude start did not settle: {reply}"
+        );
+        let detail_ref = reply["detail_ref"].clone();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        *next += 1;
+        reply = managed_claude_call(
+            mcp,
+            project,
+            *next,
+            session,
+            agent,
+            "ide.inspect",
+            json!({"detail_ref":detail_ref}),
+        )
+        .await;
+    }
+    reply
 }
 
 /// Lists live short managed runtime directories so EOF cleanup can be observed at the product edge.
@@ -3535,7 +3455,7 @@ async fn parallel_managed_daemons_do_not_fence_each_others_workspace() {
 /// Managed Claude hooks silently ignore absent and corrupt project-derived attachment state.
 #[tokio::test]
 async fn managed_claude_hook_missing_or_corrupt_attachment_is_silent() {
-    let fixture = ProductFixture::new_claude(json!([]));
+    let fixture = ProductFixture::new(json!([]));
     let runtime = managed_claude_runtime_path(&fixture.root);
     assert!(!runtime.exists());
     let payload = managed_claude_event("PreToolUse", "root", None, "missing");
@@ -3623,37 +3543,33 @@ async fn managed_claude_hook_distinguishes_input_timeout_and_oversize() {
     std::fs::remove_dir_all(home).unwrap();
 }
 
-/// Missing templates and templates without strict Claude evidence stay bounded and disconnected.
+/// A missing launcher template stays bounded and disconnected.
 #[tokio::test]
-async fn managed_claude_startup_requires_template_and_strict_profile() {
+async fn managed_claude_startup_requires_template() {
     let fixture = ProductFixture::new(json!([]));
     let runtime = managed_claude_runtime_path(&fixture.root);
-    for template in [
-        fixture.base.join("missing-launcher.json"),
-        fixture.config.clone(),
-    ] {
-        let mut mcp = Mcp::start_managed_claude(&template, &fixture.root).await;
-        let response = mcp
-            .exchange(
-                json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
-                    "name":"ide.start","arguments":{"activation_id":"unavailable"},
-                    "_meta":{"claudecode/toolUseId":"unavailable"}
-                }}),
-            )
-            .await;
-        assert_eq!(response["result"]["isError"], true, "{response}");
-        assert!(
-            response["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("continue with native tools")
-        );
-        mcp.close().await;
-        // The shared rendezvous directory this MCP created is never removed on exit, even when no
-        // daemon ever started inside it; a later MCP simply reuses it through the same idempotent
-        // ensure-or-adopt path.
-        assert!(runtime.is_dir());
-    }
+    let template = fixture.base.join("missing-launcher.json");
+    let mut mcp = Mcp::start_managed_claude(&template, &fixture.root).await;
+    let response = mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                "name":"ide.start","arguments":{"activation_id":"unavailable"},
+                "_meta":{"claudecode/toolUseId":"unavailable"}
+            }}),
+        )
+        .await;
+    assert_eq!(response["result"]["isError"], true, "{response}");
+    assert!(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("continue with native tools")
+    );
+    mcp.close().await;
+    // The shared rendezvous directory this MCP created is never removed on exit, even when no
+    // daemon ever started inside it; a later MCP simply reuses it through the same idempotent
+    // ensure-or-adopt path.
+    assert!(runtime.is_dir());
 }
 
 /// The standard Claude MCP/hook pair activates root then child; a second MCP for the same
@@ -3661,13 +3577,10 @@ async fn managed_claude_startup_requires_template_and_strict_profile() {
 /// every MCP process's own EOF (EYES-r1 §2).
 #[tokio::test]
 async fn managed_claude_root_child_rendezvous_shared_daemon_survives_eof() {
-    let fixture = ProductFixture::new_claude(json!([]));
+    let fixture = ProductFixture::new(json!([]));
     let runtime = managed_claude_runtime_path(&fixture.root);
     let _guard = SharedClaudeDaemonGuard(runtime.clone());
     assert!(!runtime.exists());
-    // Claude validates the helper binary before every minted operation. Warm the test artifact so
-    // this contract measures rendezvous behavior rather than cold debug-binary filesystem I/O.
-    let _helper_bytes = std::fs::read(env!("CARGO_BIN_EXE_agent-ide")).unwrap();
     let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
     assert!(runtime.is_dir());
     assert_eq!(
@@ -3839,10 +3752,10 @@ async fn managed_claude_root_child_rendezvous_shared_daemon_survives_eof() {
 }
 
 /// A fresh daemon started by its first non-root worktree pairs the real hook before the first MCP call.
-/// A stale cached key must be replaced before either worktree's full helper flow begins.
+/// A stale cached key must be replaced before either worktree's hook-paired start flow begins.
 #[tokio::test]
 async fn managed_claude_first_worktree_start_pairs_before_mcp_call() {
-    let fixture = ProductFixture::new_claude(json!([]));
+    let fixture = ProductFixture::new(json!([]));
     let left = fixture.base.join("first-worktree");
     let right = fixture.base.join("second-worktree");
     fixture.git(&[
@@ -3899,7 +3812,7 @@ async fn managed_claude_first_worktree_start_pairs_before_mcp_call() {
 /// A removed worktree must not poison later activation in the same repository daemon.
 #[tokio::test]
 async fn managed_claude_activates_after_removing_an_earlier_worktree() {
-    let fixture = ProductFixture::new_claude(json!([]));
+    let fixture = ProductFixture::new(json!([]));
     let runtime = managed_claude_runtime_path(&fixture.root);
     let _guard = SharedClaudeDaemonGuard(runtime.clone());
     let left = fixture.base.join("left");
@@ -3986,11 +3899,12 @@ async fn managed_claude_activates_after_removing_an_earlier_worktree() {
 /// (EYES-r2 §3): once that cache is warm, a hook call still correlates correctly even after the
 /// candidate's `.git` directory is moved away, which a live re-probe would instead treat as a
 /// non-git candidate and resolve to a completely different (and unreachable) rendezvous. Reaching
-/// the daemon's own unrelated `unsupported_git` outcome (rather than the "host_binding" outcome an
-/// uncorrelated call gets) proves the Pre/PostToolUse hooks still bound to the exact right daemon.
+/// the daemon's own unrelated `workspace_activation` refusal (rather than the "host_binding"
+/// outcome an uncorrelated call gets) proves the Pre/PostToolUse hooks still bound to the exact
+/// right daemon.
 #[tokio::test]
 async fn managed_claude_hook_relies_on_its_cached_key_not_a_live_git_probe() {
-    let fixture = ProductFixture::new_claude(json!([]));
+    let fixture = ProductFixture::new(json!([]));
     let runtime = managed_claude_runtime_path(&fixture.root);
     let _guard = SharedClaudeDaemonGuard(runtime.clone());
     let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
@@ -4024,7 +3938,7 @@ async fn managed_claude_hook_relies_on_its_cached_key_not_a_live_git_probe() {
     .await;
     assert_eq!(
         started,
-        json!({"state":"error","code":"unsupported_git"}),
+        json!({"state":"error","code":"workspace_activation"}),
         "{started}"
     );
 
@@ -4458,7 +4372,7 @@ async fn configured_product_returns_real_go_and_rust_semantic_context() {
         .unwrap();
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
         let providers = json!([{"executable":accepted_program(&gopls,"golang.org/x/tools/gopls v0.23.0"),"settings":"gopls_defaults","toolchain":go,"cargo":null,"cargo_version":null,"rustc":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"fixture-go-cache"},{"executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),"settings":"rust_cache_priming_disabled_v1","toolchain":toolchain,"cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"fixture-rust-cache"}]);
-        fixture.write_config(providers, None);
+        fixture.write_config(providers);
         let mut daemon = fixture.daemon().await;
         let mut actor = ProductActor::new(&fixture, "provider-root").await;
         let start = actor
@@ -5166,15 +5080,16 @@ async fn configured_product_isolates_typescript_across_two_divergent_worktree_ac
     daemon.wait().await.unwrap();
 }
 
-/// Exercises the release-pinned TypeScript provider through Claude's foreground helper path.
+/// Exercises the release-pinned TypeScript provider through the Claude daemon route.
 ///
 /// The ignored release check requires the exact accepted Node, bridge, `tsserver.js`, and closure
-/// environment paths. Helper-private `.ts` and `.js` sessions must return semantic locations and
-/// provisional type-error counts, then shut down before the helper reports all children reaped.
+/// environment paths. Daemon-owned `.ts` and `.js` sessions, retrieved through hook-paired
+/// `ide.inspect` calls, must return semantic locations and provisional type-error counts before
+/// Stop releases the binding and its provider sessions.
 #[tokio::test]
 #[ignore = "requires exact AGENT_IDE_NODE, AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER and AGENT_IDE_TSSERVER environment"]
-async fn configured_product_claude_helper_returns_real_typescript_semantic_context_and_reaps() {
-    let fixture = ProductFixture::new_claude(json!([accepted_typescript_provider()]));
+async fn configured_product_claude_returns_real_typescript_semantic_context_and_reaps() {
+    let fixture = ProductFixture::new(json!([accepted_typescript_provider()]));
     let source = "export const value: number = 42;\nexport const use: number = value;\nexport const broken: number = 'bad';\n";
     let js_source = "// @checkJs\nexport const value = 42;\nexport const use = value;\n/** @type {number} */ export const broken = 'bad';\n";
     std::fs::write(fixture.root.join("fixture.ts"), source).unwrap();
@@ -5195,7 +5110,7 @@ async fn configured_product_claude_helper_returns_real_typescript_semantic_conte
             json!({"activation_id":"typescript-start"}),
         )
         .await;
-    let (started, _) = actor.complete_claude_pending(&fixture, &started).await;
+    let (started, _) = actor.settle_claude(&fixture, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
 
     for (path, source) in [("fixture.ts", source), ("fixture.js", js_source)] {
@@ -5206,7 +5121,7 @@ async fn configured_product_claude_helper_returns_real_typescript_semantic_conte
                 json!({"path":path,"byte_offset":source.rfind("value;").unwrap()}),
             )
             .await;
-        let (context, _) = actor.complete_claude_pending(&fixture, &context).await;
+        let (context, _) = actor.settle_claude(&fixture, context).await;
         assert_eq!(context["kind"], "context", "{path}: {context}");
         let text = context["text"].as_str().unwrap();
         assert!(text.contains("mode: semantic"), "{path}: {context}");
@@ -5325,13 +5240,13 @@ async fn configured_product_typescript_membership_falls_back_after_dependencies_
     daemon.wait().await.unwrap();
 }
 
-/// Claude's foreground helper retains exact TypeScript source when its configured project does
-/// not contain the requested document, without launching the accepted semantic provider.
+/// The Claude route retains exact TypeScript source when its configured project does not contain
+/// the requested document, without launching the accepted semantic provider.
 #[tokio::test]
 #[ignore = "requires the release-pinned Node and TypeScript bundle"]
 async fn configured_product_claude_typescript_unverified_membership_falls_back_to_lexical_context()
 {
-    let fixture = ProductFixture::new_claude(json!([accepted_typescript_provider()]));
+    let fixture = ProductFixture::new(json!([accepted_typescript_provider()]));
     let source = "export const value = 42;\nexport const useValue = value;\n";
     std::fs::write(fixture.root.join("fixture.ts"), source).unwrap();
     std::fs::write(
@@ -5355,7 +5270,7 @@ async fn configured_product_claude_typescript_unverified_membership_falls_back_t
             json!({"activation_id":"typescript-unverified-start"}),
         )
         .await;
-    let (started, _) = actor.complete_claude_pending(&fixture, &started).await;
+    let (started, _) = actor.settle_claude(&fixture, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
 
     let context = actor
@@ -5365,7 +5280,7 @@ async fn configured_product_claude_typescript_unverified_membership_falls_back_t
             json!({"path":"fixture.ts","byte_offset":source.rfind("value;").unwrap()}),
         )
         .await;
-    let (context, _) = actor.complete_claude_pending(&fixture, &context).await;
+    let (context, _) = actor.settle_claude(&fixture, context).await;
     assert_eq!(context["kind"], "context", "{context}");
     assert!(
         context["text"]
@@ -5392,14 +5307,14 @@ async fn configured_product_claude_typescript_unverified_membership_falls_back_t
     daemon.wait().await.unwrap();
 }
 
-/// Exercises the accepted exclusive Pyright process through Claude's foreground-helper route.
+/// Exercises the accepted exclusive Pyright process through the Claude daemon route.
 ///
-/// The test proves that the helper reconstructs the same launcher-bound Pyright profile as Codex:
-/// semantic definitions and references, the exact current diagnostic, a native-edit refresh, the
-/// tracked diff, and Stop all complete without daemon-side provider execution.
+/// The daemon runs the same launcher-bound Pyright profile as for Codex: semantic definitions and
+/// references, the exact current diagnostic, a native-edit refresh, the tracked diff, and Stop all
+/// complete through hook-paired Claude calls, with every settled post hook silent.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
-async fn configured_product_claude_helper_returns_real_pyright_semantic_context_diff_and_stop() {
+async fn configured_product_claude_returns_real_pyright_semantic_context_diff_and_stop() {
     let pyright = std::env::var("AGENT_IDE_PYRIGHT").unwrap();
     let node = std::env::var("AGENT_IDE_NODE").unwrap();
     let node_identity = "node-fixture";
@@ -5415,7 +5330,7 @@ async fn configured_product_claude_helper_returns_real_pyright_semantic_context_
         "trust":"fixture-disabled",
         "cache_namespace":"fixture-claude-pyright-cache"
     }]);
-    let fixture = ProductFixture::new_claude(providers);
+    let fixture = ProductFixture::new(providers);
     let path = fixture.root.join("main.py");
     std::fs::write(
         &path,
@@ -5434,7 +5349,7 @@ async fn configured_product_claude_helper_returns_real_pyright_semantic_context_
             json!({"activation_id":"pyright-start"}),
         )
         .await;
-    let (started, feedback) = actor.complete_claude_pending(&fixture, &pending).await;
+    let (started, feedback) = actor.settle_claude(&fixture, pending).await;
     assert_eq!(started["kind"], "activation", "{started}");
     assert!(feedback.is_empty());
 
@@ -5446,7 +5361,7 @@ async fn configured_product_claude_helper_returns_real_pyright_semantic_context_
             json!({"path":"main.py","byte_offset":source.rfind("value()").unwrap()}),
         )
         .await;
-    let (context, _) = actor.complete_claude_pending(&fixture, &pending).await;
+    let (context, _) = actor.settle_claude(&fixture, pending).await;
     let text = context["text"].as_str().unwrap();
     assert_eq!(context["kind"], "context", "{context}");
     assert!(text.contains("mode: semantic"), "{context}");
@@ -5477,7 +5392,7 @@ async fn configured_product_claude_helper_returns_real_pyright_semantic_context_
             json!({"path":"main.py","byte_offset":fixed.rfind("value()").unwrap()}),
         )
         .await;
-    let (refreshed, _) = actor.complete_claude_pending(&fixture, &pending).await;
+    let (refreshed, _) = actor.settle_claude(&fixture, pending).await;
     let refreshed_text = refreshed["text"].as_str().unwrap();
     assert!(refreshed_text.contains("return 8"), "{refreshed}");
     assert!(
@@ -5489,7 +5404,7 @@ async fn configured_product_claude_helper_returns_real_pyright_semantic_context_
     let pending = actor
         .call_claude(&fixture, "ide.diff", json!({"mode":"head"}))
         .await;
-    let (diff, feedback) = actor.complete_claude_pending(&fixture, &pending).await;
+    let (diff, feedback) = actor.settle_claude(&fixture, pending).await;
     assert_eq!(diff["kind"], "diff", "{diff}");
     assert!(
         diff["text"].as_str().unwrap().contains("return 8"),
@@ -5550,7 +5465,7 @@ async fn configured_product_rust_resolves_definition_across_a_crate_boundary() {
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let providers = json!([{"executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),"settings":"rust_cache_priming_disabled_v1","toolchain":toolchain,"cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"fixture-rust-cross-crate-cache"}]);
-    fixture.write_config(providers, None);
+    fixture.write_config(providers);
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "cross-crate-root").await;
     let start = actor
@@ -5699,7 +5614,7 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
     )
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"slow-fixture-provider"),"settings":"gopls_defaults","toolchain":"/usr/bin/true","cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"slow-fixture-cache"}]), None);
+    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"slow-fixture-provider"),"settings":"gopls_defaults","toolchain":"/usr/bin/true","cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"slow-fixture-cache"}]));
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "cancel-root").await;
     let started = actor
@@ -5825,7 +5740,6 @@ async fn configured_product_context_settles_promptly_when_provider_exits_before_
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
     fixture.write_config(
         json!([{"executable":accepted_program(program.to_str().unwrap(),"exit-before-bind-fixture-provider"),"settings":"gopls_defaults","toolchain":"/usr/bin/true","cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"exit-before-bind-fixture-cache"}]),
-        None,
     );
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "exit-before-bind-root").await;
@@ -5931,7 +5845,7 @@ async fn configured_product_sigterm_reaps_active_provider_and_owned_sockets() {
     )
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"signal-fixture-provider"),"settings":"gopls_defaults","toolchain":"/usr/bin/true","cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"signal-fixture-cache"}]), None);
+    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"signal-fixture-provider"),"settings":"gopls_defaults","toolchain":"/usr/bin/true","cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"signal-fixture-cache"}]));
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "signal-root").await;
     let started = actor
@@ -6032,7 +5946,7 @@ async fn configured_product_sigterm_reaps_in_flight_rust_only_provider() {
     )
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"rust-analyzer signal fixture"),"settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo":accepted_program("/usr/bin/true","cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program("/usr/bin/true","rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"signal-rust-cache"}]), None);
+    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"rust-analyzer signal fixture"),"settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo":accepted_program("/usr/bin/true","cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program("/usr/bin/true","rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"signal-rust-cache"}]));
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "signal-rust-root").await;
     let started = actor
@@ -6121,7 +6035,7 @@ async fn configured_product_isolates_go_across_two_divergent_worktree_actors() {
     )
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
-    fixture.write_config(json!([{"executable":accepted_program(wrapper.to_str().unwrap(),"golang.org/x/tools/gopls v0.23.0"),"settings":"gopls_defaults","toolchain":go,"cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"shared-fixture-cache"}]), None);
+    fixture.write_config(json!([{"executable":accepted_program(wrapper.to_str().unwrap(),"golang.org/x/tools/gopls v0.23.0"),"settings":"gopls_defaults","toolchain":go,"cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"shared-fixture-cache"}]));
     let child_root = fixture.base.join("child");
     std::fs::create_dir(&child_root).unwrap();
     let git = |args: &[&str]| {
@@ -6317,7 +6231,7 @@ async fn configured_product_cold_go_burst_preserves_admission_and_peer_view() {
     )
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
-    fixture.write_config(json!([{"executable":accepted_program(wrapper.to_str().unwrap(),"golang.org/x/tools/gopls v0.23.0"),"settings":"gopls_defaults","toolchain":go,"cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"cold-shared-fixture-cache"}]), None);
+    fixture.write_config(json!([{"executable":accepted_program(wrapper.to_str().unwrap(),"golang.org/x/tools/gopls v0.23.0"),"settings":"gopls_defaults","toolchain":go,"cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"cold-shared-fixture-cache"}]));
     let child_root = fixture.base.join("cold-child");
     std::fs::create_dir(&child_root).unwrap();
     let git = |args: &[&str]| {
@@ -6641,7 +6555,7 @@ async fn configured_product_pending_context_job_completes_and_native_hook_delive
         "trust":"fixture-disabled",
         "cache_namespace":"fixture-pending-feedback-cache"
     }]);
-    fixture.write_config(providers, None);
+    fixture.write_config(providers);
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "pending-feedback-root").await;
     let start = actor
@@ -7090,15 +7004,15 @@ fn page_marker(text: &str) -> (usize, bool, usize, usize, usize) {
     )
 }
 
-/// A real Claude foreground helper reads a source file far over the former 64 KiB render cap in
-/// one capture, and the daemon pages the whole composed text across repeated `ide.inspect` calls:
+/// A Claude Context reads a source file far over the former 64 KiB render cap in one daemon
+/// capture, and the daemon pages the whole composed text across repeated `ide.inspect` calls:
 /// the first continuation call serves page two (not page one again), every page starts with a
 /// contiguous position marker, the pages join to the exact file bytes, the last page states
 /// completion, re-inspecting after it re-serves that last page, and `ide.edit` is refused on the
 /// source reference until every page was delivered (T13B, T16B).
 #[tokio::test]
 async fn claude_context_pagination_delivers_the_whole_source_across_repeated_inspect() {
-    let fixture = ProductFixture::new_claude(json!([]));
+    let fixture = ProductFixture::new(json!([]));
     // ~150 KB of short lines with a multibyte character: over the former 64 KiB cap, over the
     // 114000-byte live report, and well under the 1 MiB read ceiling.
     let content: String = (0..3300)
@@ -7114,13 +7028,13 @@ async fn claude_context_pagination_delivers_the_whole_source_across_repeated_ins
     let started = actor
         .call_claude(&fixture, "ide.start", json!({"activation_id":"start"}))
         .await;
-    let (started, _) = actor.complete_claude_pending(&fixture, &started).await;
+    let (started, _) = actor.settle_claude(&fixture, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
 
     let first_call = actor
         .call_claude(&fixture, "ide.context", json!({"path":"claude-large.py"}))
         .await;
-    let (page1, _) = actor.complete_claude_pending(&fixture, &first_call).await;
+    let (page1, _) = actor.settle_claude(&fixture, first_call).await;
     assert_eq!(page1["kind"], "context", "{page1}");
     assert_eq!(page1["truncated"], true, "{page1}");
     assert_eq!(page1["continuation"], true, "{page1}");
@@ -7130,7 +7044,7 @@ async fn claude_context_pagination_delivers_the_whole_source_across_repeated_ins
         .to_owned();
     let page1_text = page1["text"].as_str().unwrap().to_owned();
     assert!(
-        page1_text.contains("coverage: complete helper-observed path"),
+        page1_text.contains("coverage: complete registered path"),
         "{page1_text}"
     );
     let (number, last, from, mut end, total) = page_marker(&page1_text);
@@ -7174,6 +7088,7 @@ async fn claude_context_pagination_delivers_the_whole_source_across_repeated_ins
                            "source_ref":&reference,"content":"x = 1\n"}),
                 )
                 .await;
+            let (edit, _) = actor.settle_claude(&fixture, edit).await;
             assert_eq!(edit["result"]["outcome"], "stale_source", "{edit}");
             assert_eq!(edit["result"]["source_ref"], Value::Null, "{edit}");
         }
@@ -7211,7 +7126,7 @@ async fn claude_context_pagination_delivers_the_whole_source_across_repeated_ins
 /// The Python fixture is near the reported fastapi file size.
 #[tokio::test]
 async fn claude_context_problems_then_edit_keeps_unchanged_source() {
-    let fixture = ProductFixture::new_claude(json!([]));
+    let fixture = ProductFixture::new(json!([]));
     std::fs::create_dir(fixture.root.join("fastapi")).unwrap();
     let path = fixture.root.join("fastapi/utils.py");
     let original = "value = 1\n".repeat(450);
@@ -7221,13 +7136,13 @@ async fn claude_context_problems_then_edit_keeps_unchanged_source() {
     let start = actor
         .call_claude(&fixture, "ide.start", json!({"activation_id":"start"}))
         .await;
-    let (start, _) = actor.complete_claude_pending(&fixture, &start).await;
+    let (start, _) = actor.settle_claude(&fixture, start).await;
     assert_eq!(start["kind"], "activation", "{start}");
 
     let context = actor
         .call_claude(&fixture, "ide.context", json!({"path":"fastapi/utils.py"}))
         .await;
-    let (context, _) = actor.complete_claude_pending(&fixture, &context).await;
+    let (context, _) = actor.settle_claude(&fixture, context).await;
     assert_eq!(context["kind"], "context", "{context}");
     assert_eq!(context["continuation"], false, "{context}");
     let problems = actor
@@ -7247,18 +7162,18 @@ async fn claude_context_problems_then_edit_keeps_unchanged_source() {
                 "source_ref":context["detail_ref"],"content":"edited\n"}),
         )
         .await;
-    let (edit, _) = actor.complete_claude_pending(&fixture, &edit).await;
+    let (edit, _) = actor.settle_claude(&fixture, edit).await;
     assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
     assert_eq!(std::fs::read(&path).unwrap(), b"edited\n");
 
     let older = actor
         .call_claude(&fixture, "ide.context", json!({"path":"fastapi/utils.py"}))
         .await;
-    let (older, _) = actor.complete_claude_pending(&fixture, &older).await;
+    let (older, _) = actor.settle_claude(&fixture, older).await;
     let newer = actor
         .call_claude(&fixture, "ide.context", json!({"path":"fastapi/utils.py"}))
         .await;
-    let (newer, _) = actor.complete_claude_pending(&fixture, &newer).await;
+    let (newer, _) = actor.settle_claude(&fixture, newer).await;
     assert_ne!(older["detail_ref"], newer["detail_ref"]);
     let edit = actor
         .call_claude(
@@ -7270,14 +7185,14 @@ async fn claude_context_problems_then_edit_keeps_unchanged_source() {
             }),
         )
         .await;
-    let (edit, _) = actor.complete_claude_pending(&fixture, &edit).await;
+    let (edit, _) = actor.settle_claude(&fixture, edit).await;
     assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
     assert_eq!(std::fs::read(&path).unwrap(), b"edited again\n");
 
     let context = actor
         .call_claude(&fixture, "ide.context", json!({"path":"fastapi/utils.py"}))
         .await;
-    let (context, _) = actor.complete_claude_pending(&fixture, &context).await;
+    let (context, _) = actor.settle_claude(&fixture, context).await;
     std::fs::write(&path, "external\n").unwrap();
     let stale = actor
         .call_claude(
@@ -7289,7 +7204,7 @@ async fn claude_context_problems_then_edit_keeps_unchanged_source() {
             }),
         )
         .await;
-    let (stale, _) = actor.complete_claude_pending(&fixture, &stale).await;
+    let (stale, _) = actor.settle_claude(&fixture, stale).await;
     assert_eq!(stale["result"]["outcome"], "stale_source", "{stale}");
     assert_eq!(stale["result"]["source_ref"], Value::Null, "{stale}");
     assert_eq!(std::fs::read(&path).unwrap(), b"external\n");
@@ -7317,13 +7232,14 @@ fn assert_hunks_attributed(page: &str) {
     }
 }
 
-/// A real Claude foreground helper captures a diff too large for one MCP reply in the single
-/// helper round trip, and the daemon pages the composed text across repeated `ide.inspect` calls
-/// the same way it already pages a large Context result, until every hunk has been delivered
-/// (T13B).
+/// A Claude Diff too large for one MCP reply pages across repeated hook-paired `ide.inspect`
+/// calls on the same Git cursor as every daemon-executed Diff, until every hunk has been
+/// delivered: page one announces `more_available`, no continuation call re-serves an earlier page,
+/// every hunk stays attributed to its file on its own page, and only the terminal page omits the
+/// `detail_ref` from the compact Claude text (T13B, T14B).
 #[tokio::test]
 async fn claude_diff_pagination_delivers_every_hunk_across_repeated_inspect() {
-    let fixture = ProductFixture::new_claude(json!([]));
+    let fixture = ProductFixture::new(json!([]));
     for index in 0..12 {
         std::fs::write(
             fixture.root.join(format!("claude-many-{index:02}.txt")),
@@ -7341,9 +7257,11 @@ async fn claude_diff_pagination_delivers_every_hunk_across_repeated_inspect() {
         )
         .unwrap();
     }
+    // Pages hold whole hunks fitted to the duplicated MCP envelope, so this large plain hunk is
+    // sized like the Codex pagination fixture's: it needs its own page yet still fits one.
     std::fs::write(
         fixture.root.join("claude-many-big.txt"),
-        plain_ascii("claude-hunkmark-big", 600),
+        plain_ascii("claude-hunkmark-big", 500),
     )
     .unwrap();
 
@@ -7352,13 +7270,13 @@ async fn claude_diff_pagination_delivers_every_hunk_across_repeated_inspect() {
     let started = actor
         .call_claude(&fixture, "ide.start", json!({"activation_id":"start"}))
         .await;
-    let (started, _) = actor.complete_claude_pending(&fixture, &started).await;
+    let (started, _) = actor.settle_claude(&fixture, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
 
     let first_call = actor
         .call_claude(&fixture, "ide.diff", json!({"mode":"head"}))
         .await;
-    let (page1, _) = actor.complete_claude_pending(&fixture, &first_call).await;
+    let (page1, _) = actor.settle_claude(&fixture, first_call).await;
     assert_eq!(page1["kind"], "diff", "{page1}");
     let page1_text = page1["text"].as_str().unwrap().to_owned();
     let reference = page1["detail_ref"]
@@ -7367,26 +7285,12 @@ async fn claude_diff_pagination_delivers_every_hunk_across_repeated_inspect() {
         .to_owned();
     assert_eq!(page1["truncated"], true, "{page1}");
     assert_eq!(page1["continuation"], true, "{page1}");
-    // No hunk ever overflowed this single capture: every marker is somewhere in the composed
-    // evidence, so nothing here is a hard ceiling failure, only a reply too large for one page.
-    assert_eq!(
-        page_field(&page1_text, "omitted_hunks"),
-        "0",
-        "{page1_text}"
-    );
-    assert_eq!(
-        page_field(&page1_text, "omitted_bytes"),
-        "0",
-        "{page1_text}"
-    );
-
     // The header must agree with the paging the reply itself announces (T16B).
     assert_eq!(
         page_field(&page1_text, "more_available"),
         "true",
         "{page1_text}"
     );
-    assert_eq!(page_marker(&page1_text).0, 1, "{page1_text}");
     assert_hunks_attributed(&page1_text);
 
     let mut collected = page1_text;
@@ -7400,10 +7304,9 @@ async fn claude_diff_pagination_delivers_every_hunk_across_repeated_inspect() {
             .await;
         assert_eq!(next["kind"], "diff", "{next}");
         let next_text = next["text"].as_str().unwrap();
-        assert_eq!(
-            page_marker(next_text).0,
-            pages,
-            "the first continuation call must serve page two: {next_text}"
+        assert!(
+            !collected.contains(next_text),
+            "a continuation call must serve the next page, never an earlier one: {next_text}"
         );
         assert_hunks_attributed(next_text);
         continuation = next["continuation"].as_bool().unwrap();
@@ -7441,109 +7344,24 @@ async fn claude_diff_pagination_delivers_every_hunk_across_repeated_inspect() {
     daemon.wait().await.unwrap();
 }
 
-/// Drives real foreground Claude helper Start, Diff, Context and Edit launches end to end: each
-/// helper instruction is armed by a native Bash pre-hook, settles through its matching post-hook,
-/// and publishes only through `ide.inspect`, including an escape-heavy Diff that must fit whole;
-/// Stop also consumes an already-ready Edit result without losing its known replacement outcome.
-///
-/// The accepted `claude_profile` here is the fixture's test-only disabled launcher wiring proof,
-/// not a real host sandbox measurement: it only proves the daemon→hook→helper→daemon correlation
-/// and admission plumbing settle correctly, never that a live Claude host actually contained the
-/// helper.
+/// Drives Claude Start, Diff, Context and Edit end to end through the daemon route: each
+/// operation is minted by one hook-paired call and published only through hook-paired
+/// `ide.inspect` calls, including an escape-heavy Diff that must fit whole; Stop after an Edit
+/// that settled durably but was never inspected keeps its known replacement outcome.
 #[tokio::test]
-async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor_then_stops() {
-    /// Runs one complete Claude helper round trip: mint, arm, real process, post, and inspect.
+async fn configured_product_claude_activates_and_conflicts_a_second_actor_then_stops() {
+    /// Runs one complete Claude round trip: the minting call, then `ide.inspect` until settled.
     async fn claude_operation(
         actor: &mut ProductActor,
         fixture: &ProductFixture,
         name: &str,
         arguments: Value,
     ) -> Value {
-        let pending = actor.call_claude(fixture, name, arguments).await;
-        assert_eq!(pending["state"], "pending", "{pending}");
-        let detail_ref = pending["detail_ref"].as_str().unwrap().to_owned();
-        let helper = pending["helper"].as_str().unwrap().to_owned();
-        assert!(helper.contains("claude-worker"), "{helper}");
-
-        // Inspecting a ticket whose helper never ran repeats the exact command instead of a bare
-        // pending line the model could poll until the ticket expires.
-        let early = actor
-            .call_claude(fixture, "ide.inspect", json!({"detail_ref": &detail_ref}))
-            .await;
-        assert_eq!(early["state"], "pending", "{early}");
-        assert_eq!(early["helper"], helper.as_str(), "{early}");
-
-        // The ordinary Bash pre-hook recognizes the exact expected command; this is silent by
-        // construction and performs no admission decision itself. Each invocation needs its own
-        // unique tool-call id: a repeated helper launch under the same id would let the post-hook
-        // settle a still-open earlier ticket instead of this one.
-        let launch_call = format!("bash-launch-{detail_ref}");
-        let launch_call = launch_call.as_str();
-        let mut arm = claude_hook_process(&fixture.runtime, Some(actor.attachment));
-        arm.stdin
-            .take()
-            .unwrap()
-            .write_all(
-                json!({"hook_event_name":"PreToolUse","session_id":actor.actor,
-                    "tool_use_id":launch_call,"tool_name":"Bash",
-                    "tool_input":{"command":helper}})
-                .to_string()
-                .as_bytes(),
-            )
-            .await
-            .unwrap();
-        let armed = tokio::time::timeout(Duration::from_secs(2), arm.wait_with_output())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(armed.status.success() && armed.stdout.is_empty() && armed.stderr.is_empty());
-
-        // Runs the fixed helper command as a real foreground process, exactly as a native Bash
-        // tool call would; it claims the ticket once over the private socket and performs real
-        // Git discovery against the fixture's worktree.
-        let output = tokio::time::timeout(
-            Duration::from_secs(10),
-            Command::new("/bin/sh").arg("-c").arg(&helper).output(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(
-            output.status.success(),
-            "helper failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stdout).contains("claude-worker"),
-            "{}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-
-        // The matching Bash post-hook settles the claimed ticket.
-        let mut post = claude_hook_process(&fixture.runtime, Some(actor.attachment));
-        post.stdin
-            .take()
-            .unwrap()
-            .write_all(
-                json!({"hook_event_name":"PostToolUse","session_id":actor.actor,
-                    "tool_use_id":launch_call,"tool_response":{"success":true}})
-                .to_string()
-                .as_bytes(),
-            )
-            .await
-            .unwrap();
-        let settled = tokio::time::timeout(Duration::from_secs(2), post.wait_with_output())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(settled.status.success() && settled.stdout.is_empty() && settled.stderr.is_empty());
-
-        actor
-            .call_claude(fixture, "ide.inspect", json!({"detail_ref":detail_ref}))
-            .await
+        let reply = actor.call_claude(fixture, name, arguments).await;
+        actor.settle_claude(fixture, reply).await.0
     }
 
-    let fixture = ProductFixture::new_claude(json!([]));
+    let fixture = ProductFixture::new(json!([]));
     fixture.git(&["add", "--", "."]);
     fixture.git(&["commit", "--quiet", "-m", "clean claude fixture"]);
     std::fs::write(fixture.root.join("claude-heavy.txt"), "base\n").unwrap();
@@ -7636,8 +7454,7 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
     assert_eq!(still_usable, started, "{still_usable}");
 
     // This hunk is below Claude's raw selection cap but near the duplicated escaped MCP envelope.
-    // Shared fitting may omit later whole hunks, but it must neither slice this hunk nor advertise
-    // a cursor the helper cannot retain after its ticket is consumed.
+    // Shared fitting may omit later whole hunks, but it must never slice this hunk.
     let diff = claude_operation(&mut first, &fixture, "ide.diff", json!({"mode":"head"})).await;
     assert_eq!(diff["kind"], "diff", "{diff}");
     assert_eq!(diff["continuation"], false, "{diff}");
@@ -7661,7 +7478,7 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
             "operation_id":"claude-edit-1",
             "path":"tracked.txt",
             "source_ref":source_ref,
-            "content":"claude-helper-edit\n"
+            "content":"claude-edit\n"
         }),
     )
     .await;
@@ -7673,10 +7490,10 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
         .to_owned();
     assert_eq!(
         std::fs::read(fixture.root.join("tracked.txt")).unwrap(),
-        b"claude-helper-edit\n"
+        b"claude-edit\n"
     );
     // The returned Edit source reference is the already-reserved prepare detail, even while
-    // ordinary detail capacity is saturated; a second real Claude helper can consume it directly.
+    // ordinary detail capacity is saturated; a second Claude Edit can consume it directly.
     let chained = claude_operation(
         &mut first,
         &fixture,
@@ -7685,14 +7502,14 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
             "operation_id":"claude-edit-2",
             "path":"tracked.txt",
             "source_ref":edited_source_ref,
-            "content":"claude-helper-chain\n"
+            "content":"claude-chain\n"
         }),
     )
     .await;
     assert_eq!(chained["result"]["outcome"], "replaced", "{chained}");
     assert_eq!(
         std::fs::read(fixture.root.join("tracked.txt")).unwrap(),
-        b"claude-helper-chain\n"
+        b"claude-chain\n"
     );
     std::fs::write(fixture.root.join("tracked.txt"), "claude-native-fallback\n").unwrap();
     assert_eq!(
@@ -7720,7 +7537,29 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
             }),
         )
         .await;
-    first.launch_claude_pending(&fixture, &ready).await;
+    assert!(
+        matches!(ready["state"].as_str(), Some("pending" | "edit")),
+        "{ready}"
+    );
+    // The daemon settles the Edit receipt itself; wait for that durable outcome without inspecting
+    // the result, so Stop meets an Edit that is ready but was never published.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while database
+        .query_row(
+            "SELECT state FROM changes_edit_receipts WHERE operation_id='claude-stop-ready'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .as_deref()
+        != Some("settled")
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the ready Edit never settled"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert_eq!(
         std::fs::read(fixture.root.join("tracked.txt")).unwrap(),
         b"claude-stop-ready\n"
@@ -7787,31 +7626,30 @@ async fn configured_product_claude_helper_activates_and_conflicts_a_second_actor
     daemon.wait().await.unwrap();
 }
 
-/// Keeps a bounded Claude worker usable across repeated helper Diff finalization and repeated
-/// failures.
+/// Keeps a bounded Claude worker usable across repeated Diff finalization and repeated failures.
 ///
 /// One retained activation occupies the first slot. A second actor's settled-but-conflicting Start
-/// is inspected repeatedly; each identical failure must retire its unusable worker detail. A
-/// helper-composed Diff now retains a detail exactly like Context (T13B), so its capacity is sized
-/// for the activation, each of the three Diffs, and the trailing source-producing Context: if a
-/// completed Diff's detail were wrongly dropped or, conversely, never released, this sequence would
-/// either under- or over-count against the bound and the fourth-through-sixth operation would fail.
+/// keeps its one failed detail until Stop, like every daemon-executed operation, and is inspected
+/// repeatedly without allocating another. A daemon-composed Diff retains a detail exactly like
+/// Context (T13B), so capacity is sized for the activation, the failed Start, each of the three
+/// Diffs, and the trailing source-producing Context: any inspection or Diff that allocated more
+/// than its one detail would exhaust the bound before that trailing Context.
 /// A completed, non-continuation Diff's retained detail is never named in the Claude host's compact
 /// text (T14B): unlike Context's `source_ref`, it has no later `ide.edit` use, so the real client
 /// has no way to name it for an explicit re-inspection, and this test does not attempt one.
 #[tokio::test]
 async fn claude_diff_and_failed_reinspection_do_not_exhaust_detail_capacity() {
-    let fixture = ProductFixture::new_claude(json!([]));
+    let fixture = ProductFixture::new(json!([]));
     let mut config: Value =
         serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
-    config["limits"]["details"] = json!(5);
+    config["limits"]["details"] = json!(6);
     std::fs::write(&fixture.config, config.to_string()).unwrap();
     let mut daemon = fixture.daemon().await;
     let mut first = ProductActor::new(&fixture, "claude-capacity-first").await;
     let started = first
         .call_claude(&fixture, "ide.start", json!({"activation_id":"first"}))
         .await;
-    let (started, _) = first.complete_claude_pending(&fixture, &started).await;
+    let (started, _) = first.settle_claude(&fixture, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
 
     let mut second = ProductActor::new_at(
@@ -7825,8 +7663,10 @@ async fn claude_diff_and_failed_reinspection_do_not_exhaust_detail_capacity() {
     let conflicting = second
         .call_claude(&fixture, "ide.start", json!({"activation_id":"second"}))
         .await;
-    let detail_ref = second.launch_claude_pending(&fixture, &conflicting).await;
-    for _ in 0..3 {
+    let detail_ref = conflicting["detail_ref"].clone();
+    let (conflict, _) = second.settle_claude(&fixture, conflicting).await;
+    assert_eq!(conflict["code"], "conflict", "{conflict}");
+    for _ in 0..2 {
         let conflict = second
             .call_claude(&fixture, "ide.inspect", json!({"detail_ref":detail_ref}))
             .await;
@@ -7837,7 +7677,7 @@ async fn claude_diff_and_failed_reinspection_do_not_exhaust_detail_capacity() {
         let pending = first
             .call_claude(&fixture, "ide.diff", json!({"mode":"head"}))
             .await;
-        let (diff, _) = first.complete_claude_pending(&fixture, &pending).await;
+        let (diff, _) = first.settle_claude(&fixture, pending).await;
         assert_eq!(diff["kind"], "diff", "{diff}");
         assert_eq!(diff["continuation"], false, "{diff}");
     }
@@ -7845,7 +7685,7 @@ async fn claude_diff_and_failed_reinspection_do_not_exhaust_detail_capacity() {
     let context = first
         .call_claude(&fixture, "ide.context", json!({"path":"tracked.txt"}))
         .await;
-    let (context, _) = first.complete_claude_pending(&fixture, &context).await;
+    let (context, _) = first.settle_claude(&fixture, context).await;
     assert_eq!(context["kind"], "context", "{context}");
     assert!(context["detail_ref"].is_string(), "{context}");
     let stopped = first.call_claude(&fixture, "ide.stop", json!({})).await;
@@ -7856,13 +7696,14 @@ async fn claude_diff_and_failed_reinspection_do_not_exhaust_detail_capacity() {
     daemon.wait().await.unwrap();
 }
 
-/// Proves Claude Context and Diff execute in the real foreground helper, that a diagnostic
-/// already delivered inline inside a retrieved Context reply is never echoed a second time on the
-/// next ordinary native-edit hook. Cross-production identity replacement is covered by the
-/// worker's bounded ledger regression; this test owns the real Claude helper and host surfaces.
+/// Proves Claude Context and Diff retrieved through their own tools with a `detail_ref`
+/// execute on the daemon route, and that a diagnostic already delivered inline inside a retrieved
+/// Context reply is never echoed a second time on the next ordinary native-edit hook.
+/// Cross-production identity replacement is covered by the worker's bounded ledger regression;
+/// this test owns the real Claude host surfaces.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_GOPLS and AGENT_IDE_GO environment"]
-async fn configured_product_claude_helper_returns_context_diff_and_feedback() {
+async fn configured_product_claude_returns_context_diff_and_feedback() {
     let gopls = std::env::var("AGENT_IDE_GOPLS").unwrap();
     let go = std::env::var("AGENT_IDE_GO").unwrap();
     let rust_analyzer = std::env::var("AGENT_IDE_RUST_ANALYZER").unwrap();
@@ -7891,14 +7732,14 @@ async fn configured_product_claude_helper_returns_context_diff_and_feedback() {
             "cache_namespace":"fixture-claude-rust-cache"
         }
     ]);
-    let fixture = ProductFixture::new_claude(providers);
+    let fixture = ProductFixture::new(providers);
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "claude-context").await;
 
     let pending = actor
         .call_claude(&fixture, "ide.start", json!({"activation_id":"start"}))
         .await;
-    let (started, feedback) = actor.complete_claude_pending(&fixture, &pending).await;
+    let (started, feedback) = actor.settle_claude(&fixture, pending).await;
     assert_eq!(started["kind"], "activation", "{started}");
     assert!(
         started["text"]
@@ -7918,26 +7759,14 @@ async fn configured_product_claude_helper_returns_context_diff_and_feedback() {
         .unwrap()
         .find("Value")
         .unwrap();
+    let arguments = json!({"path":"main.go","byte_offset":offset});
     let pending = actor
-        .call_claude(
-            &fixture,
-            "ide.context",
-            json!({"path":"main.go","byte_offset":offset}),
-        )
+        .call_claude(&fixture, "ide.context", arguments.clone())
         .await;
-    let detail_ref = actor.launch_claude_pending(&fixture, &pending).await;
-    let context = actor
-        .call_claude(
-            &fixture,
-            "ide.context",
-            json!({"path":"main.go","byte_offset":offset,"detail_ref":detail_ref}),
-        )
+    let (context, _) = actor
+        .settle_claude_via(&fixture, pending, "ide.context", arguments)
         .await;
     assert_eq!(context["kind"], "context", "{context}");
-    assert!(
-        context["helper"].is_null(),
-        "retrieval must not mint another helper: {context}"
-    );
     let context_text = context["text"].as_str().unwrap();
     assert!(context_text.contains("mode: semantic"), "{context_text}");
     assert!(context_text.contains("return \"bad\""), "{context_text}");
@@ -7964,7 +7793,7 @@ async fn configured_product_claude_helper_returns_context_diff_and_feedback() {
             json!({"path":"src/lib.rs","byte_offset":rust_source.find("value").unwrap()}),
         )
         .await;
-    let (rust_context, feedback) = actor.complete_claude_pending(&fixture, &pending).await;
+    let (rust_context, feedback) = actor.settle_claude(&fixture, pending).await;
     assert_eq!(rust_context["kind"], "context", "{rust_context}");
     let rust_text = rust_context["text"].as_str().unwrap();
     assert!(rust_text.contains("mode: semantic"), "{rust_text}");
@@ -7978,19 +7807,10 @@ async fn configured_product_claude_helper_returns_context_diff_and_feedback() {
     let pending = actor
         .call_claude(&fixture, "ide.diff", json!({"mode":"head"}))
         .await;
-    let detail_ref = actor.launch_claude_pending(&fixture, &pending).await;
-    let diff = actor
-        .call_claude(
-            &fixture,
-            "ide.diff",
-            json!({"mode":"head","detail_ref":detail_ref}),
-        )
+    let (diff, _) = actor
+        .settle_claude_via(&fixture, pending, "ide.diff", json!({"mode":"head"}))
         .await;
     assert_eq!(diff["kind"], "diff", "{diff}");
-    assert!(
-        diff["helper"].is_null(),
-        "retrieval must not mint another helper: {diff}"
-    );
     let diff_text = diff["text"].as_str().unwrap();
     assert!(
         diff_text.contains("baseline_coverage: Some(Partial)"),
@@ -8011,11 +7831,9 @@ async fn configured_product_claude_helper_returns_context_diff_and_feedback() {
         .map(|entry| entry.unwrap().file_name())
         .collect::<Vec<_>>();
     retained.sort();
-    assert_eq!(
-        retained.len(),
-        2,
-        "one worktree namespace per one-shot provider"
-    );
+    // The daemon-owned providers use the same layout as on the Codex route: one shared native
+    // gopls namespace, one private per-worktree gopls namespace, and one rust-analyzer namespace.
+    assert_eq!(retained.len(), 3, "{retained:?}");
     let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     let mut after_stop = std::fs::read_dir(fixture.runtime.join("cache"))
@@ -8118,34 +7936,37 @@ printf '{"reason":"build-finished","success":true}\n'
     home
 }
 
-/// Activates a Claude actor through the real foreground helper.
+/// Activates a Claude actor through hook-paired `ide.start` and `ide.inspect` calls.
 ///
-/// Returns the actor and the `additionalContext` the activation inspect call's own post hook
-/// delivered: the first due status plate arrives there now (T22B), empty when checks are off.
+/// Returns the actor and every `additionalContext` the post hooks of those calls delivered,
+/// joined by newlines: the first due status plate reaches the first post after activation (T22B),
+/// and nothing arrives when checks are off.
 async fn eyes_claude_actor(
     fixture: &ProductFixture,
     actor: &'static str,
 ) -> (ProductActor, String) {
     let mut actor = ProductActor::new(fixture, actor).await;
-    let started = actor
-        .call_claude(fixture, "ide.start", json!({"activation_id":"eyes"}))
+    let (started, mut feedback) = actor
+        .call_claude_with_post(fixture, "ide.start", json!({"activation_id":"eyes"}))
         .await;
-    let (started, feedback) = actor.complete_claude_pending(fixture, &started).await;
+    let (started, settled) = actor.settle_claude(fixture, started).await;
+    feedback.extend(settled);
     assert_eq!(started["kind"], "activation", "{started}");
-    let context = if feedback.is_empty() {
-        String::new()
-    } else {
-        let rendered: Value = serde_json::from_str(&String::from_utf8(feedback).unwrap()).unwrap();
+    let mut contexts = Vec::new();
+    for rendered in serde_json::Deserializer::from_slice(&feedback).into_iter::<Value>() {
+        let rendered = rendered.unwrap();
         assert_eq!(
             rendered["hookSpecificOutput"]["hookEventName"], "PostToolUse",
             "{rendered}"
         );
-        rendered["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .unwrap()
-            .to_owned()
-    };
-    (actor, context)
+        contexts.push(
+            rendered["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    (actor, contexts.join("\n"))
 }
 
 /// Polls native `Read` post-hooks until one carries a model context, returning its text.
@@ -8196,14 +8017,18 @@ async fn eyes_problems(actor: &mut ProductActor, fixture: &ProductFixture) -> St
 /// and `ide.context kind=problems` reports the same counts (EYES-r1 §5–§7).
 #[tokio::test]
 async fn eyes_claude_post_hook_delivers_problem_block_and_delta() {
-    let fixture = ProductFixture::new_claude(json!([]));
-    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let fixture = ProductFixture::new(json!([]));
+    // The fake cargo waits at the gate, so the first check cannot complete before activation has
+    // settled, however long the inspect polls take.
+    let home =
+        enable_fake_rust_checks_holding(&fixture, &fixture.base, &hold_checks_at_gate(&fixture));
     std::fs::write(fixture.root.join("problems.count"), "2").unwrap();
     let mut daemon = fixture.daemon_with_home(Some(&home)).await;
     let (mut actor, checking) = eyes_claude_actor(&fixture, "claude-eyes").await;
-    // The first due plate reaches the activation inspect call's own post hook (T22B); the 100 ms
-    // debounce means the check cannot have completed before that hook fires.
+    // The first due plate reaches the first post hook after activation (T22B).
+    assert_eq!(checking.matches("<agent-ide>").count(), 1, "{checking}");
     assert!(checking.contains("checking (first check)"), "{checking}");
+    release_checks_gate(&fixture);
 
     let first = await_eyes_result(&mut actor, &fixture).await;
     assert_eq!(
@@ -8289,7 +8114,7 @@ async fn await_eyes_check_start(home: &Path) {
 #[tokio::test]
 async fn eyes_admitted_starts_schedule_project_checks() {
     let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
-    let claude = ProductFixture::new_claude(json!([]));
+    let claude = ProductFixture::new(json!([]));
     let claude_home = enable_fake_rust_checks(&claude, &claude.base);
     let mut daemon = claude.daemon_with_home(Some(&claude_home)).await;
     let (mut actor, plate) = eyes_claude_actor(&claude, "claude-unrestricted-eyes").await;
@@ -9493,12 +9318,15 @@ async fn eyes_codex_managed_hook_lifecycles_stay_silent_without_delivery() {
 /// due, the withheld posts stay silent, and the still-due plate reaches the next native post (T28B).
 #[tokio::test]
 async fn eyes_claude_method_replies_never_carry_the_plate() {
-    let fixture = ProductFixture::new_claude(json!([]));
-    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let fixture = ProductFixture::new(json!([]));
+    let home =
+        enable_fake_rust_checks_holding(&fixture, &fixture.base, &hold_checks_at_gate(&fixture));
     std::fs::write(fixture.root.join("problems.count"), "2").unwrap();
     let mut daemon = fixture.daemon_with_home(Some(&home)).await;
     let (mut actor, checking) = eyes_claude_actor(&fixture, "claude-eyes-replies").await;
+    assert_eq!(checking.matches("<agent-ide>").count(), 1, "{checking}");
     assert!(checking.contains("checking (first check)"), "{checking}");
+    release_checks_gate(&fixture);
 
     // Method calls with their posts withheld read the problems page while the first result is
     // becoming due; no reply ever leads with the plate.
@@ -9545,69 +9373,79 @@ async fn eyes_claude_method_replies_never_carry_the_plate() {
     daemon.wait().await.unwrap();
 }
 
-/// A plate that becomes due while a helper runs is delivered on the helper's own `Bash` post (T22B).
+/// A plate that becomes due while every MCP post hook is withheld reaches the next native post
+/// exactly once (T22B).
 ///
-/// The activation inspect call's post hook and a second helper's minting post hook are both
-/// withheld, so no hook fires between the activation and the helper's own `Bash` post; that post
-/// delivers the still-running first check's plate exactly once, and the withheld posts plus the
-/// following native post stay silent.
+/// The first check is held running, so activation makes its `checking (first check)` plate due.
+/// The post hooks of the start call, of every inspect poll and of a second minted call are all
+/// withheld, so no hook fires between activation and the native `Read` post; that post delivers
+/// the plate, after which the late MCP posts and the following native post stay silent.
 #[tokio::test]
-async fn eyes_claude_helper_post_delivers_due_first_check_plate_once() {
-    let fixture = ProductFixture::new_claude(json!([]));
+async fn eyes_claude_native_post_delivers_due_first_check_plate_once() {
+    /// Sends one Claude MCP call after its pre hook, withholding its post hook; returns the reply
+    /// fields and the call id whose post is still owed.
+    async fn withheld_call(
+        actor: &mut ProductActor,
+        fixture: &ProductFixture,
+        name: &str,
+        arguments: Value,
+    ) -> (Value, String) {
+        actor.next += 1;
+        let call = format!("call-{}", actor.next);
+        actor.claude_lifecycle(fixture, "PreToolUse", &call).await;
+        let reply = actor
+            .mcp
+            .exchange(
+                json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
+                "name":name,"arguments":arguments,"_meta":{"claudecode/toolUseId":call}}}),
+            )
+            .await;
+        (claude_fields(assert_claude_envelope(&reply)), call)
+    }
+
+    let fixture = ProductFixture::new(json!([]));
     let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, "sleep 20");
     std::fs::write(fixture.root.join("problems.count"), "1").unwrap();
     let mut daemon = fixture.daemon_with_home(Some(&home)).await;
-    let mut actor = ProductActor::new(&fixture, "claude-eyes-helper-post").await;
+    let mut actor = ProductActor::new(&fixture, "claude-eyes-native-post").await;
 
-    let started = actor
-        .call_claude(&fixture, "ide.start", json!({"activation_id":"eyes"}))
-        .await;
-    // The start helper's own Bash post stays silent: activation is not complete yet.
-    let start_ref = actor.launch_claude_pending(&fixture, &started).await;
-
-    // Activation completes inside this inspect exchange; its post hook is withheld so the
-    // first-check plate stays due.
-    actor.next += 1;
-    let inspect_call = format!("call-{}", actor.next);
-    actor
-        .claude_lifecycle(&fixture, "PreToolUse", &inspect_call)
-        .await;
-    let reply = actor
-        .mcp
-        .exchange(
-            json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
-            "name":"ide.inspect","arguments":{"detail_ref":start_ref},
-            "_meta":{"claudecode/toolUseId":inspect_call}}}),
+    let (mut started, call) = withheld_call(
+        &mut actor,
+        &fixture,
+        "ide.start",
+        json!({"activation_id":"eyes"}),
+    )
+    .await;
+    let mut withheld = vec![call];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while started["state"] == "pending" {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "activation did not settle: {started}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let detail_ref = started["detail_ref"].clone();
+        let (reply, call) = withheld_call(
+            &mut actor,
+            &fixture,
+            "ide.inspect",
+            json!({"detail_ref":detail_ref}),
         )
         .await;
-    let started = claude_fields(assert_claude_envelope(&reply));
+        started = reply;
+        withheld.push(call);
+    }
     assert_eq!(started["kind"], "activation", "{started}");
 
-    // A second helper is minted (its own post hook withheld too), then armed and run while the
-    // first check is still held running by the sleeping fake cargo.
-    actor.next += 1;
-    let diff_call = format!("call-{}", actor.next);
-    actor
-        .claude_lifecycle(&fixture, "PreToolUse", &diff_call)
-        .await;
-    let diff_reply = actor
-        .mcp
-        .exchange(
-            json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
-            "name":"ide.diff","arguments":{"mode":"head"},
-            "_meta":{"claudecode/toolUseId":diff_call}}}),
-        )
-        .await;
-    let diff = claude_fields(assert_claude_envelope(&diff_reply));
+    // A second operation is minted, its post withheld too, while the first check stays running.
+    let (diff, call) =
+        withheld_call(&mut actor, &fixture, "ide.diff", json!({"mode":"head"})).await;
     assert_eq!(diff["state"], "pending", "{diff}");
-    let (_detail_ref, launch_call) = actor.run_claude_pending(&fixture, &diff).await;
+    withheld.push(call);
 
-    // The helper's own Bash post hook carries the due plate.
-    let post = actor
-        .claude_lifecycle_output(&fixture, "PostToolUse", &launch_call)
-        .await;
-    assert!(post.status.success() && post.stderr.is_empty());
-    let rendered: Value = serde_json::from_str(&String::from_utf8(post.stdout).unwrap()).unwrap();
+    // The next native post carries the due plate.
+    let post = actor.claude_native_post(&fixture, "Read").await;
+    let rendered: Value = serde_json::from_str(&post).unwrap();
     assert_eq!(
         rendered["hookSpecificOutput"]["hookEventName"], "PostToolUse",
         "{rendered}"
@@ -9617,15 +9455,13 @@ async fn eyes_claude_helper_post_delivers_due_first_check_plate_once() {
         .unwrap();
     assert!(plate.contains("checking (first check)"), "{plate}");
 
-    // The identical plate is never repeated: the two withheld MCP posts and the next native post
-    // stay silent.
-    for call in [diff_call, inspect_call] {
-        let withheld = actor
-            .claude_lifecycle_output(&fixture, "PostToolUse", &call)
+    // The identical plate is never repeated: the late MCP posts and the next native post stay
+    // silent.
+    for call in withheld.iter().rev() {
+        let late = actor
+            .claude_lifecycle_output(&fixture, "PostToolUse", call)
             .await;
-        assert!(
-            withheld.status.success() && withheld.stdout.is_empty() && withheld.stderr.is_empty()
-        );
+        assert!(late.status.success() && late.stdout.is_empty() && late.stderr.is_empty());
     }
     assert!(actor.claude_native_post(&fixture, "Read").await.is_empty());
 
@@ -9639,7 +9475,7 @@ async fn eyes_claude_helper_post_delivers_due_first_check_plate_once() {
 /// Without `project_checks`, native post-hooks stay silent and the problems kind is disabled.
 #[tokio::test]
 async fn eyes_absent_configuration_keeps_v02_hook_replies() {
-    let fixture = ProductFixture::new_claude(json!([]));
+    let fixture = ProductFixture::new(json!([]));
     let mut daemon = fixture.daemon().await;
     let (mut actor, delivered) = eyes_claude_actor(&fixture, "claude-eyes-absent").await;
     assert!(delivered.is_empty(), "{delivered}");
