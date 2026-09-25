@@ -224,13 +224,15 @@ require_ide_journal_activity() {
     since=$2
     label=$3
     journal=$DIAG_DIR/ide-journal-$label.txt
-    "$BINARY" errors --repo "$worktree" --all --since 30 --limit 400 >"$journal" 2>>"$DIAG_LOG" \
+    "$BINARY" errors --repo "$worktree" --all --since 15 --limit 4000 >"$journal" 2>>"$DIAG_LOG" \
         || fail "E_${label}_JOURNAL" "errors reader exited nonzero"
-    for method in start stop; do
-        awk -v since="$since" -v method="$method" \
-            '$1 >= since && $3 == method && $4 == "completed" { found = 1 } END { exit !found }' \
+    # An activation is `start pending` followed by the `inspect completed` that delivers it.
+    for expected in "start pending" "inspect completed" "stop completed"; do
+        set -- $expected
+        awk -v since="$since" -v method="$1" -v outcome="$2" \
+            '$1 >= since && $3 == method && $4 == outcome { found = 1 } END { exit !found }' \
             "$journal" \
-            || fail "A_${label}_JOURNAL_${method}" "journal has no completed $method after $since"
+            || fail "A_${label}_JOURNAL_$1" "journal has no $expected after $since"
     done
     note "agent-$label-journal-backed" "transcript carried no tool rows; daemon journal proves the round trips"
 }
