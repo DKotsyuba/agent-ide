@@ -553,6 +553,41 @@ mod tests {
         assert_eq!(text, "complete context: python: unavailable:env_missing");
     }
 
+    /// Keeps a page's final source newline separate from the continuation instruction.
+    #[test]
+    fn paged_context_preserves_source_trailing_newline() {
+        let rendered = render(
+            PeerReply::Complete {
+                kind: ResultKind::Context,
+                text: "page 1; bytes 0-2 of 4\n\nx\n".into(),
+                detail_ref: Some("next-page".into()),
+                truncated: true,
+                continuation: true,
+            },
+            Envelope::TextOnly,
+        )
+        .unwrap();
+        assert_eq!(
+            text_of(&rendered),
+            "complete context: page 1; bytes 0-2 of 4\n\nx\n\nOutput is truncated; use ide.inspect with detail_ref next-page before editing"
+        );
+        let without_trailing_newline = render(
+            PeerReply::Complete {
+                kind: ResultKind::Context,
+                text: "x".into(),
+                detail_ref: Some("next-page".into()),
+                truncated: true,
+                continuation: true,
+            },
+            Envelope::TextOnly,
+        )
+        .unwrap();
+        assert_eq!(
+            text_of(&without_trailing_newline),
+            "complete context: x\nOutput is truncated; use ide.inspect with detail_ref next-page before editing"
+        );
+    }
+
     /// Recommends inspection only for a typed retained continuation, never merely for a handle.
     #[test]
     fn incomplete_results_do_not_infer_continuation_from_detail_reference() {

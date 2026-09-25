@@ -63,23 +63,23 @@ Next: use ide.context
 {%- if state == "complete" and kind == "context" -%}
 complete context: {{ text }}
 {%- if truncated and detail_ref and continuation -%}
-Output is truncated; use ide.inspect with detail_ref {{ detail_ref }} before editing
+{{ "\n" }}Output is truncated; use ide.inspect with detail_ref {{ detail_ref }} before editing
 {%- elif truncated and detail_ref -%}
-Output is incomplete; use ide.edit with source_ref {{ detail_ref }} when available, otherwise use the native editor
+{{ "\n" }}Output is incomplete; use ide.edit with source_ref {{ detail_ref }} when available, otherwise use the native editor
 {%- elif truncated -%}
-Output is incomplete; use ide.edit when available, otherwise use the native editor
+{{ "\n" }}Output is incomplete; use ide.edit when available, otherwise use the native editor
 {%- elif detail_ref -%}
-Diagnostics are exactly as reported; use ide.edit with source_ref {{ detail_ref }} when available, otherwise use the native editor
+{{ "\n" }}Diagnostics are exactly as reported; use ide.edit with source_ref {{ detail_ref }} when available, otherwise use the native editor
 {%- endif -%}
 {%- endif -%}
 {%- if state == "complete" and kind == "diff" -%}
 complete diff: {{ text }}
 {%- if truncated and detail_ref and continuation -%}
-Output is truncated; use ide.inspect with detail_ref {{ detail_ref }}
+{{ "\n" }}Output is truncated; use ide.inspect with detail_ref {{ detail_ref }}
 {%- elif truncated -%}
-Output is incomplete; stop or review the available hunks safely with native tools
+{{ "\n" }}Output is incomplete; stop or review the available hunks safely with native tools
 {%- else -%}
-Next: use ide.stop
+{{ "\n" }}Next: use ide.stop
 {%- endif -%}
 {%- endif -%}
 {%- if state == "complete" and kind == "stop" -%}
