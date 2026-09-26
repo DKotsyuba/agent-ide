@@ -14,6 +14,7 @@ use std::{
 
 use async_lsp::lsp_types as lsp;
 
+use super::render::clip;
 use super::{
     CommandSource, InsertSite, InsertWhere, LangError, Language, LanguageProject, LanguageSupport,
     LineRange, Outline, ProjectCommand, ProjectCommands, Symbol, SymbolKind, SymbolPath,
@@ -147,10 +148,13 @@ impl LanguageSupport for Python {
 
     /// Header = decorators directly above `def`/`class` (multi-line decorator arguments
     /// included); the docstring stays inside the body and its first paragraph becomes `doc`.
-    /// Functions in a class become methods (`__init__` a constructor), functions nested in
-    /// functions stay functions, and in test files module- or class-level `test_*` functions and
-    /// `Test*` classes become tests. Same-named siblings are kept as reported (pyright reports
-    /// redefinitions separately); [`Outline::find`] then resolves the first.
+    /// Names a function binds (parameters, locals, `except as` bindings, comprehension
+    /// variables) are dropped; class attributes and enum members keep only their target and
+    /// annotation (`name: Type`) or their clipped `NAME = value`. Functions in a class become
+    /// methods (`__init__` a constructor), functions nested in functions stay functions, and in
+    /// test files module- or class-level `test_*` functions and `Test*` classes become tests.
+    /// Same-named siblings are kept as reported (pyright reports redefinitions separately);
+    /// [`Outline::find`] then resolves the first.
     fn normalize(&self, file: &Path, source: &str, symbols: Vec<lsp::DocumentSymbol>) -> Outline {
         let lines = source_lines(source);
         let root = SymbolPath::new(Some(file.to_path_buf()), Vec::new());
@@ -411,7 +415,25 @@ enum Owner {
     Function,
 }
 
-/// Converts sibling document symbols under `owner_path`, ordered by their first line.
+/// Kinds pyright reports for names a function binds: parameters, locals, `except as` bindings,
+/// comprehension variables and type parameters. None of them belong in an outline.
+fn is_local(kind: SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Variable | SymbolKind::Constant | SymbolKind::Field | SymbolKind::TypeAlias
+    )
+}
+
+/// Kinds pyright reports for class-level attributes and enum members.
+fn is_attribute(kind: SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Variable | SymbolKind::Constant | SymbolKind::Field | SymbolKind::Variant
+    )
+}
+
+/// Converts sibling document symbols under `owner_path`, ordered by their first line. Children
+/// of functions only keep structure: every bound name is dropped (see [`is_local`]).
 fn convert_all(
     lines: &[&str],
     symbols: Vec<lsp::DocumentSymbol>,
@@ -421,6 +443,7 @@ fn convert_all(
 ) -> Vec<Symbol> {
     let mut converted: Vec<Symbol> = symbols
         .into_iter()
+        .filter(|symbol| owner != Owner::Function || !is_local(kind_of(symbol.kind)))
         .map(|symbol| convert(lines, symbol, owner_path, owner, test_file))
         .collect();
     converted.sort_by_key(|symbol| (symbol.range.start, symbol.body.start));
@@ -453,17 +476,22 @@ fn convert(
     if test_file && collected {
         kind = SymbolKind::Test;
     }
+    let attribute = owner == Owner::Class && is_attribute(kind);
     let (signature, doc, header) = match decl {
         Some(index) => {
             let (signature, end) = signature_at(lines, index);
             let doc = docstring(lines, &end).and_then(|doc| doc.text);
             (signature, doc, decorator_start(lines, index))
         }
-        None => (
-            one_line(line_at(lines, body.start)),
-            None,
-            body.start as usize - 1,
-        ),
+        None => {
+            let line = line_at(lines, body.start);
+            let signature = if attribute {
+                attribute_signature(line)
+            } else {
+                one_line(line)
+            };
+            (signature, None, body.start as usize - 1)
+        }
     };
     let child_owner = if is_class || kind == SymbolKind::Class {
         Owner::Class
@@ -587,6 +615,56 @@ fn signature_at(lines: &[&str], start: usize) -> (String, HeaderEnd) {
             col: lines[line].len().saturating_sub(1),
         },
     )
+}
+
+/// Character ceiling for a class attribute signature.
+const MAX_ATTRIBUTE_CHARS: usize = 60;
+
+/// Signature of a class attribute or enum member: `name: annotation` for an annotated
+/// assignment, otherwise the whole `name = value`, comment stripped and clipped at
+/// [`MAX_ATTRIBUTE_CHARS`] characters. Brackets, strings and `==`-style operators are skipped
+/// while looking for the value's `=`.
+fn attribute_signature(line: &str) -> String {
+    let line = line.trim_start();
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut annotated = false;
+    let mut cut = line.len();
+    let mut prev = ' ';
+    for (col, ch) in line.char_indices() {
+        if let Some(open) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == open {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '#' => {
+                cut = col;
+                break;
+            }
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ':' if depth <= 0 && prev != '=' => annotated = true,
+            '=' if depth <= 0
+                && !matches!(prev, '=' | '!' | '<' | '>' | ':')
+                && !line[col + 1..].starts_with('=')
+                && annotated =>
+            {
+                cut = col;
+                break;
+            }
+            _ => {}
+        }
+        prev = ch;
+    }
+    clip(&one_line(line[..cut].trim_end()), MAX_ATTRIBUTE_CHARS)
 }
 
 /// A docstring's line span and its first paragraph (`None` when the docstring is blank).
@@ -1252,6 +1330,137 @@ class TestWorker:
         let outline = Python.normalize(Path::new("src/service.py"), TESTS, symbols);
         assert_eq!(outline.symbols[0].kind, SymbolKind::Function);
         assert_eq!(outline.symbols[1].kind, SymbolKind::Class);
+    }
+
+    /// A module mirroring the reported pyright output: parameter, local and `except as`
+    /// Variable children on function bodies, a nested function, an annotated attribute and
+    /// enum members.
+    const CONTRACT: &str = "\
+\"\"\"Contract module.\"\"\"
+
+from uuid import UUID
+
+
+def parse(value: str, limit: int = 8) -> UUID:
+    parsed = UUID(value)
+    try:
+        return UUID(value)
+    except ValueError as error:
+        raise ValueError(str(error)) from error
+
+
+def outer(count: int):
+    def inner(offset: int) -> int:
+        return offset + count
+    return inner
+
+
+class ContractModel(BaseModel):
+    model_config = ConfigDict(extra=\"forbid\", strict=True, validate_assignment=True)
+    work_id: UUID = Field(default_factory=uuid4)
+
+
+class WorkKind(StrEnum):
+    PROJECT = \"project\"
+    EPIC = \"epic\"
+";
+
+    /// pyright's symbols for [`CONTRACT`]; variables cover only their name.
+    fn contract_symbols() -> Vec<lsp::DocumentSymbol> {
+        vec![
+            symbol(
+                "parse",
+                lsp::SymbolKind::FUNCTION,
+                (5, 0, 10, 45),
+                vec![
+                    symbol("value", lsp::SymbolKind::VARIABLE, (5, 10, 5, 15), vec![]),
+                    symbol("limit", lsp::SymbolKind::VARIABLE, (5, 23, 5, 28), vec![]),
+                    symbol("parsed", lsp::SymbolKind::VARIABLE, (6, 4, 6, 10), vec![]),
+                    symbol("error", lsp::SymbolKind::VARIABLE, (9, 24, 9, 29), vec![]),
+                ],
+            ),
+            symbol(
+                "outer",
+                lsp::SymbolKind::FUNCTION,
+                (13, 0, 16, 16),
+                vec![
+                    symbol("count", lsp::SymbolKind::VARIABLE, (13, 10, 13, 15), vec![]),
+                    symbol(
+                        "inner",
+                        lsp::SymbolKind::FUNCTION,
+                        (14, 4, 16, 16),
+                        vec![symbol(
+                            "offset",
+                            lsp::SymbolKind::VARIABLE,
+                            (14, 14, 14, 20),
+                            vec![],
+                        )],
+                    ),
+                ],
+            ),
+            symbol(
+                "ContractModel",
+                lsp::SymbolKind::CLASS,
+                (19, 0, 21, 44),
+                vec![
+                    symbol(
+                        "model_config",
+                        lsp::SymbolKind::VARIABLE,
+                        (20, 4, 20, 16),
+                        vec![],
+                    ),
+                    symbol(
+                        "work_id",
+                        lsp::SymbolKind::VARIABLE,
+                        (21, 4, 21, 11),
+                        vec![],
+                    ),
+                ],
+            ),
+            symbol(
+                "WorkKind",
+                lsp::SymbolKind::CLASS,
+                (24, 0, 26, 18),
+                vec![
+                    symbol(
+                        "PROJECT",
+                        lsp::SymbolKind::ENUM_MEMBER,
+                        (25, 4, 25, 11),
+                        vec![],
+                    ),
+                    symbol("EPIC", lsp::SymbolKind::ENUM_MEMBER, (26, 4, 26, 8), vec![]),
+                ],
+            ),
+        ]
+    }
+
+    #[test]
+    /// Function-local names (parameters, locals, `except as` bindings) disappear, nested
+    /// functions stay, class attributes and enum members render target/annotation or a clipped
+    /// assignment.
+    fn normalize_drops_function_locals_and_clips_class_attributes() {
+        use crate::lang::render::outline_text;
+        let outline = Python.normalize(
+            Path::new("src/pkg/contract.py"),
+            CONTRACT,
+            contract_symbols(),
+        );
+        assert_eq!(
+            outline_text(&outline),
+            "\
+src/pkg/contract.py  (27 lines, python)
+    6  def parse(value: str, limit: int = 8) -> UUID
+   14  def outer(count: int)
+   15    def inner(offset: int) -> int
+   20  class ContractModel(BaseModel)
+   21    model_config = ConfigDict(extra=\"forbid\", strict=True, vali…
+   22    work_id: UUID
+   25  class WorkKind(StrEnum)
+   26    PROJECT = \"project\"
+   27    EPIC = \"epic\"
+  (9 symbols)
+"
+        );
     }
 
     #[test]

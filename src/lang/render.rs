@@ -241,7 +241,8 @@ fn first_line(text: &str, max: usize) -> String {
     clip(text.lines().next().unwrap_or("").trim(), max)
 }
 
-fn clip(text: &str, max: usize) -> String {
+/// Clips text to `max` characters, ending with `…` when truncated.
+pub(super) fn clip(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         text.to_owned()
     } else {
