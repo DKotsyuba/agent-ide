@@ -57,6 +57,8 @@ const EDIT_CHECK_WAIT: Duration = Duration::from_secs(90);
 /// a card that exceeds it, or any panic inside the computation, degrades to the plain activation
 /// text instead of failing activation.
 const PROJECT_CARD_BUDGET: Duration = Duration::from_secs(5);
+/// Maximum time an initial tool call waits for its job before returning its retained detail.
+pub const INLINE_REPLY_WAIT: Duration = Duration::from_secs(8);
 
 /// A bounded asynchronous operation whose identity never includes the transient MCP call ID.
 struct Job {
@@ -602,13 +604,14 @@ impl Shared {
         }
     }
 
-    /// Records that the caller already received the retained page-one reply, so the next
-    /// `ide.inspect` advances instead of re-serving it (T16B).
-    fn mark_context_page_delivered(&self, reference: &str) {
+    /// Records that the caller already received its retained page, so the next `ide.inspect`
+    /// advances instead of re-serving it (T16B).
+    fn mark_page_delivered(&self, reference: &str) {
         if let Ok(mut ledger) = self.ledger.lock()
             && let Some(detail) = ledger.details.get_mut(reference)
         {
             detail.context_page_fresh = false;
+            detail.diff_page_fresh = false;
         }
     }
     /// Retains or clears the bounded Context (or Claude-captured Diff, T13B) pagination state for
@@ -1102,15 +1105,12 @@ impl WorkerHandle {
         }
         result
     }
-    /// Enqueues or resolves the exact query, returning pending without waiting for provider warmup.
+    /// Enqueues an exact query and waits up to [`INLINE_REPLY_WAIT`] for its completed reply.
     ///
-    /// `ide.test` by `path`, `pattern`, `command` or `status` needs no language server, so it
-    /// waits inline (at most 5 s, the bridge's Test budget) for its own job and answers with the
-    /// started/status line directly. `ide.test {symbol}` first resolves references through the
-    /// binding's live language server, which takes seconds on a cold session — longer than any
-    /// bridge request budget — so it is dispatched like every other language-server job: the job
-    /// is queued, this call answers `pending` at once, and the `tests #N: started` or `tests: no
-    /// tests reference …` line is retrieved through `ide.inspect` once selection is done.
+    /// A job still running at the limit returns its retained pending detail; callers can retrieve
+    /// later completion with `ide.inspect`. The initial inspection permit is reserved before
+    /// enqueueing so timeout always has capacity to return the current detail. A completed reply
+    /// uses the worker's normal delivery path, preserving continuation and feedback semantics.
     pub async fn submit(
         &self,
         invocation: ValidatedInvocation,
@@ -1131,26 +1131,17 @@ impl WorkerHandle {
                 detail: None,
             };
         }
-        if tool == AssistanceTool::Test && parameters.get("symbol").is_none() {
-            let (send, wait) = oneshot::channel();
-            if let Err(code) = self.enqueue(invocation, tool, parameters, attachment, Some(send)) {
-                return PeerReply::Error { code, detail: None };
-            }
-            return match tokio::time::timeout(Duration::from_secs(5), wait).await {
-                Ok(Ok(reply)) => reply,
-                _ => PeerReply::Error {
-                    code: FailureCode::Deadline,
-                    detail: None,
-                },
-            };
-        }
+        let (send, wait) = oneshot::channel();
         match admit_initial_inspection(&self.inspect, || {
-            self.enqueue(invocation, tool, parameters, attachment, None)
+            self.enqueue(invocation, tool, parameters, attachment, Some(send))
         }) {
-            Ok((reference, permit)) => {
-                self.inspect_reserved(binding, reference, expected, permit)
-                    .await
-            }
+            Ok((reference, permit)) => match tokio::time::timeout(INLINE_REPLY_WAIT, wait).await {
+                Ok(Ok(reply)) => reply,
+                _ => {
+                    self.inspect_reserved(binding, reference, expected, permit)
+                        .await
+                }
+            },
             Err(code) => PeerReply::Error { code, detail: None },
         }
     }
@@ -2022,7 +2013,7 @@ impl<'a> Worker<'a> {
                     // Page one just reached the caller through this settlement, so the first
                     // `ide.inspect` of its `detail_ref` must serve page two, not repeat page one
                     // (T16B). Only a lost receiver leaves the page undelivered and fresh.
-                    self.shared.mark_context_page_delivered(&job.reference);
+                    self.shared.mark_page_delivered(&job.reference);
                 }
             }
         }

@@ -39,6 +39,8 @@ const MAX_REQUEST_ID_BYTES: usize = 128;
 const MAX_V1_FRAME_BYTES: usize = 64 * 1024;
 const MAX_V2_FRAME_BYTES: usize = 128 * 1024;
 const MAX_ASSISTANCE_JSON_BYTES: usize = 64 * 1024;
+/// Total connect, exchange, and dispatch budget for every Assistance method request.
+const METHOD_DISPATCH_BUDGET: Duration = Duration::from_secs(10);
 /// Total connect, request, and acknowledgement budget when a Codex MCP opens its client lease.
 const CLIENT_LEASE_OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -460,15 +462,8 @@ pub async fn dispatch_method_if_running(
     request: MethodDispatch,
     limits: HookTransportLimits,
 ) -> MethodDispatchTransportResult {
-    // `ide.test` by path/pattern/command/status is answered inline by the daemon after its job
-    // ran (`worker::WorkerHandle::submit` waits up to the same 5 s); the symbol form answers `pending`
-    // at once, so no inline wait can outlast this budget.
-    let budget = if request.method() == AssistanceMethod::Test {
-        Duration::from_secs(5)
-    } else {
-        limits.deadline
-    };
-    let Some(deadline) = tokio::time::Instant::now().checked_add(budget) else {
+    // Keep this above the worker's inline wait so the original host-bound invocation can reply.
+    let Some(deadline) = tokio::time::Instant::now().checked_add(METHOD_DISPATCH_BUDGET) else {
         return MethodDispatchTransportResult::Unavailable;
     };
     let socket_path = runtime_dir.join(SOCKET_NAME);
@@ -639,12 +634,13 @@ fn inspect_lock(path: &Path) -> DoctorLockState {
 
 /// Identifies one accepted peer and routes it to health, Assistance dispatch, or a long-lived lease.
 ///
-/// Identifying the request, and any bounded reply, share one `connection_deadline` budget, exactly
-/// like every other accepted connection. Only an admitted lease's ensuing hold-open phase escapes
-/// that budget, run by [`hold_lease_until_eof`] after this function returns, because that phase is
-/// deliberately unbounded until the peer's own EOF (EYES-r2 §2). A lease request is admitted from
-/// its own bounded pool ([`lease::LeaseController::try_admit`]) and never acquires `permits`, the
-/// separate hook/assistance `max_connections` semaphore.
+/// Peer identity and frame reading use `connection_deadline`; routed health, hook, lease, and
+/// method replies keep their respective budgets. Method dispatch may wait up to
+/// [`METHOD_DISPATCH_BUDGET`] after frame receipt, while hooks keep their configured deadline.
+/// Only an admitted lease's ensuing hold-open phase is unbounded until peer EOF, run by
+/// [`hold_lease_until_eof`] after this function returns (EYES-r2 §2). A lease request is admitted
+/// from its own bounded pool ([`lease::LeaseController::try_admit`]) and never acquires `permits`,
+/// the separate hook/assistance `max_connections` semaphore.
 async fn serve_accepted_connection(
     mut stream: UnixStream,
     generation: String,
@@ -654,51 +650,68 @@ async fn serve_accepted_connection(
     permits: Arc<Semaphore>,
     lease: lease::LeaseController,
 ) {
-    let identified = tokio::time::timeout(connection_deadline, async {
+    let connection_deadline = tokio::time::Instant::now() + connection_deadline;
+    let request = tokio::time::timeout_at(connection_deadline, async {
         if peer_uid(stream.as_raw_fd())? != effective_uid() {
             return Ok(None);
         }
-        let request: Value = read_frame(&mut stream, MAX_V2_FRAME_BYTES).await?;
-        match request.get("version").and_then(Value::as_u64) {
-            Some(1) => {
-                serve_health(&mut stream, request, generation).await?;
-                Ok(None)
-            }
-            Some(2 | 3) => {
-                // A served v2/v3 Assistance call proves a live client session. For lease-free
-                // clients, each call restarts the idle countdown (T26B); managed MCPs also hold
-                // their own long-lived leases, so this activity update is harmless for them.
-                lease.mark_activity();
-                if let (Some(dispatcher), Some(limits)) = (dispatcher, transport_limits)
-                    && let Ok(_permit) = permits.try_acquire_owned()
-                {
-                    serve_assistance_request(&mut stream, request, dispatcher, limits).await?;
-                }
-                Ok(None)
-            }
-            Some(version)
-                if version == u64::from(transport::CLIENT_LEASE_WIRE_VERSION)
-                    && request.get("method").and_then(Value::as_str)
-                        == Some("assistance.client_lease") =>
-            {
-                serve_client_lease_handshake(&mut stream, request, &lease, dispatcher.as_deref())
-                    .await
-            }
-            // ClientLease and `ide.test` share wire version 4; the fixed method tag above owns leases.
-            Some(4) => {
-                lease.mark_activity();
-                if let (Some(dispatcher), Some(limits)) = (dispatcher, transport_limits)
-                    && let Ok(_permit) = permits.try_acquire_owned()
-                {
-                    serve_assistance_request(&mut stream, request, dispatcher, limits).await?;
-                }
-                Ok(None)
-            }
-            _ => Ok(None),
-        }
+        read_frame::<Value>(&mut stream, MAX_V2_FRAME_BYTES)
+            .await
+            .map(Some)
     })
     .await;
-    if let Ok(Ok(Some(guard))) = identified {
+    let Ok(Ok(Some(request))) = request else {
+        return;
+    };
+    let version = request.get("version").and_then(Value::as_u64);
+    let identified = match version {
+        Some(1) => {
+            let _ = tokio::time::timeout_at(
+                connection_deadline,
+                serve_health(&mut stream, request, generation),
+            )
+            .await;
+            None
+        }
+        Some(version)
+            if version == u64::from(transport::CLIENT_LEASE_WIRE_VERSION)
+                && request.get("method").and_then(Value::as_str)
+                    == Some("assistance.client_lease") =>
+        {
+            tokio::time::timeout_at(
+                connection_deadline,
+                serve_client_lease_handshake(&mut stream, request, &lease, dispatcher.as_deref()),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+        }
+        Some(2..=4) => {
+            // Served Assistance calls prove a live client session and restart the idle countdown.
+            lease.mark_activity();
+            if let (Some(dispatcher), Some(limits)) = (dispatcher, transport_limits)
+                && let Ok(_permit) = permits.try_acquire_owned()
+            {
+                let method = request.get("method").and_then(Value::as_str)
+                    == Some("assistance.method_dispatch");
+                let budget = if method {
+                    METHOD_DISPATCH_BUDGET
+                } else {
+                    connection_deadline.duration_since(tokio::time::Instant::now())
+                };
+                let deadline = tokio::time::Instant::now() + budget;
+                let _ = tokio::time::timeout_at(
+                    deadline,
+                    serve_assistance_request(&mut stream, request, dispatcher, limits),
+                )
+                .await;
+            }
+            None
+        }
+        _ => None,
+    };
+    if let Some(guard) = identified {
         hold_lease_until_eof(stream).await;
         drop(guard);
     }
@@ -935,13 +948,8 @@ async fn serve_assistance_request(
                 .ok_or_else(|| invalid_transport("invalid method parameters"))?,
             )
             .ok_or_else(|| invalid_transport("invalid method correlation"))?;
-            let dispatch_budget = if dispatch.method() == AssistanceMethod::Test {
-                Duration::from_secs(5)
-            } else {
-                limits.deadline
-            };
             let reply = tokio::time::timeout(
-                dispatch_budget,
+                METHOD_DISPATCH_BUDGET,
                 dispatcher.dispatch(AssistanceDispatch::MethodDispatch(dispatch.clone())),
             )
             .await;
@@ -1272,6 +1280,15 @@ mod tests {
     use crate::app::transport::AssistanceDispatchUnavailable;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Ensures the bridge can wait longer than the worker's inline reply window.
+    #[test]
+    fn method_dispatch_budget_exceeds_worker_inline_reply_wait() {
+        assert!(
+            METHOD_DISPATCH_BUDGET > crate::assistance::worker::INLINE_REPLY_WAIT,
+            "the bridge must preserve the original invocation through the inline wait"
+        );
+    }
 
     /// Records whether daemon initialization and shutdown reached the owned dispatcher.
     struct ShutdownProbe {

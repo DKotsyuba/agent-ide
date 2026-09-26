@@ -478,9 +478,9 @@ async fn assistance_transport_is_finite_and_hook_submission_never_autostarts() {
     stop_assistance_daemon(task, runtime_dir).await;
 }
 
-/// Proves delayed connect polling consumes the exchange budget using a real socket and virtual time.
+/// Proves connect and exchange share one hook or method budget using a real socket and virtual time.
 #[tokio::test(start_paused = true)]
-async fn hook_and_method_share_one_total_connect_and_exchange_deadline() {
+async fn hook_and_method_keep_one_total_connect_and_exchange_deadline() {
     // A runnable task prevents paused time from auto-advancing while the socket reactor catches up.
     let clock_guard = tokio::spawn(async {
         loop {
@@ -538,11 +538,16 @@ async fn hook_and_method_share_one_total_connect_and_exchange_deadline() {
                 serde_json::from_slice::<Value>(&body).unwrap()
             } => assert_eq!(frame["request_id"], "request"),
         }
-        tokio::time::advance(Duration::from_millis(50)).await;
+        tokio::time::advance(if hook {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_secs(10)
+        })
+        .await;
         assert_eq!(
             request.as_mut().poll(&mut context),
             std::task::Poll::Ready(true),
-            "hook={hook}: exchange reset the original 100ms deadline"
+            "hook={hook}: exchange reset the original transport deadline"
         );
         drop(request);
         drop(socket);
