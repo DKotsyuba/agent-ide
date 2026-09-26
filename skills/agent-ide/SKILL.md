@@ -1,17 +1,19 @@
 ---
 name: agent-ide
-description: Use Agent IDE `ide.*` tools, including `ide.edit` when offered, for source implementation, debugging, refactoring, and testing. Native host editing remains a supported fallback.
+description: Use Agent IDE `ide.*` tools for understanding and changing source code — `ide.outline`/`ide.symbol`/`ide.graph` instead of reading files and grep, `ide.edit` with a project check in the reply, `ide.test` by symbol. Native read/grep/edit remain for non-source files and as a fallback.
 ---
 
 # Agent IDE
 
 Agent IDE exposes the lifecycle tools `ide.start`, `ide.context`, `ide.diff`,
 `ide.inspect`, `ide.stop`, `ide.edit`, the symbol tools `ide.outline`, `ide.read`,
-`ide.symbol`, `ide.graph`, and `ide.test`. Use this workflow whenever they are offered and the task implements,
-debugs, refactors, or writes/fixes source.
-Skip it for read-only exploration, prose, configuration, or when `ide.*` is
-not present — use native host read/write/test tools plus CodeGraph (when
-available) instead.
+`ide.symbol`, `ide.graph`, and `ide.test`. Use this workflow whenever they are offered and the
+task touches source code — understanding it (where is X defined, who calls it, what does this
+file contain) as much as implementing, debugging, refactoring or testing. For a source
+question, `ide.outline` / `ide.symbol` / `ide.graph` answer from the language server in one
+call where grep and file reads take several and miss dynamic dispatch. Native read/grep/edit
+tools remain for prose, configuration and data files, and as the fallback when `ide.*` is not
+present.
 
 ## Deferred tool discovery
 
