@@ -1,4 +1,4 @@
-//! Contract checks for the bounded six-tool Assistance facade and fail-open feedback core.
+//! Contract checks for the bounded ten-tool Assistance facade and fail-open feedback core.
 
 use std::{fs, path::PathBuf};
 
@@ -49,9 +49,9 @@ fn pre_hook() -> agent_ide::assistance::host_binding::HookEvent {
 }
 
 #[test]
-fn discovery_is_static_and_contains_exactly_nine_current_methods() {
+fn discovery_is_static_and_contains_exactly_ten_current_methods() {
     let schemas = tool_schemas();
-    assert_eq!(schemas.len(), 9);
+    assert_eq!(schemas.len(), 10);
     assert!(schemas.iter().map(|schema| schema.name).eq([
         "ide.start",
         "ide.context",
@@ -61,7 +61,8 @@ fn discovery_is_static_and_contains_exactly_nine_current_methods() {
         "ide.edit",
         "ide.outline",
         "ide.read",
-        "ide.symbol"
+        "ide.symbol",
+        "ide.test"
     ]));
     assert!(
         schemas
@@ -442,4 +443,26 @@ fn edit_arguments_are_closed_and_bounded() {
         )
         .is_err()
     );
+}
+
+/// Keeps `ide.test` target exclusivity and its process budget at the facade trust boundary.
+#[test]
+fn test_arguments_require_one_target_and_bounded_budget() {
+    for target in [
+        json!({"path":"src/lib.rs"}),
+        json!({"pattern":"worker::"}),
+        json!({"command":["cargo","test"]}),
+        json!({"status":1}),
+    ] {
+        assert!(validate_call(AssistanceTool::Test, target).is_ok());
+    }
+    for invalid in [
+        json!({}),
+        json!({"path":"src/lib.rs","pattern":"worker"}),
+        json!({"command":[]}),
+        json!({"status":0}),
+        json!({"path":"src/lib.rs","budget_s":601}),
+    ] {
+        assert!(validate_call(AssistanceTool::Test, invalid).is_err());
+    }
 }

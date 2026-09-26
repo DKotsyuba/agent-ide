@@ -77,6 +77,8 @@ pub enum ToolMethod {
     Read,
     /// `ide.symbol` symbol card request.
     Symbol,
+    /// `ide.test` test run or status request.
+    Test,
 }
 
 /// Classifies a closed completion result without retaining a peer message or error text.

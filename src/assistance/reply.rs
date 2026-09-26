@@ -140,6 +140,8 @@ pub enum ResultKind {
     Read,
     /// A symbol card from `ide.symbol`.
     Symbol,
+    /// A background test run result from `ide.test`.
+    Test,
 }
 
 /// Closed diagnostic evidence attached to one successful Assistance edit reply.

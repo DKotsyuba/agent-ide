@@ -460,7 +460,12 @@ pub async fn dispatch_method_if_running(
     request: MethodDispatch,
     limits: HookTransportLimits,
 ) -> MethodDispatchTransportResult {
-    let Some(deadline) = tokio::time::Instant::now().checked_add(limits.deadline) else {
+    let budget = if request.method() == AssistanceMethod::Test {
+        Duration::from_secs(5)
+    } else {
+        limits.deadline
+    };
+    let Some(deadline) = tokio::time::Instant::now().checked_add(budget) else {
         return MethodDispatchTransportResult::Unavailable;
     };
     let socket_path = runtime_dir.join(SOCKET_NAME);
@@ -483,6 +488,7 @@ pub async fn dispatch_method_if_running(
         AssistanceMethod::Outline => "outline",
         AssistanceMethod::Read => "read",
         AssistanceMethod::Symbol => "symbol",
+        AssistanceMethod::Test => "test",
         AssistanceMethod::HookSubmit => return MethodDispatchTransportResult::Unavailable,
     };
     let version = request.method().wire_version();
@@ -667,9 +673,23 @@ async fn serve_accepted_connection(
                 }
                 Ok(None)
             }
-            Some(version) if version == u64::from(transport::CLIENT_LEASE_WIRE_VERSION) => {
+            Some(version)
+                if version == u64::from(transport::CLIENT_LEASE_WIRE_VERSION)
+                    && request.get("method").and_then(Value::as_str)
+                        == Some("assistance.client_lease") =>
+            {
                 serve_client_lease_handshake(&mut stream, request, &lease, dispatcher.as_deref())
                     .await
+            }
+            // ClientLease and `ide.test` share wire version 4; the fixed method tag above owns leases.
+            Some(4) => {
+                lease.mark_activity();
+                if let (Some(dispatcher), Some(limits)) = (dispatcher, transport_limits)
+                    && let Ok(_permit) = permits.try_acquire_owned()
+                {
+                    serve_assistance_request(&mut stream, request, dispatcher, limits).await?;
+                }
+                Ok(None)
             }
             _ => Ok(None),
         }
@@ -912,8 +932,13 @@ async fn serve_assistance_request(
                 .ok_or_else(|| invalid_transport("invalid method parameters"))?,
             )
             .ok_or_else(|| invalid_transport("invalid method correlation"))?;
+            let dispatch_budget = if dispatch.method() == AssistanceMethod::Test {
+                Duration::from_secs(5)
+            } else {
+                limits.deadline
+            };
             let reply = tokio::time::timeout(
-                limits.deadline,
+                dispatch_budget,
                 dispatcher.dispatch(AssistanceDispatch::MethodDispatch(dispatch.clone())),
             )
             .await;
@@ -928,11 +953,13 @@ async fn serve_assistance_request(
                             .map_err(|error| invalid_transport(error.to_string()))?,
                     })
                 }
-                Ok(Ok(_)) | Ok(Err(_)) | Err(_) => json!({
-                    "version": version,
-                    "request_id": dispatch.request_id(),
-                    "status": "unavailable",
-                }),
+                Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
+                    json!({
+                        "version": version,
+                        "request_id": dispatch.request_id(),
+                        "status": "unavailable",
+                    })
+                }
             };
             write_frame(stream, &value, limits.max_frame_bytes).await
         }

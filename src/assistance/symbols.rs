@@ -7,11 +7,80 @@
 
 use super::*;
 use crate::lang::{
-    self, Language as Lang, LineRange, Outline, SymbolPath,
+    self, Language as Lang, LineRange, Outline, SymbolPath, TestId,
     render::{self, Call, SymbolCard, Usage},
 };
 
 impl Worker<'_> {
+    /// Finds test functions that reference one exact source symbol using the live language server.
+    pub(super) async fn tests_referencing_symbol(
+        &mut self,
+        job: &mut Job,
+        requested: &str,
+    ) -> Result<(Vec<TestId>, Lang), FailureCode> {
+        let binding = job.invocation.binding_ref().clone();
+        let symbol = SymbolPath::parse(requested).map_err(|_| FailureCode::UnknownSymbol)?;
+        let file = symbol
+            .file()
+            .ok_or(FailureCode::UnknownSymbol)?
+            .to_path_buf();
+        let (observed, bytes) = self.observe(&binding, file).await?;
+        let (outline, root) = self.outline_of(job, &observed, &bytes).await?;
+        let found = outline.find(&symbol).ok_or(FailureCode::UnknownSymbol)?;
+        let offset = name_offset(observed_text(&observed, &bytes)?, found)?;
+        let refs = self
+            .live_session_for(job, &observed)
+            .await?
+            .session
+            .references(&observed, &bytes, offset)
+            .await
+            .map_err(|_| FailureCode::ProviderUnavailable)?;
+        let language = Lang::for_path(observed.path()).ok_or(FailureCode::ProviderUnavailable)?;
+        let support = lang::support(language).ok_or(FailureCode::ProviderUnavailable)?;
+        let mut tests = std::collections::BTreeSet::new();
+        for location in refs {
+            let Ok(absolute) = location.uri.to_file_path() else {
+                continue;
+            };
+            let Ok(relative) = absolute.strip_prefix(&root) else {
+                continue;
+            };
+            if !support.is_test_file(relative) {
+                continue;
+            }
+            let relative = relative.to_path_buf();
+            let (test_observed, test_bytes) = self.observe(&binding, relative.clone()).await?;
+            let (test_outline, _) = self.outline_of(job, &test_observed, &test_bytes).await?;
+            let line = location.range.start.line + 1;
+            let mut enclosing = None;
+            for candidate in &test_outline.symbols {
+                candidate.walk(&mut |candidate| {
+                    if candidate.range.start <= line
+                        && line <= candidate.range.end
+                        && enclosing.is_none_or(|old: &crate::lang::Symbol| {
+                            candidate.range.len() < old.range.len()
+                        })
+                    {
+                        enclosing = Some(candidate);
+                    }
+                });
+            }
+            if let Some(test) = enclosing
+                && test.kind == crate::lang::SymbolKind::Test
+            {
+                let name = test.path.segments().join("::");
+                tests.insert((relative.clone(), name));
+            }
+        }
+        Ok((
+            tests
+                .into_iter()
+                .map(|(file, name)| TestId { file, name })
+                .collect(),
+            language,
+        ))
+    }
+
     /// `ide.outline {path}`: the file skeleton.
     pub(super) async fn outline(
         &mut self,

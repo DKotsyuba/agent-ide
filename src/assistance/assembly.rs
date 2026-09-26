@@ -64,6 +64,7 @@ fn log_binding_unavailable(
         super::facade::AssistanceTool::Outline => errorlog::Method::Outline,
         super::facade::AssistanceTool::Read => errorlog::Method::Read,
         super::facade::AssistanceTool::Symbol => errorlog::Method::Symbol,
+        super::facade::AssistanceTool::Test => errorlog::Method::Test,
     };
     errorlog::record(
         method,
@@ -93,10 +94,12 @@ fn is_problems_context(method: AssistanceMethod, parameters: &Value) -> bool {
 ///
 /// Reads only in-memory snapshots and never waits for a running check. The plate is skipped, and
 /// stays due for a later hook, whenever it could not fit beside `feedback` inside one bounded hook
-/// context (EYES-r2 §5/§6). Hosts whose [`FeedDelivery`] is [`FeedDelivery::Replies`] never take
+/// context (EYES-r2 §5/§6). Hosts whose [`super::host_binding::FeedDelivery`] is
+/// [`super::host_binding::FeedDelivery::Replies`] never take
 /// this path; their plates ride terminal `ide.*` replies instead (`attach_reply_plate`).
 fn due_plate(
     feed: Option<&Arc<ProjectProblemFeed>>,
+    worker: Option<&WorkerHandle>,
     fingerprint: &[u8; 32],
     feedback: Option<&str>,
 ) -> Option<String> {
@@ -104,7 +107,15 @@ fn due_plate(
     if reserved + crate::feed::MAX_BLOCK_BYTES > super::reply::MAX_FEEDBACK_BYTES {
         return None;
     }
-    feed?.next_block(fingerprint)
+    if let Some(feed) = feed {
+        return feed.next_block(fingerprint);
+    }
+    let worker = worker?;
+    let line = worker.test_status_line(fingerprint)?;
+    let plate = format!("<agent-ide>\n{line}\n</agent-ide>");
+    (reserved + plate.len() <= super::reply::MAX_FEEDBACK_BYTES
+        && worker.mark_test_status_delivered(fingerprint, &line))
+    .then_some(plate)
 }
 
 /// Attaches the due status plate to one reply-delivered host's terminal reply (T28B).
@@ -136,6 +147,33 @@ fn attach_reply_plate(
     })?;
     *reply = fitting;
     Some(plate)
+}
+
+/// Attaches one explicit-test status plate when project checks are not configured.
+fn attach_test_plate(
+    worker: &WorkerHandle,
+    binding: &[u8; 32],
+    reply: &mut PeerReply,
+) -> Option<String> {
+    let line = worker.test_status_line(binding)?;
+    let plate = format!("<agent-ide>\n{line}\n</agent-ide>");
+    let mut fitting = reply.clone();
+    loop {
+        if super::content::fits_with_status(
+            &fitting,
+            &plate,
+            super::content::Envelope::WithStructured,
+        ) {
+            if worker.mark_test_status_delivered(binding, &line) {
+                *reply = fitting;
+                return Some(plate);
+            }
+            return None;
+        }
+        if !fitting.shrink_text() {
+            return None;
+        }
+    }
 }
 
 impl std::fmt::Debug for ProductDispatcher {
@@ -308,6 +346,7 @@ impl ProductDispatcher {
                             && let Some(worker) = &self.worker
                             && let Some(block) = due_plate(
                                 worker.project_feed(),
+                                Some(worker),
                                 &binding.binding_ref().fingerprint(),
                                 None,
                             )
@@ -344,7 +383,8 @@ impl ProductDispatcher {
                             // The block is taken from in-memory snapshots only. It is skipped, and
                             // stays due for a later hook, whenever it could not fit beside the
                             // feedback inside one bounded hook context.
-                            let block = due_plate(feed, &fingerprint, feedback.as_deref());
+                            let block =
+                                due_plate(feed, Some(worker), &fingerprint, feedback.as_deref());
                             let text = match (block, feedback) {
                                 (Some(block), Some(feedback)) => {
                                     Some(format!("{block}\n{feedback}"))
@@ -378,6 +418,7 @@ impl ProductDispatcher {
                     AssistanceMethod::Outline => super::facade::AssistanceTool::Outline,
                     AssistanceMethod::Read => super::facade::AssistanceTool::Read,
                     AssistanceMethod::Symbol => super::facade::AssistanceTool::Symbol,
+                    AssistanceMethod::Test => super::facade::AssistanceTool::Test,
                     AssistanceMethod::HookSubmit => return None,
                 };
                 let call =
@@ -514,8 +555,10 @@ impl ProductDispatcher {
                         feed.changed(&fingerprint);
                     }
                     if !matches!(reply, PeerReply::Pending { .. }) {
-                        *status =
-                            attach_reply_plate(worker.project_feed(), &fingerprint, &mut reply);
+                        *status = match worker.project_feed() {
+                            Some(feed) => attach_reply_plate(Some(feed), &fingerprint, &mut reply),
+                            None => attach_test_plate(worker, &fingerprint, &mut reply),
+                        };
                     }
                 }
                 Some(reply)
@@ -610,6 +653,7 @@ impl AssistanceDispatcher for ProductDispatcher {
                     AssistanceMethod::Outline => Some(super::facade::AssistanceTool::Outline),
                     AssistanceMethod::Read => Some(super::facade::AssistanceTool::Read),
                     AssistanceMethod::Symbol => Some(super::facade::AssistanceTool::Symbol),
+                    AssistanceMethod::Test => Some(super::facade::AssistanceTool::Test),
                     AssistanceMethod::HookSubmit => None,
                 };
                 if let Some(tool) = tool {

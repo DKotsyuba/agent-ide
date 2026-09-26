@@ -257,9 +257,10 @@ fn assert_compact_envelope(reply: &Value) {
     assert_eq!(content.len(), 1, "{reply}");
     let text = content[0]["text"].as_str().expect("sole text block");
     assert!(serde_json::from_str::<Value>(text).is_err(), "{reply}");
-    let structured = result["structuredContent"]
-        .as_object()
-        .expect("typed structured result");
+    let structured = result
+        .get("structuredContent")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("missing typed structured result: {reply}"));
     let state = structured["state"].as_str().expect("closed reply state");
     let text = match text.strip_prefix("<agent-ide>\n") {
         Some(rest) => {
@@ -268,7 +269,12 @@ fn assert_compact_envelope(reply: &Value) {
         }
         None => text,
     };
-    assert!(text.starts_with(state), "{reply}");
+    let expected_prefix = if state == "complete" && structured.get("kind") == Some(&json!("test")) {
+        "tests #"
+    } else {
+        state
+    };
+    assert!(text.starts_with(expected_prefix), "{reply}");
     assert_eq!(
         result.get("isError") == Some(&json!(true)),
         state == "error"
@@ -460,7 +466,8 @@ async fn binary_discovery_is_static_and_inactive_calls_are_fail_open() {
             "ide.read",
             "ide.start",
             "ide.stop",
-            "ide.symbol"
+            "ide.symbol",
+            "ide.test"
         ]
     );
     assert!(
@@ -513,7 +520,7 @@ async fn binary_discovery_is_static_and_inactive_calls_are_fail_open() {
     assert!(!runtime.exists());
 }
 
-/// Managed startup failure remains a disconnected static nine-tool MCP with bounded fallback calls.
+/// Managed startup failure remains a disconnected static ten-tool MCP with bounded fallback calls.
 #[tokio::test]
 async fn managed_startup_failure_serves_exact_static_tools_without_ipc() {
     let candidate = std::env::current_dir().unwrap();
@@ -543,7 +550,8 @@ async fn managed_startup_failure_serves_exact_static_tools_without_ipc() {
             "ide.read",
             "ide.start",
             "ide.stop",
-            "ide.symbol"
+            "ide.symbol",
+            "ide.test"
         ]
     );
     let unavailable = mcp
@@ -563,9 +571,9 @@ async fn managed_startup_failure_serves_exact_static_tools_without_ipc() {
     mcp.close().await;
 }
 
-/// Proves all six shipping handlers reach the real daemon only after separated launcher and request ingress.
+/// Proves shipping handlers reach the real daemon only after separated launcher and request ingress.
 #[tokio::test]
-async fn binary_routes_six_methods_to_typed_missing_peer_and_survives_daemon_loss() {
+async fn binary_routes_methods_to_typed_missing_peer_and_survives_daemon_loss() {
     let runtime = runtime();
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
         .args(["daemon", "--runtime-dir"])
@@ -4203,6 +4211,78 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
     assert_ne!(fresh["detail_ref"], started["detail_ref"]);
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Runs an explicitly requested fixture crate in the background and retrieves its parsed result.
+#[tokio::test]
+async fn configured_product_test_runs_in_background_and_reports_failures() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        r#"
+#[cfg(test)] mod tests {
+    #[test] fn passes() { assert_eq!(2 + 2, 4); }
+    #[test] fn fails() { assert_eq!(2 + 2, 5); }
+}
+"#,
+    )
+    .unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "test-runner").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"start-tests"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let started = actor
+        .call(&fixture, "ide.test", json!({"path":"src/lib.rs"}))
+        .await;
+    let start_text = started["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{started}"))
+        .to_owned();
+    assert!(
+        start_text.starts_with("tests #1: started — cargo test --workspace --lib (budget 120 s)"),
+        "{start_text}"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let completed = loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fixture tests did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let status = actor.call(&fixture, "ide.test", json!({"status":1})).await;
+        if status["text"]
+            .as_str()
+            .unwrap()
+            .contains("1 passed, 1 failed")
+        {
+            break status;
+        }
+    };
+    let result_text = completed["text"].as_str().unwrap();
+    assert!(result_text.contains("FAIL tests::fails"), "{result_text}");
+    assert!(
+        carried_status(&completed)
+            .is_some_and(|status| status.contains("tests #1: 1 passed, 1 failed")),
+        "completion status plate must carry the test delta once: {completed}"
+    );
+    let repeated = actor.call(&fixture, "ide.test", json!({"status":1})).await;
+    assert!(
+        carried_status(&repeated).is_none(),
+        "the completion plate must not repeat: {repeated}"
+    );
+    println!("ide.test start: {start_text}");
+    println!("ide.test result: {result_text}");
+    println!("ide.test status: {}", carried_status(&completed).unwrap());
+    actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
