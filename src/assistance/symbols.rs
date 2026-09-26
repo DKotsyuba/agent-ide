@@ -12,12 +12,12 @@ use crate::lang::{
 };
 
 impl Worker<'_> {
-    /// Finds test functions that reference one exact source symbol using the live language server.
+    /// Finds referencing tests and counts outline tests in the symbol's own file.
     pub(super) async fn tests_referencing_symbol(
         &mut self,
         job: &mut Job,
         requested: &str,
-    ) -> Result<(Vec<TestId>, Lang), FailureCode> {
+    ) -> Result<(Vec<TestId>, Lang, usize), FailureCode> {
         let binding = job.invocation.binding_ref().clone();
         let symbol = SymbolPath::parse(requested).map_err(|_| FailureCode::UnknownSymbol)?;
         let file = symbol
@@ -27,6 +27,12 @@ impl Worker<'_> {
         let (observed, bytes) = self.observe(&binding, file).await?;
         let (outline, root) = self.outline_of(job, &observed, &bytes).await?;
         let found = outline.find(&symbol).ok_or(FailureCode::UnknownSymbol)?;
+        let mut file_test_count = 0;
+        for candidate in &outline.symbols {
+            candidate.walk(&mut |candidate| {
+                file_test_count += usize::from(candidate.kind == crate::lang::SymbolKind::Test);
+            });
+        }
         let offset = name_offset(observed_text(&observed, &bytes)?, found)?;
         let refs = self
             .live_session_for(job, &observed)
@@ -83,6 +89,7 @@ impl Worker<'_> {
                 .map(|(file, name)| TestId { file, name })
                 .collect(),
             language,
+            file_test_count,
         ))
     }
 
@@ -96,6 +103,23 @@ impl Worker<'_> {
             .as_str()
             .ok_or(FailureCode::SourceUnavailable)?
             .to_owned();
+        let authority = self.authority(&binding).await?;
+        let root = authority.worktree().worktree_path();
+        let requested = root.join(&path);
+        if requested.is_dir() {
+            let root = std::fs::canonicalize(root).map_err(|_| FailureCode::SourceUnavailable)?;
+            let directory =
+                std::fs::canonicalize(&requested).map_err(|_| FailureCode::SourceUnavailable)?;
+            let relative = directory
+                .strip_prefix(&root)
+                .map_err(|_| FailureCode::OutsideAllowedRoots)?;
+            let text = render::directory_outline(&root, relative)
+                .map_err(|_| FailureCode::SourceUnavailable)?;
+            let (reply, page) =
+                ContextPageState::new(text, 0, false, ResultKind::Outline).next(&job.reference)?;
+            self.shared.set_context_page(&job.reference, page);
+            return Ok((reply, Some(authority), None));
+        }
         let (observed, bytes) = self.observe(&binding, path.clone().into()).await?;
         let (outline, _) = self.outline_of(job, &observed, &bytes).await?;
         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
@@ -231,15 +255,7 @@ impl Worker<'_> {
             ),
             signature: Some(found.signature.clone()),
             doc: found.doc.clone(),
-            definition: Some(render::read_text(
-                &file,
-                Some(&found.path.to_string()),
-                LineRange::new(
-                    found.range.start,
-                    found.range.end.min(found.range.start + 24),
-                ),
-                source,
-            )),
+            definition: Some(format!("{}  (lines {})", found.path, found.range)),
             ..Default::default()
         };
         {
@@ -265,7 +281,7 @@ impl Worker<'_> {
                     .await
                     .map_err(|_| FailureCode::ProviderUnavailable)?;
                 card.usages = self
-                    .usage_lines(&worktree_root, &found.path, references)
+                    .usage_lines(&worktree_root, &found.path, found.body.start, references)
                     .await;
             }
             if callers_depth > 0 {
@@ -275,14 +291,13 @@ impl Worker<'_> {
                     .incoming_calls(&observed, &bytes, byte_offset)
                     .await
                 {
-                    card.callers = calls
-                        .into_iter()
-                        .map(|call| Call {
-                            name: call.from.name,
+                    for call in calls {
+                        card.callers.push(Call {
+                            name: self.call_symbol_path(job, &worktree_root, &call.from).await,
                             file: render::display_path(&worktree_root, &call.from.uri),
                             line: call.from.selection_range.start.line + 1,
-                        })
-                        .collect();
+                        });
+                    }
                 }
             }
             if callees_depth > 0 {
@@ -292,14 +307,13 @@ impl Worker<'_> {
                     .outgoing_calls(&observed, &bytes, byte_offset)
                     .await
                 {
-                    card.callees = calls
-                        .into_iter()
-                        .map(|call| Call {
-                            name: call.to.name,
+                    for call in calls {
+                        card.callees.push(Call {
+                            name: self.call_symbol_path(job, &worktree_root, &call.to).await,
                             file: render::display_path(&worktree_root, &call.to.uri),
                             line: call.to.selection_range.start.line + 1,
-                        })
-                        .collect();
+                        });
+                    }
                 }
             }
         }
@@ -436,6 +450,7 @@ impl Worker<'_> {
         &mut self,
         worktree_root: &Path,
         definition: &SymbolPath,
+        definition_line: u32,
         references: Vec<async_lsp::lsp_types::Location>,
     ) -> Vec<Usage> {
         let mut cache: std::collections::BTreeMap<std::path::PathBuf, String> =
@@ -451,8 +466,8 @@ impl Worker<'_> {
             let relative = relative.to_path_buf();
             let line = location.range.start.line + 1;
             // Skip the declaration itself: it is the definition, not a usage.
-            if definition.file() == Some(relative.as_path()) {
-                // Declaration lines are filtered below by text once the source is known.
+            if definition.file() == Some(relative.as_path()) && line == definition_line {
+                continue;
             }
             let text = match cache.get(&relative) {
                 Some(source) => render::line_text(source, line),
@@ -474,6 +489,41 @@ impl Worker<'_> {
             });
         }
         usages
+    }
+
+    /// Resolves a call hierarchy item to its enclosing outline path, falling back to its LSP name.
+    async fn call_symbol_path(
+        &mut self,
+        job: &mut Job,
+        worktree_root: &Path,
+        item: &async_lsp::lsp_types::CallHierarchyItem,
+    ) -> String {
+        let Ok(absolute) = item.uri.to_file_path() else {
+            return item.name.clone();
+        };
+        let Ok(relative) = absolute.strip_prefix(worktree_root) else {
+            return item.name.clone();
+        };
+        let binding = job.invocation.binding_ref().clone();
+        let Ok((observed, bytes)) = self.observe(&binding, relative.to_path_buf()).await else {
+            return item.name.clone();
+        };
+        let Ok((outline, _)) = self.outline_of(job, &observed, &bytes).await else {
+            return item.name.clone();
+        };
+        let line = item.selection_range.start.line + 1;
+        let mut enclosing: Option<&crate::lang::Symbol> = None;
+        for symbol in &outline.symbols {
+            symbol.walk(&mut |candidate| {
+                if candidate.range.start <= line
+                    && line <= candidate.range.end
+                    && enclosing.is_none_or(|old| candidate.range.len() < old.range.len())
+                {
+                    enclosing = Some(candidate);
+                }
+            });
+        }
+        enclosing.map_or_else(|| item.name.clone(), |symbol| symbol.path.to_string())
     }
 
     /// Shared tail of every symbol job: deadline, authority, liveness and source checks.

@@ -510,7 +510,7 @@ pub fn validate_call(
     match tool {
         AssistanceTool::Outline => {
             let path = required_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
-            if let Some(rule) = path_shape_rule(path) {
+            if let Some(rule) = path_shape_rule(path.strip_suffix('/').unwrap_or(path)) {
                 return Err(invalid_field("path", rule));
             }
         }
