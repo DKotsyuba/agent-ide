@@ -83,10 +83,18 @@ fn project(reply: &PeerReply, status: Option<&str>, envelope: Envelope) -> Optio
     let cause_tag = match reply {
         PeerReply::Error {
             code: FailureCode::ExecutionProfileCause(cause),
+            ..
         } => Some(cause.tag()),
         _ => None,
     };
     let mut context = structured.clone();
+    if let PeerReply::Error { detail, .. } = reply {
+        context["resolution_detail"] =
+            serde_json::Value::String(detail.clone().unwrap_or_default());
+        if let Some(fields) = structured.as_object_mut() {
+            fields.remove("detail");
+        }
+    }
     if let Some(tag) = cause_tag {
         let public = serde_json::Value::String("execution_profile".to_owned());
         structured["code"] = public.clone();
@@ -250,6 +258,7 @@ mod tests {
             },
             PeerReply::Error {
                 code: FailureCode::Capacity,
+                detail: None,
             },
             PeerReply::Complete {
                 kind: ResultKind::Activation,
@@ -304,6 +313,7 @@ mod tests {
         let expired = render(
             PeerReply::Error {
                 code: FailureCode::InvalidDetail,
+                detail: None,
             },
             Envelope::TextOnly,
         )
@@ -324,6 +334,7 @@ mod tests {
         let rendered = render(
             PeerReply::Error {
                 code: FailureCode::ExecutionProfileCause(cause),
+                detail: None,
             },
             Envelope::WithStructured,
         )
@@ -344,11 +355,17 @@ mod tests {
     fn resolution_unverified_is_closed_without_native_path_overclaim() {
         let reply = PeerReply::Error {
             code: FailureCode::ResolutionUnverified,
+            detail: Some(
+                "tsconfig.json could not prove membership for src/outside.ts; add it to files or include".into(),
+            ),
         };
-        let expected = serde_json::to_value(&reply).unwrap();
+        let mut expected = serde_json::to_value(&reply).unwrap();
+        expected.as_object_mut().unwrap().remove("detail");
         let rendered = render(reply, Envelope::WithStructured).unwrap();
         let text = text_of(&rendered);
+        assert!(call_tool_result_fits(&rendered), "{text}");
         assert!(text.contains("resolution_unverified") && text.contains("ide.context"));
+        assert!(text.contains("tsconfig.json") && text.contains("src/outside.ts"));
         assert!(!text.contains("native"));
         assert_eq!(rendered.structured_content, Some(expected));
         assert_eq!(rendered.is_error, Some(true));

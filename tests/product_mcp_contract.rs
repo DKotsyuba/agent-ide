@@ -257,9 +257,11 @@ fn assert_compact_envelope(reply: &Value) {
     assert_eq!(content.len(), 1, "{reply}");
     let text = content[0]["text"].as_str().expect("sole text block");
     assert!(serde_json::from_str::<Value>(text).is_err(), "{reply}");
-    let structured = result["structuredContent"]
+    let structured = result
+        .get("structuredContent")
+        .unwrap_or_else(|| panic!("missing typed structured result: {reply}"))
         .as_object()
-        .expect("typed structured result");
+        .unwrap_or_else(|| panic!("missing typed structured result: {reply}"));
     let state = structured["state"].as_str().expect("closed reply state");
     let text = match text.strip_prefix("<agent-ide>\n") {
         Some(rest) => {
@@ -268,12 +270,20 @@ fn assert_compact_envelope(reply: &Value) {
         }
         None => text,
     };
-    // Symbol tools return their rendered document/card body directly on complete replies.
-    if !matches!(
-        structured.get("kind").and_then(Value::as_str),
-        Some("outline" | "read" | "symbol")
-    ) {
-        assert!(text.starts_with(state), "{reply}");
+    match structured.get("kind").and_then(Value::as_str) {
+        Some("outline") => {
+            let header = text.lines().next().unwrap_or_default();
+            let (file, details) = header.split_once("  (").expect("outline file header");
+            assert!(!file.is_empty() && details.ends_with(')'), "{reply}");
+            assert!(details.contains(" lines, "), "{reply}");
+        }
+        Some("read") => {
+            let header = text.lines().next().unwrap_or_default();
+            let (symbol, details) = header.split_once("  (lines ").expect("read symbol header");
+            assert!(!symbol.is_empty() && details.ends_with(')'), "{reply}");
+        }
+        Some("symbol") => assert!(text.starts_with("symbol: "), "{reply}"),
+        _ => assert!(text.starts_with(state), "{reply}"),
     }
     if structured.get("kind").and_then(Value::as_str) == Some("edit") {
         let outcome = structured["result"]["outcome"].as_str().unwrap();
@@ -929,7 +939,9 @@ fn boundary(response: &Value, expected: &str) {
 async fn binary_codex_hooks_bind_exact_parallel_actors_and_stop_before_workspace() {
     let fixture = ProductFixture::new(json!([]));
     let runtime = fixture.runtime.clone();
-    let mut daemon = fixture.daemon().await;
+    let mut daemon = fixture
+        .daemon_with_startup_timeout(Duration::from_secs(30))
+        .await;
     let (mut root, mut child) = tokio::join!(
         Mcp::start(&runtime, Some("private-host-channel")),
         Mcp::start(&runtime, Some("private-host-channel"))
@@ -4640,8 +4652,11 @@ async fn configured_product_pyright_symbol_tools_and_edit() {
 #[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
 async fn configured_product_pyright_semantics_and_checks() {
     let fixture = ProductFixture::new(json!([accepted_pyright_provider("pyright-check-cache")]));
-    let source = "def value() -> int:\n    return \"bad\"\n";
-    std::fs::write(fixture.root.join("main.py"), source).unwrap();
+    std::fs::write(
+        fixture.root.join("main.py"),
+        "def value() -> int:\n    return \"bad\"\n",
+    )
+    .unwrap();
     fixture.git(&["add", "--", "main.py"]);
     fixture.git(&["commit", "--quiet", "-m", "Python fixture"]);
     let state = fixture.state();
@@ -4668,16 +4683,12 @@ async fn configured_product_pyright_semantics_and_checks() {
     assert!(plate.starts_with("<agent-ide>\nrust:"), "{plate}");
     await_eyes_check_start(&home).await;
     let context = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"main.py","byte_offset":source.find("value").unwrap()}),
-        )
+        .call(&fixture, "ide.context", json!({"path":"main.py"}))
         .await;
     let context = actor.settle(&fixture, context).await;
     let text = context["text"].as_str().unwrap();
     assert!(
-        text.contains("mode: semantic") && text.contains("not assignable"),
+        text.contains("diagnostic_count: 1") && text.contains("not assignable"),
         "{context}"
     );
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
@@ -5394,6 +5405,120 @@ async fn configured_product_typescript_membership_falls_back_after_dependencies_
         .await;
     let edit = actor.settle(&fixture, edit).await;
     assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Resolves a Vite-style project by literal include directory while refusing a source outside it.
+#[tokio::test]
+#[ignore = "requires exact AGENT_IDE_NODE, AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER and AGENT_IDE_TSSERVER environment"]
+async fn configured_product_typescript_vite_directory_include_membership() {
+    let fixture = ProductFixture::new(json!([accepted_typescript_provider()]));
+    let source = "export function callOperation(): number { return 42; }\nexport function caller(): number { return callOperation(); }\n";
+    std::fs::create_dir_all(fixture.root.join("src")).unwrap();
+    std::fs::create_dir_all(fixture.root.join("node_modules/vite")).unwrap();
+    std::fs::write(fixture.root.join("src/api.ts"), source).unwrap();
+    std::fs::write(
+        fixture.root.join("src/App.tsx"),
+        "export const App = (): string => \"ready\";\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.root.join("vite.config.ts"), "export default {};\n").unwrap();
+    std::fs::write(
+        fixture.root.join("outside.ts"),
+        "export const outside = true;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("package.json"),
+        "{\"type\":\"module\",\"devDependencies\":{\"vite\":\"8.2.2\"}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("node_modules/vite/client.d.ts"),
+        "interface ImportMetaEnv { readonly MODE: string; }\ninterface ImportMeta { readonly env: ImportMetaEnv; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("tsconfig.json"),
+        "{\"compilerOptions\":{\"target\":\"ES2022\",\"module\":\"ESNext\",\"moduleResolution\":\"Bundler\",\"jsx\":\"react-jsx\",\"types\":[\"vite/client\"],\"noEmit\":true,\"allowImportingTsExtensions\":true},\"include\":[\"src\",\"vite.config.ts\"]}\n",
+    )
+    .unwrap();
+    fixture.git(&[
+        "add",
+        "--",
+        "src/api.ts",
+        "src/App.tsx",
+        "vite.config.ts",
+        "outside.ts",
+        "package.json",
+        "tsconfig.json",
+    ]);
+    fixture.git(&["commit", "--quiet", "-m", "Vite include fixture"]);
+
+    let mut daemon = fixture
+        .daemon_with_startup_timeout(Duration::from_secs(30))
+        .await;
+    let mut actor = ProductActor::new(&fixture, "typescript-vite-include").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"vite-include-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+
+    let outline = actor
+        .call(&fixture, "ide.outline", json!({"path":"src/api.ts"}))
+        .await;
+    let outline = actor.settle(&fixture, outline).await;
+    assert_eq!(outline["kind"], "outline", "{outline}");
+    assert!(
+        outline["text"].as_str().unwrap().contains("callOperation"),
+        "{outline}"
+    );
+    let symbol = actor
+        .call(
+            &fixture,
+            "ide.symbol",
+            json!({"symbol":"src/api.ts#callOperation"}),
+        )
+        .await;
+    let symbol = actor.settle(&fixture, symbol).await;
+    assert!(
+        symbol["text"]
+            .as_str()
+            .unwrap()
+            .contains("symbol: callOperation"),
+        "{symbol}"
+    );
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"symbol":"src/api.ts#callOperation"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, read).await["kind"], "read");
+
+    let outside = actor
+        .call(&fixture, "ide.context", json!({"path":"outside.ts"}))
+        .await;
+    let outside = actor.settle(&fixture, outside).await;
+    assert!(
+        outside["text"].as_str().unwrap().contains("mode: lexical"),
+        "{outside}"
+    );
+    assert!(
+        outside["text"].as_str().unwrap().contains("tsconfig.json")
+            && outside["text"].as_str().unwrap().contains("outside.ts"),
+        "{outside}"
+    );
+
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();

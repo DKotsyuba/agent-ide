@@ -288,6 +288,9 @@ pub enum PeerReply {
     Error {
         /// Stable actionable failure category.
         code: FailureCode,
+        /// Request-local diagnostic text rendered in compact errors, stripped from the public reply.
+        #[serde(default)]
+        detail: Option<String>,
     },
     /// Bounded rendering of actual owner evidence; only peer completion may construct this variant.
     Complete {

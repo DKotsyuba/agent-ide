@@ -228,18 +228,19 @@ impl ProjectResolutionInputsV1 {
     /// `files` may contain at most 16 strictly sorted, unique normal relative paths whose basenames
     /// are one of the supported TypeScript/JavaScript project or package inputs. Their declared
     /// sizes may total at most 8 MiB, and at least one `tsconfig.json` or `jsconfig.json` is
-    /// required because inferred projects are unsupported. The selected config must list the
-    /// current document exactly once in its bounded top-level `files` array; each entry is UTF-8,
-    /// normalized relative, and free of glob metacharacters. A configuration must explicitly set
-    /// `compilerOptions.types` to `[]` and `compilerOptions.moduleResolution` to `node10`; a
-    /// JavaScript or JSX document additionally requires `compilerOptions.allowJs` to be exactly
-    /// `true`. `include` and `exclude` are refused because glob membership is not observed, and
-    /// `compilerOptions.outDir` and `declarationDir` are refused because output membership is not
-    /// observed. The optional `checkJs` and `noImplicitAny` options are closed to the exact
-    /// boolean value `true` when present.
-    /// Workspace reads only those exact names without following symlinks or listing directories,
-    /// and refuses an ancestor `node_modules` entry before tsserver can resolve an unobserved bare
-    /// dependency. Missing declarations, changed bytes, unsupported composite project shapes, and
+    /// required because inferred projects are unsupported. The selected config must explicitly
+    /// admit the current document through a bounded top-level `files` entry or a literal `include`
+    /// file/directory entry; wildcard includes and `exclude` are refused. Entries are UTF-8,
+    /// normalized relative paths. `compilerOptions.types` must be `[]` or exactly `["vite/client"]`,
+    /// and `moduleResolution` must be `node10` or `bundler`; a JavaScript or JSX document additionally
+    /// requires `compilerOptions.allowJs` to be exactly `true`. `include` is supported only for
+    /// literal paths so membership remains decidable. `compilerOptions.outDir` and `declarationDir`
+    /// are refused because output membership is not observed. The optional `checkJs` and
+    /// `noImplicitAny` options are closed to the exact boolean value `true` when present. Workspace
+    /// reads only bounded project metadata without directory listing; package resolution is
+    /// confined to real `node_modules` directories below the worktree, and ambient ancestor
+    /// `node_modules` entries are refused. Missing declarations, changed bytes, unsupported
+    /// composite project shapes, and
     /// any bound mismatch return
     /// [`TypeScriptProfileError::InvalidResolution`].
     pub fn new(
@@ -566,15 +567,6 @@ pub struct TypeScriptProfiles {
     quarantined: BTreeSet<TypeScriptCompatibilityKey>,
 }
 
-/// Closed abnormal outcomes that permanently quarantine one exact TypeScript profile key.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TypeScriptShutdownFailure {
-    /// The direct bridge child exited with a nonzero status after the protocol exchange.
-    NonzeroExit,
-    /// The direct bridge did not exit within the bounded graceful wait.
-    WaitTimeout,
-}
-
 impl TypeScriptProfiles {
     /// Requests one exclusive view unless this exact profile was previously quarantined.
     pub fn request(
@@ -625,18 +617,6 @@ impl TypeScriptProfiles {
         self.quarantined.insert(view.key.clone());
     }
 
-    /// Records one closed abnormal outcome and monotonically quarantines the exact profile key.
-    ///
-    /// The category is retained by the caller's public failure mapping; all categories have the
-    /// same owner-lifetime admission effect, and this method never releases Execution resources.
-    pub(crate) fn quarantine_after(
-        &mut self,
-        view: &TypeScriptView,
-        _failure: TypeScriptShutdownFailure,
-    ) {
-        self.quarantine(view);
-    }
-
     /// Quarantines a view when its actual direct-child wait proves a nonzero bridge exit.
     ///
     /// Returns `true` exactly for the failure branch so the provider can map that observed exit to
@@ -649,14 +629,9 @@ impl TypeScriptProfiles {
         if waited.success() {
             false
         } else {
-            self.quarantine_after(view, TypeScriptShutdownFailure::NonzeroExit);
+            self.quarantine(view);
             true
         }
-    }
-
-    /// Quarantines a view after its actual direct-child wait exceeded the graceful deadline.
-    pub(crate) fn quarantine_after_wait_timeout(&mut self, view: &TypeScriptView) {
-        self.quarantine_after(view, TypeScriptShutdownFailure::WaitTimeout);
     }
 
     /// Releases one exclusive view and returns the capability required for direct-child settlement.
@@ -973,9 +948,7 @@ fn observe_resolution_files(
     document: &Path,
     path_proof: &ResolutionPathProof<'_>,
 ) -> Result<Vec<ProjectResolutionFileV1>, TypeScriptProfileError> {
-    if ancestor_has_node_modules(&worktree.worktree_path().join(document))? {
-        return Err(TypeScriptProfileError::InvalidResolution);
-    }
+    validate_node_modules_ancestry(worktree, document)?;
     let language_id =
         typescript_language_id(document).ok_or(TypeScriptProfileError::InvalidResolution)?;
     let parent = document
@@ -1015,23 +988,25 @@ fn observe_resolution_files(
     Ok(files)
 }
 
-/// Returns whether an exact ancestor `node_modules` entry could admit bare-module resolution.
-///
-/// The check examines only that fixed name, not package contents or directory listings. Any entry,
-/// including a symlink or an unreadable object, is unsafe because tsserver could follow or inspect
-/// it; an I/O failure also rejects the profile rather than claiming the ambient chain is closed.
-fn ancestor_has_node_modules(document: &Path) -> Result<bool, TypeScriptProfileError> {
-    let parent = document
-        .parent()
-        .ok_or(TypeScriptProfileError::InvalidResolution)?;
-    for directory in parent.ancestors() {
-        match std::fs::symlink_metadata(directory.join("node_modules")) {
-            Ok(_) => return Ok(true),
+/// Allows only real `node_modules` directories inside the worktree, never an ambient parent.
+fn validate_node_modules_ancestry(
+    worktree: &WorktreeRef,
+    document: &Path,
+) -> Result<(), TypeScriptProfileError> {
+    let root = worktree.worktree_path();
+    let mut directory = root.join(document).parent().map(Path::to_path_buf);
+    while let Some(path) = directory {
+        let is_inside = path.starts_with(root);
+        match std::fs::symlink_metadata(path.join("node_modules")) {
+            Ok(metadata)
+                if is_inside && metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => return Err(TypeScriptProfileError::InvalidResolution),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err(TypeScriptProfileError::InvalidResolution),
         }
+        directory = path.parent().map(Path::to_path_buf);
     }
-    Ok(false)
+    Ok(())
 }
 
 /// Rejects project metadata that can redirect tsserver beyond the exact observed ancestor inputs.
@@ -1072,12 +1047,16 @@ fn validate_resolution_shape(
             .get("compilerOptions")
             .and_then(serde_json::Value::as_object)
             .ok_or(TypeScriptProfileError::InvalidResolution)?;
-        let configured_files = object
-            .get("files")
-            .and_then(serde_json::Value::as_array)
-            .ok_or(TypeScriptProfileError::InvalidResolution)?;
-        validate_configured_membership(path, document, configured_files)?;
-        if options.get("types") != Some(&serde_json::Value::Array(Vec::new()))
+        let configured_files = object.get("files").and_then(serde_json::Value::as_array);
+        let configured_includes = object.get("include").and_then(serde_json::Value::as_array);
+        validate_configured_membership(
+            path,
+            document,
+            configured_files.map(Vec::as_slice),
+            configured_includes.map(Vec::as_slice),
+            options.get("allowJs") == Some(&serde_json::Value::Bool(true)),
+        )?;
+        if !closed_types_option(options)
             || !closed_module_resolution(options)
             || (matches!(language_id, "javascript" | "javascriptreact")
                 && options.get("allowJs") != Some(&serde_json::Value::Bool(true)))
@@ -1097,41 +1076,37 @@ fn validate_resolution_shape(
                     .get(*key)
                     .is_some_and(|value| value != &serde_json::Value::Bool(true))
             })
-            || ["include", "exclude"]
-                .iter()
-                .any(|key| object.contains_key(*key))
+            || object.contains_key("exclude")
         {
             return Err(TypeScriptProfileError::InvalidResolution);
         }
     } else if name == "package.json"
-        && [
-            "dependencies",
-            "devDependencies",
-            "imports",
-            "optionalDependencies",
-            "peerDependencies",
-            "workspaces",
-        ]
-        .iter()
-        .any(|key| object.contains_key(*key))
+        && ["imports", "workspaces"]
+            .iter()
+            .any(|key| object.contains_key(*key))
     {
         return Err(TypeScriptProfileError::InvalidResolution);
     }
     Ok(())
 }
 
-/// Validates one config's bounded exact membership list against the current document.
+/// Validates one config's bounded literal membership list against the current document.
 ///
-/// Entries are JSON strings, so they are already valid UTF-8. They must be normalized relative
-/// paths without empty, dot, parent, absolute, backslash, or glob components. Duplicate entries
-/// are rejected, the list is limited by the existing resolution-file ceiling, and the document
-/// must occur exactly once relative to the config directory.
+/// `files` entries must match the current relative document exactly. Literal `include` directories
+/// recursively admit only the supported source extensions (and JavaScript only with `allowJs`);
+/// literal file includes match exactly. Wildcards and implicit all-files membership are refused.
 fn validate_configured_membership(
     config: &Path,
     document: &Path,
-    entries: &[serde_json::Value],
+    files: Option<&[serde_json::Value]>,
+    includes: Option<&[serde_json::Value]>,
+    allow_js: bool,
 ) -> Result<(), TypeScriptProfileError> {
-    if entries.is_empty() || entries.len() > MAX_RESOLUTION_FILES {
+    if files.is_none() && includes.is_none_or(<[_]>::is_empty)
+        || files.is_some_and(|entries| entries.len() > MAX_RESOLUTION_FILES)
+        || includes
+            .is_some_and(|entries| entries.is_empty() || entries.len() > MAX_RESOLUTION_FILES)
+    {
         return Err(TypeScriptProfileError::InvalidResolution);
     }
     let config_directory = config
@@ -1143,41 +1118,79 @@ fn validate_configured_membership(
         .filter(|path| normal_relative(path))
         .ok_or(TypeScriptProfileError::InvalidResolution)?;
     let mut seen = BTreeSet::new();
-    for entry in entries {
-        let value = entry
-            .as_str()
-            .ok_or(TypeScriptProfileError::InvalidResolution)?;
-        let path = Path::new(value);
-        if value.contains('\\')
-            || value.chars().any(|character| {
-                matches!(
-                    character,
-                    '*' | '?' | '[' | ']' | '{' | '}' | '(' | ')' | '!'
-                )
-            })
-            || !normal_relative(path)
-            || value.split('/').any(str::is_empty)
-            || !seen.insert(path)
-        {
-            return Err(TypeScriptProfileError::InvalidResolution);
+    let parse_entries = |entries: &[serde_json::Value], seen: &mut BTreeSet<PathBuf>| {
+        for entry in entries {
+            let value = entry
+                .as_str()
+                .ok_or(TypeScriptProfileError::InvalidResolution)?;
+            let path = Path::new(value);
+            if value.contains('\\')
+                || value.chars().any(|character| {
+                    matches!(
+                        character,
+                        '*' | '?' | '[' | ']' | '{' | '}' | '(' | ')' | '!'
+                    )
+                })
+                || !normal_relative(path)
+                || value.split('/').any(str::is_empty)
+                || !seen.insert(path.to_path_buf())
+            {
+                return Err(TypeScriptProfileError::InvalidResolution);
+            }
         }
+        Ok(())
+    };
+    if let Some(files) = files {
+        parse_entries(files, &mut seen)?;
     }
-    (seen.contains(document) && seen.len() == entries.len())
+    let exact = seen.contains(document);
+    let mut included = false;
+    if let Some(includes) = includes {
+        parse_entries(includes, &mut seen)?;
+        included = includes.iter().any(|entry| {
+            let Some(value) = entry.as_str() else {
+                return false;
+            };
+            let path = Path::new(value);
+            document == path
+                || (path.extension().is_none()
+                    && document.starts_with(path)
+                    && (matches!(
+                        typescript_language_id(document),
+                        Some("typescript" | "typescriptreact")
+                    ) || (allow_js
+                        && matches!(
+                            typescript_language_id(document),
+                            Some("javascript" | "javascriptreact")
+                        ))))
+        });
+    }
+    (exact || included)
         .then_some(())
         .ok_or(TypeScriptProfileError::InvalidResolution)
 }
 
+/// Allows only no global type packages or the bounded Vite client declaration entry.
+fn closed_types_option(options: &serde_json::Map<String, serde_json::Value>) -> bool {
+    match options.get("types").and_then(serde_json::Value::as_array) {
+        Some(types) if types.is_empty() => true,
+        Some(types) if types.len() == 1 => types[0].as_str() == Some("vite/client"),
+        _ => false,
+    }
+}
+
 /// Returns whether compiler options select only the explicit closed TypeScript resolution mode.
 ///
-/// `node10` is the pinned TypeScript mode whose ancestor lookup is already closed by the exact
-/// `node_modules` gate. Missing, alternate, or unknown resolution modes are rejected. Node16,
-/// NodeNext, and Preserve module modes are also refused because they select or imply incompatible
-/// package-resolution semantics even when a conflicting resolution option is present.
+/// `node10` and `bundler` are supported with project-root authority and explicit membership.
+/// Missing, alternate, or unknown resolution modes are rejected. Node16, NodeNext, and Preserve
+/// module modes are also refused because they select incompatible package-resolution semantics.
 fn closed_module_resolution(options: &serde_json::Map<String, serde_json::Value>) -> bool {
     options
         .get("moduleResolution")
         .and_then(serde_json::Value::as_str)
-        == Some("node10")
+        .is_some_and(|mode| {
+            mode.eq_ignore_ascii_case("node10") || mode.eq_ignore_ascii_case("bundler")
+        })
         && !options
             .get("module")
             .and_then(serde_json::Value::as_str)
@@ -1544,13 +1557,10 @@ mod tests {
             br#"{"dependencies":{"outside":"1"}}"#,
         )
         .unwrap();
-        assert!(matches!(
-            ProjectResolutionInputsV1::observe(worktree, document, &bundle, &|_| true),
-            Err(TypeScriptProfileError::InvalidResolution)
-        ));
+        assert!(ProjectResolutionInputsV1::observe(worktree, document, &bundle, &|_| true).is_ok());
     }
 
-    /// Rejects ambient type discovery, escaping config entries, and ancestor dependency directories.
+    /// Rejects unsupported type discovery, escaping entries, and ambient ancestor dependencies.
     #[test]
     fn project_resolution_rejects_ambient_type_and_dependency_reads() {
         let fixture = Fixture::new();
@@ -1593,7 +1603,21 @@ mod tests {
             Err(TypeScriptProfileError::InvalidResolution)
         ));
 
-        std::fs::write(fixture.root.join("tsconfig.json"), CLOSED_CONFIG).unwrap();
+        std::fs::write(
+            fixture.root.join("tsconfig.json"),
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"node10"},"files":["src/file.ts"]}"#,
+        )
+        .unwrap();
+        std::fs::create_dir(fixture.root.join("node_modules")).unwrap();
+        assert!(
+            ProjectResolutionInputsV1::observe(
+                worktree.clone(),
+                document.clone(),
+                &bundle,
+                &|_| true
+            )
+            .is_ok()
+        );
         std::fs::create_dir(fixture.cleanup_root.join("node_modules")).unwrap();
         assert!(matches!(
             ProjectResolutionInputsV1::observe(worktree, document, &bundle, &|_| true),
@@ -1608,6 +1632,7 @@ mod tests {
             br#"{"compilerOptions":{"types":[],"moduleResolution":"node10"},"files":["fixture.ts"]}"#.as_slice(),
             br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","module":"commonjs"},"files":["fixture.ts"]}"#
                 .as_slice(),
+            br#"{"compilerOptions":{"types":["vite/client"],"moduleResolution":"bundler","module":"esnext","jsx":"react-jsx","allowImportingTsExtensions":true,"noEmit":true},"include":["src","vite.config.ts","fixture.ts"]}"#.as_slice(),
         ] {
             assert!(
                 validate_resolution_shape(
@@ -1629,7 +1654,6 @@ mod tests {
             br#"{"compilerOptions":{"types":[],"moduleResolution":"classic"}}"#.as_slice(),
             br#"{"compilerOptions":{"types":[],"moduleResolution":"node16"}}"#.as_slice(),
             br#"{"compilerOptions":{"types":[],"moduleResolution":"nodenext"}}"#.as_slice(),
-            br#"{"compilerOptions":{"types":[],"moduleResolution":"bundler"}}"#.as_slice(),
             br#"{"compilerOptions":{"types":[],"moduleResolution":"future"}}"#.as_slice(),
             br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","module":"node16"}}"#
                 .as_slice(),
@@ -1768,6 +1792,39 @@ mod tests {
         }
     }
 
+    /// Admits literal include directories recursively without admitting prefix siblings.
+    #[test]
+    fn project_resolution_accepts_literal_include_directories() {
+        let config = br#"{"compilerOptions":{"types":["vite/client"],"moduleResolution":"Bundler","module":"esnext","jsx":"react-jsx","allowImportingTsExtensions":true,"noEmit":true},"include":["src","vite.config.ts"]}"#;
+        for (document, language) in [
+            ("src/api.ts", "typescript"),
+            ("src/App.tsx", "typescriptreact"),
+            ("vite.config.ts", "typescript"),
+        ] {
+            assert!(
+                validate_resolution_shape(
+                    Path::new("tsconfig.json"),
+                    config,
+                    language,
+                    Path::new(document),
+                )
+                .is_ok(),
+                "{document} should be admitted by a literal project include"
+            );
+        }
+        for document in ["outside.ts", "src2/api.ts"] {
+            assert!(matches!(
+                validate_resolution_shape(
+                    Path::new("tsconfig.json"),
+                    config,
+                    "typescript",
+                    Path::new(document),
+                ),
+                Err(TypeScriptProfileError::InvalidResolution)
+            ));
+        }
+    }
+
     /// Rechecks every declared bundle member and refuses a changed TypeScript closure file.
     #[test]
     fn bundle_remeasurement_rejects_changed_closure() {
@@ -1895,9 +1952,9 @@ mod tests {
         ));
     }
 
-    /// A real hanging TypeScript bridge wait timeout quarantines only its exact profile after kill.
+    /// A client teardown timeout does not quarantine a live TypeScript profile.
     #[tokio::test]
-    async fn hanging_bridge_wait_timeout_quarantines_the_exact_profile() {
+    async fn client_teardown_wait_timeout_does_not_quarantine_the_profile() {
         let fixture = Fixture::new();
         let (profile, worktree) = fixture.profile_with_node_script("ts", b"#!/bin/sh\nsleep 10\n");
         let request = fixture_request(&profile, &worktree, fixture.root.join("node"));
@@ -1944,7 +2001,6 @@ mod tests {
                 .is_err(),
             "the fixture bridge must take the wait-timeout branch"
         );
-        profiles.quarantine_after_wait_timeout(&view);
         let reaped = child
             .terminate_abnormally(Duration::from_millis(10), Duration::from_secs(1))
             .await
@@ -1953,16 +2009,18 @@ mod tests {
         registry
             .complete_reap(&mut admission, capability, reaped.proof)
             .unwrap();
-        assert!(matches!(
-            profiles.request(
-                &profile,
-                &worktree,
-                &mut registry,
-                &mut admission,
-                OwnerId::new("wait-timeout-retry").unwrap(),
-                AdmissionClass::Interactive,
-            ),
-            TypeScriptViewAdmission::Unavailable(TypeScriptProfileError::Quarantined)
-        ));
+        let TypeScriptViewAdmission::Granted(retry) = profiles.request(
+            &profile,
+            &worktree,
+            &mut registry,
+            &mut admission,
+            OwnerId::new("wait-timeout-retry").unwrap(),
+            AdmissionClass::Interactive,
+        ) else {
+            panic!("teardown timeout must leave this exact project admissible")
+        };
+        registry
+            .cancel_unstarted(&mut admission, retry.lease())
+            .unwrap();
     }
 }
