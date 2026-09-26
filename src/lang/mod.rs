@@ -1,12 +1,12 @@
 //! Language support contract for the symbol-addressed tools (v0.4).
 //!
-//! Everything that differs between languages lives behind [`LanguageSupport`]: how a project and
+//! Everything that differs between languages lives behind `LanguageSupport`: how a project and
 //! its environment are detected, how a language server's document symbols become header-inclusive
-//! [`Symbol`]s with stable [`SymbolPath`]s, where new code is inserted, how tests are selected, run
+//! `Symbol`s with stable `SymbolPath`s, where new code is inserted, how tests are selected, run
 //! and parsed, and which formatter the project uses. The transport (LSP session), the reply
 //! rendering and the size ceilings stay in the shared layers and never depend on the language.
 //!
-//! The contract is deliberately synchronous and side-effect free apart from [`LanguageSupport::detect`],
+//! The contract is deliberately synchronous and side-effect free apart from `LanguageSupport::detect`,
 //! which reads manifests under the project root: implementations are plain data transformations
 //! that unit tests exercise with fixture sources and hand-built document symbols.
 

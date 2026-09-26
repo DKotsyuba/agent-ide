@@ -748,6 +748,19 @@ impl Session {
                             related_information: Some(false),
                             ..Default::default()
                         }),
+                        // Nested document symbols carry the owner/member structure the symbol
+                        // paths are built from; a flat list would lose it.
+                        document_symbol: Some(lsp::DocumentSymbolClientCapabilities {
+                            hierarchical_document_symbol_support: Some(true),
+                            ..Default::default()
+                        }),
+                        hover: Some(lsp::HoverClientCapabilities {
+                            content_format: Some(vec![
+                                lsp::MarkupKind::PlainText,
+                                lsp::MarkupKind::Markdown,
+                            ]),
+                            ..Default::default()
+                        }),
                         ..Default::default()
                     }),
                     workspace: Some(lsp::WorkspaceClientCapabilities {

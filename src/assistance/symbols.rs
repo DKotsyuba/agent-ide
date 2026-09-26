@@ -168,15 +168,14 @@ impl Worker<'_> {
             if let Ok(Some(hover)) = live.session.hover(&observed, &bytes, byte_offset).await {
                 // The server's hover carries the resolved signature; prefer it over the one-line
                 // header when it is a single code line.
+                // The server's hover carries the resolved declaration; prefer its first
+                // declaration line over the header when it is a single, bounded code line.
                 let resolved = hover
                     .lines()
-                    .find(|line| !line.trim().is_empty() && !line.starts_with("```"))
                     .map(str::trim)
+                    .find(|line| is_declaration_line(line))
                     .filter(|line| line.len() <= 200);
-                if let Some(resolved) = resolved
-                    && resolved != found.name
-                    && !resolved.contains("::")
-                {
+                if let Some(resolved) = resolved {
                     card.signature = Some(resolved.to_owned());
                 }
             }
@@ -225,21 +224,8 @@ impl Worker<'_> {
                 }
             }
         }
-        if card.usages.len() > render::MAX_USAGE_LINES {
-            card.more_detail = Some(job.reference.clone());
-        }
         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
-        let mut text = render::symbol_card_text(&card);
-        if card.usages.len() > render::MAX_USAGE_LINES {
-            // The full usage list follows on later pages of the same detail.
-            text.push_str("\nall usages:\n");
-            for usage in &card.usages {
-                text.push_str(&format!(
-                    "  {}:{}  {}\n",
-                    usage.file, usage.line, usage.text
-                ));
-            }
-        }
+        let text = render::symbol_card_text(&card);
         let (reply, page) =
             ContextPageState::new(text, 0, false, ResultKind::Symbol).next(&job.reference)?;
         self.shared.set_context_page(&job.reference, page);
@@ -437,6 +423,35 @@ impl Worker<'_> {
         }
         Ok(authority)
     }
+}
+
+/// Whether a hover line is a declaration rather than a module path or a code fence.
+fn is_declaration_line(line: &str) -> bool {
+    const KEYWORDS: [&str; 20] = [
+        "pub ",
+        "fn ",
+        "struct ",
+        "enum ",
+        "trait ",
+        "impl ",
+        "type ",
+        "const ",
+        "static ",
+        "mod ",
+        "class ",
+        "def ",
+        "async ",
+        "func ",
+        "interface ",
+        "export ",
+        "let ",
+        "var ",
+        "function ",
+        "unsafe ",
+    ];
+    !line.is_empty()
+        && !line.starts_with("```")
+        && KEYWORDS.iter().any(|keyword| line.starts_with(keyword))
 }
 
 /// Where a bare name resolved to.
