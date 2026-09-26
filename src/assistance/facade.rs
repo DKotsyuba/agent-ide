@@ -174,12 +174,17 @@ pub fn tool_schemas() -> [ToolSchema; 9] {
             AssistanceTool::Edit,
             json!({
                 "type": "object", "additionalProperties": false,
-                "required": ["operation_id", "path", "source_ref", "content"],
+                "required": ["operation_id"],
                 "properties": {
                     "operation_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "op": {"type": "string", "enum": ["replace", "insert", "delete", "rename"], "default": "replace", "description": "Symbol operation. replace: new body for `symbol` (or for `path`+`lines`); insert: new symbol placed `where` relative to `symbol`; delete: remove `symbol` with its header; rename: rename `symbol` project-wide to `new_name`."},
+                    "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Symbol path `file#Owner/name`."},
+                    "where": {"type": "string", "enum": ["before", "after", "first", "last"], "description": "For insert: before/after the anchor symbol, or first/last member of a container anchor."},
+                    "new_name": {"type": "string", "minLength": 1, "maxLength": 128},
                     "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES},
-                    "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES},
-                    "content": {"type": "string", "maxLength": crate::workspace::edit::MAX_EDIT_CONTENT_BYTES}
+                    "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$", "description": "With `path`: inclusive 1-based line range to replace."},
+                    "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Full-file form: the source_ref of the context/read this content is based on."},
+                    "content": {"type": "string", "maxLength": MAX_EDIT_ARGUMENT_CONTENT_BYTES, "description": "Replacement or inserted code, including the symbol's doc comment and attributes."}
                 }
             }),
         ),
@@ -222,6 +227,9 @@ pub fn tool_schemas() -> [ToolSchema; 9] {
 
 /// Maximum bytes of a symbol path argument.
 pub const MAX_SYMBOL_PATH_BYTES: usize = 1024;
+/// Maximum bytes of the `content` argument on the wire; spliced whole files may be larger
+/// internally (`crate::workspace::edit::MAX_EDIT_CONTENT_BYTES`).
+pub const MAX_EDIT_ARGUMENT_CONTENT_BYTES: usize = 48 * 1024;
 
 /// Parses an inclusive 1-based `start-end` line range; `None` for any other shape.
 pub(crate) fn parse_line_range(text: &str) -> Option<crate::lang::LineRange> {
@@ -264,6 +272,9 @@ pub enum ParameterError {
     ContextTarget,
     /// `ide.read` needs either `symbol` or both `path` and `lines`.
     ReadTarget,
+    /// `ide.edit` needs `symbol` (with `op`), or `path` with `lines` for a range replace, or the
+    /// full-file form `path` + `source_ref` + `content`.
+    EditTarget,
 }
 
 /// Names the specific closed rule one field value violated (T21B).
@@ -352,6 +363,7 @@ impl ParameterError {
             }
             Self::ContextTarget => CONTEXT_TARGET_MESSAGE.to_string(),
             Self::ReadTarget => "ide.read needs `symbol`, or `path` with `lines`".to_string(),
+            Self::EditTarget => "ide.edit needs `symbol` with `op`, or `path` with `lines`, or `path` with `source_ref` and `content`".to_string(),
         }
     }
 }
@@ -375,7 +387,17 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
         AssistanceTool::Diff => &["mode", "detail_ref"],
         AssistanceTool::Inspect => &["detail_ref"],
         AssistanceTool::Stop => &[],
-        AssistanceTool::Edit => &["operation_id", "path", "source_ref", "content"],
+        AssistanceTool::Edit => &[
+            "operation_id",
+            "path",
+            "source_ref",
+            "content",
+            "op",
+            "symbol",
+            "where",
+            "new_name",
+            "lines",
+        ],
         AssistanceTool::Outline => &["path"],
         AssistanceTool::Read => &["symbol", "path", "lines"],
         AssistanceTool::Symbol => &["symbol", "usages", "callers", "callees"],
@@ -599,9 +621,83 @@ pub fn validate_call(
             required_string(object, "detail_ref", MAX_DETAIL_REF_BYTES)?;
         }
         AssistanceTool::Stop => {}
+        AssistanceTool::Edit if object.contains_key("symbol") || object.contains_key("lines") => {
+            required_string(object, "operation_id", 128)?;
+            let op = object
+                .get("op")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .ok_or_else(|| invalid_field("op", FieldRule::String))
+                })
+                .transpose()?
+                .unwrap_or("replace");
+            if !matches!(op, "replace" | "insert" | "delete" | "rename") {
+                return Err(invalid_field(
+                    "op",
+                    FieldRule::OneOf("\"replace\", \"insert\", \"delete\", or \"rename\""),
+                ));
+            }
+            if object.contains_key("symbol") {
+                required_string(object, "symbol", MAX_SYMBOL_PATH_BYTES)?;
+                if object.contains_key("path") || object.contains_key("lines") {
+                    return Err(ParameterError::EditTarget);
+                }
+            } else {
+                if op != "replace" {
+                    return Err(ParameterError::EditTarget);
+                }
+                let path = required_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
+                if let Some(rule) = path_shape_rule(path) {
+                    return Err(invalid_field("path", rule));
+                }
+                if parse_line_range(required_string(object, "lines", 32)?).is_none() {
+                    return Err(invalid_field("lines", FieldRule::LineRange));
+                }
+            }
+            match op {
+                "replace" | "insert" => {
+                    let Some(content) = object.get("content").and_then(Value::as_str) else {
+                        return Err(invalid_field("content", FieldRule::String));
+                    };
+                    if content.len() > MAX_EDIT_ARGUMENT_CONTENT_BYTES {
+                        return Err(invalid_field(
+                            "content",
+                            FieldRule::TooLong(MAX_EDIT_ARGUMENT_CONTENT_BYTES),
+                        ));
+                    }
+                }
+                "delete" => {}
+                _ => {
+                    required_string(object, "new_name", 128)?;
+                }
+            }
+            if op == "insert"
+                && !object
+                    .get("where")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| matches!(value, "before" | "after" | "first" | "last"))
+            {
+                return Err(invalid_field(
+                    "where",
+                    FieldRule::OneOf("\"before\", \"after\", \"first\", or \"last\""),
+                ));
+            }
+            optional_string(object, "source_ref", MAX_DETAIL_REF_BYTES)?;
+        }
         AssistanceTool::Edit => {
             let operation_id = required_string(object, "operation_id", 128)?;
             let path = required_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
+            if object
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.len() > MAX_EDIT_ARGUMENT_CONTENT_BYTES)
+            {
+                return Err(invalid_field(
+                    "content",
+                    FieldRule::TooLong(MAX_EDIT_ARGUMENT_CONTENT_BYTES),
+                ));
+            }
             let request = crate::changes::edit::EditRequest::new(
                 operation_id,
                 path,
@@ -622,9 +718,6 @@ pub fn validate_call(
                     "path",
                     path_shape_rule(path).unwrap_or(FieldRule::RelativePath),
                 ),
-                crate::changes::edit::EditRequestError::ArgumentsTooLarge => {
-                    ParameterError::InvalidObject
-                }
             })?;
             parameters =
                 serde_json::to_value(request).map_err(|_| ParameterError::InvalidObject)?;

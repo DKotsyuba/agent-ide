@@ -77,13 +77,8 @@ impl EditRequest {
         if self.content.len() > MAX_EDIT_CONTENT_BYTES {
             return Err(EditRequestError::ContentTooLarge);
         }
-        if serde_json::to_vec(self)
-            .map_err(|_| EditRequestError::InvalidArgument)?
-            .len()
-            > MAX_EDIT_ARGUMENT_BYTES
-        {
-            return Err(EditRequestError::ArgumentsTooLarge);
-        }
+        // The wire argument object is bounded separately by the facade (`MAX_EDIT_ARGUMENT_BYTES`);
+        // an internally spliced symbol edit legitimately carries a whole file here.
         Ok(())
     }
 
@@ -111,8 +106,6 @@ pub enum EditRequestError {
     InvalidArgument,
     /// Full UTF-8 content exceeds 48 KiB.
     ContentTooLarge,
-    /// Canonical serialization of the four arguments exceeds 56 KiB.
-    ArgumentsTooLarge,
 }
 
 /// Closed public edit outcome tags owned by Changes.

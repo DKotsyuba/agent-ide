@@ -2407,6 +2407,9 @@ impl<'a> Worker<'a> {
         &mut self,
         job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        if job.parameters.get("symbol").is_some() || job.parameters.get("lines").is_some() {
+            return self.edit_by_symbol(job).await;
+        }
         let request: EditRequest =
             serde_json::from_value(job.parameters.clone()).map_err(|_| FailureCode::Internal)?;
         request.validate().map_err(|_| FailureCode::Internal)?;
@@ -2460,6 +2463,19 @@ impl<'a> Worker<'a> {
                 )
                 .await;
         };
+        self.edit_with_source(job, request, prepared, source).await
+    }
+
+    /// Writes one prepared edit whose base observation is already known: the full-file form
+    /// resolves it from a retained detail, the symbol forms observe the file themselves.
+    pub(super) async fn edit_with_source(
+        &mut self,
+        job: &mut Job,
+        request: EditRequest,
+        prepared: crate::changes::edit::PreparedEdit,
+        source: SourceObservation,
+    ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        let binding = job.invocation.binding_ref().clone();
         let authority = match self.authority(&binding).await {
             Ok(authority) => authority,
             Err(_) => {

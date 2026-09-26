@@ -502,3 +502,448 @@ fn observed_text<'a>(
     }
     std::str::from_utf8(bytes).map_err(|_| FailureCode::SourceUnavailable)
 }
+
+// ---------------------------------------------------------------------------------------------
+// ide.edit by symbol (v0.4): replace / insert / delete, plus a line-range replace.
+// ---------------------------------------------------------------------------------------------
+
+impl Worker<'_> {
+    /// `ide.edit` with `symbol` (+ `op`) or `path` + `lines`: splices the file in memory, formats
+    /// the candidate when the project has a formatter, then writes it through the ordinary
+    /// stale-safe edit path with the fresh observation as the base.
+    pub(super) async fn edit_by_symbol(
+        &mut self,
+        job: &mut Job,
+    ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        let binding = job.invocation.binding_ref().clone();
+        let operation_id = job.parameters["operation_id"]
+            .as_str()
+            .ok_or(FailureCode::Internal)?
+            .to_owned();
+        let op = job
+            .parameters
+            .get("op")
+            .and_then(Value::as_str)
+            .unwrap_or("replace")
+            .to_owned();
+        if op == "rename" {
+            return self.rename_symbol(job).await;
+        }
+        let content = job
+            .parameters
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        // Resolve the file and the line span the operation touches.
+        let (file, splice) = match job.parameters.get("symbol").and_then(Value::as_str) {
+            Some(symbol) => {
+                let symbol = SymbolPath::parse(symbol).map_err(|_| FailureCode::UnknownSymbol)?;
+                let file = symbol
+                    .file()
+                    .ok_or(FailureCode::UnknownSymbol)?
+                    .to_path_buf();
+                let (observed, bytes) = self.observe(&binding, file.clone()).await?;
+                let source = observed_text(&observed, &bytes)?.to_owned();
+                let (outline, _) = self.outline_of(job, &observed, &bytes).await?;
+                let splice = match op.as_str() {
+                    "insert" => {
+                        let where_ = match job.parameters.get("where").and_then(Value::as_str) {
+                            Some("before") => lang::InsertWhere::Before,
+                            Some("after") => lang::InsertWhere::After,
+                            Some("first") => lang::InsertWhere::First,
+                            Some("last") => lang::InsertWhere::Last,
+                            _ => return Err(FailureCode::Internal),
+                        };
+                        let support = lang::support(outline.language)
+                            .ok_or(FailureCode::ProviderUnavailable)?;
+                        let site = support
+                            .insert_site(&source, &outline, &symbol, where_)
+                            .map_err(|error| match error {
+                                lang::LangError::UnknownSymbol(_) => FailureCode::UnknownSymbol,
+                                _ => FailureCode::Internal,
+                            })?;
+                        Splice::Insert(site)
+                    }
+                    _ => {
+                        let found = outline.find(&symbol).ok_or(FailureCode::UnknownSymbol)?;
+                        Splice::Replace(found.range)
+                    }
+                };
+                (file, splice)
+            }
+            None => {
+                let path = job.parameters["path"]
+                    .as_str()
+                    .ok_or(FailureCode::Internal)?
+                    .to_owned();
+                let range = job
+                    .parameters
+                    .get("lines")
+                    .and_then(Value::as_str)
+                    .and_then(crate::assistance::facade::parse_line_range)
+                    .ok_or(FailureCode::Internal)?;
+                (std::path::PathBuf::from(path), Splice::Replace(range))
+            }
+        };
+        // Observe again right before splicing so the base is the exact text being replaced.
+        let (observed, bytes) = self.observe(&binding, file.clone()).await?;
+        let source = observed_text(&observed, &bytes)?.to_owned();
+        let total = lang::line_count(&source);
+        let candidate = match (&op[..], &splice) {
+            ("delete", Splice::Replace(range)) => {
+                if range.start > total {
+                    return Err(FailureCode::UnknownSymbol);
+                }
+                splice_lines(&source, *range, "")
+            }
+            ("insert", Splice::Insert(site)) => {
+                let content = content.ok_or(FailureCode::Internal)?;
+                insert_lines(&source, site, &content)
+            }
+            (_, Splice::Replace(range)) => {
+                let content = content.ok_or(FailureCode::Internal)?;
+                if range.start > total {
+                    return Err(FailureCode::SourceUnavailable);
+                }
+                splice_lines(&source, *range, &content)
+            }
+            _ => return Err(FailureCode::Internal),
+        };
+        let candidate = self.format_candidate(&observed, &file, candidate).await;
+        let request = EditRequest::new(
+            &operation_id,
+            file.display().to_string(),
+            &job.reference,
+            &candidate,
+        )
+        .map_err(|_| FailureCode::Internal)?;
+        let prepared = match self.edits.prepare(request.clone()).await {
+            Ok(PrepareAdmission::Prepared(prepared)) => prepared,
+            Ok(
+                PrepareAdmission::Settled(result)
+                | PrepareAdmission::ConflictingDuplicate(result)
+                | PrepareAdmission::OutcomeUnknown(result),
+            ) => {
+                let authority = self.authority(&binding).await.ok();
+                return Ok((
+                    PeerReply::Edit {
+                        result,
+                        diagnostics: EditDiagnostics::Unknown {},
+                    },
+                    authority,
+                    None,
+                ));
+            }
+            Err(_) => return Err(FailureCode::Internal),
+        };
+        self.edit_with_source(job, request, prepared, observed)
+            .await
+    }
+
+    /// Runs the project's stdin formatter over a candidate text; the candidate is returned
+    /// unchanged when there is no formatter, it fails, or it takes longer than ten seconds.
+    async fn format_candidate(
+        &mut self,
+        observed: &SourceObservation,
+        file: &Path,
+        candidate: String,
+    ) -> String {
+        let Some(language) = Lang::for_path(file) else {
+            return candidate;
+        };
+        let Some(support) = lang::support(language) else {
+            return candidate;
+        };
+        let root = observed.worktree().worktree_path().to_path_buf();
+        let Some(project) = support.detect(&root) else {
+            return candidate;
+        };
+        let Some(argv) = support.format_stdin_command(&project, file) else {
+            return candidate;
+        };
+        let Some((program, args)) = argv.split_first() else {
+            return candidate;
+        };
+        let mut command = tokio::process::Command::new(program);
+        command
+            .args(args)
+            .current_dir(&root)
+            .env("PATH", formatter_path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let Ok(mut child) = command.spawn() else {
+            return candidate;
+        };
+        let Some(mut stdin) = child.stdin.take() else {
+            return candidate;
+        };
+        let input = candidate.clone();
+        let writer = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(input.as_bytes()).await;
+            let _ = stdin.shutdown().await;
+        });
+        let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await;
+        writer.abort();
+        match output {
+            Ok(Ok(output)) if output.status.success() && !output.stdout.is_empty() => {
+                String::from_utf8(output.stdout).unwrap_or(candidate)
+            }
+            _ => candidate,
+        }
+    }
+
+    /// `ide.edit {op:"rename", symbol, new_name}`: the language server computes the project-wide
+    /// edit; every touched file is written through the stale-safe edit path.
+    async fn rename_symbol(
+        &mut self,
+        job: &mut Job,
+    ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        let binding = job.invocation.binding_ref().clone();
+        let operation_id = job.parameters["operation_id"]
+            .as_str()
+            .ok_or(FailureCode::Internal)?
+            .to_owned();
+        let new_name = job.parameters["new_name"]
+            .as_str()
+            .ok_or(FailureCode::Internal)?
+            .to_owned();
+        let symbol = SymbolPath::parse(
+            job.parameters["symbol"]
+                .as_str()
+                .ok_or(FailureCode::UnknownSymbol)?,
+        )
+        .map_err(|_| FailureCode::UnknownSymbol)?;
+        let file = symbol
+            .file()
+            .ok_or(FailureCode::UnknownSymbol)?
+            .to_path_buf();
+        let (observed, bytes) = self.observe(&binding, file.clone()).await?;
+        let (outline, worktree_root) = self.outline_of(job, &observed, &bytes).await?;
+        let found = outline
+            .find(&symbol)
+            .cloned()
+            .ok_or(FailureCode::UnknownSymbol)?;
+        let source = observed_text(&observed, &bytes)?;
+        let byte_offset = name_offset(source, &found)?;
+        let (edit, encoding) = {
+            let live = self.live_session_for(job, &observed).await?;
+            let encoding = live.session.capabilities().position_encoding.clone();
+            let edit = live
+                .session
+                .rename(&observed, &bytes, byte_offset, &new_name)
+                .await
+                .map_err(|_| FailureCode::ProviderUnavailable)?
+                .ok_or(FailureCode::ProviderUnavailable)?;
+            (edit, encoding)
+        };
+        let grouped = lang::edits::group_workspace_edit(edit);
+        if !grouped.unsupported.is_empty() {
+            job.failure_detail = Some(grouped.unsupported.join(", "));
+            return Err(FailureCode::ProviderUnavailable);
+        }
+        let mut summary = Vec::new();
+        let mut written = 0usize;
+        let mut last: Option<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>)> = None;
+        for (index, file_edits) in grouped.files.iter().enumerate() {
+            let Ok(absolute) = file_edits.uri.to_file_path() else {
+                continue;
+            };
+            let Ok(relative) = absolute.strip_prefix(&worktree_root) else {
+                continue;
+            };
+            let relative = relative.to_path_buf();
+            let (observed, bytes) = self.observe(&binding, relative.clone()).await?;
+            let source = observed_text(&observed, &bytes)?;
+            let candidate = lang::edits::apply_text_edits(source, &file_edits.edits, &encoding)
+                .map_err(|_| FailureCode::Internal)?;
+            let request = EditRequest::new(
+                format!("{operation_id}/{index}"),
+                relative.display().to_string(),
+                &job.reference,
+                &candidate,
+            )
+            .map_err(|_| FailureCode::Internal)?;
+            let prepared = match self.edits.prepare(request.clone()).await {
+                Ok(PrepareAdmission::Prepared(prepared)) => prepared,
+                _ => return Err(FailureCode::Internal),
+            };
+            let outcome = self
+                .edit_with_source(job, request, prepared, observed)
+                .await?;
+            if let PeerReply::Edit { result, .. } = &outcome.0 {
+                summary.push(format!(
+                    "{} ({}, {:?})",
+                    relative.display(),
+                    file_edits.edits.len(),
+                    result.outcome
+                ));
+                written += 1;
+            }
+            last = Some(outcome);
+        }
+        let authority = self.authority(&binding).await?;
+        let mut text = format!(
+            "rename: {} → {new_name}; {} edits in {written} files\n",
+            found.name,
+            grouped
+                .files
+                .iter()
+                .map(|file| file.edits.len())
+                .sum::<usize>()
+        );
+        for line in summary.iter().take(30) {
+            text.push_str(&format!("  {line}\n"));
+        }
+        if let Some((PeerReply::Edit { diagnostics, .. }, _, _)) = &last {
+            text.push_str(&format!("diagnostics (last file): {diagnostics:?}\n"));
+        }
+        let (reply, page) =
+            ContextPageState::new(text, 0, false, ResultKind::Symbol).next(&job.reference)?;
+        self.shared.set_context_page(&job.reference, page);
+        Ok((reply, Some(authority), last.and_then(|outcome| outcome.2)))
+    }
+}
+
+/// What a symbol edit replaces or where it inserts.
+enum Splice {
+    Replace(LineRange),
+    Insert(lang::InsertSite),
+}
+
+/// Replaces the inclusive line range with `content` (a trailing newline is added when missing;
+/// an empty content deletes the lines).
+fn splice_lines(source: &str, range: LineRange, content: &str) -> String {
+    let mut out = String::with_capacity(source.len() + content.len());
+    let mut replaced = false;
+    for (index, line) in source.split_inclusive('\n').enumerate() {
+        let number = index as u32 + 1;
+        if number >= range.start && number <= range.end {
+            if !replaced {
+                push_block(&mut out, content);
+                replaced = true;
+            }
+            continue;
+        }
+        out.push_str(line);
+    }
+    if !replaced {
+        push_block(&mut out, content);
+    }
+    out
+}
+
+/// Inserts `content` before `site.line` with the site's indentation and blank lines.
+fn insert_lines(source: &str, site: &lang::InsertSite, content: &str) -> String {
+    let mut out = String::with_capacity(source.len() + content.len() + 64);
+    let mut inserted = false;
+    let block = indent_block(content, &site.indent);
+    for (index, line) in source.split_inclusive('\n').enumerate() {
+        let number = index as u32 + 1;
+        if number == site.line && !inserted {
+            for _ in 0..site.blank_before {
+                out.push('\n');
+            }
+            push_block(&mut out, &block);
+            for _ in 0..site.blank_after {
+                out.push('\n');
+            }
+            inserted = true;
+        }
+        out.push_str(line);
+    }
+    if !inserted {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        for _ in 0..site.blank_before {
+            out.push('\n');
+        }
+        push_block(&mut out, &block);
+    }
+    out
+}
+
+/// Re-indents a block so its least-indented non-blank line sits at `indent`.
+fn indent_block(content: &str, indent: &str) -> String {
+    let common = content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    content
+        .lines()
+        .map(|line| {
+            if line.trim().is_empty() {
+                String::new()
+            } else {
+                format!("{indent}{}", &line[common.min(line.len())..])
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn push_block(out: &mut String, content: &str) {
+    if content.is_empty() {
+        return;
+    }
+    out.push_str(content);
+    if !content.ends_with('\n') {
+        out.push('\n');
+    }
+}
+
+/// PATH for formatters: the toolchain directories the daemon itself was configured with plus the
+/// system directories, never the agent's shell environment.
+fn formatter_path() -> String {
+    let mut parts = vec![];
+    if let Ok(home) = std::env::var("HOME") {
+        parts.push(format!("{home}/.cargo/bin"));
+        parts.push(format!("{home}/.local/bin"));
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        parts.push(path.to_string_lossy().into_owned());
+    }
+    parts.extend(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"].map(String::from));
+    parts.join(":")
+}
+
+#[cfg(test)]
+mod splice_tests {
+    use super::*;
+
+    #[test]
+    fn replace_delete_and_insert_keep_the_rest_of_the_file() {
+        let source = "a\nb\nc\nd\n";
+        assert_eq!(
+            splice_lines(source, LineRange::new(2, 3), "X\nY"),
+            "a\nX\nY\nd\n"
+        );
+        assert_eq!(splice_lines(source, LineRange::new(2, 3), ""), "a\nd\n");
+        assert_eq!(
+            splice_lines(source, LineRange::new(4, 4), "Z\n"),
+            "a\nb\nc\nZ\n"
+        );
+        let site = lang::InsertSite {
+            line: 3,
+            indent: "    ".into(),
+            blank_before: 1,
+            blank_after: 0,
+        };
+        assert_eq!(
+            insert_lines(source, &site, "fn g() {\n    x\n}"),
+            "a\nb\n\n    fn g() {\n        x\n    }\nc\nd\n"
+        );
+        let append = lang::InsertSite {
+            line: 5,
+            indent: String::new(),
+            blank_before: 1,
+            blank_after: 0,
+        };
+        assert_eq!(insert_lines(source, &append, "e"), "a\nb\nc\nd\n\ne\n");
+    }
+}

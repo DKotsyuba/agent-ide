@@ -19,7 +19,7 @@ use super::{
 };
 
 /// Maximum UTF-8 replacement content accepted by Workspace.
-pub const MAX_EDIT_CONTENT_BYTES: usize = 48 * 1024;
+pub const MAX_EDIT_CONTENT_BYTES: usize = 1024 * 1024;
 
 /// A completed-context binding to exact bytes (or exact absence) under one authority epoch.
 ///
