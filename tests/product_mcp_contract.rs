@@ -283,6 +283,7 @@ fn assert_compact_envelope(reply: &Value) {
             "{reply}"
         ),
         ("complete", Some("symbol")) => assert!(body.starts_with("symbol: "), "{reply}"),
+        ("complete", Some("graph")) => assert!(body.starts_with("graph: "), "{reply}"),
         // `<file>  (<n> lines, <lang>)` outline header.
         ("complete", Some("outline")) => {
             let header = body.lines().next().unwrap_or_default();
@@ -494,6 +495,7 @@ async fn binary_discovery_is_static_and_inactive_calls_are_fail_open() {
             "ide.context",
             "ide.diff",
             "ide.edit",
+            "ide.graph",
             "ide.inspect",
             "ide.outline",
             "ide.read",
@@ -578,6 +580,7 @@ async fn managed_startup_failure_serves_exact_static_tools_without_ipc() {
             "ide.context",
             "ide.diff",
             "ide.edit",
+            "ide.graph",
             "ide.inspect",
             "ide.outline",
             "ide.read",
@@ -4566,7 +4569,7 @@ fn graph_test_fixture() -> ProductFixture {
     let fixture = symbol_test_fixture();
     std::fs::write(
         fixture.root.join("src/lib.rs"),
-        "pub fn a() { b(); }\npub fn b() { c(); }\npub fn c() { a(); }\n#[cfg(test)] mod tests { #[test] fn reaches_a() { super::a(); } }\n",
+        "pub fn a() { b(); }\npub fn b() { c(); }\npub fn c() { a(); }\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn reaches_a() {\n        super::a();\n    }\n}\n",
     )
     .unwrap();
     std::fs::write(fixture.root.join("tests/path_tests.rs"), "").unwrap();
