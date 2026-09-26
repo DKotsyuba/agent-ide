@@ -2272,7 +2272,7 @@ impl<'a> Worker<'a> {
             }
         };
         let mut text = format!(
-            "activated: epoch {}; baseline: {baseline}; worktree_cache: retained. Provider readiness is not implied.",
+            "activated: epoch {}; baseline: {baseline}",
             authority.epoch(),
         );
         if !card.is_empty() {
