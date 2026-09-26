@@ -83,6 +83,13 @@ impl SnapshotRunner for ProductSnapshotRunner<'_, '_> {
         // Re-verify the binding is still live after the awaited durable I/O before trusting or
         // acting on what it returned.
         self.worker.shared.active(&binding).ok()?;
+        // A row a previous authority grant recorded (an earlier session's ide.context or
+        // ide.edit on a path still modified on disk) is not this grant's observation: the
+        // capture would reject it as an unstable snapshot although nothing moved. Fall through
+        // to the plain read exactly like a path Workspace never registered.
+        if latest.authority_epoch() != authority.epoch() {
+            return None;
+        }
         let confirmed = self
             .worker
             .observations
