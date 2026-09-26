@@ -72,7 +72,10 @@ the language server is still loading the workspace: repeat the same call in a fe
 ## Workflow
 
 1. `ide.start` once per actor per worktree, optionally with `"root": "/absolute/dir"`
-   to name the working directory (default: the host's project directory). The root, the
+   to name the working directory (default: the host's project directory). Its reply
+   carries the project card: git state, languages with line counts, the project's build /
+   check / test / lint commands with their provenance, toolchain, layout, entry points and
+   docs — read it before exploring by hand. The root, the
    Git worktree it belongs to and that worktree's Git directory must all lie inside the
    operator's configured `allowed_roots`; `outside_allowed_roots` means start the IDE in
    an allowed directory (or ask the operator to extend the list) and otherwise continue

@@ -9,7 +9,7 @@ Revision: v0.4. Provider: Agent IDE. Consumers: coding agents and IDE hosts.
 | `ide.outline`, `ide.read`, `ide.symbol` (usages, callers/callees; `history` planned) | implemented |
 | `ide.edit` symbol operations (`replace`, `insert`, `delete`, `rename`) and `path` + `lines` range operation | implemented (landing now) |
 | Long-lived language server session for Rust | implemented |
-| `ide.start` project card | planned |
+| `ide.start` project card | implemented (appended to the activation reply; no `ide.project`, no `not_a_project`; servers always `not started`) |
 | `ide.test` | planned |
 | `ide.diff` / `ide.problems` cleanup | planned |
 | Live language server sessions for Python, TypeScript, and Go | planned |
@@ -79,7 +79,7 @@ The IDE's configured `allowed_roots` is the sole path rule and remains unchanged
 
 ## 2. Tools
 
-### 2.1 `ide.start` — activation and project card (planned)
+### 2.1 `ide.start` — activation and project card (implemented, see status table for gaps)
 
 Input: `{activation_id, root?}`.
 
@@ -101,6 +101,8 @@ problems: rust checking (first check)
 ```
 
 Commands come from CI (`.github/workflows`), `Makefile`/`justfile`, or manifests. If a command comes from README, mark it `(README)`. Layout lists only first- and second-level directories with file counts. Cache the card for the session; `ide.project {}` returns it again.
+
+Implemented wire form: the activation reply keeps its first line (`Workspace activated; authority_epoch: …`) and appends the card after a blank line. The card is computed under a 5 s budget off the runtime; when it does not fit the budget the reply is the plain activation text. Commands print one line per kind with the provenance in the heading (`commands (ci, manifest):`), `environment:` names the toolchain and edition, `servers:` prints `not started` for each detected language (the daemon does not probe servers at start), and there is no `ide.project` yet — call `ide.start` again to see the card. Symbol requests on a Rust worktree where the root is not a Cargo workspace also load nested crates (two directories deep, excluding test material), so references across such a crate's own tests resolve.
 
 Errors: `outside_allowed_roots` (as today), `not_a_project` (no manifest is present; continue in files-only mode).
 
