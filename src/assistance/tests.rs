@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
+    io,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
@@ -11,6 +12,12 @@ use crate::lang::{Language, TestReport, support};
 
 /// Maximum combined stdout and stderr retained for `ide.inspect`.
 const MAX_OUTPUT: usize = 256 * 1024;
+/// Completed results stay queryable for ten minutes unless observed earlier.
+const COMPLETED_TTL: Duration = Duration::from_secs(600);
+/// Pipe drain grace after a budget kill; never extends a run indefinitely for an orphan reader.
+const READER_DRAIN_GRACE: Duration = Duration::from_millis(500);
+/// At most this many completed jobs remain per worktree.
+const COMPLETED_PER_WORKTREE: usize = 4;
 
 /// One daemon's monotonically numbered test jobs, independent of host binding lifetimes.
 #[derive(Clone, Default)]
@@ -24,8 +31,10 @@ pub struct TestRuns(
 struct State {
     /// Highest allocated daemon-local identifier; identifiers start at one and never repeat.
     next_id: u64,
-    /// Retained jobs, partitioned by each job's canonical worktree root.
+    /// Retained jobs keyed by daemon-local id and partitioned by `Job::root`.
     jobs: BTreeMap<u64, Job>,
+    /// Last no-feed status plate delivered per worktree.
+    delivered_status: BTreeMap<PathBuf, String>,
 }
 
 /// One job's worktree, command, timing, and optional completed report/output.
@@ -38,10 +47,10 @@ struct Job {
     started: tokio::time::Instant,
     /// Absent while active, present after exit, spawn failure, or budget expiry.
     result: Option<RunResult>,
+    /// Monotonic completion time for the bounded result lifetime.
+    completed_at: Option<tokio::time::Instant>,
     /// True after an explicit `status` request has retrieved the completed result.
     observed: bool,
-    /// Last status line delivered to the owner when no project check feed exists.
-    delivered_status: Option<String>,
 }
 
 /// Captured parser summary, bounded output, and whether the budget killed the child.
@@ -65,12 +74,12 @@ pub struct RunResult {
 
 /// Result of attempting to start a job in one worktree.
 pub enum StartResult {
-    /// Newly admitted job id.
+    /// The command spawned and its daemon-owned job id.
     Started(u64),
-    /// Existing active job id and age.
+    /// An existing live job id and its age; no second command was spawned.
     Running(u64, Duration),
-    /// Command could not be started.
-    Failed,
+    /// A local configuration or operating-system error prevented command spawn.
+    Failed(String),
 }
 
 /// Read-only age and optional completed result returned by a status lookup.
@@ -97,7 +106,7 @@ impl Drop for KillOnDrop {
     /// Kills remaining descendants without blocking the daemon task shutdown path.
     fn drop(&mut self) {
         if self.armed {
-            let _ = std::process::Command::new("kill")
+            let _ = std::process::Command::new("/bin/kill")
                 .args(["-KILL", "--", &format!("-{}", self.pid)])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -119,7 +128,7 @@ impl TestRuns {
     ) -> StartResult {
         let mut state = match self.0.lock() {
             Ok(state) => state,
-            Err(_) => return StartResult::Failed,
+            Err(error) => return StartResult::Failed(error.to_string()),
         };
         if let Some((id, job)) = state
             .jobs
@@ -128,6 +137,10 @@ impl TestRuns {
         {
             return StartResult::Running(*id, job.started.elapsed());
         }
+        let child = match spawn_command(&root, &argv) {
+            Ok(child) => child,
+            Err(error) => return StartResult::Failed(error.to_string()),
+        };
         state.next_id = state.next_id.saturating_add(1);
         let id = state.next_id;
         let started = tokio::time::Instant::now();
@@ -138,20 +151,22 @@ impl TestRuns {
                 owner,
                 started,
                 result: None,
+                completed_at: None,
                 observed: false,
-                delivered_status: None,
             },
         );
         let registry = self.0.clone();
         tokio::spawn(async move {
-            let mut result = run(&root, &argv, language, budget).await;
+            let mut result = run_child(language, budget, child).await;
             result.detail_ref = detail_ref;
             result.command = argv;
             if let Ok(mut state) = registry.lock()
                 && let Some(job) = state.jobs.get_mut(&id)
             {
                 job.result = Some(result);
+                job.completed_at = Some(tokio::time::Instant::now());
             }
+            prune_completed(&registry, &root);
         });
         StartResult::Started(id)
     }
@@ -171,47 +186,47 @@ impl TestRuns {
         })
     }
 
+    /// Marks every job started by `binding` observed so stopping that actor cannot pin idle exit.
+    pub fn observe_binding(&self, binding: &[u8; 32]) {
+        if let Ok(mut state) = self.0.lock() {
+            for job in state.jobs.values_mut().filter(|job| &job.owner == binding) {
+                job.observed = true;
+            }
+        }
+    }
+
+    /// Drops buffered output after its paged copy is retained by the owner's detail ledger.
+    pub fn clear_output(&self, root: &PathBuf, id: u64, binding: &[u8; 32]) {
+        if let Ok(mut state) = self.0.lock()
+            && let Some(job) = state.jobs.get_mut(&id)
+            && &job.root == root
+            && &job.owner == binding
+            && let Some(result) = &mut job.result
+        {
+            result.output.clear();
+            result.output.shrink_to_fit();
+        }
+    }
+
     /// Returns the current compact status line for the newest run in `root`.
     pub fn status_line(&self, root: &PathBuf) -> Option<String> {
         let state = self.0.lock().ok()?;
         let (id, job) = state.jobs.iter().rev().find(|(_, job)| &job.root == root)?;
-        Some(match &job.result {
-            Some(result) if result.stopped => format!(
-                "tests #{id}: stopped at budget {} s — {} passed, {} failed so far",
-                result.budget.as_secs(),
-                result.report.passed,
-                result.report.failed
-            ),
-            Some(result)
-                if result.report.passed == 0
-                    && result.report.failed == 0
-                    && result.report.incomplete =>
-            {
-                format!(
-                    "tests #{id}: no summary parsed, {} s",
-                    result.elapsed.as_secs()
-                )
-            }
-            Some(result) => format!(
-                "tests #{id}: {} passed, {} failed, {} s",
-                result.report.passed,
-                result.report.failed,
-                result.elapsed.as_secs()
-            ),
-            None => format!("tests #{id}: running {} s", job.started.elapsed().as_secs()),
-        })
+        render_status_line(*id, job)
     }
 
     /// Returns an undelivered current status line owned by one binding.
     pub fn status_line_for_binding(&self, binding: &[u8; 32]) -> Option<String> {
         let state = self.0.lock().ok()?;
-        let (id, job) = state
+        let (_, owner_job) = state
             .jobs
             .iter()
             .rev()
             .find(|(_, job)| &job.owner == binding)?;
+        let root = &owner_job.root;
+        let (id, job) = state.jobs.iter().rev().find(|(_, job)| &job.root == root)?;
         let line = render_status_line(*id, job)?;
-        (job.delivered_status.as_deref() != Some(&line)).then_some(line)
+        (state.delivered_status.get(root) != Some(&line)).then_some(line)
     }
 
     /// Marks one exact current status line delivered for its starting binding.
@@ -219,19 +234,31 @@ impl TestRuns {
         let Ok(mut state) = self.0.lock() else {
             return false;
         };
-        let Some((id, job)) = state
+        let Some((owner_id, owner_job)) = state
             .jobs
-            .iter_mut()
+            .iter()
             .rev()
             .find(|(_, job)| &job.owner == binding)
         else {
             return false;
         };
-        if render_status_line(*id, job).as_deref() != Some(line) {
-            return false;
+        let root = owner_job.root.clone();
+        let owner_id = *owner_id;
+        let is_current = state
+            .jobs
+            .iter()
+            .rev()
+            .find(|(_, job)| job.root == root)
+            .and_then(|(id, job)| render_status_line(*id, job))
+            .as_deref()
+            == Some(line);
+        state.delivered_status.insert(root, line.to_owned());
+        if is_current
+            && let Some(job) = state.jobs.get_mut(&owner_id)
+            && job.result.is_some()
+        {
+            job.observed = true;
         }
-        job.delivered_status = Some(line.to_owned());
-        job.observed |= job.result.is_some();
         true
     }
 
@@ -240,29 +267,57 @@ impl TestRuns {
         let Ok(mut state) = self.0.lock() else {
             return false;
         };
-        let Some((id, job)) = state
+        let Some(id) = state
             .jobs
-            .iter_mut()
+            .iter()
             .rev()
-            .find(|(_, job)| &job.root == root)
+            .find(|(_, job)| &job.root == root && job.result.is_some())
+            .map(|(id, _)| *id)
         else {
             return false;
         };
-        if render_status_line(*id, job).as_deref() != Some(line) || job.result.is_none() {
+        if state
+            .jobs
+            .get(&id)
+            .and_then(|job| render_status_line(id, job))
+            .as_deref()
+            != Some(line)
+        {
             return false;
         }
-        job.observed = true;
+        state.delivered_status.insert(root.clone(), line.to_owned());
+        if let Some(job) = state.jobs.get_mut(&id) {
+            job.observed = true;
+        }
         true
     }
 
     /// Reports whether any daemon-owned test child is still running.
     pub fn is_busy(&self) -> bool {
         self.0.lock().is_ok_and(|state| {
-            state
-                .jobs
-                .values()
-                .any(|job| job.result.is_none() || !job.observed)
+            state.jobs.values().any(|job| {
+                job.result.is_none()
+                    || (!job.observed
+                        && job
+                            .completed_at
+                            .is_some_and(|completed| completed.elapsed() < COMPLETED_TTL))
+            })
         })
+    }
+}
+
+/// Removes the oldest finished runs until each worktree retains at most four.
+fn prune_completed(registry: &Arc<Mutex<State>>, root: &PathBuf) {
+    if let Ok(mut state) = registry.lock() {
+        let mut completed = state
+            .jobs
+            .iter()
+            .filter(|(_, job)| &job.root == root && job.result.is_some())
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        while completed.len() > COMPLETED_PER_WORKTREE {
+            state.jobs.remove(&completed.remove(0));
+        }
     }
 }
 
@@ -297,80 +352,120 @@ fn render_status_line(id: u64, job: &Job) -> Option<String> {
 
 /// Runs one command with inherited environment, bounded output, a process-group budget kill,
 /// and language-native output parsing.
+#[cfg(test)]
 async fn run(root: &PathBuf, argv: &[String], language: Language, budget: Duration) -> RunResult {
-    let started = tokio::time::Instant::now();
-    let mut report = TestReport {
-        incomplete: true,
-        ..TestReport::default()
-    };
-    let mut output = String::new();
-    let mut stopped = false;
-    if let Some((program, args)) = argv.split_first() {
-        let executable = (program == "cargo")
-            .then(|| {
-                std::env::var_os("AGENT_IDE_RUST_TOOLCHAIN_DIR")
-                    .map(PathBuf::from)
-                    .map(|root| root.join("bin/cargo"))
-            })
-            .flatten()
-            .filter(|path| path.is_file())
-            .unwrap_or_else(|| PathBuf::from(program));
-        let mut command = tokio::process::Command::new(executable);
-        command
-            .args(args)
-            .current_dir(root)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        command.process_group(0);
-        if let Ok(mut child) = command.spawn() {
-            #[cfg(unix)]
-            let mut kill_on_drop = child.id().map(|pid| KillOnDrop { pid, armed: true });
-            let stdout = child.stdout.take();
-            let stderr = child.stderr.take();
-            let combined = Arc::new(tokio::sync::Mutex::new(VecDeque::with_capacity(MAX_OUTPUT)));
-            let out_task = tokio::spawn(read_into_tail(stdout, combined.clone()));
-            let err_task = tokio::spawn(read_into_tail(stderr, combined.clone()));
-            let status = match tokio::time::timeout(budget, child.wait()).await {
-                Ok(status) => status.ok(),
-                Err(_) => {
-                    stopped = true;
-                    #[cfg(unix)]
-                    if let Some(pid) = child.id() {
-                        kill_group(pid).await;
-                    }
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                    #[cfg(unix)]
-                    if let Some(guard) = &mut kill_on_drop {
-                        guard.armed = false;
-                    }
-                    None
-                }
-            };
-            #[cfg(unix)]
-            if status.is_some()
-                && let Some(guard) = &mut kill_on_drop
-            {
-                guard.armed = false;
-            }
-            let _ = (out_task.await, err_task.await);
-            let bytes = combined.lock().await.iter().copied().collect::<Vec<_>>();
-            output = String::from_utf8_lossy(&bytes).into_owned();
-            if let Some(parser) = support(language) {
-                report = parser.parse_test_output(&output, "");
-            }
-            if stopped || status.is_none() {
-                report.incomplete = true;
-            }
-        }
+    match spawn_command(root, argv) {
+        Ok(child) => run_child(language, budget, child).await,
+        Err(error) => failed_run(budget, error.to_string()),
     }
+}
+
+/// Spawns an exact argv from the worktree with inherited environment and a private process group.
+fn spawn_command(root: &PathBuf, argv: &[String]) -> io::Result<tokio::process::Child> {
+    let Some((program, args)) = argv.split_first() else {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty argv"));
+    };
+    let executable = (program == "cargo")
+        .then(|| {
+            std::env::var_os("AGENT_IDE_RUST_TOOLCHAIN_DIR")
+                .map(PathBuf::from)
+                .map(|root| root.join("bin/cargo"))
+        })
+        .flatten()
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from(program));
+    let mut command = tokio::process::Command::new(executable);
+    command
+        .args(args)
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    command.spawn()
+}
+
+/// Runs one already-spawned child, enforcing its wall-clock budget and bounded pipe drain.
+async fn run_child(
+    language: Language,
+    budget: Duration,
+    mut child: tokio::process::Child,
+) -> RunResult {
+    let started = tokio::time::Instant::now();
+    let mut stopped = false;
+    let process_group = child.id();
+    #[cfg(unix)]
+    let mut kill_on_drop = process_group.map(|pid| KillOnDrop { pid, armed: true });
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let combined = Arc::new(tokio::sync::Mutex::new(VecDeque::with_capacity(MAX_OUTPUT)));
+    let mut out_task = tokio::spawn(read_into_tail(stdout, combined.clone()));
+    let mut err_task = tokio::spawn(read_into_tail(stderr, combined.clone()));
+    let status = match tokio::time::timeout(budget, child.wait()).await {
+        Ok(status) => status.ok(),
+        Err(_) => {
+            stopped = true;
+            #[cfg(unix)]
+            if let Some(pid) = process_group {
+                let _ = kill_group(pid).await;
+            }
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            None
+        }
+    };
+    let reader_budget = if stopped {
+        READER_DRAIN_GRACE
+    } else {
+        budget.saturating_sub(started.elapsed())
+    };
+    let drain = async {
+        let _ = (&mut out_task).await;
+        let _ = (&mut err_task).await;
+    };
+    if tokio::time::timeout(reader_budget, drain).await.is_err() {
+        stopped = true;
+        #[cfg(unix)]
+        if let Some(pid) = process_group {
+            let _ = kill_group(pid).await;
+        }
+        out_task.abort();
+        err_task.abort();
+    }
+    #[cfg(unix)]
+    if let Some(guard) = &mut kill_on_drop {
+        guard.armed = false;
+    }
+    let bytes = combined.lock().await.iter().copied().collect::<Vec<_>>();
+    let output = String::from_utf8_lossy(&bytes).into_owned();
+    let mut report = support(language)
+        .map(|parser| parser.parse_test_output(&output, ""))
+        .unwrap_or_default();
+    report.incomplete |= stopped || status.is_none();
     RunResult {
         report,
         output,
         elapsed: started.elapsed(),
         stopped,
+        budget,
+        detail_ref: String::new(),
+        command: Vec::new(),
+    }
+}
+
+/// Builds the empty-output report returned by the async runner helper after spawn failure.
+#[cfg(test)]
+fn failed_run(budget: Duration, output: String) -> RunResult {
+    RunResult {
+        report: TestReport {
+            incomplete: true,
+            ..TestReport::default()
+        },
+        output,
+        elapsed: Duration::ZERO,
+        stopped: false,
         budget,
         detail_ref: String::new(),
         command: Vec::new(),
@@ -404,13 +499,13 @@ async fn read_into_tail<R: tokio::io::AsyncRead + Unpin>(
 
 /// Sends SIGKILL to the isolated child process group through the platform utility.
 #[cfg(unix)]
-async fn kill_group(pid: u32) {
-    let _ = tokio::process::Command::new("kill")
+async fn kill_group(pid: u32) -> io::Result<std::process::ExitStatus> {
+    tokio::process::Command::new("/bin/kill")
         .args(["-KILL", "--", &format!("-{pid}")])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .await;
+        .await
 }
 
 #[cfg(test)]
@@ -442,7 +537,7 @@ mod runner_tests {
         let command = [
             "/bin/sh".into(),
             "-c".into(),
-            format!("echo $$ > {}; exec sleep 30", pid_file.display()),
+            format!("sleep 30 & echo $! > {}; wait", pid_file.display()),
         ];
         let result = run(
             &std::env::temp_dir(),
@@ -456,7 +551,7 @@ mod runner_tests {
             .unwrap()
             .trim()
             .to_owned();
-        let alive = tokio::process::Command::new("kill")
+        let alive = tokio::process::Command::new("/bin/kill")
             .args(["-0", &pid])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

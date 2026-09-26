@@ -291,6 +291,12 @@ pub enum PeerReply {
         /// Stable actionable failure category.
         code: FailureCode,
     },
+    /// Model-facing parameter rejection discovered after the worktree's runner contract is known.
+    InvalidParameters {
+        /// Bounded one-line ParameterError-style explanation.
+        #[serde(rename = "text")]
+        message: String,
+    },
     /// Bounded rendering of actual owner evidence; only peer completion may construct this variant.
     Complete {
         /// Closed owner/result kind.

@@ -487,6 +487,16 @@ impl ProjectProblemFeed {
         binding: &[u8; 32],
         fits: impl FnOnce(&str) -> bool,
     ) -> Option<String> {
+        self.next_block_when_with_test_status(binding, None, fits)
+    }
+
+    /// Like [`Self::next_block_when`], using a status snapshot already selected for this reply.
+    pub fn next_block_when_with_test_status(
+        &self,
+        binding: &[u8; 32],
+        test_status_snapshot: Option<&str>,
+        fits: impl FnOnce(&str) -> bool,
+    ) -> Option<String> {
         let mut guard = self.state.lock().ok()?;
         let state = &mut *guard;
         let bound = state.bindings.get(binding)?;
@@ -504,10 +514,12 @@ impl ProjectProblemFeed {
         } else {
             self.rechecks_for(&bound.worktree)
         };
-        let test_status = state
-            .test_runs
-            .as_ref()
-            .and_then(|runs| runs.status_line(&bound.worktree));
+        let test_status = test_status_snapshot.map(str::to_owned).or_else(|| {
+            state
+                .test_runs
+                .as_ref()
+                .and_then(|runs| runs.status_line(&bound.worktree))
+        });
         let due_test = test_status
             .as_ref()
             .filter(|status| state.test_delivered.get(&key) != Some(*status));

@@ -270,11 +270,20 @@ fn assert_compact_envelope(reply: &Value) {
         None => text,
     };
     let kind = structured.get("kind").and_then(Value::as_str);
-    if state == "complete" && kind == Some("test") {
-        assert!(text.starts_with("tests #"), "{reply}");
-    } else if !matches!(kind, Some("outline" | "read" | "symbol")) {
+    match (state, kind) {
+        ("complete", Some("test")) => assert!(
+            text.starts_with("tests #")
+                || text.starts_with("tests: could not start ")
+                || text.starts_with("page "),
+            "{reply}"
+        ),
+        ("complete", Some("symbol")) => assert!(text.starts_with("symbol:"), "{reply}"),
         // Symbol tools return their rendered document/card body directly on complete replies.
-        assert!(text.starts_with(state), "{reply}");
+        ("complete", Some("outline" | "read")) => {}
+        ("invalid_parameters", _) => {
+            assert!(text.starts_with("invalid bounded parameters:"), "{reply}")
+        }
+        _ => assert!(text.starts_with(state), "{reply}"),
     }
     if kind == Some("edit") {
         let outcome = structured["result"]["outcome"].as_str().unwrap();
@@ -282,7 +291,7 @@ fn assert_compact_envelope(reply: &Value) {
     }
     assert_eq!(
         result.get("isError") == Some(&json!(true)),
-        state == "error"
+        matches!(state, "error" | "invalid_parameters")
     );
 }
 
@@ -4232,6 +4241,7 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
     #[test] fn passes() { assert_eq!(2 + 2, 4); }
     #[test] fn fails() { assert_eq!(2 + 2, 5); }
 }
+
 "#,
     )
     .unwrap();
@@ -4245,6 +4255,31 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
         )
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let unsupported = actor
+        .call(&fixture, "ide.test", json!({"path":"README.md"}))
+        .await;
+    assert_eq!(unsupported["state"], "invalid_parameters", "{unsupported}");
+    assert!(
+        unsupported["text"]
+            .as_str()
+            .unwrap()
+            .contains("neither under src/ nor tests/"),
+        "{unsupported}"
+    );
+    let spawn_failure = actor
+        .call(
+            &fixture,
+            "ide.test",
+            json!({"command":["ide-test-command-that-does-not-exist"]}),
+        )
+        .await;
+    assert!(
+        spawn_failure["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("tests: could not start ide-test-command-that-does-not-exist:"),
+        "{spawn_failure}"
+    );
     let started = actor
         .call(&fixture, "ide.test", json!({"path":"src/lib.rs"}))
         .await;
@@ -4279,6 +4314,11 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
             .is_some_and(|status| status.contains("tests #1: 1 passed, 1 failed")),
         "completion status plate must carry the test delta once: {completed}"
     );
+    assert_eq!(
+        carried_status(&completed).and_then(|status| status.lines().nth(1)),
+        result_text.lines().next(),
+        "the result and completion plate use the same worker status snapshot"
+    );
     let repeated = actor.call(&fixture, "ide.test", json!({"status":1})).await;
     assert!(
         carried_status(&repeated).is_none(),
@@ -4287,6 +4327,167 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
     println!("ide.test start: {start_text}");
     println!("ide.test result: {result_text}");
     println!("ide.test status: {}", carried_status(&completed).unwrap());
+
+    // The runner keeps a 256 KiB tail, and ide.inspect must page that tail rather than shrink it.
+    let verbose_start = actor
+        .call(
+            &fixture,
+            "ide.test",
+            json!({"command":["/bin/sh","-c","head -c 70000 /dev/zero | tr '\\000' x; printf '\\nrunning 1 test\\ntest demo ... ok\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\\n'"]}),
+        )
+        .await;
+    let verbose_ref = verbose_start["detail_ref"].as_str().unwrap().to_owned();
+    let verbose_result = loop {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let status = actor.call(&fixture, "ide.test", json!({"status":2})).await;
+        if status["text"]
+            .as_str()
+            .unwrap()
+            .contains("1 passed, 0 failed")
+        {
+            break status;
+        }
+    };
+    assert_eq!(verbose_result["detail_ref"], verbose_ref);
+    let mut page = actor
+        .call(&fixture, "ide.inspect", json!({"detail_ref":verbose_ref}))
+        .await;
+    assert_eq!(
+        page["continuation"], true,
+        "70 KiB runner output must page: {page}"
+    );
+    while page["continuation"] == true {
+        page = actor
+            .call(
+                &fixture,
+                "ide.inspect",
+                json!({"detail_ref":verbose_result["detail_ref"]}),
+            )
+            .await;
+    }
+    assert!(
+        page["text"]
+            .as_str()
+            .unwrap()
+            .contains("test result: ok. 1 passed"),
+        "last output page lost the summary: {page}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Reuses `ide.symbol`'s live Rust session to select and run a test referencing that symbol.
+#[tokio::test]
+async fn configured_product_symbol_test_uses_the_live_symbol_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let toolchain_dir = std::env::var("AGENT_IDE_RUST_TOOLCHAIN_DIR")
+        .unwrap_or_else(|_| "/Users/pluto/.rustup/toolchains/1.98.1-aarch64-apple-darwin".into());
+    let analyzer = std::env::var("AGENT_IDE_RUST_ANALYZER")
+        .unwrap_or_else(|_| format!("{toolchain_dir}/bin/rust-analyzer"));
+    let toolchain = std::env::var("AGENT_IDE_RUST_TOOLCHAIN").unwrap_or_else(|_| {
+        Path::new(&toolchain_dir)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    });
+    let fixture = ProductFixture::new(json!([]));
+    let wrapper = fixture.base.join("rust-provider");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexec '{}' \"$@\"\n",
+            analyzer.replace('\'', "'\\''")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let providers = json!([{
+        "executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),
+        "settings":"rust_cache_priming_disabled_v1",
+        "toolchain":toolchain,
+        "cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),
+        "cargo_version":"cargo 1.98.1",
+        "rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),
+        "rustc_version":"rustc 1.98.1",
+        "trust":"fixture-disabled",
+        "cache_namespace":"fixture-symbol-test-cache"
+    }]);
+    fixture.write_config(providers);
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "pub struct FileFlag;\nimpl FileFlag { pub fn is_file(&self) -> bool { true } }\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(fixture.root.join("tests")).unwrap();
+    std::fs::write(
+        fixture.root.join("tests/path_tests.rs"),
+        "#[test]\nfn checks_is_file() {\n    assert!(product_fixture::FileFlag.is_file());\n}\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "src/lib.rs", "tests/path_tests.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "symbol test fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "symbol-test").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"symbol-test-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let symbol = actor
+        .call(
+            &fixture,
+            "ide.symbol",
+            json!({"symbol":"src/lib.rs#FileFlag/is_file"}),
+        )
+        .await;
+    let symbol = actor.settle(&fixture, symbol).await;
+    assert_eq!(symbol["kind"], "symbol", "{symbol}");
+    assert!(
+        symbol["text"].as_str().unwrap().contains("checks_is_file"),
+        "{symbol}"
+    );
+    let started = actor
+        .call(
+            &fixture,
+            "ide.test",
+            json!({"symbol":"src/lib.rs#FileFlag/is_file"}),
+        )
+        .await;
+    assert_eq!(started["state"], "complete", "{started}");
+    assert!(
+        started["text"]
+            .as_str()
+            .unwrap()
+            .contains("(1 tests selected)"),
+        "{started}"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let result = loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "symbol test selection did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let status = actor.call(&fixture, "ide.test", json!({"status":1})).await;
+        if status["text"]
+            .as_str()
+            .unwrap()
+            .contains("1 passed, 0 failed")
+        {
+            break status;
+        }
+    };
+    assert!(
+        result["text"].as_str().unwrap().contains("checks_is_file"),
+        "{result}"
+    );
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
