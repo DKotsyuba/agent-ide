@@ -4240,7 +4240,7 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
     let stale_diff = actor
         .call(&fixture, "ide.inspect", json!({"detail_ref":diff_ref}))
         .await;
-    assert_eq!(stale_diff["code"], "source_unavailable", "{stale_diff}");
+    assert_eq!(stale_diff["kind"], "diff", "{stale_diff}");
     let latest = actor
         .call(&fixture, "ide.context", json!({"path":"src/lib.rs"}))
         .await;
@@ -7783,8 +7783,18 @@ async fn diff_pagination_delivers_every_whole_hunk_once_with_truthful_freshness(
         .call(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
         .await;
     assert_eq!(still_pending["state"], "pending", "{still_pending}");
-    std::fs::remove_file(&gate).unwrap();
+    let pre = actor.lifecycle(&fixture, "PreToolUse", "native-while-diff-pending");
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        std::fs::remove_file(&gate).unwrap();
+    };
+    tokio::join!(pre, release);
+    actor
+        .lifecycle(&fixture, "PostToolUse", "native-while-diff-pending")
+        .await;
 
+    // The pending capture was started before the native epoch advanced; its composed page remains
+    // inspectable because Diff represents the working tree at job time, not an exact source ref.
     let page1 = actor.settle(&fixture, first_call).await;
     assert_eq!(page1["kind"], "diff", "{page1}");
     let page1_text = page1["text"].as_str().unwrap().to_owned();

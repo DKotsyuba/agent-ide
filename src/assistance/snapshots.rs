@@ -780,16 +780,7 @@ impl Worker<'_> {
         let scope = GitScope::from_authority(&authority, mode);
         let budget = crate::changes::DiffSelectionBudget::bounded(32, 48 * 1024);
         let authority = self.authority(&binding).await?;
-        let epoch = self
-            .shared
-            .ledger
-            .lock()
-            .map_err(|_| FailureCode::Internal)?
-            .native_epoch
-            .get(&binding)
-            .copied()
-            .unwrap_or(0);
-        if epoch != job.native_epoch || tokio::time::Instant::now() >= job.deadline {
+        if tokio::time::Instant::now() >= job.deadline {
             return Err(FailureCode::SourceUnavailable);
         }
         self.shared.active(&binding)?;

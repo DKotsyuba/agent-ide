@@ -80,13 +80,6 @@ pub(super) struct ProviderContext {
     pub(super) diagnostics: DiagnosticSnapshot,
 }
 
-/// Longest a symbol request waits for the language server to become ready before answering
-/// `provider_loading`: a cold rust-analyzer on a fresh worktree needs cargo metadata and an index
-/// pass, routinely 20–40 s and over a minute on a loaded machine or a large workspace. The
-/// reply stays `pending` meanwhile (within the 120 s job deadline), so the agent keeps polling
-/// instead of managing retries.
-const LIVE_READINESS_WAIT: Duration = Duration::from_secs(100);
-
 /// Owns the protocol child for one binding's long-lived language-server session.
 enum LiveChild {
     /// Rust analyzer process and its exclusive view.
@@ -1039,8 +1032,8 @@ impl Worker<'_> {
     }
 
     /// Answers a Rust context request from the binding's long-lived analyzer session, starting
-    /// one on first use. Readiness is awaited per request with a bounded budget, so a slow
-    /// workspace load reports `ProviderLoading` while the analyzer keeps loading in the background.
+    /// one on first use. Readiness is probed for at most 100 ms; a loading non-edit job records a
+    /// 300 ms resume time so the worker can run other work while the analyzer keeps loading.
     async fn rust_context(
         &mut self,
         job: &mut Job,
@@ -1051,11 +1044,10 @@ impl Worker<'_> {
     ) -> Result<ProviderContext, FailureCode> {
         let binding = job.invocation.binding_ref().clone();
         self.ensure_live_rust(job, launch, source).await?;
-        let budget = job
-            .deadline
-            .saturating_duration_since(tokio::time::Instant::now())
-            .saturating_sub(Duration::from_secs(1))
-            .clamp(Duration::from_millis(100), LIVE_READINESS_WAIT);
+        let budget = Duration::from_millis(100).min(
+            job.deadline
+                .saturating_duration_since(tokio::time::Instant::now()),
+        );
         let lease = self
             .providers
             .live
@@ -1112,7 +1104,20 @@ impl Worker<'_> {
                         diagnostics,
                     })
                 }
-                Err(ReadinessError::Loading) => return Err(FailureCode::ProviderLoading),
+                Err(ReadinessError::Loading) => {
+                    // An edit may already have changed the worktree; report provider diagnostics
+                    // unknown and let its receipt settle instead of restarting that mutation.
+                    if job.tool != AssistanceTool::Edit
+                        && job
+                            .deadline
+                            .saturating_duration_since(tokio::time::Instant::now())
+                            > Duration::from_secs(1)
+                    {
+                        job.park_until =
+                            Some(tokio::time::Instant::now() + Duration::from_millis(300));
+                    }
+                    return Err(FailureCode::ProviderLoading);
+                }
                 Err(ReadinessError::WorkspaceError) => {
                     return Err(FailureCode::ProviderUnavailable);
                 }
@@ -1162,8 +1167,9 @@ impl Worker<'_> {
     ///
     /// `job` supplies accepted provider settings, cancellation, and a bounded readiness deadline;
     /// `source` must be a supported Rust, Python, or TypeScript-family observation. Unsupported
-    /// extensions and missing provider settings return `ProviderUnavailable`; Rust loading,
-    /// workspace failure, cancellation, and a dead transport retain their existing outcomes.
+    /// extensions and missing provider settings return `ProviderUnavailable`; loading returns an
+    /// internal marker and parks eligible jobs, while edit diagnostics return `ProviderLoading`
+    /// directly so a prior write can settle. Workspace failure and dead transport remain errors.
     pub(super) async fn live_session_for(
         &mut self,
         job: &mut Job,
@@ -1203,11 +1209,10 @@ impl Worker<'_> {
             }
             _ => return Err(FailureCode::ProviderUnavailable),
         }
-        let budget = job
-            .deadline
-            .saturating_duration_since(tokio::time::Instant::now())
-            .saturating_sub(Duration::from_secs(1))
-            .clamp(Duration::from_millis(100), LIVE_READINESS_WAIT);
+        let budget = Duration::from_millis(100).min(
+            job.deadline
+                .saturating_duration_since(tokio::time::Instant::now()),
+        );
         let readiness = {
             let entry = self
                 .providers
@@ -1222,7 +1227,18 @@ impl Worker<'_> {
         };
         match readiness {
             Ok(()) => {}
-            Err(ReadinessError::Loading) => return Err(FailureCode::ProviderLoading),
+            Err(ReadinessError::Loading) => {
+                // Post-edit provider data is optional: do not restart a write whose receipt must settle.
+                if job.tool != AssistanceTool::Edit
+                    && job
+                        .deadline
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        > Duration::from_secs(1)
+                {
+                    job.park_until = Some(tokio::time::Instant::now() + Duration::from_millis(300));
+                }
+                return Err(FailureCode::ProviderLoading);
+            }
             Err(ReadinessError::WorkspaceError) => return Err(FailureCode::ProviderUnavailable),
             Err(ReadinessError::Gone) => {
                 let cancelled = *job.cancel.borrow();

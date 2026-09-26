@@ -86,6 +86,37 @@ struct Job {
     /// `true` once the edit scheduled its project check itself (post-edit diagnostics), so the
     /// reply path must not schedule a second run that would shift the worktree's generation.
     check_scheduled: bool,
+    /// Earliest retry time when an external provider/check condition is not ready.
+    park_until: Option<tokio::time::Instant>,
+    /// Retained in-memory continuation for work that cannot safely be repeated from its start.
+    stage: Option<JobStage>,
+}
+
+/// Resumable state for operations that have already performed an externally visible edit.
+enum JobStage {
+    /// The edit is settled; only its target project-check snapshot and reply remain.
+    EditAwaitingCheck {
+        /// Settled Changes result returned to the caller after diagnostics are resolved.
+        result: EditResult,
+        /// Fresh post-edit observation retained for the source reference and detail ledger.
+        refreshed: Option<SourceObservation>,
+        /// Durable authority under which the edit and its diagnostics were checked.
+        authority: AuthorityStamp,
+        /// Edited relative path, retained alongside the check cursor.
+        path: String,
+        /// Exact provider answer retained if the project feed disappears before resume.
+        fallback: EditDiagnostics,
+        /// Project-check generation created by the edit.
+        generation: u64,
+        /// Worktree used to normalize checker-reported paths.
+        worktree: PathBuf,
+        /// Normalized edited path matched against checker output.
+        wanted: String,
+        /// Language-specific project feed slot.
+        language: crate::checks::Language,
+        /// Last time a matching check may affect the edit reply.
+        deadline: tokio::time::Instant,
+    },
 }
 
 /// A retained outcome requiring exact binding ownership and fresh durable authorization on access.
@@ -1384,7 +1415,14 @@ impl WorkerHandle {
             return Ok(reference.clone());
         }
         let queue_cap = queue_capacity(self.shared.launcher.limits.queued, tool);
-        if ledger.queue.len() >= queue_cap {
+        let now = tokio::time::Instant::now();
+        if ledger
+            .queue
+            .iter()
+            .filter(|job| job.park_until.is_none_or(|until| until <= now))
+            .count()
+            >= queue_cap
+        {
             return Err(FailureCode::Capacity);
         }
         if retain_detail && ledger.details.len() >= self.shared.launcher.limits.details {
@@ -1442,6 +1480,8 @@ impl WorkerHandle {
             native_epoch: 0,
             failure_detail: None,
             check_scheduled: false,
+            park_until: None,
+            stage: None,
         };
         if tool == AssistanceTool::Stop {
             ledger.queue.push_front(job);
@@ -1452,6 +1492,28 @@ impl WorkerHandle {
         self.shared.notify.notify_one();
         Ok(reference)
     }
+}
+
+/// Removes the oldest runnable job and returns the next parked wake time, if any.
+///
+/// Jobs still awaiting an external condition rotate to the back without changing their ownership
+/// or counting as in-flight; runnable jobs preserve their arrival order relative to one another.
+fn pop_ready_job(
+    queue: &mut VecDeque<Job>,
+    now: tokio::time::Instant,
+) -> (Option<Job>, Option<tokio::time::Instant>) {
+    let mut earliest = None;
+    for _ in 0..queue.len() {
+        let job = queue.pop_front().expect("queue length was captured");
+        if let Some(until) = job.park_until.filter(|until| *until > now) {
+            earliest =
+                Some(earliest.map_or(until, |current: tokio::time::Instant| current.min(until)));
+            queue.push_back(job);
+        } else {
+            return (Some(job), earliest);
+        }
+    }
+    (None, earliest)
 }
 
 /// Returns whether an operation needs a retained result detail after it completes.
@@ -1868,26 +1930,47 @@ impl<'a> Worker<'a> {
             let wake = shared.notify.notified();
             // The in-flight count moves in the same locked section as the pop, so "queue empty
             // and nothing in flight" is never observed while a job is between the two (T26B).
-            let job = shared.ledger.lock().ok().and_then(|mut ledger| {
-                ledger
-                    .queue
-                    .pop_front()
-                    .inspect(|_| ledger.in_flight = ledger.in_flight.saturating_add(1))
-            });
+            let (job, earliest) = shared
+                .ledger
+                .lock()
+                .ok()
+                .map_or((None, None), |mut ledger| {
+                    let (job, earliest) =
+                        pop_ready_job(&mut ledger.queue, tokio::time::Instant::now());
+                    if job.is_some() {
+                        ledger.in_flight = ledger.in_flight.saturating_add(1);
+                    }
+                    (job, earliest)
+                });
             match job {
                 Some(job) => {
-                    self.perform(job).await;
+                    let mut job = job;
+                    self.perform(&mut job).await;
                     if let Ok(mut ledger) = shared.ledger.lock() {
                         ledger.in_flight = ledger.in_flight.saturating_sub(1);
+                        if job.park_until.is_some() {
+                            ledger.queue.push_back(job);
+                        }
                     }
                 }
-                None => wake.await,
+                None => match earliest {
+                    Some(until) => tokio::select! {
+                        _ = wake => {},
+                        _ = tokio::time::sleep_until(until) => {},
+                    },
+                    None => wake.await,
+                },
             }
         }
     }
     /// Rechecks queued liveness, executes only the selected owner operation, and fences every result.
-    async fn perform(&mut self, mut job: Job) {
+    async fn perform(&mut self, job: &mut Job) {
         let binding = job.invocation.binding_ref().clone();
+        let was_parked = job.park_until.take().is_some();
+        // Read/query jobs can restart from the top after readiness probes: observe records a fresh
+        // source snapshot, and ensure_live_* reuses the same alive per-binding session.
+        // A resumed job uses the latest epoch: Context observes and promises exact current bytes,
+        // while Diff is a job-time working-tree snapshot and is intentionally not epoch-fenced.
         job.native_epoch = self
             .shared
             .ledger
@@ -1898,29 +1981,48 @@ impl<'a> Worker<'a> {
         let result = if job.tool == AssistanceTool::Stop {
             self.revoke(&binding, &job.reference).await
         } else if *job.cancel.borrow() || self.shared.active(&binding).is_err() {
-            Err(FailureCode::Cancelled)
+            if job.stage.is_some() {
+                self.edit(job).await
+            } else {
+                Err(FailureCode::Cancelled)
+            }
         } else if tokio::time::Instant::now() >= job.deadline {
-            Err(FailureCode::Deadline)
+            if job.stage.is_some() {
+                self.edit(job).await
+            } else if was_parked {
+                Err(FailureCode::ProviderLoading)
+            } else {
+                Err(FailureCode::Deadline)
+            }
         } else {
             if job.tool != AssistanceTool::Test {
-                self.reconcile_hints(&job).await;
+                self.reconcile_hints(job).await;
             }
             if tokio::time::Instant::now() >= job.deadline {
-                Err(FailureCode::Deadline)
+                if job.stage.is_some() {
+                    self.edit(job).await
+                } else if was_parked {
+                    Err(FailureCode::ProviderLoading)
+                } else {
+                    Err(FailureCode::Deadline)
+                }
             } else {
                 match job.tool {
-                    AssistanceTool::Edit => self.edit(&mut job).await,
-                    AssistanceTool::Start => self.activate(&mut job).await,
-                    AssistanceTool::Context => self.context(&mut job).await,
-                    AssistanceTool::Diff => self.diff(&mut job).await,
-                    AssistanceTool::Outline => self.outline(&mut job).await,
-                    AssistanceTool::Read => self.read(&mut job).await,
-                    AssistanceTool::Symbol => self.symbol(&mut job).await,
-                    AssistanceTool::Test => self.test(&mut job).await,
+                    AssistanceTool::Edit => self.edit(job).await,
+                    AssistanceTool::Start => self.activate(job).await,
+                    AssistanceTool::Context => self.context(job).await,
+                    AssistanceTool::Diff => self.diff(job).await,
+                    AssistanceTool::Outline => self.outline(job).await,
+                    AssistanceTool::Read => self.read(job).await,
+                    AssistanceTool::Symbol => self.symbol(job).await,
+                    AssistanceTool::Test => self.test(job).await,
                     _ => Err(FailureCode::Internal),
                 }
             }
         };
+        if job.park_until.is_some() {
+            return;
+        }
         let (reply, authority, source) = match result {
             Ok(result) => result,
             Err(code) => (
@@ -2794,6 +2896,42 @@ impl<'a> Worker<'a> {
         &mut self,
         job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        if let Some(stage @ JobStage::EditAwaitingCheck { .. }) = job.stage.take() {
+            let deadline = match &stage {
+                JobStage::EditAwaitingCheck { deadline, .. } => *deadline,
+            };
+            let diagnostics = if *job.cancel.borrow() || tokio::time::Instant::now() >= deadline {
+                Some(EditDiagnostics::Unknown {})
+            } else {
+                self.check_diagnostics(&stage)
+            };
+            let Some(diagnostics) = diagnostics else {
+                job.stage = Some(stage);
+                job.park_until = Some(tokio::time::Instant::now() + Duration::from_millis(250));
+                return Err(FailureCode::ProviderLoading);
+            };
+            let JobStage::EditAwaitingCheck {
+                result,
+                refreshed,
+                authority,
+                path,
+                ..
+            } = stage;
+            debug_assert_eq!(result.path, path);
+            let source = result
+                .outcome
+                .has_post_source()
+                .then_some(refreshed)
+                .flatten();
+            return Ok((
+                PeerReply::Edit {
+                    result,
+                    diagnostics,
+                },
+                Some(authority),
+                source,
+            ));
+        }
         if job.parameters.get("symbol").is_some() || job.parameters.get("lines").is_some() {
             return self.edit_by_symbol(job).await;
         }
@@ -2999,28 +3137,44 @@ impl<'a> Worker<'a> {
         } else {
             (None, EditDiagnostics::Unknown {})
         };
-        // A provider report for the exact version is real and instant; keep it. Anything else is
-        // verified by the project check the write scheduled: an empty provider publish is not
-        // proof of cleanliness (rust-analyzer publishes its own diagnostics before cargo's), and
-        // only the project check sees breakage the edit caused in other files.
-        let diagnostics = match diagnostics {
-            EditDiagnostics::CurrentReported { .. } => diagnostics,
-            other if refreshed.is_some() => self
-                .check_diagnostics(job, &authority, &request.path)
-                .await
-                .unwrap_or(other),
-            other => other,
-        };
         let post_reference = refreshed.as_ref().map(|_| job.reference.clone());
         let expected = EditResult::from_workspace(&request, outcome, |_| post_reference);
         let result = self
             .settle_prepared_edit(prepared, &request, expected.clone())
             .await;
-        let diagnostics = if result == expected && result.outcome.has_post_source() {
+        let mut diagnostics = if result == expected && result.outcome.has_post_source() {
             diagnostics
         } else {
             EditDiagnostics::Unknown {}
         };
+        // A matching provider report is already authoritative. Otherwise the scheduled project
+        // check verifies the settled write; its durable receipt is safe while this job is parked.
+        if result == expected
+            && result.outcome.has_post_source()
+            && !matches!(diagnostics, EditDiagnostics::CurrentReported { .. })
+            && let Some(stage) = self.edit_check_stage(
+                job,
+                &authority,
+                &request.path,
+                result.clone(),
+                refreshed.clone(),
+                diagnostics.clone(),
+            )
+        {
+            match self.check_diagnostics(&stage) {
+                Some(checked) => diagnostics = checked,
+                None if tokio::time::Instant::now()
+                    < match &stage {
+                        JobStage::EditAwaitingCheck { deadline, .. } => *deadline,
+                    } =>
+                {
+                    job.stage = Some(stage);
+                    job.park_until = Some(tokio::time::Instant::now() + Duration::from_millis(250));
+                    return Err(FailureCode::ProviderLoading);
+                }
+                None => diagnostics = EditDiagnostics::Unknown {},
+            }
+        }
         let source = (result.outcome.has_post_source())
             .then_some(refreshed)
             .flatten();
@@ -3034,18 +3188,22 @@ impl<'a> Worker<'a> {
         ))
     }
 
-    /// Schedules the project check for the edit and waits (bounded) for its result, reporting
-    /// the edited file's problems from it: `current_reported` with `path:line:col severity
-    /// [code] message` lines, `current_clean` when the completed check names none, `unknown`
-    /// when no check at the edit's generation completes in time. `None` when checks are not
-    /// configured for this worktree or file type, so the caller keeps the provider's answer.
-    async fn check_diagnostics(
+    /// Captures the matching check generation and reply state for a settled edit.
+    ///
+    /// Returns `None` when checks are unavailable, the file type is unsupported, or no generation
+    /// exists, leaving the provider answer untouched. Otherwise the saved stage retains the edit
+    /// result, source, authority, path, provider fallback, and absolute check deadline so the
+    /// worker can probe snapshots without repeating the write or sleeping inside the job.
+    fn edit_check_stage(
         &self,
         job: &mut Job,
         authority: &AuthorityStamp,
         path: &str,
-    ) -> Option<EditDiagnostics> {
-        use crate::checks::{CheckState, Language as CheckLanguage, Severity};
+        result: EditResult,
+        refreshed: Option<SourceObservation>,
+        fallback: EditDiagnostics,
+    ) -> Option<JobStage> {
+        use crate::checks::Language as CheckLanguage;
         let feed = self.shared.project_feed.as_ref()?;
         let language = match std::path::Path::new(path)
             .extension()
@@ -3061,79 +3219,99 @@ impl<'a> Worker<'a> {
         let generation = feed.changed_generation(&job.invocation.binding_ref().fingerprint())?;
         job.check_scheduled = true;
         let worktree = authority.worktree().worktree_path().to_path_buf();
-        let wanted = path.trim_start_matches("./");
         let deadline = job
             .deadline
             .checked_sub(EDIT_SETTLEMENT_RESERVE)?
             .min(tokio::time::Instant::now() + EDIT_CHECK_WAIT);
-        loop {
-            if *job.cancel.borrow() {
-                return None;
-            }
-            let snapshot = feed
-                .latest(&worktree)
-                .into_iter()
-                .find(|snapshot| snapshot.language == language);
-            if let Some(snapshot) = snapshot
-                && snapshot.input_generation >= generation
-            {
-                if !matches!(snapshot.state, CheckState::Ready | CheckState::Partial) {
-                    return Some(EditDiagnostics::Unknown {});
-                }
-                let mut errors = 0u32;
-                let mut warnings = 0u32;
-                let mut messages = Vec::new();
-                let mut truncated = snapshot.truncated;
-                for problem in &snapshot.problems {
-                    let reported = problem.path.trim_start_matches("./");
-                    let reported = std::path::Path::new(reported)
-                        .strip_prefix(&worktree)
-                        .map(|relative| relative.to_string_lossy().into_owned())
-                        .unwrap_or_else(|_| reported.to_owned());
-                    if reported != wanted {
-                        continue;
-                    }
-                    match problem.severity {
-                        Severity::Error => errors += 1,
-                        Severity::Warning => warnings += 1,
-                    }
-                    if messages.len() < 8 {
-                        let code = problem
-                            .code
-                            .as_deref()
-                            .map(|code| format!("[{code}] "))
-                            .unwrap_or_default();
-                        let severity = match problem.severity {
-                            Severity::Error => "error",
-                            Severity::Warning => "warning",
-                        };
-                        let line = format!(
-                            "{wanted}:{}:{} {severity} {code}{}",
-                            problem.line, problem.column, problem.message
-                        );
-                        messages.push(line.chars().take(256).collect());
-                    } else {
-                        truncated = true;
-                    }
-                }
-                return Some(if messages.is_empty() && !truncated {
-                    EditDiagnostics::CurrentClean {}
-                } else {
-                    EditDiagnostics::CurrentReported {
-                        messages,
-                        delta: format!(
-                            "project check {:.1}s: {errors} errors, {warnings} warnings in this file",
-                            snapshot.duration_ms as f64 / 1000.0
-                        ),
-                        truncated,
-                    }
-                });
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Some(EditDiagnostics::Unknown {});
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+        Some(JobStage::EditAwaitingCheck {
+            result,
+            refreshed,
+            authority: authority.clone(),
+            path: path.to_owned(),
+            fallback,
+            generation,
+            worktree,
+            wanted: path.trim_start_matches("./").to_owned(),
+            language,
+            deadline,
+        })
+    }
+
+    /// Returns the matching generation's diagnostics without waiting; absence means the job parks.
+    /// Missing feed state preserves the provider fallback, while a completed non-ready snapshot
+    /// and a matching ready snapshot map to the same states used by the former bounded wait.
+    fn check_diagnostics(&self, stage: &JobStage) -> Option<EditDiagnostics> {
+        use crate::checks::{CheckState, Severity};
+        let JobStage::EditAwaitingCheck {
+            fallback,
+            generation,
+            worktree,
+            wanted,
+            language,
+            ..
+        } = stage;
+        let Some(feed) = self.shared.project_feed.as_ref() else {
+            return Some(fallback.clone());
+        };
+        let snapshot = feed.latest(worktree).into_iter().find(|snapshot| {
+            snapshot.language == *language && snapshot.input_generation >= *generation
+        })?;
+        if !matches!(snapshot.state, CheckState::Ready | CheckState::Partial) {
+            return Some(EditDiagnostics::Unknown {});
         }
+        let mut errors = 0u32;
+        let mut warnings = 0u32;
+        let mut messages = Vec::new();
+        let mut truncated = snapshot.truncated;
+        for problem in &snapshot.problems {
+            let reported = problem.path.trim_start_matches("./");
+            let reported = std::path::Path::new(reported)
+                .strip_prefix(worktree)
+                .map(|relative| relative.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| reported.to_owned());
+            if reported != *wanted {
+                continue;
+            }
+            match problem.severity {
+                Severity::Error => errors += 1,
+                Severity::Warning => warnings += 1,
+            }
+            if messages.len() < 8 {
+                let code = problem
+                    .code
+                    .as_deref()
+                    .map(|code| format!("[{code}] "))
+                    .unwrap_or_default();
+                let severity = match problem.severity {
+                    Severity::Error => "error",
+                    Severity::Warning => "warning",
+                };
+                messages.push(
+                    format!(
+                        "{wanted}:{}:{} {severity} {code}{}",
+                        problem.line, problem.column, problem.message
+                    )
+                    .chars()
+                    .take(256)
+                    .collect(),
+                );
+            } else {
+                truncated = true;
+            }
+        }
+        Some(if messages.is_empty() && !truncated {
+            EditDiagnostics::CurrentClean {}
+        } else {
+            EditDiagnostics::CurrentReported {
+                messages,
+                delta: format!(
+                    "project check {:.1}s: {errors} errors, {warnings} warnings in this file",
+                    snapshot.duration_ms as f64 / 1000.0
+                ),
+                truncated,
+            }
+        })
+        .or_else(|| Some(fallback.clone()))
     }
 
     /// Durably settles one typed pre-effect Workspace outcome without dispatching a write.
@@ -3391,7 +3569,7 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
         if matches!(
             reply,
             PeerReply::Complete {
-                kind: ResultKind::Context | ResultKind::Diff,
+                kind: ResultKind::Context,
                 ..
             }
         ) && shared
@@ -3404,7 +3582,8 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
             .unwrap_or(0)
             != native_epoch
         {
-            // Same wire code as a changed source; the journal names which fence fired.
+            // Context carries an exact-byte source reference. Diff is a job-time tree snapshot,
+            // so a later native edit makes it stale in the same way as an inline-completed diff.
             crate::errorlog::record(
                 crate::errorlog::Method::Inspect,
                 crate::errorlog::Outcome::Failed,
@@ -4158,6 +4337,8 @@ mod stop_retry_tests {
             native_epoch: 0,
             failure_detail: None,
             check_scheduled: false,
+            park_until: None,
+            stage: None,
         };
         worker.activate(&mut job).await.unwrap();
         let receipt = worker.grants.get(&binding).cloned().unwrap();
@@ -4217,6 +4398,8 @@ mod stop_retry_tests {
             native_epoch: 0,
             failure_detail: None,
             check_scheduled: false,
+            park_until: None,
+            stage: None,
         };
         (job, cancel_sender)
     }
@@ -4311,6 +4494,8 @@ mod stop_retry_tests {
             native_epoch: 0,
             failure_detail: None,
             check_scheduled: false,
+            park_until: None,
+            stage: None,
         };
         let (context_reply, authority, source) = worker.context(&mut context_job).await.unwrap();
         worker.shared.ledger.lock().unwrap().details.insert(
@@ -4349,6 +4534,8 @@ mod stop_retry_tests {
             native_epoch: 0,
             failure_detail: None,
             check_scheduled: false,
+            park_until: None,
+            stage: None,
         };
         let (reply, authority, source) = worker.edit(&mut edit_job).await.unwrap();
         assert!(matches!(
@@ -4590,6 +4777,8 @@ mod stop_retry_tests {
             native_epoch: 0,
             failure_detail: None,
             check_scheduled: false,
+            park_until: None,
+            stage: None,
         };
         let (reply, _, source) = worker.context(&mut job).await.unwrap();
         assert!(matches!(
@@ -4689,9 +4878,37 @@ mod stop_retry_tests {
                 native_epoch: 0,
                 failure_detail: None,
                 check_scheduled: false,
+                park_until: None,
+                stage: None,
             },
             cancel_sender,
         )
+    }
+
+    /// A parked job yields the worker slot to the next runnable arrival.
+    #[tokio::test]
+    async fn parked_job_does_not_block_later_runnable_job() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let worker = worker(&store, workspace, fixture.root.clone());
+        let first = production_call(&worker, "park-actor", "park-first");
+        let second = production_call(&worker, "park-actor", "park-second");
+        let (mut parked, _) = context_job(&fixture.root, first);
+        let (ready, _) = context_job(&fixture.root, second);
+        parked.park_until = Some(tokio::time::Instant::now() + Duration::from_secs(5));
+        let parked_ref = parked.reference.clone();
+        let ready_ref = ready.reference.clone();
+        let mut queue = VecDeque::from([parked, ready]);
+
+        let (selected, next_wake) = pop_ready_job(&mut queue, tokio::time::Instant::now());
+
+        assert_eq!(selected.unwrap().reference, ready_ref);
+        assert!(next_wake.is_some());
+        assert_eq!(queue.front().unwrap().reference, parked_ref);
+        let binding = queue.front().unwrap().invocation.binding_ref().clone();
+        queue.retain(|job| job.invocation.binding_ref() != &binding);
+        assert!(queue.is_empty(), "stop must drop parked binding work too");
     }
 
     /// Drops the position marker line every page of a multi-page result starts with (T16B).
@@ -5194,6 +5411,8 @@ mod stop_retry_tests {
                 native_epoch: 0,
                 failure_detail: None,
                 check_scheduled: false,
+                park_until: None,
+                stage: None,
             },
             cancel_sender,
         )
