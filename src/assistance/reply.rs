@@ -140,6 +140,8 @@ pub enum ResultKind {
     Read,
     /// A symbol card from `ide.symbol`.
     Symbol,
+    /// A bounded live call graph from `ide.graph`.
+    Graph,
     /// A background test run result from `ide.test`.
     Test,
 }

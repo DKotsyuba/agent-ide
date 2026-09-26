@@ -64,6 +64,7 @@ fn log_binding_unavailable(
         super::facade::AssistanceTool::Outline => errorlog::Method::Outline,
         super::facade::AssistanceTool::Read => errorlog::Method::Read,
         super::facade::AssistanceTool::Symbol => errorlog::Method::Symbol,
+        super::facade::AssistanceTool::Graph => errorlog::Method::Graph,
         super::facade::AssistanceTool::Test => errorlog::Method::Test,
     };
     errorlog::record(
@@ -441,6 +442,7 @@ impl ProductDispatcher {
                     AssistanceMethod::Outline => super::facade::AssistanceTool::Outline,
                     AssistanceMethod::Read => super::facade::AssistanceTool::Read,
                     AssistanceMethod::Symbol => super::facade::AssistanceTool::Symbol,
+                    AssistanceMethod::Graph => super::facade::AssistanceTool::Graph,
                     AssistanceMethod::Test => super::facade::AssistanceTool::Test,
                     AssistanceMethod::HookSubmit => return None,
                 };
@@ -687,6 +689,7 @@ impl AssistanceDispatcher for ProductDispatcher {
                     AssistanceMethod::Outline => Some(super::facade::AssistanceTool::Outline),
                     AssistanceMethod::Read => Some(super::facade::AssistanceTool::Read),
                     AssistanceMethod::Symbol => Some(super::facade::AssistanceTool::Symbol),
+                    AssistanceMethod::Graph => Some(super::facade::AssistanceTool::Graph),
                     AssistanceMethod::Test => Some(super::facade::AssistanceTool::Test),
                     AssistanceMethod::HookSubmit => None,
                 };

@@ -77,6 +77,8 @@ pub enum ToolMethod {
     Read,
     /// `ide.symbol` symbol card request.
     Symbol,
+    /// `ide.graph` live call graph request.
+    Graph,
     /// `ide.test` test run or status request.
     Test,
 }

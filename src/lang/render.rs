@@ -137,7 +137,7 @@ pub fn call_graph_text(graph: &CallGraph, direction: &str, depth: u8) -> String 
         render_graph_children(graph, 0, selected, 1, depth, &mut seen, &mut out);
     }
     if graph.capped {
-        out.push_str("  (stopped at the 60-node or 120-edge limit)\n");
+        out.push_str("… capped at 60 nodes or 120 edges\n");
     }
     out
 }
@@ -163,20 +163,21 @@ fn render_graph_children(
         let node = &graph.nodes[edge.to];
         let already_seen = seen[edge.to];
         out.push_str(&format!(
-            "{}{} {}  {}",
-            "  ".repeat(level),
+            "{}{} {}  {}:{}",
+            "  ".repeat(level as usize),
             direction.arrow(),
             node.path,
-            node.file
+            node.file,
+            node.line
         ));
+        if !already_seen {
+            seen[edge.to] = true;
+        }
+        if node.is_test {
+            out.push_str(" [test]");
+        }
         if already_seen {
             out.push_str(" (seen)");
-        } else {
-            seen[edge.to] = true;
-            out.push_str(&format!(":{}", node.line));
-            if node.is_test {
-                out.push_str(" [test]");
-            }
         }
         out.push('\n');
         if !already_seen {
@@ -219,27 +220,70 @@ mod graph_tests {
             direction: GraphDirection::Callers,
         });
         let text = call_graph_text(&graph, "callers", 3);
-        assert!(text.contains("← src/lib.rs#root  src/lib.rs (seen)"));
+        assert!(text.contains("← src/lib.rs#root  src/lib.rs:1 (seen)"));
         assert!(text.contains("[test]"));
 
         for index in graph.nodes.len()..MAX_GRAPH_NODES {
-            assert!(graph
+            assert!(
+                graph
+                    .add_node(GraphNode {
+                        path: format!("src/lib.rs#f{index}"),
+                        file: "src/lib.rs".to_owned(),
+                        line: index as u32 + 1,
+                        is_test: false,
+                    })
+                    .is_some()
+            );
+        }
+        assert!(
+            graph
                 .add_node(GraphNode {
-                    path: format!("src/lib.rs#f{index}"),
+                    path: "src/lib.rs#overflow".to_owned(),
                     file: "src/lib.rs".to_owned(),
-                    line: index as u32 + 1,
+                    line: 99,
                     is_test: false,
                 })
-                .is_some());
-        }
-        assert!(graph.add_node(GraphNode {
-            path: "src/lib.rs#overflow".to_owned(),
-            file: "src/lib.rs".to_owned(),
-            line: 99,
-            is_test: false,
-        }).is_none());
+                .is_none()
+        );
         assert!(graph.capped);
-        assert!(call_graph_text(&graph, "callers", 1).contains("stopped at the 60-node"));
+        assert!(call_graph_text(&graph, "callers", 1).contains("… capped at 60 nodes"));
+    }
+
+    /// Keeps callers before callees for a two-sided graph and marks a repeated test node.
+    #[test]
+    fn call_graph_renders_both_sides_in_order_and_marks_seen_tests() {
+        let mut graph = CallGraph::new(GraphNode {
+            path: "root".into(),
+            file: "src/lib.rs".into(),
+            line: 1,
+            is_test: false,
+        });
+        for (path, is_test, direction) in [
+            ("caller", false, GraphDirection::Callers),
+            ("test", true, GraphDirection::Callees),
+        ] {
+            let index = graph
+                .add_node(GraphNode {
+                    path: path.into(),
+                    file: "src/lib.rs".into(),
+                    line: 2,
+                    is_test,
+                })
+                .unwrap();
+            graph.add_edge(GraphEdge {
+                from: 0,
+                to: index,
+                direction,
+            });
+        }
+        graph.add_edge(GraphEdge {
+            from: 1,
+            to: 2,
+            direction: GraphDirection::Callers,
+        });
+        let text = call_graph_text(&graph, "both", 2);
+        assert!(text.find("← caller").unwrap() < text.find("→ test").unwrap());
+        assert!(text.contains("→ test  src/lib.rs:2 [test] (seen)"));
     }
 }
 
