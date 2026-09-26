@@ -101,7 +101,8 @@ toolchains, and one private cache under
 `$HOME/.agent-ide/checks/<repository>/<worktree>/<language>`; the environment is rebuilt from an
 allowlist (`CARGO_NET_OFFLINE=true`, private `CARGO_TARGET_DIR` and temp). Runs are debounced,
 bounded by `check_timeout_s`, and their process groups are killed on cancel or timeout. See the
-[EYES-r2 contract](docs/contracts/eyes-v0.3.md) and the
+[EYES-r2 contract](docs/contracts/eyes-v0.3.md), the
+[symbol-addressed tools v0.4 contract](docs/contracts/tools-v0.4.md), and the
 [launcher configuration](docs/assistance-launcher.md).
 
 Checks run in one shared per-repository daemon under `/private/tmp/ai-r-<hash>`, keyed by the
