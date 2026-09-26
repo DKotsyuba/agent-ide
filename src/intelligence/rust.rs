@@ -82,7 +82,7 @@ pub struct RustProfile {
 /// a single package (no `[workspace]` table) or no Cargo project at all is opened as a detached
 /// file: hover works, references across the crate's own tests do not. For such roots this lists
 /// the root manifest (when present) and every nested manifest found up to
-/// [`LINKED_PROJECT_DEPTH`] directories deep, skipping `target`, `node_modules`, hidden
+/// two directories deep, skipping `target`, `node_modules`, hidden
 /// directories and the conventional test-material directories (`tests`, `fixtures`, `examples`,
 /// `benches`), whose crates are fixtures rather than projects. A root with a `[workspace]`
 /// table keeps auto-discovery: its members are covered and cross-workspace nesting is rare.
