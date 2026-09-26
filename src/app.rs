@@ -39,7 +39,7 @@ const MAX_REQUEST_ID_BYTES: usize = 128;
 const MAX_V1_FRAME_BYTES: usize = 64 * 1024;
 const MAX_V2_FRAME_BYTES: usize = 128 * 1024;
 const MAX_ASSISTANCE_JSON_BYTES: usize = 64 * 1024;
-/// Total connect, exchange, and dispatch budget for every Assistance method request.
+/// Maximum time to wait for an Assistance method reply after its request is written.
 const METHOD_DISPATCH_BUDGET: Duration = Duration::from_secs(10);
 /// Total connect, request, and acknowledgement budget when a Codex MCP opens its client lease.
 const CLIENT_LEASE_OPEN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -454,24 +454,26 @@ pub async fn submit_hook_if_running(
 
 /// Connects to an already-running daemon for one closed v2/v3 method dispatch without starting it.
 ///
-/// Transport faults return `Unavailable`; Application does not retry, render, or reinterpret the
-/// opaque result. Assistance decides whether that unavailable result must be shown to its caller.
-/// Connect and exchange consume the same absolute deadline; a completed connect never resets it.
+/// Connect, framing, and daemon faults return `Unavailable`; elapsed bounded phases return
+/// `TimedOut`. Application does not retry, render, or reinterpret the opaque result.
+/// Connect and request write share the hook transport deadline; after the write, reply waiting gets
+/// the longer method budget. A short no-reply interval checks daemon health before keeping the
+/// request open, so a paused daemon fails fast while a live worker retains the full method budget.
 pub async fn dispatch_method_if_running(
     runtime_dir: &Path,
     request: MethodDispatch,
     limits: HookTransportLimits,
 ) -> MethodDispatchTransportResult {
-    // Keep this above the worker's inline wait so the original host-bound invocation can reply.
-    let Some(deadline) = tokio::time::Instant::now().checked_add(METHOD_DISPATCH_BUDGET) else {
+    let Some(write_deadline) = tokio::time::Instant::now().checked_add(limits.deadline) else {
         return MethodDispatchTransportResult::Unavailable;
     };
     let socket_path = runtime_dir.join(SOCKET_NAME);
-    let mut stream = match tokio::time::timeout_at(deadline, UnixStream::connect(socket_path)).await
-    {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(_)) | Err(_) => return MethodDispatchTransportResult::Unavailable,
-    };
+    let mut stream =
+        match tokio::time::timeout_at(write_deadline, UnixStream::connect(socket_path)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(_)) => return MethodDispatchTransportResult::Unavailable,
+            Err(_) => return MethodDispatchTransportResult::TimedOut,
+        };
     let params = match serde_json::from_str::<Value>(request.params_json().as_str()) {
         Ok(params) => params,
         Err(_) => return MethodDispatchTransportResult::Unavailable,
@@ -499,14 +501,44 @@ pub async fn dispatch_method_if_running(
         "dispatch_method": method,
         "params_json": params,
     });
+    match tokio::time::timeout_at(
+        write_deadline,
+        write_frame(&mut stream, &wire, limits.max_frame_bytes),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => return MethodDispatchTransportResult::Unavailable,
+        Err(_) => return MethodDispatchTransportResult::TimedOut,
+    }
+    let Some(reply_deadline) = tokio::time::Instant::now().checked_add(METHOD_DISPATCH_BUDGET)
+    else {
+        return MethodDispatchTransportResult::Unavailable;
+    };
+    let Some(first_reply_deadline) =
+        tokio::time::Instant::now().checked_add(limits.deadline.min(METHOD_DISPATCH_BUDGET))
+    else {
+        return MethodDispatchTransportResult::Unavailable;
+    };
     let result = async {
-        write_frame(&mut stream, &wire, limits.max_frame_bytes).await?;
         let reply: Value = read_frame(&mut stream, limits.max_frame_bytes).await?;
         parse_method_dispatch_reply(&reply, &request)
     };
-    match tokio::time::timeout_at(deadline, result).await {
+    tokio::pin!(result);
+    match tokio::time::timeout_at(first_reply_deadline, &mut result).await {
         Ok(Ok(reply)) => reply,
-        Ok(Err(_)) | Err(_) => MethodDispatchTransportResult::Unavailable,
+        Ok(Err(_)) => MethodDispatchTransportResult::Unavailable,
+        Err(_) => {
+            let responsive = tokio::time::timeout(limits.deadline, doctor(runtime_dir)).await;
+            if !matches!(responsive, Ok(Ok(DoctorStatus::Healthy { .. }))) {
+                return MethodDispatchTransportResult::TimedOut;
+            }
+            match tokio::time::timeout_at(reply_deadline, &mut result).await {
+                Ok(Ok(reply)) => reply,
+                Ok(Err(_)) => MethodDispatchTransportResult::Unavailable,
+                Err(_) => MethodDispatchTransportResult::TimedOut,
+            }
+        }
     }
 }
 

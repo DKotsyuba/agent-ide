@@ -113,6 +113,21 @@ impl AssistanceTool {
     }
 }
 
+/// Checks that one completed result kind belongs to the called tool before the facade renders it.
+fn tool_accepts_result_kind(tool: AssistanceTool, kind: ResultKind) -> bool {
+    matches!(
+        (tool, kind),
+        (AssistanceTool::Start, ResultKind::Activation)
+            | (AssistanceTool::Context, ResultKind::Context)
+            | (AssistanceTool::Diff, ResultKind::Diff)
+            | (AssistanceTool::Stop, ResultKind::Stop)
+            | (AssistanceTool::Outline, ResultKind::Outline)
+            | (AssistanceTool::Read, ResultKind::Read)
+            | (AssistanceTool::Symbol, ResultKind::Symbol)
+            | (AssistanceTool::Test, ResultKind::Test)
+    )
+}
+
 /// Describes one statically available MCP tool without consulting daemon health.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolSchema {
@@ -913,6 +928,8 @@ pub enum FacadeOutcome {
     MissingHostMetadata,
     /// The daemon, IPC, or typed peer result was unavailable; native host work remains unblocked.
     Unavailable,
+    /// The daemon did not answer an admitted call in time; managed routes must not reconnect.
+    TimedOut,
     /// Transport failed and this managed client could not re-establish a daemon.
     ReestablishFailed,
     /// IPC accepted the envelope but no typed peer result was available for safe rendering.
@@ -1013,6 +1030,7 @@ impl AssistanceFacade {
         };
         match dispatch_method_if_running(runtime_dir, request, self.limits).await {
             MethodDispatchTransportResult::Unavailable => FacadeOutcome::Unavailable,
+            MethodDispatchTransportResult::TimedOut => FacadeOutcome::TimedOut,
             MethodDispatchTransportResult::Dispatched { opaque_result_json } => {
                 match PeerReply::decode_delivered(opaque_result_json.as_str()) {
                     Some((
@@ -1030,14 +1048,7 @@ impl AssistanceFacade {
                     }
                     Some((reply @ PeerReply::Complete { kind, .. }, status))
                         if tool == AssistanceTool::Inspect
-                            || matches!(
-                                (tool, kind),
-                                (AssistanceTool::Start, ResultKind::Activation)
-                                    | (AssistanceTool::Context, ResultKind::Context)
-                                    | (AssistanceTool::Diff, ResultKind::Diff)
-                                    | (AssistanceTool::Stop, ResultKind::Stop)
-                                    | (AssistanceTool::Test, ResultKind::Test)
-                            ) =>
+                            || tool_accepts_result_kind(tool, kind) =>
                     {
                         FacadeOutcome::Reply(reply, status)
                     }
@@ -1715,6 +1726,9 @@ impl StdioFacade {
             FacadeOutcome::Unavailable => {
                 "Assistance daemon transport is unavailable; continue with native tools"
             }
+            FacadeOutcome::TimedOut => {
+                "Assistance daemon transport timed out; continue with native tools"
+            }
             FacadeOutcome::ReestablishFailed => {
                 "Assistance daemon exited; re-establish failed; continue with native tools"
             }
@@ -1835,6 +1849,41 @@ fn rendered_reply_bounds_the_complete_mcp_result() {
     assert_eq!(result["truncated"], true);
     assert_eq!(result["detail_ref"], "same-binding-detail");
     assert!(result["text"].as_str().unwrap().contains('🦀'));
+}
+
+/// Keeps every tool's inline completion kind in the same typed rendered envelope used by Inspect.
+#[test]
+fn inline_complete_kinds_keep_structured_content() {
+    for (tool, kind) in [
+        (AssistanceTool::Start, ResultKind::Activation),
+        (AssistanceTool::Context, ResultKind::Context),
+        (AssistanceTool::Diff, ResultKind::Diff),
+        (AssistanceTool::Stop, ResultKind::Stop),
+        (AssistanceTool::Outline, ResultKind::Outline),
+        (AssistanceTool::Read, ResultKind::Read),
+        (AssistanceTool::Symbol, ResultKind::Symbol),
+        (AssistanceTool::Test, ResultKind::Test),
+    ] {
+        let reply = PeerReply::Complete {
+            kind,
+            text: "complete".into(),
+            detail_ref: None,
+            truncated: false,
+            continuation: false,
+        };
+        assert!(tool_accepts_result_kind(tool, kind));
+        let encoded = reply.encode().unwrap();
+        let (decoded, _) = PeerReply::decode_delivered(encoded.as_str()).unwrap();
+        let rendered = render_reply(decoded, content::Envelope::WithStructured);
+        assert_eq!(
+            rendered.structured_content.unwrap()["kind"],
+            format!("{kind:?}").to_lowercase()
+        );
+    }
+    assert!(!tool_accepts_result_kind(
+        AssistanceTool::Start,
+        ResultKind::Outline
+    ));
 }
 
 /// Projects typed unavailable and stop lifecycle replies through the shared compact envelope.
