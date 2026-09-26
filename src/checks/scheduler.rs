@@ -175,6 +175,9 @@ struct LanguageState {
     run_start_fingerprint: Option<u64>,
     /// Fingerprint the last completed run started with (T20B); the skip comparison baseline.
     completed_fingerprint: Option<u64>,
+    /// `true` when an edit reply is waiting for the next run: that run skips the EYES-r2
+    /// cooldown once, since the caller asked for it explicitly instead of the feed guessing.
+    urgent: bool,
     /// `true` only when the last completed run ended `Ready` (T20B): any other outcome —
     /// `Partial`, `Checking`, or an `Unavailable` failure or condition — must be re-checked on
     /// the next trigger, so only a `Ready` completion arms the skip-unchanged rule.
@@ -308,14 +311,20 @@ impl Scheduler {
     /// `input_generation` once regardless of how many languages are configured. A trigger
     /// received after [`Scheduler::shutdown`] has started is silently ignored.
     pub fn trigger(&self, repository_key: &str, worktree: &Path) {
-        self.trigger_inner(repository_key, worktree, false);
+        self.trigger_inner(repository_key, worktree, false, false);
+    }
+
+    /// Like [`Scheduler::trigger`], for a check a caller is waiting on (an edit reply): the run
+    /// it leads to skips the cooldown after the previous run instead of waiting it out.
+    pub fn trigger_urgent(&self, repository_key: &str, worktree: &Path) {
+        self.trigger_inner(repository_key, worktree, false, true);
     }
 
     /// Like [`Scheduler::trigger`], for a session activating `worktree`: also records the new
     /// `input_generation` as the activation generation, so [`Scheduler::stale`] flags every
     /// snapshot produced before this activation until a check completed after it replaces it.
     pub fn activate(&self, repository_key: &str, worktree: &Path) {
-        self.trigger_inner(repository_key, worktree, true);
+        self.trigger_inner(repository_key, worktree, true, false);
     }
 
     /// Cancels this worktree's pending and running checks when its caller loses whole-tree read
@@ -339,7 +348,7 @@ impl Scheduler {
     }
 
     /// Shared body of [`Scheduler::trigger`] and [`Scheduler::activate`].
-    fn trigger_inner(&self, repository_key: &str, worktree: &Path, activation: bool) {
+    fn trigger_inner(&self, repository_key: &str, worktree: &Path, activation: bool, urgent: bool) {
         let worktree = canonical_worktree(worktree);
         let mut state = self.inner.lock_state();
         if state.shutting_down {
@@ -357,6 +366,9 @@ impl Scheduler {
         }
         for language in self.inner.checkers.keys().copied().collect::<Vec<_>>() {
             let lang = wt.languages.entry(language).or_default();
+            if urgent {
+                lang.urgent = true;
+            }
             if activation {
                 // An ordinary trigger inside the debounce window clears `activation_armed`; the
                 // dropped baseline keeps the session's first check from being skipped anyway.
@@ -433,6 +445,17 @@ impl Scheduler {
 
     /// Returns the languages of `worktree` with a check running right now, in language order.
     ///
+    /// Returns `worktree`'s current input generation: the generation a check started after the
+    /// most recent trigger reports in its snapshot. `0` for an unknown worktree.
+    pub fn generation(&self, worktree: &Path) -> u64 {
+        let worktree = canonical_worktree(worktree);
+        let state = self.inner.lock_state();
+        state
+            .worktrees
+            .get(&worktree)
+            .map_or(0, |wt| wt.input_generation)
+    }
+
     /// Only a started check counts, not an armed debounce timer: a trigger that changes nothing
     /// (a no-op tool) then never flips the status before its check actually runs (T18B).
     /// Non-blocking and synchronous.
@@ -613,6 +636,13 @@ impl Inner {
                 return;
             };
             if !force_run && fingerprint.is_some() && completed_fingerprint == fingerprint {
+                // Inputs unchanged since the retained result's run began, so that result is
+                // current for this generation too: a waiter keyed on the generation (an edit
+                // reply) must see it instead of waiting for a run that never starts.
+                if let Some(snapshot) = lang.latest_snapshot.as_mut() {
+                    snapshot.input_generation = generation;
+                    lang.last_stored_generation = generation;
+                }
                 return;
             } else {
                 lang.running = true;
@@ -805,18 +835,26 @@ impl Inner {
         policy_generation: u64,
     ) -> bool {
         let mut state = self.lock_state();
-        let Some(lang) = state
+        let Some(wt) = state
             .worktrees
             .get_mut(worktree)
             .filter(|wt| wt.policy_generation == policy_generation)
-            .and_then(|wt| wt.languages.get_mut(&language))
         else {
+            return false;
+        };
+        let generation = wt.input_generation;
+        let Some(lang) = wt.languages.get_mut(&language) else {
             return false;
         };
         let skip = lang.skip_eligible
             && fingerprint.is_some()
             && lang.completed_fingerprint == fingerprint;
         if skip {
+            // Same rule as the debounce skip: the retained result is current for this generation.
+            if let Some(snapshot) = lang.latest_snapshot.as_mut() {
+                snapshot.input_generation = generation;
+                lang.last_stored_generation = generation;
+            }
             lang.running = false;
             lang.dirty = false;
             lang.run_abort = None;
@@ -948,14 +986,17 @@ impl Inner {
     /// completion. Returns [`Duration::ZERO`] before any run has ever completed, or once that
     /// interval has already elapsed.
     fn cooldown_remaining(&self, worktree: &Path, language: Language) -> Duration {
-        let state = self.lock_state();
+        let mut state = self.lock_state();
         let Some(lang) = state
             .worktrees
-            .get(worktree)
-            .and_then(|wt| wt.languages.get(&language))
+            .get_mut(worktree)
+            .and_then(|wt| wt.languages.get_mut(&language))
         else {
             return Duration::ZERO;
         };
+        if std::mem::take(&mut lang.urgent) {
+            return Duration::ZERO;
+        }
         let Some(last_completion) = lang.last_completion else {
             return Duration::ZERO;
         };

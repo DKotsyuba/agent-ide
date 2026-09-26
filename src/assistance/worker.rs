@@ -47,6 +47,8 @@ use tokio::sync::{Notify, mpsc, oneshot, watch};
 /// Time reserved after an edit diagnostic attempt for reaping, receipt settlement, and reply
 /// delivery before the operation or foreground-helper ticket expires.
 const EDIT_SETTLEMENT_RESERVE: Duration = Duration::from_secs(2);
+/// Longest an edit reply waits for the project check it scheduled before answering `unknown`.
+const EDIT_CHECK_WAIT: Duration = Duration::from_secs(90);
 
 /// A bounded asynchronous operation whose identity never includes the transient MCP call ID.
 struct Job {
@@ -71,6 +73,9 @@ struct Job {
     /// Closed failing-stage tag for the terminal error log (T27B); never repository paths or
     /// child output, only fixed tags such as `diff:deadline` or `diff:child_exit:cat-file`.
     failure_detail: Option<String>,
+    /// `true` once the edit scheduled its project check itself (post-edit diagnostics), so the
+    /// reply path must not schedule a second run that would shift the worktree's generation.
+    check_scheduled: bool,
 }
 
 /// A retained outcome requiring exact binding ownership and fresh durable authorization on access.
@@ -1391,6 +1396,7 @@ impl WorkerHandle {
             stop_reply,
             native_epoch: 0,
             failure_detail: None,
+            check_scheduled: false,
         };
         if tool == AssistanceTool::Stop {
             ledger.queue.push_front(job);
@@ -1632,7 +1638,9 @@ impl<'a> Worker<'a> {
                         Vec::new(),
                     );
                 }
-                (PeerReply::Edit { result, .. }, _) if result.outcome.has_post_source() => {
+                (PeerReply::Edit { result, .. }, _)
+                    if result.outcome.has_post_source() && !job.check_scheduled =>
+                {
                     feed.changed(&binding.fingerprint());
                 }
                 _ => {}
@@ -2612,6 +2620,18 @@ impl<'a> Worker<'a> {
         } else {
             (None, EditDiagnostics::Unknown {})
         };
+        // A provider report for the exact version is real and instant; keep it. Anything else is
+        // verified by the project check the write scheduled: an empty provider publish is not
+        // proof of cleanliness (rust-analyzer publishes its own diagnostics before cargo's), and
+        // only the project check sees breakage the edit caused in other files.
+        let diagnostics = match diagnostics {
+            EditDiagnostics::CurrentReported { .. } => diagnostics,
+            other if refreshed.is_some() => self
+                .check_diagnostics(job, &authority, &request.path)
+                .await
+                .unwrap_or(other),
+            other => other,
+        };
         let post_reference = refreshed.as_ref().map(|_| job.reference.clone());
         let expected = EditResult::from_workspace(&request, outcome, |_| post_reference);
         let result = self
@@ -2633,6 +2653,108 @@ impl<'a> Worker<'a> {
             Some(authority),
             source,
         ))
+    }
+
+    /// Schedules the project check for the edit and waits (bounded) for its result, reporting
+    /// the edited file's problems from it: `current_reported` with `path:line:col severity
+    /// [code] message` lines, `current_clean` when the completed check names none, `unknown`
+    /// when no check at the edit's generation completes in time. `None` when checks are not
+    /// configured for this worktree or file type, so the caller keeps the provider's answer.
+    async fn check_diagnostics(
+        &self,
+        job: &mut Job,
+        authority: &AuthorityStamp,
+        path: &str,
+    ) -> Option<EditDiagnostics> {
+        use crate::checks::{CheckState, Language as CheckLanguage, Severity};
+        let feed = self.shared.project_feed.as_ref()?;
+        let language = match std::path::Path::new(path)
+            .extension()
+            .and_then(|value| value.to_str())
+        {
+            Some("rs") => CheckLanguage::Rust,
+            Some("py" | "pyi") => CheckLanguage::Python,
+            Some("ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs") => {
+                CheckLanguage::TypeScript
+            }
+            _ => return None,
+        };
+        let generation = feed.changed_generation(&job.invocation.binding_ref().fingerprint())?;
+        job.check_scheduled = true;
+        let worktree = authority.worktree().worktree_path().to_path_buf();
+        let wanted = path.trim_start_matches("./");
+        let deadline = job
+            .deadline
+            .checked_sub(EDIT_SETTLEMENT_RESERVE)?
+            .min(tokio::time::Instant::now() + EDIT_CHECK_WAIT);
+        loop {
+            if *job.cancel.borrow() {
+                return None;
+            }
+            let snapshot = feed
+                .latest(&worktree)
+                .into_iter()
+                .find(|snapshot| snapshot.language == language);
+            if let Some(snapshot) = snapshot
+                && snapshot.input_generation >= generation
+            {
+                if !matches!(snapshot.state, CheckState::Ready | CheckState::Partial) {
+                    return Some(EditDiagnostics::Unknown {});
+                }
+                let mut errors = 0u32;
+                let mut warnings = 0u32;
+                let mut messages = Vec::new();
+                let mut truncated = snapshot.truncated;
+                for problem in &snapshot.problems {
+                    let reported = problem.path.trim_start_matches("./");
+                    let reported = std::path::Path::new(reported)
+                        .strip_prefix(&worktree)
+                        .map(|relative| relative.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| reported.to_owned());
+                    if reported != wanted {
+                        continue;
+                    }
+                    match problem.severity {
+                        Severity::Error => errors += 1,
+                        Severity::Warning => warnings += 1,
+                    }
+                    if messages.len() < 8 {
+                        let code = problem
+                            .code
+                            .as_deref()
+                            .map(|code| format!("[{code}] "))
+                            .unwrap_or_default();
+                        let severity = match problem.severity {
+                            Severity::Error => "error",
+                            Severity::Warning => "warning",
+                        };
+                        let line = format!(
+                            "{wanted}:{}:{} {severity} {code}{}",
+                            problem.line, problem.column, problem.message
+                        );
+                        messages.push(line.chars().take(256).collect());
+                    } else {
+                        truncated = true;
+                    }
+                }
+                return Some(if messages.is_empty() && !truncated {
+                    EditDiagnostics::CurrentClean {}
+                } else {
+                    EditDiagnostics::CurrentReported {
+                        messages,
+                        delta: format!(
+                            "project check {:.1}s: {errors} errors, {warnings} warnings in this file",
+                            snapshot.duration_ms as f64 / 1000.0
+                        ),
+                        truncated,
+                    }
+                });
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Some(EditDiagnostics::Unknown {});
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 
     /// Durably settles one typed pre-effect Workspace outcome without dispatching a write.
@@ -3524,6 +3646,7 @@ mod stop_retry_tests {
             stop_reply: None,
             native_epoch: 0,
             failure_detail: None,
+            check_scheduled: false,
         };
         worker.activate(&mut job).await.unwrap();
         let receipt = worker.grants.get(&binding).cloned().unwrap();
@@ -3582,6 +3705,7 @@ mod stop_retry_tests {
             stop_reply: None,
             native_epoch: 0,
             failure_detail: None,
+            check_scheduled: false,
         };
         (job, cancel_sender)
     }
@@ -3674,6 +3798,7 @@ mod stop_retry_tests {
             stop_reply: None,
             native_epoch: 0,
             failure_detail: None,
+            check_scheduled: false,
         };
         let (context_reply, authority, source) = worker.context(&mut context_job).await.unwrap();
         worker.shared.ledger.lock().unwrap().details.insert(
@@ -3711,6 +3836,7 @@ mod stop_retry_tests {
             stop_reply: None,
             native_epoch: 0,
             failure_detail: None,
+            check_scheduled: false,
         };
         let (reply, authority, source) = worker.edit(&mut edit_job).await.unwrap();
         assert!(matches!(
@@ -3951,6 +4077,7 @@ mod stop_retry_tests {
             stop_reply: None,
             native_epoch: 0,
             failure_detail: None,
+            check_scheduled: false,
         };
         let (reply, _, source) = worker.context(&mut job).await.unwrap();
         assert!(matches!(
@@ -4049,6 +4176,7 @@ mod stop_retry_tests {
                 stop_reply: None,
                 native_epoch: 0,
                 failure_detail: None,
+                check_scheduled: false,
             },
             cancel_sender,
         )
@@ -4551,6 +4679,7 @@ mod stop_retry_tests {
                 stop_reply: None,
                 native_epoch: 0,
                 failure_detail: None,
+                check_scheduled: false,
             },
             cancel_sender,
         )

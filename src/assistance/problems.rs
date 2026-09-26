@@ -394,21 +394,41 @@ impl ProjectProblemFeed {
     /// An unknown or read-restricted binding, or a worktree outside the allowed roots, schedules
     /// nothing.
     pub fn changed(&self, binding: &[u8; 32]) {
-        self.changed_with(binding, || {});
+        self.changed_with(binding, false, || {});
     }
 
-    /// Admits the trigger while holding the binding lock; `before_trigger` is a test seam for
-    /// proving a concurrent restriction cannot slip between the decision and scheduler call.
-    fn changed_with(&self, binding: &[u8; 32], before_trigger: impl FnOnce()) {
+    /// Like [`ProjectProblemFeed::changed`] for a check the caller waits on: the run skips the
+    /// cooldown after the previous run, and the returned input generation lets the caller wait
+    /// for a snapshot at or past it. `None` when the trigger was not admitted.
+    pub fn changed_generation(&self, binding: &[u8; 32]) -> Option<u64> {
+        self.changed_with(binding, true, || {})
+    }
+
+    /// Admits the trigger while holding the binding lock and returns the resulting input
+    /// generation; `before_trigger` is a test seam for proving a concurrent restriction cannot
+    /// slip between the decision and scheduler call.
+    fn changed_with(
+        &self,
+        binding: &[u8; 32],
+        urgent: bool,
+        before_trigger: impl FnOnce(),
+    ) -> Option<u64> {
         if let Ok(state) = self.state.lock()
             && let Some(bound) = state.bindings.get(binding)
             && bound.admitted
             && !bound.read_restricted
         {
             before_trigger();
-            self.scheduler
-                .trigger(&bound.repository_key, &bound.worktree);
+            if urgent {
+                self.scheduler
+                    .trigger_urgent(&bound.repository_key, &bound.worktree);
+            } else {
+                self.scheduler
+                    .trigger(&bound.repository_key, &bound.worktree);
+            }
+            return Some(self.scheduler.generation(&bound.worktree));
         }
+        None
     }
 
     /// Returns the `<agent-ide>` block due for `binding`, marking it delivered, or `None`.
@@ -1453,7 +1473,7 @@ mod tests {
             let feed_ref = &feed;
             let trigger = scope.spawn(move || {
                 let _runtime = handle.enter();
-                feed_ref.changed_with(&binding, || {
+                feed_ref.changed_with(&binding, false, || {
                     entered_check.wait();
                     release_check.wait();
                 });
