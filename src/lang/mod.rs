@@ -17,6 +17,7 @@ use std::{
 
 use async_lsp::lsp_types as lsp;
 
+pub mod edits;
 pub mod go;
 pub mod path;
 pub mod python;
