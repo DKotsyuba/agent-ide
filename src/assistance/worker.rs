@@ -1747,7 +1747,7 @@ impl<'a> Worker<'a> {
                 .shutting_down
                 .load(std::sync::atomic::Ordering::Acquire)
             {
-                self.release_all_live_rust().await;
+                self.release_all_live().await;
                 if let Err(code) = self.close_all_providers().await
                     && let Ok(mut failure) = self.shared.shutdown_failure.lock()
                 {
@@ -3089,7 +3089,7 @@ impl<'a> Worker<'a> {
         }
         self.grants.remove(binding);
         self.pending_revocations.remove(binding);
-        self.release_live_rust(binding).await;
+        self.release_live(binding).await;
         self.release_binding_state(binding);
         Ok(())
     }

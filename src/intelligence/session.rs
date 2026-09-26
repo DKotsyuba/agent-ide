@@ -13,7 +13,7 @@ use async_lsp::{
     router::Router,
 };
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     future::Future,
     io,
     ops::ControlFlow,
@@ -1028,7 +1028,7 @@ impl Session {
 
     /// Synchronizes the source and returns the provider's document symbols (nested form).
     ///
-    /// A flat response is lifted to childless document symbols so callers see one shape.
+    /// Flat responses are nested by `containerName` when their parent is present.
     pub async fn document_symbols(
         &mut self,
         observation: &SourceObservation,
@@ -1044,11 +1044,12 @@ impl Session {
             .await?;
         Ok(match reply {
             Some(lsp::DocumentSymbolResponse::Nested(symbols)) => symbols,
-            Some(lsp::DocumentSymbolResponse::Flat(symbols)) => symbols
-                .into_iter()
-                .map(|symbol| {
+            Some(lsp::DocumentSymbolResponse::Flat(symbols)) => {
+                let mut roots = Vec::new();
+                let mut children = BTreeMap::<String, Vec<lsp::DocumentSymbol>>::new();
+                for symbol in symbols {
                     #[allow(deprecated)]
-                    lsp::DocumentSymbol {
+                    let document = lsp::DocumentSymbol {
                         name: symbol.name,
                         detail: None,
                         kind: symbol.kind,
@@ -1057,9 +1058,21 @@ impl Session {
                         range: symbol.location.range,
                         selection_range: symbol.location.range,
                         children: None,
+                    };
+                    if let Some(container) = symbol.container_name {
+                        children.entry(container).or_default().push(document);
+                    } else {
+                        roots.push(document);
                     }
-                })
-                .collect(),
+                }
+                for root in &mut roots {
+                    if let Some(nested) = children.remove(&root.name) {
+                        root.children = Some(nested);
+                    }
+                }
+                roots.extend(children.into_values().flatten());
+                roots
+            }
             None => Vec::new(),
         })
     }

@@ -211,6 +211,17 @@ pub struct ProjectResolutionInputsV1 {
 }
 
 impl ProjectResolutionInputsV1 {
+    /// Reports whether two documents share the same worktree, immutable bundle, and captured project files.
+    ///
+    /// The document path and its JS/TS language identifier may differ; both remain valid documents
+    /// for one TypeScript server session. A changed configuration, package input, worktree, or
+    /// provider bundle selects a different project identity and requires a new session.
+    pub fn same_project(&self, other: &Self) -> bool {
+        self.worktree == other.worktree
+            && self.bundle_id == other.bundle_id
+            && self.files == other.files
+    }
+
     /// Validates an already-observed canonical input set against a fresh Workspace observation.
     ///
     /// `document` must be an absolute `.js`, `.jsx`, `.ts`, or `.tsx` path below `worktree`.
@@ -558,8 +569,6 @@ pub struct TypeScriptProfiles {
 /// Closed abnormal outcomes that permanently quarantine one exact TypeScript profile key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TypeScriptShutdownFailure {
-    /// The LSP exchange, cancellation, or pre-spawn remeasurement failed.
-    Operation,
     /// The direct bridge child exited with a nonzero status after the protocol exchange.
     NonzeroExit,
     /// The direct bridge did not exit within the bounded graceful wait.
@@ -730,6 +739,13 @@ impl TypeScriptProtocolChild {
             self.child.stdout.as_mut().expect("protocol stdout taken"),
             self.child.stdin.as_mut().expect("protocol stdin taken"),
         )
+    }
+
+    /// Transfers the protocol pipes to one live session while retaining child ownership for reap.
+    pub fn take_pipes(
+        &mut self,
+    ) -> Option<(tokio::process::ChildStdin, tokio::process::ChildStdout)> {
+        Some((self.child.stdin.take()?, self.child.stdout.take()?))
     }
 
     /// Reaps a normally shut down bridge without requesting TERM or KILL.

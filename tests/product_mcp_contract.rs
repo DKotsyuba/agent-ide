@@ -269,12 +269,17 @@ fn assert_compact_envelope(reply: &Value) {
         }
         None => text,
     };
-    let expected_prefix = if state == "complete" && structured.get("kind") == Some(&json!("test")) {
-        "tests #"
-    } else {
-        state
-    };
-    assert!(text.starts_with(expected_prefix), "{reply}");
+    let kind = structured.get("kind").and_then(Value::as_str);
+    if state == "complete" && kind == Some("test") {
+        assert!(text.starts_with("tests #"), "{reply}");
+    } else if !matches!(kind, Some("outline" | "read" | "symbol")) {
+        // Symbol tools return their rendered document/card body directly on complete replies.
+        assert!(text.starts_with(state), "{reply}");
+    }
+    if kind == Some("edit") {
+        let outcome = structured["result"]["outcome"].as_str().unwrap();
+        assert!(text.starts_with(&format!("edit: {outcome}")), "{reply}");
+    }
     assert_eq!(
         result.get("isError") == Some(&json!(true)),
         state == "error"
@@ -4681,17 +4686,82 @@ async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
     daemon.wait().await.unwrap();
 }
 
+/// Exercises persistent Pyright symbol tools and a symbol-addressed replacement through binding stop.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
+async fn configured_product_pyright_symbol_tools_and_edit() {
+    let fixture = ProductFixture::new(json!([accepted_pyright_provider("pyright-symbol-cache")]));
+    let source = "class Greeter:\n    def method(self) -> str:\n        return \"hello\"\n\ndef caller() -> str:\n    return Greeter().method()\n";
+    std::fs::write(fixture.root.join("main.py"), source).unwrap();
+    fixture.git(&["add", "--", "main.py"]);
+    fixture.git(&["commit", "--quiet", "-m", "Python symbol fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "pyright-symbol").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"pyright-symbol-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+
+    let outline = actor
+        .call(&fixture, "ide.outline", json!({"path":"main.py"}))
+        .await;
+    let outline = actor.settle(&fixture, outline).await;
+    assert_eq!(outline["kind"], "outline", "{outline}");
+    assert!(
+        outline["text"].as_str().unwrap().contains("class Greeter"),
+        "{outline}"
+    );
+    assert!(
+        outline["text"].as_str().unwrap().contains("method"),
+        "{outline}"
+    );
+    let symbol = actor
+        .call(
+            &fixture,
+            "ide.symbol",
+            json!({"symbol":"main.py#Greeter/method"}),
+        )
+        .await;
+    let symbol = actor.settle(&fixture, symbol).await;
+    let text = symbol["text"].as_str().unwrap();
+    assert!(text.contains("symbol: method — method"), "{symbol}");
+    assert!(
+        text.contains("caller")
+            && text.contains("main.py:6")
+            && text.contains("Greeter().method()"),
+        "{symbol}"
+    );
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"symbol":"main.py#Greeter/method"}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    assert_eq!(read["kind"], "read", "{read}");
+    let edit = actor.call(&fixture, "ide.edit", json!({"operation_id":"pyright-symbol-replace","symbol":"main.py#Greeter/method","op":"replace","content":"    def method(self) -> str:\n        return \"updated\""})).await;
+    let edit = actor.settle(&fixture, edit).await;
+    assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A managed Codex profile with the accepted credential-glob denies retains Pyright semantics
 /// and project check plates while a denied source path remains unavailable.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
 async fn configured_product_pyright_semantics_and_checks() {
     let fixture = ProductFixture::new(json!([accepted_pyright_provider("pyright-check-cache")]));
-    std::fs::write(
-        fixture.root.join("main.py"),
-        "def value() -> int:\n    return \"bad\"\n",
-    )
-    .unwrap();
+    let source = "def value() -> int:\n    return \"bad\"\n";
+    std::fs::write(fixture.root.join("main.py"), source).unwrap();
     fixture.git(&["add", "--", "main.py"]);
     fixture.git(&["commit", "--quiet", "-m", "Python fixture"]);
     let state = fixture.state();
@@ -4718,7 +4788,11 @@ async fn configured_product_pyright_semantics_and_checks() {
     assert!(plate.starts_with("<agent-ide>\nrust:"), "{plate}");
     await_eyes_check_start(&home).await;
     let context = actor
-        .call(&fixture, "ide.context", json!({"path":"main.py"}))
+        .call(
+            &fixture,
+            "ide.context",
+            json!({"path":"main.py","byte_offset":source.find("value").unwrap()}),
+        )
         .await;
     let context = actor.settle(&fixture, context).await;
     let text = context["text"].as_str().unwrap();
@@ -4972,10 +5046,10 @@ async fn configured_product_acceptance_edit_diagnostics_telemetry_and_fallback()
 /// Exercises real JS, JSX, TS, and TSX through the pinned exclusive TypeScript product profile.
 ///
 /// The ignored release check requires exact launcher-owned Node, bridge, `tsserver.js`, and loaded
-/// closure paths. Each extension must reach semantic definition/reference results through a fresh
-/// one-shot bridge; JS and TS return provisional lower bounds for type errors, while a clean TS
-/// source stays unknown. Exact membership proves project selection; graceful shutdown, EOF, zero
-/// exit, and direct-child reap are enforced before the next fixture may run.
+/// closure paths. Each extension must reach semantic definition/reference results through the
+/// binding's retained bridge; JS and TS return provisional lower bounds for type errors, while a
+/// clean TS source stays unknown. Exact membership proves project selection; `ide.stop` shuts down
+/// and reaps the child.
 #[tokio::test]
 #[ignore = "requires exact AGENT_IDE_NODE, AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER and AGENT_IDE_TSSERVER environment"]
 async fn configured_product_returns_real_typescript_family_context_and_reaps() {
@@ -5074,6 +5148,75 @@ async fn configured_product_returns_real_typescript_family_context_and_reaps() {
     }
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Exercises persistent TypeScript symbol tools and a symbol-addressed replacement through binding stop.
+#[tokio::test]
+#[ignore = "requires exact AGENT_IDE_NODE, AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER and AGENT_IDE_TSSERVER environment"]
+async fn configured_product_typescript_symbol_tools_and_edit() {
+    let fixture = ProductFixture::new(json!([accepted_typescript_provider()]));
+    let source = "class Greeter {\n  method(): string { return \"hello\"; }\n}\nfunction caller(): string { return new Greeter().method(); }\n";
+    std::fs::write(fixture.root.join("fixture.ts"), source).unwrap();
+    std::fs::write(fixture.root.join("tsconfig.json"), "{\"compilerOptions\":{\"types\":[],\"moduleResolution\":\"node10\"},\"files\":[\"fixture.ts\"]}\n").unwrap();
+    fixture.git(&["add", "--", "fixture.ts", "tsconfig.json"]);
+    fixture.git(&["commit", "--quiet", "-m", "TypeScript symbol fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "typescript-symbol").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"typescript-symbol-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+
+    let outline = actor
+        .call(&fixture, "ide.outline", json!({"path":"fixture.ts"}))
+        .await;
+    let outline = actor.settle(&fixture, outline).await;
+    assert_eq!(outline["kind"], "outline", "{outline}");
+    assert!(
+        outline["text"].as_str().unwrap().contains("class Greeter"),
+        "{outline}"
+    );
+    assert!(
+        outline["text"].as_str().unwrap().contains("method"),
+        "{outline}"
+    );
+    let symbol = actor
+        .call(
+            &fixture,
+            "ide.symbol",
+            json!({"symbol":"fixture.ts#Greeter/method"}),
+        )
+        .await;
+    let symbol = actor.settle(&fixture, symbol).await;
+    let text = symbol["text"].as_str().unwrap();
+    assert!(text.contains("symbol: method — method"), "{symbol}");
+    assert!(
+        text.contains("caller")
+            && text.contains("fixture.ts:4")
+            && text.contains("new Greeter().method()"),
+        "{symbol}"
+    );
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"symbol":"fixture.ts#Greeter/method"}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    assert_eq!(read["kind"], "read", "{read}");
+    let edit = actor.call(&fixture, "ide.edit", json!({"operation_id":"typescript-symbol-replace","symbol":"fixture.ts#Greeter/method","op":"replace","content":"  method(): string { return \"updated\"; }"})).await;
+    let edit = actor.settle(&fixture, edit).await;
+    assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
