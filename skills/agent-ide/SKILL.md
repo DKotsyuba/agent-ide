@@ -45,6 +45,21 @@ and cost a fraction of the context:
 - `ide.read {"symbol":"src/x.rs#Type/method"}` or `{"path":"src/x.rs","lines":"120-180"}`
   — the body with line numbers; its `source_ref` is what `ide.edit` needs.
 
+Edit by symbol with the same paths; every form formats the candidate with the project's
+formatter and answers with the file's diagnostics:
+
+- `ide.edit {"operation_id":"…","op":"replace","symbol":"src/x.rs#Type/method","content":"…"}`
+  — new body for the symbol; `content` is the whole symbol including its doc comment and
+  attributes.
+- `ide.edit {"operation_id":"…","op":"insert","symbol":"src/x.rs#Type/anchor","where":"before"|"after"|"first"|"last","content":"…"}`
+  — a new symbol placed relative to the anchor (`first`/`last` inside a container such as an
+  impl, class or module); indentation follows the neighbours.
+- `ide.edit {"operation_id":"…","op":"delete","symbol":"…"}` — removes the symbol with its header.
+- `ide.edit {"operation_id":"…","op":"rename","symbol":"…","new_name":"…"}` — project-wide rename
+  by the language server; the reply lists every touched file.
+- `ide.edit {"operation_id":"…","path":"src/x.rs","lines":"120-180","content":"…"}` — replaces a
+  line range when the target is not a symbol (imports, constants, configuration).
+
 Symbol paths are `file#Owner/name`: `#` separates the file, `/` is nesting (impl, class,
 namespace, module → member). Inherent `impl Foo` members are addressed as `Foo/method`;
 trait impls keep `impl Trait for Foo` as the segment. A `provider_loading` error means
