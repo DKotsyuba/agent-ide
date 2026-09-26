@@ -456,8 +456,11 @@ async fn binary_discovery_is_static_and_inactive_calls_are_fail_open() {
             "ide.diff",
             "ide.edit",
             "ide.inspect",
+            "ide.outline",
+            "ide.read",
             "ide.start",
-            "ide.stop"
+            "ide.stop",
+            "ide.symbol"
         ]
     );
     assert!(
@@ -510,7 +513,7 @@ async fn binary_discovery_is_static_and_inactive_calls_are_fail_open() {
     assert!(!runtime.exists());
 }
 
-/// Managed startup failure remains a disconnected static six-tool MCP with bounded fallback calls.
+/// Managed startup failure remains a disconnected static nine-tool MCP with bounded fallback calls.
 #[tokio::test]
 async fn managed_startup_failure_serves_exact_static_tools_without_ipc() {
     let candidate = std::env::current_dir().unwrap();
@@ -536,8 +539,11 @@ async fn managed_startup_failure_serves_exact_static_tools_without_ipc() {
             "ide.diff",
             "ide.edit",
             "ide.inspect",
+            "ide.outline",
+            "ide.read",
             "ide.start",
-            "ide.stop"
+            "ide.stop",
+            "ide.symbol"
         ]
     );
     let unavailable = mcp

@@ -176,7 +176,7 @@ impl Worker<'_> {
                     .find(|line| is_declaration_line(line))
                     .filter(|line| line.len() <= 200);
                 if let Some(resolved) = resolved {
-                    card.signature = Some(resolved.to_owned());
+                    card.signature = Some(resolved.trim_end_matches(" {").to_owned());
                 }
             }
             if want_usages {

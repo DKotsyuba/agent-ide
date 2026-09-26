@@ -754,6 +754,9 @@ impl Session {
                             hierarchical_document_symbol_support: Some(true),
                             ..Default::default()
                         }),
+                        call_hierarchy: Some(lsp::CallHierarchyClientCapabilities {
+                            dynamic_registration: Some(false),
+                        }),
                         hover: Some(lsp::HoverClientCapabilities {
                             content_format: Some(vec![
                                 lsp::MarkupKind::PlainText,

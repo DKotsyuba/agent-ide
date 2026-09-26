@@ -2,7 +2,7 @@
 //!
 //! Per-language detection (manifests, environment, commands, entry points) is owned by the
 //! [`crate::lang::LanguageSupport`] modules and arrives here as an already-built
-//! `Vec<`[`LanguageProject`]`>`. This module adds everything no language module owns: git
+//! `Vec<`[`LanguageProject`](crate::lang::LanguageProject)`>`. This module adds everything no language module owns: git
 //! plumbing, a single walk of the tree for layout/line counts/docs, and the caller-supplied
 //! language server states and problem summary, then renders the fixed-shape card.
 //!
@@ -69,7 +69,7 @@ pub struct LanguageSummary {
     pub language: Language,
     /// Files under the root whose extension [`Language::for_path`] maps to this language.
     pub files: u32,
-    /// Summed line count of those files that are at most [`MAX_LINE_COUNT_BYTES`]; larger files
+    /// Summed line count of those files that are at most `MAX_LINE_COUNT_BYTES`; larger files
     /// still count towards `files` but are never opened, so `lines` can undercount on repos with
     /// huge generated sources.
     pub lines: u64,
@@ -109,15 +109,15 @@ pub struct ProjectCard {
     /// Sorted by `lines` descending (ties broken by [`Language`]'s declaration order) so the
     /// largest language always leads `render`'s `languages:` line.
     pub languages: Vec<LanguageSummary>,
-    /// Top-level directories, sorted by `files` descending, capped at [`MAX_LAYOUT_TOP`] entries.
+    /// Top-level directories, sorted by `files` descending, capped at `MAX_LAYOUT_TOP` entries.
     pub layout: Vec<DirSummary>,
     /// Matched doc paths (`README*`, `CLAUDE.md`, `AGENTS.md`, `CONTRIBUTING*` at the root;
     /// `docs/**/*.md` at any depth), in display priority order (that same list order, then
-    /// alphabetical). `render` shows only the first [`MAX_DOCS_SHOWN`].
+    /// alphabetical). `render` shows only the first `MAX_DOCS_SHOWN`.
     pub docs: Vec<PathBuf>,
     pub servers: Vec<ServerState>,
     pub problems: Option<String>,
-    /// Set when the walk hit [`MAX_WALK_FILES`] before finishing; every count above is then a
+    /// Set when the walk hit `MAX_WALK_FILES` before finishing; every count above is then a
     /// partial result, not a complete one.
     pub truncated: bool,
 }
@@ -211,7 +211,7 @@ fn count_lines(bytes: &[u8]) -> u64 {
 
 /// Classifies one file the walk discovered: records it as a doc when it matches a doc pattern,
 /// and when its extension maps to a [`Language`], counts it and (when it is at most
-/// [`MAX_LINE_COUNT_BYTES`]) adds its line count.
+/// `MAX_LINE_COUNT_BYTES`) adds its line count.
 fn visit_file(root: &Path, path: &Path, state: &mut WalkState) {
     let rel = path.strip_prefix(root).unwrap_or(path).to_path_buf();
     if is_doc_path(&rel) {
@@ -234,7 +234,7 @@ fn visit_file(root: &Path, path: &Path, state: &mut WalkState) {
 }
 
 /// Recursively scans `dir`, `depth` levels below `root`, stopping early once
-/// [`MAX_WALK_FILES`] files have been seen. Returns the total file count anywhere under `dir`
+/// `MAX_WALK_FILES` files have been seen. Returns the total file count anywhere under `dir`
 /// (noise directories excluded, no depth limit) and, only for `depth < 2`, a [`DirSummary`] per
 /// immediate subdirectory — so the root call (`depth == 0`) returns the depth-1 entries with
 /// their own depth-2 children attached, and depth-2 directories report a file count but no
@@ -428,7 +428,7 @@ const COMMAND_SOURCE_ORDER: [CommandSource; 5] = [
 /// `project:`/`root:` and, when any language was detected, `languages:` always appear;
 /// `git:`/`problems:` vanish with a `None` value, and `commands:`/`environment:`/`layout:`/
 /// `entry points:`/`docs:`/`servers:` vanish when there is nothing to say. When the full render
-/// exceeds [`MAX_CARD_BYTES`] bytes, `layout` drops its depth-2 children first, then `docs`
+/// exceeds `MAX_CARD_BYTES` bytes, `layout` drops its depth-2 children first, then `docs`
 /// collapses to 3 entries, then to none, in that order, until the render fits (or the smallest
 /// attempt is returned as a best effort).
 pub fn render(card: &ProjectCard) -> String {

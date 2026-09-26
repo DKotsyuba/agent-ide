@@ -5,9 +5,10 @@ description: Use Agent IDE `ide.*` tools, including `ide.edit` when offered, for
 
 # Agent IDE
 
-Agent IDE exposes five lifecycle tools: `ide.start`, `ide.context`, `ide.diff`,
-`ide.inspect`, `ide.stop`, plus `ide.edit` when the active product surface offers it. Use this workflow whenever they are
-offered and the task implements, debugs, refactors, or writes/fixes source.
+Agent IDE exposes the lifecycle tools `ide.start`, `ide.context`, `ide.diff`,
+`ide.inspect`, `ide.stop`, `ide.edit`, and the symbol tools `ide.outline`, `ide.read`,
+`ide.symbol`. Use this workflow whenever they are offered and the task implements,
+debugs, refactors, or writes/fixes source.
 Skip it for read-only exploration, prose, configuration, or when `ide.*` is
 not present — use native host read/write/test tools plus CodeGraph (when
 available) instead.
@@ -27,6 +28,27 @@ below. Do not repeat discovery in a loop.
 Each accepted reply carries one compact decision-facing text block that states every fact needed
 for the next action — state, `detail_ref`, `continuation`, `retry`, Edit outcome and `source_ref`.
 When a reply is `pending`, call `ide.inspect` with its `detail_ref` to retrieve the result.
+
+## Understanding code by symbols
+
+Prefer the symbol tools over reading whole files; they answer from the language server
+and cost a fraction of the context:
+
+- `ide.outline {"path":"src/x.rs"}` — the file skeleton: every symbol with its signature,
+  doc line and line numbers, members indented, test modules collapsed. Use it before
+  reading any file longer than a screen.
+- `ide.symbol {"symbol":"src/x.rs#Type/method"}` or `{"symbol":"Name"}` — a symbol card:
+  resolved signature, documentation, the definition with line numbers, usages grouped by
+  `src`/`tests` with the source line text, and `callers`/`callees` (set `"callers":1`).
+  A bare name that matches several symbols answers with the candidate paths; repeat
+  with one exact path.
+- `ide.read {"symbol":"src/x.rs#Type/method"}` or `{"path":"src/x.rs","lines":"120-180"}`
+  — the body with line numbers; its `source_ref` is what `ide.edit` needs.
+
+Symbol paths are `file#Owner/name`: `#` separates the file, `/` is nesting (impl, class,
+namespace, module → member). Inherent `impl Foo` members are addressed as `Foo/method`;
+trait impls keep `impl Trait for Foo` as the segment. A `provider_loading` error means
+the language server is still loading the workspace: repeat the same call in a few seconds.
 
 ## Workflow
 
