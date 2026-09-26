@@ -36,7 +36,11 @@ impl Worker<'_> {
             .await
             .map_err(|_| FailureCode::ProviderUnavailable)?;
         let language = Lang::for_path(observed.path()).ok_or(FailureCode::ProviderUnavailable)?;
-        let support = lang::support(language).ok_or(FailureCode::ProviderUnavailable)?;
+        // A test is whatever the outline marks as one, wherever it lives: Rust keeps most unit
+        // tests in a `#[cfg(test)] mod tests` of the file under test, so the test-file
+        // convention alone would miss them. One outline per referenced file.
+        let mut outlines: std::collections::BTreeMap<std::path::PathBuf, crate::lang::Outline> =
+            std::collections::BTreeMap::new();
         let mut tests = std::collections::BTreeSet::new();
         for location in refs {
             let Ok(absolute) = location.uri.to_file_path() else {
@@ -45,12 +49,13 @@ impl Worker<'_> {
             let Ok(relative) = absolute.strip_prefix(&root) else {
                 continue;
             };
-            if !support.is_test_file(relative) {
-                continue;
-            }
             let relative = relative.to_path_buf();
-            let (test_observed, test_bytes) = self.observe(&binding, relative.clone()).await?;
-            let (test_outline, _) = self.outline_of(job, &test_observed, &test_bytes).await?;
+            if !outlines.contains_key(&relative) {
+                let (test_observed, test_bytes) = self.observe(&binding, relative.clone()).await?;
+                let (test_outline, _) = self.outline_of(job, &test_observed, &test_bytes).await?;
+                outlines.insert(relative.clone(), test_outline);
+            }
+            let test_outline = &outlines[&relative];
             let line = location.range.start.line + 1;
             let mut enclosing = None;
             for candidate in &test_outline.symbols {
