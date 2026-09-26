@@ -448,7 +448,13 @@ impl Worker<'_> {
             .unwrap_or_default();
             for item in related_items {
                 let (node, item_file, item_symbol) =
-                    self.graph_node(job, &worktree_root, item.clone()).await?;
+                    match self.graph_node(job, &worktree_root, item.clone()).await {
+                        Ok(resolved) => resolved,
+                        // Calls into dependencies or the standard library resolve to files outside
+                        // the worktree; they are not graph nodes and must not fail the whole graph.
+                        Err(FailureCode::UnknownSymbol) => continue,
+                        Err(code) => return Err(code),
+                    };
                 let (related, is_new) = if let Some(index) = indexes.get(&node.path).copied() {
                     (index, false)
                 } else {

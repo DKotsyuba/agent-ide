@@ -4569,7 +4569,7 @@ fn graph_test_fixture() -> ProductFixture {
     let fixture = symbol_test_fixture();
     std::fs::write(
         fixture.root.join("src/lib.rs"),
-        "pub fn a() { b(); }\npub fn b() { c(); }\npub fn c() { a(); }\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn reaches_a() {\n        super::a();\n    }\n}\n",
+        "pub fn a() {\n    b();\n    let _ = String::new();\n}\npub fn b() { c(); }\npub fn c() { a(); }\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn reaches_a() {\n        super::a();\n    }\n}\n",
     )
     .unwrap();
     std::fs::write(fixture.root.join("tests/path_tests.rs"), "").unwrap();
