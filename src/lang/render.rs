@@ -114,6 +114,9 @@ impl CallGraph {
 }
 
 /// Renders a depth-limited graph as an indented tree; repeated nodes are marked `(seen)`.
+///
+/// When [`CallGraph::capped`] is set, the closing line names the ceiling(s) actually reached:
+/// `… capped at 60 nodes`, `… capped at 120 edges`, or both joined by `or`.
 pub fn call_graph_text(graph: &CallGraph, direction: &str, depth: u8) -> String {
     let root = &graph.nodes[0];
     let subject = match direction {
@@ -140,7 +143,19 @@ pub fn call_graph_text(graph: &CallGraph, direction: &str, depth: u8) -> String 
         render_graph_children(graph, 0, selected, 1, depth, &mut seen, &mut out);
     }
     if graph.capped {
-        out.push_str("… capped at 60 nodes or 120 edges\n");
+        // A cap can only be recorded when its list reached the ceiling, so the lengths say
+        // which one was hit; a hand-built `capped` graph falls back to naming both.
+        let message = match (
+            graph.nodes.len() == MAX_GRAPH_NODES,
+            graph.edges.len() == MAX_GRAPH_EDGES,
+        ) {
+            (true, true) | (false, false) => {
+                format!("… capped at {MAX_GRAPH_NODES} nodes or {MAX_GRAPH_EDGES} edges\n")
+            }
+            (true, false) => format!("… capped at {MAX_GRAPH_NODES} nodes\n"),
+            (false, true) => format!("… capped at {MAX_GRAPH_EDGES} edges\n"),
+        };
+        out.push_str(&message);
     }
     out
 }
@@ -256,7 +271,54 @@ mod graph_tests {
                 .is_none()
         );
         assert!(graph.capped);
-        assert!(call_graph_text(&graph, "callers", 1).contains("… capped at 60 nodes"));
+        // Only the node ceiling was reached, so the line stops after the node count.
+        assert!(call_graph_text(&graph, "callers", 1).contains("… capped at 60 nodes\n"));
+    }
+
+    /// Names the edge ceiling alone when only the 120-edge cap stopped collection.
+    #[test]
+    fn call_graph_names_the_edge_cap_when_only_edges_are_capped() {
+        let mut graph = CallGraph::new(GraphNode {
+            path: "src/lib.rs#root".to_owned(),
+            file: "src/lib.rs".to_owned(),
+            line: 1,
+            is_test: false,
+        });
+        for index in 1..16 {
+            graph
+                .add_node(GraphNode {
+                    path: format!("src/lib.rs#f{index}"),
+                    file: "src/lib.rs".to_owned(),
+                    line: index + 1,
+                    is_test: false,
+                })
+                .unwrap();
+        }
+        // Sixteen nodes supply 240 distinct caller pairs, enough to reach the edge ceiling
+        // (and one refused attempt past it) long before the 60-node ceiling.
+        let mut accepted = 0;
+        'fill: for from in 0..graph.nodes.len() {
+            for to in 0..graph.nodes.len() {
+                if from == to {
+                    continue;
+                }
+                if !graph.add_edge(GraphEdge {
+                    from,
+                    to,
+                    direction: GraphDirection::Callers,
+                }) {
+                    break 'fill;
+                }
+                accepted += 1;
+            }
+        }
+        assert_eq!(accepted, MAX_GRAPH_EDGES);
+        assert_eq!(graph.edges.len(), MAX_GRAPH_EDGES);
+        assert!(graph.nodes.len() < MAX_GRAPH_NODES);
+        assert!(graph.capped);
+        let text = call_graph_text(&graph, "callers", 1);
+        assert!(text.contains("… capped at 120 edges\n"));
+        assert!(!text.contains("… capped at 60 nodes"));
     }
 
     /// Keeps callers before callees for a two-sided graph and marks a repeated test node.
