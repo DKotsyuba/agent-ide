@@ -5956,8 +5956,9 @@ async fn configured_product_claude_returns_real_pyright_semantic_context_diff_an
 /// crate, so a passing cross-crate definition is real evidence of loaded workspace semantics, not
 /// same-file lexical fallback. The managed-sandbox `procMacro`-disabled route is proven separately
 /// (`session_tests::managed_rust_settings_disable_proc_macro_expansion`); this exercises the same
-/// production Rust profile construction through the disabled-profile fixture route. The two commits
-/// touching `value` also let `ide.symbol {history: true}` return the real per-definition git log.
+/// production Rust profile construction through the disabled-profile fixture route. The three
+/// commits touching line 1 of `src/lib.rs` — the `ProductFixture::new` base commit plus the two made
+/// here — also let `ide.symbol {history: true}` return the real per-definition git log.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN environment"]
 async fn configured_product_rust_resolves_definition_across_a_crate_boundary() {
@@ -6053,11 +6054,18 @@ async fn configured_product_rust_resolves_definition_across_a_crate_boundary() {
     let symbol = actor.settle(&fixture, symbol).await;
     let symbol_text = symbol["text"].as_str().unwrap();
     assert!(
-        symbol_text.contains("history: 2 last commits touching the definition"),
+        symbol_text.contains("history: 3 last commits touching the definition"),
         "{symbol}"
     );
-    assert!(
-        symbol_text.contains("tune value bound") && symbol_text.contains("cross-crate fixture"),
+    let subjects: Vec<&str> = symbol_text
+        .lines()
+        .skip_while(|line| !line.starts_with("history:"))
+        .skip(1)
+        .map(|line| line.trim_start().splitn(3, ' ').nth(2).unwrap_or(""))
+        .collect();
+    assert_eq!(
+        subjects,
+        ["tune value bound", "cross-crate fixture", "fixture"],
         "{symbol}"
     );
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
