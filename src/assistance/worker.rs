@@ -1101,6 +1101,14 @@ impl WorkerHandle {
         result
     }
     /// Enqueues or resolves the exact query, returning pending without waiting for provider warmup.
+    ///
+    /// `ide.test` by `path`, `pattern`, `command` or `status` needs no language server, so it
+    /// waits inline (at most 5 s, the bridge's Test budget) for its own job and answers with the
+    /// started/status line directly. `ide.test {symbol}` first resolves references through the
+    /// binding's live language server, which takes seconds on a cold session — longer than any
+    /// bridge request budget — so it is dispatched like every other language-server job: the job
+    /// is queued, this call answers `pending` at once, and the `tests #N: started` or `tests: no
+    /// tests reference …` line is retrieved through `ide.inspect` once selection is done.
     pub async fn submit(
         &self,
         invocation: ValidatedInvocation,
@@ -1120,7 +1128,7 @@ impl WorkerHandle {
                 code: FailureCode::LauncherConfiguration,
             };
         }
-        if tool == AssistanceTool::Test {
+        if tool == AssistanceTool::Test && parameters.get("symbol").is_none() {
             let (send, wait) = oneshot::channel();
             if let Err(code) = self.enqueue(invocation, tool, parameters, attachment, Some(send)) {
                 return PeerReply::Error { code };
@@ -1516,6 +1524,11 @@ struct Worker<'a> {
 
 impl<'a> Worker<'a> {
     /// Handles an explicit test start or same-worktree status request.
+    ///
+    /// Runs inside the queued job. The `symbol` branch resolves references through the live
+    /// language server before selecting tests, so its caller already holds a `pending` reply (see
+    /// [`WorkerHandle::submit`]) and reads the started/no-tests line through `ide.inspect`; the other
+    /// branches are answered inline by the waiting submit.
     async fn test(
         &mut self,
         job: &mut Job,

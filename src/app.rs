@@ -460,6 +460,9 @@ pub async fn dispatch_method_if_running(
     request: MethodDispatch,
     limits: HookTransportLimits,
 ) -> MethodDispatchTransportResult {
+    // `ide.test` by path/pattern/command/status is answered inline by the daemon after its job
+    // ran (`worker::WorkerHandle::submit` waits up to the same 5 s); the symbol form answers `pending`
+    // at once, so no inline wait can outlast this budget.
     let budget = if request.method() == AssistanceMethod::Test {
         Duration::from_secs(5)
     } else {
