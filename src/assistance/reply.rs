@@ -41,6 +41,8 @@ pub enum FailureCode {
     WorkspaceAuthority,
     /// The accepted language provider could not supply the requested service.
     ProviderUnavailable,
+    /// The accepted provider is still loading its workspace; the same call succeeds later.
+    ProviderLoading,
     /// TypeScript project inputs were absent, unsupported, oversized, reordered, or changed.
     ResolutionUnverified,
     /// Stop or a generation fence cancelled this operation.

@@ -691,8 +691,10 @@ impl LiveSession {
     /// Graceful shutdown/exit; the caller still reaps the process. Errors are ignored: a server
     /// that no longer answers is simply reaped.
     pub async fn shutdown(mut self) {
-        let _ = self.session.shutdown().await;
-        let _ = tokio::time::timeout(Duration::from_secs(2), &mut self.driver).await;
+        // A server busy loading its workspace may not answer shutdown promptly; the caller reaps
+        // the process anyway, so the graceful exchange gets one second and no more.
+        let _ = tokio::time::timeout(Duration::from_secs(1), self.session.shutdown()).await;
+        let _ = tokio::time::timeout(Duration::from_millis(500), &mut self.driver).await;
         self.driver.abort();
     }
 }

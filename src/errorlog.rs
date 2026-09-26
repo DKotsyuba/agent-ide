@@ -243,6 +243,8 @@ pub enum ReasonCode {
     WorkspaceAuthority,
     /// [`FailureCode::ProviderUnavailable`].
     ProviderUnavailable,
+    /// [`FailureCode::ProviderLoading`].
+    ProviderLoading,
     /// [`FailureCode::ResolutionUnverified`].
     ResolutionUnverified,
     /// [`FailureCode::Cancelled`].
@@ -327,6 +329,7 @@ impl ReasonCode {
             Self::WorkspaceActivation => "workspace_activation",
             Self::WorkspaceAuthority => "workspace_authority",
             Self::ProviderUnavailable => "provider_unavailable",
+            Self::ProviderLoading => "provider_loading",
             Self::ResolutionUnverified => "resolution_unverified",
             Self::Cancelled => "cancelled",
             Self::Deadline => "deadline",
@@ -389,6 +392,7 @@ impl From<FailureCode> for ReasonCode {
             FailureCode::WorkspaceActivation => Self::WorkspaceActivation,
             FailureCode::WorkspaceAuthority => Self::WorkspaceAuthority,
             FailureCode::ProviderUnavailable => Self::ProviderUnavailable,
+            FailureCode::ProviderLoading => Self::ProviderLoading,
             FailureCode::ResolutionUnverified => Self::ResolutionUnverified,
             FailureCode::Cancelled => Self::Cancelled,
             FailureCode::Deadline => Self::Deadline,

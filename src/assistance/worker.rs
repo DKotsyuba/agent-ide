@@ -1528,6 +1528,7 @@ impl<'a> Worker<'a> {
                 .shutting_down
                 .load(std::sync::atomic::Ordering::Acquire)
             {
+                self.release_all_live_rust().await;
                 if let Err(code) = self.close_all_providers().await
                     && let Ok(mut failure) = self.shared.shutdown_failure.lock()
                 {
@@ -2151,6 +2152,7 @@ impl<'a> Worker<'a> {
             Ok(Some(result))=>(result.context, Some(result.diagnostics)),
             Ok(None)=>(lexical_context(&observed,&bytes,query,"no accepted provider is configured for this source, or the registered path is missing").map_err(|_|FailureCode::SourceUnavailable)?, None),
             Err(FailureCode::ProviderUnavailable)=>(lexical_context(&observed,&bytes,query,"accepted semantic provider is unavailable").map_err(|_|FailureCode::SourceUnavailable)?, None),
+            Err(FailureCode::ProviderLoading)=>(lexical_context(&observed,&bytes,query,"semantic provider is still loading the workspace; repeat the call in a few seconds").map_err(|_|FailureCode::SourceUnavailable)?, None),
             Err(FailureCode::ResolutionUnverified)=>(lexical_context(&observed,&bytes,query,"semantic project resolution is unverified").map_err(|_|FailureCode::SourceUnavailable)?, None),
             Err(FailureCode::ExecutionProfile)=>(lexical_context(&observed,&bytes,query,"accepted semantic provider cannot run under the current execution profile").map_err(|_|FailureCode::SourceUnavailable)?, None),
             Err(code)=>return Err(code),
@@ -2692,6 +2694,7 @@ impl<'a> Worker<'a> {
         }
         self.grants.remove(binding);
         self.pending_revocations.remove(binding);
+        self.release_live_rust(binding).await;
         self.release_binding_state(binding);
         Ok(())
     }

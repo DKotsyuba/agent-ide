@@ -17,10 +17,13 @@ use crate::{
             PyrightViewAdmission, PyrightWorktree,
         },
         rust::{
-            RustProfile, RustProfileError, RustProfileIdentity, RustProtocolChild,
+            RustProfile, RustProfileError, RustProfileIdentity, RustProtocolChild, RustView,
             RustViewAdmission, RustViews, RustWorktree,
         },
-        session::{DiagnosticSnapshot, GoEnv, ProviderSettings, SessionOptions, with_session},
+        session::{
+            DiagnosticSnapshot, GoEnv, LiveSession, ProviderSettings, ReadinessError,
+            SessionOptions, with_session,
+        },
         typescript::{
             ProjectResolutionInputsV1, TypeScriptProfile, TypeScriptProfileError,
             TypeScriptProfiles, TypeScriptProtocolChild, TypeScriptShutdownFailure,
@@ -37,6 +40,14 @@ pub(super) struct ProviderContext {
     pub(super) context: ContextResult,
     /// Latest bounded diagnostic push retained by the same session before shutdown.
     pub(super) diagnostics: DiagnosticSnapshot,
+}
+
+/// One long-lived Rust session owned by a binding: the child, its transport driver and the
+/// admitted view it holds until the binding stops or the transport dies.
+struct LiveRust {
+    child: RustProtocolChild,
+    live: LiveSession,
+    view: RustView,
 }
 
 /// Keeps a shared listener owned until the final logical view is released and reaped.
@@ -120,6 +131,8 @@ pub(super) struct Providers {
     socket_generation: BTreeMap<String, u64>,
     /// Exclusive Rust generation and source bookkeeping.
     rust: RustViews,
+    /// Long-lived Rust sessions, one per binding, kept until the binding stops or the transport dies.
+    live_rust: BTreeMap<BindingRef, LiveRust>,
     /// Exclusive TypeScript generations and owner-lifetime exact-profile quarantine.
     typescript: TypeScriptProfiles,
     /// Strictly increasing protocol/backend generation within this boot.
@@ -148,6 +161,7 @@ impl Providers {
             go_views: BTreeMap::new(),
             socket_generation: BTreeMap::new(),
             rust: RustViews::default(),
+            live_rust: BTreeMap::new(),
             typescript: TypeScriptProfiles::default(),
             generation: 0,
             caches: BTreeMap::new(),
@@ -770,7 +784,9 @@ impl Worker<'_> {
         result
     }
 
-    /// Starts one exclusive accepted Rust session and settles it only after bounded direct-child reap.
+    /// Answers a Rust context request from the binding's long-lived analyzer session, starting
+    /// one on first use. Readiness is awaited per request with a bounded budget, so a slow
+    /// workspace load reports `ProviderLoading` while the analyzer keeps loading in the background.
     async fn rust_context(
         &mut self,
         job: &mut Job,
@@ -780,6 +796,103 @@ impl Worker<'_> {
         query: ContextQuery,
     ) -> Result<ProviderContext, FailureCode> {
         let binding = job.invocation.binding_ref().clone();
+        self.ensure_live_rust(job, launch, source).await?;
+        let budget = job
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .saturating_sub(Duration::from_secs(1))
+            .clamp(Duration::from_millis(100), Duration::from_secs(10));
+        let lease = self
+            .providers
+            .live_rust
+            .get(&binding)
+            .map(|entry| entry.view.lease())
+            .ok_or(FailureCode::Internal)?;
+        self.providers
+            .rust
+            .observe_source(lease, source.sequence())
+            .map_err(|_| FailureCode::Internal)?;
+        let outcome = {
+            let entry = self
+                .providers
+                .live_rust
+                .get_mut(&binding)
+                .ok_or(FailureCode::Internal)?;
+            let readiness = tokio::select! {
+                readiness = entry.live.wait_ready(budget) => readiness,
+                _ = job.cancel.changed() => return Err(FailureCode::Cancelled),
+            };
+            match readiness {
+                Ok(()) => {
+                    let result = {
+                        let operation = entry.live.session.context(source, bytes, query);
+                        tokio::pin!(operation);
+                        tokio::select! {
+                            result = &mut operation => result,
+                            _ = job.cancel.changed() => Err(std::io::Error::other("cancelled")),
+                        }
+                    };
+                    let diagnostics = entry.live.session.diagnostics();
+                    result.map(|context| ProviderContext {
+                        context,
+                        diagnostics,
+                    })
+                }
+                Err(ReadinessError::Loading) => return Err(FailureCode::ProviderLoading),
+                Err(ReadinessError::WorkspaceError) => {
+                    return Err(FailureCode::ProviderUnavailable);
+                }
+                Err(ReadinessError::Gone) => Err(std::io::Error::other("transport gone")),
+            }
+        };
+        let result = match outcome {
+            Ok(context) => Ok(context),
+            Err(_) => {
+                // A failed exchange retires the session; the next request starts a fresh one.
+                self.release_live_rust(&binding).await;
+                Err(FailureCode::ProviderUnavailable)
+            }
+        };
+        if let Some(telemetry) = self.telemetry.as_ref() {
+            let diagnostics = match &result {
+                Ok(context) => match context.diagnostics.readiness {
+                    crate::intelligence::freshness::DiagnosticReadiness::Clean => {
+                        DiagnosticState::Clean
+                    }
+                    crate::intelligence::freshness::DiagnosticReadiness::Reported => {
+                        DiagnosticState::Changed
+                    }
+                    crate::intelligence::freshness::DiagnosticReadiness::Unknown => {
+                        DiagnosticState::Unavailable
+                    }
+                },
+                Err(_) => DiagnosticState::Unavailable,
+            };
+            adapters::provider_summary(
+                telemetry,
+                Language::Rust,
+                CacheState::Unavailable,
+                diagnostics,
+            );
+        }
+        self.shared.active(&binding)?;
+        result
+    }
+
+    /// Starts the binding's long-lived Rust session unless a live one already exists.
+    async fn ensure_live_rust(
+        &mut self,
+        job: &mut Job,
+        launch: &ProviderLaunch,
+        source: &SourceObservation,
+    ) -> Result<(), FailureCode> {
+        let binding = job.invocation.binding_ref().clone();
+        if let Some(entry) = self.providers.live_rust.get(&binding) {
+            if entry.live.is_alive() {
+                return Ok(());
+            }
+            self.release_live_rust(&binding).await;
+        }
         let authority = self.authority(&binding).await?;
         let cache_namespace =
             self.provider_cache_namespace(&binding, &authority, launch, &launch.trust)?;
@@ -823,9 +936,8 @@ impl Worker<'_> {
             .execution_request(job, &authority, command, &launch.executable)
             .await?;
         let active = self.shared.active(&binding)?;
-        // The shared controller guard is confined to this block: it is a `std` mutex the helper
-        // socket task also locks, so it must never reach the awaits below or this worker future
-        // stops being `Send`.
+        // The shared controller guard is confined to this block: it is a `std` mutex, so it must
+        // never reach the awaits below or this worker future stops being `Send`.
         let view = {
             let admission = self.admission.clone();
             let mut admission = admission
@@ -849,10 +961,6 @@ impl Worker<'_> {
                 _ => return Err(FailureCode::ProviderUnavailable),
             }
         };
-        self.providers
-            .rust
-            .observe_source(view.lease(), source.sequence())
-            .map_err(|_| FailureCode::Internal)?;
         let mut child = match RustProtocolChild::spawn(
             &request,
             &worktree,
@@ -873,55 +981,103 @@ impl Worker<'_> {
                 return Err(FailureCode::ProviderUnavailable);
             }
         };
-        let result = {
-            let telemetry = self.telemetry.clone();
-            let (input, output) = child.pipes();
-            let operation = session_operation(
-                input,
-                output,
-                source.clone(),
-                bytes.to_vec(),
-                query,
-                ViewGeneration {
-                    backend: view.generation(),
-                    configuration: 1,
-                    toolchain: 1,
-                    view: view.generation(),
-                },
-                ProviderSettings::Rust(profile),
-                remaining_options(job),
-                telemetry.as_ref(),
-                Language::Rust,
-            );
-            tokio::pin!(operation);
-            tokio::select! {result=&mut operation=>result,_=job.cancel.changed()=>Err(FailureCode::Cancelled)}
+        let generation = ViewGeneration {
+            backend: view.generation(),
+            configuration: 1,
+            toolchain: 1,
+            view: view.generation(),
         };
-        let reaped = match child
+        let opened = match child.take_pipes() {
+            Some((stdin, stdout)) => {
+                let open = LiveSession::open(
+                    stdout,
+                    stdin,
+                    source.worktree().clone(),
+                    source.authority_epoch(),
+                    generation,
+                    ProviderSettings::Rust(profile),
+                    Duration::from_secs(30),
+                );
+                tokio::pin!(open);
+                // Stop or shutdown must be able to interrupt a handshake the server never answers.
+                tokio::select! {
+                    opened = &mut open => opened,
+                    _ = job.cancel.changed() => Err(std::io::Error::other("cancelled")),
+                }
+            }
+            None => Err(std::io::Error::other("protocol pipes already taken")),
+        };
+        match opened {
+            Ok(live) => {
+                self.providers
+                    .live_rust
+                    .insert(binding, LiveRust { child, live, view });
+                Ok(())
+            }
+            Err(_) => {
+                self.reap_live_rust(&binding, child, view).await;
+                if *job.cancel.borrow() {
+                    Err(FailureCode::Cancelled)
+                } else {
+                    Err(FailureCode::ProviderUnavailable)
+                }
+            }
+        }
+    }
+
+    /// Shuts down and reaps the binding's live Rust session, if any.
+    pub(super) async fn release_live_rust(&mut self, binding: &BindingRef) {
+        if let Some(LiveRust { child, live, view }) = self.providers.live_rust.remove(binding) {
+            live.shutdown().await;
+            self.reap_live_rust(binding, child, view).await;
+        }
+    }
+
+    /// Shuts down and reaps every live Rust session; used at worker shutdown.
+    pub(super) async fn release_all_live_rust(&mut self) {
+        let bindings = self.providers.live_rust.keys().cloned().collect::<Vec<_>>();
+        for binding in bindings {
+            self.release_live_rust(&binding).await;
+        }
+    }
+
+    /// Reaps one analyzer child and returns its view to the registry; a reap that cannot prove
+    /// the child's fate leaves the binding uncertain exactly like the one-shot path did.
+    async fn reap_live_rust(
+        &mut self,
+        binding: &BindingRef,
+        child: RustProtocolChild,
+        view: RustView,
+    ) {
+        match child
             .cancel_and_reap(Duration::from_millis(100), Duration::from_millis(500))
             .await
         {
-            Ok(reaped) => reaped,
-            Err(_) => {
-                self.uncertain.insert(binding);
-                return Err(FailureCode::Deadline);
+            Ok(reaped) => {
+                if let Ok(capability) = self
+                    .providers
+                    .rust
+                    .release(&mut self.providers.registry, view.lease())
+                {
+                    let admission = self.admission.clone();
+                    let mut admission = admission
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let _ = self.providers.registry.complete_reap(
+                        &mut admission,
+                        capability,
+                        reaped.proof,
+                    );
+                }
             }
-        };
-        let release = self
-            .providers
-            .rust
-            .release(&mut self.providers.registry, view.lease())
-            .map_err(|_| FailureCode::Internal)?;
-        let capability = release;
-        let admission = self.admission.clone();
-        let mut admission = admission
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.providers
-            .registry
-            .complete_reap(&mut admission, capability, reaped.proof)
-            .map_err(|_| FailureCode::Internal)?;
-        self.shared.active(&binding)?;
-        result
+            Err(_) => {
+                self.uncertain.insert(binding.clone());
+                let _ = self
+                    .providers
+                    .rust
+                    .release(&mut self.providers.registry, view.lease());
+            }
+        }
     }
 
     /// Reuses one compatible listener but gives each request its own independently accounted forwarder.
@@ -1165,8 +1321,8 @@ impl Worker<'_> {
         let result = {
             let telemetry = self.telemetry.clone();
             let operation = session_operation(
-                &mut child.stdout,
-                &mut child.stdin,
+                child.stdout.as_mut().expect("protocol stdout taken"),
+                child.stdin.as_mut().expect("protocol stdin taken"),
                 source.clone(),
                 bytes.to_vec(),
                 query,

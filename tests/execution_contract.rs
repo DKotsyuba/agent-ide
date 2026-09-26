@@ -735,7 +735,13 @@ async fn protocol_stdout_has_one_owner_and_borrowed_endpoints_cannot_be_killed()
         execution::OwnedProtocolChild::spawn_from_provider_lease(&request, capability, None, 64)
             .unwrap();
     let mut protocol = String::new();
-    child.stdout.read_to_string(&mut protocol).await.unwrap();
+    child
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_to_string(&mut protocol)
+        .await
+        .unwrap();
     let reaped = child.reap(Duration::from_secs(1)).await.unwrap();
     let status = reaped.status;
     let stderr = &reaped.stderr;

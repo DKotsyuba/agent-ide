@@ -363,7 +363,10 @@ impl PyrightProtocolChild {
         &mut tokio::process::ChildStdout,
         &mut tokio::process::ChildStdin,
     ) {
-        (&mut self.child.stdout, &mut self.child.stdin)
+        (
+            self.child.stdout.as_mut().expect("protocol stdout taken"),
+            self.child.stdin.as_mut().expect("protocol stdin taken"),
+        )
     }
 
     /// Cancels and reaps this child, returning Execution's direct-child settlement proof.

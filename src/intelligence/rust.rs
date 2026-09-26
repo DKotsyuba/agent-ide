@@ -520,6 +520,13 @@ pub struct RustProtocolChild {
 }
 
 impl RustProtocolChild {
+    /// Moves the protocol pipes out for a long-lived session driver; `None` once taken.
+    pub fn take_pipes(
+        &mut self,
+    ) -> Option<(tokio::process::ChildStdin, tokio::process::ChildStdout)> {
+        self.child.take_pipes()
+    }
+
     /// Spawns one Rust protocol child through its exact lease and a newly consumed host-binding use.
     /// Host-bound requests reject missing/mismatched uses; this wrapper never retains liveness.
     pub fn spawn(
@@ -549,12 +556,12 @@ impl RustProtocolChild {
 
     /// Returns the sole stdin writer owned by this protocol lifecycle.
     pub fn stdin_mut(&mut self) -> &mut tokio::process::ChildStdin {
-        &mut self.child.stdin
+        self.child.stdin.as_mut().expect("protocol stdin taken")
     }
 
     /// Returns the sole stdout reader owned by this protocol lifecycle.
     pub fn stdout_mut(&mut self) -> &mut tokio::process::ChildStdout {
-        &mut self.child.stdout
+        self.child.stdout.as_mut().expect("protocol stdout taken")
     }
 
     /// Borrows the sole protocol reader/writer together for the production Session driver.
@@ -564,7 +571,10 @@ impl RustProtocolChild {
         &mut tokio::process::ChildStdout,
         &mut tokio::process::ChildStdin,
     ) {
-        (&mut self.child.stdout, &mut self.child.stdin)
+        (
+            self.child.stdout.as_mut().expect("protocol stdout taken"),
+            self.child.stdin.as_mut().expect("protocol stdin taken"),
+        )
     }
 
     /// Reaps the direct child and stderr under a bounded deadline without dropping accounting proof.

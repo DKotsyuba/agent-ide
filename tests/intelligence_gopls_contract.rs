@@ -262,8 +262,8 @@ async fn run_session(
         Ok::<_, Box<dyn std::error::Error>>((initial_hover, post_detach_hover))
     };
     let loop_run = mainloop.run_buffered(
-        (&mut child.stdout).compat(),
-        (&mut child.stdin).compat_write(),
+        child.stdout.as_mut().unwrap().compat(),
+        child.stdin.as_mut().unwrap().compat_write(),
     );
     let (exchange, loop_result) = tokio::join!(exchange, loop_run);
     let reaped = tokio::time::timeout(DEADLINE, child.reap(DEADLINE))

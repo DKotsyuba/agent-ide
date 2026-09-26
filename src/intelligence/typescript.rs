@@ -726,7 +726,10 @@ impl TypeScriptProtocolChild {
         &mut tokio::process::ChildStdout,
         &mut tokio::process::ChildStdin,
     ) {
-        (&mut self.child.stdout, &mut self.child.stdin)
+        (
+            self.child.stdout.as_mut().expect("protocol stdout taken"),
+            self.child.stdin.as_mut().expect("protocol stdin taken"),
+        )
     }
 
     /// Reaps a normally shut down bridge without requesting TERM or KILL.

@@ -204,7 +204,7 @@ async fn abnormal_typescript_cleanup_waits_full_grace_before_kill_and_reap() {
     let mut descendant = String::new();
     tokio::time::timeout(
         Duration::from_secs(2),
-        tokio::io::BufReader::new(&mut child.stdout).read_line(&mut descendant),
+        tokio::io::BufReader::new(child.stdout.as_mut().unwrap()).read_line(&mut descendant),
     )
     .await
     .unwrap()

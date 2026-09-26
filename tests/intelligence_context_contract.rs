@@ -203,8 +203,8 @@ async fn real_gopls_production_context_tracks_exact_observed_bytes() {
     )
     .unwrap();
     let result = with_session(
-        &mut child.stdout,
-        &mut child.stdin,
+        child.stdout.as_mut().unwrap(),
+        child.stdin.as_mut().unwrap(),
         tree,
         1,
         ViewGeneration {

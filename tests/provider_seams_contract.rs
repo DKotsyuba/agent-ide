@@ -241,10 +241,13 @@ async fn protocol_cancellation_fences_promotion_until_direct_child_reap() {
     )
     .unwrap();
     let mut ready = [0; 5];
-    tokio::time::timeout(Duration::from_secs(1), child.stdout.read_exact(&mut ready))
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        child.stdout.as_mut().unwrap().read_exact(&mut ready),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(&ready, b"ready");
     let BackendRelease::ReapOwned(reap) = registry.release(view).unwrap() else {
         panic!("draining capability")

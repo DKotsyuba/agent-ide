@@ -2571,10 +2571,10 @@ impl WaitedProtocolChild {
 /// Dropping the handle or consuming reap future requests owned group/direct kill and aborts stderr;
 /// it produces no exit evidence and does not free the admission reservation.
 pub struct OwnedProtocolChild {
-    /// The sole stdin writer for the selected protocol client.
-    pub stdin: ChildStdin,
+    /// The sole stdin writer for the selected protocol client; `None` once a live session took it.
+    pub stdin: Option<ChildStdin>,
     /// The sole stdout reader for the selected protocol client; Execution never drains it.
-    pub stdout: ChildStdout,
+    pub stdout: Option<ChildStdout>,
     /// Cancellation-safe child ownership retained after the protocol pipes move or close.
     process: ChildOwnership,
     /// Sole stderr drainer; stdout is deliberately unavailable to Execution.
@@ -2586,6 +2586,11 @@ pub struct OwnedProtocolChild {
 }
 
 impl OwnedProtocolChild {
+    /// Moves both protocol pipes out once, for a driver that must own them; later calls return None.
+    pub fn take_pipes(&mut self) -> Option<(ChildStdin, ChildStdout)> {
+        Some((self.stdin.take()?, self.stdout.take()?))
+    }
+
     /// Transfers this child's opaque launch identity once; subsequent calls return None.
     pub fn take_process_identity(&mut self) -> Option<ProcessIdentity> {
         self.process.launch_identity.take()
@@ -2655,8 +2660,8 @@ impl OwnedProtocolChild {
             output_cap,
         ));
         Ok(Self {
-            stdin,
-            stdout,
+            stdin: Some(stdin),
+            stdout: Some(stdout),
             process: ChildOwnership {
                 identity,
                 launch_identity: Some(ProcessIdentity(identity)),
