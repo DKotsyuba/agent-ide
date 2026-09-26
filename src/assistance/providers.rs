@@ -879,6 +879,61 @@ impl Worker<'_> {
         result
     }
 
+    /// The binding's live session for the language of `source`, ready to answer requests.
+    ///
+    /// Only Rust has a long-lived session so far; other languages report `ProviderUnavailable`
+    /// until their modules move onto the live path. A loading workspace reports
+    /// `ProviderLoading` after a bounded wait.
+    pub(super) async fn live_session_for(
+        &mut self,
+        job: &mut Job,
+        source: &SourceObservation,
+    ) -> Result<&mut LiveSession, FailureCode> {
+        let binding = job.invocation.binding_ref().clone();
+        let required = match source.path().extension().and_then(|value| value.to_str()) {
+            Some("rs") => AcceptedProviderSettings::RustCachePrimingDisabledV1,
+            _ => return Err(FailureCode::ProviderUnavailable),
+        };
+        let launch = job
+            .target
+            .providers
+            .iter()
+            .find(|profile| profile.settings == required)
+            .cloned()
+            .ok_or(FailureCode::ProviderUnavailable)?;
+        self.ensure_live_rust(job, &launch, source).await?;
+        let budget = job
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .saturating_sub(Duration::from_secs(1))
+            .clamp(Duration::from_millis(100), Duration::from_secs(10));
+        let readiness = {
+            let entry = self
+                .providers
+                .live_rust
+                .get_mut(&binding)
+                .ok_or(FailureCode::Internal)?;
+            tokio::select! {
+                readiness = entry.live.wait_ready(budget) => readiness,
+                _ = job.cancel.changed() => return Err(FailureCode::Cancelled),
+            }
+        };
+        match readiness {
+            Ok(()) => {}
+            Err(ReadinessError::Loading) => return Err(FailureCode::ProviderLoading),
+            Err(ReadinessError::WorkspaceError) => return Err(FailureCode::ProviderUnavailable),
+            Err(ReadinessError::Gone) => {
+                self.release_live_rust(&binding).await;
+                return Err(FailureCode::ProviderUnavailable);
+            }
+        }
+        self.providers
+            .live_rust
+            .get_mut(&binding)
+            .map(|entry| &mut entry.live)
+            .ok_or(FailureCode::Internal)
+    }
+
     /// Starts the binding's long-lived Rust session unless a live one already exists.
     async fn ensure_live_rust(
         &mut self,

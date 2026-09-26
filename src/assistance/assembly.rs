@@ -61,6 +61,9 @@ fn log_binding_unavailable(
         super::facade::AssistanceTool::Inspect => errorlog::Method::Inspect,
         super::facade::AssistanceTool::Stop => errorlog::Method::Stop,
         super::facade::AssistanceTool::Edit => errorlog::Method::Edit,
+        super::facade::AssistanceTool::Outline => errorlog::Method::Outline,
+        super::facade::AssistanceTool::Read => errorlog::Method::Read,
+        super::facade::AssistanceTool::Symbol => errorlog::Method::Symbol,
     };
     errorlog::record(
         method,
@@ -372,6 +375,9 @@ impl ProductDispatcher {
                     AssistanceMethod::Inspect => super::facade::AssistanceTool::Inspect,
                     AssistanceMethod::Stop => super::facade::AssistanceTool::Stop,
                     AssistanceMethod::Edit => super::facade::AssistanceTool::Edit,
+                    AssistanceMethod::Outline => super::facade::AssistanceTool::Outline,
+                    AssistanceMethod::Read => super::facade::AssistanceTool::Read,
+                    AssistanceMethod::Symbol => super::facade::AssistanceTool::Symbol,
                     AssistanceMethod::HookSubmit => return None,
                 };
                 let call =
@@ -601,6 +607,9 @@ impl AssistanceDispatcher for ProductDispatcher {
                     AssistanceMethod::Inspect => Some(super::facade::AssistanceTool::Inspect),
                     AssistanceMethod::Stop => Some(super::facade::AssistanceTool::Stop),
                     AssistanceMethod::Edit => Some(super::facade::AssistanceTool::Edit),
+                    AssistanceMethod::Outline => Some(super::facade::AssistanceTool::Outline),
+                    AssistanceMethod::Read => Some(super::facade::AssistanceTool::Read),
+                    AssistanceMethod::Symbol => Some(super::facade::AssistanceTool::Symbol),
                     AssistanceMethod::HookSubmit => None,
                 };
                 if let Some(tool) = tool {

@@ -69,6 +69,12 @@ pub enum AssistanceTool {
     Stop,
     /// Applies one full-content, stale-safe edit through Changes and Workspace.
     Edit,
+    /// Returns a file's skeleton: symbols with signatures and docs, no bodies.
+    Outline,
+    /// Returns one symbol's body or an explicit line range, numbered.
+    Read,
+    /// Returns a symbol card: definition, signature, docs, usages, callers.
+    Symbol,
 }
 
 impl AssistanceTool {
@@ -81,6 +87,9 @@ impl AssistanceTool {
             Self::Inspect => "ide.inspect",
             Self::Stop => "ide.stop",
             Self::Edit => "ide.edit",
+            Self::Outline => "ide.outline",
+            Self::Read => "ide.read",
+            Self::Symbol => "ide.symbol",
         }
     }
 
@@ -93,6 +102,9 @@ impl AssistanceTool {
             Self::Inspect => AssistanceMethod::Inspect,
             Self::Stop => AssistanceMethod::Stop,
             Self::Edit => AssistanceMethod::Edit,
+            Self::Outline => AssistanceMethod::Outline,
+            Self::Read => AssistanceMethod::Read,
+            Self::Symbol => AssistanceMethod::Symbol,
         }
     }
 }
@@ -108,8 +120,8 @@ pub struct ToolSchema {
     pub input_schema: Value,
 }
 
-/// Returns exactly the six current Assistance schemas regardless of daemon availability.
-pub fn tool_schemas() -> [ToolSchema; 6] {
+/// Returns exactly the nine current Assistance schemas regardless of daemon availability.
+pub fn tool_schemas() -> [ToolSchema; 9] {
     [
         schema(
             AssistanceTool::Start,
@@ -171,7 +183,52 @@ pub fn tool_schemas() -> [ToolSchema; 6] {
                 }
             }),
         ),
+        schema(
+            AssistanceTool::Outline,
+            json!({
+                "type": "object", "additionalProperties": false,
+                "required": ["path"],
+                "properties": {
+                    "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File relative to the project root."}
+                }
+            }),
+        ),
+        schema(
+            AssistanceTool::Read,
+            json!({
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                    "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Symbol path `file#Owner/name`; returns its body with the doc header."},
+                    "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File relative to the project root, with `lines`."},
+                    "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$", "description": "Inclusive 1-based line range such as `120-180`."}
+                }
+            }),
+        ),
+        schema(
+            AssistanceTool::Symbol,
+            json!({
+                "type": "object", "additionalProperties": false,
+                "required": ["symbol"],
+                "properties": {
+                    "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Symbol path `file#Owner/name`, or a bare name to search the project."},
+                    "usages": {"type": "boolean", "default": true},
+                    "callers": {"type": "integer", "minimum": 0, "maximum": 3, "default": 1},
+                    "callees": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0}
+                }
+            }),
+        ),
     ]
+}
+
+/// Maximum bytes of a symbol path argument.
+pub const MAX_SYMBOL_PATH_BYTES: usize = 1024;
+
+/// Parses an inclusive 1-based `start-end` line range; `None` for any other shape.
+pub(crate) fn parse_line_range(text: &str) -> Option<crate::lang::LineRange> {
+    let (start, end) = text.split_once('-')?;
+    let start: u32 = start.parse().ok()?;
+    let end: u32 = end.parse().ok()?;
+    (start >= 1 && end >= start).then(|| crate::lang::LineRange::new(start, end))
 }
 
 /// Builds one schema record while keeping its MCP name coupled to its logical method.
@@ -205,6 +262,8 @@ pub enum ParameterError {
     /// The published schema stays a plain object (providers such as GLM drop a tool whose schema
     /// uses `allOf`/`if`/`else`), so this either-or rule lives here instead of in the schema.
     ContextTarget,
+    /// `ide.read` needs either `symbol` or both `path` and `lines`.
+    ReadTarget,
 }
 
 /// Names the specific closed rule one field value violated (T21B).
@@ -232,6 +291,10 @@ pub enum FieldRule {
     OneOf(&'static str),
     /// The field is meaningless without `kind: "problems"`.
     RequiresProblemsKind,
+    /// The value must be `true` or `false`.
+    Boolean,
+    /// The value must be an inclusive 1-based range `start-end` with `start <= end`.
+    LineRange,
 }
 
 impl FieldRule {
@@ -255,6 +318,8 @@ impl FieldRule {
             }
             Self::OneOf(values) => format!("must be {values}"),
             Self::RequiresProblemsKind => "requires \"kind\":\"problems\"".to_string(),
+            Self::Boolean => "must be true or false".to_string(),
+            Self::LineRange => "must be an inclusive 1-based range like 120-180".to_string(),
         }
     }
 }
@@ -286,6 +351,7 @@ impl ParameterError {
                 format!("invalid bounded parameters: \"{field}\" {}", rule.text())
             }
             Self::ContextTarget => CONTEXT_TARGET_MESSAGE.to_string(),
+            Self::ReadTarget => "ide.read needs `symbol`, or `path` with `lines`".to_string(),
         }
     }
 }
@@ -310,6 +376,9 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
         AssistanceTool::Inspect => &["detail_ref"],
         AssistanceTool::Stop => &[],
         AssistanceTool::Edit => &["operation_id", "path", "source_ref", "content"],
+        AssistanceTool::Outline => &["path"],
+        AssistanceTool::Read => &["symbol", "path", "lines"],
+        AssistanceTool::Symbol => &["symbol", "usages", "callers", "callees"],
     }
 }
 
@@ -394,6 +463,51 @@ pub fn validate_call(
         return Err(ParameterError::UnknownField(echoable_field(field)));
     }
     match tool {
+        AssistanceTool::Outline => {
+            let path = required_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
+            if let Some(rule) = path_shape_rule(path) {
+                return Err(invalid_field("path", rule));
+            }
+        }
+        AssistanceTool::Read => {
+            optional_string(object, "symbol", MAX_SYMBOL_PATH_BYTES)?;
+            optional_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
+            optional_string(object, "lines", 32)?;
+            match (
+                object.contains_key("symbol"),
+                object.contains_key("path"),
+                object.contains_key("lines"),
+            ) {
+                (true, false, false) => {}
+                (false, true, true) => {
+                    let path = object["path"].as_str().unwrap_or_default();
+                    if let Some(rule) = path_shape_rule(path) {
+                        return Err(invalid_field("path", rule));
+                    }
+                    if parse_line_range(object["lines"].as_str().unwrap_or_default()).is_none() {
+                        return Err(invalid_field("lines", FieldRule::LineRange));
+                    }
+                }
+                _ => return Err(ParameterError::ReadTarget),
+            }
+        }
+        AssistanceTool::Symbol => {
+            required_string(object, "symbol", MAX_SYMBOL_PATH_BYTES)?;
+            if object
+                .get("usages")
+                .is_some_and(|value| !value.is_boolean())
+            {
+                return Err(invalid_field("usages", FieldRule::Boolean));
+            }
+            for field in ["callers", "callees"] {
+                if object
+                    .get(field)
+                    .is_some_and(|value| value.as_u64().is_none_or(|depth| depth > 3))
+                {
+                    return Err(invalid_field(field, FieldRule::NonNegativeInteger(3)));
+                }
+            }
+        }
         AssistanceTool::Start => {
             required_string(object, "activation_id", MAX_ACTIVATION_ID_BYTES)?;
             optional_string(object, "root", MAX_RELATIVE_PATH_BYTES)?;
@@ -1647,6 +1761,37 @@ impl StdioFacade {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         self.call(AssistanceTool::Diff, parameters, context).await
+    }
+
+    /// Returns a file's skeleton: symbols with signatures and docs, no bodies.
+    #[tool(name = "ide.outline", input_schema = tool_schemas()[6].input_schema.as_object().expect("tool schema is an object").clone())]
+    async fn outline(
+        &self,
+        Parameters(parameters): Parameters<Value>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.call(AssistanceTool::Outline, parameters, context)
+            .await
+    }
+
+    /// Returns one symbol's body (`symbol`) or an explicit line range (`path` + `lines`), numbered.
+    #[tool(name = "ide.read", input_schema = tool_schemas()[7].input_schema.as_object().expect("tool schema is an object").clone())]
+    async fn read(
+        &self,
+        Parameters(parameters): Parameters<Value>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.call(AssistanceTool::Read, parameters, context).await
+    }
+
+    /// Returns a symbol card: definition, signature, docs, usages and callers.
+    #[tool(name = "ide.symbol", input_schema = tool_schemas()[8].input_schema.as_object().expect("tool schema is an object").clone())]
+    async fn symbol(
+        &self,
+        Parameters(parameters): Parameters<Value>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.call(AssistanceTool::Symbol, parameters, context).await
     }
 
     /// Expands only a `detail_ref` returned by a pending or truncated IDE reply.

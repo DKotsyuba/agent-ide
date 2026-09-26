@@ -71,6 +71,12 @@ pub enum ToolMethod {
     Stop,
     /// `ide.edit` bounded single-file edit request.
     Edit,
+    /// `ide.outline` file skeleton request.
+    Outline,
+    /// `ide.read` symbol body request.
+    Read,
+    /// `ide.symbol` symbol card request.
+    Symbol,
 }
 
 /// Classifies a closed completion result without retaining a peer message or error text.

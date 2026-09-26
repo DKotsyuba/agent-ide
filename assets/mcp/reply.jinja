@@ -42,6 +42,10 @@ pending: use ide.inspect with detail_ref {{ detail_ref }}
 error: resolution_unverified; establish a supported configured project with exact document membership, then retry ide.context
 {%- elif code is mapping -%}
 error: source_too_large; source is {{ code.source_too_large.size }} bytes, exceeding the {{ code.source_too_large.ceiling }} byte read ceiling; continue with native tools
+{%- elif code == "unknown_symbol" -%}
+error: unknown_symbol; no symbol matches that path or name; check the file with ide.outline or search a bare name with ide.symbol
+{%- elif code == "provider_loading" -%}
+error: provider_loading; the language server is still loading the workspace; repeat the call in a few seconds
 {%- elif code == "invalid_detail" -%}
 error: invalid_detail; this detail_ref is unknown or has expired; repeat the original ide.* call to get a fresh one, or continue with native tools
 {%- elif code == "outside_allowed_roots" -%}
@@ -66,6 +70,14 @@ complete context: {{ text }}
 {{ "\n" }}Output is incomplete; use ide.edit when available, otherwise use the native editor
 {%- elif detail_ref -%}
 {{ "\n" }}Diagnostics are exactly as reported; use ide.edit with source_ref {{ detail_ref }} when available, otherwise use the native editor
+{%- endif -%}
+{%- endif -%}
+{%- if state == "complete" and (kind == "outline" or kind == "read" or kind == "symbol") -%}
+{{ text }}
+{%- if truncated and detail_ref and continuation -%}
+{{ "\n" }}Output is truncated; use ide.inspect with detail_ref {{ detail_ref }} for the next page
+{%- elif truncated -%}
+{{ "\n" }}Output is incomplete
 {%- endif -%}
 {%- endif -%}
 {%- if state == "complete" and kind == "diff" -%}

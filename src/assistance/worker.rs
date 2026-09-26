@@ -32,6 +32,8 @@ use crate::{
 mod providers;
 #[path = "snapshots.rs"]
 pub(super) mod snapshots;
+#[path = "symbols.rs"]
+mod symbols;
 
 use serde_json::Value;
 use std::{
@@ -1583,6 +1585,9 @@ impl<'a> Worker<'a> {
                     AssistanceTool::Start => self.activate(&mut job).await,
                     AssistanceTool::Context => self.context(&mut job).await,
                     AssistanceTool::Diff => self.diff(&mut job).await,
+                    AssistanceTool::Outline => self.outline(&mut job).await,
+                    AssistanceTool::Read => self.read(&mut job).await,
+                    AssistanceTool::Symbol => self.symbol(&mut job).await,
                     _ => Err(FailureCode::Internal),
                 }
             }
@@ -3248,6 +3253,9 @@ fn errorlog_method(tool: AssistanceTool) -> crate::errorlog::Method {
         AssistanceTool::Inspect => crate::errorlog::Method::Inspect,
         AssistanceTool::Stop => crate::errorlog::Method::Stop,
         AssistanceTool::Edit => crate::errorlog::Method::Edit,
+        AssistanceTool::Outline => crate::errorlog::Method::Outline,
+        AssistanceTool::Read => crate::errorlog::Method::Read,
+        AssistanceTool::Symbol => crate::errorlog::Method::Symbol,
     }
 }
 

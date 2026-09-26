@@ -480,13 +480,12 @@ pub async fn dispatch_method_if_running(
         AssistanceMethod::Inspect => "inspect",
         AssistanceMethod::Stop => "stop",
         AssistanceMethod::Edit => "edit",
+        AssistanceMethod::Outline => "outline",
+        AssistanceMethod::Read => "read",
+        AssistanceMethod::Symbol => "symbol",
         AssistanceMethod::HookSubmit => return MethodDispatchTransportResult::Unavailable,
     };
-    let version = if request.method() == AssistanceMethod::Edit {
-        3
-    } else {
-        2
-    };
+    let version = request.method().wire_version();
     let wire = json!({
         "version": version,
         "request_id": request.request_id(),
@@ -975,11 +974,7 @@ fn parse_method_dispatch_reply(
     let object = reply
         .as_object()
         .ok_or_else(|| invalid_transport("method reply is not an object"))?;
-    let expected_version = if request.method() == AssistanceMethod::Edit {
-        3
-    } else {
-        2
-    };
+    let expected_version = request.method().wire_version();
     if object.get("version").and_then(Value::as_u64) != Some(expected_version)
         || object.get("request_id").and_then(Value::as_str) != Some(request.request_id())
     {

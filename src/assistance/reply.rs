@@ -43,6 +43,8 @@ pub enum FailureCode {
     ProviderUnavailable,
     /// The accepted provider is still loading its workspace; the same call succeeds later.
     ProviderLoading,
+    /// No symbol matches the requested path or name in the file or project.
+    UnknownSymbol,
     /// TypeScript project inputs were absent, unsupported, oversized, reordered, or changed.
     ResolutionUnverified,
     /// Stop or a generation fence cancelled this operation.
@@ -132,6 +134,12 @@ pub enum ResultKind {
     Diff,
     /// Durable authority was revoked and cleanup reached its reported outcome.
     Stop,
+    /// A file skeleton from `ide.outline`.
+    Outline,
+    /// A symbol body or line range from `ide.read`.
+    Read,
+    /// A symbol card from `ide.symbol`.
+    Symbol,
 }
 
 /// Closed diagnostic evidence attached to one successful Assistance edit reply.

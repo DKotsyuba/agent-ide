@@ -136,9 +136,23 @@ pub enum AssistanceMethod {
     Stop,
     /// v0.2 `ide.edit` method dispatch, available only on wire version 3.
     Edit,
+    /// v0.4 `ide.outline` file skeleton, wire version 3.
+    Outline,
+    /// v0.4 `ide.read` symbol body or line range, wire version 3.
+    Read,
+    /// v0.4 `ide.symbol` symbol card, wire version 3.
+    Symbol,
 }
 
 impl AssistanceMethod {
+    /// Wire version that carries this method: the v0.2+ methods need version 3.
+    pub(crate) fn wire_version(self) -> u64 {
+        match self {
+            Self::Edit | Self::Outline | Self::Read | Self::Symbol => 3,
+            _ => 2,
+        }
+    }
+
     /// Parses the closed version-specific method tags; v2 never accepts `edit`.
     pub(crate) fn from_dispatch_tag(value: &str, version: u64) -> Option<Self> {
         match value {
@@ -148,6 +162,9 @@ impl AssistanceMethod {
             "inspect" => Some(Self::Inspect),
             "stop" => Some(Self::Stop),
             "edit" if version == 3 => Some(Self::Edit),
+            "outline" if version == 3 => Some(Self::Outline),
+            "read" if version == 3 => Some(Self::Read),
+            "symbol" if version == 3 => Some(Self::Symbol),
             _ => None,
         }
     }

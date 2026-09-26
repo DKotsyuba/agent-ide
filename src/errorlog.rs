@@ -61,6 +61,12 @@ pub enum Method {
     Inspect,
     /// `ide.stop`.
     Stop,
+    /// `ide.outline`.
+    Outline,
+    /// `ide.read`.
+    Read,
+    /// `ide.symbol`.
+    Symbol,
     /// A native pre/post hook observation.
     Hook,
     /// A confined background project check.
@@ -81,6 +87,9 @@ impl Method {
             Self::Context => "context",
             Self::Diff => "diff",
             Self::Edit => "edit",
+            Self::Outline => "outline",
+            Self::Read => "read",
+            Self::Symbol => "symbol",
             Self::Inspect => "inspect",
             Self::Stop => "stop",
             Self::Hook => "hook",
@@ -245,6 +254,8 @@ pub enum ReasonCode {
     ProviderUnavailable,
     /// [`FailureCode::ProviderLoading`].
     ProviderLoading,
+    /// [`FailureCode::UnknownSymbol`].
+    UnknownSymbol,
     /// [`FailureCode::ResolutionUnverified`].
     ResolutionUnverified,
     /// [`FailureCode::Cancelled`].
@@ -330,6 +341,7 @@ impl ReasonCode {
             Self::WorkspaceAuthority => "workspace_authority",
             Self::ProviderUnavailable => "provider_unavailable",
             Self::ProviderLoading => "provider_loading",
+            Self::UnknownSymbol => "unknown_symbol",
             Self::ResolutionUnverified => "resolution_unverified",
             Self::Cancelled => "cancelled",
             Self::Deadline => "deadline",
@@ -393,6 +405,7 @@ impl From<FailureCode> for ReasonCode {
             FailureCode::WorkspaceAuthority => Self::WorkspaceAuthority,
             FailureCode::ProviderUnavailable => Self::ProviderUnavailable,
             FailureCode::ProviderLoading => Self::ProviderLoading,
+            FailureCode::UnknownSymbol => Self::UnknownSymbol,
             FailureCode::ResolutionUnverified => Self::ResolutionUnverified,
             FailureCode::Cancelled => Self::Cancelled,
             FailureCode::Deadline => Self::Deadline,

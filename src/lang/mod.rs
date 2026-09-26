@@ -20,6 +20,7 @@ use async_lsp::lsp_types as lsp;
 pub mod go;
 pub mod path;
 pub mod python;
+pub mod render;
 pub mod rust;
 pub mod typescript;
 
@@ -438,6 +439,16 @@ pub trait LanguageSupport: Send + Sync {
 
     /// Formatter command for one file, if the project has one; run from the project root.
     fn format_command(&self, project: &LanguageProject, file: &Path) -> Option<Vec<String>>;
+}
+
+/// The support module for a language, or `None` while it is not implemented.
+pub fn support(language: Language) -> Option<&'static dyn LanguageSupport> {
+    match language {
+        Language::Rust => Some(&rust::RustSupport),
+        Language::Go => Some(&go::GoSupport),
+        Language::Python => Some(&python::Python),
+        Language::TypeScript => Some(&typescript::TypeScript),
+    }
 }
 
 /// Reads the exact lines `range` covers from `source`, keeping line terminators.

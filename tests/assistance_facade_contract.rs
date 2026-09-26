@@ -49,16 +49,19 @@ fn pre_hook() -> agent_ide::assistance::host_binding::HookEvent {
 }
 
 #[test]
-fn discovery_is_static_and_contains_exactly_six_current_methods() {
+fn discovery_is_static_and_contains_exactly_nine_current_methods() {
     let schemas = tool_schemas();
-    assert_eq!(schemas.len(), 6);
+    assert_eq!(schemas.len(), 9);
     assert!(schemas.iter().map(|schema| schema.name).eq([
         "ide.start",
         "ide.context",
         "ide.diff",
         "ide.inspect",
         "ide.stop",
-        "ide.edit"
+        "ide.edit",
+        "ide.outline",
+        "ide.read",
+        "ide.symbol"
     ]));
     assert!(
         schemas

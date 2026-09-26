@@ -111,6 +111,9 @@ fn errorlog_method(method: ToolMethod) -> crate::errorlog::Method {
         ToolMethod::Inspect => crate::errorlog::Method::Inspect,
         ToolMethod::Stop => crate::errorlog::Method::Stop,
         ToolMethod::Edit => crate::errorlog::Method::Edit,
+        ToolMethod::Outline => crate::errorlog::Method::Outline,
+        ToolMethod::Read => crate::errorlog::Method::Read,
+        ToolMethod::Symbol => crate::errorlog::Method::Symbol,
     }
 }
 
@@ -267,6 +270,9 @@ fn tool_method(tool: AssistanceTool) -> ToolMethod {
         AssistanceTool::Inspect => ToolMethod::Inspect,
         AssistanceTool::Stop => ToolMethod::Stop,
         AssistanceTool::Edit => ToolMethod::Edit,
+        AssistanceTool::Outline => ToolMethod::Outline,
+        AssistanceTool::Read => ToolMethod::Read,
+        AssistanceTool::Symbol => ToolMethod::Symbol,
     }
 }
 
