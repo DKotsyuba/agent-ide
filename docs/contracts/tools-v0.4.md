@@ -6,13 +6,13 @@ Revision: v0.4. Provider: Agent IDE. Consumers: coding agents and IDE hosts.
 
 | Tool or capability | Status |
 |---|---|
-| `ide.outline`, `ide.read`, `ide.symbol` (usages, callers/callees; `history` planned) | implemented |
+| `ide.outline`, `ide.read`, `ide.symbol` (usages, callers/callees, `history: true` for the last 3 commits touching the definition) | implemented |
 | `ide.edit` symbol operations (`replace`, `insert`, `delete`, `rename`) and `path` + `lines` range operation | implemented (landing now) |
 | Long-lived language server session for Rust | implemented |
 | `ide.start` project card | implemented (appended to the activation reply; no `ide.project`, no `not_a_project`; servers always `not started`) |
-| `ide.test` | planned |
+| `ide.test` (`symbol` / `path` / `pattern` / `command` / `status`, `budget_s`; one job per worktree; status line in the `<agent-ide>` block; full output paged through `ide.inspect`) | implemented (wire version 4, 10 tools) |
 | `ide.diff` / `ide.problems` cleanup | planned |
-| Live language server sessions for Python, TypeScript, and Go | planned |
+| Live language server sessions for Python and TypeScript (one per binding and language) | implemented (Go planned) |
 
 ## 0. Principles
 
@@ -211,7 +211,7 @@ diagnostics: clean
 
 Errors: `stale_source`, `ambiguous_symbol`, `unknown_symbol`, `syntax_error` (the edit is applied, but the file does not parse; report the error and do not roll back).
 
-### 2.6 `ide.test` — run tests on request, in the background (planned)
+### 2.6 `ide.test` — run tests on request, in the background (implemented)
 
 Input: `{symbol}` | `{path}` | `{pattern}` | `{command}`, with optional `budget_s?: 120`.
 

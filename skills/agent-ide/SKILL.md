@@ -6,8 +6,8 @@ description: Use Agent IDE `ide.*` tools, including `ide.edit` when offered, for
 # Agent IDE
 
 Agent IDE exposes the lifecycle tools `ide.start`, `ide.context`, `ide.diff`,
-`ide.inspect`, `ide.stop`, `ide.edit`, and the symbol tools `ide.outline`, `ide.read`,
-`ide.symbol`. Use this workflow whenever they are offered and the task implements,
+`ide.inspect`, `ide.stop`, `ide.edit`, the symbol tools `ide.outline`, `ide.read`,
+`ide.symbol`, and `ide.test`. Use this workflow whenever they are offered and the task implements,
 debugs, refactors, or writes/fixes source.
 Skip it for read-only exploration, prose, configuration, or when `ide.*` is
 not present — use native host read/write/test tools plus CodeGraph (when
@@ -95,8 +95,17 @@ the language server is still loading the workspace: repeat the same call in a fe
    from `unknown` *diagnostics*: the edit's own effect, not just its
    diagnostics, is unproven, so inspect the named path with native host tools
    instead — never call `ide.context` to replay it, and never blind-retry.
-5. `ide.diff` before finishing the task, to review the accumulated change.
-6. `ide.inspect` with the returned `detail_ref` whenever a reply is `Pending`
+5. `ide.test` to run the project's tests on request — never the whole suite by reflex:
+   `{"symbol":"src/x.rs#Type/method"}` runs the tests that reference the symbol (including
+   in-file `mod tests`), `{"path":"src/x.rs"}` the file's tests, `{"pattern":"name"}` a runner
+   filter, `{"command":["cargo","test","--lib"]}` an exact argv; optional `budget_s` (default
+   120, max 600). The reply is `tests #N: started — <argv> (budget B s)`; poll with
+   `{"status":N}` until `tests #N: P passed, F failed, T s` with up to eight `FAIL name` /
+   `file:line message` lines, a `rerun:` argv and `full output: ide.inspect <detail_ref>`.
+   One job per worktree at a time; a stopped budget says `stopped at budget`. The
+   `<agent-ide>` block carries the job's line once while it runs and once when it ends.
+6. `ide.diff` before finishing the task, to review the accumulated change.
+7. `ide.inspect` with the returned `detail_ref` whenever a reply is `Pending`
    or reports truncated content. Do not repeat the same call instead. A
    `Context` or `Diff` reply with `continuation: true` means the result is
    larger than one reply: call `ide.inspect` with that same `detail_ref` again
