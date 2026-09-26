@@ -82,9 +82,10 @@ pub(super) struct ProviderContext {
 
 /// Longest a symbol request waits for the language server to become ready before answering
 /// `provider_loading`: a cold rust-analyzer on a fresh worktree needs cargo metadata and an index
-/// pass, routinely 20–40 s. The reply stays `pending` meanwhile, so the agent keeps polling
+/// pass, routinely 20–40 s and over a minute on a loaded machine or a large workspace. The
+/// reply stays `pending` meanwhile (within the 120 s job deadline), so the agent keeps polling
 /// instead of managing retries.
-const LIVE_READINESS_WAIT: Duration = Duration::from_secs(60);
+const LIVE_READINESS_WAIT: Duration = Duration::from_secs(100);
 
 /// Owns the protocol child for one binding's long-lived language-server session.
 enum LiveChild {
