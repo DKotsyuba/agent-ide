@@ -4246,6 +4246,51 @@ async fn configured_product_start_enforces_allowed_roots_and_accepts_root_argume
     daemon.wait().await.unwrap();
 }
 
+/// The activation reply keeps its fixed first line and appends the project card: one rendered
+/// block describing the fixture worktree (rust from Cargo.toml, typescript from package.json,
+/// plus the go module the shared fixture ships), with the layout, docs, and not-started server
+/// lines exactly as `project::render` prints them.
+#[tokio::test]
+async fn configured_product_activation_reply_includes_the_project_card() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(
+        fixture.root.join("package.json"),
+        "{\"name\":\"fixture-web\",\"private\":true}\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.root.join("README.md"), "# fixture\n").unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "product-card").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"card"}))
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let text = started["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("Workspace activated; authority_epoch: "),
+        "{text}"
+    );
+    assert!(text.contains("\n\nproject: repo  root: "), "{text}");
+    // Sorted by line count: main.go (3 lines) leads src/lib.rs (2 lines); package.json maps to
+    // no owned source files, so typescript reports 0 in 0.
+    assert!(
+        text.contains("languages: go 3 lines in 1 files · rust 2 in 1 · typescript 0 in 0"),
+        "{text}"
+    );
+    assert!(text.contains("\nlayout: src/ 1"), "{text}");
+    assert!(text.contains("\ndocs: README.md"), "{text}");
+    assert!(
+        text.contains("\nservers: rust not started · typescript not started · go not started"),
+        "{text}"
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Holds SQLite's real write lock while a shipping Start needs durable activation, proving the
 /// frontend fails closed without delaying the independent host hook or ordinary native command.
 #[tokio::test]

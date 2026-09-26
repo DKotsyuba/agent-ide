@@ -22,6 +22,8 @@ use crate::{
         EditOutcome as ChangesEditOutcome, EditReceiptStore, EditRequest, EditResult,
         PrepareAdmission,
     },
+    lang::{Language, LanguageProject},
+    project::{self as project_card, ServerState as CardServerState},
     workspace::{
         authority::{AuthorityStamp, StopBindingHandoff},
         durable::{DurableWorkspace, StartReceipt},
@@ -49,6 +51,11 @@ use tokio::sync::{Notify, mpsc, oneshot, watch};
 const EDIT_SETTLEMENT_RESERVE: Duration = Duration::from_secs(2);
 /// Longest an edit reply waits for the project check it scheduled before answering `unknown`.
 const EDIT_CHECK_WAIT: Duration = Duration::from_secs(90);
+/// Whole budget for the `ide.start` project card (language detection, git plumbing, the tree
+/// walk, and the render). The work is blocking, so it runs off the runtime under this deadline;
+/// a card that exceeds it, or any panic inside the computation, degrades to the plain activation
+/// text instead of failing activation.
+const PROJECT_CARD_BUDGET: Duration = Duration::from_secs(5);
 
 /// A bounded asynchronous operation whose identity never includes the transient MCP call ID.
 struct Job {
@@ -1926,13 +1933,51 @@ impl<'a> Worker<'a> {
             }
             Err(_) => "unknown (durable capture unavailable)".to_owned(),
         };
+        // The project card is a bounded best-effort addition: detection, git plumbing, and the
+        // tree walk block, so they run on the blocking pool under [`PROJECT_CARD_BUDGET`]. Any
+        // timeout, panic, or join failure yields an empty card and the plain activation text;
+        // the card must never fail an activation that already succeeded.
+        let card = {
+            let root = discovered.root().to_path_buf();
+            let walk = tokio::task::spawn_blocking(move || {
+                let languages: Vec<LanguageProject> = [
+                    Language::Rust,
+                    Language::Python,
+                    Language::TypeScript,
+                    Language::Go,
+                ]
+                .into_iter()
+                .filter_map(crate::lang::support)
+                .filter_map(|support| support.detect(&root))
+                .collect();
+                // The daemon does not probe language servers at start; every detected language's
+                // server state is the honest "not started" until a later tool observes otherwise.
+                let servers = languages
+                    .iter()
+                    .map(|project| CardServerState {
+                        language: project.language,
+                        state: "not started".to_owned(),
+                    })
+                    .collect();
+                project_card::render(&project_card::collect(&root, languages, servers, None))
+            });
+            match tokio::time::timeout(PROJECT_CARD_BUDGET, walk).await {
+                Ok(Ok(card)) => card,
+                Ok(Err(_)) | Err(_) => String::new(),
+            }
+        };
+        let mut text = format!(
+            "Workspace activated; authority_epoch: {}; baseline: {baseline}; worktree_cache: retained. Provider readiness is not implied.",
+            authority.epoch(),
+        );
+        if !card.is_empty() {
+            text.push_str("\n\n");
+            text.push_str(&card);
+        }
         Ok((
             PeerReply::Complete {
                 kind: ResultKind::Activation,
-                text: format!(
-                    "Workspace activated; authority_epoch: {}; baseline: {baseline}; worktree_cache: retained. Provider readiness is not implied.",
-                    authority.epoch(),
-                ),
+                text,
                 detail_ref: Some(job.reference.clone()),
                 truncated: false,
                 continuation: false,
