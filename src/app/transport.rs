@@ -404,8 +404,10 @@ pub enum MethodDispatchTransportResult {
         /// Assistance-owned opaque method result JSON.
         opaque_result_json: OpaqueJson,
     },
-    /// Daemon, framing, deadline, or Assistance dispatch was unavailable to the caller.
+    /// Daemon, framing, or Assistance dispatch was unavailable to the caller.
     Unavailable,
+    /// A connection, write, or method reply exceeded its bounded transport deadline.
+    TimedOut,
 }
 
 /// Checks the common bounded opaque identifier invariant without making an identity claim.

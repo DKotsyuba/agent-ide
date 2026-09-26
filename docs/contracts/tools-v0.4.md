@@ -108,7 +108,9 @@ Errors: `outside_allowed_roots` (as today), `not_a_project` (no manifest is pres
 
 ### 2.2 `ide.outline` — file skeleton (implemented)
 
-Input: `{path, depth?: 1|2|all (default all), bodies: false}`.
+Input: `{path, depth?: 1|2|all (default all), bodies: false}`. A `path` naming a directory (trailing slash optional) answers a directory outline instead: subdirectories with file counts, then files with line counts and the first documentation line (`//!` for Rust, the module docstring for Python, the leading comment for TypeScript/JavaScript), one level deep, at most 200 files.
+
+Replies of every tool are delivered inline when the job completes within 8 s (the daemon waits; the MCP bridge allows 10 s for the reply after a fast 1 s connect); a longer job answers `pending` with a `detail_ref` as before.
 
 Output contains signatures, docstrings, and line numbers, without bodies:
 

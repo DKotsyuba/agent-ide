@@ -478,9 +478,9 @@ async fn assistance_transport_is_finite_and_hook_submission_never_autostarts() {
     stop_assistance_daemon(task, runtime_dir).await;
 }
 
-/// Proves delayed connect polling consumes the exchange budget using a real socket and virtual time.
+/// Proves connect and write keep the configured deadline for both hook and method requests.
 #[tokio::test(start_paused = true)]
-async fn hook_and_method_share_one_total_connect_and_exchange_deadline() {
+async fn hook_and_method_keep_connect_write_within_the_configured_deadline() {
     // A runnable task prevents paused time from auto-advancing while the socket reactor catches up.
     let clock_guard = tokio::spawn(async {
         loop {
@@ -529,21 +529,38 @@ async fn hook_and_method_share_one_total_connect_and_exchange_deadline() {
         tokio::time::advance(Duration::from_millis(60)).await;
         let (mut socket, _) = listener.accept().await.unwrap();
         // Drive the suspended connect and write to completion, then keep the peer silent.
-        tokio::select! {
+        let frame = tokio::select! {
             _ = &mut request => panic!("transport completed before the fake peer read its request"),
             frame = async {
                 let length = socket.read_u32().await.unwrap() as usize;
                 let mut body = vec![0; length];
                 socket.read_exact(&mut body).await.unwrap();
                 serde_json::from_slice::<Value>(&body).unwrap()
-            } => assert_eq!(frame["request_id"], "request"),
+            } => {
+                assert_eq!(frame["request_id"], "request");
+                frame
+            },
+        };
+        if hook {
+            tokio::time::advance(Duration::from_millis(50)).await;
+            assert_eq!(
+                request.as_mut().poll(&mut context),
+                std::task::Poll::Ready(true)
+            );
+        } else {
+            let response = json!({"version":frame["version"],"request_id":"request","opaque_result_json":{"state":"pending","detail_ref":"detail"}});
+            let body = serde_json::to_vec(&response).unwrap();
+            socket
+                .write_all(&(body.len() as u32).to_be_bytes())
+                .await
+                .unwrap();
+            socket.write_all(&body).await.unwrap();
+            tokio::task::yield_now().await;
+            assert_eq!(
+                request.as_mut().poll(&mut context),
+                std::task::Poll::Ready(false)
+            );
         }
-        tokio::time::advance(Duration::from_millis(50)).await;
-        assert_eq!(
-            request.as_mut().poll(&mut context),
-            std::task::Poll::Ready(true),
-            "hook={hook}: exchange reset the original 100ms deadline"
-        );
         drop(request);
         drop(socket);
         drop(listener);

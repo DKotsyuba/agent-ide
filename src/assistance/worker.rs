@@ -57,6 +57,8 @@ const EDIT_CHECK_WAIT: Duration = Duration::from_secs(90);
 /// a card that exceeds it, or any panic inside the computation, degrades to the plain activation
 /// text instead of failing activation.
 const PROJECT_CARD_BUDGET: Duration = Duration::from_secs(5);
+/// Maximum time an initial tool call waits for its job before returning its retained detail.
+pub const INLINE_REPLY_WAIT: Duration = Duration::from_secs(8);
 
 /// A bounded asynchronous operation whose identity never includes the transient MCP call ID.
 struct Job {
@@ -602,13 +604,14 @@ impl Shared {
         }
     }
 
-    /// Records that the caller already received the retained page-one reply, so the next
-    /// `ide.inspect` advances instead of re-serving it (T16B).
-    fn mark_context_page_delivered(&self, reference: &str) {
+    /// Records that the caller already received its retained page, so the next `ide.inspect`
+    /// advances instead of re-serving it (T16B).
+    fn mark_page_delivered(&self, reference: &str) {
         if let Ok(mut ledger) = self.ledger.lock()
             && let Some(detail) = ledger.details.get_mut(reference)
         {
             detail.context_page_fresh = false;
+            detail.diff_page_fresh = false;
         }
     }
     /// Retains or clears the bounded Context (or Claude-captured Diff, T13B) pagination state for
@@ -1102,15 +1105,12 @@ impl WorkerHandle {
         }
         result
     }
-    /// Enqueues or resolves the exact query, returning pending without waiting for provider warmup.
+    /// Enqueues an exact query and waits up to [`INLINE_REPLY_WAIT`] for its completed reply.
     ///
-    /// `ide.test` by `path`, `pattern`, `command` or `status` needs no language server, so it
-    /// waits inline (at most 5 s, the bridge's Test budget) for its own job and answers with the
-    /// started/status line directly. `ide.test {symbol}` first resolves references through the
-    /// binding's live language server, which takes seconds on a cold session — longer than any
-    /// bridge request budget — so it is dispatched like every other language-server job: the job
-    /// is queued, this call answers `pending` at once, and the `tests #N: started` or `tests: no
-    /// tests reference …` line is retrieved through `ide.inspect` once selection is done.
+    /// A job still running at the limit returns its retained pending detail; callers can retrieve
+    /// later completion with `ide.inspect`. The initial inspection permit is reserved before
+    /// enqueueing so timeout always has capacity to return the current detail. A completed reply
+    /// uses the worker's normal delivery path, preserving continuation and feedback semantics.
     pub async fn submit(
         &self,
         invocation: ValidatedInvocation,
@@ -1131,26 +1131,17 @@ impl WorkerHandle {
                 detail: None,
             };
         }
-        if tool == AssistanceTool::Test && parameters.get("symbol").is_none() {
-            let (send, wait) = oneshot::channel();
-            if let Err(code) = self.enqueue(invocation, tool, parameters, attachment, Some(send)) {
-                return PeerReply::Error { code, detail: None };
-            }
-            return match tokio::time::timeout(Duration::from_secs(5), wait).await {
-                Ok(Ok(reply)) => reply,
-                _ => PeerReply::Error {
-                    code: FailureCode::Deadline,
-                    detail: None,
-                },
-            };
-        }
+        let (send, wait) = oneshot::channel();
         match admit_initial_inspection(&self.inspect, || {
-            self.enqueue(invocation, tool, parameters, attachment, None)
+            self.enqueue(invocation, tool, parameters, attachment, Some(send))
         }) {
-            Ok((reference, permit)) => {
-                self.inspect_reserved(binding, reference, expected, permit)
-                    .await
-            }
+            Ok((reference, permit)) => match tokio::time::timeout(INLINE_REPLY_WAIT, wait).await {
+                Ok(Ok(reply)) => reply,
+                _ => {
+                    self.inspect_reserved(binding, reference, expected, permit)
+                        .await
+                }
+            },
             Err(code) => PeerReply::Error { code, detail: None },
         }
     }
@@ -1649,14 +1640,28 @@ impl<'a> Worker<'a> {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
             {
-                let (referencing_tests, language) =
+                let (referencing_tests, language, file_test_count) =
                     self.tests_referencing_symbol(job, &symbol).await?;
+                let path = crate::lang::SymbolPath::parse(&symbol)
+                    .map_err(|_| FailureCode::UnknownSymbol)?;
                 if referencing_tests.is_empty() {
+                    let file = path
+                        .file()
+                        .and_then(|file| file.to_str())
+                        .ok_or(FailureCode::UnknownSymbol)?;
+                    let path_argument = serde_json::json!({"path": file});
                     return Ok((
                         PeerReply::Complete {
                             kind: ResultKind::Test,
                             text: format!(
-                                "tests: no tests reference {symbol}; run by path or pattern"
+                                "tests: no tests reference {symbol}; {}",
+                                if file_test_count == 0 {
+                                    "the file has no tests".to_owned()
+                                } else {
+                                    format!(
+                                        "the file has {file_test_count} tests — ide.test {path_argument}"
+                                    )
+                                }
                             ),
                             detail_ref: None,
                             truncated: false,
@@ -1666,8 +1671,6 @@ impl<'a> Worker<'a> {
                         None,
                     ));
                 }
-                let path = crate::lang::SymbolPath::parse(&symbol)
-                    .map_err(|_| FailureCode::UnknownSymbol)?;
                 let target = crate::lang::TestTarget::Symbol {
                     path,
                     referencing_tests,
@@ -1692,7 +1695,25 @@ impl<'a> Worker<'a> {
                     )),
                     Err(_) => return Err(FailureCode::ProviderUnavailable),
                 };
-                let count = Some(selection.tests.len());
+                let bins: std::collections::BTreeSet<_> = if language == crate::lang::Language::Rust
+                {
+                    selection
+                        .tests
+                        .iter()
+                        .filter_map(|test| crate::lang::rust::integration_test_bin(&test.file))
+                        .collect()
+                } else {
+                    std::collections::BTreeSet::new()
+                };
+                let count = Some(if bins.len() > 1 {
+                    format!(
+                        "{} tests in {} binaries; running the workspace filter",
+                        selection.tests.len(),
+                        bins.len()
+                    )
+                } else {
+                    format!("{} tests selected", selection.tests.len())
+                });
                 (selection.command, language, count)
             } else {
                 return Ok((
@@ -1716,8 +1737,8 @@ impl<'a> Worker<'a> {
                 binding.fingerprint(),
             ) {
                 StartResult::Started(id) => {
-                    let selected = selected_count
-                        .map_or_else(String::new, |count| format!(" ({count} tests selected)"));
+                    let selected =
+                        selected_count.map_or_else(String::new, |summary| format!(" ({summary})"));
                     let line = format!(
                         "tests #{id}: started — {}{selected} (budget {} s)",
                         display_argv(&argv),
@@ -2022,7 +2043,7 @@ impl<'a> Worker<'a> {
                     // Page one just reached the caller through this settlement, so the first
                     // `ide.inspect` of its `detail_ref` must serve page two, not repeat page one
                     // (T16B). Only a lost receiver leaves the page undelivered and fresh.
-                    self.shared.mark_context_page_delivered(&job.reference);
+                    self.shared.mark_page_delivered(&job.reference);
                 }
             }
         }
@@ -2269,7 +2290,7 @@ impl<'a> Worker<'a> {
             }
         };
         let mut text = format!(
-            "Workspace activated; authority_epoch: {}; baseline: {baseline}; worktree_cache: retained. Provider readiness is not implied.",
+            "activated: epoch {}; baseline: {baseline}",
             authority.epoch(),
         );
         if !card.is_empty() {
@@ -3772,11 +3793,13 @@ fn detect_test_language(root: &Path) -> Option<crate::lang::Language> {
     })
 }
 
-/// Resolves a file or filter target through the detected language's existing runner contract.
+/// Resolves a target through the detected runner, returning argv, language, and an optional
+/// user-facing selected-test summary (`None` when the runner cannot enumerate tests). Returns
+/// [`crate::lang::LangError::Unsupported`] when no runner supports the target.
 fn test_selection(
     root: &Path,
     target: crate::lang::TestTarget,
-) -> Result<(Vec<String>, crate::lang::Language, Option<usize>), crate::lang::LangError> {
+) -> Result<(Vec<String>, crate::lang::Language, Option<String>), crate::lang::LangError> {
     for language in [
         crate::lang::Language::Rust,
         crate::lang::Language::Python,
@@ -3790,7 +3813,8 @@ fn test_selection(
             continue;
         };
         let selection = support.test_selection(&project, &target)?;
-        let count = (!selection.tests.is_empty()).then_some(selection.tests.len());
+        let count = (!selection.tests.is_empty())
+            .then_some(format!("{} tests selected", selection.tests.len()));
         return Ok((selection.command, language, count));
     }
     Err(crate::lang::LangError::Unsupported(

@@ -264,6 +264,193 @@ pub fn outline_text(outline: &Outline) -> String {
     out
 }
 
+/// Renders one bounded directory level, counting regular files recursively inside child folders.
+pub fn directory_outline(root: &Path, directory: &Path) -> std::io::Result<String> {
+    use std::fs;
+
+    let absolute = root.join(directory);
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    for entry in fs::read_dir(&absolute)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.')
+            || matches!(
+                name.as_ref(),
+                "target" | "node_modules" | "__pycache__" | ".git"
+            )
+        {
+            continue;
+        }
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            dirs.push((name.into_owned(), count_files(&entry.path())?));
+        } else if kind.is_file() {
+            files.push((name.into_owned(), entry.path()));
+        }
+    }
+    dirs.sort_by(|a, b| a.0.cmp(&b.0));
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let displayed = files.len().min(200);
+    let title = if directory.as_os_str().is_empty() {
+        String::new()
+    } else {
+        format!("{}/", directory.display())
+    };
+    let mut out = format!("{title}  ({} files, {} dirs)\n", files.len(), dirs.len());
+    if !dirs.is_empty() {
+        out.push_str("  dirs: ");
+        out.push_str(
+            &dirs
+                .iter()
+                .map(|(name, count)| format!("{name}/ {count}"))
+                .collect::<Vec<_>>()
+                .join(" · "),
+        );
+        out.push('\n');
+    }
+    for (name, path) in files.iter().take(displayed) {
+        let (line_count, prefix) = read_file_lines_and_prefix(path)?;
+        let doc = first_file_doc(path, &prefix);
+        out.push_str(&format!("  {name:<20} {line_count:>5}"));
+        if let Some(doc) = doc {
+            out.push_str("  ");
+            out.push_str(&clip(&doc, 60));
+        }
+        out.push('\n');
+    }
+    if files.len() > displayed {
+        out.push_str(&format!("  … {} more files\n", files.len() - displayed));
+    }
+    Ok(out)
+}
+
+/// Counts file lines in constant memory and retains only the first 4 KiB for documentation.
+fn read_file_lines_and_prefix(path: &Path) -> std::io::Result<(u32, Vec<u8>)> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut buffer = [0; 8192];
+    let mut prefix = Vec::with_capacity(4096);
+    let mut newlines = 0u64;
+    let mut last = None;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let bytes = &buffer[..read];
+        newlines += bytes.iter().filter(|byte| **byte == b'\n').count() as u64;
+        last = bytes.last().copied();
+        let take = (4096 - prefix.len()).min(read);
+        prefix.extend_from_slice(&bytes[..take]);
+    }
+    let lines = newlines + u64::from(last.is_some() && last != Some(b'\n'));
+    Ok((lines.min(u32::MAX as u64) as u32, prefix))
+}
+
+/// Counts non-hidden regular files below a directory, without following symlinks.
+fn count_files(directory: &Path) -> std::io::Result<usize> {
+    let mut count = 0;
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.')
+            || matches!(
+                name.as_ref(),
+                "target" | "node_modules" | "__pycache__" | ".git"
+            )
+        {
+            continue;
+        }
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            count += count_files(&entry.path())?;
+        } else if kind.is_file() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Extracts the first module documentation line for the file's supported source language.
+fn first_file_doc(path: &Path, bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let lines: Vec<_> = text.lines().collect();
+    match path.extension()?.to_str()? {
+        "rs" => {
+            let mut docs = Vec::new();
+            for line in &lines {
+                let line = line.trim();
+                if line.is_empty() && docs.is_empty() {
+                    continue;
+                }
+                if let Some(doc) = line
+                    .strip_prefix("//!")
+                    .or_else(|| line.strip_prefix("///"))
+                {
+                    docs.push(doc.trim());
+                } else if !line.starts_with("//") && !line.starts_with("#![") {
+                    break;
+                }
+            }
+            docs.into_iter()
+                .find(|doc| !doc.is_empty())
+                .map(str::to_owned)
+        }
+        "py" | "pyi" => {
+            let first = lines.iter().find(|line| !line.trim().is_empty())?.trim();
+            let quote = if first.starts_with("\"\"\"") {
+                "\"\"\""
+            } else if first.starts_with("'''") {
+                "'''"
+            } else {
+                return None;
+            };
+            let content = first.trim_start_matches(quote).trim();
+            let content = content.trim_end_matches(quote).trim();
+            if !content.is_empty() {
+                Some(content.to_owned())
+            } else {
+                lines
+                    .iter()
+                    .skip_while(|line| line.trim().is_empty())
+                    .nth(1)
+                    .map(|line| line.trim().to_owned())
+                    .filter(|doc| !doc.is_empty())
+            }
+        }
+        "ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs" => {
+            let first = lines.iter().find(|line| !line.trim().is_empty())?.trim();
+            if let Some(comment) = first.strip_prefix("//") {
+                return Some(comment.trim().to_owned()).filter(|s| !s.is_empty());
+            }
+            if let Some(comment) = first.strip_prefix("/**") {
+                let line = comment
+                    .trim()
+                    .trim_end_matches("*/")
+                    .trim()
+                    .trim_start_matches('*')
+                    .trim();
+                let line = if line.is_empty() {
+                    lines
+                        .iter()
+                        .skip(1)
+                        .map(|line| line.trim().trim_start_matches('*').trim())
+                        .find(|line| !line.is_empty())?
+                } else {
+                    line
+                };
+                return Some(line.to_owned());
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 fn render_symbol_line(
     symbol: &Symbol,
     depth: usize,
@@ -331,7 +518,7 @@ pub struct Usage {
     pub is_test: bool,
 }
 
-/// One caller or callee line.
+/// One caller or callee path and its location; `name` is `file#Owner/name` when resolved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Call {
     pub name: String,
@@ -346,7 +533,7 @@ pub struct SymbolCard {
     pub heading: String,
     pub signature: Option<String>,
     pub doc: Option<String>,
-    /// Definition snippet: file, range and numbered text, already rendered by [`read_text`].
+    /// Definition address: `file#symbol (lines a–b)`; read the body separately with `ide.read`.
     pub definition: Option<String>,
     pub usages: Vec<Usage>,
     pub callers: Vec<Call>,
@@ -484,6 +671,43 @@ mod tests {
     use crate::lang::{Language, SymbolPath};
     use std::path::PathBuf;
 
+    #[test]
+    fn directory_outline_lists_docs_and_counts_child_files() {
+        let root = std::env::temp_dir().join(format!(
+            "outline-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src/sub")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "//! Rust module docs\nfn a() {}\n").unwrap();
+        std::fs::write(root.join("src/sub/x"), "x\n").unwrap();
+        let text = directory_outline(&root, Path::new("src")).unwrap();
+        assert_eq!(
+            text,
+            "src/  (1 files, 1 dirs)\n  dirs: sub/ 1\n  lib.rs                   2  Rust module docs\n"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn first_file_doc_extracts_rust_python_and_typescript_comments() {
+        assert_eq!(
+            first_file_doc(Path::new("a.rs"), b"//! Rust docs\nfn a() {}"),
+            Some("Rust docs".into())
+        );
+        assert_eq!(
+            first_file_doc(Path::new("a.py"), b"\"\"\"Python docs\"\"\"\n"),
+            Some("Python docs".into())
+        );
+        assert_eq!(
+            first_file_doc(Path::new("a.ts"), b"/** TS docs */\nexport {}"),
+            Some("TS docs".into())
+        );
+    }
+
     fn symbol(name: &str, kind: SymbolKind, start: u32, end: u32, doc: Option<&str>) -> Symbol {
         Symbol {
             path: SymbolPath::new(Some(PathBuf::from("a.rs")), vec![name.into()]),
@@ -573,6 +797,12 @@ mod tests {
             heading: "Run — fn, a.rs#Run (lines 1–3)".into(),
             signature: Some("pub fn run()".into()),
             doc: Some("Runs.".into()),
+            definition: Some("a.rs#Run  (lines 1–3)".into()),
+            callers: vec![Call {
+                name: "a.rs#Owner/caller".into(),
+                file: "a.rs".into(),
+                line: 8,
+            }],
             ..Default::default()
         };
         for index in 0..35 {
@@ -585,8 +815,9 @@ mod tests {
         }
         card.more_detail = Some("sym-1".into());
         let text = symbol_card_text(&card);
-        assert!(text.starts_with("symbol: Run — fn, a.rs#Run (lines 1–3)\nsignature: pub fn run()\ndoc: Runs.\nusages: 35 in 3 files (src 28, tests 7)\n"));
+        assert!(text.starts_with("symbol: Run — fn, a.rs#Run (lines 1–3)\nsignature: pub fn run()\ndoc: Runs.\ndefinition a.rs#Run  (lines 1–3)\nusages: 35 in 3 files (src 28, tests 7)\n"));
         assert!(text.contains("… 5 more (ide.inspect sym-1)"));
+        assert!(text.contains("callers: 1\n  a.rs#Owner/caller  a.rs:8\n"));
         assert_eq!(text.matches("run();").count(), MAX_USAGE_LINES);
     }
 }

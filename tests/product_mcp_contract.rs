@@ -206,11 +206,11 @@ impl Mcp {
         self.input.flush().await.unwrap();
     }
 
-    /// Exchanges one request, ignoring notifications and enforcing a five-second test deadline.
+    /// Exchanges one request, ignoring notifications and enforcing a twelve-second test deadline.
     async fn exchange(&mut self, request: Value) -> Value {
         let id = request["id"].clone();
         self.send(request).await;
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(12), async {
             loop {
                 let mut line = String::new();
                 assert_ne!(
@@ -288,7 +288,10 @@ fn assert_compact_envelope(reply: &Value) {
             let header = body.lines().next().unwrap_or_default();
             let (file, details) = header.split_once("  (").expect("outline file header");
             assert!(!file.is_empty() && details.ends_with(')'), "{reply}");
-            assert!(details.contains(" lines, "), "{reply}");
+            assert!(
+                details.contains(" lines, ") || details.contains(" files, "),
+                "{reply}"
+            );
         }
         // `<title>  (lines A–B)` read header.
         ("complete", Some("read")) => {
@@ -385,7 +388,7 @@ fn claude_fields(text: &str) -> Value {
         let truncated = continuation || rest.contains("\nOutput is incomplete;");
         let detail_ref = after(rest, "detail_ref ").or_else(|| after(rest, "source_ref "));
         let body_end = [
-            "\nNext: use ide.context",
+            "\nNext: use ide.outline a file or ide.symbol a name",
             "\nOutput is truncated;",
             "\nOutput is incomplete;",
             "\nDiagnostics are exactly as reported;",
@@ -962,13 +965,17 @@ async fn binary_codex_hooks_bind_exact_parallel_actors_and_stop_before_workspace
         Mcp::start(&runtime, Some("private-host-channel")),
         Mcp::start(&runtime, Some("private-host-channel"))
     );
-    // One actor's pre-hook must never validate the other's identical pending call.
+    // One actor's pre-hook must never validate the other's identical call.
     hook(&runtime, "PreToolUse", "session_id", "root", "only-root").await;
     let (root_reply, child_reply) = tokio::join!(
         root.exchange(host_call("root", "only-root", "ide.start")),
         child.exchange(host_call("child", "only-root", "ide.start"))
     );
-    boundary(&root_reply, "pending");
+    assert_compact_envelope(&root_reply);
+    assert_ne!(
+        root_reply["result"]["structuredContent"]["code"],
+        "host_binding"
+    );
     boundary(&child_reply, "host_binding");
     hook(&runtime, "PostToolUse", "session_id", "root", "only-root").await;
     // Both actors supply their own exact lifecycle, with identical call/JSON-RPC correlations.
@@ -980,8 +987,10 @@ async fn binary_codex_hooks_bind_exact_parallel_actors_and_stop_before_workspace
         root.exchange(host_call("root", "parallel", "ide.start")),
         child.exchange(host_call("child", "parallel", "ide.start"))
     );
-    boundary(&root_reply, "pending");
-    boundary(&child_reply, "pending");
+    for reply in [&root_reply, &child_reply] {
+        assert_compact_envelope(reply);
+        assert_ne!(reply["result"]["structuredContent"]["code"], "host_binding");
+    }
     tokio::join!(
         hook(&runtime, "PostToolUse", "session_id", "root", "parallel"),
         hook(&runtime, "PostToolUse", "agent_id", "child", "parallel")
@@ -1007,13 +1016,19 @@ async fn binary_codex_hooks_bind_exact_parallel_actors_and_stop_before_workspace
         child.exchange(host_call("child", "after-stop", "ide.context"))
     );
     boundary(&root_reply, "host_binding");
-    boundary(&child_reply, "pending");
+    assert_compact_envelope(&child_reply);
+    assert_ne!(
+        child_reply["result"]["structuredContent"]["code"],
+        "host_binding"
+    );
     hook(&runtime, "PreToolUse", "session_id", "root", "restart").await;
-    boundary(
-        &root
-            .exchange(host_call("root", "restart", "ide.start"))
-            .await,
-        "pending",
+    let restarted = root
+        .exchange(host_call("root", "restart", "ide.start"))
+        .await;
+    assert_compact_envelope(&restarted);
+    assert_ne!(
+        restarted["result"]["structuredContent"]["code"],
+        "host_binding"
     );
     // Duplicate and premature post observations cannot be repaired by a subsequent MCP call.
     for (call, second_phase) in [("duplicate", "PreToolUse"), ("early-post", "PostToolUse")] {
@@ -1724,7 +1739,7 @@ async fn binary_active_native_hooks_accept_edits_deletes_renames_and_failed_comm
     hook(&runtime, "PreToolUse", "session_id", "actor", "start").await;
     boundary(
         &mcp.exchange(host_call("actor", "start", "ide.start")).await,
-        "pending",
+        "complete activation",
     );
     assert_eq!(
         post_ack(&runtime, "actor", "start").await["state"],
@@ -2971,7 +2986,10 @@ async fn managed_codex_publishes_distinct_actor_routes_and_retires_them_on_shutd
         &state,
     )
     .await;
-    assert_eq!(refreshed["state"], "pending", "{refreshed}");
+    assert!(
+        matches!(refreshed["state"].as_str(), Some("pending" | "complete")),
+        "{refreshed}"
+    );
     let route_b = CodexRouteIdentity::new("root-session-b", actor).unwrap();
     assert_ne!(route_a.digest(), route_b.digest());
     assert!(
@@ -3397,8 +3415,7 @@ async fn managed_codex_stalled_publication_keeps_replies_bounded() {
     let identity = CodexRouteIdentity::new(session, actor).unwrap();
     let next = 10;
 
-    // The very first valid call would publish before dispatch: with an unbounded publication
-    // wait this exchange could not finish inside its normal deadline.
+    // The very first valid call publishes before dispatch; this bounded wait must still finish.
     let started = std::time::Instant::now();
     let start = managed_root_call(
         &mut mcp,
@@ -3410,9 +3427,12 @@ async fn managed_codex_stalled_publication_keeps_replies_bounded() {
         &state,
     )
     .await;
-    assert_eq!(start["state"], "pending", "{start}");
     assert!(
-        started.elapsed() < Duration::from_secs(2),
+        matches!(start["state"].as_str(), Some("pending" | "complete")),
+        "{start}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(9),
         "a stalled publication delayed the MCP reply, took {:?}",
         started.elapsed()
     );
@@ -4248,13 +4268,13 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
 
 /// Parses the authority epoch from a settled activation reply's compact text.
 ///
-/// The activation text always opens with `Workspace activated; authority_epoch: N;`; this returns
+/// The activation text always opens with `activated: epoch N;`; this returns
 /// `N` so two grants on the same daemon can be ordered. Panics when the reply is not an activation
 /// or the number is missing, which is itself a failed contract.
 fn activation_epoch(activation: &Value) -> u64 {
     let text = activation["text"].as_str().unwrap();
     let rest = text
-        .strip_prefix("Workspace activated; authority_epoch: ")
+        .strip_prefix("activated: epoch ")
         .unwrap_or_else(|| panic!("{text}"));
     rest.split(';').next().unwrap().trim().parse().unwrap()
 }
@@ -4541,6 +4561,61 @@ fn symbol_test_fixture() -> ProductFixture {
     fixture
 }
 
+/// Exercises directory outlines without configuring or starting a language server.
+#[tokio::test]
+async fn product_directory_outline_lists_files_and_rejects_escaping_symlinks() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::create_dir_all(fixture.root.join("src/problems")).unwrap();
+    std::fs::write(
+        fixture.root.join("src/problems/item.rs"),
+        "//! Rust problem docs\npub fn item() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("src/problem.rs"),
+        "//! Rust module docs\npub fn problem() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("src/readme.py"),
+        "\"\"\"Python module docs\"\"\"\nvalue = 1\n",
+    )
+    .unwrap();
+    let outside = fixture.base.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, fixture.root.join("src/escape")).unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "directory-outline").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"directory-outline"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let reply = actor
+        .call(&fixture, "ide.outline", json!({"path":"src/"}))
+        .await;
+    let reply = actor.settle(&fixture, reply).await;
+    assert_eq!(reply["kind"], "outline", "{reply}");
+    let text = reply["text"].as_str().unwrap();
+    assert!(text.contains("dirs: problems/ 1"), "{text}");
+    assert!(
+        text.contains("Rust module docs") && text.contains("Python module docs"),
+        "{text}"
+    );
+    let refused = actor
+        .call(&fixture, "ide.outline", json!({"path":"src/escape"}))
+        .await;
+    assert_eq!(
+        actor.settle(&fixture, refused).await["code"],
+        "outside_allowed_roots"
+    );
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A Python request in a binding whose Rust session is live leaves that session running: the
 /// rust-analyzer wrapper is spawned exactly once across `.rs` -> `.py` -> `.rs` requests, and the
 /// second Rust request answers without another readiness wait.
@@ -4713,12 +4788,10 @@ async fn configured_product_symbol_test_uses_the_live_symbol_session() {
     daemon.wait().await.unwrap();
 }
 
-/// The first `ide.test {symbol}` on a cold session — no earlier `ide.symbol` warmed rust-analyzer —
-/// answers `pending` at once instead of holding the request while the language server starts
-/// (which outlasts the bridge's budget and made the re-sent call a rejected replay); the started
-/// line then arrives through `ide.inspect`.
+/// The first `ide.test {symbol}` on a cold session returns either its completed line or a retained
+/// pending detail if language-server startup exceeds the bounded inline reply window.
 #[tokio::test]
-async fn configured_product_symbol_test_on_a_cold_session_answers_pending_first() {
+async fn configured_product_cold_symbol_test_accepts_inline_or_pending() {
     let fixture = symbol_test_fixture();
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "cold-symbol-test").await;
@@ -4739,10 +4812,9 @@ async fn configured_product_symbol_test_on_a_cold_session_answers_pending_first(
         )
         .await;
     let elapsed = asked.elapsed();
-    assert_eq!(pending["state"], "pending", "{pending}");
     assert!(
-        elapsed < Duration::from_millis(500),
-        "cold symbol test answered after {elapsed:?}: {pending}"
+        matches!(pending["state"].as_str(), Some("pending" | "complete")),
+        "cold symbol test returned an unexpected result after {elapsed:?}: {pending}"
     );
     let started = actor.settle(&fixture, pending).await;
     assert_eq!(started["kind"], "test", "{started}");
@@ -4751,6 +4823,46 @@ async fn configured_product_symbol_test_on_a_cold_session_answers_pending_first(
         text.starts_with("tests #1: started — ") && text.contains("(1 tests selected)"),
         "{started}"
     );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Proves warm Rust outline and symbol calls finish inline without pending inspection round trips.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN environment"]
+async fn configured_product_warm_rust_calls_complete_inline_within_three_seconds() {
+    let fixture = symbol_test_fixture();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "warm-rust-inline").await;
+    let start = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"warm-rust-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, start).await["kind"], "activation");
+
+    let warmup = actor
+        .call(&fixture, "ide.outline", json!({"path":"src/lib.rs"}))
+        .await;
+    let warmup = actor.settle(&fixture, warmup).await;
+    assert_eq!(warmup["kind"], "outline", "{warmup}");
+    for (tool, params) in [
+        ("ide.outline", json!({"path":"src/lib.rs"})),
+        (
+            "ide.symbol",
+            json!({"symbol":"src/lib.rs#FileFlag/is_file","usages":false,"callers":0}),
+        ),
+    ] {
+        let began = tokio::time::Instant::now();
+        let reply = actor.call(&fixture, tool, params).await;
+        let elapsed = began.elapsed();
+        assert_eq!(reply["state"], "complete", "{tool}: {reply}");
+        assert!(elapsed < Duration::from_secs(3), "{tool} took {elapsed:?}");
+    }
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
@@ -4795,7 +4907,7 @@ async fn configured_product_start_enforces_allowed_roots_and_accepts_root_argume
     daemon.wait().await.unwrap();
 }
 
-/// The activation reply keeps its fixed first line and appends the project card: one rendered
+/// The activation reply keeps its compact epoch line and appends the project card: one rendered
 /// block describing the fixture worktree (rust from Cargo.toml, typescript from package.json,
 /// plus the go module the shared fixture ships), with the layout, docs, and not-started server
 /// lines exactly as `project::render` prints them.
@@ -4816,10 +4928,7 @@ async fn configured_product_activation_reply_includes_the_project_card() {
     let started = actor.settle(&fixture, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
     let text = started["text"].as_str().unwrap();
-    assert!(
-        text.starts_with("Workspace activated; authority_epoch: "),
-        "{text}"
-    );
+    assert!(text.starts_with("activated: epoch "), "{text}");
     assert!(text.contains("\n\nproject: repo  root: "), "{text}");
     // Sorted by line count: main.go (3 lines) leads src/lib.rs (2 lines); package.json maps to
     // no owned source files, so typescript reports 0 in 0.
@@ -5194,9 +5303,14 @@ async fn configured_product_pyright_symbol_tools_and_edit() {
     let text = symbol["text"].as_str().unwrap();
     assert!(text.contains("symbol: method — method"), "{symbol}");
     assert!(
-        text.contains("caller")
-            && text.contains("main.py:6")
-            && text.contains("Greeter().method()"),
+        text.contains("definition main.py#Greeter/method  (lines 2–3)"),
+        "{symbol}"
+    );
+    assert!(!text.contains("return \"hello\""), "{symbol}");
+    assert!(text.contains("usages: 1 in 1 files"), "{symbol}");
+    assert!(!text.contains("main.py:2"), "{symbol}");
+    assert!(
+        text.contains("main.py#caller  main.py:5") && text.contains("Greeter().method()"),
         "{symbol}"
     );
     let read = actor
@@ -5662,9 +5776,12 @@ async fn configured_product_typescript_symbol_tools_and_edit() {
     let text = symbol["text"].as_str().unwrap();
     assert!(text.contains("symbol: method — method"), "{symbol}");
     assert!(
-        text.contains("caller")
-            && text.contains("fixture.ts:4")
-            && text.contains("new Greeter().method()"),
+        text.contains("definition fixture.ts#Greeter/method  (lines 2)"),
+        "{symbol}"
+    );
+    assert!(!text.contains("return \"hello\""), "{symbol}");
+    assert!(
+        text.contains("fixture.ts#caller  fixture.ts:4") && text.contains("new Greeter().method()"),
         "{symbol}"
     );
     let read = actor
@@ -6532,7 +6649,10 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
             json!({"path":"main.go","byte_offset":59}),
         )
         .await;
-    assert_eq!(pending["state"], "pending", "{pending}");
+    assert!(
+        matches!(pending["state"].as_str(), Some("pending" | "complete")),
+        "{pending}"
+    );
     tokio::time::timeout(Duration::from_secs(5), async {
         while !marker.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -6650,7 +6770,10 @@ async fn configured_product_context_settles_promptly_when_provider_exits_before_
             json!({"path":"main.go","byte_offset":59}),
         )
         .await;
-    assert_eq!(pending["state"], "pending", "{pending}");
+    assert!(
+        matches!(pending["state"].as_str(), Some("pending" | "complete")),
+        "{pending}"
+    );
     let began = tokio::time::Instant::now();
     let settled = actor.settle(&fixture, pending).await;
     let elapsed = began.elapsed();
@@ -6699,7 +6822,10 @@ async fn configured_product_context_settles_promptly_when_provider_exits_before_
             json!({"path":"main.go","byte_offset":59}),
         )
         .await;
-    assert_eq!(refreshed["state"], "pending", "{refreshed}");
+    assert!(
+        matches!(refreshed["state"].as_str(), Some("pending" | "complete")),
+        "{refreshed}"
+    );
     let refreshed = actor.settle(&fixture, refreshed).await;
     assert_eq!(refreshed["state"], "complete", "{refreshed}");
     assert!(
@@ -6754,7 +6880,10 @@ async fn configured_product_sigterm_reaps_active_provider_and_owned_sockets() {
             json!({"path":"main.go","byte_offset":59}),
         )
         .await;
-    assert_eq!(pending["state"], "pending", "{pending}");
+    assert!(
+        matches!(pending["state"].as_str(), Some("pending" | "complete")),
+        "{pending}"
+    );
     tokio::time::timeout(Duration::from_secs(5), async {
         while !listener_ready.exists() {
             assert!(daemon.try_wait().unwrap().is_none());
@@ -6855,7 +6984,10 @@ async fn configured_product_sigterm_reaps_in_flight_rust_only_provider() {
             json!({"path":"src/lib.rs","byte_offset":48}),
         )
         .await;
-    assert_eq!(pending["state"], "pending", "{pending}");
+    assert!(
+        matches!(pending["state"].as_str(), Some("pending" | "complete")),
+        "{pending}"
+    );
     tokio::time::timeout(Duration::from_secs(5), async {
         while !ready.exists() {
             assert!(daemon.try_wait().unwrap().is_none());
@@ -8556,11 +8688,13 @@ async fn claude_diff_and_failed_reinspection_do_not_exhaust_detail_capacity() {
     let detail_ref = conflicting["detail_ref"].clone();
     let (conflict, _) = second.settle_claude(&fixture, conflicting).await;
     assert_eq!(conflict["code"], "conflict", "{conflict}");
-    for _ in 0..2 {
-        let conflict = second
-            .call_claude(&fixture, "ide.inspect", json!({"detail_ref":detail_ref}))
-            .await;
-        assert_eq!(conflict["code"], "conflict", "{conflict}");
+    if let Some(reference) = detail_ref.as_str() {
+        for _ in 0..2 {
+            let conflict = second
+                .call_claude(&fixture, "ide.inspect", json!({"detail_ref":reference}))
+                .await;
+            assert_eq!(conflict["code"], "conflict", "{conflict}");
+        }
     }
 
     for _ in 0..3 {
@@ -10146,7 +10280,10 @@ async fn eyes_codex_managed_hook_lifecycles_stay_silent_without_delivery() {
         &state,
     )
     .await;
-    assert_eq!(reply["state"], "pending", "{reply}");
+    assert!(
+        matches!(reply["state"].as_str(), Some("pending" | "complete")),
+        "{reply}"
+    );
     let own_post = managed_native_phase(
         &root,
         session,
@@ -10169,7 +10306,10 @@ async fn eyes_codex_managed_hook_lifecycles_stay_silent_without_delivery() {
         &state,
     )
     .await;
-    assert_eq!(followup["state"], "pending", "{followup}");
+    assert!(
+        matches!(followup["state"].as_str(), Some("pending" | "complete")),
+        "{followup}"
+    );
 
     // The check counter proves none of the silent lifecycles above (and not the control post
     // itself) scheduled a project check: the activation's one completed check is still all.
@@ -10395,7 +10535,10 @@ async fn eyes_claude_native_post_delivers_due_first_check_plate_once() {
     // A second operation is minted, its post withheld too, while the first check stays running.
     let (diff, call) =
         withheld_call(&mut actor, &fixture, "ide.diff", json!({"mode":"head"})).await;
-    assert_eq!(diff["state"], "pending", "{diff}");
+    assert!(
+        matches!(diff["state"].as_str(), Some("pending" | "complete")),
+        "{diff}"
+    );
     withheld.push(call);
 
     // The next native post carries the due plate.
