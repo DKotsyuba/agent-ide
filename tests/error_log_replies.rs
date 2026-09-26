@@ -38,7 +38,7 @@ async fn typed_failures_and_check_starts_are_logged_without_telemetry() {
     for (code, _) in failures {
         adapters::log_tool_reply(
             AssistanceTool::Inspect,
-            &PeerReply::Error { code },
+            &PeerReply::Error { code, detail: None },
             Duration::from_millis(3),
             Some("requested-ref"),
         );

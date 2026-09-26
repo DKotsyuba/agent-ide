@@ -465,6 +465,7 @@ impl Shared {
             .and_then(|value| PeerReply::decode(value.as_str()))
             .unwrap_or(PeerReply::Error {
                 code: FailureCode::Internal,
+                detail: None,
             });
         if let Ok(mut ledger) = self.ledger.lock()
             && let Some(detail) = ledger.details.get_mut(reference)
@@ -909,12 +910,13 @@ impl WorkerHandle {
             attachment,
             Some(send),
         ) {
-            return PeerReply::Error { code };
+            return PeerReply::Error { code, detail: None };
         }
         match tokio::time::timeout(Duration::from_millis(800), wait).await {
             Ok(Ok(reply)) => reply,
             _ => PeerReply::Error {
                 code: FailureCode::Deadline,
+                detail: None,
             },
         }
     }
@@ -1126,17 +1128,19 @@ impl WorkerHandle {
         if self.target(attachment).is_none() {
             return PeerReply::Error {
                 code: FailureCode::LauncherConfiguration,
+                detail: None,
             };
         }
         if tool == AssistanceTool::Test && parameters.get("symbol").is_none() {
             let (send, wait) = oneshot::channel();
             if let Err(code) = self.enqueue(invocation, tool, parameters, attachment, Some(send)) {
-                return PeerReply::Error { code };
+                return PeerReply::Error { code, detail: None };
             }
             return match tokio::time::timeout(Duration::from_secs(5), wait).await {
                 Ok(Ok(reply)) => reply,
                 _ => PeerReply::Error {
                     code: FailureCode::Deadline,
+                    detail: None,
                 },
             };
         }
@@ -1147,7 +1151,7 @@ impl WorkerHandle {
                 self.inspect_reserved(binding, reference, expected, permit)
                     .await
             }
-            Err(code) => PeerReply::Error { code },
+            Err(code) => PeerReply::Error { code, detail: None },
         }
     }
 
@@ -1185,12 +1189,13 @@ impl WorkerHandle {
             attachment,
             Some(send),
         ) {
-            return PeerReply::Error { code };
+            return PeerReply::Error { code, detail: None };
         }
         match tokio::time::timeout(Duration::from_millis(800), wait).await {
             Ok(Ok(reply)) => reply,
             _ => PeerReply::Error {
                 code: FailureCode::Deadline,
+                detail: None,
             },
         }
     }
@@ -1206,11 +1211,12 @@ impl WorkerHandle {
         if self.target(attachment).is_none() {
             return PeerReply::Error {
                 code: FailureCode::LauncherConfiguration,
+                detail: None,
             };
         }
         let permit = match reserve_inspection(&self.inspect) {
             Ok(permit) => permit,
-            Err(code) => return PeerReply::Error { code },
+            Err(code) => return PeerReply::Error { code, detail: None },
         };
         self.inspect_reserved(binding, reference, expected, permit)
             .await
@@ -1233,6 +1239,7 @@ impl WorkerHandle {
         });
         wait.await.unwrap_or(PeerReply::Error {
             code: FailureCode::Internal,
+            detail: None,
         })
     }
 
@@ -1895,9 +1902,16 @@ impl<'a> Worker<'a> {
         };
         let (reply, authority, source) = match result {
             Ok(result) => result,
-            Err(code) => (PeerReply::Error { code }, None, None),
+            Err(code) => (
+                PeerReply::Error {
+                    code,
+                    detail: job.failure_detail.clone(),
+                },
+                None,
+                None,
+            ),
         };
-        if let PeerReply::Error { code } = &reply {
+        if let PeerReply::Error { code, .. } = &reply {
             // T26B: a queued job's terminal failure must reach the error log with its closed
             // reason even when no caller view ever does — the dispatch path only logs the initial
             // `pending` placeholder a slow job returns, and daemon shutdown drops retained
@@ -2499,7 +2513,18 @@ impl<'a> Worker<'a> {
             Ok(None)=>(lexical_context(&observed,&bytes,query,"no accepted provider is configured for this source, or the registered path is missing").map_err(|_|FailureCode::SourceUnavailable)?, None),
             Err(FailureCode::ProviderUnavailable)=>(lexical_context(&observed,&bytes,query,"accepted semantic provider is unavailable").map_err(|_|FailureCode::SourceUnavailable)?, None),
             Err(FailureCode::ProviderLoading)=>(lexical_context(&observed,&bytes,query,"semantic provider is still loading the workspace; repeat the call in a few seconds").map_err(|_|FailureCode::SourceUnavailable)?, None),
-            Err(FailureCode::ResolutionUnverified)=>(lexical_context(&observed,&bytes,query,"semantic project resolution is unverified").map_err(|_|FailureCode::SourceUnavailable)?, None),
+            Err(FailureCode::ResolutionUnverified) => (
+                lexical_context(
+                    &observed,
+                    &bytes,
+                    query,
+                    job.failure_detail
+                        .as_deref()
+                        .unwrap_or("semantic project resolution is unverified"),
+                )
+                .map_err(|_| FailureCode::SourceUnavailable)?,
+                None,
+            ),
             Err(FailureCode::ExecutionProfile)=>(lexical_context(&observed,&bytes,query,"accepted semantic provider cannot run under the current execution profile").map_err(|_|FailureCode::SourceUnavailable)?, None),
             Err(code)=>return Err(code),
         };
@@ -3472,7 +3497,7 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
         Ok::<_, FailureCode>(reply)
     }
     .await;
-    let reply = result.unwrap_or_else(|code| PeerReply::Error { code });
+    let reply = result.unwrap_or_else(|code| PeerReply::Error { code, detail: None });
     // This is the actual submission boundary for the managed path: `reply` is about to be handed
     // to the real caller of either the initial `submit()` or a later `ide.inspect`. Marking must
     // wait for the send's own outcome — a request whose receiving side already closed must not
@@ -4950,7 +4975,8 @@ mod stop_retry_tests {
         assert!(matches!(
             reply_rx.await.unwrap(),
             PeerReply::Error {
-                code: FailureCode::InvalidDetail
+                code: FailureCode::InvalidDetail,
+                detail: None,
             }
         ));
 
@@ -4999,7 +5025,8 @@ mod stop_retry_tests {
         assert!(matches!(
             reply_rx.await.unwrap(),
             PeerReply::Error {
-                code: FailureCode::InvalidDetail
+                code: FailureCode::InvalidDetail,
+                detail: None,
             }
         ));
     }
@@ -5460,6 +5487,7 @@ mod feedback_dedup_tests {
         // A closed/failed transport for the same producer.
         let closed = PeerReply::Error {
             code: FailureCode::Deadline,
+            detail: None,
         };
         handle
             .shared

@@ -291,13 +291,16 @@ fn reply_outcome(reply: &PeerReply) -> ToolOutcome {
         },
         PeerReply::Error {
             code: FailureCode::Cancelled,
+            ..
         } => ToolOutcome::Cancelled,
         PeerReply::Error {
             code: FailureCode::InvalidDetail,
+            ..
         } => ToolOutcome::Invalid,
         PeerReply::InvalidParameters { .. } => ToolOutcome::Invalid,
         PeerReply::Error {
             code: FailureCode::Deadline,
+            ..
         } => ToolOutcome::Incomplete,
         PeerReply::Error { .. } => ToolOutcome::Failed,
         PeerReply::Feedback { .. } => ToolOutcome::Completed,
@@ -322,7 +325,7 @@ fn reply_outcome(reply: &PeerReply) -> ToolOutcome {
 /// counterpart) has no closed reason code at this boundary and reports `None`.
 fn reply_reason(reply: &PeerReply) -> Option<crate::errorlog::ReasonCode> {
     match reply {
-        PeerReply::Error { code } => Some((*code).into()),
+        PeerReply::Error { code, .. } => Some((*code).into()),
         PeerReply::Edit { result, .. } => {
             crate::errorlog::ReasonCode::from_edit_outcome(result.outcome)
         }
@@ -349,12 +352,14 @@ mod tests {
         assert_eq!(
             reply_outcome(&PeerReply::Error {
                 code: FailureCode::ProviderUnavailable,
+                detail: None,
             }),
             ToolOutcome::Failed
         );
         assert_eq!(
             reply_outcome(&PeerReply::Error {
                 code: FailureCode::Deadline,
+                detail: None,
             }),
             ToolOutcome::Incomplete
         );
@@ -395,12 +400,14 @@ mod tests {
         assert_eq!(
             errorlog_outcome(&PeerReply::Error {
                 code: FailureCode::SourceUnavailable,
+                detail: None,
             }),
             crate::errorlog::Outcome::Failed
         );
         assert_eq!(
             reply_reason(&PeerReply::Error {
                 code: FailureCode::SourceUnavailable,
+                detail: None,
             }),
             Some(crate::errorlog::ReasonCode::SourceUnavailable)
         );

@@ -984,7 +984,8 @@ async fn managed_codex_problems_context_short_circuits_before_read_boundary_reco
     assert_eq!(
         reply,
         PeerReply::Error {
-            code: super::reply::FailureCode::Internal
+            code: super::reply::FailureCode::Internal,
+            detail: None,
         }
     );
     // The removed short-circuit would have called `managed_read_boundary`, which coalesces a

@@ -290,6 +290,11 @@ pub enum PeerReply {
     Error {
         /// Stable actionable failure category.
         code: FailureCode,
+        /// Request-local plain-words reason (the worker's `failure_detail`), rendered only in the
+        /// compact `resolution_unverified` text and stripped from the public structured reply.
+        /// Absent from the encoded form when `None`, so retained replies keep their prior shape.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
     /// Model-facing parameter rejection discovered after the worktree's runner contract is known.
     InvalidParameters {
