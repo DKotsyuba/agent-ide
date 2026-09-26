@@ -8,7 +8,7 @@
 # the AGENT_IDE_ACCEPTANCE_ROUTE, AGENT_IDE_ACCEPTANCE_LEFT_WORKTREE,
 # AGENT_IDE_ACCEPTANCE_RIGHT_WORKTREE, and AGENT_IDE_ACCEPTANCE_RESULT
 # environment settings. Every function keeps the public contract closed: the
-# only public success output is the exact nine-line host-cell result document,
+# only public success output is the exact ten-line host-cell result document,
 # and every failure is recorded as a closed code in a private diagnostic log
 # that never enters evidence.
 
@@ -63,7 +63,7 @@ project_identity() {
     rm -f -- "$identity_tmp"
 }
 
-# Writes the exact closed nine-line host-cell result document on full success.
+# Writes the exact closed ten-line host-cell result document on full success.
 #
 # The only permitted status is real_pass for every scenario; a partial cell must
 # fail instead of writing a reduced document.
@@ -78,6 +78,7 @@ write_pass_result() {
         'python_provider=real_pass' \
         'typescript_r3=real_pass' \
         'divergent_worktrees=real_pass' \
+        'symbol_tools=real_pass' \
         >"$AGENT_IDE_ACCEPTANCE_RESULT"
 }
 
@@ -109,6 +110,34 @@ forbid_transcript_text() {
     matched=$(jq -sr --arg needle "$2" '
         [.[] | tostring | select(contains($needle))] | length' "$1" 2>>"$DIAG_LOG")
     [ "$matched" -eq 0 ] || { note "$3" "forbidden text $2 in $(basename -- "$1")"; return 1; }
+}
+
+# Requires the L5 symbol-tools scenario to leave the Rust fixture crate at net zero and compiling.
+#
+# The first argument is the canonical LEFT worktree and the second a closed assertion code. The
+# inserted-then-deleted `doubled` method must be fully gone from the fixture's library file; cargo
+# is optional on the operator host, so its absence is recorded as a skipped check, never a failure.
+verify_symbol_tools_left_clean() {
+    left_lib="$1/acceptance-fixture/src/lib.rs"
+    if grep -qF doubled "$left_lib" 2>>"$DIAG_LOG"; then
+        note "$2" "left fixture acceptance-fixture/src/lib.rs still contains doubled after l5"
+        return 1
+    fi
+    if command -v cargo >/dev/null 2>&1; then
+        cargo_target=$(mktemp -d "${TMPDIR:-/tmp}/agent-ide-l5-cargo.XXXXXX") || return 1
+        if CARGO_TARGET_DIR="$cargo_target" cargo check \
+            --manifest-path "$1/acceptance-fixture/Cargo.toml" >>"$DIAG_LOG" 2>&1
+        then
+            rm -rf -- "$cargo_target"
+        else
+            rm -rf -- "$cargo_target"
+            note "$2" "cargo check failed against the left fixture crate after l5"
+            return 1
+        fi
+    else
+        note "$2-cargo-skipped" "cargo not on PATH; skipped the post-l5 compile check"
+    fi
+    return 0
 }
 
 # Prints the input object of the first tool use with the given name, or null.

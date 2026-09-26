@@ -104,6 +104,46 @@ create_fixture() {
     printf '%s\n' \
         '{"compilerOptions":{"types":[],"moduleResolution":"node10"},"files":["fixture.ts"]}' \
         >"$1/acceptance-fixture/tsconfig.json"
+    mkdir -p "$1/acceptance-fixture/src" "$1/acceptance-fixture/tests"
+    printf '%s\n' \
+        '[package]' \
+        'name = "acceptance-fixture"' \
+        'version = "0.1.0"' \
+        'edition = "2021"' \
+        'publish = false' \
+        '' \
+        '[lib]' \
+        'path = "src/lib.rs"' \
+        >"$1/acceptance-fixture/Cargo.toml"
+    printf '%s\n' \
+        '//! Fixture crate for the agent-ide symbol tools acceptance scenario.' \
+        '' \
+        '/// A minimal counter used to exercise the Rust symbol tools live.' \
+        'pub struct Counter {' \
+        '    value: u32,' \
+        '}' \
+        '' \
+        'impl Counter {' \
+        '    /// Creates a new counter starting at zero.' \
+        '    pub fn new() -> Self {' \
+        '        Counter { value: 0 }' \
+        '    }' \
+        '' \
+        '    /// Returns the current value.' \
+        '    pub fn get(&self) -> u32 {' \
+        '        self.value' \
+        '    }' \
+        '}' \
+        >"$1/acceptance-fixture/src/lib.rs"
+    printf '%s\n' \
+        'use acceptance_fixture::Counter;' \
+        '' \
+        '#[test]' \
+        'fn get_returns_zero_for_a_new_counter() {' \
+        '    let counter = Counter::new();' \
+        '    assert_eq!(counter.get(), 0);' \
+        '}' \
+        >"$1/acceptance-fixture/tests/counter.rs"
     /usr/bin/git -C "$1" add -- acceptance-fixture
     /usr/bin/git -C "$1" \
         -c user.name='Acceptance Fixture' \
@@ -201,9 +241,10 @@ telemetry_restart_query_export=real_pass
 compact_content=real_pass
 python_provider=real_pass
 typescript_r3=real_pass
-divergent_worktrees=real_pass'
+divergent_worktrees=real_pass
+symbol_tools=real_pass'
     [ "$(sed -n '1,10p' "$ACCEPTANCE_RESULT")" = "$ACCEPTANCE_EXPECTED" ] || return 1
-    [ "$(wc -l <"$ACCEPTANCE_RESULT" | tr -d ' ')" -le 9 ] || return 1
+    [ "$(wc -l <"$ACCEPTANCE_RESULT" | tr -d ' ')" -le 10 ] || return 1
     verify_toolchains || return 1
 }
 

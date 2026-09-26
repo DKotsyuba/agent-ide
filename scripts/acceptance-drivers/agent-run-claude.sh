@@ -89,7 +89,7 @@ SESSION_SECONDS=${AGENT_IDE_ACCEPTANCE_SESSION_SECONDS:-1800}
 # Dry run: print the exact session command lines and exit without running
 # anything. Contract variables only need to be set; no host is touched.
 if [ "${AGENT_IDE_ACCEPTANCE_DRY:-0}" = 1 ]; then
-    for scenario in l1:LEFT l1b:LEFT l2:LEFT l3:LEFT l4:LEFT r5:RIGHT r5b:RIGHT; do
+    for scenario in l1:LEFT l1b:LEFT l2:LEFT l3:LEFT l4:LEFT l5:LEFT r5:RIGHT r5b:RIGHT; do
         case "$scenario:$AGENT_IDE_ACCEPTANCE_ROUTE" in *b:*:agent-run-claude) continue ;; esac
         label=${scenario%%:*}
         eval "worktree=\$AGENT_IDE_ACCEPTANCE_${scenario##*:}_WORKTREE"
@@ -311,6 +311,20 @@ task_prompt "$DRIVER_DIR/$PROMPT_FAMILY/l3.txt" >"$DIAG_DIR/task-l3.txt"
 run_agent l3 "$LEFT" "$DIAG_DIR/task-l3.txt"
 require_answer_text l3 "LEFT_TS_OK" A_L3_FINAL
 require_record_text l3 "mode: semantic" A_L3_SEMANTIC
+
+# Agent L5: symbol-addressed outline/symbol/edit/read loop over the Rust fixture crate. The
+# inserted method must leave no trace and the crate must still compile afterward.
+task_prompt "$DRIVER_DIR/$PROMPT_FAMILY/l5.txt" >"$DIAG_DIR/task-l5.txt"
+run_agent l5 "$LEFT" "$DIAG_DIR/task-l5.txt"
+require_answer_text l5 "LEFT_SYMBOLS_OK" A_L5_FINAL
+require_record_text l5 "impl Counter" A_L5_OUTLINE_IMPL
+require_record_text l5 "pub fn get" A_L5_OUTLINE_GET
+require_record_text l5 "symbol: get — method" A_L5_SYMBOL_HEADING
+require_record_text l5 "acceptance-fixture/tests/counter.rs" A_L5_SYMBOL_USAGE
+require_record_text l5 "edit: replaced" A_L5_EDIT_REPLACED
+require_record_text l5 "pub fn doubled" A_L5_READ_DOUBLED
+verify_symbol_tools_left_clean "$LEFT" A_L5_LEFT_CLEAN \
+    || fail A_L5_LEFT_CLEAN "left fixture crate not clean or not compiling after l5"
 
 # Restart-safe telemetry across a fresh agent's daemon generation.
 if [ "$AGENT_IDE_ACCEPTANCE_ROUTE" = agent-run-claude ]; then

@@ -9,7 +9,7 @@
 # `claude -p` sessions with the operator's authenticated home against the
 # candidate binary's managed MCP and plugin hooks, verifies every scenario from
 # the captured stream-json transcripts plus real filesystem and telemetry
-# effects, and only then emits the closed nine-line real_pass document. Any
+# effects, and only then emits the closed ten-line real_pass document. Any
 # failing step records a closed code in the private diagnostic log and fails the
 # whole cell honestly.
 #
@@ -41,7 +41,7 @@
 #   AGENT_IDE_ACCEPTANCE_SESSION_SECONDS wall-clock bound per session; default
 #                                     900.
 #   AGENT_IDE_ACCEPTANCE_ONLY        optional comma-separated scenario filter
-#                                    (l1,l1b,l2,l3,l4,r5,r5b) for single-scenario
+#                                    (l1,l1b,l2,l3,l4,l5,r5,r5b) for single-scenario
 #                                    diagnostic reruns; unset runs the complete
 #                                    cell, and a filtered run never emits the
 #                                    closed result document.
@@ -84,7 +84,7 @@ selected() {
 # Dry run: print the exact session command lines and exit without running
 # anything. Contract variables only need to be set; no host is touched.
 if [ "${AGENT_IDE_ACCEPTANCE_DRY:-0}" = 1 ]; then
-    for scenario in l1:LEFT l1b:LEFT l2:LEFT l3:LEFT l4:LEFT r5:RIGHT r5b:RIGHT; do
+    for scenario in l1:LEFT l1b:LEFT l2:LEFT l3:LEFT l4:LEFT l5:LEFT r5:RIGHT r5b:RIGHT; do
         label=${scenario%%:*}
         eval "worktree=\$AGENT_IDE_ACCEPTANCE_${scenario##*:}_WORKTREE"
         printf '%s\n' "cd $worktree && HOME=$OPERATOR_HOME AGENT_IDE_BIN=$BINARY \
@@ -305,6 +305,34 @@ verify_l3() {
     require_transcript_text "$t" "mode: semantic" A_L3_SEMANTIC || return 1
 }
 
+# Verifies the L5 symbol-tools loop: outline, symbol card, insert, read, delete over the
+# Rust fixture crate, and that the inserted method leaves no trace and the crate still compiles.
+verify_l5() {
+    t=$DIAG_DIR/transcript-l5.jsonl
+    require_tool_use "$t" mcp__agent-ide__ide_start A_L5_START || return 1
+    require_tool_use "$t" mcp__agent-ide__ide_outline A_L5_OUTLINE || return 1
+    require_tool_use "$t" mcp__agent-ide__ide_symbol A_L5_SYMBOL || return 1
+    require_tool_use "$t" mcp__agent-ide__ide_edit A_L5_EDIT || return 1
+    require_tool_use "$t" mcp__agent-ide__ide_read A_L5_READ || return 1
+    require_tool_use "$t" mcp__agent-ide__ide_stop A_L5_STOP || return 1
+    require_transcript_text "$t" "LEFT_SYMBOLS_OK" A_L5_FINAL || return 1
+    require_transcript_text "$t" "impl Counter" A_L5_OUTLINE_IMPL || return 1
+    require_transcript_text "$t" "pub fn get" A_L5_OUTLINE_GET || return 1
+    require_transcript_text "$t" "symbol: get — method" A_L5_SYMBOL_HEADING || return 1
+    require_transcript_text "$t" "acceptance-fixture/tests/counter.rs" A_L5_SYMBOL_USAGE || return 1
+    require_transcript_text "$t" "edit: replaced" A_L5_EDIT_REPLACED || return 1
+    require_transcript_text "$t" "diagnostics:" A_L5_EDIT_DIAGNOSTICS || return 1
+    require_transcript_text "$t" "pub fn doubled" A_L5_READ_DOUBLED || return 1
+    verify_symbol_tools_left_clean "$LEFT" A_L5_LEFT_CLEAN || return 1
+}
+
+# Restores the Rust fixture crate's library file to its committed baseline between L5 retries,
+# without disturbing the Python/TypeScript fixture state that earlier scenarios advanced.
+reset_left_rust_fixture() {
+    /usr/bin/git -C "$1" checkout -q -- acceptance-fixture/src/lib.rs \
+        || fail E_FIXTURE_RESET "could not restore acceptance-fixture/src/lib.rs"
+}
+
 # Verifies the R5 divergent-worktree loop.
 verify_r5() {
     t=$DIAG_DIR/transcript-r5.jsonl
@@ -347,6 +375,12 @@ if selected l3; then
     reset_left_native "$LEFT"
     cp -- "$DRIVER_DIR/$PROMPT_FAMILY/l3.txt" "$DIAG_DIR/prompt-l3.txt"
     run_scenario l3 "$LEFT" "$DIAG_DIR/prompt-l3.txt" verify_l3 reset_left_native A_L3_SCENARIO
+fi
+
+# Scenario L5: symbol-addressed outline/symbol/edit/read loop over the Rust fixture crate.
+if selected l5; then
+    cp -- "$DRIVER_DIR/$PROMPT_FAMILY/l5.txt" "$DIAG_DIR/prompt-l5.txt"
+    run_scenario l5 "$LEFT" "$DIAG_DIR/prompt-l5.txt" verify_l5 reset_left_rust_fixture A_L5_SCENARIO
 fi
 
 # Restart-safe telemetry: durable events survive the daemon restart of a fresh
