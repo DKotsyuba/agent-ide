@@ -2146,6 +2146,17 @@ impl StdioFacade {
     }
 }
 
+/// Connect-time instructions the host shows the model next to the tool list: the one-paragraph
+/// case for the IDE over native file tools, and the two rules every reply relies on.
+const SERVER_INSTRUCTIONS: &str = "Agent IDE: language-server-backed tools for source work. \
+Call ide.start once per task, then prefer the ide.* tools over native file tools for source: \
+ide.outline instead of reading a file, ide.symbol / ide.graph instead of grep for usages and \
+callers, ide.read for one symbol's body, ide.edit for changes (formatted and project-checked in \
+the same reply), ide.test to run exactly the tests that matter, ide.diff to review before \
+ide.stop. Symbols are addressed as `file#Owner/name`. A reply that says `pending` is not an \
+error: call ide.inspect with its detail_ref every few seconds until it completes. Native \
+read/edit tools remain available for non-source files and as a fallback.";
+
 /// Ensures diagnostics hide both launch attachments and populated host metadata in either format.
 #[test]
 fn debug_redacts_trusted_transport_and_host_metadata() {
@@ -2169,6 +2180,7 @@ impl rmcp::ServerHandler for StdioFacade {
                 .enable_tools()
                 .build(),
         )
+        .with_instructions(SERVER_INSTRUCTIONS)
     }
 }
 
