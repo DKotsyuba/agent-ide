@@ -832,6 +832,17 @@ impl Worker<'_> {
                             _ = job.cancel.changed() => Err(std::io::Error::other("cancelled")),
                         }
                     };
+                    // A whole-file query is the post-edit diagnostic read: give the analyzer a
+                    // few seconds to publish diagnostics for the synchronized version before
+                    // snapshotting, so an edit reply can report `current_clean`/`current_reported`
+                    // instead of `unknown`.
+                    if matches!(query, ContextQuery::File) && result.is_ok() {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(3),
+                            entry.live.session.wait_for_matching_diagnostics(),
+                        )
+                        .await;
+                    }
                     let diagnostics = entry.live.session.diagnostics();
                     result.map(|context| ProviderContext {
                         context,
