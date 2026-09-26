@@ -2015,6 +2015,7 @@ impl<'a> Worker<'a> {
                     AssistanceTool::Outline => self.outline(job).await,
                     AssistanceTool::Read => self.read(job).await,
                     AssistanceTool::Symbol => self.symbol(job).await,
+                    AssistanceTool::Graph => self.graph(job).await,
                     AssistanceTool::Test => self.test(job).await,
                     _ => Err(FailureCode::Internal),
                 }
@@ -3952,6 +3953,7 @@ fn errorlog_method(tool: AssistanceTool) -> crate::errorlog::Method {
         AssistanceTool::Outline => crate::errorlog::Method::Outline,
         AssistanceTool::Read => crate::errorlog::Method::Read,
         AssistanceTool::Symbol => crate::errorlog::Method::Symbol,
+        AssistanceTool::Graph => crate::errorlog::Method::Graph,
         AssistanceTool::Test => crate::errorlog::Method::Test,
     }
 }

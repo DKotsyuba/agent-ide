@@ -1,4 +1,4 @@
-//! Finite opaque transport values for Assistance hook ingress and closed v0.1/v0.2 method dispatch.
+//! Finite opaque transport values for Assistance hook ingress and closed versioned method dispatch.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -119,7 +119,7 @@ impl OpaqueJson {
     }
 }
 
-/// Names the closed Assistance operations Application may route through wire v2, v3, or v4.
+/// Names the closed Assistance operations Application may route through wire v2 through v5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssistanceMethod {
     /// Separate sanitized hook-observation ingress; never a generic event subscription.
@@ -142,21 +142,24 @@ pub enum AssistanceMethod {
     Read,
     /// v0.4 `ide.symbol` symbol card, wire version 3.
     Symbol,
+    /// v0.4 `ide.graph` live call graph, wire version 5.
+    Graph,
     /// v0.4 `ide.test` explicit test run/status, wire version 4.
     Test,
 }
 
 impl AssistanceMethod {
-    /// Wire version that carries this method: `ide.test` needs version 4.
+    /// Wire version that carries this method, from version 2 through version 5.
     pub(crate) fn wire_version(self) -> u64 {
         match self {
             Self::Edit | Self::Outline | Self::Read | Self::Symbol => 3,
             Self::Test => 4,
+            Self::Graph => 5,
             _ => 2,
         }
     }
 
-    /// Parses the closed version-specific method tags; v2 never accepts `edit`.
+    /// Parses only the method tag paired with its assigned wire version.
     pub(crate) fn from_dispatch_tag(value: &str, version: u64) -> Option<Self> {
         match value {
             "start" => Some(Self::Start),
@@ -169,6 +172,7 @@ impl AssistanceMethod {
             "read" if version == 3 => Some(Self::Read),
             "symbol" if version == 3 => Some(Self::Symbol),
             "test" if version == 4 => Some(Self::Test),
+            "graph" if version == 5 => Some(Self::Graph),
             _ => None,
         }
     }
@@ -310,7 +314,7 @@ impl MethodDispatch {
 pub enum AssistanceDispatch {
     /// One sanitized hook observation submitted without any retained queue or subscription.
     HookSubmit(HookSubmit),
-    /// One closed v2/v3/v4 method dispatch; Application still enforces the version-specific set.
+    /// One closed v2-v5 method dispatch; Application still enforces the version-specific set.
     MethodDispatch(MethodDispatch),
 }
 

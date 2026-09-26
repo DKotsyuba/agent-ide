@@ -4561,6 +4561,85 @@ fn symbol_test_fixture() -> ProductFixture {
     fixture
 }
 
+/// Builds a Rust project with a three-level caller chain, a cycle, and one test caller.
+fn graph_test_fixture() -> ProductFixture {
+    let fixture = symbol_test_fixture();
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "pub fn a() { b(); }\npub fn b() { c(); }\npub fn c() { a(); }\n#[cfg(test)] mod tests { #[test] fn reaches_a() { super::a(); } }\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.root.join("tests/path_tests.rs"), "").unwrap();
+    fixture.git(&["add", "--", "src/lib.rs", "tests/path_tests.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "call graph fixture"]);
+    fixture
+}
+
+/// Exercises graph depth, both traversal directions, test marking, and cycle deduplication.
+#[tokio::test]
+async fn configured_product_graph_traverses_live_calls_with_bounds() {
+    let fixture = graph_test_fixture();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "graph").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"graph-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+
+    let graph = actor
+        .call(
+            &fixture,
+            "ide.graph",
+            json!({
+                "symbol":"src/lib.rs#c", "direction":"callers", "depth":3
+            }),
+        )
+        .await;
+    let graph = actor.settle(&fixture, graph).await;
+    assert_eq!(graph["kind"], "graph", "{graph}");
+    let text = graph["text"].as_str().unwrap();
+    assert!(text.contains("← src/lib.rs#b"), "{text}");
+    assert!(text.contains("← src/lib.rs#a"), "{text}");
+    assert!(
+        text.contains("tests/reaches_a") && text.contains("[test]"),
+        "{text}"
+    );
+    assert_eq!(text.matches("(seen)").count(), 1, "{text}");
+
+    let shallow = actor
+        .call(
+            &fixture,
+            "ide.graph",
+            json!({
+                "symbol":"src/lib.rs#c", "direction":"callers", "depth":1
+            }),
+        )
+        .await;
+    let shallow = actor.settle(&fixture, shallow).await;
+    assert!(shallow["text"].as_str().unwrap().contains("#b"));
+    assert!(!shallow["text"].as_str().unwrap().contains("#a"));
+
+    let callees = actor
+        .call(
+            &fixture,
+            "ide.graph",
+            json!({
+                "symbol":"src/lib.rs#a", "direction":"callees", "depth":3
+            }),
+        )
+        .await;
+    let callees = actor.settle(&fixture, callees).await;
+    assert!(callees["text"].as_str().unwrap().contains("#c"));
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Exercises directory outlines without configuring or starting a language server.
 #[tokio::test]
 async fn product_directory_outline_lists_files_and_rejects_escaping_symlinks() {

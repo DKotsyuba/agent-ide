@@ -49,9 +49,9 @@ fn pre_hook() -> agent_ide::assistance::host_binding::HookEvent {
 }
 
 #[test]
-fn discovery_is_static_and_contains_exactly_ten_current_methods() {
+fn discovery_is_static_and_contains_exactly_eleven_current_methods() {
     let schemas = tool_schemas();
-    assert_eq!(schemas.len(), 10);
+    assert_eq!(schemas.len(), 11);
     assert!(schemas.iter().map(|schema| schema.name).eq([
         "ide.start",
         "ide.context",
@@ -62,6 +62,7 @@ fn discovery_is_static_and_contains_exactly_ten_current_methods() {
         "ide.outline",
         "ide.read",
         "ide.symbol",
+        "ide.graph",
         "ide.test"
     ]));
     assert!(
@@ -74,6 +75,25 @@ fn discovery_is_static_and_contains_exactly_ten_current_methods() {
         .find(|schema| schema.name == "ide.start")
         .unwrap();
     assert!(start.input_schema["properties"]["root"].is_object());
+}
+
+/// Keeps graph directions closed and its requested depth within the three-level ceiling.
+#[test]
+fn graph_arguments_validate_direction_and_depth() {
+    for input in [
+        json!({"symbol":"src/lib.rs#f"}),
+        json!({"symbol":"f", "direction":"both", "depth":3}),
+    ] {
+        assert!(validate_call(AssistanceTool::Graph, input).is_ok());
+    }
+    for input in [
+        json!({}),
+        json!({"symbol":"f", "direction":"all"}),
+        json!({"symbol":"f", "depth":0}),
+        json!({"symbol":"f", "depth":4}),
+    ] {
+        assert!(validate_call(AssistanceTool::Graph, input).is_err());
+    }
 }
 
 /// Walks a schema value and reports every JSON-Schema composition keyword it finds.

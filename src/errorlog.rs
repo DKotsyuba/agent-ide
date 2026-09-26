@@ -67,6 +67,8 @@ pub enum Method {
     Read,
     /// `ide.symbol`.
     Symbol,
+    /// `ide.graph`.
+    Graph,
     /// `ide.test`.
     Test,
     /// A native pre/post hook observation.
@@ -92,6 +94,7 @@ impl Method {
             Self::Outline => "outline",
             Self::Read => "read",
             Self::Symbol => "symbol",
+            Self::Graph => "graph",
             Self::Test => "test",
             Self::Inspect => "inspect",
             Self::Stop => "stop",

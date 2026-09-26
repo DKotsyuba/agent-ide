@@ -16,6 +16,276 @@ pub const MAX_USAGE_LINES: usize = 30;
 pub const MAX_CALL_LINES: usize = 20;
 /// Doc paragraph ceiling in characters.
 pub const MAX_DOC_CHARS: usize = 600;
+/// Maximum unique nodes retained by one call graph.
+pub const MAX_GRAPH_NODES: usize = 60;
+/// Maximum unique edges retained by one call graph.
+pub const MAX_GRAPH_EDGES: usize = 120;
+
+/// Direction in which one call-graph edge is rendered from its parent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphDirection {
+    /// The edge points to a function that calls its parent.
+    Callers,
+    /// The edge points to a function called by its parent.
+    Callees,
+}
+
+impl GraphDirection {
+    /// Returns the displayed arrow for this call relationship.
+    pub const fn arrow(self) -> &'static str {
+        match self {
+            Self::Callers => "←",
+            Self::Callees => "→",
+        }
+    }
+}
+
+/// One unique symbol in a bounded live call graph.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphNode {
+    /// Full relative symbol path, or its bare name when outline resolution failed.
+    pub path: String,
+    /// Relative source file used in the location suffix.
+    pub file: String,
+    /// One-based source line.
+    pub line: u32,
+    /// Whether the outline classifies this symbol as a test.
+    pub is_test: bool,
+}
+
+/// One directed call relationship between node indexes in a [`CallGraph`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GraphEdge {
+    /// Index of the symbol whose callers or callees were queried.
+    pub from: usize,
+    /// Index of the related caller or callee.
+    pub to: usize,
+    /// Whether the related symbol calls or is called by `from`.
+    pub direction: GraphDirection,
+}
+
+/// Bounded, deduplicated graph collected from live call-hierarchy requests.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CallGraph {
+    /// Unique nodes, with the queried symbol at index zero.
+    pub nodes: Vec<GraphNode>,
+    /// Unique parent-to-related-symbol relationships in discovery order.
+    pub edges: Vec<GraphEdge>,
+    /// Set when adding a node or edge reached the fixed graph ceiling.
+    pub capped: bool,
+}
+
+impl CallGraph {
+    /// Starts a graph with its root symbol at index zero.
+    pub fn new(root: GraphNode) -> Self {
+        Self {
+            nodes: vec![root],
+            edges: Vec::new(),
+            capped: false,
+        }
+    }
+
+    /// Adds a unique node, returning its index; returns `None` after the 60-node ceiling.
+    pub fn add_node(&mut self, node: GraphNode) -> Option<usize> {
+        if self.nodes.len() == MAX_GRAPH_NODES {
+            self.capped = true;
+            return None;
+        }
+        let index = self.nodes.len();
+        self.nodes.push(node);
+        Some(index)
+    }
+
+    /// Adds one deduplicated edge; returns false when it already exists or the 120-edge ceiling is hit.
+    pub fn add_edge(&mut self, edge: GraphEdge) -> bool {
+        if self.edges.contains(&edge) {
+            return true;
+        }
+        if self.edges.len() == MAX_GRAPH_EDGES {
+            self.capped = true;
+            return false;
+        }
+        self.edges.push(edge);
+        true
+    }
+}
+
+/// Renders a depth-limited graph as an indented tree; repeated nodes are marked `(seen)`.
+pub fn call_graph_text(graph: &CallGraph, direction: &str, depth: u8) -> String {
+    let root = &graph.nodes[0];
+    let subject = match direction {
+        "both" => "callers and callees",
+        "callees" => "callees",
+        _ => "callers",
+    };
+    let mut out = format!(
+        "graph: {subject} of {} (depth {depth}, {} nodes, {} edges)\n",
+        root.path,
+        graph.nodes.len(),
+        graph.edges.len()
+    );
+    let mut seen = vec![false; graph.nodes.len()];
+    seen[0] = true;
+    let directions = if direction == "both" {
+        [Some(GraphDirection::Callers), Some(GraphDirection::Callees)]
+    } else if direction == "callees" {
+        [Some(GraphDirection::Callees), None]
+    } else {
+        [Some(GraphDirection::Callers), None]
+    };
+    for selected in directions.into_iter().flatten() {
+        render_graph_children(graph, 0, selected, 1, depth, &mut seen, &mut out);
+    }
+    if graph.capped {
+        out.push_str("… capped at 60 nodes or 120 edges\n");
+    }
+    out
+}
+
+/// Renders the first-visit tree for one side of the graph without following cycles twice.
+fn render_graph_children(
+    graph: &CallGraph,
+    parent: usize,
+    direction: GraphDirection,
+    level: u8,
+    depth: u8,
+    seen: &mut [bool],
+    out: &mut String,
+) {
+    if level > depth {
+        return;
+    }
+    for edge in graph
+        .edges
+        .iter()
+        .filter(|edge| edge.from == parent && edge.direction == direction)
+    {
+        let node = &graph.nodes[edge.to];
+        let already_seen = seen[edge.to];
+        out.push_str(&format!(
+            "{}{} {}  {}:{}",
+            "  ".repeat(level as usize),
+            direction.arrow(),
+            node.path,
+            node.file,
+            node.line
+        ));
+        if !already_seen {
+            seen[edge.to] = true;
+        }
+        if node.is_test {
+            out.push_str(" [test]");
+        }
+        if already_seen {
+            out.push_str(" (seen)");
+        }
+        out.push('\n');
+        if !already_seen {
+            render_graph_children(graph, edge.to, direction, level + 1, depth, seen, out);
+        }
+    }
+}
+
+#[cfg(test)]
+mod graph_tests {
+    use super::*;
+
+    /// Builds a small cyclic graph and verifies first-visit rendering plus the node ceiling.
+    #[test]
+    fn call_graph_renders_cycles_and_stops_at_node_cap() {
+        let mut graph = CallGraph::new(GraphNode {
+            path: "src/lib.rs#root".to_owned(),
+            file: "src/lib.rs".to_owned(),
+            line: 1,
+            is_test: false,
+        });
+        for index in 1..3 {
+            let node = graph
+                .add_node(GraphNode {
+                    path: format!("src/lib.rs#f{index}"),
+                    file: "src/lib.rs".to_owned(),
+                    line: index + 1,
+                    is_test: index == 2,
+                })
+                .unwrap();
+            graph.add_edge(GraphEdge {
+                from: node - 1,
+                to: node,
+                direction: GraphDirection::Callers,
+            });
+        }
+        graph.add_edge(GraphEdge {
+            from: 2,
+            to: 0,
+            direction: GraphDirection::Callers,
+        });
+        let text = call_graph_text(&graph, "callers", 3);
+        assert!(text.contains("← src/lib.rs#root  src/lib.rs:1 (seen)"));
+        assert!(text.contains("[test]"));
+
+        for index in graph.nodes.len()..MAX_GRAPH_NODES {
+            assert!(
+                graph
+                    .add_node(GraphNode {
+                        path: format!("src/lib.rs#f{index}"),
+                        file: "src/lib.rs".to_owned(),
+                        line: index as u32 + 1,
+                        is_test: false,
+                    })
+                    .is_some()
+            );
+        }
+        assert!(
+            graph
+                .add_node(GraphNode {
+                    path: "src/lib.rs#overflow".to_owned(),
+                    file: "src/lib.rs".to_owned(),
+                    line: 99,
+                    is_test: false,
+                })
+                .is_none()
+        );
+        assert!(graph.capped);
+        assert!(call_graph_text(&graph, "callers", 1).contains("… capped at 60 nodes"));
+    }
+
+    /// Keeps callers before callees for a two-sided graph and marks a repeated test node.
+    #[test]
+    fn call_graph_renders_both_sides_in_order_and_marks_seen_tests() {
+        let mut graph = CallGraph::new(GraphNode {
+            path: "root".into(),
+            file: "src/lib.rs".into(),
+            line: 1,
+            is_test: false,
+        });
+        for (path, is_test, direction) in [
+            ("caller", false, GraphDirection::Callers),
+            ("test", true, GraphDirection::Callees),
+        ] {
+            let index = graph
+                .add_node(GraphNode {
+                    path: path.into(),
+                    file: "src/lib.rs".into(),
+                    line: 2,
+                    is_test,
+                })
+                .unwrap();
+            graph.add_edge(GraphEdge {
+                from: 0,
+                to: index,
+                direction,
+            });
+        }
+        graph.add_edge(GraphEdge {
+            from: 1,
+            to: 2,
+            direction: GraphDirection::Callers,
+        });
+        let text = call_graph_text(&graph, "both", 2);
+        assert!(text.find("← caller").unwrap() < text.find("→ test").unwrap());
+        assert!(text.contains("→ test  src/lib.rs:2 [test] (seen)"));
+    }
+}
 
 /// Renders a file skeleton: one line per symbol, members indented, test modules collapsed.
 pub fn outline_text(outline: &Outline) -> String {

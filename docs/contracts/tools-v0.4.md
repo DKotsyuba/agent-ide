@@ -10,7 +10,8 @@ Revision: v0.4. Provider: Agent IDE. Consumers: coding agents and IDE hosts.
 | `ide.edit` symbol operations (`replace`, `insert`, `delete`, `rename`) and `path` + `lines` range operation | implemented (landing now) |
 | Long-lived language server session for Rust | implemented |
 | `ide.start` project card | implemented (appended to the activation reply; no `ide.project`, no `not_a_project`; servers always `not started`) |
-| `ide.test` (`symbol` / `path` / `pattern` / `command` / `status`, `budget_s`; one job per worktree; status line in the `<agent-ide>` block; full output paged through `ide.inspect`) | implemented (wire version 4, 10 tools) |
+| `ide.test` (`symbol` / `path` / `pattern` / `command` / `status`, `budget_s`; one job per worktree; status line in the `<agent-ide>` block; full output paged through `ide.inspect`) | implemented (wire version 4, 11 tools) |
+| `ide.graph` (`symbol`, `direction`, `depth`; live bounded caller/callee tree) | implemented (wire version 5, 11 tools) |
 | `ide.diff` / `ide.problems` cleanup | planned |
 | Live language server sessions for Python and TypeScript (one per binding and language) | implemented (Go planned) |
 

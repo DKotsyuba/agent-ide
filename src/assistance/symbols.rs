@@ -1,4 +1,4 @@
-//! Symbol-addressed worker jobs: `ide.outline`, `ide.read` and `ide.symbol` (v0.4).
+//! Symbol-addressed worker jobs: `ide.outline`, `ide.read`, `ide.symbol` and `ide.graph` (v0.4).
 //!
 //! Every job observes the source through Workspace exactly like `ide.context`, asks the binding's
 //! live language server for document symbols, normalizes them through the language module and
@@ -10,6 +10,7 @@ use crate::lang::{
     self, Language as Lang, LineRange, Outline, SymbolPath, TestId,
     render::{self, Call, SymbolCard, Usage},
 };
+use std::collections::VecDeque;
 
 impl Worker<'_> {
     /// Finds referencing tests and counts outline tests in the symbol's own file. Rust test names
@@ -332,6 +333,197 @@ impl Worker<'_> {
             ContextPageState::new(text, 0, false, ResultKind::Symbol).next(&job.reference)?;
         self.shared.set_context_page(&job.reference, page);
         Ok((reply, Some(authority), Some(observed)))
+    }
+
+    /// `ide.graph {symbol, direction, depth}`: bounded breadth-first call hierarchy.
+    pub(super) async fn graph(
+        &mut self,
+        job: &mut Job,
+    ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        let binding = job.invocation.binding_ref().clone();
+        let requested = job.parameters["symbol"]
+            .as_str()
+            .ok_or(FailureCode::UnknownSymbol)?
+            .to_owned();
+        let symbol = SymbolPath::parse(&requested).map_err(|_| FailureCode::UnknownSymbol)?;
+        let file = match symbol.file() {
+            Some(file) => file.to_path_buf(),
+            None => match self
+                .locate_by_name(
+                    job,
+                    &binding,
+                    symbol.name().ok_or(FailureCode::UnknownSymbol)?,
+                )
+                .await?
+            {
+                Located::One(file) => file,
+                Located::Many(candidates) => {
+                    return self.ambiguous(job, &binding, &requested, candidates).await;
+                }
+            },
+        };
+        let (observed, bytes) = self.observe(&binding, file.clone()).await?;
+        let (outline, worktree_root) = self.outline_of(job, &observed, &bytes).await?;
+        let found = match symbol.file() {
+            Some(_) => outline.find(&symbol).cloned(),
+            None => {
+                let candidates = outline.named(symbol.name().unwrap_or_default());
+                match candidates.len() {
+                    1 => Some(candidates[0].clone()),
+                    0 => None,
+                    _ => {
+                        return self
+                            .ambiguous(
+                                job,
+                                &binding,
+                                &requested,
+                                candidates
+                                    .iter()
+                                    .map(|candidate| candidate.path.to_string())
+                                    .collect(),
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
+        .ok_or(FailureCode::UnknownSymbol)?;
+        let root = render::GraphNode {
+            path: found.path.to_string(),
+            file: file.display().to_string(),
+            line: found.range.start,
+            is_test: found.kind == lang::SymbolKind::Test,
+        };
+        let depth = job
+            .parameters
+            .get("depth")
+            .and_then(Value::as_u64)
+            .unwrap_or(2) as u8;
+        let direction = job
+            .parameters
+            .get("direction")
+            .and_then(Value::as_str)
+            .unwrap_or("callers")
+            .to_owned();
+        let directions = match direction.as_str() {
+            "both" => vec![
+                render::GraphDirection::Callers,
+                render::GraphDirection::Callees,
+            ],
+            "callees" => vec![render::GraphDirection::Callees],
+            _ => vec![render::GraphDirection::Callers],
+        };
+        let mut graph = render::CallGraph::new(root);
+        let mut indexes = std::collections::HashMap::from([(graph.nodes[0].path.clone(), 0usize)]);
+        let mut queue = VecDeque::from([(0usize, file, found, 0u8, directions[0])]);
+        if directions.len() == 2 {
+            queue.push_back((
+                0usize,
+                queue[0].1.clone(),
+                queue[0].2.clone(),
+                0,
+                directions[1],
+            ));
+        }
+        while let Some((parent, relative, symbol, level, edge_direction)) = queue.pop_front() {
+            if level >= depth || graph.capped {
+                continue;
+            }
+            let (source_observed, source_bytes) = self.observe(&binding, relative.clone()).await?;
+            let source = observed_text(&source_observed, &source_bytes)?;
+            let offset = name_offset(source, &symbol)?;
+            let live = self.live_session_for(job, &source_observed).await?;
+            let related_items = match edge_direction {
+                render::GraphDirection::Callers => live
+                    .session
+                    .incoming_calls(&source_observed, &source_bytes, offset)
+                    .await
+                    .map(|calls| calls.into_iter().map(|call| call.from).collect::<Vec<_>>()),
+                render::GraphDirection::Callees => live
+                    .session
+                    .outgoing_calls(&source_observed, &source_bytes, offset)
+                    .await
+                    .map(|calls| calls.into_iter().map(|call| call.to).collect::<Vec<_>>()),
+            }
+            .unwrap_or_default();
+            for item in related_items {
+                let (node, item_file, item_symbol) =
+                    self.graph_node(job, &worktree_root, item.clone()).await?;
+                let (related, is_new) = if let Some(index) = indexes.get(&node.path).copied() {
+                    (index, false)
+                } else {
+                    let Some(index) = graph.add_node(node.clone()) else {
+                        break;
+                    };
+                    indexes.insert(node.path.clone(), index);
+                    (index, true)
+                };
+                if !graph.add_edge(render::GraphEdge {
+                    from: parent,
+                    to: related,
+                    direction: edge_direction,
+                }) {
+                    break;
+                }
+                if is_new && level + 1 < depth {
+                    queue.push_back((related, item_file, item_symbol, level + 1, edge_direction));
+                }
+            }
+        }
+        let authority = self.finish_symbol_job(job, &binding, &observed).await?;
+        let text = render::call_graph_text(&graph, &direction, depth);
+        let (reply, page) =
+            ContextPageState::new(text, 0, false, ResultKind::Graph).next(&job.reference)?;
+        self.shared.set_context_page(&job.reference, page);
+        Ok((reply, Some(authority), Some(observed)))
+    }
+
+    /// Resolves one hierarchy item to its relative source file and normalized outline symbol.
+    async fn graph_node(
+        &mut self,
+        job: &mut Job,
+        worktree_root: &Path,
+        item: async_lsp::lsp_types::CallHierarchyItem,
+    ) -> Result<(render::GraphNode, PathBuf, lang::Symbol), FailureCode> {
+        let path = self.call_symbol_path(job, worktree_root, &item).await;
+        let absolute = item
+            .uri
+            .to_file_path()
+            .map_err(|_| FailureCode::UnknownSymbol)?;
+        let relative = absolute
+            .strip_prefix(worktree_root)
+            .map_err(|_| FailureCode::UnknownSymbol)?
+            .to_path_buf();
+        let binding = job.invocation.binding_ref().clone();
+        let (observed, bytes) = self.observe(&binding, relative.clone()).await?;
+        let (outline, _) = self.outline_of(job, &observed, &bytes).await?;
+        let line = item.selection_range.start.line + 1;
+        let found = outline
+            .symbols
+            .iter()
+            .flat_map(|symbol| {
+                let mut found = Vec::new();
+                symbol.walk(&mut |candidate| {
+                    if candidate.range.start <= line && line <= candidate.range.end {
+                        found.push(candidate.clone());
+                    }
+                });
+                found
+            })
+            .min_by_key(|candidate| candidate.range.len());
+        let Some(found) = found else {
+            return Err(FailureCode::UnknownSymbol);
+        };
+        Ok((
+            render::GraphNode {
+                path,
+                file: render::display_path(worktree_root, &item.uri),
+                line: found.range.start,
+                is_test: found.kind == lang::SymbolKind::Test,
+            },
+            relative,
+            found,
+        ))
     }
 
     /// Document symbols of one observed file through the live session, normalized by the

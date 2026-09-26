@@ -1,6 +1,6 @@
 //! Bounded MCP discovery, finite Application routing, and fail-open Assistance feedback.
 //!
-//! This module has no peer-domain implementation of its own. It validates the ten logical tool
+//! This module has no peer-domain implementation of its own. It validates the eleven logical tool
 //! inputs, carries trusted host transport context, and honestly reports an unavailable or
 //! incomplete result until Workspace, Intelligence, and Changes return their typed facts.
 
@@ -54,7 +54,7 @@ const MAX_BYTE_OFFSET: u64 = crate::workspace::observation::MAX_SOURCE_BYTES as 
 const MAX_ACTIVATION_ID_BYTES: usize = 128;
 const MAX_HOOK_BYTES: usize = 64 * 1024;
 
-/// Names the only logical MCP methods exposed by Assistance through v0.2.
+/// Names the only logical MCP methods exposed by Assistance.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum AssistanceTool {
     /// Creates or retries one bounded Workspace activation operation.
@@ -75,6 +75,8 @@ pub enum AssistanceTool {
     Read,
     /// Returns a symbol card: definition, signature, docs, usages, callers.
     Symbol,
+    /// Returns a bounded live call graph around one symbol.
+    Graph,
     /// Runs or inspects one explicitly requested project test job.
     Test,
 }
@@ -92,6 +94,7 @@ impl AssistanceTool {
             Self::Outline => "ide.outline",
             Self::Read => "ide.read",
             Self::Symbol => "ide.symbol",
+            Self::Graph => "ide.graph",
             Self::Test => "ide.test",
         }
     }
@@ -108,6 +111,7 @@ impl AssistanceTool {
             Self::Outline => AssistanceMethod::Outline,
             Self::Read => AssistanceMethod::Read,
             Self::Symbol => AssistanceMethod::Symbol,
+            Self::Graph => AssistanceMethod::Graph,
             Self::Test => AssistanceMethod::Test,
         }
     }
@@ -124,6 +128,7 @@ fn tool_accepts_result_kind(tool: AssistanceTool, kind: ResultKind) -> bool {
             | (AssistanceTool::Outline, ResultKind::Outline)
             | (AssistanceTool::Read, ResultKind::Read)
             | (AssistanceTool::Symbol, ResultKind::Symbol)
+            | (AssistanceTool::Graph, ResultKind::Graph)
             | (AssistanceTool::Test, ResultKind::Test)
     )
 }
@@ -139,8 +144,8 @@ pub struct ToolSchema {
     pub input_schema: Value,
 }
 
-/// Returns exactly the ten current Assistance schemas regardless of daemon availability.
-pub fn tool_schemas() -> [ToolSchema; 10] {
+/// Returns exactly the eleven current Assistance schemas regardless of daemon availability.
+pub fn tool_schemas() -> [ToolSchema; 11] {
     [
         schema(
             AssistanceTool::Start,
@@ -239,6 +244,18 @@ pub fn tool_schemas() -> [ToolSchema; 10] {
                     "callers": {"type": "integer", "minimum": 0, "maximum": 3, "default": 1},
                     "callees": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0},
                     "history": {"type": "boolean", "default": false, "description": "Include the last commits touching the definition (opt-in)."}
+                }
+            }),
+        ),
+        schema(
+            AssistanceTool::Graph,
+            json!({
+                "type": "object", "additionalProperties": false,
+                "required": ["symbol"],
+                "properties": {
+                    "symbol": {"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES, "description":"Symbol path `file#Owner/name`, or a bare name to search the project."},
+                    "direction": {"type":"string", "enum":["callers", "callees", "both"], "default":"callers"},
+                    "depth": {"type":"integer", "minimum":1, "maximum":3, "default":2}
                 }
             }),
         ),
@@ -438,6 +455,7 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
         AssistanceTool::Outline => &["path"],
         AssistanceTool::Read => &["symbol", "path", "lines"],
         AssistanceTool::Symbol => &["symbol", "usages", "callers", "callees", "history"],
+        AssistanceTool::Graph => &["symbol", "direction", "depth"],
         AssistanceTool::Test => &["symbol", "path", "pattern", "command", "status", "budget_s"],
     }
 }
@@ -565,6 +583,23 @@ pub fn validate_call(
                 {
                     return Err(invalid_field(field, FieldRule::NonNegativeInteger(3)));
                 }
+            }
+        }
+        AssistanceTool::Graph => {
+            required_string(object, "symbol", MAX_SYMBOL_PATH_BYTES)?;
+            if object.get("direction").is_some_and(|value| {
+                !matches!(value.as_str(), Some("callers" | "callees" | "both"))
+            }) {
+                return Err(invalid_field(
+                    "direction",
+                    FieldRule::OneOf("callers, callees, or both"),
+                ));
+            }
+            if object
+                .get("depth")
+                .is_some_and(|value| value.as_u64().is_none_or(|depth| !(1..=3).contains(&depth)))
+            {
+                return Err(invalid_field("depth", FieldRule::NonNegativeInteger(3)));
             }
         }
         AssistanceTool::Test => {
@@ -1452,7 +1487,7 @@ fn codex_route_identity(meta: &Map<String, Value>) -> Option<CodexRouteIdentity>
     CodexRouteIdentity::new(root_session, actor).ok()
 }
 
-/// Hosts the static ten-tool rmcp surface even when no trusted host attachment exists.
+/// Hosts the static eleven-tool rmcp surface even when no trusted host attachment exists.
 #[derive(Clone)]
 pub struct StdioFacade {
     /// Connect-only Application endpoint and finite deadline.
@@ -1484,7 +1519,7 @@ impl StdioFacade {
         }
     }
 
-    /// Creates a disconnected ten-tool facade for managed startup failure.
+    /// Creates a disconnected eleven-tool facade for managed startup failure.
     ///
     /// Discovery remains static and calls validate normally before returning unavailable. The
     /// facade contains neither a host attachment nor an IPC path, so it cannot disclose request
@@ -1862,6 +1897,7 @@ fn inline_complete_kinds_keep_structured_content() {
         (AssistanceTool::Outline, ResultKind::Outline),
         (AssistanceTool::Read, ResultKind::Read),
         (AssistanceTool::Symbol, ResultKind::Symbol),
+        (AssistanceTool::Graph, ResultKind::Graph),
         (AssistanceTool::Test, ResultKind::Test),
     ] {
         let reply = PeerReply::Complete {
@@ -2029,7 +2065,17 @@ impl StdioFacade {
     }
 
     /// Starts or retrieves one explicitly requested background test run.
-    #[tool(name = "ide.test", input_schema = tool_schemas()[9].input_schema.as_object().expect("tool schema is an object").clone())]
+    #[tool(name = "ide.graph", input_schema = tool_schemas()[9].input_schema.as_object().expect("tool schema is an object").clone())]
+    async fn graph(
+        &self,
+        Parameters(parameters): Parameters<Value>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.call(AssistanceTool::Graph, parameters, context).await
+    }
+
+    /// Starts or retrieves one explicitly requested background test run.
+    #[tool(name = "ide.test", input_schema = tool_schemas()[10].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn test(
         &self,
         Parameters(parameters): Parameters<Value>,

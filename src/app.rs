@@ -452,7 +452,7 @@ pub async fn submit_hook_if_running(
     }
 }
 
-/// Connects to an already-running daemon for one closed v2/v3 method dispatch without starting it.
+/// Connects to an already-running daemon for one closed v2-v5 method dispatch without starting it.
 ///
 /// Connect, framing, and daemon faults return `Unavailable`; elapsed bounded phases return
 /// `TimedOut`. Application does not retry, render, or reinterpret the opaque result.
@@ -488,6 +488,7 @@ pub async fn dispatch_method_if_running(
         AssistanceMethod::Outline => "outline",
         AssistanceMethod::Read => "read",
         AssistanceMethod::Symbol => "symbol",
+        AssistanceMethod::Graph => "graph",
         AssistanceMethod::Test => "test",
         AssistanceMethod::HookSubmit => return MethodDispatchTransportResult::Unavailable,
     };
@@ -719,7 +720,7 @@ async fn serve_accepted_connection(
             .and_then(Result::ok)
             .flatten()
         }
-        Some(2..=4) => {
+        Some(2..=5) => {
             // Served Assistance calls prove a live client session and restart the idle countdown.
             lease.mark_activity();
             if let (Some(dispatcher), Some(limits)) = (dispatcher, transport_limits)
@@ -882,7 +883,7 @@ async fn exchange(mut stream: UnixStream, request: &HealthRequest) -> io::Result
     read_frame(&mut stream, MAX_V1_FRAME_BYTES).await
 }
 
-/// Decodes and forwards exactly one finite v2/v3 Assistance request without inspecting semantics.
+/// Decodes and forwards exactly one finite versioned Assistance request without inspecting semantics.
 async fn serve_assistance_request(
     stream: &mut UnixStream,
     request: Value,

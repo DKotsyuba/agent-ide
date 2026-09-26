@@ -7,7 +7,7 @@ description: Use Agent IDE `ide.*` tools, including `ide.edit` when offered, for
 
 Agent IDE exposes the lifecycle tools `ide.start`, `ide.context`, `ide.diff`,
 `ide.inspect`, `ide.stop`, `ide.edit`, the symbol tools `ide.outline`, `ide.read`,
-`ide.symbol`, and `ide.test`. Use this workflow whenever they are offered and the task implements,
+`ide.symbol`, `ide.graph`, and `ide.test`. Use this workflow whenever they are offered and the task implements,
 debugs, refactors, or writes/fixes source.
 Skip it for read-only exploration, prose, configuration, or when `ide.*` is
 not present — use native host read/write/test tools plus CodeGraph (when
@@ -45,6 +45,8 @@ and cost a fraction of the context:
   resolved signature, documentation, the definition with line numbers, usages grouped by
   `src`/`tests` with the source line text, `callers`/`callees` (set `"callers":1`) and, with
   `"history":true`, the last three commits that touched the definition.
+  Use `ide.graph` for a bounded multi-level callers/callees tree instead of the symbol card's
+  one-level relationships.
   A bare name that matches several symbols answers with the candidate paths; repeat
   with one exact path.
 - `ide.read {"symbol":"src/x.rs#Type/method"}` or `{"path":"src/x.rs","lines":"120-180"}`
