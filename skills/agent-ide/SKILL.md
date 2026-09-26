@@ -46,7 +46,8 @@ and cost a fraction of the context:
   `src`/`tests` with the source line text, `callers`/`callees` (set `"callers":1`) and, with
   `"history":true`, the last three commits that touched the definition.
   Use `ide.graph` for a bounded multi-level callers/callees tree instead of the symbol card's
-  one-level relationships.
+  one-level relationships; only functions and methods are nodes, tests collapse to one
+  `+N tests` line per parent unless you pass `"tests":true`.
   A bare name that matches several symbols answers with the candidate paths; repeat
   with one exact path.
 - `ide.read {"symbol":"src/x.rs#Type/method"}` or `{"path":"src/x.rs","lines":"120-180"}`

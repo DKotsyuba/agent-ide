@@ -4564,12 +4564,13 @@ fn symbol_test_fixture() -> ProductFixture {
     fixture
 }
 
-/// Builds a Rust project with a three-level caller chain, a cycle, and one test caller.
+/// Builds a Rust project with a three-level caller chain, a cycle, one test caller, and one
+/// struct construction reported by call hierarchy as a callee.
 fn graph_test_fixture() -> ProductFixture {
     let fixture = symbol_test_fixture();
     std::fs::write(
         fixture.root.join("src/lib.rs"),
-        "pub fn a() {\n    b();\n    let _ = String::new();\n}\npub fn b() { c(); }\npub fn c() { a(); }\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn reaches_a() {\n        super::a();\n    }\n}\n",
+        "pub struct Unit;\npub fn a() {\n    b();\n    let _ = Unit;\n    let _ = String::new();\n}\npub fn b() { c(); }\npub fn c() { a(); }\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn reaches_a() {\n        super::a();\n    }\n}\n",
     )
     .unwrap();
     std::fs::write(fixture.root.join("tests/path_tests.rs"), "").unwrap();
@@ -4607,11 +4608,23 @@ async fn configured_product_graph_traverses_live_calls_with_bounds() {
     let text = graph["text"].as_str().unwrap();
     assert!(text.contains("← src/lib.rs#b"), "{text}");
     assert!(text.contains("← src/lib.rs#a"), "{text}");
-    assert!(
-        text.contains("tests/reaches_a") && text.contains("[test]"),
-        "{text}"
-    );
+    assert!(text.contains("  +1 tests"), "{text}");
+    assert!(!text.contains("[test]"), "{text}");
     assert_eq!(text.matches("(seen)").count(), 1, "{text}");
+
+    let with_tests = actor
+        .call(
+            &fixture,
+            "ide.graph",
+            json!({
+                "symbol":"src/lib.rs#c", "direction":"callers", "depth":3, "tests":true
+            }),
+        )
+        .await;
+    let with_tests = actor.settle(&fixture, with_tests).await;
+    let text = with_tests["text"].as_str().unwrap();
+    assert!(text.contains("tests/reaches_a"), "{text}");
+    assert!(text.contains("[test]"), "{text}");
 
     let shallow = actor
         .call(
@@ -4636,7 +4649,10 @@ async fn configured_product_graph_traverses_live_calls_with_bounds() {
         )
         .await;
     let callees = actor.settle(&fixture, callees).await;
-    assert!(callees["text"].as_str().unwrap().contains("#c"));
+    let callees_text = callees["text"].as_str().unwrap();
+    assert!(callees_text.contains("#c"), "{callees_text}");
+    // Struct and enum construction is not a call: non-callables never become nodes.
+    assert!(!callees_text.contains("Unit"), "{callees_text}");
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();

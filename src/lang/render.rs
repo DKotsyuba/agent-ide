@@ -22,7 +22,7 @@ pub const MAX_GRAPH_NODES: usize = 60;
 pub const MAX_GRAPH_EDGES: usize = 120;
 
 /// Direction in which one call-graph edge is rendered from its parent.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum GraphDirection {
     /// The edge points to a function that calls its parent.
     Callers,
@@ -71,6 +71,8 @@ pub struct CallGraph {
     pub nodes: Vec<GraphNode>,
     /// Unique parent-to-related-symbol relationships in discovery order.
     pub edges: Vec<GraphEdge>,
+    /// Tests dropped per parent node and direction when the graph hides them, rendered as `+N tests`.
+    pub collapsed_tests: std::collections::BTreeMap<(usize, GraphDirection), usize>,
     /// Set when adding a node or edge reached the fixed graph ceiling.
     pub capped: bool,
 }
@@ -81,6 +83,7 @@ impl CallGraph {
         Self {
             nodes: vec![root],
             edges: Vec::new(),
+            collapsed_tests: Default::default(),
             capped: false,
         }
     }
@@ -184,6 +187,13 @@ fn render_graph_children(
             render_graph_children(graph, edge.to, direction, level + 1, depth, seen, out);
         }
     }
+    if let Some(count) = graph
+        .collapsed_tests
+        .get(&(parent, direction))
+        .filter(|count| **count > 0)
+    {
+        out.push_str(&format!("{}+{count} tests\n", "  ".repeat(level as usize)));
+    }
 }
 
 #[cfg(test)]
@@ -284,6 +294,64 @@ mod graph_tests {
         let text = call_graph_text(&graph, "both", 2);
         assert!(text.find("← caller").unwrap() < text.find("→ test").unwrap());
         assert!(text.contains("→ test  src/lib.rs:2 [test] (seen)"));
+    }
+
+    /// Collapses hidden test children into one `+N tests` line at the parent's indent; the
+    /// default header counts only rendered nodes, and showing tests restores `[test]` marks.
+    #[test]
+    fn call_graph_collapses_test_children_until_they_are_shown() {
+        let mut collapsed = CallGraph::new(GraphNode {
+            path: "src/lib.rs#root".into(),
+            file: "src/lib.rs".into(),
+            line: 1,
+            is_test: false,
+        });
+        let production = collapsed
+            .add_node(GraphNode {
+                path: "src/lib.rs#prod".into(),
+                file: "src/lib.rs".into(),
+                line: 2,
+                is_test: false,
+            })
+            .unwrap();
+        collapsed.add_edge(GraphEdge {
+            from: 0,
+            to: production,
+            direction: GraphDirection::Callers,
+        });
+        collapsed
+            .collapsed_tests
+            .insert((0, GraphDirection::Callers), 2);
+        let text = call_graph_text(&collapsed, "callers", 2);
+        assert!(text.contains("(depth 2, 2 nodes, 1 edges)"), "{text}");
+        assert!(text.contains("← src/lib.rs#prod"), "{text}");
+        assert!(text.contains("  +2 tests\n"), "{text}");
+        assert!(!text.contains("[test]"), "{text}");
+
+        let mut shown = CallGraph::new(GraphNode {
+            path: "src/lib.rs#root".into(),
+            file: "src/lib.rs".into(),
+            line: 1,
+            is_test: false,
+        });
+        for (path, is_test) in [("prod", false), ("t1", true), ("t2", true)] {
+            let index = shown
+                .add_node(GraphNode {
+                    path: path.into(),
+                    file: "src/lib.rs".into(),
+                    line: 2,
+                    is_test,
+                })
+                .unwrap();
+            shown.add_edge(GraphEdge {
+                from: 0,
+                to: index,
+                direction: GraphDirection::Callers,
+            });
+        }
+        let text = call_graph_text(&shown, "callers", 2);
+        assert!(text.contains("(depth 2, 4 nodes, 3 edges)"), "{text}");
+        assert_eq!(text.matches("[test]").count(), 2, "{text}");
     }
 }
 

@@ -405,6 +405,11 @@ impl Worker<'_> {
             .and_then(Value::as_str)
             .unwrap_or("callers")
             .to_owned();
+        let show_tests = job
+            .parameters
+            .get("tests")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let directions = match direction.as_str() {
             "both" => vec![
                 render::GraphDirection::Callers,
@@ -455,6 +460,15 @@ impl Worker<'_> {
                         Err(FailureCode::UnknownSymbol) => continue,
                         Err(code) => return Err(code),
                     };
+                // Hidden tests stay out of the graph entirely so caps count only rendered
+                // nodes; each parent reports what it dropped as one `+N tests` line.
+                if node.is_test && !show_tests {
+                    *graph
+                        .collapsed_tests
+                        .entry((parent, edge_direction))
+                        .or_default() += 1;
+                    continue;
+                }
                 let (related, is_new) = if let Some(index) = indexes.get(&node.path).copied() {
                     (index, false)
                 } else {
@@ -520,6 +534,17 @@ impl Worker<'_> {
         let Some(found) = found else {
             return Err(FailureCode::UnknownSymbol);
         };
+        // Call hierarchy reports struct and enum construction as calls; only callables become
+        // graph nodes (tests keep their own kind so `tests: true` can still show them).
+        if !matches!(
+            found.kind,
+            lang::SymbolKind::Function
+                | lang::SymbolKind::Method
+                | lang::SymbolKind::Constructor
+                | lang::SymbolKind::Test
+        ) {
+            return Err(FailureCode::UnknownSymbol);
+        }
         Ok((
             render::GraphNode {
                 path,

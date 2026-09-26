@@ -77,12 +77,14 @@ fn discovery_is_static_and_contains_exactly_eleven_current_methods() {
     assert!(start.input_schema["properties"]["root"].is_object());
 }
 
-/// Keeps graph directions closed and its requested depth within the three-level ceiling.
+/// Keeps graph directions closed, its requested depth within the three-level ceiling, and the
+/// test toggle boolean.
 #[test]
 fn graph_arguments_validate_direction_and_depth() {
     for input in [
         json!({"symbol":"src/lib.rs#f"}),
         json!({"symbol":"f", "direction":"both", "depth":3}),
+        json!({"symbol":"f", "tests":true}),
     ] {
         assert!(validate_call(AssistanceTool::Graph, input).is_ok());
     }
@@ -91,6 +93,7 @@ fn graph_arguments_validate_direction_and_depth() {
         json!({"symbol":"f", "direction":"all"}),
         json!({"symbol":"f", "depth":0}),
         json!({"symbol":"f", "depth":4}),
+        json!({"symbol":"f", "tests":"yes"}),
     ] {
         assert!(validate_call(AssistanceTool::Graph, input).is_err());
     }

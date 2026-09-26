@@ -255,7 +255,8 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                 "properties": {
                     "symbol": {"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES, "description":"Symbol path `file#Owner/name`, or a bare name to search the project."},
                     "direction": {"type":"string", "enum":["callers", "callees", "both"], "default":"callers"},
-                    "depth": {"type":"integer", "minimum":1, "maximum":3, "default":2}
+                    "depth": {"type":"integer", "minimum":1, "maximum":3, "default":2},
+                    "tests": {"type":"boolean", "default":false, "description":"Show test symbols as nodes (marked `[test]`) instead of collapsing them into one `+N tests` line per parent."}
                 }
             }),
         ),
@@ -455,7 +456,7 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
         AssistanceTool::Outline => &["path"],
         AssistanceTool::Read => &["symbol", "path", "lines"],
         AssistanceTool::Symbol => &["symbol", "usages", "callers", "callees", "history"],
-        AssistanceTool::Graph => &["symbol", "direction", "depth"],
+        AssistanceTool::Graph => &["symbol", "direction", "depth", "tests"],
         AssistanceTool::Test => &["symbol", "path", "pattern", "command", "status", "budget_s"],
     }
 }
@@ -600,6 +601,9 @@ pub fn validate_call(
                 .is_some_and(|value| value.as_u64().is_none_or(|depth| !(1..=3).contains(&depth)))
             {
                 return Err(invalid_field("depth", FieldRule::NonNegativeInteger(3)));
+            }
+            if object.get("tests").is_some_and(|value| !value.is_boolean()) {
+                return Err(invalid_field("tests", FieldRule::Boolean));
             }
         }
         AssistanceTool::Test => {
