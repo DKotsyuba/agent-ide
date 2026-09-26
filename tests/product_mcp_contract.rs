@@ -270,6 +270,11 @@ fn assert_compact_envelope(reply: &Value) {
         None => text,
     };
     let kind = structured.get("kind").and_then(Value::as_str);
+    // Paged bodies carry a `page N; bytes A-B of TOTAL` marker before their header.
+    let body = match text.strip_prefix("page ") {
+        Some(rest) => rest.split_once('\n').map_or("", |(_, rest)| rest),
+        None => text,
+    };
     match (state, kind) {
         ("complete", Some("test")) => assert!(
             text.starts_with("tests #")
@@ -277,9 +282,20 @@ fn assert_compact_envelope(reply: &Value) {
                 || text.starts_with("page "),
             "{reply}"
         ),
-        ("complete", Some("symbol")) => assert!(text.starts_with("symbol:"), "{reply}"),
-        // Symbol tools return their rendered document/card body directly on complete replies.
-        ("complete", Some("outline" | "read")) => {}
+        ("complete", Some("symbol")) => assert!(body.starts_with("symbol: "), "{reply}"),
+        // `<file>  (<n> lines, <lang>)` outline header.
+        ("complete", Some("outline")) => {
+            let header = body.lines().next().unwrap_or_default();
+            let (file, details) = header.split_once("  (").expect("outline file header");
+            assert!(!file.is_empty() && details.ends_with(')'), "{reply}");
+            assert!(details.contains(" lines, "), "{reply}");
+        }
+        // `<title>  (lines A–B)` read header.
+        ("complete", Some("read")) => {
+            let header = body.lines().next().unwrap_or_default();
+            let (title, details) = header.split_once("  (lines ").expect("read symbol header");
+            assert!(!title.is_empty() && details.ends_with(')'), "{reply}");
+        }
         ("invalid_parameters", _) => {
             assert!(text.starts_with("invalid bounded parameters:"), "{reply}")
         }
@@ -4434,6 +4450,109 @@ fn symbol_test_fixture() -> ProductFixture {
     fixture
 }
 
+/// A Python request in a binding whose Rust session is live leaves that session running: the
+/// rust-analyzer wrapper is spawned exactly once across `.rs` -> `.py` -> `.rs` requests, and the
+/// second Rust request answers without another readiness wait.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_RUST_ANALYZER, AGENT_IDE_RUST_TOOLCHAIN, AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
+async fn configured_product_python_request_keeps_the_bindings_live_rust_session() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = symbol_test_fixture();
+    let analyzer = std::env::var("AGENT_IDE_RUST_ANALYZER").unwrap();
+    let toolchain = std::env::var("AGENT_IDE_RUST_TOOLCHAIN").unwrap();
+    let spawn_log = fixture.base.join("rust-spawns.log");
+    let wrapper = fixture.base.join("rust-provider");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\necho spawn >> '{}'\nexec '{}' \"$@\"\n",
+            spawn_log.display(),
+            analyzer.replace('\'', "'\\''")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    fixture.write_config(json!([
+        {
+            "executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),
+            "settings":"rust_cache_priming_disabled_v1",
+            "toolchain":toolchain,
+            "cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),
+            "cargo_version":"cargo 1.98.1",
+            "rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),
+            "rustc_version":"rustc 1.98.1",
+            "trust":"fixture-disabled",
+            "cache_namespace":"fixture-rust-python-cache"
+        },
+        accepted_pyright_provider("fixture-rust-python-pyright-cache")
+    ]));
+    std::fs::write(
+        fixture.root.join("main.py"),
+        "def value() -> int:\n    return 1\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "main.py"]);
+    fixture.git(&["commit", "--quiet", "-m", "python fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "rust-python-binding").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"rust-python-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+
+    let symbol = actor
+        .call(
+            &fixture,
+            "ide.symbol",
+            json!({"symbol":"src/lib.rs#FileFlag/is_file"}),
+        )
+        .await;
+    let symbol = actor.settle(&fixture, symbol).await;
+    assert_eq!(symbol["kind"], "symbol", "{symbol}");
+
+    let outline = actor
+        .call(&fixture, "ide.outline", json!({"path":"main.py"}))
+        .await;
+    let outline = actor.settle(&fixture, outline).await;
+    assert_eq!(outline["kind"], "outline", "{outline}");
+    assert!(
+        outline["text"].as_str().unwrap().contains("value"),
+        "{outline}"
+    );
+
+    let began = tokio::time::Instant::now();
+    let again = actor
+        .call(
+            &fixture,
+            "ide.symbol",
+            json!({"symbol":"src/lib.rs#FileFlag/is_file"}),
+        )
+        .await;
+    let again = actor.settle(&fixture, again).await;
+    assert_eq!(again["kind"], "symbol", "{again}");
+    let elapsed = began.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "a retained Rust session answers without reloading, took {elapsed:?}: {again}"
+    );
+    let spawns = std::fs::read_to_string(&spawn_log).unwrap_or_default();
+    assert_eq!(
+        spawns.lines().count(),
+        1,
+        "rust-analyzer must be spawned once for the binding: {spawns:?}"
+    );
+
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Reuses `ide.symbol`'s live Rust session to select and run a test referencing that symbol.
 #[tokio::test]
 async fn configured_product_symbol_test_uses_the_live_symbol_session() {
@@ -5768,6 +5887,120 @@ async fn configured_product_typescript_membership_falls_back_after_dependencies_
         .await;
     let edit = actor.settle(&fixture, edit).await;
     assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Resolves a Vite-style project by literal include directory while refusing a source outside it.
+#[tokio::test]
+#[ignore = "requires exact AGENT_IDE_NODE, AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER and AGENT_IDE_TSSERVER environment"]
+async fn configured_product_typescript_vite_directory_include_membership() {
+    let fixture = ProductFixture::new(json!([accepted_typescript_provider()]));
+    let source = "export function callOperation(): number { return 42; }\nexport function caller(): number { return callOperation(); }\n";
+    std::fs::create_dir_all(fixture.root.join("src")).unwrap();
+    std::fs::create_dir_all(fixture.root.join("node_modules/vite")).unwrap();
+    std::fs::write(fixture.root.join("src/api.ts"), source).unwrap();
+    std::fs::write(
+        fixture.root.join("src/App.tsx"),
+        "export const App = (): string => \"ready\";\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.root.join("vite.config.ts"), "export default {};\n").unwrap();
+    std::fs::write(
+        fixture.root.join("outside.ts"),
+        "export const outside = true;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("package.json"),
+        "{\"type\":\"module\",\"devDependencies\":{\"vite\":\"8.2.2\"}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("node_modules/vite/client.d.ts"),
+        "interface ImportMetaEnv { readonly MODE: string; }\ninterface ImportMeta { readonly env: ImportMetaEnv; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("tsconfig.json"),
+        "{\"compilerOptions\":{\"target\":\"ES2022\",\"module\":\"ESNext\",\"moduleResolution\":\"Bundler\",\"jsx\":\"react-jsx\",\"types\":[\"vite/client\"],\"noEmit\":true,\"allowImportingTsExtensions\":true},\"include\":[\"src\",\"vite.config.ts\"]}\n",
+    )
+    .unwrap();
+    fixture.git(&[
+        "add",
+        "--",
+        "src/api.ts",
+        "src/App.tsx",
+        "vite.config.ts",
+        "outside.ts",
+        "package.json",
+        "tsconfig.json",
+    ]);
+    fixture.git(&["commit", "--quiet", "-m", "Vite include fixture"]);
+
+    let mut daemon = fixture
+        .daemon_with_startup_timeout(Duration::from_secs(30))
+        .await;
+    let mut actor = ProductActor::new(&fixture, "typescript-vite-include").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"vite-include-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+
+    let outline = actor
+        .call(&fixture, "ide.outline", json!({"path":"src/api.ts"}))
+        .await;
+    let outline = actor.settle(&fixture, outline).await;
+    assert_eq!(outline["kind"], "outline", "{outline}");
+    assert!(
+        outline["text"].as_str().unwrap().contains("callOperation"),
+        "{outline}"
+    );
+    let symbol = actor
+        .call(
+            &fixture,
+            "ide.symbol",
+            json!({"symbol":"src/api.ts#callOperation"}),
+        )
+        .await;
+    let symbol = actor.settle(&fixture, symbol).await;
+    assert!(
+        symbol["text"]
+            .as_str()
+            .unwrap()
+            .contains("symbol: callOperation"),
+        "{symbol}"
+    );
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"symbol":"src/api.ts#callOperation"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, read).await["kind"], "read");
+
+    let outside = actor
+        .call(&fixture, "ide.context", json!({"path":"outside.ts"}))
+        .await;
+    let outside = actor.settle(&fixture, outside).await;
+    assert!(
+        outside["text"].as_str().unwrap().contains("mode: lexical"),
+        "{outside}"
+    );
+    assert!(
+        outside["text"].as_str().unwrap().contains("tsconfig.json")
+            && outside["text"].as_str().unwrap().contains("outside.ts"),
+        "{outside}"
+    );
+
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
