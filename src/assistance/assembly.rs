@@ -128,23 +128,25 @@ fn attach_reply_plate(
     feed: Option<&Arc<ProjectProblemFeed>>,
     fingerprint: &[u8; 32],
     reply: &mut PeerReply,
+    test_status_snapshot: Option<&str>,
 ) -> Option<String> {
     let feed = feed?;
     let mut fitting = reply.clone();
-    let plate = feed.next_block_when(fingerprint, |plate| {
-        loop {
-            if super::content::fits_with_status(
-                &fitting,
-                plate,
-                super::content::Envelope::WithStructured,
-            ) {
-                return true;
+    let plate =
+        feed.next_block_when_with_test_status(fingerprint, test_status_snapshot, |plate| {
+            loop {
+                if super::content::fits_with_status(
+                    &fitting,
+                    plate,
+                    super::content::Envelope::WithStructured,
+                ) {
+                    return true;
+                }
+                if !fitting.shrink_text() {
+                    return false;
+                }
             }
-            if !fitting.shrink_text() {
-                return false;
-            }
-        }
-    })?;
+        })?;
     *reply = fitting;
     Some(plate)
 }
@@ -154,8 +156,11 @@ fn attach_test_plate(
     worker: &WorkerHandle,
     binding: &[u8; 32],
     reply: &mut PeerReply,
+    test_status_snapshot: Option<&str>,
 ) -> Option<String> {
-    let line = worker.test_status_line(binding)?;
+    let line = test_status_snapshot
+        .map(str::to_owned)
+        .or_else(|| worker.test_status_line(binding))?;
     let plate = format!("<agent-ide>\n{line}\n</agent-ide>");
     let mut fitting = reply.clone();
     loop {
@@ -174,6 +179,24 @@ fn attach_test_plate(
             return None;
         }
     }
+}
+
+/// Reuses the test status captured in the worker's reply to avoid a completion race before plating.
+fn test_status_snapshot(reply: &PeerReply) -> Option<String> {
+    let PeerReply::Complete {
+        kind: super::reply::ResultKind::Test,
+        text,
+        ..
+    } = reply
+    else {
+        return None;
+    };
+    let line = text.lines().next()?;
+    (line.starts_with("tests #")
+        && !line.contains("started —")
+        && !line.contains("still running")
+        && !line.ends_with("unknown job"))
+    .then(|| line.to_owned())
 }
 
 impl std::fmt::Debug for ProductDispatcher {
@@ -551,13 +574,24 @@ impl ProductDispatcher {
                 if host.feed_delivery().allows_replies()
                     && method.method() != AssistanceMethod::Stop
                 {
+                    let test_status = test_status_snapshot(&reply);
                     if let Some(feed) = worker.project_feed() {
                         feed.changed(&fingerprint);
                     }
                     if !matches!(reply, PeerReply::Pending { .. }) {
                         *status = match worker.project_feed() {
-                            Some(feed) => attach_reply_plate(Some(feed), &fingerprint, &mut reply),
-                            None => attach_test_plate(worker, &fingerprint, &mut reply),
+                            Some(feed) => attach_reply_plate(
+                                Some(feed),
+                                &fingerprint,
+                                &mut reply,
+                                test_status.as_deref(),
+                            ),
+                            None => attach_test_plate(
+                                worker,
+                                &fingerprint,
+                                &mut reply,
+                                test_status.as_deref(),
+                            ),
                         };
                     }
                 }

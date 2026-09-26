@@ -56,6 +56,9 @@ error: execution_profile ({{ cause_tag }}); continue with native tools
 error: {{ code }}; continue with native tools
 {%- endif -%}
 {%- endif -%}
+{%- if state == "invalid_parameters" -%}
+{{ text }}
+{%- endif -%}
 {%- if state == "complete" and kind == "activation" -%}
 complete activation: {{ text }}
 Next: use ide.context

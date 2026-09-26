@@ -1142,6 +1142,9 @@ impl WorkerHandle {
     /// cancelled and removed while other bindings' jobs stay queued.
     pub async fn stop(&self, invocation: ValidatedInvocation, attachment: &str) -> PeerReply {
         let binding = invocation.binding_ref().clone();
+        self.shared
+            .test_runs
+            .observe_binding(&binding.fingerprint());
         if let Ok(mut ledger) = self.shared.ledger.lock() {
             if let Some(sender) = ledger.cancellation.remove(&binding) {
                 let _ = sender.send(true);
@@ -1541,16 +1544,25 @@ impl<'a> Worker<'a> {
             if let Some(result) = job_status.result {
                 let owns_detail = job_status.owner == binding.fingerprint();
                 let text = test_result_text(id, &result, owns_detail);
-                if let Ok(mut ledger) = self.shared.ledger.lock()
-                    && let Some(detail) = ledger.details.get_mut(&result.detail_ref)
-                {
-                    detail.reply = PeerReply::Complete {
-                        kind: ResultKind::Test,
-                        text: result.output.clone(),
-                        detail_ref: None,
-                        truncated: false,
-                        continuation: false,
+                if owns_detail {
+                    let (first_page, following_pages) =
+                        ContextPageState::new(result.output.clone(), 0, false, ResultKind::Test)
+                            .next(&result.detail_ref)?;
+                    let retained = if let Ok(mut ledger) = self.shared.ledger.lock()
+                        && let Some(detail) = ledger.details.get_mut(&result.detail_ref)
+                    {
+                        detail.reply = first_page;
+                        true
+                    } else {
+                        false
                     };
+                    if retained {
+                        self.shared
+                            .set_context_page(&result.detail_ref, following_pages);
+                        self.shared
+                            .test_runs
+                            .clear_output(&root, id, &binding.fingerprint());
+                    }
                 }
                 (text, owns_detail.then_some(result.detail_ref))
             } else {
@@ -1563,12 +1575,39 @@ impl<'a> Worker<'a> {
             let (argv, language, selected_count) = if let Some(path) =
                 job.parameters.get("path").and_then(Value::as_str)
             {
-                test_selection(&root, crate::lang::TestTarget::File(PathBuf::from(path)))?
+                match test_selection(&root, crate::lang::TestTarget::File(PathBuf::from(path))) {
+                    Ok(selection) => selection,
+                    Err(crate::lang::LangError::Unsupported(message)) => return Ok((
+                        PeerReply::InvalidParameters {
+                            message:
+                                crate::assistance::facade::ParameterError::TestTargetUnsupported(
+                                    message,
+                                )
+                                .message(AssistanceTool::Test),
+                        },
+                        Some(authority),
+                        None,
+                    )),
+                    Err(_) => return Err(FailureCode::ProviderUnavailable),
+                }
             } else if let Some(pattern) = job.parameters.get("pattern").and_then(Value::as_str) {
-                test_selection(&root, crate::lang::TestTarget::Pattern(pattern.to_owned()))?
+                match test_selection(&root, crate::lang::TestTarget::Pattern(pattern.to_owned())) {
+                    Ok(selection) => selection,
+                    Err(crate::lang::LangError::Unsupported(message)) => return Ok((
+                        PeerReply::InvalidParameters {
+                            message:
+                                crate::assistance::facade::ParameterError::TestTargetUnsupported(
+                                    message,
+                                )
+                                .message(AssistanceTool::Test),
+                        },
+                        Some(authority),
+                        None,
+                    )),
+                    Err(_) => return Err(FailureCode::ProviderUnavailable),
+                }
             } else if let Some(args) = job.parameters.get("command").and_then(Value::as_array) {
-                let language =
-                    detect_test_language(&root).ok_or(FailureCode::ProviderUnavailable)?;
+                let language = detect_test_language(&root).unwrap_or(crate::lang::Language::Rust);
                 (
                     args.iter()
                         .filter_map(Value::as_str)
@@ -1611,9 +1650,21 @@ impl<'a> Worker<'a> {
                 let project = support
                     .detect(&root)
                     .ok_or(FailureCode::ProviderUnavailable)?;
-                let selection = support
-                    .test_selection(&project, &target)
-                    .map_err(|_| FailureCode::ProviderUnavailable)?;
+                let selection = match support.test_selection(&project, &target) {
+                    Ok(selection) => selection,
+                    Err(crate::lang::LangError::Unsupported(message)) => return Ok((
+                        PeerReply::InvalidParameters {
+                            message:
+                                crate::assistance::facade::ParameterError::TestTargetUnsupported(
+                                    message,
+                                )
+                                .message(AssistanceTool::Test),
+                        },
+                        Some(authority),
+                        None,
+                    )),
+                    Err(_) => return Err(FailureCode::ProviderUnavailable),
+                };
                 let count = Some(selection.tests.len());
                 (selection.command, language, count)
             } else {
@@ -1664,7 +1715,24 @@ impl<'a> Worker<'a> {
                     ),
                     None,
                 ),
-                StartResult::Failed => return Err(FailureCode::Internal),
+                StartResult::Failed(error) => {
+                    let program = argv.first().map(String::as_str).unwrap_or("");
+                    return Ok((
+                        PeerReply::Complete {
+                            kind: ResultKind::Test,
+                            text: format!(
+                                "tests: could not start {}: {}",
+                                test_text_line(program, 160),
+                                test_text_line(&error, 240)
+                            ),
+                            detail_ref: None,
+                            truncated: false,
+                            continuation: false,
+                        },
+                        Some(authority),
+                        None,
+                    ));
+                }
             }
         };
         Ok((
@@ -3625,7 +3693,7 @@ fn detect_test_language(root: &Path) -> Option<crate::lang::Language> {
 fn test_selection(
     root: &Path,
     target: crate::lang::TestTarget,
-) -> Result<(Vec<String>, crate::lang::Language, Option<usize>), FailureCode> {
+) -> Result<(Vec<String>, crate::lang::Language, Option<usize>), crate::lang::LangError> {
     for language in [
         crate::lang::Language::Rust,
         crate::lang::Language::Python,
@@ -3638,13 +3706,13 @@ fn test_selection(
         let Some(project) = support.detect(root) else {
             continue;
         };
-        let selection = support
-            .test_selection(&project, &target)
-            .map_err(|_| FailureCode::ProviderUnavailable)?;
+        let selection = support.test_selection(&project, &target)?;
         let count = (!selection.tests.is_empty()).then_some(selection.tests.len());
         return Ok((selection.command, language, count));
     }
-    Err(FailureCode::ProviderUnavailable)
+    Err(crate::lang::LangError::Unsupported(
+        "no supported test runner was detected".to_owned(),
+    ))
 }
 
 /// Formats an argv vector for the compact test status line without shell interpretation.
@@ -3686,24 +3754,27 @@ fn test_text_line(value: &str, max_chars: usize) -> String {
 /// Renders the bounded parsed test result and actionable rerun/detail references.
 fn test_result_text(id: u64, result: &super::tests::RunResult, owns_detail: bool) -> String {
     let report = &result.report;
-    let mut text = if result.stopped {
-        format!(
-            "tests #{id}: stopped at budget {} s — {} passed, {} failed so far",
-            result.budget.as_secs(),
-            report.passed,
-            report.failed
-        )
-    } else {
-        format!(
-            "tests #{id}: {} passed, {} failed, {} s",
-            report.passed,
-            report.failed,
-            result.elapsed.as_secs()
-        )
-    };
-    if report.passed == 0 && report.failed == 0 && report.incomplete {
-        text.push_str(" (no summary parsed)");
-    }
+    let mut text =
+        if report.passed == 0 && report.failed == 0 && report.incomplete && !result.stopped {
+            format!(
+                "tests #{id}: no summary parsed, {} s",
+                result.elapsed.as_secs()
+            )
+        } else if result.stopped {
+            format!(
+                "tests #{id}: stopped at budget {} s — {} passed, {} failed so far",
+                result.budget.as_secs(),
+                report.passed,
+                report.failed
+            )
+        } else {
+            format!(
+                "tests #{id}: {} passed, {} failed, {} s",
+                report.passed,
+                report.failed,
+                result.elapsed.as_secs()
+            )
+        };
     for failure in report.failures.iter().take(8) {
         text.push_str(&format!("\n  FAIL {}", test_text_line(&failure.name, 160)));
         if let Some((path, line)) = &failure.location {

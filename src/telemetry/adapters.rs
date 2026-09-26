@@ -295,6 +295,7 @@ fn reply_outcome(reply: &PeerReply) -> ToolOutcome {
         PeerReply::Error {
             code: FailureCode::InvalidDetail,
         } => ToolOutcome::Invalid,
+        PeerReply::InvalidParameters { .. } => ToolOutcome::Invalid,
         PeerReply::Error {
             code: FailureCode::Deadline,
         } => ToolOutcome::Incomplete,

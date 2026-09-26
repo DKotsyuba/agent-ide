@@ -30,7 +30,7 @@ pub(crate) enum Envelope {
 ///
 /// The returned result contains exactly one text content block and, when `envelope` is
 /// [`Envelope::WithStructured`], the complete serialized reply in `structured_content`. Only
-/// [`PeerReply::Error`] sets `is_error`; invalid serialization or a non-shrinkable oversized result
+/// [`PeerReply::Error`] and [`PeerReply::InvalidParameters`] set `is_error`; invalid serialization or a non-shrinkable oversized result
 /// returns `None` without partially emitting identifiers.
 ///
 /// `status` is the optional due status plate (T28B): the complete `<agent-ide>` plate text, which
@@ -114,7 +114,10 @@ fn project(reply: &PeerReply, status: Option<&str>, envelope: Envelope) -> Optio
         None => reply_text,
     };
     let content = vec![ContentBlock::text(text)];
-    let mut rendered = if matches!(reply, PeerReply::Error { .. }) {
+    let mut rendered = if matches!(
+        reply,
+        PeerReply::Error { .. } | PeerReply::InvalidParameters { .. }
+    ) {
         CallToolResult::error(content)
     } else {
         CallToolResult::success(content)
@@ -122,7 +125,11 @@ fn project(reply: &PeerReply, status: Option<&str>, envelope: Envelope) -> Optio
     if matches!(envelope, Envelope::WithStructured) {
         rendered.structured_content = Some(structured);
     }
-    rendered.is_error = matches!(reply, PeerReply::Error { .. }).then_some(true);
+    rendered.is_error = matches!(
+        reply,
+        PeerReply::Error { .. } | PeerReply::InvalidParameters { .. }
+    )
+    .then_some(true);
     Some(rendered)
 }
 
@@ -251,6 +258,9 @@ mod tests {
             PeerReply::Error {
                 code: FailureCode::Capacity,
             },
+            PeerReply::InvalidParameters {
+                message: "invalid bounded parameters: unsupported path".into(),
+            },
             PeerReply::Complete {
                 kind: ResultKind::Activation,
                 text: "active".into(),
@@ -293,7 +303,11 @@ mod tests {
             assert_eq!(rendered.structured_content, Some(expected.clone()));
             assert_eq!(
                 rendered.is_error,
-                (expected["state"] == "error").then_some(true)
+                matches!(
+                    expected["state"].as_str(),
+                    Some("error" | "invalid_parameters")
+                )
+                .then_some(true)
             );
         }
     }

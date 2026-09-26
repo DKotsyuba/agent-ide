@@ -293,6 +293,8 @@ pub enum ParameterError {
     /// `ide.edit` needs `symbol` (with `op`), or `path` with `lines` for a range replace, or the
     /// full-file form `path` + `source_ref` + `content`.
     EditTarget,
+    /// The language runner rejected a semantically unsupported test target.
+    TestTargetUnsupported(String),
 }
 
 /// Names the specific closed rule one field value violated (T21B).
@@ -382,6 +384,7 @@ impl ParameterError {
             Self::ContextTarget => CONTEXT_TARGET_MESSAGE.to_string(),
             Self::ReadTarget => "ide.read needs `symbol`, or `path` with `lines`".to_string(),
             Self::EditTarget => "ide.edit needs `symbol` with `op`, or `path` with `lines`, or `path` with `source_ref` and `content`".to_string(),
+            Self::TestTargetUnsupported(message) => format!("invalid bounded parameters: {message}; use ide.test with `pattern` or `command`"),
         }
     }
 }
@@ -1016,7 +1019,8 @@ impl AssistanceFacade {
                         reply @ (PeerReply::Unavailable { .. }
                         | PeerReply::HostStopped {}
                         | PeerReply::Pending { .. }
-                        | PeerReply::Error { .. }),
+                        | PeerReply::Error { .. }
+                        | PeerReply::InvalidParameters { .. }),
                         status,
                     )) => FacadeOutcome::Reply(reply, status),
                     Some((reply @ PeerReply::Edit { .. }, status))
