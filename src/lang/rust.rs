@@ -375,28 +375,46 @@ impl LanguageSupport for RustSupport {
     /// the edition is the detected `edition` fact, 2021 when the manifest names none. rustfmt
     /// itself picks up `rustfmt.toml` from the file's ancestors.
     fn format_command(&self, project: &LanguageProject, file: &Path) -> Option<Vec<String>> {
-        let cargo = project.manifests.iter().any(|manifest| {
-            manifest
-                .file_name()
-                .is_some_and(|name| name == "Cargo.toml")
-        });
-        let fact = |name: &str| {
-            project
-                .environment
-                .iter()
-                .find(|(key, _)| key == name)
-                .map(|(_, value)| value.clone())
-        };
-        if !cargo && fact("rustfmt").is_none() {
-            return None;
-        }
+        let edition = rustfmt_edition(project)?;
         Some(vec![
             "rustfmt".to_owned(),
             "--edition".to_owned(),
-            fact("edition").unwrap_or_else(|| "2021".to_owned()),
+            edition,
             file.display().to_string(),
         ])
     }
+
+    /// `rustfmt --edition <edition>` with no file argument, so rustfmt formats the stdin text and
+    /// writes it to stdout; same detection and edition as [`Self::format_command`]. `None` for a
+    /// non-`.rs` file or a project without rustfmt.
+    fn format_stdin_command(&self, project: &LanguageProject, file: &Path) -> Option<Vec<String>> {
+        if file.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            return None;
+        }
+        let edition = rustfmt_edition(project)?;
+        Some(vec!["rustfmt".to_owned(), "--edition".to_owned(), edition])
+    }
+}
+
+/// Detected rustfmt edition for a Cargo project (or one with a rustfmt config); `None` when
+/// neither exists, so the project has no rustfmt command.
+fn rustfmt_edition(project: &LanguageProject) -> Option<String> {
+    let cargo = project.manifests.iter().any(|manifest| {
+        manifest
+            .file_name()
+            .is_some_and(|name| name == "Cargo.toml")
+    });
+    let fact = |name: &str| {
+        project
+            .environment
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+    };
+    if !cargo && fact("rustfmt").is_none() {
+        return None;
+    }
+    Some(fact("edition").unwrap_or_else(|| "2021".to_owned()))
 }
 
 /// Converts one rust-analyzer symbol (and its children) under `owner`, whose kind is `owner_kind`
@@ -1562,6 +1580,26 @@ mod tests {
             RustSupport
                 .detect(Path::new("/nonexistent-agent-ide-root"))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn format_stdin_command_drops_the_file_argument() {
+        assert_eq!(
+            RustSupport.format_stdin_command(&project(), Path::new("src/lib.rs")),
+            Some(argv_of("rustfmt --edition 2024"))
+        );
+        assert_eq!(
+            RustSupport.format_stdin_command(&project(), Path::new("src/lib.py")),
+            None
+        );
+        let no_rustfmt = LanguageProject {
+            manifests: Vec::new(),
+            ..project()
+        };
+        assert_eq!(
+            RustSupport.format_stdin_command(&no_rustfmt, Path::new("src/lib.rs")),
+            None
         );
     }
 }

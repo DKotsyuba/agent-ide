@@ -375,6 +375,29 @@ impl LanguageSupport for Python {
             _ => None,
         }
     }
+
+    /// `ruff format --stdin-filename <file> -` or `black -q -` as detected (`uv run` prefixed in
+    /// uv projects), reading the candidate text on stdin and writing the formatted text to
+    /// stdout. `None` for a non-`.py`/`.pyi` file or a project without either formatter.
+    fn format_stdin_command(&self, project: &LanguageProject, file: &Path) -> Option<Vec<String>> {
+        match file.extension().and_then(|ext| ext.to_str()) {
+            Some("py" | "pyi") => {}
+            _ => return None,
+        }
+        let uv = project
+            .environment
+            .iter()
+            .any(|(name, value)| name == "tool" && value == "uv");
+        let file = file.display().to_string();
+        match env_value(project, "formatter")? {
+            "black" => Some(with_uv(uv, &["black", "-q", "-"])),
+            "ruff" => Some(with_uv(
+                uv,
+                &["ruff", "format", "--stdin-filename", &file, "-"],
+            )),
+            _ => None,
+        }
+    }
 }
 
 /// What encloses a symbol being normalized; decides the method/constructor/test refinement.
@@ -1598,5 +1621,47 @@ FAILED tests/test_service.py::TestWorker::test_label
         let empty = scratch("empty");
         assert_eq!(Python.detect(&empty), None);
         fs::remove_dir_all(&empty).unwrap();
+    }
+
+    #[test]
+    fn format_stdin_command_reads_stdin_for_each_formatter() {
+        let ruff = project(&[("tool", "uv"), ("formatter", "ruff")]);
+        assert_eq!(
+            Python.format_stdin_command(&ruff, Path::new("src/svc/cli.py")),
+            Some(argv(&[
+                "uv",
+                "run",
+                "ruff",
+                "format",
+                "--stdin-filename",
+                "src/svc/cli.py",
+                "-"
+            ]))
+        );
+        assert_eq!(
+            Python.format_stdin_command(&ruff, Path::new("src/svc/cli.pyi")),
+            Some(argv(&[
+                "uv",
+                "run",
+                "ruff",
+                "format",
+                "--stdin-filename",
+                "src/svc/cli.pyi",
+                "-"
+            ]))
+        );
+        assert_eq!(
+            Python.format_stdin_command(&ruff, Path::new("src/svc/cli.js")),
+            None
+        );
+
+        let black = project(&[("formatter", "black")]);
+        assert_eq!(
+            Python.format_stdin_command(&black, Path::new("a.py")),
+            Some(argv(&["black", "-q", "-"]))
+        );
+
+        let none = project(&[]);
+        assert_eq!(Python.format_stdin_command(&none, Path::new("a.py")), None);
     }
 }

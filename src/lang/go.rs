@@ -325,6 +325,13 @@ impl LanguageSupport for GoSupport {
             file.display().to_string(),
         ])
     }
+
+    /// `gofmt` with no file argument, so it reads the candidate text on stdin and writes the
+    /// formatted text to stdout. `None` for a non-`.go` file.
+    fn format_stdin_command(&self, _project: &LanguageProject, file: &Path) -> Option<Vec<String>> {
+        (file.extension().and_then(|ext| ext.to_str()) == Some("go"))
+            .then(|| vec!["gofmt".to_owned()])
+    }
 }
 
 /// Converts one gopls symbol (and its children) under `owner`; method names lose their
@@ -787,6 +794,18 @@ func Any() interface{} {
             GoSupport
                 .detect(Path::new("/nonexistent-agent-ide-root"))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn format_stdin_command_drops_the_file_argument() {
+        assert_eq!(
+            GoSupport.format_stdin_command(&project(), Path::new("a/b.go")),
+            Some(argv_of("gofmt"))
+        );
+        assert_eq!(
+            GoSupport.format_stdin_command(&project(), Path::new("a/b.py")),
+            None
         );
     }
 }

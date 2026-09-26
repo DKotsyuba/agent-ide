@@ -415,6 +415,24 @@ impl LanguageSupport for TypeScript {
             ]
         })
     }
+
+    /// `npx prettier --stdin-filepath <file>`, reading the candidate text on stdin and writing the
+    /// formatted text to stdout, when prettier is configured. `None` for a file extension no
+    /// script language module owns or a project without prettier.
+    fn format_stdin_command(&self, project: &LanguageProject, file: &Path) -> Option<Vec<String>> {
+        match file.extension().and_then(|ext| ext.to_str()) {
+            Some("ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs") => {}
+            _ => return None,
+        }
+        (env_value(project, "formatter")? == "prettier").then(|| {
+            vec![
+                "npx".to_owned(),
+                "prettier".to_owned(),
+                "--stdin-filepath".to_owned(),
+                file.display().to_string(),
+            ]
+        })
+    }
 }
 
 /// Appends every string inside a `package.json` value (string, array or nested object values).
@@ -1703,5 +1721,36 @@ ok 2 - subtracts
         let empty = scratch("empty");
         assert_eq!(TypeScript.detect(&empty), None);
         fs::remove_dir_all(&empty).unwrap();
+    }
+
+    #[test]
+    fn format_stdin_command_covers_the_script_extensions() {
+        let prettier = project(&[("formatter", "prettier")]);
+        for file in [
+            "src/a.ts",
+            "src/a.tsx",
+            "src/a.js",
+            "src/a.jsx",
+            "src/a.mts",
+            "src/a.cts",
+            "src/a.mjs",
+            "src/a.cjs",
+        ] {
+            assert_eq!(
+                TypeScript.format_stdin_command(&prettier, Path::new(file)),
+                Some(argv(&["npx", "prettier", "--stdin-filepath", file])),
+                "{file}"
+            );
+        }
+        assert_eq!(
+            TypeScript.format_stdin_command(&prettier, Path::new("src/a.py")),
+            None
+        );
+
+        let none = project(&[]);
+        assert_eq!(
+            TypeScript.format_stdin_command(&none, Path::new("src/a.ts")),
+            None
+        );
     }
 }

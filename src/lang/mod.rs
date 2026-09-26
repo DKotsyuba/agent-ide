@@ -439,6 +439,11 @@ pub trait LanguageSupport: Send + Sync {
 
     /// Formatter command for one file, if the project has one; run from the project root.
     fn format_command(&self, project: &LanguageProject, file: &Path) -> Option<Vec<String>>;
+
+    /// Formatter that reads the file's text on stdin and writes the formatted text to stdout, for a
+    /// candidate that is not on disk yet. `file` is the relative path the text belongs to (formatters
+    /// pick their config and language from it). `None` when the project has no formatter for it.
+    fn format_stdin_command(&self, project: &LanguageProject, file: &Path) -> Option<Vec<String>>;
 }
 
 /// The support module for a language, or `None` while it is not implemented.
