@@ -26,8 +26,8 @@ use crate::{
         },
         typescript::{
             ProjectResolutionInputsV1, TypeScriptProfile, TypeScriptProfileError,
-            TypeScriptProfiles, TypeScriptProtocolChild, TypeScriptShutdownFailure,
-            TypeScriptViewAdmission, TypeScriptWorktree,
+            TypeScriptProfiles, TypeScriptProtocolChild, TypeScriptViewAdmission,
+            TypeScriptWorktree,
         },
     },
     telemetry::{CacheState, DiagnosticState, Language, Telemetry, adapters},
@@ -42,12 +42,29 @@ pub(super) struct ProviderContext {
     pub(super) diagnostics: DiagnosticSnapshot,
 }
 
-/// One long-lived Rust session owned by a binding: the child, its transport driver and the
-/// admitted view it holds until the binding stops or the transport dies.
-struct LiveRust {
-    child: RustProtocolChild,
+/// Owns the protocol child for one binding's long-lived language-server session.
+enum LiveChild {
+    /// Rust analyzer process and its exclusive view.
+    Rust(RustProtocolChild, RustView),
+    /// Pyright process and its exclusive view.
+    Pyright(
+        PyrightProtocolChild,
+        crate::intelligence::pyright::PyrightView,
+    ),
+    /// TypeScript bridge, its exclusive view, and the resolution inputs that selected its project.
+    TypeScript(
+        TypeScriptProtocolChild,
+        crate::intelligence::typescript::TypeScriptView,
+        Box<ProjectResolutionInputsV1>,
+    ),
+}
+
+/// One live session and the process/view resources retained until binding release.
+struct LiveEntry {
+    /// Child process and provider admission view owned by this session.
+    child: LiveChild,
+    /// Transport driver and synchronized document state shared by context and symbol requests.
     live: LiveSession,
-    view: RustView,
 }
 
 /// Keeps a shared listener owned until the final logical view is released and reaped.
@@ -131,8 +148,8 @@ pub(super) struct Providers {
     socket_generation: BTreeMap<String, u64>,
     /// Exclusive Rust generation and source bookkeeping.
     rust: RustViews,
-    /// Long-lived Rust sessions, one per binding, kept until the binding stops or the transport dies.
-    live_rust: BTreeMap<BindingRef, LiveRust>,
+    /// Long-lived language sessions, one per binding, kept until stop or transport failure.
+    live: BTreeMap<BindingRef, LiveEntry>,
     /// Exclusive TypeScript generations and owner-lifetime exact-profile quarantine.
     typescript: TypeScriptProfiles,
     /// Strictly increasing protocol/backend generation within this boot.
@@ -161,7 +178,7 @@ impl Providers {
             go_views: BTreeMap::new(),
             socket_generation: BTreeMap::new(),
             rust: RustViews::default(),
-            live_rust: BTreeMap::new(),
+            live: BTreeMap::new(),
             typescript: TypeScriptProfiles::default(),
             generation: 0,
             caches: BTreeMap::new(),
@@ -417,7 +434,7 @@ impl Worker<'_> {
         }
     }
 
-    /// Runs one release-pinned exclusive TypeScript session with strict normal/abnormal settlement.
+    /// Answers TypeScript context requests through the binding's persistent server session.
     async fn typescript_context(
         &mut self,
         job: &mut Job,
@@ -426,6 +443,296 @@ impl Worker<'_> {
         bytes: &[u8],
         query: ContextQuery,
     ) -> Result<ProviderContext, FailureCode> {
+        let binding = job.invocation.binding_ref().clone();
+        self.ensure_live_typescript(job, launch, source).await?;
+        self.live_context(job, &binding, source, bytes, query, Language::Typescript)
+            .await
+    }
+
+    /// Answers Python context requests through the binding's persistent Pyright session.
+    async fn pyright_context(
+        &mut self,
+        job: &mut Job,
+        launch: &ProviderLaunch,
+        source: &SourceObservation,
+        bytes: &[u8],
+        query: ContextQuery,
+    ) -> Result<ProviderContext, FailureCode> {
+        let binding = job.invocation.binding_ref().clone();
+        self.ensure_live_pyright(job, launch, source).await?;
+        self.live_context(job, &binding, source, bytes, query, Language::Python)
+            .await
+    }
+
+    /// Runs one context request on a retained session and returns its context with diagnostics.
+    ///
+    /// `job` supplies cancellation, `binding` selects the retained session, `source` and `bytes`
+    /// identify the exact observed document, `query` selects whole-file or symbol context, and
+    /// `language` selects diagnostics waiting and telemetry. Python and TypeScript wait for their
+    /// bounded diagnostic push; Rust keeps its file-query behavior. A failed exchange retires the
+    /// session and maps to `ProviderUnavailable`.
+    async fn live_context(
+        &mut self,
+        job: &mut Job,
+        binding: &BindingRef,
+        source: &SourceObservation,
+        bytes: &[u8],
+        query: ContextQuery,
+        language: Language,
+    ) -> Result<ProviderContext, FailureCode> {
+        let entry = self
+            .providers
+            .live
+            .get_mut(binding)
+            .ok_or(FailureCode::Internal)?;
+        let result = {
+            let operation = entry.live.session.context(source, bytes, query);
+            tokio::pin!(operation);
+            tokio::select! { result = &mut operation => result, _ = job.cancel.changed() => Err(std::io::Error::other("cancelled")), }
+        };
+        if result.is_ok() {
+            if matches!(language, Language::Python | Language::Typescript) {
+                entry.live.session.wait_for_matching_diagnostics().await;
+            } else if matches!(query, ContextQuery::File) {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    entry.live.session.wait_for_matching_diagnostics(),
+                )
+                .await;
+            }
+        }
+        let outcome = match result {
+            Ok(context) => ProviderContext {
+                context,
+                diagnostics: entry.live.session.diagnostics(),
+            },
+            Err(_) => {
+                self.release_live(binding).await;
+                return Err(FailureCode::ProviderUnavailable);
+            }
+        };
+        if language == Language::Typescript
+            && !self
+                .verify_live_typescript_inputs(job, binding, source)
+                .await?
+        {
+            self.release_live(binding).await;
+            return Err(FailureCode::ResolutionUnverified);
+        }
+        if let Some(telemetry) = self.telemetry.as_ref() {
+            let state = match outcome.diagnostics.readiness {
+                crate::intelligence::freshness::DiagnosticReadiness::Clean => {
+                    DiagnosticState::Clean
+                }
+                crate::intelligence::freshness::DiagnosticReadiness::Reported => {
+                    DiagnosticState::Changed
+                }
+                crate::intelligence::freshness::DiagnosticReadiness::Unknown => {
+                    DiagnosticState::Unavailable
+                }
+            };
+            adapters::provider_summary(telemetry, language, CacheState::Unavailable, state);
+        }
+        self.shared.active(binding)?;
+        Ok(outcome)
+    }
+
+    /// Re-observes project files after a TypeScript request and checks them against the retained view.
+    ///
+    /// `job` supplies the accepted TypeScript bundle, `binding` selects its live project snapshot,
+    /// and `source` identifies the requested document. Returns `false` when project evidence
+    /// changed; unobservable or invalid evidence returns `ResolutionUnverified`.
+    async fn verify_live_typescript_inputs(
+        &mut self,
+        job: &mut Job,
+        binding: &BindingRef,
+        source: &SourceObservation,
+    ) -> Result<bool, FailureCode> {
+        let launch = job
+            .target
+            .providers
+            .iter()
+            .find(|profile| profile.settings == AcceptedProviderSettings::TypeScriptDefaultsV1)
+            .ok_or(FailureCode::ProviderUnavailable)?;
+        let authority = self.authority(binding).await?;
+        let bundle = launch
+            .typescript_bundle()
+            .map_err(|_| FailureCode::ExecutionProfile)?;
+        let roots = self.shared.launcher.allowed_roots().to_vec();
+        let worktree_root = authority.worktree().worktree_path().to_path_buf();
+        let path_proof = |path: &Path| {
+            let absolute = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                worktree_root.join(path)
+            };
+            crate::assistance::launcher::admit_path(&roots, &absolute).is_ok()
+        };
+        let current = ProjectResolutionInputsV1::observe(
+            authority.worktree().clone(),
+            authority.worktree().worktree_path().join(source.path()),
+            &bundle,
+            &path_proof,
+        )
+        .map_err(|_| FailureCode::ResolutionUnverified)?;
+        Ok(self.providers.live.get(binding).is_some_and(|entry| {
+            matches!(&entry.child, LiveChild::TypeScript(_, _, prior) if prior.same_project(&current))
+        }))
+    }
+
+    /// Starts the accepted Pyright session for this binding, or keeps its live session.
+    ///
+    /// `job` supplies cancellation and binding ownership; `launch` is the accepted executable
+    /// profile; `source` fixes the worktree and authority epoch. A replaced child is shut down
+    /// before another is admitted. Profile, authority, capacity, spawn, handshake, and
+    /// cancellation failures return their bounded `FailureCode`.
+    async fn ensure_live_pyright(
+        &mut self,
+        job: &mut Job,
+        launch: &ProviderLaunch,
+        source: &SourceObservation,
+    ) -> Result<(), FailureCode> {
+        let binding = job.invocation.binding_ref().clone();
+        if self.providers.live.get(&binding).is_some_and(|entry| {
+            matches!(&entry.child, LiveChild::Pyright(..)) && entry.live.is_alive()
+        }) {
+            return Ok(());
+        }
+        self.release_live(&binding).await;
+        let authority = self.authority(&binding).await?;
+        let cache_namespace =
+            self.provider_cache_namespace(&binding, &authority, launch, &launch.trust)?;
+        let node = launch.node.as_ref().ok_or(FailureCode::ExecutionProfile)?;
+        let profile = PyrightProfile::new(PyrightProfileIdentity {
+            binary: launch.executable.path.clone(),
+            accepted_script_digest: blake3::Hash::from_hex(&launch.executable.blake3)
+                .map_err(|_| FailureCode::ExecutionProfile)?,
+            version: launch.executable.identity.clone(),
+            node: node.path.clone(),
+            accepted_node_digest: blake3::Hash::from_hex(&node.blake3)
+                .map_err(|_| FailureCode::ExecutionProfile)?,
+            node_identity: node.identity.clone(),
+            trust: launch.trust.clone(),
+            cache_namespace,
+        })
+        .map_err(|_| FailureCode::ExecutionProfile)?;
+        let worktree = PyrightWorktree::new(
+            authority.worktree().clone(),
+            execution_authority(&authority)?,
+        )
+        .map_err(|_| FailureCode::WorkspaceAuthority)?;
+        let command = profile
+            .command(&worktree)
+            .map_err(|_| FailureCode::ExecutionProfile)?;
+        let request = self
+            .execution_request(job, &authority, command, node)
+            .await?;
+        let active = self.shared.active(&binding)?;
+        let generation = self.providers.next()?;
+        let view = {
+            let admission = self.admission.clone();
+            let mut admission = admission
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match PyrightProfile::request_view(
+                &profile,
+                &worktree,
+                &mut self.providers.registry,
+                &mut admission,
+                owner(&binding)?,
+                AdmissionClass::Interactive,
+                generation,
+            ) {
+                PyrightViewAdmission::Granted(view) => view,
+                PyrightViewAdmission::Queued(ticket) => {
+                    self.providers
+                        .registry
+                        .cancel_pending(&mut admission, ticket);
+                    return Err(FailureCode::Capacity);
+                }
+                _ => return Err(FailureCode::ProviderUnavailable),
+            }
+        };
+        let mut child = {
+            let admission = self.admission.clone();
+            let mut admission = admission
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match PyrightProtocolChild::spawn(
+                &request,
+                &profile,
+                &worktree,
+                &mut self.providers.registry,
+                &mut admission,
+                view.lease(),
+                Some(active),
+                self.shared.launcher.limits.output_bytes,
+            ) {
+                Ok(child) => child,
+                Err(error) => {
+                    let _ = view.release(&mut self.providers.registry);
+                    if let PyrightProfileError::Process(error) = error {
+                        self.provider_spawn_failure(error, &binding);
+                    }
+                    return Err(FailureCode::ProviderUnavailable);
+                }
+            }
+        };
+        let opened = match child.take_pipes() {
+            Some((stdin, stdout)) => {
+                let open = LiveSession::open(
+                    stdout,
+                    stdin,
+                    source.worktree().clone(),
+                    source.authority_epoch(),
+                    ViewGeneration {
+                        backend: generation,
+                        configuration: 1,
+                        toolchain: 1,
+                        view: generation,
+                    },
+                    ProviderSettings::Pyright(profile),
+                    Duration::from_secs(30),
+                );
+                tokio::pin!(open);
+                tokio::select! { result = &mut open => result, _ = job.cancel.changed() => Err(std::io::Error::other("cancelled")), }
+            }
+            None => Err(std::io::Error::other("protocol pipes already taken")),
+        };
+        match opened {
+            Ok(live) => {
+                self.providers.live.insert(
+                    binding,
+                    LiveEntry {
+                        child: LiveChild::Pyright(child, view),
+                        live,
+                    },
+                );
+                Ok(())
+            }
+            Err(_) => {
+                self.reap_pyright(&binding, child, view).await;
+                if *job.cancel.borrow() {
+                    Err(FailureCode::Cancelled)
+                } else {
+                    Err(FailureCode::ProviderUnavailable)
+                }
+            }
+        }
+    }
+
+    /// Starts the accepted TypeScript session for this binding or reuses its project session.
+    ///
+    /// `job` supplies cancellation and binding ownership; `launch` provides the accepted bundle;
+    /// `source` selects and verifies project inputs. A different worktree, bundle, or captured
+    /// project file set shuts down the old session before a new one is admitted. Unverified inputs,
+    /// authority, capacity, spawn, handshake, and cancellation failures return a bounded code.
+    async fn ensure_live_typescript(
+        &mut self,
+        job: &mut Job,
+        launch: &ProviderLaunch,
+        source: &SourceObservation,
+    ) -> Result<(), FailureCode> {
         if !launch.typescript_codex_accepted() {
             return Err(FailureCode::ExecutionProfile);
         }
@@ -436,12 +743,9 @@ impl Worker<'_> {
         let bundle = launch
             .typescript_bundle()
             .map_err(|_| FailureCode::ExecutionProfile)?;
-        // Resolution inputs are auxiliary native reads: candidates arrive worktree-relative, and
-        // ancestor configs or dependencies may sit outside the worktree, so each candidate is
-        // resolved against the worktree and admitted against the allowed roots.
         let roots = self.shared.launcher.allowed_roots().to_vec();
         let worktree_root = authority.worktree().worktree_path().to_path_buf();
-        let path_proof = move |path: &Path| {
+        let path_proof = |path: &Path| {
             let absolute = if path.is_absolute() {
                 path.to_path_buf()
             } else {
@@ -449,16 +753,23 @@ impl Worker<'_> {
             };
             crate::assistance::launcher::admit_path(&roots, &absolute).is_ok()
         };
-        let resolution = ProjectResolutionInputsV1::observe(
+        let inputs = ProjectResolutionInputsV1::observe(
             authority.worktree().clone(),
             authority.worktree().worktree_path().join(source.path()),
             &bundle,
             &path_proof,
         )
         .map_err(|_| FailureCode::ResolutionUnverified)?;
+        if self.providers.live.get(&binding).is_some_and(|entry| {
+            matches!(&entry.child, LiveChild::TypeScript(_, _, prior) if prior.same_project(&inputs))
+                && entry.live.is_alive()
+        }) {
+            return Ok(());
+        }
+        self.release_live(&binding).await;
         let profile = TypeScriptProfile::new(
             bundle,
-            resolution,
+            inputs.clone(),
             launch.trust.clone(),
             Path::new(&cache_namespace).to_path_buf(),
         )
@@ -510,7 +821,7 @@ impl Worker<'_> {
             let mut admission = admission
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            TypeScriptProtocolChild::spawn(
+            match TypeScriptProtocolChild::spawn(
                 &request,
                 &profile,
                 &worktree,
@@ -520,268 +831,63 @@ impl Worker<'_> {
                 Some(active),
                 self.shared.launcher.limits.output_bytes,
                 &path_proof,
-            )
-        };
-        let mut child = match child {
-            Ok(child) => child,
-            Err(
-                error @ (TypeScriptProfileError::InvalidBundle
-                | TypeScriptProfileError::InvalidResolution),
-            ) => {
-                self.providers
-                    .typescript
-                    .quarantine_after(&view, TypeScriptShutdownFailure::Operation);
-                return Err(
-                    if matches!(error, TypeScriptProfileError::InvalidResolution) {
-                        FailureCode::ResolutionUnverified
-                    } else {
-                        FailureCode::ProviderUnavailable
-                    },
-                );
-            }
-            Err(error) => {
-                self.providers
-                    .typescript
-                    .quarantine_after(&view, TypeScriptShutdownFailure::Operation);
-                let _ = self
-                    .providers
-                    .typescript
-                    .release(view, &mut self.providers.registry);
-                if let TypeScriptProfileError::Process(error) = error {
-                    self.provider_spawn_failure(error, &binding);
-                }
-                return Err(FailureCode::ProviderUnavailable);
-            }
-        };
-        let mut outcome = {
-            let telemetry = self.telemetry.clone();
-            let (input, output) = child.pipes();
-            let operation = session_operation(
-                input,
-                output,
-                source.clone(),
-                bytes.to_vec(),
-                query,
-                ViewGeneration {
-                    backend: view.generation(),
-                    configuration: 1,
-                    toolchain: 1,
-                    view: view.generation(),
-                },
-                ProviderSettings::TypeScript(profile.clone()),
-                remaining_options(job),
-                telemetry.as_ref(),
-                Language::Typescript,
-            );
-            tokio::pin!(operation);
-            tokio::select! {result=&mut operation=>result,_=job.cancel.changed()=>Err(FailureCode::Cancelled)}
-        };
-        let reaped = if outcome.is_ok() {
-            match child.wait_for_exit(Duration::from_millis(500)).await {
-                Ok(waited) => {
-                    if self
+            ) {
+                Ok(child) => child,
+                Err(error) => {
+                    let _ = self
                         .providers
                         .typescript
-                        .quarantine_after_unsuccessful_wait(&view, &waited)
-                    {
-                        outcome = Err(FailureCode::ProviderUnavailable);
+                        .release(view, &mut self.providers.registry);
+                    if let TypeScriptProfileError::Process(error) = error {
+                        self.provider_spawn_failure(error, &binding);
                     }
-                    child.finish_reap(waited, Duration::from_millis(500)).await
-                }
-                Err(_) => {
-                    self.providers
-                        .typescript
-                        .quarantine_after_wait_timeout(&view);
-                    outcome = Err(FailureCode::Deadline);
-                    child
-                        .terminate_abnormally(
-                            Duration::from_millis(100),
-                            Duration::from_millis(500),
-                        )
-                        .await
+                    return Err(FailureCode::ProviderUnavailable);
                 }
             }
-        } else {
-            self.providers
-                .typescript
-                .quarantine_after(&view, TypeScriptShutdownFailure::Operation);
-            child
-                .terminate_abnormally(Duration::from_millis(100), Duration::from_millis(500))
-                .await
         };
-        let reaped = match reaped {
-            Ok(reaped) => reaped,
+        let mut child = child;
+        let generation = view.generation();
+        let opened = match child.take_pipes() {
+            Some((stdin, stdout)) => {
+                let open = LiveSession::open(
+                    stdout,
+                    stdin,
+                    source.worktree().clone(),
+                    source.authority_epoch(),
+                    ViewGeneration {
+                        backend: generation,
+                        configuration: 1,
+                        toolchain: 1,
+                        view: generation,
+                    },
+                    ProviderSettings::TypeScript(profile.clone()),
+                    Duration::from_secs(30),
+                );
+                tokio::pin!(open);
+                tokio::select! { result = &mut open => result, _ = job.cancel.changed() => Err(std::io::Error::other("cancelled")), }
+            }
+            None => Err(std::io::Error::other("protocol pipes already taken")),
+        };
+        match opened {
+            Ok(live) => {
+                self.providers.live.insert(
+                    binding,
+                    LiveEntry {
+                        child: LiveChild::TypeScript(child, view, Box::new(inputs)),
+                        live,
+                    },
+                );
+                Ok(())
+            }
             Err(_) => {
-                self.uncertain.insert(binding);
-                return Err(FailureCode::Deadline);
+                self.reap_typescript(&binding, child, view).await;
+                if *job.cancel.borrow() {
+                    Err(FailureCode::Cancelled)
+                } else {
+                    Err(FailureCode::ProviderUnavailable)
+                }
             }
-        };
-        // T36B: the post-operation remeasure rereads every resolution input, so it proves
-        // each one again under the live profile instead of trusting the spawn-time proof.
-        if profile.verify_resolution(&path_proof).is_err() {
-            self.providers
-                .typescript
-                .quarantine_after(&view, TypeScriptShutdownFailure::Operation);
-            outcome = Err(FailureCode::ResolutionUnverified);
         }
-        let capability = self
-            .providers
-            .typescript
-            .release(view, &mut self.providers.registry)
-            .map_err(|_| FailureCode::Internal)?;
-        let admission = self.admission.clone();
-        let mut admission = admission
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.providers
-            .registry
-            .complete_reap(&mut admission, capability, reaped.proof)
-            .map_err(|_| FailureCode::Internal)?;
-        self.shared.active(&binding)?;
-        outcome
-    }
-
-    /// Starts one exclusive accepted Pyright session and settles it only after direct-child reap.
-    async fn pyright_context(
-        &mut self,
-        job: &mut Job,
-        launch: &ProviderLaunch,
-        source: &SourceObservation,
-        bytes: &[u8],
-        query: ContextQuery,
-    ) -> Result<ProviderContext, FailureCode> {
-        let binding = job.invocation.binding_ref().clone();
-        let authority = self.authority(&binding).await?;
-        let cache_namespace =
-            self.provider_cache_namespace(&binding, &authority, launch, &launch.trust)?;
-        let node = launch.node.as_ref().ok_or(FailureCode::ExecutionProfile)?;
-        let accepted_script_digest = blake3::Hash::from_hex(&launch.executable.blake3)
-            .map_err(|_| FailureCode::ExecutionProfile)?;
-        let accepted_node_digest =
-            blake3::Hash::from_hex(&node.blake3).map_err(|_| FailureCode::ExecutionProfile)?;
-        let profile = PyrightProfile::new(PyrightProfileIdentity {
-            binary: launch.executable.path.clone(),
-            accepted_script_digest,
-            version: launch.executable.identity.clone(),
-            node: node.path.clone(),
-            accepted_node_digest,
-            node_identity: node.identity.clone(),
-            trust: launch.trust.clone(),
-            cache_namespace,
-        })
-        .map_err(|_| FailureCode::ExecutionProfile)?;
-        let worktree = PyrightWorktree::new(
-            authority.worktree().clone(),
-            execution_authority(&authority)?,
-        )
-        .map_err(|_| FailureCode::WorkspaceAuthority)?;
-        let command = profile
-            .command(&worktree)
-            .map_err(|_| FailureCode::ExecutionProfile)?;
-        let request = self
-            .execution_request(job, &authority, command, node)
-            .await?;
-        let active = self.shared.active(&binding)?;
-        let generation = self.providers.next()?;
-        let view = {
-            let admission = self.admission.clone();
-            let mut admission = admission
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match PyrightProfile::request_view(
-                &profile,
-                &worktree,
-                &mut self.providers.registry,
-                &mut admission,
-                owner(&binding)?,
-                AdmissionClass::Interactive,
-                generation,
-            ) {
-                PyrightViewAdmission::Granted(view) => view,
-                PyrightViewAdmission::Queued(ticket) => {
-                    self.providers
-                        .registry
-                        .cancel_pending(&mut admission, ticket);
-                    return Err(FailureCode::Capacity);
-                }
-                _ => return Err(FailureCode::ProviderUnavailable),
-            }
-        };
-        let child = {
-            let admission = self.admission.clone();
-            let mut admission = admission
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            PyrightProtocolChild::spawn(
-                &request,
-                &profile,
-                &worktree,
-                &mut self.providers.registry,
-                &mut admission,
-                view.lease(),
-                Some(active),
-                self.shared.launcher.limits.output_bytes,
-            )
-        };
-        let mut child = match child {
-            Ok(child) => child,
-            Err(PyrightProfileError::InvalidProfile) => {
-                return Err(FailureCode::ProviderUnavailable);
-            }
-            Err(error) => {
-                let _ = view.release(&mut self.providers.registry);
-                if let PyrightProfileError::Process(error) = error {
-                    self.provider_spawn_failure(error, &binding);
-                }
-                return Err(FailureCode::ProviderUnavailable);
-            }
-        };
-        let result = {
-            let telemetry = self.telemetry.clone();
-            let (input, output) = child.pipes();
-            let operation = session_operation(
-                input,
-                output,
-                source.clone(),
-                bytes.to_vec(),
-                query,
-                ViewGeneration {
-                    backend: view.generation(),
-                    configuration: 1,
-                    toolchain: 1,
-                    view: view.generation(),
-                },
-                ProviderSettings::Pyright(profile),
-                remaining_options(job),
-                telemetry.as_ref(),
-                Language::Python,
-            );
-            tokio::pin!(operation);
-            tokio::select! {result=&mut operation=>result,_=job.cancel.changed()=>Err(FailureCode::Cancelled)}
-        };
-        let reaped = match child
-            .cancel_and_reap(Duration::from_millis(100), Duration::from_millis(500))
-            .await
-        {
-            Ok(reaped) => reaped,
-            Err(_) => {
-                self.uncertain.insert(binding);
-                return Err(FailureCode::Deadline);
-            }
-        };
-        let capability = view
-            .release(&mut self.providers.registry)
-            .map_err(|_| FailureCode::Internal)?;
-        let admission = self.admission.clone();
-        let mut admission = admission
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.providers
-            .registry
-            .complete_reap(&mut admission, capability, reaped.proof)
-            .map_err(|_| FailureCode::Internal)?;
-        self.shared.active(&binding)?;
-        result
     }
 
     /// Answers a Rust context request from the binding's long-lived analyzer session, starting
@@ -804,9 +910,12 @@ impl Worker<'_> {
             .clamp(Duration::from_millis(100), Duration::from_secs(10));
         let lease = self
             .providers
-            .live_rust
+            .live
             .get(&binding)
-            .map(|entry| entry.view.lease())
+            .and_then(|entry| match &entry.child {
+                LiveChild::Rust(_, view) => Some(view.lease()),
+                _ => None,
+            })
             .ok_or(FailureCode::Internal)?;
         self.providers
             .rust
@@ -815,7 +924,7 @@ impl Worker<'_> {
         let outcome = {
             let entry = self
                 .providers
-                .live_rust
+                .live
                 .get_mut(&binding)
                 .ok_or(FailureCode::Internal)?;
             let readiness = tokio::select! {
@@ -860,7 +969,7 @@ impl Worker<'_> {
             Ok(context) => Ok(context),
             Err(_) => {
                 // A failed exchange retires the session; the next request starts a fresh one.
-                self.release_live_rust(&binding).await;
+                self.release_live(&binding).await;
                 Err(FailureCode::ProviderUnavailable)
             }
         };
@@ -890,11 +999,12 @@ impl Worker<'_> {
         result
     }
 
-    /// The binding's live session for the language of `source`, ready to answer requests.
+    /// Returns the binding's ready session selected by the source extension.
     ///
-    /// Only Rust has a long-lived session so far; other languages report `ProviderUnavailable`
-    /// until their modules move onto the live path. A loading workspace reports
-    /// `ProviderLoading` after a bounded wait.
+    /// `job` supplies accepted provider settings, cancellation, and a bounded readiness deadline;
+    /// `source` must be a supported Rust, Python, or TypeScript-family observation. Unsupported
+    /// extensions and missing provider settings return `ProviderUnavailable`; Rust loading,
+    /// workspace failure, cancellation, and a dead transport retain their existing outcomes.
     pub(super) async fn live_session_for(
         &mut self,
         job: &mut Job,
@@ -903,6 +1013,10 @@ impl Worker<'_> {
         let binding = job.invocation.binding_ref().clone();
         let required = match source.path().extension().and_then(|value| value.to_str()) {
             Some("rs") => AcceptedProviderSettings::RustCachePrimingDisabledV1,
+            Some("py" | "pyi") => AcceptedProviderSettings::PyrightDefaultsV1,
+            Some("ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs") => {
+                AcceptedProviderSettings::TypeScriptDefaultsV1
+            }
             _ => return Err(FailureCode::ProviderUnavailable),
         };
         let launch = job
@@ -912,7 +1026,18 @@ impl Worker<'_> {
             .find(|profile| profile.settings == required)
             .cloned()
             .ok_or(FailureCode::ProviderUnavailable)?;
-        self.ensure_live_rust(job, &launch, source).await?;
+        match required {
+            AcceptedProviderSettings::RustCachePrimingDisabledV1 => {
+                self.ensure_live_rust(job, &launch, source).await?
+            }
+            AcceptedProviderSettings::PyrightDefaultsV1 => {
+                self.ensure_live_pyright(job, &launch, source).await?
+            }
+            AcceptedProviderSettings::TypeScriptDefaultsV1 => {
+                self.ensure_live_typescript(job, &launch, source).await?
+            }
+            _ => return Err(FailureCode::ProviderUnavailable),
+        }
         let budget = job
             .deadline
             .saturating_duration_since(tokio::time::Instant::now())
@@ -921,7 +1046,7 @@ impl Worker<'_> {
         let readiness = {
             let entry = self
                 .providers
-                .live_rust
+                .live
                 .get_mut(&binding)
                 .ok_or(FailureCode::Internal)?;
             tokio::select! {
@@ -934,18 +1059,22 @@ impl Worker<'_> {
             Err(ReadinessError::Loading) => return Err(FailureCode::ProviderLoading),
             Err(ReadinessError::WorkspaceError) => return Err(FailureCode::ProviderUnavailable),
             Err(ReadinessError::Gone) => {
-                self.release_live_rust(&binding).await;
+                self.release_live(&binding).await;
                 return Err(FailureCode::ProviderUnavailable);
             }
         }
         self.providers
-            .live_rust
+            .live
             .get_mut(&binding)
             .map(|entry| &mut entry.live)
             .ok_or(FailureCode::Internal)
     }
 
-    /// Starts the binding's long-lived Rust session unless a live one already exists.
+    /// Starts the binding's long-lived Rust session unless its Rust child is still live.
+    ///
+    /// `job` supplies binding ownership, cancellation, and spawn authority; `launch` is the
+    /// accepted analyzer profile; `source` fixes the worktree and authority epoch. Admission,
+    /// profile, spawn, initialization, and cancellation failures return a bounded code.
     async fn ensure_live_rust(
         &mut self,
         job: &mut Job,
@@ -953,11 +1082,11 @@ impl Worker<'_> {
         source: &SourceObservation,
     ) -> Result<(), FailureCode> {
         let binding = job.invocation.binding_ref().clone();
-        if let Some(entry) = self.providers.live_rust.get(&binding) {
-            if entry.live.is_alive() {
+        if let Some(entry) = self.providers.live.get(&binding) {
+            if matches!(&entry.child, LiveChild::Rust(..)) && entry.live.is_alive() {
                 return Ok(());
             }
-            self.release_live_rust(&binding).await;
+            self.release_live(&binding).await;
         }
         let authority = self.authority(&binding).await?;
         let cache_namespace =
@@ -1075,13 +1204,17 @@ impl Worker<'_> {
         };
         match opened {
             Ok(live) => {
-                self.providers
-                    .live_rust
-                    .insert(binding, LiveRust { child, live, view });
+                self.providers.live.insert(
+                    binding,
+                    LiveEntry {
+                        child: LiveChild::Rust(child, view),
+                        live,
+                    },
+                );
                 Ok(())
             }
             Err(_) => {
-                self.reap_live_rust(&binding, child, view).await;
+                self.reap_rust(&binding, child, view).await;
                 if *job.cancel.borrow() {
                     Err(FailureCode::Cancelled)
                 } else {
@@ -1091,30 +1224,31 @@ impl Worker<'_> {
         }
     }
 
-    /// Shuts down and reaps the binding's live Rust session, if any.
-    pub(super) async fn release_live_rust(&mut self, binding: &BindingRef) {
-        if let Some(LiveRust { child, live, view }) = self.providers.live_rust.remove(binding) {
-            live.shutdown().await;
-            self.reap_live_rust(binding, child, view).await;
+    /// Shuts down and reaps one binding's live language session, if present.
+    pub(super) async fn release_live(&mut self, binding: &BindingRef) {
+        let Some(LiveEntry { child, live }) = self.providers.live.remove(binding) else {
+            return;
+        };
+        live.shutdown().await;
+        match child {
+            LiveChild::Rust(child, view) => self.reap_rust(binding, child, view).await,
+            LiveChild::Pyright(child, view) => self.reap_pyright(binding, child, view).await,
+            LiveChild::TypeScript(child, view, _) => {
+                self.reap_typescript(binding, child, view).await
+            }
         }
     }
 
-    /// Shuts down and reaps every live Rust session; used at worker shutdown.
-    pub(super) async fn release_all_live_rust(&mut self) {
-        let bindings = self.providers.live_rust.keys().cloned().collect::<Vec<_>>();
+    /// Shuts down and reaps all retained language sessions during worker shutdown.
+    pub(super) async fn release_all_live(&mut self) {
+        let bindings = self.providers.live.keys().cloned().collect::<Vec<_>>();
         for binding in bindings {
-            self.release_live_rust(&binding).await;
+            self.release_live(&binding).await;
         }
     }
 
-    /// Reaps one analyzer child and returns its view to the registry; a reap that cannot prove
-    /// the child's fate leaves the binding uncertain exactly like the one-shot path did.
-    async fn reap_live_rust(
-        &mut self,
-        binding: &BindingRef,
-        child: RustProtocolChild,
-        view: RustView,
-    ) {
+    /// Reaps a Rust child and returns its exclusive view to provider accounting.
+    async fn reap_rust(&mut self, binding: &BindingRef, child: RustProtocolChild, view: RustView) {
         match child
             .cancel_and_reap(Duration::from_millis(100), Duration::from_millis(500))
             .await
@@ -1142,6 +1276,88 @@ impl Worker<'_> {
                     .providers
                     .rust
                     .release(&mut self.providers.registry, view.lease());
+            }
+        }
+    }
+
+    /// Reaps a Pyright child and returns its exclusive view to provider accounting.
+    async fn reap_pyright(
+        &mut self,
+        binding: &BindingRef,
+        child: PyrightProtocolChild,
+        view: crate::intelligence::pyright::PyrightView,
+    ) {
+        match child
+            .cancel_and_reap(Duration::from_millis(100), Duration::from_millis(500))
+            .await
+        {
+            Ok(reaped) => {
+                if let Ok(capability) = view.release(&mut self.providers.registry) {
+                    let admission = self.admission.clone();
+                    let mut admission = admission
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let _ = self.providers.registry.complete_reap(
+                        &mut admission,
+                        capability,
+                        reaped.proof,
+                    );
+                }
+            }
+            Err(_) => {
+                self.uncertain.insert(binding.clone());
+                let _ = view.release(&mut self.providers.registry);
+            }
+        }
+    }
+
+    /// Gracefully reaps a TypeScript bridge, quarantining only a timed-out or unsuccessful child.
+    async fn reap_typescript(
+        &mut self,
+        binding: &BindingRef,
+        mut child: TypeScriptProtocolChild,
+        view: crate::intelligence::typescript::TypeScriptView,
+    ) {
+        let result = match child.wait_for_exit(Duration::from_secs(1)).await {
+            Ok(waited) => {
+                self.providers
+                    .typescript
+                    .quarantine_after_unsuccessful_wait(&view, &waited);
+                child.finish_reap(waited, Duration::from_millis(500)).await
+            }
+            Err(_) => {
+                self.providers
+                    .typescript
+                    .quarantine_after_wait_timeout(&view);
+                child
+                    .terminate_abnormally(Duration::from_millis(100), Duration::from_millis(500))
+                    .await
+            }
+        };
+        match result {
+            Ok(reaped) => {
+                if let Ok(capability) = self
+                    .providers
+                    .typescript
+                    .release(view, &mut self.providers.registry)
+                {
+                    let admission = self.admission.clone();
+                    let mut admission = admission
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let _ = self.providers.registry.complete_reap(
+                        &mut admission,
+                        capability,
+                        reaped.proof,
+                    );
+                }
+            }
+            Err(_) => {
+                self.uncertain.insert(binding.clone());
+                let _ = self
+                    .providers
+                    .typescript
+                    .release(view, &mut self.providers.registry);
             }
         }
     }

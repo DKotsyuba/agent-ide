@@ -369,6 +369,13 @@ impl PyrightProtocolChild {
         )
     }
 
+    /// Transfers the protocol pipes to one live session while retaining child ownership for reap.
+    pub fn take_pipes(
+        &mut self,
+    ) -> Option<(tokio::process::ChildStdin, tokio::process::ChildStdout)> {
+        Some((self.child.stdin.take()?, self.child.stdout.take()?))
+    }
+
     /// Cancels and reaps this child, returning Execution's direct-child settlement proof.
     pub async fn cancel_and_reap(
         self,
