@@ -203,16 +203,27 @@ pub struct Outline {
 }
 
 impl Outline {
-    /// Finds the symbol addressed by `path` (file already matched by the caller).
+    /// Finds the symbol addressed by `path` (file already matched by the caller); `None` for a
+    /// file path or an unknown symbol.
+    ///
+    /// Same-named siblings are tried in source order and the walk backtracks: in Rust the struct
+    /// `Foo` and its `impl Foo` blocks share the segment `Foo`, so `Foo` finds the struct while
+    /// `Foo/new` finds the method inside whichever impl declares it.
     pub fn find(&self, path: &SymbolPath) -> Option<&Symbol> {
-        let mut level = &self.symbols;
-        let mut found: Option<&Symbol> = None;
-        for segment in path.segments() {
-            let symbol = level.iter().find(|symbol| symbol.name == *segment)?;
-            level = &symbol.children;
-            found = Some(symbol);
+        fn descend<'a>(level: &'a [Symbol], segments: &[String]) -> Option<&'a Symbol> {
+            let (first, rest) = segments.split_first()?;
+            level
+                .iter()
+                .filter(|symbol| symbol.name == *first)
+                .find_map(|symbol| {
+                    if rest.is_empty() {
+                        Some(symbol)
+                    } else {
+                        descend(&symbol.children, rest)
+                    }
+                })
         }
-        found
+        descend(&self.symbols, path.segments())
     }
 
     /// All symbols whose name equals `name`, at any depth, for ambiguity reports.
