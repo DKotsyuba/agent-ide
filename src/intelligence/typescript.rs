@@ -228,19 +228,19 @@ impl ProjectResolutionInputsV1 {
     /// `files` may contain at most 16 strictly sorted, unique normal relative paths whose basenames
     /// are one of the supported TypeScript/JavaScript project or package inputs. Their declared
     /// sizes may total at most 8 MiB, and at least one `tsconfig.json` or `jsconfig.json` is
-    /// required because inferred projects are unsupported. The selected config must list the
-    /// current document exactly once in its bounded top-level `files` array; each entry is UTF-8,
-    /// normalized relative, and free of glob metacharacters. A configuration must explicitly set
-    /// `compilerOptions.types` to `[]` and `compilerOptions.moduleResolution` to `node10`; a
-    /// JavaScript or JSX document additionally requires `compilerOptions.allowJs` to be exactly
-    /// `true`. `include` and `exclude` are refused because glob membership is not observed, and
-    /// `compilerOptions.outDir` and `declarationDir` are refused because output membership is not
-    /// observed. The optional `checkJs` and `noImplicitAny` options are closed to the exact
-    /// boolean value `true` when present.
-    /// Workspace reads only those exact names without following symlinks or listing directories,
-    /// and refuses an ancestor `node_modules` entry before tsserver can resolve an unobserved bare
-    /// dependency. Missing declarations, changed bytes, unsupported composite project shapes, and
-    /// any bound mismatch return
+    /// required because inferred projects are unsupported. The selected config must explicitly
+    /// admit the current document through a bounded top-level `files` entry or a literal `include`
+    /// file/directory entry; wildcard includes and `exclude` are refused. Entries are UTF-8,
+    /// normalized relative paths. `compilerOptions.types` must be `[]` or exactly `["vite/client"]`,
+    /// and `moduleResolution` must be `node10` or `bundler`; a JavaScript or JSX document additionally
+    /// requires `compilerOptions.allowJs` to be exactly `true`. `include` is supported only for
+    /// literal paths so membership remains decidable. `compilerOptions.outDir` and `declarationDir`
+    /// are refused because output membership is not observed. The optional `checkJs` and
+    /// `noImplicitAny` options are closed to the exact boolean value `true` when present. Workspace
+    /// reads only bounded project metadata without directory listing; package resolution is
+    /// confined to real `node_modules` directories below the worktree, and ambient ancestor
+    /// `node_modules` entries are refused. Missing declarations, changed bytes, unsupported
+    /// composite project shapes, and any bound mismatch return
     /// [`TypeScriptProfileError::InvalidResolution`].
     pub fn new(
         worktree: WorktreeRef,
@@ -278,25 +278,36 @@ impl ProjectResolutionInputsV1 {
     /// This is the shared Codex/future-Claude construction path. It derives only the six supported
     /// exact basenames at the document directory and each ancestor through the worktree root; it
     /// never lists a directory or scans packages. It also checks the exact `node_modules` name at
-    /// each document ancestor through the filesystem root, rejecting any entry that could support
-    /// bare-module resolution. At most 16 present files and 8 MiB total are accepted. Malformed
-    /// JSON or a config/package shape that can redirect tsserver to undeclared config, plugin,
-    /// workspace, dependency, or path inputs fails closed as
-    /// [`TypeScriptProfileError::InvalidResolution`].
+    /// each document ancestor through the filesystem root: a real directory inside the worktree is
+    /// accepted, any other entry (ambient parent, symlink, file) is refused. At most 16 present
+    /// files and 8 MiB total are accepted. Malformed JSON, a document the nearest configs do not
+    /// admit, or a config/package shape that can redirect tsserver to undeclared config, plugin,
+    /// workspace or path inputs fails closed with a [`ResolutionRejection`] naming the file and
+    /// reason; [`Self::new`]'s bound failures on the freshly observed files map to a chain-level
+    /// rejection.
     pub fn observe(
         worktree: WorktreeRef,
         document: PathBuf,
         bundle: &TypeScriptProviderBundleV1,
         path_proof: &ResolutionPathProof<'_>,
-    ) -> Result<Self, TypeScriptProfileError> {
+    ) -> Result<Self, ResolutionRejection> {
         let relative = document
             .strip_prefix(worktree.worktree_path())
             .ok()
             .filter(|path| normal_relative(path))
-            .ok_or(TypeScriptProfileError::InvalidResolution)?
+            .ok_or_else(|| {
+                ResolutionRejection::chain(format!(
+                    "{} is not a normal path below the worktree",
+                    document.display()
+                ))
+            })?
             .to_path_buf();
         let files = observe_resolution_files(&worktree, &relative, path_proof)?;
-        Self::new(worktree, document, bundle, files, path_proof)
+        Self::new(worktree, document, bundle, files, path_proof).map_err(|_| {
+            ResolutionRejection::chain(
+                "project inputs changed or exceeded their bounds while being observed",
+            )
+        })
     }
 
     /// Remeasures every present and missing ancestor candidate against this exact snapshot.
@@ -514,6 +525,57 @@ pub enum TypeScriptProfileError {
     Process(ProcessError),
 }
 
+/// Why one bounded project-resolution observation refused the document, in words a caller can
+/// act on.
+///
+/// `file` is the worktree-relative project file consulted when the refusal concerns one (a
+/// `tsconfig.json`, `jsconfig.json` or `package.json`); it is `None` for chain-level refusals such
+/// as a missing config or an ambient `node_modules` entry. `reason` is one short fragment without a
+/// trailing period. The closed public [`TypeScriptProfileError::InvalidResolution`] carries no
+/// reason; callers that render error text keep this value instead.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionRejection {
+    /// Worktree-relative project file the refusal is attributed to, when there is one.
+    pub file: Option<PathBuf>,
+    /// Short plain-words reason.
+    pub reason: String,
+}
+
+impl ResolutionRejection {
+    /// Builds a refusal attributed to one consulted project file.
+    fn at(file: &Path, reason: impl Into<String>) -> Self {
+        Self {
+            file: Some(file.to_path_buf()),
+            reason: reason.into(),
+        }
+    }
+
+    /// Builds a chain-level refusal not attributable to one project file.
+    fn chain(reason: impl Into<String>) -> Self {
+        Self {
+            file: None,
+            reason: reason.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ResolutionRejection {
+    /// Renders `<file>: <reason>`, or the bare reason for chain-level refusals.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.file {
+            Some(file) => write!(formatter, "{}: {}", file.display(), self.reason),
+            None => formatter.write_str(&self.reason),
+        }
+    }
+}
+
+impl From<ResolutionRejection> for TypeScriptProfileError {
+    /// Collapses an explained refusal into the closed public category.
+    fn from(_: ResolutionRejection) -> Self {
+        Self::InvalidResolution
+    }
+}
+
 /// Reports every bounded outcome of requesting an exclusive TypeScript view.
 #[derive(Debug)]
 pub enum TypeScriptViewAdmission {
@@ -566,15 +628,6 @@ pub struct TypeScriptProfiles {
     quarantined: BTreeSet<TypeScriptCompatibilityKey>,
 }
 
-/// Closed abnormal outcomes that permanently quarantine one exact TypeScript profile key.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TypeScriptShutdownFailure {
-    /// The direct bridge child exited with a nonzero status after the protocol exchange.
-    NonzeroExit,
-    /// The direct bridge did not exit within the bounded graceful wait.
-    WaitTimeout,
-}
-
 impl TypeScriptProfiles {
     /// Requests one exclusive view unless this exact profile was previously quarantined.
     pub fn request(
@@ -625,18 +678,6 @@ impl TypeScriptProfiles {
         self.quarantined.insert(view.key.clone());
     }
 
-    /// Records one closed abnormal outcome and monotonically quarantines the exact profile key.
-    ///
-    /// The category is retained by the caller's public failure mapping; all categories have the
-    /// same owner-lifetime admission effect, and this method never releases Execution resources.
-    pub(crate) fn quarantine_after(
-        &mut self,
-        view: &TypeScriptView,
-        _failure: TypeScriptShutdownFailure,
-    ) {
-        self.quarantine(view);
-    }
-
     /// Quarantines a view when its actual direct-child wait proves a nonzero bridge exit.
     ///
     /// Returns `true` exactly for the failure branch so the provider can map that observed exit to
@@ -649,14 +690,9 @@ impl TypeScriptProfiles {
         if waited.success() {
             false
         } else {
-            self.quarantine_after(view, TypeScriptShutdownFailure::NonzeroExit);
+            self.quarantine(view);
             true
         }
-    }
-
-    /// Quarantines a view after its actual direct-child wait exceeded the graceful deadline.
-    pub(crate) fn quarantine_after_wait_timeout(&mut self, view: &TypeScriptView) {
-        self.quarantine_after(view, TypeScriptShutdownFailure::WaitTimeout);
     }
 
     /// Releases one exclusive view and returns the capability required for direct-child settlement.
@@ -921,42 +957,60 @@ fn supported_resolution_file(path: &Path) -> bool {
 }
 
 /// Validates canonical bounds and requires every input to be on the document's ancestor chain.
+///
+/// Returns a chain-level [`ResolutionRejection`] when no `tsconfig.json`/`jsconfig.json` is present
+/// or the file count is over the ceiling, and a file-attributed one for a member that is
+/// unsupported, off the ancestor chain, unsorted or over the byte budget.
 fn validate_resolution_files(
     document: &Path,
     files: &[ProjectResolutionFileV1],
-) -> Result<(), TypeScriptProfileError> {
-    if files.len() > MAX_RESOLUTION_FILES
-        || !files.iter().any(|file| {
-            matches!(
-                file.path.file_name().and_then(|name| name.to_str()),
-                Some("tsconfig.json" | "jsconfig.json")
-            )
-        })
-    {
-        return Err(TypeScriptProfileError::InvalidResolution);
-    }
-    let directories = document
+) -> Result<(), ResolutionRejection> {
+    let parent = document
         .parent()
-        .ok_or(TypeScriptProfileError::InvalidResolution)?
-        .ancestors()
-        .collect::<BTreeSet<_>>();
+        .ok_or_else(|| ResolutionRejection::chain("document has no parent directory"))?;
+    if files.len() > MAX_RESOLUTION_FILES {
+        return Err(ResolutionRejection::chain(format!(
+            "more than {MAX_RESOLUTION_FILES} project files on the ancestor chain"
+        )));
+    }
+    if !files.iter().any(|file| {
+        matches!(
+            file.path.file_name().and_then(|name| name.to_str()),
+            Some("tsconfig.json" | "jsconfig.json")
+        )
+    }) {
+        let scope = if parent.as_os_str().is_empty() {
+            "in the worktree root".to_owned()
+        } else {
+            format!("from {} up to the worktree root", parent.display())
+        };
+        return Err(ResolutionRejection::chain(format!(
+            "no tsconfig.json or jsconfig.json was found {scope}"
+        )));
+    }
+    let directories = parent.ancestors().collect::<BTreeSet<_>>();
     let mut total = 0_u64;
     let mut previous: Option<&Path> = None;
     for file in files {
-        total = total
-            .checked_add(file.bytes)
-            .ok_or(TypeScriptProfileError::InvalidResolution)?;
+        total = total.saturating_add(file.bytes);
+        if file.bytes > MAX_RESOLUTION_BYTES || total > MAX_RESOLUTION_BYTES {
+            return Err(ResolutionRejection::at(
+                &file.path,
+                format!("project files exceed the {MAX_RESOLUTION_BYTES} byte resolution budget"),
+            ));
+        }
         if !normal_relative(&file.path)
             || !supported_resolution_file(&file.path)
             || !file
                 .path
                 .parent()
                 .is_some_and(|path| directories.contains(path))
-            || file.bytes > MAX_RESOLUTION_BYTES
-            || total > MAX_RESOLUTION_BYTES
             || previous.is_some_and(|path| path >= file.path.as_path())
         {
-            return Err(TypeScriptProfileError::InvalidResolution);
+            return Err(ResolutionRejection::at(
+                &file.path,
+                "is not a supported project file on the document's ancestor chain",
+            ));
         }
         previous = Some(&file.path);
     }
@@ -967,20 +1021,19 @@ fn validate_resolution_files(
 ///
 /// `path_proof` must authorize each auxiliary resolution input before Workspace reads it
 /// (T36B): proving the requested source document never authorizes these files. An unproven
-/// candidate fails the resolution closed — it is never skipped as if missing.
+/// candidate fails the resolution closed — it is never skipped as if missing. Every refusal names
+/// the file and reason through [`ResolutionRejection`].
 fn observe_resolution_files(
     worktree: &WorktreeRef,
     document: &Path,
     path_proof: &ResolutionPathProof<'_>,
-) -> Result<Vec<ProjectResolutionFileV1>, TypeScriptProfileError> {
-    if ancestor_has_node_modules(&worktree.worktree_path().join(document))? {
-        return Err(TypeScriptProfileError::InvalidResolution);
-    }
-    let language_id =
-        typescript_language_id(document).ok_or(TypeScriptProfileError::InvalidResolution)?;
+) -> Result<Vec<ProjectResolutionFileV1>, ResolutionRejection> {
+    validate_node_modules_ancestry(worktree, document)?;
+    let language_id = typescript_language_id(document)
+        .ok_or_else(|| ResolutionRejection::chain("unsupported source extension"))?;
     let parent = document
         .parent()
-        .ok_or(TypeScriptProfileError::InvalidResolution)?;
+        .ok_or_else(|| ResolutionRejection::chain("document has no parent directory"))?;
     let mut candidates = BTreeSet::new();
     for directory in parent.ancestors() {
         for filename in RESOLUTION_FILENAMES {
@@ -991,193 +1044,310 @@ fn observe_resolution_files(
     let mut remaining = MAX_RESOLUTION_BYTES as usize;
     for path in candidates {
         if !path_proof(&path) {
-            return Err(TypeScriptProfileError::InvalidResolution);
+            return Err(ResolutionRejection::at(
+                &path,
+                "is outside the allowed roots",
+            ));
         }
         let observed = match read_authorized_resolution_input(worktree, &path, remaining) {
             Ok(observed) => observed,
             Err(ObservationError::Missing) => continue,
-            Err(_) => return Err(TypeScriptProfileError::InvalidResolution),
+            Err(_) => {
+                return Err(ResolutionRejection::at(
+                    &path,
+                    "could not be read within the resolution bounds",
+                ));
+            }
         };
         validate_resolution_shape(observed.path(), observed.contents(), language_id, document)?;
         remaining = remaining
             .checked_sub(observed.length() as usize)
-            .ok_or(TypeScriptProfileError::InvalidResolution)?;
+            .ok_or_else(|| {
+                ResolutionRejection::at(
+                    &path,
+                    format!(
+                        "project files exceed the {MAX_RESOLUTION_BYTES} byte resolution budget"
+                    ),
+                )
+            })?;
         files.push(ProjectResolutionFileV1 {
             path: observed.path().to_path_buf(),
             blake3: observed.digest(),
             bytes: observed.length(),
         });
         if files.len() > MAX_RESOLUTION_FILES {
-            return Err(TypeScriptProfileError::InvalidResolution);
+            return Err(ResolutionRejection::chain(format!(
+                "more than {MAX_RESOLUTION_FILES} project files on the ancestor chain"
+            )));
         }
     }
     validate_resolution_files(document, &files)?;
     Ok(files)
 }
 
-/// Returns whether an exact ancestor `node_modules` entry could admit bare-module resolution.
+/// Allows only real `node_modules` directories inside the worktree, never an ambient parent.
 ///
-/// The check examines only that fixed name, not package contents or directory listings. Any entry,
-/// including a symlink or an unreadable object, is unsafe because tsserver could follow or inspect
-/// it; an I/O failure also rejects the profile rather than claiming the ambient chain is closed.
-fn ancestor_has_node_modules(document: &Path) -> Result<bool, TypeScriptProfileError> {
-    let parent = document
-        .parent()
-        .ok_or(TypeScriptProfileError::InvalidResolution)?;
-    for directory in parent.ancestors() {
-        match std::fs::symlink_metadata(directory.join("node_modules")) {
-            Ok(_) => return Ok(true),
+/// Checks the exact `node_modules` name at the document directory and every ancestor through the
+/// filesystem root. A symlink, a file, an unreadable entry, or any entry above the worktree root
+/// is refused because tsserver could resolve unobserved packages through it.
+fn validate_node_modules_ancestry(
+    worktree: &WorktreeRef,
+    document: &Path,
+) -> Result<(), ResolutionRejection> {
+    let root = worktree.worktree_path();
+    let mut directory = root.join(document).parent().map(Path::to_path_buf);
+    while let Some(path) = directory {
+        let is_inside = path.starts_with(root);
+        let entry = path.join("node_modules");
+        match std::fs::symlink_metadata(&entry) {
+            Ok(metadata)
+                if is_inside && metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(ResolutionRejection::chain(format!(
+                    "{} is not a real directory inside the worktree; ambient dependency directories are refused",
+                    entry.display()
+                )));
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(TypeScriptProfileError::InvalidResolution),
+            Err(_) => {
+                return Err(ResolutionRejection::chain(format!(
+                    "{} could not be inspected",
+                    entry.display()
+                )));
+            }
         }
+        directory = path.parent().map(Path::to_path_buf);
     }
-    Ok(false)
+    Ok(())
 }
 
 /// Rejects project metadata that can redirect tsserver beyond the exact observed ancestor inputs.
 ///
 /// `language_id` is the fixed ID for the opened document and `document` is its worktree-relative
-/// path. Configs require a bounded top-level `files` array whose normalized relative UTF-8 entries
-/// contain no glob metacharacters and list that document exactly once relative to the config
-/// directory. JavaScript-family documents require boolean `allowJs: true`; TypeScript-family
-/// documents do not require that option. Config `include` and `exclude` keys are refused because
-/// their glob membership is not part of the observed evidence. Output-directory options are
-/// refused because output membership is not observed. The optional diagnostic switches `checkJs`
-/// and `noImplicitAny` accept only `true` when present.
+/// path. Configs must admit the document through a bounded top-level `files` entry or a literal
+/// `include` file/directory entry (see [`validate_configured_membership`]); `exclude` is refused
+/// because glob membership is not observed. `compilerOptions.types` must be `[]` or exactly
+/// `["vite/client"]`, `moduleResolution` must be `node10` or `bundler`, JavaScript-family documents
+/// require boolean `allowJs: true`, path-mapping/plugin/output options are refused because their
+/// inputs are not observed, and `checkJs`/`noImplicitAny` accept only `true` when present.
+/// `package.json` may declare dependencies but not `imports` or `workspaces`. Lockfiles are only
+/// fingerprinted. Every refusal is attributed to `path` with its reason.
 fn validate_resolution_shape(
     path: &Path,
     contents: &[u8],
     language_id: &str,
     document: &Path,
-) -> Result<(), TypeScriptProfileError> {
+) -> Result<(), ResolutionRejection> {
+    let reject = |reason: String| ResolutionRejection::at(path, reason);
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return Err(TypeScriptProfileError::InvalidResolution);
+        return Err(reject("has no file name".into()));
     };
     if matches!(name, "yarn.lock" | "pnpm-lock.yaml") {
         return Ok(());
     }
     let value: serde_json::Value =
-        serde_json::from_slice(contents).map_err(|_| TypeScriptProfileError::InvalidResolution)?;
+        serde_json::from_slice(contents).map_err(|_| reject("is not valid JSON".into()))?;
     let object = value
         .as_object()
-        .ok_or(TypeScriptProfileError::InvalidResolution)?;
+        .ok_or_else(|| reject("is not a JSON object".into()))?;
     if matches!(name, "tsconfig.json" | "jsconfig.json") {
-        if ["extends", "references", "typeAcquisition"]
+        if let Some(key) = ["extends", "references", "typeAcquisition"]
             .iter()
-            .any(|key| object.contains_key(*key))
+            .find(|key| object.contains_key(**key))
         {
-            return Err(TypeScriptProfileError::InvalidResolution);
+            return Err(reject(format!("`{key}` is unsupported")));
         }
         let options = object
             .get("compilerOptions")
             .and_then(serde_json::Value::as_object)
-            .ok_or(TypeScriptProfileError::InvalidResolution)?;
-        let configured_files = object
-            .get("files")
-            .and_then(serde_json::Value::as_array)
-            .ok_or(TypeScriptProfileError::InvalidResolution)?;
-        validate_configured_membership(path, document, configured_files)?;
-        if options.get("types") != Some(&serde_json::Value::Array(Vec::new()))
-            || !closed_module_resolution(options)
-            || (matches!(language_id, "javascript" | "javascriptreact")
-                && options.get("allowJs") != Some(&serde_json::Value::Bool(true)))
-            || [
-                "baseUrl",
-                "paths",
-                "plugins",
-                "rootDirs",
-                "typeRoots",
-                "outDir",
-                "declarationDir",
-            ]
-            .iter()
-            .any(|key| options.contains_key(*key))
-            || ["checkJs", "noImplicitAny"].iter().any(|key| {
-                options
-                    .get(*key)
-                    .is_some_and(|value| value != &serde_json::Value::Bool(true))
-            })
-            || ["include", "exclude"]
-                .iter()
-                .any(|key| object.contains_key(*key))
-        {
-            return Err(TypeScriptProfileError::InvalidResolution);
+            .ok_or_else(|| reject("`compilerOptions` must be an object".into()))?;
+        let configured_files = object.get("files").and_then(serde_json::Value::as_array);
+        let configured_includes = object.get("include").and_then(serde_json::Value::as_array);
+        validate_configured_membership(
+            path,
+            document,
+            configured_files.map(Vec::as_slice),
+            configured_includes.map(Vec::as_slice),
+            options.get("allowJs") == Some(&serde_json::Value::Bool(true)),
+        )?;
+        if !closed_types_option(options) {
+            return Err(reject(
+                "`compilerOptions.types` must be `[]` or `[\"vite/client\"]`".into(),
+            ));
         }
-    } else if name == "package.json"
-        && [
-            "dependencies",
-            "devDependencies",
-            "imports",
-            "optionalDependencies",
-            "peerDependencies",
-            "workspaces",
+        if !closed_module_resolution(options) {
+            return Err(reject(
+                "`compilerOptions.moduleResolution` must be `node10` or `bundler`, and `module` must not be node16/nodenext/preserve".into(),
+            ));
+        }
+        if matches!(language_id, "javascript" | "javascriptreact")
+            && options.get("allowJs") != Some(&serde_json::Value::Bool(true))
+        {
+            return Err(reject(
+                "JavaScript documents require `compilerOptions.allowJs: true`".into(),
+            ));
+        }
+        if let Some(key) = [
+            "baseUrl",
+            "paths",
+            "plugins",
+            "rootDirs",
+            "typeRoots",
+            "outDir",
+            "declarationDir",
         ]
         .iter()
-        .any(|key| object.contains_key(*key))
+        .find(|key| options.contains_key(**key))
+        {
+            return Err(reject(format!("`compilerOptions.{key}` is unsupported")));
+        }
+        if let Some(key) = ["checkJs", "noImplicitAny"].iter().find(|key| {
+            options
+                .get(**key)
+                .is_some_and(|value| value != &serde_json::Value::Bool(true))
+        }) {
+            return Err(reject(format!(
+                "`compilerOptions.{key}` must be `true` when present"
+            )));
+        }
+        if object.contains_key("exclude") {
+            return Err(reject(
+                "`exclude` is unsupported; membership must be literal".into(),
+            ));
+        }
+    } else if name == "package.json"
+        && let Some(key) = ["imports", "workspaces"]
+            .iter()
+            .find(|key| object.contains_key(**key))
     {
-        return Err(TypeScriptProfileError::InvalidResolution);
+        return Err(reject(format!("`{key}` is unsupported")));
     }
     Ok(())
 }
 
-/// Validates one config's bounded exact membership list against the current document.
+/// Validates one config's bounded literal membership list against the current document.
 ///
-/// Entries are JSON strings, so they are already valid UTF-8. They must be normalized relative
-/// paths without empty, dot, parent, absolute, backslash, or glob components. Duplicate entries
-/// are rejected, the list is limited by the existing resolution-file ceiling, and the document
-/// must occur exactly once relative to the config directory.
+/// `files` entries must match the current relative document exactly. Literal `include` directories
+/// (entries without an extension) recursively admit only the supported source extensions
+/// (JavaScript only with `allowJs`); literal file includes match exactly. Wildcards, backslashes,
+/// duplicates, non-normal paths, more than 16 entries per list and implicit all-files membership
+/// are refused. The refusal is attributed to `config` and names the worktree-relative document.
 fn validate_configured_membership(
     config: &Path,
     document: &Path,
-    entries: &[serde_json::Value],
-) -> Result<(), TypeScriptProfileError> {
-    if entries.is_empty() || entries.len() > MAX_RESOLUTION_FILES {
-        return Err(TypeScriptProfileError::InvalidResolution);
+    files: Option<&[serde_json::Value]>,
+    includes: Option<&[serde_json::Value]>,
+    allow_js: bool,
+) -> Result<(), ResolutionRejection> {
+    let reject = |reason: String| ResolutionRejection::at(config, reason);
+    if files.is_none() && includes.is_none_or(<[_]>::is_empty)
+        || files.is_some_and(|entries| entries.len() > MAX_RESOLUTION_FILES)
+        || includes
+            .is_some_and(|entries| entries.is_empty() || entries.len() > MAX_RESOLUTION_FILES)
+    {
+        return Err(reject(format!(
+            "needs `files` or a nonempty literal `include` list with at most {MAX_RESOLUTION_FILES} entries"
+        )));
     }
     let config_directory = config
         .parent()
-        .ok_or(TypeScriptProfileError::InvalidResolution)?;
-    let document = document
+        .ok_or_else(|| reject("has no directory".into()))?;
+    let relative = document
         .strip_prefix(config_directory)
         .ok()
         .filter(|path| normal_relative(path))
-        .ok_or(TypeScriptProfileError::InvalidResolution)?;
+        .ok_or_else(|| {
+            reject(format!(
+                "{} is not below the config directory",
+                document.display()
+            ))
+        })?;
     let mut seen = BTreeSet::new();
-    for entry in entries {
-        let value = entry
-            .as_str()
-            .ok_or(TypeScriptProfileError::InvalidResolution)?;
-        let path = Path::new(value);
-        if value.contains('\\')
-            || value.chars().any(|character| {
-                matches!(
-                    character,
-                    '*' | '?' | '[' | ']' | '{' | '}' | '(' | ')' | '!'
-                )
-            })
-            || !normal_relative(path)
-            || value.split('/').any(str::is_empty)
-            || !seen.insert(path)
-        {
-            return Err(TypeScriptProfileError::InvalidResolution);
+    let mut parse_entries = |entries: &[serde_json::Value]| {
+        for entry in entries {
+            let value = entry
+                .as_str()
+                .ok_or_else(|| reject("has a non-string `files`/`include` entry".into()))?;
+            let path = Path::new(value);
+            if value.contains('\\')
+                || value.chars().any(|character| {
+                    matches!(
+                        character,
+                        '*' | '?' | '[' | ']' | '{' | '}' | '(' | ')' | '!'
+                    )
+                })
+                || !normal_relative(path)
+                || value.split('/').any(str::is_empty)
+                || !seen.insert(path.to_path_buf())
+            {
+                return Err(reject(format!(
+                    "entry `{value}` must be a unique normalized relative path without wildcards"
+                )));
+            }
         }
+        Ok(())
+    };
+    if let Some(files) = files {
+        parse_entries(files)?;
     }
-    (seen.contains(document) && seen.len() == entries.len())
-        .then_some(())
-        .ok_or(TypeScriptProfileError::InvalidResolution)
+    if let Some(includes) = includes {
+        parse_entries(includes)?;
+    }
+    let source_family = matches!(
+        typescript_language_id(relative),
+        Some("typescript" | "typescriptreact")
+    ) || (allow_js
+        && matches!(
+            typescript_language_id(relative),
+            Some("javascript" | "javascriptreact")
+        ));
+    let exact = files.is_some_and(|files| {
+        files.iter().any(|entry| {
+            entry
+                .as_str()
+                .is_some_and(|value| Path::new(value) == relative)
+        })
+    });
+    let included = includes.is_some_and(|includes| {
+        includes.iter().any(|entry| {
+            entry.as_str().is_some_and(|value| {
+                let path = Path::new(value);
+                relative == path
+                    || (path.extension().is_none() && relative.starts_with(path) && source_family)
+            })
+        })
+    });
+    if exact || included {
+        Ok(())
+    } else {
+        Err(reject(format!(
+            "{} is not listed in `files` or under a literal `include` entry",
+            document.display()
+        )))
+    }
+}
+
+/// Allows only no global type packages or the bounded Vite client declaration entry.
+fn closed_types_option(options: &serde_json::Map<String, serde_json::Value>) -> bool {
+    match options.get("types").and_then(serde_json::Value::as_array) {
+        Some(types) if types.is_empty() => true,
+        Some(types) if types.len() == 1 => types[0].as_str() == Some("vite/client"),
+        _ => false,
+    }
 }
 
 /// Returns whether compiler options select only the explicit closed TypeScript resolution mode.
 ///
-/// `node10` is the pinned TypeScript mode whose ancestor lookup is already closed by the exact
-/// `node_modules` gate. Missing, alternate, or unknown resolution modes are rejected. Node16,
-/// NodeNext, and Preserve module modes are also refused because they select or imply incompatible
-/// package-resolution semantics even when a conflicting resolution option is present.
+/// `node10` and `bundler` are supported with project-root authority and explicit membership.
+/// Missing, alternate, or unknown resolution modes are rejected. Node16, NodeNext, and Preserve
+/// module modes are also refused because they select incompatible package-resolution semantics.
 fn closed_module_resolution(options: &serde_json::Map<String, serde_json::Value>) -> bool {
     options
         .get("moduleResolution")
         .and_then(serde_json::Value::as_str)
-        == Some("node10")
+        .is_some_and(|mode| {
+            mode.eq_ignore_ascii_case("node10") || mode.eq_ignore_ascii_case("bundler")
+        })
         && !options
             .get("module")
             .and_then(serde_json::Value::as_str)
@@ -1420,44 +1590,29 @@ mod tests {
             })
             .collect::<Vec<_>>();
         files.sort_by(|left, right| left.path.cmp(&right.path));
-        assert!(matches!(
-            validate_resolution_files(document, &files[..17]),
-            Err(TypeScriptProfileError::InvalidResolution)
-        ));
+        assert!(validate_resolution_files(document, &files[..17]).is_err());
 
         let mut oversized = files[..2].to_vec();
         oversized[0].bytes = MAX_RESOLUTION_BYTES;
-        assert!(matches!(
-            validate_resolution_files(document, &oversized),
-            Err(TypeScriptProfileError::InvalidResolution)
-        ));
+        assert!(validate_resolution_files(document, &oversized).is_err());
 
         let mut reordered = files[..2].to_vec();
         reordered.reverse();
-        assert!(matches!(
-            validate_resolution_files(document, &reordered),
-            Err(TypeScriptProfileError::InvalidResolution)
-        ));
+        assert!(validate_resolution_files(document, &reordered).is_err());
 
         let unsupported = [ProjectResolutionFileV1 {
             path: PathBuf::from("a/b/tsconfig.build.json"),
             blake3: blake3::hash(b"{}"),
             bytes: 2,
         }];
-        assert!(matches!(
-            validate_resolution_files(document, &unsupported),
-            Err(TypeScriptProfileError::InvalidResolution)
-        ));
+        assert!(validate_resolution_files(document, &unsupported).is_err());
 
         let sibling = [ProjectResolutionFileV1 {
             path: PathBuf::from("other/tsconfig.json"),
             blake3: blake3::hash(b"{}"),
             bytes: 2,
         }];
-        assert!(matches!(
-            validate_resolution_files(document, &sibling),
-            Err(TypeScriptProfileError::InvalidResolution)
-        ));
+        assert!(validate_resolution_files(document, &sibling).is_err());
     }
 
     /// Accepts all exact basenames, then rejects changed, missing, and unsupported inputs.
@@ -1529,28 +1684,25 @@ mod tests {
         ));
 
         std::fs::remove_file(fixture.root.join("tsconfig.json")).unwrap();
-        assert!(matches!(
+        assert!(
             ProjectResolutionInputsV1::observe(
                 worktree.clone(),
                 document.clone(),
                 &bundle,
                 &|_| true
-            ),
-            Err(TypeScriptProfileError::InvalidResolution)
-        ));
+            )
+            .is_err()
+        );
         std::fs::write(fixture.root.join("tsconfig.json"), nested_config).unwrap();
         std::fs::write(
             fixture.root.join("package.json"),
             br#"{"dependencies":{"outside":"1"}}"#,
         )
         .unwrap();
-        assert!(matches!(
-            ProjectResolutionInputsV1::observe(worktree, document, &bundle, &|_| true),
-            Err(TypeScriptProfileError::InvalidResolution)
-        ));
+        assert!(ProjectResolutionInputsV1::observe(worktree, document, &bundle, &|_| true).is_ok());
     }
 
-    /// Rejects ambient type discovery, escaping config entries, and ancestor dependency directories.
+    /// Rejects unsupported type discovery, escaping entries, and ambient ancestor dependencies.
     #[test]
     fn project_resolution_rejects_ambient_type_and_dependency_reads() {
         let fixture = Fixture::new();
@@ -1567,15 +1719,15 @@ mod tests {
             br#"{"compilerOptions":{"types":[]},"include":["src\\outside"]}"#.as_slice(),
         ] {
             std::fs::write(fixture.root.join("tsconfig.json"), config).unwrap();
-            assert!(matches!(
+            assert!(
                 ProjectResolutionInputsV1::observe(
                     worktree.clone(),
                     document.clone(),
                     &bundle,
                     &|_| true
-                ),
-                Err(TypeScriptProfileError::InvalidResolution)
-            ));
+                )
+                .is_err()
+            );
         }
 
         std::fs::write(
@@ -1583,22 +1735,35 @@ mod tests {
             br#"{"compilerOptions":{"types":[],"moduleResolution":"node10"},"include":["src/**/*.ts"],"files":["src/file.ts"]}"#,
         )
         .unwrap();
-        assert!(matches!(
+        assert!(
             ProjectResolutionInputsV1::observe(
                 worktree.clone(),
                 document.clone(),
                 &bundle,
                 &|_| true
-            ),
-            Err(TypeScriptProfileError::InvalidResolution)
-        ));
+            )
+            .is_err()
+        );
 
-        std::fs::write(fixture.root.join("tsconfig.json"), CLOSED_CONFIG).unwrap();
+        std::fs::write(
+            fixture.root.join("tsconfig.json"),
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"node10"},"files":["src/file.ts"]}"#,
+        )
+        .unwrap();
+        std::fs::create_dir(fixture.root.join("node_modules")).unwrap();
+        assert!(
+            ProjectResolutionInputsV1::observe(
+                worktree.clone(),
+                document.clone(),
+                &bundle,
+                &|_| true
+            )
+            .is_ok()
+        );
         std::fs::create_dir(fixture.cleanup_root.join("node_modules")).unwrap();
-        assert!(matches!(
-            ProjectResolutionInputsV1::observe(worktree, document, &bundle, &|_| true),
-            Err(TypeScriptProfileError::InvalidResolution)
-        ));
+        assert!(
+            ProjectResolutionInputsV1::observe(worktree, document, &bundle, &|_| true).is_err()
+        );
     }
 
     /// Accepts only the explicit node10 resolution mode and module combinations it preserves.
@@ -1608,6 +1773,7 @@ mod tests {
             br#"{"compilerOptions":{"types":[],"moduleResolution":"node10"},"files":["fixture.ts"]}"#.as_slice(),
             br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","module":"commonjs"},"files":["fixture.ts"]}"#
                 .as_slice(),
+            br#"{"compilerOptions":{"types":["vite/client"],"moduleResolution":"bundler","module":"esnext","jsx":"react-jsx","allowImportingTsExtensions":true,"noEmit":true},"include":["src","vite.config.ts","fixture.ts"]}"#.as_slice(),
         ] {
             assert!(
                 validate_resolution_shape(
@@ -1629,7 +1795,6 @@ mod tests {
             br#"{"compilerOptions":{"types":[],"moduleResolution":"classic"}}"#.as_slice(),
             br#"{"compilerOptions":{"types":[],"moduleResolution":"node16"}}"#.as_slice(),
             br#"{"compilerOptions":{"types":[],"moduleResolution":"nodenext"}}"#.as_slice(),
-            br#"{"compilerOptions":{"types":[],"moduleResolution":"bundler"}}"#.as_slice(),
             br#"{"compilerOptions":{"types":[],"moduleResolution":"future"}}"#.as_slice(),
             br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","module":"node16"}}"#
                 .as_slice(),
@@ -1644,15 +1809,15 @@ mod tests {
             br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","module":"PRESERVE"}}"#
                 .as_slice(),
         ] {
-            assert!(matches!(
+            assert!(
                 validate_resolution_shape(
                     Path::new("tsconfig.json"),
                     config,
                     "typescript",
                     Path::new("fixture.ts"),
-                ),
-                Err(TypeScriptProfileError::InvalidResolution)
-            ));
+                )
+                .is_err()
+            );
         }
     }
 
@@ -1677,15 +1842,15 @@ mod tests {
             "files":too_many,
         });
         let too_many_bytes = serde_json::to_vec(&too_many_config).unwrap();
-        assert!(matches!(
+        assert!(
             validate_resolution_shape(
                 Path::new("tsconfig.json"),
                 &too_many_bytes,
                 "javascript",
                 Path::new("fixture.js"),
-            ),
-            Err(TypeScriptProfileError::InvalidResolution)
-        ));
+            )
+            .is_err()
+        );
         for config in [
             br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","allowJs":true},"files":["fixture.ts"]}"#
                 .as_slice(),
@@ -1704,15 +1869,15 @@ mod tests {
             br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","allowJs":true},"files":[7]}"#
                 .as_slice(),
         ] {
-            assert!(matches!(
+            assert!(
                 validate_resolution_shape(
                     Path::new("tsconfig.json"),
                     config,
                     "javascript",
                     Path::new("fixture.js"),
-                ),
-                Err(TypeScriptProfileError::InvalidResolution)
-            ));
+                )
+                .is_err()
+            );
         }
         for config in [
             CLOSED_CONFIG,
@@ -1721,15 +1886,15 @@ mod tests {
             br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","allowJs":"true"}}"#
                 .as_slice(),
         ] {
-            assert!(matches!(
+            assert!(
                 validate_resolution_shape(
                     Path::new("tsconfig.json"),
                     config,
                     "javascript",
                     Path::new("fixture.js"),
-                ),
-                Err(TypeScriptProfileError::InvalidResolution)
-            ));
+                )
+                .is_err()
+            );
         }
         assert!(
             validate_resolution_shape(
@@ -1756,16 +1921,65 @@ mod tests {
             br#"{"compilerOptions":{"types":[],"moduleResolution":"node10","allowJs":true,"noImplicitAny":false}}"#
                 .as_slice(),
         ] {
-            assert!(matches!(
+            assert!(
                 validate_resolution_shape(
                     Path::new("tsconfig.json"),
                     config,
                     "javascript",
                     Path::new("fixture.js"),
-                ),
-                Err(TypeScriptProfileError::InvalidResolution)
-            ));
+                )
+                .is_err()
+            );
         }
+    }
+
+    /// Admits literal include directories recursively without admitting prefix siblings.
+    #[test]
+    fn project_resolution_accepts_literal_include_directories() {
+        let config = br#"{"compilerOptions":{"types":["vite/client"],"moduleResolution":"Bundler","module":"esnext","jsx":"react-jsx","allowImportingTsExtensions":true,"noEmit":true},"include":["src","vite.config.ts"]}"#;
+        for (document, language) in [
+            ("src/api.ts", "typescript"),
+            ("src/App.tsx", "typescriptreact"),
+            ("vite.config.ts", "typescript"),
+        ] {
+            assert!(
+                validate_resolution_shape(
+                    Path::new("tsconfig.json"),
+                    config,
+                    language,
+                    Path::new(document),
+                )
+                .is_ok(),
+                "{document} should be admitted by a literal project include"
+            );
+        }
+        for document in ["outside.ts", "src2/api.ts"] {
+            assert!(
+                validate_resolution_shape(
+                    Path::new("tsconfig.json"),
+                    config,
+                    "typescript",
+                    Path::new(document),
+                )
+                .is_err()
+            );
+        }
+        let rejection = validate_resolution_shape(
+            Path::new("tsconfig.json"),
+            config,
+            "typescript",
+            Path::new("outside.ts"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            rejection.to_string(),
+            "tsconfig.json: outside.ts is not listed in `files` or under a literal `include` entry"
+        );
+        let missing = validate_resolution_files(Path::new("src/api.ts"), &[]).unwrap_err();
+        assert_eq!(
+            missing.to_string(),
+            "no tsconfig.json or jsconfig.json was found from src up to the worktree root"
+        );
     }
 
     /// Rechecks every declared bundle member and refuses a changed TypeScript closure file.
@@ -1895,9 +2109,9 @@ mod tests {
         ));
     }
 
-    /// A real hanging TypeScript bridge wait timeout quarantines only its exact profile after kill.
+    /// A client teardown timeout does not quarantine a live TypeScript profile.
     #[tokio::test]
-    async fn hanging_bridge_wait_timeout_quarantines_the_exact_profile() {
+    async fn client_teardown_wait_timeout_does_not_quarantine_the_profile() {
         let fixture = Fixture::new();
         let (profile, worktree) = fixture.profile_with_node_script("ts", b"#!/bin/sh\nsleep 10\n");
         let request = fixture_request(&profile, &worktree, fixture.root.join("node"));
@@ -1944,7 +2158,6 @@ mod tests {
                 .is_err(),
             "the fixture bridge must take the wait-timeout branch"
         );
-        profiles.quarantine_after_wait_timeout(&view);
         let reaped = child
             .terminate_abnormally(Duration::from_millis(10), Duration::from_secs(1))
             .await
@@ -1953,16 +2166,18 @@ mod tests {
         registry
             .complete_reap(&mut admission, capability, reaped.proof)
             .unwrap();
-        assert!(matches!(
-            profiles.request(
-                &profile,
-                &worktree,
-                &mut registry,
-                &mut admission,
-                OwnerId::new("wait-timeout-retry").unwrap(),
-                AdmissionClass::Interactive,
-            ),
-            TypeScriptViewAdmission::Unavailable(TypeScriptProfileError::Quarantined)
-        ));
+        let TypeScriptViewAdmission::Granted(retry) = profiles.request(
+            &profile,
+            &worktree,
+            &mut registry,
+            &mut admission,
+            OwnerId::new("wait-timeout-retry").unwrap(),
+            AdmissionClass::Interactive,
+        ) else {
+            panic!("teardown timeout must leave this exact project admissible")
+        };
+        registry
+            .cancel_unstarted(&mut admission, retry.lease())
+            .unwrap();
     }
 }

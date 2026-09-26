@@ -26,13 +26,51 @@ use crate::{
         },
         typescript::{
             ProjectResolutionInputsV1, TypeScriptProfile, TypeScriptProfileError,
-            TypeScriptProfiles, TypeScriptProtocolChild, TypeScriptViewAdmission,
-            TypeScriptWorktree,
+            TypeScriptProfiles, TypeScriptProtocolChild, TypeScriptProviderBundleV1,
+            TypeScriptViewAdmission, TypeScriptWorktree,
         },
     },
     telemetry::{CacheState, DiagnosticState, Language, Telemetry, adapters},
 };
 use std::path::Path;
+
+/// Failure detail when TypeScript project inputs no longer match the snapshot a session was
+/// started from; the next request observes them afresh.
+const TYPESCRIPT_INPUTS_CHANGED: &str =
+    "TypeScript project inputs (tsconfig/package files) changed since the session started";
+
+/// Observes bounded TypeScript config and package files away from the single worker thread.
+///
+/// `job` receives the refusal text in `failure_detail` when observation rejects the document, so
+/// the `resolution_unverified` reply can name the tsconfig consulted and the reason. `document`
+/// is the absolute source path; `bundle` and `roots` are moved into the blocking task. A join
+/// failure maps to `Internal`, a rejection to `ResolutionUnverified`.
+async fn observe_typescript_inputs(
+    job: &mut Job,
+    worktree: crate::workspace::authority::WorktreeRef,
+    document: std::path::PathBuf,
+    bundle: TypeScriptProviderBundleV1,
+    roots: Vec<std::path::PathBuf>,
+) -> Result<ProjectResolutionInputsV1, FailureCode> {
+    let observed = tokio::task::spawn_blocking(move || {
+        let worktree_root = worktree.worktree_path().to_path_buf();
+        let path_proof = |path: &Path| {
+            let absolute = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                worktree_root.join(path)
+            };
+            crate::assistance::launcher::admit_path(&roots, &absolute).is_ok()
+        };
+        ProjectResolutionInputsV1::observe(worktree, document, &bundle, &path_proof)
+    })
+    .await
+    .map_err(|_| FailureCode::Internal)?;
+    observed.map_err(|rejection| {
+        job.failure_detail = Some(rejection.to_string());
+        FailureCode::ResolutionUnverified
+    })
+}
 
 /// Couples one semantic context result to diagnostics observed by that exact provider session.
 pub(super) struct ProviderContext {
@@ -71,6 +109,74 @@ struct LiveEntry {
     child: LiveChild,
     /// Transport driver and synchronized document state shared by context and symbol requests.
     live: LiveSession,
+}
+
+/// Keeps each language server independent within one actor/worktree binding.
+///
+/// `T` is the owned session resource for one language slot; removing a slot does not affect its
+/// siblings.
+struct LiveSessions<T> {
+    /// Rust analyzer session, retained across requests in other languages.
+    rust: Option<T>,
+    /// Pyright session, retained across requests in other languages.
+    pyright: Option<T>,
+    /// TypeScript session, retained across requests in other languages.
+    typescript: Option<T>,
+}
+
+impl<T> Default for LiveSessions<T> {
+    /// Creates three empty language slots without requiring the session entry type to be default.
+    fn default() -> Self {
+        Self {
+            rust: None,
+            pyright: None,
+            typescript: None,
+        }
+    }
+}
+
+impl<T> LiveSessions<T> {
+    /// Returns the slot owned by a provider language; Go has no per-binding session and gets `None`.
+    fn slot_mut(&mut self, language: Language) -> Option<&mut Option<T>> {
+        match language {
+            Language::Rust => Some(&mut self.rust),
+            Language::Python => Some(&mut self.pyright),
+            Language::Typescript => Some(&mut self.typescript),
+            Language::Go => None,
+        }
+    }
+
+    /// Returns the session slot selected by a provider language.
+    fn get(&self, language: Language) -> Option<&T> {
+        match language {
+            Language::Rust => self.rust.as_ref(),
+            Language::Python => self.pyright.as_ref(),
+            Language::Typescript => self.typescript.as_ref(),
+            Language::Go => None,
+        }
+    }
+
+    /// Returns the mutable session slot selected by a provider language.
+    fn get_mut(&mut self, language: Language) -> Option<&mut T> {
+        self.slot_mut(language).and_then(Option::as_mut)
+    }
+
+    /// Replaces only the session slot selected by a provider language; a Go entry is dropped.
+    fn insert(&mut self, language: Language, entry: T) {
+        if let Some(slot) = self.slot_mut(language) {
+            *slot = Some(entry);
+        }
+    }
+
+    /// Removes only the session slot selected by a provider language.
+    fn take(&mut self, language: Language) -> Option<T> {
+        self.slot_mut(language).and_then(Option::take)
+    }
+
+    /// Reports whether all language sessions have been removed.
+    fn is_empty(&self) -> bool {
+        self.rust.is_none() && self.pyright.is_none() && self.typescript.is_none()
+    }
 }
 
 /// Keeps a shared listener owned until the final logical view is released and reaped.
@@ -154,8 +260,8 @@ pub(super) struct Providers {
     socket_generation: BTreeMap<String, u64>,
     /// Exclusive Rust generation and source bookkeeping.
     rust: RustViews,
-    /// Long-lived language sessions, one per binding, kept until stop or transport failure.
-    live: BTreeMap<BindingRef, LiveEntry>,
+    /// Long-lived language sessions, one per binding and language, kept until stop or transport failure.
+    live: BTreeMap<BindingRef, LiveSessions<LiveEntry>>,
     /// Exclusive TypeScript generations and owner-lifetime exact-profile quarantine.
     typescript: TypeScriptProfiles,
     /// Strictly increasing protocol/backend generation within this boot.
@@ -475,8 +581,11 @@ impl Worker<'_> {
     /// `job` supplies cancellation, `binding` selects the retained session, `source` and `bytes`
     /// identify the exact observed document, `query` selects whole-file or symbol context, and
     /// `language` selects diagnostics waiting and telemetry. Python and TypeScript wait for their
-    /// bounded diagnostic push; Rust keeps its file-query behavior. A failed exchange retires the
-    /// session and maps to `ProviderUnavailable`.
+    /// diagnostic push, Rust only for whole-file queries; that wait is bounded by
+    /// `min(3 s, remaining deadline)` and by `job.cancel`. A failed or cancelled exchange retires
+    /// the session; cancellation maps to `Cancelled`, any other failure to `ProviderUnavailable`.
+    /// A TypeScript result is additionally checked against the session's project snapshot and
+    /// returns `ResolutionUnverified` (with `failure_detail` set) when the project changed.
     async fn live_context(
         &mut self,
         job: &mut Job,
@@ -486,43 +595,55 @@ impl Worker<'_> {
         query: ContextQuery,
         language: Language,
     ) -> Result<ProviderContext, FailureCode> {
-        let entry = self
-            .providers
-            .live
-            .get_mut(binding)
-            .ok_or(FailureCode::Internal)?;
-        let result = {
-            let operation = entry.live.session.context(source, bytes, query);
-            tokio::pin!(operation);
-            tokio::select! { result = &mut operation => result, _ = job.cancel.changed() => Err(std::io::Error::other("cancelled")), }
+        let (result, diagnostics) = {
+            let entry = self
+                .providers
+                .live
+                .get_mut(binding)
+                .and_then(|sessions| sessions.get_mut(language))
+                .ok_or(FailureCode::Internal)?;
+            let mut result = {
+                let operation = entry.live.session.context(source, bytes, query);
+                tokio::pin!(operation);
+                tokio::select! { result = &mut operation => result, _ = job.cancel.changed() => Err(std::io::Error::other("cancelled")), }
+            };
+            if result.is_ok()
+                && (matches!(language, Language::Python | Language::Typescript)
+                    || matches!(query, ContextQuery::File))
+            {
+                let budget = Duration::from_secs(3).min(
+                    job.deadline
+                        .saturating_duration_since(tokio::time::Instant::now()),
+                );
+                tokio::select! {
+                    _ = tokio::time::timeout(budget, entry.live.session.wait_for_matching_diagnostics()) => {}
+                    _ = job.cancel.changed() => result = Err(std::io::Error::other("cancelled")),
+                }
+            }
+            (result, entry.live.session.diagnostics())
         };
-        if result.is_ok() {
-            if matches!(language, Language::Python | Language::Typescript) {
-                entry.live.session.wait_for_matching_diagnostics().await;
-            } else if matches!(query, ContextQuery::File) {
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(3),
-                    entry.live.session.wait_for_matching_diagnostics(),
-                )
-                .await;
-            }
-        }
-        let outcome = match result {
-            Ok(context) => ProviderContext {
-                context,
-                diagnostics: entry.live.session.diagnostics(),
-            },
+        let context = match result {
+            Ok(context) => context,
             Err(_) => {
-                self.release_live(binding).await;
-                return Err(FailureCode::ProviderUnavailable);
+                self.release_live_language(binding, language).await;
+                return if *job.cancel.borrow() {
+                    Err(FailureCode::Cancelled)
+                } else {
+                    Err(FailureCode::ProviderUnavailable)
+                };
             }
+        };
+        let outcome = ProviderContext {
+            context,
+            diagnostics,
         };
         if language == Language::Typescript
             && !self
                 .verify_live_typescript_inputs(job, binding, source)
                 .await?
         {
-            self.release_live(binding).await;
+            self.release_live_language(binding, Language::Typescript)
+                .await;
             return Err(FailureCode::ResolutionUnverified);
         }
         if let Some(telemetry) = self.telemetry.as_ref() {
@@ -565,25 +686,23 @@ impl Worker<'_> {
             .typescript_bundle()
             .map_err(|_| FailureCode::ExecutionProfile)?;
         let roots = self.shared.launcher.allowed_roots().to_vec();
-        let worktree_root = authority.worktree().worktree_path().to_path_buf();
-        let path_proof = |path: &Path| {
-            let absolute = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                worktree_root.join(path)
-            };
-            crate::assistance::launcher::admit_path(&roots, &absolute).is_ok()
-        };
-        let current = ProjectResolutionInputsV1::observe(
+        let current = observe_typescript_inputs(
+            job,
             authority.worktree().clone(),
             authority.worktree().worktree_path().join(source.path()),
-            &bundle,
-            &path_proof,
+            bundle,
+            roots,
         )
-        .map_err(|_| FailureCode::ResolutionUnverified)?;
-        Ok(self.providers.live.get(binding).is_some_and(|entry| {
-            matches!(&entry.child, LiveChild::TypeScript(_, _, prior) if prior.same_project(&current))
-        }))
+        .await?;
+        let matches = self.providers.live.get(binding).is_some_and(|sessions| {
+            sessions.get(Language::Typescript).is_some_and(|entry| {
+                matches!(&entry.child, LiveChild::TypeScript(_, _, prior) if prior.same_project(&current))
+            })
+        });
+        if !matches {
+            job.failure_detail = Some(TYPESCRIPT_INPUTS_CHANGED.to_owned());
+        }
+        Ok(matches)
     }
 
     /// Starts the accepted Pyright session for this binding, or keeps its live session.
@@ -599,12 +718,18 @@ impl Worker<'_> {
         source: &SourceObservation,
     ) -> Result<(), FailureCode> {
         let binding = job.invocation.binding_ref().clone();
-        if self.providers.live.get(&binding).is_some_and(|entry| {
-            matches!(&entry.child, LiveChild::Pyright(..)) && entry.live.is_alive()
-        }) {
+        if self
+            .providers
+            .live
+            .get(&binding)
+            .and_then(|sessions| sessions.get(Language::Python))
+            .is_some_and(|entry| {
+                matches!(&entry.child, LiveChild::Pyright(..)) && entry.live.is_alive()
+            })
+        {
             return Ok(());
         }
-        self.release_live(&binding).await;
+        self.release_live_language(&binding, Language::Python).await;
         let authority = self.authority(&binding).await?;
         let cache_namespace =
             self.provider_cache_namespace(&binding, &authority, launch, &launch.trust)?;
@@ -707,8 +832,8 @@ impl Worker<'_> {
         };
         match opened {
             Ok(live) => {
-                self.providers.live.insert(
-                    binding,
+                self.providers.live.entry(binding).or_default().insert(
+                    Language::Python,
                     LiveEntry {
                         child: LiveChild::Pyright(child, view),
                         live,
@@ -750,6 +875,14 @@ impl Worker<'_> {
             .typescript_bundle()
             .map_err(|_| FailureCode::ExecutionProfile)?;
         let roots = self.shared.launcher.allowed_roots().to_vec();
+        let inputs = observe_typescript_inputs(
+            job,
+            authority.worktree().clone(),
+            authority.worktree().worktree_path().join(source.path()),
+            bundle.clone(),
+            roots.clone(),
+        )
+        .await?;
         let worktree_root = authority.worktree().worktree_path().to_path_buf();
         let path_proof = |path: &Path| {
             let absolute = if path.is_absolute() {
@@ -759,38 +892,40 @@ impl Worker<'_> {
             };
             crate::assistance::launcher::admit_path(&roots, &absolute).is_ok()
         };
-        let inputs = ProjectResolutionInputsV1::observe(
-            authority.worktree().clone(),
-            authority.worktree().worktree_path().join(source.path()),
-            &bundle,
-            &path_proof,
-        )
-        .map_err(|_| FailureCode::ResolutionUnverified)?;
-        if self.providers.live.get(&binding).is_some_and(|entry| {
+        if self.providers.live.get(&binding).and_then(|sessions| sessions.get(Language::Typescript)).is_some_and(|entry| {
             matches!(&entry.child, LiveChild::TypeScript(_, _, prior) if prior.same_project(&inputs))
                 && entry.live.is_alive()
         }) {
             return Ok(());
         }
-        self.release_live(&binding).await;
-        let profile = TypeScriptProfile::new(
+        self.release_live_language(&binding, Language::Typescript)
+            .await;
+        let profile = match TypeScriptProfile::new(
             bundle,
             inputs.clone(),
             launch.trust.clone(),
             Path::new(&cache_namespace).to_path_buf(),
-        )
-        .map_err(|_| FailureCode::ExecutionProfile)?;
+        ) {
+            Ok(profile) => profile,
+            Err(TypeScriptProfileError::InvalidResolution) => {
+                job.failure_detail = Some(TYPESCRIPT_INPUTS_CHANGED.to_owned());
+                return Err(FailureCode::ResolutionUnverified);
+            }
+            Err(_) => return Err(FailureCode::ExecutionProfile),
+        };
         let worktree = TypeScriptWorktree::new(
             authority.worktree().clone(),
             execution_authority(&authority)?,
         )
         .map_err(|_| FailureCode::WorkspaceAuthority)?;
-        let command = profile
-            .command(&worktree, &path_proof)
-            .map_err(|error| match error {
-                TypeScriptProfileError::InvalidResolution => FailureCode::ResolutionUnverified,
-                _ => FailureCode::ExecutionProfile,
-            })?;
+        let command = profile.command(&worktree, &path_proof).map_err(|error| {
+            if matches!(error, TypeScriptProfileError::InvalidResolution) {
+                job.failure_detail = Some(TYPESCRIPT_INPUTS_CHANGED.to_owned());
+                FailureCode::ResolutionUnverified
+            } else {
+                FailureCode::ExecutionProfile
+            }
+        })?;
         let node = launch.node.as_ref().ok_or(FailureCode::ExecutionProfile)?;
         let request = self
             .execution_request(job, &authority, command, node)
@@ -844,10 +979,16 @@ impl Worker<'_> {
                         .providers
                         .typescript
                         .release(view, &mut self.providers.registry);
+                    let failure = if matches!(&error, TypeScriptProfileError::InvalidResolution) {
+                        job.failure_detail = Some(TYPESCRIPT_INPUTS_CHANGED.to_owned());
+                        FailureCode::ResolutionUnverified
+                    } else {
+                        FailureCode::ProviderUnavailable
+                    };
                     if let TypeScriptProfileError::Process(error) = error {
                         self.provider_spawn_failure(error, &binding);
                     }
-                    return Err(FailureCode::ProviderUnavailable);
+                    return Err(failure);
                 }
             }
         };
@@ -876,8 +1017,8 @@ impl Worker<'_> {
         };
         match opened {
             Ok(live) => {
-                self.providers.live.insert(
-                    binding,
+                self.providers.live.entry(binding).or_default().insert(
+                    Language::Typescript,
                     LiveEntry {
                         child: LiveChild::TypeScript(child, view, Box::new(inputs)),
                         live,
@@ -886,7 +1027,7 @@ impl Worker<'_> {
                 Ok(())
             }
             Err(_) => {
-                self.reap_typescript(&binding, child, view).await;
+                self.reap_typescript(&binding, child, view, false).await;
                 if *job.cancel.borrow() {
                     Err(FailureCode::Cancelled)
                 } else {
@@ -918,6 +1059,7 @@ impl Worker<'_> {
             .providers
             .live
             .get(&binding)
+            .and_then(|sessions| sessions.get(Language::Rust))
             .and_then(|entry| match &entry.child {
                 LiveChild::Rust(_, view) => Some(view.lease()),
                 _ => None,
@@ -932,6 +1074,7 @@ impl Worker<'_> {
                 .providers
                 .live
                 .get_mut(&binding)
+                .and_then(|sessions| sessions.get_mut(Language::Rust))
                 .ok_or(FailureCode::Internal)?;
             let readiness = tokio::select! {
                 readiness = entry.live.wait_ready(budget) => readiness,
@@ -951,12 +1094,16 @@ impl Worker<'_> {
                     // few seconds to publish diagnostics for the synchronized version before
                     // snapshotting, so an edit reply can report `current_clean`/`current_reported`
                     // instead of `unknown`.
+                    let mut result = result;
                     if matches!(query, ContextQuery::File) && result.is_ok() {
-                        let _ = tokio::time::timeout(
-                            Duration::from_secs(3),
-                            entry.live.session.wait_for_matching_diagnostics(),
-                        )
-                        .await;
+                        let budget = Duration::from_secs(3).min(
+                            job.deadline
+                                .saturating_duration_since(tokio::time::Instant::now()),
+                        );
+                        tokio::select! {
+                            _ = tokio::time::timeout(budget, entry.live.session.wait_for_matching_diagnostics()) => {}
+                            _ = job.cancel.changed() => result = Err(std::io::Error::other("cancelled")),
+                        }
                     }
                     let diagnostics = entry.live.session.diagnostics();
                     result.map(|context| ProviderContext {
@@ -974,9 +1121,14 @@ impl Worker<'_> {
         let result = match outcome {
             Ok(context) => Ok(context),
             Err(_) => {
-                // A failed exchange retires the session; the next request starts a fresh one.
-                self.release_live(&binding).await;
-                Err(FailureCode::ProviderUnavailable)
+                // A failed or cancelled exchange retires the session; the next request starts a
+                // fresh one.
+                self.release_live_language(&binding, Language::Rust).await;
+                if *job.cancel.borrow() {
+                    Err(FailureCode::Cancelled)
+                } else {
+                    Err(FailureCode::ProviderUnavailable)
+                }
             }
         };
         if let Some(telemetry) = self.telemetry.as_ref() {
@@ -1025,6 +1177,12 @@ impl Worker<'_> {
             }
             _ => return Err(FailureCode::ProviderUnavailable),
         };
+        let language = match required {
+            AcceptedProviderSettings::RustCachePrimingDisabledV1 => Language::Rust,
+            AcceptedProviderSettings::PyrightDefaultsV1 => Language::Python,
+            AcceptedProviderSettings::TypeScriptDefaultsV1 => Language::Typescript,
+            _ => return Err(FailureCode::ProviderUnavailable),
+        };
         let launch = job
             .target
             .providers
@@ -1054,6 +1212,7 @@ impl Worker<'_> {
                 .providers
                 .live
                 .get_mut(&binding)
+                .and_then(|sessions| sessions.get_mut(language))
                 .ok_or(FailureCode::Internal)?;
             tokio::select! {
                 readiness = entry.live.wait_ready(budget) => readiness,
@@ -1065,13 +1224,19 @@ impl Worker<'_> {
             Err(ReadinessError::Loading) => return Err(FailureCode::ProviderLoading),
             Err(ReadinessError::WorkspaceError) => return Err(FailureCode::ProviderUnavailable),
             Err(ReadinessError::Gone) => {
-                self.release_live(&binding).await;
-                return Err(FailureCode::ProviderUnavailable);
+                let cancelled = *job.cancel.borrow();
+                self.release_live_language(&binding, language).await;
+                return Err(if cancelled {
+                    FailureCode::Cancelled
+                } else {
+                    FailureCode::ProviderUnavailable
+                });
             }
         }
         self.providers
             .live
             .get_mut(&binding)
+            .and_then(|sessions| sessions.get_mut(language))
             .map(|entry| &mut entry.live)
             .ok_or(FailureCode::Internal)
     }
@@ -1088,11 +1253,16 @@ impl Worker<'_> {
         source: &SourceObservation,
     ) -> Result<(), FailureCode> {
         let binding = job.invocation.binding_ref().clone();
-        if let Some(entry) = self.providers.live.get(&binding) {
+        if let Some(entry) = self
+            .providers
+            .live
+            .get(&binding)
+            .and_then(|sessions| sessions.get(Language::Rust))
+        {
             if matches!(&entry.child, LiveChild::Rust(..)) && entry.live.is_alive() {
                 return Ok(());
             }
-            self.release_live(&binding).await;
+            self.release_live_language(&binding, Language::Rust).await;
         }
         let authority = self.authority(&binding).await?;
         let cache_namespace =
@@ -1210,8 +1380,8 @@ impl Worker<'_> {
         };
         match opened {
             Ok(live) => {
-                self.providers.live.insert(
-                    binding,
+                self.providers.live.entry(binding).or_default().insert(
+                    Language::Rust,
                     LiveEntry {
                         child: LiveChild::Rust(child, view),
                         live,
@@ -1230,17 +1400,51 @@ impl Worker<'_> {
         }
     }
 
-    /// Shuts down and reaps one binding's live language session, if present.
+    /// Shuts down and reaps every live language session owned by one binding.
     pub(super) async fn release_live(&mut self, binding: &BindingRef) {
-        let Some(LiveEntry { child, live }) = self.providers.live.remove(binding) else {
+        let Some(mut sessions) = self.providers.live.remove(binding) else {
             return;
         };
-        live.shutdown().await;
+        for language in [Language::Rust, Language::Python, Language::Typescript] {
+            if let Some(entry) = sessions.take(language) {
+                self.release_live_entry(binding, entry).await;
+            }
+        }
+    }
+
+    /// Shuts down and reaps only one language session, preserving its sibling sessions.
+    async fn release_live_language(&mut self, binding: &BindingRef, language: Language) {
+        let entry = self
+            .providers
+            .live
+            .get_mut(binding)
+            .and_then(|sessions| sessions.take(language));
+        if self
+            .providers
+            .live
+            .get(binding)
+            .is_some_and(LiveSessions::is_empty)
+        {
+            self.providers.live.remove(binding);
+        }
+        if let Some(entry) = entry {
+            self.release_live_entry(binding, entry).await;
+        }
+    }
+
+    /// Shuts down and settles one language child and its exact provider view.
+    async fn release_live_entry(
+        &mut self,
+        binding: &BindingRef,
+        LiveEntry { child, live }: LiveEntry,
+    ) {
+        let shutdown_completed = live.shutdown().await;
         match child {
             LiveChild::Rust(child, view) => self.reap_rust(binding, child, view).await,
             LiveChild::Pyright(child, view) => self.reap_pyright(binding, child, view).await,
             LiveChild::TypeScript(child, view, _) => {
-                self.reap_typescript(binding, child, view).await
+                self.reap_typescript(binding, child, view, shutdown_completed)
+                    .await
             }
         }
     }
@@ -1317,28 +1521,42 @@ impl Worker<'_> {
         }
     }
 
-    /// Gracefully reaps a TypeScript bridge, quarantining only a timed-out or unsuccessful child.
+    /// Reaps a TypeScript bridge and settles its exact view.
+    ///
+    /// `shutdown_completed` reports whether the LSP shutdown exchange was answered while the session
+    /// was alive. Only then is the child given one second to exit on its own, and only an observed
+    /// nonzero exit quarantines the profile key. A shutdown that never completed (client-initiated
+    /// teardown after invalidation, a hung server, a failed handshake) and a graceful wait that
+    /// times out go straight to abnormal termination without quarantining, because neither proves
+    /// the bridge itself is broken. A reap that cannot settle marks the binding uncertain.
     async fn reap_typescript(
         &mut self,
         binding: &BindingRef,
         mut child: TypeScriptProtocolChild,
         view: crate::intelligence::typescript::TypeScriptView,
+        shutdown_completed: bool,
     ) {
-        let result = match child.wait_for_exit(Duration::from_secs(1)).await {
-            Ok(waited) => {
-                self.providers
-                    .typescript
-                    .quarantine_after_unsuccessful_wait(&view, &waited);
-                child.finish_reap(waited, Duration::from_millis(500)).await
+        let result = if shutdown_completed {
+            match child.wait_for_exit(Duration::from_secs(1)).await {
+                Ok(waited) => {
+                    self.providers
+                        .typescript
+                        .quarantine_after_unsuccessful_wait(&view, &waited);
+                    child.finish_reap(waited, Duration::from_millis(500)).await
+                }
+                Err(_) => {
+                    child
+                        .terminate_abnormally(
+                            Duration::from_millis(100),
+                            Duration::from_millis(500),
+                        )
+                        .await
+                }
             }
-            Err(_) => {
-                self.providers
-                    .typescript
-                    .quarantine_after_wait_timeout(&view);
-                child
-                    .terminate_abnormally(Duration::from_millis(100), Duration::from_millis(500))
-                    .await
-            }
+        } else {
+            child
+                .terminate_abnormally(Duration::from_millis(100), Duration::from_millis(500))
+                .await
         };
         match result {
             Ok(reaped) => {
@@ -2184,7 +2402,9 @@ async fn session_operation<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncW
 
 #[cfg(test)]
 mod tests {
-    use super::{FailureCode, GoBackend, OwnedProviderSocket, Providers, reap_owned_backend};
+    use super::{
+        FailureCode, GoBackend, LiveSessions, OwnedProviderSocket, Providers, reap_owned_backend,
+    };
     use crate::assistance::host_binding::{
         BindingRef, BindingStatus, HostBindingGuard, parse_candidate, parse_channel_session,
         parse_hook_event,
@@ -2201,6 +2421,24 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    /// Taking the Python slot leaves the same binding's retained Rust session untouched.
+    #[test]
+    fn language_session_release_is_binding_local() {
+        let mut sessions = LiveSessions::default();
+        sessions.insert(crate::telemetry::Language::Rust, "rust-session");
+        sessions.insert(crate::telemetry::Language::Python, "pyright-session");
+
+        assert_eq!(
+            sessions.take(crate::telemetry::Language::Python),
+            Some("pyright-session")
+        );
+        assert_eq!(
+            sessions.get(crate::telemetry::Language::Rust),
+            Some(&"rust-session")
+        );
+        assert!(!sessions.is_empty());
+    }
 
     /// Builds one accepted no-op `BindingRef` for uncertainty bookkeeping only; no daemon involved.
     fn test_binding(label: &str) -> BindingRef {

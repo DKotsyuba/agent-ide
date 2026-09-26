@@ -13,7 +13,7 @@ use async_lsp::{
     router::Router,
 };
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::VecDeque,
     future::Future,
     io,
     ops::ControlFlow,
@@ -688,14 +688,17 @@ impl LiveSession {
         }
     }
 
-    /// Graceful shutdown/exit; the caller still reaps the process. Errors are ignored: a server
-    /// that no longer answers is simply reaped.
-    pub async fn shutdown(mut self) {
+    /// Gracefully sends shutdown/exit and reaps the process separately; reports whether shutdown
+    /// completed, which lets TypeScript distinguish server exit failures from client teardown.
+    pub async fn shutdown(mut self) -> bool {
         // A server busy loading its workspace may not answer shutdown promptly; the caller reaps
         // the process anyway, so the graceful exchange gets one second and no more.
-        let _ = tokio::time::timeout(Duration::from_secs(1), self.session.shutdown()).await;
+        let completed = tokio::time::timeout(Duration::from_secs(1), self.session.shutdown())
+            .await
+            .is_ok_and(|result| result.is_ok());
         let _ = tokio::time::timeout(Duration::from_millis(500), &mut self.driver).await;
         self.driver.abort();
+        completed
     }
 }
 
@@ -1028,7 +1031,8 @@ impl Session {
 
     /// Synchronizes the source and returns the provider's document symbols (nested form).
     ///
-    /// Flat responses are nested by `containerName` when their parent is present.
+    /// Flat responses become childless top-level symbols; container names are only hints and may
+    /// be ambiguous, so the fallback does not invent a hierarchy or selection range.
     pub async fn document_symbols(
         &mut self,
         observation: &SourceObservation,
@@ -1044,12 +1048,11 @@ impl Session {
             .await?;
         Ok(match reply {
             Some(lsp::DocumentSymbolResponse::Nested(symbols)) => symbols,
-            Some(lsp::DocumentSymbolResponse::Flat(symbols)) => {
-                let mut roots = Vec::new();
-                let mut children = BTreeMap::<String, Vec<lsp::DocumentSymbol>>::new();
-                for symbol in symbols {
+            Some(lsp::DocumentSymbolResponse::Flat(symbols)) => symbols
+                .into_iter()
+                .map(|symbol| {
                     #[allow(deprecated)]
-                    let document = lsp::DocumentSymbol {
+                    lsp::DocumentSymbol {
                         name: symbol.name,
                         detail: None,
                         kind: symbol.kind,
@@ -1058,21 +1061,9 @@ impl Session {
                         range: symbol.location.range,
                         selection_range: symbol.location.range,
                         children: None,
-                    };
-                    if let Some(container) = symbol.container_name {
-                        children.entry(container).or_default().push(document);
-                    } else {
-                        roots.push(document);
                     }
-                }
-                for root in &mut roots {
-                    if let Some(nested) = children.remove(&root.name) {
-                        root.children = Some(nested);
-                    }
-                }
-                roots.extend(children.into_values().flatten());
-                roots
-            }
+                })
+                .collect(),
             None => Vec::new(),
         })
     }
