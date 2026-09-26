@@ -548,12 +548,17 @@ async fn worktree_start_flow(
         .as_str()
         .unwrap()
         .to_owned();
+    // A fast activation now completes inline; a slow one still answers `pending` and is polled.
     assert!(
-        text.starts_with("pending:"),
+        text.starts_with("pending:") || text.starts_with("complete"),
         "{} {pending}",
         worktree.display()
     );
-    let detail_ref = text.split("detail_ref ").nth(1).unwrap().to_owned();
+    let detail_ref = text
+        .split("detail_ref ")
+        .nth(1)
+        .map(str::to_owned)
+        .unwrap_or_default();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut call = id;
     while text.starts_with("pending:") {
