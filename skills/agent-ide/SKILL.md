@@ -39,7 +39,8 @@ and cost a fraction of the context:
   reading any file longer than a screen.
 - `ide.symbol {"symbol":"src/x.rs#Type/method"}` or `{"symbol":"Name"}` — a symbol card:
   resolved signature, documentation, the definition with line numbers, usages grouped by
-  `src`/`tests` with the source line text, and `callers`/`callees` (set `"callers":1`).
+  `src`/`tests` with the source line text, `callers`/`callees` (set `"callers":1`) and, with
+  `"history":true`, the last three commits that touched the definition.
   A bare name that matches several symbols answers with the candidate paths; repeat
   with one exact path.
 - `ide.read {"symbol":"src/x.rs#Type/method"}` or `{"path":"src/x.rs","lines":"120-180"}`
