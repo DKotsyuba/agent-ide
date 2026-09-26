@@ -312,6 +312,35 @@ mod tests {
         );
     }
 
+    /// The history section prints only when the card carries parsed commit entries, one
+    /// two-space-indented `sha date subject` line each.
+    #[test]
+    fn symbol_card_prints_history_entries_only_when_present() {
+        let mut card = SymbolCard {
+            heading: "value — fn, src/lib.rs#value (lines 1–1)".into(),
+            signature: Some("pub fn value() -> i32".into()),
+            ..Default::default()
+        };
+        assert!(
+            !symbol_card_text(&card).contains("history:"),
+            "{}",
+            symbol_card_text(&card)
+        );
+        card.history = vec![
+            "59482ce 2026-09-26 tune value bound".into(),
+            "6290c82 2026-09-26 cross-crate fixture".into(),
+        ];
+        assert!(
+            symbol_card_text(&card).contains(
+                "history: 2 last commits touching the definition\n  \
+                 59482ce 2026-09-26 tune value bound\n  \
+                 6290c82 2026-09-26 cross-crate fixture\n"
+            ),
+            "{}",
+            symbol_card_text(&card)
+        );
+    }
+
     #[test]
     fn symbol_card_lists_usages_with_ceiling_and_groups() {
         let mut card = SymbolCard {

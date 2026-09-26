@@ -5702,7 +5702,8 @@ async fn configured_product_claude_returns_real_pyright_semantic_context_diff_an
 /// crate, so a passing cross-crate definition is real evidence of loaded workspace semantics, not
 /// same-file lexical fallback. The managed-sandbox `procMacro`-disabled route is proven separately
 /// (`session_tests::managed_rust_settings_disable_proc_macro_expansion`); this exercises the same
-/// production Rust profile construction through the disabled-profile fixture route.
+/// production Rust profile construction through the disabled-profile fixture route. The two commits
+/// touching `value` also let `ide.symbol {history: true}` return the real per-definition git log.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN environment"]
 async fn configured_product_rust_resolves_definition_across_a_crate_boundary() {
@@ -5733,6 +5734,13 @@ async fn configured_product_rust_resolves_definition_across_a_crate_boundary() {
     .unwrap();
     fixture.git(&["add", "-A"]);
     fixture.git(&["commit", "--quiet", "-m", "cross-crate fixture"]);
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "pub fn value() -> i32 { dep::shared_value() + 0 }\npub fn caller() -> i32 { value() }\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "-A"]);
+    fixture.git(&["commit", "--quiet", "-m", "tune value bound"]);
     let wrapper = fixture.base.join("rust-provider");
     std::fs::write(
         &wrapper,
@@ -5780,6 +5788,23 @@ async fn configured_product_rust_resolves_definition_across_a_crate_boundary() {
     assert!(
         text.contains("dep/src/lib.rs"),
         "cross-crate definition did not resolve into the dependency crate: {response}"
+    );
+    let symbol = actor
+        .call(
+            &fixture,
+            "ide.symbol",
+            json!({"symbol":"src/lib.rs#value","history":true}),
+        )
+        .await;
+    let symbol = actor.settle(&fixture, symbol).await;
+    let symbol_text = symbol["text"].as_str().unwrap();
+    assert!(
+        symbol_text.contains("history: 2 last commits touching the definition"),
+        "{symbol}"
+    );
+    assert!(
+        symbol_text.contains("tune value bound") && symbol_text.contains("cross-crate fixture"),
+        "{symbol}"
     );
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");

@@ -149,7 +149,7 @@ impl Worker<'_> {
         Ok((reply, Some(authority), Some(observed)))
     }
 
-    /// `ide.symbol {symbol, usages?, callers?, callees?}`: the symbol card.
+    /// `ide.symbol {symbol, usages?, callers?, callees?, history?}`: the symbol card.
     pub(super) async fn symbol(
         &mut self,
         job: &mut Job,
@@ -175,6 +175,11 @@ impl Worker<'_> {
             .get("callees")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        let want_history = job
+            .parameters
+            .get("history")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         // Resolve the definition file: a bare name goes through workspace symbols first.
         let file = match symbol.file() {
             Some(file) => file.to_path_buf(),
@@ -292,6 +297,9 @@ impl Worker<'_> {
                         .collect();
                 }
             }
+        }
+        if want_history {
+            card.history = history_lines(&worktree_root, &file, found.range).await;
         }
         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
         let text = render::symbol_card_text(&card);
@@ -981,6 +989,103 @@ fn formatter_path() -> String {
     parts.join(":")
 }
 
+/// History entries kept on one symbol card.
+const MAX_HISTORY: usize = 3;
+/// Bytes of `git log -L` stdout captured before truncation.
+const MAX_HISTORY_OUTPUT: u64 = 64 * 1024;
+/// Characters per history entry.
+const MAX_HISTORY_CHARS: usize = 100;
+
+/// Recent commits touching one definition range, as `sha date subject` lines.
+///
+/// Runs `/usr/bin/git log -L` against the worktree exactly like every other daemon git call.
+/// Anything that goes wrong — the file is untracked, the directory is not a checkout, the child
+/// fails or exceeds the three-second budget — yields an empty list: history is an opt-in garnish
+/// and must never fail the card.
+async fn history_lines(worktree: &Path, file: &Path, range: LineRange) -> Vec<String> {
+    // Absolute program path, like every other git call of the daemon; `core.fsmonitor` is forced
+    // off because a repository-configured fsmonitor hook would otherwise run unconfined here.
+    let mut command = tokio::process::Command::new("/usr/bin/git");
+    command
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .args(["-c", "core.fsmonitor=false"])
+        .arg("-C")
+        .arg(worktree)
+        .args([
+            "log",
+            "-n",
+            "3",
+            "--no-merges",
+            "--date=short",
+            "--format=%h %ad %s",
+            "-L",
+            &format!("{},{}:{}", range.start, range.end, file.display()),
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let Ok(mut child) = command.spawn() else {
+        return Vec::new();
+    };
+    let Some(stdout) = child.stdout.take() else {
+        return Vec::new();
+    };
+    let read = tokio::time::timeout(Duration::from_secs(3), async move {
+        let mut bytes = Vec::new();
+        use tokio::io::AsyncReadExt;
+        if stdout
+            .take(MAX_HISTORY_OUTPUT)
+            .read_to_end(&mut bytes)
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        child.wait().await.ok().map(|status| (bytes, status))
+    })
+    .await;
+    match read {
+        Ok(Some((bytes, status))) if status.success() => {
+            parse_history(&String::from_utf8_lossy(&bytes))
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Picks `%h %ad %s` commit headers out of the diff hunks `git log -L` interleaves them with,
+/// deduplicated in output order, clipped and capped for the card.
+fn parse_history(output: &str) -> Vec<String> {
+    let mut entries: Vec<String> = Vec::new();
+    for line in output.lines().filter(|line| commit_header(line)) {
+        let entry: String = line.chars().take(MAX_HISTORY_CHARS).collect();
+        if !entries.contains(&entry) {
+            entries.push(entry);
+        }
+        if entries.len() == MAX_HISTORY {
+            break;
+        }
+    }
+    entries
+}
+
+/// Matches `^[0-9a-f]{7,} \d{4}-\d{2}-\d{2} ` — the header `--format=%h %ad %s` prints above
+/// each commit's diff in `git log -L` output.
+fn commit_header(line: &str) -> bool {
+    let mut parts = line.splitn(3, ' ');
+    let (Some(sha), Some(date), Some(_)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    sha.len() >= 7
+        && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && date.len() == 10
+        && date.bytes().enumerate().all(|(index, byte)| match index {
+            4 | 7 => byte == b'-',
+            _ => byte.is_ascii_digit(),
+        })
+}
+
 #[cfg(test)]
 mod splice_tests {
     use super::*;
@@ -1014,5 +1119,59 @@ mod splice_tests {
             blank_after: 0,
         };
         assert_eq!(insert_lines(source, &append, "e"), "a\nb\nc\nd\n\ne\n");
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    /// Realistic `git log -L` output: one `%h %ad %s` header per commit, each followed by its
+    /// diff hunks and function context, plus the trailing file header noise.
+    #[test]
+    fn parser_keeps_only_deduped_clipped_commit_headers() {
+        let output = "\
+3f9c2ab1e0d7 2026-09-26 fix: tighten value bound
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,1 +1,1 @@
+-pub fn value() -> i32 { dep::shared_value() }
++pub fn value() -> i32 { dep::shared_value() + 0 }
+8b41de0c99aa 2026-09-25 feat: cross-crate fixture
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,2 @@
++pub fn value() -> i32 { dep::shared_value() }
+ pub fn caller() -> i32 { value() }
+abcdef1 2026-1 not a date line
+2026-09-25 8b41de0 reversed shape is not a header
+short 2026-09-25 nope
+";
+        assert_eq!(
+            parse_history(output),
+            vec![
+                "3f9c2ab1e0d7 2026-09-26 fix: tighten value bound",
+                "8b41de0c99aa 2026-09-25 feat: cross-crate fixture",
+            ]
+        );
+    }
+
+    #[test]
+    fn parser_dedupes_clips_and_caps_at_three_entries() {
+        let line = format!("{} 2026-09-25 {}", "a1b2c3d", "subject ".repeat(30));
+        let output = [line.as_str(), line.as_str(), "e4f5a6b 2026-09-24 second"].join("\n");
+        let parsed = parse_history(&output);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].chars().count(), MAX_HISTORY_CHARS);
+        assert!(!parsed[0].ends_with('…'));
+        let long = parse_history(
+            &(0..5)
+                .map(|index| format!("0a1b2c{index} 2026-09-25 c{index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        assert_eq!(long.len(), MAX_HISTORY);
     }
 }

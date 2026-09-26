@@ -466,3 +466,38 @@ fn test_arguments_require_one_target_and_bounded_budget() {
         assert!(validate_call(AssistanceTool::Test, invalid).is_err());
     }
 }
+
+/// Keeps `ide.symbol`'s boolean toggles boolean and its depth ceilings at the trust boundary.
+#[test]
+fn symbol_arguments_accept_history_and_reject_non_boolean_history() {
+    assert!(
+        validate_call(
+            AssistanceTool::Symbol,
+            json!({"symbol":"src/lib.rs#Worker/symbol"})
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_call(
+            AssistanceTool::Symbol,
+            json!({"symbol":"src/lib.rs#Worker/symbol","usages":true,"callers":3,"callees":0,"history":true})
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_call(
+            AssistanceTool::Symbol,
+            json!({"symbol":"src/lib.rs#Worker/symbol","history":false})
+        )
+        .is_ok()
+    );
+    for invalid in [
+        json!({"symbol":"src/lib.rs#Worker/symbol","history":"yes"}),
+        json!({"symbol":"src/lib.rs#Worker/symbol","history":1}),
+        json!({"symbol":"src/lib.rs#Worker/symbol","history":null}),
+        json!({"symbol":"src/lib.rs#Worker/symbol","callers":4}),
+        json!({}),
+    ] {
+        assert!(validate_call(AssistanceTool::Symbol, invalid).is_err());
+    }
+}
