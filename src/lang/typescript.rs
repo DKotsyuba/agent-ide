@@ -324,7 +324,7 @@ impl LanguageSupport for TypeScript {
     /// `node --test`. A symbol target runs the distinct files of its referencing tests filtered
     /// by `-t` (`--test-name-pattern=` for node) with their names as an escaped regex
     /// alternation (`describe > it` becomes the runner's space-joined `describe it`); beyond
-    /// [`MAX_NAMED_TESTS`] only the files run. A symbol no test references is
+    /// `MAX_NAMED_TESTS` only the files run. A symbol no test references is
     /// [`LangError::Unsupported`]. Patterns pass through unescaped.
     fn test_selection(
         &self,

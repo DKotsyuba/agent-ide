@@ -267,7 +267,7 @@ impl LanguageSupport for Python {
 
     /// pytest with `-q --no-header -p no:cacheprovider`, prefixed by `uv run` in uv projects.
     /// A symbol target names each distinct referencing test as a node id (`file::Class::test`;
-    /// `/` in a name is read as nesting) or, beyond [`MAX_NAMED_TESTS`], their distinct files; a
+    /// `/` in a name is read as nesting) or, beyond `MAX_NAMED_TESTS`, their distinct files; a
     /// symbol no test references is [`LangError::Unsupported`]. Files run whole, patterns go to
     /// `-k`.
     fn test_selection(

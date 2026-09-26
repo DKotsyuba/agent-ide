@@ -165,7 +165,7 @@ impl LanguageSupport for RustSupport {
         }
     }
 
-    /// Computes the insertion point; see [`place`] for the shared rules. A container is any kind
+    /// Computes the insertion point; see `place` for the shared rules. A container is any kind
     /// that [`SymbolKind::is_container`] accepts plus a test module (`mod tests`), which is
     /// [`SymbolKind::Test`]; members of an empty container are indented four spaces deeper.
     fn insert_site(
@@ -602,7 +602,7 @@ pub(super) fn declaration_line(lines: &[&str], from: u32, limit: u32, attributes
 /// at bracket depth 0 (`()`, `[]`, `<>`; `->` is not a bracket). Go: stops before the first
 /// depth-0 `{` that is not an empty `{}` type literal, and keeps only the first line when there
 /// is none. Line comments are dropped, whitespace collapsed, padding inside brackets and trailing
-/// commas removed, and the result cut to [`SIGNATURE_LIMIT`] characters with `…`.
+/// commas removed, and the result cut to `SIGNATURE_LIMIT` characters with `…`.
 pub(super) fn signature(lines: &[&str], body: LineRange, item_ends: bool) -> String {
     let joined: Vec<char> = (body.start..=body.end)
         .map(|line| strip_line_comment(line_at(lines, line)))
@@ -653,7 +653,7 @@ pub(super) fn signature(lines: &[&str], body: LineRange, item_ends: bool) -> Str
     finish_signature(&text)
 }
 
-/// Whitespace-normalizes a collected declaration and bounds it to [`SIGNATURE_LIMIT`] characters.
+/// Whitespace-normalizes a collected declaration and bounds it to `SIGNATURE_LIMIT` characters.
 fn finish_signature(text: &str) -> String {
     let mut text = collapse_whitespace(text);
     for (from, to) in [
