@@ -103,7 +103,13 @@ compact_content=real_pass
 python_provider=real_pass
 typescript_r3=real_pass
 divergent_worktrees=real_pass
+symbol_tools=real_pass
 ```
+
+`symbol_tools` (scenario `l5`) exercises the v0.4 symbol-addressed tools live: `ide.outline` and
+`ide.symbol` against a small Rust fixture crate committed under `acceptance-fixture/` (a `Counter`
+struct with a `get` method used from `tests/counter.rs`), an `ide.edit` symbol insert, an `ide.read`
+by symbol, and a symbol delete that must leave the fixture crate at net zero and still compiling.
 
 This interface deliberately carries no session, run, transcript, prompt, credential, or command
 field. The agent-run Codex route requires a complete live cell before it can emit `real_pass`.
@@ -120,7 +126,7 @@ bounded `codex exec --json -C <worktree> --skip-git-repo-check -m <model>
 -o <last-message> "<prompt>"` sessions (with `--dangerously-bypass-hook-trust` only when the
 installed CLI documents that flag; approvals and sandbox are never bypassed). Its private Codex
 home selects the built-in `:workspace` permission profile. The driver writes the closed
-nine-line document only when every scenario passes on captured transcripts plus real filesystem and
+ten-line document only when every scenario passes on captured transcripts plus real filesystem and
 telemetry effects. Managed Codex binds `ide.start` directly from the MCP `_meta` attachment, so the
 prompts have no foreground helper step; a `pending` tool answer must be followed by `ide.inspect`
 with the returned `detail_ref`.

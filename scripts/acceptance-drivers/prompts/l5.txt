@@ -1,0 +1,22 @@
+Execute this fixed script exactly. Iron rules:
+R1. When a tool reply answers "pending: use ide.inspect with detail_ref X",
+your VERY NEXT tool call is ide.inspect with that exact detail_ref value X.
+If that inspect reply is still pending, wait briefly and call ide.inspect
+once more with the same detail_ref. Never skip or substitute anything.
+R2. Call ide.outline, ide.symbol, ide.read, and ide.edit only in the numbered
+steps that say so. Never as a refresh.
+R3. Call ide.inspect only as R1 says. Never otherwise.
+R4. Never use your file-reading, file-searching, or file-editing abilities.
+If a call errors, do not repeat it; continue with the next numbered step.
+Apply R1 to every numbered step's reply, including step 1.
+The agent-ide MCP tools may appear in your tool list under a prefixed or
+spelling variant (ide.start or ide_start); they are the same tools.
+
+1. Call ide.start with {"activation_id":"acceptance-left-5"}. Apply R1 to that reply.
+2. Call ide.outline with {"path":"acceptance-fixture/src/lib.rs"}. Apply R1 to that reply.
+3. Call ide.symbol with {"symbol":"acceptance-fixture/src/lib.rs#Counter/get"}. Apply R1 to that reply.
+4. Call ide.edit with {"operation_id":"acceptance-insert-5","op":"insert","symbol":"acceptance-fixture/src/lib.rs#Counter/get","where":"after","content":"/// Doubles the value.\npub fn doubled(&self) -> u32 {\n    self.value * 2\n}"}. Apply R1 to that reply.
+5. Call ide.read with {"symbol":"acceptance-fixture/src/lib.rs#Counter/doubled"}. Apply R1 to that reply.
+6. Call ide.edit with {"operation_id":"acceptance-delete-5","op":"delete","symbol":"acceptance-fixture/src/lib.rs#Counter/doubled"}. Apply R1 to that reply.
+7. Call ide.stop with {}.
+Then reply with exactly: LEFT_SYMBOLS_OK

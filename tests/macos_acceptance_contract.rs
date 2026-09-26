@@ -141,6 +141,39 @@ fn direct_codex_driver_uses_named_workspace_profile() {
     assert!(!driver.contains("-s workspace-write"));
 }
 
+/// Pins the symbol-tools acceptance scenario (`l5`) across the plain-text host-cell contract, the
+/// shared prompt, and every host driver that exercises the Rust fixture crate live.
+#[test]
+fn symbol_tools_scenario_is_wired_into_every_host_driver() {
+    let runner = include_str!("../scripts/macos-acceptance.sh");
+    assert!(runner.contains("symbol_tools=real_pass"));
+    assert!(runner.contains("-le 10"));
+    assert!(runner.contains("name = \"acceptance-fixture\""));
+
+    let common = include_str!("../scripts/acceptance-drivers/driver-common.sh");
+    assert!(common.contains("'symbol_tools=real_pass' \\"));
+    assert!(common.contains("verify_symbol_tools_left_clean"));
+
+    let prompt = include_str!("../scripts/acceptance-drivers/prompts/l5.txt");
+    assert!(prompt.contains("acceptance-left-5"));
+    assert!(prompt.contains("Counter/get"));
+    assert!(prompt.contains("LEFT_SYMBOLS_OK"));
+
+    let claude = include_str!("../scripts/acceptance-drivers/claude.sh");
+    let codex = include_str!("../scripts/acceptance-drivers/codex.sh");
+    for driver in [claude, codex] {
+        assert!(driver.contains("verify_l5"));
+        assert!(driver.contains("$PROMPT_FAMILY/l5.txt"));
+        assert!(driver.contains("verify_symbol_tools_left_clean"));
+        assert!(driver.contains("reset_left_rust_fixture"));
+    }
+
+    let agent_run = include_str!("../scripts/acceptance-drivers/agent-run-claude.sh");
+    assert!(agent_run.contains("task-l5.txt"));
+    assert!(agent_run.contains("LEFT_SYMBOLS_OK"));
+    assert!(agent_run.contains("verify_symbol_tools_left_clean"));
+}
+
 /// Ensures every fallible toolchain check for the accepted Rust, Python, and TypeScript/JavaScript
 /// toolchains propagates failure from route-guarded shell functions.
 #[test]

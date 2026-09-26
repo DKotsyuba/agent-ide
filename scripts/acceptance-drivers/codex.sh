@@ -25,7 +25,7 @@
 # bounded `codex exec --json` sessions against the candidate binary's managed
 # MCP server, verifies every scenario from the captured JSONL event transcripts
 # plus real filesystem and telemetry effects, and only then emits the closed
-# nine-line real_pass document. Any failing step records a closed code in the
+# ten-line real_pass document. Any failing step records a closed code in the
 # private diagnostic log and fails the whole cell honestly.
 #
 # Managed Codex mode binds `ide.start` directly from the trusted MCP `_meta`
@@ -63,7 +63,7 @@
 #                                     whole session bound on a dead start.
 #                                     Default 60.
 #   AGENT_IDE_ACCEPTANCE_ONLY        optional comma-separated scenario filter
-#                                    (l1,l1b,l2,l3,l4,r5,r5b) for single-scenario
+#                                    (l1,l1b,l2,l3,l4,l5,r5,r5b) for single-scenario
 #                                    diagnostic reruns; unset runs the complete
 #                                    cell, and a filtered run never emits the
 #                                    closed result document.
@@ -128,7 +128,7 @@ if [ "$DRY" = 1 ]; then
     printf '%s\n' "# $BINARY codex-hooks print > <codex-home>/hooks.json"
     printf '%s\n' "# ln $OPERATOR_HOME/.codex/auth.json <codex-home>/auth.json  # file_link, never read or printed"
     printf '%s\n' "# $CODEX exec --help | grep -q -- --dangerously-bypass-hook-trust  # else fail hook_trust_flag_missing"
-    for label in l1 l1b l2 l3 l4; do
+    for label in l1 l1b l2 l3 l4 l5; do
         printf 'cd "%s" && CODEX_HOME="<codex-home>" HOME="%s" PATH="/usr/bin:/bin:/usr/sbin:/sbin:%s" /usr/bin/perl -e '"'"'alarm shift; exec @ARGV'"'"' %s "%s" exec --json -C "%s" --skip-git-repo-check -m "%s" -o "<diag>/last-%s.txt" "$(cat "%s/%s.txt")" > "<diag>/transcript-%s.jsonl" 2> "<diag>/session-%s.err"\n' \
             "$AGENT_IDE_ACCEPTANCE_LEFT_WORKTREE" "$OPERATOR_HOME" "$(dirname -- "$CODEX")" \
             "$SESSION_SECONDS" "$CODEX" "$AGENT_IDE_ACCEPTANCE_LEFT_WORKTREE" \
@@ -502,6 +502,34 @@ verify_l3() {
     require_text "$t" "mode: semantic" A_L3_SEMANTIC || return 1
 }
 
+# Verifies the L5 symbol-tools loop: outline, symbol card, insert, read, delete over the
+# Rust fixture crate, and that the inserted method leaves no trace and the crate still compiles.
+verify_l5() {
+    t=$DIAG_DIR/transcript-l5.jsonl
+    require_codex_tool_use "$t" ide_start A_L5_START || return 1
+    require_codex_tool_use "$t" ide_outline A_L5_OUTLINE || return 1
+    require_codex_tool_use "$t" ide_symbol A_L5_SYMBOL || return 1
+    require_codex_tool_use "$t" ide_edit A_L5_EDIT || return 1
+    require_codex_tool_use "$t" ide_read A_L5_READ || return 1
+    require_codex_tool_use "$t" ide_stop A_L5_STOP || return 1
+    require_text "$t" "LEFT_SYMBOLS_OK" A_L5_FINAL || return 1
+    require_text "$t" "impl Counter" A_L5_OUTLINE_IMPL || return 1
+    require_text "$t" "pub fn get" A_L5_OUTLINE_GET || return 1
+    require_text "$t" "symbol: get — method" A_L5_SYMBOL_HEADING || return 1
+    require_text "$t" "acceptance-fixture/tests/counter.rs" A_L5_SYMBOL_USAGE || return 1
+    require_text "$t" "edit: replaced" A_L5_EDIT_REPLACED || return 1
+    require_text "$t" "diagnostics:" A_L5_EDIT_DIAGNOSTICS || return 1
+    require_text "$t" "pub fn doubled" A_L5_READ_DOUBLED || return 1
+    verify_symbol_tools_left_clean "$LEFT" A_L5_LEFT_CLEAN || return 1
+}
+
+# Restores the Rust fixture crate's library file to its committed baseline between L5 retries,
+# without disturbing the Python/TypeScript fixture state that earlier scenarios advanced.
+reset_left_rust_fixture() {
+    /usr/bin/git -C "$1" checkout -q -- acceptance-fixture/src/lib.rs \
+        || fail E_FIXTURE_RESET "could not restore acceptance-fixture/src/lib.rs"
+}
+
 # Scenario L1: real edit/diagnostic/fix/diff/stop loop over Pyright.
 if selected l1; then
     cp -- "$DRIVER_DIR/$PROMPT_FAMILY/l1.txt" "$DIAG_DIR/prompt-l1.txt"
@@ -527,6 +555,12 @@ if selected l3; then
     reset_left_native "$LEFT"
     cp -- "$DRIVER_DIR/$PROMPT_FAMILY/l3.txt" "$DIAG_DIR/prompt-l3.txt"
     run_scenario l3 "$LEFT" "$DIAG_DIR/prompt-l3.txt" verify_l3 reset_left_native A_L3_SCENARIO
+fi
+
+# Scenario L5: symbol-addressed outline/symbol/edit/read loop over the Rust fixture crate.
+if selected l5; then
+    cp -- "$DRIVER_DIR/$PROMPT_FAMILY/l5.txt" "$DIAG_DIR/prompt-l5.txt"
+    run_scenario l5 "$LEFT" "$DIAG_DIR/prompt-l5.txt" verify_l5 reset_left_rust_fixture A_L5_SCENARIO
 fi
 
 # Restart-safe telemetry: durable events survive the daemon restart of a fresh
