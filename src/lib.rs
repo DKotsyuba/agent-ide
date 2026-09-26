@@ -21,6 +21,9 @@ pub mod workspace;
 /// Provides bounded internal LSP wire safety primitives for later semantic views.
 pub mod intelligence;
 
+/// Language support contract and per-language modules for the symbol-addressed tools.
+pub mod lang;
+
 /// Composes bounded diff summaries and hunk payload for Changes v0.1.
 pub mod changes;
 
