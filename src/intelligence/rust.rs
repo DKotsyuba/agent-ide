@@ -76,6 +76,72 @@ pub struct RustProfile {
     cache_namespace: String,
 }
 
+/// Manifests rust-analyzer must load explicitly, or `None` to leave its own discovery alone.
+///
+/// rust-analyzer discovers the root `Cargo.toml` only; a crate nested under a root that is
+/// a single package (no `[workspace]` table) or no Cargo project at all is opened as a detached
+/// file: hover works, references across the crate's own tests do not. For such roots this lists
+/// the root manifest (when present) and every nested manifest found up to
+/// [`LINKED_PROJECT_DEPTH`] directories deep, skipping `target`, `node_modules`, hidden
+/// directories and the conventional test-material directories (`tests`, `fixtures`, `examples`,
+/// `benches`), whose crates are fixtures rather than projects. A root with a `[workspace]`
+/// table keeps auto-discovery: its members are covered and cross-workspace nesting is rare.
+pub fn linked_projects(root: &Path) -> Option<Vec<String>> {
+    let root_manifest = root.join("Cargo.toml");
+    if root_manifest.is_file() {
+        let text = std::fs::read_to_string(&root_manifest).ok()?;
+        if text.lines().any(|line| line.trim() == "[workspace]") {
+            return None;
+        }
+    }
+    let mut found = Vec::new();
+    collect_manifests(root, LINKED_PROJECT_DEPTH, &mut found);
+    found.retain(|path| *path != root_manifest);
+    if found.is_empty() {
+        return None;
+    }
+    found.sort();
+    let mut projects = Vec::with_capacity(found.len() + 1);
+    if root_manifest.is_file() {
+        projects.push(root_manifest.display().to_string());
+    }
+    projects.extend(found.into_iter().map(|path| path.display().to_string()));
+    Some(projects)
+}
+
+/// Directory depth [`linked_projects`] searches for nested manifests.
+const LINKED_PROJECT_DEPTH: usize = 2;
+
+fn collect_manifests(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+    if depth == 0 || found.len() >= 32 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.')
+            || matches!(
+                name,
+                "target" | "node_modules" | "tests" | "fixtures" | "examples" | "benches"
+            )
+        {
+            continue;
+        }
+        if path.is_dir() {
+            let manifest = path.join("Cargo.toml");
+            if manifest.is_file() {
+                found.push(manifest);
+            }
+            collect_manifests(&path, depth - 1, found);
+        }
+    }
+}
+
 impl RustProfile {
     /// Creates the sole supported v0.1 Rust profile from complete nonempty observed identities.
     pub fn new(identity: RustProfileIdentity) -> Result<Self, RustProfileError> {
@@ -607,5 +673,63 @@ impl RustProtocolChild {
             .cancel_and_reap(grace, deadline)
             .await
             .map_err(RustProfileError::Process)
+    }
+}
+
+#[cfg(test)]
+mod linked_project_tests {
+    use super::linked_projects;
+    use std::path::PathBuf;
+
+    fn scratch(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "agent-ide-linked-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn nested_crate_under_a_single_package_root_is_linked_and_fixtures_are_not() {
+        let dir = scratch("nested");
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"root\"\n").unwrap();
+        std::fs::create_dir_all(dir.join("nested/src")).unwrap();
+        std::fs::write(
+            dir.join("nested/Cargo.toml"),
+            "[package]\nname = \"nested\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("tests/fixtures/x")).unwrap();
+        std::fs::write(dir.join("tests/fixtures/x/Cargo.toml"), "[package]\n").unwrap();
+        std::fs::create_dir_all(dir.join("target/y")).unwrap();
+        std::fs::write(dir.join("target/y/Cargo.toml"), "[package]\n").unwrap();
+        let projects = linked_projects(&dir).expect("nested crate found");
+        assert_eq!(
+            projects,
+            vec![
+                dir.join("Cargo.toml").display().to_string(),
+                dir.join("nested/Cargo.toml").display().to_string(),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn workspace_root_and_flat_root_keep_auto_discovery() {
+        let dir = scratch("workspace");
+        std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"a\"]\n").unwrap();
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::write(dir.join("a/Cargo.toml"), "[package]\n").unwrap();
+        assert_eq!(linked_projects(&dir), None);
+        let flat = scratch("flat");
+        std::fs::write(flat.join("Cargo.toml"), "[package]\n").unwrap();
+        assert_eq!(linked_projects(&flat), None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&flat);
     }
 }

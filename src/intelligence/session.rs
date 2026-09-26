@@ -731,6 +731,21 @@ impl Session {
         Ok(())
     }
 
+    /// The fixed provider configuration, plus for rust-analyzer the crates it would not find on
+    /// its own: nested manifests under a root that is not a Cargo workspace (see
+    /// [`crate::intelligence::rust::linked_projects`]).
+    fn initialization_options(&self) -> serde_json::Value {
+        let mut options = self.settings.configuration();
+        if matches!(&self.settings, ProviderSettings::Rust(_))
+            && let Some(projects) =
+                crate::intelligence::rust::linked_projects(self.worktree.worktree_path())
+            && let Some(object) = options.as_object_mut()
+        {
+            object.insert("linkedProjects".into(), serde_json::Value::from(projects));
+        }
+        options
+    }
+
     /// Negotiates supported encodings and records the actual provider capability report.
     async fn handshake(&mut self) -> io::Result<()> {
         let root = lsp::Url::from_file_path(self.worktree.worktree_path())
@@ -741,7 +756,7 @@ impl Session {
                     uri: root,
                     name: "workspace".into(),
                 }]),
-                initialization_options: Some(self.settings.configuration()),
+                initialization_options: Some(self.initialization_options()),
                 capabilities: lsp::ClientCapabilities {
                     text_document: Some(lsp::TextDocumentClientCapabilities {
                         publish_diagnostics: Some(lsp::PublishDiagnosticsClientCapabilities {
