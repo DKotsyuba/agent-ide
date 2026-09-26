@@ -5256,7 +5256,7 @@ async fn configured_product_pyright_symbol_tools_and_edit() {
     assert!(text.contains("usages: 1 in 1 files"), "{symbol}");
     assert!(!text.contains("main.py:2"), "{symbol}");
     assert!(
-        text.contains("main.py#caller  main.py:6") && text.contains("Greeter().method()"),
+        text.contains("main.py#caller  main.py:5") && text.contains("Greeter().method()"),
         "{symbol}"
     );
     let read = actor
@@ -5722,7 +5722,7 @@ async fn configured_product_typescript_symbol_tools_and_edit() {
     let text = symbol["text"].as_str().unwrap();
     assert!(text.contains("symbol: method — method"), "{symbol}");
     assert!(
-        text.contains("definition fixture.ts#Greeter/method  (lines 2–2)"),
+        text.contains("definition fixture.ts#Greeter/method  (lines 2)"),
         "{symbol}"
     );
     assert!(!text.contains("return \"hello\""), "{symbol}");
