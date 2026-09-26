@@ -18,9 +18,10 @@ use super::{
     LineRange, Outline, ProjectCommand, ProjectCommands, Symbol, SymbolKind, SymbolPath,
     TestFailure, TestReport, TestSelection, TestTarget, kind_of, line_count, lines_of,
     python::{
-        MAX_NAMED_TESTS, distinct, distinct_files, entry_names, env_value, indent_of, indent_unit,
-        last_content_line, line_at, one_line, read_text, source_lines,
+        MAX_ATTRIBUTE_CHARS, MAX_NAMED_TESTS, distinct, distinct_files, entry_names, env_value,
+        indent_of, indent_unit, last_content_line, line_at, one_line, read_text, source_lines,
     },
+    render::clip,
 };
 
 /// TypeScript and JavaScript support over typescript-language-server's document symbols;
@@ -195,6 +196,10 @@ impl LanguageSupport for TypeScript {
     /// the server reports type aliases as variables; in test files `describe`/`it`/`test`
     /// callbacks become tests with the call (`describe("math")`) as their signature.
     /// Same-named adjacent siblings (overloads, accessor pairs) merge as the module docs describe.
+    /// The outline is a skeleton: inside function, method, constructor and test-callback bodies
+    /// only nested functions, classes, interfaces and enums stay — locals, object-literal
+    /// properties and statement-level symbols are dropped — and class/interface fields render as
+    /// `name: Type` (annotated) or the clipped `name = value`.
     fn normalize(&self, file: &Path, source: &str, symbols: Vec<lsp::DocumentSymbol>) -> Outline {
         let lines = source_lines(source);
         let root = SymbolPath::new(Some(file.to_path_buf()), Vec::new());
@@ -446,7 +451,8 @@ fn collect_strings(value: &Value, out: &mut Vec<String>) {
 }
 
 /// Converts siblings under `owner_path`: ordered by first line (the server sorts by name), then
-/// adjacent same-named siblings merged into the first.
+/// adjacent same-named siblings merged into the first. Children of a function-like owner keep
+/// only nested declarations; statement-level symbols are dropped (see [`is_body_local`]).
 fn convert_all(
     lines: &[&str],
     symbols: Vec<lsp::DocumentSymbol>,
@@ -454,8 +460,10 @@ fn convert_all(
     owner: Option<SymbolKind>,
     test_file: bool,
 ) -> Vec<Symbol> {
+    let in_body = owner.is_some_and(is_body_owner);
     let mut converted: Vec<Symbol> = symbols
         .into_iter()
+        .filter(|symbol| !in_body || !is_body_local(symbol.kind))
         .map(|symbol| convert(lines, symbol, owner_path, owner, test_file))
         .collect();
     converted.sort_by_key(|symbol| (symbol.range.start, symbol.body.start));
@@ -470,6 +478,35 @@ fn convert_all(
         }
     }
     merged
+}
+
+/// Kinds whose bodies hold no outline entries of their own: their children keep only nested
+/// functions, classes, interfaces and enums (plus the members of those).
+fn is_body_owner(kind: SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Function | SymbolKind::Method | SymbolKind::Constructor | SymbolKind::Test
+    )
+}
+
+/// Kinds tsserver reports for statements inside a body — locals, object-literal properties and
+/// call/`throw` statements carrying the statement text as their name. None belong in an outline.
+fn is_body_local(kind: lsp::SymbolKind) -> bool {
+    matches!(
+        kind,
+        lsp::SymbolKind::VARIABLE
+            | lsp::SymbolKind::CONSTANT
+            | lsp::SymbolKind::PROPERTY
+            | lsp::SymbolKind::FIELD
+            | lsp::SymbolKind::OBJECT
+            | lsp::SymbolKind::KEY
+            | lsp::SymbolKind::STRING
+            | lsp::SymbolKind::NUMBER
+            | lsp::SymbolKind::BOOLEAN
+            | lsp::SymbolKind::ARRAY
+            | lsp::SymbolKind::NULL
+            | lsp::SymbolKind::ENUM_MEMBER
+    )
 }
 
 /// Normalizes one server symbol and its children (see [`TypeScript::normalize`]).
@@ -503,8 +540,19 @@ fn convert(
     if test_call {
         kind = SymbolKind::Test;
     }
+    let member = matches!(owner, Some(SymbolKind::Class | SymbolKind::Interface))
+        && matches!(
+            symbol.kind,
+            lsp::SymbolKind::PROPERTY
+                | lsp::SymbolKind::FIELD
+                | lsp::SymbolKind::VARIABLE
+                | lsp::SymbolKind::CONSTANT
+        );
     let signature = if test_call {
         symbol.name.trim_end_matches(" callback").to_owned()
+    } else if member {
+        let decl_line = first + block[..decl].matches('\n').count();
+        attribute_signature(line_at(lines, decl_line as u32 + 1))
     } else {
         render_signature(head, stop, kind)
     };
@@ -768,6 +816,56 @@ fn arrow_signature(head: &str) -> String {
         return format!("{} => {}", one_line(&head[..=close]), one_line(result));
     }
     format!("{} =>", one_line(head))
+}
+
+/// Signature of a class/interface field or property: the declaration up to its first top-level
+/// `=` when the name carries a type annotation (`name: Type`), otherwise the whole
+/// `name = value`; `//` comments are stripped, the `=` of `=>` never cuts, and the result is
+/// clipped at [`MAX_ATTRIBUTE_CHARS`] characters.
+fn attribute_signature(line: &str) -> String {
+    let line = line.trim_start();
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut annotated = false;
+    let mut cut = line.len();
+    let mut prev = ' ';
+    for (col, ch) in line.char_indices() {
+        if let Some(open) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == open {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' | '`' => quote = Some(ch),
+            '/' if line[col + 1..].starts_with('/') => {
+                cut = col;
+                break;
+            }
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ':' if depth <= 0 && prev != '=' => annotated = true,
+            '=' if depth <= 0
+                && annotated
+                && !matches!(prev, '=' | '!' | '<' | '>')
+                && !line[col + 1..].starts_with(['=', '>']) =>
+            {
+                cut = col;
+                break;
+            }
+            _ => {}
+        }
+        prev = ch;
+    }
+    clip(
+        &one_line(line[..cut].trim_end().trim_end_matches(';')),
+        MAX_ATTRIBUTE_CHARS,
+    )
 }
 
 /// First header line index above (or at) `first`, and the nearest JSDoc block's line span.
@@ -1161,6 +1259,41 @@ describe(\"math\", () => {
 });
 ";
 
+    /// A module mirroring the reported live output: a function holding a local `const`, an
+    /// object literal with two properties and a call expression, and a nested function; a class
+    /// with a field, a constructor and a method; an interface with two members.
+    const TRANSPORT: &str = "\
+export function post(path: string, body: unknown): void {
+  const requestId = newRequestId();
+  const init = {
+    method: \"POST\",
+    headers: { \"content-type\": \"application/json\" },
+  };
+  reportDiagnostic(\"post\", requestId);
+  function retry(attempt: number): void {
+    const delay = attempt * 2;
+  }
+  retry(1);
+}
+
+export class Client {
+  private retries = 3;
+
+  constructor(private readonly url: string) {
+    const probe = open(url);
+  }
+
+  fetch(path: string): void {
+    const query = \"*\";
+  }
+}
+
+export interface Options {
+  retries: number;
+  backoff: (attempt: number) => number;
+}
+";
+
     /// Builds a document symbol over 0-based `(start line, start char, end line, end char)`.
     #[allow(deprecated)]
     fn symbol(
@@ -1224,6 +1357,77 @@ describe(\"math\", () => {
         TypeScript.normalize(Path::new("src/shapes.ts"), SHAPES, shapes_symbols())
     }
 
+    /// The server's symbols for [`TRANSPORT`]: locals, object-literal properties and a call
+    /// expression as statement symbols inside bodies, members sorted by name.
+    fn transport_symbols() -> Vec<lsp::DocumentSymbol> {
+        use lsp::SymbolKind as K;
+        vec![
+            symbol(
+                "Client",
+                K::CLASS,
+                (13, 0, 23, 1),
+                vec![
+                    symbol(
+                        "constructor",
+                        K::CONSTRUCTOR,
+                        (16, 2, 18, 3),
+                        vec![symbol("probe", K::VARIABLE, (17, 4, 17, 26), vec![])],
+                    ),
+                    symbol(
+                        "fetch",
+                        K::METHOD,
+                        (20, 2, 22, 3),
+                        vec![symbol("query", K::VARIABLE, (21, 4, 21, 22), vec![])],
+                    ),
+                    symbol("retries", K::PROPERTY, (14, 2, 14, 22), vec![]),
+                ],
+            ),
+            symbol(
+                "Options",
+                K::INTERFACE,
+                (25, 0, 28, 1),
+                vec![
+                    symbol("backoff", K::PROPERTY, (27, 2, 27, 39), vec![]),
+                    symbol("retries", K::PROPERTY, (26, 2, 26, 17), vec![]),
+                ],
+            ),
+            symbol(
+                "post",
+                K::FUNCTION,
+                (0, 0, 11, 1),
+                vec![
+                    symbol(
+                        "init",
+                        K::VARIABLE,
+                        (2, 2, 5, 3),
+                        vec![
+                            symbol(
+                                "headers: { \"content-type\": \"application/json\" }",
+                                K::PROPERTY,
+                                (4, 4, 4, 53),
+                                vec![],
+                            ),
+                            symbol("method: \"POST\"", K::PROPERTY, (3, 4, 3, 19), vec![]),
+                        ],
+                    ),
+                    symbol("requestId", K::VARIABLE, (1, 2, 1, 34), vec![]),
+                    symbol(
+                        "reportDiagnostic(\"post\", requestId)",
+                        K::CONSTANT,
+                        (6, 2, 6, 37),
+                        vec![],
+                    ),
+                    symbol(
+                        "retry",
+                        K::FUNCTION,
+                        (7, 2, 9, 3),
+                        vec![symbol("delay", K::VARIABLE, (8, 4, 8, 30), vec![])],
+                    ),
+                ],
+            ),
+        ]
+    }
+
     /// The top-level symbol named `name`.
     fn top<'a>(outline: &'a Outline, name: &str) -> &'a Symbol {
         outline
@@ -1264,6 +1468,7 @@ describe(\"math\", () => {
             constructor.signature,
             "constructor(private readonly name: string)"
         );
+        assert_eq!(registry.children[0].signature, "private items: T[]");
         let add = &registry.children[2];
         assert_eq!(add.range, LineRange::new(19, 22));
         assert_eq!(add.signature, "add(item: T): void");
@@ -1341,6 +1546,34 @@ describe(\"math\", () => {
         assert_eq!(suite.children[0].kind, SymbolKind::Test);
         let outline = TypeScript.normalize(Path::new("src/math.ts"), MATH_TEST, symbols);
         assert_eq!(outline.symbols[0].kind, SymbolKind::Function);
+    }
+
+    /// Bodies shrink to their nested declarations; class fields and interface members render
+    /// annotation-or-value; no local, object-literal property or statement symbol survives.
+    #[test]
+    fn normalize_drops_body_statements_and_renders_members() {
+        use crate::lang::render::outline_text;
+        let outline = TypeScript.normalize(
+            Path::new("src/transport.ts"),
+            TRANSPORT,
+            transport_symbols(),
+        );
+        assert_eq!(
+            outline_text(&outline),
+            "\
+src/transport.ts  (29 lines, typescript)
+    1  export function post(path: string, body: unknown): void
+    8    function retry(attempt: number): void
+   14  export class Client
+   15    private retries = 3
+   17    constructor(private readonly url: string)
+   21    fetch(path: string): void
+   26  export interface Options
+   27    retries: number
+   28    backoff: (attempt: number) => number
+  (9 symbols)
+"
+        );
     }
 
     /// Before/After with one blank line; First/Last inside class and object literal braces.

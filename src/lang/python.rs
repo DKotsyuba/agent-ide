@@ -617,8 +617,9 @@ fn signature_at(lines: &[&str], start: usize) -> (String, HeaderEnd) {
     )
 }
 
-/// Character ceiling for a class attribute signature.
-const MAX_ATTRIBUTE_CHARS: usize = 60;
+/// Character ceiling for a class attribute (Python) or class/interface field (TypeScript)
+/// signature; shared by both modules.
+pub(super) const MAX_ATTRIBUTE_CHARS: usize = 60;
 
 /// Signature of a class attribute or enum member: `name: annotation` for an annotated
 /// assignment, otherwise the whole `name = value`, comment stripped and clipped at
