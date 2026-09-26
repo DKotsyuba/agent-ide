@@ -27,13 +27,17 @@ below. Do not repeat discovery in a loop.
 
 Each accepted reply carries one compact decision-facing text block that states every fact needed
 for the next action — state, `detail_ref`, `continuation`, `retry`, Edit outcome and `source_ref`.
-When a reply is `pending`, call `ide.inspect` with its `detail_ref` to retrieve the result.
+Replies come back complete when the work finishes within a few seconds (the usual case on a
+warm language server); only a longer job answers `pending` — then call `ide.inspect` with its
+`detail_ref` to retrieve the result.
 
 ## Understanding code by symbols
 
 Prefer the symbol tools over reading whole files; they answer from the language server
 and cost a fraction of the context:
 
+- `ide.outline {"path":"src/assistance/"}` — a directory: subdirectories with file counts, then
+  files with line counts and the first documentation line, one level deep.
 - `ide.outline {"path":"src/x.rs"}` — the file skeleton: every symbol with its signature,
   doc line and line numbers, members indented, test modules collapsed. Use it before
   reading any file longer than a screen.
