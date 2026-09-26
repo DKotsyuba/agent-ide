@@ -4246,6 +4246,97 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
     daemon.wait().await.unwrap();
 }
 
+/// Parses the authority epoch from a settled activation reply's compact text.
+///
+/// The activation text always opens with `Workspace activated; authority_epoch: N;`; this returns
+/// `N` so two grants on the same daemon can be ordered. Panics when the reply is not an activation
+/// or the number is missing, which is itself a failed contract.
+fn activation_epoch(activation: &Value) -> u64 {
+    let text = activation["text"].as_str().unwrap();
+    let rest = text
+        .strip_prefix("Workspace activated; authority_epoch: ")
+        .unwrap_or_else(|| panic!("{text}"));
+    rest.split(';').next().unwrap().trim().parse().unwrap()
+}
+
+/// A later Codex binding's `ide.diff` covers a path an earlier grant's `ide.edit` observed.
+///
+/// Session A registers a durable observation for `tracked.txt` (`ide.context` + `ide.edit`) and
+/// stops. Session B is a new binding on the same daemon and store, so its authority epoch is
+/// later; the store still holds A's row for the path. The diff capture must not compare that
+/// row's epoch with B's grant and answer `source_unavailable` (`diff:unstable`): the row belongs
+/// to another grant and falls through to the plain read.
+#[tokio::test]
+async fn configured_product_later_binding_diffs_path_edited_under_earlier_grant() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut first = ProductActor::new(&fixture, "epoch-first").await;
+    let started = first
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"epoch-first"}),
+        )
+        .await;
+    let started = first.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let first_epoch = activation_epoch(&started);
+    let context = first
+        .call(&fixture, "ide.context", json!({"path":"tracked.txt"}))
+        .await;
+    let context = first.settle(&fixture, context).await;
+    assert_eq!(context["kind"], "context", "{context}");
+    let edited = first
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"epoch-first-edit",
+                "path":"tracked.txt",
+                "source_ref":context["detail_ref"],
+                "content":"edited-under-first-grant\n"
+            }),
+        )
+        .await;
+    let edited = first.settle(&fixture, edited).await;
+    assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+    let stopped = first.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    first.mcp.close().await;
+
+    let mut second = ProductActor::new(&fixture, "epoch-second").await;
+    let started = second
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"epoch-second"}),
+        )
+        .await;
+    let started = second.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let second_epoch = activation_epoch(&started);
+    assert!(
+        second_epoch > first_epoch,
+        "{first_epoch} -> {second_epoch}"
+    );
+    let diff = second.call(&fixture, "ide.diff", json!({})).await;
+    let diff = second.settle(&fixture, diff).await;
+    assert_eq!(diff["kind"], "diff", "{diff}");
+    let text = diff["text"].as_str().unwrap();
+    assert!(text.contains("\nstate: Ready\n"), "{text}");
+    assert!(text.contains("\ncoverage: Complete\n"), "{text}");
+    assert!(text.contains("tracked.txt"), "{text}");
+    assert!(
+        text.contains("-base") && text.contains("+edited-under-first-grant"),
+        "{text}"
+    );
+    let stopped = second.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    second.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Runs an explicitly requested fixture crate in the background and retrieves its parsed result.
 #[tokio::test]
 async fn configured_product_test_runs_in_background_and_reports_failures() {
@@ -8490,6 +8581,80 @@ async fn claude_diff_and_failed_reinspection_do_not_exhaust_detail_capacity() {
     let stopped = first.call_claude(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     first.mcp.close().await;
+    second.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// The Claude-route twin of [`configured_product_later_binding_diffs_path_edited_under_earlier_grant`]:
+/// a fresh Claude binding (new `session_id`) on the same daemon diffs a path an earlier session's
+/// `ide.edit` observed, and gets the diff rather than `source_unavailable`.
+#[tokio::test]
+async fn claude_later_binding_diffs_path_edited_under_earlier_grant() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut first = ProductActor::new(&fixture, "claude-epoch-first").await;
+    let pending = first
+        .call_claude(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"epoch-first"}),
+        )
+        .await;
+    let (started, _) = first.settle_claude(&fixture, pending).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let first_epoch = activation_epoch(&started);
+    let pending = first
+        .call_claude(&fixture, "ide.context", json!({"path":"tracked.txt"}))
+        .await;
+    let (context, _) = first.settle_claude(&fixture, pending).await;
+    assert_eq!(context["kind"], "context", "{context}");
+    let pending = first
+        .call_claude(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"claude-epoch-first-edit",
+                "path":"tracked.txt",
+                "source_ref":context["detail_ref"],
+                "content":"edited-under-first-grant\n"
+            }),
+        )
+        .await;
+    let (edited, _) = first.settle_claude(&fixture, pending).await;
+    assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+    let stopped = first.call_claude(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    first.mcp.close().await;
+
+    let mut second = ProductActor::new(&fixture, "claude-epoch-second").await;
+    let pending = second
+        .call_claude(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"epoch-second"}),
+        )
+        .await;
+    let (started, _) = second.settle_claude(&fixture, pending).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let second_epoch = activation_epoch(&started);
+    assert!(
+        second_epoch > first_epoch,
+        "{first_epoch} -> {second_epoch}"
+    );
+    let pending = second.call_claude(&fixture, "ide.diff", json!({})).await;
+    let (diff, _) = second.settle_claude(&fixture, pending).await;
+    assert_eq!(diff["kind"], "diff", "{diff}");
+    let text = diff["text"].as_str().unwrap();
+    assert!(text.contains("\nstate: Ready\n"), "{text}");
+    assert!(text.contains("\ncoverage: Complete\n"), "{text}");
+    assert!(text.contains("tracked.txt"), "{text}");
+    assert!(
+        text.contains("-base") && text.contains("+edited-under-first-grant"),
+        "{text}"
+    );
+    let stopped = second.call_claude(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
     second.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
