@@ -105,7 +105,7 @@ pub struct Usage {
     pub is_test: bool,
 }
 
-/// One caller or callee line.
+/// One caller or callee path and its location; `name` is `file#Owner/name` when resolved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Call {
     pub name: String,
@@ -120,7 +120,7 @@ pub struct SymbolCard {
     pub heading: String,
     pub signature: Option<String>,
     pub doc: Option<String>,
-    /// Definition snippet: file, range and numbered text, already rendered by [`read_text`].
+    /// Definition address: `file#symbol (lines a–b)`; read the body separately with `ide.read`.
     pub definition: Option<String>,
     pub usages: Vec<Usage>,
     pub callers: Vec<Call>,
@@ -347,6 +347,12 @@ mod tests {
             heading: "Run — fn, a.rs#Run (lines 1–3)".into(),
             signature: Some("pub fn run()".into()),
             doc: Some("Runs.".into()),
+            definition: Some("a.rs#Run  (lines 1–3)".into()),
+            callers: vec![Call {
+                name: "a.rs#Owner/caller".into(),
+                file: "a.rs".into(),
+                line: 8,
+            }],
             ..Default::default()
         };
         for index in 0..35 {
@@ -359,8 +365,9 @@ mod tests {
         }
         card.more_detail = Some("sym-1".into());
         let text = symbol_card_text(&card);
-        assert!(text.starts_with("symbol: Run — fn, a.rs#Run (lines 1–3)\nsignature: pub fn run()\ndoc: Runs.\nusages: 35 in 3 files (src 28, tests 7)\n"));
+        assert!(text.starts_with("symbol: Run — fn, a.rs#Run (lines 1–3)\nsignature: pub fn run()\ndoc: Runs.\ndefinition a.rs#Run  (lines 1–3)\nusages: 35 in 3 files (src 28, tests 7)\n"));
         assert!(text.contains("… 5 more (ide.inspect sym-1)"));
+        assert!(text.contains("callers: 1\n  a.rs#Owner/caller  a.rs:8\n"));
         assert_eq!(text.matches("run();").count(), MAX_USAGE_LINES);
     }
 }
