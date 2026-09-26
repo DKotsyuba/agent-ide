@@ -1058,10 +1058,16 @@ async fn scheduler_trigger_with_unchanged_fingerprint_after_a_ready_result_skips
         "a skipped run must never flip the running flag"
     );
     assert!(!scheduler.is_busy());
+    let mut expected = stored;
+    for snapshot in &mut expected {
+        // The skip proved the retained result current for the new trigger's generation, so a
+        // waiter keyed on that generation (an edit reply) sees it; nothing else changes.
+        snapshot.input_generation = scheduler.generation(&worktree);
+    }
     assert_eq!(
         scheduler.latest(&worktree),
-        stored,
-        "the stored snapshot must stay exactly as the skipped-over completion left it"
+        expected,
+        "the stored snapshot must stay as the skipped-over completion left it, restamped with the evaluated generation"
     );
 }
 
