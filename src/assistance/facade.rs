@@ -222,7 +222,8 @@ pub fn tool_schemas() -> [ToolSchema; 10] {
                     "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Symbol path `file#Owner/name`, or a bare name to search the project."},
                     "usages": {"type": "boolean", "default": true},
                     "callers": {"type": "integer", "minimum": 0, "maximum": 3, "default": 1},
-                    "callees": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0}
+                    "callees": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0},
+                    "history": {"type": "boolean", "default": false, "description": "Include the last commits touching the definition (opt-in)."}
                 }
             }),
         ),
@@ -421,7 +422,7 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
         ],
         AssistanceTool::Outline => &["path"],
         AssistanceTool::Read => &["symbol", "path", "lines"],
-        AssistanceTool::Symbol => &["symbol", "usages", "callers", "callees"],
+        AssistanceTool::Symbol => &["symbol", "usages", "callers", "callees", "history"],
         AssistanceTool::Test => &["symbol", "path", "pattern", "command", "status", "budget_s"],
     }
 }
@@ -537,11 +538,10 @@ pub fn validate_call(
         }
         AssistanceTool::Symbol => {
             required_string(object, "symbol", MAX_SYMBOL_PATH_BYTES)?;
-            if object
-                .get("usages")
-                .is_some_and(|value| !value.is_boolean())
-            {
-                return Err(invalid_field("usages", FieldRule::Boolean));
+            for field in ["usages", "history"] {
+                if object.get(field).is_some_and(|value| !value.is_boolean()) {
+                    return Err(invalid_field(field, FieldRule::Boolean));
+                }
             }
             for field in ["callers", "callees"] {
                 if object
@@ -1968,7 +1968,8 @@ impl StdioFacade {
         self.call(AssistanceTool::Read, parameters, context).await
     }
 
-    /// Returns a symbol card: definition, signature, docs, usages and callers.
+    /// Returns a symbol card: definition, signature, docs, usages, callers, and — opt-in via
+    /// `history` — the last commits touching the definition.
     #[tool(name = "ide.symbol", input_schema = tool_schemas()[8].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn symbol(
         &self,
