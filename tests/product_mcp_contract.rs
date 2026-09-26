@@ -288,7 +288,10 @@ fn assert_compact_envelope(reply: &Value) {
             let header = body.lines().next().unwrap_or_default();
             let (file, details) = header.split_once("  (").expect("outline file header");
             assert!(!file.is_empty() && details.ends_with(')'), "{reply}");
-            assert!(details.contains(" lines, "), "{reply}");
+            assert!(
+                details.contains(" lines, ") || details.contains(" files, "),
+                "{reply}"
+            );
         }
         // `<title>  (lines A–B)` read header.
         ("complete", Some("read")) => {
@@ -4539,6 +4542,61 @@ fn symbol_test_fixture() -> ProductFixture {
     fixture.git(&["add", "--", "src/lib.rs", "tests/path_tests.rs"]);
     fixture.git(&["commit", "--quiet", "-m", "symbol test fixture"]);
     fixture
+}
+
+/// Exercises directory outlines without configuring or starting a language server.
+#[tokio::test]
+async fn product_directory_outline_lists_files_and_rejects_escaping_symlinks() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::create_dir_all(fixture.root.join("src/problems")).unwrap();
+    std::fs::write(
+        fixture.root.join("src/problems/item.rs"),
+        "//! Rust problem docs\npub fn item() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("src/problem.rs"),
+        "//! Rust module docs\npub fn problem() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("src/readme.py"),
+        "\"\"\"Python module docs\"\"\"\nvalue = 1\n",
+    )
+    .unwrap();
+    let outside = fixture.base.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, fixture.root.join("src/escape")).unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "directory-outline").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"directory-outline"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let reply = actor
+        .call(&fixture, "ide.outline", json!({"path":"src/"}))
+        .await;
+    let reply = actor.settle(&fixture, reply).await;
+    assert_eq!(reply["kind"], "outline", "{reply}");
+    let text = reply["text"].as_str().unwrap();
+    assert!(text.contains("dirs: problems/ 1"), "{text}");
+    assert!(
+        text.contains("Rust module docs") && text.contains("Python module docs"),
+        "{text}"
+    );
+    let refused = actor
+        .call(&fixture, "ide.outline", json!({"path":"src/escape"}))
+        .await;
+    assert_eq!(
+        actor.settle(&fixture, refused).await["code"],
+        "outside_allowed_roots"
+    );
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
 }
 
 /// A Python request in a binding whose Rust session is live leaves that session running: the

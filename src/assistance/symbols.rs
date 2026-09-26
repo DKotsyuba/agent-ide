@@ -96,6 +96,23 @@ impl Worker<'_> {
             .as_str()
             .ok_or(FailureCode::SourceUnavailable)?
             .to_owned();
+        let authority = self.authority(&binding).await?;
+        let root = authority.worktree().worktree_path();
+        let requested = root.join(&path);
+        if requested.is_dir() {
+            let root = std::fs::canonicalize(root).map_err(|_| FailureCode::SourceUnavailable)?;
+            let directory =
+                std::fs::canonicalize(&requested).map_err(|_| FailureCode::SourceUnavailable)?;
+            let relative = directory
+                .strip_prefix(&root)
+                .map_err(|_| FailureCode::OutsideAllowedRoots)?;
+            let text = render::directory_outline(&root, relative)
+                .map_err(|_| FailureCode::SourceUnavailable)?;
+            let (reply, page) =
+                ContextPageState::new(text, 0, false, ResultKind::Outline).next(&job.reference)?;
+            self.shared.set_context_page(&job.reference, page);
+            return Ok((reply, Some(authority), None));
+        }
         let (observed, bytes) = self.observe(&binding, path.clone().into()).await?;
         let (outline, _) = self.outline_of(job, &observed, &bytes).await?;
         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
