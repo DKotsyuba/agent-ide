@@ -11,9 +11,10 @@ Agent IDE exposes the lifecycle tools `ide.start`, `ide.context`, `ide.diff`,
 task touches source code — understanding it (where is X defined, who calls it, what does this
 file contain) as much as implementing, debugging, refactoring or testing. For a source
 question, `ide.outline` / `ide.symbol` / `ide.graph` answer from the language server in one
-call where grep and file reads take several and miss dynamic dispatch. Native read/grep/edit
-tools remain for prose, configuration and data files, and as the fallback when `ide.*` is not
-present.
+call where grep and file reads take several and miss dynamic dispatch. When `ide.*` is offered
+it is the required path for source: native read/grep/edit tools are for prose, configuration and
+data files, and for source only when `ide.*` is absent or a named call answered `unavailable` —
+say which call in your report.
 
 ## Deferred tool discovery
 
