@@ -41,7 +41,7 @@ use super::{
 const SIGNATURE_LIMIT: usize = 200;
 
 /// More referencing tests than this are selected by their common module prefix instead of by name.
-const MAX_NAMED_TESTS: usize = 8;
+const MAX_NAMED_TESTS: usize = 32;
 
 /// A failure's optional `file:line` location and its first message line, as parsed from output.
 pub(super) type Located = (Option<(PathBuf, u32)>, String);
@@ -201,10 +201,10 @@ impl LanguageSupport for RustSupport {
 
     /// Builds the `cargo test` command, run from the project root.
     ///
-    /// * Symbol: one or more referencing test names as filters (`cargo test --workspace name`,
-    ///   several after `--`); more than eight fall back to their common module prefix
-    ///   (`a::b::`), or to the unfiltered workspace run when they share none. No referencing
-    ///   tests is [`LangError::Unsupported`].
+    /// * Symbol: up to 32 referencing test names as exact libtest filters. Larger selections use
+    ///   their common module prefix when it is longer than `tests`; otherwise the workspace
+    ///   filter is unfiltered. Tests in one integration binary use `--test`; mixed binaries use
+    ///   the workspace filter. No referencing tests is [`LangError::Unsupported`].
     /// * File: `tests/<name>.rs` or `tests/<name>/…` → `cargo test --test <name>`;
     ///   `src/lib.rs` → `--lib`, `src/main.rs` → `--bins`, `src/bin/<x>.rs` → `--bin <x>`, any
     ///   other `src` file → its module path filter (`src/a/b.rs` → `a::b::`, `mod.rs` dropped),
@@ -227,15 +227,28 @@ impl LanguageSupport for RustSupport {
                 if tests.is_empty() {
                     return Err(LangError::Unsupported(format!("no tests reference {path}")));
                 }
-                if tests.len() > MAX_NAMED_TESTS {
+                let integration_bins: std::collections::BTreeSet<String> = tests
+                    .iter()
+                    .filter_map(|test| integration_test_bin(&test.file))
+                    .collect();
+                let one_integration_bin = if integration_bins.len() == 1 {
+                    integration_bins.iter().next()
+                } else {
+                    None
+                };
+                if let Some(bin) = one_integration_bin {
+                    command.extend(["--test".to_owned(), bin.clone()]);
+                }
+                if integration_bins.len() > 1 {
+                    // Cargo has no single invocation for exact filters across selected binaries.
+                } else if tests.len() > MAX_NAMED_TESTS {
                     let prefix = common_module_prefix(tests.iter().map(|test| test.name.as_str()));
-                    if !prefix.is_empty() {
+                    if !prefix.is_empty() && prefix != "tests" {
+                        command.push("--".to_owned());
                         command.push(format!("{prefix}::"));
                     }
                 } else {
-                    if tests.len() > 1 {
-                        command.push("--".to_owned());
-                    }
+                    command.extend(["--".to_owned(), "--exact".to_owned()]);
                     command.extend(tests.iter().map(|test| test.name.clone()));
                 }
                 Ok(TestSelection { tests, command })
@@ -394,6 +407,41 @@ impl LanguageSupport for RustSupport {
         let edition = rustfmt_edition(project)?;
         Some(vec!["rustfmt".to_owned(), "--edition".to_owned(), edition])
     }
+}
+
+/// Builds a Rust test identifier from its project-relative source path and outline path.
+///
+/// Source modules under `src` contribute their crate-relative path; crate roots and integration
+/// test roots do not. `#[path]` module inclusions may not match their physical path.
+pub(crate) fn test_id(file: &Path, outline_path: &str) -> String {
+    let modules = if let Some(at) = file.iter().position(|part| part == "src") {
+        let parts: Vec<_> = file.iter().skip(at + 1).collect();
+        match parts.as_slice() {
+            [root] if *root == "lib.rs" || *root == "main.rs" => Vec::new(),
+            [bin, _] if *bin == "bin" => Vec::new(),
+            _ => parts
+                .iter()
+                .map(|part| part.to_string_lossy().trim_end_matches(".rs").to_owned())
+                .filter(|part| part != "mod")
+                .collect(),
+        }
+    } else {
+        Vec::new()
+    };
+    modules
+        .into_iter()
+        .chain(outline_path.split("::").map(str::to_owned))
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+/// Returns the Cargo integration-test target for a file below a `tests` directory.
+pub(crate) fn integration_test_bin(file: &Path) -> Option<String> {
+    let parts: Vec<_> = file.iter().collect();
+    let at = parts.iter().rposition(|part| *part == "tests")?;
+    parts
+        .get(at + 1)
+        .map(|part| part.to_string_lossy().trim_end_matches(".rs").to_owned())
 }
 
 /// Detected rustfmt edition for a Cargo project (or one with a rustfmt config); `None` when
@@ -1402,10 +1450,23 @@ mod tests {
             .join(" ")
     }
 
-    fn test_id(name: &str) -> TestId {
-        TestId {
-            file: PathBuf::from("src/a.rs"),
-            name: name.to_owned(),
+    #[test]
+    fn test_id_uses_crate_relative_source_modules() {
+        for (file, name, expected) in [
+            (
+                "src/lang/path.rs",
+                "tests::parses",
+                "lang::path::tests::parses",
+            ),
+            ("src/lang/mod.rs", "tests::works", "lang::tests::works"),
+            ("src/lib.rs", "tests::works", "tests::works"),
+            ("src/main.rs", "nested::test", "nested::test"),
+            ("src/a/b.rs", "tests::works", "a::b::tests::works"),
+            ("src/a/mod.rs", "tests::works", "a::tests::works"),
+            ("tests/foo.rs", "tests::works", "tests::works"),
+            ("tests/foo.rs", "nested::works", "nested::works"),
+        ] {
+            assert_eq!(super::test_id(Path::new(file), name), expected, "{file}");
         }
     }
 
@@ -1413,22 +1474,36 @@ mod tests {
     fn test_selection_commands() {
         let symbol = |names: Vec<String>| TestTarget::Symbol {
             path: SymbolPath::parse("src/a.rs#Guard/new").unwrap(),
-            referencing_tests: names.iter().map(|name| test_id(name)).collect(),
+            referencing_tests: names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| TestId {
+                    file: PathBuf::from(format!("src/m{index}.rs")),
+                    name: name.clone(),
+                })
+                .collect(),
         };
         assert_eq!(
-            command(symbol(vec!["a::tests::x".into(), "a::tests::x".into()])),
-            "cargo test --workspace a::tests::x"
+            command(symbol(vec!["a::tests::x".into()])),
+            "cargo test --workspace -- --exact a::tests::x"
         );
         assert_eq!(
             command(symbol(vec!["a::tests::x".into(), "b::y".into()])),
-            "cargo test --workspace -- a::tests::x b::y"
+            "cargo test --workspace -- --exact a::tests::x b::y"
         );
-        let many: Vec<String> = (0..9).map(|n| format!("a::worker::tests::t{n}")).collect();
+        let many: Vec<String> = (0..15).map(|n| format!("a{n}::tests::t{n}")).collect();
         assert_eq!(
-            command(symbol(many)),
-            "cargo test --workspace a::worker::tests::"
+            command(symbol(many.clone())),
+            format!("cargo test --workspace -- --exact {}", many.join(" "))
         );
-        let scattered: Vec<String> = (0..9).map(|n| format!("m{n}::t")).collect();
+        let over_limit: Vec<String> = (0..33)
+            .map(|n| format!("crate::worker::tests::case{n}"))
+            .collect();
+        assert_eq!(
+            command(symbol(over_limit)),
+            "cargo test --workspace -- crate::worker::tests::"
+        );
+        let scattered: Vec<String> = (0..33).map(|n| format!("m{n}::t")).collect();
         assert_eq!(command(symbol(scattered)), "cargo test --workspace");
         assert!(matches!(
             RustSupport.test_selection(&project(), &symbol(Vec::new())),
@@ -1447,6 +1522,29 @@ mod tests {
             command(TestTarget::Pattern("lang::".into())),
             "cargo test --workspace lang::"
         );
+        let integration = |file: &str, name: &str| TestId {
+            file: PathBuf::from(file),
+            name: name.to_owned(),
+        };
+        let one_binary = TestTarget::Symbol {
+            path: SymbolPath::parse("src/lib.rs#Thing").unwrap(),
+            referencing_tests: vec![
+                integration("tests/alpha.rs", "first"),
+                integration("tests/alpha.rs", "nested::second"),
+            ],
+        };
+        assert_eq!(
+            command(one_binary),
+            "cargo test --workspace --test alpha -- --exact first nested::second"
+        );
+        let mixed_binaries = TestTarget::Symbol {
+            path: SymbolPath::parse("src/lib.rs#Thing").unwrap(),
+            referencing_tests: vec![
+                integration("tests/alpha.rs", "first"),
+                integration("tests/beta.rs", "second"),
+            ],
+        };
+        assert_eq!(command(mixed_binaries), "cargo test --workspace");
     }
 
     #[test]

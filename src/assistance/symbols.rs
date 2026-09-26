@@ -12,7 +12,8 @@ use crate::lang::{
 };
 
 impl Worker<'_> {
-    /// Finds referencing tests and counts outline tests in the symbol's own file.
+    /// Finds referencing tests and counts outline tests in the symbol's own file. Rust test names
+    /// include source-derived crate modules; other languages keep their outline naming.
     pub(super) async fn tests_referencing_symbol(
         &mut self,
         job: &mut Job,
@@ -79,7 +80,12 @@ impl Worker<'_> {
             if let Some(test) = enclosing
                 && test.kind == crate::lang::SymbolKind::Test
             {
-                let name = test.path.segments().join("::");
+                let outline_path = test.path.segments().join("::");
+                let name = if language == Lang::Rust {
+                    crate::lang::rust::test_id(&relative, &outline_path)
+                } else {
+                    outline_path
+                };
                 tests.insert((relative.clone(), name));
             }
         }

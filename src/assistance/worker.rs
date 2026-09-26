@@ -1695,7 +1695,25 @@ impl<'a> Worker<'a> {
                     )),
                     Err(_) => return Err(FailureCode::ProviderUnavailable),
                 };
-                let count = Some(selection.tests.len());
+                let bins: std::collections::BTreeSet<_> = if language == crate::lang::Language::Rust
+                {
+                    selection
+                        .tests
+                        .iter()
+                        .filter_map(|test| crate::lang::rust::integration_test_bin(&test.file))
+                        .collect()
+                } else {
+                    std::collections::BTreeSet::new()
+                };
+                let count = Some(if bins.len() > 1 {
+                    format!(
+                        "{} tests in {} binaries; running the workspace filter",
+                        selection.tests.len(),
+                        bins.len()
+                    )
+                } else {
+                    format!("{} tests selected", selection.tests.len())
+                });
                 (selection.command, language, count)
             } else {
                 return Ok((
@@ -1719,8 +1737,8 @@ impl<'a> Worker<'a> {
                 binding.fingerprint(),
             ) {
                 StartResult::Started(id) => {
-                    let selected = selected_count
-                        .map_or_else(String::new, |count| format!(" ({count} tests selected)"));
+                    let selected =
+                        selected_count.map_or_else(String::new, |summary| format!(" ({summary})"));
                     let line = format!(
                         "tests #{id}: started — {}{selected} (budget {} s)",
                         display_argv(&argv),
@@ -3775,11 +3793,13 @@ fn detect_test_language(root: &Path) -> Option<crate::lang::Language> {
     })
 }
 
-/// Resolves a file or filter target through the detected language's existing runner contract.
+/// Resolves a target through the detected runner, returning argv, language, and an optional
+/// user-facing selected-test summary (`None` when the runner cannot enumerate tests). Returns
+/// [`crate::lang::LangError::Unsupported`] when no runner supports the target.
 fn test_selection(
     root: &Path,
     target: crate::lang::TestTarget,
-) -> Result<(Vec<String>, crate::lang::Language, Option<usize>), crate::lang::LangError> {
+) -> Result<(Vec<String>, crate::lang::Language, Option<String>), crate::lang::LangError> {
     for language in [
         crate::lang::Language::Rust,
         crate::lang::Language::Python,
@@ -3793,7 +3813,8 @@ fn test_selection(
             continue;
         };
         let selection = support.test_selection(&project, &target)?;
-        let count = (!selection.tests.is_empty()).then_some(selection.tests.len());
+        let count = (!selection.tests.is_empty())
+            .then_some(format!("{} tests selected", selection.tests.len()));
         return Ok((selection.command, language, count));
     }
     Err(crate::lang::LangError::Unsupported(
