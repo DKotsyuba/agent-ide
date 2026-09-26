@@ -24,6 +24,9 @@ pub mod intelligence;
 /// Language support contract and per-language modules for the symbol-addressed tools.
 pub mod lang;
 
+/// Builds and renders the language-independent project card `ide.start` shows.
+pub mod project;
+
 /// Composes bounded diff summaries and hunk payload for Changes v0.1.
 pub mod changes;
 
