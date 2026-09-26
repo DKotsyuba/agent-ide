@@ -1649,14 +1649,28 @@ impl<'a> Worker<'a> {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
             {
-                let (referencing_tests, language) =
+                let (referencing_tests, language, file_test_count) =
                     self.tests_referencing_symbol(job, &symbol).await?;
+                let path = crate::lang::SymbolPath::parse(&symbol)
+                    .map_err(|_| FailureCode::UnknownSymbol)?;
                 if referencing_tests.is_empty() {
+                    let file = path
+                        .file()
+                        .and_then(|file| file.to_str())
+                        .ok_or(FailureCode::UnknownSymbol)?;
+                    let path_argument = serde_json::json!({"path": file});
                     return Ok((
                         PeerReply::Complete {
                             kind: ResultKind::Test,
                             text: format!(
-                                "tests: no tests reference {symbol}; run by path or pattern"
+                                "tests: no tests reference {symbol}; {}",
+                                if file_test_count == 0 {
+                                    "the file has no tests".to_owned()
+                                } else {
+                                    format!(
+                                        "the file has {file_test_count} tests — ide.test {path_argument}"
+                                    )
+                                }
                             ),
                             detail_ref: None,
                             truncated: false,
@@ -1666,8 +1680,6 @@ impl<'a> Worker<'a> {
                         None,
                     ));
                 }
-                let path = crate::lang::SymbolPath::parse(&symbol)
-                    .map_err(|_| FailureCode::UnknownSymbol)?;
                 let target = crate::lang::TestTarget::Symbol {
                     path,
                     referencing_tests,
@@ -2269,7 +2281,7 @@ impl<'a> Worker<'a> {
             }
         };
         let mut text = format!(
-            "Workspace activated; authority_epoch: {}; baseline: {baseline}; worktree_cache: retained. Provider readiness is not implied.",
+            "activated: epoch {}; baseline: {baseline}; worktree_cache: retained. Provider readiness is not implied.",
             authority.epoch(),
         );
         if !card.is_empty() {

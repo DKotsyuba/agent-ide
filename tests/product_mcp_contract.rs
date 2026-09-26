@@ -388,7 +388,7 @@ fn claude_fields(text: &str) -> Value {
         let truncated = continuation || rest.contains("\nOutput is incomplete;");
         let detail_ref = after(rest, "detail_ref ").or_else(|| after(rest, "source_ref "));
         let body_end = [
-            "\nNext: use ide.context",
+            "\nNext: use ide.outline a file or ide.symbol a name",
             "\nOutput is truncated;",
             "\nOutput is incomplete;",
             "\nDiagnostics are exactly as reported;",
@@ -4251,13 +4251,13 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
 
 /// Parses the authority epoch from a settled activation reply's compact text.
 ///
-/// The activation text always opens with `Workspace activated; authority_epoch: N;`; this returns
+/// The activation text always opens with `activated: epoch N;`; this returns
 /// `N` so two grants on the same daemon can be ordered. Panics when the reply is not an activation
 /// or the number is missing, which is itself a failed contract.
 fn activation_epoch(activation: &Value) -> u64 {
     let text = activation["text"].as_str().unwrap();
     let rest = text
-        .strip_prefix("Workspace activated; authority_epoch: ")
+        .strip_prefix("activated: epoch ")
         .unwrap_or_else(|| panic!("{text}"));
     rest.split(';').next().unwrap().trim().parse().unwrap()
 }
@@ -4853,7 +4853,7 @@ async fn configured_product_start_enforces_allowed_roots_and_accepts_root_argume
     daemon.wait().await.unwrap();
 }
 
-/// The activation reply keeps its fixed first line and appends the project card: one rendered
+/// The activation reply keeps its compact epoch line and appends the project card: one rendered
 /// block describing the fixture worktree (rust from Cargo.toml, typescript from package.json,
 /// plus the go module the shared fixture ships), with the layout, docs, and not-started server
 /// lines exactly as `project::render` prints them.
@@ -4874,10 +4874,7 @@ async fn configured_product_activation_reply_includes_the_project_card() {
     let started = actor.settle(&fixture, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
     let text = started["text"].as_str().unwrap();
-    assert!(
-        text.starts_with("Workspace activated; authority_epoch: "),
-        "{text}"
-    );
+    assert!(text.starts_with("activated: epoch "), "{text}");
     assert!(text.contains("\n\nproject: repo  root: "), "{text}");
     // Sorted by line count: main.go (3 lines) leads src/lib.rs (2 lines); package.json maps to
     // no owned source files, so typescript reports 0 in 0.
@@ -5252,9 +5249,14 @@ async fn configured_product_pyright_symbol_tools_and_edit() {
     let text = symbol["text"].as_str().unwrap();
     assert!(text.contains("symbol: method — method"), "{symbol}");
     assert!(
-        text.contains("caller")
-            && text.contains("main.py:6")
-            && text.contains("Greeter().method()"),
+        text.contains("definition main.py#Greeter/method  (lines 2–3)"),
+        "{symbol}"
+    );
+    assert!(!text.contains("return \"hello\""), "{symbol}");
+    assert!(text.contains("usages: 1 in 1 files"), "{symbol}");
+    assert!(!text.contains("main.py:2"), "{symbol}");
+    assert!(
+        text.contains("main.py#caller  main.py:6") && text.contains("Greeter().method()"),
         "{symbol}"
     );
     let read = actor
@@ -5720,9 +5722,12 @@ async fn configured_product_typescript_symbol_tools_and_edit() {
     let text = symbol["text"].as_str().unwrap();
     assert!(text.contains("symbol: method — method"), "{symbol}");
     assert!(
-        text.contains("caller")
-            && text.contains("fixture.ts:4")
-            && text.contains("new Greeter().method()"),
+        text.contains("definition fixture.ts#Greeter/method  (lines 2–2)"),
+        "{symbol}"
+    );
+    assert!(!text.contains("return \"hello\""), "{symbol}");
+    assert!(
+        text.contains("fixture.ts#caller  fixture.ts:4") && text.contains("new Greeter().method()"),
         "{symbol}"
     );
     let read = actor
