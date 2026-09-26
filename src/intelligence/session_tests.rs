@@ -1108,3 +1108,118 @@ fn go_env_prepare_creates_the_private_namespace_directories() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A live session keeps its driver across requests: handshake without a readiness wait, then
+/// readiness arrives later, then document symbols and hover answer on the same transport, and a
+/// second request after the first proves the budget is per request.
+#[tokio::test]
+async fn live_session_outlives_requests_and_waits_for_readiness_per_request() {
+    let (client, peer) = tokio::io::duplex(65536);
+    let (input, output) = tokio::io::split(client);
+    let (peer_input, peer_output) = tokio::io::split(peer);
+    let (server, _) = MainLoop::new_server(move |client| {
+        let mut router = Router::new(client);
+        router.request::<request::Initialize, _>(|_, _| async {
+            Ok(lsp::InitializeResult {
+                capabilities: lsp::ServerCapabilities {
+                    text_document_sync: Some(lsp::TextDocumentSyncCapability::Kind(
+                        lsp::TextDocumentSyncKind::FULL,
+                    )),
+                    document_symbol_provider: Some(lsp::OneOf::Left(true)),
+                    hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
+                    ..Default::default()
+                },
+                server_info: Some(lsp::ServerInfo {
+                    name: "rust-analyzer".into(),
+                    version: Some("contract-1".into()),
+                }),
+            })
+        });
+        router.notification::<lsp::notification::Initialized>(move |client, _| {
+            // Readiness arrives a little after the handshake, like a real workspace load.
+            let client = client.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let _ = client.notify::<RustServerStatus>(RustStatus {
+                    health: RustHealth::Warning,
+                    quiescent: true,
+                });
+            });
+            ControlFlow::Continue(())
+        });
+        router.notification::<lsp::notification::DidOpenTextDocument>(|_, _| {
+            ControlFlow::Continue(())
+        });
+        router.notification::<lsp::notification::DidChangeTextDocument>(|_, _| {
+            ControlFlow::Continue(())
+        });
+        router.request::<request::DocumentSymbolRequest, _>(|_, _| async {
+            #[allow(deprecated)]
+            Ok(Some(lsp::DocumentSymbolResponse::Nested(vec![
+                lsp::DocumentSymbol {
+                    name: "main".into(),
+                    detail: None,
+                    kind: lsp::SymbolKind::FUNCTION,
+                    tags: None,
+                    deprecated: None,
+                    range: lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 12)),
+                    selection_range: lsp::Range::new(
+                        lsp::Position::new(0, 3),
+                        lsp::Position::new(0, 7),
+                    ),
+                    children: None,
+                },
+            ])))
+        });
+        router.request::<request::HoverRequest, _>(|_, _| async {
+            Ok(Some(lsp::Hover {
+                contents: lsp::HoverContents::Markup(lsp::MarkupContent {
+                    kind: lsp::MarkupKind::PlainText,
+                    value: "fn main()".into(),
+                }),
+                range: None,
+            }))
+        });
+        router.request::<request::Shutdown, _>(|_, _| async { Ok(()) });
+        router.notification::<lsp::notification::Exit>(|_, _| ControlFlow::Break(Ok(())));
+        router.unhandled_notification(|_, _| ControlFlow::Continue(()));
+        router
+    });
+    let peer_task =
+        tokio::spawn(server.run_buffered(peer_input.compat(), peer_output.compat_write()));
+    let mut live = LiveSession::open(
+        input,
+        output,
+        tree(),
+        1,
+        ViewGeneration::default(),
+        rust_settings(),
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert!(live.is_alive());
+    // Not ready yet with a tiny budget, then ready once the status arrives.
+    assert_eq!(
+        live.wait_ready(Duration::from_millis(1)).await,
+        Err(ReadinessError::Loading)
+    );
+    assert_eq!(live.wait_ready(Duration::from_secs(2)).await, Ok(()));
+    let text = "fn main() {}\n";
+    let symbols = live
+        .session
+        .document_symbols(&observation(text, 1), text.as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name, "main");
+    let hover = live
+        .session
+        .hover(&observation(text, 1), text.as_bytes(), 3)
+        .await
+        .unwrap();
+    assert_eq!(hover.as_deref(), Some("fn main()"));
+    assert!(live.is_alive());
+    live.shutdown().await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), peer_task).await;
+}

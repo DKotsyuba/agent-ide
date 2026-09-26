@@ -470,24 +470,7 @@ where
             "invalid session authority epoch or deadline",
         ));
     }
-    let state = Arc::new(Mutex::new(State {
-        active: true,
-        terminal: false,
-        shutdown_complete: false,
-        settings: settings.clone(),
-        readiness: watch::channel(UNKNOWN_READINESS).0,
-        diagnostic_revision: watch::channel(0).0,
-        document: None,
-        diagnostics: DiagnosticSnapshot {
-            source: None,
-            generation,
-            document_version: None,
-            freshness: Freshness::Unknown,
-            readiness: DiagnosticReadiness::Unknown,
-            diagnostics: vec![],
-            truncated: false,
-        },
-    }));
+    let state = fresh_state(&settings, generation);
     let deadline = Instant::now() + options.lifetime;
     let router_state = state.clone();
     let (mainloop, server) = MainLoop::new_client(|_| client_router(router_state));
@@ -565,14 +548,189 @@ where
     result
 }
 
+/// Builds the shared router/session state for one transport generation.
+fn fresh_state(settings: &ProviderSettings, generation: ViewGeneration) -> Arc<Mutex<State>> {
+    Arc::new(Mutex::new(State {
+        active: true,
+        terminal: false,
+        shutdown_complete: false,
+        settings: settings.clone(),
+        readiness: watch::channel(UNKNOWN_READINESS).0,
+        diagnostic_revision: watch::channel(0).0,
+        document: None,
+        diagnostics: DiagnosticSnapshot {
+            source: None,
+            generation,
+            document_version: None,
+            freshness: Freshness::Unknown,
+            readiness: DiagnosticReadiness::Unknown,
+            diagnostics: vec![],
+            truncated: false,
+        },
+    }))
+}
+
+/// A session whose protocol driver runs on its own task, so it outlives any single request.
+///
+/// The child process stays with the caller; this owns the pipes' driver and the negotiated
+/// `Session`. Readiness is awaited per request with [`LiveSession::wait_ready`], never at open,
+/// so a slow workspace load (rust-analyzer on a large crate) does not block the handshake.
+pub struct LiveSession {
+    /// Negotiated exclusive client; requests reset their budget per call.
+    pub session: Session,
+    /// The async-lsp driver; finished means the transport is gone and the session must be replaced.
+    driver: tokio::task::JoinHandle<Result<(), async_lsp::Error>>,
+}
+
+impl LiveSession {
+    /// Performs initialize/initialized on the given pipes and returns a long-lived session.
+    ///
+    /// `request_timeout` bounds every later request; the session itself has no lifetime deadline.
+    pub async fn open<R, W>(
+        input: R,
+        output: W,
+        worktree: WorktreeRef,
+        epoch: u64,
+        generation: ViewGeneration,
+        settings: ProviderSettings,
+        request_timeout: Duration,
+    ) -> io::Result<Self>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        if epoch == 0 || request_timeout.is_zero() || request_timeout > Duration::from_secs(60) {
+            return Err(context::invalid(
+                "invalid session authority epoch or request deadline",
+            ));
+        }
+        let state = fresh_state(&settings, generation);
+        let router_state = state.clone();
+        let (mainloop, server) = MainLoop::new_client(|_| client_router(router_state));
+        let driver_state = state.clone();
+        let driver_keepalive = server.clone();
+        let driver = tokio::spawn(async move {
+            let _keepalive = driver_keepalive;
+            let result = mainloop
+                .run_buffered(
+                    BoundedInput::new(input, generation.backend).compat(),
+                    output.compat_write(),
+                )
+                .await;
+            driver_state.lock().expect("session lock").invalidate();
+            result
+        });
+        let session = Session {
+            server,
+            worktree,
+            epoch,
+            generation,
+            state,
+            capabilities: None,
+            settings,
+            budget: OutboundBudget::default(),
+            options: SessionOptions {
+                request_timeout,
+                lifetime: Duration::from_secs(300),
+            },
+            // No lifetime fence: a live session ends by shutdown, transport loss or reap.
+            deadline: Instant::now() + Duration::from_secs(60 * 60 * 24 * 3650),
+            sequence: 0,
+            version: 0,
+        };
+        let mut live = Self { session, driver };
+        if let Err(error) = live.session.handshake().await {
+            live.driver.abort();
+            return Err(error);
+        }
+        Ok(live)
+    }
+
+    /// Whether the transport driver is still running; a finished driver means the server is gone.
+    pub fn is_alive(&self) -> bool {
+        !self.driver.is_finished() && self.session.state.lock().expect("session lock").active
+    }
+
+    /// Waits up to `budget` for the provider to become usable: Rust waits for quiescence, every
+    /// other provider is usable right after the handshake.
+    pub async fn wait_ready(&mut self, budget: Duration) -> Result<(), ReadinessError> {
+        if !matches!(&self.session.settings, ProviderSettings::Rust(_)) {
+            return Ok(());
+        }
+        let mut ready = self
+            .session
+            .state
+            .lock()
+            .expect("session lock")
+            .readiness
+            .subscribe();
+        let outcome = tokio::time::timeout(budget, async {
+            loop {
+                if !self.session.state.lock().expect("session lock").active {
+                    return Err(ReadinessError::Gone);
+                }
+                let readiness = *ready.borrow_and_update();
+                if readiness.is_rust_healthy_quiescent() {
+                    return Ok(());
+                }
+                if readiness.is_rust_workspace_error() {
+                    return Err(ReadinessError::WorkspaceError);
+                }
+                if ready.changed().await.is_err() {
+                    return Err(ReadinessError::Gone);
+                }
+            }
+        })
+        .await;
+        match outcome {
+            Ok(result) => result,
+            Err(_) => Err(ReadinessError::Loading),
+        }
+    }
+
+    /// Graceful shutdown/exit; the caller still reaps the process. Errors are ignored: a server
+    /// that no longer answers is simply reaped.
+    pub async fn shutdown(mut self) {
+        let _ = self.session.shutdown().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut self.driver).await;
+        self.driver.abort();
+    }
+}
+
+/// Why a live provider is not usable yet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadinessError {
+    /// Still loading the workspace; retry later, the session keeps loading in the background.
+    Loading,
+    /// The provider reported that the workspace failed to load.
+    WorkspaceError,
+    /// The transport is gone; the session must be replaced.
+    Gone,
+}
+
 impl Session {
+    /// Resets the outbound budget: every live request starts with a fresh allowance, while the
+    /// one-shot `context` path keeps its single per-session budget.
+    fn refill_budget(&mut self) {
+        self.budget = OutboundBudget::default();
+    }
+
     /// Returns the earlier of the per-exchange allowance and the session's one absolute deadline.
     fn exchange_deadline(&self) -> Instant {
         (Instant::now() + self.options.request_timeout).min(self.deadline)
     }
 
-    /// Negotiates supported encodings and records the actual provider capability report.
+    /// Handshake plus, for Rust, the readiness barrier: the one-shot session's entry point.
     async fn initialize(&mut self) -> io::Result<()> {
+        self.handshake().await?;
+        if matches!(&self.settings, ProviderSettings::Rust(_)) {
+            self.wait_for_readiness().await?;
+        }
+        Ok(())
+    }
+
+    /// Negotiates supported encodings and records the actual provider capability report.
+    async fn handshake(&mut self) -> io::Result<()> {
         let root = lsp::Url::from_file_path(self.worktree.worktree_path())
             .map_err(|_| context::invalid("invalid worktree URI"))?;
         let reply = self
@@ -631,9 +789,6 @@ impl Session {
             lsp::InitializedParams {},
         )
         .map_err(io::Error::other)?;
-        if matches!(&self.settings, ProviderSettings::Rust(_)) {
-            self.wait_for_readiness().await?;
-        }
         Ok(())
     }
 
@@ -836,6 +991,286 @@ impl Session {
             }
         }
         Ok(result)
+    }
+
+    /// Synchronizes the source and returns the provider's document symbols (nested form).
+    ///
+    /// A flat response is lifted to childless document symbols so callers see one shape.
+    pub async fn document_symbols(
+        &mut self,
+        observation: &SourceObservation,
+        bytes: &[u8],
+    ) -> io::Result<Vec<lsp::DocumentSymbol>> {
+        let uri = self.sync_for_request(observation, bytes).await?;
+        let reply = self
+            .request::<request::DocumentSymbolRequest>(lsp::DocumentSymbolParams {
+                text_document: lsp::TextDocumentIdentifier { uri },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await?;
+        Ok(match reply {
+            Some(lsp::DocumentSymbolResponse::Nested(symbols)) => symbols,
+            Some(lsp::DocumentSymbolResponse::Flat(symbols)) => symbols
+                .into_iter()
+                .map(|symbol| {
+                    #[allow(deprecated)]
+                    lsp::DocumentSymbol {
+                        name: symbol.name,
+                        detail: None,
+                        kind: symbol.kind,
+                        tags: symbol.tags,
+                        deprecated: None,
+                        range: symbol.location.range,
+                        selection_range: symbol.location.range,
+                        children: None,
+                    }
+                })
+                .collect(),
+            None => Vec::new(),
+        })
+    }
+
+    /// Hover text at a byte offset: the provider's signature/documentation rendering, if any.
+    pub async fn hover(
+        &mut self,
+        observation: &SourceObservation,
+        bytes: &[u8],
+        byte_offset: usize,
+    ) -> io::Result<Option<String>> {
+        let params = self
+            .position_params(observation, bytes, byte_offset)
+            .await?;
+        let reply = self
+            .request::<request::HoverRequest>(lsp::HoverParams {
+                text_document_position_params: params,
+                work_done_progress_params: Default::default(),
+            })
+            .await?;
+        Ok(reply.map(|hover| match hover.contents {
+            lsp::HoverContents::Scalar(marked) => marked_string(marked),
+            lsp::HoverContents::Array(items) => items
+                .into_iter()
+                .map(marked_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            lsp::HoverContents::Markup(markup) => markup.value,
+        }))
+    }
+
+    /// Definition locations for the symbol at a byte offset.
+    pub async fn definitions(
+        &mut self,
+        observation: &SourceObservation,
+        bytes: &[u8],
+        byte_offset: usize,
+    ) -> io::Result<Vec<lsp::Location>> {
+        let params = self
+            .position_params(observation, bytes, byte_offset)
+            .await?;
+        let reply = self
+            .request::<request::GotoDefinition>(lsp::GotoDefinitionParams {
+                text_document_position_params: params,
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await?;
+        Ok(context::definitions(reply).0)
+    }
+
+    /// Reference locations for the symbol at a byte offset, declaration included.
+    pub async fn references(
+        &mut self,
+        observation: &SourceObservation,
+        bytes: &[u8],
+        byte_offset: usize,
+    ) -> io::Result<Vec<lsp::Location>> {
+        let params = self
+            .position_params(observation, bytes, byte_offset)
+            .await?;
+        Ok(self
+            .request::<request::References>(lsp::ReferenceParams {
+                text_document_position: params,
+                context: lsp::ReferenceContext {
+                    include_declaration: true,
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await?
+            .unwrap_or_default())
+    }
+
+    /// Incoming calls of the callable at a byte offset (who calls it), one level.
+    pub async fn incoming_calls(
+        &mut self,
+        observation: &SourceObservation,
+        bytes: &[u8],
+        byte_offset: usize,
+    ) -> io::Result<Vec<lsp::CallHierarchyIncomingCall>> {
+        let params = self
+            .position_params(observation, bytes, byte_offset)
+            .await?;
+        let items = self
+            .request::<request::CallHierarchyPrepare>(lsp::CallHierarchyPrepareParams {
+                text_document_position_params: params,
+                work_done_progress_params: Default::default(),
+            })
+            .await?
+            .unwrap_or_default();
+        let mut calls = Vec::new();
+        for item in items.into_iter().take(1) {
+            calls.extend(
+                self.request::<request::CallHierarchyIncomingCalls>(
+                    lsp::CallHierarchyIncomingCallsParams {
+                        item,
+                        work_done_progress_params: Default::default(),
+                        partial_result_params: Default::default(),
+                    },
+                )
+                .await?
+                .unwrap_or_default(),
+            );
+        }
+        Ok(calls)
+    }
+
+    /// Outgoing calls of the callable at a byte offset (what it calls), one level.
+    pub async fn outgoing_calls(
+        &mut self,
+        observation: &SourceObservation,
+        bytes: &[u8],
+        byte_offset: usize,
+    ) -> io::Result<Vec<lsp::CallHierarchyOutgoingCall>> {
+        let params = self
+            .position_params(observation, bytes, byte_offset)
+            .await?;
+        let items = self
+            .request::<request::CallHierarchyPrepare>(lsp::CallHierarchyPrepareParams {
+                text_document_position_params: params,
+                work_done_progress_params: Default::default(),
+            })
+            .await?
+            .unwrap_or_default();
+        let mut calls = Vec::new();
+        for item in items.into_iter().take(1) {
+            calls.extend(
+                self.request::<request::CallHierarchyOutgoingCalls>(
+                    lsp::CallHierarchyOutgoingCallsParams {
+                        item,
+                        work_done_progress_params: Default::default(),
+                        partial_result_params: Default::default(),
+                    },
+                )
+                .await?
+                .unwrap_or_default(),
+            );
+        }
+        Ok(calls)
+    }
+
+    /// Project-wide symbols matching `query`, as flat symbol information.
+    pub async fn workspace_symbols(
+        &mut self,
+        query: &str,
+    ) -> io::Result<Vec<lsp::SymbolInformation>> {
+        if !self.state.lock().expect("session lock").active {
+            return Err(io::Error::other("provider generation unavailable"));
+        }
+        self.refill_budget();
+        let reply = self
+            .request::<request::WorkspaceSymbolRequest>(lsp::WorkspaceSymbolParams {
+                query: query.to_owned(),
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await?;
+        Ok(match reply {
+            Some(lsp::WorkspaceSymbolResponse::Flat(symbols)) => symbols,
+            Some(lsp::WorkspaceSymbolResponse::Nested(symbols)) => symbols
+                .into_iter()
+                .filter_map(|symbol| match symbol.location {
+                    lsp::OneOf::Left(location) =>
+                    {
+                        #[allow(deprecated)]
+                        Some(lsp::SymbolInformation {
+                            name: symbol.name,
+                            kind: symbol.kind,
+                            tags: symbol.tags,
+                            deprecated: None,
+                            location,
+                            container_name: symbol.container_name,
+                        })
+                    }
+                    lsp::OneOf::Right(_) => None,
+                })
+                .collect(),
+            None => Vec::new(),
+        })
+    }
+
+    /// Asks the provider for a project-wide rename of the symbol at a byte offset; nothing is
+    /// written here, the caller applies the returned edit.
+    pub async fn rename(
+        &mut self,
+        observation: &SourceObservation,
+        bytes: &[u8],
+        byte_offset: usize,
+        new_name: &str,
+    ) -> io::Result<Option<lsp::WorkspaceEdit>> {
+        let params = self
+            .position_params(observation, bytes, byte_offset)
+            .await?;
+        self.request::<request::Rename>(lsp::RenameParams {
+            text_document_position: params,
+            new_name: new_name.to_owned(),
+            work_done_progress_params: Default::default(),
+        })
+        .await
+    }
+
+    /// Synchronizes one source for a request and returns its URI; rejects a stale sequence.
+    async fn sync_for_request(
+        &mut self,
+        observation: &SourceObservation,
+        bytes: &[u8],
+    ) -> io::Result<lsp::Url> {
+        if self.state.lock().expect("session lock").terminal {
+            return Err(io::Error::other("LSP session is shut down"));
+        }
+        if observation.worktree() != &self.worktree
+            || observation.authority_epoch() != self.epoch
+            || observation.sequence() < self.sequence
+        {
+            return Err(context::invalid(
+                "source does not match the current provider view",
+            ));
+        }
+        self.refill_budget();
+        self.sequence = observation.sequence();
+        let text = context::observed_text(observation, bytes)?;
+        if !self.state.lock().expect("session lock").active {
+            return Err(io::Error::other("provider generation unavailable"));
+        }
+        self.synchronize(observation, text)?
+            .ok_or_else(|| io::Error::other("Workspace observed a missing path"))?;
+        context::observation_uri(observation)
+    }
+
+    /// Synchronizes the source and converts a byte offset into provider position parameters.
+    async fn position_params(
+        &mut self,
+        observation: &SourceObservation,
+        bytes: &[u8],
+        byte_offset: usize,
+    ) -> io::Result<lsp::TextDocumentPositionParams> {
+        let uri = self.sync_for_request(observation, bytes).await?;
+        let text = context::observed_text(observation, bytes)?;
+        let encoding = self.capabilities().position_encoding.clone();
+        Ok(lsp::TextDocumentPositionParams {
+            text_document: lsp::TextDocumentIdentifier { uri },
+            position: context::position(text, byte_offset, &encoding)?,
+        })
     }
 
     /// Sends didOpen, full-document didChange, or close/open while retaining one exact document.
@@ -1074,6 +1509,14 @@ async fn wait_for_matching_diagnostics(state: &Arc<Mutex<State>>, deadline: Inst
     })
     .await
     .unwrap_or(false)
+}
+
+/// Renders one hover marked string as plain text.
+fn marked_string(marked: lsp::MarkedString) -> String {
+    match marked {
+        lsp::MarkedString::String(text) => text,
+        lsp::MarkedString::LanguageString(code) => code.value,
+    }
 }
 
 /// Maps one observed filename to the fixed LSP language identifier used for document open.
