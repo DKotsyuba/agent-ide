@@ -80,13 +80,12 @@ fn context_schema_advertises_bounded_problems_fields() {
         .expect("context schema stays present")
         .input_schema;
     assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(schema["properties"]["kind"]["type"], "string");
+    assert_eq!(schema["properties"]["kind"]["enum"], json!(["problems"]));
+    assert_eq!(schema["properties"]["language"]["type"], "string");
     assert_eq!(
-        schema["properties"]["kind"],
-        json!({"type":"string","enum":["problems"]})
-    );
-    assert_eq!(
-        schema["properties"]["language"],
-        json!({"type":"string","enum":["rust","python","typescript"]})
+        schema["properties"]["language"]["enum"],
+        json!(["rust", "python", "typescript"])
     );
     assert_eq!(schema["properties"]["offset"]["type"], "integer");
     assert_eq!(schema["properties"]["offset"]["minimum"], 0);
