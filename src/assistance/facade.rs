@@ -153,7 +153,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                 "type": "object", "additionalProperties": false,
                 "required": ["activation_id"],
                 "properties": {
-                    "activation_id": {"type": "string", "minLength": 1, "maxLength": MAX_ACTIVATION_ID_BYTES},
+                    "activation_id": {"type": "string", "minLength": 1, "maxLength": MAX_ACTIVATION_ID_BYTES, "description": "Any stable id for this activation (e.g. the task name); repeating it returns the same activation."},
                     "root": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "Absolute working directory to activate; defaults to the host's project directory. Must lie below a configured allowed root."}
                 }
             }),
@@ -163,12 +163,12 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             json!({
                 "type": "object", "additionalProperties": false,
                 "properties": {
-                    "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES},
-                    "byte_offset": {"type": "integer", "minimum": 0, "maximum": MAX_BYTE_OFFSET},
-                    "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES},
-                    "kind": {"type": "string", "enum": ["problems"]},
-                    "language": {"type": "string", "enum": ["rust", "python", "typescript"]},
-                    "offset": {"type": "integer", "minimum": 0, "maximum": MAX_PROBLEM_OFFSET}
+                    "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File relative to the project root; returns its source with diagnostics."},
+                    "byte_offset": {"type": "integer", "minimum": 0, "maximum": MAX_BYTE_OFFSET, "description": "Continue a truncated source reply from this byte offset."},
+                    "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Reference from an earlier reply: continue that result."},
+                    "kind": {"type": "string", "enum": ["problems"], "description": "`problems`: the project check results instead of a file."},
+                    "language": {"type": "string", "enum": ["rust", "python", "typescript"], "description": "With `problems`: limit to one language."},
+                    "offset": {"type": "integer", "minimum": 0, "maximum": MAX_PROBLEM_OFFSET, "description": "With `problems`: continue from this problem index (see `next_offset`)."}
                 }
             }),
         ),
@@ -176,7 +176,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             AssistanceTool::Diff,
             json!({
                 "type": "object", "additionalProperties": false,
-                "properties": {"mode": {"type":"string","enum":["head","staged","unstaged"],"default":"head"}, "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES}}
+                "properties": {"mode": {"type":"string","enum":["head","staged","unstaged"],"default":"head","description":"`head`: everything not yet committed; `staged` / `unstaged`: only that part."}, "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Reference from an earlier reply: continue that result."}}
             }),
         ),
         schema(
@@ -184,7 +184,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             json!({
                 "type": "object", "additionalProperties": false,
                 "required": ["detail_ref"],
-                "properties": {"detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES}}
+                "properties": {"detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Reference from an earlier reply: continue that result."}}
             }),
         ),
         schema(
@@ -200,11 +200,11 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                 "type": "object", "additionalProperties": false,
                 "required": ["operation_id"],
                 "properties": {
-                    "operation_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Any unique id for this edit; repeating it never applies the edit twice."},
                     "op": {"type": "string", "enum": ["replace", "insert", "delete", "rename"], "default": "replace", "description": "Symbol operation. replace: new body for `symbol` (or for `path`+`lines`); insert: new symbol placed `where` relative to `symbol`; delete: remove `symbol` with its header; rename: rename `symbol` project-wide to `new_name`."},
                     "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Symbol path `file#Owner/name`."},
                     "where": {"type": "string", "enum": ["before", "after", "first", "last"], "description": "For insert: before/after the anchor symbol, or first/last member of a container anchor."},
-                    "new_name": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "new_name": {"type": "string", "minLength": 1, "maxLength": 128, "description": "For rename: the new identifier, applied project-wide."},
                     "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES},
                     "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$", "description": "With `path`: inclusive 1-based line range to replace."},
                     "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Full-file form: the source_ref of the context/read this content is based on."},
@@ -240,9 +240,9 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                 "required": ["symbol"],
                 "properties": {
                     "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Symbol path `file#Owner/name`, or a bare name to search the project."},
-                    "usages": {"type": "boolean", "default": true},
-                    "callers": {"type": "integer", "minimum": 0, "maximum": 3, "default": 1},
-                    "callees": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0},
+                    "usages": {"type": "boolean", "default": true, "description": "Include usages (src/tests split, with source lines)."},
+                    "callers": {"type": "integer", "minimum": 0, "maximum": 3, "default": 1, "description": "Callers to list (0 = none); use ide.graph for deeper trees."},
+                    "callees": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0, "description": "Callees to list (0 = none)."},
                     "history": {"type": "boolean", "default": false, "description": "Include the last commits touching the definition (opt-in)."}
                 }
             }),
@@ -254,8 +254,8 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                 "required": ["symbol"],
                 "properties": {
                     "symbol": {"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES, "description":"Symbol path `file#Owner/name`, or a bare name to search the project."},
-                    "direction": {"type":"string", "enum":["callers", "callees", "both"], "default":"callers"},
-                    "depth": {"type":"integer", "minimum":1, "maximum":3, "default":2}
+                    "direction": {"type":"string", "enum":["callers", "callees", "both"], "default":"callers", "description":"`callers`: who calls it (blast radius); `callees`: what it calls; `both`."},
+                    "depth": {"type":"integer", "minimum":1, "maximum":3, "default":2, "description":"Levels to expand; 2 is usually enough."}
                 }
             }),
         ),
@@ -264,12 +264,12 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             json!({
                 "type": "object", "additionalProperties": false,
                 "properties": {
-                    "symbol": {"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES},
-                    "path": {"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES},
-                    "pattern": {"type":"string", "minLength":1, "maxLength":MAX_TEXT_BYTES},
-                    "command": {"type":"array", "minItems":1, "maxItems":64, "items":{"type":"string", "maxLength":MAX_TEXT_BYTES}},
-                    "status": {"type":"integer", "minimum":1},
-                    "budget_s": {"type":"integer", "minimum":1, "maximum":600, "default":120}
+                    "symbol": {"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES, "description":"Run the tests that reference this symbol (`file#Owner/name`)."},
+                    "path": {"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES, "description":"Run the tests in this file or directory."},
+                    "pattern": {"type":"string", "minLength":1, "maxLength":MAX_TEXT_BYTES, "description":"Run tests whose name matches this substring (runner filter)."},
+                    "command": {"type":"array", "minItems":1, "maxItems":64, "items":{"type":"string", "maxLength":MAX_TEXT_BYTES}, "description":"Explicit argv to run instead of the detected runner."},
+                    "status": {"type":"integer", "minimum":1, "description":"Re-read run number N (from `tests #N`) instead of starting one."},
+                    "budget_s": {"type":"integer", "minimum":1, "maximum":600, "default":120, "description":"Seconds before the run is stopped and reported as timed out."}
                 }
             }),
         ),
@@ -2000,7 +2000,10 @@ fn claude_envelope_reconnect_retry_hint_survives_in_content_text() {
 
 #[tool_router]
 impl StdioFacade {
-    /// Activates this actor/worktree once; call `ide.context` next before a native source edit.
+    /// Activate Agent IDE for this project — once per task, before any other ide.* call. Returns
+    /// a project card: languages with sizes, the build/check/test/lint commands, layout by
+    /// directory, entry points and docs. Use it to orient instead of reading README, Cargo.toml
+    /// or package.json. Then use ide.outline / ide.symbol instead of native file reads.
     #[tool(name = "ide.start", input_schema = tool_schemas()[0].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn start(
         &self,
@@ -2010,8 +2013,10 @@ impl StdioFacade {
         self.call(AssistanceTool::Start, parameters, context).await
     }
 
-    /// Reads bounded source and diagnostics before or after editing with the native host writer;
-    /// needs `path`, or `kind` set to `problems`.
+    /// Bounded source with current diagnostics for one `path`, or with `kind: "problems"` the
+    /// project's latest check results (errors and warnings by file, paged). Use `problems` to
+    /// see what is broken right now instead of running the build yourself; use `path` before or
+    /// after editing a file natively.
     #[tool(name = "ide.context", input_schema = tool_schemas()[1].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn context(
         &self,
@@ -2022,7 +2027,9 @@ impl StdioFacade {
             .await
     }
 
-    /// Reviews the accumulated native edits before the task finishes and `ide.stop` releases them.
+    /// Diff of what this task changed in the working tree (`head`, `staged` or `unstaged`),
+    /// paged. Review it before finishing or handing off, instead of running `git diff` in a
+    /// shell.
     #[tool(name = "ide.diff", input_schema = tool_schemas()[2].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn diff(
         &self,
@@ -2032,7 +2039,11 @@ impl StdioFacade {
         self.call(AssistanceTool::Diff, parameters, context).await
     }
 
-    /// Returns a file's skeleton: symbols with signatures and docs, no bodies.
+    /// Skeleton of a file (every symbol with signature, doc line and line numbers, members
+    /// indented, tests collapsed) or of a directory (files with line counts and first doc line).
+    /// A fraction of the cost of reading the file — use it before any native read of a source
+    /// file longer than a screen. Answers inline on a warm language server; a cold one answers
+    /// `pending` — poll ide.inspect.
     #[tool(name = "ide.outline", input_schema = tool_schemas()[6].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn outline(
         &self,
@@ -2043,7 +2054,9 @@ impl StdioFacade {
             .await
     }
 
-    /// Returns one symbol's body (`symbol`) or an explicit line range (`path` + `lines`), numbered.
+    /// Body of one symbol (`file#Owner/name`) or an explicit line range, numbered, with its doc
+    /// header. The precise replacement for reading a whole file when you already know what you
+    /// need; its `source_ref` is what a full-file ide.edit is based on.
     #[tool(name = "ide.read", input_schema = tool_schemas()[7].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn read(
         &self,
@@ -2053,8 +2066,11 @@ impl StdioFacade {
         self.call(AssistanceTool::Read, parameters, context).await
     }
 
-    /// Returns a symbol card: definition, signature, docs, usages, callers, and — opt-in via
-    /// `history` — the last commits touching the definition.
+    /// Symbol card for `file#Owner/name` or a bare name: resolved signature, doc, definition
+    /// location, usages split src/tests with the source line, callers and callees as full symbol
+    /// paths, and with `history: true` the last commits touching the definition. Language-server
+    /// accurate — replaces grep for usages and reading files to find callers. A bare name with
+    /// several matches returns the candidate paths.
     #[tool(name = "ide.symbol", input_schema = tool_schemas()[8].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn symbol(
         &self,
@@ -2064,7 +2080,10 @@ impl StdioFacade {
         self.call(AssistanceTool::Symbol, parameters, context).await
     }
 
-    /// Starts or retrieves one explicitly requested background test run.
+    /// Bounded call graph around one symbol: callers, callees or both, depth 1–3, at most 60
+    /// nodes, every node a full symbol path, cycles marked `(seen)`, tests marked `[test]`. Use
+    /// it to see the blast radius before changing a function or to trace how a call reaches a
+    /// symbol, instead of chained greps.
     #[tool(name = "ide.graph", input_schema = tool_schemas()[9].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn graph(
         &self,
@@ -2074,7 +2093,11 @@ impl StdioFacade {
         self.call(AssistanceTool::Graph, parameters, context).await
     }
 
-    /// Starts or retrieves one explicitly requested background test run.
+    /// Run tests selected by `symbol` (the tests that reference it), by `path`, by name
+    /// `pattern`, or an explicit `command`; one background run per worktree under `budget_s`.
+    /// Returns the pass/fail line with an exact rerun command; full output is paged through
+    /// ide.inspect (`status` re-reads a run). Use it instead of running the test command in a
+    /// shell: exact selection, bounded output.
     #[tool(name = "ide.test", input_schema = tool_schemas()[10].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn test(
         &self,
@@ -2084,7 +2107,9 @@ impl StdioFacade {
         self.call(AssistanceTool::Test, parameters, context).await
     }
 
-    /// Expands only a `detail_ref` returned by a pending or truncated IDE reply.
+    /// Fetch the result behind a `detail_ref`: a `pending` reply that has since completed, or
+    /// the next page of a long result (outline, symbol, graph, diff, test output). Poll every
+    /// few seconds while it stays pending.
     #[tool(name = "ide.inspect", input_schema = tool_schemas()[3].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn inspect(
         &self,
@@ -2095,7 +2120,8 @@ impl StdioFacade {
             .await
     }
 
-    /// Releases this actor's IDE binding at task end or handoff; edited files remain on disk.
+    /// End this task's IDE session; edited files stay on disk. Call it once when the task is
+    /// done or before handing off.
     #[tool(name = "ide.stop", input_schema = tool_schemas()[4].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn stop(
         &self,
@@ -2105,7 +2131,11 @@ impl StdioFacade {
         self.call(AssistanceTool::Stop, parameters, context).await
     }
 
-    /// Applies one bounded full-content edit only through the active host-bound product route.
+    /// Edit by symbol: `op` replace / insert / delete / rename on `file#Owner/name` (rename is
+    /// project-wide), or replace a `path` + `lines` range, or a full-file rewrite based on a
+    /// `source_ref`. Formats the result with the project formatter, runs the project check
+    /// (cargo check, pyright or tsc) and returns this file's errors and warnings in the reply.
+    /// Prefer it over native edit/write for source: no line matching, no separate check step.
     #[tool(name = "ide.edit", input_schema = tool_schemas()[5].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn edit(
         &self,
