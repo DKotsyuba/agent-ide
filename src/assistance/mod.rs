@@ -36,3 +36,6 @@ pub mod worker;
 
 /// Replaceable nonblocking sink for privacy-safe edit and native-fallback facts.
 pub mod telemetry;
+
+/// Owns explicitly requested background test runs for the daemon lifetime.
+pub mod tests;

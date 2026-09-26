@@ -103,6 +103,36 @@ pub const PROBLEMS_PAGE_SIZE: u32 = 20;
 /// adversarial value, matching [`untrusted_line`]'s single-line, control-free guarantee.
 const MAX_CODE_CHARS: usize = 64;
 
+/// Appends one bounded explicit-test status line while preserving the feed's byte ceiling.
+fn append_test_status(block: &str, status: &str) -> String {
+    let line = status
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(160)
+        .collect::<String>();
+    let prefix = block
+        .strip_suffix("</agent-ide>")
+        .unwrap_or(block)
+        .trim_end();
+    let separator = if prefix.ends_with("<agent-ide>") {
+        ""
+    } else {
+        "\n"
+    };
+    let mut result = format!("{prefix}{separator}{line}\n</agent-ide>");
+    if result.len() > crate::feed::MAX_BLOCK_BYTES {
+        let excess = result.len() - crate::feed::MAX_BLOCK_BYTES;
+        let start = prefix.find('\n').unwrap_or(prefix.len());
+        let body = &prefix[start..];
+        let cut = body
+            .char_indices()
+            .find(|(index, _)| *index >= excess)
+            .map_or(body.len(), |(index, _)| index);
+        result = format!("<agent-ide>{}\n{line}\n</agent-ide>", &body[cut..]);
+    }
+    result
+}
+
 /// Supplies the latest completed project check snapshots for one authorized worktree.
 ///
 /// Implementers must be usable from the daemon worker concurrently (`Send + Sync`) and must
@@ -150,6 +180,10 @@ struct FeedWiring {
     pending_restricted: HashSet<[u8; 32]>,
     /// Delivered-block state per `(binding, worktree)`.
     feed: FeedState,
+    /// Daemon-owned test runner for appending explicit test status to the same plate.
+    test_runs: Option<super::tests::TestRuns>,
+    /// Last test status actually delivered for each binding/worktree.
+    test_delivered: HashMap<FeedKey, String>,
 }
 
 /// Daemon-owned project problem feed: trigger routing, admission, and block delivery state.
@@ -470,9 +504,42 @@ impl ProjectProblemFeed {
         } else {
             self.rechecks_for(&bound.worktree)
         };
+        let test_status = state
+            .test_runs
+            .as_ref()
+            .and_then(|runs| runs.status_line(&bound.worktree));
+        let due_test = test_status
+            .as_ref()
+            .filter(|status| state.test_delivered.get(&key) != Some(*status));
+        let fits = std::cell::RefCell::new(Some(fits));
         let block = state
             .feed
-            .next_block_when(&key, &snapshots, &rechecks, fits)?;
+            .next_block_when(&key, &snapshots, &rechecks, |block| {
+                let combined = if let Some(status) = due_test {
+                    append_test_status(block, status)
+                } else {
+                    block.to_owned()
+                };
+                fits.borrow_mut().take().is_some_and(|fits| fits(&combined))
+            });
+        let block = match (block, due_test) {
+            (Some(block), Some(status)) => Some(append_test_status(&block, status)),
+            (Some(block), None) => Some(block),
+            (None, Some(status)) => {
+                let plate = append_test_status("<agent-ide>\n</agent-ide>", status);
+                fits.borrow_mut()
+                    .take()
+                    .is_some_and(|fits| fits(&plate))
+                    .then_some(plate)
+            }
+            (None, None) => None,
+        }?;
+        if let Some(status) = due_test {
+            state.test_delivered.insert(key.clone(), status.clone());
+            if let Some(runs) = &state.test_runs {
+                runs.mark_feed_status_delivered(&bound.worktree, status);
+            }
+        }
         let languages = snapshots
             .iter()
             .filter(|snapshot| {
@@ -503,9 +570,20 @@ impl ProjectProblemFeed {
             if let Some(bound) = state.bindings.remove(binding) {
                 state.feed.forget(&FeedKey {
                     binding: hex(binding),
+                    worktree: bound.worktree.clone(),
+                });
+                state.test_delivered.remove(&FeedKey {
+                    binding: hex(binding),
                     worktree: bound.worktree,
                 });
             }
+        }
+    }
+
+    /// Attaches the daemon's test status source before worker startup.
+    pub fn with_test_runs(&self, runs: super::tests::TestRuns) {
+        if let Ok(mut state) = self.state.lock() {
+            state.test_runs = Some(runs);
         }
     }
 

@@ -7,6 +7,7 @@ use super::{
     launcher::{LaunchTarget, LauncherConfig},
     problems::{ProblemSource, ProjectProblemFeed, parse_language, problems_text_with_rechecks},
     reply::{EditDiagnostics, ExecutionProfileCause, FailureCode, PeerReply, ResultKind},
+    tests::{StartResult, TestRuns},
 };
 use crate::telemetry::{
     AdmissionState, CancellationState, DescendantSettlement, OutputSizeClass, Telemetry,
@@ -431,6 +432,8 @@ struct Shared {
     /// Installed through [`WorkerHandle::with_project_feed`], which also makes it the
     /// [`Shared::problem_source`]. Absent when project checks are not configured.
     project_feed: Option<Arc<ProjectProblemFeed>>,
+    /// Explicitly requested background test processes, retained until daemon shutdown.
+    test_runs: TestRuns,
 }
 impl Shared {
     /// Acquires a new transient binding use at one exact admission/return boundary.
@@ -764,10 +767,12 @@ impl WorkerHandle {
     /// the sole worker must not be killed by a daemon that considers itself idle while it runs.
     /// Both counts live behind one short-held lock, so the answer is a consistent snapshot.
     pub fn is_processing(&self) -> bool {
-        self.shared
-            .ledger
-            .lock()
-            .is_ok_and(|ledger| ledger.in_flight > 0 || !ledger.queue.is_empty())
+        self.shared.test_runs.is_busy()
+            || self
+                .shared
+                .ledger
+                .lock()
+                .is_ok_and(|ledger| ledger.in_flight > 0 || !ledger.queue.is_empty())
     }
 
     /// Creates finite channels only; Store and Workspace are opened later under the daemon lock.
@@ -813,6 +818,7 @@ impl WorkerHandle {
                 telemetry,
                 problem_source: None,
                 project_feed: None,
+                test_runs: TestRuns::default(),
             }),
             inspect,
             receiver: Mutex::new(Some(receiver)),
@@ -844,6 +850,7 @@ impl WorkerHandle {
         let shared = Arc::get_mut(&mut self.shared)
             .expect("project feed must be attached before worker startup");
         shared.problem_source = Some(feed.clone());
+        feed.with_test_runs(shared.test_runs.clone());
         shared.project_feed = Some(feed);
         self
     }
@@ -851,6 +858,16 @@ impl WorkerHandle {
     /// Returns the attached project problem feed, if project checks are configured.
     pub fn project_feed(&self) -> Option<&Arc<ProjectProblemFeed>> {
         self.shared.project_feed.as_ref()
+    }
+
+    /// Returns an undelivered test status line for the binding that started that job.
+    pub fn test_status_line(&self, binding: &[u8; 32]) -> Option<String> {
+        self.shared.test_runs.status_line_for_binding(binding)
+    }
+
+    /// Marks a test status line delivered only if it is still current and fits the reply.
+    pub fn mark_test_status_delivered(&self, binding: &[u8; 32], line: &str) -> bool {
+        self.shared.test_runs.mark_status_delivered(binding, line)
     }
 
     /// Returns the shared slot that holds the telemetry owner once startup has opened it.
@@ -1094,6 +1111,18 @@ impl WorkerHandle {
         if self.target(attachment).is_none() {
             return PeerReply::Error {
                 code: FailureCode::LauncherConfiguration,
+            };
+        }
+        if tool == AssistanceTool::Test {
+            let (send, wait) = oneshot::channel();
+            if let Err(code) = self.enqueue(invocation, tool, parameters, attachment, Some(send)) {
+                return PeerReply::Error { code };
+            }
+            return match tokio::time::timeout(Duration::from_secs(5), wait).await {
+                Ok(Ok(reply)) => reply,
+                _ => PeerReply::Error {
+                    code: FailureCode::Deadline,
+                },
             };
         }
         match admit_initial_inspection(&self.inspect, || {
@@ -1476,6 +1505,181 @@ struct Worker<'a> {
 }
 
 impl<'a> Worker<'a> {
+    /// Handles an explicit test start or same-worktree status request.
+    async fn test(
+        &mut self,
+        job: &mut Job,
+    ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        let binding = job.invocation.binding_ref().clone();
+        let authority = self.authority(&binding).await?;
+        self.shared.active(&binding)?;
+        let root = authority.worktree().worktree_path().to_path_buf();
+        let budget = Duration::from_secs(
+            job.parameters
+                .get("budget_s")
+                .and_then(Value::as_u64)
+                .unwrap_or(120)
+                .clamp(1, 600),
+        );
+        let (result, detail_ref) = if let Some(id) =
+            job.parameters.get("status").and_then(Value::as_u64)
+        {
+            let Some(job_status) = self.shared.test_runs.get(&root, id, &binding.fingerprint())
+            else {
+                return Ok((
+                    PeerReply::Complete {
+                        kind: ResultKind::Test,
+                        text: format!("tests #{id}: unknown job"),
+                        detail_ref: None,
+                        truncated: false,
+                        continuation: false,
+                    },
+                    Some(authority),
+                    None,
+                ));
+            };
+            if let Some(result) = job_status.result {
+                let owns_detail = job_status.owner == binding.fingerprint();
+                let text = test_result_text(id, &result, owns_detail);
+                if let Ok(mut ledger) = self.shared.ledger.lock()
+                    && let Some(detail) = ledger.details.get_mut(&result.detail_ref)
+                {
+                    detail.reply = PeerReply::Complete {
+                        kind: ResultKind::Test,
+                        text: result.output.clone(),
+                        detail_ref: None,
+                        truncated: false,
+                        continuation: false,
+                    };
+                }
+                (text, owns_detail.then_some(result.detail_ref))
+            } else {
+                (
+                    format!("tests #{id}: running {} s", job_status.age.as_secs()),
+                    None,
+                )
+            }
+        } else {
+            let (argv, language, selected_count) = if let Some(path) =
+                job.parameters.get("path").and_then(Value::as_str)
+            {
+                test_selection(&root, crate::lang::TestTarget::File(PathBuf::from(path)))?
+            } else if let Some(pattern) = job.parameters.get("pattern").and_then(Value::as_str) {
+                test_selection(&root, crate::lang::TestTarget::Pattern(pattern.to_owned()))?
+            } else if let Some(args) = job.parameters.get("command").and_then(Value::as_array) {
+                let language =
+                    detect_test_language(&root).ok_or(FailureCode::ProviderUnavailable)?;
+                (
+                    args.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect(),
+                    language,
+                    None,
+                )
+            } else if let Some(symbol) = job
+                .parameters
+                .get("symbol")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+            {
+                let (referencing_tests, language) =
+                    self.tests_referencing_symbol(job, &symbol).await?;
+                if referencing_tests.is_empty() {
+                    return Ok((
+                        PeerReply::Complete {
+                            kind: ResultKind::Test,
+                            text: format!(
+                                "tests: no tests reference {symbol}; run by path or pattern"
+                            ),
+                            detail_ref: None,
+                            truncated: false,
+                            continuation: false,
+                        },
+                        Some(authority),
+                        None,
+                    ));
+                }
+                let path = crate::lang::SymbolPath::parse(&symbol)
+                    .map_err(|_| FailureCode::UnknownSymbol)?;
+                let target = crate::lang::TestTarget::Symbol {
+                    path,
+                    referencing_tests,
+                };
+                let support =
+                    crate::lang::support(language).ok_or(FailureCode::ProviderUnavailable)?;
+                let project = support
+                    .detect(&root)
+                    .ok_or(FailureCode::ProviderUnavailable)?;
+                let selection = support
+                    .test_selection(&project, &target)
+                    .map_err(|_| FailureCode::ProviderUnavailable)?;
+                let count = Some(selection.tests.len());
+                (selection.command, language, count)
+            } else {
+                return Ok((
+                    PeerReply::Complete {
+                        kind: ResultKind::Test,
+                        text: "symbol test selection unavailable".into(),
+                        detail_ref: None,
+                        truncated: false,
+                        continuation: false,
+                    },
+                    Some(authority),
+                    None,
+                ));
+            };
+            match self.shared.test_runs.start(
+                root,
+                argv.clone(),
+                language,
+                budget,
+                job.reference.clone(),
+                binding.fingerprint(),
+            ) {
+                StartResult::Started(id) => {
+                    let selected = selected_count
+                        .map_or_else(String::new, |count| format!(" ({count} tests selected)"));
+                    let line = format!(
+                        "tests #{id}: started — {}{selected} (budget {} s)",
+                        display_argv(&argv),
+                        budget.as_secs()
+                    );
+                    return Ok((
+                        PeerReply::Complete {
+                            kind: ResultKind::Test,
+                            text: line,
+                            detail_ref: Some(job.reference.clone()),
+                            truncated: false,
+                            continuation: false,
+                        },
+                        Some(authority),
+                        None,
+                    ));
+                }
+                StartResult::Running(id, age) => (
+                    format!(
+                        "tests #{id}: still running ({} s); ide.test {{\"status\": {id}}}",
+                        age.as_secs()
+                    ),
+                    None,
+                ),
+                StartResult::Failed => return Err(FailureCode::Internal),
+            }
+        };
+        Ok((
+            PeerReply::Complete {
+                kind: ResultKind::Test,
+                text: result,
+                detail_ref,
+                truncated: false,
+                continuation: false,
+            },
+            Some(authority),
+            None,
+        ))
+    }
+
     /// Records one already-settled owned-child completion using closed output and lifecycle facts.
     ///
     /// `output_bytes` is the saturated sum of existing bounded captures and never contains their
@@ -1582,7 +1786,9 @@ impl<'a> Worker<'a> {
         } else if tokio::time::Instant::now() >= job.deadline {
             Err(FailureCode::Deadline)
         } else {
-            self.reconcile_hints(&job).await;
+            if job.tool != AssistanceTool::Test {
+                self.reconcile_hints(&job).await;
+            }
             if tokio::time::Instant::now() >= job.deadline {
                 Err(FailureCode::Deadline)
             } else {
@@ -1594,6 +1800,7 @@ impl<'a> Worker<'a> {
                     AssistanceTool::Outline => self.outline(&mut job).await,
                     AssistanceTool::Read => self.read(&mut job).await,
                     AssistanceTool::Symbol => self.symbol(&mut job).await,
+                    AssistanceTool::Test => self.test(&mut job).await,
                     _ => Err(FailureCode::Internal),
                 }
             }
@@ -3394,7 +3601,133 @@ fn errorlog_method(tool: AssistanceTool) -> crate::errorlog::Method {
         AssistanceTool::Outline => crate::errorlog::Method::Outline,
         AssistanceTool::Read => crate::errorlog::Method::Read,
         AssistanceTool::Symbol => crate::errorlog::Method::Symbol,
+        AssistanceTool::Test => crate::errorlog::Method::Test,
     }
+}
+
+/// Chooses the first implemented language project detected at the worktree root.
+fn detect_test_language(root: &Path) -> Option<crate::lang::Language> {
+    [
+        crate::lang::Language::Rust,
+        crate::lang::Language::Python,
+        crate::lang::Language::TypeScript,
+        crate::lang::Language::Go,
+    ]
+    .into_iter()
+    .find(|language| {
+        crate::lang::support(*language)
+            .and_then(|support| support.detect(root))
+            .is_some()
+    })
+}
+
+/// Resolves a file or filter target through the detected language's existing runner contract.
+fn test_selection(
+    root: &Path,
+    target: crate::lang::TestTarget,
+) -> Result<(Vec<String>, crate::lang::Language, Option<usize>), FailureCode> {
+    for language in [
+        crate::lang::Language::Rust,
+        crate::lang::Language::Python,
+        crate::lang::Language::TypeScript,
+        crate::lang::Language::Go,
+    ] {
+        let Some(support) = crate::lang::support(language) else {
+            continue;
+        };
+        let Some(project) = support.detect(root) else {
+            continue;
+        };
+        let selection = support
+            .test_selection(&project, &target)
+            .map_err(|_| FailureCode::ProviderUnavailable)?;
+        let count = (!selection.tests.is_empty()).then_some(selection.tests.len());
+        return Ok((selection.command, language, count));
+    }
+    Err(FailureCode::ProviderUnavailable)
+}
+
+/// Formats an argv vector for the compact test status line without shell interpretation.
+fn display_argv(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| {
+            let printable = arg
+                .chars()
+                .map(|character| {
+                    if character.is_control() {
+                        character.escape_default().to_string()
+                    } else {
+                        character.to_string()
+                    }
+                })
+                .collect::<String>();
+            if printable
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_./:-".contains(&byte))
+            {
+                printable
+            } else {
+                format!("'{}'", printable.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Keeps runner-provided failure labels and messages on bounded control-free reply lines.
+fn test_text_line(value: &str, max_chars: usize) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(max_chars)
+        .collect()
+}
+
+/// Renders the bounded parsed test result and actionable rerun/detail references.
+fn test_result_text(id: u64, result: &super::tests::RunResult, owns_detail: bool) -> String {
+    let report = &result.report;
+    let mut text = if result.stopped {
+        format!(
+            "tests #{id}: stopped at budget {} s — {} passed, {} failed so far",
+            result.budget.as_secs(),
+            report.passed,
+            report.failed
+        )
+    } else {
+        format!(
+            "tests #{id}: {} passed, {} failed, {} s",
+            report.passed,
+            report.failed,
+            result.elapsed.as_secs()
+        )
+    };
+    if report.passed == 0 && report.failed == 0 && report.incomplete {
+        text.push_str(" (no summary parsed)");
+    }
+    for failure in report.failures.iter().take(8) {
+        text.push_str(&format!("\n  FAIL {}", test_text_line(&failure.name, 160)));
+        if let Some((path, line)) = &failure.location {
+            text.push_str(&format!(
+                "\n       {}:{}  {}",
+                test_text_line(&path.display().to_string(), 128),
+                line,
+                test_text_line(&failure.message, 240)
+            ));
+        } else {
+            text.push_str(&format!(
+                "\n       {}",
+                test_text_line(&failure.message, 240)
+            ));
+        }
+    }
+    text.push_str(&format!("\n  rerun: {}", display_argv(&result.command)));
+    if owns_detail {
+        text.push_str(&format!(
+            "\n  full output: ide.inspect {}",
+            result.detail_ref
+        ));
+    }
+    text
 }
 
 /// Records one execution-profile refusal with its closed condition detail, best-effort.
@@ -3755,6 +4088,7 @@ mod stop_retry_tests {
                 telemetry: Arc::new(crate::assistance::telemetry::NoopEditTelemetry),
                 problem_source: None,
                 project_feed: None,
+                test_runs: TestRuns::default(),
             }),
             workspace,
             observations: WorkspaceStore::new(store),

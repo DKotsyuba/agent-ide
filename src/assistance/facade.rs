@@ -1,6 +1,6 @@
 //! Bounded MCP discovery, finite Application routing, and fail-open Assistance feedback.
 //!
-//! This module has no peer-domain implementation of its own. It validates the six logical tool
+//! This module has no peer-domain implementation of its own. It validates the ten logical tool
 //! inputs, carries trusted host transport context, and honestly reports an unavailable or
 //! incomplete result until Workspace, Intelligence, and Changes return their typed facts.
 
@@ -75,6 +75,8 @@ pub enum AssistanceTool {
     Read,
     /// Returns a symbol card: definition, signature, docs, usages, callers.
     Symbol,
+    /// Runs or inspects one explicitly requested project test job.
+    Test,
 }
 
 impl AssistanceTool {
@@ -90,6 +92,7 @@ impl AssistanceTool {
             Self::Outline => "ide.outline",
             Self::Read => "ide.read",
             Self::Symbol => "ide.symbol",
+            Self::Test => "ide.test",
         }
     }
 
@@ -105,6 +108,7 @@ impl AssistanceTool {
             Self::Outline => AssistanceMethod::Outline,
             Self::Read => AssistanceMethod::Read,
             Self::Symbol => AssistanceMethod::Symbol,
+            Self::Test => AssistanceMethod::Test,
         }
     }
 }
@@ -120,8 +124,8 @@ pub struct ToolSchema {
     pub input_schema: Value,
 }
 
-/// Returns exactly the nine current Assistance schemas regardless of daemon availability.
-pub fn tool_schemas() -> [ToolSchema; 9] {
+/// Returns exactly the ten current Assistance schemas regardless of daemon availability.
+pub fn tool_schemas() -> [ToolSchema; 10] {
     [
         schema(
             AssistanceTool::Start,
@@ -219,6 +223,20 @@ pub fn tool_schemas() -> [ToolSchema; 9] {
                     "usages": {"type": "boolean", "default": true},
                     "callers": {"type": "integer", "minimum": 0, "maximum": 3, "default": 1},
                     "callees": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0}
+                }
+            }),
+        ),
+        schema(
+            AssistanceTool::Test,
+            json!({
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                    "symbol": {"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES},
+                    "path": {"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES},
+                    "pattern": {"type":"string", "minLength":1, "maxLength":MAX_TEXT_BYTES},
+                    "command": {"type":"array", "minItems":1, "maxItems":64, "items":{"type":"string", "maxLength":MAX_TEXT_BYTES}},
+                    "status": {"type":"integer", "minimum":1},
+                    "budget_s": {"type":"integer", "minimum":1, "maximum":600, "default":120}
                 }
             }),
         ),
@@ -401,6 +419,7 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
         AssistanceTool::Outline => &["path"],
         AssistanceTool::Read => &["symbol", "path", "lines"],
         AssistanceTool::Symbol => &["symbol", "usages", "callers", "callees"],
+        AssistanceTool::Test => &["symbol", "path", "pattern", "command", "status", "budget_s"],
     }
 }
 
@@ -528,6 +547,73 @@ pub fn validate_call(
                 {
                     return Err(invalid_field(field, FieldRule::NonNegativeInteger(3)));
                 }
+            }
+        }
+        AssistanceTool::Test => {
+            let targets = ["symbol", "path", "pattern", "command", "status"]
+                .into_iter()
+                .filter(|field| object.contains_key(*field))
+                .count();
+            if targets != 1 {
+                return Err(invalid_field(
+                    "target",
+                    FieldRule::OneOf("exactly one of symbol, path, pattern, command, or status"),
+                ));
+            }
+            optional_string(object, "symbol", MAX_SYMBOL_PATH_BYTES)?;
+            if let Some(path) = object.get("path") {
+                let path = path
+                    .as_str()
+                    .ok_or_else(|| invalid_field("path", FieldRule::String))?;
+                if path.len() > MAX_RELATIVE_PATH_BYTES {
+                    return Err(invalid_field(
+                        "path",
+                        FieldRule::TooLong(MAX_RELATIVE_PATH_BYTES),
+                    ));
+                }
+                if let Some(rule) = path_shape_rule(path) {
+                    return Err(invalid_field("path", rule));
+                }
+            }
+            optional_string(object, "pattern", MAX_TEXT_BYTES)?;
+            if let Some(command) = object.get("command") {
+                let argv = command
+                    .as_array()
+                    .filter(|argv| !argv.is_empty() && argv.len() <= 64)
+                    .ok_or_else(|| {
+                        invalid_field(
+                            "command",
+                            FieldRule::OneOf("a non-empty argv array with at most 64 entries"),
+                        )
+                    })?;
+                if argv.iter().any(|arg| {
+                    arg.as_str()
+                        .is_none_or(|arg| arg.len() > MAX_TEXT_BYTES || arg.contains('\0'))
+                }) {
+                    return Err(invalid_field(
+                        "command",
+                        FieldRule::OneOf("strings up to 512 bytes without NUL"),
+                    ));
+                }
+            }
+            if object
+                .get("status")
+                .is_some_and(|value| value.as_u64().is_none_or(|id| id == 0))
+            {
+                return Err(invalid_field(
+                    "status",
+                    FieldRule::NonNegativeInteger(u64::MAX),
+                ));
+            }
+            if object.get("budget_s").is_some_and(|value| {
+                value
+                    .as_u64()
+                    .is_none_or(|budget| !(1..=600).contains(&budget))
+            }) {
+                return Err(invalid_field(
+                    "budget_s",
+                    FieldRule::NonNegativeInteger(600),
+                ));
             }
         }
         AssistanceTool::Start => {
@@ -946,6 +1032,7 @@ impl AssistanceFacade {
                                     | (AssistanceTool::Context, ResultKind::Context)
                                     | (AssistanceTool::Diff, ResultKind::Diff)
                                     | (AssistanceTool::Stop, ResultKind::Stop)
+                                    | (AssistanceTool::Test, ResultKind::Test)
                             ) =>
                     {
                         FacadeOutcome::Reply(reply, status)
@@ -1350,7 +1437,7 @@ fn codex_route_identity(meta: &Map<String, Value>) -> Option<CodexRouteIdentity>
     CodexRouteIdentity::new(root_session, actor).ok()
 }
 
-/// Hosts the static six-tool rmcp surface even when no trusted host attachment exists.
+/// Hosts the static ten-tool rmcp surface even when no trusted host attachment exists.
 #[derive(Clone)]
 pub struct StdioFacade {
     /// Connect-only Application endpoint and finite deadline.
@@ -1382,7 +1469,7 @@ impl StdioFacade {
         }
     }
 
-    /// Creates a disconnected six-tool facade for managed startup failure.
+    /// Creates a disconnected ten-tool facade for managed startup failure.
     ///
     /// Discovery remains static and calls validate normally before returning unavailable. The
     /// facade contains neither a host attachment nor an IPC path, so it cannot disclose request
@@ -1638,7 +1725,7 @@ impl StdioFacade {
 /// Renders the complete compact MCP result within the same exact envelope that retained Diff page
 /// fitting uses.
 ///
-/// [`content::render`] shrinks only owner Complete text at UTF-8 boundaries. Diff pages have already
+/// [`content::render_with_status`] shrinks only owner Complete text at UTF-8 boundaries. Diff pages have already
 /// passed [`content::fits`] without shrinking, so the facade never re-cuts an accepted whole hunk.
 ///
 /// `envelope` selects whether the final carrier also duplicates the typed reply as
@@ -1885,6 +1972,16 @@ impl StdioFacade {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         self.call(AssistanceTool::Symbol, parameters, context).await
+    }
+
+    /// Starts or retrieves one explicitly requested background test run.
+    #[tool(name = "ide.test", input_schema = tool_schemas()[9].input_schema.as_object().expect("tool schema is an object").clone())]
+    async fn test(
+        &self,
+        Parameters(parameters): Parameters<Value>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.call(AssistanceTool::Test, parameters, context).await
     }
 
     /// Expands only a `detail_ref` returned by a pending or truncated IDE reply.

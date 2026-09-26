@@ -389,7 +389,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// for exactly that count under the originally captured byte budget.
 ///
 /// Fitting is measured through [`content::fits`], the same compact projection and final serialized
-/// envelope predicate [`content::render`] uses for the complete MCP result the host receives. Using
+/// envelope predicate [`content::render_with_status`] uses for the complete MCP result the host receives. Using
 /// anything narrower here — such as the raw serialized [`PeerReply`] with an approximate fixed
 /// reserve — could accept a page that the facade then has to cut after its cursor advanced.
 ///

@@ -72,7 +72,7 @@ complete context: {{ text }}
 {{ "\n" }}Diagnostics are exactly as reported; use ide.edit with source_ref {{ detail_ref }} when available, otherwise use the native editor
 {%- endif -%}
 {%- endif -%}
-{%- if state == "complete" and (kind == "outline" or kind == "read" or kind == "symbol") -%}
+{%- if state == "complete" and (kind == "outline" or kind == "read" or kind == "symbol" or kind == "test") -%}
 {{ text }}
 {%- if truncated and detail_ref and continuation -%}
 {{ "\n" }}Output is truncated; use ide.inspect with detail_ref {{ detail_ref }} for the next page

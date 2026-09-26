@@ -9,10 +9,10 @@ use serde_json::Value;
 
 const MAX_OPAQUE_ID_BYTES: usize = 128;
 
-/// Wire version reserved exclusively for the long-lived `ClientLease` connection (EYES-r2 §2).
+/// Wire version for the long-lived `ClientLease` connection (EYES-r2 §2).
 ///
-/// Distinct from the v1 health, v2 hook/method, and v3 edit versions so a lease request is
-/// identified from the same top-level `version` field before any Assistance dispatch is attempted.
+/// `ide.test` also uses v4; Application distinguishes the lease handshake by its fixed `method`
+/// tag before it routes a versioned Assistance dispatch.
 pub const CLIENT_LEASE_WIRE_VERSION: u8 = 4;
 
 /// Represents the complete `ClientLease` request and rejects all undeclared wire fields.
@@ -119,7 +119,7 @@ impl OpaqueJson {
     }
 }
 
-/// Names the closed Assistance operations Application may route through wire v2 or v3.
+/// Names the closed Assistance operations Application may route through wire v2, v3, or v4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssistanceMethod {
     /// Separate sanitized hook-observation ingress; never a generic event subscription.
@@ -142,13 +142,16 @@ pub enum AssistanceMethod {
     Read,
     /// v0.4 `ide.symbol` symbol card, wire version 3.
     Symbol,
+    /// v0.4 `ide.test` explicit test run/status, wire version 4.
+    Test,
 }
 
 impl AssistanceMethod {
-    /// Wire version that carries this method: the v0.2+ methods need version 3.
+    /// Wire version that carries this method: `ide.test` needs version 4.
     pub(crate) fn wire_version(self) -> u64 {
         match self {
             Self::Edit | Self::Outline | Self::Read | Self::Symbol => 3,
+            Self::Test => 4,
             _ => 2,
         }
     }
@@ -165,6 +168,7 @@ impl AssistanceMethod {
             "outline" if version == 3 => Some(Self::Outline),
             "read" if version == 3 => Some(Self::Read),
             "symbol" if version == 3 => Some(Self::Symbol),
+            "test" if version == 4 => Some(Self::Test),
             _ => None,
         }
     }
@@ -306,7 +310,7 @@ impl MethodDispatch {
 pub enum AssistanceDispatch {
     /// One sanitized hook observation submitted without any retained queue or subscription.
     HookSubmit(HookSubmit),
-    /// One closed v2/v3 method dispatch; Application still enforces the version-specific set.
+    /// One closed v2/v3/v4 method dispatch; Application still enforces the version-specific set.
     MethodDispatch(MethodDispatch),
 }
 
