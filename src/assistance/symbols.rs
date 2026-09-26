@@ -476,25 +476,18 @@ impl Worker<'_> {
         usages
     }
 
-    /// Shared tail of every symbol job: epoch fence, deadline, authority and liveness checks.
+    /// Shared tail of every symbol job: deadline, authority, liveness and source checks.
+    ///
+    /// No native-epoch fence here: a symbol job may wait tens of seconds for a loading
+    /// language server, and a Codex host posts a native hint for every shell command the agent
+    /// runs meanwhile (its own `sleep` between polls), which would discard a correct result.
+    /// What the result depends on is the observed file, and `source_matches` re-reads it.
     async fn finish_symbol_job(
         &mut self,
         job: &Job,
         binding: &BindingRef,
         observed: &SourceObservation,
     ) -> Result<AuthorityStamp, FailureCode> {
-        let epoch = self
-            .shared
-            .ledger
-            .lock()
-            .map_err(|_| FailureCode::Internal)?
-            .native_epoch
-            .get(binding)
-            .copied()
-            .unwrap_or(0);
-        if epoch != job.native_epoch {
-            return Err(FailureCode::SourceUnavailable);
-        }
         if tokio::time::Instant::now() >= job.deadline {
             return Err(FailureCode::Deadline);
         }
