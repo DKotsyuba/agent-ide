@@ -44,6 +44,12 @@ pub(super) struct ProviderContext {
 
 /// One long-lived Rust session owned by a binding: the child, its transport driver and the
 /// admitted view it holds until the binding stops or the transport dies.
+/// Longest a symbol request waits for the language server to become ready before answering
+/// `provider_loading`: a cold rust-analyzer on a fresh worktree needs cargo metadata and an index
+/// pass, routinely 20–40 s. The reply stays `pending` meanwhile, so the agent keeps polling
+/// instead of managing retries.
+const LIVE_READINESS_WAIT: Duration = Duration::from_secs(60);
+
 struct LiveRust {
     child: RustProtocolChild,
     live: LiveSession,
@@ -917,7 +923,7 @@ impl Worker<'_> {
             .deadline
             .saturating_duration_since(tokio::time::Instant::now())
             .saturating_sub(Duration::from_secs(1))
-            .clamp(Duration::from_millis(100), Duration::from_secs(10));
+            .clamp(Duration::from_millis(100), LIVE_READINESS_WAIT);
         let readiness = {
             let entry = self
                 .providers
