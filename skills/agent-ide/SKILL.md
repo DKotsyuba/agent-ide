@@ -46,7 +46,11 @@ and cost a fraction of the context:
   — the body with line numbers; its `source_ref` is what `ide.edit` needs.
 
 Edit by symbol with the same paths; every form formats the candidate with the project's
-formatter and answers with the file's diagnostics:
+formatter, then runs the project check (cargo check, pyright or tsc) and answers with the
+edited file's problems from it — `current_reported` lists `path:line:col severity [code]
+message` lines and the check's duration, `current_clean` means the completed check named
+none. A broken edit is usually reported within seconds; the check waits at most 90 s, after
+which the reply says `unknown` and `ide.context` shows the result when it lands.
 
 - `ide.edit {"operation_id":"…","op":"replace","symbol":"src/x.rs#Type/method","content":"…"}`
   — new body for the symbol; `content` is the whole symbol including its doc comment and

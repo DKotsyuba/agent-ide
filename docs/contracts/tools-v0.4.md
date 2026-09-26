@@ -184,17 +184,21 @@ Input operations:
 {op: "replace", path: "src/index.ts", lines: "1-12", content: "…"}          // fallback mode
 ```
 
-For a symbol, `content` is the complete symbol including its header. The IDE derives indentation and blank lines from neighboring code. After writing, run the project's formatter for the file, if available, then diagnose the file. `rename` is performed by the language server across the project.
+For a symbol, `content` is the complete symbol including its header. The IDE derives indentation and blank lines from neighboring code. After writing, the project's formatter runs over the candidate (before the write), then the project check (cargo check / pyright / tsc) is scheduled at once and the reply carries the edited file's problems from it. `rename` is performed by the language server across the project.
 
-Output:
+Output (implemented wire form):
 
 ```text
-edit: replaced src/index.ts#ClassImpl/method (lines 40–58 → 40–61)
-format: prettier applied
-diagnostics: 1 error
-  src/index.ts:47:12 error TS2322: Type 'string' is not assignable to type 'number'
-rerun tests: ide.test {"symbol":"src/index.ts#ClassImpl/method"}
+edit: replaced; path src/lang/path.rs; source_ref …-3; diagnostics: current_reported (project check 1.8s: 1 errors, 0 warnings in this file)
+src/lang/path.rs:132:9 error [E0308] mismatched types
+Next: use ide.edit with source_ref …-3
 ```
+
+```text
+edit: replaced; path src/lang/path.rs; source_ref …-4; diagnostics: current_clean. Next: use ide.diff
+```
+
+`current_clean` is only ever derived from a completed project check that named no problem in the file; a language server's empty publish is not taken as proof. A provider report for the exact post-edit version (an error rust-analyzer or tsserver found on its own) is kept as it arrives instantly. The reply waits at most 90 s for the check, then says `diagnostics: unknown` and the result reaches the next `<agent-ide>` block or `ide.context`. The `rerun tests:` hint arrives with `ide.test` (§2.6).
 
 For `rename`:
 
