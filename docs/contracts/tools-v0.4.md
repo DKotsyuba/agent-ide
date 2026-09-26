@@ -223,6 +223,11 @@ Immediate output:
 tests #3: started — cargo test --workspace worker::  (4 tests selected, budget 120 s)
 ```
 
+The `symbol` form first asks the live language server for the symbol's references, which takes
+seconds on a cold session, so it answers `pending` at once and the started line (or
+`tests: no tests reference …`) arrives through `ide.inspect`; `path`, `pattern` and `command`
+answer inline.
+
 Status appears in the status block and through `ide.test {status: 3}`:
 
 ```text

@@ -4378,9 +4378,10 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
     daemon.wait().await.unwrap();
 }
 
-/// Reuses `ide.symbol`'s live Rust session to select and run a test referencing that symbol.
-#[tokio::test]
-async fn configured_product_symbol_test_uses_the_live_symbol_session() {
+/// Builds the fixture for `ide.test {symbol}`: a real rust-analyzer provider (through a wrapper
+/// script so the accepted executable stays fixture-owned), one method `FileFlag::is_file`, and one
+/// integration test referencing it. The daemon is not started; every caller starts its own.
+fn symbol_test_fixture() -> ProductFixture {
     use std::os::unix::fs::PermissionsExt;
 
     let toolchain_dir = std::env::var("AGENT_IDE_RUST_TOOLCHAIN_DIR")
@@ -4430,6 +4431,13 @@ async fn configured_product_symbol_test_uses_the_live_symbol_session() {
     .unwrap();
     fixture.git(&["add", "--", "src/lib.rs", "tests/path_tests.rs"]);
     fixture.git(&["commit", "--quiet", "-m", "symbol test fixture"]);
+    fixture
+}
+
+/// Reuses `ide.symbol`'s live Rust session to select and run a test referencing that symbol.
+#[tokio::test]
+async fn configured_product_symbol_test_uses_the_live_symbol_session() {
+    let fixture = symbol_test_fixture();
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "symbol-test").await;
     let started = actor
@@ -4460,7 +4468,8 @@ async fn configured_product_symbol_test_uses_the_live_symbol_session() {
             json!({"symbol":"src/lib.rs#FileFlag/is_file"}),
         )
         .await;
-    assert_eq!(started["state"], "complete", "{started}");
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "test", "{started}");
     assert!(
         started["text"]
             .as_str()
@@ -4487,6 +4496,50 @@ async fn configured_product_symbol_test_uses_the_live_symbol_session() {
     assert!(
         result["text"].as_str().unwrap().contains("checks_is_file"),
         "{result}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// The first `ide.test {symbol}` on a cold session — no earlier `ide.symbol` warmed rust-analyzer —
+/// answers `pending` at once instead of holding the request while the language server starts
+/// (which outlasts the bridge's budget and made the re-sent call a rejected replay); the started
+/// line then arrives through `ide.inspect`.
+#[tokio::test]
+async fn configured_product_symbol_test_on_a_cold_session_answers_pending_first() {
+    let fixture = symbol_test_fixture();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "cold-symbol-test").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"cold-symbol-test-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let asked = tokio::time::Instant::now();
+    let pending = actor
+        .call(
+            &fixture,
+            "ide.test",
+            json!({"symbol":"src/lib.rs#FileFlag/is_file"}),
+        )
+        .await;
+    let elapsed = asked.elapsed();
+    assert_eq!(pending["state"], "pending", "{pending}");
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "cold symbol test answered after {elapsed:?}: {pending}"
+    );
+    let started = actor.settle(&fixture, pending).await;
+    assert_eq!(started["kind"], "test", "{started}");
+    let text = started["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("tests #1: started — ") && text.contains("(1 tests selected)"),
+        "{started}"
     );
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
