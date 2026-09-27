@@ -302,3 +302,86 @@ fn error_journal_lines_in_the_last_day_are_counted() {
     );
     let _ = fs::remove_dir_all(&layout.root);
 }
+
+/// `.js`/`.mjs`/`.cjs` toolchain entries are probed through the configured Node — a
+/// non-executable `tsc.js` reports a version instead of `unresponsive` — an interpreter
+/// answering `--version` on stderr is accepted, and JSON-RPC framing noise (a `tsserver.js`
+/// answer that carries no version) never reads as a version.
+#[test]
+fn js_and_stderr_toolchains_report_versions_not_unresponsive() {
+    let layout = Layout::new("js-probe");
+    let tools = layout.root.join("tools");
+    fs::create_dir_all(&tools).unwrap();
+    // A fake node: its own --version is answered on stderr, a module probe echoes the module
+    // path on stdout, and a framing-only module gets the tsserver-shaped JSON-RPC noise that
+    // names no version.
+    fs::write(
+        tools.join("node"),
+        "#!/bin/sh\ncase \"$1\" in\n  --version) echo >&2 \"fake-node 24.4.0-fake\" ;;\n  *noisy.js) printf 'Content-Length: 76\\n\\n{\"seq\":0,\"type\":\"event\",\"body\":{\"pid\":33367}}\\n' ;;\n  *) echo \"fake-node $1\" ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(tools.join("node"), fs::Permissions::from_mode(0o755)).unwrap();
+    // Both modules are non-executable: only the node probe can answer for them.
+    fs::write(tools.join("tsc.js"), "module.exports = 'fake tsc';\n").unwrap();
+    fs::write(tools.join("noisy.js"), "module.exports = 'noise';\n").unwrap();
+    let node = tools.join("node");
+    let tsc = tools.join("tsc.js");
+    let noisy = tools.join("noisy.js");
+    fs::write(
+        layout.config(),
+        serde_json::json!({
+            "version": 1,
+            "limits": {"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},
+            "targets": [],
+            "allowed_roots": [layout.root],
+            "project_checks": {
+                "typescript": {"node": node, "tsc_cli": tsc},
+                "python": {"node": node, "pyright_cli": noisy},
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let output = layout.doctor();
+    assert!(
+        output.status.success(),
+        "warn findings never fail the doctor: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = report_of(&output);
+    let toolchains: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["component"] == "toolchains")
+        .collect();
+    let finding_of = |label: &str| -> serde_json::Value {
+        toolchains
+            .iter()
+            .find(|finding| finding["detail"].as_str().unwrap().starts_with(label))
+            .map(|finding| (*finding).clone())
+            .unwrap_or_else(|| panic!("no {label} finding: {toolchains:?}"))
+    };
+    // The interpreter's own probe accepts its stderr line.
+    let node_finding = finding_of("node ");
+    assert_eq!(node_finding["code"], "version");
+    assert_eq!(node_finding["detail"], "node fake-node 24.4.0-fake");
+    // The non-executable tsc.js went through node: the version line carries its path.
+    let tsc_finding = finding_of("tsc.js ");
+    assert_eq!(tsc_finding["code"], "version");
+    let tsc_detail = tsc_finding["detail"].as_str().unwrap();
+    assert!(
+        tsc_detail.starts_with("tsc.js fake-node ") && tsc_detail.ends_with("/tsc.js"),
+        "tsc.js must be probed as `node tsc.js --version`: {tsc_detail}"
+    );
+    // The framing-only answer is no version: noisy.js reads as unresponsive.
+    let noisy_finding = finding_of("noisy.js ");
+    assert_eq!(noisy_finding["code"], "unresponsive");
+    assert_eq!(noisy_finding["severity"], "warn");
+    assert_eq!(
+        toolchains.len(),
+        3,
+        "exactly the declared tools: {toolchains:?}"
+    );
+    let _ = fs::remove_dir_all(&layout.root);
+}

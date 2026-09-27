@@ -21,9 +21,11 @@ use crate::{errorlog, userhome};
 const MAX_FINDINGS: usize = 256;
 /// Wall-clock ceiling for one toolchain `--version` probe.
 const TOOLCHAIN_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Runtime entries older than this below the temp root count as stale; managed daemons idle-exit
-/// within at most one hour, so a day-old `ai-` entry has no live owner.
+/// Runtime entries older than this below the temp root count as stale once nobody listens on
+/// their sockets; a live daemon answers on its socket no matter how long it has been running.
 const STALE_RUNTIME_AGE: Duration = Duration::from_secs(24 * 3600);
+/// Wall-clock ceiling for one socket-liveness connect in the stale-runtime check.
+const SOCKET_LIVENESS_TIMEOUT: Duration = Duration::from_millis(250);
 /// Error-level journal lines in the last day above which the volume finding warns.
 const ERROR_LOG_WARN_COUNT: u64 = 50;
 
@@ -73,7 +75,7 @@ pub async fn report() -> Report {
     check_install(&mut findings, &effective);
     check_plugin(&mut findings, &effective);
     check_hosts(&mut findings, &effective);
-    check_stale_runtimes(&mut findings);
+    check_stale_runtimes(&mut findings).await;
     check_error_journal(&mut findings, &home);
     finish(findings, home)
 }
@@ -166,11 +168,15 @@ fn check_launcher(findings: &mut Vec<Finding>, effective: &Path) -> Option<Launc
 }
 
 /// Probes every toolchain executable the configuration declares with a bounded `--version`.
+///
+/// `.js`/`.mjs`/`.cjs` entries are Node modules rather than executables (`tsserver.js`,
+/// `tsc.js`, the typescript-language-server bridge), so they are probed as
+/// `<configured node> <file> --version` instead of being executed directly.
 async fn check_toolchains(findings: &mut Vec<Finding>, config: Option<&LauncherConfig>) {
     let Some(config) = config else {
         return;
     };
-    for (label, path) in declared_toolchains(config) {
+    for (label, path, node) in declared_toolchains(config) {
         if !path.is_file() {
             push(
                 findings,
@@ -181,7 +187,8 @@ async fn check_toolchains(findings: &mut Vec<Finding>, config: Option<&LauncherC
             );
             continue;
         }
-        match probe_version(&path).await {
+        let node = node.filter(|_| is_js_module(&path));
+        match probe_version(&path, node.as_deref()).await {
             Some(version) => push(
                 findings,
                 "version",
@@ -200,21 +207,31 @@ async fn check_toolchains(findings: &mut Vec<Finding>, config: Option<&LauncherC
     }
 }
 
-/// Collects the deduplicated `(label, path)` toolchain executables declared by `config`.
+/// Reports whether `path` names a Node module (`tsserver.js`, `cli.mjs`, `tsc.cjs`, ...).
+fn is_js_module(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("js" | "mjs" | "cjs")
+    )
+}
+
+/// Collects the deduplicated `(label, path, node)` toolchain executables declared by `config`.
 ///
 /// Provider executables are the configured language servers (rust-analyzer, pyright,
 /// typescript-language-server), plus each provider's Node and TypeScript `tsserver`, and the
-/// confined project-check tool paths; the accepted `git` is already digest-verified.
-fn declared_toolchains(config: &LauncherConfig) -> Vec<(String, PathBuf)> {
+/// confined project-check tool paths; the accepted `git` is already digest-verified. The third
+/// element is the Node interpreter declared alongside the entry, used only to probe
+/// `.js`-family modules that cannot exec themselves.
+fn declared_toolchains(config: &LauncherConfig) -> Vec<(String, PathBuf, Option<PathBuf>)> {
     let mut seen = HashSet::new();
     let mut found = Vec::new();
-    let mut declare = |path: &Path| {
+    let mut declare = |path: &Path, node: Option<&Path>| {
         if seen.insert(path.to_path_buf()) {
             let label = path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.to_string_lossy().into_owned());
-            found.push((label, path.to_path_buf()));
+            found.push((label, path.to_path_buf(), node.map(Path::to_path_buf)));
         }
     };
     for attachment in config.attachments() {
@@ -222,46 +239,66 @@ fn declared_toolchains(config: &LauncherConfig) -> Vec<(String, PathBuf)> {
             continue;
         };
         for provider in &target.providers {
-            declare(&provider.executable.path);
+            let interpreter = provider.node.as_ref().map(|node| node.path.as_path());
+            declare(&provider.executable.path, interpreter);
             if let Some(node) = &provider.node {
-                declare(&node.path);
+                declare(&node.path, None);
             }
             if let Some(typescript) = &provider.typescript {
-                declare(&typescript.tsserver.path);
+                declare(&typescript.tsserver.path, interpreter);
             }
         }
     }
     if let Some(checks) = config.project_checks() {
         if let Some(python) = checks.python() {
-            declare(python.node());
-            declare(python.pyright_cli());
+            declare(python.node(), None);
+            declare(python.pyright_cli(), Some(python.node()));
         }
         if let Some(typescript) = checks.typescript() {
-            declare(typescript.node());
-            declare(typescript.tsc_cli());
+            declare(typescript.node(), None);
+            declare(typescript.tsc_cli(), Some(typescript.node()));
         }
     }
     found
 }
 
-/// Runs one bounded `--version` probe, returning its first stdout line on a clean exit.
-async fn probe_version(path: &Path) -> Option<String> {
-    let output = tokio::time::timeout(
-        TOOLCHAIN_PROBE_TIMEOUT,
-        tokio::process::Command::new(path).arg("--version").output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
+/// Runs one bounded `--version` probe, returning its first version-looking line on a clean exit.
+///
+/// When `node` is set, `path` is a Node module probed as `node path --version`. A version line
+/// on stdout or stderr is accepted (`pyright-langserver --version` prints on either stream);
+/// the probe counts as unresponsive only on a non-zero exit, no version-looking line at all,
+/// or the 5 s timeout. Version-looking means a non-empty line carrying a digit that is not
+/// JSON-RPC framing — `tsserver.js` answers `--version` only with its `Content-Length`-framed
+/// startup event, which names no version and must not read as one.
+async fn probe_version(path: &Path, node: Option<&Path>) -> Option<String> {
+    let mut command = match node {
+        Some(node) => {
+            let mut command = tokio::process::Command::new(node);
+            command.arg(path);
+            command
+        }
+        None => tokio::process::Command::new(path),
+    };
+    let output = tokio::time::timeout(TOOLCHAIN_PROBE_TIMEOUT, command.arg("--version").output())
+        .await
+        .ok()?
+        .ok()?;
     if !output.status.success() {
         return None;
     }
-    let line = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .next()?
-        .trim()
-        .to_owned();
-    (!line.is_empty()).then_some(line)
+    let version_line = |bytes: &[u8]| -> Option<String> {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .map(str::trim)
+            .find(|line| {
+                !line.is_empty()
+                    && !line.starts_with("Content-")
+                    && !line.starts_with('{')
+                    && line.chars().any(|character| character.is_ascii_digit())
+            })
+            .map(str::to_owned)
+    };
+    version_line(&output.stdout).or_else(|| version_line(&output.stderr))
 }
 
 /// Reports the standalone release pinning and the launcher shim.
@@ -441,31 +478,39 @@ fn check_hosts(findings: &mut Vec<Finding>, effective: &Path) {
 
 /// Counts this user's stale `ai-` runtime entries below the temp root; never names them.
 ///
-/// Only entries owned by the effective user with a day-old modification time are counted, so
-/// other users' paths are never even read.
-fn check_stale_runtimes(findings: &mut Vec<Finding>) {
+/// Only entries owned by the effective user with a day-old modification time count, so other
+/// users' paths are never even read — and an entry counts only when nobody listens on its
+/// sockets: a live daemon answers on its socket no matter how old its runtime directory has
+/// grown, while an abandoned one refuses every connect.
+async fn check_stale_runtimes(findings: &mut Vec<Finding>) {
     let Ok(root) = fs::canonicalize(std::env::temp_dir()) else {
         return;
     };
     let Ok(entries) = fs::read_dir(&root) else {
         return;
     };
-    let stale = entries
-        .flatten()
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("ai-"))
-        .filter_map(|entry| entry.metadata().ok())
-        .filter(|metadata| {
-            metadata.uid() == unsafe { libc::geteuid() }
-                && (metadata.is_dir() || metadata.file_type().is_socket())
-        })
-        .filter(|metadata| {
-            metadata
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let owned = metadata.uid() == unsafe { libc::geteuid() }
+            && (metadata.is_dir() || metadata.file_type().is_socket())
+            && metadata
                 .modified()
                 .ok()
                 .and_then(|modified| modified.elapsed().ok())
-                .is_some_and(|age| age > STALE_RUNTIME_AGE)
-        })
-        .count();
+                .is_some_and(|age| age > STALE_RUNTIME_AGE);
+        if owned {
+            candidates.push((entry.path(), metadata.is_dir()));
+        }
+    }
+    let mut stale = 0usize;
+    for (path, is_dir) in candidates {
+        if !has_live_listener(&path, is_dir).await {
+            stale += 1;
+        }
+    }
     if stale > 0 {
         push(
             findings,
@@ -477,6 +522,38 @@ fn check_stale_runtimes(findings: &mut Vec<Finding>) {
             ),
         );
     }
+}
+
+/// Reports whether any socket at `path` — or directly inside it, for a runtime directory —
+/// still has a listening owner. A successful connect proves a live daemon; refusal, a missing
+/// path, or any other connect failure means nobody is listening. This is the same liveness
+/// question `retire_stale_socket` asks before removing a socket file.
+async fn has_live_listener(path: &Path, is_dir: bool) -> bool {
+    let mut sockets = Vec::new();
+    if is_dir {
+        let Ok(entries) = fs::read_dir(path) else {
+            return false;
+        };
+        sockets.extend(
+            entries
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_socket()))
+                .map(|entry| entry.path()),
+        );
+    } else {
+        sockets.push(path.to_path_buf());
+    }
+    for socket in sockets {
+        if let Ok(Ok(_)) = tokio::time::timeout(
+            SOCKET_LIVENESS_TIMEOUT,
+            tokio::net::UnixStream::connect(&socket),
+        )
+        .await
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Counts error-level journal lines of the last day across every repository log directory.
