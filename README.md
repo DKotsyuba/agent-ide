@@ -27,7 +27,7 @@ Or use wget:
 wget -qO- https://github.com/DKotsyuba/agent-ide/releases/latest/download/install.sh | sh -s -- --downloader wget
 ```
 
-**Availability:** the installer ships starting with 0.4.1. Earlier releases installed only
+**Availability:** the installer ships starting with 0.4.2. Earlier releases installed only
 the bare binary with the old `gh`-based `./install.sh` from the repository checkout.
 
 The repository is private today: the installer accepts `GITHUB_TOKEN` (sent as a bearer
