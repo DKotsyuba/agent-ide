@@ -648,12 +648,18 @@ pub struct SymbolCard {
     /// Definition address: `file#symbol (lines a–b)`; read the body separately with `ide.read`.
     pub definition: Option<String>,
     pub usages: Vec<Usage>,
+    /// Printed in place of an empty callers list when the language server has no call
+    /// hierarchy (`unavailable (pyright has no call hierarchy)`).
+    pub callers_note: Option<String>,
     pub callers: Vec<Call>,
     pub callees: Vec<Call>,
     /// Short sha, date and subject of recent commits touching the definition.
     pub history: Vec<String>,
     /// Detail reference for the full usage list, printed when usages were cut.
     pub more_detail: Option<String>,
+    /// Prints the `usages:` line even with no references — the server legitimately answered
+    /// none (pyright on a constructor nobody names explicitly).
+    pub report_empty_usages: bool,
 }
 
 /// Renders the card with the fixed ceilings.
@@ -714,8 +720,17 @@ pub fn symbol_card_text(card: &SymbolCard) -> String {
                 None => out.push_str(&format!("  … {hidden} more\n")),
             }
         }
+    } else if card.report_empty_usages {
+        out.push_str("usages: 0 in 0 files (src 0, tests 0)\n");
     }
-    render_calls(&mut out, "callers", &card.callers);
+    if card.callers_note.is_some() && card.callers.is_empty() {
+        out.push_str(&format!(
+            "callers: {}\n",
+            card.callers_note.as_deref().unwrap_or_default()
+        ));
+    } else {
+        render_calls(&mut out, "callers", &card.callers);
+    }
     render_calls(&mut out, "callees", &card.callees);
     if !card.history.is_empty() {
         out.push_str(&format!(
@@ -931,5 +946,39 @@ mod tests {
         assert!(text.contains("… 5 more (ide.inspect sym-1)"));
         assert!(text.contains("callers: 1\n  a.rs#Owner/caller  a.rs:8\n"));
         assert_eq!(text.matches("run();").count(), MAX_USAGE_LINES);
+    }
+
+    /// A callers note replaces an empty callers list, and an explicitly answered zero prints
+    /// the `usages:` line instead of omitting it.
+    #[test]
+    fn symbol_card_reports_callers_note_and_explicit_zero_usages() {
+        let mut card = SymbolCard {
+            heading: "__init__ — method, main.py#Greeter/__init__ (lines 2–3)".into(),
+            callers_note: Some("unavailable (pyright has no call hierarchy)".into()),
+            report_empty_usages: true,
+            ..Default::default()
+        };
+        let text = symbol_card_text(&card);
+        assert!(
+            text.contains("usages: 0 in 0 files (src 0, tests 0)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("callers: unavailable (pyright has no call hierarchy)\n"),
+            "{text}"
+        );
+        assert!(!text.contains("callers: 0"), "{text}");
+
+        // A note never suppresses a real callers list.
+        card.callers.push(Call {
+            name: "main.py#caller".into(),
+            file: "main.py".into(),
+            line: 8,
+        });
+        let text = symbol_card_text(&card);
+        assert!(
+            text.contains("callers: 1\n  main.py#caller  main.py:8\n"),
+            "{text}"
+        );
     }
 }

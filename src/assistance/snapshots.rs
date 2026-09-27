@@ -138,11 +138,17 @@ impl ProductSnapshotRunner<'_, '_> {
             .await?;
         let active = self.worker.shared.active(&binding)?;
         let lease = self.worker.admit(&binding)?;
+        // Git evidence drains at its own Workspace boundary — [`RawGitEvidence`] accepts at most
+        // `MAX_GIT_STDOUT_BYTES` per stream and rejects anything larger — never at the launcher's
+        // general `output_bytes` budget. Installed configs set that budget to 64 KiB, which
+        // truncates the fixed whole-tree metadata listings (`ls-tree`, `ls-files --stage`,
+        // `ls-files --debug`) of any real repository and fails every clean-tree diff with
+        // `EvidenceTooLarge` even though the evidence boundary itself would have accepted them.
         let mut child = match OwnedChild::spawn_captured(
             &request,
             lease,
             Some(active),
-            self.worker.shared.launcher.limits.output_bytes,
+            crate::workspace::git::MAX_GIT_STDOUT_BYTES,
         ) {
             Ok(child) => child,
             Err(error) => {
@@ -575,11 +581,14 @@ impl Worker<'_> {
                 .await?;
             let active = self.shared.active(&binding)?;
             let lease = self.admit(&binding)?;
+            // Same Workspace evidence boundary as the diff capture above: the baseline's fixed
+            // whole-tree `ls-tree` listing truncates at the launcher's general `output_bytes`
+            // budget on real repositories, which would report unknown coverage on every clean tree.
             let mut child = match OwnedChild::spawn_captured(
                 &request,
                 lease,
                 Some(active),
-                self.shared.launcher.limits.output_bytes,
+                crate::workspace::git::MAX_GIT_STDOUT_BYTES,
             ) {
                 Ok(child) => child,
                 Err(error) => {

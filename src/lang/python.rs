@@ -256,8 +256,7 @@ impl LanguageSupport for Python {
             }
         }
     }
-
-    /// `test_*.py`, `*_test.py`, `conftest.py` and any `.py` file under a `tests` directory.
+    /// `test_*.py`, `*_test.py`, `conftest.py` and any `.py` file under a `tests` or `test` directory.
     fn is_test_file(&self, file: &Path) -> bool {
         let Some(name) = file.file_name().and_then(|name| name.to_str()) else {
             return false;
@@ -266,14 +265,18 @@ impl LanguageSupport for Python {
             && (name.starts_with("test_")
                 || name.ends_with("_test.py")
                 || name == "conftest.py"
-                || file.components().any(|part| part.as_os_str() == "tests"))
+                || file.components().any(|part| {
+                    let part = part.as_os_str();
+                    part == "tests" || part == "test"
+                }))
     }
-
     /// pytest with `-q --no-header -p no:cacheprovider`, prefixed by `uv run` in uv projects.
     /// A symbol target names each distinct referencing test as a node id (`file::Class::test`;
     /// `/` in a name is read as nesting) or, beyond `MAX_NAMED_TESTS`, their distinct files; a
-    /// symbol no test references is [`LangError::Unsupported`]. Files run whole, patterns go to
-    /// `-k`.
+    /// symbol no test references is [`LangError::Unsupported`]. A file target runs whole only
+    /// when the file is one pytest would collect by convention (`test_*.py`, `*_test.py`,
+    /// `conftest.py`, under `tests/` or `test/`); a directory target selects the test files
+    /// inside it; a non-test `.py` file is [`LangError::Unsupported`]. Patterns go to `-k`.
     fn test_selection(
         &self,
         project: &LanguageProject,
@@ -299,7 +302,20 @@ impl LanguageSupport for Python {
                 };
                 (tests, args)
             }
-            TestTarget::File(file) => (Vec::new(), vec![file.display().to_string()]),
+            TestTarget::File(file) => {
+                // A directory (`tests/`) selects the test files inside it and passes through
+                // unchanged; a plain `.py` file must be one pytest would collect by convention,
+                // or the module would be imported top-level as a test target.
+                if file.extension().is_some_and(|extension| extension == "py")
+                    && !self.is_test_file(file)
+                {
+                    return Err(LangError::Unsupported(format!(
+                        "no tests in {}",
+                        file.display()
+                    )));
+                }
+                (Vec::new(), vec![file.display().to_string()])
+            }
             TestTarget::Pattern(pattern) => (Vec::new(), vec!["-k".to_owned(), pattern.clone()]),
         };
         let mut command = with_uv(uv, &["pytest"]);
@@ -1620,6 +1636,33 @@ src/pkg/contract.py  (27 lines, python)
             .unwrap()
             .command;
         assert_eq!(&command[..2], argv(&["pytest", "tests/test_service.py"]));
+
+        // Non-test `.py` files never become pytest targets; directories pass through and let
+        // pytest select the test files inside them.
+        let plain = TestTarget::File(PathBuf::from("src/hypfactory/yaml_subset.py"));
+        assert!(matches!(
+            Python.test_selection(&project(&[]), &plain),
+            Err(LangError::Unsupported(message)) if message == "no tests in src/hypfactory/yaml_subset.py"
+        ));
+        let conftest = TestTarget::File(PathBuf::from("tests/conftest.py"));
+        assert_eq!(
+            &Python
+                .test_selection(&project(&[]), &conftest)
+                .unwrap()
+                .command[..2],
+            argv(&["pytest", "tests/conftest.py"])
+        );
+        let directory = TestTarget::File(PathBuf::from("tests"));
+        assert_eq!(
+            &Python
+                .test_selection(&project(&[]), &directory)
+                .unwrap()
+                .command[..2],
+            argv(&["pytest", "tests"])
+        );
+        assert!(Python.is_test_file(&PathBuf::from("test/helper.py")));
+        assert!(!Python.is_test_file(&PathBuf::from("src/value.py")));
+
         let pattern = TestTarget::Pattern("load and not slow".to_owned());
         let command = Python
             .test_selection(&project(&[]), &pattern)

@@ -330,7 +330,10 @@ impl LanguageSupport for TypeScript {
     /// by `-t` (`--test-name-pattern=` for node) with their names as an escaped regex
     /// alternation (`describe > it` becomes the runner's space-joined `describe it`); beyond
     /// `MAX_NAMED_TESTS` only the files run. A symbol no test references is
-    /// [`LangError::Unsupported`]. Patterns pass through unescaped.
+    /// [`LangError::Unsupported`]. A file target runs whole only when the runner would collect
+    /// it by convention (`*.test.*`, `*.spec.*`, under `__tests__/`); a directory target selects
+    /// the test files inside it; a non-test script file is [`LangError::Unsupported`]. Patterns
+    /// pass through unescaped.
     fn test_selection(
         &self,
         project: &LanguageProject,
@@ -356,7 +359,23 @@ impl LanguageSupport for TypeScript {
                 let files = distinct_files(&tests);
                 (tests, files, pattern)
             }
-            TestTarget::File(file) => (Vec::new(), vec![file.display().to_string()], None),
+            TestTarget::File(file) => {
+                // A directory (`__tests__/`) selects the test files inside it and passes through
+                // unchanged; a plain script file must be one the runner would collect by
+                // convention, or the module would be imported top-level as a test target.
+                if file
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| SCRIPT_EXTENSIONS.contains(&extension))
+                    && !self.is_test_file(file)
+                {
+                    return Err(LangError::Unsupported(format!(
+                        "no tests in {}",
+                        file.display()
+                    )));
+                }
+                (Vec::new(), vec![file.display().to_string()], None)
+            }
             TestTarget::Pattern(pattern) => (Vec::new(), Vec::new(), Some(pattern.clone())),
         };
         let mut command: Vec<String> = match runner {
@@ -452,7 +471,8 @@ fn collect_strings(value: &Value, out: &mut Vec<String>) {
 
 /// Converts siblings under `owner_path`: ordered by first line (the server sorts by name), then
 /// adjacent same-named siblings merged into the first. Children of a function-like owner keep
-/// only nested declarations; statement-level symbols are dropped (see [`is_body_local`]).
+/// only nested declarations; statement-level symbols are dropped (see [`is_body_local`]), and
+/// so are names that cannot head an outline entry (see [`is_outline_name`]).
 fn convert_all(
     lines: &[&str],
     symbols: Vec<lsp::DocumentSymbol>,
@@ -463,6 +483,8 @@ fn convert_all(
     let in_body = owner.is_some_and(is_body_owner);
     let mut converted: Vec<Symbol> = symbols
         .into_iter()
+        // A `describe("suite")` call symbol carries its call expression as its name and stays.
+        .filter(|symbol| is_outline_name(&symbol.name) || is_test_call(&symbol.name))
         .filter(|symbol| !in_body || !is_body_local(symbol.kind))
         .map(|symbol| convert(lines, symbol, owner_path, owner, test_file))
         .collect();
@@ -487,6 +509,17 @@ fn is_body_owner(kind: SymbolKind) -> bool {
         kind,
         SymbolKind::Function | SymbolKind::Method | SymbolKind::Constructor | SymbolKind::Test
     )
+}
+
+/// Whether a server symbol name can head an outline entry. Anonymous callbacks arrive with an
+/// empty name and JSX children or `.map(...)` calls arrive with a whole expression as their
+/// "name"; none of those is an identifier-like token, while named nested functions and methods
+/// keep their entries.
+fn is_outline_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '(' | '<' | '>'))
 }
 
 /// Kinds tsserver reports for statements inside a body — locals, object-literal properties and
@@ -1576,6 +1609,53 @@ src/transport.ts  (29 lines, typescript)
         );
     }
 
+    /// Anonymous callbacks (empty names) and JSX children or `.map(...)` calls (expression
+    /// names) never reach the outline; a named nested function keeps its entry.
+    #[test]
+    fn normalize_drops_anonymous_and_expression_symbol_names() {
+        use crate::lang::render::outline_text;
+        let source = "export function Details({ cards }: Props) {\n  const titles = cards\n    .map((card) => card.title)\n    .sort();\n  function sortedTitle(card: Card): string {\n    return card.title.toUpperCase();\n  }\n  return (\n    <div className=\"list\">\n      {cards.map((card) => (\n        <Card key={card.id} title={card.title} />\n      ))}\n    </div>\n  );\n}\n";
+        // Captured tsserver shape: the anonymous arrow arrives with an empty name and the JSX
+        // expression container arrives with the whole `.map(...)` expression as its name.
+        let symbols = vec![symbol(
+            "Details",
+            lsp::SymbolKind::FUNCTION,
+            (0, 0, 14, 1),
+            vec![
+                symbol("", lsp::SymbolKind::FUNCTION, (2, 5, 2, 26), vec![]),
+                symbol(
+                    "cards.map((card) => <Card key={card.id} title={card.title} />)",
+                    lsp::SymbolKind::OBJECT,
+                    (8, 6, 11, 8),
+                    vec![],
+                ),
+                symbol(
+                    "sortedTitle",
+                    lsp::SymbolKind::FUNCTION,
+                    (4, 2, 6, 3),
+                    vec![],
+                ),
+            ],
+        )];
+        let outline = TypeScript.normalize(Path::new("src/details.tsx"), source, symbols);
+        let text = outline_text(&outline);
+        assert!(text.contains("Details"), "{text}");
+        assert!(
+            text.contains("function sortedTitle(card: Card): string"),
+            "{text}"
+        );
+        assert!(!text.contains("cards.map"), "{text}");
+        assert!(!text.contains("<Card"), "{text}");
+        let details = outline.named("Details").into_iter().next().unwrap();
+        let mut children = Vec::new();
+        details.walk(&mut |candidate| {
+            if candidate.name != "Details" {
+                children.push(candidate.name.clone());
+            }
+        });
+        assert_eq!(children, vec!["sortedTitle".to_owned()]);
+    }
+
     /// Before/After with one blank line; First/Last inside class and object literal braces.
     #[test]
     fn insert_sites_use_braces_and_member_indent() {
@@ -1727,6 +1807,40 @@ src/transport.ts  (29 lines, typescript)
         );
         let node = TypeScript.test_selection(&project(&[]), &file).unwrap();
         assert_eq!(node.command, argv(&["node", "--test", "src/a.test.ts"]));
+    }
+
+    /// Non-test script files never become runner targets; directories pass through and let the
+    /// runner select the test files inside them.
+    #[test]
+    fn test_selection_refuses_non_test_file_paths() {
+        let plain = TestTarget::File(PathBuf::from("src/details.tsx"));
+        assert!(matches!(
+            TypeScript.test_selection(&project(&[]), &plain),
+            Err(LangError::Unsupported(message)) if message == "no tests in src/details.tsx"
+        ));
+        let directory = TestTarget::File(PathBuf::from("src/__tests__"));
+        assert_eq!(
+            TypeScript
+                .test_selection(&project(&[]), &directory)
+                .unwrap()
+                .command,
+            argv(&["node", "--test", "src/__tests__"])
+        );
+        let jsx = TestTarget::File(PathBuf::from("src/app.jsx"));
+        assert!(matches!(
+            TypeScript.test_selection(&project(&[]), &jsx),
+            Err(LangError::Unsupported(_))
+        ));
+        let tested = TestTarget::File(PathBuf::from("src/details.test.tsx"));
+        assert_eq!(
+            TypeScript
+                .test_selection(&project(&[]), &tested)
+                .unwrap()
+                .command,
+            argv(&["node", "--test", "src/details.test.tsx"])
+        );
+        assert!(TypeScript.is_test_file(&PathBuf::from("__tests__/helpers.js")));
+        assert!(!TypeScript.is_test_file(&PathBuf::from("src/app.mjs")));
     }
 
     /// A passing vitest run with colours.

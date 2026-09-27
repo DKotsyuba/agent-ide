@@ -279,6 +279,7 @@ fn assert_compact_envelope(reply: &Value) {
         ("complete", Some("test")) => assert!(
             text.starts_with("tests #")
                 || text.starts_with("tests: could not start ")
+                || text.starts_with("tests: no tests in ")
                 || text.starts_with("page "),
             "{reply}"
         ),
@@ -2038,7 +2039,12 @@ impl ProductFixture {
     ///
     /// The one target serves Codex and Claude actors alike; a Claude target needs no profile.
     fn write_config(&self, providers: Value) {
-        let config = json!({"version":1,"limits":{"queued":16,"details":64,"operation_ms":120000,"output_bytes":1048576},"allowed_roots":[self.base],"targets":[{"attachment":"private-host-channel","candidate":self.root,"git":accepted_program("/usr/bin/git","fixture-git"),"providers":providers}]});
+        self.write_config_with_output_bytes(providers, 1_048_576);
+    }
+    /// [`Self::write_config`] with a caller-selected child capture budget; the shipped
+    /// `agent-ide init` default is 65 536.
+    fn write_config_with_output_bytes(&self, providers: Value, output_bytes: usize) {
+        let config = json!({"version":1,"limits":{"queued":16,"details":64,"operation_ms":120000,"output_bytes":output_bytes},"allowed_roots":[self.base],"targets":[{"attachment":"private-host-channel","candidate":self.root,"git":accepted_program("/usr/bin/git","fixture-git"),"providers":providers}]});
         std::fs::write(&self.config, config.to_string()).unwrap();
     }
     /// Returns the current fixture's complete measured-state-shaped payload outside model arguments.
@@ -4360,6 +4366,178 @@ async fn configured_product_later_binding_diffs_path_edited_under_earlier_grant(
     daemon.wait().await.unwrap();
 }
 
+/// A clean tree whose fixed whole-tree metadata listings exceed the installed 64 KiB child
+/// capture budget still diffs: git evidence drains at the Workspace evidence boundary, the
+/// ~3 000-file ignored directory never enters evidence, and the answer is `tracked: 0`.
+#[tokio::test]
+async fn configured_product_clean_tree_diff_completes_over_large_metadata_and_ignored_trees() {
+    let fixture = ProductFixture::new(json!([]));
+    // The shipped `agent-ide init` config captures every child at 64 KiB; the fixture mirrors
+    // that exactly (the fixture default of 1 MiB hides the truncation this test pins).
+    fixture.write_config_with_output_bytes(json!([]), 65_536);
+    let ignored = fixture.root.join("ignored");
+    std::fs::create_dir_all(ignored.join("blobs")).unwrap();
+    for index in 0..3_000 {
+        std::fs::write(
+            ignored.join("blobs").join(format!("file-{index}.txt")),
+            format!("payload {index}\n"),
+        )
+        .unwrap();
+    }
+    std::fs::write(fixture.root.join(".gitignore"), "/ignored/\n").unwrap();
+    // Whole-tree metadata listings above the 64 KiB budget: at ~70 bytes per record,
+    // `git ls-files --stage` and `git ls-tree -r` alone exceed it.
+    for index in 0..1_200 {
+        std::fs::write(
+            fixture
+                .root
+                .join("src")
+                .join(format!("generated_module_{index}.rs")),
+            format!("pub fn value_{index}() -> i32 {{ {index} }}\n"),
+        )
+        .unwrap();
+    }
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "large clean fixture"]);
+    assert_eq!(
+        std::process::Command::new("/usr/bin/git")
+            .env_clear()
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["-C"])
+            .arg(&fixture.root)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap()
+            .stdout,
+        Vec::<u8>::new(),
+        "the fixture tree must be clean"
+    );
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "clean-tree-diff").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"clean-tree-diff-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let diff = actor.call(&fixture, "ide.diff", json!({})).await;
+    let diff = actor.settle(&fixture, diff).await;
+    assert_eq!(diff["kind"], "diff", "{diff}");
+    let text = diff["text"].as_str().unwrap();
+    assert!(text.contains("tracked: 0; untracked: 0"), "{text}");
+    assert!(!text.contains("untracked_path"), "{text}");
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// `ide.test {path}` on a plain Python module answers the `no tests` hint instead of handing the
+/// file to pytest, which would import it top-level.
+#[tokio::test]
+async fn configured_product_python_non_test_file_answers_no_tests() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
+    std::fs::remove_file(fixture.root.join("go.mod")).unwrap();
+    std::fs::remove_file(fixture.root.join("main.go")).unwrap();
+    std::fs::remove_file(fixture.root.join("src/lib.rs")).unwrap();
+    std::fs::write(
+        fixture.root.join("pyproject.toml"),
+        "[project]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(fixture.root.join("src/hypfactory")).unwrap();
+    std::fs::write(
+        fixture.root.join("src/hypfactory/yaml_subset.py"),
+        "class YamlSubsetError(Exception):\n    pass\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "python fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "python-non-test").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"py-no-tests"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let refused = actor
+        .call(
+            &fixture,
+            "ide.test",
+            json!({"path":"src/hypfactory/yaml_subset.py"}),
+        )
+        .await;
+    let refused = actor.settle(&fixture, refused).await;
+    assert_eq!(refused["kind"], "test", "{refused}");
+    assert_eq!(
+        refused["text"].as_str().unwrap(),
+        "tests: no tests in src/hypfactory/yaml_subset.py; the file has no tests",
+        "{refused}"
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// `ide.test {path}` on a plain TypeScript source answers the `no tests` hint instead of running
+/// `node --test` over it.
+#[tokio::test]
+async fn configured_product_typescript_non_test_file_answers_no_tests() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
+    std::fs::remove_file(fixture.root.join("go.mod")).unwrap();
+    std::fs::remove_file(fixture.root.join("main.go")).unwrap();
+    std::fs::remove_file(fixture.root.join("src/lib.rs")).unwrap();
+    std::fs::write(
+        fixture.root.join("package.json"),
+        json!({"name":"fixture-ui","private":true}).to_string(),
+    )
+    .unwrap();
+    std::fs::create_dir_all(fixture.root.join("src")).unwrap();
+    std::fs::write(
+        fixture.root.join("src/details.tsx"),
+        "export function Details() {\n  return <div>details</div>;\n}\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "typescript fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "typescript-non-test").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"ts-no-tests"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let refused = actor
+        .call(&fixture, "ide.test", json!({"path":"src/details.tsx"}))
+        .await;
+    let refused = actor.settle(&fixture, refused).await;
+    assert_eq!(refused["kind"], "test", "{refused}");
+    assert_eq!(
+        refused["text"].as_str().unwrap(),
+        "tests: no tests in src/details.tsx; the file has no tests",
+        "{refused}"
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Runs an explicitly requested fixture crate in the background and retrieves its parsed result.
 #[tokio::test]
 async fn configured_product_test_runs_in_background_and_reports_failures() {
@@ -5362,7 +5540,7 @@ async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
 #[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
 async fn configured_product_pyright_symbol_tools_and_edit() {
     let fixture = ProductFixture::new(json!([accepted_pyright_provider("pyright-symbol-cache")]));
-    let source = "class Greeter:\n    def method(self) -> str:\n        return \"hello\"\n\ndef caller() -> str:\n    return Greeter().method()\n";
+    let source = "class Greeter:\n    def __init__(self, name: str) -> None:\n        self.name = name\n\n    def method(self) -> str:\n        return \"hello\"\n\ndef caller() -> str:\n    return Greeter(\"world\").method()\n";
     std::fs::write(fixture.root.join("main.py"), source).unwrap();
     fixture.git(&["add", "--", "main.py"]);
     fixture.git(&["commit", "--quiet", "-m", "Python symbol fixture"]);
@@ -5401,15 +5579,50 @@ async fn configured_product_pyright_symbol_tools_and_edit() {
     let text = symbol["text"].as_str().unwrap();
     assert!(text.contains("symbol: method — method"), "{symbol}");
     assert!(
-        text.contains("definition main.py#Greeter/method  (lines 2–3)"),
+        text.contains("definition main.py#Greeter/method  (lines 5–6)"),
         "{symbol}"
     );
     assert!(!text.contains("return \"hello\""), "{symbol}");
     assert!(text.contains("usages: 1 in 1 files"), "{symbol}");
-    assert!(!text.contains("main.py:2"), "{symbol}");
     assert!(
-        text.contains("main.py#caller  main.py:5") && text.contains("Greeter().method()"),
+        text.contains("main.py:9  return Greeter(\"world\").method()"),
         "{symbol}"
+    );
+    // pyright has no call hierarchy: the card says so instead of printing nothing, and a
+    // constructor nothing names explicitly still reports its zero usages at the right position.
+    assert!(
+        text.contains("callers: unavailable (pyright has no call hierarchy)"),
+        "{symbol}"
+    );
+    let init = actor
+        .call(
+            &fixture,
+            "ide.symbol",
+            json!({"symbol":"main.py#Greeter/__init__"}),
+        )
+        .await;
+    let init = actor.settle(&fixture, init).await;
+    assert_eq!(init["kind"], "symbol", "{init}");
+    let init_text = init["text"].as_str().unwrap();
+    assert!(init_text.contains("symbol: __init__"), "{init}");
+    assert!(init_text.contains("usages: 0 in 0 files"), "{init_text}");
+    assert!(
+        init_text.contains("callers: unavailable (pyright has no call hierarchy)"),
+        "{init_text}"
+    );
+    let graph = actor
+        .call(
+            &fixture,
+            "ide.graph",
+            json!({"symbol":"main.py#Greeter/method"}),
+        )
+        .await;
+    let graph = actor.settle(&fixture, graph).await;
+    assert_eq!(graph["kind"], "graph", "{graph}");
+    assert_eq!(
+        graph["text"].as_str().unwrap(),
+        "graph: callers/callees unavailable for python (pyright has no call hierarchy); use ide.symbol usages\n",
+        "{graph}"
     );
     let read = actor
         .call(
