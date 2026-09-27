@@ -471,7 +471,8 @@ fn collect_strings(value: &Value, out: &mut Vec<String>) {
 
 /// Converts siblings under `owner_path`: ordered by first line (the server sorts by name), then
 /// adjacent same-named siblings merged into the first. Children of a function-like owner keep
-/// only nested declarations; statement-level symbols are dropped (see [`is_body_local`]).
+/// only nested declarations; statement-level symbols are dropped (see [`is_body_local`]), and
+/// so are names that cannot head an outline entry (see [`is_outline_name`]).
 fn convert_all(
     lines: &[&str],
     symbols: Vec<lsp::DocumentSymbol>,
@@ -482,6 +483,8 @@ fn convert_all(
     let in_body = owner.is_some_and(is_body_owner);
     let mut converted: Vec<Symbol> = symbols
         .into_iter()
+        // A `describe("suite")` call symbol carries its call expression as its name and stays.
+        .filter(|symbol| is_outline_name(&symbol.name) || is_test_call(&symbol.name))
         .filter(|symbol| !in_body || !is_body_local(symbol.kind))
         .map(|symbol| convert(lines, symbol, owner_path, owner, test_file))
         .collect();
@@ -506,6 +509,17 @@ fn is_body_owner(kind: SymbolKind) -> bool {
         kind,
         SymbolKind::Function | SymbolKind::Method | SymbolKind::Constructor | SymbolKind::Test
     )
+}
+
+/// Whether a server symbol name can head an outline entry. Anonymous callbacks arrive with an
+/// empty name and JSX children or `.map(...)` calls arrive with a whole expression as their
+/// "name"; none of those is an identifier-like token, while named nested functions and methods
+/// keep their entries.
+fn is_outline_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '(' | '<' | '>'))
 }
 
 /// Kinds tsserver reports for statements inside a body — locals, object-literal properties and
@@ -1593,6 +1607,53 @@ src/transport.ts  (29 lines, typescript)
   (9 symbols)
 "
         );
+    }
+
+    /// Anonymous callbacks (empty names) and JSX children or `.map(...)` calls (expression
+    /// names) never reach the outline; a named nested function keeps its entry.
+    #[test]
+    fn normalize_drops_anonymous_and_expression_symbol_names() {
+        use crate::lang::render::outline_text;
+        let source = "export function Details({ cards }: Props) {\n  const titles = cards\n    .map((card) => card.title)\n    .sort();\n  function sortedTitle(card: Card): string {\n    return card.title.toUpperCase();\n  }\n  return (\n    <div className=\"list\">\n      {cards.map((card) => (\n        <Card key={card.id} title={card.title} />\n      ))}\n    </div>\n  );\n}\n";
+        // Captured tsserver shape: the anonymous arrow arrives with an empty name and the JSX
+        // expression container arrives with the whole `.map(...)` expression as its name.
+        let symbols = vec![symbol(
+            "Details",
+            lsp::SymbolKind::FUNCTION,
+            (0, 0, 14, 1),
+            vec![
+                symbol("", lsp::SymbolKind::FUNCTION, (2, 5, 2, 26), vec![]),
+                symbol(
+                    "cards.map((card) => <Card key={card.id} title={card.title} />)",
+                    lsp::SymbolKind::OBJECT,
+                    (8, 6, 11, 8),
+                    vec![],
+                ),
+                symbol(
+                    "sortedTitle",
+                    lsp::SymbolKind::FUNCTION,
+                    (4, 2, 6, 3),
+                    vec![],
+                ),
+            ],
+        )];
+        let outline = TypeScript.normalize(Path::new("src/details.tsx"), source, symbols);
+        let text = outline_text(&outline);
+        assert!(text.contains("Details"), "{text}");
+        assert!(
+            text.contains("function sortedTitle(card: Card): string"),
+            "{text}"
+        );
+        assert!(!text.contains("cards.map"), "{text}");
+        assert!(!text.contains("<Card"), "{text}");
+        let details = outline.named("Details").into_iter().next().unwrap();
+        let mut children = Vec::new();
+        details.walk(&mut |candidate| {
+            if candidate.name != "Details" {
+                children.push(candidate.name.clone());
+            }
+        });
+        assert_eq!(children, vec!["sortedTitle".to_owned()]);
     }
 
     /// Before/After with one blank line; First/Last inside class and object literal braces.
