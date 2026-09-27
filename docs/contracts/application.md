@@ -20,6 +20,8 @@ The accepted r2 addition exposes exactly `assistance.hook_submit` and `assistanc
 
 The proposed v0.2 additions are limited to the mechanics named by [Core IPC](core-ipc.md), [TELEMETRY-r1](telemetry-v0.2.md), and [EDIT-r1](changes-v0.2.md). Application offers a bounded trusted multi-row read to Telemetry and transaction/receipt persistence to Changes; it does not parse telemetry rows, edit requests, paths, source references, or outcomes. The v0.2 configuration additions are restart-only and do not introduce live reload.
 
+The operator `init` command bootstraps the per-user tree in one shot: it creates the effective home's `.agent-ide` directory with mode `0700` (refusing a non-directory) and, when the launcher configuration (the effective home's `.config/agent-ide/launcher.json`, overridable with `--config`) is absent, writes the minimal valid version-one template with mode `0600` — documented default limits, the given `--allowed-root`s (else `~/projects` when it exists, else the home) as `allowed_roots`, and one rebindable single target carrying the measured platform `git` — so `agent-ide launcher check` accepts the result immediately. Existing files are never modified and a symlinked config path is refused with exit 2 and one reason line; success prints one `{"home", "config", "created"}` JSON line.
+
 Both connect-only clients compute one absolute deadline at call entry. Connecting and the
 subsequent frame exchange consume that same `HookTransportLimits.deadline` budget; a slow
 connection never grants a second full exchange interval. The fake-socket regression uses
