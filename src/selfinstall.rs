@@ -269,7 +269,14 @@ pub fn run(args: Args) -> Result<Summary, String> {
 }
 
 /// Performs the locked install for already-resolved options.
+///
+/// Every refusal happens before any mutation: release verification, plugin parts, launcher
+/// ownership, and prefix/bin-dir/share-dir writability (proved by creating the three roots the
+/// install needs, idempotent for an existing layout) are established first. The writes then run
+/// in a fixed order — release dir, launcher shim, plugin stage, and both `current` swaps last —
+/// so a refused or failing install cannot leave a mixed layout behind.
 fn install(options: &Options) -> Result<Summary, String> {
+    // Checks first: bundle integrity and the plugin parts.
     verify_release(&options.release, &options.version)?;
     for part in PLUGIN_PARTS {
         if !options.release.join(part).is_dir() {
@@ -279,13 +286,32 @@ fn install(options: &Options) -> Result<Summary, String> {
     let releases = options.prefix.join(RELEASES_DIR);
     create_dir(&releases)?;
     let selected = releases.join(&options.version);
-    if fs::symlink_metadata(&selected).is_ok() {
-        if let Err(reason) = identical_release(&selected, &options.release, &options.version) {
-            if !options.replace {
-                return Err(format!(
-                    "refusing to overwrite a different immutable release: {reason}"
-                ));
+    // Read-only decision on what the release step must do with `releases/<version>`.
+    let reinstall = match fs::symlink_metadata(&selected) {
+        Ok(_) => match identical_release(&selected, &options.release, &options.version) {
+            Ok(()) => Reinstall::Identical,
+            Err(reason) => {
+                if !options.replace {
+                    return Err(format!(
+                        "refusing to overwrite a different immutable release: {reason}"
+                    ));
+                }
+                Reinstall::Replace
             }
+        },
+        Err(_) => Reinstall::Fresh,
+    };
+    // Launcher ownership and the remaining writability proofs.
+    let launcher = options.bin_dir.join(BINARY_NAME);
+    create_dir(&options.bin_dir)?;
+    ensure_launcher_owned(options, &launcher)?;
+    let plugin_root = options.share_dir.join(PLUGIN_DIR);
+    create_dir(&plugin_root)?;
+
+    // Writes, in order: release dir → launcher shim → plugin stage → both `current` swaps.
+    match reinstall {
+        Reinstall::Fresh => install_release(&options.release, &selected, &options.version)?,
+        Reinstall::Replace => {
             // A source build re-installed under the same version: retire the old copy first so
             // the immutable directory is rebuilt whole rather than patched in place.
             let retired = releases.join(format!(
@@ -301,31 +327,40 @@ fn install(options: &Options) -> Result<Summary, String> {
             let _ = fs::remove_dir_all(&retired);
             install_release(&options.release, &selected, &options.version)?;
         }
-    } else {
-        install_release(&options.release, &selected, &options.version)?;
+        Reinstall::Identical => {}
     }
-
+    let launcher = write_launcher(options)?;
     let current = options.prefix.join("current");
     // `current` names the versioned release below `releases/`; the link target stays relative.
     let current_target_name = format!("{RELEASES_DIR}/{}", options.version);
     let action = if current_target(&current).as_deref() == Some(current_target_name.as_str()) {
         // Same version already selected: the immutable release and the plugin are already in
-        // place, so only the launcher below is refreshed.
+        // place, so only the launcher above is refreshed.
         "refreshed"
     } else {
+        stage_plugin_parts(options, &plugin_root)?;
         swap_symlink(&current, &current_target_name)?;
-        stage_plugin(options)?;
+        swap_symlink(&plugin_root.join("current"), &options.version)?;
         "installed"
     };
-    let launcher = write_launcher(options)?;
     Ok(Summary {
         version: options.version.clone(),
         prefix: options.prefix.clone(),
         current,
         launcher,
-        plugin_current: options.share_dir.join(PLUGIN_DIR).join("current"),
+        plugin_current: plugin_root.join("current"),
         action,
     })
+}
+
+/// What the release step must do with `releases/<version>`, decided read-only before any write.
+enum Reinstall {
+    /// Nothing installed under that name yet: copy the verified bundle in whole.
+    Fresh,
+    /// An identical release already verifies: leave it untouched.
+    Identical,
+    /// A different release is installed and `--replace` was passed: rebuild it whole.
+    Replace,
 }
 
 /// Copies the verified bundle into a staged directory, writes `COMPLETE` last, re-verifies the
@@ -366,18 +401,16 @@ fn identical_release(existing: &Path, candidate: &Path, version: &str) -> Result
     Ok(())
 }
 
-/// Stages the four plugin parts, regenerates the Claude hook to exec the managed launcher
-/// (the `scripts/install-local.sh` contract), replaces the version directory, and swaps
-/// `plugin/current`.
-fn stage_plugin(options: &Options) -> Result<(), String> {
-    let plugin_root = options.share_dir.join(PLUGIN_DIR);
-    create_dir(&plugin_root)?;
-    let staged = create_unique_dir(&plugin_root)?;
+/// Stages the four plugin parts into `plugin_root/<version>`, regenerating the Claude hook to
+/// exec the managed launcher (the `scripts/install-local.sh` contract). Expects `<share>/plugin`
+/// to exist (the check phase created it); the caller owns both `current` swaps.
+fn stage_plugin_parts(options: &Options, plugin_root: &Path) -> Result<(), String> {
+    let staged = create_unique_dir(plugin_root)?;
     for part in PLUGIN_PARTS {
         copy_tree(&options.release.join(part), &staged.join(part), None)?;
     }
     let hook = staged.join("hooks/claude-hook.sh");
-    // The bundle copy is replaced: the installed hook execs the managed launcher, so the
+    // The bundle copy is replaced: the installed hook must exec the managed launcher, so the
     // installed copy no longer needs `AGENT_IDE_BIN` (the install-local.sh contract).
     remove_path(&hook)?;
     write_executable(
@@ -390,9 +423,7 @@ fn stage_plugin(options: &Options) -> Result<(), String> {
     )?;
     let version_dir = plugin_root.join(&options.version);
     remove_path(&version_dir)?;
-    fs::rename(&staged, &version_dir)
-        .map_err(|error| format!("{}: {error}", version_dir.display()))?;
-    swap_symlink(&plugin_root.join("current"), &options.version)
+    fs::rename(&staged, &version_dir).map_err(|error| format!("{}: {error}", version_dir.display()))
 }
 
 /// Verifies one sealed release directory end to end: the `COMPLETE` seal, the metadata

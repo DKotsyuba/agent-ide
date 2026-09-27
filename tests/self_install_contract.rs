@@ -550,3 +550,56 @@ fn defaults_resolve_from_the_agent_ide_home_override() {
     assert!(root.join(".local/share/agent-ide/plugin/current").exists());
     let _ = fs::remove_dir_all(&root);
 }
+
+/// Installing version B over an install of version A against an unowned launcher is refused
+/// with neither `current` symlink changed and no release written: every check runs before the
+/// first mutation.
+#[test]
+fn a_refused_second_version_install_leaves_no_mixed_state() {
+    let root = unique_root("mixed");
+    install_ok(
+        &sealed_bundle_named(&root, "bundle-a", "0.3.9", "first"),
+        &root,
+        "0.3.9",
+    );
+    // Replace the managed shim with a foreign script the installer cannot own.
+    let launcher = root.join("bin/agent-ide");
+    fs::write(&launcher, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).unwrap();
+    let prefix_current = fs::read_link(root.join("prefix/current")).unwrap();
+    let plugin_current = fs::read_link(root.join("share/plugin/current")).unwrap();
+    let output = install(
+        &sealed_bundle_named(&root, "bundle-b", VERSION, "second"),
+        &root,
+        VERSION,
+    );
+    assert!(
+        !output.status.success(),
+        "the unowned launcher must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unowned launcher"),
+        "unexpected refusal: {stderr}"
+    );
+    assert_eq!(
+        fs::read_link(root.join("prefix/current")).unwrap(),
+        prefix_current,
+        "prefix current must not change on refusal"
+    );
+    assert_eq!(
+        fs::read_link(root.join("share/plugin/current")).unwrap(),
+        plugin_current,
+        "plugin current must not change on refusal"
+    );
+    assert!(
+        !root.join("prefix/releases").join(VERSION).exists(),
+        "the refused version's release must not be written"
+    );
+    assert_eq!(
+        fs::read_to_string(&launcher).unwrap(),
+        "#!/bin/sh\nexit 0\n",
+        "the refused launcher must be untouched"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
