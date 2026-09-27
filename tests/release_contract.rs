@@ -68,7 +68,7 @@ fn release_workflow_requires_complete_gates_before_publication() {
         "scripts/release-smoke.sh \"$ASSET\"",
         // The bootstrap installer ships as a release asset, checksummed with the tarball and
         // covered by build-provenance attestation before publication.
-        "shasum -a 256 \"$ASSET\" install.sh > SHA256SUMS",
+        "shasum -a 256 \"$(basename \"$ASSET\")\" install.sh > SHA256SUMS",
         "actions/attest-build-provenance@",
         "subject-checksums: SHA256SUMS",
         "id-token: write",
@@ -213,6 +213,8 @@ fn run_install_local(script: &Path, prefix: &Path) {
         .arg("--no-build")
         .arg("--prefix")
         .arg(prefix)
+        // The wrapper keeps immutable releases under the effective home; never the real one.
+        .env("AGENT_IDE_HOME", prefix)
         .output()
         .expect("scripts/install-local.sh must execute");
     assert!(
