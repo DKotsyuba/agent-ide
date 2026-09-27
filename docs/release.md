@@ -1,17 +1,52 @@
 # Release installation and update
 
-Agent IDE 0.2.0 publishes one `aarch64-apple-darwin` archive. macOS arm64 is the only claimed
-platform; Linux remains explicitly `not_tested` and has no release artifact.
+Agent IDE 0.4.0 publishes one `aarch64-apple-darwin` archive plus `install.sh` and
+`SHA256SUMS`. macOS arm64 is the only claimed platform; Linux remains explicitly `not_tested`
+and has no release artifact.
 
-## Verified binary installation
+Publication and installation are separate boundaries: a green publication workflow does not
+prove a production cutover, and a local install never publishes to GitHub.
 
-Run `./install.sh 0.2.0` from the tag-pinned repository checkout. The installer downloads
-`agent-ide-v0.2.0-aarch64-apple-darwin.tar.gz` and `SHA256SUMS` through the authenticated GitHub
-CLI, verifies the checksum, and atomically replaces `${AGENT_IDE_INSTALL_DIR:-$HOME/.local/bin}/agent-ide`.
-It does not change host configuration. The archive contains that executable plus both plugin
-manifests and marketplace catalogs, the Agent IDE skill, Claude hooks, this guide, and the
-installer. `scripts/release-smoke.sh` checks that exact file set and executes the extracted
-executable before publication.
+## Install or update
+
+The primary public entry point is the [one-line installer](../README.md#install). Use the
+same command for a fresh installation or an update:
+
+```bash
+curl -fsSL https://github.com/DKotsyuba/agent-ide/releases/latest/download/install.sh | sh
+```
+
+Or use wget:
+
+```bash
+wget -qO- https://github.com/DKotsyuba/agent-ide/releases/latest/download/install.sh | sh -s -- --downloader wget
+```
+
+The repository is private today: the installer accepts `GITHUB_TOKEN` (sent as a bearer
+token) or falls back to `gh release download` when `gh` is authenticated. It verifies the
+tarball against the release `SHA256SUMS`, rejects unsafe tar members, and checks the bundle's
+own manifest (`metadata.json`, `SHA256SUMS`, `COMPLETE`). It keeps immutable versions under
+`~/.agent-ide/standalone/releases/<version>` with a `current` symlink, installs the host
+plugin under `~/.local/share/agent-ide/plugin/<version>` with a `plugin/current` symlink, and
+places a managed launcher shim at `~/.local/bin/agent-ide`. Repeating the command updates;
+the same version is a no-op; an existing version is never overwritten with different bytes.
+
+`install.sh --version X.Y.Z` pins a published release; omitting the version uses the latest
+stable GitHub Release. To pin a version or choose directories, download `install.sh` and run:
+
+```bash
+sh install.sh --version X.Y.Z --home "$HOME/.agent-ide" \
+  --prefix "$HOME/.agent-ide/standalone" --bin-dir "$HOME/.local/bin"
+```
+
+The home defaults to `~/.agent-ide`; override it with `AGENT_IDE_HOME` or `--home`. The
+installer does not edit host MCP or hook configuration.
+
+Restart agent-run after an install or update: it resolves
+`~/.local/share/agent-ide/plugin/current` once, when its service starts, so its runtimes keep
+the previous plugin until the restart. Register Codex hooks once with
+`agent-ide codex-hooks print`. Afterward, run `agent-ide launcher check
+~/.config/agent-ide/launcher.json` and `agent-ide doctor` to verify the installation.
 
 ## Codex plugin
 
@@ -37,7 +72,7 @@ that the configured `command` still names the installer destination.
 Add the tag-pinned marketplace and install its plugin:
 
 ```sh
-claude plugin marketplace add DKotsyuba/agent-ide@v0.2.0
+claude plugin marketplace add DKotsyuba/agent-ide@v0.4.0
 claude plugin install agent-ide@agent-ide
 ```
 
@@ -69,10 +104,29 @@ Recheck `claude mcp get agent-ide` and `AGENT_IDE_BIN` before using the updated 
 
 ## Local install from source
 
-`scripts/install-local.sh [--prefix DIR] [--dry-run] [--no-build]` builds this checkout and
-installs it into a user prefix (default `$HOME/.local`) so agent-run runtimes, crew hooks, and
-Claude skills catalogs can depend on a stable installed path instead of the checkout itself. The
-checkout remains the development working copy; nothing about it changes.
+From a clean checkout, build the release binary, package the deterministic bundle, and run the
+installer against it:
+
+```bash
+release_root="$(mktemp -d)"
+version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+cargo build --locked --release --bin agent-ide
+scripts/package-release.sh target/release/agent-ide "v$version" "$release_root"
+"$release_root/agent-ide-v$version/agent-ide" self-install --release "$release_root/agent-ide-v$version" --version "$version"
+```
+
+`package-release.sh` verifies that the tag matches the Cargo and plugin manifest versions and
+produces the bundle (`agent-ide`, plugin manifests, marketplace catalogs, hooks, skill, this
+guide, `metadata.json`, `SHA256SUMS`, `COMPLETE`) plus the tarball and its `SHA256SUMS`;
+`self-install` runs the installer's own code path on that local bundle. The temporary build
+directory may be removed after installation. Use a new version for changed source: the
+installer never overwrites an existing version with different bytes.
+
+For a development install without a release bundle, `scripts/install-local.sh [--prefix DIR]
+[--dry-run] [--no-build]` builds this checkout and installs it into a user prefix (default
+`$HOME/.local`) so agent-run runtimes, crew hooks, and Claude skills catalogs can depend on a
+stable installed path instead of the checkout itself. The checkout remains the development
+working copy; nothing about it changes.
 
 What is installed where:
 
@@ -137,3 +191,17 @@ scenarios must be `product_pass`, and all rows must carry the accepted language 
 with `go` and `gopls` pinned to `not_tested` and closed privacy fields. Missing drivers, `failed`,
 `not_tested` outside the go/gopls rows, mixed revisions, partial scenarios,
 and Linux evidence all block publication.
+
+The workflow runs the gates, then the product acceptance route
+(`scripts/macos-acceptance.sh --route product`), validates the checked-in host evidence
+(`scripts/validate-release-evidence.sh`), builds and packages the release
+(`scripts/package-release.sh`), and smoke-tests the packaged archive
+(`scripts/release-smoke.sh`, which checks the exact file set and executes the extracted
+executable). The toolchains prepared on the runner, and therefore the accepted versions in
+evidence rows, are rust-analyzer 1.98.1 (from the pinned Rust toolchain), pyright 1.1.413,
+typescript-language-server 6.0.0, TypeScript 5.9.3, and Node 24.4.0
+(`.github/workflows/release.yml`). After the smoke test the workflow generates one
+`SHA256SUMS`, attests build provenance for it (`actions/attest-build-provenance`), and
+publishes the tarball, `install.sh`, and `SHA256SUMS` to the GitHub Release only after every
+required job succeeds. A failed run leaves no public partial release. Tags are immutable;
+corrections ship as a new patch version.

@@ -2,7 +2,7 @@
 
 An explicitly activated coding companion for Codex and Claude Code on macOS arm64. One coding agent owns one Git worktree. A local broker coordinates isolated analysis views, compatible shared language-server backends and bounded feedback. Linux remains explicitly `not_tested` and no Linux release artifact is published.
 
-Status: the binary assembles the six-tool MCP surface, exact Codex hook-to-MCP binding,
+Status: the binary assembles the eleven-tool MCP surface, exact Codex hook-to-MCP binding,
 explicit Codex/Claude native ingress, bounded hook context output, durable Workspace activation,
 source context, safe Git comparisons and owned provider cleanup. Host-shaped process tests exercise
 Claude daemon activation, stale-safe Edit, Go/Rust Context, Diff and emitted additional context.
@@ -11,12 +11,90 @@ plus Codex Go context/edit/diff/stop and parent/native-child isolation across di
 roots. Complete delivery accounting and the remaining roadmap acceptance checks are still open.
 
 Tagged releases are built on GitHub Actions using an arm64 macOS runner and published
-with a SHA-256 checksum in GitHub Releases. Install the latest private release with
-`./install.sh`, or pin v0.2.0 with `./install.sh 0.2.0`. The installer uses the
-authenticated GitHub CLI, verifies `SHA256SUMS`, and atomically installs to
-`~/.local/bin` (override with `AGENT_IDE_INSTALL_DIR`). It does not edit MCP or hook
-configuration. The release archive also contains the Codex and Claude plugin manifests,
-marketplace catalogs, skill, and hooks. See the [release installation and update guide](docs/release.md).
+with a SHA-256 checksum in GitHub Releases. See [docs/release.md](docs/release.md).
+
+## Install
+
+Use the same command for a fresh installation or an update:
+
+```bash
+curl -fsSL https://github.com/DKotsyuba/agent-ide/releases/latest/download/install.sh | sh
+```
+
+Or use wget:
+
+```bash
+wget -qO- https://github.com/DKotsyuba/agent-ide/releases/latest/download/install.sh | sh -s -- --downloader wget
+```
+
+**Availability:** the installer ships starting with 0.4.0. Earlier releases installed only
+the bare binary with the old `gh`-based `./install.sh` from the repository checkout.
+
+The repository is private today: the installer accepts `GITHUB_TOKEN` (sent as a bearer
+token) or falls back to `gh release download` when `gh` is authenticated.
+
+The installer verifies the tarball against the release `SHA256SUMS`, checks the bundle's own
+manifest (`metadata.json`, `SHA256SUMS`, `COMPLETE`), keeps immutable versions under
+`~/.agent-ide/standalone/releases/<version>` with a `current` symlink, installs the host
+plugin under `~/.local/share/agent-ide/plugin/<version>` with a `plugin/current` symlink
+(what agent-run and crew reference), and places a managed launcher shim at
+`~/.local/bin/agent-ide`. Add that directory to `PATH`. Repeating the command updates; the
+same version is a no-op; an existing version is never overwritten with different bytes. No
+Cargo, Node or sudo is needed for the binary; the language servers are separate (accepted
+versions are listed under [Configure](#configure)). The installer does not edit host MCP or
+hook configuration.
+
+To pin a version or choose directories, download `install.sh` and run:
+
+```bash
+sh install.sh --version X.Y.Z --home "$HOME/.agent-ide" \
+  --prefix "$HOME/.agent-ide/standalone" --bin-dir "$HOME/.local/bin"
+```
+
+The home defaults to `~/.agent-ide`; override it with `AGENT_IDE_HOME` or `--home`.
+
+Build from source (also usable before publication):
+
+```bash
+release_root="$(mktemp -d)"
+version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+cargo build --locked --release --bin agent-ide
+scripts/package-release.sh target/release/agent-ide "v$version" "$release_root"
+"$release_root/agent-ide-v$version/agent-ide" self-install --release "$release_root/agent-ide-v$version" --version "$version"
+```
+
+Use a new version for changed source: the installer never overwrites an existing version
+with different bytes. For a development install without a release bundle, use
+`scripts/install-local.sh`.
+
+Restart agent-run after an install or update: it resolves
+`~/.local/share/agent-ide/plugin/current` once, when its service starts, so its runtimes
+keep the previous plugin until the restart. Register Codex hooks once with
+`agent-ide codex-hooks print`. Host wiring for the Codex and Claude Code plugins is in
+[docs/release.md](docs/release.md) (§Codex plugin, §Claude Code plugin).
+
+## Configure
+
+`agent-ide init` writes a minimal `~/.config/agent-ide/launcher.json` — the
+[trusted launcher configuration](docs/assistance-launcher.md) naming allowed roots and
+accepted executables — without overwriting an existing file. Validate it and inspect the
+installation:
+
+```bash
+agent-ide init
+agent-ide launcher check ~/.config/agent-ide/launcher.json
+agent-ide doctor
+```
+
+`agent-ide doctor` with no arguments prints a JSON health report of the installation —
+configuration, toolchains, install layout, plugin link, host hooks, daemons, recent errors —
+and exits 2 when it reports errors. `agent-ide doctor --runtime-dir PATH` keeps querying a
+running repository daemon.
+
+The accepted language-server versions for 0.4 are rust-analyzer 1.98.1 (from the pinned
+Rust toolchain), pyright 1.1.413, typescript-language-server 6.0.0, TypeScript 5.9.3, and
+Node 24.4.0; the release workflow installs exactly these, and [docs/release.md](docs/release.md)
+lists them for the publication gate.
 
 Runtime-neutral orchestrators can register one command for both hosts:
 
@@ -43,7 +121,7 @@ args = ["mcp", "--launcher-template", "/absolute/path/to/launcher.json"]
 The launcher file uses the existing schema and must contain exactly one target. Managed MCP captures
 the host-selected current directory, replaces only that target's candidate and a fresh internal
 attachment, validates the result, and owns its private daemon until stdio closes. Startup failure
-still exposes the same six tools with disconnected native-fallback results. A repository plugin
+still exposes the same eleven tools with disconnected native-fallback results. A repository plugin
 manifest cannot safely supply the machine-specific template path, so it remains normal host config.
 Legacy `agent-ide mcp --runtime-dir PATH` remains connect-only and compatible with separately
 started `agent-ide daemon --runtime-dir PATH` instances.
@@ -142,7 +220,7 @@ Stopping a coder releases its analysis leases and retains its worktree's cache d
 
 Go worktrees split their cache in two. Each worktree keeps a private namespace holding its own `GOCACHE`/`GOMODCACHE`/`GOTMPDIR`, delivered per LSP view rather than as process environment, so a view without one fails closed instead of reading another worktree's build state. Compatible worktrees additionally share one backend-scoped native namespace holding gopls' own on-disk filecache and the listener's temporary directory: gopls binds that filecache once per process, so sharing it is what lets divergent worktrees run on a single physical listener with one forwarder each. Compatibility is one canonical effective-rights identity — provider, settings, toolchain, and the rights the observed sandbox state actually grants; cwd-relative sandbox roots are resolved to absolute rights first, and any policy whose rights cannot be proven equal is never shared. The shared namespace is reference-counted, so it survives a partial stop while any sharing worktree is still live, and both namespaces persist across stop and handoff. gopls manages the contents of its shared native namespace itself and may evict them at any time; that eviction is a cache miss, never a loss of IDE-owned worktree state.
 
-Pyright v0.1.1 supports Codex and Claude Python (`.py` and `.pyi`). Configure its closed `pyright_defaults_v1` provider with accepted absolute `pyright-langserver` and `node` executable objects, and set `toolchain` to the accepted Node identity. The launcher invokes that exact Node executable with the absolute Pyright script and `--stdio`; The daemon uses the same accepted paths, identities, and BLAKE3 digests. The six-tool MCP surface keeps wire v2 for the original five methods and uses wire v3 for `ide.edit`.
+Pyright v0.1.1 supports Codex and Claude Python (`.py` and `.pyi`). Configure its closed `pyright_defaults_v1` provider with accepted absolute `pyright-langserver` and `node` executable objects, and set `toolchain` to the accepted Node identity. The launcher invokes that exact Node executable with the absolute Pyright script and `--stdio`; The daemon uses the same accepted paths, identities, and BLAKE3 digests. The MCP surface keeps wire v2 for the original five methods and uses wire v3 for `ide.edit`.
 
 The v0.2 TypeScript increment supports Codex and Claude semantic Context for `.js`, `.jsx`, `.ts`,
 and `.tsx` on their separate accepted macOS release cells. Configure `typescript_defaults_v1` with
