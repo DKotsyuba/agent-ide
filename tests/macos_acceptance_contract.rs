@@ -116,8 +116,8 @@ fn agent_run_drivers_use_route_matched_schema_two_providers() {
         "[ \"$PROVIDER\" = \"$DEFAULT_PROVIDER\" ]",
         "DEFAULT_MODEL=gpt-6-luna",
         "PROMPT_FAMILY=prompts",
-        "task_prompt \"$DRIVER_DIR/$PROMPT_FAMILY/l1b.txt\"",
-        "task_prompt \"$DRIVER_DIR/$PROMPT_FAMILY/r5b.txt\"",
+        "run_scenario l1b \"$LEFT\" l1b.txt verify_l1b",
+        "run_scenario r5b \"$RIGHT\" r5b.txt verify_r5b",
         "if [ \"$AGENT_IDE_ACCEPTANCE_ROUTE\" = agent-run-claude ]; then",
         "E_WORKTREE_OUTSIDE_LAUNCHER_ROOT",
         "require_agent_run_compact_replies \"$DIAG_DIR/transcript-$label.json\"",
@@ -169,7 +169,7 @@ fn symbol_tools_scenario_is_wired_into_every_host_driver() {
     }
 
     let agent_run = include_str!("../scripts/acceptance-drivers/agent-run-claude.sh");
-    assert!(agent_run.contains("task-l5.txt"));
+    assert!(agent_run.contains("run_scenario l5 \"$LEFT\" l5.txt verify_l5"));
     assert!(agent_run.contains("LEFT_SYMBOLS_OK"));
     assert!(agent_run.contains("verify_symbol_tools_left_clean"));
 }
