@@ -112,6 +112,13 @@ fi
 # launcher template declares the accepted host profile. Environment
 # set here cannot redirect the agent to the candidate, so a differing installed
 # binary fails the cell closed before any agent starts.
+# Since 0.4.1 the installed path is normally the managed launcher shim; the binary it execs
+# (`<prefix>/current/agent-ide`) is what the broker's agents run, so that is what must match.
+if [ "$(sed -n 2p "$MCP_BINARY" 2>/dev/null)" = "# agent-ide managed launcher v1" ]; then
+    MCP_BINARY=$(sed -n "s/^exec '\(.*\)' \"\$@\"$/\1/p" "$MCP_BINARY")
+    [ -n "$MCP_BINARY" ] && [ -r "$MCP_BINARY" ] \
+        || fail installed_binary_differs "the managed launcher does not name a readable binary"
+fi
 cmp -s "$BINARY" "$MCP_BINARY" \
     || fail installed_binary_differs \
         "$MCP_BINARY is not byte-identical to the candidate $BINARY"
