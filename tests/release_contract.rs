@@ -77,9 +77,8 @@ fn release_workflow_requires_complete_gates_before_publication() {
         assert!(workflow[..publish].contains(gate), "missing gate: {gate}");
     }
     assert!(
-        workflow[publish..].starts_with(
-            "gh release create \"$GITHUB_REF_NAME\" \"$ASSET\" install.sh SHA256SUMS"
-        ),
+        workflow[publish..]
+            .starts_with("gh release create \"$GITHUB_REF_NAME\" \"$ASSET\" install.sh SHA256SUMS"),
         "the release must attach the tarball, install.sh, and SHA256SUMS"
     );
     assert!(!workflow.contains("continue-on-error"));

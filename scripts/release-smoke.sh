@@ -90,7 +90,7 @@ RELEASE_HOME="$RELEASE_TMP/home"
     --prefix "$RELEASE_TMP/prefix" \
     --bin-dir "$RELEASE_TMP/bin" \
     --share-dir "$RELEASE_TMP/share"
-[ "$(readlink "$RELEASE_TMP/prefix/current")" = "$RELEASE_VERSION" ]
+[ "$(readlink "$RELEASE_TMP/prefix/current")" = "releases/$RELEASE_VERSION" ]
 [ "$(readlink "$RELEASE_TMP/share/plugin/current")" = "$RELEASE_VERSION" ]
 [ "$("$RELEASE_TMP/bin/agent-ide" --version)" = "agent-ide $RELEASE_VERSION" ]
 grep -q "exec '$RELEASE_TMP/prefix/current/agent-ide'" "$RELEASE_TMP/bin/agent-ide"
