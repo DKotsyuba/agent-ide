@@ -959,7 +959,10 @@ mod tests {
             ..Default::default()
         };
         let text = symbol_card_text(&card);
-        assert!(text.contains("usages: 0 in 0 files (src 0, tests 0)\n"), "{text}");
+        assert!(
+            text.contains("usages: 0 in 0 files (src 0, tests 0)\n"),
+            "{text}"
+        );
         assert!(
             text.contains("callers: unavailable (pyright has no call hierarchy)\n"),
             "{text}"
@@ -973,6 +976,9 @@ mod tests {
             line: 8,
         });
         let text = symbol_card_text(&card);
-        assert!(text.contains("callers: 1\n  main.py#caller  main.py:8\n"), "{text}");
+        assert!(
+            text.contains("callers: 1\n  main.py#caller  main.py:8\n"),
+            "{text}"
+        );
     }
 }

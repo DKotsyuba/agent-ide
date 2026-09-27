@@ -406,8 +406,8 @@ impl Worker<'_> {
         if Lang::for_path(observed.path()) == Some(Lang::Python) {
             let authority = self.finish_symbol_job(job, &binding, &observed).await?;
             let text = "graph: callers/callees unavailable for python (pyright has no call hierarchy); use ide.symbol usages\n".to_owned();
-            let (reply, page) = ContextPageState::new(text, 0, false, ResultKind::Graph)
-                .next(&job.reference)?;
+            let (reply, page) =
+                ContextPageState::new(text, 0, false, ResultKind::Graph).next(&job.reference)?;
             self.shared.set_context_page(&job.reference, page);
             return Ok((reply, Some(authority), Some(observed)));
         }

@@ -369,7 +369,10 @@ impl LanguageSupport for TypeScript {
                     .is_some_and(|extension| SCRIPT_EXTENSIONS.contains(&extension))
                     && !self.is_test_file(file)
                 {
-                    return Err(LangError::Unsupported(format!("no tests in {}", file.display())));
+                    return Err(LangError::Unsupported(format!(
+                        "no tests in {}",
+                        file.display()
+                    )));
                 }
                 (Vec::new(), vec![file.display().to_string()], None)
             }
