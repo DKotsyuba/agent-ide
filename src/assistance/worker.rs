@@ -1561,9 +1561,10 @@ fn detail_sequence(reference: &str) -> u64 {
 }
 
 /// Evicts one binding's oldest settled details until the ledger holds fewer than `limit` facts,
-/// returning how many were removed. Eviction stops at the freed slot, so the binding keeps its
-/// newest history — at least the newest [`FAIR_DETAILS_PER_BINDING`] whenever the older facts
-/// alone can free the slot.
+/// returning how many were removed. A live binding always keeps its newest
+/// [`FAIR_DETAILS_PER_BINDING`] settled facts: a reply the agent may still inspect is never
+/// taken from it, so a binding below that share frees nothing and the request is refused as
+/// before.
 fn evict_binding_oldest(ledger: &mut Ledger, limit: usize, owner: &BindingRef) -> usize {
     let mut candidates: Vec<(u64, String)> = ledger
         .details
@@ -1572,12 +1573,14 @@ fn evict_binding_oldest(ledger: &mut Ledger, limit: usize, owner: &BindingRef) -
         .map(|(reference, _)| (detail_sequence(reference), reference.clone()))
         .collect();
     candidates.sort_unstable();
+    let mut held = candidates.len();
     let mut removed = 0usize;
     for (_, reference) in candidates {
-        if ledger.details.len() < limit {
+        if ledger.details.len() < limit || held <= FAIR_DETAILS_PER_BINDING {
             break;
         }
         ledger.details.remove(&reference);
+        held -= 1;
         removed += 1;
     }
     removed
@@ -5233,11 +5236,11 @@ mod stop_retry_tests {
     #[tokio::test]
     async fn sole_active_binding_evicts_its_own_oldest_settled_details() {
         let fixture = Fixture::new();
-        let handle = detail_handle(&fixture.root, 4);
+        let handle = detail_handle(&fixture.root, 10);
         let sole = validated_call(&handle.shared.bindings, "sole-actor", "sole-start")
             .binding_ref()
             .clone();
-        for n in 1..=4 {
+        for n in 1..=10 {
             let reference = format!("detail-{n}");
             plant_detail(&handle, &reference, &sole, settled_detail(&reference));
         }
@@ -5255,7 +5258,7 @@ mod stop_retry_tests {
             !ledger.details.contains_key("detail-1"),
             "the requesting binding's oldest settled detail must be evicted"
         );
-        for n in 2..=4 {
+        for n in 2..=10 {
             assert!(ledger.details.contains_key(&format!("detail-{n}")));
         }
         assert!(ledger.details.contains_key(&reference));
