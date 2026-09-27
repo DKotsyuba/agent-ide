@@ -64,6 +64,28 @@ chmod 755 \
     "$RELEASE_TMP/$RELEASE_BUNDLE/agent-ide" \
     "$RELEASE_TMP/$RELEASE_BUNDLE/install.sh" \
     "$RELEASE_TMP/$RELEASE_BUNDLE/hooks/claude-hook.sh"
+
+# Seals the bundle so `agent-ide self-install` can verify it end to end: metadata names the
+# version, SHA256SUMS covers every regular file except itself, and COMPLETE — written last, with
+# the exact bytes whose digest is already recorded — asserts the finished verifiable whole.
+release_bundle="$RELEASE_TMP/$RELEASE_BUNDLE"
+jq -n --arg version "$RELEASE_VERSION" '{version: $version, format: 1}' \
+    >"$release_bundle/metadata.json"
+(
+    cd "$release_bundle"
+    complete_hash=$(printf 'complete\n' | shasum -a 256 | awk '{print $1}')
+    {
+        find . -type f ! -name SHA256SUMS ! -name COMPLETE -print | sed 's|^\./||'
+        printf '%s\n' COMPLETE
+    } | LC_ALL=C sort | while IFS= read -r relative; do
+        if [ "$relative" = COMPLETE ]; then
+            printf '%s  %s\n' "$complete_hash" "$relative"
+        else
+            shasum -a 256 "$relative"
+        fi
+    done >SHA256SUMS
+    printf 'complete\n' >COMPLETE
+)
 find "$RELEASE_TMP/$RELEASE_BUNDLE" -exec touch -t 197001010000 {} +
 
 mkdir -p "$RELEASE_OUTPUT"
