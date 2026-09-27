@@ -662,15 +662,16 @@ fn ensure_launcher_owned(options: &Options, launcher: &Path) -> Result<(), Strin
         return Ok(());
     }
     if metadata.permissions().mode() & 0o111 != 0 && is_macho(&contents) {
-        let backup = launcher.with_file_name(format!(
-            "{BINARY_NAME}.bak-{}",
-            binary_version_label(launcher)
-        ));
+        let label = binary_version_label(launcher);
+        let mut backup = launcher.with_file_name(format!("{BINARY_NAME}.bak-{label}"));
         if fs::symlink_metadata(&backup).is_ok() {
-            return Err(format!(
-                "unowned launcher: the backup {} already exists",
-                backup.display()
-            ));
+            // An earlier installer already kept a copy under that name; keep this one too
+            // rather than refusing the migration.
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or(0);
+            backup = launcher.with_file_name(format!("{BINARY_NAME}.bak-{label}-{stamp}"));
         }
         fs::rename(launcher, &backup)
             .map_err(|error| format!("{}: {error}", launcher.display()))?;
