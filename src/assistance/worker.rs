@@ -2207,14 +2207,22 @@ impl<'a> Worker<'a> {
         }
         let (reply, authority, source) = match result {
             Ok(result) => result,
-            Err(code) => (
-                PeerReply::Error {
-                    code,
-                    detail: job.failure_detail.clone(),
-                },
-                None,
-                None,
-            ),
+            Err(code) => {
+                // Every terminal failure names its stage: the failing path's own tag when it set
+                // one, else the derived `<tool>:<reason>` default — never a bare reason.
+                if job.failure_detail.is_none() {
+                    job.failure_detail =
+                        Some(crate::telemetry::adapters::default_stage(job.tool, &code));
+                }
+                (
+                    PeerReply::Error {
+                        code,
+                        detail: job.failure_detail.clone(),
+                    },
+                    None,
+                    None,
+                )
+            }
         };
         if let PeerReply::Error { code, .. } = &reply {
             // T26B: a queued job's terminal failure must reach the error log with its closed
@@ -3665,14 +3673,38 @@ async fn inspection_loop(
     }
 }
 
+/// One failed inspection: the closed failure code plus the stage tag its path knows.
+struct InspectFailure {
+    code: FailureCode,
+    stage: String,
+}
+impl InspectFailure {
+    /// Derives the default `inspect:<reason>` stage for a path with nothing more specific.
+    fn new(code: FailureCode) -> Self {
+        Self {
+            stage: crate::telemetry::adapters::default_stage(AssistanceTool::Inspect, &code),
+            code,
+        }
+    }
+    /// Names the exact stage this path failed at.
+    fn stage(code: FailureCode, stage: &'static str) -> Self {
+        Self {
+            code,
+            stage: stage.to_owned(),
+        }
+    }
+}
+
 /// Delivers only a same-binding result after fresh durable authorization and liveness checks.
 /// An Activation status or completed Diff with recorded empty provenance contains no worktree
 /// source paths or bytes and needs no read-path proof; other path-less details retain the
 /// whole-tree proof requirement. A semantic Context also proves each retained definition and
 /// reference path, so a newly denied secondary file invalidates its cached page.
 async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, request: Inspection) {
-    let result = async {
-        let active = shared.active(&request.binding)?;
+    let result: Result<PeerReply, InspectFailure> = async {
+        let active = shared
+            .active(&request.binding)
+            .map_err(InspectFailure::new)?;
         let (
             reply,
             authority,
@@ -3684,18 +3716,26 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
             context_page_fresh,
             diff_provenance,
         ) = {
-            let ledger = shared.ledger.lock().map_err(|_| FailureCode::Internal)?;
+            let ledger = shared
+                .ledger
+                .lock()
+                .map_err(|_| InspectFailure::new(FailureCode::Internal))?;
             let detail = ledger
                 .details
                 .get(&request.reference)
                 .filter(|detail| detail.binding == request.binding)
-                .ok_or(FailureCode::InvalidDetail)?;
+                .ok_or_else(|| {
+                    InspectFailure::stage(FailureCode::InvalidDetail, "inspect:detail_unknown")
+                })?;
             if request
                 .expected
                 .as_ref()
                 .is_some_and(|expected| expected != &detail.selection)
             {
-                return Err(FailureCode::InvalidDetail);
+                return Err(InspectFailure::stage(
+                    FailureCode::InvalidDetail,
+                    "inspect:detail_mismatch",
+                ));
             }
             (
                 detail.reply.clone(),
@@ -3720,10 +3760,12 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
             code
         };
         if let Some(authority) = &authority {
-            workspace
-                .authorize(authority, &active)
-                .await
-                .map_err(|_| invalidate(FailureCode::WorkspaceAuthority))?;
+            workspace.authorize(authority, &active).await.map_err(|_| {
+                InspectFailure::stage(
+                    invalidate(FailureCode::WorkspaceAuthority),
+                    "inspect:authority_stale",
+                )
+            })?;
             // Cached disclosure adds the conservative lstat preflight: a symlink component below
             // the worktree root refuses disclosure of cached bytes. The real guard for later reads
             // stays the descriptor-relative `O_NOFOLLOW` reader; a preflight can never secure a
@@ -3740,13 +3782,18 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                         .flatten(),
                 )
             {
-                symlink_disclosure_preflight(authority.worktree(), path).map_err(invalidate)?;
+                symlink_disclosure_preflight(authority.worktree(), path).map_err(|code| {
+                    InspectFailure::stage(invalidate(code), "inspect:symlink_preflight")
+                })?;
             }
         }
         if let Some(source) = source
             && !source_matches(&source)
         {
-            return Err(invalidate(FailureCode::SourceUnavailable));
+            return Err(InspectFailure::stage(
+                invalidate(FailureCode::SourceUnavailable),
+                "inspect:source_stale",
+            ));
         }
         if matches!(
             reply,
@@ -3757,7 +3804,7 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
         ) && shared
             .ledger
             .lock()
-            .map_err(|_| FailureCode::Internal)?
+            .map_err(|_| InspectFailure::new(FailureCode::Internal))?
             .native_epoch
             .get(&request.binding)
             .copied()
@@ -3776,16 +3823,25 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                     ..Default::default()
                 },
             );
-            return Err(invalidate(FailureCode::SourceUnavailable));
+            return Err(InspectFailure::stage(
+                invalidate(FailureCode::SourceUnavailable),
+                "inspect:source_stale",
+            ));
         }
-        let active = shared.active(&request.binding)?;
+        let active = shared
+            .active(&request.binding)
+            .map_err(InspectFailure::new)?;
         if let Some(authority) = &authority {
-            workspace
-                .authorize(authority, &active)
-                .await
-                .map_err(|_| invalidate(FailureCode::WorkspaceAuthority))?;
+            workspace.authorize(authority, &active).await.map_err(|_| {
+                InspectFailure::stage(
+                    invalidate(FailureCode::WorkspaceAuthority),
+                    "inspect:authority_stale",
+                )
+            })?;
         }
-        shared.active(&request.binding)?;
+        shared
+            .active(&request.binding)
+            .map_err(InspectFailure::new)?;
         if let Some(page) = diff_page {
             if diff_page_fresh {
                 // `reply` already holds this exact page's composed text, produced by the job
@@ -3796,10 +3852,13 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 {
                     detail.diff_page_fresh = false;
                 }
-                return Ok::<_, FailureCode>(reply);
+                return Ok::<_, InspectFailure>(reply);
             }
             let Some(authority) = &authority else {
-                return Err(FailureCode::WorkspaceAuthority);
+                return Err(InspectFailure::stage(
+                    FailureCode::WorkspaceAuthority,
+                    "inspect:authority_stale",
+                ));
             };
             let expected_scope =
                 crate::workspace::git::GitScope::from_authority(authority, page.mode());
@@ -3809,7 +3868,10 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
             // depend on working-tree bytes, so this is skipped rather than used as unrelated
             // "proof" for them.
             if !page.working_tree_bytes_unchanged(authority.worktree()) {
-                return Err(invalidate(FailureCode::SourceUnavailable));
+                return Err(InspectFailure::stage(
+                    invalidate(FailureCode::SourceUnavailable),
+                    "inspect:source_stale",
+                ));
             }
             // Expansion uses exactly the same whole-page fitting path as the initial composition,
             // so reply text always serializes under the bounded envelope without
@@ -3827,10 +3889,12 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
             .map_err(|code| match code {
                 // A structurally unavailable or failed selection can never be repaired by a later
                 // page.
-                FailureCode::SourceUnavailable => invalidate(code),
+                FailureCode::SourceUnavailable => {
+                    InspectFailure::stage(invalidate(code), "inspect:page_unavailable")
+                }
                 // A budget refusal delivered nothing, so the retained evidence stays: dropping the
                 // continuation here would lose hunks the caller can still reach later.
-                code => code,
+                code => InspectFailure::new(code),
             })?;
             let encoded = next
                 .clone()
@@ -3838,7 +3902,7 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 .and_then(|value| PeerReply::decode(value.as_str()));
             let Some(next) = encoded else {
                 shared.set_diff_page(&request.reference, None);
-                return Err(FailureCode::Internal);
+                return Err(InspectFailure::new(FailureCode::Internal));
             };
             if let Ok(mut ledger) = shared.ledger.lock()
                 && let Some(detail) = ledger.details.get_mut(&request.reference)
@@ -3847,7 +3911,7 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 detail.diff_page = page.advance(&advanced);
                 detail.diff_page_fresh = false;
             }
-            return Ok::<_, FailureCode>(next);
+            return Ok::<_, InspectFailure>(next);
         }
         if let Some(page) = context_page {
             if context_page_fresh {
@@ -3859,14 +3923,14 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 {
                     detail.context_page_fresh = false;
                 }
-                return Ok::<_, FailureCode>(reply);
+                return Ok::<_, InspectFailure>(reply);
             }
             // Staleness is already fully covered above (source bytes and native epoch). A
             // Context detail always retains `source`, so the generic `source_matches` check
             // already ran; a Claude-captured Diff page is a frozen text snapshot with no `source`
             // and no re-derivable Git cursor (unlike the managed `diff_page` branch above), so
             // later pages of it need no further working-tree re-check either — exactly like Context.
-            let (next, next_page) = page.next(&request.reference)?;
+            let (next, next_page) = page.next(&request.reference).map_err(InspectFailure::new)?;
             if let Ok(mut ledger) = shared.ledger.lock()
                 && let Some(detail) = ledger.details.get_mut(&request.reference)
             {
@@ -3874,12 +3938,15 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 detail.context_page = next_page;
                 detail.context_page_fresh = false;
             }
-            return Ok::<_, FailureCode>(next);
+            return Ok::<_, InspectFailure>(next);
         }
-        Ok::<_, FailureCode>(reply)
+        Ok::<_, InspectFailure>(reply)
     }
     .await;
-    let reply = result.unwrap_or_else(|code| PeerReply::Error { code, detail: None });
+    let reply = result.unwrap_or_else(|failure| PeerReply::Error {
+        code: failure.code,
+        detail: Some(failure.stage),
+    });
     // This is the actual submission boundary for the managed path: `reply` is about to be handed
     // to the real caller of either the initial `submit()` or a later `ide.inspect`. Marking must
     // wait for the send's own outcome — a request whose receiving side already closed must not
@@ -5631,13 +5698,11 @@ mod stop_retry_tests {
             },
         )
         .await;
-        assert!(matches!(
-            reply_rx.await.unwrap(),
-            PeerReply::Error {
-                code: FailureCode::InvalidDetail,
-                detail: None,
-            }
-        ));
+        let PeerReply::Error { code, detail } = reply_rx.await.unwrap() else {
+            panic!("a stale reference must fail invalid_detail")
+        };
+        assert_eq!(code, FailureCode::InvalidDetail);
+        assert_eq!(detail.as_deref(), Some("inspect:detail_unknown"));
 
         // A reference retained under a genuinely *different* binding (a distinct actor, since
         // `establish_start` reuses the existing generation for a repeated actor) must not be
@@ -5681,13 +5746,11 @@ mod stop_retry_tests {
             },
         )
         .await;
-        assert!(matches!(
-            reply_rx.await.unwrap(),
-            PeerReply::Error {
-                code: FailureCode::InvalidDetail,
-                detail: None,
-            }
-        ));
+        let PeerReply::Error { code, detail } = reply_rx.await.unwrap() else {
+            panic!("a foreign reference must fail invalid_detail")
+        };
+        assert_eq!(code, FailureCode::InvalidDetail);
+        assert_eq!(detail.as_deref(), Some("inspect:detail_unknown"));
     }
 
     /// A small file's Context reply is byte-for-byte unchanged by the chunking path: it fits one
@@ -5896,6 +5959,134 @@ mod stop_retry_tests {
                 FailureCode::Capacity
             );
             assert_eq!(job.failure_detail.as_deref(), Some("diff:too_large"));
+        }
+    }
+
+    /// Every terminal failure carries a stage tag — the exact string the journal records in
+    /// `detail` — either the failing path's own tag or the derived `<tool>:<reason>` default.
+    /// Drives the four failure shapes the journal audit called out: a bare symbol name on a
+    /// worktree with no anchor, an inspection of an unknown detail, a context on a missing
+    /// path, and a diff on a non-Git root.
+    #[tokio::test]
+    async fn every_failed_reply_names_its_stage_for_the_journal() {
+        fn stage_of(reply: &PeerReply) -> String {
+            match reply {
+                PeerReply::Error { detail, .. } => detail.clone().expect("a stage tag"),
+                other => panic!("expected an error reply, got {other:?}"),
+            }
+        }
+
+        // A bare symbol name with no source anchor anywhere in the worktree.
+        {
+            let fixture = Fixture::new();
+            let store = fixture.store();
+            let workspace = DurableWorkspace::open(&store).await.unwrap();
+            let mut worker = worker(&store, workspace, fixture.root.clone());
+            worker.observations.install_schema().await.unwrap();
+            let (_binding, _authority) =
+                activate_worktree(&mut worker, "stage-actor", "stage-start").await;
+            let invocation = production_call(&worker, "stage-actor", "stage-symbol");
+            let (mut job, _cancel) = {
+                let (cancel_sender, cancel) = watch::channel(false);
+                (
+                    Job {
+                        reference: "stage-symbol".into(),
+                        invocation,
+                        tool: AssistanceTool::Symbol,
+                        parameters: serde_json::json!({"symbol":"never_defined_anywhere"}),
+                        target: production_target(&fixture.root),
+                        deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+                        cancel,
+                        stop_reply: None,
+                        native_epoch: 0,
+                        failure_detail: None,
+                        check_scheduled: false,
+                        park_until: None,
+                        stage: None,
+                    },
+                    cancel_sender,
+                )
+            };
+            let error = worker.symbol(&mut job).await.unwrap_err();
+            assert_eq!(error, FailureCode::ProviderUnavailable);
+            assert_eq!(job.failure_detail.as_deref(), Some("symbol:anchor_missing"));
+        }
+
+        // A context on a source over the read ceiling derives the default `<tool>:<reason>` stage.
+        {
+            let fixture = Fixture::new();
+            std::fs::write(
+                fixture.root.join("main.rs"),
+                vec![b'a'; crate::workspace::observation::MAX_SOURCE_BYTES + 1],
+            )
+            .unwrap();
+            let store = fixture.store();
+            let workspace = DurableWorkspace::open(&store).await.unwrap();
+            let mut worker = worker(&store, workspace, fixture.root.clone());
+            worker.observations.install_schema().await.unwrap();
+            let (_binding, _authority) =
+                activate_worktree(&mut worker, "stage-actor", "stage-start").await;
+            let invocation = production_call(&worker, "stage-actor", "stage-context");
+            let (mut job, _cancel) = context_job(&fixture.root, invocation);
+            let error = worker.context(&mut job).await.unwrap_err();
+            assert!(matches!(error, FailureCode::SourceTooLarge { .. }));
+            assert_eq!(
+                crate::telemetry::adapters::default_stage(AssistanceTool::Context, &error),
+                "context:source_too_large"
+            );
+        }
+
+        // A diff on a non-Git root names the failing git read.
+        {
+            let fixture = Fixture::new();
+            let store = fixture.store();
+            let workspace = DurableWorkspace::open(&store).await.unwrap();
+            let mut worker = worker(&store, workspace, fixture.root.clone());
+            worker.observations.install_schema().await.unwrap();
+            let (binding, authority) =
+                activate_worktree(&mut worker, "stage-actor", "stage-start").await;
+            let invocation = production_call(&worker, "stage-actor", "stage-diff");
+            let (mut job, _cancel) = diff_job(&fixture.root, invocation, "stage-diff");
+            retain_detail(
+                &worker,
+                &binding,
+                "stage-diff",
+                AssistanceTool::Diff,
+                &authority,
+            );
+            let error = worker.diff(&mut job).await.unwrap_err();
+            assert_eq!(error, FailureCode::SourceUnavailable);
+            assert!(
+                job.failure_detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.starts_with("diff:")),
+                "{:?}",
+                job.failure_detail
+            );
+        }
+
+        // An inspection of an unknown detail names the exact stage.
+        {
+            let fixture = Fixture::new();
+            let store = fixture.store();
+            let workspace = DurableWorkspace::open(&store).await.unwrap();
+            let mut worker = worker(&store, workspace, fixture.root.clone());
+            worker.observations.install_schema().await.unwrap();
+            let (binding, _authority) =
+                activate_worktree(&mut worker, "stage-actor", "stage-start").await;
+            let (reply_tx, reply_rx) = oneshot::channel();
+            serve_inspection(
+                &worker.workspace,
+                &worker.shared,
+                Inspection {
+                    binding,
+                    reference: "never-issued".to_owned(),
+                    expected: None,
+                    reply: reply_tx,
+                },
+            )
+            .await;
+            assert_eq!(stage_of(&reply_rx.await.unwrap()), "inspect:detail_unknown");
         }
     }
 }

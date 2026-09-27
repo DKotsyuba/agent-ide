@@ -637,6 +637,7 @@ impl Worker<'_> {
         let root = authority.worktree().worktree_path().to_path_buf();
         let files = collect_language_files(&root);
         if files.is_empty() {
+            job.failure_detail = Some("symbol:anchor_missing".to_owned());
             return Err(FailureCode::ProviderUnavailable);
         }
         // (relative file, outline symbol path) candidates in provider order.
@@ -711,10 +712,14 @@ impl Worker<'_> {
             }
         }
         if !answered {
+            job.failure_detail = Some("symbol:workspace_symbols".to_owned());
             return Err(FailureCode::ProviderUnavailable);
         }
         match matches.len() {
-            0 => Err(FailureCode::UnknownSymbol),
+            0 => {
+                job.failure_detail = Some("symbol:outline_scan".to_owned());
+                Err(FailureCode::UnknownSymbol)
+            }
             1 => Ok(Located::One(matches.remove(0).0)),
             _ => Ok(Located::Many(
                 matches

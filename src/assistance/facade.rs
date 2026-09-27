@@ -1745,6 +1745,19 @@ impl StdioFacade {
         // JSON copy. `parse_host_kind` reads the same trusted per-call `_meta` shape `build_host`
         // already establishes host identity from, so this holds for every managed Claude MCP mode
         // regardless of how the process itself was launched.
+        // Every failed reply names its stage: the failing path's own tag when it set one, else
+        // the derived `<tool>:<reason>` default — the same tag the daemon journal records.
+        let outcome = match outcome {
+            FacadeOutcome::Reply(mut reply, status) => {
+                if let PeerReply::Error { code, detail } = &mut reply
+                    && detail.is_none()
+                {
+                    *detail = Some(crate::telemetry::adapters::default_stage(tool, code));
+                }
+                FacadeOutcome::Reply(reply, status)
+            }
+            other => other,
+        };
         let envelope = match parse_host_kind(&context.meta) {
             Ok(HostKind::Claude) => content::Envelope::TextOnly,
             _ => content::Envelope::WithStructured,

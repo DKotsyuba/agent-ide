@@ -90,16 +90,61 @@ pub fn log_tool_reply(
     elapsed: Duration,
     requested: Option<&str>,
 ) {
+    let reason = reply_reason(reply);
+    // Every failure line names its stage: the reply's own detail when the failing path set one,
+    // else the derived `<tool>:<reason>` default, so no failed reply journals without a stage.
+    let stage = reply_detail(reply).map(str::to_owned).or_else(|| {
+        reason
+            .as_ref()
+            .map(|reason| stage_default(tool, reason.as_str()))
+    });
     crate::errorlog::record(
         errorlog_method(reply_method(tool, reply)),
         errorlog_outcome(reply),
         crate::errorlog::Fields {
-            reason: reply_reason(reply),
+            reason,
             correlation: reply_correlation(reply).or(requested),
             duration_ms: elapsed.as_millis().try_into().ok(),
+            detail: stage.as_deref(),
             ..Default::default()
         },
     );
+}
+
+/// Returns the stage tag an error reply already carries, when it carries one.
+fn reply_detail(reply: &PeerReply) -> Option<&str> {
+    match reply {
+        PeerReply::Error { detail, .. } => detail.as_deref(),
+        _ => None,
+    }
+}
+
+/// The closed stage word for one assistance tool: the error-log method name.
+pub(crate) fn tool_stage(tool: AssistanceTool) -> &'static str {
+    match tool {
+        AssistanceTool::Start => "start",
+        AssistanceTool::Context => "context",
+        AssistanceTool::Diff => "diff",
+        AssistanceTool::Inspect => "inspect",
+        AssistanceTool::Stop => "stop",
+        AssistanceTool::Edit => "edit",
+        AssistanceTool::Outline => "outline",
+        AssistanceTool::Read => "read",
+        AssistanceTool::Symbol => "symbol",
+        AssistanceTool::Graph => "graph",
+        AssistanceTool::Test => "test",
+    }
+}
+
+/// Derives the default `<tool>:<reason>` stage tag for a failure that set no specific one.
+pub(crate) fn stage_default(tool: AssistanceTool, reason: &str) -> String {
+    format!("{}:{reason}", tool_stage(tool))
+}
+
+/// Derives the default `<tool>:<reason>` stage tag for one closed failure code.
+pub(crate) fn default_stage(tool: AssistanceTool, code: &FailureCode) -> String {
+    let reason: crate::errorlog::ReasonCode = (*code).into();
+    stage_default(tool, reason.as_str())
 }
 
 /// Converts the closed telemetry method tag into the closed error-log method tag.
@@ -340,6 +385,37 @@ mod tests {
     use super::*;
     use crate::telemetry::{Filter, TelemetryConfig, ToolMethod};
     use std::time::Duration;
+
+    /// Every failure derives a non-empty `<tool>:<reason>` journal stage, and an error reply's
+    /// own detail always wins over the derivation.
+    #[test]
+    fn every_failure_derives_a_journal_stage() {
+        assert_eq!(
+            stage_default(AssistanceTool::Symbol, "unknown_symbol"),
+            "symbol:unknown_symbol"
+        );
+        assert_eq!(tool_stage(AssistanceTool::Inspect), "inspect");
+        assert_eq!(
+            default_stage(
+                AssistanceTool::Context,
+                &FailureCode::SourceTooLarge {
+                    size: 2_000_000,
+                    ceiling: 1_048_576,
+                },
+            ),
+            "context:source_too_large"
+        );
+        let staged = PeerReply::Error {
+            code: FailureCode::Capacity,
+            detail: Some("diff:too_large".to_owned()),
+        };
+        assert_eq!(reply_detail(&staged), Some("diff:too_large"));
+        let bare = PeerReply::Error {
+            code: FailureCode::Capacity,
+            detail: None,
+        };
+        assert_eq!(reply_detail(&bare), None);
+    }
 
     /// Proves adapters mention only the fixed closed event vocabulary in their source module.
     #[test]

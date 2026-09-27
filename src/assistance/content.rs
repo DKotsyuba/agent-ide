@@ -339,6 +339,36 @@ mod tests {
         assert_eq!(expired.is_error, Some(true));
     }
 
+    /// A generic failure carrying a stage tag names it after the reason, exactly the same tag
+    /// the daemon journal records; a failure without one renders the bare reason as before.
+    #[test]
+    fn generic_error_names_its_stage_when_one_is_set() {
+        let staged = render(
+            PeerReply::Error {
+                code: FailureCode::Capacity,
+                detail: Some("inspect:detail_unknown".to_owned()),
+            },
+            Envelope::WithStructured,
+        )
+        .unwrap();
+        assert_eq!(
+            text_of(&staged),
+            "error: capacity (inspect:detail_unknown); continue with native tools"
+        );
+        let bare = render(
+            PeerReply::Error {
+                code: FailureCode::Capacity,
+                detail: None,
+            },
+            Envelope::TextOnly,
+        )
+        .unwrap();
+        assert_eq!(
+            text_of(&bare),
+            "error: capacity; continue with native tools"
+        );
+    }
+
     /// A closed profile cause appears after the stable code; capture suffixes and unknown tags
     /// cannot be admitted into agent-facing text.
     #[test]

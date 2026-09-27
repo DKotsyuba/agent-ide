@@ -20,7 +20,7 @@ Revision: v0.4. Provider: Agent IDE. Consumers: coding agents and IDE hosts.
 1. **Address symbols**, not lines or offsets. Lines are a fallback mode and are used in read output.
 2. A tool returns information an agent cannot get from `grep` or `cat` in a second: types, documentation, relationships, compiler errors, and project commands.
 3. **Keep responses compact.** Responses contain no internal bookkeeping fields (`authority_epoch`, hashes, generations). Lists have ceilings and report “N more”; retrieve the complete list through `detail_ref`.
-4. Errors use one line with the reason and next step, for example `error: ambiguous_symbol; candidates: …`.
+4. Errors use one line with the reason and next step, for example `error: ambiguous_symbol; candidates: …`. Every failure also names its closed stage — `<tool>:<stage>` (`diff:too_large`, `symbol:anchor_missing`) — in parentheses after the reason when one is set, and the same tag lands in the daemon journal's `detail` field; a failure with no specific tag derives `<tool>:<reason>`, so no journal line is ever detail-less. Stage tags carry no payloads, paths, or user text.
 5. The language server runs as it would in a human's editor and remains alive for the session.
 6. Every host uses one path: return the result directly when it arrives within about 10 seconds; otherwise return `pending` and use `ide.inspect`.
 

@@ -43,17 +43,17 @@ error: resolution_unverified; {{ resolution_detail if resolution_detail else "th
 {%- elif code is mapping -%}
 error: source_too_large; source is {{ code.source_too_large.size }} bytes, exceeding the {{ code.source_too_large.ceiling }} byte read ceiling; continue with native tools
 {%- elif code == "unknown_symbol" -%}
-error: unknown_symbol; no symbol matches that path or name; check the file with ide.outline or search a bare name with ide.symbol
+error: unknown_symbol{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; no symbol matches that path or name; check the file with ide.outline or search a bare name with ide.symbol
 {%- elif code == "provider_loading" -%}
-error: provider_loading; the language server is still loading the workspace; repeat the call in a few seconds
+error: provider_loading{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; the language server is still loading the workspace; repeat the call in a few seconds
 {%- elif code == "invalid_detail" -%}
-error: invalid_detail; this detail_ref is unknown or has expired; repeat the original ide.* call to get a fresh one, or continue with native tools
+error: invalid_detail{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; this detail_ref is unknown or has expired; repeat the original ide.* call to get a fresh one, or continue with native tools
 {%- elif code == "outside_allowed_roots" -%}
-error: outside_allowed_roots; the working directory is not below any configured allowed root; start the IDE in an allowed directory or add this one to allowed_roots, otherwise continue with native tools
+error: outside_allowed_roots{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; the working directory is not below any configured allowed root; start the IDE in an allowed directory or add this one to allowed_roots, otherwise continue with native tools
 {%- elif code == "execution_profile" and cause_tag is defined -%}
 error: execution_profile ({{ cause_tag }}); continue with native tools
 {%- else -%}
-error: {{ code }}; continue with native tools
+error: {{ code }}{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; continue with native tools
 {%- endif -%}
 {%- endif -%}
 {%- if state == "invalid_parameters" -%}
