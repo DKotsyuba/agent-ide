@@ -420,7 +420,11 @@ run_scenario l5 "$LEFT" l5.txt verify_l5 reset_none
 
 # Restart-safe telemetry across a fresh agent's daemon generation.
 if [ "$AGENT_IDE_ACCEPTANCE_ROUTE" = agent-run-claude ]; then
-    telemetry_candidate=$(jq -er '.targets[0].candidate | select(type == "string" and startswith("/"))' "$LEFT_RUNTIME/launcher.json") \
+    # The managed daemon removes its runtime launcher copy the moment its last lease closes, which
+    # can happen before this line runs (l5's agent has already exited). That copy names the
+    # daemon's own worktree as its first target, so the left fixture itself is the same candidate.
+    telemetry_candidate=$(jq -er '.targets[0].candidate | select(type == "string" and startswith("/"))' "$LEFT_RUNTIME/launcher.json" 2>/dev/null \
+        || printf '%s' "$LEFT") \
         || fail E_TELEMETRY_CANDIDATE
     telemetry_identity=$(project_identity "$BINARY" "$telemetry_candidate") \
         || fail E_TELEMETRY_IDENTITY
