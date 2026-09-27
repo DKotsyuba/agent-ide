@@ -4,7 +4,7 @@
 //! launcher shim, the host plugin pinning, Codex/Claude host wiring, stale runtime entries under
 //! the temporary root, and the last day's error-journal volume as bounded JSON findings. It never
 //! creates or mutates state, never starts a daemon, and only ever names paths below the effective
-//! user's own home (see [`agent_ide::userhome`]).
+//! user's own home (see [`crate::userhome`]).
 
 use std::collections::HashSet;
 use std::fs;
@@ -50,7 +50,7 @@ pub struct Report {
     pub home: String,
     /// RFC 3339 UTC moment of the check.
     pub checked_at: String,
-    /// Findings in check order, capped at [`MAX_FINDINGS`].
+    /// Findings in check order, capped at 256 entries.
     pub findings: Vec<Finding>,
 }
 

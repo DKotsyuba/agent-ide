@@ -1,7 +1,7 @@
 //! The `agent-ide init` command: one-shot creation of the per-user home tree and launcher
 //! template.
 //!
-//! Creates `<home>` (the effective home's `.agent-ide`; see [`agent_ide::userhome`]) with mode
+//! Creates `<home>` (the effective home's `.agent-ide`; see [`crate::userhome`]) with mode
 //! `0700` when missing, and the launcher configuration (`~/.config/agent-ide/launcher.json` by
 //! default) with mode `0600` when absent. Existing files are never modified and symlinked paths
 //! are refused. The written template is the documented minimal version-one shape with the
