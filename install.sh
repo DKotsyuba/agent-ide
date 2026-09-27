@@ -157,7 +157,8 @@ else
 fi
 
 # The tarball hash must be listed in, and match, the release-level SHA256SUMS.
-expected=$(awk -v asset="$asset" '$2 == asset { print $1 }' "$tmp_dir/SHA256SUMS")
+# Entries may carry a leading directory (`./name`); match on the file name only.
+expected=$(awk -v asset="$asset" '{ name = $2; sub(/^.*\//, "", name) } name == asset { print $1 }' "$tmp_dir/SHA256SUMS")
 [ -n "$expected" ] || fail "SHA256SUMS does not list $asset"
 actual=$(shasum -a 256 "$tmp_dir/$asset" | awk '{print $1}')
 [ "$actual" = "$expected" ] || fail "the downloaded $asset does not match SHA256SUMS"

@@ -41,7 +41,7 @@ jobs:
           echo "AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER=$npm_root/typescript-language-server/lib/cli.mjs" >> "$GITHUB_ENV"
           echo "AGENT_IDE_TSSERVER=$npm_root/typescript/lib/tsserver.js" >> "$GITHUB_ENV"
       - name: Run complete quality gates
-        # Go and gopls are outside the v0.4.2 release scope: the runner installs no Go toolchain,
+        # Go and gopls are outside the v0.4.3 release scope: the runner installs no Go toolchain,
         # so the workspace gate skips exactly the three real-gopls toolchain contracts by name and
         # still runs every other workspace test.
         run: |
@@ -62,7 +62,8 @@ jobs:
       - name: Smoke packaged executable
         run: scripts/release-smoke.sh "$ASSET"
       - name: Build the aggregate release checksum manifest
-        run: shasum -a 256 "$ASSET" install.sh > SHA256SUMS
+        # Manifest entries are bare asset names: the bootstrap looks the tarball up by its name.
+        run: shasum -a 256 "$(basename "$ASSET")" install.sh > SHA256SUMS
       - name: Attest build provenance
         # GitHub keeps attestations for public repositories only ("Feature not available for
         # user-owned private repositories"); the step returns once the repository is public.
