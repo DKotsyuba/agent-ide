@@ -365,16 +365,29 @@ fn spawn_command(root: &PathBuf, argv: &[String]) -> io::Result<tokio::process::
     let Some((program, args)) = argv.split_first() else {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty argv"));
     };
-    let executable = (program == "cargo")
+    let toolchain_bin = (program == "cargo")
         .then(|| {
             std::env::var_os("AGENT_IDE_RUST_TOOLCHAIN_DIR")
                 .map(PathBuf::from)
-                .map(|root| root.join("bin/cargo"))
+                .map(|root| root.join("bin"))
         })
         .flatten()
-        .filter(|path| path.is_file())
-        .unwrap_or_else(|| PathBuf::from(program));
+        .filter(|bin| bin.join("cargo").is_file());
+    let executable = toolchain_bin
+        .as_ref()
+        .map_or_else(|| PathBuf::from(program), |bin| bin.join("cargo"));
     let mut command = tokio::process::Command::new(executable);
+    if let Some(bin) = &toolchain_bin {
+        // A toolchain cargo invoked directly still resolves `rustc` through PATH, i.e. the rustup
+        // proxy, which answers "no default is configured" outside the repo's toolchain override
+        // and the run ends in 0 s with no summary. Put the toolchain's own bin first so cargo
+        // finds its matching rustc without rustup.
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut joined = std::ffi::OsString::from(bin);
+        joined.push(":");
+        joined.push(path);
+        command.env("PATH", joined);
+    }
     command
         .args(args)
         .current_dir(root)
