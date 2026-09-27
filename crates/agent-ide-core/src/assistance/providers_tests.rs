@@ -59,7 +59,7 @@ fn plan() -> Vec<CacheRequest> {
         CacheRequest {
             key: "first-provider".to_owned(),
             identity: identity("first"),
-            required: &["gopls"],
+            required: &["listener"],
             shared: false,
         },
         CacheRequest {
@@ -164,7 +164,7 @@ fn a_live_namespace_owner_is_reported_as_a_conflict_until_it_quiesces() {
     let incompatible = vec![CacheRequest {
         key: "first-provider".to_owned(),
         identity: identity("relaunched-with-other-configuration"),
-        required: &["gopls"],
+        required: &["listener"],
         shared: false,
     }];
     assert_eq!(
@@ -205,7 +205,7 @@ fn bounded_lifecycle_ownership_fails_closed_instead_of_evicting_retained_state()
     let held = vec![CacheRequest {
         key: "held-0".to_owned(),
         identity: identity("held"),
-        required: &["gopls"],
+        required: &["listener"],
         shared: false,
     }];
     retain_cache_plan(&mut caches, &shared_refs, &root, &tree, &held)
@@ -233,11 +233,14 @@ fn a_failed_later_provider_leaves_no_unaccounted_namespace_or_directory_growth()
     let retained = vec![CacheRequest {
         key: "retained-provider".to_owned(),
         identity: identity("retained"),
-        required: &["gopls"],
+        required: &["listener"],
         shared: false,
     }];
     retain_cache_plan(&mut caches, &shared_refs, &root, &tree, &retained).unwrap();
-    let retained_content = root_path.join("retained-provider").join("gopls").join("db");
+    let retained_content = root_path
+        .join("retained-provider")
+        .join("listener")
+        .join("db");
     fs::write(&retained_content, b"native cache content").unwrap();
 
     // A stale regular file blocks the second provider's required directory on every attempt.
@@ -255,7 +258,7 @@ fn a_failed_later_provider_leaves_no_unaccounted_namespace_or_directory_growth()
             CacheRequest {
                 key: format!("unique-provider-{attempt}"),
                 identity: identity("unique"),
-                required: &["gopls", "tmp"],
+                required: &["listener", "tmp"],
                 shared: false,
             },
             CacheRequest {

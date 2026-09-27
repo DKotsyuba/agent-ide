@@ -192,8 +192,8 @@ fn blank_or_eof(lines: &[&str], line: u32) -> bool {
 /// * `First`/`Last` on a container (`is_container`): after the line holding its opening `{`
 ///   (skipping `//!` and `#![...]` inner lines) resp. after its last member (or before the
 ///   closing line when empty); indentation of the first member, else the container's own plus
-///   `unit`. A container without a `{` but with members (Go's synthetic method sets) places
-///   `First` at its first member and `Last` like `After` its last member.
+///   `unit`. A container without a `{` but with members (a synthetic set of file-level
+///   methods) places `First` at its first member and `Last` like `After` its last member.
 ///
 /// Errors: [`LangError::UnknownSymbol`] when `anchor` is not in `outline`,
 /// [`LangError::NotAContainer`] for `First`/`Last` on a non-container or a body-less container

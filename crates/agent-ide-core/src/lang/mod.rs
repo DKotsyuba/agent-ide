@@ -368,9 +368,9 @@ impl Outline {
     /// Finds the symbol addressed by `path` (file already matched by the caller); `None` for a
     /// file path or an unknown symbol.
     ///
-    /// Same-named siblings are tried in source order and the walk backtracks: in Rust the struct
-    /// `Foo` and its `impl Foo` blocks share the segment `Foo`, so `Foo` finds the struct while
-    /// `Foo/new` finds the method inside whichever impl declares it.
+    /// Same-named siblings are tried in source order and the walk backtracks: where a type `Foo`
+    /// and its implementation blocks share the segment `Foo`, `Foo` finds the type while `Foo/new`
+    /// finds the method inside whichever block declares it.
     pub fn find(&self, path: &SymbolPath) -> Option<&Symbol> {
         fn descend<'a>(level: &'a [Symbol], segments: &[String]) -> Option<&'a Symbol> {
             let (first, rest) = segments.split_first()?;
@@ -619,6 +619,16 @@ pub trait LanguageSupport: Send + Sync {
     /// agent that a selection spans several binaries.
     fn test_binary(&self, file: &Path) -> Option<String> {
         let _ = file;
+        None
+    }
+
+    /// Pinned toolchain for a test command whose program is `program`: the executable to run
+    /// instead of resolving `program` through `PATH`, and a directory to put first on the command's
+    /// `PATH` so the tools it starts resolve from the same toolchain. `None` (the default) runs
+    /// `program` as given with the inherited environment. Reads only process configuration (the
+    /// daemon's environment) and the filesystem; never the agent's.
+    fn test_toolchain(&self, program: &str) -> Option<(PathBuf, PathBuf)> {
+        let _ = program;
         None
     }
 

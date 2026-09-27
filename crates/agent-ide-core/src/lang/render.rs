@@ -583,7 +583,7 @@ pub struct SymbolCard {
     pub definition: Option<String>,
     pub usages: Vec<Usage>,
     /// Printed in place of an empty callers list when the language server has no call
-    /// hierarchy (`unavailable (pyright has no call hierarchy)`).
+    /// hierarchy (`unavailable (<server> has no call hierarchy)`).
     pub callers_note: Option<String>,
     pub callers: Vec<Call>,
     pub callees: Vec<Call>,
@@ -592,7 +592,7 @@ pub struct SymbolCard {
     /// Detail reference for the full usage list, printed when usages were cut.
     pub more_detail: Option<String>,
     /// Prints the `usages:` line even with no references — the server legitimately answered
-    /// none (pyright on a constructor nobody names explicitly).
+    /// none (a server answering nothing for a constructor nobody names explicitly).
     pub report_empty_usages: bool,
 }
 
@@ -877,7 +877,7 @@ mod tests {
     fn symbol_card_reports_callers_note_and_explicit_zero_usages() {
         let mut card = SymbolCard {
             heading: "__init__ — method, main.py#Greeter/__init__ (lines 2–3)".into(),
-            callers_note: Some("unavailable (pyright has no call hierarchy)".into()),
+            callers_note: Some("unavailable (fake-server has no call hierarchy)".into()),
             report_empty_usages: true,
             ..Default::default()
         };
@@ -887,7 +887,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("callers: unavailable (pyright has no call hierarchy)\n"),
+            text.contains("callers: unavailable (fake-server has no call hierarchy)\n"),
             "{text}"
         );
         assert!(!text.contains("callers: 0"), "{text}");

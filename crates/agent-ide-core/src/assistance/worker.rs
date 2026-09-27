@@ -2075,7 +2075,7 @@ impl<'a> Worker<'a> {
 
     /// Processes one slow operation at a time; inspections run on an independently scheduled task
     /// (see `inspection_loop`) so a non-yielding poll of the current operation cannot starve
-    /// `ide.inspect`. Shutdown first cancels the current operation, allowing its Rust or forwarder
+    /// `ide.inspect`. Shutdown first cancels the current operation, allowing its provider or forwarder
     /// child to reap, then this loop closes retained providers before returning.
     async fn run(mut self, inspections: mpsc::Receiver<Inspection>)
     where

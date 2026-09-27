@@ -442,6 +442,20 @@ impl LanguageSupport for RustSupport {
             .find(|doc| !doc.is_empty())
             .map(str::to_owned)
     }
+
+    /// `cargo` runs from the toolchain named by `AGENT_IDE_RUST_TOOLCHAIN_DIR` when that
+    /// directory holds a `bin/cargo`: a toolchain cargo invoked directly still resolves `rustc`
+    /// through `PATH`, i.e. the rustup proxy, which answers "no default is configured" outside the
+    /// repository's toolchain override and ends the run in 0 s with no summary. Putting the
+    /// toolchain's own `bin` first lets cargo find its matching rustc without rustup.
+    fn test_toolchain(&self, program: &str) -> Option<(PathBuf, PathBuf)> {
+        if program != "cargo" {
+            return None;
+        }
+        let bin = PathBuf::from(std::env::var_os("AGENT_IDE_RUST_TOOLCHAIN_DIR")?).join("bin");
+        let cargo = bin.join("cargo");
+        cargo.is_file().then_some((cargo, bin))
+    }
 }
 
 /// Builds a Rust test identifier from its project-relative source path and outline path.

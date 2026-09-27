@@ -20,8 +20,9 @@ use crate::workspace::{
 use std::collections::VecDeque;
 
 impl Worker<'_> {
-    /// Finds referencing tests and counts outline tests in the symbol's own file. Rust test names
-    /// include source-derived crate modules; other languages keep their outline naming. A bare
+    /// Finds referencing tests and counts outline tests in the symbol's own file. Test names come
+    /// from the language's [`LanguageSupport::test_id`](crate::lang::LanguageSupport::test_id)
+    /// (some derive module paths from the file, most keep their outline naming). A bare
     /// name arrives with its definition file already resolved through `locate_by_name` and the
     /// outline matches it at any depth.
     pub(super) async fn tests_referencing_symbol(
@@ -642,7 +643,7 @@ impl Worker<'_> {
     /// Every language present in the worktree opens its own session — any source file of that
     /// language opens it — and a mixed worktree searches each language session until one names
     /// the symbol. The search asks the provider's workspace symbols first; a provider whose
-    /// workspace search stays empty or cannot answer (pyright never lists unopened project
+    /// workspace search stays empty or cannot answer (some servers never list unopened project
     /// files) falls back to scanning the bounded file list of that language's outlines. Only
     /// when no session produced any answer at all is the name reported provider-unavailable.
     pub(super) async fn locate_by_name(
@@ -999,7 +1000,7 @@ const ANCHOR_SKIPPED_DIRECTORIES: [&str; 7] = [
 /// Maximum directories the bounded session-anchor walk visits.
 const ANCHOR_MAX_DIRECTORIES: usize = 64;
 /// Source files kept per language for the bare-name outline scan that covers providers whose
-/// workspace symbol search stays empty (pyright never lists unopened project files).
+/// workspace symbol search stays empty (some servers never list unopened project files).
 const ANCHOR_SCAN_FILES_PER_LANGUAGE: usize = 64;
 
 /// First source files of each language in the worktree, from one bounded breadth-first walk

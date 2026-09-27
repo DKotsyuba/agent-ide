@@ -271,15 +271,15 @@ pub struct ProviderCapabilities {
 /// Bounded diagnostic evidence correlated to the latest synchronized provider document.
 #[derive(Clone, Debug)]
 pub struct DiagnosticSnapshot {
-    /// Synchronized source binding; an unversioned TypeScript push may carry provisional evidence.
+    /// Synchronized source binding; an accepted unversioned push may carry provisional evidence.
     pub source: Option<SourceBinding>,
     /// Provider generation that received this message.
     pub generation: ViewGeneration,
-    /// Provider's published document version; absent on a bound TypeScript one-shot report.
+    /// Provider's published document version; absent on a bound unversioned one-shot report.
     pub document_version: Option<i32>,
     /// Provisional for matching pushes, unknown for absence/invalidation; silence never implies clean.
     pub freshness: Freshness,
-    /// `Clean` needs a matching version; TypeScript can report nonempty unversioned evidence.
+    /// `Clean` needs a matching version; an accepted unversioned push can only report items.
     pub readiness: DiagnosticReadiness,
     /// At most 128 diagnostics from one accepted provider push.
     pub diagnostics: Vec<lsp::Diagnostic>,
@@ -295,7 +295,8 @@ struct Document {
     source: SourceBinding,
     /// Monotonic positive version within this session, including across file switches.
     version: i32,
-    /// An initial one-shot TypeScript open may bind a nonempty unversioned push until didChange.
+    /// An initial open may bind a nonempty unversioned push until didChange, when the profile
+    /// accepts unversioned initial reports.
     accepts_unversioned_report: bool,
 }
 
@@ -311,7 +312,7 @@ struct State {
     settings: ProviderSettings,
     /// Current provider-specific status, independently observable by the initialize barrier.
     readiness: watch::Sender<ProviderReadiness>,
-    /// Monotonic revision for versioned pushes or a bound nonempty TypeScript push.
+    /// Monotonic revision for versioned pushes or a bound nonempty unversioned push.
     diagnostic_revision: watch::Sender<u64>,
     /// Current document; only one exact file is retained.
     document: Option<Document>,
@@ -501,7 +502,7 @@ fn fresh_state(settings: &ProviderSettings, generation: ViewGeneration) -> Arc<M
 ///
 /// The child process stays with the caller; this owns the pipes' driver and the negotiated
 /// `Session`. Readiness is awaited per request with [`LiveSession::wait_ready`], never at open,
-/// so a slow workspace load (rust-analyzer on a large crate) does not block the handshake.
+/// so a slow workspace load (a large project on a status-gated server) does not block the handshake.
 pub struct LiveSession {
     /// Negotiated exclusive client; requests reset their budget per call.
     pub session: Session,
@@ -617,7 +618,7 @@ impl LiveSession {
     }
 
     /// Gracefully sends shutdown/exit and reaps the process separately; reports whether shutdown
-    /// completed, which lets TypeScript distinguish server exit failures from client teardown.
+    /// completed, which lets a backend distinguish server exit failures from client teardown.
     pub async fn shutdown(mut self) -> bool {
         // A server busy loading its workspace may not answer shutdown promptly; the caller reaps
         // the process anyway, so the graceful exchange gets one second and no more.
@@ -1429,7 +1430,7 @@ impl Session {
     }
 }
 
-/// Waits for correlated versioned evidence or a bound nonempty TypeScript report. The revision
+/// Waits for correlated versioned evidence or a bound nonempty unversioned report. The revision
 /// subscription precedes the snapshot check so a callback cannot be lost; silence, an empty
 /// unversioned push, and stale pushes never establish readiness.
 async fn wait_for_matching_diagnostics(state: &Arc<Mutex<State>>, deadline: Instant) -> bool {

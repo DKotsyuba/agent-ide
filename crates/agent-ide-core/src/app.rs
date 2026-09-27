@@ -357,7 +357,7 @@ async fn initialize_dispatcher(
     dispatcher: &Arc<dyn AssistanceDispatcher>,
     runtime_dir: &Path,
 ) -> Result<(), AppError> {
-    // Initialization measures every accepted executable (the TypeScript bundle alone is ~40 MB
+    // Initialization measures every accepted executable (one language-server bundle alone is ~40 MB
     // of digests) and opens the store; on a loaded developer machine that takes over five
     // seconds, so the bound is generous while still finite.
     let initialized =

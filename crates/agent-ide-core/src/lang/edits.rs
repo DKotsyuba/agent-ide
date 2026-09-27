@@ -335,10 +335,10 @@ mod tests {
     fn apply_text_edits_replaces_a_single_range() {
         let result = apply_text_edits(
             "hello world",
-            &[edit((0, 6), (0, 11), "Rust")],
+            &[edit((0, 6), (0, 11), "Earth")],
             &lsp::PositionEncodingKind::UTF16,
         );
-        assert_eq!(result, Ok("hello Rust".to_string()));
+        assert_eq!(result, Ok("hello Earth".to_string()));
     }
 
     #[test]

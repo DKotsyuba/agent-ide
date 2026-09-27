@@ -1,8 +1,8 @@
 //! Resolves the real per-user home from the password database, never from `$HOME`.
 //!
 //! Hosts such as `agent-run` start MCP clients, daemons and shells with a substitute `HOME`. Every
-//! per-user state root (error log, check caches, telemetry) and every toolchain home (cargo,
-//! rustup) must still land in the owner's real home, so this is the one place they are derived.
+//! per-user state root (error log, check caches, telemetry) and every toolchain home must still
+//! land in the owner's real home, so this is the one place they are derived.
 //! `AGENT_IDE_HOME` is the only override and exists for tests and explicit relocation.
 
 use std::{

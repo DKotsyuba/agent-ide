@@ -8,7 +8,7 @@ use rmcp::model::{CallToolResult, ContentBlock};
 use super::reply::{FailureCode, MAX_REPLY_BYTES, MCP_RESERVE, PeerReply};
 
 /// Build-embedded MiniJinja source projecting every closed [`PeerReply`] state into its compact
-/// model-facing text; the template owns the presentation so Rust code never formats reply text.
+/// model-facing text; the template owns the presentation so daemon code never formats reply text.
 const REPLY_TEMPLATE: &str = include_str!("../../../../assets/mcp/reply.jinja");
 
 /// Selects whether a projected [`CallToolResult`] also carries the duplicate typed
@@ -395,7 +395,7 @@ mod tests {
         assert!(ExecutionProfileCause::from_log_tag("spawn:io:/private/path").is_none());
     }
 
-    /// Keeps unresolved TypeScript configuration actionable without claiming a native substitute.
+    /// Keeps unverified project configuration actionable without claiming a native substitute.
     #[test]
     fn resolution_unverified_is_closed_without_native_path_overclaim() {
         let reply = PeerReply::Error {
@@ -566,7 +566,7 @@ mod tests {
         let rendered = render(
             PeerReply::Complete {
                 kind: ResultKind::Context,
-                text: "python: unavailable:env_missing".into(),
+                text: "beta: unavailable:env_missing".into(),
                 detail_ref: None,
                 truncated: false,
                 continuation: false,
@@ -575,7 +575,7 @@ mod tests {
         )
         .unwrap();
         let text = text_of(&rendered);
-        assert_eq!(text, "complete context: python: unavailable:env_missing");
+        assert_eq!(text, "complete context: beta: unavailable:env_missing");
     }
 
     /// Keeps a page's final source newline separate from the continuation instruction.
@@ -718,11 +718,11 @@ mod tests {
     /// `status` string field.
     #[test]
     fn carried_status_leads_both_carriers() {
-        let plate = "<agent-ide>\nrust: 2 errors, 0 warnings\n</agent-ide>";
+        let plate = "<agent-ide>\nalpha: 2 errors, 0 warnings\n</agent-ide>";
         let rendered = render_with_status(
             PeerReply::Complete {
                 kind: ResultKind::Context,
-                text: "rust: ready; errors: 2; warnings: 0".into(),
+                text: "alpha: ready; errors: 2; warnings: 0".into(),
                 detail_ref: None,
                 truncated: false,
                 continuation: false,
@@ -732,7 +732,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            text_of(&rendered).starts_with(&format!("{plate}\ncomplete context: rust: ready")),
+            text_of(&rendered).starts_with(&format!("{plate}\ncomplete context: alpha: ready")),
             "{}",
             text_of(&rendered)
         );
@@ -742,7 +742,7 @@ mod tests {
         // presence and verbatim content are asserted, not key position.
         assert_eq!(fields["status"], plate, "{fields:?}");
         assert_eq!(structured["state"], "complete");
-        assert_eq!(structured["text"], "rust: ready; errors: 2; warnings: 0");
+        assert_eq!(structured["text"], "alpha: ready; errors: 2; warnings: 0");
     }
 
     /// The plate is never a shrink candidate: a reply that only fits with the plate after owner
@@ -750,7 +750,7 @@ mod tests {
     /// forms the facade's own render loop accepts.
     #[test]
     fn fitting_cuts_owner_text_never_the_plate() {
-        let plate = "<agent-ide>\nrust: 2 errors, 0 warnings\n</agent-ide>";
+        let plate = "<agent-ide>\nalpha: 2 errors, 0 warnings\n</agent-ide>";
         let mut reply = PeerReply::Complete {
             kind: ResultKind::Context,
             text: "evidence ".repeat(6000),

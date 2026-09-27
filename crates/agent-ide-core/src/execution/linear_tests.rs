@@ -152,7 +152,8 @@ async fn raw_provider_spawns_require_typed_registry_capabilities() {
     assert_eq!(admission.running_count(), 0);
 }
 
-/// Normal TypeScript-style protocol settlement reaps successfully without requesting any signal.
+/// Normal protocol settlement (shutdown answered, child exits) reaps successfully without
+/// requesting any signal.
 #[tokio::test]
 async fn normal_protocol_reap_sends_no_signal_and_keeps_descendants_unverified() {
     let (mut admission, mut registry) = controllers();
@@ -180,7 +181,7 @@ async fn normal_protocol_reap_sends_no_signal_and_keeps_descendants_unverified()
     assert_eq!(admission.running_count(), 0);
 }
 
-/// Abnormal TypeScript cleanup preserves the TERM grace before group/direct KILL and direct reap.
+/// Abnormal cleanup preserves the TERM grace before group/direct KILL and direct reap.
 #[cfg(unix)]
 #[tokio::test]
 async fn abnormal_typescript_cleanup_waits_full_grace_before_kill_and_reap() {

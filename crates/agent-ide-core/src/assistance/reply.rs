@@ -45,7 +45,8 @@ pub enum FailureCode {
     ProviderLoading,
     /// No symbol matches the requested path or name in the file or project.
     UnknownSymbol,
-    /// TypeScript project inputs were absent, unsupported, oversized, reordered, or changed.
+    /// A language server's project inputs were absent, unsupported, oversized, reordered, or
+    /// changed.
     ResolutionUnverified,
     /// Stop or a generation fence cancelled this operation.
     Cancelled,

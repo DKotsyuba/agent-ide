@@ -100,7 +100,7 @@ impl FeedState {
     ///
     /// The block is a status plate (T18B): it names each language's current state, process states
     /// included, and is (re)sent whenever the rendered status changes — never while it is
-    /// unchanged. Items render in fixed [`Language`] order (rust, python, typescript), skipping languages
+    /// unchanged. Items render in [`Language`] (registration) order, skipping languages
     /// absent from the worktree (T10B: `Unavailable(Disabled)`) and languages without any
     /// snapshot; the last snapshot of a language wins. A language in `rechecks` — or with a
     /// `Checking` snapshot — renders `checking (first check)` or `checking (files changed; last
@@ -709,7 +709,7 @@ mod tests {
             crate::lang::testing::BETA,
             UnavailableReason::NoFiles,
             1,
-            Some("pyright analyzed 0 files".to_string()),
+            Some("checker analyzed 0 files".to_string()),
         );
         assert_eq!(
             FeedState::default().next_block(&key("hook"), &[no_files], &[]),

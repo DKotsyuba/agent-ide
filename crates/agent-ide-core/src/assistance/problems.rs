@@ -135,7 +135,7 @@ fn append_test_status(block: &str, status: &str) -> String {
 /// Implementers must be usable from the daemon worker concurrently (`Send + Sync`) and must
 /// return promptly without running checks, executing processes, or blocking: the caller answers
 /// a bounded `ide.context` request from this lookup alone. The returned list holds at most one
-/// snapshot per configured language, in Rust, Python, TypeScript feed order.
+/// snapshot per configured language, in feed (registration) order.
 pub trait ProblemSource: Send + Sync {
     /// Returns the latest completed snapshot per configured language for `worktree`.
     ///
@@ -600,7 +600,8 @@ impl ProjectProblemFeed {
         }
         let completed = self.scheduler.latest(worktree);
         // A language absent from the worktree never gets a `checking` placeholder: before its
-        // first result a Python-only project would otherwise announce `rust: checking` (T10B).
+        // first result a project of only one language would otherwise announce the others as
+        // `checking` (T10B).
         self.languages
             .iter()
             .filter_map(|language| {

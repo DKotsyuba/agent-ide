@@ -51,7 +51,8 @@ pub trait LanguageChecks: Send + Sync + 'static {
     /// its manifest starts being checked on its next trigger.
     fn is_present(&self, worktree: &Path) -> bool;
 
-    /// The check tool named in model-facing tool descriptions (`cargo check`).
+    /// The check tool named in model-facing tool descriptions (for example a compiler's check
+    /// command).
     fn tool_name(&self) -> &'static str;
 
     /// Subdirectory of this language's check cache to seed, before a worktree's first check, with
@@ -120,10 +121,10 @@ pub enum UnavailableReason {
     OutsideRoots,
     /// The configured language toolchain binary was not found.
     ToolMissing,
-    /// The required project environment (for example the Python interpreter) was not found.
+    /// The required project environment (for example the project's interpreter) was not found.
     EnvMissing,
     /// The check tool ran against a resolved environment but analyzed zero files (for example
-    /// pyright with a malformed `include`/`exclude` in `pyrightconfig.json`); distinct from
+    /// a checker whose `include`/`exclude` configuration matches no file); distinct from
     /// [`UnavailableReason::EnvMissing`], which means the environment itself could not be
     /// resolved. Carries the same durable-condition replacement semantics as `EnvMissing` (T12B).
     NoFiles,

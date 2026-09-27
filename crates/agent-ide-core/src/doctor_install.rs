@@ -169,8 +169,8 @@ fn check_launcher(findings: &mut Vec<Finding>, effective: &Path) -> Option<Launc
 
 /// Probes every toolchain executable the configuration declares with a bounded `--version`.
 ///
-/// `.js`/`.mjs`/`.cjs` entries are Node modules rather than executables (`tsserver.js`,
-/// `tsc.js`, the typescript-language-server bridge), so they are probed as
+/// `.js`/`.mjs`/`.cjs` entries are Node modules rather than executables (language-server
+/// bridges, compiler and server modules), so they are probed as
 /// `<configured node> <file> --version` instead of being executed directly.
 async fn check_toolchains(findings: &mut Vec<Finding>, config: Option<&LauncherConfig>) {
     let Some(config) = config else {
@@ -207,7 +207,7 @@ async fn check_toolchains(findings: &mut Vec<Finding>, config: Option<&LauncherC
     }
 }
 
-/// Reports whether `path` names a Node module (`tsserver.js`, `cli.mjs`, `tsc.cjs`, ...).
+/// Reports whether `path` names a Node module (`server.js`, `cli.mjs`, `tool.cjs`, ...).
 fn is_js_module(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|extension| extension.to_str()),
@@ -258,11 +258,11 @@ fn declared_toolchains(config: &LauncherConfig) -> Vec<(String, PathBuf, Option<
 /// Runs one bounded `--version` probe, returning its first version-looking line on a clean exit.
 ///
 /// When `node` is set, `path` is a Node module probed as `node path --version`. A version line
-/// on stdout or stderr is accepted (`pyright-langserver --version` prints on either stream);
+/// on stdout or stderr is accepted (some language servers print `--version` on either stream);
 /// the probe counts as unresponsive only on a non-zero exit, no version-looking line at all,
 /// or the 5 s timeout. Version-looking means a non-empty line carrying a digit that is not
-/// JSON-RPC framing — `tsserver.js` answers `--version` only with its `Content-Length`-framed
-/// startup event, which names no version and must not read as one.
+/// JSON-RPC framing — a protocol-only server module may answer `--version` only with its
+/// `Content-Length`-framed startup event, which names no version and must not read as one.
 async fn probe_version(path: &Path, node: Option<&Path>) -> Option<String> {
     let mut command = match node {
         Some(node) => {

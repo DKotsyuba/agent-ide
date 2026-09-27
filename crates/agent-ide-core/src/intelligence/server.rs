@@ -107,7 +107,7 @@ pub trait LanguageServer: Send + Sync + 'static {
         vec![(launch.executable.path.clone(), None)]
     }
 
-    /// Short server name used in replies that explain a missing capability (`pyright`).
+    /// Short server name used in replies that explain a missing capability.
     fn name(&self) -> &'static str;
 
     /// Immutable settings identity used by cache compatibility and namespace derivation.
