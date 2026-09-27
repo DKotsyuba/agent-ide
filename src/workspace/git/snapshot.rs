@@ -417,7 +417,11 @@ impl SnapshotIntent {
     /// unchanged oversized asset is proven clean instead of failing the whole capture. The
     /// caller proves a no-follow regular-file stat immediately before hashing; paths are
     /// worktree-relative and this command's cwd is exactly that worktree.
-    fn hash_worktree(scope: &GitScope, program: &Path, paths: &[PathBuf]) -> Result<Self, GitError> {
+    fn hash_worktree(
+        scope: &GitScope,
+        program: &Path,
+        paths: &[PathBuf],
+    ) -> Result<Self, GitError> {
         let mut arguments: Vec<OsString> = HASH_BATCH_FLAGS.iter().map(Into::into).collect();
         for path in paths {
             if !crate::workspace::observation::valid_relative_path(path) {
@@ -1679,49 +1683,51 @@ async fn capture_attempt<R: SnapshotRunner>(
         };
         // T36B: the live per-path proof precedes every native capture, staged mode included.
         runner.authorize_read_path(path).await?;
-        let source = match SnapshotSource::capture(scope.worktree(), scope.authority_epoch(), path, current)
-        {
-            Ok(source) => source,
-            // Bytes beyond the retained-read bound stay unread (T114): a no-follow regular-file
-            // stat plus a no-filter object hash of the live file classify it instead, so a
-            // stat-drifted but unchanged oversized asset is proven clean while a genuinely
-            // changed one stays an explicit finite-budget failure.
-            Err(GitError::EvidenceTooLarge) => {
-                let index = index_entries
-                    .get(path)
-                    .and_then(|entries| entries.get(&0))
-                    .expect("captured path has stage zero");
-                let metadata = match crate::workspace::observation::snapshot_source_metadata(
-                    scope.worktree(),
-                    path,
-                ) {
-                    Ok(metadata) => metadata,
-                    Err(ObservationError::RootIdentityChanged) => {
-                        return Err(GitError::UnstableSnapshot);
+        let source =
+            match SnapshotSource::capture(scope.worktree(), scope.authority_epoch(), path, current)
+            {
+                Ok(source) => source,
+                // Bytes beyond the retained-read bound stay unread (T114): a no-follow regular-file
+                // stat plus a no-filter object hash of the live file classify it instead, so a
+                // stat-drifted but unchanged oversized asset is proven clean while a genuinely
+                // changed one stays an explicit finite-budget failure.
+                Err(GitError::EvidenceTooLarge) => {
+                    let index = index_entries
+                        .get(path)
+                        .and_then(|entries| entries.get(&0))
+                        .expect("captured path has stage zero");
+                    let metadata = match crate::workspace::observation::snapshot_source_metadata(
+                        scope.worktree(),
+                        path,
+                    ) {
+                        Ok(metadata) => metadata,
+                        Err(ObservationError::RootIdentityChanged) => {
+                            return Err(GitError::UnstableSnapshot);
+                        }
+                        Err(_) => return Err(GitError::EvidenceTooLarge),
+                    };
+                    let mode_w = if metadata.permissions().mode() & 0o100 != 0 {
+                        0o100755
+                    } else {
+                        0o100644
+                    };
+                    let hash =
+                        batch_worktree_hashes(&scope, program, std::slice::from_ref(path), runner)
+                            .await?
+                            .remove(0);
+                    if hash == index.oid && mode_w == index.mode {
+                        oversized_clean.insert(path.clone());
+                        working.update(b"oversized");
+                        working.update(&(path.as_os_str().as_bytes().len() as u64).to_le_bytes());
+                        working.update(path.as_os_str().as_bytes());
+                        working.update(&mode_w.to_le_bytes());
+                        working.update(hash.as_str().as_bytes());
+                        continue;
                     }
-                    Err(_) => return Err(GitError::EvidenceTooLarge),
-                };
-                let mode_w = if metadata.permissions().mode() & 0o100 != 0 {
-                    0o100755
-                } else {
-                    0o100644
-                };
-                let hash = batch_worktree_hashes(&scope, program, std::slice::from_ref(path), runner)
-                    .await?
-                    .remove(0);
-                if hash == index.oid && mode_w == index.mode {
-                    oversized_clean.insert(path.clone());
-                    working.update(b"oversized");
-                    working.update(&(path.as_os_str().as_bytes().len() as u64).to_le_bytes());
-                    working.update(path.as_os_str().as_bytes());
-                    working.update(&mode_w.to_le_bytes());
-                    working.update(hash.as_str().as_bytes());
-                    continue;
+                    return Err(GitError::EvidenceTooLarge);
                 }
-                return Err(GitError::EvidenceTooLarge);
-            }
-            Err(error) => return Err(error),
-        };
+                Err(error) => return Err(error),
+            };
         hashed_bytes += source.contents().len();
         if hashed_bytes > MAX_SNAPSHOT_HASH_BYTES {
             return Err(GitError::EvidenceTooLarge);

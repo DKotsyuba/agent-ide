@@ -14,28 +14,42 @@ use std::collections::VecDeque;
 
 impl Worker<'_> {
     /// Finds referencing tests and counts outline tests in the symbol's own file. Rust test names
-    /// include source-derived crate modules; other languages keep their outline naming.
+    /// include source-derived crate modules; other languages keep their outline naming. A bare
+    /// name arrives with its definition file already resolved through `locate_by_name` and the
+    /// outline matches it at any depth.
     pub(super) async fn tests_referencing_symbol(
         &mut self,
         job: &mut Job,
         requested: &str,
+        resolved: Option<&std::path::PathBuf>,
     ) -> Result<(Vec<TestId>, Lang, usize), FailureCode> {
         let binding = job.invocation.binding_ref().clone();
         let symbol = SymbolPath::parse(requested).map_err(|_| FailureCode::UnknownSymbol)?;
-        let file = symbol
-            .file()
-            .ok_or(FailureCode::UnknownSymbol)?
-            .to_path_buf();
+        let file = match symbol.file() {
+            Some(file) => file.to_path_buf(),
+            None => resolved.cloned().ok_or(FailureCode::UnknownSymbol)?,
+        };
         let (observed, bytes) = self.observe(&binding, file).await?;
         let (outline, root) = self.outline_of(job, &observed, &bytes).await?;
-        let found = outline.find(&symbol).ok_or(FailureCode::UnknownSymbol)?;
+        let found = if symbol.file().is_some() {
+            outline
+                .find(&symbol)
+                .cloned()
+                .ok_or(FailureCode::UnknownSymbol)?
+        } else {
+            let name = symbol.name().ok_or(FailureCode::UnknownSymbol)?;
+            match outline.named(name).as_slice() {
+                [found] => (*found).clone(),
+                _ => return Err(FailureCode::UnknownSymbol),
+            }
+        };
         let mut file_test_count = 0;
         for candidate in &outline.symbols {
             candidate.walk(&mut |candidate| {
                 file_test_count += usize::from(candidate.kind == crate::lang::SymbolKind::Test);
             });
         }
-        let offset = name_offset(observed_text(&observed, &bytes)?, found)?;
+        let offset = name_offset(observed_text(&observed, &bytes)?, &found)?;
         let refs = self
             .live_session_for(job, &observed)
             .await?
@@ -604,59 +618,115 @@ impl Worker<'_> {
         ))
     }
 
-    /// Resolves a bare symbol name to its definition file through workspace symbols.
-    async fn locate_by_name(
+    /// Resolves a bare symbol name to its definition file.
+    ///
+    /// Every language present in the worktree opens its own session — any source file of that
+    /// language opens it — and a mixed worktree searches each language session until one names
+    /// the symbol. The search asks the provider's workspace symbols first; a provider whose
+    /// workspace search stays empty or cannot answer (pyright never lists unopened project
+    /// files) falls back to scanning the bounded file list of that language's outlines. Only
+    /// when no session produced any answer at all is the name reported provider-unavailable.
+    pub(super) async fn locate_by_name(
         &mut self,
         job: &mut Job,
         binding: &BindingRef,
         name: &str,
     ) -> Result<Located, FailureCode> {
-        // Workspace symbol search needs a session; any file of the language opens it, and the
-        // activation root is always inside the worktree.
-        let anchor = self.any_source_for_session(job, binding).await?;
-        let (observed, _bytes) = self.observe(binding, anchor).await?;
-        let worktree_root = observed.worktree().worktree_path().to_path_buf();
-        let live = self.live_session_for(job, &observed).await?;
-        let mut matches = live
-            .session
-            .workspace_symbols(name)
-            .await
-            .map_err(|_| FailureCode::ProviderUnavailable)?
-            .into_iter()
-            .filter(|symbol| symbol.name == name)
-            .filter_map(|symbol| {
-                symbol
-                    .location
-                    .uri
-                    .to_file_path()
-                    .ok()
-                    .and_then(|path| {
-                        path.strip_prefix(&worktree_root)
-                            .ok()
-                            .map(Path::to_path_buf)
-                    })
-                    .map(|path| (path, symbol.container_name))
-            })
-            .collect::<Vec<_>>();
-        matches.sort();
-        matches.dedup();
+        let binding = binding.clone();
+        let authority = self.authority(&binding).await?;
+        let root = authority.worktree().worktree_path().to_path_buf();
+        let files = collect_language_files(&root);
+        if files.is_empty() {
+            return Err(FailureCode::ProviderUnavailable);
+        }
+        // (relative file, outline symbol path) candidates in provider order.
+        let mut matches: Vec<(std::path::PathBuf, String)> = Vec::new();
+        // True once at least one language produced a definite empty-or-nonempty answer.
+        let mut answered = false;
+        for language_files in files.values() {
+            let Some(anchor) = language_files.first() else {
+                continue;
+            };
+            let Ok((observed, _bytes)) = self.observe(&binding, anchor.clone()).await else {
+                continue;
+            };
+            let live = match self.live_session_for(job, &observed).await {
+                Ok(live) => live,
+                Err(_) => continue,
+            };
+            // Workspace symbol search is exact-name and answers in one round trip.
+            let workspace_hits: Vec<(std::path::PathBuf, Option<String>)> =
+                match live.session.workspace_symbols(name).await {
+                    Ok(found) => {
+                        answered = true;
+                        found
+                            .into_iter()
+                            .filter(|symbol| symbol.name == name)
+                            .filter_map(|symbol| {
+                                symbol
+                                    .location
+                                    .uri
+                                    .to_file_path()
+                                    .ok()
+                                    .and_then(|path| {
+                                        path.strip_prefix(&root).ok().map(Path::to_path_buf)
+                                    })
+                                    .map(|path| (path, symbol.container_name))
+                            })
+                            .collect()
+                    }
+                    Err(_) => Vec::new(),
+                };
+            if !workspace_hits.is_empty() {
+                return Ok(match workspace_hits.len() {
+                    1 => Located::One(workspace_hits.into_iter().next().unwrap().0),
+                    _ => Located::Many(
+                        workspace_hits
+                            .iter()
+                            .map(|(path, container)| match container {
+                                Some(container) => {
+                                    format!("{}#{container}/{name}", path.display())
+                                }
+                                None => format!("{}#{name}", path.display()),
+                            })
+                            .collect(),
+                    ),
+                });
+            }
+            // Fallback scan: the bounded per-language file list through ordinary outlines.
+            for file in language_files {
+                let Ok((observed, bytes)) = self.observe(&binding, file.clone()).await else {
+                    continue;
+                };
+                if let Ok((outline, _)) = self.outline_of(job, &observed, &bytes).await {
+                    answered = true;
+                    for candidate in outline.named(name) {
+                        matches.push((file.clone(), candidate.path.to_string()));
+                    }
+                }
+            }
+            // A name several languages share resolves in the first language that names it.
+            if !matches.is_empty() {
+                break;
+            }
+        }
+        if !answered {
+            return Err(FailureCode::ProviderUnavailable);
+        }
         match matches.len() {
             0 => Err(FailureCode::UnknownSymbol),
             1 => Ok(Located::One(matches.remove(0).0)),
             _ => Ok(Located::Many(
                 matches
                     .iter()
-                    .map(|(path, container)| match container {
-                        Some(container) => format!("{}#{container}/{name}", path.display()),
-                        None => format!("{}#{name}", path.display()),
-                    })
+                    .map(|(file, path)| format!("{}#{path}", file.display()))
                     .collect(),
             )),
         }
     }
 
     /// Answers an ambiguous name with its candidates instead of guessing.
-    async fn ambiguous(
+    pub(super) async fn ambiguous(
         &mut self,
         job: &mut Job,
         binding: &BindingRef,
@@ -679,22 +749,6 @@ impl Worker<'_> {
             ContextPageState::new(text, 0, false, ResultKind::Symbol).next(&job.reference)?;
         self.shared.set_context_page(&job.reference, page);
         Ok((reply, Some(authority), None))
-    }
-
-    /// Picks the first Rust source of the worktree as the document that opens a session.
-    async fn any_source_for_session(
-        &mut self,
-        _job: &mut Job,
-        binding: &BindingRef,
-    ) -> Result<std::path::PathBuf, FailureCode> {
-        let authority = self.authority(binding).await?;
-        let root = authority.worktree().worktree_path().to_path_buf();
-        for candidate in ["src/lib.rs", "src/main.rs"] {
-            if root.join(candidate).is_file() {
-                return Ok(std::path::PathBuf::from(candidate));
-            }
-        }
-        Err(FailureCode::ProviderUnavailable)
     }
 
     /// Usage lines for reference locations: relative path, line, trimmed text, test flag.
@@ -832,9 +886,71 @@ fn is_declaration_line(line: &str) -> bool {
 }
 
 /// Where a bare name resolved to.
-enum Located {
+pub(super) enum Located {
     One(std::path::PathBuf),
     Many(Vec<String>),
+}
+
+/// Directories the session-anchor walk never enters: VCS internals, virtual environments,
+/// dependency installs and build output. None of them open a language session.
+const ANCHOR_SKIPPED_DIRECTORIES: [&str; 7] = [
+    ".git",
+    ".hg",
+    ".venv",
+    "venv",
+    "node_modules",
+    "target",
+    "dist",
+];
+/// Maximum directories the bounded session-anchor walk visits.
+const ANCHOR_MAX_DIRECTORIES: usize = 64;
+/// Source files kept per language for the bare-name outline scan that covers providers whose
+/// workspace symbol search stays empty (pyright never lists unopened project files).
+const ANCHOR_SCAN_FILES_PER_LANGUAGE: usize = 64;
+
+/// First source files of each language in the worktree, from one bounded breadth-first walk
+/// over the top level plus two nested levels of ordinary directories, skipping ignored trees.
+/// Deterministic order; every language keeps up to [`ANCHOR_SCAN_FILES_PER_LANGUAGE`] files.
+fn collect_language_files(
+    root: &Path,
+) -> std::collections::BTreeMap<Lang, Vec<std::path::PathBuf>> {
+    let mut files: std::collections::BTreeMap<Lang, Vec<std::path::PathBuf>> =
+        std::collections::BTreeMap::new();
+    let mut queue = VecDeque::from([(root.to_path_buf(), 0u8)]);
+    let mut visited = 0usize;
+    while let Some((directory, depth)) = queue.pop_front() {
+        visited += 1;
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if depth < 2
+                    && !name.starts_with('.')
+                    && !ANCHOR_SKIPPED_DIRECTORIES.contains(&name.as_ref())
+                {
+                    queue.push_back((path, depth + 1));
+                }
+            } else if let Some(language) = Lang::for_path(&path) {
+                let list = files.entry(language).or_default();
+                if list.len() < ANCHOR_SCAN_FILES_PER_LANGUAGE {
+                    list.push(path.strip_prefix(root).unwrap_or(&path).to_path_buf());
+                }
+            }
+        }
+        if visited >= ANCHOR_MAX_DIRECTORIES {
+            break;
+        }
+    }
+    files
 }
 
 /// Byte offset of the symbol's name on its declaration line, for position-based requests.

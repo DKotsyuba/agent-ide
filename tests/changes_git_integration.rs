@@ -332,7 +332,9 @@ async fn stat_drifted_oversized_tracked_file_is_hash_proven_clean() {
     // drifts, exactly the state that made a clean traider-lab diff fail `diff:too_large`.
     fixture.write(b"oversized.js", &big);
     let mut runner = Runner::default();
-    let snapshot = collect(&fixture, DiffMode::Head, &mut runner).await.unwrap();
+    let snapshot = collect(&fixture, DiffMode::Head, &mut runner)
+        .await
+        .unwrap();
     assert_eq!(
         snapshot.paths().len(),
         0,

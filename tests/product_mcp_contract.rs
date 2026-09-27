@@ -5058,6 +5058,40 @@ async fn configured_product_symbol_test_uses_the_live_symbol_session() {
         result["text"].as_str().unwrap().contains("checks_is_file"),
         "{result}"
     );
+    // A bare symbol name resolves through the same workspace-symbol path the symbol card uses
+    // (T114 demo defect) instead of answering unknown_symbol for a missing `file#` prefix.
+    let bare = actor
+        .call(&fixture, "ide.test", json!({"symbol":"is_file"}))
+        .await;
+    let bare = actor.settle(&fixture, bare).await;
+    assert_eq!(bare["kind"], "test", "{bare}");
+    assert!(
+        bare["text"]
+            .as_str()
+            .unwrap()
+            .contains("(1 tests selected)"),
+        "{bare}"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let result = loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "bare symbol test selection did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let status = actor.call(&fixture, "ide.test", json!({"status":2})).await;
+        if status["text"]
+            .as_str()
+            .unwrap()
+            .contains("1 passed, 0 failed")
+        {
+            break status;
+        }
+    };
+    assert!(
+        result["text"].as_str().unwrap().contains("checks_is_file"),
+        "{result}"
+    );
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
@@ -5594,6 +5628,19 @@ async fn configured_product_pyright_symbol_tools_and_edit() {
         text.contains("callers: unavailable (pyright has no call hierarchy)"),
         "{symbol}"
     );
+    // A bare name resolves through the worktree's Python session (T114 demo defect): the anchor
+    // walk finds main.py even though there is no src/lib.rs to open the session.
+    let bare = actor
+        .call(&fixture, "ide.symbol", json!({"symbol":"caller"}))
+        .await;
+    let bare = actor.settle(&fixture, bare).await;
+    assert_eq!(bare["kind"], "symbol", "{bare}");
+    let bare_text = bare["text"].as_str().unwrap();
+    assert!(
+        bare_text.contains("definition main.py#caller"),
+        "{bare_text}"
+    );
+    assert!(bare_text.contains("def caller()"), "{bare_text}");
     let init = actor
         .call(
             &fixture,
@@ -6062,6 +6109,23 @@ async fn configured_product_typescript_symbol_tools_and_edit() {
         )
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+
+    // A bare name resolves through the worktree's TypeScript session (T114 demo defect): the
+    // anchor walk finds fixture.ts even though there is no src/lib.rs to open the session.
+    let bare = actor
+        .call(&fixture, "ide.symbol", json!({"symbol":"caller"}))
+        .await;
+    let bare = actor.settle(&fixture, bare).await;
+    assert_eq!(bare["kind"], "symbol", "{bare}");
+    let bare_text = bare["text"].as_str().unwrap();
+    assert!(
+        bare_text.contains("definition fixture.ts#caller"),
+        "{bare_text}"
+    );
+    assert!(
+        bare_text.contains("function caller(): string"),
+        "{bare_text}"
+    );
 
     let outline = actor
         .call(&fixture, "ide.outline", json!({"path":"fixture.ts"}))

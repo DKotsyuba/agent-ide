@@ -38,6 +38,8 @@ pub(super) mod snapshots;
 #[path = "symbols.rs"]
 mod symbols;
 
+use self::symbols::Located;
+
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -984,9 +986,7 @@ impl WorkerHandle {
         let runtime = runtime.to_path_buf();
         let (ready, wait) = oneshot::channel();
         let cancel = self.startup_cancel.clone();
-        eprintln!("T114-DEBUG boot task spawning");
         let task = tokio::spawn(async move {
-            eprintln!("T114-DEBUG boot task started");
             let verification = shared.clone();
             if !matches!(
                 tokio::task::spawn_blocking(move || verification
@@ -995,12 +995,10 @@ impl WorkerHandle {
                 .await,
                 Ok(Ok(()))
             ) {
-                eprintln!("T114-DEBUG verify_executables failed");
                 let _ = ready.send(Err(FailureCode::ExecutionProfile));
                 return;
             }
 
-            eprintln!("T114-DEBUG executables verified");
             let database = std::env::var_os("AGENT_IDE_STATE_DATABASE")
                 .map(std::path::PathBuf::from)
                 .filter(|path| path.is_absolute())
@@ -1012,7 +1010,6 @@ impl WorkerHandle {
             ) {
                 Ok(store) => store,
                 Err(_) => {
-                    eprintln!("T114-DEBUG store open failed");
                     let _ = ready.send(Err(FailureCode::Internal));
                     return;
                 }
@@ -1033,8 +1030,7 @@ impl WorkerHandle {
             };
             let workspace = match DurableWorkspace::open(store).await {
                 Ok(owner) => owner,
-                Err(error) => {
-                    eprintln!("T114-DEBUG durable open: {error:?}");
+                Err(_) => {
                     let _ = ready.send(Err(FailureCode::WorkspaceActivation));
                     return;
                 }
@@ -1044,7 +1040,6 @@ impl WorkerHandle {
                 observations.install_schema().await,
                 Ok(MigrationAdmission::Applied { .. } | MigrationAdmission::AlreadyApplied { .. })
             ) {
-                eprintln!("T114-DEBUG observations schema failed");
                 let _ = ready.send(Err(FailureCode::SourceUnavailable));
                 return;
             }
@@ -1053,11 +1048,9 @@ impl WorkerHandle {
                 edits.install_schema().await,
                 Ok(MigrationAdmission::Applied { .. } | MigrationAdmission::AlreadyApplied { .. })
             ) {
-                eprintln!("T114-DEBUG edits schema failed");
                 let _ = ready.send(Err(FailureCode::Internal));
                 return;
             }
-            eprintln!("T114-DEBUG startup about to complete");
             if let Ok(mut configured) = telemetry_owner.lock() {
                 *configured = telemetry.clone();
             }
@@ -1862,10 +1855,38 @@ impl<'a> Worker<'a> {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
             {
-                let (referencing_tests, language, file_test_count) =
-                    self.tests_referencing_symbol(job, &symbol).await?;
                 let path = crate::lang::SymbolPath::parse(&symbol)
                     .map_err(|_| FailureCode::UnknownSymbol)?;
+                // A bare name resolves through the same workspace-symbol path the symbol card
+                // uses (T114); ambiguity answers with the candidates instead of guessing.
+                let resolved = match path.file() {
+                    Some(_) => None,
+                    None => match self
+                        .locate_by_name(job, &binding, path.name().unwrap_or_default())
+                        .await?
+                    {
+                        Located::One(file) => Some(file),
+                        Located::Many(candidates) => {
+                            return self.ambiguous(job, &binding, &symbol, candidates).await;
+                        }
+                    },
+                };
+                // The selection target and the no-tests hint always name the definition file.
+                let path = match path.file() {
+                    Some(_) => path,
+                    None => crate::lang::SymbolPath::parse(&format!(
+                        "{}#{}",
+                        resolved
+                            .as_ref()
+                            .ok_or(FailureCode::UnknownSymbol)?
+                            .display(),
+                        path.name().unwrap_or_default()
+                    ))
+                    .map_err(|_| FailureCode::UnknownSymbol)?,
+                };
+                let (referencing_tests, language, file_test_count) = self
+                    .tests_referencing_symbol(job, &symbol, resolved.as_ref())
+                    .await?;
                 if referencing_tests.is_empty() {
                     let file = path
                         .file()
@@ -4202,27 +4223,30 @@ fn test_text_line(value: &str, max_chars: usize) -> String {
 /// Renders the bounded parsed test result and actionable rerun/detail references.
 fn test_result_text(id: u64, result: &super::tests::RunResult, owns_detail: bool) -> String {
     let report = &result.report;
-    let mut text =
-        if report.passed == 0 && report.failed == 0 && report.incomplete && !result.stopped {
-            format!(
-                "tests #{id}: no summary parsed, {} s — inspect the runner's full output with ide.inspect",
-                result.elapsed.as_secs()
-            )
-        } else if result.stopped {
-            format!(
-                "tests #{id}: stopped at budget {} s — {} passed, {} failed so far",
-                result.budget.as_secs(),
-                report.passed,
-                report.failed
-            )
-        } else {
-            format!(
-                "tests #{id}: {} passed, {} failed, {} s",
-                report.passed,
-                report.failed,
-                result.elapsed.as_secs()
-            )
-        };
+    let mut text = if report.passed == 0
+        && report.failed == 0
+        && report.incomplete
+        && !result.stopped
+    {
+        format!(
+            "tests #{id}: no summary parsed, {} s — inspect the runner's full output with ide.inspect",
+            result.elapsed.as_secs()
+        )
+    } else if result.stopped {
+        format!(
+            "tests #{id}: stopped at budget {} s — {} passed, {} failed so far",
+            result.budget.as_secs(),
+            report.passed,
+            report.failed
+        )
+    } else {
+        format!(
+            "tests #{id}: {} passed, {} failed, {} s",
+            report.passed,
+            report.failed,
+            result.elapsed.as_secs()
+        )
+    };
     for failure in report.failures.iter().take(8) {
         text.push_str(&format!("\n  FAIL {}", test_text_line(&failure.name, 160)));
         if let Some((path, line)) = &failure.location {
