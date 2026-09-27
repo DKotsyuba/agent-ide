@@ -41,3 +41,6 @@ pub mod userhome;
 
 /// Implements the `init` command: per-user home tree and launcher template creation.
 pub mod init;
+
+/// Implements the argument-less `doctor` command: read-only installation health findings.
+pub mod doctor_install;

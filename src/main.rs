@@ -287,6 +287,24 @@ async fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Ok(Command::DoctorInstall) => {
+            let report = agent_ide::doctor_install::report().await;
+            match serde_json::to_string(&report) {
+                Ok(line) => {
+                    println!("{line}");
+                    if report
+                        .findings
+                        .iter()
+                        .any(|finding| finding.severity == "error")
+                    {
+                        ExitCode::from(2)
+                    } else {
+                        ExitCode::SUCCESS
+                    }
+                }
+                Err(_) => fail(AppError::InvalidResponse),
+            }
+        }
         Err(error) => fail(error),
     }
 }
@@ -482,7 +500,9 @@ enum Command {
         /// Absolute allowed roots for the template; defaults to `~/projects` or the home itself.
         allowed_roots: Vec<PathBuf>,
     },
-  }
+    /// Reports installation health read-only as bounded JSON findings (no daemon is contacted).
+    DoctorInstall,
+}
 
 /// Selects the host-specific identity and binding behavior of a self-contained managed MCP.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -613,6 +633,12 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
         && mode == "errors"
     {
         return parse_errors_command(rest);
+    }
+    // `doctor` with no arguments is the installation doctor; the daemon form keeps its flag.
+    if let [mode] = arguments.as_slice()
+        && mode == "doctor"
+    {
+        return Ok(Command::DoctorInstall);
     }
     // `init` accepts its flags in any order, like `errors`.
     if let [mode, rest @ ..] = arguments.as_slice()
