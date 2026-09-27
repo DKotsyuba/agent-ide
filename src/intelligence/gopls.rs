@@ -583,3 +583,92 @@ pub fn isolated_views(worktrees: impl IntoIterator<Item = WorktreeRef>) -> bool 
     let mut seen = BTreeSet::new();
     worktrees.into_iter().all(|worktree| seen.insert(worktree))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::intelligence::session::SessionProfile;
+
+    /// The session profile accepts only an omitted or `gopls` identity and opens only `.go` files
+    /// as `go`.
+    #[test]
+    fn go_session_profile_is_closed() {
+        let env = GoEnv::new(
+            PathBuf::from("/private/tmp/agent-ide-go-env/go-build"),
+            PathBuf::from("/private/tmp/agent-ide-go-env/go-mod"),
+            PathBuf::from("/private/tmp/agent-ide-go-env/tmp"),
+        )
+        .unwrap();
+        assert!(env.accepts_server(None));
+        let named = |name: &str| async_lsp::lsp_types::ServerInfo {
+            name: name.into(),
+            version: None,
+        };
+        assert!(env.accepts_server(Some(&named("gopls"))));
+        assert!(!env.accepts_server(Some(&named("rust-analyzer"))));
+        assert_eq!(env.language_id(Path::new("main.go")), "go");
+        assert_eq!(env.language_id(Path::new("module.py")), "plaintext");
+        assert_eq!(
+            env.workspace_configuration(),
+            serde_json::json!({"env": {
+                "GOCACHE": "/private/tmp/agent-ide-go-env/go-build",
+                "GOMODCACHE": "/private/tmp/agent-ide-go-env/go-mod",
+                "GOTMPDIR": "/private/tmp/agent-ide-go-env/tmp",
+            }})
+        );
+    }
+
+    /// A per-worktree Go namespace must be an absolute normal path or the session refuses to exist.
+    ///
+    /// The provider process resolves a relative value against its own cwd, so accepting one would let
+    /// worktree-owned build state escape the private namespace this session is accounted for.
+    #[test]
+    fn go_env_rejects_paths_that_could_escape_the_private_namespace() {
+        let good =
+            |name: &str| std::path::PathBuf::from("/private/tmp/agent-ide-go-env").join(name);
+        assert!(GoEnv::new(good("go-build"), good("go-mod"), good("tmp")).is_some());
+        for bad in [
+            std::path::PathBuf::new(),
+            std::path::PathBuf::from("relative/go-build"),
+            std::path::PathBuf::from("/private/tmp/../escape"),
+        ] {
+            assert!(
+                GoEnv::new(bad.clone(), good("go-mod"), good("tmp")).is_none(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// `prepare` must materialize every private Go directory a real view is configured to use.
+    ///
+    /// A missing `GOTMPDIR` makes `go` refuse to create its work directory, which gopls surfaces only
+    /// as `no package metadata for file ... (jsonrpc error 0)`, silently demoting the view to lexical
+    /// context; the namespace root exists but these three subdirectories belong to the session alone.
+    /// The same refusals as `new` still apply before anything is created.
+    #[test]
+    fn go_env_prepare_creates_the_private_namespace_directories() {
+        let root = std::path::PathBuf::from("/private/tmp").join(format!(
+            "agent-ide-go-env-prepare-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = ["go-build", "go-mod", "tmp"].map(|name| root.join("nested").join(name));
+        let env = GoEnv::prepare(paths[0].clone(), paths[1].clone(), paths[2].clone())
+            .expect("an absolute private namespace is creatable");
+        for path in &paths {
+            assert!(path.is_dir(), "{path:?} must exist before a view uses it");
+        }
+        assert_eq!(env.go_tmp_dir(), paths[2]);
+        assert!(
+            GoEnv::prepare(
+                std::path::PathBuf::from("relative/go-build"),
+                paths[1].clone(),
+                paths[2].clone(),
+            )
+            .is_none(),
+            "prepare must keep every rejection new performs"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

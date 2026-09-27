@@ -6,10 +6,7 @@
 //! from it. Counts always describe the full deduplicated result even when the retained
 //! [`ProblemSnapshot::problems`](crate::checks::ProblemSnapshot::problems) list is capped; messages are untrusted checker output.
 
-pub mod python;
 pub mod runner;
-pub mod rust;
-pub mod typescript;
 
 /// Cheap whole-worktree input fingerprint backing the scheduler's skip-unchanged rule (T20B).
 pub mod fingerprint;

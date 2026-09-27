@@ -270,7 +270,7 @@ impl ControlledCommand {
     ///
     /// This performs no I/O and does not revalidate the executable; callers use it to bind a newly
     /// captured command to an independently accepted digest before later spawn-time revalidation.
-    pub(crate) fn has_program_digest(&self, expected: &blake3::Hash) -> bool {
+    pub fn has_program_digest(&self, expected: &blake3::Hash) -> bool {
         self.program_identity.digest == *expected
     }
 
@@ -279,7 +279,7 @@ impl ControlledCommand {
     /// The executable object and bytes are rechecked immediately before spawn. The returned
     /// command has a cleared environment, fixed cwd/argv, kill-on-drop and its own process group;
     /// the caller still owns pipe selection, bounded cancellation and direct-child wait evidence.
-    pub(crate) fn inherited_process(&self) -> Result<Command, RequestError> {
+    pub fn inherited_process(&self) -> Result<Command, RequestError> {
         if executable_identity(&self.program)? != self.program_identity {
             return Err(RequestError::ExecutableUnavailable);
         }
@@ -2552,7 +2552,7 @@ pub struct ReapedProtocolProcess {
 }
 
 /// Opaque identity-bound result of waiting one protocol child without consuming its owner.
-pub(crate) struct WaitedProtocolChild {
+pub struct WaitedProtocolChild {
     /// Exit status returned by the direct wait.
     status: ExitStatus,
     /// Exact launch identity of the child that produced `status`.
@@ -2561,7 +2561,7 @@ pub(crate) struct WaitedProtocolChild {
 
 impl WaitedProtocolChild {
     /// Returns whether the waited direct child reported successful exit.
-    pub(crate) fn success(&self) -> bool {
+    pub fn success(&self) -> bool {
         self.status.success()
     }
 }
@@ -2712,7 +2712,7 @@ impl OwnedProtocolChild {
     /// wait returns direct-child settlement, always with unverified descendant evidence. It must
     /// never be used for a normal provider shutdown, whose successful path calls [`Self::reap`]
     /// without requesting a signal.
-    pub(crate) async fn terminate_abnormally(
+    pub async fn terminate_abnormally(
         mut self,
         grace: Duration,
         deadline: Duration,
@@ -2730,7 +2730,7 @@ impl OwnedProtocolChild {
     /// Waits for the direct bridge child without consuming ownership or requesting a signal.
     ///
     /// A timeout leaves this handle available for the ordered abnormal cleanup path.
-    pub(crate) async fn wait_for_exit(
+    pub async fn wait_for_exit(
         &mut self,
         deadline: Duration,
     ) -> Result<WaitedProtocolChild, ProcessError> {
@@ -2746,7 +2746,7 @@ impl OwnedProtocolChild {
     }
 
     /// Consumes an already reaped direct child into its sole accounting proof and stderr evidence.
-    pub(crate) async fn finish_reap(
+    pub async fn finish_reap(
         self,
         waited: WaitedProtocolChild,
         deadline: Duration,
@@ -2778,7 +2778,7 @@ impl OwnedProtocolChild {
 /// seconds. This function requests group TERM, sleeps the complete grace without polling or
 /// reaping, requests group KILL and direct-child kill, then performs the sole direct wait. It never
 /// signals after that wait and makes no descendant-settlement or process-group-containment claim.
-pub(crate) async fn terminate_child_abnormally(
+pub async fn terminate_child_abnormally(
     child: &mut Child,
     grace: Duration,
     deadline: Duration,
@@ -3014,7 +3014,7 @@ fn executable_identity(path: &Path) -> Result<ExecutableIdentity, RequestError> 
 }
 
 /// Returns the measured executable digest used by trusted provider compatibility identities.
-pub(crate) fn measured_executable_digest(path: &Path) -> Result<blake3::Hash, RequestError> {
+pub fn measured_executable_digest(path: &Path) -> Result<blake3::Hash, RequestError> {
     executable_identity(path).map(|identity| identity.digest)
 }
 

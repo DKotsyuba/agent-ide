@@ -6,6 +6,24 @@ version = 4
 name = "agent-ide"
 version = "0.4.5"
 dependencies = [
+ "agent-ide-core",
+ "async-lsp",
+ "blake3",
+ "libc",
+ "minijinja",
+ "rmcp",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tower-service",
+]
+
+[[package]]
+name = "agent-ide-core"
+version = "0.4.5"
+dependencies = [
  "async-lsp",
  "blake3",
  "libc",

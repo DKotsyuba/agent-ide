@@ -716,7 +716,7 @@ fn first_line(text: &str, max: usize) -> String {
 }
 
 /// Clips text to `max` characters, ending with `…` when truncated.
-pub(super) fn clip(text: &str, max: usize) -> String {
+pub fn clip(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         text.to_owned()
     } else {
@@ -742,17 +742,18 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        crate::lang::testing::install();
         std::fs::create_dir_all(root.join("src/sub")).unwrap();
         std::fs::write(
-            root.join("src/lib.rs"),
-            "//! Alpha module docs\nfn a() {}\n",
+            root.join("src/lib.alpha"),
+            "#!doc Alpha module docs\nfn a() {}\n",
         )
         .unwrap();
         std::fs::write(root.join("src/sub/x"), "x\n").unwrap();
         let text = directory_outline(&root, Path::new("src")).unwrap();
         assert_eq!(
             text,
-            "src/  (1 files, 1 dirs)\n  dirs: sub/ 1\n  lib.rs                   2  Alpha module docs\n"
+            "src/  (1 files, 1 dirs)\n  dirs: sub/ 1\n  lib.alpha                2  Alpha module docs\n"
         );
         std::fs::remove_dir_all(root).unwrap();
     }

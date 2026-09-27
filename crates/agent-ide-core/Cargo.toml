@@ -1,21 +1,14 @@
-[workspace]
-members = ["crates/*"]
-
-[workspace.package]
-version = "0.4.5"
-edition = "2024"
-
 [package]
-name = "agent-ide"
+name = "agent-ide-core"
 version.workspace = true
 edition.workspace = true
 publish = false
+description = "Language-independent core of Agent IDE: sessions, providers, checks, tools and storage."
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-agent-ide-core = { path = "crates/agent-ide-core" }
 async-lsp = { version = "0.2.4", default-features = false, features = ["omni-trait", "tokio"] }
 blake3 = "1"
 libc = "0.2"

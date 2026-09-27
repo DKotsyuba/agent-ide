@@ -35,111 +35,86 @@ fn observation(text: &str, sequence: u64) -> SourceObservation {
     .unwrap()
 }
 
-/// Checks raw URI encoding, Unicode coordinate units, invalid offsets, exact bytes, and lexical limits.
-/// Builds the accepted gopls settings with one absolute private per-worktree Go namespace.
+/// Neutral language-server profile for session mechanism tests.
 ///
-/// The session always carries a worktree-owned `GoEnv`: the shared listener never receives these
-/// as process environment, so a session without them could only inherit another worktree's cache.
-fn gopls_settings() -> ProviderSettings {
-    ProviderSettings::new(
-        crate::intelligence::gopls::GoEnv::new(
-            std::path::PathBuf::from("/private/tmp/agent-ide-session-cache/go-build"),
-            std::path::PathBuf::from("/private/tmp/agent-ide-session-cache/go-mod"),
-            std::path::PathBuf::from("/private/tmp/agent-ide-session-cache/tmp"),
-        )
-        .expect("absolute private go namespace"),
-    )
+/// The server is named `fake-server`. Without a status barrier any omitted or `fake-server`
+/// identity is accepted; with one, only `fake-server` at version `contract-1` is, readiness arrives
+/// as `fake/status` notifications whose `state` is `ready`, `failed` or `busy`, and `.fake` files
+/// open as `fake`.
+#[derive(Debug)]
+struct FakeProfile {
+    /// Whether requests wait for a `fake/status` readiness report.
+    status: bool,
 }
 
-/// Builds fixed Pyright settings against a measured harmless executable for protocol-only tests.
-fn pyright_settings() -> ProviderSettings {
-    ProviderSettings::new(
-        crate::intelligence::pyright::PyrightProfile::new(
-            crate::intelligence::pyright::PyrightProfileIdentity {
-                binary: "/usr/bin/true".into(),
-                accepted_script_digest: crate::execution::measured_executable_digest(
-                    std::path::Path::new("/usr/bin/true"),
-                )
-                .unwrap(),
-                version: "pyright-test".into(),
-                node: "/usr/bin/true".into(),
-                accepted_node_digest: crate::execution::measured_executable_digest(
-                    std::path::Path::new("/usr/bin/true"),
-                )
-                .unwrap(),
-                node_identity: "node-test".into(),
-                trust: "test".into(),
-                cache_namespace: "/private/tmp/agent-ide-pyright-session-test-cache".into(),
-            },
-        )
-        .unwrap(),
-    )
+impl SessionProfile for FakeProfile {
+    /// A fixed marker object.
+    fn workspace_configuration(&self) -> serde_json::Value {
+        json!({"fake": {"enabled": true}})
+    }
+
+    /// See [`FakeProfile`].
+    fn accepts_server(&self, info: Option<&lsp::ServerInfo>) -> bool {
+        if self.status {
+            info.is_some_and(|info| {
+                info.name == "fake-server" && info.version.as_deref() == Some("contract-1")
+            })
+        } else {
+            info.is_none_or(|info| info.name == "fake-server")
+        }
+    }
+
+    /// Asks for status notifications only with a barrier.
+    fn experimental_capabilities(&self) -> Option<serde_json::Value> {
+        self.status.then(|| json!({"fakeStatus": true}))
+    }
+
+    /// `fake/status` with a barrier.
+    fn status_method(&self) -> Option<&'static str> {
+        self.status.then_some("fake/status")
+    }
+
+    /// Maps `{"state": ...}`; anything else fails decoding.
+    fn status(&self, params: serde_json::Value) -> Result<ProviderStatus, serde_json::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "lowercase")]
+        enum State {
+            Ready,
+            Failed,
+            Busy,
+        }
+        #[derive(serde::Deserialize)]
+        struct Status {
+            state: State,
+        }
+        let status: Status = serde_json::from_value(params)?;
+        Ok(match status.state {
+            State::Ready => ProviderStatus::Ready,
+            State::Failed => ProviderStatus::Failed,
+            State::Busy => ProviderStatus::Busy,
+        })
+    }
+
+    /// `.fake` files open as `fake`.
+    fn language_id(&self, path: &std::path::Path) -> &'static str {
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("fake") => "fake",
+            _ => "plaintext",
+        }
+    }
 }
 
-/// Confirms fixed Pyright settings accept omitted server metadata and reject a wrong identity.
-#[test]
-fn pyright_settings_are_closed_and_allow_omitted_server_info() {
-    let settings = pyright_settings();
-    assert_eq!(
-        settings.profile().workspace_configuration(),
-        serde_json::json!({})
-    );
-    assert!(settings.validate_server(None).is_ok());
-    assert!(
-        settings
-            .validate_server(Some(&lsp::ServerInfo {
-                name: "pyright".into(),
-                version: Some("1.1.413".into()),
-            }))
-            .is_ok()
-    );
-    assert!(
-        settings
-            .validate_server(Some(&lsp::ServerInfo {
-                name: "gopls".into(),
-                version: None,
-            }))
-            .is_err()
-    );
+/// A profile usable right after the handshake.
+fn plain_settings() -> ProviderSettings {
+    ProviderSettings::new(FakeProfile { status: false })
 }
 
-/// Each profile opens its own extensions with exact language ids and everything else as plaintext.
-#[test]
-fn configured_file_extensions_use_exact_language_ids() {
-    let python = pyright_settings();
-    let python = python.profile();
-    assert_eq!(
-        python.language_id(std::path::Path::new("module.py")),
-        "python"
-    );
-    assert_eq!(
-        python.language_id(std::path::Path::new("module.pyi")),
-        "python"
-    );
-    assert_eq!(
-        python.language_id(std::path::Path::new("module.txt")),
-        "plaintext"
-    );
-    let go = gopls_settings();
-    assert_eq!(
-        go.profile().language_id(std::path::Path::new("main.go")),
-        "go"
-    );
-    assert_eq!(
-        go.profile().language_id(std::path::Path::new("module.py")),
-        "plaintext"
-    );
-    let rust = rust_settings();
-    assert_eq!(
-        rust.profile().language_id(std::path::Path::new("lib.rs")),
-        "rust"
-    );
-    assert_eq!(
-        rust.profile().language_id(std::path::Path::new("main.go")),
-        "plaintext"
-    );
+/// A profile whose requests wait for a reported readiness.
+fn status_settings() -> ProviderSettings {
+    ProviderSettings::new(FakeProfile { status: true })
 }
 
+/// Checks raw URI encoding, Unicode coordinate units, invalid offsets, exact bytes, and lexical limits.
 #[test]
 fn exact_lexical_context_and_positions() {
     let text = "// 🦀\nfunc Hello() { Hello() }\n";
@@ -200,7 +175,7 @@ fn diagnostic_state() -> Arc<Mutex<State>> {
         active: true,
         terminal: false,
         shutdown_complete: false,
-        settings: gopls_settings(),
+        settings: plain_settings(),
         readiness: watch::channel(UNKNOWN_READINESS).0,
         diagnostic_revision: watch::channel(0).0,
         document: Some(Document {
@@ -225,10 +200,11 @@ fn diagnostic_state() -> Arc<Mutex<State>> {
     }))
 }
 
-/// A one-shot TypeScript open ignores an empty syntax push, binds a later nonempty report, and
-/// refuses to rebind unversioned evidence after a full-document change to different bytes.
+/// For a profile that accepts unversioned initial reports, a one-shot open ignores an empty syntax
+/// push, binds a later nonempty report, and refuses to rebind unversioned evidence after a
+/// full-document change to different bytes.
 #[tokio::test]
-async fn unversioned_typescript_diagnostics_require_unchanged_initial_open() {
+async fn unversioned_diagnostics_require_unchanged_initial_open() {
     let state = diagnostic_state();
     state
         .lock()
@@ -275,7 +251,7 @@ async fn unversioned_typescript_diagnostics_require_unchanged_initial_open() {
         worktree: tree(),
         epoch: 1,
         generation: ViewGeneration::default(),
-        settings: gopls_settings(),
+        settings: plain_settings(),
         budget: OutboundBudget::default(),
         state: state.clone(),
         capabilities: Some(ProviderCapabilities {
@@ -348,7 +324,7 @@ async fn missing_diagnostics_do_not_consume_shutdown_deadline() {
         tree(),
         1,
         ViewGeneration::default(),
-        gopls_settings(),
+        plain_settings(),
         SessionOptions {
             request_timeout: Duration::from_millis(600),
             lifetime: Duration::from_millis(600),
@@ -530,15 +506,10 @@ async fn request_timeout_retires_generation_and_late_results() {
                         })
                         .await
                         .unwrap();
-                    // The gopls view is configured with this session's own private per-worktree
-                    // Go namespace; the shared listener never carries it as process environment.
+                    // The configuration request is answered with the profile's own settings.
                     assert_eq!(
                         settings,
-                        vec![serde_json::json!({"env":{
-                            "GOCACHE":"/private/tmp/agent-ide-session-cache/go-build",
-                            "GOMODCACHE":"/private/tmp/agent-ide-session-cache/go-mod",
-                            "GOTMPDIR":"/private/tmp/agent-ide-session-cache/tmp",
-                        }})]
+                        vec![serde_json::json!({"fake": {"enabled": true}})]
                     );
                     Ok(lsp::InitializeResult {
                         capabilities: lsp::ServerCapabilities {
@@ -568,7 +539,7 @@ async fn request_timeout_retires_generation_and_late_results() {
                 backend: 7,
                 ..Default::default()
             },
-            gopls_settings(),
+            plain_settings(),
             SessionOptions {
                 request_timeout: Duration::from_millis(50),
                 lifetime: Duration::from_secs(2),
@@ -622,7 +593,7 @@ async fn eof_never_becomes_provider_readiness() {
         tree(),
         1,
         ViewGeneration::default(),
-        gopls_settings(),
+        plain_settings(),
         SessionOptions::default(),
         |_| async { panic!("EOF must not initialize") },
     )
@@ -630,105 +601,46 @@ async fn eof_never_becomes_provider_readiness() {
     assert!(result.is_err());
 }
 
-/// Returns the accepted immutable Rust identity for controlled protocol peers without spawning a server.
-fn rust_settings() -> ProviderSettings {
-    rust_settings_with_configuration("cache-priming-disabled-v1")
-}
-
-/// Returns a Rust identity with one explicit accepted initialization configuration.
-fn rust_settings_with_configuration(configuration: &str) -> ProviderSettings {
-    ProviderSettings::new(
-        crate::intelligence::rust::RustProfile::new(
-            crate::intelligence::rust::RustProfileIdentity {
-                binary: "/usr/bin/true".into(),
-                rust_analyzer_version: "rust-analyzer contract-1".into(),
-                cargo: "/usr/bin/true".into(),
-                cargo_version: "cargo-test".into(),
-                rustc: "/usr/bin/true".into(),
-                rustc_version: "rustc-test".into(),
-                rustup_toolchain: "test-toolchain".into(),
-                configuration: configuration.into(),
-                trust: "test".into(),
-                transport: "stdio-v1".into(),
-                cache_namespace: "/private/tmp/agent-ide-session-test-cache".into(),
-            },
-        )
-        .unwrap(),
-    )
-}
-
-/// Managed sandbox initialization disables proc macros while retaining cache-priming suppression.
-#[test]
-fn managed_rust_settings_disable_proc_macro_expansion() {
-    let settings = rust_settings_with_configuration("cache-priming-and-proc-macro-disabled-v1");
-    assert_eq!(
-        settings.profile().workspace_configuration(),
-        serde_json::json!({
-            "cachePriming":{"enable":false},
-            "procMacro":{"enable":false}
-        })
-    );
-    assert_eq!(
-        rust_settings().profile().workspace_configuration(),
-        serde_json::json!({
-            "cachePriming":{"enable":false},
-            "procMacro":{"enable":true}
-        })
-    );
-}
-
-/// Negotiates exact gopls/Rust settings and refuses wrong Rust identity, a non-quiescent barrier and a
-/// quiescent workspace error; a quiescent warning (failed build scripts) stays usable.
+/// Negotiates the profile's exact settings and identity, and holds the one-shot session behind a
+/// status barrier: a ready report proceeds, a wrong identity, a busy report and a failed workspace
+/// do not; a profile without a barrier proceeds with unknown readiness.
 #[tokio::test]
-async fn closed_settings_and_rust_status_barrier_match_the_actual_provider() {
-    for (settings, name, version, health, quiescent, success) in [
-        (gopls_settings(), "gopls", "test", "ok", true, true),
+async fn closed_settings_and_status_barrier_match_the_actual_provider() {
+    for (settings, name, version, state, success) in [
+        (plain_settings(), "fake-server", "test", "ready", true),
         (
-            rust_settings(),
-            "rust-analyzer",
+            status_settings(),
+            "fake-server",
             "contract-1",
-            "ok",
-            true,
+            "ready",
             true,
         ),
         (
-            rust_settings(),
-            "rust-analyzer",
+            status_settings(),
+            "fake-server",
             "wrong-version",
-            "ok",
-            true,
+            "ready",
             false,
         ),
         (
-            rust_settings(),
-            "rust-analyzer",
+            status_settings(),
+            "fake-server",
             "contract-1",
-            "warning",
-            true,
-            true,
-        ),
-        (
-            rust_settings(),
-            "rust-analyzer",
-            "contract-1",
-            "error",
-            true,
+            "failed",
             false,
         ),
         (
-            rust_settings(),
-            "rust-analyzer",
+            status_settings(),
+            "fake-server",
             "contract-1",
-            "ok",
-            false,
+            "busy",
             false,
         ),
         (
-            gopls_settings(),
-            "rust-analyzer",
+            plain_settings(),
+            "other-server",
             "contract-1",
-            "ok",
-            true,
+            "ready",
             false,
         ),
     ] {
@@ -736,9 +648,8 @@ async fn closed_settings_and_rust_status_barrier_match_the_actual_provider() {
         let (input, output) = tokio::io::split(client);
         let (peer_input, peer_output) = tokio::io::split(peer);
         let expected = settings.profile().workspace_configuration();
-        let rust = settings
-            .downcast_ref::<crate::intelligence::rust::RustProfile>()
-            .is_some();
+        let barrier = settings.profile().status_method().is_some();
+        let experimental = settings.profile().experimental_capabilities();
         let (server, _) = MainLoop::new_server(move |client| {
             let mut router = Router::new(client);
             router.request::<request::Initialize, _>(move |client, params| {
@@ -785,15 +696,7 @@ async fn closed_settings_and_rust_status_barrier_match_the_actual_provider() {
                         .unwrap_or(serde_json::Value::Null),
                     expected
                 );
-                assert_eq!(
-                    params
-                        .capabilities
-                        .experimental
-                        .as_ref()
-                        .and_then(|value| value.get("serverStatusNotification"))
-                        .and_then(serde_json::Value::as_bool),
-                    rust.then_some(true)
-                );
+                assert_eq!(params.capabilities.experimental, experimental);
                 let expected = expected.clone();
                 let client = client.clone();
                 async move {
@@ -821,7 +724,7 @@ async fn closed_settings_and_rust_status_barrier_match_the_actual_provider() {
             });
             router.notification::<lsp::notification::Initialized>(move |client, _| {
                 client
-                    .notify::<ServerStatus>(json!({"health": health, "quiescent": quiescent}))
+                    .notify::<ServerStatus>(json!({"state": state}))
                     .unwrap();
                 ControlFlow::Continue(())
             });
@@ -845,7 +748,7 @@ async fn closed_settings_and_rust_status_barrier_match_the_actual_provider() {
                 assert!(success, "unsupported settings/status reached the operation");
                 assert_eq!(
                     session.provider_readiness(),
-                    if rust {
+                    if barrier {
                         ProviderReadiness::from_status(ProviderStatus::Ready)
                     } else {
                         UNKNOWN_READINESS
@@ -883,8 +786,8 @@ enum ServerStatus {}
 impl lsp::notification::Notification for ServerStatus {
     /// Raw status fields, decoded only by the session's profile.
     type Params = serde_json::Value;
-    /// The status method the Rust profile listens to.
-    const METHOD: &'static str = "experimental/serverStatus";
+    /// The status method the barrier profile listens to.
+    const METHOD: &'static str = "fake/status";
 }
 
 /// Reads one small exact frame in controlled tests; production framing remains owned by BoundedInput.
@@ -920,7 +823,7 @@ async fn write_peer_frame(writer: &mut (impl AsyncWrite + Unpin), message: serde
 async fn peer_initialize(peer: &mut tokio::io::DuplexStream, sync: bool) {
     let request = read_peer_frame(peer).await;
     assert_eq!(request["method"], "initialize");
-    write_peer_frame(peer,json!({"jsonrpc":"2.0","id":request["id"],"result":{"capabilities":{"textDocumentSync":if sync {1}else{0}},"serverInfo":{"name":"gopls","version":"test"}}})).await;
+    write_peer_frame(peer,json!({"jsonrpc":"2.0","id":request["id"],"result":{"capabilities":{"textDocumentSync":if sync {1}else{0}},"serverInfo":{"name":"fake-server","version":"test"}}})).await;
 }
 
 /// EOF and malformed input after initialize remain transport errors even when the operation returns Ok.
@@ -943,7 +846,7 @@ async fn post_initialize_transport_failures_are_not_swallowed() {
             tree(),
             1,
             ViewGeneration::default(),
-            gopls_settings(),
+            plain_settings(),
             SessionOptions {
                 request_timeout: Duration::from_millis(100),
                 lifetime: Duration::from_secs(1),
@@ -1015,7 +918,7 @@ async fn post_initialize_output_error_is_propagated() {
         tree(),
         1,
         ViewGeneration::default(),
-        gopls_settings(),
+        plain_settings(),
         SessionOptions {
             request_timeout: Duration::from_millis(100),
             lifetime: Duration::from_secs(1),
@@ -1053,7 +956,7 @@ async fn outbound_budget_retires_full_document_flood_before_unbounded_queueing()
         tree(),
         1,
         ViewGeneration::default(),
-        gopls_settings(),
+        plain_settings(),
         SessionOptions {
             request_timeout: Duration::from_millis(100),
             lifetime: Duration::from_millis(400),
@@ -1082,61 +985,6 @@ async fn outbound_budget_retires_full_document_flood_before_unbounded_queueing()
     );
 }
 
-/// A per-worktree Go namespace must be an absolute normal path or the session refuses to exist.
-///
-/// The provider process resolves a relative value against its own cwd, so accepting one would let
-/// worktree-owned build state escape the private namespace this session is accounted for.
-#[test]
-fn go_env_rejects_paths_that_could_escape_the_private_namespace() {
-    use crate::intelligence::gopls::GoEnv;
-    let good = |name: &str| std::path::PathBuf::from("/private/tmp/agent-ide-go-env").join(name);
-    assert!(GoEnv::new(good("go-build"), good("go-mod"), good("tmp")).is_some());
-    for bad in [
-        std::path::PathBuf::new(),
-        std::path::PathBuf::from("relative/go-build"),
-        std::path::PathBuf::from("/private/tmp/../escape"),
-    ] {
-        assert!(
-            GoEnv::new(bad.clone(), good("go-mod"), good("tmp")).is_none(),
-            "{bad:?} must be refused"
-        );
-    }
-}
-
-/// `prepare` must materialize every private Go directory a real view is configured to use.
-///
-/// A missing `GOTMPDIR` makes `go` refuse to create its work directory, which gopls surfaces only
-/// as `no package metadata for file ... (jsonrpc error 0)`, silently demoting the view to lexical
-/// context; the namespace root exists but these three subdirectories belong to the session alone.
-/// The same refusals as `new` still apply before anything is created.
-#[test]
-fn go_env_prepare_creates_the_private_namespace_directories() {
-    use crate::intelligence::gopls::GoEnv;
-    let root = std::path::PathBuf::from("/private/tmp").join(format!(
-        "agent-ide-go-env-prepare-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = std::fs::remove_dir_all(&root);
-    let paths = ["go-build", "go-mod", "tmp"].map(|name| root.join("nested").join(name));
-    let env = GoEnv::prepare(paths[0].clone(), paths[1].clone(), paths[2].clone())
-        .expect("an absolute private namespace is creatable");
-    for path in &paths {
-        assert!(path.is_dir(), "{path:?} must exist before a view uses it");
-    }
-    assert_eq!(env.go_tmp_dir(), paths[2]);
-    assert!(
-        GoEnv::prepare(
-            std::path::PathBuf::from("relative/go-build"),
-            paths[1].clone(),
-            paths[2].clone(),
-        )
-        .is_none(),
-        "prepare must keep every rejection new performs"
-    );
-    let _ = std::fs::remove_dir_all(&root);
-}
-
 /// A live session keeps its driver across requests: handshake without a readiness wait, then
 /// readiness arrives later, then document symbols and hover answer on the same transport, and a
 /// second request after the first proves the budget is per request.
@@ -1158,7 +1006,7 @@ async fn live_session_outlives_requests_and_waits_for_readiness_per_request() {
                     ..Default::default()
                 },
                 server_info: Some(lsp::ServerInfo {
-                    name: "rust-analyzer".into(),
+                    name: "fake-server".into(),
                     version: Some("contract-1".into()),
                 }),
             })
@@ -1168,8 +1016,7 @@ async fn live_session_outlives_requests_and_waits_for_readiness_per_request() {
             let client = client.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                let _ =
-                    client.notify::<ServerStatus>(json!({"health": "warning", "quiescent": true}));
+                let _ = client.notify::<ServerStatus>(json!({"state": "ready"}));
             });
             ControlFlow::Continue(())
         });
@@ -1219,7 +1066,7 @@ async fn live_session_outlives_requests_and_waits_for_readiness_per_request() {
         tree(),
         1,
         ViewGeneration::default(),
-        rust_settings(),
+        status_settings(),
         Duration::from_secs(5),
     )
     .await

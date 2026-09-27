@@ -18,12 +18,8 @@ use std::{
 use async_lsp::lsp_types as lsp;
 
 pub mod edits;
-pub mod go;
 pub mod path;
-pub mod python;
 pub mod render;
-pub mod rust;
-pub mod typescript;
 
 pub use path::SymbolPath;
 
@@ -769,6 +765,13 @@ pub(crate) mod testing {
                 ..TestReport::default()
             }
         }
+        /// A leading `#!doc ` line is the module documentation.
+        fn file_doc(&self, text: &str) -> Option<String> {
+            text.lines()
+                .next()?
+                .strip_prefix("#!doc ")
+                .map(str::to_owned)
+        }
         /// No formatter.
         fn format_command(&self, _project: &LanguageProject, _file: &Path) -> Option<Vec<String>> {
             None
@@ -860,9 +863,7 @@ pub(crate) mod testing {
 
     /// Registers the test languages (idempotent) for tests that look languages up by path or id.
     pub(crate) fn install() {
-        let mut languages = crate::languages::ALL.to_vec();
-        languages.extend([ALPHA, BETA, GAMMA, DELTA]);
-        super::install(&languages);
+        super::install(&[ALPHA, BETA, GAMMA, DELTA]);
     }
 }
 
@@ -894,21 +895,19 @@ mod tests {
     fn language_is_selected_by_extension() {
         testing::install();
         assert_eq!(
-            Language::for_path(Path::new("a/b.rs")),
-            Some(crate::languages::RUST)
+            Language::for_path(Path::new("a/b.alpha")),
+            Some(testing::ALPHA)
         );
         assert_eq!(
-            Language::for_path(Path::new("x.tsx")),
-            Some(crate::languages::TYPESCRIPT)
+            Language::for_path(Path::new("x.gamma")),
+            Some(testing::GAMMA)
         );
         assert_eq!(
-            Language::for_path(Path::new("x.pyi")),
-            Some(crate::languages::PYTHON)
-        );
-        assert_eq!(
-            Language::for_path(Path::new("main.go")),
-            Some(crate::languages::GO)
+            Language::for_path(Path::new("x.delta")),
+            Some(testing::DELTA)
         );
         assert_eq!(Language::for_path(Path::new("README.md")), None);
+        assert_eq!(Language::by_id("beta"), Some(testing::BETA));
+        assert!(testing::ALPHA < testing::BETA && testing::BETA < testing::GAMMA);
     }
 }

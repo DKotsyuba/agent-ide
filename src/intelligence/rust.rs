@@ -765,8 +765,8 @@ impl RustProtocolChild {
 
 #[cfg(test)]
 mod linked_project_tests {
-    use super::linked_projects;
-    use std::path::PathBuf;
+    use super::{RustProfile, RustProfileIdentity, linked_projects};
+    use std::path::{Path, PathBuf};
 
     fn scratch(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -818,5 +818,88 @@ mod linked_project_tests {
         assert_eq!(linked_projects(&flat), None);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&flat);
+    }
+
+    /// Returns a Rust profile over a harmless measured executable with one accepted configuration.
+    fn session_profile(configuration: &str) -> RustProfile {
+        RustProfile::new(RustProfileIdentity {
+            binary: "/usr/bin/true".into(),
+            rust_analyzer_version: "rust-analyzer contract-1".into(),
+            cargo: "/usr/bin/true".into(),
+            cargo_version: "cargo-test".into(),
+            rustc: "/usr/bin/true".into(),
+            rustc_version: "rustc-test".into(),
+            rustup_toolchain: "test-toolchain".into(),
+            configuration: configuration.into(),
+            trust: "test".into(),
+            transport: "stdio-v1".into(),
+            cache_namespace: "/private/tmp/agent-ide-session-test-cache".into(),
+        })
+        .unwrap()
+    }
+
+    /// Managed sandbox initialization disables proc macros while retaining cache-priming suppression.
+    #[test]
+    fn managed_rust_settings_disable_proc_macro_expansion() {
+        use crate::intelligence::session::SessionProfile;
+        assert_eq!(
+            session_profile("cache-priming-and-proc-macro-disabled-v1").workspace_configuration(),
+            serde_json::json!({
+                "cachePriming":{"enable":false},
+                "procMacro":{"enable":false}
+            })
+        );
+        assert_eq!(
+            session_profile("cache-priming-disabled-v1").workspace_configuration(),
+            serde_json::json!({
+                "cachePriming":{"enable":false},
+                "procMacro":{"enable":true}
+            })
+        );
+    }
+
+    /// Only the exact analyzer identity is accepted, `.rs` opens as `rust`, and the server-status
+    /// barrier is requested.
+    #[test]
+    fn rust_session_profile_requires_the_exact_analyzer_identity() {
+        use crate::intelligence::session::SessionProfile;
+        let profile = session_profile("cache-priming-disabled-v1");
+        let info = |name: &str, version: &str| async_lsp::lsp_types::ServerInfo {
+            name: name.into(),
+            version: Some(version.into()),
+        };
+        assert!(profile.accepts_server(Some(&info("rust-analyzer", "contract-1"))));
+        assert!(!profile.accepts_server(Some(&info("rust-analyzer", "wrong-version"))));
+        assert!(!profile.accepts_server(Some(&info("gopls", "contract-1"))));
+        assert!(!profile.accepts_server(None));
+        assert_eq!(
+            profile.experimental_capabilities(),
+            Some(serde_json::json!({"serverStatusNotification":true}))
+        );
+        assert_eq!(profile.status_method(), Some("experimental/serverStatus"));
+        assert_eq!(profile.language_id(Path::new("lib.rs")), "rust");
+        assert_eq!(profile.language_id(Path::new("main.go")), "plaintext");
+    }
+
+    /// Quiescent `ok` or `warning` (failed build scripts) is ready, quiescent `error` failed,
+    /// anything not quiescent busy; a malformed status fails decoding.
+    #[test]
+    fn server_status_maps_quiescent_health_to_readiness() {
+        use crate::intelligence::session::{ProviderStatus, SessionProfile};
+        let profile = session_profile("cache-priming-disabled-v1");
+        let status = |health: &str, quiescent: bool| {
+            profile
+                .status(serde_json::json!({"health": health, "quiescent": quiescent}))
+                .unwrap()
+        };
+        assert_eq!(status("ok", true), ProviderStatus::Ready);
+        assert_eq!(status("warning", true), ProviderStatus::Ready);
+        assert_eq!(status("error", true), ProviderStatus::Failed);
+        assert_eq!(status("ok", false), ProviderStatus::Busy);
+        assert!(
+            profile
+                .status(serde_json::json!({"health": "unknown"}))
+                .is_err()
+        );
     }
 }

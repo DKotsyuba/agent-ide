@@ -9,7 +9,7 @@ use super::reply::{FailureCode, MAX_REPLY_BYTES, MCP_RESERVE, PeerReply};
 
 /// Build-embedded MiniJinja source projecting every closed [`PeerReply`] state into its compact
 /// model-facing text; the template owns the presentation so Rust code never formats reply text.
-const REPLY_TEMPLATE: &str = include_str!("../../assets/mcp/reply.jinja");
+const REPLY_TEMPLATE: &str = include_str!("../../../../assets/mcp/reply.jinja");
 
 /// Selects whether a projected [`CallToolResult`] also carries the duplicate typed
 /// `structuredContent` copy alongside the compact `content` text block.

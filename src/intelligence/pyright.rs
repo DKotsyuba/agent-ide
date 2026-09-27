@@ -588,4 +588,45 @@ mod tests {
 
         std::fs::remove_dir_all(directory).unwrap();
     }
+
+    /// Pyright runs on an empty configuration, accepts an omitted or `pyright` identity only, and
+    /// opens `.py`/`.pyi` files as `python`.
+    #[test]
+    fn pyright_session_profile_is_closed_and_allows_omitted_server_info() {
+        use crate::intelligence::session::SessionProfile;
+        let profile = PyrightProfile::new(PyrightProfileIdentity {
+            binary: "/usr/bin/true".into(),
+            accepted_script_digest: crate::execution::measured_executable_digest(Path::new(
+                "/usr/bin/true",
+            ))
+            .unwrap(),
+            version: "pyright-test".into(),
+            node: "/usr/bin/true".into(),
+            accepted_node_digest: crate::execution::measured_executable_digest(Path::new(
+                "/usr/bin/true",
+            ))
+            .unwrap(),
+            node_identity: "node-test".into(),
+            trust: "test".into(),
+            cache_namespace: "/private/tmp/agent-ide-pyright-session-test-cache".into(),
+        })
+        .unwrap();
+        assert_eq!(profile.workspace_configuration(), serde_json::json!({}));
+        assert!(profile.accepts_server(None));
+        assert!(
+            profile.accepts_server(Some(&async_lsp::lsp_types::ServerInfo {
+                name: "pyright".into(),
+                version: Some("1.1.413".into()),
+            }))
+        );
+        assert!(
+            !profile.accepts_server(Some(&async_lsp::lsp_types::ServerInfo {
+                name: "gopls".into(),
+                version: None,
+            }))
+        );
+        assert_eq!(profile.language_id(Path::new("module.py")), "python");
+        assert_eq!(profile.language_id(Path::new("module.pyi")), "python");
+        assert_eq!(profile.language_id(Path::new("module.txt")), "plaintext");
+    }
 }
