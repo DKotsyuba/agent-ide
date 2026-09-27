@@ -25,8 +25,11 @@ use super::{
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Python;
 
-/// Flags appended to every pytest run: terse output, no header, no `.pytest_cache` writes.
-const PYTEST_FLAGS: [&str; 4] = ["-q", "--no-header", "-p", "no:cacheprovider"];
+/// Flags appended to every pytest run: no header, no `.pytest_cache` writes.
+///
+/// No own verbosity flag: the project's `addopts` may already carry `-q`, and a doubled `-qq`
+/// makes pytest print no summary line at all, which the parser then cannot read.
+const PYTEST_FLAGS: [&str; 3] = ["--no-header", "-p", "no:cacheprovider"];
 
 /// Most individually named tests one command addresses before it falls back to their files.
 pub(super) const MAX_NAMED_TESTS: usize = 12;
@@ -270,7 +273,7 @@ impl LanguageSupport for Python {
                     part == "tests" || part == "test"
                 }))
     }
-    /// pytest with `-q --no-header -p no:cacheprovider`, prefixed by `uv run` in uv projects.
+    /// pytest with `--no-header -p no:cacheprovider`, prefixed by `uv run` in uv projects.
     /// A symbol target names each distinct referencing test as a node id (`file::Class::test`;
     /// `/` in a name is read as nesting) or, beyond `MAX_NAMED_TESTS`, their distinct files; a
     /// symbol no test references is [`LangError::Unsupported`]. A file target runs whole only
@@ -1602,7 +1605,6 @@ src/pkg/contract.py  (27 lines, python)
                 "pytest",
                 "tests/test_service.py::test_load",
                 "tests/test_service.py::TestWorker::test_label",
-                "-q",
                 "--no-header",
                 "-p",
                 "no:cacheprovider",
@@ -1685,6 +1687,20 @@ src/pkg/contract.py  (27 lines, python)
     fn parse_passing_run() {
         let report = Python.parse_test_output("....\n4 passed in 0.03s\n", "");
         assert_eq!((report.passed, report.failed, report.ignored), (4, 0, 0));
+        assert!(!report.incomplete);
+        assert!(report.failures.is_empty());
+    }
+
+    #[test]
+    /// The banner form pytest prints without own `-q` (a project `addopts -q` must not
+    /// double into `-qq` and suppress this line): counts parse, nothing incomplete.
+    fn parse_banner_summary_without_own_quiet_flag() {
+        let report = Python.parse_test_output(
+            "tests/unit/test_statistics_bets.py .....\n\n\
+             ============================ 21 passed in 0.42s ============================\n",
+            "",
+        );
+        assert_eq!((report.passed, report.failed, report.ignored), (21, 0, 0));
         assert!(!report.incomplete);
         assert!(report.failures.is_empty());
     }

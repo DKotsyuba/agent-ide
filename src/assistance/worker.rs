@@ -984,7 +984,9 @@ impl WorkerHandle {
         let runtime = runtime.to_path_buf();
         let (ready, wait) = oneshot::channel();
         let cancel = self.startup_cancel.clone();
+        eprintln!("T114-DEBUG boot task spawning");
         let task = tokio::spawn(async move {
+            eprintln!("T114-DEBUG boot task started");
             let verification = shared.clone();
             if !matches!(
                 tokio::task::spawn_blocking(move || verification
@@ -993,10 +995,12 @@ impl WorkerHandle {
                 .await,
                 Ok(Ok(()))
             ) {
+                eprintln!("T114-DEBUG verify_executables failed");
                 let _ = ready.send(Err(FailureCode::ExecutionProfile));
                 return;
             }
 
+            eprintln!("T114-DEBUG executables verified");
             let database = std::env::var_os("AGENT_IDE_STATE_DATABASE")
                 .map(std::path::PathBuf::from)
                 .filter(|path| path.is_absolute())
@@ -1008,6 +1012,7 @@ impl WorkerHandle {
             ) {
                 Ok(store) => store,
                 Err(_) => {
+                    eprintln!("T114-DEBUG store open failed");
                     let _ = ready.send(Err(FailureCode::Internal));
                     return;
                 }
@@ -1028,7 +1033,8 @@ impl WorkerHandle {
             };
             let workspace = match DurableWorkspace::open(store).await {
                 Ok(owner) => owner,
-                Err(_) => {
+                Err(error) => {
+                    eprintln!("T114-DEBUG durable open: {error:?}");
                     let _ = ready.send(Err(FailureCode::WorkspaceActivation));
                     return;
                 }
@@ -1038,6 +1044,7 @@ impl WorkerHandle {
                 observations.install_schema().await,
                 Ok(MigrationAdmission::Applied { .. } | MigrationAdmission::AlreadyApplied { .. })
             ) {
+                eprintln!("T114-DEBUG observations schema failed");
                 let _ = ready.send(Err(FailureCode::SourceUnavailable));
                 return;
             }
@@ -1046,9 +1053,11 @@ impl WorkerHandle {
                 edits.install_schema().await,
                 Ok(MigrationAdmission::Applied { .. } | MigrationAdmission::AlreadyApplied { .. })
             ) {
+                eprintln!("T114-DEBUG edits schema failed");
                 let _ = ready.send(Err(FailureCode::Internal));
                 return;
             }
+            eprintln!("T114-DEBUG startup about to complete");
             if let Ok(mut configured) = telemetry_owner.lock() {
                 *configured = telemetry.clone();
             }
@@ -4196,7 +4205,7 @@ fn test_result_text(id: u64, result: &super::tests::RunResult, owns_detail: bool
     let mut text =
         if report.passed == 0 && report.failed == 0 && report.incomplete && !result.stopped {
             format!(
-                "tests #{id}: no summary parsed, {} s",
+                "tests #{id}: no summary parsed, {} s — inspect the runner's full output with ide.inspect",
                 result.elapsed.as_secs()
             )
         } else if result.stopped {

@@ -336,7 +336,7 @@ fn render_status_line(id: u64, job: &Job) -> Option<String> {
                 && result.report.incomplete =>
         {
             format!(
-                "tests #{id}: no summary parsed, {} s",
+                "tests #{id}: no summary parsed, {} s — inspect the runner's full output with ide.inspect",
                 result.elapsed.as_secs()
             )
         }
