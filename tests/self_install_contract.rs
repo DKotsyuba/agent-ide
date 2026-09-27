@@ -281,6 +281,52 @@ fn a_byte_different_bundle_for_the_installed_version_is_refused() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// With `--replace` (source builds), a byte-different bundle for the installed version replaces
+/// the release directory whole and re-selects it.
+#[test]
+fn replace_reinstalls_a_byte_different_source_build_of_the_same_version() {
+    let root = unique_root("replace");
+    install_ok(&sealed_bundle(&root, VERSION, "original"), &root, VERSION);
+    let other = sealed_bundle_named(&root, "bundle-other", VERSION, "rebuilt bytes");
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+        .args(["self-install", "--replace", "--release"])
+        .arg(&other)
+        .args(["--version", VERSION])
+        .args(["--home", &root.join("home").to_string_lossy()])
+        .args(["--prefix", &root.join("prefix").to_string_lossy()])
+        .args(["--bin-dir", &root.join("bin").to_string_lossy()])
+        .args(["--share-dir", &root.join("share").to_string_lossy()])
+        .output()
+        .expect("agent-ide self-install must execute");
+    assert!(
+        output.status.success(),
+        "replace must succeed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let installed = fs::read(
+        root.join("prefix/releases")
+            .join(VERSION)
+            .join("SHA256SUMS"),
+    )
+    .unwrap();
+    let candidate = fs::read(other.join("SHA256SUMS")).unwrap();
+    assert_eq!(
+        installed, candidate,
+        "the replaced release must carry the new manifest"
+    );
+    assert!(
+        !fs::read_dir(root.join("prefix/releases"))
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".replaced-")),
+        "the retired copy must be removed"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// A foreign script at the launcher path is refused and left untouched.
 #[test]
 fn an_unowned_launcher_is_refused() {

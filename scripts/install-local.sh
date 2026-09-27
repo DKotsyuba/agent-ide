@@ -74,7 +74,8 @@ bundle="$tmp_dir/agent-ide-v$version"
     --version "$version" \
     --prefix "$prefix" \
     --bin-dir "$prefix/bin" \
-    --share-dir "$prefix/share/agent-ide"
+    --share-dir "$prefix/share/agent-ide" \
+    --replace
 
 current_link="$prefix/share/agent-ide/plugin/current"
 printf '\n'

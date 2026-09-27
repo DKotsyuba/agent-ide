@@ -57,6 +57,9 @@ pub struct Args {
     pub bin_dir: Option<PathBuf>,
     /// Plugin root parent; default is `<home>/.local/share/agent-ide`.
     pub share_dir: Option<PathBuf>,
+    /// Source builds only: replace an already installed release of the same version whose
+    /// bytes differ instead of refusing (published releases never change bytes).
+    pub replace: bool,
 }
 
 /// Everything one install needs, with every path resolved absolute and normalized.
@@ -74,6 +77,8 @@ pub struct Options {
     pub bin_dir: PathBuf,
     /// Directory holding `plugin/<version>/` and `plugin/current`.
     pub share_dir: PathBuf,
+    /// Replace a same-version release with different bytes (source builds only).
+    pub replace: bool,
 }
 
 /// One completed install, rendered as the command's JSON summary line.
@@ -118,11 +123,17 @@ pub fn parse_args(rest: &[OsString]) -> Result<Args, String> {
     let mut prefix: Option<PathBuf> = None;
     let mut bin_dir: Option<PathBuf> = None;
     let mut share_dir: Option<PathBuf> = None;
+    let mut replace = false;
     let mut index = 0;
     while index < rest.len() {
         let flag = rest[index]
             .to_str()
             .ok_or_else(|| format!("non-UTF-8 self-install argument: {:?}", rest[index]))?;
+        if flag == "--replace" {
+            replace = true;
+            index += 1;
+            continue;
+        }
         let value = rest
             .get(index + 1)
             .ok_or_else(|| format!("{flag} needs a value"))?
@@ -151,6 +162,7 @@ pub fn parse_args(rest: &[OsString]) -> Result<Args, String> {
         prefix,
         bin_dir,
         share_dir,
+        replace,
     })
 }
 
@@ -205,6 +217,7 @@ pub fn resolve(args: Args) -> Result<Options, String> {
         prefix: checked_absolute(prefix, "--prefix")?,
         bin_dir: checked_absolute(bin_dir, "--bin-dir")?,
         share_dir: checked_absolute(share_dir, "--share-dir")?,
+        replace: args.replace,
     })
 }
 
@@ -273,9 +286,25 @@ fn install(options: &Options) -> Result<Summary, String> {
     let selected = releases.join(&options.version);
     if fs::symlink_metadata(&selected).is_ok() {
         if let Err(reason) = identical_release(&selected, &options.release, &options.version) {
-            return Err(format!(
-                "refusing to overwrite a different immutable release: {reason}"
+            if !options.replace {
+                return Err(format!(
+                    "refusing to overwrite a different immutable release: {reason}"
+                ));
+            }
+            // A source build re-installed under the same version: retire the old copy first so
+            // the immutable directory is rebuilt whole rather than patched in place.
+            let retired = releases.join(format!(
+                ".replaced-{}-{}",
+                options.version,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_secs())
+                    .unwrap_or(0)
             ));
+            fs::rename(&selected, &retired)
+                .map_err(|error| format!("{}: {error}", selected.display()))?;
+            let _ = fs::remove_dir_all(&retired);
+            install_release(&options.release, &selected, &options.version)?;
         }
     } else {
         install_release(&options.release, &selected, &options.version)?;
