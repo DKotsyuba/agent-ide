@@ -2038,7 +2038,12 @@ impl ProductFixture {
     ///
     /// The one target serves Codex and Claude actors alike; a Claude target needs no profile.
     fn write_config(&self, providers: Value) {
-        let config = json!({"version":1,"limits":{"queued":16,"details":64,"operation_ms":120000,"output_bytes":1048576},"allowed_roots":[self.base],"targets":[{"attachment":"private-host-channel","candidate":self.root,"git":accepted_program("/usr/bin/git","fixture-git"),"providers":providers}]});
+        self.write_config_with_output_bytes(providers, 1_048_576);
+    }
+    /// [`Self::write_config`] with a caller-selected child capture budget; the shipped
+    /// `agent-ide init` default is 65 536.
+    fn write_config_with_output_bytes(&self, providers: Value, output_bytes: usize) {
+        let config = json!({"version":1,"limits":{"queued":16,"details":64,"operation_ms":120000,"output_bytes":output_bytes},"allowed_roots":[self.base],"targets":[{"attachment":"private-host-channel","candidate":self.root,"git":accepted_program("/usr/bin/git","fixture-git"),"providers":providers}]});
         std::fs::write(&self.config, config.to_string()).unwrap();
     }
     /// Returns the current fixture's complete measured-state-shaped payload outside model arguments.
@@ -4356,6 +4361,76 @@ async fn configured_product_later_binding_diffs_path_edited_under_earlier_grant(
     let stopped = second.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     second.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A clean tree whose fixed whole-tree metadata listings exceed the installed 64 KiB child
+/// capture budget still diffs: git evidence drains at the Workspace evidence boundary, the
+/// ~3 000-file ignored directory never enters evidence, and the answer is `tracked: 0`.
+#[tokio::test]
+async fn configured_product_clean_tree_diff_completes_over_large_metadata_and_ignored_trees() {
+    let fixture = ProductFixture::new(json!([]));
+    // The shipped `agent-ide init` config captures every child at 64 KiB; the fixture mirrors
+    // that exactly (the fixture default of 1 MiB hides the truncation this test pins).
+    fixture.write_config_with_output_bytes(json!([]), 65_536);
+    let ignored = fixture.root.join("ignored");
+    std::fs::create_dir_all(ignored.join("blobs")).unwrap();
+    for index in 0..3_000 {
+        std::fs::write(
+            ignored.join("blobs").join(format!("file-{index}.txt")),
+            format!("payload {index}\n"),
+        )
+        .unwrap();
+    }
+    std::fs::write(fixture.root.join(".gitignore"), "/ignored/\n").unwrap();
+    // Whole-tree metadata listings above the 64 KiB budget: at ~70 bytes per record,
+    // `git ls-files --stage` and `git ls-tree -r` alone exceed it.
+    for index in 0..1_200 {
+        std::fs::write(
+            fixture
+                .root
+                .join("src")
+                .join(format!("generated_module_{index}.rs")),
+            format!("pub fn value_{index}() -> i32 {{ {index} }}\n"),
+        )
+        .unwrap();
+    }
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "large clean fixture"]);
+    assert_eq!(
+        std::process::Command::new("/usr/bin/git")
+            .env_clear()
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["-C"])
+            .arg(&fixture.root)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap()
+            .stdout,
+        Vec::<u8>::new(),
+        "the fixture tree must be clean"
+    );
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "clean-tree-diff").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"clean-tree-diff-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let diff = actor.call(&fixture, "ide.diff", json!({})).await;
+    let diff = actor.settle(&fixture, diff).await;
+    assert_eq!(diff["kind"], "diff", "{diff}");
+    let text = diff["text"].as_str().unwrap();
+    assert!(text.contains("tracked: 0; untracked: 0"), "{text}");
+    assert!(!text.contains("untracked_path"), "{text}");
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
 }
