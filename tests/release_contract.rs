@@ -9,7 +9,7 @@ use std::{
 
 use serde_json::Value;
 
-/// Keeps the Rust package and both plugin manifests on the exact v0.3 release version.
+/// Keeps the Rust package and both plugin manifests on the exact release version.
 #[test]
 fn release_versions_are_synchronized() {
     assert!(include_str!("../Cargo.toml").contains("version = \"0.4.0\""));
@@ -66,9 +66,21 @@ fn release_workflow_requires_complete_gates_before_publication() {
         "cargo build --locked --release --bin agent-ide",
         "scripts/package-release.sh",
         "scripts/release-smoke.sh \"$ASSET\"",
+        // The bootstrap installer ships as a release asset, checksummed with the tarball and
+        // covered by build-provenance attestation before publication.
+        "shasum -a 256 \"$ASSET\" install.sh > SHA256SUMS",
+        "actions/attest-build-provenance@",
+        "subject-checksums: SHA256SUMS",
+        "id-token: write",
+        "attestations: write",
     ] {
         assert!(workflow[..publish].contains(gate), "missing gate: {gate}");
     }
+    assert!(
+        workflow[publish..]
+            .starts_with("gh release create \"$GITHUB_REF_NAME\" \"$ASSET\" install.sh SHA256SUMS"),
+        "the release must attach the tarball, install.sh, and SHA256SUMS"
+    );
     assert!(!workflow.contains("continue-on-error"));
     assert!(!workflow.contains("setup-go"));
     assert!(!workflow.contains("go-version"));
@@ -278,12 +290,42 @@ fn install_local_installs_into_a_disposable_prefix() {
     assert_install_layout(&prefix, &installed_bin, version);
     let _ = std::fs::remove_dir_all(&prefix);
 
-    let backup_prefix = unique_install_prefix("backup");
-    let bin_dir = backup_prefix.join("bin");
+    // A foreign script at the launcher path is refused: no backup, no replacement.
+    let unowned_prefix = unique_install_prefix("unowned");
+    let bin_dir = unowned_prefix.join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
     let fake_binary = bin_dir.join("agent-ide");
     std::fs::write(&fake_binary, "#!/bin/sh\nexit 1\n").unwrap();
     std::fs::set_permissions(&fake_binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = Command::new(&script)
+        .arg("--no-build")
+        .arg("--prefix")
+        .arg(&unowned_prefix)
+        .output()
+        .expect("scripts/install-local.sh must execute");
+    assert!(
+        !output.status.success(),
+        "an unowned launcher must refuse the install:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unowned launcher"),
+        "unexpected refusal: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&fake_binary).unwrap(),
+        "#!/bin/sh\nexit 1\n",
+        "the refused launcher must be untouched"
+    );
+    let _ = std::fs::remove_dir_all(&unowned_prefix);
+
+    // A previously installed plain binary moves aside exactly once as `agent-ide.bak-*`.
+    let backup_prefix = unique_install_prefix("backup");
+    let bin_dir = backup_prefix.join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let fake_binary = bin_dir.join("agent-ide");
+    std::fs::copy(release_bin, &fake_binary).unwrap();
     run_install_local(&script, &backup_prefix);
     let backups = std::fs::read_dir(&bin_dir)
         .unwrap()
@@ -298,6 +340,12 @@ fn install_local_installs_into_a_disposable_prefix() {
     assert_eq!(
         backups, 1,
         "expected exactly one backup file after reinstall"
+    );
+    assert!(
+        std::fs::read_to_string(backup_prefix.join("bin/agent-ide"))
+            .unwrap()
+            .starts_with("#!/bin/sh"),
+        "the launcher must be the managed shim"
     );
     let _ = std::fs::remove_dir_all(&backup_prefix);
 }

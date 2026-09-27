@@ -1,43 +1,196 @@
 #!/bin/sh
+# Downloads one sealed agent-ide release, verifies it, and installs it through the bundle's own
+# `agent-ide self-install`.
+#
+# usage: install.sh [--version X.Y.Z] [--home DIR] [--prefix DIR] [--bin-dir DIR]
+#                   [--downloader curl|wget] [-h]
+#
+# The GitHub repository is private today: either export GITHUB_TOKEN (sent as
+# `Authorization: Bearer`) or keep an authenticated `gh` on PATH, which this script falls back
+# to for downloads when no token is set.
+
 set -eu
+umask 077
 
-repo="${AGENT_IDE_REPOSITORY:-DKotsyuba/agent-ide}"
-install_dir="${AGENT_IDE_INSTALL_DIR:-$HOME/.local/bin}"
-version="${1:-latest}"
+repository="${AGENT_IDE_REPOSITORY:-DKotsyuba/agent-ide}"
+version=""
+home=""
+prefix=""
+bin_dir=""
+downloader=""
 
-test "$(uname -s)" = Darwin && test "$(uname -m)" = arm64 || {
-  echo "agent-ide supports macOS arm64 only" >&2
-  exit 1
+usage_text() {
+    printf '%s\n' \
+        'usage: install.sh [--version X.Y.Z] [--home DIR] [--prefix DIR] [--bin-dir DIR]' \
+        '                  [--downloader curl|wget] [-h]' \
+        '' \
+        'Downloads the sealed agent-ide release bundle, verifies its SHA256SUMS, and runs the' \
+        "bundle's own \`agent-ide self-install\`. macOS arm64 only." \
+        '' \
+        '  --version X.Y.Z   install this version (a leading `v` is allowed); default: latest release' \
+        '  --home DIR        state home (default: $AGENT_IDE_HOME, else ~/.agent-ide)' \
+        '  --prefix DIR      standalone prefix (default: <home>/standalone)' \
+        '  --bin-dir DIR     launcher directory (default: ~/.local/bin)' \
+        '  --downloader TOOL force `curl` or `wget` (default: auto-detect)' \
+        '  -h                print this help' \
+        '' \
+        'The repository is private today: export GITHUB_TOKEN (sent as `Authorization: Bearer`)' \
+        'or keep an authenticated `gh` on PATH, which is used as the download fallback.'
 }
-command -v gh >/dev/null 2>&1 || {
-  echo "gh is required to download the private GitHub Release" >&2
-  exit 1
+
+fail() {
+    printf 'install.sh: %s\n' "$1" >&2
+    exit 1
 }
 
-if test "$version" = latest; then
-  tag="$(gh release view --repo "$repo" --json tagName --jq .tagName)"
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --version)
+            [ "$#" -ge 2 ] || fail '--version needs a value'
+            version=$2
+            shift 2
+            ;;
+        --version=*)
+            version=${1#--version=}
+            shift
+            ;;
+        --home)
+            [ "$#" -ge 2 ] || fail '--home needs a value'
+            home=$2
+            shift 2
+            ;;
+        --prefix)
+            [ "$#" -ge 2 ] || fail '--prefix needs a value'
+            prefix=$2
+            shift 2
+            ;;
+        --bin-dir)
+            [ "$#" -ge 2 ] || fail '--bin-dir needs a value'
+            bin_dir=$2
+            shift 2
+            ;;
+        --downloader)
+            [ "$#" -ge 2 ] || fail '--downloader needs a value'
+            downloader=$2
+            shift 2
+            ;;
+        -h | --help)
+            usage_text
+            exit 0
+            ;;
+        *)
+            fail "unknown argument: $1"
+            ;;
+    esac
+done
+
+# macOS arm64 is the only claimed platform.
+[ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ] ||
+    fail 'agent-ide supports macOS arm64 only'
+
+# Resolves the downloader: forced --downloader wins, then curl, then wget.
+if [ -n "$downloader" ]; then
+    case "$downloader" in
+        curl | wget) ;;
+        *) fail "--downloader must be curl or wget, got: $downloader" ;;
+    esac
+    command -v "$downloader" >/dev/null 2>&1 || fail "$downloader is not on PATH"
 else
-  case "$version" in
-    v*) tag="$version" ;;
-    *) tag="v$version" ;;
-  esac
+    if command -v curl >/dev/null 2>&1; then
+        downloader=curl
+    elif command -v wget >/dev/null 2>&1; then
+        downloader=wget
+    else
+        fail 'neither curl nor wget is on PATH'
+    fi
 fi
 
-asset="agent-ide-${tag}-aarch64-apple-darwin.tar.gz"
-tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agent-ide-install.XXXXXX")"
-trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
-gh release download "$tag" --repo "$repo" --pattern "$asset" --pattern SHA256SUMS --dir "$tmp_dir"
-(cd "$tmp_dir" && shasum -a 256 -c SHA256SUMS)
-tar -xzf "$tmp_dir/$asset" -C "$tmp_dir"
-bundle="$tmp_dir/agent-ide-$tag"
-[ -d "$bundle" ] && [ -x "$bundle/agent-ide" ] || {
-  echo "release archive is missing the $tag bundle" >&2
-  exit 1
+# fetch URL FILE — https-only curl or no-config wget, with the bearer token when set.
+fetch() {
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        case "$downloader" in
+            curl) curl -q --proto '=https' -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" --output "$2" "$1" ;;
+            wget) wget --no-config -q --header="Authorization: Bearer $GITHUB_TOKEN" -O "$2" "$1" ;;
+        esac
+    else
+        case "$downloader" in
+            curl) curl -q --proto '=https' -fsSL --output "$2" "$1" ;;
+            wget) wget --no-config -q -O "$2" "$1" ;;
+        esac
+    fi
 }
 
-mkdir -p "$install_dir"
-tmp_binary="$install_dir/.agent-ide.$$"
-cp "$bundle/agent-ide" "$tmp_binary"
-chmod 755 "$tmp_binary"
-mv -f "$tmp_binary" "$install_dir/agent-ide"
-echo "installed $tag to $install_dir/agent-ide"
+case "$version" in
+    v*) version=${version#v} ;;
+esac
+if [ -z "$version" ]; then
+    # No --version: resolve the latest published release through the GitHub API.
+    tmp_latest=$(mktemp "${TMPDIR:-/tmp}/agent-ide-latest.XXXXXX")
+    fetch "https://api.github.com/repos/$repository/releases/latest" "$tmp_latest" ||
+        fail 'cannot query the latest release (set GITHUB_TOKEN or authenticate gh)'
+    version=$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$tmp_latest" | head -n 1)
+    rm -f "$tmp_latest"
+    [ -n "$version" ] || fail 'the latest-release response carried no tag_name'
+fi
+case "$version" in
+    v*) version=${version#v} ;;
+esac
+printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' ||
+    fail "--version must be X.Y.Z, got: $version"
+
+tag="v$version"
+asset="agent-ide-$tag-aarch64-apple-darwin.tar.gz"
+
+tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/agent-ide-install.XXXXXX")
+trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
+
+if [ -z "${GITHUB_TOKEN:-}" ] && command -v gh >/dev/null 2>&1; then
+    # Token-less private-repository downloads fall back to an authenticated gh CLI.
+    gh release download "$tag" --repo "$repository" \
+        --pattern "$asset" --pattern SHA256SUMS --dir "$tmp_dir" --clobber ||
+        fail "gh could not download release $tag"
+else
+    fetch "https://github.com/$repository/releases/download/$tag/$asset" "$tmp_dir/$asset" ||
+        fail "cannot download $asset"
+    fetch "https://github.com/$repository/releases/download/$tag/SHA256SUMS" "$tmp_dir/SHA256SUMS" ||
+        fail 'cannot download SHA256SUMS'
+fi
+
+# The tarball hash must be listed in, and match, the release-level SHA256SUMS.
+expected=$(awk -v asset="$asset" '$2 == asset { print $1 }' "$tmp_dir/SHA256SUMS")
+[ -n "$expected" ] || fail "SHA256SUMS does not list $asset"
+actual=$(shasum -a 256 "$tmp_dir/$asset" | awk '{print $1}')
+[ "$actual" = "$expected" ] || fail "the downloaded $asset does not match SHA256SUMS"
+
+# Lists the archive and rejects anything that is not a plain relative file or directory.
+tar -tvzf "$tmp_dir/$asset" >"$tmp_dir/listing" || fail 'cannot list the downloaded archive'
+while IFS= read -r line; do
+    case $line in
+        -* | d*) ;;
+        *) fail "the archive contains a non-regular entry: $line" ;;
+    esac
+    path=${line##* }
+    case $path in
+        /* | *..*) fail "the archive contains an unsafe path: $path" ;;
+    esac
+done <"$tmp_dir/listing"
+
+tar -xzf "$tmp_dir/$asset" --no-same-owner --no-same-permissions -C "$tmp_dir" ||
+    fail 'cannot extract the downloaded archive'
+bundle="$tmp_dir/agent-ide-$tag"
+[ -d "$bundle" ] && [ -f "$bundle/COMPLETE" ] && [ -x "$bundle/agent-ide" ] ||
+    fail "the archive is missing the $tag bundle"
+
+# Installs through the bundle itself; every verification runs once more inside self-install.
+set -- "$bundle/agent-ide" self-install --release "$bundle" --version "$version"
+if [ -n "$home" ]; then
+    set -- "$@" --home "$home"
+fi
+if [ -n "$prefix" ]; then
+    set -- "$@" --prefix "$prefix"
+fi
+if [ -n "$bin_dir" ]; then
+    set -- "$@" --bin-dir "$bin_dir"
+fi
+"$@"
+printf 'agent-ide %s installed; launcher: %s\n' "$version" "${bin_dir:-$HOME/.local/bin}/agent-ide"

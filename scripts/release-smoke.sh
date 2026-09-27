@@ -30,12 +30,15 @@ RELEASE_EXPECTED=$(printf '%s\n' \
     "$RELEASE_BUNDLE/.claude-plugin/marketplace.json" \
     "$RELEASE_BUNDLE/.claude-plugin/plugin.json" \
     "$RELEASE_BUNDLE/.codex-plugin/plugin.json" \
+    "$RELEASE_BUNDLE/COMPLETE" \
     "$RELEASE_BUNDLE/README.md" \
+    "$RELEASE_BUNDLE/SHA256SUMS" \
     "$RELEASE_BUNDLE/agent-ide" \
     "$RELEASE_BUNDLE/docs/release.md" \
     "$RELEASE_BUNDLE/hooks/claude-hook.sh" \
     "$RELEASE_BUNDLE/hooks/hooks.json" \
     "$RELEASE_BUNDLE/install.sh" \
+    "$RELEASE_BUNDLE/metadata.json" \
     "$RELEASE_BUNDLE/skills/agent-ide/SKILL.md" \
     "$RELEASE_BUNDLE/skills/agent-ide/agents/openai.yaml" | LC_ALL=C sort)
 RELEASE_ACTUAL=$(tar -tzf "$RELEASE_ARCHIVE" | sed '/\/$/d' | LC_ALL=C sort)
@@ -53,6 +56,16 @@ file "$RELEASE_BIN" | grep -q 'Mach-O 64-bit executable arm64'
 jq -e --arg version "$RELEASE_VERSION" '.version == $version' \
     "$RELEASE_TMP/$RELEASE_BUNDLE/.codex-plugin/plugin.json" \
     "$RELEASE_TMP/$RELEASE_BUNDLE/.claude-plugin/plugin.json" >/dev/null
+jq -e --arg version "$RELEASE_VERSION" '.version == $version and .format == 1' \
+    "$RELEASE_TMP/$RELEASE_BUNDLE/metadata.json" >/dev/null
+printf 'complete\n' | cmp -s - "$RELEASE_TMP/$RELEASE_BUNDLE/COMPLETE" || {
+    printf '%s\n' 'release seal COMPLETE is not exactly "complete\n"' >&2
+    exit 1
+}
+(
+    cd "$RELEASE_TMP/$RELEASE_BUNDLE"
+    shasum -a 256 -c SHA256SUMS >/dev/null
+)
 jq -e --arg version "$RELEASE_VERSION" \
     '.plugins == [{"name":"agent-ide", "source":"./", "description":"Agent IDE coding-companion skill and Claude lifecycle hooks.", "version":$version}]' \
     "$RELEASE_TMP/$RELEASE_BUNDLE/.claude-plugin/marketplace.json" >/dev/null
@@ -66,3 +79,18 @@ printf '%s\n' "$RELEASE_MEASUREMENT" | jq -e \
 printf '%s\n' '{}' | \
     AGENT_IDE_BIN="$RELEASE_BIN" CLAUDE_PROJECT_DIR="$RELEASE_TMP" \
     "$RELEASE_TMP/$RELEASE_BUNDLE/hooks/claude-hook.sh"
+
+# The bundle must install itself: run self-install into disposable dirs and launch through the
+# written launcher, proving the managed shim, both `current` symlinks, and the payload binary.
+RELEASE_HOME="$RELEASE_TMP/home"
+"$RELEASE_BIN" self-install \
+    --release "$RELEASE_TMP/$RELEASE_BUNDLE" \
+    --version "$RELEASE_VERSION" \
+    --home "$RELEASE_HOME" \
+    --prefix "$RELEASE_TMP/prefix" \
+    --bin-dir "$RELEASE_TMP/bin" \
+    --share-dir "$RELEASE_TMP/share"
+[ "$(readlink "$RELEASE_TMP/prefix/current")" = "releases/$RELEASE_VERSION" ]
+[ "$(readlink "$RELEASE_TMP/share/plugin/current")" = "$RELEASE_VERSION" ]
+[ "$("$RELEASE_TMP/bin/agent-ide" --version)" = "agent-ide $RELEASE_VERSION" ]
+grep -q "exec '$RELEASE_TMP/prefix/current/agent-ide'" "$RELEASE_TMP/bin/agent-ide"

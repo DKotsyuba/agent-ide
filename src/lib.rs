@@ -44,3 +44,5 @@ pub mod init;
 
 /// Implements the argument-less `doctor` command: read-only installation health findings.
 pub mod doctor_install;
+/// Installs one sealed release bundle into the immutable standalone layout (`self-install`).
+pub mod selfinstall;

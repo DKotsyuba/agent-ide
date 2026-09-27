@@ -6,6 +6,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   release:
@@ -59,7 +61,13 @@ jobs:
           echo "ASSET=$asset" >> "$GITHUB_ENV"
       - name: Smoke packaged executable
         run: scripts/release-smoke.sh "$ASSET"
+      - name: Build the aggregate release checksum manifest
+        run: shasum -a 256 "$ASSET" install.sh > SHA256SUMS
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: SHA256SUMS
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" "$ASSET" SHA256SUMS --verify-tag --generate-notes --title "Agent IDE $GITHUB_REF_NAME"
+        run: gh release create "$GITHUB_REF_NAME" "$ASSET" install.sh SHA256SUMS --verify-tag --generate-notes --title "Agent IDE $GITHUB_REF_NAME"

@@ -1,19 +1,24 @@
 #!/bin/sh
-# Builds and installs a source checkout into a user prefix (default $HOME/.local) so agent-run
-# runtimes, crew hooks, and Claude skills catalogs can point at a stable installed path instead of
-# this checkout. Never targets the real $HOME/.local from an automated task or test run.
+# Builds this checkout into a sealed release bundle and installs it through
+# `agent-ide self-install` — the one code path that writes the standalone prefix, both
+# `current` symlinks, and the managed launcher. Never targets the real $HOME/.local from an
+# automated task or test run.
 
 set -eu
 
 usage() {
-    printf '%s\n' 'usage: scripts/install-local.sh [--prefix DIR] [--dry-run] [--no-build]' >&2
+    printf '%s\n' 'usage: scripts/install-local.sh [--prefix DIR] [--no-build]' >&2
+}
+
+fail() {
+    printf 'install-local.sh: %s\n' "$1" >&2
+    exit 1
 }
 
 script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
 
 prefix="$HOME/.local"
-dry_run=0
 no_build=0
 
 while [ "$#" -gt 0 ]; do
@@ -25,10 +30,6 @@ while [ "$#" -gt 0 ]; do
             ;;
         --prefix=*)
             prefix=${1#--prefix=}
-            shift
-            ;;
-        --dry-run)
-            dry_run=1
             shift
             ;;
         --no-build)
@@ -51,116 +52,31 @@ case "$prefix" in
     *) prefix="$PWD/$prefix" ;;
 esac
 
-# Reports and, unless --dry-run is set, executes one filesystem-mutating command; every call
-# prints its argv on stdout before running so a dry run shows the exact plan.
-act() {
-    printf '+ %s\n' "$*"
-    if [ "$dry_run" -eq 0 ]; then
-        "$@"
-    fi
-}
-
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$repo_root/Cargo.toml" | head -n 1)
-[ -n "$version" ] || {
-    printf 'cannot read version from %s\n' "$repo_root/Cargo.toml" >&2
-    exit 1
-}
-
-bin_dir="$prefix/bin"
-installed_bin="$bin_dir/agent-ide"
-plugin_root="$prefix/share/agent-ide/plugin"
-version_dir="$plugin_root/$version"
-current_link="$plugin_root/current"
-release_bin="$repo_root/target/release/agent-ide"
-
-# Determines the backup-file suffix for a previously installed binary: its own `--version`
-# output, sanitized to safe filename characters, when it prints one, else a UTC timestamp. Reads
-# only; never writes. Prints nothing when no previous binary is installed.
-detect_old_version_label() {
-    [ -e "$installed_bin" ] || return 0
-    version_output=""
-    if [ -x "$installed_bin" ]; then
-        version_output=$("$installed_bin" --version 2>/dev/null) || version_output=""
-    fi
-    if [ -n "$version_output" ]; then
-        printf '%s' "$version_output" | head -n 1 | tr -c 'A-Za-z0-9._-' '-'
-    else
-        date -u +ts-%Y%m%dT%H%M%SZ
-    fi
-}
-
-old_version_label=$(detect_old_version_label)
+[ -n "$version" ] || fail "cannot read version from $repo_root/Cargo.toml"
 
 if [ "$no_build" -eq 0 ]; then
-    act sh -c 'cd "$1" && exec cargo build --locked --release' -- "$repo_root"
+    (cd "$repo_root" && cargo build --locked --release)
 fi
+release_bin="$repo_root/target/release/agent-ide"
+[ -x "$release_bin" ] || fail "release binary not found: $release_bin (build first or drop --no-build)"
 
-if [ "$dry_run" -eq 0 ]; then
-    [ -x "$release_bin" ] || {
-        printf 'release binary not found: %s (build first or drop --no-build)\n' "$release_bin" >&2
-        exit 1
-    }
-fi
+# Package this checkout into the sealed bundle and hand it to the installer inside it.
+tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/agent-ide-install-local.XXXXXX")
+trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
+asset=$("$script_dir/package-release.sh" "$release_bin" "v$version" "$tmp_dir")
+tar -xzf "$asset" -C "$tmp_dir"
+bundle="$tmp_dir/agent-ide-v$version"
+[ -x "$bundle/agent-ide" ] || fail "the packaged bundle is missing its binary"
 
-act mkdir -p "$bin_dir"
+"$bundle/agent-ide" self-install \
+    --release "$bundle" \
+    --version "$version" \
+    --prefix "$prefix" \
+    --bin-dir "$prefix/bin" \
+    --share-dir "$prefix/share/agent-ide"
 
-if [ -e "$installed_bin" ]; then
-    act cp "$installed_bin" "$bin_dir/agent-ide.bak-$old_version_label"
-fi
-
-tmp_bin="$bin_dir/agent-ide.tmp-$$"
-act cp "$release_bin" "$tmp_bin"
-act chmod 755 "$tmp_bin"
-act mv -f "$tmp_bin" "$installed_bin"
-
-staged_version_dir="$plugin_root/$version.tmp-$$"
-act mkdir -p "$plugin_root"
-act rm -rf "$staged_version_dir"
-act mkdir -p "$staged_version_dir"
-for part in .claude-plugin .codex-plugin hooks skills; do
-    act cp -R "$repo_root/$part" "$staged_version_dir/$part"
-done
-
-hook_path="$staged_version_dir/hooks/claude-hook.sh"
-printf '+ generate %s (exec %s claude-hook)\n' "$hook_path" "$installed_bin"
-if [ "$dry_run" -eq 0 ]; then
-    printf '#!/bin/sh\nexec "%s" claude-hook\n' "$installed_bin" >"$hook_path"
-    chmod 755 "$hook_path"
-fi
-
-act rm -rf "$version_dir"
-act mv -f "$staged_version_dir" "$version_dir"
-
-# `ln -sfh` replaces the symlink itself; `mv` onto a symlink that points at a directory would
-# move the new link *into* that directory and leave `current` unchanged (A02B).
-act ln -sfh "$version" "$current_link"
-
-if [ "$dry_run" -eq 0 ]; then
-    launcher_config="$HOME/.config/agent-ide/launcher.json"
-    if [ -f "$launcher_config" ]; then
-        if launcher_output=$("$installed_bin" launcher check "$launcher_config" 2>&1); then
-            printf 'launcher check: ok (%s)\n' "$launcher_config"
-        else
-            printf 'launcher check: warning - %s\n' "$launcher_output" >&2
-        fi
-    else
-        printf 'launcher check: skipped, no %s\n' "$launcher_config"
-    fi
-
-    [ -f "$version_dir/hooks/hooks.json" ] || {
-        printf 'installed bundle is missing hooks/hooks.json\n' >&2
-        exit 1
-    }
-    [ -f "$version_dir/skills/agent-ide/SKILL.md" ] || {
-        printf 'installed bundle is missing skills/agent-ide/SKILL.md\n' >&2
-        exit 1
-    }
-    [ -x "$version_dir/hooks/claude-hook.sh" ] || {
-        printf 'generated hooks/claude-hook.sh is not executable\n' >&2
-        exit 1
-    }
-fi
-
+current_link="$prefix/share/agent-ide/plugin/current"
 printf '\n'
 printf 'agent-run (~/.agent-run/config.toml) runtimes: replace the checkout path with\n'
 printf '  plugins = [..., "%s"]\n' "$current_link"
@@ -171,17 +87,7 @@ printf '  %s/hooks/claude-hook.sh\n' "$current_link"
 printf 'Claude skills catalogs: symlink target\n'
 printf '  %s/skills/agent-ide\n' "$current_link"
 printf '\n'
-printf 'agent-ide install: %s -> %s\n' "${old_version_label:-none}" "$version"
-printf '  binary:  %s\n' "$installed_bin"
-printf '  plugin:  %s\n' "$version_dir"
-printf '  current: %s\n' "$current_link"
-
-# Codex native hooks (T29B): this installer never reads or writes ~/.codex. It only prints
-# the printer command and the operator's manual merge/trust steps.
-printf '\n'
 printf 'Codex native hooks (managed): print the exact hooks.json fragment with\n'
-printf '  %s codex-hooks print\n' "$installed_bin"
-printf 'then merge its two handlers into the existing PreToolUse/PostToolUse arrays of ~/.codex/hooks.json, preserving existing entries.\n'
-printf 'Review and trust both definitions in Codex itself (/hooks); untrusted hooks simply stay silent.\n'
-printf 'Never register the agent-ide handler twice: duplicate pre-events are rejected as replays. The product never writes ~/.codex.\n'
-printf 'agent-run resolves plugin/current once when its service starts: restart that service after this install, or its Claude runtimes keep loading the previous plugin version.\n'
+printf '  %s codex-hooks print\n' "$prefix/bin/agent-ide"
+printf 'agent-run resolves %s once when its service starts: restart that service after this\n' "$current_link"
+printf 'install, or its Claude runtimes keep loading the previous plugin version.\n'
