@@ -5690,6 +5690,67 @@ async fn configured_product_pyright_symbol_tools_and_edit() {
     daemon.wait().await.unwrap();
 }
 
+/// Keeps bare-name fallback scans from consuming the registered-source budget.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
+async fn configured_product_bare_symbol_scans_preserve_detail_budget() {
+    let fixture = ProductFixture::new(json!([accepted_pyright_provider(
+        "pyright-scan-budget-cache"
+    )]));
+    std::fs::write(
+        fixture.root.join("main.py"),
+        "def first():\n    return 1\n\ndef second():\n    return 2\n\ndef third():\n    return 3\n",
+    )
+    .unwrap();
+    for index in 0..20 {
+        std::fs::write(
+            fixture.root.join(format!("other_{index}.py")),
+            "def unrelated():\n    return 0\n",
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        fixture.root.join("zz_extra.py"),
+        "def extra():\n    return 0\n",
+    )
+    .unwrap();
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+    config["limits"]["details"] = json!(8);
+    std::fs::write(&fixture.config, config.to_string()).unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "pyright-scan-budget").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"pyright-scan-budget-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let outline = actor
+        .call(&fixture, "ide.outline", json!({"path":"main.py"}))
+        .await;
+    assert_eq!(actor.settle(&fixture, outline).await["kind"], "outline");
+    for name in ["first", "second", "third"] {
+        let reply = actor
+            .call(&fixture, "ide.symbol", json!({"symbol":name}))
+            .await;
+        let reply = actor.settle(&fixture, reply).await;
+        assert_eq!(reply["kind"], "symbol", "{reply}");
+    }
+    let read = actor
+        .call(&fixture, "ide.read", json!({"symbol":"zz_extra.py#extra"}))
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    assert_eq!(read["kind"], "read", "{read}");
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A managed Codex profile with the accepted credential-glob denies retains Pyright semantics
 /// and project check plates while a denied source path remains unavailable.
 #[tokio::test]

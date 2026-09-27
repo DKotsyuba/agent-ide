@@ -10,6 +10,13 @@ use crate::lang::{
     self, Language as Lang, LineRange, Outline, SymbolPath, TestId,
     render::{self, Call, SymbolCard, Usage},
 };
+use crate::workspace::{
+    authority::WorktreeRef,
+    observation::{
+        MAX_SOURCE_BYTES, ObservationRef, SourceBytes, SourceCoverage, SourceObservation,
+        SourceReadLimits, SourceRevision, read_authorized_source,
+    },
+};
 use std::collections::VecDeque;
 
 impl Worker<'_> {
@@ -648,10 +655,20 @@ impl Worker<'_> {
             let Some(anchor) = language_files.first() else {
                 continue;
             };
-            let Ok((observed, _bytes)) = self.observe(&binding, anchor.clone()).await else {
+            let Ok(anchor_read) = read_authorized_source(
+                authority.worktree(),
+                anchor,
+                SourceReadLimits::new(1024, MAX_SOURCE_BYTES).map_err(|_| FailureCode::Internal)?,
+            ) else {
                 continue;
             };
-            let live = match self.live_session_for(job, &observed).await {
+            let anchor_source = scan_observation(
+                authority.worktree(),
+                authority.epoch(),
+                anchor,
+                anchor_read.contents(),
+            )?;
+            let live = match self.live_session_for(job, &anchor_source).await {
                 Ok(live) => live,
                 Err(_) => continue,
             };
@@ -694,13 +711,34 @@ impl Worker<'_> {
                     ),
                 });
             }
-            // Fallback scan: the bounded per-language file list through ordinary outlines.
+            // Scanned paths are read without registering them as editable source.
             for file in language_files {
-                let Ok((observed, bytes)) = self.observe(&binding, file.clone()).await else {
+                let Ok(read) = read_authorized_source(
+                    authority.worktree(),
+                    file,
+                    SourceReadLimits::new(1024, MAX_SOURCE_BYTES)
+                        .map_err(|_| FailureCode::Internal)?,
+                ) else {
                     continue;
                 };
-                if let Ok((outline, _)) = self.outline_of(job, &observed, &bytes).await {
+                let bytes = read.contents();
+                if !contains_bare_name(bytes, name.as_bytes()) {
+                    continue;
+                }
+                let Ok(observed) =
+                    scan_observation(authority.worktree(), authority.epoch(), file, bytes)
+                else {
+                    continue;
+                };
+                let language = Lang::for_path(file).ok_or(FailureCode::ProviderUnavailable)?;
+                let support = lang::support(language).ok_or(FailureCode::ProviderUnavailable)?;
+                let Ok(live) = self.live_session_for(job, &observed).await else {
+                    continue;
+                };
+                if let Ok(symbols) = live.session.document_symbols(&observed, bytes).await {
                     answered = true;
+                    let source = String::from_utf8_lossy(bytes);
+                    let outline = support.normalize(file, &source, symbols);
                     for candidate in outline.named(name) {
                         matches.push((file.clone(), candidate.path.to_string()));
                     }
@@ -859,6 +897,46 @@ impl Worker<'_> {
         }
         Ok(authority)
     }
+}
+
+/// Builds an ephemeral provider input that carries no persisted or registered source authority.
+fn scan_observation(
+    worktree: &WorktreeRef,
+    authority_epoch: u64,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<SourceObservation, FailureCode> {
+    SourceObservation::new(
+        worktree.clone(),
+        authority_epoch,
+        1,
+        ObservationRef::new("symbol-scan").map_err(|_| FailureCode::Internal)?,
+        path.to_path_buf(),
+        Some(SourceBytes::from_bytes(bytes)),
+        SourceRevision::new(blake3::hash(bytes).to_hex().to_string())
+            .map_err(|_| FailureCode::Internal)?,
+        SourceCoverage::Complete,
+        crate::workspace::observation::ObservedState::Present,
+    )
+    .map_err(|_| FailureCode::Internal)
+}
+
+/// Returns whether `bytes` contains `name` as a complete ASCII identifier word.
+fn contains_bare_name(bytes: &[u8], name: &[u8]) -> bool {
+    bytes
+        .windows(name.len())
+        .enumerate()
+        .any(|(index, candidate)| {
+            candidate == name
+                && (index == 0 || !is_identifier_byte(bytes[index - 1]))
+                && (index + name.len() == bytes.len()
+                    || !is_identifier_byte(bytes[index + name.len()]))
+        })
+}
+
+/// Treats ASCII letters, digits, and underscore as identifier bytes for scan pre-filtering.
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 /// Whether a hover line is a declaration rather than a module path or a code fence.
@@ -1540,6 +1618,15 @@ mod splice_tests {
             blank_after: 0,
         };
         assert_eq!(insert_lines(source, &append, "e"), "a\nb\nc\nd\n\ne\n");
+    }
+
+    /// Keeps identifier matches while rejecting names embedded in larger ASCII identifiers.
+    #[test]
+    fn bare_name_prefilter_matches_whole_words() {
+        assert!(contains_bare_name(b"def value(): pass", b"value"));
+        assert!(contains_bare_name(b"value = 1", b"value"));
+        assert!(!contains_bare_name(b"def my_value(): pass", b"value"));
+        assert!(!contains_bare_name(b"def value2(): pass", b"value"));
     }
 }
 
