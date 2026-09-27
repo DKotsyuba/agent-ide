@@ -36,10 +36,12 @@ stable GitHub Release. To pin a version or choose directories, download `install
 
 ```bash
 sh install.sh --version X.Y.Z --home "$HOME/.agent-ide" \
-  --prefix "$HOME/.agent-ide/standalone" --bin-dir "$HOME/.local/bin"
+  --prefix "$HOME/.agent-ide/standalone" --bin-dir "$HOME/.local/bin" \
+  --share-dir "$HOME/.local/share/agent-ide"
 ```
 
-State lives in `~/.agent-ide` (`--home`). `AGENT_IDE_HOME` is a user-home override for tests and relocation: it moves the whole per-user tree (`.agent-ide`, `.config/agent-ide`, `.local`) together. The
+State lives in `~/.agent-ide` (`--home`); the host plugin lives under `--share-dir`
+(default `~/.local/share/agent-ide`). `AGENT_IDE_HOME` is a user-home override for tests and relocation: it moves the whole per-user tree (`.agent-ide`, `.config/agent-ide`, `.local`) together. The
 installer does not edit host MCP or hook configuration.
 
 Restart agent-run after an install or update: it resolves

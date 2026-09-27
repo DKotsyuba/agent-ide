@@ -3,7 +3,7 @@
 # `agent-ide self-install`.
 #
 # usage: install.sh [--version X.Y.Z] [--home DIR] [--prefix DIR] [--bin-dir DIR]
-#                   [--downloader curl|wget] [-h]
+#                   [--share-dir DIR] [--downloader curl|wget] [-h]
 #
 # The GitHub repository is private today: either export GITHUB_TOKEN (sent as
 # `Authorization: Bearer`) or keep an authenticated `gh` on PATH, which this script falls back
@@ -17,12 +17,13 @@ version=""
 home=""
 prefix=""
 bin_dir=""
+share_dir=""
 downloader=""
 
 usage_text() {
     printf '%s\n' \
         'usage: install.sh [--version X.Y.Z] [--home DIR] [--prefix DIR] [--bin-dir DIR]' \
-        '                  [--downloader curl|wget] [-h]' \
+        '                  [--share-dir DIR] [--downloader curl|wget] [-h]' \
         '' \
         'Downloads the sealed agent-ide release bundle, verifies its SHA256SUMS, and runs the' \
         "bundle's own \`agent-ide self-install\`. macOS arm64 only." \
@@ -31,6 +32,7 @@ usage_text() {
         '  --home DIR        state home (default: ~/.agent-ide; AGENT_IDE_HOME relocates the user home)' \
         '  --prefix DIR      standalone prefix (default: <home>/standalone)' \
         '  --bin-dir DIR     launcher directory (default: ~/.local/bin)' \
+        '  --share-dir DIR   plugin root parent (default: ~/.local/share/agent-ide)' \
         '  --downloader TOOL force `curl` or `wget` (default: auto-detect)' \
         '  -h                print this help' \
         '' \
@@ -68,6 +70,15 @@ while [ "$#" -gt 0 ]; do
             [ "$#" -ge 2 ] || fail '--bin-dir needs a value'
             bin_dir=$2
             shift 2
+            ;;
+        --share-dir)
+            [ "$#" -ge 2 ] || fail '--share-dir needs a value'
+            share_dir=$2
+            shift 2
+            ;;
+        --share-dir=*)
+            share_dir=${1#--share-dir=}
+            shift
             ;;
         --downloader)
             [ "$#" -ge 2 ] || fail '--downloader needs a value'
@@ -192,6 +203,9 @@ if [ -n "$prefix" ]; then
 fi
 if [ -n "$bin_dir" ]; then
     set -- "$@" --bin-dir "$bin_dir"
+fi
+if [ -n "$share_dir" ]; then
+    set -- "$@" --share-dir "$share_dir"
 fi
 "$@"
 printf 'agent-ide %s installed; launcher: %s\n' "$version" "${bin_dir:-$HOME/.local/bin}/agent-ide"
