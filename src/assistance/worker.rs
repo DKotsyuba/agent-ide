@@ -367,7 +367,8 @@ struct Ledger {
     in_flight: usize,
     /// FIFO ordinary jobs; explicit stop is prioritized at the front.
     queue: VecDeque<Job>,
-    /// Retained results, never silently evicted to admit more work.
+    /// Retained results, released only by an explicit stop or by the settled-fact eviction
+    /// policy of [`evict_settled_details`] (which journals every batch).
     details: BTreeMap<String, Detail>,
     /// Stable start requests under each immutable binding generation.
     starts: BTreeMap<(BindingRef, String), String>,
@@ -1426,7 +1427,15 @@ impl WorkerHandle {
             return Err(FailureCode::Capacity);
         }
         if retain_detail && ledger.details.len() >= self.shared.launcher.limits.details {
-            return Err(FailureCode::Capacity);
+            evict_settled_details(
+                &mut ledger,
+                self.shared.launcher.limits.details,
+                &binding,
+                tool,
+            );
+            if ledger.details.len() >= self.shared.launcher.limits.details {
+                return Err(FailureCode::Capacity);
+            }
         }
         ledger.next = ledger.next.checked_add(1).ok_or(FailureCode::Capacity)?;
         let reference = format!(
@@ -1530,6 +1539,118 @@ fn retains_detail(tool: AssistanceTool) -> bool {
 /// existing lifecycle state rather than creating new details.
 fn queue_capacity(ordinary: usize, tool: AssistanceTool) -> usize {
     ordinary + usize::from(tool == AssistanceTool::Stop) * 64
+}
+
+/// Settled details every live binding keeps before its oldest facts may be evicted to admit
+/// another binding's work.
+const FAIR_DETAILS_PER_BINDING: usize = 8;
+
+/// `true` exactly when a detail's reply reached a terminal state, so only a future inspection —
+/// never its own still-running job — can consume it. Pending facts are never eviction candidates.
+fn detail_settled(reply: &PeerReply) -> bool {
+    !matches!(reply, PeerReply::Pending { .. })
+}
+
+/// Extracts the monotonic per-boot counter from one detail reference (`<nonce>-<n>`), which is
+/// the detail's age order. A reference without a numeric suffix sorts as the oldest.
+fn detail_sequence(reference: &str) -> u64 {
+    reference
+        .rsplit_once('-')
+        .and_then(|(_, suffix)| suffix.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Evicts one binding's oldest settled details until the ledger holds fewer than `limit` facts,
+/// returning how many were removed. Eviction stops at the freed slot, so the binding keeps its
+/// newest history — at least the newest [`FAIR_DETAILS_PER_BINDING`] whenever the older facts
+/// alone can free the slot.
+fn evict_binding_oldest(ledger: &mut Ledger, limit: usize, owner: &BindingRef) -> usize {
+    let mut candidates: Vec<(u64, String)> = ledger
+        .details
+        .iter()
+        .filter(|(_, detail)| detail.binding == *owner && detail_settled(&detail.reply))
+        .map(|(reference, _)| (detail_sequence(reference), reference.clone()))
+        .collect();
+    candidates.sort_unstable();
+    let mut removed = 0usize;
+    for (_, reference) in candidates {
+        if ledger.details.len() < limit {
+            break;
+        }
+        ledger.details.remove(&reference);
+        removed += 1;
+    }
+    removed
+}
+
+/// Frees ledger room for one new operation by evicting only settled, uninspectable facts.
+///
+/// Called once the ledger already holds its `limits.details` ceiling. The batch order is fixed:
+/// first every settled detail whose binding is absent from `cancellation` (stopped, or never
+/// completed activation) and can therefore never be inspected again, then the requesting
+/// binding's own oldest settled details, then the oldest settled details of any other binding
+/// holding more than [`FAIR_DETAILS_PER_BINDING`]. Pending facts are never evicted; a ledger
+/// that stays full after the batch refuses the request as before. One informational journal
+/// line records the whole batch so an operator can see the release happened.
+fn evict_settled_details(
+    ledger: &mut Ledger,
+    limit: usize,
+    requesting: &BindingRef,
+    tool: AssistanceTool,
+) {
+    let mut freed = 0usize;
+    // (a) Settled facts of bindings no longer active: no future `ide.inspect` under any live
+    // binding can ever name them again.
+    let inactive: Vec<String> = ledger
+        .details
+        .iter()
+        .filter(|(_, detail)| {
+            detail_settled(&detail.reply) && !ledger.cancellation.contains_key(&detail.binding)
+        })
+        .map(|(reference, _)| reference.clone())
+        .collect();
+    for reference in &inactive {
+        ledger.details.remove(reference);
+    }
+    freed += inactive.len();
+    if ledger.details.len() >= limit {
+        // (b) The requesting binding's own oldest settled facts yield before any other
+        // binding's.
+        freed += evict_binding_oldest(ledger, limit, requesting);
+    }
+    if ledger.details.len() >= limit {
+        // (c) Bindings beyond their fair share give up their oldest settled facts.
+        let others: BTreeSet<BindingRef> = ledger
+            .details
+            .values()
+            .filter(|detail| &detail.binding != requesting)
+            .map(|detail| detail.binding.clone())
+            .collect();
+        for binding in others {
+            if ledger.details.len() < limit {
+                break;
+            }
+            let held = ledger
+                .details
+                .values()
+                .filter(|detail| detail.binding == binding)
+                .count();
+            if held > FAIR_DETAILS_PER_BINDING {
+                freed += evict_binding_oldest(ledger, limit, &binding);
+            }
+        }
+    }
+    if freed > 0 {
+        let detail = format!("details_evicted:{freed}");
+        crate::errorlog::record(
+            errorlog_method(tool),
+            crate::errorlog::Outcome::Completed,
+            crate::errorlog::Fields {
+                detail: Some(&detail),
+                ..Default::default()
+            },
+        );
+    }
 }
 
 /// Bounds the in-memory pending-revocation set so an unbounded stream of failed durable revokes
@@ -4264,7 +4385,18 @@ mod stop_retry_tests {
 
     /// Creates one current host binding for a managed job.
     fn production_call(worker: &Worker<'_>, actor: &str, id: &str) -> ValidatedInvocation {
-        let mut guard = worker.shared.bindings.lock().unwrap();
+        validated_call(&worker.shared.bindings, actor, id)
+    }
+
+    /// Validates one real host binding against one binding guard, shared by the `Worker`
+    /// fixture and the `WorkerHandle` enqueue tests. Bindings are keyed by the actor alone,
+    /// so repeated calls with one actor return invocations of the same binding.
+    fn validated_call(
+        bindings: &Arc<Mutex<HostBindingGuard>>,
+        actor: &str,
+        id: &str,
+    ) -> ValidatedInvocation {
+        let mut guard = bindings.lock().unwrap();
         let channel = parse_channel_session(b"stop-retry").unwrap();
         let hook = parse_hook_event(
             serde_json::json!({"hook_event_name":"PreToolUse","session_id":actor,"tool_use_id":id})
@@ -4288,8 +4420,9 @@ mod stop_retry_tests {
         invocation
     }
 
-    /// Builds the fixture launcher with the worktree's temporary base as its allowed root.
-    fn production_launcher(root: &std::path::Path) -> LauncherConfig {
+    /// Builds the fixture launcher with the worktree's temporary base as its allowed root and
+    /// the requested details ceiling.
+    fn production_launcher(root: &std::path::Path, details: usize) -> LauncherConfig {
         let git = std::path::Path::new("/usr/bin/git");
         let executable = serde_json::json!({
             "path":git,
@@ -4298,7 +4431,7 @@ mod stop_retry_tests {
         });
         let config = serde_json::json!({
             "version":1,
-            "limits":{"queued":8,"details":8,"operation_ms":5000,"output_bytes":1024},
+            "limits":{"queued":8,"details":details,"operation_ms":5000,"output_bytes":1024},
             "allowed_roots":[root.parent().unwrap()],
             "targets":[{
                 "attachment":"stop-retry",
@@ -4312,7 +4445,7 @@ mod stop_retry_tests {
 
     /// Returns the target selected by the fixture's trusted launcher attachment.
     fn production_target(root: &std::path::Path) -> LaunchTarget {
-        production_launcher(root)
+        production_launcher(root, 8)
             .target("stop-retry")
             .unwrap()
             .clone()
@@ -4911,6 +5044,226 @@ mod stop_retry_tests {
         let binding = queue.front().unwrap().invocation.binding_ref().clone();
         queue.retain(|job| job.invocation.binding_ref() != &binding);
         assert!(queue.is_empty(), "stop must drop parked binding work too");
+    }
+
+    /// Builds a `WorkerHandle` with the fixture's real target and a chosen details ceiling.
+    ///
+    /// No worker loop is spawned: a never-finishing dummy task satisfies `enqueue`'s liveness
+    /// gate, so enqueued jobs stay queued and their details stay `Pending`, keeping the eviction
+    /// assertions free of completion races.
+    fn detail_handle(root: &std::path::Path, details: usize) -> WorkerHandle {
+        let handle = WorkerHandle::new(
+            Arc::new(Mutex::new(HostBindingGuard::default())),
+            production_launcher(root, details),
+            [9; 32],
+            Arc::new(Mutex::new(admission_controller())),
+        );
+        *handle.task.lock().unwrap() = Some(tokio::spawn(std::future::pending()));
+        handle
+    }
+
+    /// Plants one detail owned by `binding`, shaped exactly as a settled or pending job leaves
+    /// it behind in the ledger.
+    fn plant_detail(
+        handle: &WorkerHandle,
+        reference: &str,
+        binding: &BindingRef,
+        reply: PeerReply,
+    ) {
+        handle.shared.ledger.lock().unwrap().details.insert(
+            reference.to_owned(),
+            Detail {
+                binding: binding.clone(),
+                reply,
+                selection: (
+                    AssistanceTool::Context,
+                    selection(&serde_json::json!({"path":"main.rs"})),
+                ),
+                authority: None,
+                source: None,
+                native_epoch: 0,
+                diff_page: None,
+                diff_page_fresh: false,
+                context_page: None,
+                context_page_fresh: false,
+                diff_provenance: None,
+            },
+        );
+    }
+
+    /// Builds one settled `Complete{Context}` reply so a planted detail looks job-settled.
+    fn settled_detail(reference: &str) -> PeerReply {
+        PeerReply::Complete {
+            kind: ResultKind::Context,
+            text: "fact".into(),
+            detail_ref: Some(reference.to_owned()),
+            truncated: false,
+            continuation: false,
+        }
+    }
+
+    /// Enqueues one Context request through the production admission path, exactly as the
+    /// facade would for the fixture's trusted attachment.
+    fn enqueue_context(
+        handle: &WorkerHandle,
+        invocation: ValidatedInvocation,
+    ) -> Result<String, FailureCode> {
+        handle.enqueue(
+            invocation,
+            AssistanceTool::Context,
+            serde_json::json!({"path":"main.rs"}),
+            "stop-retry",
+            None,
+        )
+    }
+
+    /// A full ledger evicts a dead binding's settled facts for a new binding instead of
+    /// refusing `capacity`.
+    #[tokio::test]
+    async fn full_ledger_evicts_inactive_binding_settled_details_for_a_new_binding() {
+        let fixture = Fixture::new();
+        let handle = detail_handle(&fixture.root, 4);
+        let old = validated_call(&handle.shared.bindings, "old-actor", "old-start")
+            .binding_ref()
+            .clone();
+        for n in 1..=4 {
+            let reference = format!("detail-{n}");
+            plant_detail(&handle, &reference, &old, settled_detail(&reference));
+        }
+        let invocation = validated_call(&handle.shared.bindings, "new-actor", "new-start");
+        let reference = enqueue_context(&handle, invocation).unwrap();
+        let ledger = handle.shared.ledger.lock().unwrap();
+        for n in 1..=4 {
+            assert!(
+                !ledger.details.contains_key(&format!("detail-{n}")),
+                "inactive binding's settled detail-{n} must be evicted"
+            );
+        }
+        assert!(ledger.details.contains_key(&reference));
+    }
+
+    /// A pending fact is never an eviction candidate: the request is refused while it is the
+    /// only thing left, and it survives the eviction that admits a later request.
+    #[tokio::test]
+    async fn pending_detail_is_never_evicted() {
+        let fixture = Fixture::new();
+        let handle = detail_handle(&fixture.root, 2);
+        let held = validated_call(&handle.shared.bindings, "hold-actor", "hold-start")
+            .binding_ref()
+            .clone();
+        plant_detail(
+            &handle,
+            "detail-1",
+            &held,
+            PeerReply::Pending {
+                detail_ref: "detail-1".into(),
+            },
+        );
+        plant_detail(
+            &handle,
+            "detail-2",
+            &held,
+            PeerReply::Pending {
+                detail_ref: "detail-2".into(),
+            },
+        );
+        let invocation = validated_call(&handle.shared.bindings, "next-actor", "next-start");
+        assert!(matches!(
+            enqueue_context(&handle, invocation),
+            Err(FailureCode::Capacity)
+        ));
+        assert!(
+            handle
+                .shared
+                .ledger
+                .lock()
+                .unwrap()
+                .details
+                .contains_key("detail-1")
+        );
+        handle
+            .shared
+            .ledger
+            .lock()
+            .unwrap()
+            .details
+            .get_mut("detail-2")
+            .unwrap()
+            .reply = settled_detail("detail-2");
+        let invocation = validated_call(&handle.shared.bindings, "next-actor", "next-retry");
+        let reference = enqueue_context(&handle, invocation).unwrap();
+        let ledger = handle.shared.ledger.lock().unwrap();
+        assert!(
+            ledger.details.contains_key("detail-1"),
+            "pending must survive"
+        );
+        assert!(!ledger.details.contains_key("detail-2"));
+        assert!(ledger.details.contains_key(&reference));
+    }
+
+    /// A sole active binding at the ceiling evicts its own oldest settled detail for its next
+    /// request, keeping the newer history.
+    #[tokio::test]
+    async fn sole_active_binding_evicts_its_own_oldest_settled_details() {
+        let fixture = Fixture::new();
+        let handle = detail_handle(&fixture.root, 4);
+        let sole = validated_call(&handle.shared.bindings, "sole-actor", "sole-start")
+            .binding_ref()
+            .clone();
+        for n in 1..=4 {
+            let reference = format!("detail-{n}");
+            plant_detail(&handle, &reference, &sole, settled_detail(&reference));
+        }
+        handle
+            .shared
+            .ledger
+            .lock()
+            .unwrap()
+            .cancellation
+            .insert(sole.clone(), watch::channel(false).0);
+        let invocation = validated_call(&handle.shared.bindings, "sole-actor", "sole-next");
+        let reference = enqueue_context(&handle, invocation).unwrap();
+        let ledger = handle.shared.ledger.lock().unwrap();
+        assert!(
+            !ledger.details.contains_key("detail-1"),
+            "the requesting binding's oldest settled detail must be evicted"
+        );
+        for n in 2..=4 {
+            assert!(ledger.details.contains_key(&format!("detail-{n}")));
+        }
+        assert!(ledger.details.contains_key(&reference));
+    }
+
+    /// An explicit stop still clears that binding's details and its cancellation entry.
+    #[tokio::test]
+    async fn stop_still_clears_the_binding_details() {
+        let fixture = Fixture::new();
+        let handle = detail_handle(&fixture.root, 8);
+        let binding = validated_call(&handle.shared.bindings, "stop-actor", "stop-start")
+            .binding_ref()
+            .clone();
+        for n in 1..=4 {
+            let reference = format!("detail-{n}");
+            plant_detail(&handle, &reference, &binding, settled_detail(&reference));
+        }
+        handle
+            .shared
+            .ledger
+            .lock()
+            .unwrap()
+            .cancellation
+            .insert(binding.clone(), watch::channel(false).0);
+        let invocation = validated_call(&handle.shared.bindings, "stop-actor", "stop-call");
+        let _ = handle.stop(invocation, "stop-retry").await;
+        let ledger = handle.shared.ledger.lock().unwrap();
+        assert!(
+            ledger
+                .details
+                .values()
+                .all(|detail| detail.binding != binding),
+            "stop must clear the binding's details"
+        );
+        assert!(!ledger.cancellation.contains_key(&binding));
     }
 
     /// Drops the position marker line every page of a multi-page result starts with (T16B).
