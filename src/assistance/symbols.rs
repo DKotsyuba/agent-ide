@@ -65,9 +65,9 @@ impl Worker<'_> {
             .await
             .map_err(|_| FailureCode::ProviderUnavailable)?;
         let language = Lang::for_path(observed.path()).ok_or(FailureCode::ProviderUnavailable)?;
-        // A test is whatever the outline marks as one, wherever it lives: Rust keeps most unit
-        // tests in a `#[cfg(test)] mod tests` of the file under test, so the test-file
-        // convention alone would miss them. One outline per referenced file.
+        // A test is whatever the outline marks as one, wherever it lives: some languages keep
+        // most unit tests in a test module of the file under test, so the test-file convention
+        // alone would miss them. One outline per referenced file.
         let mut outlines: std::collections::BTreeMap<std::path::PathBuf, crate::lang::Outline> =
             std::collections::BTreeMap::new();
         let mut tests = std::collections::BTreeSet::new();
@@ -103,11 +103,7 @@ impl Worker<'_> {
                 && test.kind == crate::lang::SymbolKind::Test
             {
                 let outline_path = test.path.segments().join("::");
-                let name = if language == Lang::Rust {
-                    crate::lang::rust::test_id(&relative, &outline_path)
-                } else {
-                    outline_path
-                };
+                let name = language.support().test_id(&relative, &outline_path);
                 tests.insert((relative.clone(), name));
             }
         }
@@ -626,7 +622,7 @@ impl Worker<'_> {
         bytes: &[u8],
     ) -> Result<(Outline, std::path::PathBuf), FailureCode> {
         let language = Lang::for_path(observed.path()).ok_or(FailureCode::ProviderUnavailable)?;
-        let support = lang::support(language).ok_or(FailureCode::ProviderUnavailable)?;
+        let support = language.support();
         let source = observed_text(observed, bytes)?.to_owned();
         let worktree_root = observed.worktree().worktree_path().to_path_buf();
         let live = self.live_session_for(job, observed).await?;
@@ -747,7 +743,7 @@ impl Worker<'_> {
                     continue;
                 };
                 let language = Lang::for_path(file).ok_or(FailureCode::ProviderUnavailable)?;
-                let support = lang::support(language).ok_or(FailureCode::ProviderUnavailable)?;
+                let support = language.support();
                 let Ok(live) = self.live_session_for(job, &observed).await else {
                     continue;
                 };
@@ -844,8 +840,7 @@ impl Worker<'_> {
                 }
             };
             let is_test = Lang::for_path(&relative)
-                .and_then(lang::support)
-                .is_some_and(|support| support.is_test_file(&relative));
+                .is_some_and(|language| language.support().is_test_file(&relative));
             usages.push(Usage {
                 file: relative.display().to_string(),
                 line,
@@ -1146,8 +1141,7 @@ impl Worker<'_> {
                             Some("last") => lang::InsertWhere::Last,
                             _ => return Err(FailureCode::Internal),
                         };
-                        let support = lang::support(outline.language)
-                            .ok_or(FailureCode::ProviderUnavailable)?;
+                        let support = outline.language.support();
                         let site = support
                             .insert_site(&source, &outline, &symbol, where_)
                             .map_err(|error| match error {
@@ -1243,9 +1237,7 @@ impl Worker<'_> {
         let Some(language) = Lang::for_path(file) else {
             return candidate;
         };
-        let Some(support) = lang::support(language) else {
-            return candidate;
-        };
+        let support = language.support();
         let root = observed.worktree().worktree_path().to_path_buf();
         let Some(project) = support.detect(&root) else {
             return candidate;
@@ -1489,13 +1481,18 @@ fn push_block(out: &mut String, content: &str) {
     }
 }
 
-/// PATH for formatters: the toolchain directories the daemon itself was configured with plus the
-/// system directories, never the agent's shell environment.
+/// PATH for formatters: the registered languages' home tool directories (see
+/// [`LanguageDescriptor::home_tool_dirs`](crate::lang::LanguageDescriptor::home_tool_dirs)), the
+/// daemon's own configured PATH, then the system directories — never the agent's shell
+/// environment.
 fn formatter_path() -> String {
     let mut parts = vec![];
     if let Ok(home) = std::env::var("HOME") {
-        parts.push(format!("{home}/.cargo/bin"));
-        parts.push(format!("{home}/.local/bin"));
+        for language in crate::lang::registered() {
+            for dir in language.descriptor().home_tool_dirs {
+                parts.push(format!("{home}/{dir}"));
+            }
+        }
     }
     if let Some(path) = std::env::var_os("PATH") {
         parts.push(path.to_string_lossy().into_owned());

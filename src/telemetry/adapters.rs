@@ -12,7 +12,7 @@ use crate::{
         reply::{EditDiagnostics, FailureCode, MissingPeer, PeerReply},
     },
     changes::edit::EditOutcome,
-    checks::{self, CheckState, ProblemSnapshot, UnavailableReason},
+    checks::{CheckState, ProblemSnapshot, UnavailableReason},
     telemetry::{
         AdmissionState, CacheState, CancellationState, CountBucket, DescendantSettlement,
         DiagnosticState, Event, FallbackReason, Language, OutputSizeClass, ProjectCheckState,
@@ -278,11 +278,7 @@ pub fn log_project_check(snapshot: &ProblemSnapshot) {
 /// saturated to whole `u32` milliseconds. Recording is synchronous, bounded and fail-open.
 pub fn project_check(telemetry: &Telemetry, snapshot: &ProblemSnapshot) {
     telemetry.record(Event::ProjectCheckCompleted {
-        language: match snapshot.language {
-            checks::Language::Rust => Language::Rust,
-            checks::Language::Python => Language::Python,
-            checks::Language::TypeScript => Language::Typescript,
-        },
+        language: snapshot.language,
         state: match snapshot.state {
             CheckState::Ready => ProjectCheckState::Ready,
             CheckState::Partial => ProjectCheckState::Partial,
@@ -555,7 +551,7 @@ mod tests {
             AssistanceTool::Edit,
             &reply,
             Duration::from_millis(18),
-            Some(crate::telemetry::Language::Typescript),
+            Some(crate::lang::testing::GAMMA),
             CacheState::Miss,
             DiagnosticState::NotApplicable,
         );
@@ -572,7 +568,7 @@ mod tests {
                 method: ToolMethod::Edit,
                 outcome: ToolOutcome::Completed,
                 duration_ms: 18,
-                language: Some(crate::telemetry::Language::Typescript),
+                language: Some(crate::lang::testing::GAMMA),
                 cache: CacheState::Miss,
                 diagnostics: DiagnosticState::Changed,
                 reason: None,

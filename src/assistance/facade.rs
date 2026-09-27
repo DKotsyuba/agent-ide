@@ -144,6 +144,54 @@ pub struct ToolSchema {
     pub input_schema: Value,
 }
 
+/// Identifiers of the registered languages with project checks, in registration order: the
+/// closed values of the `problems` language filter.
+fn checked_language_ids() -> Vec<&'static str> {
+    crate::lang::registered()
+        .iter()
+        .filter(|language| language.checks().is_some())
+        .map(|language| language.name())
+        .collect()
+}
+
+/// Joins `items` as an English list: `a`, `a or b`, `a, b<last> c` where `last` separates the
+/// final item (`", or "` or `" or "`) when there are three or more.
+fn alternatives(items: &[String], last: &str) -> String {
+    match items {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} or {second}"),
+        [init @ .., tail] => format!("{}{last}{tail}", init.join(", ")),
+    }
+}
+
+/// Fills the language-derived phrases of the tool descriptions from the registered languages.
+///
+/// `{project_checks}` becomes the check tools (`a, b or c`); `{manifests_head}` and
+/// `{manifests_tail}` become the project manifests the card replaces reading, split before the
+/// last one (`a, b` and `or c`) so the description keeps its line break there.
+fn describe_languages(description: &str) -> String {
+    let registered = crate::lang::registered();
+    let checks = registered
+        .iter()
+        .filter_map(|language| language.checks())
+        .map(|checks| checks.tool_name().to_owned())
+        .collect::<Vec<_>>();
+    let manifests = registered
+        .iter()
+        .filter_map(|language| language.descriptor().card_manifest)
+        .collect::<Vec<_>>();
+    let (head, tail) = match manifests.split_last() {
+        None => (String::new(), String::new()),
+        Some((last, [])) => (String::new(), (*last).to_owned()),
+        Some((last, init)) => (init.join(", "), format!("or {last}")),
+    };
+    description
+        .replace("{project_checks}", &alternatives(&checks, " or "))
+        .replace("{manifests_head}", &head)
+        .replace("{manifests_tail}", &tail)
+}
+
 /// Returns exactly the eleven current Assistance schemas regardless of daemon availability.
 pub fn tool_schemas() -> [ToolSchema; 11] {
     [
@@ -167,7 +215,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                     "byte_offset": {"type": "integer", "minimum": 0, "maximum": MAX_BYTE_OFFSET, "description": "Continue a truncated source reply from this byte offset."},
                     "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Reference from an earlier reply: continue that result."},
                     "kind": {"type": "string", "enum": ["problems"], "description": "`problems`: the project check results instead of a file."},
-                    "language": {"type": "string", "enum": ["rust", "python", "typescript"], "description": "With `problems`: limit to one language."},
+                    "language": {"type": "string", "enum": checked_language_ids(), "description": "With `problems`: limit to one language."},
                     "offset": {"type": "integer", "minimum": 0, "maximum": MAX_PROBLEM_OFFSET, "description": "With `problems`: continue from this problem index (see `next_offset`)."}
                 }
             }),
@@ -354,6 +402,8 @@ pub enum FieldRule {
     NonNegativeInteger(u64),
     /// The value must be one of the carried quoted alternatives.
     OneOf(&'static str),
+    /// The value must be the identifier of a registered language with project checks.
+    CheckedLanguage,
     /// The field is meaningless without `kind: "problems"`.
     RequiresProblemsKind,
     /// The value must be `true` or `false`.
@@ -382,6 +432,16 @@ impl FieldRule {
                 format!("must be a non-negative integer up to {limit}")
             }
             Self::OneOf(values) => format!("must be {values}"),
+            Self::CheckedLanguage => format!(
+                "must be {}",
+                alternatives(
+                    &checked_language_ids()
+                        .iter()
+                        .map(|id| format!("\"{id}\""))
+                        .collect::<Vec<_>>(),
+                    ", or ",
+                )
+            ),
             Self::RequiresProblemsKind => "requires \"kind\":\"problems\"".to_string(),
             Self::Boolean => "must be true or false".to_string(),
             Self::LineRange => "must be an inclusive 1-based range like 120-180".to_string(),
@@ -701,12 +761,12 @@ pub fn validate_call(
             }
             if problems {
                 if object.get("language").is_some_and(|value| {
-                    !matches!(value.as_str(), Some("rust" | "python" | "typescript"))
+                    value
+                        .as_str()
+                        .and_then(crate::assistance::problems::parse_language)
+                        .is_none()
                 }) {
-                    return Err(invalid_field(
-                        "language",
-                        FieldRule::OneOf("\"rust\", \"python\", or \"typescript\""),
-                    ));
+                    return Err(invalid_field("language", FieldRule::CheckedLanguage));
                 }
                 if object.get("offset").is_some_and(|value| {
                     value
@@ -1519,7 +1579,7 @@ impl StdioFacade {
             attachment: None,
             reconnect: None,
             publisher: None,
-            router: Self::tool_router(),
+            router: Self::described_tool_router(),
         }
     }
 
@@ -1534,7 +1594,7 @@ impl StdioFacade {
             attachment: None,
             reconnect: None,
             publisher: None,
-            router: Self::tool_router(),
+            router: Self::described_tool_router(),
         }
     }
 
@@ -1549,7 +1609,7 @@ impl StdioFacade {
             attachment: Some(attachment),
             reconnect: None,
             publisher: None,
-            router: Self::tool_router(),
+            router: Self::described_tool_router(),
         })
     }
 
@@ -1569,7 +1629,7 @@ impl StdioFacade {
             attachment: None,
             reconnect: Some(ManagedConnection::new(runtime_dir, attachment, reestablish)),
             publisher: Some(publisher),
-            router: Self::tool_router(),
+            router: Self::described_tool_router(),
         })
     }
 
@@ -1588,7 +1648,7 @@ impl StdioFacade {
             attachment: None,
             reconnect: Some(ManagedConnection::new(runtime_dir, attachment, reestablish)),
             publisher: None,
-            router: Self::tool_router(),
+            router: Self::described_tool_router(),
         })
     }
 
@@ -2015,12 +2075,26 @@ fn claude_envelope_reconnect_retry_hint_survives_in_content_text() {
     assert!(text.text.contains(RECONNECT_START_HINT), "{}", text.text);
 }
 
+impl StdioFacade {
+    /// Builds the eleven-tool router with the language-derived description phrases filled in
+    /// from the registered languages (see [`describe_languages`]).
+    fn described_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<Self> {
+        let mut router = Self::tool_router();
+        for route in router.map.values_mut() {
+            if let Some(description) = route.attr.description.as_mut() {
+                *description = std::borrow::Cow::Owned(describe_languages(description));
+            }
+        }
+        router
+    }
+}
+
 #[tool_router]
 impl StdioFacade {
     /// Activate Agent IDE for this project — once per task, before any other ide.* call. Returns
     /// a project card: languages with sizes, the build/check/test/lint commands, layout by
-    /// directory, entry points and docs. Use it to orient instead of reading README, Cargo.toml
-    /// or package.json. Then use ide.outline / ide.symbol instead of native file reads.
+    /// directory, entry points and docs. Use it to orient instead of reading README, {manifests_head}
+    /// {manifests_tail}. Then use ide.outline / ide.symbol instead of native file reads.
     #[tool(name = "ide.start", input_schema = tool_schemas()[0].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn start(
         &self,
@@ -2151,7 +2225,7 @@ impl StdioFacade {
     /// Edit by symbol: `op` replace / insert / delete / rename on `file#Owner/name` (rename is
     /// project-wide), or replace a `path` + `lines` range, or a full-file rewrite based on a
     /// `source_ref`. Formats the result with the project formatter, runs the project check
-    /// (cargo check, pyright or tsc) and returns this file's errors and warnings in the reply.
+    /// ({project_checks}) and returns this file's errors and warnings in the reply.
     /// Prefer it over native edit/write for source: no line matching, no separate check step.
     #[tool(name = "ide.edit", input_schema = tool_schemas()[5].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn edit(
@@ -2289,11 +2363,14 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
         (
             validate_call(
                 AssistanceTool::Context,
-                json!({"kind":"problems","language":"go"}),
+                json!({"kind":"problems","language":"delta"}),
             )
             .unwrap_err(),
             AssistanceTool::Context,
-            "invalid bounded parameters: \"language\" must be \"rust\", \"python\", or \"typescript\"".to_string(),
+            format!(
+                "invalid bounded parameters: \"language\" must be {}",
+                checked_language_alternatives()
+            ),
         ),
         (
             validate_call(AssistanceTool::Context, json!({"path":"a.rs","offset":5})).unwrap_err(),
@@ -2364,9 +2441,25 @@ fn start_root_must_be_absolute_and_normalized() {
     );
 }
 
+/// The quoted alternatives the `problems` language refusal lists: every registered checked
+/// language in registration order, the last one after `, or `.
+#[cfg(test)]
+fn checked_language_alternatives() -> String {
+    let quoted = checked_language_ids()
+        .into_iter()
+        .map(|id| format!("\"{id}\""))
+        .collect::<Vec<_>>();
+    let (last, init) = quoted
+        .split_last()
+        .expect("checked test languages are registered");
+    format!("{}, or {last}", init.join(", "))
+}
+
 /// Every T21B refusal names the exact parameter to fix, stays single-line, and stays bounded.
 #[test]
 fn invalid_parameter_refusals_name_the_field_and_rule() {
+    crate::lang::testing::install();
+    assert!(checked_language_alternatives().ends_with(", or \"gamma\""));
     for (error, tool, expected) in t21b_refusals() {
         let message = error.message(tool);
         assert_eq!(message, expected);
@@ -2375,15 +2468,24 @@ fn invalid_parameter_refusals_name_the_field_and_rule() {
     }
 }
 
-/// The context validator accepts the advertised TypeScript problems filter.
+/// The context validator accepts every checked language's problems filter and refuses a
+/// registered language without checks.
 #[test]
-fn typescript_problems_filter_is_admitted() {
+fn checked_language_problems_filter_is_admitted() {
+    crate::lang::testing::install();
     assert!(
         validate_call(
             AssistanceTool::Context,
-            json!({"kind":"problems","language":"typescript"})
+            json!({"kind":"problems","language":"gamma"})
         )
         .is_ok()
+    );
+    assert!(
+        validate_call(
+            AssistanceTool::Context,
+            json!({"kind":"problems","language":"delta"})
+        )
+        .is_err()
     );
 }
 

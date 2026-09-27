@@ -255,7 +255,7 @@ impl FeedState {
     }
 }
 
-/// Builds the rendered items for `snapshots` in fixed [`Language`] order.
+/// Builds the rendered items for `snapshots` in [`Language`] order (registration order).
 ///
 /// Several snapshots per language are allowed; the last one in `snapshots` wins, matching the
 /// scheduler's latest-completed-wins rule. A language with no snapshot is skipped. A language
@@ -265,7 +265,10 @@ impl FeedState {
 /// as the first check of the session; a [`Recheck::FilesChanged`] keeps the last counts in view.
 fn build_items(snapshots: &[ProblemSnapshot], rechecks: &[(Language, Recheck)]) -> Vec<FeedItem> {
     let mut items = Vec::new();
-    for language in [Language::Rust, Language::Python, Language::TypeScript] {
+    let mut languages: Vec<Language> = snapshots.iter().map(|snapshot| snapshot.language).collect();
+    languages.sort();
+    languages.dedup();
+    for language in languages {
         let Some(snapshot) = snapshots.iter().rev().find(|s| s.language == language) else {
             continue;
         };
@@ -487,10 +490,14 @@ mod tests {
     #[test]
     fn first_ready_snapshot_emits_without_deltas() {
         let mut state = FeedState::default();
-        let block = state.next_block(&key("hook"), &[ready(Language::Rust, 3, 5)], &[]);
+        let block = state.next_block(
+            &key("hook"),
+            &[ready(crate::lang::testing::ALPHA, 3, 5)],
+            &[],
+        );
         assert_eq!(
             block,
-            Some("<agent-ide>\nrust: 3 errors, 5 warnings\n</agent-ide>".to_string())
+            Some("<agent-ide>\nalpha: 3 errors, 5 warnings\n</agent-ide>".to_string())
         );
     }
 
@@ -500,11 +507,11 @@ mod tests {
         let hook = key("hook");
         assert!(
             state
-                .next_block(&hook, &[ready(Language::Rust, 1, 0)], &[])
+                .next_block(&hook, &[ready(crate::lang::testing::ALPHA, 1, 0)], &[])
                 .is_some()
         );
         assert_eq!(
-            state.next_block(&hook, &[ready(Language::Rust, 1, 0)], &[]),
+            state.next_block(&hook, &[ready(crate::lang::testing::ALPHA, 1, 0)], &[]),
             None
         );
     }
@@ -514,14 +521,14 @@ mod tests {
         let mut state = FeedState::default();
         let hook = key("hook");
         state
-            .next_block(&hook, &[ready(Language::Rust, 1, 0)], &[])
+            .next_block(&hook, &[ready(crate::lang::testing::ALPHA, 1, 0)], &[])
             .expect("first delivery emits");
         let block = state
-            .next_block(&hook, &[ready(Language::Rust, 3, 0)], &[])
+            .next_block(&hook, &[ready(crate::lang::testing::ALPHA, 3, 0)], &[])
             .expect("changed state emits");
         assert_eq!(
             block,
-            "<agent-ide>\nrust: 3 errors (+2), 0 warnings\n</agent-ide>"
+            "<agent-ide>\nalpha: 3 errors (+2), 0 warnings\n</agent-ide>"
         );
     }
 
@@ -530,17 +537,17 @@ mod tests {
         let mut state = FeedState::default();
         let hook = key("hook");
         state
-            .next_block(&hook, &[ready(Language::Rust, 1, 0)], &[])
+            .next_block(&hook, &[ready(crate::lang::testing::ALPHA, 1, 0)], &[])
             .expect("first delivery emits");
         state
-            .next_block(&hook, &[ready(Language::Rust, 3, 0)], &[])
+            .next_block(&hook, &[ready(crate::lang::testing::ALPHA, 3, 0)], &[])
             .expect("changed state emits");
         let block = state
-            .next_block(&hook, &[ready(Language::Rust, 1, 0)], &[])
+            .next_block(&hook, &[ready(crate::lang::testing::ALPHA, 1, 0)], &[])
             .expect("restored state emits");
         assert_eq!(
             block,
-            "<agent-ide>\nrust: 1 error (-2), 0 warnings\n</agent-ide>"
+            "<agent-ide>\nalpha: 1 error (-2), 0 warnings\n</agent-ide>"
         );
     }
 
@@ -550,18 +557,18 @@ mod tests {
         let hook = key("hook");
         assert!(
             state
-                .next_block(&hook, &[ready(Language::Rust, 2, 1)], &[])
+                .next_block(&hook, &[ready(crate::lang::testing::ALPHA, 2, 1)], &[])
                 .is_some()
         );
         let block = state
-            .next_block(&hook, &[partial(Language::Rust, 2, 1)], &[])
+            .next_block(&hook, &[partial(crate::lang::testing::ALPHA, 2, 1)], &[])
             .expect("partial change emits");
         assert_eq!(
             block,
-            "<agent-ide>\nrust: 2 errors, 1 warning (partial)\n</agent-ide>"
+            "<agent-ide>\nalpha: 2 errors, 1 warning (partial)\n</agent-ide>"
         );
         assert_eq!(
-            state.next_block(&hook, &[partial(Language::Rust, 2, 1)], &[]),
+            state.next_block(&hook, &[partial(crate::lang::testing::ALPHA, 2, 1)], &[]),
             None
         );
     }
@@ -579,12 +586,13 @@ mod tests {
         for (reason, phrase) in phrases {
             let mut state = FeedState::default();
             let block = state
-                .next_block(&key("hook"), &[unavailable(Language::Python, reason)], &[])
+                .next_block(
+                    &key("hook"),
+                    &[unavailable(crate::lang::testing::BETA, reason)],
+                    &[],
+                )
                 .expect("unavailable state emits");
-            assert_eq!(
-                block,
-                format!("<agent-ide>\npython: {phrase}\n</agent-ide>")
-            );
+            assert_eq!(block, format!("<agent-ide>\nbeta: {phrase}\n</agent-ide>"));
         }
     }
 
@@ -594,11 +602,14 @@ mod tests {
     fn first_check_renders_a_checking_plate_then_the_result() {
         let mut state = FeedState::default();
         let hook = key("hook");
-        let checking_both = [checking(Language::Rust), checking(Language::Python)];
+        let checking_both = [
+            checking(crate::lang::testing::ALPHA),
+            checking(crate::lang::testing::BETA),
+        ];
         assert_eq!(
             state.next_block(&hook, &checking_both, &[]),
             Some(
-                "<agent-ide>\nrust: checking (first check) | python: checking (first check)\n</agent-ide>"
+                "<agent-ide>\nalpha: checking (first check) | beta: checking (first check)\n</agent-ide>"
                     .to_string()
             )
         );
@@ -606,13 +617,16 @@ mod tests {
         let block = state
             .next_block(
                 &hook,
-                &[checking(Language::Rust), ready(Language::Python, 0, 1)],
+                &[
+                    checking(crate::lang::testing::ALPHA),
+                    ready(crate::lang::testing::BETA, 0, 1),
+                ],
                 &[],
             )
             .expect("completed language emits");
         assert_eq!(
             block,
-            "<agent-ide>\nrust: checking (first check) | python: 0 errors, 1 warning\n</agent-ide>"
+            "<agent-ide>\nalpha: checking (first check) | beta: 0 errors, 1 warning\n</agent-ide>"
         );
     }
 
@@ -622,35 +636,35 @@ mod tests {
     fn files_changed_recheck_keeps_last_counts_and_the_delta_baseline() {
         let mut state = FeedState::default();
         let hook = key("hook");
-        let changed = [(Language::Rust, Recheck::FilesChanged)];
-        state.next_block(&hook, &[ready(Language::Rust, 0, 0)], &[]);
+        let changed = [(crate::lang::testing::ALPHA, Recheck::FilesChanged)];
+        state.next_block(&hook, &[ready(crate::lang::testing::ALPHA, 0, 0)], &[]);
         assert_eq!(
-            state.next_block(&hook, &[ready(Language::Rust, 0, 0)], &changed),
+            state.next_block(&hook, &[ready(crate::lang::testing::ALPHA, 0, 0)], &changed),
             Some(
-                "<agent-ide>\nrust: checking (files changed; last result: 0 errors, 0 warnings)\n</agent-ide>"
+                "<agent-ide>\nalpha: checking (files changed; last result: 0 errors, 0 warnings)\n</agent-ide>"
                     .to_string()
             )
         );
         assert_eq!(
-            state.next_block(&hook, &[ready(Language::Rust, 0, 0)], &changed),
+            state.next_block(&hook, &[ready(crate::lang::testing::ALPHA, 0, 0)], &changed),
             None
         );
         assert_eq!(
-            state.next_block(&hook, &[ready(Language::Rust, 0, 1)], &[]),
-            Some("<agent-ide>\nrust: 0 errors, 1 warning (+1)\n</agent-ide>".to_string())
+            state.next_block(&hook, &[ready(crate::lang::testing::ALPHA, 0, 1)], &[]),
+            Some("<agent-ide>\nalpha: 0 errors, 1 warning (+1)\n</agent-ide>".to_string())
         );
         // A no-op check: checking plate, then the same text again — sent once, without a delta.
         assert!(
             state
-                .next_block(&hook, &[ready(Language::Rust, 0, 1)], &changed)
+                .next_block(&hook, &[ready(crate::lang::testing::ALPHA, 0, 1)], &changed)
                 .is_some()
         );
         assert_eq!(
-            state.next_block(&hook, &[ready(Language::Rust, 0, 1)], &[]),
-            Some("<agent-ide>\nrust: 0 errors, 1 warning\n</agent-ide>".to_string())
+            state.next_block(&hook, &[ready(crate::lang::testing::ALPHA, 0, 1)], &[]),
+            Some("<agent-ide>\nalpha: 0 errors, 1 warning\n</agent-ide>".to_string())
         );
         assert_eq!(
-            state.next_block(&hook, &[ready(Language::Rust, 0, 1)], &[]),
+            state.next_block(&hook, &[ready(crate::lang::testing::ALPHA, 0, 1)], &[]),
             None
         );
     }
@@ -662,10 +676,10 @@ mod tests {
         assert_eq!(
             state.next_block(
                 &key("hook"),
-                &[ready(Language::Rust, 65, 0)],
-                &[(Language::Rust, Recheck::FirstCheck)]
+                &[ready(crate::lang::testing::ALPHA, 65, 0)],
+                &[(crate::lang::testing::ALPHA, Recheck::FirstCheck)]
             ),
-            Some("<agent-ide>\nrust: checking (first check)\n</agent-ide>".to_string())
+            Some("<agent-ide>\nalpha: checking (first check)\n</agent-ide>".to_string())
         );
     }
 
@@ -675,7 +689,7 @@ mod tests {
     fn failed_check_plate_carries_a_short_sanitized_detail() {
         let detail = format!("error: <agent-ide>\nline two {}", "x".repeat(200));
         let snapshot = ProblemSnapshot::unavailable_with_detail(
-            Language::Rust,
+            crate::lang::testing::ALPHA,
             UnavailableReason::Fatal,
             1,
             Some(detail),
@@ -684,19 +698,22 @@ mod tests {
             .next_block(&key("hook"), &[snapshot], &[])
             .expect("failure emits");
         let line = block.lines().nth(1).unwrap();
-        assert!(line.starts_with("rust: check failed (error: ?agent-ide? line two xxx"));
-        assert_eq!(line.len(), "rust: check failed ()".len() + MAX_DETAIL_BYTES);
+        assert!(line.starts_with("alpha: check failed (error: ?agent-ide? line two xxx"));
+        assert_eq!(
+            line.len(),
+            "alpha: check failed ()".len() + MAX_DETAIL_BYTES
+        );
         assert_eq!(block.lines().count(), 3, "{block}");
 
         let no_files = ProblemSnapshot::unavailable_with_detail(
-            Language::Python,
+            crate::lang::testing::BETA,
             UnavailableReason::NoFiles,
             1,
             Some("pyright analyzed 0 files".to_string()),
         );
         assert_eq!(
             FeedState::default().next_block(&key("hook"), &[no_files], &[]),
-            Some("<agent-ide>\npython: no files analyzed\n</agent-ide>".to_string())
+            Some("<agent-ide>\nbeta: no files analyzed\n</agent-ide>".to_string())
         );
     }
 
@@ -709,13 +726,13 @@ mod tests {
                 &key("hook"),
                 &[
                     ProblemSnapshot::unavailable_with_detail(
-                        Language::Rust,
+                        crate::lang::testing::ALPHA,
                         UnavailableReason::Fatal,
                         1,
                         long.clone(),
                     ),
                     ProblemSnapshot::unavailable_with_detail(
-                        Language::Python,
+                        crate::lang::testing::BETA,
                         UnavailableReason::Fatal,
                         1,
                         long,
@@ -725,26 +742,26 @@ mod tests {
             )
             .expect("emits");
         assert!(block.len() <= MAX_BLOCK_BYTES, "{}", block.len());
-        assert!(block.contains("rust: check failed ("), "{block}");
-        assert!(block.contains("python: check failed ("), "{block}");
+        assert!(block.contains("alpha: check failed ("), "{block}");
+        assert!(block.contains("beta: check failed ("), "{block}");
 
         let huge = u32::MAX;
         let block = FeedState::default()
             .next_block(
                 &key("hook2"),
                 &[
-                    ready(Language::Rust, huge, huge),
-                    ready(Language::Python, huge, huge),
+                    ready(crate::lang::testing::ALPHA, huge, huge),
+                    ready(crate::lang::testing::BETA, huge, huge),
                 ],
                 &[
-                    (Language::Rust, Recheck::FilesChanged),
-                    (Language::Python, Recheck::FilesChanged),
+                    (crate::lang::testing::ALPHA, Recheck::FilesChanged),
+                    (crate::lang::testing::BETA, Recheck::FilesChanged),
                 ],
             )
             .expect("emits");
         assert!(block.len() <= MAX_BLOCK_BYTES, "{}", block.len());
         assert!(
-            block.contains("rust: checking") && block.contains("python: checking"),
+            block.contains("alpha: checking") && block.contains("beta: checking"),
             "{block}"
         );
     }
@@ -757,8 +774,8 @@ mod tests {
             state.next_block(
                 &hook,
                 &[
-                    unavailable(Language::Rust, UnavailableReason::Disabled),
-                    unavailable(Language::Python, UnavailableReason::Disabled)
+                    unavailable(crate::lang::testing::ALPHA, UnavailableReason::Disabled),
+                    unavailable(crate::lang::testing::BETA, UnavailableReason::Disabled)
                 ],
                 &[]
             ),
@@ -769,15 +786,15 @@ mod tests {
             .next_block(
                 &hook,
                 &[
-                    unavailable(Language::Rust, UnavailableReason::Disabled),
-                    ready(Language::Python, 2, 0),
+                    unavailable(crate::lang::testing::ALPHA, UnavailableReason::Disabled),
+                    ready(crate::lang::testing::BETA, 2, 0),
                 ],
                 &[],
             )
             .expect("the present language still emits");
         assert_eq!(
-            block, "<agent-ide>\npython: 2 errors, 0 warnings\n</agent-ide>",
-            "the absent rust language is never mentioned"
+            block, "<agent-ide>\nbeta: 2 errors, 0 warnings\n</agent-ide>",
+            "the absent alpha language is never mentioned"
         );
     }
 
@@ -788,15 +805,15 @@ mod tests {
             .next_block(
                 &key("hook"),
                 &[
-                    ready(Language::Python, 1, 0),
-                    unavailable(Language::Rust, UnavailableReason::ToolMissing),
+                    ready(crate::lang::testing::BETA, 1, 0),
+                    unavailable(crate::lang::testing::ALPHA, UnavailableReason::ToolMissing),
                 ],
                 &[],
             )
             .expect("mixed states emit");
         assert_eq!(
             block,
-            "<agent-ide>\nrust: tool not found | python: 1 error, 0 warnings\n</agent-ide>"
+            "<agent-ide>\nalpha: tool not found | beta: 1 error, 0 warnings\n</agent-ide>"
         );
     }
 
@@ -804,15 +821,15 @@ mod tests {
     fn keys_track_delivery_independently() {
         let mut state = FeedState::default();
         let (a, b) = (key("a"), key("b"));
-        let snapshots = [ready(Language::Rust, 3, 5)];
+        let snapshots = [ready(crate::lang::testing::ALPHA, 3, 5)];
         assert!(state.next_block(&a, &snapshots, &[]).is_some());
         assert!(state.next_block(&b, &snapshots, &[]).is_some());
         assert_eq!(state.next_block(&a, &snapshots, &[]), None);
         assert_eq!(state.next_block(&b, &snapshots, &[]), None);
-        let changed = [ready(Language::Rust, 4, 5)];
+        let changed = [ready(crate::lang::testing::ALPHA, 4, 5)];
         assert_eq!(
             state.next_block(&a, &changed, &[]),
-            Some("<agent-ide>\nrust: 4 errors (+1), 5 warnings\n</agent-ide>".to_string())
+            Some("<agent-ide>\nalpha: 4 errors (+1), 5 warnings\n</agent-ide>".to_string())
         );
         assert_eq!(state.next_block(&b, &snapshots, &[]), None);
     }
@@ -821,11 +838,14 @@ mod tests {
     fn worst_case_block_with_max_counts_and_deltas_stays_within_cap() {
         let mut state = FeedState::default();
         let hook = key("hook");
-        let zeroes = [ready(Language::Rust, 0, 0), ready(Language::Python, 0, 0)];
+        let zeroes = [
+            ready(crate::lang::testing::ALPHA, 0, 0),
+            ready(crate::lang::testing::BETA, 0, 0),
+        ];
         assert!(state.next_block(&hook, &zeroes, &[]).is_some());
         let worst = [
-            partial(Language::Rust, u32::MAX, u32::MAX),
-            partial(Language::Python, u32::MAX, u32::MAX),
+            partial(crate::lang::testing::ALPHA, u32::MAX, u32::MAX),
+            partial(crate::lang::testing::BETA, u32::MAX, u32::MAX),
         ];
         let block = state
             .next_block(&hook, &worst, &[])
@@ -834,44 +854,40 @@ mod tests {
         assert!(block.len() <= MAX_BLOCK_BYTES);
     }
 
-    /// Three present languages retain Rust/Python/TypeScript order and accurate changed counts.
+    /// Three present languages retain Alpha/Beta/Gamma order and accurate changed counts.
     ///
     /// Small changes show exact deltas. With maximum counts the 256-byte cap drops delta suffixes
-    /// from all items, but each current count and the TypeScript item remain visible.
+    /// from all items, but each current count and the Gamma item remain visible.
     #[test]
     fn three_languages_keep_order_deltas_and_counts_at_the_cap() {
         let mut state = FeedState::default();
         let hook = key("three-languages");
         let initial = [
-            ready(Language::TypeScript, 0, 0),
-            ready(Language::Rust, 0, 0),
-            ready(Language::Python, 0, 0),
+            ready(crate::lang::testing::GAMMA, 0, 0),
+            ready(crate::lang::testing::ALPHA, 0, 0),
+            ready(crate::lang::testing::BETA, 0, 0),
         ];
         state
             .next_block(&hook, &initial, &[])
             .expect("initial plate");
         let changed = [
-            ready(Language::TypeScript, 3, 1),
-            ready(Language::Rust, 1, 2),
-            ready(Language::Python, 2, 3),
+            ready(crate::lang::testing::GAMMA, 3, 1),
+            ready(crate::lang::testing::ALPHA, 1, 2),
+            ready(crate::lang::testing::BETA, 2, 3),
         ];
         let block = state
             .next_block(&hook, &changed, &[])
             .expect("changed plate");
         assert!(block.len() <= MAX_BLOCK_BYTES);
-        let rust = block.find("rust: 1 error (+1), 2 warnings (+2)").unwrap();
-        let python = block
-            .find("python: 2 errors (+2), 3 warnings (+3)")
-            .unwrap();
-        let typescript = block
-            .find("typescript: 3 errors (+3), 1 warning (+1)")
-            .unwrap();
-        assert!(rust < python && python < typescript, "{block}");
+        let alpha = block.find("alpha: 1 error (+1), 2 warnings (+2)").unwrap();
+        let beta = block.find("beta: 2 errors (+2), 3 warnings (+3)").unwrap();
+        let gamma = block.find("gamma: 3 errors (+3), 1 warning (+1)").unwrap();
+        assert!(alpha < beta && beta < gamma, "{block}");
 
         let maximum = [
-            partial(Language::TypeScript, u32::MAX, u32::MAX),
-            partial(Language::Rust, u32::MAX, u32::MAX),
-            partial(Language::Python, u32::MAX, u32::MAX),
+            partial(crate::lang::testing::GAMMA, u32::MAX, u32::MAX),
+            partial(crate::lang::testing::ALPHA, u32::MAX, u32::MAX),
+            partial(crate::lang::testing::BETA, u32::MAX, u32::MAX),
         ];
         let compact = state
             .next_block(&hook, &maximum, &[])
@@ -881,16 +897,16 @@ mod tests {
             "{} bytes: {compact}",
             compact.len()
         );
-        let rust = compact
-            .find("rust: 4294967295 errors, 4294967295 warnings")
+        let alpha = compact
+            .find("alpha: 4294967295 errors, 4294967295 warnings")
             .unwrap();
-        let python = compact
-            .find("python: 4294967295 errors, 4294967295 warnings")
+        let beta = compact
+            .find("beta: 4294967295 errors, 4294967295 warnings")
             .unwrap();
-        let typescript = compact
-            .find("typescript: 4294967295 errors, 4294967295 warnings")
+        let gamma = compact
+            .find("gamma: 4294967295 errors, 4294967295 warnings")
             .unwrap();
-        assert!(rust < python && python < typescript, "{compact}");
+        assert!(alpha < beta && beta < gamma, "{compact}");
         assert!(
             !compact.contains("(+"),
             "compaction omits deltas rather than cutting one mid-number: {compact}"
@@ -905,7 +921,7 @@ mod tests {
                 state
                     .next_block(
                         &key(&format!("b{index}")),
-                        &[ready(Language::Rust, 1, 0)],
+                        &[ready(crate::lang::testing::ALPHA, 1, 0)],
                         &[]
                     )
                     .is_some()
@@ -913,15 +929,15 @@ mod tests {
         }
         let oldest = key("b0");
         assert_eq!(
-            state.next_block(&oldest, &[ready(Language::Rust, 2, 0)], &[]),
-            Some("<agent-ide>\nrust: 2 errors (+1), 0 warnings\n</agent-ide>".to_string())
+            state.next_block(&oldest, &[ready(crate::lang::testing::ALPHA, 2, 0)], &[]),
+            Some("<agent-ide>\nalpha: 2 errors (+1), 0 warnings\n</agent-ide>".to_string())
         );
         // Admitting one more key evicts b1, now the least recently used one; b0 survives.
         assert!(
             state
                 .next_block(
                     &key(&format!("b{MAX_FEED_KEYS}")),
-                    &[ready(Language::Rust, 1, 0)],
+                    &[ready(crate::lang::testing::ALPHA, 1, 0)],
                     &[]
                 )
                 .is_some()
@@ -931,11 +947,11 @@ mod tests {
         assert!(state.delivered.contains_key(&oldest));
         // The evicted key re-delivers like a first delivery, without deltas.
         let block = state
-            .next_block(&key("b1"), &[ready(Language::Rust, 1, 0)], &[])
+            .next_block(&key("b1"), &[ready(crate::lang::testing::ALPHA, 1, 0)], &[])
             .expect("evicted key re-delivers");
         assert_eq!(
             block,
-            "<agent-ide>\nrust: 1 error, 0 warnings\n</agent-ide>"
+            "<agent-ide>\nalpha: 1 error, 0 warnings\n</agent-ide>"
         );
     }
 
@@ -945,42 +961,48 @@ mod tests {
         let hook = key("hook");
         assert!(
             state
-                .next_block(&hook, &[ready(Language::Rust, 1, 0)], &[])
+                .next_block(&hook, &[ready(crate::lang::testing::ALPHA, 1, 0)], &[])
                 .is_some()
         );
         assert_eq!(
-            state.next_block(&hook, &[ready(Language::Rust, 1, 0)], &[]),
+            state.next_block(&hook, &[ready(crate::lang::testing::ALPHA, 1, 0)], &[]),
             None
         );
         state.forget(&hook);
         assert_eq!(
-            state.next_block(&hook, &[ready(Language::Rust, 1, 0)], &[]),
-            Some("<agent-ide>\nrust: 1 error, 0 warnings\n</agent-ide>".to_string())
+            state.next_block(&hook, &[ready(crate::lang::testing::ALPHA, 1, 0)], &[]),
+            Some("<agent-ide>\nalpha: 1 error, 0 warnings\n</agent-ide>".to_string())
         );
         assert_eq!(
-            state.next_block(&hook, &[ready(Language::Rust, 1, 0)], &[]),
+            state.next_block(&hook, &[ready(crate::lang::testing::ALPHA, 1, 0)], &[]),
             None
         );
         // Forgetting an unknown key is a no-op.
         state.forget(&key("unknown"));
     }
 
-    /// Two languages present simultaneously with distinct starting counts: only python's count
+    /// Two languages present simultaneously with distinct starting counts: only beta's count
     /// changes, proving each item's delta is matched by its own language rather than by position
-    /// (a `last_counts` mixup would misattribute rust's unchanged counts to python or vice versa).
+    /// (a `last_counts` mixup would misattribute alpha's unchanged counts to beta or vice versa).
     #[test]
     fn per_language_last_counts_are_not_mixed_up_across_languages() {
         let mut state = FeedState::default();
         let hook = key("hook");
-        let first = [ready(Language::Rust, 1, 0), ready(Language::Python, 5, 0)];
+        let first = [
+            ready(crate::lang::testing::ALPHA, 1, 0),
+            ready(crate::lang::testing::BETA, 5, 0),
+        ];
         assert!(state.next_block(&hook, &first, &[]).is_some());
-        let second = [ready(Language::Rust, 1, 0), ready(Language::Python, 10, 0)];
+        let second = [
+            ready(crate::lang::testing::ALPHA, 1, 0),
+            ready(crate::lang::testing::BETA, 10, 0),
+        ];
         let block = state
             .next_block(&hook, &second, &[])
-            .expect("changed python count emits");
+            .expect("changed beta count emits");
         assert_eq!(
             block,
-            "<agent-ide>\nrust: 1 error, 0 warnings | python: 10 errors (+5), 0 warnings\n</agent-ide>"
+            "<agent-ide>\nalpha: 1 error, 0 warnings | beta: 10 errors (+5), 0 warnings\n</agent-ide>"
         );
     }
 
@@ -1014,8 +1036,13 @@ mod tests {
             Some("SECRET_CODE".to_owned()),
             "super secret message".to_owned(),
         )];
-        let snapshot =
-            ProblemSnapshot::from_problems(Language::Rust, CheckState::Ready, problems, 1, 5);
+        let snapshot = ProblemSnapshot::from_problems(
+            crate::lang::testing::ALPHA,
+            CheckState::Ready,
+            problems,
+            1,
+            5,
+        );
         let block = state
             .next_block(&key("hook"), &[snapshot], &[])
             .expect("ready snapshot emits");
@@ -1029,14 +1056,14 @@ mod tests {
     fn several_snapshots_of_the_same_language_the_last_one_wins() {
         let mut state = FeedState::default();
         let snapshots = [
-            ready(Language::Rust, 1, 0),
-            ready(Language::Rust, 9, 9),
-            unavailable(Language::Rust, UnavailableReason::ToolMissing),
+            ready(crate::lang::testing::ALPHA, 1, 0),
+            ready(crate::lang::testing::ALPHA, 9, 9),
+            unavailable(crate::lang::testing::ALPHA, UnavailableReason::ToolMissing),
         ];
         let block = state
             .next_block(&key("hook"), &snapshots, &[])
             .expect("last snapshot state emits");
-        assert_eq!(block, "<agent-ide>\nrust: tool not found\n</agent-ide>");
+        assert_eq!(block, "<agent-ide>\nalpha: tool not found\n</agent-ide>");
     }
 
     /// A block `next_block_when` refuses (T28B) is never recorded as delivered: it stays due and
@@ -1045,8 +1072,8 @@ mod tests {
     fn refused_blocks_stay_due_and_deliver_once_accepted() {
         let mut state = FeedState::default();
         let hook = key("hook");
-        let snapshots = [ready(Language::Rust, 2, 0)];
-        let block = "<agent-ide>\nrust: 2 errors, 0 warnings\n</agent-ide>";
+        let snapshots = [ready(crate::lang::testing::ALPHA, 2, 0)];
+        let block = "<agent-ide>\nalpha: 2 errors, 0 warnings\n</agent-ide>";
         assert_eq!(
             state.next_block_when(&hook, &snapshots, &[], |_| false),
             None,

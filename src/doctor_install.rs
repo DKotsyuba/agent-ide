@@ -217,11 +217,12 @@ fn is_js_module(path: &Path) -> bool {
 
 /// Collects the deduplicated `(label, path, node)` toolchain executables declared by `config`.
 ///
-/// Provider executables are the configured language servers (rust-analyzer, pyright,
-/// typescript-language-server), plus each provider's Node and TypeScript `tsserver`, and the
-/// confined project-check tool paths; the accepted `git` is already digest-verified. The third
-/// element is the Node interpreter declared alongside the entry, used only to probe
-/// `.js`-family modules that cannot exec themselves.
+/// Provider executables are each configured language server's toolchain programs (the server
+/// and the interpreters and modules its declaration names, see
+/// [`LanguageServer::toolchain_programs`](crate::intelligence::server::LanguageServer::toolchain_programs)),
+/// and the confined project-check tool paths of each declared language; the accepted `git` is
+/// already digest-verified. The third element is the interpreter declared alongside the entry,
+/// used only to probe `.js`-family modules that cannot exec themselves.
 fn declared_toolchains(config: &LauncherConfig) -> Vec<(String, PathBuf, Option<PathBuf>)> {
     let mut seen = HashSet::new();
     let mut found = Vec::new();
@@ -239,24 +240,16 @@ fn declared_toolchains(config: &LauncherConfig) -> Vec<(String, PathBuf, Option<
             continue;
         };
         for provider in &target.providers {
-            let interpreter = provider.node.as_ref().map(|node| node.path.as_path());
-            declare(&provider.executable.path, interpreter);
-            if let Some(node) = &provider.node {
-                declare(&node.path, None);
-            }
-            if let Some(typescript) = &provider.typescript {
-                declare(&typescript.tsserver.path, interpreter);
+            for (path, interpreter) in provider.server().toolchain_programs(provider) {
+                declare(&path, interpreter.as_deref());
             }
         }
     }
     if let Some(checks) = config.project_checks() {
-        if let Some(python) = checks.python() {
-            declare(python.node(), None);
-            declare(python.pyright_cli(), Some(python.node()));
-        }
-        if let Some(typescript) = checks.typescript() {
-            declare(typescript.node(), None);
-            declare(typescript.tsc_cli(), Some(typescript.node()));
+        for (_, section) in checks.sections() {
+            for (path, interpreter) in section.programs() {
+                declare(&path, interpreter.as_deref());
+            }
         }
     }
     found

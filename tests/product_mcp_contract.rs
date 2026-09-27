@@ -2211,6 +2211,8 @@ fn accepted_typescript_provider() -> Value {
         "trust":"fixture-disabled",
         "cache_namespace":"fixture-typescript-cache"
     });
+    use agent_ide::intelligence::typescript_backend::TypeScriptLaunch;
+    agent_ide::languages::install();
     let unbound: agent_ide::assistance::launcher::ProviderLaunch =
         serde_json::from_value(provider.clone()).unwrap();
     provider["typescript"]["codex_macos_evidence"] =

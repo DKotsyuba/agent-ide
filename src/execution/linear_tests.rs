@@ -217,7 +217,7 @@ async fn abnormal_typescript_cleanup_waits_full_grace_before_kill_and_reap() {
     let started = tokio::time::Instant::now();
 
     let completed = child
-        .terminate_typescript_abnormally(grace, Duration::from_secs(2))
+        .terminate_abnormally(grace, Duration::from_secs(2))
         .await
         .unwrap();
 

@@ -487,80 +487,14 @@ fn count_files(directory: &Path) -> std::io::Result<usize> {
     Ok(count)
 }
 
-/// Extracts the first module documentation line for the file's supported source language.
+/// Extracts the first module documentation line of `path` in the language that owns its
+/// extension (see [`LanguageSupport::file_doc`](crate::lang::LanguageSupport::file_doc)); `None`
+/// for non-UTF-8 bytes, an unowned extension or a file without module documentation.
 fn first_file_doc(path: &Path, bytes: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(bytes).ok()?;
-    let lines: Vec<_> = text.lines().collect();
-    match path.extension()?.to_str()? {
-        "rs" => {
-            let mut docs = Vec::new();
-            for line in &lines {
-                let line = line.trim();
-                if line.is_empty() && docs.is_empty() {
-                    continue;
-                }
-                if let Some(doc) = line
-                    .strip_prefix("//!")
-                    .or_else(|| line.strip_prefix("///"))
-                {
-                    docs.push(doc.trim());
-                } else if !line.starts_with("//") && !line.starts_with("#![") {
-                    break;
-                }
-            }
-            docs.into_iter()
-                .find(|doc| !doc.is_empty())
-                .map(str::to_owned)
-        }
-        "py" | "pyi" => {
-            let first = lines.iter().find(|line| !line.trim().is_empty())?.trim();
-            let quote = if first.starts_with("\"\"\"") {
-                "\"\"\""
-            } else if first.starts_with("'''") {
-                "'''"
-            } else {
-                return None;
-            };
-            let content = first.trim_start_matches(quote).trim();
-            let content = content.trim_end_matches(quote).trim();
-            if !content.is_empty() {
-                Some(content.to_owned())
-            } else {
-                lines
-                    .iter()
-                    .skip_while(|line| line.trim().is_empty())
-                    .nth(1)
-                    .map(|line| line.trim().to_owned())
-                    .filter(|doc| !doc.is_empty())
-            }
-        }
-        "ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs" => {
-            let first = lines.iter().find(|line| !line.trim().is_empty())?.trim();
-            if let Some(comment) = first.strip_prefix("//") {
-                return Some(comment.trim().to_owned()).filter(|s| !s.is_empty());
-            }
-            if let Some(comment) = first.strip_prefix("/**") {
-                let line = comment
-                    .trim()
-                    .trim_end_matches("*/")
-                    .trim()
-                    .trim_start_matches('*')
-                    .trim();
-                let line = if line.is_empty() {
-                    lines
-                        .iter()
-                        .skip(1)
-                        .map(|line| line.trim().trim_start_matches('*').trim())
-                        .find(|line| !line.is_empty())?
-                } else {
-                    line
-                };
-                return Some(line.to_owned());
-            }
-            None
-        }
-        _ => None,
-    }
+    crate::lang::Language::for_path(path)?
+        .support()
+        .file_doc(text)
 }
 
 fn render_symbol_line(
@@ -795,7 +729,7 @@ pub(super) fn clip(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lang::{Language, SymbolPath};
+    use crate::lang::SymbolPath;
     use std::path::PathBuf;
 
     #[test]
@@ -809,30 +743,18 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(root.join("src/sub")).unwrap();
-        std::fs::write(root.join("src/lib.rs"), "//! Rust module docs\nfn a() {}\n").unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "//! Alpha module docs\nfn a() {}\n",
+        )
+        .unwrap();
         std::fs::write(root.join("src/sub/x"), "x\n").unwrap();
         let text = directory_outline(&root, Path::new("src")).unwrap();
         assert_eq!(
             text,
-            "src/  (1 files, 1 dirs)\n  dirs: sub/ 1\n  lib.rs                   2  Rust module docs\n"
+            "src/  (1 files, 1 dirs)\n  dirs: sub/ 1\n  lib.rs                   2  Alpha module docs\n"
         );
         std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn first_file_doc_extracts_rust_python_and_typescript_comments() {
-        assert_eq!(
-            first_file_doc(Path::new("a.rs"), b"//! Rust docs\nfn a() {}"),
-            Some("Rust docs".into())
-        );
-        assert_eq!(
-            first_file_doc(Path::new("a.py"), b"\"\"\"Python docs\"\"\"\n"),
-            Some("Python docs".into())
-        );
-        assert_eq!(
-            first_file_doc(Path::new("a.ts"), b"/** TS docs */\nexport {}"),
-            Some("TS docs".into())
-        );
     }
 
     fn symbol(name: &str, kind: SymbolKind, start: u32, end: u32, doc: Option<&str>) -> Symbol {
@@ -855,7 +777,7 @@ mod tests {
         tests.children = vec![symbol("it_works", SymbolKind::Test, 42, 50, None)];
         let outline = Outline {
             file: PathBuf::from("a.rs"),
-            language: Language::Rust,
+            language: crate::lang::testing::ALPHA,
             line_count: 90,
             symbols: vec![
                 symbol(
@@ -871,7 +793,7 @@ mod tests {
         let text = outline_text(&outline);
         assert_eq!(
             text,
-            "a.rs  (90 lines, rust)\n    3  pub fn run()    // Runs it.\n   40  mod tests [2 tests collapsed]\n  (1 symbols; 2 tests collapsed)\n"
+            "a.rs  (90 lines, alpha)\n    3  pub fn run()    // Runs it.\n   40  mod tests [2 tests collapsed]\n  (1 symbols; 2 tests collapsed)\n"
         );
     }
 

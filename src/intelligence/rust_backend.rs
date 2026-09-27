@@ -4,10 +4,16 @@
 //! session starts on the first request, is reused while its transport lives, and is shut down and
 //! reaped when the binding stops or an exchange fails.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{any::Any, collections::BTreeMap, sync::Arc, time::Duration};
+
+use serde::Deserialize;
 
 use crate::{
-    assistance::{host_binding::BindingRef, launcher::ProviderLaunch, reply::FailureCode},
+    assistance::{
+        host_binding::BindingRef,
+        launcher::{AcceptedExecutable, ProviderLaunch, identifier},
+        reply::FailureCode,
+    },
     checks::BoxFuture,
     execution::AdmissionClass,
     intelligence::{
@@ -20,17 +26,79 @@ use crate::{
         server::{self, LanguageServer, ProviderContext, ProviderHost, ProviderJob, ServerBackend},
         session::{LiveSession, ProviderSettings, ReadinessError},
     },
-    telemetry::{DiagnosticState, Language},
+    lang::Language,
+    telemetry::DiagnosticState,
     workspace::observation::SourceObservation,
 };
+
+/// rust-analyzer declaration fields beyond the common ones.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RustLaunchOptions {
+    /// Absolute operator-declared `cargo` executable. Never chosen by model or project input; its
+    /// measured identity must match `cargo_version`.
+    pub cargo: Option<AcceptedExecutable>,
+    /// Accepted Cargo identity.
+    pub cargo_version: Option<String>,
+    /// Absolute operator-declared `rustc` executable. Never chosen by model or project input; its
+    /// measured identity must match `rustc_version`.
+    pub rustc: Option<AcceptedExecutable>,
+    /// Accepted rustc identity.
+    pub rustc_version: Option<String>,
+}
 
 /// The rust-analyzer server integration.
 pub struct RustServer;
 
 impl LanguageServer for RustServer {
-    /// Rust provider observations.
+    /// The Rust language.
     fn language(&self) -> Language {
-        Language::Rust
+        crate::lang::rust::LANGUAGE
+    }
+
+    /// Cache priming disabled, versioned.
+    fn settings_key(&self) -> &'static str {
+        "rust_cache_priming_disabled_v1"
+    }
+
+    /// The Cargo and rustc executables and their identities.
+    fn option_fields(&self) -> &'static [&'static str] {
+        &["cargo", "cargo_version", "rustc", "rustc_version"]
+    }
+
+    /// Decodes [`RustLaunchOptions`].
+    fn parse_options(
+        &self,
+        fields: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Arc<dyn Any + Send + Sync>, serde_json::Error> {
+        let options: RustLaunchOptions = serde_json::from_value(serde_json::Value::Object(fields))?;
+        Ok(Arc::new(options))
+    }
+
+    /// Requires identifier-shaped Cargo and rustc versions and valid `cargo`/`rustc` executables
+    /// whose identities equal those versions.
+    fn validate_launch(&self, launch: &ProviderLaunch) -> bool {
+        let Some(options) = launch.options::<RustLaunchOptions>() else {
+            return false;
+        };
+        options.cargo_version.as_deref().is_some_and(identifier)
+            && options.rustc_version.as_deref().is_some_and(identifier)
+            && options.cargo.as_ref().is_some_and(|cargo| {
+                cargo.validate().is_ok()
+                    && Some(cargo.identity.as_str()) == options.cargo_version.as_deref()
+            })
+            && options.rustc.as_ref().is_some_and(|rustc| {
+                rustc.validate().is_ok()
+                    && Some(rustc.identity.as_str()) == options.rustc_version.as_deref()
+            })
+    }
+
+    /// The declared `cargo` and `rustc`.
+    fn launch_executables<'a>(&self, launch: &'a ProviderLaunch) -> Vec<&'a AcceptedExecutable> {
+        launch
+            .options::<RustLaunchOptions>()
+            .map(|options| options.cargo.iter().chain(options.rustc.iter()).collect())
+            .unwrap_or_default()
     }
 
     /// The analyzer's own name.
@@ -110,26 +178,29 @@ impl RustBackend {
         }
         let authority = host.authority(&binding).await?;
         let cache_namespace = host.cache_namespace(&binding, &authority, launch, &launch.trust)?;
+        let options = launch
+            .options::<RustLaunchOptions>()
+            .ok_or(FailureCode::ExecutionProfile)?;
         let profile = RustProfile::new(RustProfileIdentity {
             binary: launch.executable.path.clone(),
             rust_analyzer_version: launch.executable.identity.clone(),
-            cargo: launch
+            cargo: options
                 .cargo
                 .as_ref()
                 .ok_or(FailureCode::ExecutionProfile)?
                 .path
                 .clone(),
-            cargo_version: launch
+            cargo_version: options
                 .cargo_version
                 .clone()
                 .ok_or(FailureCode::ExecutionProfile)?,
-            rustc: launch
+            rustc: options
                 .rustc
                 .as_ref()
                 .ok_or(FailureCode::ExecutionProfile)?
                 .path
                 .clone(),
-            rustc_version: launch
+            rustc_version: options
                 .rustc_version
                 .clone()
                 .ok_or(FailureCode::ExecutionProfile)?,
@@ -321,7 +392,7 @@ impl RustBackend {
             Ok(context) => server::diagnostic_state(context.diagnostics.readiness),
             Err(_) => DiagnosticState::Unavailable,
         };
-        server::record_provider(&*host, Language::Rust, diagnostics);
+        server::record_provider(&*host, crate::lang::rust::LANGUAGE, diagnostics);
         host.active(&binding)?;
         result
     }

@@ -16,10 +16,26 @@ use async_lsp::lsp_types as lsp;
 
 use super::render::clip;
 use super::{
-    CommandSource, InsertSite, InsertWhere, LangError, Language, LanguageProject, LanguageSupport,
-    LineRange, Outline, ProjectCommand, ProjectCommands, Symbol, SymbolKind, SymbolPath,
-    TestFailure, TestId, TestReport, TestSelection, TestTarget, kind_of, line_count, lines_of,
+    CommandSource, InsertSite, InsertWhere, LangError, Language, LanguageDescriptor,
+    LanguageProject, LanguageSupport, LineRange, Outline, ProjectCommand, ProjectCommands, Symbol,
+    SymbolKind, SymbolPath, TestFailure, TestId, TestReport, TestSelection, TestTarget, kind_of,
+    line_count, lines_of,
 };
+
+/// Registration descriptor of the Python language.
+pub static DESCRIPTOR: LanguageDescriptor = LanguageDescriptor {
+    id: "python",
+    display_name: "Python",
+    extensions: &["py", "pyi"],
+    card_manifest: None,
+    home_tool_dirs: &[".local/bin"],
+    support: &Python,
+    checks: Some(&crate::checks::python::PythonChecks),
+    server: Some(&crate::intelligence::pyright_backend::PyrightServer),
+};
+
+/// The Python language handle.
+pub const LANGUAGE: Language = Language::of(&DESCRIPTOR);
 
 /// Python support over pyright's hierarchical document symbols; stateless.
 #[derive(Clone, Copy, Debug, Default)]
@@ -35,9 +51,9 @@ const PYTEST_FLAGS: [&str; 3] = ["--no-header", "-p", "no:cacheprovider"];
 pub(super) const MAX_NAMED_TESTS: usize = 12;
 
 impl LanguageSupport for Python {
-    /// Always [`Language::Python`].
+    /// Always this module's [`LANGUAGE`].
     fn language(&self) -> Language {
-        Language::Python
+        LANGUAGE
     }
 
     /// Establishes a Python project from `pyproject.toml`, `setup.py`, `setup.cfg` or
@@ -140,7 +156,7 @@ impl LanguageSupport for Python {
         apply_ci(root, &mut commands);
 
         Some(LanguageProject {
-            language: Language::Python,
+            language: LANGUAGE,
             manifests,
             environment,
             interpreter,
@@ -163,7 +179,7 @@ impl LanguageSupport for Python {
         let root = SymbolPath::new(Some(file.to_path_buf()), Vec::new());
         Outline {
             file: file.to_path_buf(),
-            language: Language::Python,
+            language: LANGUAGE,
             line_count: line_count(source),
             symbols: convert_all(
                 &lines,
@@ -419,6 +435,37 @@ impl LanguageSupport for Python {
                 &["ruff", "format", "--stdin-filename", &file, "-"],
             )),
             _ => None,
+        }
+    }
+
+    /// Tests live only in test files by this runner's naming convention.
+    fn tests_only_in_test_files(&self) -> bool {
+        true
+    }
+
+    /// The module docstring's first line (or the line after an empty opening quote).
+    fn file_doc(&self, text: &str) -> Option<String> {
+        let lines: Vec<_> = text.lines().collect();
+
+        let first = lines.iter().find(|line| !line.trim().is_empty())?.trim();
+        let quote = if first.starts_with("\"\"\"") {
+            "\"\"\""
+        } else if first.starts_with("'''") {
+            "'''"
+        } else {
+            return None;
+        };
+        let content = first.trim_start_matches(quote).trim();
+        let content = content.trim_end_matches(quote).trim();
+        if !content.is_empty() {
+            Some(content.to_owned())
+        } else {
+            lines
+                .iter()
+                .skip_while(|line| line.trim().is_empty())
+                .nth(1)
+                .map(|line| line.trim().to_owned())
+                .filter(|doc| !doc.is_empty())
         }
     }
 }
@@ -1560,7 +1607,7 @@ src/pkg/contract.py  (27 lines, python)
     /// A project with only the given environment facts.
     fn project(environment: &[(&str, &str)]) -> LanguageProject {
         LanguageProject {
-            language: Language::Python,
+            language: LANGUAGE,
             manifests: vec![PathBuf::from("pyproject.toml")],
             environment: environment
                 .iter()
@@ -1932,5 +1979,13 @@ FAILED tests/test_service.py::TestWorker::test_label
 
         let none = project(&[]);
         assert_eq!(Python.format_stdin_command(&none, Path::new("a.py")), None);
+    }
+
+    #[test]
+    fn file_doc_reads_the_module_docstring() {
+        assert_eq!(
+            Python.file_doc("\"\"\"Python docs\"\"\"\n"),
+            Some("Python docs".into())
+        );
     }
 }

@@ -27,23 +27,39 @@ use std::{
 use async_lsp::lsp_types as lsp;
 
 use super::{
-    CommandSource, InsertSite, InsertWhere, LangError, Language, LanguageProject, LanguageSupport,
-    LineRange, Outline, ProjectCommand, ProjectCommands, Symbol, SymbolKind, SymbolPath,
-    TestFailure, TestReport, TestSelection, TestTarget, kind_of, line_count, lines_of,
+    CommandSource, InsertSite, InsertWhere, LangError, Language, LanguageDescriptor,
+    LanguageProject, LanguageSupport, LineRange, Outline, ProjectCommand, ProjectCommands, Symbol,
+    SymbolKind, SymbolPath, TestFailure, TestReport, TestSelection, TestTarget, kind_of,
+    line_count, lines_of,
     rust::{
         Located, argv_of, declaration_line, dedup_tests, first_paragraph, line_at, place,
         signature, source_lines,
     },
 };
 
+/// Registration descriptor of the Go language.
+pub static DESCRIPTOR: LanguageDescriptor = LanguageDescriptor {
+    id: "go",
+    display_name: "Go",
+    extensions: &["go"],
+    card_manifest: None,
+    home_tool_dirs: &[],
+    support: &GoSupport,
+    checks: None,
+    server: Some(&crate::intelligence::gopls_backend::GoplsServer),
+};
+
+/// The Go language handle.
+pub const LANGUAGE: Language = Language::of(&DESCRIPTOR);
+
 /// Stateless Go implementation of [`LanguageSupport`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GoSupport;
 
 impl LanguageSupport for GoSupport {
-    /// Always [`Language::Go`].
+    /// Always this module's [`LANGUAGE`].
     fn language(&self) -> Language {
-        Language::Go
+        LANGUAGE
     }
 
     /// Detects a Go module by `root/go.mod`.
@@ -90,7 +106,7 @@ impl LanguageSupport for GoSupport {
             entry_points.extend(commands);
         }
         Some(LanguageProject {
-            language: Language::Go,
+            language: LANGUAGE,
             manifests: vec![PathBuf::from("go.mod")],
             environment,
             interpreter: None,
@@ -165,7 +181,7 @@ impl LanguageSupport for GoSupport {
         }
         Outline {
             file: file.to_path_buf(),
-            language: Language::Go,
+            language: LANGUAGE,
             line_count: line_count(source),
             symbols: output,
         }
@@ -663,7 +679,7 @@ func Any() interface{} {
 
     fn project() -> LanguageProject {
         LanguageProject {
-            language: Language::Go,
+            language: LANGUAGE,
             manifests: vec![PathBuf::from("go.mod")],
             environment: Vec::new(),
             interpreter: None,

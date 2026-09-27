@@ -21,9 +21,10 @@ use serde::Deserialize;
 
 use super::runner::{ConfinedRunner, RunOutput, RunSpec};
 use super::{
-    BoxFuture, CheckRequest, CheckState, Checker, Language, Problem, ProblemSnapshot, Severity,
-    UnavailableReason,
+    BoxFuture, CheckConfig, CheckRequest, CheckState, Checker, Language, LanguageChecks, Problem,
+    ProblemSnapshot, Severity, UnavailableReason,
 };
+use crate::assistance::launcher::absolute;
 
 /// Per-stream capture limit for one confined cargo run: 64 MiB.
 ///
@@ -464,7 +465,7 @@ fn existing_dir(path: &str) -> Option<PathBuf> {
 
 impl Checker for RustChecker {
     fn language(&self) -> Language {
-        Language::Rust
+        crate::lang::rust::LANGUAGE
     }
 
     /// Runs one confined `cargo check` and maps it to a snapshot.
@@ -492,7 +493,7 @@ impl RustChecker {
         let cargo = self.toolchain_dir.join("bin").join("cargo");
         if request.read_denies.iter().any(|deny| deny.matches(&cargo)) || !cargo.is_file() {
             return ProblemSnapshot::unavailable(
-                Language::Rust,
+                crate::lang::rust::LANGUAGE,
                 UnavailableReason::ToolMissing,
                 request.input_generation,
             );
@@ -501,7 +502,7 @@ impl RustChecker {
         let cache_target = request.cache_dir.join("target");
         if fs::create_dir_all(&cache_tmp).is_err() || fs::create_dir_all(&cache_target).is_err() {
             return ProblemSnapshot::unavailable(
-                Language::Rust,
+                crate::lang::rust::LANGUAGE,
                 UnavailableReason::Fatal,
                 request.input_generation,
             );
@@ -509,7 +510,7 @@ impl RustChecker {
         let spec = self.cargo_check_spec(&request);
         match self.runner.run(spec).await {
             Err(_) => ProblemSnapshot::unavailable(
-                Language::Rust,
+                crate::lang::rust::LANGUAGE,
                 UnavailableReason::Fatal,
                 request.input_generation,
             ),
@@ -529,21 +530,21 @@ impl RustChecker {
 fn map_run_output(request: &CheckRequest, output: &RunOutput, duration_ms: u64) -> ProblemSnapshot {
     if output.timed_out {
         return ProblemSnapshot::unavailable(
-            Language::Rust,
+            crate::lang::rust::LANGUAGE,
             UnavailableReason::Timeout,
             request.input_generation,
         );
     }
     if output.truncated {
         return ProblemSnapshot::unavailable(
-            Language::Rust,
+            crate::lang::rust::LANGUAGE,
             UnavailableReason::Fatal,
             request.input_generation,
         );
     }
     if lockfile_write_failure(&output.stderr) {
         return ProblemSnapshot::unavailable(
-            Language::Rust,
+            crate::lang::rust::LANGUAGE,
             UnavailableReason::EnvMissing,
             request.input_generation,
         );
@@ -670,14 +671,14 @@ fn parse_cargo_messages_with_denies(
 
     let Some(success) = build_finished else {
         return ProblemSnapshot::unavailable_with_detail(
-            Language::Rust,
+            crate::lang::rust::LANGUAGE,
             UnavailableReason::Fatal,
             input_generation,
             first_error_line(stderr),
         );
     };
     let base = ProblemSnapshot::from_problems(
-        Language::Rust,
+        crate::lang::rust::LANGUAGE,
         CheckState::Ready,
         problems,
         input_generation,
@@ -688,7 +689,7 @@ fn parse_cargo_messages_with_denies(
             .map(|message| truncate_bytes(&message, 160))
             .or_else(|| first_error_line(stderr));
         return ProblemSnapshot::unavailable_with_detail(
-            Language::Rust,
+            crate::lang::rust::LANGUAGE,
             UnavailableReason::Fatal,
             input_generation,
             detail,
@@ -842,6 +843,92 @@ struct RustcSpan {
     column_start: u64,
 }
 
+/// Rust's project-check integration.
+pub struct RustChecks;
+
+impl LanguageChecks for RustChecks {
+    /// Rust is present iff `<worktree>/Cargo.toml` exists.
+    fn is_present(&self, worktree: &Path) -> bool {
+        worktree.join("Cargo.toml").exists()
+    }
+
+    /// `cargo check`.
+    fn tool_name(&self) -> &'static str {
+        "cargo check"
+    }
+
+    /// A sibling worktree's `target/` directory seeds a first check.
+    fn sibling_cache(&self) -> Option<&'static str> {
+        Some("target")
+    }
+
+    /// Decodes [`ProjectRustChecksConfig`].
+    fn parse_config(
+        &self,
+        section: serde_json::Value,
+    ) -> Result<Arc<dyn CheckConfig>, serde_json::Error> {
+        let config: ProjectRustChecksConfig = serde_json::from_value(section)?;
+        Ok(Arc::new(config))
+    }
+}
+
+/// Accepted Rust toolchain declaration for confined background project checks.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectRustChecksConfig {
+    /// Absolute normalized rustup toolchain directory used to run confined Rust checks.
+    toolchain_dir: PathBuf,
+    /// Optional absolute normalized cargo home; `None` falls back to the default `$HOME/.cargo`.
+    #[serde(default)]
+    cargo_home: Option<PathBuf>,
+    /// Optional absolute normalized Apple developer directory override; `None` resolves it from
+    /// `/usr/bin/xcode-select -p` with the fixed fallbacks (T05B, EYES-r2 §3).
+    #[serde(default)]
+    developer_dir: Option<PathBuf>,
+}
+
+impl ProjectRustChecksConfig {
+    /// Returns the declared absolute toolchain directory; never resolved from model or project input.
+    pub fn toolchain_dir(&self) -> &Path {
+        &self.toolchain_dir
+    }
+    /// Returns the declared absolute cargo home, or `None` for the default `$HOME/.cargo` (EYES-r2 §1).
+    pub fn cargo_home(&self) -> Option<&Path> {
+        self.cargo_home.as_deref()
+    }
+    /// Returns the declared absolute Apple developer directory override, or `None` to resolve it
+    /// from `/usr/bin/xcode-select -p` (T05B).
+    pub fn developer_dir(&self) -> Option<&Path> {
+        self.developer_dir.as_deref()
+    }
+}
+
+impl CheckConfig for ProjectRustChecksConfig {
+    /// Rejects a relative or lexically non-normal toolchain directory, cargo home or developer
+    /// directory.
+    fn validate(&self) -> bool {
+        absolute(&self.toolchain_dir)
+            && self.cargo_home.as_deref().is_none_or(absolute)
+            && self.developer_dir.as_deref().is_none_or(absolute)
+    }
+
+    /// Builds the confined `cargo check` runner for this toolchain.
+    fn checker(&self, runner: Arc<dyn ConfinedRunner>, timeout: Duration) -> Arc<dyn Checker> {
+        Arc::new(RustChecker::new(
+            runner,
+            self.toolchain_dir.clone(),
+            self.cargo_home.clone(),
+            timeout,
+            self.developer_dir.clone(),
+        ))
+    }
+
+    /// The toolchain directory is not probed.
+    fn programs(&self) -> Vec<(PathBuf, Option<PathBuf>)> {
+        Vec::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -895,5 +982,31 @@ mod tests {
     #[test]
     fn derive_target_env_var_returns_none_for_unrecognized_name() {
         assert_eq!(derive_target_env_var(Path::new("tc")), None);
+    }
+
+    /// Builds a fresh empty scratch directory for presence-detection tests.
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "agent-ide-checks-presence-{}-{name}-{}",
+            std::process::id(),
+            name.len()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir created");
+        dir
+    }
+
+    #[test]
+    fn is_present_rust_requires_cargo_toml_at_the_worktree_root() {
+        let dir = scratch_dir("rust-presence");
+        assert!(!RustChecks.is_present(&dir));
+        std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+        assert!(RustChecks.is_present(&dir));
+    }
+
+    #[test]
+    fn is_present_rust_is_false_on_an_empty_worktree() {
+        let dir = scratch_dir("empty-rust-presence");
+        assert!(!RustChecks.is_present(&dir));
     }
 }

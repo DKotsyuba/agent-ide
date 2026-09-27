@@ -1781,20 +1781,16 @@ impl<'a> Worker<'a> {
             let (argv, language, selected_count) = if let Some(path) =
                 job.parameters.get("path").and_then(Value::as_str)
             {
-                // A Python/TypeScript file the runner's naming convention does not count as a
-                // test file answers the same `no tests` hint the symbol path gives, instead of
-                // being handed to pytest or `node --test` as a target (pytest imports the module
-                // top-level; `node --test src/details.tsx` just fails). Directories keep
-                // selecting the test files inside them.
+                // In a language whose tests live only in test files, a file the runner's naming
+                // convention does not count as a test file answers the same `no tests` hint the
+                // symbol path gives, instead of being handed to the runner as a target (which may
+                // import the module top-level or just fail). Directories keep selecting the test
+                // files inside them.
                 let target = PathBuf::from(path);
                 if !root.join(&target).is_dir()
                     && let Some(language) = crate::lang::Language::for_path(&target)
-                    && matches!(
-                        language,
-                        crate::lang::Language::Python | crate::lang::Language::TypeScript
-                    )
-                    && crate::lang::support(language)
-                        .is_some_and(|support| !support.is_test_file(&target))
+                    && language.support().tests_only_in_test_files()
+                    && !language.support().is_test_file(&target)
                 {
                     return Ok((
                         PeerReply::Complete {
@@ -1840,7 +1836,11 @@ impl<'a> Worker<'a> {
                     Err(_) => return Err(FailureCode::ProviderUnavailable),
                 }
             } else if let Some(args) = job.parameters.get("command").and_then(Value::as_array) {
-                let language = detect_test_language(&root).unwrap_or(crate::lang::Language::Rust);
+                let Some(language) = detect_test_language(&root)
+                    .or_else(|| crate::lang::registered().first().copied())
+                else {
+                    return Err(FailureCode::ProviderUnavailable);
+                };
                 (
                     args.iter()
                         .filter_map(Value::as_str)
@@ -1918,8 +1918,7 @@ impl<'a> Worker<'a> {
                     path,
                     referencing_tests,
                 };
-                let support =
-                    crate::lang::support(language).ok_or(FailureCode::ProviderUnavailable)?;
+                let support = language.support();
                 let project = support
                     .detect(&root)
                     .ok_or(FailureCode::ProviderUnavailable)?;
@@ -1938,16 +1937,11 @@ impl<'a> Worker<'a> {
                     )),
                     Err(_) => return Err(FailureCode::ProviderUnavailable),
                 };
-                let bins: std::collections::BTreeSet<_> = if language == crate::lang::Language::Rust
-                {
-                    selection
-                        .tests
-                        .iter()
-                        .filter_map(|test| crate::lang::rust::integration_test_bin(&test.file))
-                        .collect()
-                } else {
-                    std::collections::BTreeSet::new()
-                };
+                let bins: std::collections::BTreeSet<_> = selection
+                    .tests
+                    .iter()
+                    .filter_map(|test| support.test_binary(&test.file))
+                    .collect();
                 let count = Some(if bins.len() > 1 {
                     format!(
                         "{} tests in {} binaries; running the workspace filter",
@@ -2555,16 +2549,10 @@ impl<'a> Worker<'a> {
         let card = {
             let root = discovered.root().to_path_buf();
             let walk = tokio::task::spawn_blocking(move || {
-                let languages: Vec<LanguageProject> = [
-                    Language::Rust,
-                    Language::Python,
-                    Language::TypeScript,
-                    Language::Go,
-                ]
-                .into_iter()
-                .filter_map(crate::lang::support)
-                .filter_map(|support| support.detect(&root))
-                .collect();
+                let languages: Vec<LanguageProject> = crate::lang::registered()
+                    .iter()
+                    .filter_map(|language| language.support().detect(&root))
+                    .collect();
                 // The daemon does not probe language servers at start; every detected language's
                 // server state is the honest "not started" until a later tool observes otherwise.
                 let servers = languages
@@ -3393,19 +3381,9 @@ impl<'a> Worker<'a> {
         refreshed: Option<SourceObservation>,
         fallback: EditDiagnostics,
     ) -> Option<JobStage> {
-        use crate::checks::Language as CheckLanguage;
         let feed = self.shared.project_feed.as_ref()?;
-        let language = match std::path::Path::new(path)
-            .extension()
-            .and_then(|value| value.to_str())
-        {
-            Some("rs") => CheckLanguage::Rust,
-            Some("py" | "pyi") => CheckLanguage::Python,
-            Some("ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs") => {
-                CheckLanguage::TypeScript
-            }
-            _ => return None,
-        };
+        let language = Language::for_path(std::path::Path::new(path))
+            .filter(|language| language.checks().is_some())?;
         let generation = feed.changed_generation(&job.invocation.binding_ref().fingerprint())?;
         job.check_scheduled = true;
         let worktree = authority.worktree().worktree_path().to_path_buf();
@@ -4206,20 +4184,12 @@ fn errorlog_method(tool: AssistanceTool) -> crate::errorlog::Method {
     }
 }
 
-/// Chooses the first implemented language project detected at the worktree root.
+/// Chooses the first registered language whose project is detected at the worktree root.
 fn detect_test_language(root: &Path) -> Option<crate::lang::Language> {
-    [
-        crate::lang::Language::Rust,
-        crate::lang::Language::Python,
-        crate::lang::Language::TypeScript,
-        crate::lang::Language::Go,
-    ]
-    .into_iter()
-    .find(|language| {
-        crate::lang::support(*language)
-            .and_then(|support| support.detect(root))
-            .is_some()
-    })
+    crate::lang::registered()
+        .iter()
+        .copied()
+        .find(|language| language.support().detect(root).is_some())
 }
 
 /// Resolves a target through the detected runner, returning argv, language, and an optional
@@ -4229,15 +4199,8 @@ fn test_selection(
     root: &Path,
     target: crate::lang::TestTarget,
 ) -> Result<(Vec<String>, crate::lang::Language, Option<String>), crate::lang::LangError> {
-    for language in [
-        crate::lang::Language::Rust,
-        crate::lang::Language::Python,
-        crate::lang::Language::TypeScript,
-        crate::lang::Language::Go,
-    ] {
-        let Some(support) = crate::lang::support(language) else {
-            continue;
-        };
+    for &language in crate::lang::registered() {
+        let support = language.support();
         let Some(project) = support.detect(root) else {
             continue;
         };
@@ -4457,7 +4420,7 @@ mod stop_retry_tests {
         assistance::host_binding::{
             BindingStatus, parse_candidate, parse_channel_session, parse_hook_event,
         },
-        checks::{CheckState, Language, Problem, ProblemSnapshot, Severity},
+        checks::{CheckState, Problem, ProblemSnapshot, Severity},
         intelligence::freshness::{CacheIdentity, CacheLifecycle},
     };
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4909,8 +4872,8 @@ mod stop_retry_tests {
         // non-quiescent, i.e. actively owned by the still-live binding, not yet eligible for handoff.
         let cache_root = CacheRoot::prepare(fixture.base.join("cache")).unwrap();
         let cache_identity = CacheIdentity::new(
-            "rust-analyzer",
-            "rust-cache-priming-disabled-v1",
+            "server-a",
+            "server-a-settings-v1",
             "config",
             "1.98.1",
             "trusted",
@@ -5085,8 +5048,9 @@ mod stop_retry_tests {
         assert_eq!(text, "checks disabled");
 
         // With an attached source the page renders from the authorized worktree's snapshots.
+        crate::lang::testing::install();
         let snapshot = ProblemSnapshot::from_problems(
-            Language::Rust,
+            crate::lang::testing::ALPHA,
             CheckState::Ready,
             vec![Problem::new(
                 "src/main.rs".to_owned(),
@@ -5107,14 +5071,14 @@ mod stop_retry_tests {
             &mut worker,
             "problems-actor",
             "problems-page",
-            serde_json::json!({"kind":"problems","language":"rust","offset":0}),
+            serde_json::json!({"kind":"problems","language":"alpha","offset":0}),
         )
         .await;
         let PeerReply::Complete { text, .. } = &reply else {
             panic!("problems context must complete: {reply:?}")
         };
         assert!(
-            text.contains("rust: ready; errors: 1; warnings: 0"),
+            text.contains("alpha: ready; errors: 1; warnings: 0"),
             "{text}"
         );
         assert!(

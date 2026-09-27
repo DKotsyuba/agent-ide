@@ -1,7 +1,14 @@
 //! Restart-only trusted launcher configuration, separate from host metadata and model arguments.
 
+use crate::{
+    checks::CheckConfig,
+    intelligence::server::LanguageServer,
+    lang::{Language, registered},
+};
 use serde::Deserialize;
 use serde_json::Value;
+use std::any::Any;
+use std::sync::Arc;
 use std::{
     collections::BTreeMap,
     fs::File,
@@ -16,55 +23,6 @@ const MAX_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_ALLOWED_ROOTS: usize = 16;
 /// Maximum executable bytes hashed during a pre-spawn identity check.
 const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
-/// Compiled Codex release record prefix for the exact TypeScript r3 macOS bundle cell.
-const TYPESCRIPT_CODEX_MACOS_EVIDENCE_V1: &str =
-    "macos-26.6.2-node-24.4.0-tls-6.0.0-ts-5.9.3-codex-r3-2026-09-14";
-/// Compiled Claude release record prefix for the same exact TypeScript r3 macOS bundle cell.
-const TYPESCRIPT_CLAUDE_MACOS_EVIDENCE_V1: &str =
-    "macos-26.6.2-node-24.4.0-tls-6.0.0-ts-5.9.3-claude-r3-2026-09-14";
-/// Exact Node release admitted by the compiled Codex TypeScript record.
-const TYPESCRIPT_NODE_VERSION_V1: &str = "24.4.0";
-/// BLAKE3 identity of the accepted macOS Node 24.4.0 executable bytes.
-const TYPESCRIPT_NODE_BLAKE3_V1: &str =
-    "f3d5f7b7c7296b22889c5ca6a62fbfebc6f263190cefec97255d98a286e92ce9";
-/// Exact TypeScript Language Server release admitted by the compiled Codex record.
-const TYPESCRIPT_BRIDGE_VERSION_V1: &str = "6.0.0";
-/// BLAKE3 identity of the accepted TypeScript Language Server 6.0.0 bridge bytes.
-const TYPESCRIPT_BRIDGE_BLAKE3_V1: &str =
-    "541877f06eff230f60b5ca90332d2db54128d0dd8b88bd7fdc987976e22a8c9b";
-/// Exact accepted TypeScript Language Server bridge byte length.
-const TYPESCRIPT_BRIDGE_BYTES_V1: u64 = 917_064;
-/// Exact TypeScript release admitted by the compiled Codex record.
-const TYPESCRIPT_VERSION_V1: &str = "5.9.3";
-/// BLAKE3 identity of the accepted TypeScript 5.9.3 `tsserver.js` bytes.
-const TYPESCRIPT_TSSERVER_BLAKE3_V1: &str =
-    "fd205df6b7930ede592846b8aeabc046f75a76f8f4eaf74a2b6dba9b3bd6a1a8";
-/// Exact accepted TypeScript 5.9.3 `tsserver.js` byte length.
-const TYPESCRIPT_TSSERVER_BYTES_V1: u64 = 272;
-/// Ordered basename, BLAKE3 digest, and length of the accepted loaded runtime closure.
-const TYPESCRIPT_CLOSURE_V1: [(&str, &str, u64); 4] = [
-    (
-        "_tsserver.js",
-        "2f5f9a981943299237ca1a8f566aff95814508abf919027c4f5bb82dc9c5762f",
-        27_888,
-    ),
-    (
-        "typescript.js",
-        "90519822fe3575779770b1e3a921528d30777e2be3c97cb68457caf2c22393e9",
-        9_112_572,
-    ),
-    (
-        "package.json",
-        "822486c3f526033cfa7e628d2725e1ee968850b281194496ef733dd6b1d9096d",
-        3_620,
-    ),
-    (
-        "package.json",
-        "d93faca38a6da90246cddcb64eaf2ec7537a1dd3973f74034fd33e6c667ceca7",
-        2_542,
-    ),
-];
-
 /// Fixed launcher failure categories; no paths, attachments or accepted evidence are rendered.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LauncherError {
@@ -91,7 +49,7 @@ pub struct AcceptedExecutable {
 }
 impl AcceptedExecutable {
     /// Rejects malformed paths/identities without opening or launching the executable.
-    fn validate(&self) -> Result<(), LauncherError> {
+    pub fn validate(&self) -> Result<(), LauncherError> {
         if !absolute(&self.path)
             || !identifier(&self.identity)
             || self.blake3.len() != 64
@@ -172,281 +130,156 @@ impl AcceptedExecutable {
     }
 }
 
-/// Closed effective provider configuration; arbitrary settings JSON is never accepted.
-#[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum AcceptedProviderSettings {
-    /// Accepted gopls defaults on a separately owned logical view.
-    GoplsDefaults,
-    /// Accepted Rust profile with cache priming disabled and server-status synchronization.
-    RustCachePrimingDisabledV1,
-    /// Accepted Pyright defaults over one exclusive, worktree-isolated stdio child.
-    PyrightDefaultsV1,
-    /// Accepted release-pinned TypeScript bundle over one exclusive stdio bridge child.
-    #[serde(rename = "typescript_defaults_v1")]
-    TypeScriptDefaultsV1,
-}
+/// A launcher object decoded as ordered `(key, value)` pairs that refuses a repeated key, exactly
+/// as a closed struct refuses a duplicate field.
+///
+/// Used for the language-owned remainder of provider declarations and project-check sections,
+/// whose keys are only known to the registered languages.
+struct UniqueEntries(Vec<(String, Value)>);
 
-/// One restart-configured regular file in the immutable TypeScript runtime closure.
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AcceptedTypeScriptFileV1 {
-    /// Absolute normalized file path selected only by trusted launcher configuration.
-    pub path: PathBuf,
-    /// Complete hexadecimal BLAKE3 digest of the accepted bytes.
-    pub blake3: String,
-    /// Exact accepted byte length, bounded and rechecked with the digest.
-    pub bytes: u64,
-}
-
-impl AcceptedTypeScriptFileV1 {
-    /// Rejects malformed paths, digests, and files above the TypeScript bundle member ceiling.
-    fn validate(&self) -> Result<(), LauncherError> {
-        if !absolute(&self.path)
-            || self.blake3.len() != 64
-            || !self.blake3.bytes().all(|byte| byte.is_ascii_hexdigit())
-            || self.bytes > 64 * 1024 * 1024
-        {
-            return Err(LauncherError::Rejected);
-        }
-        Ok(())
-    }
-
-    /// Converts the validated launcher identity into Intelligence's immutable bundle member.
-    fn bundle_file(
-        &self,
-    ) -> Result<crate::intelligence::typescript::TypeScriptBundleFileV1, LauncherError> {
-        Ok(crate::intelligence::typescript::TypeScriptBundleFileV1 {
-            path: self.path.clone(),
-            blake3: blake3::Hash::from_hex(&self.blake3).map_err(|_| LauncherError::Rejected)?,
-            bytes: self.bytes,
-        })
-    }
-}
-
-/// Closed TypeScript-specific portion of one fourth launcher provider declaration.
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AcceptedTypeScriptBundleV1 {
-    /// Exact byte length of `ProviderLaunch::executable`, the bridge entry module.
-    pub bridge_bytes: u64,
-    /// Exact accepted TypeScript Language Server release identity.
-    pub bridge_version: String,
-    /// Explicit accepted `tsserver.js` entry module.
-    pub tsserver: AcceptedTypeScriptFileV1,
-    /// Exact accepted TypeScript release identity.
-    pub typescript_version: String,
-    /// Strictly sorted complete loaded runtime closure excluding bridge and `tsserver.js`.
-    pub closure: Vec<AcceptedTypeScriptFileV1>,
-    /// Exact compiled Codex macOS release record required to enable this provider for Codex.
-    pub codex_macos_evidence: String,
-    /// Optional separate Claude macOS record; `None` keeps the provider unavailable to Claude.
-    pub claude_macos_evidence: Option<String>,
-}
-
-impl AcceptedTypeScriptBundleV1 {
-    /// Validates the bounded closed declaration without granting either host execution authority.
-    fn validate(&self) -> Result<(), LauncherError> {
-        if self.bridge_bytes > 64 * 1024 * 1024
-            || !identifier(&self.bridge_version)
-            || !identifier(&self.typescript_version)
-            || self.closure.is_empty()
-            || self.closure.len() > 64
-            || !identifier(&self.codex_macos_evidence)
-            || self
-                .claude_macos_evidence
-                .as_deref()
-                .is_some_and(|evidence| !identifier(evidence))
-        {
-            return Err(LauncherError::Rejected);
-        }
-        self.tsserver.validate()?;
-        let mut previous: Option<&Path> = None;
-        for file in &self.closure {
-            file.validate()?;
-            if previous.is_some_and(|path| path >= file.path.as_path())
-                || file.path == self.tsserver.path
-            {
-                return Err(LauncherError::Rejected);
+impl<'de> Deserialize<'de> for UniqueEntries {
+    /// Accepts any JSON object; a duplicate key is a decoding error.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// Visits one object, collecting its entries in document order.
+        struct Entries;
+        impl<'de> serde::de::Visitor<'de> for Entries {
+            type Value = UniqueEntries;
+            /// Names the accepted shape in decoding errors.
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an object")
             }
-            previous = Some(&file.path);
+            /// Collects entries, refusing a key seen before.
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut entries: Vec<(String, Value)> = Vec::new();
+                while let Some((key, value)) = map.next_entry::<String, Value>()? {
+                    if entries.iter().any(|(existing, _)| *existing == key) {
+                        return Err(serde::de::Error::custom(format_args!(
+                            "duplicate field `{key}`"
+                        )));
+                    }
+                    entries.push((key, value));
+                }
+                Ok(UniqueEntries(entries))
+            }
         }
-        Ok(())
+        deserializer.deserialize_map(Entries)
     }
 }
 
 /// Trusted provider identity; populated only by the restart-loaded launcher file.
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// The closed `settings` identifier selects the language whose server the declaration configures;
+/// fields beyond the common ones below belong to that language's server, which decodes and
+/// validates them (see [`LanguageServer::option_fields`]). A field only another registered server
+/// accepts is refused at validation, and a field no registered server accepts at decoding.
+#[derive(Clone)]
 pub struct ProviderLaunch {
     /// Absolute executable and measured binary fingerprint.
     pub executable: AcceptedExecutable,
-    /// Closed settings contract whose exact identifier participates in compatibility checks.
-    pub settings: AcceptedProviderSettings,
-    /// Accepted toolchain identity; gopls and Pyright use absolute executables, Rust a rustup selector.
+    /// Language whose server this declaration configures, selected by its settings identifier.
+    pub language: Language,
+    /// Accepted toolchain identity, validated by the server (an absolute executable, a rustup
+    /// selector, or an interpreter identity).
     pub toolchain: String,
-    /// Absolute operator-declared Node executable for Pyright; absent for Go and Rust. Its measured
-    /// identity must match `toolchain`, and it is the only program permitted to start Pyright.
-    pub node: Option<AcceptedExecutable>,
-    /// Immutable TypeScript closure and host-specific release records; present only for TypeScript.
-    pub typescript: Option<AcceptedTypeScriptBundleV1>,
-    /// Absolute operator-declared `cargo` executable for Rust; absent for gopls. Never chosen by
-    /// model or project input; its measured identity must match `cargo_version`.
-    pub cargo: Option<AcceptedExecutable>,
-    /// Accepted Cargo identity for Rust; absent for gopls.
-    pub cargo_version: Option<String>,
-    /// Absolute operator-declared `rustc` executable for Rust; absent for gopls. Never chosen by
-    /// model or project input; its measured identity must match `rustc_version`.
-    pub rustc: Option<AcceptedExecutable>,
-    /// Accepted rustc identity for Rust; absent for gopls.
-    pub rustc_version: Option<String>,
     /// Explicit operator trust identity, never derived from a sandbox observation.
     pub trust: String,
     /// Persistent compatible cache namespace, retained after stopping a view.
     pub cache_namespace: String,
+    /// The server's decoded declaration fields; its concrete type belongs to the server.
+    options: Arc<dyn Any + Send + Sync>,
+    /// Whether the declaration carries a field that only another registered server accepts.
+    foreign_fields: bool,
 }
 
 impl ProviderLaunch {
-    /// Derives the only Codex macOS record accepted for this exact declared TypeScript bundle.
+    /// Returns the server this declaration configures.
+    pub fn server(&self) -> &'static dyn LanguageServer {
+        self.language
+            .server()
+            .expect("a provider declaration resolves only to a language with a server")
+    }
+
+    /// Returns the server's decoded declaration fields when they are a `T`.
+    pub fn options<T: Any>(&self) -> Option<&T> {
+        self.options.downcast_ref::<T>()
+    }
+}
+
+/// The common fields of one provider declaration plus the language-owned remainder.
+#[derive(Deserialize)]
+struct RawProviderLaunch {
+    /// Absolute executable and measured binary fingerprint.
+    executable: AcceptedExecutable,
+    /// Closed settings identifier of one registered server.
+    settings: String,
+    /// Accepted toolchain identity.
+    toolchain: String,
+    /// Explicit operator trust identity.
+    trust: String,
+    /// Persistent compatible cache namespace.
+    cache_namespace: String,
+    /// Every other field, decoded by the servers that declare it.
+    #[serde(flatten)]
+    fields: UniqueEntries,
+}
+
+impl<'de> Deserialize<'de> for ProviderLaunch {
+    /// Decodes the closed declaration schema of the registered servers.
     ///
-    /// The public release prefix is accepted only with Node 24.4.0, TypeScript Language Server
-    /// 6.0.0, TypeScript 5.9.3, the compiled accepted Node/bridge/tsserver/closure byte identities,
-    /// an exact `tsserver.js` basename, and a BLAKE3 suffix over every declared path, digest, byte
-    /// length, and identity. Returns `None` for any other provider kind, release, malformed bundle,
-    /// or absent Node. This performs no filesystem read and grants no execution authority; startup
-    /// and pre-spawn remeasurement remain separate mandatory checks.
-    pub fn expected_typescript_codex_macos_evidence(&self) -> Option<String> {
-        let node = self.node.as_ref()?;
-        let bundle = self.typescript.as_ref()?;
-        if self.settings != AcceptedProviderSettings::TypeScriptDefaultsV1
-            || node.validate().is_err()
-            || self.executable.validate().is_err()
-            || bundle.validate().is_err()
-            || self.toolchain != TYPESCRIPT_NODE_VERSION_V1
-            || node.identity != TYPESCRIPT_NODE_VERSION_V1
-            || !node.blake3.eq_ignore_ascii_case(TYPESCRIPT_NODE_BLAKE3_V1)
-            || self.executable.identity != TYPESCRIPT_BRIDGE_VERSION_V1
-            || !self
-                .executable
-                .blake3
-                .eq_ignore_ascii_case(TYPESCRIPT_BRIDGE_BLAKE3_V1)
-            || bundle.bridge_bytes != TYPESCRIPT_BRIDGE_BYTES_V1
-            || bundle.bridge_version != TYPESCRIPT_BRIDGE_VERSION_V1
-            || bundle.typescript_version != TYPESCRIPT_VERSION_V1
-            || !bundle
-                .tsserver
-                .blake3
-                .eq_ignore_ascii_case(TYPESCRIPT_TSSERVER_BLAKE3_V1)
-            || bundle.tsserver.bytes != TYPESCRIPT_TSSERVER_BYTES_V1
-            || bundle
-                .tsserver
-                .path
-                .file_name()
-                .and_then(|name| name.to_str())
-                != Some("tsserver.js")
-            || bundle.closure.len() != TYPESCRIPT_CLOSURE_V1.len()
-            || bundle.closure.iter().zip(TYPESCRIPT_CLOSURE_V1).any(
-                |(file, (name, digest, bytes))| {
-                    file.path.file_name().and_then(|value| value.to_str()) != Some(name)
-                        || !file.blake3.eq_ignore_ascii_case(digest)
-                        || file.bytes != bytes
-                },
-            )
-        {
-            return None;
-        }
-        let mut hash = blake3::Hasher::new();
-        evidence_frame(&mut hash, b"typescript-codex-macos-bundle-v1");
-        for value in [
-            self.toolchain.as_bytes(),
-            node.path.as_os_str().as_encoded_bytes(),
-            node.identity.as_bytes(),
-            node.blake3.as_bytes(),
-            self.executable.path.as_os_str().as_encoded_bytes(),
-            self.executable.identity.as_bytes(),
-            self.executable.blake3.as_bytes(),
-            bundle.bridge_version.as_bytes(),
-            bundle.tsserver.path.as_os_str().as_encoded_bytes(),
-            bundle.tsserver.blake3.as_bytes(),
-            bundle.typescript_version.as_bytes(),
-        ] {
-            evidence_frame(&mut hash, value);
-        }
-        evidence_frame(&mut hash, &bundle.bridge_bytes.to_le_bytes());
-        evidence_frame(&mut hash, &bundle.tsserver.bytes.to_le_bytes());
-        for file in &bundle.closure {
-            evidence_frame(&mut hash, file.path.as_os_str().as_encoded_bytes());
-            evidence_frame(&mut hash, file.blake3.as_bytes());
-            evidence_frame(&mut hash, &file.bytes.to_le_bytes());
-        }
-        Some(format!(
-            "{TYPESCRIPT_CODEX_MACOS_EVIDENCE_V1}:{}",
-            hash.finalize().to_hex()
-        ))
-    }
-
-    /// Reconstructs the exact immutable TypeScript bundle from this validated launcher provider.
-    pub fn typescript_bundle(
-        &self,
-    ) -> Result<crate::intelligence::typescript::TypeScriptProviderBundleV1, LauncherError> {
-        let configured = self.typescript.as_ref().ok_or(LauncherError::Rejected)?;
-        let node = self.node.as_ref().ok_or(LauncherError::Rejected)?;
-        crate::intelligence::typescript::TypeScriptProviderBundleV1::new(
-            crate::intelligence::typescript::TypeScriptProviderBundleV1Identity {
-                node: node.path.clone(),
-                node_blake3: blake3::Hash::from_hex(&node.blake3)
-                    .map_err(|_| LauncherError::Rejected)?,
-                node_version: node.identity.clone(),
-                bridge: crate::intelligence::typescript::TypeScriptBundleFileV1 {
-                    path: self.executable.path.clone(),
-                    blake3: blake3::Hash::from_hex(&self.executable.blake3)
-                        .map_err(|_| LauncherError::Rejected)?,
-                    bytes: configured.bridge_bytes,
-                },
-                bridge_version: configured.bridge_version.clone(),
-                tsserver: configured.tsserver.bundle_file()?,
-                typescript_version: configured.typescript_version.clone(),
-                closure: configured
-                    .closure
-                    .iter()
-                    .map(AcceptedTypeScriptFileV1::bundle_file)
-                    .collect::<Result<Vec<_>, _>>()?,
-            },
-        )
-        .map_err(|_| LauncherError::ExecutableChanged)
-    }
-
-    /// Returns whether the compiled Codex release record accepts this exact provider declaration.
-    pub fn typescript_codex_accepted(&self) -> bool {
-        self.expected_typescript_codex_macos_evidence()
-            .is_some_and(|expected| {
-                self.typescript
-                    .as_ref()
-                    .is_some_and(|bundle| bundle.codex_macos_evidence == expected)
+    /// Fails (the launcher's `Invalid`) for an unknown settings identifier, a field no registered
+    /// server declares, a repeated field, or a value the declaring server cannot decode. A JSON
+    /// `null` field is treated as absent. A field another server declares is decoded by that
+    /// server for shape only and marks the declaration for refusal at validation.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let raw = RawProviderLaunch::deserialize(deserializer)?;
+        let language = registered()
+            .iter()
+            .copied()
+            .find(|language| {
+                language
+                    .server()
+                    .is_some_and(|server| server.settings_key() == raw.settings)
             })
-    }
-
-    /// Derives the Claude record for the same exact bundle already bound by the Codex digest.
-    ///
-    /// The distinct prefix names the independently exercised Claude host cell. Reusing the exact
-    /// bundle suffix keeps both records bound to identical declared paths, bytes, and releases;
-    /// malformed or non-Codex-accepted declarations return `None` without filesystem I/O.
-    pub fn expected_typescript_claude_macos_evidence(&self) -> Option<String> {
-        let codex = self.expected_typescript_codex_macos_evidence()?;
-        let (_, bundle_digest) = codex.rsplit_once(':')?;
-        Some(format!(
-            "{TYPESCRIPT_CLAUDE_MACOS_EVIDENCE_V1}:{bundle_digest}"
-        ))
-    }
-
-    /// Returns whether the independent Claude release record accepts this exact declaration.
-    pub fn typescript_claude_accepted(&self) -> bool {
-        self.expected_typescript_claude_macos_evidence()
-            .is_some_and(|expected| {
-                self.typescript.as_ref().is_some_and(|bundle| {
-                    bundle.claude_macos_evidence.as_deref() == Some(expected.as_str())
-                })
-            })
+            .ok_or_else(|| {
+                D::Error::custom(format_args!("unknown provider settings `{}`", raw.settings))
+            })?;
+        let own = language.server().expect("selected by its server");
+        let mut fields = serde_json::Map::new();
+        let mut foreign_fields = false;
+        for (key, value) in raw.fields.0 {
+            if value.is_null() {
+                continue;
+            }
+            let Some(owner) = registered()
+                .iter()
+                .filter_map(|language| language.server())
+                .find(|server| server.option_fields().contains(&key.as_str()))
+            else {
+                return Err(D::Error::custom(format_args!("unknown field `{key}`")));
+            };
+            if own.option_fields().contains(&key.as_str()) {
+                fields.insert(key, value);
+            } else {
+                let mut single = serde_json::Map::new();
+                single.insert(key, value);
+                owner.parse_options(single).map_err(D::Error::custom)?;
+                foreign_fields = true;
+            }
+        }
+        let options = own.parse_options(fields).map_err(D::Error::custom)?;
+        Ok(Self {
+            executable: raw.executable,
+            language,
+            toolchain: raw.toolchain,
+            trust: raw.trust,
+            cache_namespace: raw.cache_namespace,
+            options,
+            foreign_fields,
+        })
     }
 }
 
@@ -490,133 +323,75 @@ const fn default_check_timeout_s() -> u64 {
     300
 }
 
-/// Accepted Rust toolchain declaration for confined background project checks.
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProjectRustChecksConfig {
-    /// Absolute normalized rustup toolchain directory used to run confined Rust checks.
-    toolchain_dir: PathBuf,
-    /// Optional absolute normalized cargo home; `None` falls back to the default `$HOME/.cargo`.
-    #[serde(default)]
-    cargo_home: Option<PathBuf>,
-    /// Optional absolute normalized Apple developer directory override; `None` resolves it from
-    /// `/usr/bin/xcode-select -p` with the fixed fallbacks (T05B, EYES-r2 §3).
-    #[serde(default)]
-    developer_dir: Option<PathBuf>,
-}
-impl ProjectRustChecksConfig {
-    /// Returns the declared absolute toolchain directory; never resolved from model or project input.
-    pub fn toolchain_dir(&self) -> &Path {
-        &self.toolchain_dir
-    }
-    /// Returns the declared absolute cargo home, or `None` for the default `$HOME/.cargo` (EYES-r2 §1).
-    pub fn cargo_home(&self) -> Option<&Path> {
-        self.cargo_home.as_deref()
-    }
-    /// Returns the declared absolute Apple developer directory override, or `None` to resolve it
-    /// from `/usr/bin/xcode-select -p` (T05B).
-    pub fn developer_dir(&self) -> Option<&Path> {
-        self.developer_dir.as_deref()
-    }
-    /// Rejects a relative or lexically non-normal toolchain directory, cargo home or developer
-    /// directory at parse time.
-    fn validate(&self) -> Result<(), LauncherError> {
-        if !absolute(&self.toolchain_dir) {
-            return Err(LauncherError::Rejected);
-        }
-        if let Some(cargo_home) = &self.cargo_home
-            && !absolute(cargo_home)
-        {
-            return Err(LauncherError::Rejected);
-        }
-        if let Some(developer_dir) = &self.developer_dir
-            && !absolute(developer_dir)
-        {
-            return Err(LauncherError::Rejected);
-        }
-        Ok(())
-    }
-}
-
-/// Accepted Python toolchain declaration for confined background project checks.
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProjectPythonChecksConfig {
-    /// Absolute normalized Node executable; the only program allowed to start confined Pyright.
-    node: PathBuf,
-    /// Absolute normalized Pyright CLI entry module executed by `node`.
-    pyright_cli: PathBuf,
-}
-/// Accepted TypeScript CLI declaration for confined background project checks.
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProjectTypeScriptChecksConfig {
-    /// Absolute normalized pinned Node executable.
-    node: PathBuf,
-    /// Absolute normalized pinned TypeScript `tsc.js` module.
-    tsc_cli: PathBuf,
-}
-impl ProjectTypeScriptChecksConfig {
-    /// Returns the declared Node executable path.
-    pub fn node(&self) -> &Path {
-        &self.node
-    }
-    /// Returns the declared TypeScript CLI module path.
-    pub fn tsc_cli(&self) -> &Path {
-        &self.tsc_cli
-    }
-    /// Rejects either tool path unless absolute and lexically normalized.
-    fn validate(&self) -> Result<(), LauncherError> {
-        if !absolute(&self.node) || !absolute(&self.tsc_cli) {
-            return Err(LauncherError::Rejected);
-        }
-        Ok(())
-    }
-}
-impl ProjectPythonChecksConfig {
-    /// Returns the declared absolute Node executable path.
-    pub fn node(&self) -> &Path {
-        &self.node
-    }
-    /// Returns the declared absolute Pyright CLI entry module path.
-    pub fn pyright_cli(&self) -> &Path {
-        &self.pyright_cli
-    }
-    /// Rejects a relative or lexically non-normal tool path at parse time.
-    fn validate(&self) -> Result<(), LauncherError> {
-        if !absolute(&self.node) || !absolute(&self.pyright_cli) {
-            return Err(LauncherError::Rejected);
-        }
-        Ok(())
-    }
-}
-
 /// Optional timing and language declarations for confined background project checks.
 ///
 /// Presence enables project checks only together with a nonempty [`LauncherConfig::allowed_roots`];
-/// an absent language subsection means that language is never checked and never appears in a feed.
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// an absent language section means that language is never checked and never appears in a feed.
+/// Each language section is keyed by the language's identifier and decoded by its
+/// [`LanguageChecks`](crate::checks::LanguageChecks) integration.
+#[derive(Clone)]
 pub struct ProjectChecksConfig {
     /// Minimum milliseconds between an observed worktree change and a check start, 100..=10000.
-    #[serde(default = "default_debounce_ms")]
     debounce_ms: u64,
     /// Seconds of zero leases and no running check before the shared daemon stops, 30..=3600.
-    #[serde(default = "default_idle_timeout_s")]
     idle_timeout_s: u64,
     /// Total wall-clock ceiling of one check run including its tool startup, 10..=900.
+    check_timeout_s: u64,
+    /// Declared language sections in registration order.
+    sections: Vec<(Language, Arc<dyn CheckConfig>)>,
+}
+
+/// The closed timing fields of `project_checks` plus the language sections.
+#[derive(Deserialize)]
+struct RawProjectChecksConfig {
+    /// See [`ProjectChecksConfig`].
+    #[serde(default = "default_debounce_ms")]
+    debounce_ms: u64,
+    /// See [`ProjectChecksConfig`].
+    #[serde(default = "default_idle_timeout_s")]
+    idle_timeout_s: u64,
+    /// See [`ProjectChecksConfig`].
     #[serde(default = "default_check_timeout_s")]
     check_timeout_s: u64,
-    /// Rust check toolchain declaration; `None` keeps Rust unchecked.
-    #[serde(default)]
-    rust: Option<ProjectRustChecksConfig>,
-    /// Python check toolchain declaration; `None` keeps Python unchecked.
-    #[serde(default)]
-    python: Option<ProjectPythonChecksConfig>,
-    /// TypeScript/JavaScript check toolchain declaration; `None` keeps it unchecked.
-    #[serde(default)]
-    typescript: Option<ProjectTypeScriptChecksConfig>,
+    /// Language sections keyed by language identifier.
+    #[serde(flatten)]
+    sections: UniqueEntries,
 }
+
+impl<'de> Deserialize<'de> for ProjectChecksConfig {
+    /// Decodes the timing fields and every section of a registered language with project checks.
+    ///
+    /// Fails (the launcher's `Invalid`) for a key that is neither a timing field nor such a
+    /// language, a repeated key, or a section its language cannot decode. A `null` section is
+    /// treated as absent.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let raw = RawProjectChecksConfig::deserialize(deserializer)?;
+        let mut sections = Vec::new();
+        for (key, value) in raw.sections.0 {
+            let Some((language, checks)) = Language::by_id(&key)
+                .and_then(|language| language.checks().map(|checks| (language, checks)))
+            else {
+                return Err(D::Error::custom(format_args!("unknown field `{key}`")));
+            };
+            if value.is_null() {
+                continue;
+            }
+            sections.push((
+                language,
+                checks.parse_config(value).map_err(D::Error::custom)?,
+            ));
+        }
+        sections.sort_by_key(|(language, _)| *language);
+        Ok(Self {
+            debounce_ms: raw.debounce_ms,
+            idle_timeout_s: raw.idle_timeout_s,
+            check_timeout_s: raw.check_timeout_s,
+            sections,
+        })
+    }
+}
+
 impl ProjectChecksConfig {
     /// Returns the debounce window between a change and the check it triggers.
     pub fn debounce(&self) -> Duration {
@@ -630,19 +405,20 @@ impl ProjectChecksConfig {
     pub fn check_timeout(&self) -> Duration {
         Duration::from_secs(self.check_timeout_s)
     }
-    /// Returns the Rust declaration; `None` means Rust is never checked.
-    pub fn rust(&self) -> Option<&ProjectRustChecksConfig> {
-        self.rust.as_ref()
+    /// Returns `language`'s declared section; `None` means the language is never checked.
+    pub fn section(&self, language: Language) -> Option<&dyn CheckConfig> {
+        self.sections
+            .iter()
+            .find(|(declared, _)| *declared == language)
+            .map(|(_, config)| &**config)
     }
-    /// Returns the Python declaration; `None` means Python is never checked.
-    pub fn python(&self) -> Option<&ProjectPythonChecksConfig> {
-        self.python.as_ref()
+    /// Iterates the declared sections in registration order.
+    pub fn sections(&self) -> impl Iterator<Item = (Language, &dyn CheckConfig)> {
+        self.sections
+            .iter()
+            .map(|(language, config)| (*language, &**config))
     }
-    /// Returns the TypeScript declaration; `None` means it is never checked.
-    pub fn typescript(&self) -> Option<&ProjectTypeScriptChecksConfig> {
-        self.typescript.as_ref()
-    }
-    /// Checks the contract timing ranges and every declared path before any check can run.
+    /// Checks the contract timing ranges and every declared section before any check can run.
     fn validate(&self) -> Result<(), LauncherError> {
         if !(100..=10_000).contains(&self.debounce_ms)
             || !(30..=3600).contains(&self.idle_timeout_s)
@@ -650,14 +426,8 @@ impl ProjectChecksConfig {
         {
             return Err(LauncherError::Rejected);
         }
-        if let Some(rust) = &self.rust {
-            rust.validate()?;
-        }
-        if let Some(python) = &self.python {
-            python.validate()?;
-        }
-        if let Some(typescript) = &self.typescript {
-            typescript.validate()?;
+        if self.sections.iter().any(|(_, config)| !config.validate()) {
+            return Err(LauncherError::Rejected);
         }
         Ok(())
     }
@@ -680,7 +450,7 @@ struct RawTarget {
     _codex: Option<Value>,
     #[serde(default, rename = "cwd_trampoline")]
     _cwd_trampoline: Option<Value>,
-    /// At most the two current language profiles; duplicate settings/languages are rejected.
+    /// At most one declaration per registered server; duplicate settings/languages are rejected.
     providers: Vec<ProviderLaunch>,
     #[serde(default, rename = "profiles")]
     _profiles: Vec<Value>,
@@ -802,7 +572,7 @@ impl LauncherConfig {
         let launcher = Self::parse(&bytes)?;
         Ok((launcher, bytes))
     }
-    /// Validates bounded trusted JSON, including the ceiling of three provider languages per target,
+    /// Validates bounded trusted JSON, including the ceiling of one provider per registered server,
     /// without host inference, network access, or process effects.
     pub fn parse(bytes: &[u8]) -> Result<Self, LauncherError> {
         if bytes.len() > MAX_CONFIG_BYTES {
@@ -826,7 +596,7 @@ impl LauncherConfig {
             if !identifier(&target.attachment)
                 || target.attachment.len() > 128
                 || !absolute(&target.candidate)
-                || target.providers.len() > 4
+                || target.providers.len() > server_count()
             {
                 return Err(LauncherError::Rejected);
             }
@@ -834,78 +604,16 @@ impl LauncherConfig {
             let mut provider_kinds = Vec::new();
             for provider in &target.providers {
                 provider.executable.validate()?;
-                if provider_kinds.contains(&provider.settings)
+                if provider_kinds.contains(&provider.language)
                     || !identifier(&provider.toolchain)
                     || !identifier(&provider.trust)
                     || !identifier(&provider.cache_namespace)
                 {
                     return Err(LauncherError::Rejected);
                 }
-                provider_kinds.push(provider.settings);
-                match provider.settings {
-                    AcceptedProviderSettings::GoplsDefaults
-                        if !absolute(Path::new(&provider.toolchain))
-                            || provider.node.is_some()
-                            || provider.typescript.is_some()
-                            || provider.cargo.is_some()
-                            || provider.cargo_version.is_some()
-                            || provider.rustc.is_some()
-                            || provider.rustc_version.is_some() =>
-                    {
-                        return Err(LauncherError::Rejected);
-                    }
-                    AcceptedProviderSettings::PyrightDefaultsV1
-                        if !provider.node.as_ref().is_some_and(|node| {
-                            node.validate().is_ok() && provider.toolchain == node.identity
-                        }) || provider.typescript.is_some()
-                            || provider.cargo.is_some()
-                            || provider.cargo_version.is_some()
-                            || provider.rustc.is_some()
-                            || provider.rustc_version.is_some() =>
-                    {
-                        return Err(LauncherError::Rejected);
-                    }
-                    AcceptedProviderSettings::RustCachePrimingDisabledV1
-                        if provider.node.is_some()
-                            || provider.typescript.is_some()
-                            || !provider.cargo_version.as_deref().is_some_and(identifier)
-                            || !provider.rustc_version.as_deref().is_some_and(identifier)
-                            || !provider.cargo.as_ref().is_some_and(|cargo| {
-                                cargo.validate().is_ok()
-                                    && Some(cargo.identity.as_str())
-                                        == provider.cargo_version.as_deref()
-                            }) =>
-                    {
-                        return Err(LauncherError::Rejected);
-                    }
-                    AcceptedProviderSettings::RustCachePrimingDisabledV1
-                        if !provider.rustc.as_ref().is_some_and(|rustc| {
-                            rustc.validate().is_ok()
-                                && Some(rustc.identity.as_str())
-                                    == provider.rustc_version.as_deref()
-                        }) =>
-                    {
-                        return Err(LauncherError::Rejected);
-                    }
-                    AcceptedProviderSettings::TypeScriptDefaultsV1
-                        if !provider.node.as_ref().is_some_and(|node| {
-                            node.validate().is_ok() && provider.toolchain == node.identity
-                        }) || !provider.typescript.as_ref().is_some_and(|bundle| {
-                            bundle.validate().is_ok()
-                                && provider.executable.identity == bundle.bridge_version
-                        }) || !provider.typescript_codex_accepted()
-                            || provider.typescript.as_ref().is_some_and(|bundle| {
-                                bundle.claude_macos_evidence.is_some()
-                                    && !provider.typescript_claude_accepted()
-                            })
-                            || provider.cargo.is_some()
-                            || provider.cargo_version.is_some()
-                            || provider.rustc.is_some()
-                            || provider.rustc_version.is_some() =>
-                    {
-                        return Err(LauncherError::Rejected);
-                    }
-                    _ => {}
+                provider_kinds.push(provider.language);
+                if provider.foreign_fields || !provider.server().validate_launch(provider) {
+                    return Err(LauncherError::Rejected);
                 }
             }
             let launch = LaunchTarget {
@@ -938,19 +646,7 @@ impl LauncherConfig {
                     target
                         .providers
                         .iter()
-                        .filter_map(|provider| provider.node.as_ref()),
-                )
-                .chain(
-                    target
-                        .providers
-                        .iter()
-                        .filter_map(|provider| provider.cargo.as_ref()),
-                )
-                .chain(
-                    target
-                        .providers
-                        .iter()
-                        .filter_map(|provider| provider.rustc.as_ref()),
+                        .flat_map(|provider| provider.server().launch_executables(provider)),
                 )
             {
                 if let Some(existing) = programs.insert(program.path.as_path(), program)
@@ -967,12 +663,8 @@ impl LauncherConfig {
             .targets
             .values()
             .flat_map(|target| target.providers.iter())
-            .filter(|provider| provider.settings == AcceptedProviderSettings::TypeScriptDefaultsV1)
         {
-            if cancel.load(std::sync::atomic::Ordering::Acquire) {
-                return Err(LauncherError::Cancelled);
-            }
-            provider.typescript_bundle()?;
+            provider.server().verify_launch(provider, cancel)?;
         }
         Ok(())
     }
@@ -1158,17 +850,21 @@ mod path_admission_tests {
 }
 
 /// Accepts bounded nonempty identity strings without control bytes.
-fn identifier(value: &str) -> bool {
+pub fn identifier(value: &str) -> bool {
     !value.is_empty() && value.len() <= 4096 && !value.chars().any(char::is_control)
 }
 
-/// Appends one unambiguous raw field to the declared TypeScript evidence digest.
-fn evidence_frame(hash: &mut blake3::Hasher, value: &[u8]) {
-    hash.update(&(value.len() as u64).to_le_bytes());
-    hash.update(value);
+/// Returns how many registered languages have a server: the ceiling of provider declarations per
+/// target, since each server may be declared at most once.
+fn server_count() -> usize {
+    registered()
+        .iter()
+        .filter(|language| language.server().is_some())
+        .count()
 }
+
 /// Rejects relative or lexically non-normal launcher paths without deriving them from cwd.
-fn absolute(path: &Path) -> bool {
+pub fn absolute(path: &Path) -> bool {
     path.is_absolute()
         && path
             .components()
@@ -1187,7 +883,13 @@ fn allowed_root(path: &Path) -> bool {
 /// Validates trusted mappings and limits and refuses ambiguous mappings or unknown settings.
 #[test]
 fn launcher_mapping_is_closed_bounded_and_restart_only() {
+    use crate::intelligence::typescript_backend::{
+        TYPESCRIPT_BRIDGE_BLAKE3_V1, TYPESCRIPT_BRIDGE_BYTES_V1, TYPESCRIPT_CLOSURE_V1,
+        TYPESCRIPT_CODEX_MACOS_EVIDENCE_V1, TYPESCRIPT_NODE_BLAKE3_V1,
+        TYPESCRIPT_TSSERVER_BLAKE3_V1, TYPESCRIPT_TSSERVER_BYTES_V1, TypeScriptLaunch,
+    };
     use serde_json::json;
+    crate::lang::testing::install();
     let executable = json!({"path":"/private/tmp/accepted-program","identity":"accepted-git","blake3":"0".repeat(64)});
     let target = json!({"attachment":"private-attachment","candidate":"/private/tmp/worktree","git":executable,"codex":executable,"providers":[],"profiles":[],"allow_disabled_host":true});
     let config = json!({"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[target.clone()]});
@@ -1309,6 +1011,7 @@ fn launcher_mapping_is_closed_bounded_and_restart_only() {
 /// Legacy host execution fields remain accepted but do not appear in the launch target.
 #[test]
 fn launcher_ignores_legacy_execution_fields() {
+    crate::lang::testing::install();
     let config = LauncherConfig::parse(
         br#"{"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[{"attachment":"legacy","candidate":"/private/tmp/worktree","git":{"path":"/usr/bin/git","identity":"git","blake3":"0000000000000000000000000000000000000000000000000000000000000000"},"codex":{"path":"/usr/bin/codex"},"cwd_trampoline":"/usr/bin/env","profiles":[{"ignored":true}],"allow_disabled_host":true,"providers":[]}]}"#,
     )
@@ -1341,6 +1044,7 @@ fn accepted_executable_requires_exact_current_bytes() {
 #[test]
 fn launcher_verify_checks_current_executable_bytes_without_a_daemon() {
     use serde_json::json;
+    crate::lang::testing::install();
     use std::os::unix::fs::PermissionsExt;
     let path =
         std::env::temp_dir().join(format!("agent-ide-launcher-check-{}", std::process::id()));
@@ -1379,19 +1083,25 @@ fn startup_fingerprint_verification_is_cooperatively_cancellable() {
 /// Accepts an optional TypeScript checker and rejects non-normal checker paths.
 #[test]
 fn project_checks_accept_optional_typescript_and_reject_non_normal_paths() {
+    use crate::checks::typescript::ProjectTypeScriptChecksConfig;
     use serde_json::json;
+    crate::lang::testing::install();
+    let typescript = crate::languages::TYPESCRIPT;
     let old: ProjectChecksConfig = serde_json::from_value(
         json!({"python": {"node": "/abs/node", "pyright_cli": "/abs/pyright"}}),
     )
     .unwrap();
-    assert!(old.typescript().is_none());
+    assert!(old.section(typescript).is_none());
     assert!(old.validate().is_ok());
     let new: ProjectChecksConfig = serde_json::from_value(
         json!({"typescript": {"node": "/abs/node", "tsc_cli": "/abs/typescript/lib/tsc.js"}}),
     )
     .unwrap();
     assert_eq!(
-        new.typescript().unwrap().tsc_cli(),
+        new.section(typescript)
+            .and_then(|section| section.downcast_ref::<ProjectTypeScriptChecksConfig>())
+            .unwrap()
+            .tsc_cli(),
         Path::new("/abs/typescript/lib/tsc.js")
     );
     assert!(new.validate().is_ok());

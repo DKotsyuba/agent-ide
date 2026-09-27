@@ -247,7 +247,7 @@ pub enum Event {
     },
     /// Records one completed confined project check with bucketed counts only (EYES-r1 §8).
     ProjectCheckCompleted {
-        /// Checked language: `rust`, `python`, or `typescript`.
+        /// Checked language, recorded as its identifier.
         language: Language,
         /// Closed state of the completed snapshot.
         state: ProjectCheckState,
@@ -317,19 +317,9 @@ impl CountBucket {
     }
 }
 
-/// Names a closed provider language profile without carrying a file path, source, or command.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Language {
-    /// Rust provider profile.
-    Rust,
-    /// Go provider profile.
-    Go,
-    /// Python provider profile.
-    Python,
-    /// TypeScript provider profile.
-    Typescript,
-}
+/// Names a registered language without carrying a file path, source, or command; serialized as
+/// the language identifier.
+pub use crate::lang::Language;
 
 impl Event {
     /// Returns this event's fixed schema tag for durable filtering and canonical export.
@@ -1075,7 +1065,7 @@ mod tests {
             method: ToolMethod::Context,
             outcome: ToolOutcome::Completed,
             duration_ms: 84,
-            language: Some(Language::Rust),
+            language: Some(crate::lang::testing::ALPHA),
             cache: CacheState::Hit,
             diagnostics: DiagnosticState::Clean,
             reason: None,
@@ -1094,7 +1084,7 @@ mod tests {
     #[test]
     fn project_check_event_encodes_closed_buckets() {
         let event = Event::ProjectCheckCompleted {
-            language: Language::Python,
+            language: crate::lang::testing::BETA,
             state: ProjectCheckState::OutsideRoots,
             duration_ms: 7,
             errors_bucket: CountBucket::of(100),
@@ -1103,7 +1093,7 @@ mod tests {
         assert_eq!(event.tag(), "project_check_completed");
         assert_eq!(
             String::from_utf8(event.encode().unwrap()).unwrap(),
-            r#"{"tag":"project_check_completed","language":"python","state":"outside_roots","duration_ms":7,"errors_bucket":"100+","warnings_bucket":"1-9"}"#
+            r#"{"tag":"project_check_completed","language":"beta","state":"outside_roots","duration_ms":7,"errors_bucket":"100+","warnings_bucket":"1-9"}"#
         );
         for (count, bucket) in [
             (0, CountBucket::Zero),

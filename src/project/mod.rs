@@ -681,7 +681,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// A directory under the system temp dir, removed on drop, unique per test run so parallel
-    /// `cargo test` invocations of this module never collide.
+    /// test runs of this module never collide.
     struct TempTree {
         root: PathBuf,
     }
@@ -719,47 +719,50 @@ mod tests {
         Path::new("/usr/bin/git").exists()
     }
 
-    fn rust_project() -> LanguageProject {
+    fn alpha_project() -> LanguageProject {
         LanguageProject {
-            language: Language::Rust,
-            manifests: vec![PathBuf::from("Cargo.toml")],
+            language: crate::lang::testing::ALPHA,
+            manifests: vec![PathBuf::from("alpha.toml")],
             environment: vec![("toolchain".to_string(), "1.98.1".to_string())],
             interpreter: None,
             commands: ProjectCommands {
                 build: Some(ProjectCommand {
-                    argv: vec!["cargo".into(), "build".into(), "--release".into()],
+                    argv: vec!["alphac".into(), "build".into(), "--release".into()],
                     source: CommandSource::Manifest,
                 }),
                 check: Some(ProjectCommand {
-                    argv: vec!["cargo".into(), "check".into()],
+                    argv: vec!["alphac".into(), "check".into()],
                     source: CommandSource::Manifest,
                 }),
                 test: Some(ProjectCommand {
-                    argv: vec!["cargo".into(), "test".into()],
+                    argv: vec!["alphac".into(), "test".into()],
                     source: CommandSource::Ci,
                 }),
                 lint: None,
                 format: Some(ProjectCommand {
-                    argv: vec!["cargo".into(), "fmt".into(), "--all".into()],
+                    argv: vec!["alphac".into(), "fmt".into(), "--all".into()],
                     source: CommandSource::Default,
                 }),
                 typecheck: None,
             },
-            entry_points: vec![PathBuf::from("src/main.rs"), PathBuf::from("src/lib.rs")],
+            entry_points: vec![
+                PathBuf::from("src/main.alpha"),
+                PathBuf::from("src/lib.alpha"),
+            ],
         }
     }
 
-    fn python_project() -> LanguageProject {
+    fn beta_project() -> LanguageProject {
         LanguageProject {
-            language: Language::Python,
-            manifests: vec![PathBuf::from("pyproject.toml")],
+            language: crate::lang::testing::BETA,
+            manifests: vec![PathBuf::from("beta.toml")],
             environment: vec![("venv".to_string(), "none".to_string())],
             interpreter: None,
             commands: ProjectCommands {
                 build: None,
                 check: None,
                 test: Some(ProjectCommand {
-                    argv: vec!["pytest".into()],
+                    argv: vec!["betatest".into()],
                     source: CommandSource::Manifest,
                 }),
                 lint: None,
@@ -772,23 +775,24 @@ mod tests {
 
     #[test]
     fn renders_a_fixed_fixture_exactly() {
+        crate::lang::testing::install();
         let tree = TempTree::new("fixture");
-        tree.write("src/main.rs", "fn main() {}\n");
-        tree.write("src/lib.rs", "pub fn lib() {}\npub fn two() {}\n");
-        tree.write("src/assistance/mod.rs", "pub struct A;\n");
-        tree.write("tests/it.rs", "#[test]\nfn ok() {}\n");
-        tree.write("app.py", "print('hi')\n");
+        tree.write("src/main.alpha", "fn main() {}\n");
+        tree.write("src/lib.alpha", "pub fn lib() {}\npub fn two() {}\n");
+        tree.write("src/assistance/mod.alpha", "pub struct A;\n");
+        tree.write("tests/it.alpha", "#[test]\nfn ok() {}\n");
+        tree.write("app.beta", "print('hi')\n");
         tree.write("README.md", "# demo\n");
         tree.write("CLAUDE.md", "notes\n");
 
         let card = collect(
             tree.path(),
-            vec![rust_project(), python_project()],
+            vec![alpha_project(), beta_project()],
             vec![ServerState {
-                language: Language::Rust,
+                language: crate::lang::testing::ALPHA,
                 state: "ready".to_string(),
             }],
-            Some("rust checking (first check)".to_string()),
+            Some("alpha checking (first check)".to_string()),
         );
 
         assert_eq!(card.git, None);
@@ -797,21 +801,21 @@ mod tests {
         let rendered = render(&card);
         let expected = format!(
             "project: {name}  root: {root}\n\
-             languages: rust 6 lines in 4 files · python 1 in 1\n\
+             languages: alpha 6 lines in 4 files · beta 1 in 1\n\
              commands (ci, manifest, default):\n\
-             \x20 build: cargo build --release\n\
-             \x20 check: cargo check\n\
-             \x20 test (rust): cargo test\n\
-             \x20 test (python): pytest\n\
+             \x20 build: alphac build --release\n\
+             \x20 check: alphac check\n\
+             \x20 test (alpha): alphac test\n\
+             \x20 test (beta): betatest\n\
              \x20 lint: —\n\
-             \x20 fmt: cargo fmt --all\n\
+             \x20 fmt: alphac fmt --all\n\
              \x20 typecheck: —\n\
-             environment: rust toolchain 1.98.1 · python venv none\n\
+             environment: alpha toolchain 1.98.1 · beta venv none\n\
              layout: src/ 3 (assistance 1) · tests/ 1\n\
-             entry points: src/main.rs · src/lib.rs\n\
+             entry points: src/main.alpha · src/lib.alpha\n\
              docs: README.md, CLAUDE.md\n\
-             servers: rust ready\n\
-             problems: rust checking (first check)",
+             servers: alpha ready\n\
+             problems: alpha checking (first check)",
             name = tree.path().file_name().unwrap().to_string_lossy(),
             root = tree.path().display(),
         );
@@ -820,39 +824,44 @@ mod tests {
 
     #[test]
     fn noise_directories_are_never_counted() {
+        crate::lang::testing::install();
         let tree = TempTree::new("noise");
-        tree.write("src/main.rs", "fn main() {}\n");
-        tree.write("target/debug/build.rs", "junk\n");
+        tree.write("src/main.alpha", "fn main() {}\n");
+        tree.write("target/debug/build.alpha", "junk\n");
         tree.write("node_modules/pkg/index.js", "junk\n");
         tree.write(".git/HEAD", "ref: refs/heads/main\n");
-        tree.write(".venv/lib/site.py", "junk\n");
+        tree.write(".venv/lib/site.beta", "junk\n");
         tree.write("__pycache__/mod.cpython.pyc", "junk\n");
 
-        let card = collect(tree.path(), vec![rust_project()], vec![], None);
+        let card = collect(tree.path(), vec![alpha_project()], vec![], None);
         assert_eq!(card.layout.len(), 1);
         assert_eq!(card.layout[0].path, PathBuf::from("src"));
         assert_eq!(card.layout[0].files, 1);
-        let rust = card
+        let alpha = card
             .languages
             .iter()
-            .find(|s| s.language == Language::Rust)
+            .find(|s| s.language == crate::lang::testing::ALPHA)
             .unwrap();
-        assert_eq!(rust.files, 1);
+        assert_eq!(alpha.files, 1);
     }
 
     #[test]
     fn render_collapses_detail_to_fit_the_byte_ceiling() {
+        crate::lang::testing::install();
         let tree = TempTree::new("big");
         for top in 0..20 {
             for child in 0..5 {
-                tree.write(&format!("src/dir{top}/child{child}/f.rs",), "fn f() {}\n");
+                tree.write(
+                    &format!("src/dir{top}/child{child}/f.alpha",),
+                    "fn f() {}\n",
+                );
             }
         }
         for doc in 0..30 {
             tree.write(&format!("docs/topic{doc}.md"), "# doc\n");
         }
 
-        let card = collect(tree.path(), vec![rust_project()], vec![], None);
+        let card = collect(tree.path(), vec![alpha_project()], vec![], None);
         let rendered = render(&card);
         assert!(
             rendered.len() <= MAX_CARD_BYTES,

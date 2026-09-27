@@ -2702,22 +2702,23 @@ impl OwnedProtocolChild {
         self.reap(deadline).await
     }
 
-    /// Performs the fixed abnormal TypeScript cleanup sequence while retaining direct-child ownership.
+    /// Performs the fixed abnormal cleanup sequence (group TERM, grace, group and direct KILL,
+    /// direct reap) while retaining direct-child ownership.
     ///
     /// This crate-private path requires positive `grace` and `deadline` values of at most 60
     /// seconds. It requests group TERM, waits the complete grace without polling or reaping the
     /// child, then requests group KILL and a direct-child kill before the
     /// sole direct wait. Signal failures do not skip later cleanup steps; only a successful bounded
     /// wait returns direct-child settlement, always with unverified descendant evidence. It must
-    /// never be used for normal TypeScript shutdown, whose successful path calls [`Self::reap`]
+    /// never be used for a normal provider shutdown, whose successful path calls [`Self::reap`]
     /// without requesting a signal.
-    pub(crate) async fn terminate_typescript_abnormally(
+    pub(crate) async fn terminate_abnormally(
         mut self,
         grace: Duration,
         deadline: Duration,
     ) -> Result<ReapedProtocolProcess, ProcessError> {
         let (status, evidence) =
-            terminate_typescript_child_abnormally(&mut self.process.child, grace, deadline).await?;
+            terminate_child_abnormally(&mut self.process.child, grace, deadline).await?;
         self.process.cancellation = Some(evidence);
         let waited = WaitedProtocolChild {
             status,
@@ -2728,7 +2729,7 @@ impl OwnedProtocolChild {
 
     /// Waits for the direct bridge child without consuming ownership or requesting a signal.
     ///
-    /// A timeout leaves this handle available for the ordered abnormal TypeScript cleanup path.
+    /// A timeout leaves this handle available for the ordered abnormal cleanup path.
     pub(crate) async fn wait_for_exit(
         &mut self,
         deadline: Duration,
@@ -2771,13 +2772,13 @@ impl OwnedProtocolChild {
     }
 }
 
-/// Applies the one fixed abnormal TypeScript signal order to an unreaped direct child.
+/// Applies the one fixed abnormal signal order to an unreaped direct child.
 ///
 /// The caller retains the child handle. Positive `grace` and `deadline` values may not exceed 60
 /// seconds. This function requests group TERM, sleeps the complete grace without polling or
 /// reaping, requests group KILL and direct-child kill, then performs the sole direct wait. It never
 /// signals after that wait and makes no descendant-settlement or process-group-containment claim.
-pub(crate) async fn terminate_typescript_child_abnormally(
+pub(crate) async fn terminate_child_abnormally(
     child: &mut Child,
     grace: Duration,
     deadline: Duration,
@@ -2786,12 +2787,12 @@ pub(crate) async fn terminate_typescript_child_abnormally(
     if grace.is_zero() || grace > Duration::from_secs(60) {
         return Err(ProcessError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "invalid TypeScript cleanup grace",
+            "invalid abnormal cleanup grace",
         )));
     }
     let pid = child
         .id()
-        .ok_or_else(|| io::Error::other("owned TypeScript child has no live PID"))?;
+        .ok_or_else(|| io::Error::other("owned child has no live PID"))?;
     let mut evidence = CancellationEvidence {
         term_requested: signal_group(pid, libc::SIGTERM).is_ok(),
         kill_requested: false,

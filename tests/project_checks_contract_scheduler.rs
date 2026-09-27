@@ -3,7 +3,7 @@
 //! `FakeChecker` (in `agent_ide::checks`) does not record concurrency or reflect the dispatched
 //! `input_generation`, so these tests use `RecordingChecker` below instead.
 
-use agent_ide::checks::scheduler::{FingerprintFn, RustCacheClone, Scheduler, sweep_stale_caches};
+use agent_ide::checks::scheduler::{CacheClone, FingerprintFn, Scheduler, sweep_stale_caches};
 use agent_ide::checks::{
     BoxFuture, CheckRequest, CheckState, Checker, Language, ProblemSnapshot, UnavailableReason,
 };
@@ -168,10 +168,12 @@ fn scratch_dir(name: &str) -> PathBuf {
 /// real per-language checkers.
 fn scratch_worktree(name: &str, language: Language) -> PathBuf {
     let dir = scratch_dir(name);
-    match language {
-        Language::Rust => std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap(),
-        Language::Python => std::fs::write(dir.join("pyproject.toml"), "").unwrap(),
-        Language::TypeScript => std::fs::write(dir.join("tsconfig.json"), "{}").unwrap(),
+    if language == agent_ide::languages::RUST {
+        std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+    } else if language == agent_ide::languages::PYTHON {
+        std::fs::write(dir.join("pyproject.toml"), "").unwrap();
+    } else if language == agent_ide::languages::TYPESCRIPT {
+        std::fs::write(dir.join("tsconfig.json"), "{}").unwrap();
     }
     dir
 }
@@ -232,9 +234,10 @@ async fn settle(total: Duration, step: Duration) {
 /// Ten triggers within one debounce window collapse into exactly one check, whose cache dir is 0700.
 #[tokio::test(start_paused = true)]
 async fn scheduler_burst_of_triggers_debounces_to_one_check() {
-    let checker = RecordingChecker::new(Language::Python);
+    agent_ide::languages::install();
+    let checker = RecordingChecker::new(agent_ide::languages::PYTHON);
     let cache_root = scratch_dir("burst-cache");
-    let worktree = scratch_worktree("burst-worktree", Language::Python);
+    let worktree = scratch_worktree("burst-worktree", agent_ide::languages::PYTHON);
     let scheduler = Scheduler::new(
         vec![Arc::new(checker.clone())],
         Duration::from_millis(50),
@@ -251,7 +254,7 @@ async fn scheduler_burst_of_triggers_debounces_to_one_check() {
     assert_eq!(checker.calls().len(), 1);
     let latest = scheduler.latest(&worktree);
     assert_eq!(latest.len(), 1);
-    assert_eq!(latest[0].language, Language::Python);
+    assert_eq!(latest[0].language, agent_ide::languages::PYTHON);
     assert!(!scheduler.is_busy());
 
     let cache_dir = &checker.calls()[0].cache_dir;
@@ -262,9 +265,11 @@ async fn scheduler_burst_of_triggers_debounces_to_one_check() {
 /// A trigger that lands while a check is running marks it dirty for exactly one latest-wins rerun.
 #[tokio::test(start_paused = true)]
 async fn scheduler_trigger_during_running_check_causes_one_extra_run_with_newest_generation() {
-    let checker = RecordingChecker::with_delay(Language::Python, Duration::from_millis(200));
+    agent_ide::languages::install();
+    let checker =
+        RecordingChecker::with_delay(agent_ide::languages::PYTHON, Duration::from_millis(200));
     let cache_root = scratch_dir("dirty-cache");
-    let worktree = scratch_worktree("dirty-worktree", Language::Python);
+    let worktree = scratch_worktree("dirty-worktree", agent_ide::languages::PYTHON);
     let scheduler = Scheduler::new(
         vec![Arc::new(checker.clone())],
         Duration::from_millis(50),
@@ -307,9 +312,11 @@ async fn scheduler_trigger_during_running_check_causes_one_extra_run_with_newest
 /// run, the follow-up spawns no checker process at all and leaves the stored snapshot current.
 #[tokio::test(start_paused = true)]
 async fn scheduler_dirty_rerun_with_unchanged_fingerprint_is_skipped() {
-    let checker = RecordingChecker::with_delay(Language::Python, Duration::from_millis(200));
+    agent_ide::languages::install();
+    let checker =
+        RecordingChecker::with_delay(agent_ide::languages::PYTHON, Duration::from_millis(200));
     let cache_root = scratch_dir("dirty-skip-cache");
-    let worktree = scratch_worktree("dirty-skip-worktree", Language::Python);
+    let worktree = scratch_worktree("dirty-skip-worktree", agent_ide::languages::PYTHON);
     let scheduler = Scheduler::new(
         vec![Arc::new(checker.clone())],
         Duration::from_millis(50),
@@ -348,10 +355,12 @@ async fn scheduler_dirty_rerun_with_unchanged_fingerprint_is_skipped() {
 /// runs: latest wins.
 #[tokio::test(start_paused = true)]
 async fn scheduler_dirty_rerun_with_changed_fingerprint_runs() {
-    let checker = RecordingChecker::with_delay(Language::Python, Duration::from_millis(200));
+    agent_ide::languages::install();
+    let checker =
+        RecordingChecker::with_delay(agent_ide::languages::PYTHON, Duration::from_millis(200));
     let cell = Arc::new(AtomicU64::new(7));
     let cache_root = scratch_dir("dirty-changed-cache");
-    let worktree = scratch_worktree("dirty-changed-worktree", Language::Python);
+    let worktree = scratch_worktree("dirty-changed-worktree", agent_ide::languages::PYTHON);
     let scheduler = Scheduler::new(
         vec![Arc::new(checker.clone())],
         Duration::from_millis(50),
@@ -385,16 +394,17 @@ async fn scheduler_dirty_rerun_with_changed_fingerprint_runs() {
 /// Five worktrees times two languages never exceed the configured global concurrency cap.
 #[tokio::test(start_paused = true)]
 async fn scheduler_never_runs_more_than_max_concurrent_checks_across_worktrees_and_languages() {
+    agent_ide::languages::install();
     let concurrent = Arc::new(AtomicUsize::new(0));
     let max_seen = Arc::new(AtomicUsize::new(0));
     let rust_checker = RecordingChecker::with_shared(
-        Language::Rust,
+        agent_ide::languages::RUST,
         Some(Duration::from_millis(100)),
         Arc::clone(&concurrent),
         Arc::clone(&max_seen),
     );
     let python_checker = RecordingChecker::with_shared(
-        Language::Python,
+        agent_ide::languages::PYTHON,
         Some(Duration::from_millis(100)),
         Arc::clone(&concurrent),
         Arc::clone(&max_seen),
@@ -438,9 +448,11 @@ async fn scheduler_never_runs_more_than_max_concurrent_checks_across_worktrees_a
 /// `latest()` keeps returning the previous snapshot, non-blocking, until a newer run completes.
 #[tokio::test(start_paused = true)]
 async fn scheduler_latest_reflects_previous_snapshot_while_a_newer_check_runs() {
-    let checker = RecordingChecker::with_delay(Language::Python, Duration::from_millis(200));
+    agent_ide::languages::install();
+    let checker =
+        RecordingChecker::with_delay(agent_ide::languages::PYTHON, Duration::from_millis(200));
     let cache_root = scratch_dir("latest-cache");
-    let worktree = scratch_worktree("latest-worktree", Language::Python);
+    let worktree = scratch_worktree("latest-worktree", agent_ide::languages::PYTHON);
     let scheduler = Scheduler::new(
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),
@@ -485,9 +497,11 @@ async fn scheduler_latest_reflects_previous_snapshot_while_a_newer_check_runs() 
 /// `shutdown()` drops a long-running check's future promptly and ignores triggers received after.
 #[tokio::test(start_paused = true)]
 async fn scheduler_shutdown_cancels_a_long_running_check_promptly() {
-    let checker = RecordingChecker::with_delay(Language::Python, Duration::from_secs(3600));
+    agent_ide::languages::install();
+    let checker =
+        RecordingChecker::with_delay(agent_ide::languages::PYTHON, Duration::from_secs(3600));
     let cache_root = scratch_dir("shutdown-cache");
-    let worktree = scratch_worktree("shutdown-worktree", Language::Python);
+    let worktree = scratch_worktree("shutdown-worktree", agent_ide::languages::PYTHON);
     let scheduler = Scheduler::new(
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),
@@ -524,10 +538,11 @@ async fn scheduler_shutdown_cancels_a_long_running_check_promptly() {
 /// A worktree's first Rust check clones `target/` copy-on-write from a completed sibling worktree.
 #[tokio::test(start_paused = true)]
 async fn scheduler_clones_rust_target_from_sibling_worktree_of_the_same_repository() {
-    let checker = RecordingChecker::new(Language::Rust);
+    agent_ide::languages::install();
+    let checker = RecordingChecker::new(agent_ide::languages::RUST);
     let cache_root = scratch_dir("clone-cache");
-    let worktree_a = scratch_worktree("clone-worktree-a", Language::Rust);
-    let worktree_b = scratch_worktree("clone-worktree-b", Language::Rust);
+    let worktree_a = scratch_worktree("clone-worktree-a", agent_ide::languages::RUST);
+    let worktree_b = scratch_worktree("clone-worktree-b", agent_ide::languages::RUST);
     let scheduler = Scheduler::new(
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),
@@ -539,8 +554,8 @@ async fn scheduler_clones_rust_target_from_sibling_worktree_of_the_same_reposito
     advance(Duration::from_millis(30)).await;
     assert_eq!(checker.calls().len(), 1);
     assert_eq!(
-        scheduler.rust_cache_clone_outcome(&worktree_a),
-        RustCacheClone::SkippedNoSource,
+        scheduler.cache_clone_outcome(&worktree_a, agent_ide::languages::RUST),
+        CacheClone::SkippedNoSource,
         "the first worktree of a repository has no sibling cache to clone from"
     );
 
@@ -563,16 +578,16 @@ async fn scheduler_clones_rust_target_from_sibling_worktree_of_the_same_reposito
     }
     assert_eq!(checker.calls().len(), 2);
 
-    let outcome = scheduler.rust_cache_clone_outcome(&worktree_b);
+    let outcome = scheduler.cache_clone_outcome(&worktree_b, agent_ide::languages::RUST);
     let cache_dir_b = checker.calls()[1].cache_dir.clone();
     match outcome {
-        RustCacheClone::Cloned => {
+        CacheClone::Cloned => {
             assert_eq!(
                 std::fs::read(cache_dir_b.join("target/marker.txt")).unwrap(),
                 b"built"
             );
         }
-        RustCacheClone::Failed => {
+        CacheClone::Failed => {
             // Non-APFS filesystems reject `cp -c`; the scheduler must fall back to a cold
             // check rather than fail, which this arm confirms without asserting file content.
         }
@@ -583,10 +598,11 @@ async fn scheduler_clones_rust_target_from_sibling_worktree_of_the_same_reposito
 /// Persistent caches and sibling Rust clones are isolated by the effective deny set.
 #[tokio::test(start_paused = true)]
 async fn scheduler_partitions_caches_and_clones_by_policy() {
-    let checker = RecordingChecker::new(Language::Rust);
+    agent_ide::languages::install();
+    let checker = RecordingChecker::new(agent_ide::languages::RUST);
     let cache_root = scratch_dir("policy-cache");
-    let worktree_a = scratch_worktree("policy-worktree-a", Language::Rust);
-    let worktree_b = scratch_worktree("policy-worktree-b", Language::Rust);
+    let worktree_a = scratch_worktree("policy-worktree-a", agent_ide::languages::RUST);
+    let worktree_b = scratch_worktree("policy-worktree-b", agent_ide::languages::RUST);
     let scheduler = Scheduler::new(
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),
@@ -617,8 +633,8 @@ async fn scheduler_partitions_caches_and_clones_by_policy() {
         second_cache.parent().unwrap().file_name()
     );
     assert_eq!(
-        scheduler.rust_cache_clone_outcome(&worktree_b),
-        RustCacheClone::SkippedNoSource
+        scheduler.cache_clone_outcome(&worktree_b, agent_ide::languages::RUST),
+        CacheClone::SkippedNoSource
     );
     assert!(!second_cache.join("target/marker.txt").exists());
 
@@ -633,16 +649,17 @@ async fn scheduler_partitions_caches_and_clones_by_policy() {
     assert_ne!(first_cache, stricter_cache);
     assert!(!stricter_cache.join("target/marker.txt").exists());
     assert_eq!(
-        scheduler.rust_cache_clone_outcome(&worktree_a),
-        RustCacheClone::SkippedNoSource
+        scheduler.cache_clone_outcome(&worktree_a, agent_ide::languages::RUST),
+        CacheClone::SkippedNoSource
     );
 }
 
 /// A transient Fatal completion keeps the prior Ready snapshot; a durable Unavailable reason replaces it.
 #[tokio::test(start_paused = true)]
 async fn scheduler_fatal_or_timeout_completion_never_replaces_a_ready_snapshot() {
+    agent_ide::languages::install();
     let checker = RecordingChecker::with_states(
-        Language::Python,
+        agent_ide::languages::PYTHON,
         vec![
             CheckState::Ready,
             CheckState::Unavailable(UnavailableReason::Fatal),
@@ -650,7 +667,7 @@ async fn scheduler_fatal_or_timeout_completion_never_replaces_a_ready_snapshot()
         ],
     );
     let cache_root = scratch_dir("fatal-cache");
-    let worktree = scratch_worktree("fatal-worktree", Language::Python);
+    let worktree = scratch_worktree("fatal-worktree", agent_ide::languages::PYTHON);
     let scheduler = Scheduler::new(
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),
@@ -687,6 +704,7 @@ async fn scheduler_fatal_or_timeout_completion_never_replaces_a_ready_snapshot()
 /// `sweep_stale_caches` removes only cache directories whose recorded worktree path is gone.
 #[test]
 fn scheduler_sweep_stale_caches_removes_only_worktrees_that_no_longer_exist() {
+    agent_ide::languages::install();
     let cache_root = scratch_dir("sweep-cache-root");
     let live_worktree = scratch_dir("sweep-live-worktree");
 
@@ -743,11 +761,12 @@ fn scheduler_sweep_stale_caches_removes_only_worktrees_that_no_longer_exist() {
 /// The next run waits max(debounce, previous run duration) after the previous completion, not just the debounce.
 #[tokio::test(start_paused = true)]
 async fn scheduler_enforces_a_cooldown_of_max_debounce_and_previous_duration() {
+    agent_ide::languages::install();
     let debounce = Duration::from_millis(10);
     let run_duration = Duration::from_millis(150);
-    let checker = RecordingChecker::with_delay(Language::Python, run_duration);
+    let checker = RecordingChecker::with_delay(agent_ide::languages::PYTHON, run_duration);
     let cache_root = scratch_dir("cooldown-cache");
-    let worktree = scratch_worktree("cooldown-worktree", Language::Python);
+    let worktree = scratch_worktree("cooldown-worktree", agent_ide::languages::PYTHON);
     let scheduler = Scheduler::new(vec![Arc::new(checker.clone())], debounce, 2, cache_root);
 
     // Settle just past the expected completion (debounce + 150ms delay), with only a small
@@ -779,10 +798,11 @@ async fn scheduler_enforces_a_cooldown_of_max_debounce_and_previous_duration() {
 /// `Unavailable(Disabled)` without creating a cache directory (T10B).
 #[tokio::test(start_paused = true)]
 async fn scheduler_rust_only_worktree_checks_rust_and_reports_python_disabled() {
-    let rust_checker = RecordingChecker::new(Language::Rust);
-    let python_checker = RecordingChecker::new(Language::Python);
+    agent_ide::languages::install();
+    let rust_checker = RecordingChecker::new(agent_ide::languages::RUST);
+    let python_checker = RecordingChecker::new(agent_ide::languages::PYTHON);
     let cache_root = scratch_dir("presence-rust-only-cache");
-    let worktree = scratch_worktree("presence-rust-only-worktree", Language::Rust);
+    let worktree = scratch_worktree("presence-rust-only-worktree", agent_ide::languages::RUST);
     let scheduler = Scheduler::new(
         vec![
             Arc::new(rust_checker.clone()),
@@ -809,7 +829,7 @@ async fn scheduler_rust_only_worktree_checks_rust_and_reports_python_disabled() 
     let latest = scheduler.latest(&worktree);
     let python_snapshot = latest
         .iter()
-        .find(|snapshot| snapshot.language == Language::Python)
+        .find(|snapshot| snapshot.language == agent_ide::languages::PYTHON)
         .expect("python still reports a snapshot");
     assert_eq!(
         python_snapshot.state,
@@ -844,10 +864,14 @@ fn any_entry_named(root: &Path, name: &str) -> bool {
 /// reports `Unavailable(Disabled)` (T10B).
 #[tokio::test(start_paused = true)]
 async fn scheduler_python_only_worktree_checks_python_and_reports_rust_disabled() {
-    let rust_checker = RecordingChecker::new(Language::Rust);
-    let python_checker = RecordingChecker::new(Language::Python);
+    agent_ide::languages::install();
+    let rust_checker = RecordingChecker::new(agent_ide::languages::RUST);
+    let python_checker = RecordingChecker::new(agent_ide::languages::PYTHON);
     let cache_root = scratch_dir("presence-python-only-cache");
-    let worktree = scratch_worktree("presence-python-only-worktree", Language::Python);
+    let worktree = scratch_worktree(
+        "presence-python-only-worktree",
+        agent_ide::languages::PYTHON,
+    );
     let scheduler = Scheduler::new(
         vec![
             Arc::new(rust_checker.clone()),
@@ -874,7 +898,7 @@ async fn scheduler_python_only_worktree_checks_python_and_reports_rust_disabled(
     let latest = scheduler.latest(&worktree);
     let rust_snapshot = latest
         .iter()
-        .find(|snapshot| snapshot.language == Language::Rust)
+        .find(|snapshot| snapshot.language == agent_ide::languages::RUST)
         .expect("rust still reports a snapshot");
     assert_eq!(
         rust_snapshot.state,
@@ -886,8 +910,9 @@ async fn scheduler_python_only_worktree_checks_python_and_reports_rust_disabled(
 /// (T10B).
 #[tokio::test(start_paused = true)]
 async fn scheduler_worktree_with_both_manifests_checks_both_languages() {
-    let rust_checker = RecordingChecker::new(Language::Rust);
-    let python_checker = RecordingChecker::new(Language::Python);
+    agent_ide::languages::install();
+    let rust_checker = RecordingChecker::new(agent_ide::languages::RUST);
+    let python_checker = RecordingChecker::new(agent_ide::languages::PYTHON);
     let cache_root = scratch_dir("presence-both-cache");
     let worktree = scratch_worktree_both_languages("presence-both-worktree");
     let scheduler = Scheduler::new(
@@ -916,9 +941,10 @@ async fn scheduler_worktree_with_both_manifests_checks_both_languages() {
 /// A configured TypeScript checker runs for a root config, while package-only roots stay absent.
 #[tokio::test(start_paused = true)]
 async fn scheduler_typescript_presence_requires_root_config() {
-    let rust_checker = RecordingChecker::new(Language::Rust);
-    let python_checker = RecordingChecker::new(Language::Python);
-    let typescript_checker = RecordingChecker::new(Language::TypeScript);
+    agent_ide::languages::install();
+    let rust_checker = RecordingChecker::new(agent_ide::languages::RUST);
+    let python_checker = RecordingChecker::new(agent_ide::languages::PYTHON);
+    let typescript_checker = RecordingChecker::new(agent_ide::languages::TYPESCRIPT);
     let scheduler = Scheduler::new(
         vec![
             Arc::new(rust_checker.clone()),
@@ -929,7 +955,10 @@ async fn scheduler_typescript_presence_requires_root_config() {
         2,
         scratch_dir("presence-typescript-cache"),
     );
-    let configured = scratch_worktree("presence-typescript-configured", Language::TypeScript);
+    let configured = scratch_worktree(
+        "presence-typescript-configured",
+        agent_ide::languages::TYPESCRIPT,
+    );
     scheduler.trigger("repo", &configured);
     settle(Duration::from_millis(60), Duration::from_millis(5)).await;
     assert_eq!(typescript_checker.calls().len(), 1);
@@ -941,7 +970,11 @@ async fn scheduler_typescript_presence_requires_root_config() {
             .iter()
             .map(|snapshot| snapshot.language)
             .collect::<Vec<_>>(),
-        vec![Language::Rust, Language::Python, Language::TypeScript]
+        vec![
+            agent_ide::languages::RUST,
+            agent_ide::languages::PYTHON,
+            agent_ide::languages::TYPESCRIPT
+        ]
     );
     assert_eq!(latest[2].state, CheckState::Ready);
 
@@ -960,8 +993,9 @@ async fn scheduler_typescript_presence_requires_root_config() {
 /// languages report `Unavailable(Disabled)` (T10B).
 #[tokio::test(start_paused = true)]
 async fn scheduler_empty_worktree_checks_neither_language() {
-    let rust_checker = RecordingChecker::new(Language::Rust);
-    let python_checker = RecordingChecker::new(Language::Python);
+    agent_ide::languages::install();
+    let rust_checker = RecordingChecker::new(agent_ide::languages::RUST);
+    let python_checker = RecordingChecker::new(agent_ide::languages::PYTHON);
     let cache_root = scratch_dir("presence-empty-cache");
     let worktree = scratch_dir("presence-empty-worktree");
     let scheduler = Scheduler::new(
@@ -992,7 +1026,8 @@ async fn scheduler_empty_worktree_checks_neither_language() {
 /// one, without requiring a restart (T10B).
 #[tokio::test(start_paused = true)]
 async fn scheduler_worktree_gaining_cargo_toml_is_checked_on_the_next_trigger() {
-    let rust_checker = RecordingChecker::new(Language::Rust);
+    agent_ide::languages::install();
+    let rust_checker = RecordingChecker::new(agent_ide::languages::RUST);
     let cache_root = scratch_dir("presence-late-cache");
     let worktree = scratch_dir("presence-late-worktree");
     let scheduler = Scheduler::new(
@@ -1030,9 +1065,10 @@ async fn scheduler_worktree_gaining_cargo_toml_is_checked_on_the_next_trigger() 
 /// entirely: no second checker call, no `running` flag, and the stored snapshot stays current.
 #[tokio::test(start_paused = true)]
 async fn scheduler_trigger_with_unchanged_fingerprint_after_a_ready_result_skips_the_run() {
-    let checker = RecordingChecker::new(Language::Python);
+    agent_ide::languages::install();
+    let checker = RecordingChecker::new(agent_ide::languages::PYTHON);
     let cache_root = scratch_dir("skip-unchanged-cache");
-    let worktree = scratch_worktree("skip-unchanged-worktree", Language::Python);
+    let worktree = scratch_worktree("skip-unchanged-worktree", agent_ide::languages::PYTHON);
     let scheduler = Scheduler::new(
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),
@@ -1074,10 +1110,11 @@ async fn scheduler_trigger_with_unchanged_fingerprint_after_a_ready_result_skips
 /// (T20B) A trigger whose fingerprint differs from the last completion's inputs runs.
 #[tokio::test(start_paused = true)]
 async fn scheduler_trigger_with_a_changed_fingerprint_reruns_the_check() {
-    let checker = RecordingChecker::new(Language::Python);
+    agent_ide::languages::install();
+    let checker = RecordingChecker::new(agent_ide::languages::PYTHON);
     let cell = Arc::new(AtomicU64::new(7));
     let cache_root = scratch_dir("skip-changed-cache");
-    let worktree = scratch_worktree("skip-changed-worktree", Language::Python);
+    let worktree = scratch_worktree("skip-changed-worktree", agent_ide::languages::PYTHON);
     let scheduler = Scheduler::new(
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),
@@ -1104,9 +1141,10 @@ async fn scheduler_trigger_with_a_changed_fingerprint_reruns_the_check() {
 /// trigger with the same unchanged inputs skips again.
 #[tokio::test(start_paused = true)]
 async fn scheduler_activate_with_unchanged_fingerprint_still_runs() {
-    let checker = RecordingChecker::new(Language::Python);
+    agent_ide::languages::install();
+    let checker = RecordingChecker::new(agent_ide::languages::PYTHON);
     let cache_root = scratch_dir("skip-activate-cache");
-    let worktree = scratch_worktree("skip-activate-worktree", Language::Python);
+    let worktree = scratch_worktree("skip-activate-worktree", agent_ide::languages::PYTHON);
     let scheduler = Scheduler::new(
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),
@@ -1139,9 +1177,10 @@ async fn scheduler_activate_with_unchanged_fingerprint_still_runs() {
 /// (T20B) An unknown fingerprint (`None`) never skips: unknown means changed means run.
 #[tokio::test(start_paused = true)]
 async fn scheduler_unknown_fingerprint_always_runs() {
-    let checker = RecordingChecker::new(Language::Python);
+    agent_ide::languages::install();
+    let checker = RecordingChecker::new(agent_ide::languages::PYTHON);
     let cache_root = scratch_dir("skip-unknown-cache");
-    let worktree = scratch_worktree("skip-unknown-worktree", Language::Python);
+    let worktree = scratch_worktree("skip-unknown-worktree", agent_ide::languages::PYTHON);
     let scheduler = Scheduler::new(
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),
@@ -1168,15 +1207,16 @@ async fn scheduler_unknown_fingerprint_always_runs() {
 /// completion arms the skip.
 #[tokio::test(start_paused = true)]
 async fn scheduler_trigger_after_a_fatal_completion_reruns_despite_unchanged_fingerprint() {
+    agent_ide::languages::install();
     let checker = RecordingChecker::with_states(
-        Language::Python,
+        agent_ide::languages::PYTHON,
         vec![
             CheckState::Unavailable(UnavailableReason::Fatal),
             CheckState::Ready,
         ],
     );
     let cache_root = scratch_dir("skip-fatal-cache");
-    let worktree = scratch_worktree("skip-fatal-worktree", Language::Python);
+    let worktree = scratch_worktree("skip-fatal-worktree", agent_ide::languages::PYTHON);
     let scheduler = Scheduler::new(
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),

@@ -3,10 +3,16 @@
 //! Every exchange waits for the versioned diagnostics push of the synchronized document, so a
 //! context reply carries the checker's own verdict on the exact bytes.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{any::Any, collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+
+use serde::Deserialize;
 
 use crate::{
-    assistance::{host_binding::BindingRef, launcher::ProviderLaunch, reply::FailureCode},
+    assistance::{
+        host_binding::BindingRef,
+        launcher::{AcceptedExecutable, ProviderLaunch},
+        reply::FailureCode,
+    },
     checks::BoxFuture,
     execution::AdmissionClass,
     intelligence::{
@@ -19,17 +25,74 @@ use crate::{
         server::{self, LanguageServer, ProviderContext, ProviderHost, ProviderJob, ServerBackend},
         session::{LiveSession, ProviderSettings},
     },
-    telemetry::Language,
+    lang::Language,
     workspace::observation::SourceObservation,
 };
+
+/// Pyright declaration fields beyond the common ones.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PyrightLaunchOptions {
+    /// Absolute operator-declared Node executable, the only program permitted to start Pyright.
+    /// Its measured identity must match the declaration's `toolchain`.
+    pub node: Option<AcceptedExecutable>,
+}
 
 /// The Pyright server integration.
 pub struct PyrightServer;
 
 impl LanguageServer for PyrightServer {
-    /// Python provider observations.
+    /// The Python language.
     fn language(&self) -> Language {
-        Language::Python
+        crate::lang::python::LANGUAGE
+    }
+
+    /// Pyright defaults, versioned.
+    fn settings_key(&self) -> &'static str {
+        "pyright_defaults_v1"
+    }
+
+    /// The Node executable.
+    fn option_fields(&self) -> &'static [&'static str] {
+        &["node"]
+    }
+
+    /// Decodes [`PyrightLaunchOptions`].
+    fn parse_options(
+        &self,
+        fields: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Arc<dyn Any + Send + Sync>, serde_json::Error> {
+        let options: PyrightLaunchOptions =
+            serde_json::from_value(serde_json::Value::Object(fields))?;
+        Ok(Arc::new(options))
+    }
+
+    /// Requires a valid Node executable whose identity is the declared toolchain.
+    fn validate_launch(&self, launch: &ProviderLaunch) -> bool {
+        launch
+            .options::<PyrightLaunchOptions>()
+            .and_then(|options| options.node.as_ref())
+            .is_some_and(|node| node.validate().is_ok() && launch.toolchain == node.identity)
+    }
+
+    /// The declared Node executable.
+    fn launch_executables<'a>(&self, launch: &'a ProviderLaunch) -> Vec<&'a AcceptedExecutable> {
+        launch
+            .options::<PyrightLaunchOptions>()
+            .and_then(|options| options.node.as_ref())
+            .into_iter()
+            .collect()
+    }
+
+    /// The Pyright script (run by Node) and Node itself.
+    fn toolchain_programs(&self, launch: &ProviderLaunch) -> Vec<(PathBuf, Option<PathBuf>)> {
+        let node = launch
+            .options::<PyrightLaunchOptions>()
+            .and_then(|options| options.node.as_ref())
+            .map(|node| node.path.clone());
+        let mut programs = vec![(launch.executable.path.clone(), node.clone())];
+        programs.extend(node.map(|node| (node, None)));
+        programs
     }
 
     /// The server's own name, used where a reply explains its missing call hierarchy.
@@ -122,7 +185,10 @@ impl PyrightBackend {
         self.release(host, &binding).await;
         let authority = host.authority(&binding).await?;
         let cache_namespace = host.cache_namespace(&binding, &authority, launch, &launch.trust)?;
-        let node = launch.node.as_ref().ok_or(FailureCode::ExecutionProfile)?;
+        let node = launch
+            .options::<PyrightLaunchOptions>()
+            .and_then(|options| options.node.as_ref())
+            .ok_or(FailureCode::ExecutionProfile)?;
         let profile = PyrightProfile::new(PyrightProfileIdentity {
             binary: launch.executable.path.clone(),
             accepted_script_digest: blake3::Hash::from_hex(&launch.executable.blake3)
@@ -271,7 +337,7 @@ impl PyrightBackend {
         };
         server::record_provider(
             &*host,
-            Language::Python,
+            crate::lang::python::LANGUAGE,
             server::diagnostic_state(outcome.diagnostics.readiness),
         );
         host.active(&binding)?;

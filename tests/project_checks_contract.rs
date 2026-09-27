@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use agent_ide::checks::runner::{FakeRunner, RunOutput};
 use agent_ide::checks::rust::{RustChecker, parse_cargo_messages};
-use agent_ide::checks::{CheckRequest, CheckState, Checker, Language, Severity, UnavailableReason};
+use agent_ide::checks::{CheckRequest, CheckState, Checker, Severity, UnavailableReason};
 
 /// Recorded real cargo JSON stream (probe fixture, failing variant): probe-b fails with one
 /// E0308 duplicated across its lib and lib-test units, probe-a carries one duplicated warning,
@@ -132,6 +132,7 @@ fn rust_home() -> PathBuf {
 /// the rustup home, or the `HOME` handed to the confined check.
 #[test]
 fn rust_cargo_check_spec_ignores_a_substituted_home_variable() {
+    agent_ide::languages::install();
     let root = rust_scratch("spec-substituted-home");
     let request = rust_request(&root, true);
     let checker = rust_checker(&root, FakeRunner::default());
@@ -156,6 +157,7 @@ fn rust_cargo_check_spec_ignores_a_substituted_home_variable() {
 /// the 64 MiB output cap.
 #[test]
 fn rust_cargo_check_spec_matches_confined_contract() {
+    agent_ide::languages::install();
     let root = rust_scratch("spec");
     let request = rust_request(&root, true);
     let checker = rust_checker(&root, FakeRunner::default());
@@ -229,6 +231,7 @@ fn rust_cargo_check_spec_matches_confined_contract() {
 /// Proves `--locked` is passed even when the worktree carries no `Cargo.lock` (EYES-r2 §4).
 #[test]
 fn rust_cargo_check_spec_passes_locked_without_lockfile() {
+    agent_ide::languages::install();
     let root = rust_scratch("spec-unlocked");
     let request = rust_request(&root, false);
     let checker = rust_checker(&root, FakeRunner::default());
@@ -256,6 +259,7 @@ fn rust_cargo_check_spec_passes_locked_without_lockfile() {
 /// Proves an explicit cargo home overrides the default read root.
 #[test]
 fn rust_cargo_check_spec_honors_explicit_cargo_home() {
+    agent_ide::languages::install();
     let root = rust_scratch("spec-cargo-home");
     let request = rust_request(&root, true);
     let toolchain_dir = root.join("standalone-tc");
@@ -282,6 +286,7 @@ fn rust_cargo_check_spec_honors_explicit_cargo_home() {
 /// has no `toolchains` ancestor.
 #[test]
 fn rust_cargo_check_spec_falls_back_to_home_rustup() {
+    agent_ide::languages::install();
     let root = rust_scratch("spec-rustup-fallback");
     let request = rust_request(&root, true);
     let toolchain_dir = root.join("standalone-tc");
@@ -315,6 +320,7 @@ fn rust_cargo_check_spec_falls_back_to_home_rustup() {
 /// neither file (the scratch root, two levels up) adds nothing.
 #[test]
 fn rust_cargo_check_spec_adds_ancestor_manifest_files_for_nested_worktree() {
+    agent_ide::languages::install();
     let root = rust_scratch("ancestor-manifests");
     let parent_project = root.join("parent-project");
     fs::create_dir_all(parent_project.join(".cargo")).expect("parent .cargo dir creates");
@@ -372,6 +378,7 @@ fn rust_cargo_check_spec_adds_ancestor_manifest_files_for_nested_worktree() {
 /// case: a standalone checkout, as in every other spec test) adds no extra read roots at all.
 #[test]
 fn rust_cargo_check_spec_without_ancestor_manifests_adds_nothing() {
+    agent_ide::languages::install();
     let root = rust_scratch("ancestor-manifests-none");
     let request = rust_request(&root, true);
     let checker = rust_checker(&root, FakeRunner::default());
@@ -392,9 +399,10 @@ fn rust_cargo_check_spec_without_ancestor_manifests_adds_nothing() {
 /// Proves the checker reports the Rust language.
 #[test]
 fn rust_checker_reports_rust_language() {
+    agent_ide::languages::install();
     let root = rust_scratch("language");
     let checker = rust_checker(&root, FakeRunner::default());
-    assert_eq!(checker.language(), Language::Rust);
+    assert_eq!(checker.language(), agent_ide::languages::RUST);
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -402,6 +410,7 @@ fn rust_checker_reports_rust_language() {
 /// is started.
 #[tokio::test]
 async fn rust_check_reports_tool_missing_without_cargo_binary() {
+    agent_ide::languages::install();
     let root = rust_scratch("tool-missing");
     let request = rust_request(&root, true);
     let runner = FakeRunner::default();
@@ -431,6 +440,7 @@ async fn rust_check_reports_tool_missing_without_cargo_binary() {
 /// fenced through.
 #[tokio::test]
 async fn rust_check_failure_stream_is_partial_with_deduped_problems() {
+    agent_ide::languages::install();
     let root = rust_scratch("failure");
     let request = rust_request(&root, true);
     let checker = rust_checker(
@@ -467,6 +477,7 @@ async fn rust_check_failure_stream_is_partial_with_deduped_problems() {
 /// one.
 #[tokio::test]
 async fn rust_check_clean_stream_is_ready_with_deduped_warning() {
+    agent_ide::languages::install();
     let root = rust_scratch("clean");
     let request = rust_request(&root, true);
     let checker = rust_checker(&root, FakeRunner::with_stdout(0, CLEAN_STREAM.as_bytes()));
@@ -486,6 +497,7 @@ async fn rust_check_clean_stream_is_ready_with_deduped_warning() {
 /// duration through verbatim.
 #[test]
 fn rust_parser_failure_stream_maps_partial_with_dedup() {
+    agent_ide::languages::install();
     let snapshot = parse_cargo_messages(FAILURE_STREAM.as_bytes(), &[], 7, 1234);
     assert_eq!(snapshot.state, CheckState::Partial);
     assert_eq!(snapshot.errors, 1);
@@ -498,6 +510,7 @@ fn rust_parser_failure_stream_maps_partial_with_dedup() {
 /// collapsed.
 #[test]
 fn rust_parser_clean_stream_maps_ready() {
+    agent_ide::languages::install();
     let snapshot = parse_cargo_messages(CLEAN_STREAM.as_bytes(), &[], 8, 20);
     assert_eq!(snapshot.state, CheckState::Ready);
     assert_eq!(snapshot.errors, 0);
@@ -511,6 +524,7 @@ fn rust_parser_clean_stream_maps_ready() {
 /// snapshot's detail.
 #[test]
 fn rust_parser_failed_build_with_no_errors_is_fatal_with_stderr_detail() {
+    agent_ide::languages::install();
     let stream = br#"{"reason":"build-finished","success":false}"#;
     let stderr = b"Compiling blake3 v1.5.0\nerror: failed to run custom build command for `blake3 v1.5.0`\n\nCaused by:\n  process didn't exit successfully\n";
     let snapshot = parse_cargo_messages(stream, stderr, 11, 99);
@@ -532,6 +546,7 @@ fn rust_parser_failed_build_with_no_errors_is_fatal_with_stderr_detail() {
 /// reports `Unavailable(Fatal)`, with no detail rather than a guessed one.
 #[test]
 fn rust_parser_failed_build_with_no_errors_and_no_stderr_has_no_detail() {
+    agent_ide::languages::install();
     let stream = br#"{"reason":"build-finished","success":false}"#;
     let snapshot = parse_cargo_messages(stream, b"", 11, 99);
     assert_eq!(
@@ -544,6 +559,7 @@ fn rust_parser_failed_build_with_no_errors_and_no_stderr_has_no_detail() {
 /// Proves a stderr `error:` line longer than 160 bytes is truncated on a UTF-8 boundary.
 #[test]
 fn rust_parser_failed_build_detail_is_truncated_to_160_bytes() {
+    agent_ide::languages::install();
     let stream = br#"{"reason":"build-finished","success":false}"#;
     let long_suffix = "x".repeat(200);
     let stderr = format!("error: {long_suffix}\n");
@@ -559,6 +575,7 @@ fn rust_parser_failed_build_detail_is_truncated_to_160_bytes() {
 /// preference to cargo's own stderr summary line.
 #[test]
 fn rust_parser_prefers_spanless_compiler_error_message_over_stderr() {
+    agent_ide::languages::install();
     let stream = concat!(
         r#"{"reason":"compiler-message","package_id":"pastey 0.2.3","message":{"level":"error","message":"linking with `cc` failed: exit status: 71","spans":[]}}"#,
         "\n",
@@ -582,6 +599,7 @@ fn rust_parser_prefers_spanless_compiler_error_message_over_stderr() {
 /// zero counts and no detail when stderr carries no `error:` line.
 #[test]
 fn rust_parser_stream_without_build_finished_is_fatal() {
+    agent_ide::languages::install();
     let snapshot = parse_cargo_messages(TRUNCATED_STREAM.as_bytes(), &[], 9, 55);
     assert_eq!(
         snapshot.state,
@@ -601,6 +619,7 @@ fn rust_parser_stream_without_build_finished_is_fatal() {
 /// so this is the only place such a failure can surface a cause.
 #[test]
 fn rust_parser_stream_without_build_finished_carries_stderr_detail() {
+    agent_ide::languages::install();
     let stderr =
         b"error: failed searching for potential workspace\nCaused by:\n  Operation not permitted (os error 1)\n";
     let snapshot = parse_cargo_messages(TRUNCATED_STREAM.as_bytes(), stderr, 9, 55);
@@ -617,6 +636,7 @@ fn rust_parser_stream_without_build_finished_carries_stderr_detail() {
 /// Proves a runner-level failure maps to `Unavailable(Fatal)`.
 #[tokio::test]
 async fn rust_check_runner_error_is_fatal() {
+    agent_ide::languages::install();
     let root = rust_scratch("runner-error");
     let request = rust_request(&root, true);
     let checker = rust_checker(
@@ -636,6 +656,7 @@ async fn rust_check_runner_error_is_fatal() {
 /// Proves a timed-out run maps to `Unavailable(Timeout)`.
 #[tokio::test]
 async fn rust_check_timed_out_run_is_timeout() {
+    agent_ide::languages::install();
     let root = rust_scratch("timeout");
     let request = rust_request(&root, true);
     let checker = rust_checker(
@@ -657,6 +678,7 @@ async fn rust_check_timed_out_run_is_timeout() {
 /// would parse.
 #[tokio::test]
 async fn rust_check_truncated_output_is_fatal() {
+    agent_ide::languages::install();
     let root = rust_scratch("truncated-output");
     let request = rust_request(&root, true);
     let checker = rust_checker(
@@ -680,6 +702,7 @@ async fn rust_check_truncated_output_is_fatal() {
 /// unrelated stderr does not mask a partial parse.
 #[tokio::test]
 async fn rust_check_lockfile_stderr_is_env_missing() {
+    agent_ide::languages::install();
     let refusal_root = rust_scratch("env-missing-refusal");
     let refusal_request = rust_request(&refusal_root, true);
     let refusal_checker = rust_checker(
@@ -736,6 +759,7 @@ async fn rust_check_lockfile_stderr_is_env_missing() {
 /// `error:` line of stderr as the snapshot detail.
 #[tokio::test]
 async fn rust_check_failed_build_with_no_errors_is_fatal_not_ready() {
+    agent_ide::languages::install();
     let root = rust_scratch("build-failed-no-errors");
     let request = rust_request(&root, true);
     let checker = rust_checker(
@@ -765,6 +789,7 @@ async fn rust_check_failed_build_with_no_errors_is_fatal_not_ready() {
 /// (T05B, EYES-r2 §3), so a build script's `cc` invocation can resolve through it.
 #[test]
 fn rust_cargo_check_spec_includes_configured_developer_dir() {
+    agent_ide::languages::install();
     let root = rust_scratch("developer-dir-configured");
     let request = rust_request(&root, true);
     let developer_dir = root.join("custom-xcode");
@@ -789,6 +814,7 @@ fn rust_cargo_check_spec_includes_configured_developer_dir() {
 /// checker falls back to its own resolution instead of admitting a nonexistent read root.
 #[test]
 fn rust_cargo_check_spec_ignores_nonexistent_developer_dir_override() {
+    agent_ide::languages::install();
     let root = rust_scratch("developer-dir-missing-override");
     let request = rust_request(&root, true);
     let bogus_developer_dir = root.join("does-not-exist");
@@ -814,6 +840,7 @@ fn rust_cargo_check_spec_ignores_nonexistent_developer_dir_override() {
 /// a build script's link step never reaches the `/usr/bin/cc` `xcrun` shim.
 #[test]
 fn rust_cargo_check_spec_sets_linker_env_when_xcode_clang_present() {
+    agent_ide::languages::install();
     let root = rust_scratch("linker-env-xcode");
     let request = rust_request(&root, true);
     let developer_dir = rust_xcode_developer_dir(&root);
@@ -859,6 +886,7 @@ fn rust_cargo_check_spec_sets_linker_env_when_xcode_clang_present() {
 /// found but the toolchain directory's own name carries no recognizable target triple.
 #[test]
 fn rust_cargo_check_spec_falls_back_to_rustflags_when_triple_unknown() {
+    agent_ide::languages::install();
     let root = rust_scratch("linker-env-unknown-triple");
     let request = rust_request(&root, true);
     let developer_dir = rust_xcode_developer_dir(&root);

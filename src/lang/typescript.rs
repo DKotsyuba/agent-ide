@@ -14,15 +14,31 @@ use async_lsp::lsp_types as lsp;
 use serde_json::Value;
 
 use super::{
-    CommandSource, InsertSite, InsertWhere, LangError, Language, LanguageProject, LanguageSupport,
-    LineRange, Outline, ProjectCommand, ProjectCommands, Symbol, SymbolKind, SymbolPath,
-    TestFailure, TestReport, TestSelection, TestTarget, kind_of, line_count, lines_of,
+    CommandSource, InsertSite, InsertWhere, LangError, Language, LanguageDescriptor,
+    LanguageProject, LanguageSupport, LineRange, Outline, ProjectCommand, ProjectCommands, Symbol,
+    SymbolKind, SymbolPath, TestFailure, TestReport, TestSelection, TestTarget, kind_of,
+    line_count, lines_of,
     python::{
         MAX_ATTRIBUTE_CHARS, MAX_NAMED_TESTS, distinct, distinct_files, entry_names, env_value,
         indent_of, indent_unit, last_content_line, line_at, one_line, read_text, source_lines,
     },
     render::clip,
 };
+
+/// Registration descriptor of the TypeScript language.
+pub static DESCRIPTOR: LanguageDescriptor = LanguageDescriptor {
+    id: "typescript",
+    display_name: "TypeScript",
+    extensions: &["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"],
+    card_manifest: Some("package.json"),
+    home_tool_dirs: &[],
+    support: &TypeScript,
+    checks: Some(&crate::checks::typescript::TypeScriptChecks),
+    server: Some(&crate::intelligence::typescript_backend::TypeScriptServer),
+};
+
+/// The TypeScript language handle.
+pub const LANGUAGE: Language = Language::of(&DESCRIPTOR);
 
 /// TypeScript and JavaScript support over typescript-language-server's document symbols;
 /// stateless.
@@ -36,9 +52,9 @@ const SCRIPT_EXTENSIONS: [&str; 8] = ["ts", "tsx", "js", "jsx", "mts", "cts", "m
 const SCAN_LINES: usize = 200;
 
 impl LanguageSupport for TypeScript {
-    /// Always [`Language::TypeScript`] (JavaScript files included).
+    /// Always this module's [`LANGUAGE`] (JavaScript files included).
     fn language(&self) -> Language {
-        Language::TypeScript
+        LANGUAGE
     }
 
     /// Establishes a project from `package.json`, `tsconfig.json`, `tsconfig.*.json` or
@@ -178,7 +194,7 @@ impl LanguageSupport for TypeScript {
         }
 
         Some(LanguageProject {
-            language: Language::TypeScript,
+            language: LANGUAGE,
             manifests,
             environment,
             interpreter: None,
@@ -205,7 +221,7 @@ impl LanguageSupport for TypeScript {
         let root = SymbolPath::new(Some(file.to_path_buf()), Vec::new());
         Outline {
             file: file.to_path_buf(),
-            language: Language::TypeScript,
+            language: LANGUAGE,
             line_count: line_count(source),
             symbols: convert_all(&lines, symbols, &root, None, self.is_test_file(file)),
         }
@@ -456,6 +472,40 @@ impl LanguageSupport for TypeScript {
                 file.display().to_string(),
             ]
         })
+    }
+
+    /// Tests live only in test files by this runner's naming convention.
+    fn tests_only_in_test_files(&self) -> bool {
+        true
+    }
+
+    /// A leading `//` comment, or the first text line of a leading `/** */` block.
+    fn file_doc(&self, text: &str) -> Option<String> {
+        let lines: Vec<_> = text.lines().collect();
+
+        let first = lines.iter().find(|line| !line.trim().is_empty())?.trim();
+        if let Some(comment) = first.strip_prefix("//") {
+            return Some(comment.trim().to_owned()).filter(|s| !s.is_empty());
+        }
+        if let Some(comment) = first.strip_prefix("/**") {
+            let line = comment
+                .trim()
+                .trim_end_matches("*/")
+                .trim()
+                .trim_start_matches('*')
+                .trim();
+            let line = if line.is_empty() {
+                lines
+                    .iter()
+                    .skip(1)
+                    .map(|line| line.trim().trim_start_matches('*').trim())
+                    .find(|line| !line.is_empty())?
+            } else {
+                line
+            };
+            return Some(line.to_owned());
+        }
+        None
     }
 }
 
@@ -1742,7 +1792,7 @@ src/transport.ts  (29 lines, typescript)
     /// A project with only the given environment facts.
     fn project(environment: &[(&str, &str)]) -> LanguageProject {
         LanguageProject {
-            language: Language::TypeScript,
+            language: LANGUAGE,
             manifests: vec![PathBuf::from("package.json")],
             environment: environment
                 .iter()
@@ -2098,6 +2148,14 @@ ok 2 - subtracts
         assert_eq!(
             TypeScript.format_stdin_command(&none, Path::new("src/a.ts")),
             None
+        );
+    }
+
+    #[test]
+    fn file_doc_reads_the_leading_comment() {
+        assert_eq!(
+            TypeScript.file_doc("/** TS docs */\nexport {}"),
+            Some("TS docs".into())
         );
     }
 }

@@ -39,69 +39,64 @@ pub const MAX_PROBLEMS: usize = 500;
 /// so multi-byte text keeps up to 200 characters.
 pub const MAX_MESSAGE_CHARS: usize = 200;
 
-/// Language a project check runs for.
+/// Language a project check runs for: the registered language handle.
+pub use crate::lang::Language;
+
+/// A language's confined project-check integration, reached through its registered descriptor.
 ///
-/// The declaration order is the fixed feed order (Rust, Python, TypeScript); the derived ordering
-/// relies on it.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-pub enum Language {
-    /// Rust checks (`cargo check --workspace --all-targets …`).
-    Rust,
-    /// Python checks (`pyright --outputjson …`).
-    Python,
-    /// TypeScript or JavaScript checks through the pinned `tsc.js` CLI.
-    TypeScript,
-}
-
-impl Language {
-    /// Canonical lowercase identifier used by the feed and `ide.context` problems kind:
-    /// `"rust"`, `"python"`, or `"typescript"`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Language::Rust => "rust",
-            Language::Python => "python",
-            Language::TypeScript => "typescript",
-        }
-    }
-
+/// Implementations are stateless `'static` values. The scheduler asks them whether a worktree is
+/// a project of the language and which cache to seed from a sibling worktree; the launcher asks
+/// them to decode the language's `project_checks` section.
+pub trait LanguageChecks: Send + Sync + 'static {
     /// Reports whether `worktree` looks like a project of this language, per the cheap and
-    /// deterministic presence rule (T10B): a language absent from a worktree is never checked and
-    /// never mentioned. Rust is present iff `<worktree>/Cargo.toml` exists. Python is present iff
-    /// the worktree root has any of `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt`,
-    /// `Pipfile`, `pyrightconfig.json`, or a `.venv`/`venv` directory. This deliberately never
-    /// walks the tree for source files (for example `*.py`). TypeScript is present only when a
-    /// root `tsconfig.json` or `jsconfig.json` entry exists, including a link that the checker
-    /// will reject as unprovable; `package.json` alone does not count. Presence is a handful of `stat`
-    /// calls at the worktree root, cheap enough to re-evaluate on every trigger so a worktree that
-    /// later gains a `Cargo.toml` starts being checked on its next trigger.
-    pub fn is_present(self, worktree: &Path) -> bool {
-        match self {
-            Language::Rust => worktree.join("Cargo.toml").exists(),
-            Language::Python => {
-                PYTHON_PRESENCE_FILES
-                    .iter()
-                    .any(|name| worktree.join(name).exists())
-                    || worktree.join(".venv").is_dir()
-                    || worktree.join("venv").is_dir()
-            }
-            Language::TypeScript => {
-                std::fs::symlink_metadata(worktree.join("tsconfig.json")).is_ok()
-                    || std::fs::symlink_metadata(worktree.join("jsconfig.json")).is_ok()
-            }
-        }
+    /// deterministic presence rule (T10B): a handful of `stat` calls at the worktree root, never
+    /// a tree walk, cheap enough to re-evaluate on every trigger so a worktree that later gains
+    /// its manifest starts being checked on its next trigger.
+    fn is_present(&self, worktree: &Path) -> bool;
+
+    /// The check tool named in model-facing tool descriptions (`cargo check`).
+    fn tool_name(&self) -> &'static str;
+
+    /// Subdirectory of this language's check cache to seed, before a worktree's first check, with
+    /// a copy-on-write clone of the most recently completed sibling worktree's cache for the same
+    /// repository and read policy; `None` (the default) never seeds.
+    fn sibling_cache(&self) -> Option<&'static str> {
+        None
     }
+
+    /// Decodes this language's closed `project_checks` launcher section. A shape error is the
+    /// launcher's `Invalid`; path rules are checked later by [`CheckConfig::validate`].
+    fn parse_config(
+        &self,
+        section: serde_json::Value,
+    ) -> Result<Arc<dyn CheckConfig>, serde_json::Error>;
 }
 
-/// Root-level marker files whose presence identifies a worktree as a Python project (T10B),
-/// besides a `.venv`/`venv` directory (checked separately since it is a directory, not a file).
-const PYTHON_PRESENCE_FILES: [&str; 6] = [
-    "pyproject.toml",
-    "setup.py",
-    "setup.cfg",
-    "requirements.txt",
-    "Pipfile",
-    "pyrightconfig.json",
-];
+/// One language's decoded project-check declaration from the launcher configuration.
+pub trait CheckConfig: std::any::Any + Send + Sync {
+    /// Whether every declared path is absolute and lexically normal; `false` is the launcher's
+    /// `Rejected`.
+    fn validate(&self) -> bool;
+
+    /// Builds this language's checker, confined through `runner`, with `timeout` as the total
+    /// wall-clock ceiling of one run.
+    fn checker(
+        &self,
+        runner: Arc<dyn runner::ConfinedRunner>,
+        timeout: Duration,
+    ) -> Arc<dyn Checker>;
+
+    /// Toolchain programs `doctor` probes, in declaration order, each with the interpreter that
+    /// runs it when it is not directly executable.
+    fn programs(&self) -> Vec<(PathBuf, Option<PathBuf>)>;
+}
+
+impl dyn CheckConfig {
+    /// Returns the concrete declaration when it is a `T`.
+    pub fn downcast_ref<T: CheckConfig>(&self) -> Option<&T> {
+        (self as &dyn std::any::Any).downcast_ref::<T>()
+    }
+}
 
 /// Severity of one reported problem.
 ///
@@ -561,8 +556,13 @@ mod tests {
             problem("src/lib.rs", 1, 1, Severity::Error, "boom"),
             problem("src/lib.rs", 1, 1, Severity::Error, "different"),
         ];
-        let snapshot =
-            ProblemSnapshot::from_problems(Language::Rust, CheckState::Ready, problems, 7, 10);
+        let snapshot = ProblemSnapshot::from_problems(
+            crate::lang::testing::ALPHA,
+            CheckState::Ready,
+            problems,
+            7,
+            10,
+        );
         assert_eq!(snapshot.errors, 2);
         assert_eq!(snapshot.warnings, 0);
         assert_eq!(snapshot.problems.len(), 2);
@@ -595,8 +595,13 @@ mod tests {
             problem_with_code("src/lib.rs", 1, 1, Severity::Error, Some("E0308"), "boom"),
             problem_with_code("src/lib.rs", 1, 1, Severity::Error, Some("E0309"), "boom"),
         ];
-        let snapshot =
-            ProblemSnapshot::from_problems(Language::Rust, CheckState::Ready, differing_code, 1, 1);
+        let snapshot = ProblemSnapshot::from_problems(
+            crate::lang::testing::ALPHA,
+            CheckState::Ready,
+            differing_code,
+            1,
+            1,
+        );
         assert_eq!(snapshot.problems.len(), 2);
         assert_eq!(snapshot.errors, 2);
 
@@ -605,8 +610,13 @@ mod tests {
             problem_with_code("src/lib.rs", 1, 1, Severity::Error, Some("E0308"), "boom"),
             problem_with_code("src/lib.rs", 1, 1, Severity::Error, Some("E0308"), "boom"),
         ];
-        let snapshot =
-            ProblemSnapshot::from_problems(Language::Rust, CheckState::Ready, same_code, 1, 1);
+        let snapshot = ProblemSnapshot::from_problems(
+            crate::lang::testing::ALPHA,
+            CheckState::Ready,
+            same_code,
+            1,
+            1,
+        );
         assert_eq!(snapshot.problems.len(), 1);
         assert_eq!(snapshot.errors, 1);
     }
@@ -620,8 +630,13 @@ mod tests {
             problem("a.rs", 1, 1, Severity::Error, "e"),
             problem("a.rs", 5, 2, Severity::Error, "e"),
         ];
-        let snapshot =
-            ProblemSnapshot::from_problems(Language::Rust, CheckState::Ready, problems, 1, 5);
+        let snapshot = ProblemSnapshot::from_problems(
+            crate::lang::testing::ALPHA,
+            CheckState::Ready,
+            problems,
+            1,
+            5,
+        );
         let order: Vec<(String, u32, u32, Severity)> = snapshot
             .problems
             .iter()
@@ -652,8 +667,13 @@ mod tests {
             .map(|line| problem("e.rs", line, 1, Severity::Error, "e"))
             .collect();
         problems.extend((1..=203).map(|line| problem("w.rs", line, 1, Severity::Warning, "w")));
-        let snapshot =
-            ProblemSnapshot::from_problems(Language::Rust, CheckState::Ready, problems, 2, 20);
+        let snapshot = ProblemSnapshot::from_problems(
+            crate::lang::testing::ALPHA,
+            CheckState::Ready,
+            problems,
+            2,
+            20,
+        );
         assert_eq!(snapshot.errors, 300);
         assert_eq!(snapshot.warnings, 203);
         assert_eq!(snapshot.problems.len(), MAX_PROBLEMS);
@@ -672,8 +692,13 @@ mod tests {
         let exact: Vec<Problem> = (0..MAX_PROBLEMS as u32)
             .map(|line| problem("e.rs", line, 1, Severity::Error, "e"))
             .collect();
-        let snapshot =
-            ProblemSnapshot::from_problems(Language::Rust, CheckState::Ready, exact, 1, 1);
+        let snapshot = ProblemSnapshot::from_problems(
+            crate::lang::testing::ALPHA,
+            CheckState::Ready,
+            exact,
+            1,
+            1,
+        );
         assert_eq!(snapshot.errors, MAX_PROBLEMS as u32);
         assert_eq!(snapshot.problems.len(), MAX_PROBLEMS);
         assert!(!snapshot.truncated);
@@ -682,8 +707,13 @@ mod tests {
         let over: Vec<Problem> = (0..=MAX_PROBLEMS as u32)
             .map(|line| problem("e.rs", line, 1, Severity::Error, "e"))
             .collect();
-        let snapshot =
-            ProblemSnapshot::from_problems(Language::Rust, CheckState::Ready, over, 1, 1);
+        let snapshot = ProblemSnapshot::from_problems(
+            crate::lang::testing::ALPHA,
+            CheckState::Ready,
+            over,
+            1,
+            1,
+        );
         assert_eq!(snapshot.errors, MAX_PROBLEMS as u32 + 1);
         assert_eq!(snapshot.problems.len(), MAX_PROBLEMS);
         assert!(snapshot.truncated);
@@ -744,7 +774,7 @@ mod tests {
             message: "ё".repeat(300),
         };
         let snapshot = ProblemSnapshot::from_problems(
-            Language::Python,
+            crate::lang::testing::BETA,
             CheckState::Ready,
             vec![oversized],
             3,
@@ -758,10 +788,13 @@ mod tests {
 
     #[tokio::test]
     async fn fake_checker_returns_scripted_snapshot_and_records_requests() {
-        let snapshot = ProblemSnapshot::checking(Language::Python, 3);
-        let checker =
-            FakeChecker::with_delay(Language::Python, snapshot.clone(), Duration::from_millis(1));
-        assert_eq!(checker.language(), Language::Python);
+        let snapshot = ProblemSnapshot::checking(crate::lang::testing::BETA, 3);
+        let checker = FakeChecker::with_delay(
+            crate::lang::testing::BETA,
+            snapshot.clone(),
+            Duration::from_millis(1),
+        );
+        assert_eq!(checker.language(), crate::lang::testing::BETA);
         let first = CheckRequest {
             worktree: PathBuf::from("/wt"),
             cache_dir: PathBuf::from("/cache"),
@@ -782,11 +815,15 @@ mod tests {
 
     #[test]
     fn snapshot_constructors_and_wire_format_round_trip() {
-        assert_eq!(Language::Rust.as_str(), "rust");
-        assert_eq!(Language::Python.as_str(), "python");
-        assert!(Language::Rust < Language::Python);
-        let unavailable =
-            ProblemSnapshot::unavailable(Language::Rust, UnavailableReason::ToolMissing, 11);
+        crate::lang::testing::install();
+        assert_eq!(crate::lang::testing::ALPHA.as_str(), "alpha");
+        assert_eq!(crate::lang::testing::BETA.as_str(), "beta");
+        assert!(crate::lang::testing::ALPHA < crate::lang::testing::BETA);
+        let unavailable = ProblemSnapshot::unavailable(
+            crate::lang::testing::ALPHA,
+            UnavailableReason::ToolMissing,
+            11,
+        );
         assert_eq!(unavailable.errors, 0);
         assert_eq!(unavailable.warnings, 0);
         assert!(unavailable.problems.is_empty());
@@ -795,48 +832,5 @@ mod tests {
         let text = serde_json::to_string(&unavailable).expect("snapshot serializes");
         let parsed: ProblemSnapshot = serde_json::from_str(&text).expect("snapshot parses");
         assert_eq!(parsed, unavailable);
-    }
-
-    /// Builds a fresh empty scratch directory for presence-detection tests.
-    fn scratch_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "agent-ide-checks-mod-{}-{name}-{}",
-            std::process::id(),
-            name.len()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir created");
-        dir
-    }
-
-    #[test]
-    fn is_present_rust_requires_cargo_toml_at_the_worktree_root() {
-        let dir = scratch_dir("rust-presence");
-        assert!(!Language::Rust.is_present(&dir));
-        std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
-        assert!(Language::Rust.is_present(&dir));
-    }
-
-    #[test]
-    fn is_present_python_accepts_any_marker_file_or_venv_directory() {
-        for marker in PYTHON_PRESENCE_FILES {
-            let dir = scratch_dir(&format!("python-presence-{marker}"));
-            assert!(!Language::Python.is_present(&dir), "{marker}");
-            std::fs::write(dir.join(marker), "").unwrap();
-            assert!(Language::Python.is_present(&dir), "{marker}");
-        }
-        for venv_name in [".venv", "venv"] {
-            let dir = scratch_dir(&format!("python-presence-{venv_name}"));
-            assert!(!Language::Python.is_present(&dir), "{venv_name}");
-            std::fs::create_dir(dir.join(venv_name)).unwrap();
-            assert!(Language::Python.is_present(&dir), "{venv_name}");
-        }
-    }
-
-    #[test]
-    fn is_present_neither_language_on_an_empty_worktree() {
-        let dir = scratch_dir("empty-presence");
-        assert!(!Language::Rust.is_present(&dir));
-        assert!(!Language::Python.is_present(&dir));
     }
 }

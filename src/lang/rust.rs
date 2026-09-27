@@ -32,9 +32,10 @@ use std::{
 use async_lsp::lsp_types as lsp;
 
 use super::{
-    CommandSource, InsertSite, InsertWhere, LangError, Language, LanguageProject, LanguageSupport,
-    LineRange, Outline, ProjectCommand, ProjectCommands, Symbol, SymbolKind, SymbolPath,
-    TestFailure, TestId, TestReport, TestSelection, TestTarget, kind_of, line_count, lines_of,
+    CommandSource, InsertSite, InsertWhere, LangError, Language, LanguageDescriptor,
+    LanguageProject, LanguageSupport, LineRange, Outline, ProjectCommand, ProjectCommands, Symbol,
+    SymbolKind, SymbolPath, TestFailure, TestId, TestReport, TestSelection, TestTarget, kind_of,
+    line_count, lines_of,
 };
 
 /// Longest signature kept on a symbol card, in characters (the ellipsis included).
@@ -46,14 +47,29 @@ const MAX_NAMED_TESTS: usize = 32;
 /// A failure's optional `file:line` location and its first message line, as parsed from output.
 pub(super) type Located = (Option<(PathBuf, u32)>, String);
 
+/// Registration descriptor of the Rust language.
+pub static DESCRIPTOR: LanguageDescriptor = LanguageDescriptor {
+    id: "rust",
+    display_name: "Rust",
+    extensions: &["rs"],
+    card_manifest: Some("Cargo.toml"),
+    home_tool_dirs: &[".cargo/bin"],
+    support: &RustSupport,
+    checks: Some(&crate::checks::rust::RustChecks),
+    server: Some(&crate::intelligence::rust_backend::RustServer),
+};
+
+/// The Rust language handle.
+pub const LANGUAGE: Language = Language::of(&DESCRIPTOR);
+
 /// Stateless Rust implementation of [`LanguageSupport`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RustSupport;
 
 impl LanguageSupport for RustSupport {
-    /// Always [`Language::Rust`].
+    /// Always this module's [`LANGUAGE`].
     fn language(&self) -> Language {
-        Language::Rust
+        LANGUAGE
     }
 
     /// Detects a Cargo project (package or workspace) by `root/Cargo.toml`.
@@ -135,7 +151,7 @@ impl LanguageSupport for RustSupport {
         }
 
         Some(LanguageProject {
-            language: Language::Rust,
+            language: LANGUAGE,
             manifests: vec![PathBuf::from("Cargo.toml")],
             environment,
             interpreter: None,
@@ -156,7 +172,7 @@ impl LanguageSupport for RustSupport {
         let root = SymbolPath::new(Some(file.to_path_buf()), Vec::new());
         Outline {
             file: file.to_path_buf(),
-            language: Language::Rust,
+            language: LANGUAGE,
             line_count: line_count(source),
             symbols: symbols
                 .into_iter()
@@ -406,6 +422,41 @@ impl LanguageSupport for RustSupport {
         }
         let edition = rustfmt_edition(project)?;
         Some(vec!["rustfmt".to_owned(), "--edition".to_owned(), edition])
+    }
+
+    /// Rust test names are module paths derived from the file (`tests/` files name their
+    /// integration-test binary as the first segment).
+    fn test_id(&self, file: &Path, outline_path: &str) -> String {
+        test_id(file, outline_path)
+    }
+
+    /// Files under `tests/` build into their own integration-test binaries.
+    fn test_binary(&self, file: &Path) -> Option<String> {
+        integration_test_bin(file)
+    }
+
+    /// The first non-empty `//!` or `///` line of the leading comment block.
+    fn file_doc(&self, text: &str) -> Option<String> {
+        let lines: Vec<_> = text.lines().collect();
+
+        let mut docs = Vec::new();
+        for line in &lines {
+            let line = line.trim();
+            if line.is_empty() && docs.is_empty() {
+                continue;
+            }
+            if let Some(doc) = line
+                .strip_prefix("//!")
+                .or_else(|| line.strip_prefix("///"))
+            {
+                docs.push(doc.trim());
+            } else if !line.starts_with("//") && !line.starts_with("#![") {
+                break;
+            }
+        }
+        docs.into_iter()
+            .find(|doc| !doc.is_empty())
+            .map(str::to_owned)
     }
 }
 
@@ -1433,7 +1484,7 @@ mod tests {
 
     fn project() -> LanguageProject {
         LanguageProject {
-            language: Language::Rust,
+            language: LANGUAGE,
             manifests: vec![PathBuf::from("Cargo.toml")],
             environment: vec![("edition".to_owned(), "2024".to_owned())],
             interpreter: None,
@@ -1698,6 +1749,14 @@ mod tests {
         assert_eq!(
             RustSupport.format_stdin_command(&no_rustfmt, Path::new("src/lib.rs")),
             None
+        );
+    }
+
+    #[test]
+    fn file_doc_reads_the_leading_module_comment() {
+        assert_eq!(
+            RustSupport.file_doc("//! Rust docs\nfn a() {}"),
+            Some("Rust docs".into())
         );
     }
 }

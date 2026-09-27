@@ -853,7 +853,7 @@ impl TypeScriptProtocolChild {
         deadline: Duration,
     ) -> Result<ReapedProtocolProcess, TypeScriptProfileError> {
         self.child
-            .terminate_typescript_abnormally(grace, deadline)
+            .terminate_abnormally(grace, deadline)
             .await
             .map_err(TypeScriptProfileError::Process)
     }

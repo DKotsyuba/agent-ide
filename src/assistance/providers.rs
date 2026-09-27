@@ -6,7 +6,7 @@
 //! [`ProviderHost`] and [`ProviderJob`].
 
 use super::*;
-use crate::assistance::launcher::{AcceptedProviderSettings, ProviderLaunch};
+use crate::assistance::launcher::ProviderLaunch;
 use crate::{
     app::cache::{CacheNamespaceId, CacheRoot},
     execution::{
@@ -23,38 +23,12 @@ use crate::{
 };
 use std::path::Path;
 
-/// Selects the language server a launcher provider declaration configures.
-pub(super) fn server_for(settings: AcceptedProviderSettings) -> &'static dyn LanguageServer {
-    match settings {
-        AcceptedProviderSettings::GoplsDefaults => &crate::intelligence::gopls_backend::GoplsServer,
-        AcceptedProviderSettings::RustCachePrimingDisabledV1 => {
-            &crate::intelligence::rust_backend::RustServer
-        }
-        AcceptedProviderSettings::PyrightDefaultsV1 => {
-            &crate::intelligence::pyright_backend::PyrightServer
-        }
-        AcceptedProviderSettings::TypeScriptDefaultsV1 => {
-            &crate::intelligence::typescript_backend::TypeScriptServer
-        }
-    }
-}
-
-/// Whether two server handles describe the same server.
-///
-/// Servers are compared by their immutable settings identity, never by address: the static
-/// server values are zero-sized, so their references carry no distinguishing address.
-fn same_server(left: &dyn LanguageServer, right: &dyn LanguageServer) -> bool {
-    left.cache_settings() == right.cache_settings()
-}
-
-/// Every language server in routing and release order.
-fn servers() -> [&'static dyn LanguageServer; 4] {
-    [
-        &crate::intelligence::rust_backend::RustServer,
-        &crate::intelligence::pyright_backend::PyrightServer,
-        &crate::intelligence::typescript_backend::TypeScriptServer,
-        &crate::intelligence::gopls_backend::GoplsServer,
-    ]
+/// Every registered language server in registration order, which is also release order.
+fn servers() -> Vec<&'static dyn LanguageServer> {
+    crate::lang::registered()
+        .iter()
+        .filter_map(|language| language.server())
+        .collect()
 }
 
 /// Bounds the in-memory cache-lifecycle map so an unbounded stream of distinct worktree
@@ -77,7 +51,7 @@ struct ServerSlot {
 pub(super) struct Providers {
     /// Central typed backend/view accounting; physical limits live in the worker admission controller.
     registry: ProviderLeaseRegistry,
-    /// One slot per language server, in [`servers`] order.
+    /// One slot per registered language server, in registration order.
     slots: Vec<ServerSlot>,
     /// Strictly increasing protocol/backend generation within this boot.
     generation: u64,
@@ -128,7 +102,7 @@ impl Providers {
     fn slot_of(&self, server: &'static dyn LanguageServer) -> Result<usize, FailureCode> {
         self.slots
             .iter()
-            .position(|slot| same_server(slot.server, server))
+            .position(|slot| slot.server.language() == server.language())
             .ok_or(FailureCode::Internal)
     }
 
@@ -210,7 +184,7 @@ impl Worker<'_> {
         );
         let mut plan = Vec::with_capacity(launches.len() * 2);
         for launch in launches {
-            let server = server_for(launch.settings);
+            let server = launch.server();
             let settings = server.cache_settings();
             let configuration = server.effective_configuration();
             let trust = server::effective_trust(launch);
@@ -350,7 +324,7 @@ impl Worker<'_> {
             .target
             .providers
             .iter()
-            .find(|launch| same_server(server_for(launch.settings), server))
+            .find(|launch| launch.language == server.language())
             .cloned()
         else {
             return Ok(None);
@@ -387,7 +361,7 @@ impl Worker<'_> {
             .target
             .providers
             .iter()
-            .find(|launch| same_server(server_for(launch.settings), server))
+            .find(|launch| launch.language == server.language())
             .cloned()
             .ok_or(FailureCode::ProviderUnavailable)?;
         let mut backend = self.providers.take_backend(index)?;
@@ -517,7 +491,7 @@ impl Worker<'_> {
             &provider_cache_key(
                 &worktree_state,
                 launch,
-                server_for(launch.settings).cache_settings(),
+                launch.server().cache_settings(),
                 trust,
             ),
         )
@@ -536,7 +510,7 @@ impl Worker<'_> {
             &provider_cache_key(
                 SHARED_NATIVE_CACHE_STATE,
                 launch,
-                server_for(launch.settings).cache_settings(),
+                launch.server().cache_settings(),
                 trust,
             ),
         )

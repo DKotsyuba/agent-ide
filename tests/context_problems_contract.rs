@@ -74,6 +74,7 @@ fn ready(language: Language, problems: Vec<Problem>) -> ProblemSnapshot {
 /// Advertises the closed problems fields alongside the unchanged v0.2 context properties.
 #[test]
 fn context_schema_advertises_bounded_problems_fields() {
+    agent_ide::languages::install();
     let schema = tool_schemas()
         .into_iter()
         .find(|schema| schema.name == "ide.context")
@@ -97,6 +98,7 @@ fn context_schema_advertises_bounded_problems_fields() {
 /// Accepts the problems kind without a path while rejecting every unbounded argument shape.
 #[test]
 fn validation_accepts_problems_without_path_and_keeps_bounds_closed() {
+    agent_ide::languages::install();
     assert!(validate_call(AssistanceTool::Context, json!({"kind":"problems"})).is_ok());
     assert!(
         validate_call(
@@ -128,6 +130,7 @@ fn validation_accepts_problems_without_path_and_keeps_bounds_closed() {
 /// A context request naming neither `path` nor `kind: "problems"` gets the dedicated typed error.
 #[test]
 fn context_without_path_or_problems_kind_is_a_context_target_error() {
+    agent_ide::languages::install();
     for invalid in [
         json!({}),
         json!({"byte_offset":0}),
@@ -146,6 +149,7 @@ fn context_without_path_or_problems_kind_is_a_context_target_error() {
 /// The source seam stays usable as a shared trait object behind the worker builder.
 #[test]
 fn problem_source_is_object_safe_send_and_sync() {
+    agent_ide::languages::install();
     fn require_send_sync(source: Arc<dyn ProblemSource>) -> Arc<dyn ProblemSource> {
         source
     }
@@ -156,13 +160,17 @@ fn problem_source_is_object_safe_send_and_sync() {
     assert!(concrete.latest(Path::new("/wt")).is_empty());
     assert_eq!(concrete.queried(), vec![PathBuf::from("/wt")]);
     assert_eq!(PROBLEMS_PAGE_SIZE, 20);
-    assert_eq!(parse_language("python"), Some(Language::Python));
-    assert_eq!(parse_language("typescript"), Some(Language::TypeScript));
+    assert_eq!(parse_language("python"), Some(agent_ide::languages::PYTHON));
+    assert_eq!(
+        parse_language("typescript"),
+        Some(agent_ide::languages::TYPESCRIPT)
+    );
 }
 
 /// Pages 45 fake problems 20 at a time with exact counts, ordering and next_offset markers.
 #[test]
 fn fake_source_pages_45_problems_with_next_offset() {
+    agent_ide::languages::install();
     let problems: Vec<Problem> = (1..=45)
         .map(|line| {
             problem(
@@ -178,7 +186,7 @@ fn fake_source_pages_45_problems_with_next_offset() {
             )
         })
         .collect();
-    let source = FakeSource::new(vec![ready(Language::Rust, problems)]);
+    let source = FakeSource::new(vec![ready(agent_ide::languages::RUST, problems)]);
     let snapshots = source.latest(Path::new("/private/tmp/worktree"));
     assert_eq!(snapshots.len(), 1);
     assert_eq!(
@@ -216,13 +224,14 @@ fn fake_source_pages_45_problems_with_next_offset() {
 /// A language filter renders only the matching configured language's state and problems.
 #[test]
 fn language_filter_selects_only_the_matching_configured_language() {
+    agent_ide::languages::install();
     let source = FakeSource::new(vec![
         ready(
-            Language::Rust,
+            agent_ide::languages::RUST,
             vec![problem("a.rs", 1, 1, Severity::Error, "rust one")],
         ),
         ready(
-            Language::Python,
+            agent_ide::languages::PYTHON,
             vec![problem("b.py", 2, 1, Severity::Warning, "python one")],
         ),
     ]);
@@ -237,7 +246,7 @@ fn language_filter_selects_only_the_matching_configured_language() {
     assert!(all.contains("a.rs:1:1 error [E0001] rust one"));
     assert!(all.contains("b.py:2:1 warning [E0001] python one"));
 
-    let python = problems_text(&snapshots, Some(Language::Python), 0);
+    let python = problems_text(&snapshots, Some(agent_ide::languages::PYTHON), 0);
     assert!(python.contains("python: ready"), "{python}");
     assert!(python.contains("b.py:2:1 warning [E0001] python one"));
     assert!(!python.contains("rust:"), "{python}");
@@ -247,8 +256,9 @@ fn language_filter_selects_only_the_matching_configured_language() {
 /// Untrusted checker text renders on exactly one line with all control characters stripped.
 #[test]
 fn untrusted_text_is_single_line_without_control_characters() {
+    agent_ide::languages::install();
     let source = FakeSource::new(vec![ready(
-        Language::Rust,
+        agent_ide::languages::RUST,
         vec![Problem::new(
             "a\nb.rs".to_owned(),
             1,
@@ -274,11 +284,12 @@ fn untrusted_text_is_single_line_without_control_characters() {
 /// An empty snapshot list and a filter matching no configured language both report disabled.
 #[test]
 fn unconfigured_feed_renders_checks_disabled() {
+    agent_ide::languages::install();
     assert_eq!(problems_text(&[], None, 0), "checks disabled");
-    let source = FakeSource::new(vec![ready(Language::Rust, Vec::new())]);
+    let source = FakeSource::new(vec![ready(agent_ide::languages::RUST, Vec::new())]);
     let snapshots = source.latest(Path::new("/wt"));
     assert_eq!(
-        problems_text(&snapshots, Some(Language::Python), 0),
+        problems_text(&snapshots, Some(agent_ide::languages::PYTHON), 0),
         "checks disabled"
     );
 }

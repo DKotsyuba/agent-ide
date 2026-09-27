@@ -6,7 +6,7 @@ use std::time::Duration;
 use agent_ide::assistance::facade::AssistanceTool;
 use agent_ide::assistance::reply::{FailureCode, PeerReply};
 use agent_ide::checks::scheduler::Scheduler;
-use agent_ide::checks::{CheckState, FakeChecker, Language, ProblemSnapshot};
+use agent_ide::checks::{CheckState, FakeChecker, ProblemSnapshot};
 use agent_ide::errorlog;
 use agent_ide::telemetry::adapters;
 
@@ -14,6 +14,7 @@ use agent_ide::telemetry::adapters;
 /// reply settled through `ide.inspect` is one of them; no telemetry is involved.
 #[tokio::test(start_paused = true)]
 async fn typed_failures_and_check_starts_are_logged_without_telemetry() {
+    agent_ide::languages::install();
     let key = format!(
         "{:016x}",
         std::process::id() as u64 * 7919 + 0xabc0_0000_0000
@@ -69,11 +70,16 @@ async fn typed_failures_and_check_starts_are_logged_without_telemetry() {
     let worktree = root.join("wt");
     std::fs::create_dir_all(&worktree).unwrap();
     std::fs::write(worktree.join("Cargo.toml"), "[package]\n").unwrap();
-    let snapshot =
-        ProblemSnapshot::from_problems(Language::Rust, CheckState::Ready, Vec::new(), 1, 0);
+    let snapshot = ProblemSnapshot::from_problems(
+        agent_ide::languages::RUST,
+        CheckState::Ready,
+        Vec::new(),
+        1,
+        0,
+    );
     let scheduler = Scheduler::new(
         vec![std::sync::Arc::new(FakeChecker::new(
-            Language::Rust,
+            agent_ide::languages::RUST,
             snapshot,
         ))],
         Duration::from_millis(10),

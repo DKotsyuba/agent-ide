@@ -8,8 +8,9 @@
 //! state and the worker never branches on a language.
 
 use std::{
+    any::Any,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicBool},
     time::Duration,
 };
 
@@ -18,7 +19,7 @@ use tokio::sync::watch;
 use crate::{
     assistance::{
         host_binding::{ActiveBindingUse, BindingRef},
-        launcher::{AcceptedExecutable, ProviderLaunch},
+        launcher::{AcceptedExecutable, LauncherError, ProviderLaunch},
         reply::FailureCode,
     },
     checks::BoxFuture,
@@ -31,7 +32,8 @@ use crate::{
         freshness::DiagnosticReadiness,
         session::{DiagnosticSnapshot, LiveSession, SessionOptions},
     },
-    telemetry::{CacheState, DiagnosticState, Language, Telemetry, adapters},
+    lang::Language,
+    telemetry::{CacheState, DiagnosticState, Telemetry, adapters},
     workspace::{authority::AuthorityStamp, observation::SourceObservation},
 };
 
@@ -48,8 +50,62 @@ pub struct ProviderContext {
 /// Implementations are stateless `'static` values; everything that changes at runtime lives in
 /// the [`ServerBackend`] each worker creates with [`LanguageServer::new_backend`].
 pub trait LanguageServer: Send + Sync + 'static {
-    /// Closed telemetry language recorded for this server's provider observations.
+    /// The language this server belongs to; also recorded in its provider observations.
     fn language(&self) -> Language;
+
+    /// Closed launcher `settings` identifier that selects this server in a provider declaration.
+    fn settings_key(&self) -> &'static str;
+
+    /// Declaration fields this server accepts beyond the common executable, settings, toolchain,
+    /// trust and cache namespace. Empty (the default) when it needs none. A field listed by
+    /// another registered server is refused on this server's declarations.
+    fn option_fields(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Decodes this server's declaration fields into its typed options.
+    ///
+    /// `fields` holds only keys from [`LanguageServer::option_fields`] with non-null values. A
+    /// shape error is the launcher's `Invalid`. The default accepts only an empty object.
+    fn parse_options(
+        &self,
+        fields: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Arc<dyn Any + Send + Sync>, serde_json::Error> {
+        if let Some(key) = fields.keys().next() {
+            return Err(serde::de::Error::custom(format_args!(
+                "unknown field `{key}`"
+            )));
+        }
+        Ok(Arc::new(()))
+    }
+
+    /// Server-specific declaration rules (toolchain shape, required fields, identity matches);
+    /// `false` is the launcher's `Rejected`. Runs without filesystem access.
+    fn validate_launch(&self, launch: &ProviderLaunch) -> bool;
+
+    /// Additional accepted executables of `launch` (interpreters, companion tools) whose bytes
+    /// startup verifies alongside the server executable. Empty by default.
+    fn launch_executables<'a>(&self, launch: &'a ProviderLaunch) -> Vec<&'a AcceptedExecutable> {
+        let _ = launch;
+        Vec::new()
+    }
+
+    /// Further startup verification after every executable was verified, honouring `cancel`.
+    /// The default has nothing more to verify.
+    fn verify_launch(
+        &self,
+        launch: &ProviderLaunch,
+        cancel: &AtomicBool,
+    ) -> Result<(), LauncherError> {
+        let _ = (launch, cancel);
+        Ok(())
+    }
+
+    /// Toolchain programs `doctor` probes for `launch`, in declaration order, each with the
+    /// interpreter that runs it when it is not directly executable.
+    fn toolchain_programs(&self, launch: &ProviderLaunch) -> Vec<(PathBuf, Option<PathBuf>)> {
+        vec![(launch.executable.path.clone(), None)]
+    }
 
     /// Short server name used in replies that explain a missing capability (`pyright`).
     fn name(&self) -> &'static str;

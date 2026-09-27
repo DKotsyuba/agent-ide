@@ -13,9 +13,10 @@ use std::time::{Duration, Instant};
 
 use super::runner::{ConfinedRunner, RunOutput, RunSpec};
 use super::{
-    BoxFuture, CheckRequest, CheckState, Checker, Language, Problem, ProblemSnapshot, Severity,
-    UnavailableReason,
+    BoxFuture, CheckConfig, CheckRequest, CheckState, Checker, Language, LanguageChecks, Problem,
+    ProblemSnapshot, Severity, UnavailableReason,
 };
+use crate::assistance::launcher::absolute;
 use crate::execution::seatbelt::ReadDeny;
 
 /// Maximum bytes captured from either CLI stream; a larger report fails closed.
@@ -168,7 +169,7 @@ impl TypeScriptChecker {
 impl Checker for TypeScriptChecker {
     /// Identifies the single TypeScript/JavaScript project snapshot produced here.
     fn language(&self) -> Language {
-        Language::TypeScript
+        crate::lang::typescript::LANGUAGE
     }
 
     /// Runs the selected root config and admits only a fully parsed, nontruncated CLI result.
@@ -179,21 +180,21 @@ impl Checker for TypeScriptChecker {
             let generation = request.input_generation;
             let Some(config) = select_config(&request.worktree, &request.read_denies) else {
                 return ProblemSnapshot::unavailable(
-                    Language::TypeScript,
+                    crate::lang::typescript::LANGUAGE,
                     UnavailableReason::ReadRestricted,
                     generation,
                 );
             };
             if fs::create_dir_all(request.cache_dir.join("tmp")).is_err() {
                 return ProblemSnapshot::unavailable(
-                    Language::TypeScript,
+                    crate::lang::typescript::LANGUAGE,
                     UnavailableReason::Fatal,
                     generation,
                 );
             }
             if stage_adapter(&request.cache_dir).is_err() {
                 return ProblemSnapshot::unavailable(
-                    Language::TypeScript,
+                    crate::lang::typescript::LANGUAGE,
                     UnavailableReason::Fatal,
                     generation,
                 );
@@ -204,7 +205,7 @@ impl Checker for TypeScriptChecker {
                     .any(|part| request.read_denies.iter().any(|deny| deny.matches(part)))
             }) {
                 return ProblemSnapshot::unavailable(
-                    Language::TypeScript,
+                    crate::lang::typescript::LANGUAGE,
                     UnavailableReason::ReadRestricted,
                     generation,
                 );
@@ -213,7 +214,7 @@ impl Checker for TypeScriptChecker {
                 || !regular_allowed(&self.tsc_cli, &request.read_denies)
             {
                 return ProblemSnapshot::unavailable(
-                    Language::TypeScript,
+                    crate::lang::typescript::LANGUAGE,
                     UnavailableReason::ToolMissing,
                     generation,
                 );
@@ -223,7 +224,7 @@ impl Checker for TypeScriptChecker {
                 Ok(output) => output,
                 Err(_) => {
                     return ProblemSnapshot::unavailable(
-                        Language::TypeScript,
+                        crate::lang::typescript::LANGUAGE,
                         UnavailableReason::Fatal,
                         generation,
                     );
@@ -231,21 +232,21 @@ impl Checker for TypeScriptChecker {
             };
             if output.timed_out {
                 return ProblemSnapshot::unavailable(
-                    Language::TypeScript,
+                    crate::lang::typescript::LANGUAGE,
                     UnavailableReason::Timeout,
                     generation,
                 );
             }
             if output.truncated {
                 return ProblemSnapshot::unavailable(
-                    Language::TypeScript,
+                    crate::lang::typescript::LANGUAGE,
                     UnavailableReason::Fatal,
                     generation,
                 );
             }
             if output.status == Some(READ_RESTRICTED_STATUS) {
                 return ProblemSnapshot::unavailable(
-                    Language::TypeScript,
+                    crate::lang::typescript::LANGUAGE,
                     UnavailableReason::ReadRestricted,
                     generation,
                 );
@@ -408,8 +409,13 @@ pub fn parse_tsc_output(
     generation: u64,
     duration_ms: u64,
 ) -> ProblemSnapshot {
-    let fatal =
-        || ProblemSnapshot::unavailable(Language::TypeScript, UnavailableReason::Fatal, generation);
+    let fatal = || {
+        ProblemSnapshot::unavailable(
+            crate::lang::typescript::LANGUAGE,
+            UnavailableReason::Fatal,
+            generation,
+        )
+    };
     if output.truncated
         || output.timed_out
         || !output.stderr.is_empty()
@@ -497,7 +503,7 @@ pub fn parse_tsc_output(
     }
     if !project_file {
         return ProblemSnapshot::unavailable(
-            Language::TypeScript,
+            crate::lang::typescript::LANGUAGE,
             UnavailableReason::NoFiles,
             generation,
         );
@@ -510,7 +516,7 @@ pub fn parse_tsc_output(
         return fatal();
     }
     let mut snapshot = ProblemSnapshot::from_problems(
-        Language::TypeScript,
+        crate::lang::typescript::LANGUAGE,
         CheckState::Ready,
         problems,
         generation,
@@ -594,4 +600,76 @@ fn diagnostic(line: &str, worktree: &Path, config: &Path) -> Option<Problem> {
         Some(code.to_owned()),
         message.to_owned(),
     ))
+}
+/// TypeScript's (and JavaScript's) project-check integration.
+pub struct TypeScriptChecks;
+
+impl LanguageChecks for TypeScriptChecks {
+    /// TypeScript is present only when a root `tsconfig.json` or `jsconfig.json` entry exists,
+    /// including a link that the checker will reject as unprovable; `package.json` alone does
+    /// not count.
+    fn is_present(&self, worktree: &Path) -> bool {
+        fs::symlink_metadata(worktree.join("tsconfig.json")).is_ok()
+            || fs::symlink_metadata(worktree.join("jsconfig.json")).is_ok()
+    }
+
+    /// `tsc`.
+    fn tool_name(&self) -> &'static str {
+        "tsc"
+    }
+
+    /// Decodes [`ProjectTypeScriptChecksConfig`].
+    fn parse_config(
+        &self,
+        section: serde_json::Value,
+    ) -> Result<Arc<dyn CheckConfig>, serde_json::Error> {
+        let config: ProjectTypeScriptChecksConfig = serde_json::from_value(section)?;
+        Ok(Arc::new(config))
+    }
+}
+
+/// Accepted TypeScript CLI declaration for confined background project checks.
+#[derive(Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectTypeScriptChecksConfig {
+    /// Absolute normalized pinned Node executable.
+    node: PathBuf,
+    /// Absolute normalized pinned TypeScript `tsc.js` module.
+    tsc_cli: PathBuf,
+}
+
+impl ProjectTypeScriptChecksConfig {
+    /// Returns the declared Node executable path.
+    pub fn node(&self) -> &Path {
+        &self.node
+    }
+    /// Returns the declared TypeScript CLI module path.
+    pub fn tsc_cli(&self) -> &Path {
+        &self.tsc_cli
+    }
+}
+
+impl CheckConfig for ProjectTypeScriptChecksConfig {
+    /// Rejects either tool path unless absolute and lexically normalized.
+    fn validate(&self) -> bool {
+        absolute(&self.node) && absolute(&self.tsc_cli)
+    }
+
+    /// Builds the confined `tsc` runner for these tools.
+    fn checker(&self, runner: Arc<dyn ConfinedRunner>, timeout: Duration) -> Arc<dyn Checker> {
+        Arc::new(TypeScriptChecker::new(
+            runner,
+            self.node.clone(),
+            self.tsc_cli.clone(),
+            timeout,
+        ))
+    }
+
+    /// Node, then the `tsc` module run by Node.
+    fn programs(&self) -> Vec<(PathBuf, Option<PathBuf>)> {
+        vec![
+            (self.node.clone(), None),
+            (self.tsc_cli.clone(), Some(self.node.clone())),
+        ]
+    }
 }

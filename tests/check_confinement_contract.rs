@@ -5,6 +5,24 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Returns the decoded Rust project-check section, if declared.
+fn rust_checks(
+    checks: &agent_ide::assistance::launcher::ProjectChecksConfig,
+) -> Option<&agent_ide::checks::rust::ProjectRustChecksConfig> {
+    checks
+        .section(agent_ide::languages::RUST)
+        .and_then(|section| section.downcast_ref())
+}
+
+/// Returns the decoded Python project-check section, if declared.
+fn python_checks(
+    checks: &agent_ide::assistance::launcher::ProjectChecksConfig,
+) -> Option<&agent_ide::checks::python::ProjectPythonChecksConfig> {
+    checks
+        .section(agent_ide::languages::PYTHON)
+        .and_then(|section| section.downcast_ref())
+}
+
 /// Creates a fresh empty scratch root under the system temporary directory.
 ///
 /// Any leftover directory from an earlier run of the same binary is removed first, so symlink
@@ -46,6 +64,7 @@ fn v02_config() -> Value {
 /// A v0.2 configuration without the new fields parses unchanged and reports project checks off.
 #[test]
 fn config_v02_configuration_parses_without_new_fields() {
+    agent_ide::languages::install();
     let loaded = LauncherConfig::parse(v02_config().to_string().as_bytes()).unwrap();
     assert!(loaded.allowed_roots().is_empty());
     assert!(loaded.project_checks().is_none());
@@ -59,6 +78,7 @@ fn config_v02_configuration_parses_without_new_fields() {
 /// A complete v0.3 configuration parses and exposes allowed roots and typed check timings.
 #[test]
 fn config_full_v03_configuration_parses_and_exposes_accessors() {
+    agent_ide::languages::install();
     let root = scratch("full");
     let mut config = v02_config();
     config["allowed_roots"] = json!([root.to_string_lossy()]);
@@ -76,10 +96,10 @@ fn config_full_v03_configuration_parses_and_exposes_accessors() {
     assert_eq!(checks.idle_timeout(), Duration::from_secs(30));
     assert_eq!(checks.check_timeout(), Duration::from_secs(900));
     assert_eq!(
-        checks.rust().unwrap().toolchain_dir(),
+        rust_checks(checks).unwrap().toolchain_dir(),
         std::path::Path::new("/private/tmp/toolchain")
     );
-    let python = checks.python().unwrap();
+    let python = python_checks(checks).unwrap();
     assert_eq!(python.node(), std::path::Path::new("/private/tmp/node"));
     assert_eq!(
         python.pyright_cli(),
@@ -92,13 +112,14 @@ fn config_full_v03_configuration_parses_and_exposes_accessors() {
 /// (EYES-r2 §1: optional, defaulting to `$HOME/.cargo`).
 #[test]
 fn config_rust_cargo_home_parses_when_present_and_stays_none_when_absent() {
+    agent_ide::languages::install();
     let mut config = v02_config();
     config["allowed_roots"] = json!(["/private/tmp/worktree"]);
     config["project_checks"] = json!({
         "rust": {"toolchain_dir": "/private/tmp/toolchain", "cargo_home": "/private/tmp/cargo"}
     });
     let loaded = LauncherConfig::parse(config.to_string().as_bytes()).unwrap();
-    let rust = loaded.project_checks().unwrap().rust().unwrap();
+    let rust = rust_checks(loaded.project_checks().unwrap()).unwrap();
     assert_eq!(
         rust.cargo_home(),
         Some(std::path::Path::new("/private/tmp/cargo"))
@@ -106,13 +127,14 @@ fn config_rust_cargo_home_parses_when_present_and_stays_none_when_absent() {
 
     config["project_checks"] = json!({"rust": {"toolchain_dir": "/private/tmp/toolchain"}});
     let loaded = LauncherConfig::parse(config.to_string().as_bytes()).unwrap();
-    let rust = loaded.project_checks().unwrap().rust().unwrap();
+    let rust = rust_checks(loaded.project_checks().unwrap()).unwrap();
     assert_eq!(rust.cargo_home(), None);
 }
 
 /// Relative or `..`-escaping `rust.cargo_home` declarations are rejected at parse time.
 #[test]
 fn config_rejects_relative_rust_cargo_home() {
+    agent_ide::languages::install();
     let mut config = v02_config();
     config["allowed_roots"] = json!(["/private/tmp/worktree"]);
     for rust in [
@@ -132,13 +154,14 @@ fn config_rejects_relative_rust_cargo_home() {
 /// (T05B: optional, defaulting to the `xcode-select -p` resolution).
 #[test]
 fn config_rust_developer_dir_parses_when_present_and_stays_none_when_absent() {
+    agent_ide::languages::install();
     let mut config = v02_config();
     config["allowed_roots"] = json!(["/private/tmp/worktree"]);
     config["project_checks"] = json!({
         "rust": {"toolchain_dir": "/private/tmp/toolchain", "developer_dir": "/private/tmp/xcode"}
     });
     let loaded = LauncherConfig::parse(config.to_string().as_bytes()).unwrap();
-    let rust = loaded.project_checks().unwrap().rust().unwrap();
+    let rust = rust_checks(loaded.project_checks().unwrap()).unwrap();
     assert_eq!(
         rust.developer_dir(),
         Some(std::path::Path::new("/private/tmp/xcode"))
@@ -146,13 +169,14 @@ fn config_rust_developer_dir_parses_when_present_and_stays_none_when_absent() {
 
     config["project_checks"] = json!({"rust": {"toolchain_dir": "/private/tmp/toolchain"}});
     let loaded = LauncherConfig::parse(config.to_string().as_bytes()).unwrap();
-    let rust = loaded.project_checks().unwrap().rust().unwrap();
+    let rust = rust_checks(loaded.project_checks().unwrap()).unwrap();
     assert_eq!(rust.developer_dir(), None);
 }
 
 /// Relative or `..`-escaping `rust.developer_dir` declarations are rejected at parse time.
 #[test]
 fn config_rejects_relative_rust_developer_dir() {
+    agent_ide::languages::install();
     let mut config = v02_config();
     config["allowed_roots"] = json!(["/private/tmp/worktree"]);
     for rust in [
@@ -171,6 +195,7 @@ fn config_rejects_relative_rust_developer_dir() {
 /// Absent project-check timing and language fields fall back to the contract defaults.
 #[test]
 fn config_project_check_defaults_apply_when_optional_fields_absent() {
+    agent_ide::languages::install();
     let mut config = v02_config();
     config["allowed_roots"] = json!(["/private/tmp/worktree"]);
     config["project_checks"] = json!({});
@@ -180,14 +205,15 @@ fn config_project_check_defaults_apply_when_optional_fields_absent() {
     assert_eq!(checks.idle_timeout(), Duration::from_secs(300));
     assert_eq!(checks.check_timeout(), Duration::from_secs(300));
     // A language subsection absent means that language is never checked.
-    assert!(checks.rust().is_none());
-    assert!(checks.python().is_none());
+    assert!(rust_checks(checks).is_none());
+    assert!(python_checks(checks).is_none());
 }
 
 /// The shipped `docs/examples/launcher-eyes.json` fragment parses when merged into an otherwise
 /// valid base configuration, and exposes both configured languages.
 #[test]
 fn config_example_parses() {
+    agent_ide::languages::install();
     let example: Value =
         serde_json::from_str(include_str!("../docs/examples/launcher-eyes.json")).unwrap();
     let mut config = v02_config();
@@ -200,13 +226,14 @@ fn config_example_parses() {
         std::slice::from_ref(&PathBuf::from("/Users/you/projects"))
     );
     let checks = loaded.project_checks().unwrap();
-    assert!(checks.rust().is_some());
-    assert!(checks.python().is_some());
+    assert!(rust_checks(checks).is_some());
+    assert!(python_checks(checks).is_some());
 }
 
 /// Each out-of-range project-check timing is rejected with the launcher configuration error.
 #[test]
 fn config_rejects_out_of_range_project_check_values() {
+    agent_ide::languages::install();
     for (field, values) in [
         ("debounce_ms", [99, 10_001]),
         ("idle_timeout_s", [29, 3601]),
@@ -229,6 +256,7 @@ fn config_rejects_out_of_range_project_check_values() {
 /// at parse time, as are relative or `..`-escaping project-check tool paths.
 #[test]
 fn config_rejects_malformed_allowed_roots_and_paths() {
+    agent_ide::languages::install();
     let mut config = v02_config();
     for roots in [
         json!(["relative/path"]),
@@ -270,6 +298,7 @@ fn config_rejects_malformed_allowed_roots_and_paths() {
 /// above by the 17-root case in [`config_rejects_malformed_allowed_roots_and_paths`]).
 #[test]
 fn config_accepts_exactly_sixteen_allowed_roots() {
+    agent_ide::languages::install();
     let mut config = v02_config();
     let roots: Vec<String> = (0..16)
         .map(|index| format!("/private/tmp/r{index}"))
@@ -282,6 +311,7 @@ fn config_accepts_exactly_sixteen_allowed_roots() {
 /// Each project-check timing field is accepted at both ends of its contract range.
 #[test]
 fn config_accepts_boundary_project_check_values() {
+    agent_ide::languages::install();
     let mut config = v02_config();
     config["allowed_roots"] = json!(["/private/tmp/worktree"]);
     for (field, min, max) in [
@@ -303,6 +333,7 @@ fn config_accepts_boundary_project_check_values() {
 /// Worktrees equal to or below one allowed root are admitted and returned in canonical form.
 #[test]
 fn config_admission_accepts_equal_and_nested_worktrees() {
+    agent_ide::languages::install();
     let root = scratch("admit");
     let nested = root.join("repo");
     std::fs::create_dir_all(&nested).unwrap();
@@ -321,6 +352,7 @@ fn config_admission_accepts_equal_and_nested_worktrees() {
 /// A worktree outside every allowed root is rejected without returning a path.
 #[test]
 fn config_admission_rejects_outside_worktrees() {
+    agent_ide::languages::install();
     let root = scratch("outside-root");
     let other = scratch("outside-other");
     assert_eq!(
@@ -334,6 +366,7 @@ fn config_admission_rejects_outside_worktrees() {
 /// A sibling path sharing only a string prefix with a root is not admitted.
 #[test]
 fn config_admission_rejects_prefix_trap_siblings() {
+    agent_ide::languages::install();
     let parent = scratch("prefix-trap");
     let root = parent.join("b");
     let sibling = parent.join("bc");
@@ -349,6 +382,7 @@ fn config_admission_rejects_prefix_trap_siblings() {
 /// A symlink inside a root whose target resolves outside every root is rejected.
 #[test]
 fn config_admission_rejects_symlink_escape() {
+    agent_ide::languages::install();
     let root = scratch("symlink-root");
     let outside = scratch("symlink-outside");
     let link = root.join("escape");
@@ -364,6 +398,7 @@ fn config_admission_rejects_symlink_escape() {
 /// Admission fails closed with no configured roots or an unresolvable worktree.
 #[test]
 fn config_admission_fails_closed_without_roots_or_unresolvable_worktree() {
+    agent_ide::languages::install();
     let root = scratch("fail-closed");
     assert_eq!(admit_worktree(&[], &root), Err(RootAdmissionError::NoRoots));
     assert_eq!(
@@ -377,6 +412,7 @@ fn config_admission_fails_closed_without_roots_or_unresolvable_worktree() {
 /// of where it sits in the list; a resolvable root elsewhere still admits the worktree.
 #[test]
 fn config_admission_skips_unresolvable_roots_regardless_of_order() {
+    agent_ide::languages::install();
     let missing = scratch("skip-missing");
     let missing_root = missing.join("missing-root");
     std::fs::remove_dir_all(&missing).unwrap();
@@ -401,6 +437,7 @@ fn config_admission_skips_unresolvable_roots_regardless_of_order() {
 /// `Unresolvable`.
 #[test]
 fn config_admission_rejects_outside_roots_when_only_root_is_unresolvable() {
+    agent_ide::languages::install();
     let root = scratch("only-root-unresolvable");
     let missing_root = root.join("missing-root");
     assert_eq!(

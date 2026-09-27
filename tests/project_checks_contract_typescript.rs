@@ -7,9 +7,7 @@ use std::time::Duration;
 use agent_ide::assistance::problems::{parse_language, problems_text};
 use agent_ide::checks::runner::{FakeRunner, RunOutput, SeatbeltRunner};
 use agent_ide::checks::typescript::{TypeScriptChecker, parse_tsc_output};
-use agent_ide::checks::{
-    CheckRequest, CheckState, Checker, Language, ProblemSnapshot, UnavailableReason,
-};
+use agent_ide::checks::{CheckRequest, CheckState, Checker, ProblemSnapshot, UnavailableReason};
 use agent_ide::execution::seatbelt::{CredentialGlob, ReadDeny};
 use agent_ide::feed::{FeedKey, FeedState};
 
@@ -45,6 +43,7 @@ fn parsed(root: &Path, config: &str, output: &RunOutput) -> ProblemSnapshot {
 /// A complete clean report with a project source file proves exact `Ready 0`.
 #[tokio::test]
 async fn clean_project_is_ready_zero() {
+    agent_ide::languages::install();
     let root = project("clean", "tsconfig.json");
     let source = root.join("a.ts");
     std::fs::write(&source, "const x: number = 1;\n").unwrap();
@@ -116,6 +115,7 @@ async fn clean_project_is_ready_zero() {
 /// A poisoned adapter destination cannot redirect the private-cache write.
 #[tokio::test]
 async fn adapter_write_replaces_symlink_without_following_it() {
+    agent_ide::languages::install();
     let root = project("adapter-symlink", "tsconfig.json");
     let source = root.join("a.ts");
     std::fs::write(&source, "export const a = 1;\n").unwrap();
@@ -154,6 +154,7 @@ async fn adapter_write_replaces_symlink_without_following_it() {
 /// TS and checkJs diagnostics retain their project-relative path, position, and TS code.
 #[test]
 fn typescript_and_checkjs_errors_are_exact() {
+    agent_ide::languages::install();
     for (name, config, source, column) in [
         ("ts", "tsconfig.json", "a.ts", 7),
         ("js", "jsconfig.json", "a.js", 12),
@@ -187,6 +188,7 @@ fn typescript_and_checkjs_errors_are_exact() {
 /// File-less project errors attach to the chosen config at line and column zero.
 #[test]
 fn project_diagnostic_uses_config_line_zero() {
+    agent_ide::languages::install();
     let root = project("project-error", "tsconfig.json");
     let source = root.join("a.ts");
     std::fs::write(&source, "x\n").unwrap();
@@ -211,6 +213,7 @@ fn project_diagnostic_uses_config_line_zero() {
 /// Empty and solution-style roots carry `NoFiles`, even with a config diagnostic or exit zero.
 #[test]
 fn zero_file_roots_are_unavailable() {
+    agent_ide::languages::install();
     let root = project("no-files", "tsconfig.json");
     for output in [
         report(&[], "", 0),
@@ -230,6 +233,7 @@ fn zero_file_roots_are_unavailable() {
 /// A malformed, truncated, or abnormal result cannot become clean.
 #[test]
 fn incomplete_and_abnormal_output_fails_closed() {
+    agent_ide::languages::install();
     let root = project("fatal", "tsconfig.json");
     let file = root.join("a.ts");
     std::fs::write(&file, "x\n").unwrap();
@@ -258,6 +262,7 @@ fn incomplete_and_abnormal_output_fails_closed() {
 /// A denied diagnostic file invalidates the whole result instead of dropping an error count.
 #[test]
 fn denied_problem_path_fails_closed() {
+    agent_ide::languages::install();
     let root = project("denied-problem", "tsconfig.json");
     let source = root.join("a.ts");
     std::fs::write(&source, "bad\n").unwrap();
@@ -279,6 +284,7 @@ fn denied_problem_path_fails_closed() {
 /// A denied config or tool returns unavailable before the fake runner is invoked.
 #[tokio::test]
 async fn denied_config_or_tool_is_unavailable() {
+    agent_ide::languages::install();
     let root = project("denied", "tsconfig.json");
     let node = root.join("node");
     let cli = root.join("tsc.js");
@@ -315,6 +321,7 @@ async fn denied_config_or_tool_is_unavailable() {
 /// A compiler refusal takes precedence over any partial output and maps to `ReadRestricted`.
 #[tokio::test]
 async fn source_overlapping_path_deny_is_read_restricted() {
+    agent_ide::languages::install();
     let root = project("source-deny", "tsconfig.json");
     let source = root.join("src/hidden.ts");
     std::fs::create_dir_all(source.parent().unwrap()).unwrap();
@@ -365,6 +372,7 @@ async fn source_overlapping_path_deny_is_read_restricted() {
 /// A denied symlink target reported by the adapter cannot become a clean snapshot.
 #[tokio::test]
 async fn nonintersecting_path_deny_rejects_worktree_alias() {
+    agent_ide::languages::install();
     let root = project("outside-deny-alias", "tsconfig.json");
     std::fs::write(root.join("a.ts"), "const x: number = 1;\n").unwrap();
     std::os::unix::fs::symlink("/Users/pluto/.ssh", root.join("private-link")).unwrap();
@@ -395,6 +403,7 @@ async fn nonintersecting_path_deny_rejects_worktree_alias() {
 /// Existing irrelevant credentials and safe aliases remain usable; messages stay redacted.
 #[tokio::test]
 async fn credential_glob_messages_stay_redacted() {
+    agent_ide::languages::install();
     let root = project("credential-glob", "tsconfig.json");
     let source = root.join("a.ts");
     std::fs::write(&source, "bad\n").unwrap();
@@ -457,6 +466,7 @@ async fn credential_glob_messages_stay_redacted() {
 /// A symlinked tsconfig defers to a regular jsconfig; a lone link never proves a project.
 #[tokio::test]
 async fn config_selection_prefers_regular_root_file() {
+    agent_ide::languages::install();
     let root = project("config-choice", "jsconfig.json");
     std::os::unix::fs::symlink("jsconfig.json", root.join("tsconfig.json")).unwrap();
     let source = root.join("a.js");
@@ -492,19 +502,26 @@ async fn config_selection_prefers_regular_root_file() {
 /// Presence, problems filtering, and feed order add TypeScript after Rust and Python only when configured.
 #[test]
 fn presence_filter_and_feed_keep_three_language_order() {
+    agent_ide::languages::install();
     let root = project("presence", "tsconfig.json");
-    assert!(Language::TypeScript.is_present(&root));
+    assert!(agent_ide::languages::TYPESCRIPT.is_present(&root));
     let package_only =
         std::env::temp_dir().join(format!("agent-ide-package-only-{}", std::process::id()));
     std::fs::create_dir_all(&package_only).unwrap();
     std::fs::write(package_only.join("package.json"), "{}").unwrap();
-    assert!(!Language::TypeScript.is_present(&package_only));
-    assert_eq!(parse_language("typescript"), Some(Language::TypeScript));
-    let snapshots = [Language::TypeScript, Language::Python, Language::Rust].map(|language| {
-        ProblemSnapshot::from_problems(language, CheckState::Ready, Vec::new(), 1, 0)
-    });
+    assert!(!agent_ide::languages::TYPESCRIPT.is_present(&package_only));
     assert_eq!(
-        problems_text(&snapshots, Some(Language::TypeScript), 0),
+        parse_language("typescript"),
+        Some(agent_ide::languages::TYPESCRIPT)
+    );
+    let snapshots = [
+        agent_ide::languages::TYPESCRIPT,
+        agent_ide::languages::PYTHON,
+        agent_ide::languages::RUST,
+    ]
+    .map(|language| ProblemSnapshot::from_problems(language, CheckState::Ready, Vec::new(), 1, 0));
+    assert_eq!(
+        problems_text(&snapshots, Some(agent_ide::languages::TYPESCRIPT), 0),
         "typescript: ready; errors: 0; warnings: 0"
     );
     let mut feed = FeedState::default();
@@ -541,6 +558,7 @@ fn presence_filter_and_feed_keep_three_language_order() {
 #[tokio::test]
 #[ignore = "requires the local pinned Node/tsc files and macOS sandbox-exec"]
 async fn real_confined_tsc_smoke() {
+    agent_ide::languages::install();
     let root = project("confined", "tsconfig.json");
     std::fs::write(
         root.join("a.ts"),
@@ -613,6 +631,7 @@ async fn real_confined_tsc_smoke() {
 #[tokio::test]
 #[ignore = "requires the local pinned Node v24.4.0 and TypeScript 5.9.3"]
 async fn real_pinned_cli_with_default_style_denies() {
+    agent_ide::languages::install();
     let root = project("real-default-denies", "tsconfig.json");
     std::fs::write(root.join("tsconfig.json"), r#"{"compilerOptions":{"incremental":true,"composite":true,"extendedDiagnostics":true,"explainFiles":true,"traceResolution":true}}"#).unwrap();
     std::fs::write(
@@ -742,6 +761,7 @@ async fn pinned_adapter_output(request: &CheckRequest) -> RunOutput {
 #[tokio::test]
 #[ignore = "requires the local pinned Node v24.4.0 and TypeScript 5.9.3"]
 async fn real_pinned_denied_inputs_are_read_restricted() {
+    agent_ide::languages::install();
     for case in ["extends", "source", "directory", "alias", "outside-grant"] {
         let root = project(&format!("real-denied-{case}"), "tsconfig.json");
         let source = root.join("a.ts");
@@ -819,6 +839,7 @@ async fn real_pinned_denied_inputs_are_read_restricted() {
 #[tokio::test]
 #[ignore = "requires the local pinned Node v24.4.0 and TypeScript 5.9.3"]
 async fn real_pinned_composite_diagnostics_match_cli() {
+    agent_ide::languages::install();
     let root = project("real-composite", "tsconfig.json");
     std::fs::write(
         root.join("tsconfig.json"),
@@ -872,6 +893,7 @@ async fn real_pinned_composite_diagnostics_match_cli() {
 #[tokio::test]
 #[ignore = "requires the local pinned Node v24.4.0 and TypeScript 5.9.3"]
 async fn real_pinned_safe_source_alias_is_ready() {
+    agent_ide::languages::install();
     let root = project("real-safe-alias", "tsconfig.json");
     std::fs::write(root.join("tsconfig.json"), r#"{"files":["alias.ts"]}"#).unwrap();
     let mut source = vec![0xff, 0xfe];
@@ -911,6 +933,7 @@ async fn real_pinned_safe_source_alias_is_ready() {
 #[tokio::test]
 #[ignore = "requires the local pinned Node v24.4.0 and TypeScript 5.9.3"]
 async fn real_pinned_excluded_aliases_do_not_restrict() {
+    agent_ide::languages::install();
     for kind in ["file", "directory"] {
         let root = project(&format!("real-excluded-alias-{kind}"), "tsconfig.json");
         std::fs::write(root.join("a.ts"), "const a: number = 'bad';\n").unwrap();
@@ -970,6 +993,7 @@ async fn real_pinned_excluded_aliases_do_not_restrict() {
 #[tokio::test]
 #[ignore = "requires the local pinned Node v24.4.0 and TypeScript 5.9.3"]
 async fn real_pinned_irrelevant_aliases_do_not_restrict() {
+    agent_ide::languages::install();
     let root = project("real-irrelevant-aliases", "tsconfig.json");
     let config = root.join("tsconfig.json");
     std::fs::write(&config, r#"{"include":["a.ts"]}"#).unwrap();
@@ -1021,6 +1045,7 @@ async fn real_pinned_irrelevant_aliases_do_not_restrict() {
 #[tokio::test]
 #[ignore = "requires the local pinned Node v24.4.0 and TypeScript 5.9.3"]
 async fn real_pinned_root_credential_glob_restricts() {
+    agent_ide::languages::install();
     let root = project("real-root-glob", "tsconfig.json");
     std::fs::write(
         root.join("tsconfig.json"),
@@ -1045,6 +1070,7 @@ async fn real_pinned_root_credential_glob_restricts() {
 #[tokio::test]
 #[ignore = "requires the local pinned Node v24.4.0 and TypeScript 5.9.3"]
 async fn real_pinned_jsconfig_reports_checkjs_errors() {
+    agent_ide::languages::install();
     let root = project("real-js", "jsconfig.json");
     std::fs::write(
         root.join("jsconfig.json"),

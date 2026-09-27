@@ -20,9 +20,10 @@ use serde::Deserialize;
 
 use super::runner::{ConfinedRunner, RunSpec};
 use super::{
-    BoxFuture, CheckRequest, CheckState, Checker, Language, Problem, ProblemSnapshot, Severity,
-    UnavailableReason,
+    BoxFuture, CheckConfig, CheckRequest, CheckState, Checker, Language, LanguageChecks, Problem,
+    ProblemSnapshot, Severity, UnavailableReason,
 };
+use crate::assistance::launcher::absolute;
 
 /// Name of the pyright project config file consulted at a worktree's root.
 const PYRIGHT_CONFIG_FILE: &str = "pyrightconfig.json";
@@ -169,7 +170,7 @@ impl PythonChecker {
 
 impl Checker for PythonChecker {
     fn language(&self) -> Language {
-        Language::Python
+        crate::lang::python::LANGUAGE
     }
 
     fn check(&self, request: CheckRequest) -> BoxFuture<'_, ProblemSnapshot> {
@@ -180,7 +181,7 @@ impl Checker for PythonChecker {
                 .any(|path| !allowed_file(path, &request.read_denies))
             {
                 return ProblemSnapshot::unavailable(
-                    Language::Python,
+                    crate::lang::python::LANGUAGE,
                     UnavailableReason::ToolMissing,
                     generation,
                 );
@@ -189,7 +190,7 @@ impl Checker for PythonChecker {
                 resolve_interpreter_with_denies(&request.worktree, &request.read_denies)
             else {
                 return ProblemSnapshot::unavailable(
-                    Language::Python,
+                    crate::lang::python::LANGUAGE,
                     UnavailableReason::EnvMissing,
                     generation,
                 );
@@ -197,7 +198,7 @@ impl Checker for PythonChecker {
             let tmp_dir = request.cache_dir.join("tmp");
             if fs::create_dir_all(&tmp_dir).is_err() {
                 return ProblemSnapshot::unavailable(
-                    Language::Python,
+                    crate::lang::python::LANGUAGE,
                     UnavailableReason::Fatal,
                     generation,
                 );
@@ -208,7 +209,7 @@ impl Checker for PythonChecker {
                 Ok(output) => output,
                 Err(_) => {
                     return ProblemSnapshot::unavailable(
-                        Language::Python,
+                        crate::lang::python::LANGUAGE,
                         UnavailableReason::Fatal,
                         generation,
                     );
@@ -216,7 +217,7 @@ impl Checker for PythonChecker {
             };
             if output.timed_out {
                 return ProblemSnapshot::unavailable(
-                    Language::Python,
+                    crate::lang::python::LANGUAGE,
                     UnavailableReason::Timeout,
                     generation,
                 );
@@ -643,21 +644,21 @@ fn parse_pyright_output_with_denies(
 ) -> ProblemSnapshot {
     if !matches!(exit, Some(0) | Some(1)) {
         return ProblemSnapshot::unavailable(
-            Language::Python,
+            crate::lang::python::LANGUAGE,
             UnavailableReason::Fatal,
             input_generation,
         );
     }
     let Ok(report) = serde_json::from_slice::<PyrightReport>(stdout) else {
         return ProblemSnapshot::unavailable(
-            Language::Python,
+            crate::lang::python::LANGUAGE,
             UnavailableReason::Fatal,
             input_generation,
         );
     };
     if report.summary.files_analyzed == 0 {
         return ProblemSnapshot::unavailable_with_detail(
-            Language::Python,
+            crate::lang::python::LANGUAGE,
             UnavailableReason::NoFiles,
             input_generation,
             Some(NO_FILES_DETAIL.to_owned()),
@@ -694,19 +695,106 @@ fn parse_pyright_output_with_denies(
 
     if errors != report.summary.error_count || warnings != report.summary.warning_count {
         return ProblemSnapshot::unavailable(
-            Language::Python,
+            crate::lang::python::LANGUAGE,
             UnavailableReason::Fatal,
             input_generation,
         );
     }
 
     ProblemSnapshot::from_problems(
-        Language::Python,
+        crate::lang::python::LANGUAGE,
         CheckState::Ready,
         problems,
         input_generation,
         duration_ms,
     )
+}
+
+/// Python's project-check integration.
+pub struct PythonChecks;
+
+/// Root-level marker files whose presence identifies a worktree as a Python project (T10B),
+/// besides a `.venv`/`venv` directory (checked separately since it is a directory, not a file).
+const PYTHON_PRESENCE_FILES: [&str; 6] = [
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "requirements.txt",
+    "Pipfile",
+    "pyrightconfig.json",
+];
+
+impl LanguageChecks for PythonChecks {
+    /// Python is present iff the worktree root has any of `pyproject.toml`, `setup.py`,
+    /// `setup.cfg`, `requirements.txt`, `Pipfile`, `pyrightconfig.json`, or a `.venv`/`venv`
+    /// directory. This deliberately never walks the tree for source files (for example `*.py`).
+    fn is_present(&self, worktree: &Path) -> bool {
+        PYTHON_PRESENCE_FILES
+            .iter()
+            .any(|name| worktree.join(name).exists())
+            || worktree.join(".venv").is_dir()
+            || worktree.join("venv").is_dir()
+    }
+
+    /// `pyright`.
+    fn tool_name(&self) -> &'static str {
+        "pyright"
+    }
+
+    /// Decodes [`ProjectPythonChecksConfig`].
+    fn parse_config(
+        &self,
+        section: serde_json::Value,
+    ) -> Result<Arc<dyn CheckConfig>, serde_json::Error> {
+        let config: ProjectPythonChecksConfig = serde_json::from_value(section)?;
+        Ok(Arc::new(config))
+    }
+}
+
+/// Accepted Python toolchain declaration for confined background project checks.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectPythonChecksConfig {
+    /// Absolute normalized Node executable; the only program allowed to start confined Pyright.
+    node: PathBuf,
+    /// Absolute normalized Pyright CLI entry module executed by `node`.
+    pyright_cli: PathBuf,
+}
+
+impl ProjectPythonChecksConfig {
+    /// Returns the declared absolute Node executable path.
+    pub fn node(&self) -> &Path {
+        &self.node
+    }
+    /// Returns the declared absolute Pyright CLI entry module path.
+    pub fn pyright_cli(&self) -> &Path {
+        &self.pyright_cli
+    }
+}
+
+impl CheckConfig for ProjectPythonChecksConfig {
+    /// Rejects a relative or lexically non-normal tool path.
+    fn validate(&self) -> bool {
+        absolute(&self.node) && absolute(&self.pyright_cli)
+    }
+
+    /// Builds the confined Pyright runner for these tools.
+    fn checker(&self, runner: Arc<dyn ConfinedRunner>, timeout: Duration) -> Arc<dyn Checker> {
+        Arc::new(PythonChecker::new(
+            runner,
+            self.node.clone(),
+            self.pyright_cli.clone(),
+            timeout,
+        ))
+    }
+
+    /// Node, then the Pyright CLI run by Node.
+    fn programs(&self) -> Vec<(PathBuf, Option<PathBuf>)> {
+        vec![
+            (self.node.clone(), None),
+            (self.pyright_cli.clone(), Some(self.node.clone())),
+        ]
+    }
 }
 
 #[cfg(test)]
@@ -839,5 +927,39 @@ mod deny_tests {
         assert_eq!(resolved_link_target(&root.join("bin/node"), &denies), None);
         assert!(!allowed_file(&root.join("bin/node"), &denies));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Builds a fresh empty scratch directory for presence-detection tests.
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "agent-ide-checks-presence-{}-{name}-{}",
+            std::process::id(),
+            name.len()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir created");
+        dir
+    }
+
+    #[test]
+    fn is_present_python_accepts_any_marker_file_or_venv_directory() {
+        for marker in PYTHON_PRESENCE_FILES {
+            let dir = scratch_dir(&format!("python-presence-{marker}"));
+            assert!(!PythonChecks.is_present(&dir), "{marker}");
+            std::fs::write(dir.join(marker), "").unwrap();
+            assert!(PythonChecks.is_present(&dir), "{marker}");
+        }
+        for venv_name in [".venv", "venv"] {
+            let dir = scratch_dir(&format!("python-presence-{venv_name}"));
+            assert!(!PythonChecks.is_present(&dir), "{venv_name}");
+            std::fs::create_dir(dir.join(venv_name)).unwrap();
+            assert!(PythonChecks.is_present(&dir), "{venv_name}");
+        }
+    }
+
+    #[test]
+    fn is_present_python_is_false_on_an_empty_worktree() {
+        let dir = scratch_dir("empty-python-presence");
+        assert!(!PythonChecks.is_present(&dir));
     }
 }

@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use crate::lang::{Language, TestReport, support};
+use crate::lang::{Language, TestReport};
 
 /// Maximum combined stdout and stderr retained for `ide.inspect`.
 const MAX_OUTPUT: usize = 256 * 1024;
@@ -453,9 +453,7 @@ async fn run_child(
     }
     let bytes = combined.lock().await.iter().copied().collect::<Vec<_>>();
     let output = String::from_utf8_lossy(&bytes).into_owned();
-    let mut report = support(language)
-        .map(|parser| parser.parse_test_output(&output, ""))
-        .unwrap_or_default();
+    let mut report = language.support().parse_test_output(&output, "");
     report.incomplete |= stopped || status.is_none();
     RunResult {
         report,
@@ -526,15 +524,15 @@ mod runner_tests {
     //! Minimal process and parser checks for the test runner.
     use super::*;
 
-    /// Uses a Rust test transcript to prove captured output reaches the language parser.
+    /// Uses a test-language transcript to prove captured output reaches the language parser.
     #[tokio::test]
-    async fn fake_rust_test_command_is_parsed() {
+    async fn fake_test_command_is_parsed() {
         let root = std::env::temp_dir();
-        let script = "printf 'running 1 test\\ntest demo ... ok\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\\n'";
+        let script = "printf 'pass\\n'";
         let result = run(
             &root,
             &["/bin/sh".into(), "-c".into(), script.into()],
-            Language::Rust,
+            crate::lang::testing::ALPHA,
             Duration::from_secs(2),
         )
         .await;
@@ -555,7 +553,7 @@ mod runner_tests {
         let result = run(
             &std::env::temp_dir(),
             &command,
-            Language::Rust,
+            crate::lang::testing::ALPHA,
             Duration::from_secs(1),
         )
         .await;
@@ -585,7 +583,7 @@ mod runner_tests {
             runs.start(
                 root.clone(),
                 vec!["/bin/sh".into(), "-c".into(), "sleep 1".into()],
-                Language::Rust,
+                crate::lang::testing::ALPHA,
                 Duration::from_secs(3),
                 "r1".into(),
                 [1; 32]
@@ -596,7 +594,7 @@ mod runner_tests {
             runs.start(
                 root,
                 vec!["true".into()],
-                Language::Rust,
+                crate::lang::testing::ALPHA,
                 Duration::from_secs(3),
                 "r2".into(),
                 [2; 32]

@@ -46,3 +46,26 @@ pub mod init;
 pub mod doctor_install;
 /// Installs one sealed release bundle into the immutable standalone layout (`self-install`).
 pub mod selfinstall;
+
+/// The bundled languages and their one-time registration into [`lang::install`].
+pub mod languages {
+    use crate::lang::Language;
+
+    /// The Rust language.
+    pub const RUST: Language = crate::lang::rust::LANGUAGE;
+    /// The Python language.
+    pub const PYTHON: Language = crate::lang::python::LANGUAGE;
+    /// The TypeScript language (JavaScript files included).
+    pub const TYPESCRIPT: Language = crate::lang::typescript::LANGUAGE;
+    /// The Go language.
+    pub const GO: Language = crate::lang::go::LANGUAGE;
+
+    /// Every bundled language in the order replies list them.
+    pub const ALL: [Language; 4] = [RUST, PYTHON, TYPESCRIPT, GO];
+
+    /// Registers every bundled language for this process. Idempotent; call it before parsing a
+    /// launcher configuration or mapping any path to a language.
+    pub fn install() {
+        crate::lang::install(&ALL);
+    }
+}

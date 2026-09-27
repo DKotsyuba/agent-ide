@@ -17,11 +17,8 @@ use std::sync::{Arc, Mutex};
 
 use super::host_binding::HostKind;
 use super::launcher::{LauncherConfig, admit_worktree};
-use crate::checks::python::PythonChecker;
 use crate::checks::runner::{ConfinedRunner, SeatbeltRunner};
-use crate::checks::rust::RustChecker;
 use crate::checks::scheduler::{CompletionHook, Scheduler, sweep_stale_caches};
-use crate::checks::typescript::TypeScriptChecker;
 use crate::checks::{
     CheckState, Checker, Language, MAX_PROBLEMS, Problem, ProblemSnapshot, Recheck, Severity,
     UnavailableReason,
@@ -237,32 +234,10 @@ impl ProjectProblemFeed {
             return None;
         }
         let runner: Arc<dyn ConfinedRunner> = Arc::new(SeatbeltRunner);
-        let mut checkers: Vec<Arc<dyn Checker>> = Vec::new();
-        if let Some(rust) = checks.rust() {
-            checkers.push(Arc::new(RustChecker::new(
-                runner.clone(),
-                rust.toolchain_dir().to_path_buf(),
-                rust.cargo_home().map(Path::to_path_buf),
-                checks.check_timeout(),
-                rust.developer_dir().map(Path::to_path_buf),
-            )));
-        }
-        if let Some(python) = checks.python() {
-            checkers.push(Arc::new(PythonChecker::new(
-                runner.clone(),
-                python.node().to_path_buf(),
-                python.pyright_cli().to_path_buf(),
-                checks.check_timeout(),
-            )));
-        }
-        if let Some(typescript) = checks.typescript() {
-            checkers.push(Arc::new(TypeScriptChecker::new(
-                runner.clone(),
-                typescript.node().to_path_buf(),
-                typescript.tsc_cli().to_path_buf(),
-                checks.check_timeout(),
-            )));
-        }
+        let checkers: Vec<Arc<dyn Checker>> = checks
+            .sections()
+            .map(|(_, config)| config.checker(runner.clone(), checks.check_timeout()))
+            .collect();
         if checkers.is_empty() {
             return None;
         }
@@ -690,15 +665,10 @@ fn hex(bytes: &[u8; 32]) -> String {
 
 /// Parses one closed `language` parameter value into its snapshot language.
 ///
-/// Accepts exactly `"rust"`, `"python"`, or `"typescript"`; any other
+/// Accepts exactly the identifier of a registered language with project checks; any other
 /// value returns `None` for the caller to treat as a filter-less request or a validation error.
 pub fn parse_language(value: &str) -> Option<Language> {
-    match value {
-        "rust" => Some(Language::Rust),
-        "python" => Some(Language::Python),
-        "typescript" => Some(Language::TypeScript),
-        _ => None,
-    }
+    Language::by_id(value).filter(|language| language.checks().is_some())
 }
 
 /// Renders the compact problems page text for the requested language filter and offset.
@@ -921,13 +891,13 @@ mod tests {
         let problems: Vec<Problem> = (1..=45)
             .map(|line| problem("src/lib.rs", line, 1, Severity::Error, "boom"))
             .collect();
-        let snapshots = [ready(Language::Rust, problems)];
+        let snapshots = [ready(crate::lang::testing::ALPHA, problems)];
         assert_eq!(PROBLEMS_PAGE_SIZE, 20);
 
         let first = problems_text(&snapshots, None, 0);
         let first_lines: Vec<&str> = first.lines().collect();
         assert_eq!(first_lines.len(), 22, "{first}");
-        assert_eq!(first_lines[0], "rust: ready; errors: 45; warnings: 0");
+        assert_eq!(first_lines[0], "alpha: ready; errors: 45; warnings: 0");
         assert!(first_lines[1].starts_with("src/lib.rs:1:1 error [E0001] boom"));
         assert!(first_lines[20].starts_with("src/lib.rs:20:1 error [E0001] boom"));
         assert_eq!(first_lines[21], "next_offset: 20");
@@ -1020,43 +990,46 @@ mod tests {
     fn language_filter_selects_only_the_matching_configured_language() {
         let snapshots = [
             ready(
-                Language::Rust,
-                vec![problem("a.rs", 1, 1, Severity::Error, "rust one")],
+                crate::lang::testing::ALPHA,
+                vec![problem("a.rs", 1, 1, Severity::Error, "alpha one")],
             ),
             ready(
-                Language::Python,
-                vec![problem("b.py", 2, 1, Severity::Warning, "python one")],
+                crate::lang::testing::BETA,
+                vec![problem("b.py", 2, 1, Severity::Warning, "beta one")],
             ),
         ];
         let all = problems_text(&snapshots, None, 0);
-        assert!(all.contains("rust: ready; errors: 1; warnings: 0"), "{all}");
         assert!(
-            all.contains("python: ready; errors: 0; warnings: 1"),
+            all.contains("alpha: ready; errors: 1; warnings: 0"),
             "{all}"
         );
-        assert!(all.contains("a.rs:1:1 error [E0001] rust one"));
-        assert!(all.contains("b.py:2:1 warning [E0001] python one"));
+        assert!(all.contains("beta: ready; errors: 0; warnings: 1"), "{all}");
+        assert!(all.contains("a.rs:1:1 error [E0001] alpha one"));
+        assert!(all.contains("b.py:2:1 warning [E0001] beta one"));
 
-        let python = problems_text(&snapshots, Some(Language::Python), 0);
-        assert!(python.contains("b.py:2:1 warning [E0001] python one"));
-        assert!(!python.contains("rust:"), "{python}");
-        assert!(!python.contains("a.rs"));
+        let beta = problems_text(&snapshots, Some(crate::lang::testing::BETA), 0);
+        assert!(beta.contains("b.py:2:1 warning [E0001] beta one"));
+        assert!(!beta.contains("alpha:"), "{beta}");
+        assert!(!beta.contains("a.rs"));
 
-        let rust = problems_text(
+        let alpha = problems_text(
             &snapshots,
-            Some(parse_language("rust").expect("rust parses")),
+            Some({
+                crate::lang::testing::install();
+                parse_language("alpha").expect("alpha parses")
+            }),
             0,
         );
-        assert!(rust.contains("a.rs:1:1 error [E0001] rust one"));
-        assert!(!rust.contains("python:"), "{rust}");
-        assert_eq!(parse_language("go"), None);
+        assert!(alpha.contains("a.rs:1:1 error [E0001] alpha one"));
+        assert!(!alpha.contains("beta:"), "{alpha}");
+        assert_eq!(parse_language("delta"), None);
     }
 
     /// Untrusted checker text renders on exactly one line with all control characters stripped.
     #[test]
     fn untrusted_text_is_single_line_without_control_characters() {
         let snapshots = [ready(
-            Language::Rust,
+            crate::lang::testing::ALPHA,
             vec![Problem::new(
                 "a\nb.rs".to_owned(),
                 1,
@@ -1083,9 +1056,9 @@ mod tests {
     #[test]
     fn unconfigured_feed_renders_checks_disabled() {
         assert_eq!(problems_text(&[], None, 0), "checks disabled");
-        let snapshots = [ready(Language::Rust, Vec::new())];
+        let snapshots = [ready(crate::lang::testing::ALPHA, Vec::new())];
         assert_eq!(
-            problems_text(&snapshots, Some(Language::Python), 0),
+            problems_text(&snapshots, Some(crate::lang::testing::BETA), 0),
             "checks disabled"
         );
     }
@@ -1098,17 +1071,22 @@ mod tests {
         let problems: Vec<Problem> = (0..=MAX_PROBLEMS as u32)
             .map(|line| problem("e.rs", line, 1, Severity::Error, "e"))
             .collect();
-        let snapshot =
-            ProblemSnapshot::from_problems(Language::Rust, CheckState::Ready, problems, 1, 1);
+        let snapshot = ProblemSnapshot::from_problems(
+            crate::lang::testing::ALPHA,
+            CheckState::Ready,
+            problems,
+            1,
+            1,
+        );
         assert!(snapshot.truncated);
         let notice = format!(
-            "rust: list truncated to first {MAX_PROBLEMS} problems; counts above are complete"
+            "alpha: list truncated to first {MAX_PROBLEMS} problems; counts above are complete"
         );
 
         let first = problems_text(std::slice::from_ref(&snapshot), None, 0);
         let first_lines: Vec<&str> = first.lines().collect();
         assert_eq!(
-            first_lines[0], "rust: ready; errors: 501; warnings: 0",
+            first_lines[0], "alpha: ready; errors: 501; warnings: 0",
             "{first}"
         );
         assert_eq!(first_lines[1], notice, "{first}");
@@ -1123,7 +1101,7 @@ mod tests {
     #[test]
     fn under_cap_snapshot_renders_no_truncation_notice() {
         let snapshots = [ready(
-            Language::Rust,
+            crate::lang::testing::ALPHA,
             vec![problem("a.rs", 1, 1, Severity::Error, "e")],
         )];
         let text = problems_text(&snapshots, None, 0);
@@ -1135,47 +1113,51 @@ mod tests {
     fn lifecycle_states_render_without_counts_and_closed_reasons() {
         let snapshots = [
             ProblemSnapshot::from_problems(
-                Language::Rust,
+                crate::lang::testing::ALPHA,
                 CheckState::Partial,
                 vec![problem("a.rs", 1, 1, Severity::Error, "e")],
                 1,
                 5,
             ),
-            ProblemSnapshot::checking(Language::Python, 3),
+            ProblemSnapshot::checking(crate::lang::testing::BETA, 3),
         ];
         let text = problems_text(&snapshots, None, 0);
         assert!(
-            text.contains("rust: partial; errors: 1; warnings: 0"),
+            text.contains("alpha: partial; errors: 1; warnings: 0"),
             "{text}"
         );
         assert!(
             text.lines()
-                .any(|line| line == "python: checking (first check in this session)"),
+                .any(|line| line == "beta: checking (first check in this session)"),
             "{text}"
         );
         assert!(
-            !text.contains("python: checking (first check in this session);"),
+            !text.contains("beta: checking (first check in this session);"),
             "{text}"
         );
 
         for (reason, rendered) in [
             (
                 UnavailableReason::OutsideRoots,
-                "rust: unavailable:outside_roots",
+                "alpha: unavailable:outside_roots",
             ),
             (
                 UnavailableReason::ToolMissing,
-                "rust: unavailable:tool_missing",
+                "alpha: unavailable:tool_missing",
             ),
             (
                 UnavailableReason::EnvMissing,
-                "rust: unavailable:env_missing",
+                "alpha: unavailable:env_missing",
             ),
-            (UnavailableReason::NoFiles, "rust: unavailable:no_files"),
-            (UnavailableReason::Fatal, "rust: unavailable:fatal"),
-            (UnavailableReason::Timeout, "rust: unavailable:timeout"),
+            (UnavailableReason::NoFiles, "alpha: unavailable:no_files"),
+            (UnavailableReason::Fatal, "alpha: unavailable:fatal"),
+            (UnavailableReason::Timeout, "alpha: unavailable:timeout"),
         ] {
-            let snapshots = [ProblemSnapshot::unavailable(Language::Rust, reason, 1)];
+            let snapshots = [ProblemSnapshot::unavailable(
+                crate::lang::testing::ALPHA,
+                reason,
+                1,
+            )];
             assert_eq!(problems_text(&snapshots, None, 0), rendered);
         }
     }
@@ -1187,7 +1169,7 @@ mod tests {
     #[test]
     fn absent_language_is_omitted_and_all_absent_reports_no_supported_project() {
         let rust_only = [ProblemSnapshot::unavailable(
-            Language::Rust,
+            crate::lang::testing::ALPHA,
             UnavailableReason::Disabled,
             1,
         )];
@@ -1197,16 +1179,20 @@ mod tests {
         );
 
         let mixed = [
-            ProblemSnapshot::unavailable(Language::Rust, UnavailableReason::Disabled, 1),
+            ProblemSnapshot::unavailable(
+                crate::lang::testing::ALPHA,
+                UnavailableReason::Disabled,
+                1,
+            ),
             ready(
-                Language::Python,
-                vec![problem("b.py", 2, 1, Severity::Warning, "python one")],
+                crate::lang::testing::BETA,
+                vec![problem("b.py", 2, 1, Severity::Warning, "beta one")],
             ),
         ];
         let text = problems_text(&mixed, None, 0);
-        assert!(!text.contains("rust"), "{text}");
+        assert!(!text.contains("alpha"), "{text}");
         assert!(
-            text.contains("python: ready; errors: 0; warnings: 1"),
+            text.contains("beta: ready; errors: 0; warnings: 1"),
             "{text}"
         );
     }
@@ -1216,18 +1202,18 @@ mod tests {
     #[test]
     fn unavailable_detail_renders_in_parentheses_and_strips_control_characters() {
         let with_detail = [ProblemSnapshot::unavailable_with_detail(
-            Language::Rust,
+            crate::lang::testing::ALPHA,
             UnavailableReason::Fatal,
             1,
             Some("error: failed to run custom build command for `blake3 v1.5.0`".to_owned()),
         )];
         assert_eq!(
             problems_text(&with_detail, None, 0),
-            "rust: unavailable:fatal (error: failed to run custom build command for `blake3 v1.5.0`)"
+            "alpha: unavailable:fatal (error: failed to run custom build command for `blake3 v1.5.0`)"
         );
 
         let with_control_chars = [ProblemSnapshot::unavailable_with_detail(
-            Language::Rust,
+            crate::lang::testing::ALPHA,
             UnavailableReason::Fatal,
             1,
             Some("error: line one\nline two <agent-ide>x</agent-ide>".to_owned()),
@@ -1236,38 +1222,38 @@ mod tests {
         assert_eq!(text.lines().count(), 1, "{text}");
         assert_eq!(
             text,
-            "rust: unavailable:fatal (error: line oneline two <agent-ide>x</agent-ide>)"
+            "alpha: unavailable:fatal (error: line oneline two <agent-ide>x</agent-ide>)"
         );
 
         let without_detail = [ProblemSnapshot::unavailable(
-            Language::Rust,
+            crate::lang::testing::ALPHA,
             UnavailableReason::Fatal,
             1,
         )];
         assert_eq!(
             problems_text(&without_detail, None, 0),
-            "rust: unavailable:fatal"
+            "alpha: unavailable:fatal"
         );
     }
 
-    /// A pyright run that analyzed zero files (T12B) renders `unavailable:no_files` with a detail
+    /// A checker run that analyzed zero files (T12B) renders `unavailable:no_files` with a detail
     /// pointing at the project's `include`/`exclude` configuration, distinct from `env_missing`.
     #[test]
     fn python_no_files_analyzed_renders_with_include_exclude_detail() {
         let snapshots = [ProblemSnapshot::unavailable_with_detail(
-            Language::Python,
+            crate::lang::testing::BETA,
             UnavailableReason::NoFiles,
             1,
             Some(
-                "pyright analyzed 0 files; check \"include\"/\"exclude\" in pyrightconfig.json \
-                 or [tool.pyright]"
+                "checker analyzed 0 files; check \"include\"/\"exclude\" in checker.json \
+                 or [tool.checker]"
                     .to_owned(),
             ),
         )];
         assert_eq!(
             problems_text(&snapshots, None, 0),
-            "python: unavailable:no_files (pyright analyzed 0 files; check \"include\"/\"exclude\" \
-             in pyrightconfig.json or [tool.pyright])"
+            "beta: unavailable:no_files (checker analyzed 0 files; check \"include\"/\"exclude\" \
+             in checker.json or [tool.checker])"
         );
     }
 
@@ -1276,7 +1262,7 @@ mod tests {
     #[test]
     fn untrusted_code_is_single_line_without_control_characters_or_tags() {
         let snapshots = [ready(
-            Language::Rust,
+            crate::lang::testing::ALPHA,
             vec![Problem::new(
                 "a.rs".to_owned(),
                 1,
@@ -1306,7 +1292,7 @@ mod tests {
             .map(|index| char::from(b'a' + (index % 26) as u8))
             .collect();
         let snapshots = [ready(
-            Language::Rust,
+            crate::lang::testing::ALPHA,
             vec![Problem::new(
                 "a.rs".to_owned(),
                 1,
@@ -1328,7 +1314,7 @@ mod tests {
     #[test]
     fn missing_code_omits_the_bracket_segment() {
         let snapshots = [ready(
-            Language::Rust,
+            crate::lang::testing::ALPHA,
             vec![Problem::new(
                 "a.rs".to_owned(),
                 1,
@@ -1359,7 +1345,7 @@ mod tests {
 
     impl crate::checks::Checker for ScriptedChecker {
         fn language(&self) -> Language {
-            Language::Rust
+            crate::lang::testing::ALPHA
         }
 
         fn check(
@@ -1370,7 +1356,7 @@ mod tests {
             Box::pin(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 ProblemSnapshot::from_problems(
-                    Language::Rust,
+                    crate::lang::testing::ALPHA,
                     CheckState::Ready,
                     problems,
                     request.input_generation,
@@ -1388,7 +1374,7 @@ mod tests {
             .join(format!("agent-ide-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("wt")).unwrap();
-        std::fs::write(root.join("wt/Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(root.join("wt/alpha.toml"), "").unwrap();
         let problems = Arc::new(Mutex::new(Vec::new()));
         let scheduler = Scheduler::new(
             vec![Arc::new(ScriptedChecker(Arc::clone(&problems)))],
@@ -1396,7 +1382,11 @@ mod tests {
             2,
             root.join("cache"),
         );
-        let feed = ProjectProblemFeed::new(scheduler, vec![root.clone()], vec![Language::Rust]);
+        let feed = ProjectProblemFeed::new(
+            scheduler,
+            vec![root.clone()],
+            vec![crate::lang::testing::ALPHA],
+        );
         (feed, problems, root)
     }
 
@@ -1433,14 +1423,17 @@ mod tests {
 
         feed.activated([2; 32], &worktree, Path::new("repo"), false);
         let rechecks = feed.rechecks(&worktree);
-        assert_eq!(rechecks, vec![(Language::Rust, Recheck::FirstCheck)]);
+        assert_eq!(
+            rechecks,
+            vec![(crate::lang::testing::ALPHA, Recheck::FirstCheck)]
+        );
         assert_eq!(
             problems_text_with_rechecks(&feed.latest(&worktree), &rechecks, None, 0),
-            "rust: checking (first check in this session); previous session result: errors: 0; warnings: 0"
+            "alpha: checking (first check in this session); previous session result: errors: 0; warnings: 0"
         );
         assert_eq!(
             feed.next_block(&[2; 32]),
-            plate("rust: checking (first check)"),
+            plate("alpha: checking (first check)"),
             "previous session counts must not be presented as current"
         );
 
@@ -1448,11 +1441,11 @@ mod tests {
         assert!(feed.rechecks(&worktree).is_empty());
         assert_eq!(
             problems_text_with_rechecks(&feed.latest(&worktree), &[], None, 0),
-            "rust: ready; errors: 0; warnings: 0"
+            "alpha: ready; errors: 0; warnings: 0"
         );
         assert_eq!(
             feed.next_block(&[2; 32]),
-            plate("rust: 0 errors, 0 warnings")
+            plate("alpha: 0 errors, 0 warnings")
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1471,7 +1464,7 @@ mod tests {
         assert!(feed.scheduler.latest(&worktree).is_empty());
         assert_eq!(
             feed.next_block(&restricted),
-            plate("rust: unavailable: read_restricted")
+            plate("alpha: unavailable: read_restricted")
         );
         feed.changed(&restricted);
         settle().await;
@@ -1503,11 +1496,11 @@ mod tests {
         settle().await;
         assert_eq!(
             feed.next_block(&allowed),
-            plate("rust: unavailable: read_restricted")
+            plate("alpha: unavailable: read_restricted")
         );
         assert_eq!(
             problems_text_with_rechecks(&feed.read_restricted_snapshots(), &[], None, 0),
-            "rust: unavailable: read_restricted"
+            "alpha: unavailable: read_restricted"
         );
         assert_eq!(feed.next_block(&restricted), None);
         let _ = std::fs::remove_dir_all(&root);
@@ -1528,7 +1521,7 @@ mod tests {
         assert!(feed.scheduler.latest(&worktree).is_empty());
         assert_eq!(
             feed.next_block(&binding),
-            plate("rust: unavailable: read_restricted")
+            plate("alpha: unavailable: read_restricted")
         );
         feed.activated(binding, &worktree, Path::new("repo"), false);
         assert!(
@@ -1540,7 +1533,7 @@ mod tests {
         settle().await;
         assert_eq!(
             feed.next_block(&binding),
-            plate("rust: 0 errors, 0 warnings")
+            plate("alpha: 0 errors, 0 warnings")
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1603,11 +1596,11 @@ mod tests {
         feed.activated(hook, &worktree, Path::new("repo"), false);
         assert_eq!(
             feed.next_block(&hook),
-            plate("rust: checking (first check)")
+            plate("alpha: checking (first check)")
         );
         assert_eq!(feed.next_block(&hook), None);
         settle().await;
-        assert_eq!(feed.next_block(&hook), plate("rust: 0 errors, 0 warnings"));
+        assert_eq!(feed.next_block(&hook), plate("alpha: 0 errors, 0 warnings"));
         assert_eq!(feed.next_block(&hook), None);
 
         // Quiet session: hook events re-arm the timer, but nothing runs or changes yet.
@@ -1617,7 +1610,7 @@ mod tests {
         assert_eq!(feed.next_block(&hook), None);
         assert_eq!(
             problems_text_with_rechecks(&feed.latest(&worktree), &[], None, 0),
-            "rust: ready; errors: 0; warnings: 0"
+            "alpha: ready; errors: 0; warnings: 0"
         );
         settle().await;
         assert_eq!(
@@ -1630,18 +1623,21 @@ mod tests {
         feed.changed(&hook);
         until_running(&feed, &worktree).await;
         let rechecks = feed.rechecks(&worktree);
-        assert_eq!(rechecks, vec![(Language::Rust, Recheck::FilesChanged)]);
+        assert_eq!(
+            rechecks,
+            vec![(crate::lang::testing::ALPHA, Recheck::FilesChanged)]
+        );
         assert_eq!(
             problems_text_with_rechecks(&feed.latest(&worktree), &rechecks, None, 0),
-            "rust: checking (files changed); last result: errors: 0; warnings: 0"
+            "alpha: checking (files changed); last result: errors: 0; warnings: 0"
         );
         assert_eq!(
             feed.next_block(&hook),
-            plate("rust: checking (files changed; last result: 0 errors, 0 warnings)")
+            plate("alpha: checking (files changed; last result: 0 errors, 0 warnings)")
         );
         assert_eq!(feed.next_block(&hook), None);
         settle().await;
-        assert_eq!(feed.next_block(&hook), plate("rust: 0 errors, 0 warnings"));
+        assert_eq!(feed.next_block(&hook), plate("alpha: 0 errors, 0 warnings"));
         assert_eq!(feed.next_block(&hook), None);
 
         // Edit adds a warning.
@@ -1653,12 +1649,12 @@ mod tests {
         until_running(&feed, &worktree).await;
         assert_eq!(
             feed.next_block(&hook),
-            plate("rust: checking (files changed; last result: 0 errors, 0 warnings)")
+            plate("alpha: checking (files changed; last result: 0 errors, 0 warnings)")
         );
         settle().await;
         assert_eq!(
             feed.next_block(&hook),
-            plate("rust: 0 errors, 1 warning (+1)")
+            plate("alpha: 0 errors, 1 warning (+1)")
         );
         assert_eq!(feed.next_block(&hook), None);
 
@@ -1668,12 +1664,12 @@ mod tests {
         until_running(&feed, &worktree).await;
         assert_eq!(
             feed.next_block(&hook),
-            plate("rust: checking (files changed; last result: 0 errors, 1 warning)")
+            plate("alpha: checking (files changed; last result: 0 errors, 1 warning)")
         );
         settle().await;
         assert_eq!(
             feed.next_block(&hook),
-            plate("rust: 0 errors, 0 warnings (-1)")
+            plate("alpha: 0 errors, 0 warnings (-1)")
         );
         assert_eq!(feed.next_block(&hook), None);
         let _ = std::fs::remove_dir_all(&root);
@@ -1687,7 +1683,7 @@ mod tests {
         let worktree = root.join("wt");
         let hook = [1; 32];
         feed.activated(hook, &worktree, Path::new("repo"), false);
-        let due = plate("rust: checking (first check)").unwrap();
+        let due = plate("alpha: checking (first check)").unwrap();
         assert_eq!(
             feed.next_block_when(&hook, |_| false),
             None,

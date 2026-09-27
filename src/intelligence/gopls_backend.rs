@@ -26,7 +26,8 @@ use crate::{
         server::{self, LanguageServer, ProviderContext, ProviderHost, ProviderJob, ServerBackend},
         session::{ProviderSettings, SessionOptions, with_session},
     },
-    telemetry::{CacheState, DiagnosticState, Language, Telemetry, adapters},
+    lang::Language,
+    telemetry::{CacheState, DiagnosticState, Telemetry, adapters},
     workspace::observation::SourceObservation,
 };
 
@@ -34,9 +35,19 @@ use crate::{
 pub struct GoplsServer;
 
 impl LanguageServer for GoplsServer {
-    /// Go provider observations.
+    /// The Go language.
     fn language(&self) -> Language {
-        Language::Go
+        crate::lang::go::LANGUAGE
+    }
+
+    /// gopls defaults.
+    fn settings_key(&self) -> &'static str {
+        "gopls_defaults"
+    }
+
+    /// Requires an absolute Go toolchain executable as the declared toolchain.
+    fn validate_launch(&self, launch: &ProviderLaunch) -> bool {
+        crate::assistance::launcher::absolute(Path::new(&launch.toolchain))
     }
 
     /// The server's own name.
@@ -649,7 +660,7 @@ async fn session_operation<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncW
         };
         adapters::provider_summary(
             telemetry,
-            Language::Go,
+            crate::lang::go::LANGUAGE,
             CacheState::Unavailable,
             diagnostics,
         );

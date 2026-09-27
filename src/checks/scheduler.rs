@@ -5,8 +5,10 @@
 //! [`Checker`] invocation, and the latest completed [`ProblemSnapshot`]. It never blocks a
 //! caller: [`Scheduler::trigger`](crate::checks::scheduler::Scheduler::trigger) only restarts a timer, and
 //! [`Scheduler::latest`](crate::checks::scheduler::Scheduler::latest) only reads
-//! the last stored result. A new worktree's first Rust check is preceded by a best-effort
-//! copy-on-write clone of a sibling worktree's `target/` directory. Between completions, a run
+//! the last stored result. A new worktree's first check of a language whose checks seed a
+//! sibling cache (see [`LanguageChecks::sibling_cache`](crate::checks::LanguageChecks::sibling_cache))
+//! is preceded by a best-effort copy-on-write clone of a sibling worktree's cache subdirectory.
+//! Between completions, a run
 //! is further throttled by a cooldown of `max(debounce, previous run duration)`, and a
 //! transient `Fatal`/`Timeout` completion never overwrites an existing `Ready`/`Partial` result.
 //! (T20B) A debounce firing whose worktree inputs are unchanged since the pair's last completed
@@ -40,18 +42,22 @@ const WORKTREE_MARKER_FILE_NAME: &str = "worktree.path";
 /// fingerprinted cheaply, `None` when unknown (the scheduler then assumes "changed" and runs).
 pub type FingerprintFn = Arc<dyn Fn(&Path) -> Option<u64> + Send + Sync>;
 
-/// Outcome of the copy-on-write `target/` clone attempted before a worktree's first Rust check.
+/// Outcome of the copy-on-write sibling-cache clone attempted before a worktree's first check of a
+/// language whose checks seed one (see
+/// [`LanguageChecks::sibling_cache`](crate::checks::LanguageChecks::sibling_cache)).
 ///
 /// Exposed so tests can observe the clone decision without depending on filesystem timing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RustCacheClone {
-    /// No Rust check has reached the clone decision for this worktree yet.
+pub enum CacheClone {
+    /// No check of the language has reached the clone decision for this worktree yet.
     NotAttempted,
-    /// `cp -c -R` completed successfully; the destination `target/` was populated from `source`.
+    /// `cp -c -R` completed successfully; the destination cache subdirectory was populated from
+    /// the sibling's.
     Cloned,
-    /// No sibling worktree of the same repository had a completed Rust cache dir to clone from.
+    /// No sibling worktree of the same repository had a completed cache of the language to
+    /// clone from.
     SkippedNoSource,
-    /// A source `target/` existed but the clone process failed; the check proceeds cold.
+    /// A source subdirectory existed but the clone process failed; the check proceeds cold.
     Failed,
 }
 
@@ -109,7 +115,7 @@ struct State {
 
 /// Scheduling state for one worktree.
 struct WorktreeState {
-    /// Repository identity shared with sibling worktrees for Rust cache cloning.
+    /// Repository identity shared with sibling worktrees for sibling cache cloning.
     repository_key: String,
     /// Counter incremented on every [`Scheduler::trigger`] call for this worktree.
     input_generation: u64,
@@ -122,8 +128,9 @@ struct WorktreeState {
     /// their firings must run even when the worktree inputs are unchanged (T20B). Cleared by
     /// the next ordinary [`Scheduler::trigger`].
     activation_armed: bool,
-    /// Outcome of this worktree's Rust `target/` clone decision, for [`Scheduler::rust_cache_clone_outcome`].
-    rust_clone_outcome: RustCacheClone,
+    /// Outcome of this worktree's sibling-cache clone decision per language, for
+    /// [`Scheduler::cache_clone_outcome`]; absent means not attempted.
+    clone_outcomes: HashMap<Language, CacheClone>,
     /// Strongest exclusions observed for any check on this worktree.
     read_denies: Vec<ReadDeny>,
     /// Incremented when the effective exclusions change; stale completions cannot publish.
@@ -141,7 +148,7 @@ impl WorktreeState {
             activation_generation: 0,
             languages: HashMap::new(),
             activation_armed: false,
-            rust_clone_outcome: RustCacheClone::NotAttempted,
+            clone_outcomes: HashMap::new(),
             read_denies: Vec::new(),
             policy_generation: 0,
             policy_digest: policy_digest(&[]),
@@ -187,8 +194,8 @@ struct LanguageState {
 /// Per-repository state shared across sibling worktrees.
 #[derive(Default)]
 struct RepositoryState {
-    /// Latest completed Rust cache for each exact effective exclusion set.
-    most_recent_rust_cache_dir: HashMap<String, PathBuf>,
+    /// Latest completed seedable cache for each language and exact effective exclusion set.
+    most_recent_cache_dir: HashMap<(Language, String), PathBuf>,
 }
 
 impl Scheduler {
@@ -213,7 +220,7 @@ impl Scheduler {
             wt.input_generation += 1;
             wt.policy_generation += 1;
             wt.policy_digest = policy_digest(&wt.read_denies);
-            wt.rust_clone_outcome = RustCacheClone::NotAttempted;
+            wt.clone_outcomes.clear();
             for lang in wt.languages.values_mut() {
                 if let Some(timer) = lang.timer_abort.take() {
                     timer.abort();
@@ -306,7 +313,7 @@ impl Scheduler {
     ///
     /// Non-blocking and never awaits: it only updates in-memory state and spawns the timer
     /// tasks that will later run checks. `repository_key` identifies the repository this
-    /// worktree belongs to, for Rust cache cloning between sibling worktrees; it is refreshed on
+    /// worktree belongs to, for cache cloning between sibling worktrees; it is refreshed on
     /// every call in case a worktree's repository identity changes. Increments this worktree's
     /// `input_generation` once regardless of how many languages are configured. A trigger
     /// received after [`Scheduler::shutdown`] has started is silently ignored.
@@ -491,18 +498,18 @@ impl Scheduler {
         })
     }
 
-    /// Returns the outcome of `worktree`'s Rust `target/` clone decision.
+    /// Returns the outcome of `worktree`'s sibling-cache clone decision for `language`.
     ///
-    /// [`RustCacheClone::NotAttempted`] until this worktree's first Rust check has reached the
-    /// clone decision point; a debug-visible field kept mainly for tests.
-    pub fn rust_cache_clone_outcome(&self, worktree: &Path) -> RustCacheClone {
+    /// [`CacheClone::NotAttempted`] until this worktree's first check of `language` has reached
+    /// the clone decision point; a debug-visible field kept mainly for tests.
+    pub fn cache_clone_outcome(&self, worktree: &Path, language: Language) -> CacheClone {
         let worktree = canonical_worktree(worktree);
         let state = self.inner.lock_state();
         state
             .worktrees
             .get(&worktree)
-            .map(|wt| wt.rust_clone_outcome)
-            .unwrap_or(RustCacheClone::NotAttempted)
+            .and_then(|wt| wt.clone_outcomes.get(&language).copied())
+            .unwrap_or(CacheClone::NotAttempted)
     }
 
     /// Cancels every pending debounce timer and drops every running check's future, then
@@ -667,12 +674,12 @@ impl Inner {
     /// omit it. Presence is re-checked on every iteration rather than cached, so a worktree that
     /// gains its manifest between triggers is checked again on the next one. Otherwise, this
     /// waits out any pending EYES-r2 cooldown (see [`Inner::cooldown_remaining`]), then prepares
-    /// the cache directory (cloning Rust's `target/` on the worktree's first Rust check when
-    /// possible), acquires the shared concurrency permit, dispatches the configured [`Checker`],
+    /// the cache directory (cloning a sibling's cache subdirectory on the worktree's first check
+    /// of a seeding language when possible), acquires the shared concurrency permit, dispatches the configured [`Checker`],
     /// stores the resulting snapshot only if its policy generation is current (and subject to
     /// the Fatal/Timeout guard), then reports accepted completion to [`CompletionHook`],
-    /// records this completion's timing for the next iteration's cooldown, and records Rust
-    /// cache completion for sibling worktrees. If the pair was marked dirty while this run was
+    /// records this completion's timing for the next iteration's cooldown, and records a seeding
+    /// language's cache completion for sibling worktrees. If the pair was marked dirty while this run was
     /// in flight, one more iteration follows with the latest `input_generation`; the [`Checker`]
     /// contract's cancellation is dropping its future, which happens automatically when
     /// [`Scheduler::shutdown`] aborts this task mid-await (including while it is waiting out a
@@ -793,9 +800,13 @@ impl Inner {
                 &completed_state,
                 policy_generation,
             );
-            if language == Language::Rust {
-                inner.record_completed_rust_cache(
+            if language
+                .checks()
+                .is_some_and(|checks| checks.sibling_cache().is_some())
+            {
+                inner.record_completed_cache(
                     &worktree,
+                    language,
                     &cache_dir,
                     policy_generation,
                     &policy_digest,
@@ -1004,11 +1015,12 @@ impl Inner {
         required.saturating_sub(last_completion.elapsed())
     }
 
-    /// Records `cache_dir` for sibling Rust clones only under the same live policy generation
-    /// and digest; stale completions cannot seed a newer policy's cache.
-    fn record_completed_rust_cache(
+    /// Records `cache_dir` for sibling clones of `language` only under the same live policy
+    /// generation and digest; stale completions cannot seed a newer policy's cache.
+    fn record_completed_cache(
         &self,
         worktree: &Path,
+        language: Language,
         cache_dir: &Path,
         policy_generation: u64,
         policy_digest: &str,
@@ -1026,8 +1038,11 @@ impl Inner {
             .repositories
             .entry(repository_key)
             .or_default()
-            .most_recent_rust_cache_dir
-            .insert(policy_digest.to_owned(), cache_dir.to_path_buf());
+            .most_recent_cache_dir
+            .insert(
+                (language, policy_digest.to_owned()),
+                cache_dir.to_path_buf(),
+            );
     }
 
     /// Ends the current iteration only for its policy generation and reports whether another
@@ -1063,9 +1078,9 @@ impl Inner {
         false
     }
 
-    /// Creates `worktree`'s `language` cache directory if it is missing, attempting a Rust
-    /// `target/` clone from a sibling worktree beforehand when this is the worktree's first Rust
-    /// check.
+    /// Creates `worktree`'s `language` cache directory if it is missing, attempting a sibling
+    /// cache clone beforehand when this is the worktree's first check of a language whose checks
+    /// seed one.
     ///
     /// The directory layout is `<cache_root>/<hash(repository_key)>/<hash(canonical
     /// worktree)>/<policy_digest>/<language>`, so caches from different policies never collide
@@ -1113,9 +1128,11 @@ impl Inner {
                 dir.display()
             );
         }
-        if language == Language::Rust && !existed {
+        if let Some(subdirectory) = language.checks().and_then(|checks| checks.sibling_cache())
+            && !existed
+        {
             let outcome = self
-                .try_clone_rust_cache(worktree, &dir, policy_digest)
+                .try_clone_cache(worktree, language, subdirectory, &dir, policy_digest)
                 .await;
             let mut state = self.lock_state();
             if let Some(wt) = state
@@ -1123,24 +1140,27 @@ impl Inner {
                 .get_mut(worktree)
                 .filter(|wt| wt.policy_generation == policy_generation)
             {
-                wt.rust_clone_outcome = outcome;
+                wt.clone_outcomes.insert(language, outcome);
             }
         }
         dir
     }
 
-    /// Attempts an APFS copy-on-write clone of a sibling worktree's `target/` into `dst_dir`.
+    /// Attempts an APFS copy-on-write clone of a sibling worktree's `subdirectory` of its
+    /// `language` cache into `dst_dir`.
     ///
-    /// Looks up the most recently completed Rust cache for this repository and exact deny-policy
-    /// digest; if none exists, or its `target/` is missing, the check proceeds cold. The
-    /// clone itself runs `/bin/cp -c -R <source>/target <dst_dir>/target`; any failure is logged
-    /// and treated as a cold start rather than propagated.
-    async fn try_clone_rust_cache(
+    /// Looks up the most recently completed cache of `language` for this repository and exact
+    /// deny-policy digest; if none exists, or its `subdirectory` is missing, the check proceeds
+    /// cold. The clone itself runs `/bin/cp -c -R <source>/<subdirectory> <dst_dir>/<subdirectory>`;
+    /// any failure is logged and treated as a cold start rather than propagated.
+    async fn try_clone_cache(
         &self,
         worktree: &Path,
+        language: Language,
+        subdirectory: &str,
         dst_dir: &Path,
         policy_digest: &str,
-    ) -> RustCacheClone {
+    ) -> CacheClone {
         let repository_key = {
             let state = self.lock_state();
             state
@@ -1149,7 +1169,7 @@ impl Inner {
                 .map(|wt| wt.repository_key.clone())
         };
         let Some(repository_key) = repository_key else {
-            return RustCacheClone::NotAttempted;
+            return CacheClone::NotAttempted;
         };
         let source_dir = {
             let state = self.lock_state();
@@ -1158,19 +1178,19 @@ impl Inner {
                 .get(&repository_key)
                 .and_then(|repository| {
                     repository
-                        .most_recent_rust_cache_dir
-                        .get(policy_digest)
+                        .most_recent_cache_dir
+                        .get(&(language, policy_digest.to_owned()))
                         .cloned()
                 })
         };
         let Some(source_dir) = source_dir else {
-            return RustCacheClone::SkippedNoSource;
+            return CacheClone::SkippedNoSource;
         };
-        let source_target = source_dir.join("target");
+        let source_target = source_dir.join(subdirectory);
         if !source_target.exists() {
-            return RustCacheClone::SkippedNoSource;
+            return CacheClone::SkippedNoSource;
         }
-        let destination_target = dst_dir.join("target");
+        let destination_target = dst_dir.join(subdirectory);
         match tokio::process::Command::new("/bin/cp")
             .arg("-c")
             .arg("-R")
@@ -1179,7 +1199,7 @@ impl Inner {
             .output()
             .await
         {
-            Ok(output) if output.status.success() => RustCacheClone::Cloned,
+            Ok(output) if output.status.success() => CacheClone::Cloned,
             Ok(_) | Err(_) => {
                 crate::errorlog::record(
                     crate::errorlog::Method::Check,
@@ -1189,7 +1209,7 @@ impl Inner {
                         ..Default::default()
                     },
                 );
-                RustCacheClone::Failed
+                CacheClone::Failed
             }
         }
     }
@@ -1329,10 +1349,17 @@ mod deny_tests {
     fn denied_check_diagnostics_are_removed_before_caching() {
         let root = Path::new("/tmp/check-project");
         let mut snapshot = ProblemSnapshot::from_problems(
-            Language::Python,
+            crate::lang::testing::BETA,
             CheckState::Ready,
             vec![
-                Problem::new("good.py".into(), 1, 1, Severity::Error, None, "good".into()),
+                Problem::new(
+                    "good.src".into(),
+                    1,
+                    1,
+                    Severity::Error,
+                    None,
+                    "good".into(),
+                ),
                 Problem::new(
                     "secret.key".into(),
                     1,
@@ -1355,7 +1382,7 @@ mod deny_tests {
         );
         assert_eq!(snapshot.errors, 1);
         assert_eq!(snapshot.problems.len(), 1);
-        assert_eq!(snapshot.problems[0].path, "good.py");
+        assert_eq!(snapshot.problems[0].path, "good.src");
     }
 
     /// A deny-bearing worktree never invokes even an installed fingerprint callback.
@@ -1385,14 +1412,14 @@ mod deny_tests {
             std::env::temp_dir().join(format!("agent-ide-policy-barrier-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let root = std::fs::canonicalize(root).unwrap();
-        std::fs::write(root.join("pyproject.toml"), "[project]\nname='barrier'\n").unwrap();
+        std::fs::write(root.join("beta.toml"), "").unwrap();
         let entered = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
         let completed = Arc::new(AtomicUsize::new(0));
         let scheduler = Scheduler::new(
             vec![Arc::new(FakeChecker::with_delay(
-                Language::Python,
-                ProblemSnapshot::checking(Language::Python, 1),
+                crate::lang::testing::BETA,
+                ProblemSnapshot::checking(crate::lang::testing::BETA, 1),
                 Duration::ZERO,
             ))],
             Duration::from_millis(1),

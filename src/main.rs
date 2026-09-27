@@ -34,6 +34,7 @@ use tokio::sync::Mutex;
 /// Selects an explicit mode; MCP writes only protocol messages to stdout and never autostarts.
 #[tokio::main]
 async fn main() -> ExitCode {
+    agent_ide::languages::install();
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     if is_version_request(&arguments) {
         println!("agent-ide {}", env!("CARGO_PKG_VERSION"));

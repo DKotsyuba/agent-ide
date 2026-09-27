@@ -27,41 +27,201 @@ pub mod typescript;
 
 pub use path::SymbolPath;
 
-/// Languages with a support module; the order is the order `ide.start` reports them.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
-pub enum Language {
-    Rust,
-    Python,
-    TypeScript,
-    Go,
+/// Static identity and behaviour of one supported language, defined once by its language module.
+///
+/// Core code never names a language: it keys behaviour on the [`Language`] handle built from a
+/// descriptor and reaches everything language-specific through the descriptor's traits. A
+/// language module defines its descriptor as a `static` and exposes a `LANGUAGE` constant made
+/// with [`Language::of`]; the application registers its languages once at startup with
+/// [`install`].
+pub struct LanguageDescriptor {
+    /// Stable lowercase identifier used in replies, journal lines, telemetry, launcher
+    /// configuration sections and the `problems` language filter. Unique among registered
+    /// languages.
+    pub id: &'static str,
+    /// Human-facing name, also the handle's `Debug` form.
+    pub display_name: &'static str,
+    /// File extensions (without the dot) whose files this language owns. An extension belongs to
+    /// at most one registered language.
+    pub extensions: &'static [&'static str],
+    /// Project manifest the `ide.start` description says the project card replaces reading, or
+    /// `None` when the language has no manifest worth naming there.
+    pub card_manifest: Option<&'static str>,
+    /// Directories below the user's home where the language's user-installed tools (formatters)
+    /// live, prepended to the formatter `PATH` in registration order.
+    pub home_tool_dirs: &'static [&'static str],
+    /// Symbol-tool behaviour: outlines, insertion points, test selection and formatting.
+    pub support: &'static dyn LanguageSupport,
+    /// Confined project-check integration, when the language has a checker.
+    pub checks: Option<&'static dyn crate::checks::LanguageChecks>,
+    /// Language-server integration, when the language has one.
+    pub server: Option<&'static dyn crate::intelligence::server::LanguageServer>,
+}
+
+/// A registered language: a cheap copyable handle to its [`LanguageDescriptor`].
+///
+/// Equality and hashing use the descriptor's `id`. Ordering follows registration order (the
+/// order `ide.start`, the `<agent-ide>` block and problem pages list languages), with
+/// unregistered languages after every registered one, ordered by `id`. The handle serializes as
+/// its `id` and deserializes only an `id` of a registered language.
+#[derive(Clone, Copy)]
+pub struct Language(&'static LanguageDescriptor);
+
+/// Languages registered for this process, in registration order; set once by [`install`].
+static REGISTRY: std::sync::OnceLock<Vec<Language>> = std::sync::OnceLock::new();
+
+/// Registers the process's languages, in the order replies list them.
+///
+/// Only the first call installs; later calls change nothing. Returns whether `languages` is the
+/// installed set, so a caller can detect a conflicting earlier registration. Must run before any
+/// launcher configuration is parsed or any path is mapped to a language.
+pub fn install(languages: &[Language]) -> bool {
+    let installed = REGISTRY.get_or_init(|| languages.to_vec());
+    installed.as_slice() == languages
+}
+
+/// Returns the registered languages in registration order; empty before [`install`].
+pub fn registered() -> &'static [Language] {
+    REGISTRY.get().map_or(&[], Vec::as_slice)
 }
 
 impl Language {
-    /// Stable lowercase name used in replies and journal lines.
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Rust => "rust",
-            Self::Python => "python",
-            Self::TypeScript => "typescript",
-            Self::Go => "go",
-        }
+    /// Builds the handle for one language module's descriptor.
+    pub const fn of(descriptor: &'static LanguageDescriptor) -> Self {
+        Self(descriptor)
     }
 
-    /// Selects the language by file extension; `None` for files no support module owns.
+    /// Stable lowercase identifier used in replies and journal lines.
+    pub const fn name(self) -> &'static str {
+        self.0.id
+    }
+
+    /// Same as [`Language::name`]: the canonical lowercase identifier the feed and the
+    /// `ide.context` problems kind use.
+    pub const fn as_str(self) -> &'static str {
+        self.0.id
+    }
+
+    /// Human-facing name.
+    pub const fn display_name(self) -> &'static str {
+        self.0.display_name
+    }
+
+    /// The full static descriptor.
+    pub const fn descriptor(self) -> &'static LanguageDescriptor {
+        self.0
+    }
+
+    /// The language's symbol-tool behaviour.
+    pub fn support(self) -> &'static dyn LanguageSupport {
+        self.0.support
+    }
+
+    /// The language's project-check integration, if any.
+    pub fn checks(self) -> Option<&'static dyn crate::checks::LanguageChecks> {
+        self.0.checks
+    }
+
+    /// The language's server integration, if any.
+    pub fn server(self) -> Option<&'static dyn crate::intelligence::server::LanguageServer> {
+        self.0.server
+    }
+
+    /// Selects the registered language owning `path`'s extension; `None` for files no registered
+    /// language owns.
     pub fn for_path(path: &Path) -> Option<Self> {
-        match path.extension().and_then(|value| value.to_str())? {
-            "rs" => Some(Self::Rust),
-            "py" | "pyi" => Some(Self::Python),
-            "ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs" => Some(Self::TypeScript),
-            "go" => Some(Self::Go),
-            _ => None,
-        }
+        let extension = path.extension().and_then(|value| value.to_str())?;
+        registered()
+            .iter()
+            .copied()
+            .find(|language| language.0.extensions.contains(&extension))
+    }
+
+    /// Selects the registered language with identifier `id`.
+    pub fn by_id(id: &str) -> Option<Self> {
+        registered()
+            .iter()
+            .copied()
+            .find(|language| language.0.id == id)
+    }
+
+    /// Reports whether `worktree` looks like a project of this language, per the language's cheap
+    /// root-level presence rule (T10B); always `false` for a language without project checks. A
+    /// language absent from a worktree is never checked and never mentioned.
+    pub fn is_present(self, worktree: &Path) -> bool {
+        self.0
+            .checks
+            .is_some_and(|checks| checks.is_present(worktree))
+    }
+
+    /// Position in registration order; unregistered languages sort last.
+    fn rank(self) -> usize {
+        registered()
+            .iter()
+            .position(|language| *language == self)
+            .unwrap_or(usize::MAX)
+    }
+}
+
+impl PartialEq for Language {
+    /// Compares identifiers.
+    fn eq(&self, other: &Self) -> bool {
+        self.0.id == other.0.id
+    }
+}
+
+impl Eq for Language {}
+
+impl std::hash::Hash for Language {
+    /// Hashes the identifier.
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.id.hash(state);
+    }
+}
+
+impl PartialOrd for Language {
+    /// Total order; see [`Language`].
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Language {
+    /// Registration order, then identifier.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank()
+            .cmp(&other.rank())
+            .then_with(|| self.0.id.cmp(other.0.id))
+    }
+}
+
+impl fmt::Debug for Language {
+    /// Writes the display name.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0.display_name)
     }
 }
 
 impl fmt::Display for Language {
+    /// Writes the identifier.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
+    }
+}
+
+impl serde::Serialize for Language {
+    /// Serializes the identifier.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Language {
+    /// Accepts only the identifier of a registered language.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let id = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        Self::by_id(&id)
+            .ok_or_else(|| serde::de::Error::custom(format_args!("unknown language `{id}`")))
     }
 }
 
@@ -445,15 +605,36 @@ pub trait LanguageSupport: Send + Sync {
     /// candidate that is not on disk yet. `file` is the relative path the text belongs to (formatters
     /// pick their config and language from it). `None` when the project has no formatter for it.
     fn format_stdin_command(&self, project: &LanguageProject, file: &Path) -> Option<Vec<String>>;
-}
 
-/// The support module for a language, or `None` while it is not implemented.
-pub fn support(language: Language) -> Option<&'static dyn LanguageSupport> {
-    match language {
-        Language::Rust => Some(&rust::RustSupport),
-        Language::Go => Some(&go::GoSupport),
-        Language::Python => Some(&python::Python),
-        Language::TypeScript => Some(&typescript::TypeScript),
+    /// Runner identifier of the test whose outline path (segments joined with `::`) is
+    /// `outline_path` in the project-relative `file`. Defaults to `outline_path` itself; a
+    /// language whose runner addresses tests by module path derives it from `file`.
+    fn test_id(&self, file: &Path, outline_path: &str) -> String {
+        let _ = file;
+        outline_path.to_owned()
+    }
+
+    /// Name of the separately built test binary `file` belongs to, when the language compiles
+    /// some test files into their own binaries; `None` (the default) otherwise. Used to tell the
+    /// agent that a selection spans several binaries.
+    fn test_binary(&self, file: &Path) -> Option<String> {
+        let _ = file;
+        None
+    }
+
+    /// First module documentation line of a file's `text` (a directory outline shows it next to
+    /// the file), or `None` (the default) when the language has no module-doc convention or the
+    /// file has none.
+    fn file_doc(&self, text: &str) -> Option<String> {
+        let _ = text;
+        None
+    }
+
+    /// Whether tests live only in files [`LanguageSupport::is_test_file`] accepts, so a path
+    /// target that is not a test file can be answered "no tests" without running anything.
+    /// Defaults to `false`: tests may sit next to the code they test.
+    fn tests_only_in_test_files(&self) -> bool {
+        false
     }
 }
 
@@ -513,6 +694,178 @@ pub fn kind_of(kind: lsp::SymbolKind) -> SymbolKind {
     }
 }
 
+/// Neutral languages for unit tests of language-independent code.
+///
+/// They carry identity, ordering, extensions and a root-marker presence rule but no real
+/// language behaviour, so core tests never depend on a bundled language. `ALPHA`, `BETA` and
+/// `GAMMA` have project checks (present when `<id>.toml` exists at the worktree root); `DELTA`
+/// has none. Their identifiers sort in that order.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+
+    /// Symbol-tool stub for the test language with the carried identifier: detects nothing,
+    /// normalizes to an empty outline, supports no runner.
+    struct Support(&'static str);
+
+    impl LanguageSupport for Support {
+        /// The stubbed language.
+        fn language(&self) -> Language {
+            Language::by_id(self.0)
+                .or_else(|| {
+                    [ALPHA, BETA, GAMMA, DELTA]
+                        .into_iter()
+                        .find(|l| l.name() == self.0)
+                })
+                .expect("a test language")
+        }
+        /// Never detects a project.
+        fn detect(&self, _root: &Path) -> Option<LanguageProject> {
+            None
+        }
+        /// An outline with no symbols.
+        fn normalize(
+            &self,
+            file: &Path,
+            source: &str,
+            _symbols: Vec<lsp::DocumentSymbol>,
+        ) -> Outline {
+            Outline {
+                file: file.to_path_buf(),
+                language: self.language(),
+                line_count: line_count(source),
+                symbols: Vec::new(),
+            }
+        }
+        /// No insertion points.
+        fn insert_site(
+            &self,
+            _source: &str,
+            _outline: &Outline,
+            anchor: &SymbolPath,
+            _where_: InsertWhere,
+        ) -> Result<InsertSite, LangError> {
+            Err(LangError::UnknownSymbol(anchor.clone()))
+        }
+        /// Files named `test_*` are tests.
+        fn is_test_file(&self, file: &Path) -> bool {
+            file.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("test_"))
+        }
+        /// No runner.
+        fn test_selection(
+            &self,
+            _project: &LanguageProject,
+            _target: &TestTarget,
+        ) -> Result<TestSelection, LangError> {
+            Err(LangError::Unsupported("test language".into()))
+        }
+        /// Counts `pass` and `fail` lines of `stdout`.
+        fn parse_test_output(&self, stdout: &str, _stderr: &str) -> TestReport {
+            TestReport {
+                passed: stdout.lines().filter(|line| *line == "pass").count() as u32,
+                failed: stdout.lines().filter(|line| *line == "fail").count() as u32,
+                ..TestReport::default()
+            }
+        }
+        /// No formatter.
+        fn format_command(&self, _project: &LanguageProject, _file: &Path) -> Option<Vec<String>> {
+            None
+        }
+        /// No formatter.
+        fn format_stdin_command(
+            &self,
+            _project: &LanguageProject,
+            _file: &Path,
+        ) -> Option<Vec<String>> {
+            None
+        }
+    }
+
+    /// Project-check stub: present when the root marker file exists.
+    struct Checks(&'static str);
+
+    impl crate::checks::LanguageChecks for Checks {
+        /// Present iff `<worktree>/<marker>` exists.
+        fn is_present(&self, worktree: &Path) -> bool {
+            worktree.join(self.0).exists()
+        }
+        /// The marker doubles as the tool name.
+        fn tool_name(&self) -> &'static str {
+            self.0
+        }
+        /// Test languages have no launcher section.
+        fn parse_config(
+            &self,
+            _section: serde_json::Value,
+        ) -> Result<std::sync::Arc<dyn crate::checks::CheckConfig>, serde_json::Error> {
+            Err(serde::de::Error::custom("test language"))
+        }
+    }
+
+    /// Descriptor of the first checked test language.
+    static ALPHA_DESCRIPTOR: LanguageDescriptor = LanguageDescriptor {
+        id: "alpha",
+        display_name: "Alpha",
+        extensions: &["alpha"],
+        card_manifest: Some("alpha.toml"),
+        home_tool_dirs: &[],
+        support: &Support("alpha"),
+        checks: Some(&Checks("alpha.toml")),
+        server: None,
+    };
+    /// Descriptor of the second checked test language.
+    static BETA_DESCRIPTOR: LanguageDescriptor = LanguageDescriptor {
+        id: "beta",
+        display_name: "Beta",
+        extensions: &["beta"],
+        card_manifest: None,
+        home_tool_dirs: &[],
+        support: &Support("beta"),
+        checks: Some(&Checks("beta.toml")),
+        server: None,
+    };
+    /// Descriptor of the third checked test language.
+    static GAMMA_DESCRIPTOR: LanguageDescriptor = LanguageDescriptor {
+        id: "gamma",
+        display_name: "Gamma",
+        extensions: &["gamma"],
+        card_manifest: Some("gamma.json"),
+        home_tool_dirs: &[],
+        support: &Support("gamma"),
+        checks: Some(&Checks("gamma.toml")),
+        server: None,
+    };
+    /// Descriptor of the unchecked test language.
+    static DELTA_DESCRIPTOR: LanguageDescriptor = LanguageDescriptor {
+        id: "delta",
+        display_name: "Delta",
+        extensions: &["delta"],
+        card_manifest: None,
+        home_tool_dirs: &[],
+        support: &Support("delta"),
+        checks: None,
+        server: None,
+    };
+
+    /// First checked test language.
+    pub(crate) const ALPHA: Language = Language::of(&ALPHA_DESCRIPTOR);
+    /// Second checked test language.
+    pub(crate) const BETA: Language = Language::of(&BETA_DESCRIPTOR);
+    /// Third checked test language.
+    pub(crate) const GAMMA: Language = Language::of(&GAMMA_DESCRIPTOR);
+    /// Unchecked test language.
+    pub(crate) const DELTA: Language = Language::of(&DELTA_DESCRIPTOR);
+
+    /// Registers the test languages (idempotent) for tests that look languages up by path or id.
+    pub(crate) fn install() {
+        let mut languages = crate::languages::ALL.to_vec();
+        languages.extend([ALPHA, BETA, GAMMA, DELTA]);
+        super::install(&languages);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,19 +892,23 @@ mod tests {
 
     #[test]
     fn language_is_selected_by_extension() {
+        testing::install();
         assert_eq!(
             Language::for_path(Path::new("a/b.rs")),
-            Some(Language::Rust)
+            Some(crate::languages::RUST)
         );
         assert_eq!(
             Language::for_path(Path::new("x.tsx")),
-            Some(Language::TypeScript)
+            Some(crate::languages::TYPESCRIPT)
         );
         assert_eq!(
             Language::for_path(Path::new("x.pyi")),
-            Some(Language::Python)
+            Some(crate::languages::PYTHON)
         );
-        assert_eq!(Language::for_path(Path::new("main.go")), Some(Language::Go));
+        assert_eq!(
+            Language::for_path(Path::new("main.go")),
+            Some(crate::languages::GO)
+        );
         assert_eq!(Language::for_path(Path::new("README.md")), None);
     }
 }

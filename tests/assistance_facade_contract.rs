@@ -50,6 +50,7 @@ fn pre_hook() -> agent_ide::assistance::host_binding::HookEvent {
 
 #[test]
 fn discovery_is_static_and_contains_exactly_eleven_current_methods() {
+    agent_ide::languages::install();
     let schemas = tool_schemas();
     assert_eq!(schemas.len(), 11);
     assert!(schemas.iter().map(|schema| schema.name).eq([
@@ -81,6 +82,7 @@ fn discovery_is_static_and_contains_exactly_eleven_current_methods() {
 /// test toggle boolean.
 #[test]
 fn graph_arguments_validate_direction_and_depth() {
+    agent_ide::languages::install();
     for input in [
         json!({"symbol":"src/lib.rs#f"}),
         json!({"symbol":"f", "direction":"both", "depth":3}),
@@ -125,6 +127,7 @@ fn composition_keywords(value: &serde_json::Value, found: &mut Vec<String>) {
 /// Providers that accept only a plain object schema (GLM) drop a tool using composition keywords.
 #[test]
 fn published_schemas_are_plain_objects_without_composition_keywords() {
+    agent_ide::languages::install();
     for schema in tool_schemas() {
         let mut found = Vec::new();
         composition_keywords(&schema.input_schema, &mut found);
@@ -140,6 +143,7 @@ fn published_schemas_are_plain_objects_without_composition_keywords() {
 
 #[test]
 fn validation_rejects_unknown_identity_and_requires_stable_operation_and_detail_ids() {
+    agent_ide::languages::install();
     assert!(validate_call(AssistanceTool::Start, json!({"activation_id":"activate-1"})).is_ok());
     assert!(
         validate_call(
@@ -163,6 +167,7 @@ fn validation_rejects_unknown_identity_and_requires_stable_operation_and_detail_
 
 #[tokio::test]
 async fn unavailable_facade_and_hook_are_connect_only_and_fail_open() {
+    agent_ide::languages::install();
     let runtime = missing_runtime();
     let _ = fs::remove_dir_all(&runtime);
     let facade = AssistanceFacade::new(runtime.clone());
@@ -190,6 +195,7 @@ async fn unavailable_facade_and_hook_are_connect_only_and_fail_open() {
 
 #[test]
 fn stop_revokes_binding_before_workspace_and_old_expected_stamp_cannot_revoke_newer() {
+    agent_ide::languages::install();
     let mut bindings = HostBindingGuard::default();
     let channel = parse_channel_session(b"attachment").unwrap();
     assert!(matches!(
@@ -232,6 +238,7 @@ fn stop_revokes_binding_before_workspace_and_old_expected_stamp_cannot_revoke_ne
 
 #[test]
 fn feedback_deduplicates_rechecks_and_suppresses_after_stop() {
+    agent_ide::languages::install();
     let delta = FeedbackDelta::new(
         "one new fact",
         "workspace observation",
@@ -277,6 +284,7 @@ fn feedback_deduplicates_rechecks_and_suppresses_after_stop() {
 /// Emits only bounded post-hook JSON context and never emits context from a pre-hook.
 #[test]
 fn host_feedback_output_is_closed_bounded_and_post_only() {
+    agent_ide::languages::install();
     let codex = parse_hook_event(
         br#"{"hook_event_name":"PostToolUse","session_id":"root","tool_use_id":"call"}"#,
     )
@@ -307,6 +315,7 @@ fn host_feedback_output_is_closed_bounded_and_post_only() {
 /// Keeps context source scope and diff modes bounded while rejecting authority-like model inputs.
 #[test]
 fn context_paths_offsets_and_diff_modes_are_closed() {
+    agent_ide::languages::install();
     for path in [
         "",
         "/absolute",
@@ -355,6 +364,7 @@ fn context_paths_offsets_and_diff_modes_are_closed() {
 /// other kind value falls back to v0.2 behaviour (EYES-r1 §7).
 #[test]
 fn context_problems_arguments_are_bounded_and_v02_behaviour_is_unchanged() {
+    agent_ide::languages::install();
     assert!(validate_call(AssistanceTool::Context, json!({"kind":"problems"})).is_ok());
     assert!(
         validate_call(
@@ -444,6 +454,7 @@ fn context_problems_arguments_are_bounded_and_v02_behaviour_is_unchanged() {
 /// Keeps the edit schema exact and enforces its independent full-content and argument limits.
 #[test]
 fn edit_arguments_are_closed_and_bounded() {
+    agent_ide::languages::install();
     let valid = json!({
         "operation_id":"edit-1",
         "path":"src/main.rs",
@@ -471,6 +482,7 @@ fn edit_arguments_are_closed_and_bounded() {
 /// Keeps `ide.test` target exclusivity and its process budget at the facade trust boundary.
 #[test]
 fn test_arguments_require_one_target_and_bounded_budget() {
+    agent_ide::languages::install();
     for target in [
         json!({"path":"src/lib.rs"}),
         json!({"pattern":"worker::"}),
@@ -493,6 +505,7 @@ fn test_arguments_require_one_target_and_bounded_budget() {
 /// Keeps `ide.symbol`'s boolean toggles boolean and its depth ceilings at the trust boundary.
 #[test]
 fn symbol_arguments_accept_history_and_reject_non_boolean_history() {
+    agent_ide::languages::install();
     assert!(
         validate_call(
             AssistanceTool::Symbol,
