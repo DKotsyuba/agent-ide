@@ -273,6 +273,38 @@ async fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(error),
         },
+        Ok(Command::Init {
+            home,
+            config,
+            allowed_roots,
+        }) => match agent_ide::init::run(home, config, allowed_roots) {
+            Ok(outcome) => {
+                println!("{}", outcome.to_json());
+                ExitCode::SUCCESS
+            }
+            Err(reason) => {
+                eprintln!("agent-ide: {reason}");
+                ExitCode::from(2)
+            }
+        },
+        Ok(Command::DoctorInstall) => {
+            let report = agent_ide::doctor_install::report().await;
+            match serde_json::to_string(&report) {
+                Ok(line) => {
+                    println!("{line}");
+                    if report
+                        .findings
+                        .iter()
+                        .any(|finding| finding.severity == "error")
+                    {
+                        ExitCode::from(2)
+                    } else {
+                        ExitCode::SUCCESS
+                    }
+                }
+                Err(_) => fail(AppError::InvalidResponse),
+            }
+        }
         Err(error) => fail(error),
     }
 }
@@ -459,6 +491,17 @@ enum Command {
         /// `warn`/`error` only.
         all: bool,
     },
+    /// Creates the per-user home tree and a minimal launcher template, never modifying existing files.
+    Init {
+        /// Explicit home root; defaults to the effective home's `.agent-ide` (`AGENT_IDE_HOME`-aware).
+        home: Option<PathBuf>,
+        /// Explicit launcher configuration path; defaults to the effective home's config path.
+        config: Option<PathBuf>,
+        /// Absolute allowed roots for the template; defaults to `~/projects` or the home itself.
+        allowed_roots: Vec<PathBuf>,
+    },
+    /// Reports installation health read-only as bounded JSON findings (no daemon is contacted).
+    DoctorInstall,
 }
 
 /// Selects the host-specific identity and binding behavior of a self-contained managed MCP.
@@ -502,6 +545,7 @@ commands:
   mcp --claude-launcher-template <file>   managed Claude MCP server
   mcp --auto-launcher-template <file>     managed MCP server, host auto-detected
   daemon --runtime-dir <dir>              run the repository daemon
+  doctor                                  report installation health as JSON findings
   doctor --runtime-dir <dir>              report daemon health
   codex-hook --runtime-dir <dir>          Codex native hook
   codex-hook --managed                    Codex native hook, managed route discovery
@@ -510,6 +554,8 @@ commands:
   claude-rendezvous <project-dir>         print the Claude shared daemon runtime path
   errors [--repo <path>] [--all] [--summary] [--since <minutes>] [--limit <n>]
                                           read the error log
+  init [--home <dir>] [--config <file>] [--allowed-root <dir>]...
+                                          create the home tree and a launcher template
   evidence executable --identity <id> <path>
                                           accepted-executable launcher fragment
   launcher check <file>                   validate a launcher configuration
@@ -528,6 +574,7 @@ const SUBCOMMANDS: &[&str] = &[
     "claude-hook",
     "claude-rendezvous",
     "errors",
+    "init",
     "evidence",
     "launcher",
     "telemetry",
@@ -586,6 +633,18 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
         && mode == "errors"
     {
         return parse_errors_command(rest);
+    }
+    // `doctor` with no arguments is the installation doctor; the daemon form keeps its flag.
+    if let [mode] = arguments.as_slice()
+        && mode == "doctor"
+    {
+        return Ok(Command::DoctorInstall);
+    }
+    // `init` accepts its flags in any order, like `errors`.
+    if let [mode, rest @ ..] = arguments.as_slice()
+        && mode == "init"
+    {
+        return parse_init_command(rest);
     }
     // `launcher check` takes a bare configuration path; no `--runtime-dir` is involved.
     if let [mode, sub, path] = arguments.as_slice()
@@ -852,6 +911,42 @@ fn parse_errors_command(rest: &[OsString]) -> Result<Command, AppError> {
         summary,
         all,
     })
+}
+
+/// Parses `init`'s optional, any-order `--home`/`--config`/`--allowed-root` flags.
+fn parse_init_command(rest: &[OsString]) -> Result<Command, AppError> {
+    let mut home = None;
+    let mut config = None;
+    let mut allowed_roots = Vec::new();
+    let mut index = 0;
+    while index < rest.len() {
+        let flag = rest[index].to_str().ok_or(AppError::InvalidResponse)?;
+        match flag {
+            "--home" if home.is_none() => {
+                home = Some(PathBuf::from(flag_value(rest, index + 1)?));
+                index += 2;
+            }
+            "--config" if config.is_none() => {
+                config = Some(PathBuf::from(flag_value(rest, index + 1)?));
+                index += 2;
+            }
+            "--allowed-root" => {
+                allowed_roots.push(PathBuf::from(flag_value(rest, index + 1)?));
+                index += 2;
+            }
+            _ => return Err(AppError::InvalidResponse),
+        }
+    }
+    Ok(Command::Init {
+        home,
+        config,
+        allowed_roots,
+    })
+}
+
+/// Returns the flag value at `index`, rejecting a missing one.
+fn flag_value(rest: &[OsString], index: usize) -> Result<&OsString, AppError> {
+    rest.get(index).ok_or(AppError::InvalidResponse)
 }
 
 /// Converts only canonical closed tags into query filters, rejecting arbitrary local SQLite selectors.
