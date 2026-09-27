@@ -212,6 +212,26 @@ impl PyrightProfile {
     }
 }
 
+impl crate::intelligence::session::SessionProfile for PyrightProfile {
+    /// Pyright runs on its defaults: an empty configuration object.
+    fn workspace_configuration(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+
+    /// Accepts an omitted identity or one named `pyright`.
+    fn accepts_server(&self, info: Option<&async_lsp::lsp_types::ServerInfo>) -> bool {
+        info.is_none_or(|info| info.name == "pyright")
+    }
+
+    /// Opens `.py`/`.pyi` files as `python`; everything else stays `plaintext`.
+    fn language_id(&self, path: &Path) -> &'static str {
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("py") | Some("pyi") => "python",
+            _ => "plaintext",
+        }
+    }
+}
+
 /// Couples a canonical worktree incarnation with its exact Execution authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PyrightWorktree {

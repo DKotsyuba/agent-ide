@@ -671,20 +671,20 @@ impl Worker<'_> {
     /// Combines startup-verified executable selection with current durable authority and sandbox state before spawn.
     pub(super) async fn execution_request(
         &self,
-        job: &Job,
+        job: &dyn crate::intelligence::server::ProviderJob,
         authority: &AuthorityStamp,
         command: ControlledCommand,
         program: &crate::assistance::launcher::AcceptedExecutable,
     ) -> Result<ValidatedExecutionRequest, FailureCode> {
-        let binding = job.invocation.binding_ref();
+        let binding = job.binding();
         let active = self.shared.active(binding)?;
         self.workspace
             .authorize(authority, &active)
             .await
             .map_err(|_| FailureCode::WorkspaceAuthority)?;
         if let Some(code) = request_wait_failure(
-            *job.cancel.borrow(),
-            tokio::time::Instant::now() >= job.deadline,
+            job.cancelled(),
+            tokio::time::Instant::now() >= job.deadline(),
         ) {
             return Err(code);
         }

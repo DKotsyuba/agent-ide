@@ -21,5 +21,15 @@ pub mod gopls;
 
 /// Exact-file and exact-symbol context with bounded lexical fallback.
 pub mod context;
+/// Worker-side shared-listener gopls backend.
+pub mod gopls_backend;
+/// Worker-side Pyright backend.
+pub mod pyright_backend;
+/// Worker-side rust-analyzer backend.
+pub mod rust_backend;
+/// The language-server seam: static server descriptions, per-worker backends and their host.
+pub mod server;
 /// Production async-lsp sessions over borrowed Execution-owned protocol pipes.
 pub mod session;
+/// Worker-side TypeScript backend.
+pub mod typescript_backend;

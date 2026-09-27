@@ -318,6 +318,93 @@ impl RustProfile {
     }
 }
 
+/// Exact rust-analyzer status notification accepted by the versioned profile.
+const RUST_STATUS_METHOD: &str = "experimental/serverStatus";
+
+/// Bounded status fields used for the Rust readiness barrier; optional provider messages are ignored.
+#[derive(serde::Deserialize)]
+struct RustStatus {
+    /// Whether the analyzer reports successful workspace health.
+    health: RustHealth,
+    /// Whether current background workspace activity is quiescent.
+    quiescent: bool,
+}
+
+/// Closed health values defined by the accepted rust-analyzer status protocol.
+#[derive(serde::Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum RustHealth {
+    /// Workspace health is reported as successful.
+    Ok,
+    /// Provider reports a warning (for example failed build scripts); still usable when quiescent.
+    Warning,
+    /// Provider reports an error: the workspace did not load, semantic operations stay unavailable.
+    Error,
+}
+
+impl crate::intelligence::session::SessionProfile for RustProfile {
+    /// Disables cache priming and enables proc-macro expansion unless this profile suppresses it.
+    fn workspace_configuration(&self) -> serde_json::Value {
+        serde_json::json!({
+            "cachePriming":{"enable":false},
+            "procMacro":{"enable":!self.proc_macros_disabled()}
+        })
+    }
+
+    /// The fixed configuration plus the crates rust-analyzer would not find on its own: nested
+    /// manifests under a root that is not a Cargo workspace (see [`linked_projects`]).
+    fn initialization_options(&self, worktree_root: &Path) -> serde_json::Value {
+        let mut options = self.workspace_configuration();
+        if let Some(projects) = linked_projects(worktree_root)
+            && let Some(object) = options.as_object_mut()
+        {
+            object.insert("linkedProjects".into(), serde_json::Value::from(projects));
+        }
+        options
+    }
+
+    /// Requires the exact analyzer identity: name `rust-analyzer` and the accepted version.
+    fn accepts_server(&self, info: Option<&async_lsp::lsp_types::ServerInfo>) -> bool {
+        info.is_some_and(|info| {
+            info.name == "rust-analyzer"
+                && info.version.as_deref() == Some(self.initialize_version())
+        })
+    }
+
+    /// Asks rust-analyzer for its server-status notification, the readiness barrier.
+    fn experimental_capabilities(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"serverStatusNotification":true}))
+    }
+
+    /// Readiness arrives as `experimental/serverStatus`.
+    fn status_method(&self) -> Option<&'static str> {
+        Some(RUST_STATUS_METHOD)
+    }
+
+    /// Quiescent with health `ok` or `warning` is ready, quiescent with `error` failed, anything
+    /// not quiescent still busy; params that are not the accepted status shape fail decoding.
+    fn status(
+        &self,
+        params: serde_json::Value,
+    ) -> Result<crate::intelligence::session::ProviderStatus, serde_json::Error> {
+        use crate::intelligence::session::ProviderStatus;
+        let status: RustStatus = serde_json::from_value(params)?;
+        Ok(match (status.quiescent, status.health) {
+            (true, RustHealth::Ok | RustHealth::Warning) => ProviderStatus::Ready,
+            (true, RustHealth::Error) => ProviderStatus::Failed,
+            (false, _) => ProviderStatus::Busy,
+        })
+    }
+
+    /// Opens `.rs` files as `rust`; everything else stays `plaintext`.
+    fn language_id(&self, path: &Path) -> &'static str {
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("rs") => "rust",
+            _ => "plaintext",
+        }
+    }
+}
+
 /// Opaque hash of the immutable exclusive-profile compatibility inputs.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct RustCompatibilityKey(String);

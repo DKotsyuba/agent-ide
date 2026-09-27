@@ -468,6 +468,34 @@ impl TypeScriptProfile {
     }
 }
 
+impl crate::intelligence::session::SessionProfile for TypeScriptProfile {
+    /// Answers configuration requests with the fixed initialization options.
+    fn workspace_configuration(&self) -> serde_json::Value {
+        self.initialization_options()
+    }
+
+    /// Accepts an omitted identity or one named `typescript-language-server`.
+    fn accepts_server(&self, info: Option<&async_lsp::lsp_types::ServerInfo>) -> bool {
+        info.is_none_or(|info| info.name == "typescript-language-server")
+    }
+
+    /// The bridge pushes unversioned diagnostics; a diagnostics wait never exceeds two seconds.
+    fn diagnostic_wait_cap(&self) -> Option<Duration> {
+        Some(Duration::from_secs(2))
+    }
+
+    /// A nonempty unversioned push after the initial open describes the opened bytes.
+    fn accepts_unversioned_initial_report(&self) -> bool {
+        true
+    }
+
+    /// Opens `.js`/`.jsx`/`.ts`/`.tsx` with their exact identifiers; everything else (including
+    /// `.mts`/`.cts`/`.mjs`/`.cjs`) stays `plaintext`.
+    fn language_id(&self, path: &Path) -> &'static str {
+        typescript_language_id(path).unwrap_or("plaintext")
+    }
+}
+
 /// Couples one canonical worktree incarnation to its exact Execution authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TypeScriptWorktree {

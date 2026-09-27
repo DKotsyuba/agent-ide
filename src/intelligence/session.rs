@@ -3,7 +3,6 @@
 use super::{
     context::{self, ContextMode, ContextQuery, ContextResult, MAX_CONTEXT_ITEMS},
     freshness::{DiagnosticReadiness, Freshness, SourceBinding, ViewGeneration},
-    rust::RustProfile,
     wire::{WireLimits, WireSafety},
 };
 use crate::workspace::{authority::WorktreeRef, observation::SourceObservation};
@@ -37,157 +36,113 @@ const MAX_SESSION_OUTBOUND_BYTES: usize = 8 * 1024 * 1024;
 /// Cumulative client messages accepted before retiring this session's unbounded async-lsp sender.
 const MAX_SESSION_OUTBOUND_MESSAGES: usize = 256;
 
-/// Per-worktree Go build/module/temp namespace delivered only through this session's view
-/// configuration.
+/// Readiness one provider status notification reports.
 ///
-/// The shared listener process never receives these as process environment (see
-/// `GoplsProfile::command`): its `GOPLSCACHE`/`TMPDIR` belong to the one *shared* native namespace
-/// every compatible worktree uses, while `GOCACHE`/`GOMODCACHE`/`GOTMPDIR` are worktree-owned. A
-/// session that cannot supply them fails closed instead of silently inheriting another worktree's
-/// build cache, so the fields are private and only `GoEnv::new` can produce a value.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GoEnv {
-    /// Absolute per-worktree `GOCACHE` directory.
-    go_cache: std::path::PathBuf,
-    /// Absolute per-worktree `GOMODCACHE` directory.
-    go_mod_cache: std::path::PathBuf,
-    /// Absolute per-worktree `GOTMPDIR` directory.
-    go_tmp_dir: std::path::PathBuf,
+/// Only a [`SessionProfile`] that names a [`SessionProfile::status_method`] produces these values;
+/// every other profile is usable right after the handshake and never gates requests on readiness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderStatus {
+    /// Background workspace work is still running, or the status makes no quiescence claim.
+    Busy,
+    /// The workspace is quiescent and the provider answers semantic requests. A degraded but
+    /// usable workspace (for example some failed build scripts) also reports this.
+    Ready,
+    /// The workspace is quiescent but failed to load, so waiting any longer cannot make semantic
+    /// operations available.
+    Failed,
 }
 
-impl GoEnv {
-    /// Accepts only three absolute, normal, non-empty per-worktree cache directories.
+/// Language-specific behaviour of one production LSP session.
+///
+/// A language server module implements this for its accepted, immutable profile. The session asks
+/// it for the fixed initialize payload, the accepted server identity, status-based readiness and
+/// the few diagnostic-synchronization differences between servers; the transport, document
+/// lifecycle and every request stay language-independent. Implementations must be cheap to query
+/// and perform no I/O except where a method says so.
+pub trait SessionProfile: std::any::Any + Send + Sync + std::fmt::Debug {
+    /// Returns the fixed `workspace/configuration` answer, also the base of the initialization
+    /// options; no dynamic settings or model keys are accepted.
+    fn workspace_configuration(&self) -> serde_json::Value;
+
+    /// Returns the initialize `initializationOptions` for a session rooted at `worktree_root`.
     ///
-    /// Returns `None` for an empty, relative, or `..`-containing path: such a value would be
-    /// resolved by the provider process against its own cwd and could therefore escape the private
-    /// namespace this session is accounted for. Callers pass paths derived from the retained
-    /// `CacheLifecycle`, which are absolute by construction, so a rejection is a real defect.
-    ///
-    /// This constructor only validates: it never touches the filesystem, so the three directories
-    /// may still be missing. A caller whose session reaches a real provider must use
-    /// [`GoEnv::prepare`] instead, which additionally creates them.
-    pub fn new(
-        go_cache: std::path::PathBuf,
-        go_mod_cache: std::path::PathBuf,
-        go_tmp_dir: std::path::PathBuf,
-    ) -> Option<Self> {
-        [&go_cache, &go_mod_cache, &go_tmp_dir]
-            .iter()
-            .all(|path| {
-                path.is_absolute()
-                    && path.components().all(|component| {
-                        matches!(
-                            component,
-                            std::path::Component::RootDir | std::path::Component::Normal(_)
-                        )
-                    })
-            })
-            .then_some(Self {
-                go_cache,
-                go_mod_cache,
-                go_tmp_dir,
-            })
+    /// Defaults to [`SessionProfile::workspace_configuration`]. A profile may add facts it reads
+    /// from the worktree (bounded manifest discovery); that read is the only I/O allowed here.
+    fn initialization_options(&self, worktree_root: &std::path::Path) -> serde_json::Value {
+        let _ = worktree_root;
+        self.workspace_configuration()
     }
 
-    /// Validates the three paths exactly like [`GoEnv::new`] and creates them on disk.
+    /// Returns whether the initialize reply's server identity matches this accepted profile.
     ///
-    /// Every session that is about to reach a real `gopls` view must use this constructor rather
-    /// than [`GoEnv::new`]. `go` creates a missing `GOCACHE`/`GOMODCACHE` itself, but it refuses a
-    /// missing `GOTMPDIR` with `creating work dir: stat <path>: no such file or directory`, which
-    /// gopls reports back only as `no package metadata for file ... (jsonrpc error 0)`; the view
-    /// then silently degrades to lexical context instead of failing. The namespace root retained by
-    /// `CacheLifecycle` exists, but the `go-build`/`go-mod`/`tmp` directories under it are this
-    /// session's own, so nothing else creates them.
-    ///
-    /// The directories are created recursively with owner-only `0o700` permissions, matching the
-    /// private cache root they live under; an already existing directory is accepted unchanged and
-    /// no file inside one is ever read or removed here. Returns `None` for a path [`GoEnv::new`]
-    /// refuses and for any directory that cannot be created, because a view whose private namespace
-    /// is unusable must fail closed rather than inherit another worktree's cache.
-    pub fn prepare(
-        go_cache: std::path::PathBuf,
-        go_mod_cache: std::path::PathBuf,
-        go_tmp_dir: std::path::PathBuf,
-    ) -> Option<Self> {
-        use std::os::unix::fs::DirBuilderExt;
-        let env = Self::new(go_cache, go_mod_cache, go_tmp_dir)?;
-        [&env.go_cache, &env.go_mod_cache, &env.go_tmp_dir]
-            .iter()
-            .all(|path| {
-                path.is_dir()
-                    || std::fs::DirBuilder::new()
-                        .recursive(true)
-                        .mode(0o700)
-                        .create(path)
-                        .is_ok()
-            })
-            .then_some(env)
+    /// `info` is `None` when the provider omitted `serverInfo`; returning `false` fails the
+    /// handshake with an invalid-data error before `initialized` is sent.
+    fn accepts_server(&self, info: Option<&lsp::ServerInfo>) -> bool;
+
+    /// Returns provider-specific `experimental` client capabilities; `None` (the default) sends
+    /// none.
+    fn experimental_capabilities(&self) -> Option<serde_json::Value> {
+        None
     }
 
-    /// Returns this view's private `GOCACHE` directory.
-    pub fn go_cache(&self) -> &std::path::Path {
-        &self.go_cache
+    /// Names the provider notification that carries readiness, or `None` (the default) when the
+    /// provider is usable right after the handshake and requests never wait for readiness.
+    fn status_method(&self) -> Option<&'static str> {
+        None
     }
 
-    /// Returns this view's private `GOMODCACHE` directory.
-    pub fn go_mod_cache(&self) -> &std::path::Path {
-        &self.go_mod_cache
+    /// Maps the params of one [`SessionProfile::status_method`] notification onto a
+    /// [`ProviderStatus`]. Called only for that method; a decoding error stops the session's
+    /// protocol driver exactly as a malformed typed notification does.
+    fn status(&self, params: serde_json::Value) -> Result<ProviderStatus, serde_json::Error> {
+        let _ = params;
+        Ok(ProviderStatus::Busy)
     }
 
-    /// Returns this view's private `GOTMPDIR` directory.
-    pub fn go_tmp_dir(&self) -> &std::path::Path {
-        &self.go_tmp_dir
+    /// Returns the ceiling of one diagnostics wait for this provider, or `None` (the default) for
+    /// no provider-specific ceiling beyond the request and shutdown-reserve deadlines.
+    fn diagnostic_wait_cap(&self) -> Option<Duration> {
+        None
     }
+
+    /// Whether a nonempty unversioned diagnostics push after the initial `didOpen` may stand for
+    /// the opened bytes until the first `didChange`. Defaults to `false`: only versioned pushes
+    /// bind a document.
+    fn accepts_unversioned_initial_report(&self) -> bool {
+        false
+    }
+
+    /// Returns the LSP language identifier sent with `didOpen` for `path`. Extensions the profile
+    /// does not own must answer `plaintext`, so only configured provider routing adds semantics.
+    fn language_id(&self, path: &std::path::Path) -> &'static str;
 }
 
-/// Closed provider configurations accepted by the production pipe client.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(clippy::large_enum_variant)]
-pub enum ProviderSettings {
-    /// The accepted gopls configuration, carrying this session's exact private Go cache namespace;
-    /// never represents a Rust profile.
-    GoplsDefaults(GoEnv),
-    /// Exact accepted Rust analyzer/toolchain/configuration identity retained through the session.
-    Rust(RustProfile),
-    /// The fixed Pyright configuration for one exclusive Python stdio session.
-    Pyright(crate::intelligence::pyright::PyrightProfile),
-    /// Release-pinned TypeScript initialization for one exclusive JS/JSX/TS/TSX session.
-    TypeScript(crate::intelligence::typescript::TypeScriptProfile),
-}
+/// The accepted profile one session runs with, shared by the session and its protocol callbacks.
+///
+/// Cloning shares the same immutable profile; the wrapped profile never changes for the life of a
+/// session.
+#[derive(Clone, Debug)]
+pub struct ProviderSettings(Arc<dyn SessionProfile>);
+
 impl ProviderSettings {
-    /// Returns the fixed initialize/configuration payload; no dynamic settings or model keys are accepted.
-    fn configuration(&self) -> serde_json::Value {
-        match self {
-            Self::GoplsDefaults(env) => serde_json::json!({
-                "env": {
-                    "GOCACHE": env.go_cache().display().to_string(),
-                    "GOMODCACHE": env.go_mod_cache().display().to_string(),
-                    "GOTMPDIR": env.go_tmp_dir().display().to_string(),
-                }
-            }),
-            Self::Rust(profile) => serde_json::json!({
-                "cachePriming":{"enable":false},
-                "procMacro":{"enable":!profile.proc_macros_disabled()}
-            }),
-            Self::Pyright(_) => serde_json::json!({}),
-            Self::TypeScript(profile) => profile.initialization_options(),
-        }
+    /// Wraps one accepted language-server profile for a new session.
+    pub fn new(profile: impl SessionProfile) -> Self {
+        Self(Arc::new(profile))
     }
 
-    /// Refuses a Rust identity under generic defaults and requires exact analyzer identity for Rust.
+    /// Returns the profile behaviour this session was opened with.
+    pub fn profile(&self) -> &dyn SessionProfile {
+        &*self.0
+    }
+
+    /// Returns the concrete profile when it is a `P`; `None` for any other profile type.
+    pub fn downcast_ref<P: SessionProfile>(&self) -> Option<&P> {
+        (&*self.0 as &dyn std::any::Any).downcast_ref::<P>()
+    }
+
+    /// Refuses a provider whose initialize identity the profile does not accept.
     fn validate_server(&self, info: Option<&lsp::ServerInfo>) -> io::Result<()> {
-        let valid = match self {
-            Self::GoplsDefaults(_) => info.is_none_or(|info| info.name == "gopls"),
-            Self::Rust(profile) => info.is_some_and(|info| {
-                info.name == "rust-analyzer"
-                    && info.version.as_deref() == Some(profile.initialize_version())
-            }),
-            Self::Pyright(_) => info.is_none_or(|info| info.name == "pyright"),
-            Self::TypeScript(_) => {
-                info.is_none_or(|info| info.name == "typescript-language-server")
-            }
-        };
-        if valid {
+        if self.0.accepts_server(info) {
             Ok(())
         } else {
             Err(context::invalid(
@@ -209,70 +164,42 @@ pub struct ProviderReadiness(ReadinessState);
 enum ReadinessState {
     /// No exact accepted provider-specific status barrier is available.
     Unknown,
-    /// This Rust transport reported quiescent=true with health ok or warning. A warning (for
-    /// example failed build scripts of some packages) degrades results but the analyzer answers
-    /// definition and reference requests, exactly as it does for a human editor.
-    RustHealthyQuiescent,
-    /// This Rust transport reported quiescent=true with health=error: the workspace failed to
-    /// load, so waiting any longer cannot make semantic operations available.
-    RustWorkspaceError,
+    /// This transport reported [`ProviderStatus::Ready`]: quiescent and answering definition and
+    /// reference requests, exactly as it does for a human editor.
+    Ready,
+    /// This transport reported [`ProviderStatus::Failed`]: the workspace failed to load, so
+    /// waiting any longer cannot make semantic operations available.
+    WorkspaceError,
 }
 
 impl ProviderReadiness {
-    /// Returns whether the trusted Rust status route observed usable quiescence for this generation.
-    pub const fn is_rust_healthy_quiescent(self) -> bool {
-        matches!(self.0, ReadinessState::RustHealthyQuiescent)
+    /// Returns whether the trusted status route observed usable quiescence for this generation.
+    pub const fn is_ready(self) -> bool {
+        matches!(self.0, ReadinessState::Ready)
     }
 
-    /// Returns whether the trusted Rust status route reported a quiescent workspace error.
-    pub const fn is_rust_workspace_error(self) -> bool {
-        matches!(self.0, ReadinessState::RustWorkspaceError)
+    /// Returns whether the trusted status route reported a quiescent workspace error.
+    pub const fn is_workspace_error(self) -> bool {
+        matches!(self.0, ReadinessState::WorkspaceError)
     }
 
     /// Returns whether no accepted provider-specific readiness proof is currently retained.
     pub const fn is_unknown(self) -> bool {
         matches!(self.0, ReadinessState::Unknown)
     }
+
+    /// Mints the readiness one accepted status notification establishes.
+    const fn from_status(status: ProviderStatus) -> Self {
+        match status {
+            ProviderStatus::Busy => UNKNOWN_READINESS,
+            ProviderStatus::Ready => ProviderReadiness(ReadinessState::Ready),
+            ProviderStatus::Failed => ProviderReadiness(ReadinessState::WorkspaceError),
+        }
+    }
 }
 
 /// Readiness value used before or after trusted correlated provider evidence.
 const UNKNOWN_READINESS: ProviderReadiness = ProviderReadiness(ReadinessState::Unknown);
-/// Readiness value minted only by the accepted Rust status notification callback.
-const RUST_HEALTHY_QUIESCENT: ProviderReadiness =
-    ProviderReadiness(ReadinessState::RustHealthyQuiescent);
-/// Readiness value minted when the accepted Rust status reports a quiescent workspace error.
-const RUST_WORKSPACE_ERROR: ProviderReadiness =
-    ProviderReadiness(ReadinessState::RustWorkspaceError);
-
-/// Exact rust-analyzer status notification accepted by the versioned profile.
-enum RustServerStatus {}
-impl lsp::notification::Notification for RustServerStatus {
-    /// Only the accepted health/quiescence fields participate in readiness.
-    type Params = RustStatus;
-    /// Exact versioned rust-analyzer notification name.
-    const METHOD: &'static str = "experimental/serverStatus";
-}
-
-/// Bounded status fields used for the Rust readiness barrier; optional provider messages are ignored.
-#[derive(serde::Deserialize, serde::Serialize)]
-struct RustStatus {
-    /// Whether the analyzer reports successful workspace health.
-    health: RustHealth,
-    /// Whether current background workspace activity is quiescent.
-    quiescent: bool,
-}
-
-/// Closed health values defined by the accepted rust-analyzer status protocol.
-#[derive(serde::Deserialize, serde::Serialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-enum RustHealth {
-    /// Workspace health is reported as successful.
-    Ok,
-    /// Provider reports a warning (for example failed build scripts); still usable when quiescent.
-    Warning,
-    /// Provider reports an error: the workspace did not load, semantic operations stay unavailable.
-    Error,
-}
 
 /// Conservative cumulative admission before async-lsp's unbounded outbound channel.
 /// The allowance is deliberately never replenished; a new bounded session is needed after exhaustion.
@@ -651,10 +578,11 @@ impl LiveSession {
         !self.driver.is_finished() && self.session.state.lock().expect("session lock").active
     }
 
-    /// Waits up to `budget` for the provider to become usable: Rust waits for quiescence, every
-    /// other provider is usable right after the handshake.
+    /// Waits up to `budget` for the provider to become usable: a profile with a
+    /// [`SessionProfile::status_method`] waits for its reported quiescence, every other provider is
+    /// usable right after the handshake.
     pub async fn wait_ready(&mut self, budget: Duration) -> Result<(), ReadinessError> {
-        if !matches!(&self.session.settings, ProviderSettings::Rust(_)) {
+        if self.session.settings.profile().status_method().is_none() {
             return Ok(());
         }
         let mut ready = self
@@ -670,10 +598,10 @@ impl LiveSession {
                     return Err(ReadinessError::Gone);
                 }
                 let readiness = *ready.borrow_and_update();
-                if readiness.is_rust_healthy_quiescent() {
+                if readiness.is_ready() {
                     return Ok(());
                 }
-                if readiness.is_rust_workspace_error() {
+                if readiness.is_workspace_error() {
                     return Err(ReadinessError::WorkspaceError);
                 }
                 if ready.changed().await.is_err() {
@@ -725,28 +653,14 @@ impl Session {
         (Instant::now() + self.options.request_timeout).min(self.deadline)
     }
 
-    /// Handshake plus, for Rust, the readiness barrier: the one-shot session's entry point.
+    /// Handshake plus, for a profile with a status notification, the readiness barrier: the
+    /// one-shot session's entry point.
     async fn initialize(&mut self) -> io::Result<()> {
         self.handshake().await?;
-        if matches!(&self.settings, ProviderSettings::Rust(_)) {
+        if self.settings.profile().status_method().is_some() {
             self.wait_for_readiness().await?;
         }
         Ok(())
-    }
-
-    /// The fixed provider configuration, plus for rust-analyzer the crates it would not find on
-    /// its own: nested manifests under a root that is not a Cargo workspace (see
-    /// [`crate::intelligence::rust::linked_projects`]).
-    fn initialization_options(&self) -> serde_json::Value {
-        let mut options = self.settings.configuration();
-        if matches!(&self.settings, ProviderSettings::Rust(_))
-            && let Some(projects) =
-                crate::intelligence::rust::linked_projects(self.worktree.worktree_path())
-            && let Some(object) = options.as_object_mut()
-        {
-            object.insert("linkedProjects".into(), serde_json::Value::from(projects));
-        }
-        options
     }
 
     /// Negotiates supported encodings and records the actual provider capability report.
@@ -759,7 +673,11 @@ impl Session {
                     uri: root,
                     name: "workspace".into(),
                 }]),
-                initialization_options: Some(self.initialization_options()),
+                initialization_options: Some(
+                    self.settings
+                        .profile()
+                        .initialization_options(self.worktree.worktree_path()),
+                ),
                 capabilities: lsp::ClientCapabilities {
                     text_document: Some(lsp::TextDocumentClientCapabilities {
                         publish_diagnostics: Some(lsp::PublishDiagnosticsClientCapabilities {
@@ -793,8 +711,7 @@ impl Session {
                         work_done_progress: Some(true),
                         ..Default::default()
                     }),
-                    experimental: matches!(&self.settings, ProviderSettings::Rust(_))
-                        .then(|| serde_json::json!({"serverStatusNotification":true})),
+                    experimental: self.settings.profile().experimental_capabilities(),
                     general: Some(lsp::GeneralClientCapabilities {
                         position_encodings: Some(vec![
                             lsp::PositionEncodingKind::UTF8,
@@ -828,8 +745,8 @@ impl Session {
         Ok(())
     }
 
-    /// Waits under the request deadline for Rust quiescence; transport loss cannot satisfy it and a
-    /// quiescent workspace error fails at once instead of burning the whole deadline.
+    /// Waits under the request deadline for reported provider quiescence; transport loss cannot
+    /// satisfy it and a quiescent workspace error fails at once instead of burning the whole deadline.
     async fn wait_for_readiness(&mut self) -> io::Result<()> {
         let mut ready = self
             .state
@@ -843,17 +760,22 @@ impl Session {
                     return Err(io::Error::other("provider generation unavailable"));
                 }
                 let readiness = *ready.borrow_and_update();
-                if readiness.is_rust_healthy_quiescent() {
+                if readiness.is_ready() {
                     return Ok(());
                 }
-                if readiness.is_rust_workspace_error() {
-                    return Err(io::Error::other("Rust workspace failed to load"));
+                if readiness.is_workspace_error() {
+                    return Err(io::Error::other("provider workspace failed to load"));
                 }
                 ready.changed().await.map_err(io::Error::other)?;
             }
         })
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Rust readiness barrier timed out"))?
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "provider readiness barrier timed out",
+            )
+        })?
     }
 
     /// Returns the exact accepted profile settings retained by this connection.
@@ -861,7 +783,8 @@ impl Session {
         &self.settings
     }
 
-    /// Returns only the latest exact Rust status barrier; it is separate from document diagnostics.
+    /// Returns only the latest exact provider status barrier; it is separate from document
+    /// diagnostics.
     pub fn provider_readiness(&self) -> ProviderReadiness {
         *self.state.lock().expect("session lock").readiness.borrow()
     }
@@ -876,10 +799,11 @@ impl Session {
         self.state.lock().expect("session lock").diagnostics.clone()
     }
 
-    /// Waits under the request deadline for a versioned result or up to two seconds for a
-    /// nonempty one-shot TypeScript report, reserving two seconds of session lifetime for shutdown
-    /// and EOF. Silence and empty unversioned pushes leave readiness unknown; semantic context
-    /// already computed by the caller is unaffected.
+    /// Waits under the request deadline — further capped by the profile's
+    /// [`SessionProfile::diagnostic_wait_cap`] — for a versioned result or a bound nonempty
+    /// unversioned report, reserving two seconds of session lifetime for shutdown and EOF. Silence
+    /// and empty unversioned pushes leave readiness unknown; semantic context already computed by
+    /// the caller is unaffected.
     pub(crate) async fn wait_for_matching_diagnostics(&self) {
         let now = Instant::now();
         let shutdown_reserve = Duration::from_secs(2);
@@ -889,10 +813,9 @@ impl Session {
         let deadline = self
             .exchange_deadline()
             .min(self.deadline - shutdown_reserve);
-        let deadline = if matches!(self.settings, ProviderSettings::TypeScript(_)) {
-            deadline.min(now + Duration::from_secs(2))
-        } else {
-            deadline
+        let deadline = match self.settings.profile().diagnostic_wait_cap() {
+            Some(cap) => deadline.min(now + cap),
+            None => deadline,
         };
         let _ = wait_for_matching_diagnostics(&self.state, deadline).await;
     }
@@ -1408,7 +1331,7 @@ impl Session {
             )
             .map_err(io::Error::other)?;
         } else {
-            let language_id = language_id(observation.path());
+            let language_id = self.settings.profile().language_id(observation.path());
             send_notification::<lsp::notification::DidOpenTextDocument>(
                 &self.server,
                 &mut self.budget,
@@ -1430,7 +1353,7 @@ impl Session {
             source: binding,
             version,
             accepts_unversioned_report: !changing_document
-                && matches!(self.settings, ProviderSettings::TypeScript(_)),
+                && self.settings.profile().accepts_unversioned_initial_report(),
         });
         state.diagnostics.source = None;
         state.diagnostics.document_version = None;
@@ -1556,22 +1479,6 @@ fn marked_string(marked: lsp::MarkedString) -> String {
     }
 }
 
-/// Maps one observed filename to the fixed LSP language identifier used for document open.
-/// Unknown extensions deliberately remain plaintext so only configured provider routing can add
-/// semantic behavior.
-fn language_id(path: &std::path::Path) -> &'static str {
-    match path.extension().and_then(|extension| extension.to_str()) {
-        Some("go") => "go",
-        Some("rs") => "rust",
-        Some("py") | Some("pyi") => "python",
-        Some("js") => "javascript",
-        Some("jsx") => "javascriptreact",
-        Some("ts") => "typescript",
-        Some("tsx") => "typescriptreact",
-        _ => "plaintext",
-    }
-}
-
 /// Fences cancellation even if a consumer drops a request future before its deadline.
 struct RequestGuard {
     /// Generation liveness and diagnostic evidence to invalidate on cancellation.
@@ -1622,7 +1529,12 @@ fn client_router(state: Arc<Mutex<State>>) -> Router<Arc<Mutex<State>>> {
         })
     });
     router.request::<request::WorkspaceConfiguration, _>(|state, params| {
-        let settings = state.lock().expect("session lock").settings.configuration();
+        let settings = state
+            .lock()
+            .expect("session lock")
+            .settings
+            .profile()
+            .workspace_configuration();
         async move {
             if params.items.len() > MAX_CONTEXT_ITEMS {
                 return Err(async_lsp::ResponseError::new(
@@ -1691,20 +1603,26 @@ fn client_router(state: Arc<Mutex<State>>) -> Router<Arc<Mutex<State>>> {
         }
         ControlFlow::Continue(())
     });
-    router.notification::<RustServerStatus>(|state, status| {
+    // The profile's own status notification (if any) is decoded by the profile; every other
+    // notification stays inert.
+    router.unhandled_notification(|state, notification| {
         let state = state.lock().expect("session lock");
-        if state.active && matches!(&state.settings, ProviderSettings::Rust(_)) {
-            state
-                .readiness
-                .send_replace(match (status.quiescent, status.health) {
-                    (true, RustHealth::Ok | RustHealth::Warning) => RUST_HEALTHY_QUIESCENT,
-                    (true, RustHealth::Error) => RUST_WORKSPACE_ERROR,
-                    (false, _) => UNKNOWN_READINESS,
-                });
+        let profile = state.settings.profile();
+        if profile.status_method() != Some(notification.method.as_str()) {
+            return ControlFlow::Continue(());
         }
-        ControlFlow::Continue(())
+        match profile.status(notification.params) {
+            Ok(status) => {
+                if state.active {
+                    state
+                        .readiness
+                        .send_replace(ProviderReadiness::from_status(status));
+                }
+                ControlFlow::Continue(())
+            }
+            Err(error) => ControlFlow::Break(Err(error.into())),
+        }
     });
-    router.unhandled_notification(|_, _| ControlFlow::Continue(()));
     router.event(|_, _: Stop| ControlFlow::Break(Ok(())));
     router
 }

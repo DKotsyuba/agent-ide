@@ -41,8 +41,8 @@ fn observation(text: &str, sequence: u64) -> SourceObservation {
 /// The session always carries a worktree-owned `GoEnv`: the shared listener never receives these
 /// as process environment, so a session without them could only inherit another worktree's cache.
 fn gopls_settings() -> ProviderSettings {
-    ProviderSettings::GoplsDefaults(
-        crate::intelligence::session::GoEnv::new(
+    ProviderSettings::new(
+        crate::intelligence::gopls::GoEnv::new(
             std::path::PathBuf::from("/private/tmp/agent-ide-session-cache/go-build"),
             std::path::PathBuf::from("/private/tmp/agent-ide-session-cache/go-mod"),
             std::path::PathBuf::from("/private/tmp/agent-ide-session-cache/tmp"),
@@ -53,7 +53,7 @@ fn gopls_settings() -> ProviderSettings {
 
 /// Builds fixed Pyright settings against a measured harmless executable for protocol-only tests.
 fn pyright_settings() -> ProviderSettings {
-    ProviderSettings::Pyright(
+    ProviderSettings::new(
         crate::intelligence::pyright::PyrightProfile::new(
             crate::intelligence::pyright::PyrightProfileIdentity {
                 binary: "/usr/bin/true".into(),
@@ -80,7 +80,10 @@ fn pyright_settings() -> ProviderSettings {
 #[test]
 fn pyright_settings_are_closed_and_allow_omitted_server_info() {
     let settings = pyright_settings();
-    assert_eq!(settings.configuration(), serde_json::json!({}));
+    assert_eq!(
+        settings.profile().workspace_configuration(),
+        serde_json::json!({})
+    );
     assert!(settings.validate_server(None).is_ok());
     assert!(
         settings
@@ -100,22 +103,41 @@ fn pyright_settings_are_closed_and_allow_omitted_server_info() {
     );
 }
 
-/// Maps configured Python and TypeScript-family extensions while preserving lexical fallback ids.
+/// Each profile opens its own extensions with exact language ids and everything else as plaintext.
 #[test]
 fn configured_file_extensions_use_exact_language_ids() {
-    assert_eq!(language_id(std::path::Path::new("module.py")), "python");
-    assert_eq!(language_id(std::path::Path::new("module.pyi")), "python");
-    assert_eq!(language_id(std::path::Path::new("module.js")), "javascript");
+    let python = pyright_settings();
+    let python = python.profile();
     assert_eq!(
-        language_id(std::path::Path::new("module.jsx")),
-        "javascriptreact"
+        python.language_id(std::path::Path::new("module.py")),
+        "python"
     );
-    assert_eq!(language_id(std::path::Path::new("module.ts")), "typescript");
     assert_eq!(
-        language_id(std::path::Path::new("module.tsx")),
-        "typescriptreact"
+        python.language_id(std::path::Path::new("module.pyi")),
+        "python"
     );
-    assert_eq!(language_id(std::path::Path::new("module.txt")), "plaintext");
+    assert_eq!(
+        python.language_id(std::path::Path::new("module.txt")),
+        "plaintext"
+    );
+    let go = gopls_settings();
+    assert_eq!(
+        go.profile().language_id(std::path::Path::new("main.go")),
+        "go"
+    );
+    assert_eq!(
+        go.profile().language_id(std::path::Path::new("module.py")),
+        "plaintext"
+    );
+    let rust = rust_settings();
+    assert_eq!(
+        rust.profile().language_id(std::path::Path::new("lib.rs")),
+        "rust"
+    );
+    assert_eq!(
+        rust.profile().language_id(std::path::Path::new("main.go")),
+        "plaintext"
+    );
 }
 
 #[test]
@@ -615,20 +637,22 @@ fn rust_settings() -> ProviderSettings {
 
 /// Returns a Rust identity with one explicit accepted initialization configuration.
 fn rust_settings_with_configuration(configuration: &str) -> ProviderSettings {
-    ProviderSettings::Rust(
-        RustProfile::new(super::super::rust::RustProfileIdentity {
-            binary: "/usr/bin/true".into(),
-            rust_analyzer_version: "rust-analyzer contract-1".into(),
-            cargo: "/usr/bin/true".into(),
-            cargo_version: "cargo-test".into(),
-            rustc: "/usr/bin/true".into(),
-            rustc_version: "rustc-test".into(),
-            rustup_toolchain: "test-toolchain".into(),
-            configuration: configuration.into(),
-            trust: "test".into(),
-            transport: "stdio-v1".into(),
-            cache_namespace: "/private/tmp/agent-ide-session-test-cache".into(),
-        })
+    ProviderSettings::new(
+        crate::intelligence::rust::RustProfile::new(
+            crate::intelligence::rust::RustProfileIdentity {
+                binary: "/usr/bin/true".into(),
+                rust_analyzer_version: "rust-analyzer contract-1".into(),
+                cargo: "/usr/bin/true".into(),
+                cargo_version: "cargo-test".into(),
+                rustc: "/usr/bin/true".into(),
+                rustc_version: "rustc-test".into(),
+                rustup_toolchain: "test-toolchain".into(),
+                configuration: configuration.into(),
+                trust: "test".into(),
+                transport: "stdio-v1".into(),
+                cache_namespace: "/private/tmp/agent-ide-session-test-cache".into(),
+            },
+        )
         .unwrap(),
     )
 }
@@ -638,14 +662,14 @@ fn rust_settings_with_configuration(configuration: &str) -> ProviderSettings {
 fn managed_rust_settings_disable_proc_macro_expansion() {
     let settings = rust_settings_with_configuration("cache-priming-and-proc-macro-disabled-v1");
     assert_eq!(
-        settings.configuration(),
+        settings.profile().workspace_configuration(),
         serde_json::json!({
             "cachePriming":{"enable":false},
             "procMacro":{"enable":false}
         })
     );
     assert_eq!(
-        rust_settings().configuration(),
+        rust_settings().profile().workspace_configuration(),
         serde_json::json!({
             "cachePriming":{"enable":false},
             "procMacro":{"enable":true}
@@ -711,8 +735,10 @@ async fn closed_settings_and_rust_status_barrier_match_the_actual_provider() {
         let (client, peer) = tokio::io::duplex(16384);
         let (input, output) = tokio::io::split(client);
         let (peer_input, peer_output) = tokio::io::split(peer);
-        let expected = settings.configuration();
-        let rust = matches!(settings, ProviderSettings::Rust(_));
+        let expected = settings.profile().workspace_configuration();
+        let rust = settings
+            .downcast_ref::<crate::intelligence::rust::RustProfile>()
+            .is_some();
         let (server, _) = MainLoop::new_server(move |client| {
             let mut router = Router::new(client);
             router.request::<request::Initialize, _>(move |client, params| {
@@ -795,14 +821,7 @@ async fn closed_settings_and_rust_status_barrier_match_the_actual_provider() {
             });
             router.notification::<lsp::notification::Initialized>(move |client, _| {
                 client
-                    .notify::<RustServerStatus>(RustStatus {
-                        health: match health {
-                            "ok" => RustHealth::Ok,
-                            "error" => RustHealth::Error,
-                            _ => RustHealth::Warning,
-                        },
-                        quiescent,
-                    })
+                    .notify::<ServerStatus>(json!({"health": health, "quiescent": quiescent}))
                     .unwrap();
                 ControlFlow::Continue(())
             });
@@ -827,7 +846,7 @@ async fn closed_settings_and_rust_status_barrier_match_the_actual_provider() {
                 assert_eq!(
                     session.provider_readiness(),
                     if rust {
-                        RUST_HEALTHY_QUIESCENT
+                        ProviderReadiness::from_status(ProviderStatus::Ready)
                     } else {
                         UNKNOWN_READINESS
                     }
@@ -857,6 +876,15 @@ async fn closed_settings_and_rust_status_barrier_match_the_actual_provider() {
             "unexpected settings/barrier outcome: {result:?}"
         );
     }
+}
+
+/// The status notification a controlled peer sends; params stay raw so each case can shape them.
+enum ServerStatus {}
+impl lsp::notification::Notification for ServerStatus {
+    /// Raw status fields, decoded only by the session's profile.
+    type Params = serde_json::Value;
+    /// The status method the Rust profile listens to.
+    const METHOD: &'static str = "experimental/serverStatus";
 }
 
 /// Reads one small exact frame in controlled tests; production framing remains owned by BoundedInput.
@@ -1060,7 +1088,7 @@ async fn outbound_budget_retires_full_document_flood_before_unbounded_queueing()
 /// worktree-owned build state escape the private namespace this session is accounted for.
 #[test]
 fn go_env_rejects_paths_that_could_escape_the_private_namespace() {
-    use crate::intelligence::session::GoEnv;
+    use crate::intelligence::gopls::GoEnv;
     let good = |name: &str| std::path::PathBuf::from("/private/tmp/agent-ide-go-env").join(name);
     assert!(GoEnv::new(good("go-build"), good("go-mod"), good("tmp")).is_some());
     for bad in [
@@ -1083,7 +1111,7 @@ fn go_env_rejects_paths_that_could_escape_the_private_namespace() {
 /// The same refusals as `new` still apply before anything is created.
 #[test]
 fn go_env_prepare_creates_the_private_namespace_directories() {
-    use crate::intelligence::session::GoEnv;
+    use crate::intelligence::gopls::GoEnv;
     let root = std::path::PathBuf::from("/private/tmp").join(format!(
         "agent-ide-go-env-prepare-{}-{:?}",
         std::process::id(),
@@ -1140,10 +1168,8 @@ async fn live_session_outlives_requests_and_waits_for_readiness_per_request() {
             let client = client.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                let _ = client.notify::<RustServerStatus>(RustStatus {
-                    health: RustHealth::Warning,
-                    quiescent: true,
-                });
+                let _ =
+                    client.notify::<ServerStatus>(json!({"health": "warning", "quiescent": true}));
             });
             ControlFlow::Continue(())
         });
