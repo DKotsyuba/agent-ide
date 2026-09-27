@@ -21,7 +21,11 @@
 # prompt family.
 #
 # The outer `perl alarm` bounds each start call independently of agent-run's
-# own timeout setting. Setting
+# own timeout setting. Like the direct drivers, each scenario is attempted up
+# to three times when its post-checks fail transiently (a transcript without
+# tool rows, or an unfixed fixture file); a scenario that passes on a later
+# attempt counts as passed, with the attempt number only in the diagnostic
+# log. Setting
 # AGENT_IDE_ACCEPTANCE_DRY=1 prints the exact session command lines and exits 0
 # without running anything.
 #
@@ -69,6 +73,8 @@ case "${AGENT_IDE_ACCEPTANCE_ROUTE:-}" in
 esac
 # Host-neutral acceptance prompt family shared with every other driver.
 PROMPT_FAMILY=prompts
+# Maximum model-session attempts per scenario before the driver fails, as in claude.sh.
+MAX_ATTEMPTS=3
 [ -n "${AGENT_IDE_ACCEPTANCE_LEFT_WORKTREE:-}" ] || fail E_LEFT_WORKTREE_MISSING
 [ -n "${AGENT_IDE_ACCEPTANCE_RIGHT_WORKTREE:-}" ] || fail E_RIGHT_WORKTREE_MISSING
 [ -n "${AGENT_IDE_ACCEPTANCE_RESULT:-}" ] || fail E_RESULT_PATH_MISSING
@@ -211,7 +217,11 @@ run_agent() {
         # diagnostic log records that this cell is journal-backed.
         require_ide_journal_activity "$worktree" "$started_at" "$label"
     else
-        fail "A_${label}_COMPACT_REPLIES" "agent $label has no bounded Agent IDE replies"
+        # The model answered the completion token without calling a single Agent IDE tool (the
+        # transcript carries no tool rows). This is the one transient scenario failure, already
+        # noted under A_${label}_COMPACT_REPLIES above, so report it to run_scenario instead of
+        # failing the driver at once.
+        return 1
     fi
     printf '%s %s\n' "$label" "$agent_id" >>"$DIAG_DIR/agent-ids.log"
 }
@@ -247,6 +257,63 @@ require_answer_text() {
         || fail "$3" "answer $1 lacks $2"
 }
 
+# Requires one fixture file to hold the exact expected bytes. Unlike the closed post-checks,
+# a content miss is retryable: the model may have skipped its tool calls, so the miss is
+# recorded and the scenario rerun rather than the driver failing at once.
+require_retryable_file() {
+    label=$1
+    actual=$2
+    expected=$3
+    if cmp -s "$actual" "$expected"; then
+        return 0
+    fi
+    note "A_${label}_FILE_CONTENT" "fixture file is not the expected edited content"
+    return 1
+}
+
+# Repeats one agent-run scenario until its post-checks accept or attempts run out, the same
+# bounded discipline the direct drivers apply. The arguments are the label, the worktree, the
+# prompt file basename under the prompt family, the verify function name, and the reset
+# function name. A scenario that passes on a later attempt counts as passed; only the
+# diagnostic log records the attempt numbers.
+run_scenario() {
+    label=$1
+    worktree=$2
+    prompt_file=$3
+    verify=$4
+    reset=$5
+    attempt=1
+    while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
+        note "scenario-$label-attempt" "$attempt"
+        task_prompt "$DRIVER_DIR/$PROMPT_FAMILY/$prompt_file" "$attempt" \
+            >"$DIAG_DIR/task-$label.txt"
+        if run_agent "$label" "$worktree" "$DIAG_DIR/task-$label.txt" && "$verify"; then
+            note "scenario-$label-passed" "attempt $attempt"
+            return 0
+        fi
+        [ -f "$DIAG_DIR/transcript-$label.json" ] && mv -- \
+            "$DIAG_DIR/transcript-$label.json" \
+            "$DIAG_DIR/transcript-$label-fail$attempt.json"
+        attempt=$((attempt + 1))
+        "$reset" "$worktree"
+    done
+    fail "A_${label}_SCENARIO" "scenario $label never passed within $MAX_ATTEMPTS attempts"
+}
+
+# Restores the committed fixture state of one worktree between attempts, exactly as the direct
+# drivers do, so a retried scenario never inherits a partial ide.edit.
+reset_committed() {
+    /usr/bin/git -C "$1" checkout -q -- acceptance-fixture \
+        || fail E_FIXTURE_RESET "git checkout failed in $1"
+}
+
+# No reset between attempts: the scenario's only retryable failure is a transcript without
+# tool rows, which leaves the worktree untouched, and its precondition may be a later
+# scenario's post state that a checkout would destroy.
+reset_none() {
+    :
+}
+
 # Requires the agent's stored transcript (tool results included) to contain one
 # literal token. The scripts force a fixed final reply, so tool outcomes such as
 # stale_source or the semantic mode line only ever appear in tool results, as on
@@ -270,10 +337,10 @@ require_record_text() {
 
 # The edit ledger is durable per repository, so a later run must never reuse an
 # earlier run's operation_id (it would answer conflicting_duplicate). Each run
-# suffixes every operation_id with this driver's PID, as the direct Claude
-# driver does per session; verifiers never read the id.
+# suffixes every operation_id with this driver's PID and the scenario attempt,
+# as the direct Claude driver does per session; verifiers never read the id.
 task_prompt() {
-    sed "s/\"operation_id\":\"\([A-Za-z0-9-]*\)\"/\"operation_id\":\"\\1-$$\"/g" "$1"
+    sed "s/\"operation_id\":\"\([A-Za-z0-9-]*\)\"/\"operation_id\":\"\\1-$$-$2\"/g" "$1"
 }
 
 if [ "$AGENT_IDE_ACCEPTANCE_ROUTE" = agent-run-claude ]; then
@@ -283,27 +350,38 @@ if [ "$AGENT_IDE_ACCEPTANCE_ROUTE" = agent-run-claude ]; then
 fi
 
 # Agent L1: real edit/diagnostic/fix/diff/stop loop over Pyright.
-task_prompt "$DRIVER_DIR/$PROMPT_FAMILY/l1.txt" >"$DIAG_DIR/task-l1.txt"
-run_agent l1 "$LEFT" "$DIAG_DIR/task-l1.txt"
-require_answer_text l1 "LEFT_LOOP_OK" A_L1_FINAL
-if [ "$AGENT_IDE_ACCEPTANCE_ROUTE" = agent-run-codex ]; then
-    require_record_text l1 "not assignable" A_L1_PYRIGHT_SEMANTIC
-fi
 printf 'def value() -> int:\n    return 0\n' >"$DIAG_DIR/expected-l1.py"
-cmp -s "$LEFT/acceptance-fixture/fixture.py" "$DIAG_DIR/expected-l1.py" \
-    || fail A_L1_FILE_CONTENT "left fixture.py is not the expected edited content"
-if [ "$AGENT_IDE_ACCEPTANCE_ROUTE" = agent-run-codex ]; then
-    task_prompt "$DRIVER_DIR/$PROMPT_FAMILY/l1b.txt" >"$DIAG_DIR/task-l1b.txt"
-    run_agent l1b "$LEFT" "$DIAG_DIR/task-l1b.txt"
+
+# Post-checks for l1: the answer token, the Codex-only Pyright marker, and the exact edited
+# file. The file-content miss is the retryable one.
+verify_l1() {
+    require_answer_text l1 "LEFT_LOOP_OK" A_L1_FINAL
+    if [ "$AGENT_IDE_ACCEPTANCE_ROUTE" = agent-run-codex ]; then
+        require_record_text l1 "not assignable" A_L1_PYRIGHT_SEMANTIC
+    fi
+    require_retryable_file l1 "$LEFT/acceptance-fixture/fixture.py" "$DIAG_DIR/expected-l1.py"
+}
+
+# Post-checks for l1b: the answer token and the diff marker. Only the transcript class can
+# retry, and the precondition is l1's post state, which a checkout would destroy.
+verify_l1b() {
     require_answer_text l1b "LEFT_DIFF_OK" A_L1B_FINAL
     require_record_text l1b "left-python-bad" A_L1B_DIFF_CONTENT
+}
+
+run_scenario l1 "$LEFT" l1.txt verify_l1 reset_committed
+if [ "$AGENT_IDE_ACCEPTANCE_ROUTE" = agent-run-codex ]; then
+    run_scenario l1b "$LEFT" l1b.txt verify_l1b reset_none
 fi
 
 # Agent L2: native fallback while inactive, then a stale edit with zero writes.
-task_prompt "$DRIVER_DIR/$PROMPT_FAMILY/l2.txt" >"$DIAG_DIR/task-l2.txt"
-run_agent l2 "$LEFT" "$DIAG_DIR/task-l2.txt"
-require_answer_text l2 "LEFT_FALLBACK_OK" A_L2_FINAL
-require_record_text l2 "stale_source" A_L2_STALE_OUTCOME
+# Post-checks for l2: the answer token and the stale outcome marker. Only the transcript
+# class can retry, and the precondition is l1's post state, so no reset.
+verify_l2() {
+    require_answer_text l2 "LEFT_FALLBACK_OK" A_L2_FINAL
+    require_record_text l2 "stale_source" A_L2_STALE_OUTCOME
+}
+run_scenario l2 "$LEFT" l2.txt verify_l2 reset_none
 # A byte-exact compare against a fixed expectation is too strict: a native tool (for
 # example BSD `sed -i '' '1i\...'`) may insert the marker line with different trailing
 # whitespace than an idealized rendering while still writing zero IDE bytes. Three
@@ -319,24 +397,26 @@ fi
 cp -- "$left_py" "$DIAG_DIR/left-after-l2.py" || fail A_L2_ZERO_WRITE "could not snapshot left fixture"
 
 # Agent L3: real TypeScript semantic context through the accepted bundle.
-task_prompt "$DRIVER_DIR/$PROMPT_FAMILY/l3.txt" >"$DIAG_DIR/task-l3.txt"
-run_agent l3 "$LEFT" "$DIAG_DIR/task-l3.txt"
-require_answer_text l3 "LEFT_TS_OK" A_L3_FINAL
-require_record_text l3 "mode: semantic" A_L3_SEMANTIC
+verify_l3() {
+    require_answer_text l3 "LEFT_TS_OK" A_L3_FINAL
+    require_record_text l3 "mode: semantic" A_L3_SEMANTIC
+}
+run_scenario l3 "$LEFT" l3.txt verify_l3 reset_none
 
 # Agent L5: symbol-addressed outline/symbol/edit/read loop over the Rust fixture crate. The
 # inserted method must leave no trace and the crate must still compile afterward.
-task_prompt "$DRIVER_DIR/$PROMPT_FAMILY/l5.txt" >"$DIAG_DIR/task-l5.txt"
-run_agent l5 "$LEFT" "$DIAG_DIR/task-l5.txt"
-require_answer_text l5 "LEFT_SYMBOLS_OK" A_L5_FINAL
-require_record_text l5 "impl Counter" A_L5_OUTLINE_IMPL
-require_record_text l5 "pub fn get" A_L5_OUTLINE_GET
-require_record_text l5 "symbol: get — method" A_L5_SYMBOL_HEADING
-require_record_text l5 "acceptance-fixture/tests/counter.rs" A_L5_SYMBOL_USAGE
-require_record_text l5 "edit: replaced" A_L5_EDIT_REPLACED
-require_record_text l5 "pub fn doubled" A_L5_READ_DOUBLED
-verify_symbol_tools_left_clean "$LEFT" A_L5_LEFT_CLEAN \
-    || fail A_L5_LEFT_CLEAN "left fixture crate not clean or not compiling after l5"
+verify_l5() {
+    require_answer_text l5 "LEFT_SYMBOLS_OK" A_L5_FINAL
+    require_record_text l5 "impl Counter" A_L5_OUTLINE_IMPL
+    require_record_text l5 "pub fn get" A_L5_OUTLINE_GET
+    require_record_text l5 "symbol: get — method" A_L5_SYMBOL_HEADING
+    require_record_text l5 "acceptance-fixture/tests/counter.rs" A_L5_SYMBOL_USAGE
+    require_record_text l5 "edit: replaced" A_L5_EDIT_REPLACED
+    require_record_text l5 "pub fn doubled" A_L5_READ_DOUBLED
+    verify_symbol_tools_left_clean "$LEFT" A_L5_LEFT_CLEAN \
+        || fail A_L5_LEFT_CLEAN "left fixture crate not clean or not compiling after l5"
+}
+run_scenario l5 "$LEFT" l5.txt verify_l5 reset_none
 
 # Restart-safe telemetry across a fresh agent's daemon generation.
 if [ "$AGENT_IDE_ACCEPTANCE_ROUTE" = agent-run-claude ]; then
@@ -351,37 +431,47 @@ fi
 [ -f "$TELEMETRY_DB" ] || fail A_TELEMETRY_DB_MISSING "no durable database before restart"
 before_rows=$("$BINARY" telemetry export --database "$TELEMETRY_DB" 2>>"$DIAG_LOG" | wc -l | tr -d ' ')
 [ "${before_rows:-0}" -ge 1 ] || fail A_TELEMETRY_PRE_RESTART_EMPTY "export before restart"
-task_prompt "$DRIVER_DIR/$PROMPT_FAMILY/l4.txt" >"$DIAG_DIR/task-l4.txt"
-run_agent l4 "$LEFT" "$DIAG_DIR/task-l4.txt"
-require_answer_text l4 "LEFT_RESTART_OK" A_L4_FINAL
-after_rows=$("$BINARY" telemetry export --database "$TELEMETRY_DB" 2>>"$DIAG_LOG" | wc -l | tr -d ' ')
-[ "$after_rows" -gt "$before_rows" ] || fail A_TELEMETRY_RESTART_LOST "no new rows after restart"
+
+# Post-checks for l4: the answer token and durable telemetry growth across the restart. A
+# retried attempt only adds rows, so the growth check stays valid across attempts.
+verify_l4() {
+    require_answer_text l4 "LEFT_RESTART_OK" A_L4_FINAL
+    after_rows=$("$BINARY" telemetry export --database "$TELEMETRY_DB" 2>>"$DIAG_LOG" | wc -l | tr -d ' ')
+    [ "$after_rows" -gt "$before_rows" ] || fail A_TELEMETRY_RESTART_LOST "no new rows after restart"
+}
+run_scenario l4 "$LEFT" l4.txt verify_l4 reset_none
 
 # Agent R5: the complete loop in the divergent right worktree.
-task_prompt "$DRIVER_DIR/$PROMPT_FAMILY/r5.txt" >"$DIAG_DIR/task-r5.txt"
-run_agent r5 "$RIGHT" "$DIAG_DIR/task-r5.txt"
-require_answer_text r5 "RIGHT_LOOP_OK" A_R5_FINAL
-require_record_text r5 "right-python-bad" A_R5_PYRIGHT_MARKER
-require_record_text r5 "right-typescript-bad" A_R5_TYPESCRIPT_MARKER
-for marker in left-python-bad left-typescript-bad; do
-    if /usr/bin/grep -qF "$marker" "$DIAG_DIR/transcript-r5.json"; then
-        fail A_R5_LEFT_LEAK "right transcript leaked left worktree content"
-    fi
-done
-cmp -s "$RIGHT/acceptance-fixture/fixture.py" "$DIAG_DIR/expected-l1.py" \
-    || fail A_R5_FILE_CONTENT "right fixture.py is not the expected edited content"
+# Post-checks for r5: the answer token, the right-worktree markers, the left-leak guard, and
+# the exact edited right file. The file-content miss is the retryable one; the leak guard and
+# the left-worktree isolation snapshot stay closed.
+verify_r5() {
+    require_answer_text r5 "RIGHT_LOOP_OK" A_R5_FINAL
+    require_record_text r5 "right-python-bad" A_R5_PYRIGHT_MARKER
+    require_record_text r5 "right-typescript-bad" A_R5_TYPESCRIPT_MARKER
+    for marker in left-python-bad left-typescript-bad; do
+        if /usr/bin/grep -qF "$marker" "$DIAG_DIR/transcript-r5.json"; then
+            fail A_R5_LEFT_LEAK "right transcript leaked left worktree content"
+        fi
+    done
+    require_retryable_file r5 "$RIGHT/acceptance-fixture/fixture.py" "$DIAG_DIR/expected-l1.py"
+}
+run_scenario r5 "$RIGHT" r5.txt verify_r5 reset_committed
 cmp -s "$LEFT/acceptance-fixture/fixture.py" "$DIAG_DIR/left-after-l2.py" \
     || fail A_R5_LEFT_ISOLATION "left fixture.py changed during the right agent"
 if [ "$AGENT_IDE_ACCEPTANCE_ROUTE" = agent-run-codex ]; then
-    task_prompt "$DRIVER_DIR/$PROMPT_FAMILY/r5b.txt" >"$DIAG_DIR/task-r5b.txt"
-    run_agent r5b "$RIGHT" "$DIAG_DIR/task-r5b.txt"
-    require_answer_text r5b "RIGHT_DIFF_OK" A_R5B_FINAL
-    require_record_text r5b "right-python-bad" A_R5B_DIFF_CONTENT
-    for marker in left-python-bad left-typescript-bad; do
-        if /usr/bin/grep -qF "$marker" "$DIAG_DIR/transcript-r5b.json"; then
-            fail A_R5B_LEFT_LEAK "right diff transcript leaked left worktree content"
-        fi
-    done
+    # Post-checks for r5b: the answer token, the diff marker, and the leak guard. Only the
+    # transcript class can retry, and the precondition is r5's post state, so no reset.
+    verify_r5b() {
+        require_answer_text r5b "RIGHT_DIFF_OK" A_R5B_FINAL
+        require_record_text r5b "right-python-bad" A_R5B_DIFF_CONTENT
+        for marker in left-python-bad left-typescript-bad; do
+            if /usr/bin/grep -qF "$marker" "$DIAG_DIR/transcript-r5b.json"; then
+                fail A_R5B_LEFT_LEAK "right diff transcript leaked left worktree content"
+            fi
+        done
+    }
+    run_scenario r5b "$RIGHT" r5b.txt verify_r5b reset_none
 fi
 
 write_pass_result
