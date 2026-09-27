@@ -152,7 +152,9 @@ require_agent_run_compact_replies() {
          | ($results | length > 0)
            and all($results[];
                .role == "tool_result"
-               and (.content | type == "string" and utf8bytelength <= $bound)))
+               and ((.content
+                     | if type == "string" then . else (map(.text // "") | join("")) end)
+                    | utf8bytelength <= $bound)))
     ' "$1" >/dev/null 2>>"$DIAG_LOG" \
         || { note "$2" "missing, malformed, or oversized Agent IDE reply"; return 1; }
 }
@@ -218,11 +220,14 @@ require_ide_journal_activity() {
     journal=$DIAG_DIR/ide-journal-$label.txt
     "$BINARY" errors --repo "$worktree" --all --since 15 --limit 4000 >"$journal" 2>>"$DIAG_LOG" \
         || fail "E_${label}_JOURNAL" "errors reader exited nonzero"
-    # An activation is `start pending` followed by the `inspect completed` that delivers it.
-    for expected in "start pending" "inspect completed" "stop completed"; do
+    # An activation completes inline (`start completed`) or answers `start pending` and is
+    # delivered by a later `inspect completed`; either shape proves the round trip.
+    for expected in "start pending|completed" "stop completed"; do
         set -- $expected
-        awk -v since="$since" -v method="$1" -v outcome="$2" \
-            '$1 >= since && $3 == method && $4 == outcome { found = 1 } END { exit !found }' \
+        awk -v since="$since" -v method="$1" -v outcomes="$2" \
+            'BEGIN { n = split(outcomes, ok, "|") }
+             $1 >= since && $3 == method { for (i = 1; i <= n; i++) if ($4 == ok[i]) found = 1 }
+             END { exit !found }' \
             "$journal" \
             || fail "A_${label}_JOURNAL_$1" "journal has no $expected after $since"
     done
