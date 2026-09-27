@@ -24,6 +24,7 @@ use agent_ide::assistance::{
 };
 use agent_ide::{
     app::store::Store,
+    selfinstall,
     telemetry::{Filter, Telemetry, TelemetryConfig},
 };
 use rmcp::{serve_server, transport::io::stdio};
@@ -273,6 +274,16 @@ async fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(error),
         },
+        Ok(Command::SelfInstall { args }) => match selfinstall::run(args) {
+            Ok(summary) => {
+                println!("{}", summary.to_json());
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("agent-ide: {error}");
+                ExitCode::FAILURE
+            }
+        },
         Err(error) => fail(error),
     }
 }
@@ -459,6 +470,11 @@ enum Command {
         /// `warn`/`error` only.
         all: bool,
     },
+    /// Verifies and installs one sealed release bundle into the standalone layout, offline.
+    SelfInstall {
+        /// Explicit flags; the documented home, prefix, bin, and share defaults resolve at run time.
+        args: selfinstall::Args,
+    },
 }
 
 /// Selects the host-specific identity and binding behavior of a self-contained managed MCP.
@@ -510,6 +526,8 @@ commands:
   claude-rendezvous <project-dir>         print the Claude shared daemon runtime path
   errors [--repo <path>] [--all] [--summary] [--since <minutes>] [--limit <n>]
                                           read the error log
+  self-install --release <dir> --version <v>
+                                          install a sealed release bundle
   evidence executable --identity <id> <path>
                                           accepted-executable launcher fragment
   launcher check <file>                   validate a launcher configuration
@@ -531,6 +549,7 @@ const SUBCOMMANDS: &[&str] = &[
     "evidence",
     "launcher",
     "telemetry",
+    "self-install",
 ];
 
 /// How a command line asks for the usage listing instead of a real command.
@@ -586,6 +605,14 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
         && mode == "errors"
     {
         return parse_errors_command(rest);
+    }
+    // `self-install` accepts its flags in any order; the installer validates them itself.
+    if let [mode, rest @ ..] = arguments.as_slice()
+        && mode == "self-install"
+    {
+        return selfinstall::parse_args(rest)
+            .map_err(|_| AppError::InvalidResponse)
+            .map(|args| Command::SelfInstall { args });
     }
     // `launcher check` takes a bare configuration path; no `--runtime-dir` is involved.
     if let [mode, sub, path] = arguments.as_slice()
