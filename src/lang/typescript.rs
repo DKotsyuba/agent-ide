@@ -330,7 +330,10 @@ impl LanguageSupport for TypeScript {
     /// by `-t` (`--test-name-pattern=` for node) with their names as an escaped regex
     /// alternation (`describe > it` becomes the runner's space-joined `describe it`); beyond
     /// `MAX_NAMED_TESTS` only the files run. A symbol no test references is
-    /// [`LangError::Unsupported`]. Patterns pass through unescaped.
+    /// [`LangError::Unsupported`]. A file target runs whole only when the runner would collect
+    /// it by convention (`*.test.*`, `*.spec.*`, under `__tests__/`); a directory target selects
+    /// the test files inside it; a non-test script file is [`LangError::Unsupported`]. Patterns
+    /// pass through unescaped.
     fn test_selection(
         &self,
         project: &LanguageProject,
@@ -356,7 +359,20 @@ impl LanguageSupport for TypeScript {
                 let files = distinct_files(&tests);
                 (tests, files, pattern)
             }
-            TestTarget::File(file) => (Vec::new(), vec![file.display().to_string()], None),
+            TestTarget::File(file) => {
+                // A directory (`__tests__/`) selects the test files inside it and passes through
+                // unchanged; a plain script file must be one the runner would collect by
+                // convention, or the module would be imported top-level as a test target.
+                if file
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| SCRIPT_EXTENSIONS.contains(&extension))
+                    && !self.is_test_file(file)
+                {
+                    return Err(LangError::Unsupported(format!("no tests in {}", file.display())));
+                }
+                (Vec::new(), vec![file.display().to_string()], None)
+            }
             TestTarget::Pattern(pattern) => (Vec::new(), Vec::new(), Some(pattern.clone())),
         };
         let mut command: Vec<String> = match runner {
@@ -1727,6 +1743,40 @@ src/transport.ts  (29 lines, typescript)
         );
         let node = TypeScript.test_selection(&project(&[]), &file).unwrap();
         assert_eq!(node.command, argv(&["node", "--test", "src/a.test.ts"]));
+    }
+
+    /// Non-test script files never become runner targets; directories pass through and let the
+    /// runner select the test files inside them.
+    #[test]
+    fn test_selection_refuses_non_test_file_paths() {
+        let plain = TestTarget::File(PathBuf::from("src/details.tsx"));
+        assert!(matches!(
+            TypeScript.test_selection(&project(&[]), &plain),
+            Err(LangError::Unsupported(message)) if message == "no tests in src/details.tsx"
+        ));
+        let directory = TestTarget::File(PathBuf::from("src/__tests__"));
+        assert_eq!(
+            TypeScript
+                .test_selection(&project(&[]), &directory)
+                .unwrap()
+                .command,
+            argv(&["node", "--test", "src/__tests__"])
+        );
+        let jsx = TestTarget::File(PathBuf::from("src/app.jsx"));
+        assert!(matches!(
+            TypeScript.test_selection(&project(&[]), &jsx),
+            Err(LangError::Unsupported(_))
+        ));
+        let tested = TestTarget::File(PathBuf::from("src/details.test.tsx"));
+        assert_eq!(
+            TypeScript
+                .test_selection(&project(&[]), &tested)
+                .unwrap()
+                .command,
+            argv(&["node", "--test", "src/details.test.tsx"])
+        );
+        assert!(TypeScript.is_test_file(&PathBuf::from("__tests__/helpers.js")));
+        assert!(!TypeScript.is_test_file(&PathBuf::from("src/app.mjs")));
     }
 
     /// A passing vitest run with colours.

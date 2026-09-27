@@ -279,6 +279,7 @@ fn assert_compact_envelope(reply: &Value) {
         ("complete", Some("test")) => assert!(
             text.starts_with("tests #")
                 || text.starts_with("tests: could not start ")
+                || text.starts_with("tests: no tests in ")
                 || text.starts_with("page "),
             "{reply}"
         ),
@@ -4428,6 +4429,102 @@ async fn configured_product_clean_tree_diff_completes_over_large_metadata_and_ig
     let text = diff["text"].as_str().unwrap();
     assert!(text.contains("tracked: 0; untracked: 0"), "{text}");
     assert!(!text.contains("untracked_path"), "{text}");
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// `ide.test {path}` on a plain Python module answers the `no tests` hint instead of handing the
+/// file to pytest, which would import it top-level.
+#[tokio::test]
+async fn configured_product_python_non_test_file_answers_no_tests() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
+    std::fs::remove_file(fixture.root.join("go.mod")).unwrap();
+    std::fs::remove_file(fixture.root.join("main.go")).unwrap();
+    std::fs::remove_file(fixture.root.join("src/lib.rs")).unwrap();
+    std::fs::write(
+        fixture.root.join("pyproject.toml"),
+        "[project]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(fixture.root.join("src/hypfactory")).unwrap();
+    std::fs::write(
+        fixture
+            .root
+            .join("src/hypfactory/yaml_subset.py"),
+        "class YamlSubsetError(Exception):\n    pass\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "python fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "python-non-test").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"py-no-tests"}))
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let refused = actor
+        .call(
+            &fixture,
+            "ide.test",
+            json!({"path":"src/hypfactory/yaml_subset.py"}),
+        )
+        .await;
+    let refused = actor.settle(&fixture, refused).await;
+    assert_eq!(refused["kind"], "test", "{refused}");
+    assert_eq!(
+        refused["text"].as_str().unwrap(),
+        "tests: no tests in src/hypfactory/yaml_subset.py; the file has no tests",
+        "{refused}"
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// `ide.test {path}` on a plain TypeScript source answers the `no tests` hint instead of running
+/// `node --test` over it.
+#[tokio::test]
+async fn configured_product_typescript_non_test_file_answers_no_tests() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
+    std::fs::remove_file(fixture.root.join("go.mod")).unwrap();
+    std::fs::remove_file(fixture.root.join("main.go")).unwrap();
+    std::fs::remove_file(fixture.root.join("src/lib.rs")).unwrap();
+    std::fs::write(
+        fixture.root.join("package.json"),
+        json!({"name":"fixture-ui","private":true}).to_string(),
+    )
+    .unwrap();
+    std::fs::create_dir_all(fixture.root.join("src")).unwrap();
+    std::fs::write(
+        fixture.root.join("src/details.tsx"),
+        "export function Details() {\n  return <div>details</div>;\n}\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "typescript fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "typescript-non-test").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"ts-no-tests"}))
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let refused = actor
+        .call(&fixture, "ide.test", json!({"path":"src/details.tsx"}))
+        .await;
+    let refused = actor.settle(&fixture, refused).await;
+    assert_eq!(refused["kind"], "test", "{refused}");
+    assert_eq!(
+        refused["text"].as_str().unwrap(),
+        "tests: no tests in src/details.tsx; the file has no tests",
+        "{refused}"
+    );
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
     actor.mcp.close().await;

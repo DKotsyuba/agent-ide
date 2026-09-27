@@ -1655,7 +1655,34 @@ impl<'a> Worker<'a> {
             let (argv, language, selected_count) = if let Some(path) =
                 job.parameters.get("path").and_then(Value::as_str)
             {
-                match test_selection(&root, crate::lang::TestTarget::File(PathBuf::from(path))) {
+                // A Python/TypeScript file the runner's naming convention does not count as a
+                // test file answers the same `no tests` hint the symbol path gives, instead of
+                // being handed to pytest or `node --test` as a target (pytest imports the module
+                // top-level; `node --test src/details.tsx` just fails). Directories keep
+                // selecting the test files inside them.
+                let target = PathBuf::from(path);
+                if !root.join(&target).is_dir()
+                    && let Some(language) = crate::lang::Language::for_path(&target)
+                    && matches!(
+                        language,
+                        crate::lang::Language::Python | crate::lang::Language::TypeScript
+                    )
+                    && crate::lang::support(language)
+                        .is_some_and(|support| !support.is_test_file(&target))
+                {
+                    return Ok((
+                        PeerReply::Complete {
+                            kind: ResultKind::Test,
+                            text: format!("tests: no tests in {path}; the file has no tests"),
+                            detail_ref: None,
+                            truncated: false,
+                            continuation: false,
+                        },
+                        Some(authority),
+                        None,
+                    ));
+                }
+                match test_selection(&root, crate::lang::TestTarget::File(target)) {
                     Ok(selection) => selection,
                     Err(crate::lang::LangError::Unsupported(message)) => return Ok((
                         PeerReply::InvalidParameters {
