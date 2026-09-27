@@ -22,7 +22,7 @@ never blocks native tools, `ide.*` calls or turn completion.
 
 ## 1. Configuration
 
-The launcher configuration (`src/assistance/launcher.rs`, `deny_unknown_fields`) gains two optional
+The launcher configuration (`crates/agent-ide-core/src/assistance/launcher.rs`; language sections are decoded by each language crate) gains two optional
 top-level fields:
 
 ```json
