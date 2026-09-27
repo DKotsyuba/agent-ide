@@ -124,7 +124,7 @@ fn install_ok(bundle: &Path, root: &Path, version: &str) -> serde_json::Value {
 
 /// Asserts the installed layout for `version`: the immutable release, both `current` swaps,
 /// the regenerated hook, and the exact managed shim bytes.
-fn assert_layout(root: &Path, version: &str, home: &Path) {
+fn assert_layout(root: &Path, version: &str, _home: &Path) {
     let prefix = root.join("prefix");
     let share = root.join("share");
     let release = prefix.join("releases").join(version);
