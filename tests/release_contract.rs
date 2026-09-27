@@ -270,7 +270,10 @@ fn assert_install_layout(prefix: &Path, installed_bin: &Path, version: &str) {
 #[test]
 fn install_local_installs_into_a_disposable_prefix() {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let release_bin = repo_root.join("target/release/agent-ide");
+    let release_bin = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo_root.join("target"))
+        .join("release/agent-ide");
     if !release_bin.is_file() {
         eprintln!(
             "skipping install_local_installs_into_a_disposable_prefix: no {} \

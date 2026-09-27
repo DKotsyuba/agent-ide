@@ -58,7 +58,8 @@ version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$repo_root/Cargo.toml" | head -n 
 if [ "$no_build" -eq 0 ]; then
     (cd "$repo_root" && cargo build --locked --release)
 fi
-release_bin="$repo_root/target/release/agent-ide"
+# cargo honours CARGO_TARGET_DIR; look where it actually wrote the binary.
+release_bin="${CARGO_TARGET_DIR:-$repo_root/target}/release/agent-ide"
 [ -x "$release_bin" ] || fail "release binary not found: $release_bin (build first or drop --no-build)"
 
 # Package this checkout into the sealed bundle and hand it to the installer inside it.
