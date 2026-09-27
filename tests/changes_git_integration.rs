@@ -308,6 +308,48 @@ async fn snapshot_bounds_and_unborn_head_are_explicit() {
     );
 }
 
+/// A tracked file above the retained-read bound is classified by object hash: a stat-drifted but
+/// unchanged oversized asset keeps the clean-tree capture empty (T114 demo defect), while an
+/// actual worktree change above the bound still fails with the explicit finite budget.
+#[tokio::test]
+async fn stat_drifted_oversized_tracked_file_is_hash_proven_clean() {
+    let fixture = GitFixture::unborn();
+    fixture.git([
+        "config",
+        "--local",
+        "user.email",
+        "changes-git@example.invalid",
+    ]);
+    fixture.git(["config", "--local", "user.name", "Changes Git Fixture"]);
+    let big: Vec<u8> = (0..=MAX_SNAPSHOT_BLOB_BYTES)
+        .map(|byte| (byte % 251) as u8)
+        .collect();
+    fixture.write(b"oversized.js", &big);
+    fixture.git(["add", "--", "."]);
+    fixture.git(["commit", "--quiet", "-m", "oversized baseline"]);
+
+    // Rewriting the identical bytes leaves the content equal to HEAD while every stat field
+    // drifts, exactly the state that made a clean traider-lab diff fail `diff:too_large`.
+    fixture.write(b"oversized.js", &big);
+    let mut runner = Runner::default();
+    let snapshot = collect(&fixture, DiffMode::Head, &mut runner).await.unwrap();
+    assert_eq!(
+        snapshot.paths().len(),
+        0,
+        "an unchanged oversized file must not fail the whole capture"
+    );
+    assert_eq!(snapshot.status().untracked().len(), 0);
+
+    // A real worktree change above the bound remains an explicit bounded failure.
+    let mut changed = big.clone();
+    changed[0] ^= 0xff;
+    fixture.write(b"oversized.js", &changed);
+    assert_eq!(
+        collect(&fixture, DiffMode::Head, &mut Runner::default()).await,
+        Err(GitError::EvidenceTooLarge)
+    );
+}
+
 /// An abandoned or oversized comparison leaves no scratch files, including cloned pending intents.
 #[test]
 fn snapshot_intents_own_private_file_cleanup() {

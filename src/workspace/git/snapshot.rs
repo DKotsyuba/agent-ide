@@ -410,6 +410,38 @@ impl SnapshotIntent {
         })
     }
 
+    /// Hashes live worktree files by validated relative path without retaining their bytes.
+    ///
+    /// Used only for tracked files whose bytes exceed the retained-read bound: the no-filter
+    /// object hash classifies the live file against the index identity, so a stat-drifted but
+    /// unchanged oversized asset is proven clean instead of failing the whole capture. The
+    /// caller proves a no-follow regular-file stat immediately before hashing; paths are
+    /// worktree-relative and this command's cwd is exactly that worktree.
+    fn hash_worktree(scope: &GitScope, program: &Path, paths: &[PathBuf]) -> Result<Self, GitError> {
+        let mut arguments: Vec<OsString> = HASH_BATCH_FLAGS.iter().map(Into::into).collect();
+        for path in paths {
+            if !crate::workspace::observation::valid_relative_path(path) {
+                return Err(GitError::InvalidPorcelain);
+            }
+            arguments.push(path.as_os_str().to_os_string());
+        }
+        let command = ControlledCommand::from_validated_peer(
+            CommandKind::Git,
+            program.to_path_buf(),
+            arguments,
+            scope.worktree().worktree_path().to_path_buf(),
+            safe_git_environment(),
+        )
+        .map_err(|_| GitError::InvalidGitProgram)?;
+        Ok(Self {
+            scope: scope.clone(),
+            command,
+            directory: None,
+            differences_allowed: false,
+            label: "hash-object",
+        })
+    }
+
     /// Copies two exact sides into private files and compares them outside repository configuration.
     /// Modes stay in path evidence, so private files always remain 0600 even for executable sources.
     pub fn compare(
@@ -602,6 +634,33 @@ async fn batch_hashes<R: SnapshotRunner>(
         let intent = SnapshotIntent::hash_files(scope, program, directory, &names)?;
         let output = intent.accept(runner.run(intent.clone()).await?)?;
         hashes.extend(parse_batch_hashes(&output, names.len())?);
+    }
+    Ok(hashes)
+}
+
+/// Hashes live worktree files directly in packed bounded batches, order-aligned with `paths`.
+///
+/// The only callers are tracked paths whose bytes exceed the retained-read bound, where the
+/// object hash alone classifies the file; argv packing and fail-closed ceilings match
+/// [`batch_hashes`].
+async fn batch_worktree_hashes<R: SnapshotRunner>(
+    scope: &GitScope,
+    program: &Path,
+    paths: &[PathBuf],
+    runner: &mut R,
+) -> Result<Vec<GitObjectId>, GitError> {
+    let prefix_cost = hash_batch_prefix_bytes()?;
+    let ranges = hash_batch_ranges(
+        paths.len(),
+        prefix_cost,
+        |index| paths[index].as_os_str().as_bytes().len(),
+        crate::execution::MAX_PRODUCT_ARGV_BYTES,
+    )?;
+    let mut hashes = Vec::with_capacity(paths.len());
+    for (start, end) in ranges {
+        let intent = SnapshotIntent::hash_worktree(scope, program, &paths[start..end])?;
+        let output = intent.accept(runner.run(intent.clone()).await?)?;
+        hashes.extend(parse_batch_hashes(&output, end - start)?);
     }
     Ok(hashes)
 }
@@ -1585,6 +1644,8 @@ async fn capture_attempt<R: SnapshotRunner>(
     let mut retained_bytes = 0usize;
     let mut patch_bytes = 0usize;
     let mut working = blake3::Hasher::new();
+    // Tracked files whose bytes exceed the retained-read bound, proven unchanged by object hash.
+    let mut oversized_clean = std::collections::BTreeSet::new();
     for path in &union {
         let stages = index_entries.get(path);
         if stages.is_some_and(|entries| !entries.contains_key(&0)) {
@@ -1618,8 +1679,49 @@ async fn capture_attempt<R: SnapshotRunner>(
         };
         // T36B: the live per-path proof precedes every native capture, staged mode included.
         runner.authorize_read_path(path).await?;
-        let source =
-            SnapshotSource::capture(scope.worktree(), scope.authority_epoch(), path, current)?;
+        let source = match SnapshotSource::capture(scope.worktree(), scope.authority_epoch(), path, current)
+        {
+            Ok(source) => source,
+            // Bytes beyond the retained-read bound stay unread (T114): a no-follow regular-file
+            // stat plus a no-filter object hash of the live file classify it instead, so a
+            // stat-drifted but unchanged oversized asset is proven clean while a genuinely
+            // changed one stays an explicit finite-budget failure.
+            Err(GitError::EvidenceTooLarge) => {
+                let index = index_entries
+                    .get(path)
+                    .and_then(|entries| entries.get(&0))
+                    .expect("captured path has stage zero");
+                let metadata = match crate::workspace::observation::snapshot_source_metadata(
+                    scope.worktree(),
+                    path,
+                ) {
+                    Ok(metadata) => metadata,
+                    Err(ObservationError::RootIdentityChanged) => {
+                        return Err(GitError::UnstableSnapshot);
+                    }
+                    Err(_) => return Err(GitError::EvidenceTooLarge),
+                };
+                let mode_w = if metadata.permissions().mode() & 0o100 != 0 {
+                    0o100755
+                } else {
+                    0o100644
+                };
+                let hash = batch_worktree_hashes(&scope, program, std::slice::from_ref(path), runner)
+                    .await?
+                    .remove(0);
+                if hash == index.oid && mode_w == index.mode {
+                    oversized_clean.insert(path.clone());
+                    working.update(b"oversized");
+                    working.update(&(path.as_os_str().as_bytes().len() as u64).to_le_bytes());
+                    working.update(path.as_os_str().as_bytes());
+                    working.update(&mode_w.to_le_bytes());
+                    working.update(hash.as_str().as_bytes());
+                    continue;
+                }
+                return Err(GitError::EvidenceTooLarge);
+            }
+            Err(error) => return Err(error),
+        };
         hashed_bytes += source.contents().len();
         if hashed_bytes > MAX_SNAPSHOT_HASH_BYTES {
             return Err(GitError::EvidenceTooLarge);
@@ -1656,6 +1758,11 @@ async fn capture_attempt<R: SnapshotRunner>(
     // Pure classification: X from committed/index identities, Y from the proven worktree hash.
     let mut compares: Vec<PendingCompare> = Vec::new();
     for path in union {
+        // Proven-unchanged oversized files never captured bytes; their object hash already
+        // fixed the worktree side, so they classify as `..` without outline or patch work.
+        if oversized_clean.contains(&path) {
+            continue;
+        }
         let head = head_entries.get(&path).and_then(|entries| entries.get(&0));
         let stages = index_entries.get(&path);
         if stages.is_some_and(|entries| !entries.contains_key(&0)) {
@@ -1823,6 +1930,37 @@ async fn capture_attempt<R: SnapshotRunner>(
         let after = SnapshotSource::capture(scope.worktree(), scope.authority_epoch(), path, None)?;
         if after.read != source.read {
             return Err(GitError::UnstableSnapshot);
+        }
+    }
+    // A hash-proven oversized clean path must still classify the same at the end of the attempt;
+    // a concurrent edit or mode flip retries instead of minting an empty diff.
+    if !oversized_clean.is_empty() {
+        let ordered: Vec<PathBuf> = oversized_clean.iter().cloned().collect();
+        for path in &ordered {
+            runner.authorize_read_path(path).await?;
+            let metadata =
+                crate::workspace::observation::snapshot_source_metadata(scope.worktree(), path)
+                    .map_err(|_| GitError::UnstableSnapshot)?;
+            let index = index_entries[path]
+                .get(&0)
+                .expect("oversized clean path has stage zero");
+            let mode_w = if metadata.permissions().mode() & 0o100 != 0 {
+                0o100755
+            } else {
+                0o100644
+            };
+            if index.mode != mode_w {
+                return Err(GitError::UnstableSnapshot);
+            }
+        }
+        let hashes = batch_worktree_hashes(&scope, program, &ordered, runner).await?;
+        for (path, hash) in ordered.iter().zip(hashes) {
+            let index = index_entries[path]
+                .get(&0)
+                .expect("oversized clean path has stage zero");
+            if index.oid != hash {
+                return Err(GitError::UnstableSnapshot);
+            }
         }
     }
     for (path, target) in &symlinks {
