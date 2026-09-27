@@ -5447,21 +5447,46 @@ mod stop_retry_tests {
         )
     }
     #[tokio::test]
-    async fn diff_stream_caps_report_capacity_for_metadata_and_blob() {
-        for case in ["metadata", "blob"] {
+    async fn diff_streams_drain_at_the_workspace_boundary_not_the_launcher_budget() {
+        // The launcher's 1 KiB child-capture budget no longer truncates fixed Git metadata:
+        // a tree whose listings exceed it still diffs.
+        {
             let fixture = Fixture::new();
-            if case == "metadata" {
-                for n in 0..30 {
-                    std::fs::write(fixture.root.join(format!("file-{n:02}.txt")), "base\n")
-                        .unwrap();
-                }
-            } else {
-                std::fs::write(fixture.root.join("large.txt"), vec![b'a'; 4096]).unwrap();
+            for n in 0..30 {
+                std::fs::write(fixture.root.join(format!("file-{n:02}.txt")), "base\n").unwrap();
             }
             git_commit(&fixture.root, "stream baseline");
-            if case == "blob" {
-                std::fs::write(fixture.root.join("large.txt"), vec![b'b'; 4096]).unwrap();
-            }
+            let store = fixture.store();
+            let workspace = DurableWorkspace::open(&store).await.unwrap();
+            let mut worker = worker(&store, workspace, fixture.root.clone());
+            worker.observations.install_schema().await.unwrap();
+            let (binding, authority) =
+                activate_worktree(&mut worker, "stream-actor", "stream-start").await;
+            let invocation = production_call(&worker, "stream-actor", "stream-diff-call");
+            let (mut job, _cancel) = diff_job(&fixture.root, invocation, "stream-diff");
+            retain_detail(
+                &worker,
+                &binding,
+                "stream-diff",
+                AssistanceTool::Diff,
+                &authority,
+            );
+            assert!(
+                worker.diff(&mut job).await.is_ok(),
+                "the launcher output budget must not cap git evidence"
+            );
+        }
+        // The Workspace evidence boundary itself still caps: a worktree file above
+        // `MAX_SOURCE_BYTES` fails the capture with the explicit finite-budget error.
+        {
+            let fixture = Fixture::new();
+            std::fs::write(fixture.root.join("large.txt"), vec![b'a'; 4096]).unwrap();
+            git_commit(&fixture.root, "stream baseline");
+            std::fs::write(
+                fixture.root.join("large.txt"),
+                vec![b'b'; crate::workspace::observation::MAX_SOURCE_BYTES + 1],
+            )
+            .unwrap();
             let store = fixture.store();
             let workspace = DurableWorkspace::open(&store).await.unwrap();
             let mut worker = worker(&store, workspace, fixture.root.clone());
@@ -5479,14 +5504,9 @@ mod stop_retry_tests {
             );
             assert_eq!(
                 worker.diff(&mut job).await.unwrap_err(),
-                FailureCode::Capacity,
-                "{case}"
+                FailureCode::Capacity
             );
-            assert_eq!(
-                job.failure_detail.as_deref(),
-                Some("diff:too_large"),
-                "{case}"
-            );
+            assert_eq!(job.failure_detail.as_deref(), Some("diff:too_large"));
         }
     }
 }
