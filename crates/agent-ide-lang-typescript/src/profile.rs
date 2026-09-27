@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{
+use agent_ide_core::{
     assistance::host_binding::ActiveBindingUse,
     execution::{
         AdmissionClass, AdmissionController, BackendReapCapability, BackendRelease, CommandKind,
@@ -101,7 +101,7 @@ impl TypeScriptProviderBundleV1 {
         identity: TypeScriptProviderBundleV1Identity,
     ) -> Result<Self, TypeScriptProfileError> {
         if !normal_absolute(&identity.node)
-            || !crate::execution::measured_executable_digest(&identity.node)
+            || !agent_ide_core::execution::measured_executable_digest(&identity.node)
                 .is_ok_and(|digest| digest == identity.node_blake3)
             || !bounded_identity(&identity.node_version)
             || !bounded_identity(&identity.bridge_version)
@@ -137,7 +137,7 @@ impl TypeScriptProviderBundleV1 {
     /// content-mismatched member. This is called immediately before the one-time spawn capability
     /// is consumed; Execution separately rechecks Node at its final spawn boundary.
     pub fn verify(&self) -> Result<(), TypeScriptProfileError> {
-        if !crate::execution::measured_executable_digest(&self.identity.node)
+        if !agent_ide_core::execution::measured_executable_digest(&self.identity.node)
             .is_ok_and(|digest| digest == self.identity.node_blake3)
             || measure_bundle_file(&self.identity.bridge).is_err()
             || measure_bundle_file(&self.identity.tsserver).is_err()
@@ -468,7 +468,7 @@ impl TypeScriptProfile {
     }
 }
 
-impl crate::intelligence::session::SessionProfile for TypeScriptProfile {
+impl agent_ide_core::intelligence::session::SessionProfile for TypeScriptProfile {
     /// Answers configuration requests with the fixed initialization options.
     fn workspace_configuration(&self) -> serde_json::Value {
         self.initialization_options()
@@ -548,7 +548,7 @@ pub enum TypeScriptProfileError {
     /// Execution rejected an exclusive provider lease operation.
     Execution(ProviderLeaseError),
     /// Execution refused admission under current capacity policy.
-    Refused(crate::execution::AdmissionError),
+    Refused(agent_ide_core::execution::AdmissionError),
     /// Execution could not start, signal, or reap the owned direct bridge child.
     Process(ProcessError),
 }
@@ -612,7 +612,7 @@ pub enum TypeScriptViewAdmission {
     /// Admission queued without launching or reserving a view.
     Queued(QueueTicket),
     /// Central capacity policy refused the operation.
-    Refused(crate::execution::AdmissionError),
+    Refused(agent_ide_core::execution::AdmissionError),
     /// Profile validation, quarantine, or registry rules refused the operation.
     Unavailable(TypeScriptProfileError),
 }
@@ -676,7 +676,7 @@ impl TypeScriptProfiles {
             owner,
             class,
             &key.digest,
-            crate::execution::ProviderBackendKind::OwnedExclusive,
+            agent_ide_core::execution::ProviderBackendKind::OwnedExclusive,
             worktree.authority(),
         ) {
             ProviderLeaseAdmission::Granted(lease) => {
@@ -781,7 +781,7 @@ impl TypeScriptProtocolChild {
             return Err(TypeScriptProfileError::Process(
                 ProcessError::NeverStarted {
                     cause: Box::new(ProcessError::Request(
-                        crate::execution::RequestError::WorktreeDenied,
+                        agent_ide_core::execution::RequestError::WorktreeDenied,
                     )),
                     settlement: capability.cancel(),
                 },
@@ -1389,7 +1389,7 @@ fn closed_module_resolution(options: &serde_json::Map<String, serde_json::Value>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::{
+    use agent_ide_core::execution::{
         AdmissionLimits, LocalExecutionPolicy, ProviderLeaseLimits, ValidatedExecutionRequest,
         ValidatedHostInvocation,
     };

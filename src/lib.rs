@@ -15,9 +15,9 @@ pub use agent_ide_core::{
 pub mod checks {
     pub use agent_ide_core::checks::*;
 
-    pub mod python;
-    pub mod rust;
-    pub mod typescript;
+    pub use agent_ide_lang_python::checks as python;
+    pub use agent_ide_lang_rust::checks as rust;
+    pub use agent_ide_lang_typescript::checks as typescript;
 }
 
 /// Provider sessions and semantic context: the core session machinery plus each bundled
@@ -25,14 +25,14 @@ pub mod checks {
 pub mod intelligence {
     pub use agent_ide_core::intelligence::*;
 
-    pub mod gopls;
-    pub mod gopls_backend;
-    pub mod pyright;
-    pub mod pyright_backend;
-    pub mod rust;
-    pub mod rust_backend;
-    pub mod typescript;
-    pub mod typescript_backend;
+    pub use agent_ide_lang_go::backend as gopls_backend;
+    pub use agent_ide_lang_go::profile as gopls;
+    pub use agent_ide_lang_python::backend as pyright_backend;
+    pub use agent_ide_lang_python::profile as pyright;
+    pub use agent_ide_lang_rust::backend as rust_backend;
+    pub use agent_ide_lang_rust::profile as rust;
+    pub use agent_ide_lang_typescript::backend as typescript_backend;
+    pub use agent_ide_lang_typescript::profile as typescript;
 }
 
 /// Language identity and the symbol-tool contract from the core plus each bundled language's
@@ -40,10 +40,10 @@ pub mod intelligence {
 pub mod lang {
     pub use agent_ide_core::lang::*;
 
-    pub mod go;
-    pub mod python;
-    pub mod rust;
-    pub mod typescript;
+    pub use agent_ide_lang_go::support as go;
+    pub use agent_ide_lang_python::support as python;
+    pub use agent_ide_lang_rust::support as rust;
+    pub use agent_ide_lang_typescript::support as typescript;
 }
 
 /// The bundled languages and their one-time registration into [`lang::install`].
@@ -51,13 +51,13 @@ pub mod languages {
     use crate::lang::Language;
 
     /// The Rust language.
-    pub const RUST: Language = crate::lang::rust::LANGUAGE;
+    pub const RUST: Language = agent_ide_lang_rust::LANGUAGE;
     /// The Python language.
-    pub const PYTHON: Language = crate::lang::python::LANGUAGE;
+    pub const PYTHON: Language = agent_ide_lang_python::LANGUAGE;
     /// The TypeScript language (JavaScript files included).
-    pub const TYPESCRIPT: Language = crate::lang::typescript::LANGUAGE;
+    pub const TYPESCRIPT: Language = agent_ide_lang_typescript::LANGUAGE;
     /// The Go language.
-    pub const GO: Language = crate::lang::go::LANGUAGE;
+    pub const GO: Language = agent_ide_lang_go::LANGUAGE;
 
     /// Every bundled language in the order replies list them.
     pub const ALL: [Language; 4] = [RUST, PYTHON, TYPESCRIPT, GO];

@@ -17,9 +17,13 @@ use std::{
 
 use async_lsp::lsp_types as lsp;
 
+/// Line and brace helpers shared by the support modules of brace-delimited languages.
+pub mod brace;
 pub mod edits;
 pub mod path;
 pub mod render;
+/// Line, indentation and project-fact helpers shared by language support modules.
+pub mod text;
 
 pub use path::SymbolPath;
 

@@ -11,8 +11,8 @@ use std::{
     time::Duration,
 };
 
-use crate::assistance::host_binding::ActiveBindingUse;
-use crate::{
+use agent_ide_core::assistance::host_binding::ActiveBindingUse;
+use agent_ide_core::{
     execution::{
         AdmissionClass, AdmissionController, AdmissionError, AdmissionPromotion,
         BackendReapCapability, BackendRelease, CommandKind, ControlledCommand, OwnedProtocolChild,
@@ -145,11 +145,11 @@ fn collect_manifests(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
 impl RustProfile {
     /// Creates the sole supported v0.1 Rust profile from complete nonempty observed identities.
     pub fn new(identity: RustProfileIdentity) -> Result<Self, RustProfileError> {
-        let binary_digest = crate::execution::measured_executable_digest(&identity.binary)
+        let binary_digest = agent_ide_core::execution::measured_executable_digest(&identity.binary)
             .map_err(|_| RustProfileError::InvalidProfile)?;
-        let cargo_digest = crate::execution::measured_executable_digest(&identity.cargo)
+        let cargo_digest = agent_ide_core::execution::measured_executable_digest(&identity.cargo)
             .map_err(|_| RustProfileError::InvalidProfile)?;
-        let rustc_digest = crate::execution::measured_executable_digest(&identity.rustc)
+        let rustc_digest = agent_ide_core::execution::measured_executable_digest(&identity.rustc)
             .map_err(|_| RustProfileError::InvalidProfile)?;
         let profile = Self {
             binary: identity.binary,
@@ -342,7 +342,7 @@ enum RustHealth {
     Error,
 }
 
-impl crate::intelligence::session::SessionProfile for RustProfile {
+impl agent_ide_core::intelligence::session::SessionProfile for RustProfile {
     /// Disables cache priming and enables proc-macro expansion unless this profile suppresses it.
     fn workspace_configuration(&self) -> serde_json::Value {
         serde_json::json!({
@@ -386,8 +386,8 @@ impl crate::intelligence::session::SessionProfile for RustProfile {
     fn status(
         &self,
         params: serde_json::Value,
-    ) -> Result<crate::intelligence::session::ProviderStatus, serde_json::Error> {
-        use crate::intelligence::session::ProviderStatus;
+    ) -> Result<agent_ide_core::intelligence::session::ProviderStatus, serde_json::Error> {
+        use agent_ide_core::intelligence::session::ProviderStatus;
         let status: RustStatus = serde_json::from_value(params)?;
         Ok(match (status.quiescent, status.health) {
             (true, RustHealth::Ok | RustHealth::Warning) => ProviderStatus::Ready,
@@ -551,7 +551,7 @@ impl RustViews {
             owner,
             class,
             key.as_str(),
-            crate::execution::ProviderBackendKind::OwnedExclusive,
+            agent_ide_core::execution::ProviderBackendKind::OwnedExclusive,
             worktree.authority(),
         ) {
             ProviderLeaseAdmission::Granted(lease) => {
@@ -696,7 +696,7 @@ impl RustProtocolChild {
         if request.authority() != worktree.authority() {
             return Err(RustProfileError::Process(ProcessError::NeverStarted {
                 cause: Box::new(ProcessError::Request(
-                    crate::execution::RequestError::WorktreeDenied,
+                    agent_ide_core::execution::RequestError::WorktreeDenied,
                 )),
                 settlement: capability.cancel(),
             }));
@@ -841,7 +841,7 @@ mod linked_project_tests {
     /// Managed sandbox initialization disables proc macros while retaining cache-priming suppression.
     #[test]
     fn managed_rust_settings_disable_proc_macro_expansion() {
-        use crate::intelligence::session::SessionProfile;
+        use agent_ide_core::intelligence::session::SessionProfile;
         assert_eq!(
             session_profile("cache-priming-and-proc-macro-disabled-v1").workspace_configuration(),
             serde_json::json!({
@@ -862,7 +862,7 @@ mod linked_project_tests {
     /// barrier is requested.
     #[test]
     fn rust_session_profile_requires_the_exact_analyzer_identity() {
-        use crate::intelligence::session::SessionProfile;
+        use agent_ide_core::intelligence::session::SessionProfile;
         let profile = session_profile("cache-priming-disabled-v1");
         let info = |name: &str, version: &str| async_lsp::lsp_types::ServerInfo {
             name: name.into(),
@@ -885,7 +885,7 @@ mod linked_project_tests {
     /// anything not quiescent busy; a malformed status fails decoding.
     #[test]
     fn server_status_maps_quiescent_health_to_readiness() {
-        use crate::intelligence::session::{ProviderStatus, SessionProfile};
+        use agent_ide_core::intelligence::session::{ProviderStatus, SessionProfile};
         let profile = session_profile("cache-priming-disabled-v1");
         let status = |health: &str, quiescent: bool| {
             profile

@@ -8,13 +8,13 @@ use std::{
     time::Duration,
 };
 
-use crate::assistance::host_binding::ActiveBindingUse;
-use crate::execution::{
+use agent_ide_core::assistance::host_binding::ActiveBindingUse;
+use agent_ide_core::execution::{
     CommandKind, CompletedProcess, ControlledCommand, OwnedChild, OwnedProtocolChild, ProcessError,
     ProviderForwarderSpawnLease, ProviderSpawnLease, ProviderViewLease, ValidatedExecutionRequest,
     WorkspaceAuthority,
 };
-pub use crate::workspace::authority::WorktreeRef;
+pub use agent_ide_core::workspace::authority::WorktreeRef;
 
 /// Describes the immutable compatibility inputs for one shared `gopls` daemon.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,8 +63,8 @@ impl GoplsProfile {
                 "gopls profile requires an absolute binary/toolchain/cache namespace and nonempty identity components",
             ));
         }
-        let binary_digest =
-            crate::execution::measured_executable_digest(&binary).map_err(|_| {
+        let binary_digest = agent_ide_core::execution::measured_executable_digest(&binary)
+            .map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidInput, "gopls executable unavailable")
             })?;
         Ok(Self {
@@ -552,7 +552,7 @@ impl GoEnv {
     }
 }
 
-impl crate::intelligence::session::SessionProfile for GoEnv {
+impl agent_ide_core::intelligence::session::SessionProfile for GoEnv {
     /// Delivers this view's private Go build/module/temp namespace through the `env` setting.
     fn workspace_configuration(&self) -> serde_json::Value {
         serde_json::json!({
@@ -587,7 +587,7 @@ pub fn isolated_views(worktrees: impl IntoIterator<Item = WorktreeRef>) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intelligence::session::SessionProfile;
+    use agent_ide_core::intelligence::session::SessionProfile;
 
     /// The session profile accepts only an omitted or `gopls` identity and opens only `.go` files
     /// as `go`.

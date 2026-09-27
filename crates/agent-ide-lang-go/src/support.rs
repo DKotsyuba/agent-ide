@@ -16,7 +16,8 @@
 //! first and `T` alone finds it; [`Outline::find`] backtracks so `T/Name` still reaches the
 //! method, but `First`/`Last` on `T` then address the type's fields, not the method set.
 //!
-//! The line-oriented helpers are shared with the Rust module (`super::rust`).
+//! The line-oriented helpers are the core's shared brace-language helpers
+//! ([`agent_ide_core::lang::brace`]).
 
 use std::{
     collections::HashMap,
@@ -26,38 +27,25 @@ use std::{
 
 use async_lsp::lsp_types as lsp;
 
-use super::{
-    CommandSource, InsertSite, InsertWhere, LangError, Language, LanguageDescriptor,
-    LanguageProject, LanguageSupport, LineRange, Outline, ProjectCommand, ProjectCommands, Symbol,
-    SymbolKind, SymbolPath, TestFailure, TestReport, TestSelection, TestTarget, kind_of,
-    line_count, lines_of,
-    rust::{
+use agent_ide_core::lang::{
+    CommandSource, InsertSite, InsertWhere, LangError, Language, LanguageProject, LanguageSupport,
+    LineRange, Outline, ProjectCommand, ProjectCommands, Symbol, SymbolKind, SymbolPath,
+    TestFailure, TestReport, TestSelection, TestTarget,
+    brace::{
         Located, argv_of, declaration_line, dedup_tests, first_paragraph, line_at, place,
         signature, source_lines,
     },
+    kind_of, line_count, lines_of,
 };
 
-/// Registration descriptor of the Go language.
-pub static DESCRIPTOR: LanguageDescriptor = LanguageDescriptor {
-    id: "go",
-    display_name: "Go",
-    extensions: &["go"],
-    card_manifest: None,
-    home_tool_dirs: &[],
-    support: &GoSupport,
-    checks: None,
-    server: Some(&crate::intelligence::gopls_backend::GoplsServer),
-};
-
-/// The Go language handle.
-pub const LANGUAGE: Language = Language::of(&DESCRIPTOR);
+use crate::LANGUAGE;
 
 /// Stateless Go implementation of [`LanguageSupport`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GoSupport;
 
 impl LanguageSupport for GoSupport {
-    /// Always this module's [`LANGUAGE`].
+    /// Always the Go [`LANGUAGE`].
     fn language(&self) -> Language {
         LANGUAGE
     }
@@ -187,7 +175,7 @@ impl LanguageSupport for GoSupport {
         }
     }
 
-    /// Computes the insertion point with the shared brace-language rules (`super::rust::place`);
+    /// Computes the insertion point with the shared brace-language rules (`agent_ide_core::lang::brace::place`);
     /// containers are the kinds [`SymbolKind::is_container`] accepts (structs, interfaces and the
     /// synthetic method sets), and members of an empty container are indented one tab deeper.
     fn insert_site(
@@ -470,7 +458,7 @@ fn logged_message(line: &str) -> Option<Located> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lang::TestId;
+    use agent_ide_core::lang::TestId;
 
     /// Builds a document symbol spanning 0-based lines `start..=end` with its name on `name_line`.
     #[allow(deprecated)]

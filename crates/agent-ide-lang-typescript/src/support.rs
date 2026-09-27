@@ -13,32 +13,18 @@ use std::path::{Path, PathBuf};
 use async_lsp::lsp_types as lsp;
 use serde_json::Value;
 
-use super::{
-    CommandSource, InsertSite, InsertWhere, LangError, Language, LanguageDescriptor,
-    LanguageProject, LanguageSupport, LineRange, Outline, ProjectCommand, ProjectCommands, Symbol,
-    SymbolKind, SymbolPath, TestFailure, TestReport, TestSelection, TestTarget, kind_of,
-    line_count, lines_of,
-    python::{
+use agent_ide_core::lang::{
+    CommandSource, InsertSite, InsertWhere, LangError, Language, LanguageProject, LanguageSupport,
+    LineRange, Outline, ProjectCommand, ProjectCommands, Symbol, SymbolKind, SymbolPath,
+    TestFailure, TestReport, TestSelection, TestTarget, kind_of, line_count, lines_of,
+    render::clip,
+    text::{
         MAX_ATTRIBUTE_CHARS, MAX_NAMED_TESTS, distinct, distinct_files, entry_names, env_value,
         indent_of, indent_unit, last_content_line, line_at, one_line, read_text, source_lines,
     },
-    render::clip,
 };
 
-/// Registration descriptor of the TypeScript language.
-pub static DESCRIPTOR: LanguageDescriptor = LanguageDescriptor {
-    id: "typescript",
-    display_name: "TypeScript",
-    extensions: &["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"],
-    card_manifest: Some("package.json"),
-    home_tool_dirs: &[],
-    support: &TypeScript,
-    checks: Some(&crate::checks::typescript::TypeScriptChecks),
-    server: Some(&crate::intelligence::typescript_backend::TypeScriptServer),
-};
-
-/// The TypeScript language handle.
-pub const LANGUAGE: Language = Language::of(&DESCRIPTOR);
+use crate::LANGUAGE;
 
 /// TypeScript and JavaScript support over typescript-language-server's document symbols;
 /// stateless.
@@ -52,7 +38,7 @@ const SCRIPT_EXTENSIONS: [&str; 8] = ["ts", "tsx", "js", "jsx", "mts", "cts", "m
 const SCAN_LINES: usize = 200;
 
 impl LanguageSupport for TypeScript {
-    /// Always this module's [`LANGUAGE`] (JavaScript files included).
+    /// Always the TypeScript [`LANGUAGE`] (JavaScript files included).
     fn language(&self) -> Language {
         LANGUAGE
     }
@@ -1280,7 +1266,7 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::lang::TestId;
+    use agent_ide_core::lang::TestId;
 
     /// A module with a decorated class, overloads, an arrow const, a type alias, an interface
     /// and an object literal.
@@ -1635,7 +1621,7 @@ export interface Options {
     /// annotation-or-value; no local, object-literal property or statement symbol survives.
     #[test]
     fn normalize_drops_body_statements_and_renders_members() {
-        use crate::lang::render::outline_text;
+        use agent_ide_core::lang::render::outline_text;
         let outline = TypeScript.normalize(
             Path::new("src/transport.ts"),
             TRANSPORT,
@@ -1663,7 +1649,7 @@ src/transport.ts  (29 lines, typescript)
     /// names) never reach the outline; a named nested function keeps its entry.
     #[test]
     fn normalize_drops_anonymous_and_expression_symbol_names() {
-        use crate::lang::render::outline_text;
+        use agent_ide_core::lang::render::outline_text;
         let source = "export function Details({ cards }: Props) {\n  const titles = cards\n    .map((card) => card.title)\n    .sort();\n  function sortedTitle(card: Card): string {\n    return card.title.toUpperCase();\n  }\n  return (\n    <div className=\"list\">\n      {cards.map((card) => (\n        <Card key={card.id} title={card.title} />\n      ))}\n    </div>\n  );\n}\n";
         // Captured tsserver shape: the anonymous arrow arrives with an empty name and the JSX
         // expression container arrives with the whole `.map(...)` expression as its name.

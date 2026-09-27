@@ -7,7 +7,7 @@
 //! the primary span of `error`/`warning` compiler messages, deduplicated by the shared snapshot
 //! builder, and the state heuristic reflects cargo's completion marker and per-package coverage
 //! ([`parse_cargo_messages`]). No process is started outside the runner seam; the real Seatbelt
-//! runner is wired separately from `crate::execution`.
+//! runner is wired separately from `agent_ide_core::execution`.
 
 use std::collections::HashSet;
 use std::env;
@@ -19,12 +19,12 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use super::runner::{ConfinedRunner, RunOutput, RunSpec};
-use super::{
+use agent_ide_core::assistance::launcher::absolute;
+use agent_ide_core::checks::runner::{ConfinedRunner, RunOutput, RunSpec};
+use agent_ide_core::checks::{
     BoxFuture, CheckConfig, CheckRequest, CheckState, Checker, Language, LanguageChecks, Problem,
     ProblemSnapshot, Severity, UnavailableReason,
 };
-use crate::assistance::launcher::absolute;
 
 /// Per-stream capture limit for one confined cargo run: 64 MiB.
 ///
@@ -200,14 +200,14 @@ impl RustChecker {
 /// confined profile.
 fn git_exclude_root(
     home: &Path,
-    denies: &[crate::execution::seatbelt::ReadDeny],
+    denies: &[agent_ide_core::execution::seatbelt::ReadDeny],
 ) -> Option<PathBuf> {
     let path = home.join(".config/git/ignore");
     check_file(&path, denies).then_some(path)
 }
 
 /// Tests an auxiliary file without following a symlink under a deny-bearing host profile.
-fn check_file(path: &Path, denies: &[crate::execution::seatbelt::ReadDeny]) -> bool {
+fn check_file(path: &Path, denies: &[agent_ide_core::execution::seatbelt::ReadDeny]) -> bool {
     if denies.is_empty() {
         return path.is_file();
     }
@@ -239,7 +239,7 @@ fn check_file(path: &Path, denies: &[crate::execution::seatbelt::ReadDeny]) -> b
 /// manifest and config files cargo consults.
 fn ancestor_manifest_roots(
     worktree: &Path,
-    denies: &[crate::execution::seatbelt::ReadDeny],
+    denies: &[agent_ide_core::execution::seatbelt::ReadDeny],
 ) -> Vec<PathBuf> {
     let canonical = std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
     let mut ancestors = canonical.ancestors();
@@ -260,7 +260,7 @@ fn ancestor_manifest_roots(
 /// may substitute), honoring only the `AGENT_IDE_HOME` override; when neither resolves the system
 /// temp dir is substituted so path construction stays absolute.
 fn real_home() -> PathBuf {
-    crate::userhome::user_home().unwrap_or_else(env::temp_dir)
+    agent_ide_core::userhome::user_home().unwrap_or_else(env::temp_dir)
 }
 
 /// Derives the rustup home from the toolchain directory.
@@ -465,7 +465,7 @@ fn existing_dir(path: &str) -> Option<PathBuf> {
 
 impl Checker for RustChecker {
     fn language(&self) -> Language {
-        crate::lang::rust::LANGUAGE
+        crate::LANGUAGE
     }
 
     /// Runs one confined `cargo check` and maps it to a snapshot.
@@ -493,7 +493,7 @@ impl RustChecker {
         let cargo = self.toolchain_dir.join("bin").join("cargo");
         if request.read_denies.iter().any(|deny| deny.matches(&cargo)) || !cargo.is_file() {
             return ProblemSnapshot::unavailable(
-                crate::lang::rust::LANGUAGE,
+                crate::LANGUAGE,
                 UnavailableReason::ToolMissing,
                 request.input_generation,
             );
@@ -502,7 +502,7 @@ impl RustChecker {
         let cache_target = request.cache_dir.join("target");
         if fs::create_dir_all(&cache_tmp).is_err() || fs::create_dir_all(&cache_target).is_err() {
             return ProblemSnapshot::unavailable(
-                crate::lang::rust::LANGUAGE,
+                crate::LANGUAGE,
                 UnavailableReason::Fatal,
                 request.input_generation,
             );
@@ -510,7 +510,7 @@ impl RustChecker {
         let spec = self.cargo_check_spec(&request);
         match self.runner.run(spec).await {
             Err(_) => ProblemSnapshot::unavailable(
-                crate::lang::rust::LANGUAGE,
+                crate::LANGUAGE,
                 UnavailableReason::Fatal,
                 request.input_generation,
             ),
@@ -530,21 +530,21 @@ impl RustChecker {
 fn map_run_output(request: &CheckRequest, output: &RunOutput, duration_ms: u64) -> ProblemSnapshot {
     if output.timed_out {
         return ProblemSnapshot::unavailable(
-            crate::lang::rust::LANGUAGE,
+            crate::LANGUAGE,
             UnavailableReason::Timeout,
             request.input_generation,
         );
     }
     if output.truncated {
         return ProblemSnapshot::unavailable(
-            crate::lang::rust::LANGUAGE,
+            crate::LANGUAGE,
             UnavailableReason::Fatal,
             request.input_generation,
         );
     }
     if lockfile_write_failure(&output.stderr) {
         return ProblemSnapshot::unavailable(
-            crate::lang::rust::LANGUAGE,
+            crate::LANGUAGE,
             UnavailableReason::EnvMissing,
             request.input_generation,
         );
@@ -628,7 +628,7 @@ fn parse_cargo_messages_with_denies(
     input_generation: u64,
     duration_ms: u64,
     worktree: &Path,
-    denies: &[crate::execution::seatbelt::ReadDeny],
+    denies: &[agent_ide_core::execution::seatbelt::ReadDeny],
 ) -> ProblemSnapshot {
     let mut problems: Vec<Problem> = Vec::new();
     let mut message_packages: HashSet<String> = HashSet::new();
@@ -653,7 +653,11 @@ fn parse_cargo_messages_with_denies(
                         first_error_message = Some(message.message.clone());
                     }
                     if let Some(problem) = diagnostic_problem(&message)
-                        && super::check_problem_path_allowed(worktree, &problem.path, denies)
+                        && agent_ide_core::checks::check_problem_path_allowed(
+                            worktree,
+                            &problem.path,
+                            denies,
+                        )
                     {
                         problems.push(problem);
                     }
@@ -671,14 +675,14 @@ fn parse_cargo_messages_with_denies(
 
     let Some(success) = build_finished else {
         return ProblemSnapshot::unavailable_with_detail(
-            crate::lang::rust::LANGUAGE,
+            crate::LANGUAGE,
             UnavailableReason::Fatal,
             input_generation,
             first_error_line(stderr),
         );
     };
     let base = ProblemSnapshot::from_problems(
-        crate::lang::rust::LANGUAGE,
+        crate::LANGUAGE,
         CheckState::Ready,
         problems,
         input_generation,
@@ -689,7 +693,7 @@ fn parse_cargo_messages_with_denies(
             .map(|message| truncate_bytes(&message, 160))
             .or_else(|| first_error_line(stderr));
         return ProblemSnapshot::unavailable_with_detail(
-            crate::lang::rust::LANGUAGE,
+            crate::LANGUAGE,
             UnavailableReason::Fatal,
             input_generation,
             detail,

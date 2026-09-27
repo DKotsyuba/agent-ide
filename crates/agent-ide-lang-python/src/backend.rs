@@ -7,7 +7,7 @@ use std::{any::Any, collections::BTreeMap, path::PathBuf, sync::Arc, time::Durat
 
 use serde::Deserialize;
 
-use crate::{
+use agent_ide_core::{
     assistance::{
         host_binding::BindingRef,
         launcher::{AcceptedExecutable, ProviderLaunch},
@@ -18,15 +18,16 @@ use crate::{
     intelligence::{
         context::ContextQuery,
         freshness::ViewGeneration,
-        pyright::{
-            PyrightProfile, PyrightProfileError, PyrightProfileIdentity, PyrightProtocolChild,
-            PyrightView, PyrightViewAdmission, PyrightWorktree,
-        },
         server::{self, LanguageServer, ProviderContext, ProviderHost, ProviderJob, ServerBackend},
         session::{LiveSession, ProviderSettings},
     },
     lang::Language,
     workspace::observation::SourceObservation,
+};
+
+use crate::profile::{
+    PyrightProfile, PyrightProfileError, PyrightProfileIdentity, PyrightProtocolChild, PyrightView,
+    PyrightViewAdmission, PyrightWorktree,
 };
 
 /// Pyright declaration fields beyond the common ones.
@@ -44,7 +45,7 @@ pub struct PyrightServer;
 impl LanguageServer for PyrightServer {
     /// The Python language.
     fn language(&self) -> Language {
-        crate::lang::python::LANGUAGE
+        crate::LANGUAGE
     }
 
     /// Pyright defaults, versioned.
@@ -337,7 +338,7 @@ impl PyrightBackend {
         };
         server::record_provider(
             &*host,
-            crate::lang::python::LANGUAGE,
+            crate::LANGUAGE,
             server::diagnostic_state(outcome.diagnostics.readiness),
         );
         host.active(&binding)?;

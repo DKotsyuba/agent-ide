@@ -14,28 +14,18 @@ use std::{
 
 use async_lsp::lsp_types as lsp;
 
-use super::render::clip;
-use super::{
-    CommandSource, InsertSite, InsertWhere, LangError, Language, LanguageDescriptor,
-    LanguageProject, LanguageSupport, LineRange, Outline, ProjectCommand, ProjectCommands, Symbol,
-    SymbolKind, SymbolPath, TestFailure, TestId, TestReport, TestSelection, TestTarget, kind_of,
-    line_count, lines_of,
+use agent_ide_core::lang::render::clip;
+use agent_ide_core::lang::text::{
+    MAX_ATTRIBUTE_CHARS, MAX_NAMED_TESTS, distinct, distinct_files, entry_names, env_value,
+    indent_of, indent_unit, last_content_line, line_at, one_line, read_text, source_lines,
+};
+use agent_ide_core::lang::{
+    CommandSource, InsertSite, InsertWhere, LangError, Language, LanguageProject, LanguageSupport,
+    LineRange, Outline, ProjectCommand, ProjectCommands, Symbol, SymbolKind, SymbolPath,
+    TestFailure, TestId, TestReport, TestSelection, TestTarget, kind_of, line_count, lines_of,
 };
 
-/// Registration descriptor of the Python language.
-pub static DESCRIPTOR: LanguageDescriptor = LanguageDescriptor {
-    id: "python",
-    display_name: "Python",
-    extensions: &["py", "pyi"],
-    card_manifest: None,
-    home_tool_dirs: &[".local/bin"],
-    support: &Python,
-    checks: Some(&crate::checks::python::PythonChecks),
-    server: Some(&crate::intelligence::pyright_backend::PyrightServer),
-};
-
-/// The Python language handle.
-pub const LANGUAGE: Language = Language::of(&DESCRIPTOR);
+use crate::LANGUAGE;
 
 /// Python support over pyright's hierarchical document symbols; stateless.
 #[derive(Clone, Copy, Debug, Default)]
@@ -47,11 +37,8 @@ pub struct Python;
 /// makes pytest print no summary line at all, which the parser then cannot read.
 const PYTEST_FLAGS: [&str; 3] = ["--no-header", "-p", "no:cacheprovider"];
 
-/// Most individually named tests one command addresses before it falls back to their files.
-pub(super) const MAX_NAMED_TESTS: usize = 12;
-
 impl LanguageSupport for Python {
-    /// Always this module's [`LANGUAGE`].
+    /// Always the Python [`LANGUAGE`].
     fn language(&self) -> Language {
         LANGUAGE
     }
@@ -683,10 +670,6 @@ fn signature_at(lines: &[&str], start: usize) -> (String, HeaderEnd) {
     )
 }
 
-/// Character ceiling for a class attribute (Python) or class/interface field (TypeScript)
-/// signature; shared by both modules.
-pub(super) const MAX_ATTRIBUTE_CHARS: usize = 60;
-
 /// Signature of a class attribute or enum member: `name: annotation` for an annotated
 /// assignment, otherwise the whole `name = value`, comment stripped and clipped at
 /// [`MAX_ATTRIBUTE_CHARS`] characters. Brackets, strings and `==`-style operators are skipped
@@ -998,29 +981,6 @@ fn node_id(test: &TestId) -> String {
     }
 }
 
-/// Tests in first-seen order without duplicates.
-pub(super) fn distinct(tests: &[TestId]) -> Vec<TestId> {
-    let mut unique: Vec<TestId> = Vec::new();
-    for test in tests {
-        if !unique.contains(test) {
-            unique.push(test.clone());
-        }
-    }
-    unique
-}
-
-/// Distinct files of `tests`, first-seen order, as display strings.
-pub(super) fn distinct_files(tests: &[TestId]) -> Vec<String> {
-    let mut files: Vec<String> = Vec::new();
-    for test in tests {
-        let file = test.file.display().to_string();
-        if !files.contains(&file) {
-            files.push(file);
-        }
-    }
-    files
-}
-
 /// Parses a pytest summary line (`==== 1 failed, 2 passed in 0.12s ====` or the `-q` form)
 /// into `(passed, failed, ignored)`; `no tests ran in …` is all zeros. Unknown words such as
 /// `warnings` or `deselected` are ignored; any unparsable item rejects the line.
@@ -1092,105 +1052,6 @@ fn failure_blocks(lines: &[&str]) -> Vec<FailureBlock> {
         }
     }
     blocks
-}
-
-/// Lines of `source` without terminators; never empty so line lookups stay in bounds.
-pub(super) fn source_lines(source: &str) -> Vec<&str> {
-    let mut lines: Vec<&str> = source.lines().collect();
-    if lines.is_empty() {
-        lines.push("");
-    }
-    lines
-}
-
-/// The 1-based line `number`, clamped into the file.
-pub(super) fn line_at<'a>(lines: &[&'a str], number: u32) -> &'a str {
-    lines[(number as usize).clamp(1, lines.len()) - 1]
-}
-
-/// Last non-blank 1-based line inside `range` (clamped to the file; `range.start` when all
-/// lines are blank).
-pub(super) fn last_content_line(lines: &[&str], range: LineRange) -> u32 {
-    let end = (range.end as usize).min(lines.len()) as u32;
-    (range.start..=end)
-        .rev()
-        .find(|&number| !line_at(lines, number).trim().is_empty())
-        .unwrap_or(range.start)
-}
-
-/// Reads `root/name` as text; a missing or unreadable file reads as empty.
-pub(super) fn read_text(root: &Path, name: &str) -> String {
-    fs::read_to_string(root.join(name)).unwrap_or_default()
-}
-
-/// Sorted names of the entries directly under `dir`; empty when it cannot be listed.
-pub(super) fn entry_names(dir: &Path) -> Vec<String> {
-    let mut names: Vec<String> = fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .collect();
-    names.sort();
-    names
-}
-
-/// Value of the first `name` fact in the project's environment.
-pub(super) fn env_value<'a>(project: &'a LanguageProject, name: &str) -> Option<&'a str> {
-    project
-        .environment
-        .iter()
-        .find(|(key, _)| key == name)
-        .map(|(_, value)| value.as_str())
-}
-
-/// Leading whitespace of `line`.
-pub(super) fn indent_of(line: &str) -> &str {
-    &line[..line.len() - line.trim_start().len()]
-}
-
-/// The file's indentation unit: the indentation step after the first line ending in `opener`
-/// (`:` for Python, `{` for TypeScript) — a tab when that step is tab-indented — or `default`
-/// spaces when no such step exists.
-pub(super) fn indent_unit(lines: &[&str], opener: char, default: usize) -> String {
-    for (index, line) in lines.iter().enumerate() {
-        if !line.trim_end().ends_with(opener) {
-            continue;
-        }
-        let Some(next) = lines[index + 1..]
-            .iter()
-            .find(|line| !line.trim().is_empty())
-        else {
-            break;
-        };
-        let (outer, inner) = (indent_of(line), indent_of(next));
-        if inner.len() > outer.len() && inner.starts_with(outer) {
-            let step = &inner[outer.len()..];
-            return if step.starts_with('\t') {
-                "\t".to_owned()
-            } else {
-                step.to_owned()
-            };
-        }
-    }
-    " ".repeat(default)
-}
-
-/// Collapses a multi-line declaration into one line: whitespace runs become one space, and the
-/// spaces and trailing commas that line breaks leave inside brackets are dropped.
-pub(super) fn one_line(text: &str) -> String {
-    let mut out = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    for (from, to) in [
-        ("( ", "("),
-        ("[ ", "["),
-        (" )", ")"),
-        (" ]", "]"),
-        (",)", ")"),
-        (",]", "]"),
-    ] {
-        out = out.replace(from, to);
-    }
-    out
 }
 
 #[cfg(test)]
@@ -1506,7 +1367,7 @@ class WorkKind(StrEnum):
     /// functions stay, class attributes and enum members render target/annotation or a clipped
     /// assignment.
     fn normalize_drops_function_locals_and_clips_class_attributes() {
-        use crate::lang::render::outline_text;
+        use agent_ide_core::lang::render::outline_text;
         let outline = Python.normalize(
             Path::new("src/pkg/contract.py"),
             CONTRACT,

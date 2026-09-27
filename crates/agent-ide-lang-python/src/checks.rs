@@ -18,12 +18,12 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use super::runner::{ConfinedRunner, RunSpec};
-use super::{
+use agent_ide_core::assistance::launcher::absolute;
+use agent_ide_core::checks::runner::{ConfinedRunner, RunSpec};
+use agent_ide_core::checks::{
     BoxFuture, CheckConfig, CheckRequest, CheckState, Checker, Language, LanguageChecks, Problem,
     ProblemSnapshot, Severity, UnavailableReason,
 };
-use crate::assistance::launcher::absolute;
 
 /// Name of the pyright project config file consulted at a worktree's root.
 const PYRIGHT_CONFIG_FILE: &str = "pyrightconfig.json";
@@ -131,7 +131,7 @@ impl PythonChecker {
         let base_prefix = grandparent_or_self(&canonical_interpreter);
 
         let tmp_dir = request.cache_dir.join("tmp");
-        let home = crate::userhome::user_home()
+        let home = agent_ide_core::userhome::user_home()
             .map(|home| home.to_string_lossy().into_owned())
             .unwrap_or_default();
         let path_env = format!("{}:/usr/bin:/bin", node_bin_dir.display());
@@ -170,7 +170,7 @@ impl PythonChecker {
 
 impl Checker for PythonChecker {
     fn language(&self) -> Language {
-        crate::lang::python::LANGUAGE
+        crate::LANGUAGE
     }
 
     fn check(&self, request: CheckRequest) -> BoxFuture<'_, ProblemSnapshot> {
@@ -181,7 +181,7 @@ impl Checker for PythonChecker {
                 .any(|path| !allowed_file(path, &request.read_denies))
             {
                 return ProblemSnapshot::unavailable(
-                    crate::lang::python::LANGUAGE,
+                    crate::LANGUAGE,
                     UnavailableReason::ToolMissing,
                     generation,
                 );
@@ -190,7 +190,7 @@ impl Checker for PythonChecker {
                 resolve_interpreter_with_denies(&request.worktree, &request.read_denies)
             else {
                 return ProblemSnapshot::unavailable(
-                    crate::lang::python::LANGUAGE,
+                    crate::LANGUAGE,
                     UnavailableReason::EnvMissing,
                     generation,
                 );
@@ -198,7 +198,7 @@ impl Checker for PythonChecker {
             let tmp_dir = request.cache_dir.join("tmp");
             if fs::create_dir_all(&tmp_dir).is_err() {
                 return ProblemSnapshot::unavailable(
-                    crate::lang::python::LANGUAGE,
+                    crate::LANGUAGE,
                     UnavailableReason::Fatal,
                     generation,
                 );
@@ -209,7 +209,7 @@ impl Checker for PythonChecker {
                 Ok(output) => output,
                 Err(_) => {
                     return ProblemSnapshot::unavailable(
-                        crate::lang::python::LANGUAGE,
+                        crate::LANGUAGE,
                         UnavailableReason::Fatal,
                         generation,
                     );
@@ -217,7 +217,7 @@ impl Checker for PythonChecker {
             };
             if output.timed_out {
                 return ProblemSnapshot::unavailable(
-                    crate::lang::python::LANGUAGE,
+                    crate::LANGUAGE,
                     UnavailableReason::Timeout,
                     generation,
                 );
@@ -288,7 +288,7 @@ pub fn resolve_interpreter(worktree: &Path) -> Option<PathBuf> {
 /// Resolves the interpreter without probing any host-denied config or executable path.
 fn resolve_interpreter_with_denies(
     worktree: &Path,
-    denies: &[crate::execution::seatbelt::ReadDeny],
+    denies: &[agent_ide_core::execution::seatbelt::ReadDeny],
 ) -> Option<PathBuf> {
     if [PYRIGHT_CONFIG_FILE, PYPROJECT_FILE]
         .iter()
@@ -323,7 +323,7 @@ fn venv_interpreter_path(worktree: &Path, venv_path: &str, venv: &str) -> PathBu
 /// when every hop is allowed; denied paths and symlinked parents return `None`.
 fn existing_python(
     candidate: PathBuf,
-    denies: &[crate::execution::seatbelt::ReadDeny],
+    denies: &[agent_ide_core::execution::seatbelt::ReadDeny],
 ) -> Option<PathBuf> {
     allowed_file(&candidate, denies).then_some(candidate)
 }
@@ -332,7 +332,7 @@ fn existing_python(
 /// hop first. Loops, denied paths, and unsafe relative targets return `None`.
 fn resolved_link_target(
     path: &Path,
-    denies: &[crate::execution::seatbelt::ReadDeny],
+    denies: &[agent_ide_core::execution::seatbelt::ReadDeny],
 ) -> Option<PathBuf> {
     let mut current = path.to_path_buf();
     let mut seen = std::collections::HashSet::new();
@@ -359,7 +359,7 @@ fn resolved_link_target(
 fn lexical_link_target(
     link: &Path,
     target: &Path,
-    denies: &[crate::execution::seatbelt::ReadDeny],
+    denies: &[agent_ide_core::execution::seatbelt::ReadDeny],
 ) -> Option<PathBuf> {
     let joined = if target.is_absolute() {
         target.to_path_buf()
@@ -387,7 +387,7 @@ fn lexical_link_target(
 }
 
 /// Accepts an existing regular file without following an unproved link under host read denies.
-fn allowed_file(path: &Path, denies: &[crate::execution::seatbelt::ReadDeny]) -> bool {
+fn allowed_file(path: &Path, denies: &[agent_ide_core::execution::seatbelt::ReadDeny]) -> bool {
     if denies.is_empty() {
         path.is_file()
     } else {
@@ -396,7 +396,7 @@ fn allowed_file(path: &Path, denies: &[crate::execution::seatbelt::ReadDeny]) ->
 }
 
 /// Accepts a project config only when its final component is a regular file, not a link.
-fn allowed_config(path: &Path, denies: &[crate::execution::seatbelt::ReadDeny]) -> bool {
+fn allowed_config(path: &Path, denies: &[agent_ide_core::execution::seatbelt::ReadDeny]) -> bool {
     if denies.is_empty() {
         return path.is_file();
     }
@@ -405,7 +405,10 @@ fn allowed_config(path: &Path, denies: &[crate::execution::seatbelt::ReadDeny]) 
 }
 
 /// Reads a project config through an `O_NOFOLLOW` descriptor under host read exclusions.
-fn read_config(path: &Path, denies: &[crate::execution::seatbelt::ReadDeny]) -> Option<String> {
+fn read_config(
+    path: &Path,
+    denies: &[agent_ide_core::execution::seatbelt::ReadDeny],
+) -> Option<String> {
     if denies.is_empty() {
         return fs::read_to_string(path).ok();
     }
@@ -424,7 +427,10 @@ fn read_config(path: &Path, denies: &[crate::execution::seatbelt::ReadDeny]) -> 
 }
 
 /// Rejects a denied interpreter path or a symlinked parent before any following `is_file` probe.
-fn denied_interpreter_path(path: &Path, denies: &[crate::execution::seatbelt::ReadDeny]) -> bool {
+fn denied_interpreter_path(
+    path: &Path,
+    denies: &[agent_ide_core::execution::seatbelt::ReadDeny],
+) -> bool {
     if denies.is_empty() {
         return false;
     }
@@ -465,7 +471,7 @@ struct PyrightConfigVenvKeys {
 /// and configs without both keys return `None`.
 fn read_pyrightconfig_venv_keys(
     worktree: &Path,
-    denies: &[crate::execution::seatbelt::ReadDeny],
+    denies: &[agent_ide_core::execution::seatbelt::ReadDeny],
 ) -> Option<(String, String)> {
     let text = read_config(&worktree.join(PYRIGHT_CONFIG_FILE), denies)?;
     let config: PyrightConfigVenvKeys = serde_json::from_str(&text).ok()?;
@@ -489,7 +495,7 @@ fn read_pyrightconfig_venv_keys(
 /// uses `O_NOFOLLOW` and refuses denied or linked config files.
 fn read_pyproject_venv_keys(
     worktree: &Path,
-    denies: &[crate::execution::seatbelt::ReadDeny],
+    denies: &[agent_ide_core::execution::seatbelt::ReadDeny],
 ) -> Option<(String, String)> {
     let text = read_config(&worktree.join(PYPROJECT_FILE), denies)?;
     let mut in_target_section = false;
@@ -640,25 +646,25 @@ fn parse_pyright_output_with_denies(
     input_generation: u64,
     duration_ms: u64,
     worktree: &Path,
-    denies: &[crate::execution::seatbelt::ReadDeny],
+    denies: &[agent_ide_core::execution::seatbelt::ReadDeny],
 ) -> ProblemSnapshot {
     if !matches!(exit, Some(0) | Some(1)) {
         return ProblemSnapshot::unavailable(
-            crate::lang::python::LANGUAGE,
+            crate::LANGUAGE,
             UnavailableReason::Fatal,
             input_generation,
         );
     }
     let Ok(report) = serde_json::from_slice::<PyrightReport>(stdout) else {
         return ProblemSnapshot::unavailable(
-            crate::lang::python::LANGUAGE,
+            crate::LANGUAGE,
             UnavailableReason::Fatal,
             input_generation,
         );
     };
     if report.summary.files_analyzed == 0 {
         return ProblemSnapshot::unavailable_with_detail(
-            crate::lang::python::LANGUAGE,
+            crate::LANGUAGE,
             UnavailableReason::NoFiles,
             input_generation,
             Some(NO_FILES_DETAIL.to_owned()),
@@ -680,7 +686,7 @@ fn parse_pyright_output_with_denies(
             }
             _ => continue,
         };
-        if !super::check_problem_path_allowed(worktree, &diagnostic.file, denies) {
+        if !agent_ide_core::checks::check_problem_path_allowed(worktree, &diagnostic.file, denies) {
             continue;
         }
         problems.push(Problem::new(
@@ -695,14 +701,14 @@ fn parse_pyright_output_with_denies(
 
     if errors != report.summary.error_count || warnings != report.summary.warning_count {
         return ProblemSnapshot::unavailable(
-            crate::lang::python::LANGUAGE,
+            crate::LANGUAGE,
             UnavailableReason::Fatal,
             input_generation,
         );
     }
 
     ProblemSnapshot::from_problems(
-        crate::lang::python::LANGUAGE,
+        crate::LANGUAGE,
         CheckState::Ready,
         problems,
         input_generation,
@@ -800,7 +806,7 @@ impl CheckConfig for ProjectPythonChecksConfig {
 #[cfg(test)]
 mod deny_tests {
     use super::*;
-    use crate::execution::seatbelt::{CredentialGlob, ReadDeny};
+    use agent_ide_core::execution::seatbelt::{CredentialGlob, ReadDeny};
     use std::os::unix::fs::symlink;
 
     /// A second interpreter link and symlinked project configs never follow into a denied file.

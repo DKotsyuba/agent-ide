@@ -14,7 +14,7 @@ use std::{
 
 use serde::Deserialize;
 
-use crate::{
+use agent_ide_core::{
     assistance::{
         host_binding::BindingRef,
         launcher::{AcceptedExecutable, LauncherError, ProviderLaunch, absolute, identifier},
@@ -27,49 +27,50 @@ use crate::{
         freshness::ViewGeneration,
         server::{self, LanguageServer, ProviderContext, ProviderHost, ProviderJob, ServerBackend},
         session::{LiveSession, ProviderSettings},
-        typescript::{
-            ProjectResolutionInputsV1, TypeScriptBundleFileV1, TypeScriptProfile,
-            TypeScriptProfileError, TypeScriptProfiles, TypeScriptProtocolChild,
-            TypeScriptProviderBundleV1, TypeScriptProviderBundleV1Identity, TypeScriptView,
-            TypeScriptViewAdmission, TypeScriptWorktree,
-        },
     },
     lang::Language,
     workspace::{authority::WorktreeRef, observation::SourceObservation},
 };
 
+use crate::profile::{
+    ProjectResolutionInputsV1, TypeScriptBundleFileV1, TypeScriptProfile, TypeScriptProfileError,
+    TypeScriptProfiles, TypeScriptProtocolChild, TypeScriptProviderBundleV1,
+    TypeScriptProviderBundleV1Identity, TypeScriptView, TypeScriptViewAdmission,
+    TypeScriptWorktree,
+};
+
 /// Failure detail when TypeScript project inputs no longer match the snapshot a session was
 /// started from; the next request observes them afresh.
-pub(crate) const TYPESCRIPT_INPUTS_CHANGED: &str =
+pub const TYPESCRIPT_INPUTS_CHANGED: &str =
     "TypeScript project inputs (tsconfig/package files) changed since the session started";
 
 /// Compiled Codex release record prefix for the exact TypeScript r3 macOS bundle cell.
-pub(crate) const TYPESCRIPT_CODEX_MACOS_EVIDENCE_V1: &str =
+pub const TYPESCRIPT_CODEX_MACOS_EVIDENCE_V1: &str =
     "macos-26.6.2-node-24.4.0-tls-6.0.0-ts-5.9.3-codex-r3-2026-09-14";
 /// Compiled Claude release record prefix for the same exact TypeScript r3 macOS bundle cell.
-pub(crate) const TYPESCRIPT_CLAUDE_MACOS_EVIDENCE_V1: &str =
+pub const TYPESCRIPT_CLAUDE_MACOS_EVIDENCE_V1: &str =
     "macos-26.6.2-node-24.4.0-tls-6.0.0-ts-5.9.3-claude-r3-2026-09-14";
 /// Exact Node release admitted by the compiled Codex TypeScript record.
-pub(crate) const TYPESCRIPT_NODE_VERSION_V1: &str = "24.4.0";
+pub const TYPESCRIPT_NODE_VERSION_V1: &str = "24.4.0";
 /// BLAKE3 identity of the accepted macOS Node 24.4.0 executable bytes.
-pub(crate) const TYPESCRIPT_NODE_BLAKE3_V1: &str =
+pub const TYPESCRIPT_NODE_BLAKE3_V1: &str =
     "f3d5f7b7c7296b22889c5ca6a62fbfebc6f263190cefec97255d98a286e92ce9";
 /// Exact TypeScript Language Server release admitted by the compiled Codex record.
-pub(crate) const TYPESCRIPT_BRIDGE_VERSION_V1: &str = "6.0.0";
+pub const TYPESCRIPT_BRIDGE_VERSION_V1: &str = "6.0.0";
 /// BLAKE3 identity of the accepted TypeScript Language Server 6.0.0 bridge bytes.
-pub(crate) const TYPESCRIPT_BRIDGE_BLAKE3_V1: &str =
+pub const TYPESCRIPT_BRIDGE_BLAKE3_V1: &str =
     "541877f06eff230f60b5ca90332d2db54128d0dd8b88bd7fdc987976e22a8c9b";
 /// Exact accepted TypeScript Language Server bridge byte length.
-pub(crate) const TYPESCRIPT_BRIDGE_BYTES_V1: u64 = 917_064;
+pub const TYPESCRIPT_BRIDGE_BYTES_V1: u64 = 917_064;
 /// Exact TypeScript release admitted by the compiled Codex record.
-pub(crate) const TYPESCRIPT_VERSION_V1: &str = "5.9.3";
+pub const TYPESCRIPT_VERSION_V1: &str = "5.9.3";
 /// BLAKE3 identity of the accepted TypeScript 5.9.3 `tsserver.js` bytes.
-pub(crate) const TYPESCRIPT_TSSERVER_BLAKE3_V1: &str =
+pub const TYPESCRIPT_TSSERVER_BLAKE3_V1: &str =
     "fd205df6b7930ede592846b8aeabc046f75a76f8f4eaf74a2b6dba9b3bd6a1a8";
 /// Exact accepted TypeScript 5.9.3 `tsserver.js` byte length.
-pub(crate) const TYPESCRIPT_TSSERVER_BYTES_V1: u64 = 272;
+pub const TYPESCRIPT_TSSERVER_BYTES_V1: u64 = 272;
 /// Ordered basename, BLAKE3 digest, and length of the accepted loaded runtime closure.
-pub(crate) const TYPESCRIPT_CLOSURE_V1: [(&str, &str, u64); 4] = [
+pub const TYPESCRIPT_CLOSURE_V1: [(&str, &str, u64); 4] = [
     (
         "_tsserver.js",
         "2f5f9a981943299237ca1a8f566aff95814508abf919027c4f5bb82dc9c5762f",
@@ -226,7 +227,7 @@ impl TypeScriptLaunch for ProviderLaunch {
         let options = self.options::<TypeScriptLaunchOptions>()?;
         let node = options.node.as_ref()?;
         let bundle = options.typescript.as_ref()?;
-        if self.language != crate::lang::typescript::LANGUAGE
+        if self.language != crate::LANGUAGE
             || node.validate().is_err()
             || self.executable.validate().is_err()
             || bundle.validate().is_err()
@@ -371,7 +372,7 @@ pub struct TypeScriptServer;
 impl LanguageServer for TypeScriptServer {
     /// The TypeScript language (JavaScript files included).
     fn language(&self) -> Language {
-        crate::lang::typescript::LANGUAGE
+        crate::LANGUAGE
     }
 
     /// TypeScript defaults, versioned.
@@ -532,7 +533,7 @@ async fn observe_typescript_inputs(
             } else {
                 worktree_root.join(path)
             };
-            crate::assistance::launcher::admit_path(&roots, &absolute).is_ok()
+            agent_ide_core::assistance::launcher::admit_path(&roots, &absolute).is_ok()
         };
         ProjectResolutionInputsV1::observe(worktree, document, &bundle, &path_proof)
     })
@@ -583,7 +584,7 @@ impl TypeScriptBackend {
             } else {
                 worktree_root.join(path)
             };
-            crate::assistance::launcher::admit_path(&roots, &absolute).is_ok()
+            agent_ide_core::assistance::launcher::admit_path(&roots, &absolute).is_ok()
         };
         if self
             .live
@@ -776,7 +777,7 @@ impl TypeScriptBackend {
         }
         server::record_provider(
             &*host,
-            crate::lang::typescript::LANGUAGE,
+            crate::LANGUAGE,
             server::diagnostic_state(outcome.diagnostics.readiness),
         );
         host.active(&binding)?;

@@ -1,0 +1,21 @@
+[package]
+name = "agent-ide-lang-python"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "The Python language for Agent IDE: symbol support, Pyright checks and the Pyright server."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+agent-ide-core = { path = "../agent-ide-core" }
+async-lsp = { version = "0.2.4", default-features = false, features = ["omni-trait", "tokio"] }
+blake3 = "1"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

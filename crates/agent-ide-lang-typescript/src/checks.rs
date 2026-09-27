@@ -11,13 +11,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use super::runner::{ConfinedRunner, RunOutput, RunSpec};
-use super::{
+use agent_ide_core::assistance::launcher::absolute;
+use agent_ide_core::checks::runner::{ConfinedRunner, RunOutput, RunSpec};
+use agent_ide_core::checks::{
     BoxFuture, CheckConfig, CheckRequest, CheckState, Checker, Language, LanguageChecks, Problem,
     ProblemSnapshot, Severity, UnavailableReason,
 };
-use crate::assistance::launcher::absolute;
-use crate::execution::seatbelt::ReadDeny;
+use agent_ide_core::execution::seatbelt::ReadDeny;
 
 /// Maximum bytes captured from either CLI stream; a larger report fails closed.
 const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
@@ -138,7 +138,7 @@ impl TypeScriptChecker {
                 ),
                 (
                     "HOME".into(),
-                    crate::userhome::user_home()
+                    agent_ide_core::userhome::user_home()
                         .map(|path| path.display().to_string())
                         .unwrap_or_default(),
                 ),
@@ -169,7 +169,7 @@ impl TypeScriptChecker {
 impl Checker for TypeScriptChecker {
     /// Identifies the single TypeScript/JavaScript project snapshot produced here.
     fn language(&self) -> Language {
-        crate::lang::typescript::LANGUAGE
+        crate::LANGUAGE
     }
 
     /// Runs the selected root config and admits only a fully parsed, nontruncated CLI result.
@@ -180,21 +180,21 @@ impl Checker for TypeScriptChecker {
             let generation = request.input_generation;
             let Some(config) = select_config(&request.worktree, &request.read_denies) else {
                 return ProblemSnapshot::unavailable(
-                    crate::lang::typescript::LANGUAGE,
+                    crate::LANGUAGE,
                     UnavailableReason::ReadRestricted,
                     generation,
                 );
             };
             if fs::create_dir_all(request.cache_dir.join("tmp")).is_err() {
                 return ProblemSnapshot::unavailable(
-                    crate::lang::typescript::LANGUAGE,
+                    crate::LANGUAGE,
                     UnavailableReason::Fatal,
                     generation,
                 );
             }
             if stage_adapter(&request.cache_dir).is_err() {
                 return ProblemSnapshot::unavailable(
-                    crate::lang::typescript::LANGUAGE,
+                    crate::LANGUAGE,
                     UnavailableReason::Fatal,
                     generation,
                 );
@@ -205,7 +205,7 @@ impl Checker for TypeScriptChecker {
                     .any(|part| request.read_denies.iter().any(|deny| deny.matches(part)))
             }) {
                 return ProblemSnapshot::unavailable(
-                    crate::lang::typescript::LANGUAGE,
+                    crate::LANGUAGE,
                     UnavailableReason::ReadRestricted,
                     generation,
                 );
@@ -214,7 +214,7 @@ impl Checker for TypeScriptChecker {
                 || !regular_allowed(&self.tsc_cli, &request.read_denies)
             {
                 return ProblemSnapshot::unavailable(
-                    crate::lang::typescript::LANGUAGE,
+                    crate::LANGUAGE,
                     UnavailableReason::ToolMissing,
                     generation,
                 );
@@ -224,7 +224,7 @@ impl Checker for TypeScriptChecker {
                 Ok(output) => output,
                 Err(_) => {
                     return ProblemSnapshot::unavailable(
-                        crate::lang::typescript::LANGUAGE,
+                        crate::LANGUAGE,
                         UnavailableReason::Fatal,
                         generation,
                     );
@@ -232,21 +232,21 @@ impl Checker for TypeScriptChecker {
             };
             if output.timed_out {
                 return ProblemSnapshot::unavailable(
-                    crate::lang::typescript::LANGUAGE,
+                    crate::LANGUAGE,
                     UnavailableReason::Timeout,
                     generation,
                 );
             }
             if output.truncated {
                 return ProblemSnapshot::unavailable(
-                    crate::lang::typescript::LANGUAGE,
+                    crate::LANGUAGE,
                     UnavailableReason::Fatal,
                     generation,
                 );
             }
             if output.status == Some(READ_RESTRICTED_STATUS) {
                 return ProblemSnapshot::unavailable(
-                    crate::lang::typescript::LANGUAGE,
+                    crate::LANGUAGE,
                     UnavailableReason::ReadRestricted,
                     generation,
                 );
@@ -409,13 +409,8 @@ pub fn parse_tsc_output(
     generation: u64,
     duration_ms: u64,
 ) -> ProblemSnapshot {
-    let fatal = || {
-        ProblemSnapshot::unavailable(
-            crate::lang::typescript::LANGUAGE,
-            UnavailableReason::Fatal,
-            generation,
-        )
-    };
+    let fatal =
+        || ProblemSnapshot::unavailable(crate::LANGUAGE, UnavailableReason::Fatal, generation);
     if output.truncated
         || output.timed_out
         || !output.stderr.is_empty()
@@ -503,7 +498,7 @@ pub fn parse_tsc_output(
     }
     if !project_file {
         return ProblemSnapshot::unavailable(
-            crate::lang::typescript::LANGUAGE,
+            crate::LANGUAGE,
             UnavailableReason::NoFiles,
             generation,
         );
@@ -516,7 +511,7 @@ pub fn parse_tsc_output(
         return fatal();
     }
     let mut snapshot = ProblemSnapshot::from_problems(
-        crate::lang::typescript::LANGUAGE,
+        crate::LANGUAGE,
         CheckState::Ready,
         problems,
         generation,

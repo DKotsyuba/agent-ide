@@ -8,7 +8,7 @@ use std::{any::Any, collections::BTreeMap, sync::Arc, time::Duration};
 
 use serde::Deserialize;
 
-use crate::{
+use agent_ide_core::{
     assistance::{
         host_binding::BindingRef,
         launcher::{AcceptedExecutable, ProviderLaunch, identifier},
@@ -19,16 +19,17 @@ use crate::{
     intelligence::{
         context::ContextQuery,
         freshness::ViewGeneration,
-        rust::{
-            RustProfile, RustProfileError, RustProfileIdentity, RustProtocolChild, RustView,
-            RustViewAdmission, RustViews, RustWorktree,
-        },
         server::{self, LanguageServer, ProviderContext, ProviderHost, ProviderJob, ServerBackend},
         session::{LiveSession, ProviderSettings, ReadinessError},
     },
     lang::Language,
     telemetry::DiagnosticState,
     workspace::observation::SourceObservation,
+};
+
+use crate::profile::{
+    RustProfile, RustProfileError, RustProfileIdentity, RustProtocolChild, RustView,
+    RustViewAdmission, RustViews, RustWorktree,
 };
 
 /// rust-analyzer declaration fields beyond the common ones.
@@ -53,7 +54,7 @@ pub struct RustServer;
 impl LanguageServer for RustServer {
     /// The Rust language.
     fn language(&self) -> Language {
-        crate::lang::rust::LANGUAGE
+        crate::LANGUAGE
     }
 
     /// Cache priming disabled, versioned.
@@ -392,7 +393,7 @@ impl RustBackend {
             Ok(context) => server::diagnostic_state(context.diagnostics.readiness),
             Err(_) => DiagnosticState::Unavailable,
         };
-        server::record_provider(&*host, crate::lang::rust::LANGUAGE, diagnostics);
+        server::record_provider(&*host, crate::LANGUAGE, diagnostics);
         host.active(&binding)?;
         result
     }

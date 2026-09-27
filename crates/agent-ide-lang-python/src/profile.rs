@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{
+use agent_ide_core::{
     assistance::host_binding::ActiveBindingUse,
     execution::{
         AdmissionClass, AdmissionController, BackendReapCapability, BackendRelease, CommandKind,
@@ -67,7 +67,7 @@ pub struct PyrightProfile {
 impl PyrightProfile {
     /// Validates current Pyright script and Node bytes against launcher-accepted identities without consulting project Python settings.
     pub fn new(identity: PyrightProfileIdentity) -> Result<Self, PyrightProfileError> {
-        let script_digest = crate::execution::measured_executable_digest(&identity.binary)
+        let script_digest = agent_ide_core::execution::measured_executable_digest(&identity.binary)
             .map_err(|_| PyrightProfileError::InvalidProfile)?;
         if script_digest != identity.accepted_script_digest {
             return Err(PyrightProfileError::InvalidProfile);
@@ -75,7 +75,7 @@ impl PyrightProfile {
         if !identity.node.is_absolute() {
             return Err(PyrightProfileError::InvalidProfile);
         }
-        let node_digest = crate::execution::measured_executable_digest(&identity.node)
+        let node_digest = agent_ide_core::execution::measured_executable_digest(&identity.node)
             .map_err(|_| PyrightProfileError::InvalidProfile)?;
         if node_digest != identity.accepted_node_digest {
             return Err(PyrightProfileError::InvalidProfile);
@@ -139,7 +139,7 @@ impl PyrightProfile {
     /// The final Execution Node recheck immediately before spawn leaves only its already acknowledged
     /// narrow same-user race after those final pre-spawn checks.
     pub fn verify_script(&self) -> Result<(), PyrightProfileError> {
-        (crate::execution::measured_executable_digest(&self.binary)
+        (agent_ide_core::execution::measured_executable_digest(&self.binary)
             .map_err(|_| PyrightProfileError::InvalidProfile)?
             == self.accepted_script_digest)
             .then_some(())
@@ -212,7 +212,7 @@ impl PyrightProfile {
     }
 }
 
-impl crate::intelligence::session::SessionProfile for PyrightProfile {
+impl agent_ide_core::intelligence::session::SessionProfile for PyrightProfile {
     /// Pyright runs on its defaults: an empty configuration object.
     fn workspace_configuration(&self) -> serde_json::Value {
         serde_json::json!({})
@@ -278,7 +278,7 @@ pub enum PyrightProfileError {
     /// Execution rejected an exclusive provider lease operation.
     Execution(ProviderLeaseError),
     /// Execution refused an admission request under current capacity policy.
-    Refused(crate::execution::AdmissionError),
+    Refused(agent_ide_core::execution::AdmissionError),
     /// Execution could not start or reap the owned protocol child.
     Process(ProcessError),
 }
@@ -291,7 +291,7 @@ pub enum PyrightViewAdmission {
     /// Admission queued a request without launching a process.
     Queued(QueueTicket),
     /// Admission refused the request under current capacity policy.
-    Refused(crate::execution::AdmissionError),
+    Refused(agent_ide_core::execution::AdmissionError),
     /// Profile or registry validation refused the request before launch.
     Unavailable(PyrightProfileError),
 }
@@ -366,7 +366,7 @@ impl PyrightProtocolChild {
         if request.authority() != worktree.authority() {
             return Err(PyrightProfileError::Process(ProcessError::NeverStarted {
                 cause: Box::new(ProcessError::Request(
-                    crate::execution::RequestError::WorktreeDenied,
+                    agent_ide_core::execution::RequestError::WorktreeDenied,
                 )),
                 settlement: capability.cancel(),
             }));
@@ -412,7 +412,7 @@ impl PyrightProtocolChild {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::{
+    use agent_ide_core::execution::{
         AdmissionLimits, LocalExecutionPolicy, ProviderLeaseLimits, ValidatedHostInvocation,
     };
     use std::collections::BTreeSet;
@@ -460,10 +460,12 @@ mod tests {
     fn profile(script: &Path, node: &Path) -> Result<PyrightProfile, PyrightProfileError> {
         PyrightProfile::new(PyrightProfileIdentity {
             binary: script.to_path_buf(),
-            accepted_script_digest: crate::execution::measured_executable_digest(script).unwrap(),
+            accepted_script_digest: agent_ide_core::execution::measured_executable_digest(script)
+                .unwrap(),
             version: "pyright-test".into(),
             node: node.to_path_buf(),
-            accepted_node_digest: crate::execution::measured_executable_digest(node).unwrap(),
+            accepted_node_digest: agent_ide_core::execution::measured_executable_digest(node)
+                .unwrap(),
             node_identity: "node-test".into(),
             trust: "test".into(),
             cache_namespace: "/private/tmp/agent-ide-pyright-profile-test-cache".into(),
@@ -593,16 +595,16 @@ mod tests {
     /// opens `.py`/`.pyi` files as `python`.
     #[test]
     fn pyright_session_profile_is_closed_and_allows_omitted_server_info() {
-        use crate::intelligence::session::SessionProfile;
+        use agent_ide_core::intelligence::session::SessionProfile;
         let profile = PyrightProfile::new(PyrightProfileIdentity {
             binary: "/usr/bin/true".into(),
-            accepted_script_digest: crate::execution::measured_executable_digest(Path::new(
-                "/usr/bin/true",
-            ))
+            accepted_script_digest: agent_ide_core::execution::measured_executable_digest(
+                Path::new("/usr/bin/true"),
+            )
             .unwrap(),
             version: "pyright-test".into(),
             node: "/usr/bin/true".into(),
-            accepted_node_digest: crate::execution::measured_executable_digest(Path::new(
+            accepted_node_digest: agent_ide_core::execution::measured_executable_digest(Path::new(
                 "/usr/bin/true",
             ))
             .unwrap(),

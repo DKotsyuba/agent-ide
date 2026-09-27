@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{
+use agent_ide_core::{
     assistance::{host_binding::BindingRef, launcher::ProviderLaunch, reply::FailureCode},
     checks::BoxFuture,
     execution::{
@@ -22,7 +22,6 @@ use crate::{
     intelligence::{
         context::ContextQuery,
         freshness::ViewGeneration,
-        gopls::{GoEnv, GoplsProfile, SharedGopls},
         server::{self, LanguageServer, ProviderContext, ProviderHost, ProviderJob, ServerBackend},
         session::{ProviderSettings, SessionOptions, with_session},
     },
@@ -31,13 +30,15 @@ use crate::{
     workspace::observation::SourceObservation,
 };
 
+use crate::profile::{GoEnv, GoplsProfile, SharedGopls};
+
 /// The shared-listener gopls server integration.
 pub struct GoplsServer;
 
 impl LanguageServer for GoplsServer {
     /// The Go language.
     fn language(&self) -> Language {
-        crate::lang::go::LANGUAGE
+        crate::LANGUAGE
     }
 
     /// gopls defaults.
@@ -47,7 +48,7 @@ impl LanguageServer for GoplsServer {
 
     /// Requires an absolute Go toolchain executable as the declared toolchain.
     fn validate_launch(&self, launch: &ProviderLaunch) -> bool {
-        crate::assistance::launcher::absolute(Path::new(&launch.toolchain))
+        agent_ide_core::assistance::launcher::absolute(Path::new(&launch.toolchain))
     }
 
     /// The server's own name.
@@ -581,12 +582,12 @@ impl ServerBackend for GoplsBackend {
 async fn reap_owned_backend(
     socket_generation: &mut BTreeMap<String, u64>,
     registry: &mut ProviderLeaseRegistry,
-    admission: &std::sync::Mutex<crate::execution::AdmissionController>,
+    admission: &std::sync::Mutex<agent_ide_core::execution::AdmissionController>,
     uncertain: &mut std::collections::BTreeSet<BindingRef>,
     binding: &BindingRef,
     view_backend: &str,
     backend: GoBackend,
-    capability: crate::execution::BackendReapCapability,
+    capability: agent_ide_core::execution::BackendReapCapability,
 ) -> Result<(), FailureCode> {
     let socket = backend.socket;
     let stop_result = backend
@@ -660,7 +661,7 @@ async fn session_operation<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncW
         };
         adapters::provider_summary(
             telemetry,
-            crate::lang::go::LANGUAGE,
+            crate::LANGUAGE,
             CacheState::Unavailable,
             diagnostics,
         );
@@ -671,19 +672,19 @@ async fn session_operation<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncW
 #[cfg(test)]
 mod tests {
     use super::{GoBackend, OwnedProviderSocket, dispose_socket, reap_owned_backend};
-    use crate::assistance::host_binding::{
+    use crate::profile::{GoplsProfile, SharedGopls};
+    use agent_ide_core::assistance::host_binding::{
         BindingRef, BindingStatus, HostBindingGuard, parse_candidate, parse_channel_session,
         parse_hook_event,
     };
-    use crate::assistance::reply::FailureCode;
-    use crate::execution::{
+    use agent_ide_core::assistance::reply::FailureCode;
+    use agent_ide_core::execution::{
         Admission, AdmissionClass, AdmissionController, AdmissionLimits, BackendRelease,
         ControlledCommand, LocalExecutionPolicy, OwnerId, ProviderBackendKind,
         ProviderLeaseAdmission, ProviderViewLease, ValidatedExecutionRequest,
         ValidatedHostInvocation, WorkspaceAuthority,
     };
-    use crate::intelligence::gopls::{GoplsProfile, SharedGopls};
-    use crate::workspace::authority::WorktreeRef;
+    use agent_ide_core::workspace::authority::WorktreeRef;
     use serde_json::json;
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
@@ -693,7 +694,7 @@ mod tests {
     /// directly by each test instead of by a worker.
     struct Providers {
         /// Central typed backend/view accounting with the worker's fixed limits.
-        registry: crate::execution::ProviderLeaseRegistry,
+        registry: agent_ide_core::execution::ProviderLeaseRegistry,
         /// Per-backend socket path generations advanced by unproved disposals.
         socket_generation: std::collections::BTreeMap<String, u64>,
     }
@@ -702,8 +703,8 @@ mod tests {
         /// Creates the worker's fixed finite accounting without launching processes.
         fn new() -> Self {
             Self {
-                registry: crate::execution::ProviderLeaseRegistry::new(
-                    crate::execution::ProviderLeaseLimits {
+                registry: agent_ide_core::execution::ProviderLeaseRegistry::new(
+                    agent_ide_core::execution::ProviderLeaseLimits {
                         total_views: 64,
                         per_backend_views: 64,
                     },

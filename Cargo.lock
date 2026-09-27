@@ -7,6 +7,10 @@ name = "agent-ide"
 version = "0.4.5"
 dependencies = [
  "agent-ide-core",
+ "agent-ide-lang-go",
+ "agent-ide-lang-python",
+ "agent-ide-lang-rust",
+ "agent-ide-lang-typescript",
  "async-lsp",
  "blake3",
  "libc",
@@ -35,6 +39,55 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower-service",
+]
+
+[[package]]
+name = "agent-ide-lang-go"
+version = "0.4.5"
+dependencies = [
+ "agent-ide-core",
+ "async-lsp",
+ "blake3",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "agent-ide-lang-python"
+version = "0.4.5"
+dependencies = [
+ "agent-ide-core",
+ "async-lsp",
+ "blake3",
+ "libc",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "agent-ide-lang-rust"
+version = "0.4.5"
+dependencies = [
+ "agent-ide-core",
+ "async-lsp",
+ "blake3",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "agent-ide-lang-typescript"
+version = "0.4.5"
+dependencies = [
+ "agent-ide-core",
+ "async-lsp",
+ "blake3",
+ "libc",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
