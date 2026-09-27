@@ -72,7 +72,7 @@ bundle="$tmp_dir/agent-ide-v$version"
 "$bundle/agent-ide" self-install \
     --release "$bundle" \
     --version "$version" \
-    --prefix "$prefix" \
+    --prefix "${AGENT_IDE_HOME:-$HOME}/.agent-ide/standalone" \
     --bin-dir "$prefix/bin" \
     --share-dir "$prefix/share/agent-ide" \
     --replace

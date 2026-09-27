@@ -51,7 +51,7 @@ sh install.sh --version X.Y.Z --home "$HOME/.agent-ide" \
   --prefix "$HOME/.agent-ide/standalone" --bin-dir "$HOME/.local/bin"
 ```
 
-The home defaults to `~/.agent-ide`; override it with `AGENT_IDE_HOME` or `--home`.
+State lives in `~/.agent-ide` (`--home`). `AGENT_IDE_HOME` is a user-home override for tests and relocation: it moves the whole per-user tree (`.agent-ide`, `.config/agent-ide`, `.local`) together.
 
 Build from source (also usable before publication):
 

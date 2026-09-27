@@ -49,7 +49,8 @@ pub struct Args {
     pub release: PathBuf,
     /// Exact `X.Y.Z` the bundle's `metadata.json` must carry and the layout must name.
     pub version: String,
-    /// State home; default is `$AGENT_IDE_HOME` or the real user home plus `.agent-ide`.
+    /// State home; default is the effective user home (`AGENT_IDE_HOME` override or passwd)
+    /// plus `.agent-ide`.
     pub home: Option<PathBuf>,
     /// Standalone prefix; default is `<home>/standalone`.
     pub prefix: Option<PathBuf>,
@@ -175,26 +176,20 @@ fn set_path(slot: &mut Option<PathBuf>, flag: &str, value: &str) -> Result<(), S
     Ok(())
 }
 
-/// Resolves the documented defaults: `--home` from `$AGENT_IDE_HOME` or the real user home,
-/// `--prefix` from `<home>/standalone`, `--bin-dir` from `<home>/.local/bin`, and
-/// `--share-dir` from `<home>/.local/share/agent-ide`. Every result is absolute, normalized,
+/// Resolves the documented defaults: `--home` is the effective user home plus `.agent-ide`,
+/// `--prefix` is `<home>/standalone`, `--bin-dir` is `<user home>/.local/bin`, and
+/// `--share-dir` is `<user home>/.local/share/agent-ide`. `AGENT_IDE_HOME` relocates the
+/// whole per-user tree, exactly as the daemon and the journal treat it. Every result is absolute, normalized,
 /// not the filesystem root, and free of single quotes so the launcher shim can quote it.
 pub fn resolve(args: Args) -> Result<Options, String> {
     checked_version(&args.version)?;
     let default_home = userhome::user_home();
     let home = match args.home {
         Some(home) => home,
-        // `$AGENT_IDE_HOME` names the home itself when set; otherwise the real home plus
-        // `.agent-ide` is the default state home.
-        None => match std::env::var_os(userhome::HOME_OVERRIDE_ENV) {
-            Some(override_value) if PathBuf::from(&override_value).is_absolute() => {
-                PathBuf::from(override_value)
-            }
-            _ => default_home
-                .clone()
-                .ok_or("cannot resolve the user home; pass --home or set AGENT_IDE_HOME")?
-                .join(".agent-ide"),
-        },
+        None => default_home
+            .clone()
+            .ok_or("cannot resolve the user home; pass --home or set AGENT_IDE_HOME")?
+            .join(".agent-ide"),
     };
     let prefix = args.prefix.unwrap_or_else(|| home.join("standalone"));
     let bin_dir = match args.bin_dir {
@@ -612,30 +607,25 @@ fn write_launcher(options: &Options) -> Result<PathBuf, String> {
     Ok(launcher)
 }
 
-/// Renders the exact managed shim bytes for one home and prefix.
+/// Renders the exact managed shim bytes for one prefix. The shim sets no environment: the
+/// daemon resolves its home itself, and `AGENT_IDE_HOME` keeps its single meaning (a user-home
+/// override for tests and relocation).
 fn launcher_shim(options: &Options) -> String {
     format!(
-        "#!/bin/sh\n{LAUNCHER_MARKER}\nif [ -z \"${{AGENT_IDE_HOME:-}}\" ]; then AGENT_IDE_HOME='{}'; fi\nexport AGENT_IDE_HOME\nexec '{}/current/{BINARY_NAME}' \"$@\"\n",
-        options.home.display(),
+        "#!/bin/sh\n{LAUNCHER_MARKER}\nexec '{}/current/{BINARY_NAME}' \"$@\"\n",
         options.prefix.display(),
     )
 }
 
-/// Recognizes the managed shim format, returning the embedded home and prefix when the bytes
-/// are exactly one shim for any home and prefix.
+/// Recognizes the managed shim format, returning the embedded prefix (and an empty home, kept
+/// for the earlier shape) when the bytes are exactly one shim for any prefix.
 fn parse_shim(contents: &[u8]) -> Option<(String, String)> {
     let text = std::str::from_utf8(contents).ok()?;
     let mut lines = text.split('\n');
     if lines.next()? != "#!/bin/sh" || lines.next()? != LAUNCHER_MARKER {
         return None;
     }
-    let home = lines
-        .next()?
-        .strip_prefix("if [ -z \"${AGENT_IDE_HOME:-}\" ]; then AGENT_IDE_HOME='")?
-        .strip_suffix("'; fi")?;
-    if lines.next()? != "export AGENT_IDE_HOME" {
-        return None;
-    }
+    let home = "";
     let prefix = lines
         .next()?
         .strip_prefix("exec '")?
@@ -643,7 +633,7 @@ fn parse_shim(contents: &[u8]) -> Option<(String, String)> {
     if !lines.next()?.is_empty() || lines.next().is_some() {
         return None;
     }
-    if home.is_empty() || prefix.is_empty() {
+    if prefix.is_empty() {
         return None;
     }
     Some((home.to_owned(), prefix.to_owned()))
@@ -687,7 +677,14 @@ fn ensure_launcher_owned(options: &Options, launcher: &Path) -> Result<(), Strin
     }
     let contents =
         fs::read(launcher).map_err(|error| format!("{}: {error}", launcher.display()))?;
-    if parse_shim(&contents).is_some() {
+    // Any file carrying the marker on its second line is a managed shim (including the first
+    // 0.4.1 candidate shape that exported AGENT_IDE_HOME); it is rewritten, never refused.
+    if parse_shim(&contents).is_some()
+        || std::str::from_utf8(&contents)
+            .ok()
+            .and_then(|text| text.split('\n').nth(1))
+            .is_some_and(|line| line == LAUNCHER_MARKER)
+    {
         return Ok(());
     }
     if metadata.permissions().mode() & 0o111 != 0 && is_macho(&contents) {
@@ -980,12 +977,13 @@ mod tests {
             prefix: PathBuf::from("/Users/someone/.agent-ide/standalone"),
             bin_dir: PathBuf::from("/Users/someone/.local/bin"),
             share_dir: PathBuf::from("/Users/someone/.local/share/agent-ide"),
+            replace: false,
         };
         let shim = launcher_shim(&options);
         assert_eq!(
             parse_shim(shim.as_bytes()),
             Some((
-                "/Users/someone/.agent-ide".to_owned(),
+                String::new(),
                 "/Users/someone/.agent-ide/standalone".to_owned(),
             ))
         );

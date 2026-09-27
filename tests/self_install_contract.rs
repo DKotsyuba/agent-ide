@@ -165,8 +165,7 @@ fn assert_layout(root: &Path, version: &str, home: &Path) {
     assert_eq!(
         shim,
         format!(
-            "#!/bin/sh\n# agent-ide managed launcher v1\nif [ -z \"${{AGENT_IDE_HOME:-}}\" ]; then AGENT_IDE_HOME='{}'; fi\nexport AGENT_IDE_HOME\nexec '{}/current/agent-ide' \"$@\"\n",
-            home.display(),
+            "#!/bin/sh\n# agent-ide managed launcher v1\nexec '{}/current/agent-ide' \"$@\"\n",
             prefix.display(),
         ),
         "launcher must be the exact managed shim"
@@ -523,8 +522,8 @@ fn bad_invocations_are_refused() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// Without explicit flags, home, bin, and share defaults resolve from `AGENT_IDE_HOME` inside
-/// the child process only, and the prefix defaults to `<home>/standalone`.
+/// Without explicit flags, `AGENT_IDE_HOME` relocates the whole per-user tree: the state home is
+/// `<user home>/.agent-ide`, the prefix `<home>/standalone`, bin and share under `.local`.
 #[test]
 fn defaults_resolve_from_the_agent_ide_home_override() {
     let root = unique_root("defaults");
@@ -546,7 +545,7 @@ fn defaults_resolve_from_the_agent_ide_home_override() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(root.join("standalone/current").exists());
+    assert!(root.join(".agent-ide/standalone/current").exists());
     assert!(root.join(".local/bin/agent-ide").is_file());
     assert!(root.join(".local/share/agent-ide/plugin/current").exists());
     let _ = fs::remove_dir_all(&root);

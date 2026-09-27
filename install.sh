@@ -28,7 +28,7 @@ usage_text() {
         "bundle's own \`agent-ide self-install\`. macOS arm64 only." \
         '' \
         '  --version X.Y.Z   install this version (a leading `v` is allowed); default: latest release' \
-        '  --home DIR        state home (default: $AGENT_IDE_HOME, else ~/.agent-ide)' \
+        '  --home DIR        state home (default: ~/.agent-ide; AGENT_IDE_HOME relocates the user home)' \
         '  --prefix DIR      standalone prefix (default: <home>/standalone)' \
         '  --bin-dir DIR     launcher directory (default: ~/.local/bin)' \
         '  --downloader TOOL force `curl` or `wget` (default: auto-detect)' \
