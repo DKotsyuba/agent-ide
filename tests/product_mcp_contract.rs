@@ -4452,9 +4452,7 @@ async fn configured_product_python_non_test_file_answers_no_tests() {
     .unwrap();
     std::fs::create_dir_all(fixture.root.join("src/hypfactory")).unwrap();
     std::fs::write(
-        fixture
-            .root
-            .join("src/hypfactory/yaml_subset.py"),
+        fixture.root.join("src/hypfactory/yaml_subset.py"),
         "class YamlSubsetError(Exception):\n    pass\n",
     )
     .unwrap();
@@ -4463,7 +4461,11 @@ async fn configured_product_python_non_test_file_answers_no_tests() {
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "python-non-test").await;
     let started = actor
-        .call(&fixture, "ide.start", json!({"activation_id":"py-no-tests"}))
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"py-no-tests"}),
+        )
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
     let refused = actor
@@ -4512,7 +4514,11 @@ async fn configured_product_typescript_non_test_file_answers_no_tests() {
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "typescript-non-test").await;
     let started = actor
-        .call(&fixture, "ide.start", json!({"activation_id":"ts-no-tests"}))
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"ts-no-tests"}),
+        )
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
     let refused = actor
@@ -5534,7 +5540,7 @@ async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
 #[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
 async fn configured_product_pyright_symbol_tools_and_edit() {
     let fixture = ProductFixture::new(json!([accepted_pyright_provider("pyright-symbol-cache")]));
-    let source = "class Greeter:\n    def method(self) -> str:\n        return \"hello\"\n\ndef caller() -> str:\n    return Greeter().method()\n";
+    let source = "class Greeter:\n    def __init__(self, name: str) -> None:\n        self.name = name\n\n    def method(self) -> str:\n        return \"hello\"\n\ndef caller() -> str:\n    return Greeter(\"world\").method()\n";
     std::fs::write(fixture.root.join("main.py"), source).unwrap();
     fixture.git(&["add", "--", "main.py"]);
     fixture.git(&["commit", "--quiet", "-m", "Python symbol fixture"]);
@@ -5573,15 +5579,50 @@ async fn configured_product_pyright_symbol_tools_and_edit() {
     let text = symbol["text"].as_str().unwrap();
     assert!(text.contains("symbol: method — method"), "{symbol}");
     assert!(
-        text.contains("definition main.py#Greeter/method  (lines 2–3)"),
+        text.contains("definition main.py#Greeter/method  (lines 5–6)"),
         "{symbol}"
     );
     assert!(!text.contains("return \"hello\""), "{symbol}");
     assert!(text.contains("usages: 1 in 1 files"), "{symbol}");
-    assert!(!text.contains("main.py:2"), "{symbol}");
     assert!(
-        text.contains("main.py#caller  main.py:5") && text.contains("Greeter().method()"),
+        text.contains("main.py:9  return Greeter(\"world\").method()"),
         "{symbol}"
+    );
+    // pyright has no call hierarchy: the card says so instead of printing nothing, and a
+    // constructor nothing names explicitly still reports its zero usages at the right position.
+    assert!(
+        text.contains("callers: unavailable (pyright has no call hierarchy)"),
+        "{symbol}"
+    );
+    let init = actor
+        .call(
+            &fixture,
+            "ide.symbol",
+            json!({"symbol":"main.py#Greeter/__init__"}),
+        )
+        .await;
+    let init = actor.settle(&fixture, init).await;
+    assert_eq!(init["kind"], "symbol", "{init}");
+    let init_text = init["text"].as_str().unwrap();
+    assert!(init_text.contains("symbol: __init__"), "{init}");
+    assert!(init_text.contains("usages: 0 in 0 files"), "{init_text}");
+    assert!(
+        init_text.contains("callers: unavailable (pyright has no call hierarchy)"),
+        "{init_text}"
+    );
+    let graph = actor
+        .call(
+            &fixture,
+            "ide.graph",
+            json!({"symbol":"main.py#Greeter/method"}),
+        )
+        .await;
+    let graph = actor.settle(&fixture, graph).await;
+    assert_eq!(graph["kind"], "graph", "{graph}");
+    assert_eq!(
+        graph["text"].as_str().unwrap(),
+        "graph: callers/callees unavailable for python (pyright has no call hierarchy); use ide.symbol usages\n",
+        "{graph}"
     );
     let read = actor
         .call(

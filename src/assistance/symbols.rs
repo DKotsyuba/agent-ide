@@ -290,10 +290,23 @@ impl Worker<'_> {
                 card.usages = self
                     .usage_lines(&worktree_root, &found.path, found.body.start, references)
                     .await;
+                // pyright answers references with an empty list when nothing names the symbol
+                // explicitly (a constructor is only ever called through its class); that zero
+                // must be reported, not silently omitted.
+                if card.usages.is_empty() && Lang::for_path(observed.path()) == Some(Lang::Python) {
+                    card.report_empty_usages = true;
+                }
             }
             if callers_depth > 0 {
-                let live = self.live_session_for(job, &observed).await?;
-                if let Ok(calls) = live
+                // pyright's call hierarchy is unreliable — a constructor answers nothing while a
+                // plain method answers, so graphs through callers silently miss call sites; say
+                // unavailable for Python instead of printing a partial answer.
+                if Lang::for_path(observed.path()) == Some(Lang::Python) {
+                    card.callers_note =
+                        Some("unavailable (pyright has no call hierarchy)".to_owned());
+                } else if let Ok(calls) = self
+                    .live_session_for(job, &observed)
+                    .await?
                     .session
                     .incoming_calls(&observed, &bytes, byte_offset)
                     .await
@@ -388,6 +401,16 @@ impl Worker<'_> {
             }
         }
         .ok_or(FailureCode::UnknownSymbol)?;
+        // pyright's call hierarchy answers nothing for constructors and partial answers for
+        // everything else, so the walk below would render a misleading graph; answer the fact.
+        if Lang::for_path(observed.path()) == Some(Lang::Python) {
+            let authority = self.finish_symbol_job(job, &binding, &observed).await?;
+            let text = "graph: callers/callees unavailable for python (pyright has no call hierarchy); use ide.symbol usages\n".to_owned();
+            let (reply, page) = ContextPageState::new(text, 0, false, ResultKind::Graph)
+                .next(&job.reference)?;
+            self.shared.set_context_page(&job.reference, page);
+            return Ok((reply, Some(authority), Some(observed)));
+        }
         let root = render::GraphNode {
             path: found.path.to_string(),
             file: file.display().to_string(),
