@@ -357,8 +357,11 @@ async fn initialize_dispatcher(
     dispatcher: &Arc<dyn AssistanceDispatcher>,
     runtime_dir: &Path,
 ) -> Result<(), AppError> {
+    // Initialization measures every accepted executable (the TypeScript bundle alone is ~40 MB
+    // of digests) and opens the store; on a loaded developer machine that takes over five
+    // seconds, so the bound is generous while still finite.
     let initialized =
-        tokio::time::timeout(Duration::from_secs(5), dispatcher.initialize(runtime_dir))
+        tokio::time::timeout(Duration::from_secs(60), dispatcher.initialize(runtime_dir))
             .await
             .map_err(|_| AppError::InvalidResponse)
             .and_then(|result| result.map_err(|_| AppError::InvalidResponse));
