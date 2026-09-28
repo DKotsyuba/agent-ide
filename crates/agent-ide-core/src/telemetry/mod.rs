@@ -266,6 +266,8 @@ pub enum Event {
         files_bucket: CountBucket,
         /// Bucketed fact count.
         facts_bucket: CountBucket,
+        /// Bucketed count of files whose facts came from the cache shared by the worktrees.
+        reused_bucket: CountBucket,
         /// Refresh duration, saturated to whole milliseconds.
         duration_ms: u32,
     },
@@ -1112,12 +1114,13 @@ mod tests {
             state: NameIndexState::Partial,
             files_bucket: CountBucket::of(12),
             facts_bucket: CountBucket::of(5_000),
+            reused_bucket: CountBucket::of(3),
             duration_ms: 840,
         };
         assert_eq!(event.tag(), "name_index_refreshed");
         assert_eq!(
             String::from_utf8(event.encode().unwrap()).unwrap(),
-            r#"{"tag":"name_index_refreshed","state":"partial","files_bucket":"10-99","facts_bucket":"100+","duration_ms":840}"#
+            r#"{"tag":"name_index_refreshed","state":"partial","files_bucket":"10-99","facts_bucket":"100+","reused_bucket":"1-9","duration_ms":840}"#
         );
     }
 

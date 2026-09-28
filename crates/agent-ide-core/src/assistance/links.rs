@@ -741,7 +741,8 @@ pub(super) fn candidate(summary: &KeySummary) -> String {
     )
 }
 
-/// Refreshes `index` until `deadline` and records the refresh in telemetry when it re-read files.
+/// Refreshes `index` until `deadline` and records the refresh in telemetry when it read files or
+/// reused cached facts.
 fn timed_refresh(
     index: &mut NameIndex,
     deadline: std::time::Instant,
@@ -749,13 +750,14 @@ fn timed_refresh(
 ) -> IndexState {
     let started = std::time::Instant::now();
     let state = index.refresh(deadline);
-    if index.last_reread() > 0
+    if index.last_reread() + index.last_reused() > 0
         && let Some(telemetry) = telemetry
     {
         crate::telemetry::adapters::name_index_refreshed(
             telemetry,
             state,
             index.summary(),
+            index.last_reused(),
             started.elapsed(),
         );
     }

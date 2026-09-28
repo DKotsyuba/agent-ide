@@ -311,6 +311,13 @@ pub trait NameFacts: Send + Sync {
     /// The namespaces this language may define and/or use names in.
     fn coverage(&self) -> &'static [NamespaceCoverage];
 
+    /// Revision of the extraction rules; part of the key of cached facts, so facts cached by an
+    /// earlier extractor never survive a change. Bump it whenever [`NameFacts::extract`] would
+    /// answer differently for some input.
+    fn revision(&self) -> &'static str {
+        "1"
+    }
+
     /// Facts of one file. `file` is worktree-relative (for resolving relative references);
     /// `source` is its complete UTF-8 text (the core skips non-UTF-8 files). No I/O, no language
     /// server, no subprocess.

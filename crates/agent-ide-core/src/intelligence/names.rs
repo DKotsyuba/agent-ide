@@ -52,6 +52,11 @@ pub const MAX_WORKTREES: usize = 4;
 pub const BUILD_BUDGET: Duration = Duration::from_secs(20);
 /// Design target for a refresh with nothing changed at 10 000 candidate files.
 pub const WARM_REFRESH_TARGET: Duration = Duration::from_millis(200);
+/// Extractions the daemon-level fact cache keeps (two worktrees' worth of indexed files).
+pub const MAX_CACHED_ENTRIES: usize = 2 * MAX_INDEXED_FILES;
+/// Facts the daemon-level fact cache keeps. Live indexes share the cached facts, so this bounds
+/// the memory of every worktree index together (about 12 MB per 500 000 facts).
+pub const MAX_CACHED_FACTS: usize = 2 * MAX_FACTS_PER_WORKTREE;
 /// Directories the fallback walk visits at most.
 const WALK_MAX_DIRECTORIES: usize = 10_000;
 /// Skip reason of a file whose facts would pass [`MAX_FACTS_PER_WORKTREE`].
@@ -130,26 +135,178 @@ pub struct KeySummary {
     pub files: usize,
 }
 
-/// Indexed state of one candidate file.
-struct FileEntry {
-    /// Language owning the file.
-    language: Language,
-    /// `(length, mtime in ns)` when last read; an unchanged stamp skips the read.
-    stamp: (u64, i128),
-    /// blake3 of the bytes the facts came from.
-    digest: [u8; 32],
+/// What identifies a file's content: its Git blob (clean tracked files, no read needed) or the
+/// blake3 digest of its bytes (everything else).
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum ContentKey {
+    /// A Git blob id from the worktree's index, for a file whose working copy is clean.
+    GitBlob(Box<str>),
+    /// blake3 of the bytes read.
+    Digest([u8; 32]),
+}
+
+/// Key of one cached extraction: the language, its extractor revision and the content.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CacheKey {
+    /// Language identifier.
+    language: &'static str,
+    /// [`NameFacts::revision`](crate::lang::names::NameFacts::revision) of its provider.
+    revision: &'static str,
+    /// The content.
+    content: ContentKey,
+}
+
+impl CacheKey {
+    /// The key of `content` in `language`'s current extractor.
+    fn of(language: Language, content: ContentKey) -> Option<Self> {
+        Some(Self {
+            language: language.name(),
+            revision: language.names()?.revision(),
+            content,
+        })
+    }
+}
+
+/// One file's extraction, shared by every worktree whose file has the same content.
+#[derive(Debug)]
+struct Extracted {
     /// Facts sorted by line, column, namespace id and name; empty for a skipped file.
-    facts: Vec<NameFact>,
-    /// Why the file has no facts (`large`, `non-utf8`, a provider reason), if skipped.
+    facts: Box<[NameFact]>,
+    /// Why the content has no facts (`large`, `non-utf8`, a provider reason), if skipped.
     skipped: Option<&'static str>,
     /// The per-file fact cap refused facts.
     capped: bool,
 }
 
+/// Daemon-level cache of extractions by content, shared by the worktree indexes of one daemon
+/// (one repository). Bounded by [`MAX_CACHED_ENTRIES`] and [`MAX_CACHED_FACTS`]; extractions no
+/// live index references leave first, least recently used first.
+#[derive(Debug)]
+pub struct FactCache {
+    /// Extractions with their last-use tick.
+    entries: HashMap<CacheKey, (Arc<Extracted>, u64)>,
+    /// Facts held across entries.
+    facts: usize,
+    /// Monotonic use counter.
+    tick: u64,
+    /// Entry bound ([`MAX_CACHED_ENTRIES`]).
+    max_entries: usize,
+    /// Fact bound ([`MAX_CACHED_FACTS`]).
+    max_facts: usize,
+}
+
+impl Default for FactCache {
+    /// An empty cache with the fixed bounds.
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            facts: 0,
+            tick: 0,
+            max_entries: MAX_CACHED_ENTRIES,
+            max_facts: MAX_CACHED_FACTS,
+        }
+    }
+}
+
+impl FactCache {
+    /// The cached extraction of `key`, marked used.
+    fn get(&mut self, key: &CacheKey) -> Option<Arc<Extracted>> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.entries.get_mut(key).map(|(extracted, used)| {
+            *used = tick;
+            extracted.clone()
+        })
+    }
+
+    /// Caches `extracted` under `key`, evicting when a bound is passed.
+    fn insert(&mut self, key: CacheKey, extracted: Arc<Extracted>) {
+        self.tick += 1;
+        self.facts += extracted.facts.len();
+        if let Some((old, _)) = self.entries.insert(key, (extracted, self.tick)) {
+            self.facts -= old.facts.len();
+        }
+        if self.entries.len() > self.max_entries || self.facts > self.max_facts {
+            self.evict();
+        }
+    }
+
+    /// Evicts down to 90 % of both bounds: unreferenced extractions first (least recently used
+    /// first), then referenced ones, which only stop being shared.
+    ///
+    /// ponytail: one sort of all entries per eviction batch; an intrusive LRU list if eviction
+    /// ever shows up in profiles.
+    fn evict(&mut self) {
+        let mut victims: Vec<(bool, u64, CacheKey)> = self
+            .entries
+            .iter()
+            .map(|(key, (extracted, used))| (Arc::strong_count(extracted) > 1, *used, key.clone()))
+            .collect();
+        victims.sort_unstable_by_key(|victim| (victim.0, victim.1));
+        for (_, _, key) in victims {
+            if self.entries.len() * 10 <= self.max_entries * 9
+                && self.facts * 10 <= self.max_facts * 9
+            {
+                break;
+            }
+            if let Some((extracted, _)) = self.entries.remove(&key) {
+                self.facts -= extracted.facts.len();
+            }
+        }
+    }
+
+    /// Extractions held.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the cache holds nothing.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Indexed state of one candidate file.
+struct FileEntry {
+    /// Language owning the file.
+    language: Language,
+    /// `(length, mtime in ns)` when last read; `None` for a clean tracked file known by its blob.
+    stamp: Option<(u64, i128)>,
+    /// What the facts were extracted from.
+    content: ContentKey,
+    /// blake3 of the bytes, once they were read.
+    digest: Option<[u8; 32]>,
+    /// The (possibly shared) extraction.
+    extracted: Arc<Extracted>,
+    /// The worktree fact cap refused this file.
+    over_cap: bool,
+}
+
+impl FileEntry {
+    /// Facts the worktree holds for this file.
+    fn facts(&self) -> &[NameFact] {
+        if self.over_cap {
+            &[]
+        } else {
+            &self.extracted.facts
+        }
+    }
+
+    /// Why the file has no facts, if skipped.
+    fn skipped(&self) -> Option<&'static str> {
+        if self.over_cap {
+            Some(FACTS_CAP)
+        } else {
+            self.extracted.skipped
+        }
+    }
+}
+
 /// One pass over the listed candidates, resumable across refreshes.
 struct Sweep {
-    /// Candidates in path-byte order, at most [`MAX_INDEXED_FILES`].
-    candidates: Vec<(PathBuf, Language)>,
+    /// Candidates in path-byte order, at most [`MAX_INDEXED_FILES`], with the Git blob id of a
+    /// clean tracked file.
+    candidates: Vec<(PathBuf, Language, Option<Box<str>>)>,
     /// Provider-backed candidates listed, at most [`MAX_LISTED_FILES`].
     listed: usize,
     /// Next candidate to visit.
@@ -172,13 +329,25 @@ pub struct NameIndex {
     present: BTreeSet<Language>,
     /// The unfinished sweep, if any.
     sweep: Option<Sweep>,
-    /// Files the last refresh re-read (0 when nothing changed).
+    /// Files the last refresh read (0 when nothing changed or everything came from the cache).
     reread: usize,
+    /// Files the last refresh took from the fact cache instead of extracting them.
+    reused: usize,
+    /// A sweep has completed at least once.
+    built: bool,
+    /// Extractions shared with the other worktrees of the daemon.
+    cache: Arc<Mutex<FactCache>>,
 }
 
 impl NameIndex {
-    /// An empty index of `worktree`; nothing is read until [`NameIndex::refresh`].
+    /// An empty index of `worktree` with a cache of its own; nothing is read until
+    /// [`NameIndex::refresh`].
     pub fn new(worktree: WorktreeRef) -> Self {
+        Self::with_cache(worktree, Arc::default())
+    }
+
+    /// An empty index of `worktree` sharing `cache` with the daemon's other worktree indexes.
+    pub fn with_cache(worktree: WorktreeRef, cache: Arc<Mutex<FactCache>>) -> Self {
         Self {
             worktree,
             files: HashMap::new(),
@@ -187,6 +356,9 @@ impl NameIndex {
             present: BTreeSet::new(),
             sweep: None,
             reread: 0,
+            reused: 0,
+            built: false,
+            cache,
         }
     }
 
@@ -200,13 +372,14 @@ impl NameIndex {
     pub fn refresh(&mut self, deadline: Instant) -> IndexState {
         let started = Instant::now();
         self.reread = 0;
+        self.reused = 0;
         let mut sweep = match self.sweep.take() {
             Some(sweep) => sweep,
             None => self.list(),
         };
         while sweep.cursor < sweep.candidates.len() && Instant::now() < deadline {
-            let (path, language) = sweep.candidates[sweep.cursor].clone();
-            self.visit(&path, language);
+            let (path, language, blob) = sweep.candidates[sweep.cursor].clone();
+            self.visit(&path, language, blob);
             sweep.cursor += 1;
         }
         sweep.elapsed += started.elapsed();
@@ -222,7 +395,7 @@ impl NameIndex {
             self.sweep = Some(sweep);
             return state;
         }
-        let kept: HashSet<&PathBuf> = sweep.candidates.iter().map(|(path, _)| path).collect();
+        let kept: HashSet<&PathBuf> = sweep.candidates.iter().map(|(path, ..)| path).collect();
         let vanished: Vec<PathBuf> = self
             .files
             .keys()
@@ -232,12 +405,9 @@ impl NameIndex {
         for path in vanished {
             self.remove(&path);
         }
-        let indexed = sweep.candidates.len()
-            - self
-                .files
-                .values()
-                .filter(|entry| entry.skipped == Some(FACTS_CAP))
-                .count();
+        self.built = true;
+        let indexed =
+            sweep.candidates.len() - self.files.values().filter(|entry| entry.over_cap).count();
         if indexed == sweep.listed {
             IndexState::Ready
         } else {
@@ -261,7 +431,7 @@ impl NameIndex {
             .flat_map(|file| {
                 let entry = &self.files[file];
                 entry
-                    .facts
+                    .facts()
                     .iter()
                     .filter(|fact| fact.key == *key)
                     .map(|fact| Site {
@@ -284,7 +454,7 @@ impl NameIndex {
                 let (mut defines, mut uses) = (0, 0);
                 for fact in files
                     .iter()
-                    .flat_map(|file| &self.files[file].facts)
+                    .flat_map(|file| self.files[file].facts())
                     .filter(|fact| fact.key == *key)
                 {
                     match fact.role {
@@ -306,7 +476,7 @@ impl NameIndex {
     pub fn facts_in(&self, file: &Path, lines: LineRange) -> Vec<Site> {
         self.files.get(file).map_or_else(Vec::new, |entry| {
             entry
-                .facts
+                .facts()
                 .iter()
                 .filter(|fact| lines.start <= fact.line && fact.line <= lines.end)
                 .map(|fact| Site {
@@ -323,22 +493,38 @@ impl NameIndex {
     /// is returned, so the caller queries again.
     pub fn verify(&mut self, file: &Path, bytes: &[u8]) -> bool {
         let digest = *blake3::hash(bytes).as_bytes();
-        if self
-            .files
-            .get(file)
-            .is_some_and(|entry| entry.digest == digest)
-        {
+        let Some(entry) = self.files.get_mut(file) else {
+            self.reindex(file, bytes);
+            return false;
+        };
+        if entry.digest == Some(digest) {
             return true;
         }
+        // A file known only by its Git blob was never read here: its bytes prove the facts when
+        // they extract to the same facts.
+        if entry.digest.is_none()
+            && let Some(extracted) = extract(entry.language, file, bytes)
+            && extracted.facts == entry.extracted.facts
+            && extracted.skipped == entry.extracted.skipped
+        {
+            entry.digest = Some(digest);
+            return true;
+        }
+        self.reindex(file, bytes);
+        false
+    }
+
+    /// Replaces `file`'s entry with the facts of `bytes` (a render-time read).
+    fn reindex(&mut self, file: &Path, bytes: &[u8]) {
         if let Some(language) =
             Language::for_path(file).filter(|language| language.names().is_some())
             && bytes.len() <= MAX_FILE_BYTES
         {
             let stamp = std::fs::symlink_metadata(self.worktree.worktree_path().join(file))
-                .map_or((bytes.len() as u64, 0), |metadata| stamp_of(&metadata));
-            self.ingest(file, language, stamp, bytes);
+                .ok()
+                .map(|metadata| stamp_of(&metadata));
+            self.ingest(file, language, stamp, bytes, None);
         }
-        false
     }
 
     /// Languages present in the worktree (by the last listing) whose provider covers neither
@@ -425,15 +611,25 @@ impl NameIndex {
         (self.files.len(), self.facts)
     }
 
-    /// Files the last refresh re-read; 0 when nothing changed since the previous one.
+    /// Files the last refresh read; 0 when nothing changed or every change came from the cache.
     pub fn last_reread(&self) -> usize {
         self.reread
+    }
+
+    /// Files the last refresh took from the fact cache instead of extracting them.
+    pub fn last_reused(&self) -> usize {
+        self.reused
+    }
+
+    /// Whether a sweep has completed at least once (the index answers without building).
+    pub fn is_built(&self) -> bool {
+        self.built
     }
 
     /// Skipped files counted by reason.
     pub fn skipped(&self) -> BTreeMap<&'static str, usize> {
         let mut counts = BTreeMap::new();
-        for reason in self.files.values().filter_map(|entry| entry.skipped) {
+        for reason in self.files.values().filter_map(FileEntry::skipped) {
             *counts.entry(reason).or_default() += 1;
         }
         counts
@@ -441,24 +637,26 @@ impl NameIndex {
 
     /// Files whose facts the per-file cap cut short.
     pub fn capped_files(&self) -> usize {
-        self.files.values().filter(|entry| entry.capped).count()
+        self.files
+            .values()
+            .filter(|entry| !entry.over_cap && entry.extracted.capped)
+            .count()
     }
 
     /// Starts a sweep: lists candidates, records present languages, keeps provider-backed files.
+    ///
+    /// In a Git worktree, tracked files come from the index with their blob ids
+    /// (`git ls-files -s`), those whose working copy differs lose theirs (`git diff-files`, which
+    /// answers from Git's stat cache without reading contents), and untracked non-ignored files
+    /// follow (`git ls-files --others --exclude-standard`). Without Git the bounded walk lists
+    /// files without blob ids.
     fn list(&mut self) -> Sweep {
         let root = self.worktree.worktree_path();
-        let paths = crate::checks::fingerprint::git_listed_paths(root)
-            .map(|listed| {
-                listed
-                    .split(|byte| *byte == 0)
-                    .filter(|path| !path.is_empty())
-                    .map(|path| PathBuf::from(OsStr::from_bytes(path)))
-                    .collect()
-            })
-            .unwrap_or_else(|| walk(root));
+        let listed = git_candidates(root)
+            .unwrap_or_else(|| walk(root).into_iter().map(|path| (path, None)).collect());
         self.present.clear();
         let mut candidates = Vec::new();
-        for path in paths {
+        for (path, blob) in listed {
             let Some(language) = Language::for_path(&path) else {
                 continue;
             };
@@ -469,7 +667,7 @@ impl NameIndex {
             if candidates.len() == MAX_LISTED_FILES {
                 break;
             }
-            candidates.push((path, language));
+            candidates.push((path, language, blob));
         }
         candidates.sort_by(|a, b| path_bytes(&a.0).cmp(path_bytes(&b.0)));
         let listed = candidates.len();
@@ -482,108 +680,137 @@ impl NameIndex {
         }
     }
 
-    /// Brings one candidate up to date: unchanged stamps cost one `lstat`.
-    fn visit(&mut self, path: &Path, language: Language) {
+    /// Brings one candidate up to date. A clean tracked file costs nothing when its blob is
+    /// already indexed and no read when the fact cache has it; any other file costs one `lstat`
+    /// when unchanged.
+    fn visit(&mut self, path: &Path, language: Language, blob: Option<Box<str>>) {
+        let content = blob.map(ContentKey::GitBlob);
+        if let Some(content) = &content {
+            if self
+                .files
+                .get(path)
+                .is_some_and(|entry| entry.content == *content && entry.language == language)
+            {
+                return;
+            }
+            let key = CacheKey::of(language, content.clone());
+            let cached = key.and_then(|key| self.cache.lock().ok()?.get(&key));
+            if let Some(extracted) = cached {
+                self.reused += 1;
+                return self.store(path, language, None, content.clone(), None, extracted);
+            }
+        }
         let metadata = match std::fs::symlink_metadata(self.worktree.worktree_path().join(path)) {
             Ok(metadata) if metadata.is_file() => metadata,
             _ => return self.remove(path),
         };
         let stamp = stamp_of(&metadata);
-        if self
-            .files
-            .get(path)
-            .is_some_and(|entry| entry.stamp == stamp && entry.language == language)
+        if content.is_none()
+            && self.files.get(path).is_some_and(|entry| {
+                entry.stamp == Some(stamp)
+                    && entry.language == language
+                    && matches!(entry.content, ContentKey::Digest(_))
+            })
         {
             return;
         }
         self.reread += 1;
         if metadata.len() > MAX_FILE_BYTES as u64 {
-            return self.store(path, language, stamp, [0; 32], Err("large"));
+            let content = content.unwrap_or(ContentKey::Digest([0; 32]));
+            return self.store(path, language, Some(stamp), content, None, skipped("large"));
         }
         let limits =
             SourceReadLimits::new(MAX_SOURCE_PATH_BYTES, MAX_FILE_BYTES).expect("fixed limits");
         match read_authorized_source(&self.worktree, path, limits) {
-            Ok(read) => self.ingest(path, language, stamp, read.contents()),
+            Ok(read) => self.ingest(path, language, Some(stamp), read.contents(), content),
             Err(ObservationError::TooLarge { .. }) => {
-                self.store(path, language, stamp, [0; 32], Err("large"))
+                let content = content.unwrap_or(ContentKey::Digest([0; 32]));
+                self.store(path, language, Some(stamp), content, None, skipped("large"))
             }
             Err(_) => self.remove(path),
         }
     }
 
-    /// Replaces `path`'s facts with those extracted from `bytes`, unless the digest is unchanged.
-    fn ingest(&mut self, path: &Path, language: Language, stamp: (u64, i128), bytes: &[u8]) {
+    /// Indexes `path` from `bytes` just read: the extraction comes from the fact cache when the
+    /// content (`content`, else the digest of `bytes`) was extracted before, else it is extracted
+    /// and cached. An unchanged digest only refreshes the stamp.
+    fn ingest(
+        &mut self,
+        path: &Path,
+        language: Language,
+        stamp: Option<(u64, i128)>,
+        bytes: &[u8],
+        content: Option<ContentKey>,
+    ) {
         let digest = *blake3::hash(bytes).as_bytes();
         if let Some(entry) = self.files.get_mut(path)
-            && entry.digest == digest
+            && entry.digest == Some(digest)
             && entry.language == language
         {
             entry.stamp = stamp;
+            if let Some(content) = content {
+                // Same bytes, newly known by their blob: other worktrees may reuse them.
+                if let Some(key) = CacheKey::of(language, content.clone())
+                    && let Ok(mut cache) = self.cache.lock()
+                {
+                    cache.insert(key, entry.extracted.clone());
+                }
+                entry.content = content;
+            }
             return;
         }
-        let Ok(source) = std::str::from_utf8(bytes) else {
-            return self.store(path, language, stamp, digest, Err("non-utf8"));
-        };
-        let Some(provider) = language.names() else {
+        let content = content.unwrap_or(ContentKey::Digest(digest));
+        let Some(key) = CacheKey::of(language, content.clone()) else {
             return self.remove(path);
         };
-        let mut sink = FactSink::new();
-        let verdict = provider.extract(path, source, &mut sink);
-        let capped = sink.is_capped();
-        let mut facts = sink.into_facts();
-        let held = self.files.get(path).map_or(0, |entry| entry.facts.len());
-        let outcome = match verdict {
-            FileVerdict::Skipped(reason) => Err(reason),
-            FileVerdict::Indexed if self.facts - held + facts.len() > MAX_FACTS_PER_WORKTREE => {
-                Err(FACTS_CAP)
+        let cached = self.cache.lock().ok().and_then(|mut cache| cache.get(&key));
+        let extracted = match cached {
+            Some(extracted) => {
+                self.reused += 1;
+                extracted
             }
-            FileVerdict::Indexed => {
-                facts.sort_by(|a, b| {
-                    (a.line, a.column, a.key.namespace, &a.key.name).cmp(&(
-                        b.line,
-                        b.column,
-                        b.key.namespace,
-                        &b.key.name,
-                    ))
-                });
-                Ok((facts, capped))
+            None => {
+                let Some(extracted) = extract(language, path, bytes) else {
+                    return self.remove(path);
+                };
+                let extracted = Arc::new(extracted);
+                if let Ok(mut cache) = self.cache.lock() {
+                    cache.insert(key, extracted.clone());
+                }
+                extracted
             }
         };
-        self.store(path, language, stamp, digest, outcome);
+        self.store(path, language, stamp, content, Some(digest), extracted);
     }
 
     /// Replaces `path`'s entry atomically: its old facts leave the postings before new ones enter.
+    /// A file whose facts would pass [`MAX_FACTS_PER_WORKTREE`] is kept without facts.
     fn store(
         &mut self,
         path: &Path,
         language: Language,
-        stamp: (u64, i128),
-        digest: [u8; 32],
-        outcome: Result<(Vec<NameFact>, bool), &'static str>,
+        stamp: Option<(u64, i128)>,
+        content: ContentKey,
+        digest: Option<[u8; 32]>,
+        extracted: Arc<Extracted>,
     ) {
         self.remove(path);
-        let (facts, skipped, capped) = match outcome {
-            Ok((facts, capped)) => (facts, None, capped),
-            Err(reason) => (Vec::new(), Some(reason), false),
+        let entry = FileEntry {
+            language,
+            stamp,
+            content,
+            digest,
+            over_cap: self.facts + extracted.facts.len() > MAX_FACTS_PER_WORKTREE,
+            extracted,
         };
-        for fact in &facts {
+        for fact in entry.facts() {
             self.postings
                 .entry(fact.key.clone())
                 .or_default()
                 .insert(path.to_path_buf());
         }
-        self.facts += facts.len();
-        self.files.insert(
-            path.to_path_buf(),
-            FileEntry {
-                language,
-                stamp,
-                digest,
-                facts,
-                skipped,
-                capped,
-            },
-        );
+        self.facts += entry.facts().len();
+        self.files.insert(path.to_path_buf(), entry);
     }
 
     /// Drops `path` and its facts.
@@ -591,8 +818,8 @@ impl NameIndex {
         let Some(entry) = self.files.remove(path) else {
             return;
         };
-        self.facts -= entry.facts.len();
-        for fact in &entry.facts {
+        self.facts -= entry.facts().len();
+        for fact in entry.facts() {
             if let Some(files) = self.postings.get_mut(&fact.key) {
                 files.remove(path);
                 if files.is_empty() {
@@ -608,6 +835,8 @@ impl NameIndex {
 pub struct NameIndexes {
     /// At most [`MAX_WORKTREES`] indexes, keyed by worktree id and incarnation.
     recent: Vec<(WorktreeRef, Arc<Mutex<NameIndex>>)>,
+    /// Extractions shared by every index, keyed by content.
+    cache: Arc<Mutex<FactCache>>,
 }
 
 impl NameIndexes {
@@ -619,6 +848,11 @@ impl NameIndexes {
                 held.id() == worktree.id() && held.incarnation() == worktree.incarnation()
             })
             .map(|(_, index)| index.clone())
+    }
+
+    /// Whether the shared fact cache holds any extraction (another worktree was indexed).
+    pub fn has_cached_facts(&self) -> bool {
+        self.cache.lock().is_ok_and(|cache| !cache.is_empty())
     }
 
     /// Whether an index of `worktree` (this incarnation) is held.
@@ -643,11 +877,105 @@ impl NameIndexes {
         }
         self.recent
             .retain(|(held, _)| held.worktree_path() != worktree.worktree_path());
-        let index = Arc::new(Mutex::new(NameIndex::new(worktree.clone())));
+        let index = Arc::new(Mutex::new(NameIndex::with_cache(
+            worktree.clone(),
+            self.cache.clone(),
+        )));
         self.recent.insert(0, (worktree.clone(), index.clone()));
         self.recent.truncate(MAX_WORKTREES);
         index
     }
+}
+
+/// The extraction of `bytes` for `path` in `language`, facts sorted; `None` without a provider.
+fn extract(language: Language, path: &Path, bytes: &[u8]) -> Option<Extracted> {
+    let provider = language.names()?;
+    let Ok(source) = std::str::from_utf8(bytes) else {
+        return Some(Extracted {
+            facts: Box::new([]),
+            skipped: Some("non-utf8"),
+            capped: false,
+        });
+    };
+    let mut sink = FactSink::new();
+    let verdict = provider.extract(path, source, &mut sink);
+    let capped = sink.is_capped();
+    let mut facts = sink.into_facts();
+    Some(match verdict {
+        FileVerdict::Skipped(reason) => Extracted {
+            facts: Box::new([]),
+            skipped: Some(reason),
+            capped: false,
+        },
+        FileVerdict::Indexed => {
+            facts.sort_by(|a, b| {
+                (a.line, a.column, a.key.namespace, &a.key.name).cmp(&(
+                    b.line,
+                    b.column,
+                    b.key.namespace,
+                    &b.key.name,
+                ))
+            });
+            Extracted {
+                facts: facts.into_boxed_slice(),
+                skipped: None,
+                capped,
+            }
+        }
+    })
+}
+
+/// A factless extraction skipped for `reason`.
+fn skipped(reason: &'static str) -> Arc<Extracted> {
+    Arc::new(Extracted {
+        facts: Box::new([]),
+        skipped: Some(reason),
+        capped: false,
+    })
+}
+
+/// Candidate paths of a Git worktree with the blob id of each clean tracked file, or `None` when
+/// `root` is not a Git worktree or a query fails.
+fn git_candidates(root: &Path) -> Option<Vec<(PathBuf, Option<Box<str>>)>> {
+    use crate::checks::fingerprint::git_output;
+    let staged = git_output(root, &["ls-files", "-s", "-z", "--cached"])?;
+    let modified = git_output(root, &["diff-files", "--name-only", "-z"])?;
+    let others = git_output(root, &["ls-files", "-z", "--others", "--exclude-standard"])?;
+    let modified: HashSet<&[u8]> = modified
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .collect();
+    let mut found = Vec::new();
+    for record in staged.split(|byte| *byte == 0) {
+        // `<mode> <oid> <stage>\t<path>`; conflicted paths (stage > 0) carry no single blob.
+        let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+            continue;
+        };
+        let (meta, path) = (&record[..tab], &record[tab + 1..]);
+        let mut fields = meta.split(|byte| *byte == b' ');
+        let (Some(_mode), Some(oid), Some(stage)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let blob = (stage == b"0" && !modified.contains(path))
+            .then(|| String::from_utf8_lossy(oid).into());
+        if found
+            .last()
+            .is_some_and(|(last, _): &(PathBuf, Option<Box<str>>)| {
+                last.as_os_str().as_bytes() == path
+            })
+        {
+            continue;
+        }
+        found.push((PathBuf::from(OsStr::from_bytes(path)), blob));
+    }
+    found.extend(
+        others
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| (PathBuf::from(OsStr::from_bytes(path)), None)),
+    );
+    Some(found)
 }
 
 /// Raw path bytes, the index's sort key for files.
@@ -1014,6 +1342,122 @@ mod tests {
         assert_eq!(index.source(Path::new("b.beta")), None);
     }
 
+    /// Runs `git` with a fixed identity in `root`.
+    fn git(root: &Path, args: &[&str]) {
+        let status = std::process::Command::new("/usr/bin/git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    /// Two worktrees of one repository share facts by content: the second builds from the cache
+    /// without reading a clean tracked file; an unstaged edit or a branch that changes a file
+    /// gives that worktree its own facts, and the first is unaffected.
+    #[test]
+    fn worktrees_share_facts_by_content() {
+        testing::install();
+        let first = scratch("share-a");
+        git(&first, &["init", "--quiet"]);
+        write(&first, &[("a.alpha", "@btn\n"), ("b.beta", "use:btn\n")]);
+        git(&first, &["add", "--", "."]);
+        git(&first, &["commit", "--quiet", "-m", "one"]);
+        let second = scratch("share-b");
+        std::fs::remove_dir(&*second).unwrap();
+        git(
+            &first,
+            &["worktree", "add", "--quiet", "-b", "other"]
+                .into_iter()
+                .chain([second.to_str().unwrap()])
+                .collect::<Vec<_>>(),
+        );
+        let cache: Arc<Mutex<FactCache>> = Arc::default();
+        let mut a = NameIndex::with_cache(worktree(&first, 1), cache.clone());
+        assert_eq!(a.refresh(far()), IndexState::Ready);
+        assert_eq!((a.last_reread(), a.last_reused()), (2, 0));
+        let mut b = NameIndex::with_cache(worktree(&second, 1), cache.clone());
+        assert_eq!(b.refresh(far()), IndexState::Ready);
+        assert_eq!(
+            (b.last_reread(), b.last_reused()),
+            (0, 2),
+            "no read for clean files"
+        );
+        let key = NameKey::global(ns::CLASS, "btn");
+        assert_eq!(rows(&a.sites(&key)), rows(&b.sites(&key)));
+        assert!(
+            b.verify(Path::new("b.beta"), b"use:btn\n"),
+            "the blob's bytes prove it"
+        );
+
+        // An unstaged edit in the second worktree only.
+        std::thread::sleep(Duration::from_millis(5));
+        write(&second, &[("b.beta", "\nuse:btn\n")]);
+        assert_eq!(b.refresh(far()), IndexState::Ready);
+        assert_eq!(b.last_reread(), 1);
+        assert_eq!(a.refresh(far()), IndexState::Ready);
+        assert_eq!(a.last_reread(), 0);
+        let lines = |index: &NameIndex| -> Vec<u32> {
+            index
+                .sites(&key)
+                .iter()
+                .map(|site| site.fact.line)
+                .collect()
+        };
+        assert_eq!((lines(&a), lines(&b)), (vec![1, 1], vec![1, 2]));
+
+        // A branch that changes a file: a new blob, its own facts.
+        write(&second, &[("a.alpha", "@btn @card\n")]);
+        git(&second, &["commit", "--quiet", "-am", "two"]);
+        assert_eq!(b.refresh(far()), IndexState::Ready);
+        assert_eq!(b.keys_named("card", None).len(), 1);
+        a.refresh(far());
+        assert!(a.keys_named("card", None).is_empty());
+        git(
+            &first,
+            &["worktree", "remove", "--force", second.to_str().unwrap()],
+        );
+    }
+
+    /// Cached facts are keyed by the extractor revision, so a revision bump misses them; the
+    /// cache evicts unreferenced extractions first when a bound is passed.
+    #[test]
+    fn fact_cache_keys_by_revision_and_evicts_unreferenced_first() {
+        testing::install();
+        let content = ContentKey::GitBlob("abc".into());
+        let key = CacheKey::of(ALPHA, content.clone()).unwrap();
+        assert_eq!(key.revision, "1");
+        let mut cache = FactCache {
+            max_entries: 2,
+            ..FactCache::default()
+        };
+        let held = skipped("held");
+        cache.insert(key.clone(), held.clone());
+        let bumped = CacheKey {
+            revision: "2",
+            ..key.clone()
+        };
+        assert!(cache.get(&bumped).is_none());
+        assert!(cache.get(&key).is_some());
+        let other = |name: &str| CacheKey {
+            content: ContentKey::GitBlob(name.into()),
+            ..key.clone()
+        };
+        cache.insert(other("b"), skipped("b"));
+        cache.insert(other("c"), skipped("c"));
+        // Over the bound: the unreferenced, least recently used extraction goes first; the one a
+        // live index still holds stays.
+        assert!(cache.get(&key).is_some());
+        assert!(cache.get(&other("b")).is_none());
+        assert_eq!(cache.len(), 1);
+        drop(held);
+    }
+
     /// The sink drops invalid names and stops at the per-file cap; a capped file is counted.
     #[test]
     fn sink_caps_and_validates_names() {
@@ -1088,8 +1532,8 @@ mod tests {
         // Visit exactly one file, then stop.
         let sweep = index.sweep.as_mut().unwrap();
         sweep.cursor = 1;
-        let (path, language) = sweep.candidates[0].clone();
-        index.visit(&path, language);
+        let (path, language, blob) = sweep.candidates[0].clone();
+        index.visit(&path, language, blob);
         assert_eq!(index.keys_named("a", None).len(), 1);
         assert_eq!(index.refresh(far()), IndexState::Ready);
         assert_eq!(index.keys_named("c", None).len(), 1);

@@ -376,12 +376,13 @@ fn reply_reason(reply: &PeerReply) -> Option<crate::errorlog::ReasonCode> {
     }
 }
 
-/// Records one name-index refresh that re-read files: its state, bucketed file and fact counts
-/// and duration. Nothing names a language, a path or a name; fail-open like every adapter.
+/// Records one name-index refresh that read files or reused cached facts: its state, bucketed
+/// file, fact and reused counts and duration. Nothing names a language, a path or a name; fail-open like every adapter.
 pub fn name_index_refreshed(
     telemetry: &Telemetry,
     state: crate::intelligence::names::IndexState,
     (files, facts): (usize, usize),
+    reused: usize,
     duration: std::time::Duration,
 ) {
     use crate::intelligence::names::IndexState;
@@ -395,6 +396,7 @@ pub fn name_index_refreshed(
         },
         files_bucket: bucket(files),
         facts_bucket: bucket(facts),
+        reused_bucket: bucket(reused),
         duration_ms: u32::try_from(duration.as_millis()).unwrap_or(u32::MAX),
     });
 }

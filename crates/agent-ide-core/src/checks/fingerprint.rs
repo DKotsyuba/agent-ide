@@ -69,24 +69,36 @@ pub fn git_worktree_fingerprint(worktree: &Path) -> Option<u64> {
 /// entry, the child fails, or it exceeds `GIT_BUDGET`. Shared by the fingerprint and the
 /// cross-language name index so both see the same candidate files.
 pub(crate) fn git_listed_paths(worktree: &Path) -> Option<Vec<u8>> {
-    if !worktree.join(".git").exists() {
-        return None;
-    }
-    // Absolute program path, like every other git call of the daemon; `core.fsmonitor` is forced
-    // off because a repository-configured fsmonitor hook would otherwise run unconfined here.
-    let mut child = Command::new("/usr/bin/git")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .args(["-c", "core.fsmonitor=false"])
-        .arg("-C")
-        .arg(worktree)
-        .args([
+    git_output(
+        worktree,
+        &[
             "ls-files",
             "-z",
             "--cached",
             "--others",
             "--exclude-standard",
-        ])
+        ],
+    )
+}
+
+/// The stdout of one read-only `git` query in `worktree`, or `None` when `worktree` has no
+/// `.git` entry, the child fails, or it exceeds `GIT_BUDGET`.
+///
+/// Absolute program path, like every other git call of the daemon; `core.fsmonitor` is forced
+/// off because a repository-configured fsmonitor hook would otherwise run unconfined here. The
+/// stdout pipe is drained on a helper thread so a large answer cannot deadlock the child.
+pub(crate) fn git_output(worktree: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    if !worktree.join(".git").exists() {
+        return None;
+    }
+    let mut child = Command::new("/usr/bin/git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .args(["-c", "core.fsmonitor=false"])
+        .arg("-C")
+        .arg(worktree)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

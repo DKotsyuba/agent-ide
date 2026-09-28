@@ -97,10 +97,13 @@ activation reply) when the bounded presence walk finds files of a language that 
 repository without such files builds nothing. One build runs at a time per worktree: a bridge
 question that arrives while the build holds the index parks as `names:building` (the ordinary
 `pending` path) and is answered from the index once it is done. The `ide.start` card's `links:` line
-gains `(indexed N files, M facts)` once a build of the worktree exists.
+gains `(indexed N files, M facts)` once a build of the worktree has completed; when the shared cache
+can serve the build (another worktree was indexed), the card waits up to 200 ms for it, so a second
+worktree reports the summary at once.
 
-**Telemetry.** A refresh that re-read files records `name_index_refreshed` with the index state,
-bucketed file and fact counts and the duration; it names no language, path or name.
+**Telemetry.** A refresh that read files or reused cached facts records `name_index_refreshed` with
+the index state, bucketed file, fact and reused counts and the duration; it names no language, path
+or name.
 
 **Candidates.** In a Git worktree: `git ls-files -z --cached --others --exclude-standard`, run like
 the check fingerprint (`/usr/bin/git`, fsmonitor off, 5 s budget), so ignored trees never enter.
@@ -108,9 +111,27 @@ Without Git, or when Git fails: a bounded breadth-first walk that skips hidden d
 `.git`, `.hg`, `.venv`, `venv`, `node_modules`, `target`, `dist`. Only files of languages with a
 provider are indexed; every registered language seen is recorded as present.
 
-**Sweep.** A refresh lists candidates, stats each one, and re-reads only files whose `(size, mtime)`
-changed. A blake3 digest confirms the change before the file's facts are replaced, all at once.
-Files no longer listed lose their facts. Every read goes through `read_authorized_source`.
+**Sweep.** A refresh lists candidates and brings each one up to date:
+
+- In a Git worktree, tracked files come from the index with their blob ids (`git ls-files -s`);
+  `git diff-files` (Git's stat cache, no content reads) marks those whose working copy differs, and
+  untracked non-ignored files follow (`git ls-files --others --exclude-standard`). A clean tracked
+  file is identified by its blob id and is not read when its facts are already cached.
+- Every other file (modified, untracked, or any file without Git) is stat'ed and re-read only when
+  its `(size, mtime)` changed; a blake3 digest identifies its content.
+
+A file's facts are replaced all at once; files no longer listed lose theirs. Every read goes
+through `read_authorized_source`.
+
+**Shared facts.** Extractions live in one daemon-level cache (the daemon serves one repository and
+all its worktrees), keyed by `(language, extractor revision, content)` where the content is the Git
+blob id of a clean tracked file or the blake3 digest of the bytes read. A second worktree therefore
+builds from the cache without reading its clean tracked files; files that differ between worktrees
+(another branch, an unstaged edit) have other content keys and their own facts.
+`NameFacts::revision()` is part of the key, so a provider bumps it whenever its extraction changes
+and no fact of an earlier extractor survives. The cache is bounded (see §6); extractions no live
+index uses are evicted first, least recently used first. The per-worktree index keeps only paths,
+content keys, stamps and postings.
 
 **States.**
 
@@ -126,9 +147,10 @@ of the namespace, or that have no provider. Replies must say "unavailable for" t
 
 **Counts are indexed, not live.** A count comes from the last sweep. A same-size rewrite within the
 same mtime nanosecond keeps an undisplayed count stale until the next change. A displayed row is
-always proven: its file is read at render time and `verify(file, bytes)` compares the digest; on a
-mismatch the file is re-extracted from those bytes and the caller queries again, so a stale row never
-reaches a reply.
+always proven: its file is read at render time and `verify(file, bytes)` compares the digest (a file
+known only by its blob id is proven when its bytes extract to the same facts); on a mismatch the
+file is re-extracted from those bytes and the caller queries again, so a stale row never reaches a
+reply.
 
 **Order.** Sites are ordered by file path bytes, then line, column, namespace id and name,
 independent of discovery order.
@@ -143,6 +165,7 @@ independent of discovery order.
 | Facts per file | 5 000 (the file is marked capped) |
 | Facts per worktree | 500 000; a file that would pass it is skipped as `facts cap` |
 | Worktrees kept | 4, least recently used dropped |
+| Shared fact cache | 40 000 extractions and 1 000 000 facts (twice one worktree's bounds; indexes share the cached facts) |
 | Build budget | 20 s of sweeping, resumable |
 | Warm refresh target | ≤ 200 ms at 10 000 unchanged files |
 | Fallback walk | 10 000 directories |

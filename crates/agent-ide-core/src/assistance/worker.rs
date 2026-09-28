@@ -734,6 +734,35 @@ impl Shared {
     }
 }
 
+/// Longest the activation card waits for a running name-index build to report its summary.
+const CARD_INDEX_WAIT: Duration = Duration::from_millis(200);
+
+/// `(files, facts)` of a completed build of `index`; `None` while it is still building (the card
+/// then omits the summary). With `wait` (the shared fact cache can serve the build) it waits up to
+/// [`CARD_INDEX_WAIT`] for the build to complete; otherwise it never delays the card.
+fn built_summary(
+    index: &Arc<Mutex<crate::intelligence::names::NameIndex>>,
+    wait: bool,
+) -> Option<(usize, usize)> {
+    let deadline = std::time::Instant::now()
+        + if wait {
+            CARD_INDEX_WAIT
+        } else {
+            Duration::ZERO
+        };
+    loop {
+        if let Ok(index) = index.try_lock()
+            && index.is_built()
+        {
+            return Some(index.summary());
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// Worst-case bytes one retained Diff page's evidence can hold: Workspace bounds per-path source
 /// content to `MAX_SNAPSHOT_TOTAL_BYTES` and raw patch bytes to `MAX_SNAPSHOT_PATCH_BYTES`
 /// separately, so a single `GitSnapshot` can approach their sum. Charging this fixed worst case
@@ -2612,8 +2641,22 @@ impl<'a> Worker<'a> {
         // tree walk block, so they run on the blocking pool under [`PROJECT_CARD_BUDGET`]. Any
         // timeout, panic, or join failure yields an empty card and the plain activation text;
         // the card must never fail an activation that already succeeded.
+        // Prewarm the name index off the reply path when files of a language that defines names
+        // are present; nothing is built in other repositories. A worktree whose files the daemon
+        // already indexed elsewhere builds from the shared cache in moments, so the card waits
+        // briefly for it and reports the summary.
+        let bridged = {
+            let root = discovered.root().to_path_buf();
+            tokio::task::spawn_blocking(move || links::bridged_files_present(&root))
+                .await
+                .unwrap_or(false)
+        };
+        let reusable = bridged && self.names.has_cached_facts();
+        if bridged {
+            self.prewarm_names(authority.worktree());
+        }
         let names = self.names.get(authority.worktree());
-        let (card, bridged) = {
+        let card = {
             let root = discovered.root().to_path_buf();
             let walk = tokio::task::spawn_blocking(move || {
                 let languages: Vec<LanguageProject> = crate::lang::registered()
@@ -2632,32 +2675,26 @@ impl<'a> Worker<'a> {
                     })
                     .collect();
                 let links = project_card::links_line(&languages);
-                let bridged = links::bridged_files_present(&root);
                 let mut card =
                     project_card::render(&project_card::collect(&root, languages, servers, None));
                 if let Some(links) = links {
                     card.push('\n');
                     card.push_str(&links);
-                    // The index summary, once a build of this worktree exists and is idle.
+                    // The index summary, once a build of this worktree has completed.
                     if let Some((files, facts)) = names
                         .as_ref()
-                        .and_then(|index| index.try_lock().ok().map(|index| index.summary()))
+                        .and_then(|index| built_summary(index, reusable))
                     {
                         card.push_str(&format!(" (indexed {files} files, {facts} facts)"));
                     }
                 }
-                (card, bridged)
+                card
             });
             match tokio::time::timeout(PROJECT_CARD_BUDGET, walk).await {
                 Ok(Ok(card)) => card,
-                Ok(Err(_)) | Err(_) => (String::new(), false),
+                Ok(Err(_)) | Err(_) => String::new(),
             }
         };
-        // Prewarm the name index off the reply path when files of a language that defines names
-        // are present; nothing is built in other repositories.
-        if bridged {
-            self.prewarm_names(authority.worktree());
-        }
         let mut text = format!(
             "activated: epoch {}; baseline: {baseline}",
             authority.epoch(),

@@ -5337,8 +5337,8 @@ async fn configured_product_links_css_html_and_python_names() {
 }
 
 /// `ide.start` prewarms the name index in the background when files of a language that defines
-/// names are present: the activation answers at once, the first bridge card answers inline, and a
-/// later activation card carries the index summary.
+/// names are present: the first bridge card answers inline, and a later activation card carries
+/// the index summary.
 #[tokio::test]
 async fn product_start_prewarms_the_name_index() {
     let fixture = ProductFixture::new(json!([]));
@@ -5354,11 +5354,11 @@ async fn product_start_prewarms_the_name_index() {
         .call(&fixture, "ide.start", json!({"activation_id":"prewarm-1"}))
         .await;
     assert_eq!(started["state"], "complete", "{started}");
+    // The prewarm starts before the card; a small tree may already be indexed when it renders.
     let first = started["text"].as_str().unwrap();
     assert!(
-        first.contains("\nlinks: class, id, style-variable facts from css, html\n")
-            || first.ends_with("\nlinks: class, id, style-variable facts from css, html"),
-        "no index summary before the first build: {first}"
+        first.contains("\nlinks: class, id, style-variable facts from css, html"),
+        "{first}"
     );
     tokio::time::sleep(Duration::from_millis(500)).await;
     let card = actor
@@ -5384,6 +5384,74 @@ async fn product_start_prewarms_the_name_index() {
     assert!(
         text.contains("links: class, id, style-variable facts from css, html (indexed 3 files, "),
         "{text}"
+    );
+    next.call(&fixture, "ide.stop", json!({})).await;
+    next.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A second worktree of the repository inherits the name index by content: its activation card
+/// reports the index summary at once and its first `.btn` card answers inline.
+#[tokio::test]
+async fn product_second_worktree_inherits_the_name_index() {
+    let fixture = ProductFixture::new(json!([]));
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mixed-frontend");
+    for name in ["index.html", "styles.css", "theme.scss"] {
+        std::fs::copy(source.join(name), fixture.root.join(name)).unwrap();
+    }
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "web files"]);
+    let second = fixture.base.join("second");
+    fixture.git(&["worktree", "add", "--quiet", second.to_str().unwrap()]);
+    let mut daemon = fixture.daemon().await;
+    let mut first = ProductActor::new(&fixture, "first-worktree").await;
+    let started = first
+        .call(&fixture, "ide.start", json!({"activation_id":"first"}))
+        .await;
+    assert_eq!(first.settle(&fixture, started).await["kind"], "activation");
+    // The first worktree's cold build fills the shared cache.
+    let card = first
+        .call(&fixture, "ide.symbol", json!({"symbol":"styles.css#.btn"}))
+        .await;
+    let card = first.settle(&fixture, card).await;
+    assert!(
+        card["text"]
+            .as_str()
+            .unwrap()
+            .contains("usages: 2 indexed in 1 files"),
+        "{card}"
+    );
+    first.call(&fixture, "ide.stop", json!({})).await;
+    first.mcp.close().await;
+
+    let mut next = ProductActor::new(&fixture, "second-worktree").await;
+    let started = next
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"second", "root": second}),
+        )
+        .await;
+    let started = next.settle(&fixture, started).await;
+    let text = started["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{started}"));
+    assert!(text.contains("root: "), "{text}");
+    assert!(
+        text.contains("links: class, id, style-variable facts from css, html (indexed 3 files, "),
+        "{text}"
+    );
+    let card = next
+        .call(&fixture, "ide.symbol", json!({"symbol":"styles.css#.btn"}))
+        .await;
+    assert_eq!(card["state"], "complete", "{card}");
+    assert!(
+        card["text"]
+            .as_str()
+            .unwrap()
+            .contains("usages: 2 indexed in 1 files"),
+        "{card}"
     );
     next.call(&fixture, "ide.stop", json!({})).await;
     next.mcp.close().await;
