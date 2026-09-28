@@ -678,6 +678,29 @@ pub fn symbol_card_text(card: &SymbolCard) -> String {
     out
 }
 
+/// Usage rows the card cut after [`MAX_USAGE_LINES`], in the card's order (source files first,
+/// then tests), headed `usages 31–N of N:`; `None` when nothing was cut. Retained behind the
+/// card's `detail_ref` and delivered by `ide.inspect`.
+pub fn hidden_usages_text(card: &SymbolCard) -> Option<String> {
+    let (src, tests): (Vec<_>, Vec<_>) = card.usages.iter().partition(|usage| !usage.is_test);
+    let hidden: Vec<&Usage> = src.into_iter().chain(tests).skip(MAX_USAGE_LINES).collect();
+    if hidden.is_empty() {
+        return None;
+    }
+    let total = card.usages.len();
+    let mut out = format!("usages {}–{total} of {total}:\n", MAX_USAGE_LINES + 1);
+    let width = hidden
+        .iter()
+        .map(|usage| usage.file.len() + 1 + usage.line.to_string().len())
+        .max()
+        .unwrap_or(0);
+    for usage in hidden {
+        let location = format!("{}:{}", usage.file, usage.line);
+        out.push_str(&format!("  {location:<width$}  {}\n", usage.text));
+    }
+    Some(out)
+}
+
 fn render_calls(out: &mut String, label: &str, calls: &[Call]) {
     if calls.is_empty() {
         return;
@@ -869,6 +892,14 @@ mod tests {
         assert!(text.contains("… 5 more (ide.inspect sym-1)"));
         assert!(text.contains("callers: 1\n  a.rs#Owner/caller  a.rs:8\n"));
         assert_eq!(text.matches("run();").count(), MAX_USAGE_LINES);
+        // Sources come first, so the cut rows are the last five tests, in card order.
+        assert_eq!(
+            hidden_usages_text(&card).unwrap(),
+            "usages 31–35 of 35:\n  f1.rs:11  run();\n  f0.rs:16  run();\n  \
+             f2.rs:21  run();\n  f1.rs:26  run();\n  f0.rs:31  run();\n"
+        );
+        card.usages.truncate(MAX_USAGE_LINES);
+        assert_eq!(hidden_usages_text(&card), None);
     }
 
     /// A callers note replaces an empty callers list, and an explicitly answered zero prints

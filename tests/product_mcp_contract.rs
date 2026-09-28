@@ -283,7 +283,13 @@ fn assert_compact_envelope(reply: &Value) {
                 || text.starts_with("page "),
             "{reply}"
         ),
-        ("complete", Some("symbol")) => assert!(body.starts_with("symbol: "), "{reply}"),
+        // A card or an ambiguity list; a later page continues one of them.
+        ("complete", Some("symbol")) => assert!(
+            body.starts_with("symbol: ")
+                || body.starts_with("ambiguous_symbol: ")
+                || (text.starts_with("page ") && !text.starts_with("page 1;")),
+            "{reply}"
+        ),
         ("complete", Some("graph")) => assert!(body.starts_with("graph: "), "{reply}"),
         // `<file>  (<n> lines, <lang>)` outline header.
         ("complete", Some("outline")) => {
@@ -4833,6 +4839,105 @@ async fn configured_product_graph_traverses_live_calls_with_bounds() {
     assert!(callees_text.contains("#c"), "{callees_text}");
     // Struct and enum construction is not a call: non-callables never become nodes.
     assert!(!callees_text.contains("Unit"), "{callees_text}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A symbol card with more than 30 usages and an ambiguity list with more than 20 candidates
+/// keep their first page and name a `detail_ref`; `ide.inspect` then delivers the cut rows.
+#[tokio::test]
+async fn configured_product_symbol_pages_long_usage_and_candidate_lists() {
+    let fixture = symbol_test_fixture();
+    let calls: String = (0..35).map(|_| "    target();\n").collect();
+    let modules: String = (0..22)
+        .map(|index| format!("pub mod m{index} {{\n    pub fn dup() {{}}\n}}\n"))
+        .collect();
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        format!("pub fn target() {{}}\npub fn caller() {{\n{calls}}}\n{modules}"),
+    )
+    .unwrap();
+    std::fs::write(fixture.root.join("tests/path_tests.rs"), "").unwrap();
+    fixture.git(&["add", "--", "src/lib.rs", "tests/path_tests.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "long lists fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "long-lists").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"long-lists"}))
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+
+    let card = actor
+        .call(
+            &fixture,
+            "ide.symbol",
+            json!({"symbol":"src/lib.rs#target", "callers":0}),
+        )
+        .await;
+    let card = actor.settle(&fixture, card).await;
+    assert_eq!(card["kind"], "symbol", "{card}");
+    assert_eq!(card["continuation"], true, "{card}");
+    let reference = card["detail_ref"].as_str().unwrap().to_owned();
+    let text = card["text"].as_str().unwrap();
+    assert!(text.starts_with("page 1; bytes 0-"), "{text}");
+    assert!(
+        text.contains("usages: 35 in 1 files (src 35, tests 0)\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("  … 5 more (ide.inspect {reference})\n")),
+        "{text}"
+    );
+    assert_eq!(text.matches("target();").count(), 30, "{text}");
+    let rest = actor
+        .call(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
+        .await;
+    assert_eq!(rest["continuation"], false, "{rest}");
+    let rest_text = rest["text"].as_str().unwrap();
+    assert!(
+        rest_text.starts_with("page 2 (last); bytes ")
+            && rest_text.contains("; complete\nusages 31–35 of 35:\n"),
+        "{rest_text}"
+    );
+    assert_eq!(rest_text.matches("target();").count(), 5, "{rest_text}");
+    let mut lines: Vec<u32> = [text, rest_text]
+        .iter()
+        .flat_map(|page| page.lines())
+        .filter(|line| line.ends_with("target();"))
+        .map(|line| {
+            let location = line.split_whitespace().next().unwrap();
+            location.rsplit(':').next().unwrap().parse().unwrap()
+        })
+        .collect();
+    lines.sort_unstable();
+    assert_eq!(
+        lines,
+        (3..38).collect::<Vec<u32>>(),
+        "every usage exactly once"
+    );
+
+    let ambiguous = actor
+        .call(&fixture, "ide.symbol", json!({"symbol":"dup"}))
+        .await;
+    let ambiguous = actor.settle(&fixture, ambiguous).await;
+    let reference = ambiguous["detail_ref"].as_str().unwrap().to_owned();
+    let text = ambiguous["text"].as_str().unwrap();
+    assert!(text.contains("dup matches 22 symbols"), "{text}");
+    assert!(
+        text.contains(&format!("  … 2 more (ide.inspect {reference})\n")),
+        "{text}"
+    );
+    let rest = actor
+        .call(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
+        .await;
+    let rest_text = rest["text"].as_str().unwrap();
+    assert!(
+        rest_text.contains("; complete\ncandidates 21–22 of 22:\n"),
+        "{rest_text}"
+    );
+    assert_eq!(rest_text.matches("dup\n").count(), 2, "{rest_text}");
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();

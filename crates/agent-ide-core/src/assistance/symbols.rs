@@ -368,9 +368,16 @@ impl Worker<'_> {
             card.history = history_lines(&worktree_root, &file, found.range).await;
         }
         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
+        if card.usages.len() > render::MAX_USAGE_LINES {
+            card.more_detail = Some(job.reference.clone());
+        }
         let text = render::symbol_card_text(&card);
-        let (reply, page) =
-            ContextPageState::new(text, 0, false, ResultKind::Symbol).next(&job.reference)?;
+        let (reply, page) = ContextPageState::with_tail(
+            text,
+            render::hidden_usages_text(&card),
+            ResultKind::Symbol,
+        )
+        .next(&job.reference)?;
         self.shared.set_context_page(&job.reference, page);
         Ok((reply, Some(authority), Some(observed)))
     }
@@ -795,14 +802,27 @@ impl Worker<'_> {
             "ambiguous_symbol: {requested} matches {} symbols; repeat ide.symbol with one exact path:\n",
             candidates.len()
         );
-        for candidate in candidates.iter().take(20) {
+        for candidate in candidates.iter().take(MAX_CANDIDATE_LINES) {
             text.push_str(&format!("  {candidate}\n"));
         }
-        if candidates.len() > 20 {
-            text.push_str(&format!("  … {} more\n", candidates.len() - 20));
-        }
+        let hidden = candidates.len().saturating_sub(MAX_CANDIDATE_LINES);
+        let tail = (hidden > 0).then(|| {
+            text.push_str(&format!(
+                "  … {hidden} more (ide.inspect {})\n",
+                job.reference
+            ));
+            let total = candidates.len();
+            let mut tail = format!(
+                "candidates {}–{total} of {total}:\n",
+                MAX_CANDIDATE_LINES + 1
+            );
+            for candidate in &candidates[MAX_CANDIDATE_LINES..] {
+                tail.push_str(&format!("  {candidate}\n"));
+            }
+            tail
+        });
         let (reply, page) =
-            ContextPageState::new(text, 0, false, ResultKind::Symbol).next(&job.reference)?;
+            ContextPageState::with_tail(text, tail, ResultKind::Symbol).next(&job.reference)?;
         self.shared.set_context_page(&job.reference, page);
         Ok((reply, Some(authority), None))
     }
@@ -979,6 +999,9 @@ fn is_declaration_line(line: &str) -> bool {
         && !line.starts_with("```")
         && KEYWORDS.iter().any(|keyword| line.starts_with(keyword))
 }
+
+/// Candidates an ambiguity reply prints before the rest moves behind its `detail_ref`.
+const MAX_CANDIDATE_LINES: usize = 20;
 
 /// Where a bare name resolved to.
 pub(super) enum Located {

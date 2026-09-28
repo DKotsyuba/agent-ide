@@ -187,6 +187,10 @@ struct ContextPageState {
     body_start: usize,
     /// One-based number of the page `delivered` is about to produce.
     page: usize,
+    /// Offset in `text` no page before it may extend past: the end of a result's first part (a
+    /// card whose list was cut), so that part reads as before and the retained rest follows on
+    /// later pages. `0` when the text has one part.
+    first_part_end: usize,
 }
 
 impl ContextPageState {
@@ -199,7 +203,20 @@ impl ContextPageState {
             kind,
             body_start,
             page: 1,
+            first_part_end: 0,
         }
+    }
+
+    /// Pages `head` and then `tail`: no page mixes the two, so `head` keeps its own first page
+    /// and `ide.inspect` delivers the retained `tail` after it. Without a tail this is
+    /// [`ContextPageState::new`] over `head`.
+    fn with_tail(head: String, tail: Option<String>, kind: ResultKind) -> Self {
+        let mut state = Self::new(head, 0, false, kind);
+        if let Some(tail) = tail {
+            state.first_part_end = state.text.len();
+            state.text.push_str(&tail);
+        }
+        state
     }
 
     /// Cuts the next line-bounded, byte-exact chunk that provably fits the bounded reply envelope
@@ -233,7 +250,11 @@ impl ContextPageState {
                     .find(|line| line.starts_with("file: "))
             })
             .flatten();
-        let mut len = remaining.len();
+        let mut len = if self.delivered < self.first_part_end {
+            self.first_part_end - self.delivered
+        } else {
+            remaining.len()
+        };
         loop {
             let mut cut = len.min(remaining.len());
             while !remaining.is_char_boundary(cut) {
@@ -290,6 +311,43 @@ impl ContextPageState {
             }
             len = snapped / 2;
         }
+    }
+}
+
+#[cfg(test)]
+mod context_page_tests {
+    use super::*;
+
+    /// Text and continuation flag of a complete reply.
+    fn page(reply: &PeerReply) -> (&str, bool) {
+        match reply {
+            PeerReply::Complete {
+                text, continuation, ..
+            } => (text, *continuation),
+            other => panic!("not a page: {other:?}"),
+        }
+    }
+
+    /// A head that fits one page keeps a page of its own and the tail follows on the next one;
+    /// without a tail the head is one plain page.
+    #[test]
+    fn a_tail_never_shares_the_head_page() {
+        let (first, rest) =
+            ContextPageState::with_tail("head\n".into(), Some("tail\n".into()), ResultKind::Symbol)
+                .next("ref")
+                .unwrap();
+        assert_eq!(page(&first), ("page 1; bytes 0-5 of 10\nhead\n", true));
+        let (second, rest) = rest.unwrap().next("ref").unwrap();
+        assert_eq!(
+            page(&second),
+            ("page 2 (last); bytes 5-10 of 10; complete\ntail\n", false)
+        );
+        assert!(rest.is_none());
+        let (only, rest) = ContextPageState::with_tail("head\n".into(), None, ResultKind::Symbol)
+            .next("ref")
+            .unwrap();
+        assert_eq!(page(&only), ("head\n", false));
+        assert!(rest.is_none());
     }
 }
 
@@ -2317,7 +2375,6 @@ impl<'a> Worker<'a> {
             let paged = matches!(
                 reply,
                 PeerReply::Complete {
-                    kind: ResultKind::Context | ResultKind::Diff,
                     continuation: true,
                     ..
                 }
@@ -2333,7 +2390,8 @@ impl<'a> Worker<'a> {
                 if paged {
                     // Page one just reached the caller through this settlement, so the first
                     // `ide.inspect` of its `detail_ref` must serve page two, not repeat page one
-                    // (T16B). Only a lost receiver leaves the page undelivered and fresh.
+                    // (T16B) — for every paged kind, symbol cards and outlines included. Only a
+                    // lost receiver leaves the page undelivered and fresh.
                     self.shared.mark_page_delivered(&job.reference);
                 }
             }
