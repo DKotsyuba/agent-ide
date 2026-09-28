@@ -255,7 +255,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                     "new_name": {"type": "string", "minLength": 1, "maxLength": 128, "description": "For rename: the new identifier, applied project-wide."},
                     "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES},
                     "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$", "description": "With `path`: inclusive 1-based line range to replace."},
-                    "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Full-file form: the source_ref of the context/read this content is based on."},
+                    "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "The source_ref of the ide.read/ide.context this content is based on; required with `path`+`lines`, optional (but validated) with `symbol`."},
                     "content": {"type": "string", "maxLength": MAX_EDIT_ARGUMENT_CONTENT_BYTES, "description": "Replacement or inserted code, including the symbol's doc comment and attributes."}
                 }
             }),
@@ -410,6 +410,8 @@ pub enum FieldRule {
     Boolean,
     /// The value must be an inclusive 1-based range `start-end` with `start <= end`.
     LineRange,
+    /// The closed method cannot proceed without the `source_ref` of the read its lines came from.
+    RangeEditSourceRef,
 }
 
 impl FieldRule {
@@ -445,6 +447,11 @@ impl FieldRule {
             Self::RequiresProblemsKind => "requires \"kind\":\"problems\"".to_string(),
             Self::Boolean => "must be true or false".to_string(),
             Self::LineRange => "must be an inclusive 1-based range like 120-180".to_string(),
+            Self::RangeEditSourceRef => {
+                "is required for a line-range edit; re-read the lines (ide.read) and retry with \
+                 the new source_ref"
+                    .to_string()
+            }
         }
     }
 }
@@ -857,6 +864,12 @@ pub fn validate_call(
                 if parse_line_range(required_string(object, "lines", 32)?).is_none() {
                     return Err(invalid_field("lines", FieldRule::LineRange));
                 }
+                // Line numbers are only meaningful for the exact content the caller read, so the
+                // range form always names the observation it came from.
+                if !object.contains_key("source_ref") {
+                    return Err(invalid_field("source_ref", FieldRule::RangeEditSourceRef));
+                }
+                required_string(object, "source_ref", MAX_DETAIL_REF_BYTES)?;
             }
             match op {
                 "replace" | "insert" => {
@@ -2417,7 +2430,43 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             "invalid bounded parameters: ide.context needs either \"path\" or \"kind\":\"problems\""
                 .to_string(),
         ),
+        (
+            validate_call(
+                AssistanceTool::Edit,
+                json!({"operation_id":"o","path":"a.rs","lines":"1-2","content":"x"}),
+            )
+            .unwrap_err(),
+            AssistanceTool::Edit,
+            "invalid bounded parameters: \"source_ref\" is required for a line-range edit; \
+             re-read the lines (ide.read) and retry with the new source_ref"
+                .to_string(),
+        ),
     ]
+}
+
+/// A line-range edit carrying the read it came from validates; the symbol form's `source_ref`
+/// stays optional.
+#[test]
+fn range_edit_accepts_the_read_it_came_from() {
+    assert!(
+        validate_call(
+            AssistanceTool::Edit,
+            json!({"operation_id":"o","path":"a.rs","lines":"1-2","source_ref":"s","content":"x"})
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_call(
+            AssistanceTool::Edit,
+            json!({"operation_id":"o","op":"replace","symbol":"a.rs#run","content":"x"})
+        )
+        .is_ok()
+    );
+    assert!(validate_call(
+        AssistanceTool::Edit,
+        json!({"operation_id":"o","op":"replace","symbol":"a.rs#run","source_ref":"s","content":"x"})
+    )
+    .is_ok());
 }
 
 /// Start accepts only absolute, normalized optional working-directory roots.

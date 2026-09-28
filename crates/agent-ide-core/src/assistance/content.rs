@@ -224,6 +224,7 @@ mod tests {
             )
             .expect("fixed successful edit result"),
             diagnostics,
+            note: None,
         }
     }
 
@@ -435,6 +436,7 @@ mod tests {
             let reply = PeerReply::Edit {
                 result: edit_result(outcome).unwrap(),
                 diagnostics: EditDiagnostics::Unknown {},
+                note: None,
             };
             let expected = serde_json::to_value(&reply).unwrap();
             let rendered = render(reply, Envelope::WithStructured).unwrap();
@@ -498,13 +500,42 @@ mod tests {
         let reply = PeerReply::Edit {
             result: edit_result(EditOutcome::StaleSource).unwrap(),
             diagnostics: EditDiagnostics::Unknown {},
+            note: None,
         };
         let rendered = render(reply, Envelope::TextOnly).unwrap();
         let text = text_of(&rendered);
         assert!(text.contains("No write occurred"));
         assert!(text.contains("content/presence changed"));
         assert!(text.contains("newer observation alone does not invalidate"));
+        assert!(
+            text.contains("Re-read the lines (ide.read) and retry with the new source_ref"),
+            "{text}"
+        );
         assert!(!text.contains("source_ref "));
+    }
+
+    /// A formatter that moved lines is stated as the reply's last line, with the reference the
+    /// next edit must use.
+    #[test]
+    fn edit_reply_states_formatter_line_movement() {
+        let mut reply = successful_edit_reply(EditDiagnostics::CurrentClean {});
+        if let PeerReply::Edit { note, .. } = &mut reply {
+            *note = Some(
+                "formatted: +3 lines after line 24; use source_ref sym-9 for the next edit"
+                    .to_owned(),
+            );
+        }
+        let rendered = render(reply, Envelope::TextOnly).unwrap();
+        let text = text_of(&rendered);
+        assert!(
+            text.ends_with(
+                "\nformatted: +3 lines after line 24; use source_ref sym-9 for the next edit"
+            ),
+            "{text}"
+        );
+        // A reply whose formatter moved nothing carries no movement line at all.
+        let unchanged = successful_edit_reply(EditDiagnostics::CurrentClean {});
+        assert!(!text_of(&render(unchanged, Envelope::TextOnly).unwrap()).contains("formatted:"));
     }
 
     /// Keeps exact truncated references in model text and omits unrelated structured field names.
@@ -665,6 +696,7 @@ mod tests {
             PeerReply::Edit {
                 result: edit_result(EditOutcome::ConflictingDuplicate).unwrap(),
                 diagnostics: EditDiagnostics::Unknown {},
+                note: None,
             },
             Envelope::WithStructured,
         )

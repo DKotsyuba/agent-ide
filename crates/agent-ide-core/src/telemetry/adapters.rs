@@ -608,6 +608,7 @@ mod tests {
                 delta: "private diagnostic delta".into(),
                 truncated: false,
             },
+            note: None,
         };
         tool_reply(
             &telemetry,

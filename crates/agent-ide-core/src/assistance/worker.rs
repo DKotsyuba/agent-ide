@@ -87,6 +87,9 @@ struct Job {
     /// Closed failing-stage tag for the terminal error log (T27B); never repository paths or
     /// child output, only fixed tags such as `diff:deadline` or `diff:child_exit:cat-file`.
     failure_detail: Option<String>,
+    /// Set by a symbol or line-range edit whose project formatter moved lines: the reply then
+    /// states the movement so the next line-addressed edit does not reuse stale line numbers.
+    format_note: Option<String>,
     /// `true` once the edit scheduled its project check itself (post-edit diagnostics), so the
     /// reply path must not schedule a second run that would shift the worktree's generation.
     check_scheduled: bool,
@@ -1580,6 +1583,7 @@ impl WorkerHandle {
             stop_reply,
             native_epoch: 0,
             failure_detail: None,
+            format_note: None,
             check_scheduled: false,
             park_until: None,
             stage: None,
@@ -3227,10 +3231,17 @@ impl<'a> Worker<'a> {
                 .has_post_source()
                 .then_some(refreshed)
                 .flatten();
+            // The parked stage resumes the same job that formatted the candidate, so its
+            // movement note still belongs to this reply.
+            let note = job
+                .format_note
+                .take()
+                .filter(|_| result.outcome.has_post_source());
             return Ok((
                 PeerReply::Edit {
                     result,
                     diagnostics,
+                    note,
                 },
                 Some(authority),
                 source,
@@ -3255,6 +3266,7 @@ impl<'a> Worker<'a> {
                     PeerReply::Edit {
                         result,
                         diagnostics: EditDiagnostics::Unknown {},
+                        note: None,
                     },
                     authority,
                     None,
@@ -3270,6 +3282,7 @@ impl<'a> Worker<'a> {
                             source_ref: None,
                         },
                         diagnostics: EditDiagnostics::Unknown {},
+                        note: None,
                     },
                     None,
                     None,
@@ -3482,10 +3495,16 @@ impl<'a> Worker<'a> {
         let source = (result.outcome.has_post_source())
             .then_some(refreshed)
             .flatten();
+        // Only a settled write keeps the formatter's line movement meaningful.
+        let note = job
+            .format_note
+            .take()
+            .filter(|_| result.outcome.has_post_source());
         Ok((
             PeerReply::Edit {
                 result,
                 diagnostics,
+                note,
             },
             Some(authority),
             source,
@@ -3623,6 +3642,7 @@ impl<'a> Worker<'a> {
             PeerReply::Edit {
                 result,
                 diagnostics: EditDiagnostics::Unknown {},
+                note: None,
             },
             authority,
             source,
@@ -4110,12 +4130,13 @@ fn source_matches(source: &SourceObservation) -> bool {
 
 /// Returns the exact same-binding source eligible to authorize a replacement edit.
 ///
-/// Context and a successful prior Edit are the only source-producing details. A prior Edit must
-/// name this exact reference as its post-read source and retain a source observation for the same
-/// requested path; every other detail, missing observation, mismatched binding, or failed edit is
-/// rejected as stale rather than being used to authorize bytes the caller has not observed. A
-/// Context whose pages are not all delivered yet is likewise rejected: its reference denotes the
-/// full observed source, but the caller has only seen part of it (T16B).
+/// Context, a completed Read and a successful prior Edit are the only source-producing details. A
+/// prior Edit must name this exact reference as its post-read source and retain a source
+/// observation for the same requested path; every other detail, missing observation, mismatched
+/// binding, or failed edit is rejected as stale rather than being used to authorize bytes the
+/// caller has not observed. A Context or Read whose pages are not all delivered yet is likewise
+/// rejected: its reference denotes the full observed source, but the caller has only seen part of
+/// it (T16B).
 fn admitted_edit_source(
     detail: &Detail,
     binding: &BindingRef,
@@ -4123,17 +4144,18 @@ fn admitted_edit_source(
     path: &str,
 ) -> Option<SourceObservation> {
     (detail.binding == *binding
-        // A Context source_ref names the complete observed source, but its pages are the only
-        // view the caller has: while any page is still undelivered the caller has not observed
-        // the whole file, so a full-content replace built on it could silently truncate it (T16B).
+        // A Context or Read source_ref names the complete observed source, but its pages are the
+        // only view the caller has: while any page is still undelivered the caller has not
+        // observed the whole file, so a full-content replace built on it could silently truncate
+        // it (T16B).
         && detail.context_page.is_none()
         && matches!(
             detail.selection.0,
-            AssistanceTool::Context | AssistanceTool::Edit
+            AssistanceTool::Context | AssistanceTool::Read | AssistanceTool::Edit
         )
         && match &detail.reply {
             PeerReply::Complete {
-                kind: ResultKind::Context,
+                kind: ResultKind::Context | ResultKind::Read,
                 ..
             } => true,
             PeerReply::Edit { result, .. } => {
@@ -4694,6 +4716,7 @@ mod stop_retry_tests {
             stop_reply: None,
             native_epoch: 0,
             failure_detail: None,
+            format_note: None,
             check_scheduled: false,
             park_until: None,
             stage: None,
@@ -4755,6 +4778,7 @@ mod stop_retry_tests {
             stop_reply: None,
             native_epoch: 0,
             failure_detail: None,
+            format_note: None,
             check_scheduled: false,
             park_until: None,
             stage: None,
@@ -4852,6 +4876,7 @@ mod stop_retry_tests {
             stop_reply: None,
             native_epoch: 0,
             failure_detail: None,
+            format_note: None,
             check_scheduled: false,
             park_until: None,
             stage: None,
@@ -4892,6 +4917,7 @@ mod stop_retry_tests {
             stop_reply: None,
             native_epoch: 0,
             failure_detail: None,
+            format_note: None,
             check_scheduled: false,
             park_until: None,
             stage: None,
@@ -4975,6 +5001,292 @@ mod stop_retry_tests {
         assert_eq!(
             std::fs::read(fixture.root.join("main.rs")).unwrap(),
             b"fn newest() {}\n"
+        );
+    }
+
+    /// Runs one Read job to completion, retrying while it parks, and retains its completed
+    /// detail with the observation `ide.edit` later names as `source_ref`.
+    async fn read_and_retain(
+        worker: &mut Worker<'_>,
+        root: &std::path::Path,
+        actor: &str,
+        binding: &BindingRef,
+        reference: &str,
+        parameters: Value,
+    ) {
+        let invocation = production_call(worker, actor, &format!("{reference}-call"));
+        let (mut job, _cancel) = tool_job(
+            root,
+            invocation,
+            reference,
+            AssistanceTool::Read,
+            parameters.clone(),
+        );
+        let (reply, authority, source) = loop {
+            match worker.read(&mut job).await {
+                Ok(complete) => break complete,
+                Err(FailureCode::ProviderLoading) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(code) => panic!("read {reference} failed: {code:?}"),
+            }
+        };
+        worker.shared.ledger.lock().unwrap().details.insert(
+            reference.to_owned(),
+            Detail {
+                binding: binding.clone(),
+                reply,
+                selection: (AssistanceTool::Read, selection(&parameters)),
+                authority,
+                source,
+                native_epoch: 0,
+                diff_page: None,
+                diff_page_fresh: false,
+                context_page: None,
+                context_page_fresh: false,
+                diff_provenance: None,
+            },
+        );
+    }
+
+    /// Runs one `ide.edit` job to completion and returns its reply.
+    async fn run_edit(
+        worker: &mut Worker<'_>,
+        root: &std::path::Path,
+        reference: &str,
+        parameters: Value,
+    ) -> PeerReply {
+        let invocation = production_call(worker, "line-actor", reference);
+        let (mut job, _cancel) = tool_job(
+            root,
+            invocation,
+            reference,
+            AssistanceTool::Edit,
+            parameters,
+        );
+        loop {
+            match worker.edit(&mut job).await {
+                Ok((reply, _, _)) => return reply,
+                Err(FailureCode::ProviderLoading) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(code) => panic!("edit {reference} failed: {code:?}"),
+            }
+        }
+    }
+
+    /// A line-range edit applies only on a retained same-path observation whose bytes are still
+    /// current, reports the formatter's line movement, and never writes on a refused base; the
+    /// symbol form validates an explicit `source_ref` the same way and stays optional.
+    #[tokio::test]
+    async fn line_and_symbol_edits_gate_on_a_fresh_retained_source() {
+        crate::lang::testing::install();
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join("fmt.toml"), "gamma formatter marker\n").unwrap();
+        let source = "sym card\nsym btn\nmark\nend\nend\n";
+        std::fs::write(fixture.root.join("a.gamma"), source).unwrap();
+        git_commit(&fixture.root, "line-edit fixture");
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        worker.edits.install_schema().await.unwrap();
+        let (binding, _authority) =
+            activate_worktree(&mut worker, "line-actor", "line-start").await;
+
+        // A completed read of the exact lines is an admitted base, and the formatter's added
+        // line is stated so a later line edit does not reuse the pre-format numbers.
+        read_and_retain(
+            &mut worker,
+            &fixture.root,
+            "line-actor",
+            &binding,
+            "line-read",
+            serde_json::json!({"path":"a.gamma","lines":"2-3"}),
+        )
+        .await;
+        let reply = run_edit(
+            &mut worker,
+            &fixture.root,
+            "line-edit",
+            serde_json::json!({
+                "operation_id":"line-1",
+                "path":"a.gamma",
+                "lines":"2-3",
+                "source_ref":"line-read",
+                "content":"sym btn\nmark,x\n"
+            }),
+        )
+        .await;
+        assert!(
+            matches!(
+                &reply,
+                PeerReply::Edit {
+                    result: EditResult {
+                        outcome: ChangesEditOutcome::Replaced,
+                        source_ref: Some(reference),
+                        ..
+                    },
+                    note: Some(note),
+                    ..
+                } if reference == "line-edit"
+                    && note == "formatted: +1 lines after line 3; use source_ref line-edit for the next edit"
+            ),
+            "{reply:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("a.gamma")).unwrap(),
+            "sym card\nsym btn\nmark\nx\nend\nend\n"
+        );
+
+        // The file changed after the read: the edit is refused with no write at all.
+        std::fs::write(fixture.root.join("a.gamma"), source).unwrap();
+        read_and_retain(
+            &mut worker,
+            &fixture.root,
+            "line-actor",
+            &binding,
+            "stale-read",
+            serde_json::json!({"path":"a.gamma","lines":"2-3"}),
+        )
+        .await;
+        std::fs::write(
+            fixture.root.join("a.gamma"),
+            "sym card\nsym other\nmark\nend\nend\n",
+        )
+        .unwrap();
+        let reply = run_edit(
+            &mut worker,
+            &fixture.root,
+            "stale-edit",
+            serde_json::json!({
+                "operation_id":"line-stale",
+                "path":"a.gamma",
+                "lines":"2-3",
+                "source_ref":"stale-read",
+                "content":"sym btn\nmark\n"
+            }),
+        )
+        .await;
+        assert!(
+            matches!(
+                &reply,
+                PeerReply::Edit {
+                    result: EditResult {
+                        outcome: ChangesEditOutcome::StaleSource,
+                        source_ref: None,
+                        ..
+                    },
+                    note: None,
+                    ..
+                }
+            ),
+            "{reply:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("a.gamma")).unwrap(),
+            "sym card\nsym other\nmark\nend\nend\n"
+        );
+
+        // A reference that was never issued is refused the same way, before any write.
+        let reply = run_edit(
+            &mut worker,
+            &fixture.root,
+            "garbled-edit",
+            serde_json::json!({
+                "operation_id":"line-garbled",
+                "path":"a.gamma",
+                "lines":"2-3",
+                "source_ref":"no-such-observation",
+                "content":"sym btn\nmark\n"
+            }),
+        )
+        .await;
+        assert!(
+            matches!(
+                &reply,
+                PeerReply::Edit {
+                    result: EditResult {
+                        outcome: ChangesEditOutcome::StaleSource,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "{reply:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("a.gamma")).unwrap(),
+            "sym card\nsym other\nmark\nend\nend\n"
+        );
+
+        // The symbol form resolves its own range, so its source_ref is optional — but when one
+        // is given it is held to the same retained-and-current rule.
+        std::fs::write(fixture.root.join("a.gamma"), source).unwrap();
+        let reply = run_edit(
+            &mut worker,
+            &fixture.root,
+            "symbol-no-ref",
+            serde_json::json!({
+                "operation_id":"symbol-1",
+                "op":"replace",
+                "symbol":"a.gamma#card/btn",
+                "content":"sym btn\nend\n"
+            }),
+        )
+        .await;
+        assert!(
+            matches!(
+                &reply,
+                PeerReply::Edit {
+                    result: EditResult {
+                        outcome: ChangesEditOutcome::Replaced,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "{reply:?}"
+        );
+        let symbol_source = std::fs::read(fixture.root.join("a.gamma")).unwrap();
+        read_and_retain(
+            &mut worker,
+            &fixture.root,
+            "line-actor",
+            &binding,
+            "symbol-read",
+            serde_json::json!({"symbol":"a.gamma#card/btn"}),
+        )
+        .await;
+        let reply = run_edit(
+            &mut worker,
+            &fixture.root,
+            "symbol-bad-ref",
+            serde_json::json!({
+                "operation_id":"symbol-2",
+                "op":"replace",
+                "symbol":"a.gamma#card/btn",
+                "source_ref":"also-not-issued",
+                "content":"sym btn\nend\n"
+            }),
+        )
+        .await;
+        assert!(
+            matches!(
+                &reply,
+                PeerReply::Edit {
+                    result: EditResult {
+                        outcome: ChangesEditOutcome::StaleSource,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "{reply:?}"
+        );
+        assert_eq!(
+            std::fs::read(fixture.root.join("a.gamma")).unwrap(),
+            symbol_source
         );
     }
 
@@ -5135,6 +5447,7 @@ mod stop_retry_tests {
             stop_reply: None,
             native_epoch: 0,
             failure_detail: None,
+            format_note: None,
             check_scheduled: false,
             park_until: None,
             stage: None,
@@ -5237,6 +5550,7 @@ mod stop_retry_tests {
                 stop_reply: None,
                 native_epoch: 0,
                 failure_detail: None,
+                format_note: None,
                 check_scheduled: false,
                 park_until: None,
                 stage: None,
@@ -5986,6 +6300,7 @@ mod stop_retry_tests {
                 stop_reply: None,
                 native_epoch: 0,
                 failure_detail: None,
+                format_note: None,
                 check_scheduled: false,
                 park_until: None,
                 stage: None,
@@ -6078,6 +6393,7 @@ mod stop_retry_tests {
                 stop_reply: None,
                 native_epoch: 0,
                 failure_detail: None,
+                format_note: None,
                 check_scheduled: false,
                 park_until: None,
                 stage: None,
@@ -6288,6 +6604,7 @@ mod stop_retry_tests {
                         stop_reply: None,
                         native_epoch: 0,
                         failure_detail: None,
+                        format_note: None,
                         check_scheduled: false,
                         park_until: None,
                         stage: None,

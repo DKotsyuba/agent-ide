@@ -1447,6 +1447,42 @@ impl Worker<'_> {
         // Observe again right before splicing so the base is the exact text being replaced.
         let (observed, bytes) = self.observe(&binding, file.clone()).await?;
         let source = observed_text(&observed, &bytes)?.to_owned();
+        let path = file.display().to_string();
+        // An explicit `source_ref` (mandatory for the line-range form) must name a retained
+        // same-path observation whose bytes are still the file's current ones: the splice's line
+        // numbers and the symbol's range are only meaningful for the content the caller read.
+        // Anything else is refused before any write, exactly as a changed full-file base is.
+        let base = match job.parameters.get("source_ref").and_then(Value::as_str) {
+            Some(reference) => {
+                let retained = self.shared.ledger.lock().ok().and_then(|ledger| {
+                    ledger
+                        .details
+                        .get(reference)
+                        .and_then(|detail| admitted_edit_source(detail, &binding, reference, &path))
+                });
+                match retained {
+                    Some(retained) if retained.bytes() == observed.bytes() => retained,
+                    _ => {
+                        let authority = self.authority(&binding).await.ok();
+                        return Ok((
+                            PeerReply::Edit {
+                                result: EditResult {
+                                    operation_id,
+                                    path,
+                                    outcome: ChangesEditOutcome::StaleSource,
+                                    source_ref: None,
+                                },
+                                diagnostics: EditDiagnostics::Unknown {},
+                                note: None,
+                            },
+                            authority,
+                            None,
+                        ));
+                    }
+                }
+            }
+            None => observed.clone(),
+        };
         let total = lang::line_count(&source);
         let candidate = match (&op[..], &splice) {
             ("delete", Splice::Replace(range)) => {
@@ -1468,7 +1504,15 @@ impl Worker<'_> {
             }
             _ => return Err(FailureCode::Internal),
         };
-        let candidate = self.format_candidate(&observed, &file, candidate).await;
+        let spliced_lines = lang::line_count(&candidate);
+        let formatted = self.format_candidate(&observed, &file, candidate).await;
+        job.format_note = formatted_note(
+            spliced_lines,
+            &formatted,
+            &job.reference,
+            splice_end(&splice),
+        );
+        let candidate = formatted;
         let request = EditRequest::new(
             &operation_id,
             file.display().to_string(),
@@ -1488,6 +1532,7 @@ impl Worker<'_> {
                     PeerReply::Edit {
                         result,
                         diagnostics: EditDiagnostics::Unknown {},
+                        note: None,
                     },
                     authority,
                     None,
@@ -1495,8 +1540,7 @@ impl Worker<'_> {
             }
             Err(_) => return Err(FailureCode::Internal),
         };
-        self.edit_with_source(job, request, prepared, observed)
-            .await
+        self.edit_with_source(job, request, prepared, base).await
     }
 
     /// Runs the project's stdin formatter over a candidate text; the candidate is returned
@@ -1668,6 +1712,31 @@ impl Worker<'_> {
 enum Splice {
     Replace(LineRange),
     Insert(lang::InsertSite),
+}
+
+/// Last pre-format line the operation touched: everything after it shifts when the formatter
+/// moves lines.
+fn splice_end(splice: &Splice) -> u32 {
+    match splice {
+        Splice::Replace(range) => range.end,
+        Splice::Insert(site) => site.line,
+    }
+}
+
+/// States the formatter's line movement when it changed the file's line count, so a later
+/// line-addressed edit re-reads instead of reusing the pre-format line numbers.
+fn formatted_note(
+    spliced_lines: u32,
+    formatted: &str,
+    reference: &str,
+    anchor: u32,
+) -> Option<String> {
+    let shift = i64::from(lang::line_count(formatted)) - i64::from(spliced_lines);
+    (shift != 0).then(|| {
+        format!(
+            "formatted: {shift:+} lines after line {anchor}; use source_ref {reference} for the next edit"
+        )
+    })
 }
 
 /// Replaces the inclusive line range with `content` (a trailing newline is added when missing;

@@ -109,9 +109,10 @@ edit: {{ result.outcome }}; path {{ result.path }}; source_ref {{ result.source_
 {%- elif diagnostics.state == "pending" -%}
 edit: {{ result.outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: pending. Next: use ide.inspect with detail_ref {{ diagnostics.detail_ref }}
 {%- endif -%}
+{%- if note %}{{ "\n" }}{{ note }}{%- endif %}
 {%- endif -%}
 {%- if state == "edit" and result.outcome == "stale_source" -%}
-edit: stale_source; path {{ result.path }}. No write occurred. The source reference is incomplete or unavailable for this binding, or the file content/presence changed since context; a newer observation alone does not invalidate unchanged content. Use ide.context before another edit, and read every page of a paged context (ide.inspect) first
+edit: stale_source; path {{ result.path }}. No write occurred. The source reference is incomplete or unavailable for this binding, or the file content/presence changed since it was read; a newer observation alone does not invalidate unchanged content. Re-read the lines (ide.read) and retry with the new source_ref, and read every page of a paged read (ide.inspect) first
 {%- endif -%}
 {%- if state == "edit" and result.outcome == "conflicting_duplicate" -%}
 edit: conflicting_duplicate; path {{ result.path }}. No write occurred; use ide.context to inspect the target before a new operation_id

@@ -749,9 +749,18 @@ pub(crate) mod testing {
                 })
                 .expect("a test language")
         }
-        /// Never detects a project.
-        fn detect(&self, _root: &Path) -> Option<LanguageProject> {
-            None
+        /// Never detects a project, except gamma: a root `fmt.toml` marks a project whose only
+        /// command is the stdin formatter below, so core tests can exercise a formatting edit
+        /// without a real toolchain.
+        fn detect(&self, root: &Path) -> Option<LanguageProject> {
+            (self.0 == "gamma" && root.join("fmt.toml").exists()).then(|| LanguageProject {
+                language: self.language(),
+                manifests: vec![PathBuf::from("fmt.toml")],
+                environment: Vec::new(),
+                interpreter: None,
+                commands: ProjectCommands::default(),
+                entry_points: Vec::new(),
+            })
         }
         /// An outline with no symbols.
         fn normalize(
@@ -848,17 +857,19 @@ pub(crate) mod testing {
                 symbols,
             })
         }
-        /// No formatter.
+        /// No formatter except gamma's stdin `tr`, which turns every comma into a line break so
+        /// a test candidate's line count visibly moves.
         fn format_command(&self, _project: &LanguageProject, _file: &Path) -> Option<Vec<String>> {
             None
         }
-        /// No formatter.
+        /// Gamma formats stdin by splitting on commas; no other test language formats.
         fn format_stdin_command(
             &self,
             _project: &LanguageProject,
             _file: &Path,
         ) -> Option<Vec<String>> {
-            None
+            (self.0 == "gamma")
+                .then(|| vec!["/usr/bin/tr".to_owned(), ",".to_owned(), "\n".to_owned()])
         }
     }
 

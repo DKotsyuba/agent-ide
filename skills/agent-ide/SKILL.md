@@ -72,8 +72,15 @@ which the reply says `unknown` and `ide.context` shows the result when it lands.
 - `ide.edit {"operation_id":"…","op":"delete","symbol":"…"}` — removes the symbol with its header.
 - `ide.edit {"operation_id":"…","op":"rename","symbol":"…","new_name":"…"}` — project-wide rename
   by the language server; the reply lists every touched file.
-- `ide.edit {"operation_id":"…","path":"src/x.rs","lines":"120-180","content":"…"}` — replaces a
-  line range when the target is not a symbol (imports, constants, configuration).
+- `ide.edit {"operation_id":"…","path":"src/x.rs","lines":"120-180","source_ref":"…","content":"…"}` —
+  replaces a line range when the target is not a symbol (imports, constants, configuration).
+  `source_ref` is required: the `ide.read` the lines came from. The edit is refused
+  `stale_source` (no write) when that read no longer matches the file — re-read the lines
+  (ide.read) and retry with the new `source_ref`. The symbol forms take `source_ref` too
+  (optional; validated when given).
+- When a reply's last line reads `formatted: +N lines after line X; use source_ref …`, the
+  formatter moved lines: any further line-range edit must start from a fresh `ide.read`, not
+  from the line numbers you held before the edit.
 
 Symbol paths are `file#Owner/name`: `#` separates the file, `/` is nesting (impl, class,
 namespace, module → member). Inherent `impl Foo` members are addressed as `Foo/method`;

@@ -330,6 +330,12 @@ pub enum PeerReply {
         /// Closed diagnostic projection for the exact post-read source generation.
         #[serde(default)]
         diagnostics: EditDiagnostics,
+        /// Present only when the project's formatter moved lines after the edited region, so a
+        /// later line-addressed edit does not reuse the pre-format line numbers. Always
+        /// serialized (`null` when absent; the strict template reads it), and absent from an
+        /// older envelope, decoding as `None`.
+        #[serde(default)]
+        note: Option<String>,
     },
 }
 impl std::fmt::Debug for PeerReply {
