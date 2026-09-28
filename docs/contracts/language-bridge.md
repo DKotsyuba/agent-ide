@@ -1,6 +1,6 @@
 # Language bridge contract (cross-language name facts)
 
-Revision: stage 3. Provider: Agent IDE core. Consumers: language crates (providers) and the core's
+Revision: stage 4. Provider: Agent IDE core. Consumers: language crates (providers) and the core's
 tool integration (planned).
 
 ## Implementation status
@@ -12,7 +12,7 @@ tool integration (planned).
 | Worker glue (`assistance/links.rs`): refresh on the blocking pool, park while building | implemented |
 | Style-sheet provider (`agent-ide-lang-css`: CSS, SCSS, Sass, LESS), §7 | implemented |
 | HTML provider (`agent-ide-lang-html`), §8 | implemented |
-| JSX provider | planned (stage 4) |
+| TypeScript/JavaScript provider (`agent-ide-lang-typescript`, JSX included), §9 | implemented |
 | Bridge data in `ide.symbol`, `ide.read` of sigil addresses and the `ide.start` card (tools-v0.4 §2.3.1) | implemented |
 | Link edges in `ide.graph` | planned (stage 5) |
 
@@ -205,3 +205,30 @@ holding one, yield no fact.
 
 **Skips.** `*.min.*` files and files whose average line exceeds 2 000 bytes are
 `Skipped("minified")`.
+
+## 9. TypeScript provider
+
+`agent-ide-lang-typescript` states name facts for its files (`.ts`, `.tsx`, `.js`, `.jsx`, `.mts`,
+`.cts`, `.mjs`, `.cjs`). Scripts only use names: coverage is `class/v1` use and `id/v1` use.
+
+**Scanner.** A lexical scan (no parser) produces identifiers, punctuation, string literals and
+template literals (nested `${…}` tracked), skipping comments and regular-expression literals.
+Regex versus division is decided from the previous token (`</` closes a JSX element, it is not a
+regex); a quoted string never spans a line, so an apostrophe in JSX text costs at most the rest of
+that line.
+
+| Syntax | Fact |
+|---|---|
+| `className="a b"`, `class="a b"`, `className={"a b"}` | `Use class a`, `Use class b`, exact |
+| a template literal there | static tokens that touch no `${…}`, `Heuristic("template literal")` |
+| inside `className={…}`: string literals and object keys within `clsx`, `classnames`, `classNames`, `cx`, `cn`, `twMerge`, `twJoin` | `Heuristic("clsx call")` |
+| any other string literal inside `className={…}` | `Heuristic("expression")` |
+| `getElementById("x")` | `Use id x`, exact |
+| `querySelector("#x")` / `querySelector(".x")` / `querySelectorAll(…)` with one simple selector | `Use id x` / `Use class x`, exact |
+
+Strings with escapes and compound selectors name nothing. `*.min.*` files and files whose average
+line exceeds 2 000 bytes are `Skipped("minified")`.
+
+**Cost.** A symbol card consults the index only when the symbol's own file states a fact inside
+the symbol (checked from the observed bytes), so cards of ordinary code keep their latency. Bare
+names consult the index only when a language that defines names (style sheets, markup) is present.

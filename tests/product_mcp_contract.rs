@@ -5176,7 +5176,10 @@ async fn product_style_sheets_answer_symbol_tools_without_a_server() {
 /// project card's `links:` line, and a native edit reflected by the very next query.
 #[tokio::test]
 async fn configured_product_links_css_html_and_python_names() {
-    let fixture = ProductFixture::new(json!([accepted_pyright_provider("links-pyright-cache")]));
+    let fixture = ProductFixture::new(json!([
+        accepted_pyright_provider("links-pyright-cache"),
+        accepted_typescript_provider()
+    ]));
     fixture.git(&[
         "rm",
         "--quiet",
@@ -5187,7 +5190,16 @@ async fn configured_product_links_css_html_and_python_names() {
         "main.go",
     ]);
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mixed-frontend");
-    for name in ["index.html", "styles.css", "theme.scss", "app.py"] {
+    std::fs::create_dir_all(fixture.root.join("src")).unwrap();
+    for name in [
+        "index.html",
+        "styles.css",
+        "theme.scss",
+        "app.py",
+        "tsconfig.json",
+        "src/Button.tsx",
+        "src/Menu.tsx",
+    ] {
         std::fs::copy(source.join(name), fixture.root.join(name)).unwrap();
     }
     fixture.git(&["add", "--", "."]);
@@ -5202,7 +5214,7 @@ async fn configured_product_links_css_html_and_python_names() {
         started["text"]
             .as_str()
             .unwrap()
-            .contains("\nlinks: class, id, style-variable facts from css, html"),
+            .contains("\nlinks: class, id, style-variable facts from typescript, css, html"),
         "{started}"
     );
     let symbol = async |actor: &mut ProductActor, requested: &str| {
@@ -5220,9 +5232,11 @@ async fn configured_product_links_css_html_and_python_names() {
         "symbol: .btn — symbol, styles.css#.btn (lines 2–4)\nsignature: .btn\n\
          definition styles.css#.btn  (lines 2–4)\n\
          defines: class name btn — also styles.css:6 .layout .btn, theme.scss:2 .btn\n\
-         usages: 2 indexed in 1 files (src 2, tests 0)\n\
-         \x20 index.html:5  [html] <button class=\"btn btn-primary\">Save</button>\n\
-         \x20 index.html:6  [html ~template] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n\
+         usages: 4 indexed in 3 files (src 4, tests 0)\n\
+         \x20 index.html:5      [html] <button class=\"btn btn-primary\">Save</button>\n\
+         \x20 index.html:6      [html ~template] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n\
+         \x20 src/Button.tsx:2  [typescript] return <button className=\"btn\">Save</button>;\n\
+         \x20 src/Menu.tsx:3    [typescript ~clsx call] return <nav className={clsx(\"btn\", { \"btn-lg\": props.big })}>Menu</nav>;\n\
          \x20 (~ = heuristic match, not proven)\n\
          links: 1 style variable used here\n\
          \x20 --brand  → theme.scss:1 :root\n\
@@ -5241,14 +5255,16 @@ async fn configured_product_links_css_html_and_python_names() {
     );
     assert_eq!(
         symbol(&mut actor, ".btn").await,
-        "symbol: .btn — class name, 3 rules, 2 usages in 1 files (css, html)\n\
+        "symbol: .btn — class name, 3 rules, 4 usages in 3 files (typescript, css, html)\n\
          definitions:\n\
          \x20 styles.css:2  [css] .btn  (styles.css#.btn, lines 2–4)\n\
          \x20 styles.css:6  [css] .layout .btn  (styles.css#.layout .btn, lines 6)\n\
          \x20 theme.scss:2  [css] .btn  (theme.scss#.btn, lines 2–4)\n\
-         usages: 2 indexed in 1 files (src 2, tests 0)\n\
-         \x20 index.html:5  [html] <button class=\"btn btn-primary\">Save</button>\n\
-         \x20 index.html:6  [html ~template] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n\
+         usages: 4 indexed in 3 files (src 4, tests 0)\n\
+         \x20 index.html:5      [html] <button class=\"btn btn-primary\">Save</button>\n\
+         \x20 index.html:6      [html ~template] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n\
+         \x20 src/Button.tsx:2  [typescript] return <button className=\"btn\">Save</button>;\n\
+         \x20 src/Menu.tsx:3    [typescript ~clsx call] return <nav className={clsx(\"btn\", { \"btn-lg\": props.big })}>Menu</nav>;\n\
          \x20 (~ = heuristic match, not proven)\n\
          unavailable for: python\n"
     );
@@ -5256,7 +5272,12 @@ async fn configured_product_links_css_html_and_python_names() {
         symbol(&mut actor, "btn").await,
         "ambiguous_symbol: btn matches 2 symbols; repeat ide.symbol with one exact path:\n\
          \x20 app.py#btn\n\
-         \x20 .btn  (class name: 3 rules, 2 usages)\n"
+         \x20 .btn  (class name: 3 rules, 4 usages)\n"
+    );
+    let button = symbol(&mut actor, "src/Button.tsx#Button").await;
+    assert!(
+        button.contains("links: 1 class name used here\n  .btn  → styles.css:2 .btn, styles.css:6 .layout .btn (+1 more)\n"),
+        "{button}"
     );
     let read = actor
         .call(&fixture, "ide.read", json!({"symbol":".btn"}))
@@ -5277,9 +5298,9 @@ async fn configured_product_links_css_html_and_python_names() {
     let after = symbol(&mut actor, "styles.css#.btn").await;
     assert!(
         after.contains(
-            "usages: 1 indexed in 1 files (src 1, tests 0)\n\
-             \x20 index.html:5  [html ~template] <a href=\"#main\""
-        ) && !after.contains("<button"),
+            "usages: 3 indexed in 3 files (src 3, tests 0)\n\
+             \x20 index.html:5      [html ~template] <a href=\"#main\""
+        ) && !after.contains("<button class="),
         "{after}"
     );
     actor.call(&fixture, "ide.stop", json!({})).await;

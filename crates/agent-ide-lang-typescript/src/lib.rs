@@ -1,6 +1,7 @@
 //! The TypeScript language (JavaScript files included) for Agent IDE: symbol support over
 //! typescript-language-server document symbols, confined `tsc` project checks, the release-pinned
-//! TypeScript server integration, and the registration entry [`LANGUAGE`].
+//! TypeScript server integration, cross-language name facts (class and element-id uses from JSX
+//! and DOM queries), and the registration entry [`LANGUAGE`].
 //!
 //! Depends only on `agent-ide-core`; the application registers [`LANGUAGE`] at startup.
 
@@ -8,6 +9,7 @@ use agent_ide_core::lang::{Language, LanguageDescriptor};
 
 pub mod backend;
 pub mod checks;
+pub mod names;
 pub mod profile;
 pub mod support;
 
@@ -21,7 +23,7 @@ pub static DESCRIPTOR: LanguageDescriptor = LanguageDescriptor {
     support: &support::TypeScript,
     checks: Some(&checks::TypeScriptChecks),
     server: Some(&backend::TypeScriptServer),
-    names: None,
+    names: Some(&names::TsFacts),
 };
 
 /// The TypeScript language handle.

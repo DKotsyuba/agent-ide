@@ -2621,8 +2621,10 @@ impl<'a> Worker<'a> {
                     .collect();
                 // The daemon does not probe language servers at start; every detected language's
                 // server state is the honest "not started" until a later tool observes otherwise.
+                // Only languages that have a server get a server state.
                 let servers = languages
                     .iter()
+                    .filter(|project| project.language.server().is_some())
                     .map(|project| CardServerState {
                         language: project.language,
                         state: "not started".to_owned(),

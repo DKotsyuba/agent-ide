@@ -54,14 +54,35 @@ fn bridged() -> bool {
         .any(|language| language.names().is_some())
 }
 
-/// Whether the bounded presence walk of `root` finds a file of a language with name facts.
-fn bridged_files_present(root: &Path) -> bool {
+/// Whether the bounded presence walk of `root` finds a file of a language that defines names
+/// (a bare name can only name a key something defines; languages that only use names, such as
+/// scripts, do not make a project bridged on their own).
+pub(super) fn bridged_files_present(root: &Path) -> bool {
     let extensions: Vec<&str> = crate::lang::registered()
         .iter()
-        .filter(|language| language.names().is_some())
+        .filter(|language| {
+            language
+                .names()
+                .is_some_and(|names| names.coverage().iter().any(|coverage| coverage.defines))
+        })
         .flat_map(|language| language.descriptor().extensions.iter().copied())
         .collect();
     crate::lang::text::has_files_with(root, &extensions)
+}
+
+/// Whether `file`'s own language states a name fact on `range` of `bytes`.
+fn has_facts_in(file: &Path, bytes: &[u8], range: LineRange) -> bool {
+    let (Some(names), Ok(source)) = (
+        Lang::for_path(file).and_then(Lang::names),
+        std::str::from_utf8(bytes),
+    ) else {
+        return false;
+    };
+    let mut sink = crate::lang::names::FactSink::new();
+    names.extract(file, source, &mut sink);
+    sink.facts()
+        .iter()
+        .any(|fact| range.start <= fact.line && fact.line <= range.end)
 }
 
 /// `sigil + name` of a key, with its domain when scoped.
@@ -222,6 +243,11 @@ impl Worker<'_> {
         found: &Symbol,
         card: &mut SymbolCard,
     ) -> Result<(), FailureCode> {
+        // The file's own facts decide first, from the observed bytes: a symbol without name facts
+        // (most code) never touches the index, so its card costs nothing extra.
+        if !has_facts_in(file, bytes, found.range) {
+            return Ok(());
+        }
         let (index, state) = self.name_index(job, worktree).await?;
         let own_file = file.to_path_buf();
         let (file, bytes) = (file.to_path_buf(), bytes.to_vec());
