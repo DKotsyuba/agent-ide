@@ -51,7 +51,7 @@ error: ambiguous_symbol; 3 candidates:
 ### Lines and coordinates in output
 
 - Lines are 1-based, as in editors and compilers; locations use `file:line[:column]`.
-- Code fragments include line numbers on the left.
+- Code fragments include line numbers on the left, followed by one tab before the code: `906\t/// Establishes one exact start binding …`. A tab is the separator agents already strip from their own read tool, so a copied line never keeps separator spaces.
 
 ### Readiness and waiting
 
@@ -247,11 +247,11 @@ Output is code with line numbers and the header included:
 
 ```text
 src/assistance/host_binding.rs#HostBindingGuard/establish_start  (lines 906–931)
-906  /// Establishes one exact start binding after a trusted pre-observation …
-907  pub fn establish_start(&mut self, candidate: Candidate, channel: ChannelRef) -> BindingStatus {
-908      let invocation = (candidate.host, candidate.actor_id.clone(), channel.clone());
+906\t/// Establishes one exact start binding after a trusted pre-observation …
+907\tpub fn establish_start(&mut self, candidate: Candidate, channel: ChannelRef) -> BindingStatus {
+908\t    let invocation = (candidate.host, candidate.actor_id.clone(), channel.clone());
 …
-931  }
+931\t}
 source_ref: sym-14
 ```
 
