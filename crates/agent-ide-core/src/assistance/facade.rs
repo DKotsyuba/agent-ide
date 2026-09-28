@@ -35,7 +35,7 @@ use crate::{
             HookEvent, HookPhase, HostBindingGuard, HostKind, parse_candidate,
             parse_claude_call_id, parse_hook_event, parse_host_kind,
         },
-        reply::{MAX_FEEDBACK_BYTES, MissingPeer, PeerReply, ResultKind},
+        reply::{HostBindingCause, MAX_FEEDBACK_BYTES, MissingPeer, PeerReply, ResultKind},
     },
     workspace::authority::{
         AuthorityError, AuthorityRegistry, AuthorityRevoked, AuthorityStamp, StopBindingHandoff,
@@ -1481,6 +1481,27 @@ impl FeedbackLedger {
 pub type ReestablishFn =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Option<(PathBuf, String)>> + Send>> + Send + Sync>;
 
+/// Re-roots one managed Claude session to the root directory an `ide.start {root}` named (T15B).
+///
+/// The closure receives the model's exact `root` argument, canonicalizes and admits it itself, and
+/// attaches through the same path a fresh session in that directory would take.
+pub type RerootFn =
+    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = RerootOutcome> + Send>> + Send + Sync>;
+
+/// Closed outcome of one managed Claude re-root attempt (T15B).
+#[derive(Debug, Eq, PartialEq)]
+pub enum RerootOutcome {
+    /// The session is already bound to this exact root; dispatch proceeds unchanged.
+    Unchanged,
+    /// Attached to the requested root's daemon: the fresh pair and the bound candidate.
+    Attached(PathBuf, String, PathBuf),
+    /// The requested root resolves below no allowed root; the call proceeds against the current
+    /// pair and the daemon's own admission answers.
+    OutsideAllowedRoots,
+    /// The allowed root's daemon could not be attached.
+    Failed,
+}
+
 /// Shares one managed Codex publisher between the facade call path and MCP teardown (T29B §2).
 ///
 /// The facade publishes actor routes before dispatching valid managed Codex calls; the MCP process
@@ -1513,9 +1534,14 @@ pub(crate) fn stall_rendezvous_for_test() {
 ///
 /// A managed daemon can exit while its MCP process keeps running. Every call reads the current
 /// pair and, on transport loss, re-runs `reestablish` once and stores its result for later calls.
+/// A managed Claude session additionally tracks the canonical project it is bound to and may carry
+/// a `reroot` hook that moves the whole pair (and the host's hook rendezvous) to another root an
+/// `ide.start {root}` named (T15B).
 #[derive(Clone)]
 struct ManagedConnection {
     current: Arc<Mutex<(PathBuf, String)>>,
+    candidate: Arc<Mutex<Option<PathBuf>>>,
+    reroot: Option<RerootFn>,
     reestablish: ReestablishFn,
 }
 
@@ -1523,6 +1549,25 @@ impl ManagedConnection {
     fn new(runtime_dir: PathBuf, attachment: String, reestablish: ReestablishFn) -> Self {
         Self {
             current: Arc::new(Mutex::new((runtime_dir, attachment))),
+            candidate: Arc::new(Mutex::new(None)),
+            reroot: None,
+            reestablish,
+        }
+    }
+
+    /// Like [`Self::new`], for a managed Claude session that knows its bound project and can
+    /// re-root to another admitted root (T15B).
+    fn rerootable(
+        runtime_dir: PathBuf,
+        attachment: String,
+        candidate: PathBuf,
+        reestablish: ReestablishFn,
+        reroot: RerootFn,
+    ) -> Self {
+        Self {
+            current: Arc::new(Mutex::new((runtime_dir, attachment))),
+            candidate: Arc::new(Mutex::new(Some(candidate))),
+            reroot: Some(reroot),
             reestablish,
         }
     }
@@ -1533,6 +1578,16 @@ impl ManagedConnection {
 
     async fn store(&self, runtime_dir: PathBuf, attachment: String) {
         *self.current.lock().await = (runtime_dir, attachment);
+    }
+
+    /// Returns the canonical project this session is currently bound to, when it knows one.
+    async fn bound_candidate(&self) -> Option<PathBuf> {
+        self.candidate.lock().await.clone()
+    }
+
+    /// Records the project a successful re-root bound the session to.
+    async fn store_candidate(&self, candidate: PathBuf) {
+        *self.candidate.lock().await = Some(candidate);
     }
 }
 
@@ -1652,6 +1707,34 @@ impl StdioFacade {
         })
     }
 
+    /// Configures one managed Claude session bound to `candidate` that can re-establish its shared
+    /// daemon and re-root to another admitted root an `ide.start {root}` names (T15B).
+    ///
+    /// A host that moves a project never restarts this MCP process; the re-root hook re-attaches
+    /// through the fresh-session path of the requested root before the call dispatches.
+    pub fn with_reestablishing_claude_attachment(
+        runtime_dir: PathBuf,
+        attachment: String,
+        candidate: PathBuf,
+        reestablish: ReestablishFn,
+        reroot: RerootFn,
+    ) -> Option<Self> {
+        TrustedTransport::from_host_ingress("validate", "validate", attachment.clone())?;
+        Some(Self {
+            facade: AssistanceFacade::new(runtime_dir.clone()),
+            attachment: None,
+            reconnect: Some(ManagedConnection::rerootable(
+                runtime_dir,
+                attachment,
+                candidate,
+                reestablish,
+                reroot,
+            )),
+            publisher: None,
+            router: Self::described_tool_router(),
+        })
+    }
+
     /// Publishes this process's actor route for the managed Codex native hook, best-effort.
     ///
     /// The identity comes from the original trusted request `_meta` before projection: the root
@@ -1735,20 +1818,66 @@ impl StdioFacade {
     /// exactly once. A failed hook reports re-establishment failure; a still-unavailable retry
     /// reports transport unavailability. There is no retry loop.
     ///
-    /// The returned flag is true only when the target pair changed: a transient timeout against
-    /// the same live daemon must not claim it restarted. A replacement's first dispatch may need
-    /// the T08B binding-recovery hint because its earlier pre-hook observation is gone.
+    /// A managed Claude session first re-roots when this `ide.start` names another admitted root
+    /// (T15B): the reroot hook attaches through the requested root's fresh-session path, stores the
+    /// new pair for every later call, and this call then dispatches there. Its own pre-hook may
+    /// have been refused before the re-root, so the first reply carries the re-root retry hint
+    /// instead of a hard refusal; a re-root that cannot attach answers `project_moved` honestly.
+    ///
+    /// The returned [`Resume`] value names a target change: a transient timeout against the same
+    /// live daemon must not claim it restarted. A replacement's or re-root's first dispatch may
+    /// need the binding-recovery hint because its earlier pre-hook observation is gone.
     async fn dispatch_with_reconnect(
         &self,
         tool: AssistanceTool,
         parameters: Value,
         context: &RequestContext<RoleServer>,
-    ) -> (FacadeOutcome, bool) {
+    ) -> (FacadeOutcome, Resume) {
         let Some((runtime_dir, attachment)) = self.current_connection().await else {
-            return (FacadeOutcome::MissingHostMetadata, false);
+            return (FacadeOutcome::MissingHostMetadata, Resume::Fresh);
+        };
+        let mut resume = Resume::Fresh;
+        if let Some(reconnect) = &self.reconnect
+            && let Some(reroot) = &reconnect.reroot
+            && tool == AssistanceTool::Start
+            && let Some(root) = parameters.get("root").and_then(Value::as_str)
+        {
+            match reroot(root.to_owned()).await {
+                RerootOutcome::Unchanged | RerootOutcome::OutsideAllowedRoots => {}
+                RerootOutcome::Attached(new_runtime, new_attachment, candidate) => {
+                    if new_runtime != runtime_dir || new_attachment != attachment {
+                        resume = Resume::Rerooted;
+                    }
+                    reconnect.store(new_runtime, new_attachment).await;
+                    reconnect.store_candidate(candidate).await;
+                }
+                RerootOutcome::Failed => {
+                    // Name both directories honestly; only an admitted root can be re-rooted.
+                    let bound = reconnect.bound_candidate().await;
+                    let cause = bound.map(|bound| HostBindingCause::project_moved(&bound, root));
+                    return (
+                        FacadeOutcome::Reply(
+                            PeerReply::Unavailable {
+                                reason: MissingPeer::HostBinding,
+                                cause,
+                            },
+                            None,
+                        ),
+                        resume,
+                    );
+                }
+            }
+        }
+        let (runtime_dir, attachment) = if resume == Resume::Rerooted {
+            let Some(current) = self.current_connection().await else {
+                return (FacadeOutcome::MissingHostMetadata, resume);
+            };
+            current
+        } else {
+            (runtime_dir, attachment)
         };
         let Some(host) = self.build_host(&attachment, context) else {
-            return (FacadeOutcome::MissingHostMetadata, false);
+            return (FacadeOutcome::MissingHostMetadata, resume);
         };
         // Managed Codex only: publish this process's route before the first dispatch of every
         // valid call. Idempotent, so retried calls after publication failure still publish.
@@ -1758,27 +1887,29 @@ impl StdioFacade {
             .dispatch_at(&runtime_dir, &host, tool, parameters.clone())
             .await;
         let Some(reconnect) = &self.reconnect else {
-            return (outcome, false);
+            return (outcome, resume);
         };
         if !matches!(outcome, FacadeOutcome::Unavailable) {
-            return (outcome, false);
+            return (outcome, resume);
         }
         let Some((new_runtime, new_attachment)) = (reconnect.reestablish)().await else {
-            return (FacadeOutcome::ReestablishFailed, false);
+            return (FacadeOutcome::ReestablishFailed, resume);
         };
-        let replaced = new_runtime != runtime_dir || new_attachment != attachment;
+        if new_runtime != runtime_dir || new_attachment != attachment {
+            resume = Resume::Restarted;
+        }
         reconnect
             .store(new_runtime.clone(), new_attachment.clone())
             .await;
         let Some(host) = self.build_host(&new_attachment, context) else {
-            return (outcome, false);
+            return (outcome, resume);
         };
         self.publish_codex_route(&context.meta).await;
         let retried = self
             .facade
             .dispatch_at(&new_runtime, &host, tool, parameters)
             .await;
-        (retried, replaced)
+        (retried, resume)
     }
 
     /// Validates model parameters before using separately supplied host metadata for finite IPC.
@@ -1791,7 +1922,7 @@ impl StdioFacade {
         parameters: Value,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        let (outcome, reconnected) = match validate_call(tool, parameters.clone()) {
+        let (outcome, resume) = match validate_call(tool, parameters.clone()) {
             Ok(_) => {
                 self.dispatch_with_reconnect(tool, parameters, &context)
                     .await
@@ -1823,8 +1954,14 @@ impl StdioFacade {
             _ => content::Envelope::WithStructured,
         };
         let message = match outcome {
-            FacadeOutcome::Reply(reply, status) if reconnected => {
-                return render_reply_after_reconnect(tool, reply, status.as_deref(), envelope);
+            FacadeOutcome::Reply(reply, status) if resume != Resume::Fresh => {
+                return render_reply_after_reconnect(
+                    tool,
+                    reply,
+                    status.as_deref(),
+                    envelope,
+                    resume == Resume::Rerooted,
+                );
             }
             FacadeOutcome::Reply(reply, status) => {
                 return render_reply_with_status(reply, status.as_deref(), envelope);
@@ -1900,23 +2037,28 @@ const RECONNECT_RETRY_HINT: &str = "daemon restarted; repeat this call once";
 /// Recovery when a non-Start call reaches a replacement with no actor binding.
 const RECONNECT_START_HINT: &str =
     "daemon restarted; call ide.start first, then repeat this call with fresh references";
+/// Recovery after this session re-rooted to the requested root (T15B): the re-rooted call's own
+/// pre-hook ran before the new rendezvous existed, so the next call pairs normally.
+const REROOT_RETRY_HINT: &str = "session re-rooted to the requested root; repeat this call once";
 
-/// Renders like [`render_reply`], with a binding-recovery hint after a daemon replacement.
+/// Renders like [`render_reply`], with a binding-recovery hint after a daemon replacement or
+/// re-root.
 ///
 /// After [`StdioFacade::dispatch_with_reconnect`] re-establishes a lost shared daemon mid call,
 /// that first retried dispatch has no pre-hook observation for the call whose hook fired before
 /// the new daemon existed ([`crate::assistance::host_binding::BindingUnavailable::MissingPre`]),
 /// so it reports the same host-binding-unavailable outcome an agent would otherwise see with no
 /// daemon at all. A Start call can be repeated after its new pre-hook; every other tool first needs
-/// a fresh `ide.start` binding, and old detail/source references must be refreshed. This keeps
-/// the existing machine fields and adds a short stable `retry` hint. Every other reply
-/// following a reconnect (including a still-unavailable transport outcome, which never reaches
-/// this function) renders unchanged.
+/// a fresh `ide.start` binding, and old detail/source references must be refreshed. A re-rooted
+/// Start (T15B) says so instead of claiming a restart. This keeps the existing machine fields and
+/// adds a short stable `retry` hint. Every other reply following a reconnect (including a
+/// still-unavailable transport outcome, which never reaches this function) renders unchanged.
 fn render_reply_after_reconnect(
     tool: AssistanceTool,
     reply: PeerReply,
     status: Option<&str>,
     envelope: content::Envelope,
+    rerooted: bool,
 ) -> CallToolResult {
     let is_host_binding_unavailable = matches!(
         reply,
@@ -1929,7 +2071,9 @@ fn render_reply_after_reconnect(
     if !is_host_binding_unavailable {
         return rendered;
     }
-    let hint = if tool == AssistanceTool::Start {
+    let hint = if rerooted {
+        REROOT_RETRY_HINT
+    } else if tool == AssistanceTool::Start {
         RECONNECT_RETRY_HINT
     } else {
         RECONNECT_START_HINT
@@ -1941,6 +2085,17 @@ fn render_reply_after_reconnect(
         text.text = format!("{}; retry: {hint}", text.text);
     }
     rendered
+}
+
+/// Why one dispatch's target changed under the call, selecting its recovery hint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Resume {
+    /// The target pair did not change; the reply renders unchanged.
+    Fresh,
+    /// A lost daemon was re-established mid-call (T08B).
+    Restarted,
+    /// The session re-rooted to the requested root before this call (T15B).
+    Rerooted,
 }
 
 /// Ensures escaped compact text cannot defeat the actual serialized response budget.
@@ -2047,7 +2202,8 @@ fn claude_envelope_never_carries_structured_content() {
 }
 
 /// Both reconnect recovery hints reach Claude through content alone; its envelope never populates
-/// `structuredContent` for either hint to be inserted into.
+/// `structuredContent` for either hint to be inserted into. A re-rooted Start names the re-root,
+/// not a restart (T15B).
 #[test]
 fn claude_envelope_reconnect_retry_hint_survives_in_content_text() {
     let rendered = render_reply_after_reconnect(
@@ -2058,6 +2214,7 @@ fn claude_envelope_reconnect_retry_hint_survives_in_content_text() {
         },
         None,
         content::Envelope::TextOnly,
+        false,
     );
     assert_eq!(rendered.structured_content, None);
     let ContentBlock::Text(text) = &rendered.content[0] else {
@@ -2072,12 +2229,28 @@ fn claude_envelope_reconnect_retry_hint_survives_in_content_text() {
         },
         None,
         content::Envelope::TextOnly,
+        false,
     );
     assert_eq!(context.structured_content, None);
     let ContentBlock::Text(text) = &context.content[0] else {
         panic!("sole content block must be text");
     };
     assert!(text.text.contains(RECONNECT_START_HINT), "{}", text.text);
+    let rerooted = render_reply_after_reconnect(
+        AssistanceTool::Start,
+        PeerReply::Unavailable {
+            reason: crate::assistance::reply::MissingPeer::HostBinding,
+            cause: None,
+        },
+        None,
+        content::Envelope::TextOnly,
+        true,
+    );
+    let ContentBlock::Text(text) = &rerooted.content[0] else {
+        panic!("sole content block must be text");
+    };
+    assert!(text.text.contains(REROOT_RETRY_HINT), "{}", text.text);
+    assert!(!text.text.contains(RECONNECT_RETRY_HINT), "{}", text.text);
 }
 
 impl StdioFacade {

@@ -18,7 +18,7 @@ use agent_ide::app::{
 use agent_ide::assistance::{
     assembly::ProductDispatcher,
     codex_rendezvous::ManagedCodexPublisher,
-    facade::{ReestablishFn, SharedCodexPublisher, StdioFacade},
+    facade::{ReestablishFn, RerootFn, RerootOutcome, SharedCodexPublisher, StdioFacade},
     host_binding::HostKind,
     launcher::{AcceptedExecutable, LauncherConfig},
 };
@@ -2005,6 +2005,41 @@ fn managed_codex_publisher(runtime_dir: &Path, attachment: &str) -> Option<Share
 /// directory, or `candidate` itself outside a git repository), not by this one MCP process. This
 /// generation never owns the resulting daemon's lifetime: on stdio EOF, MCP cancellation, SIGINT,
 /// or SIGTERM it exits without terminating or removing an adopted or spawned daemon.
+/// One managed Claude session's current repository binding (T15B).
+#[derive(Clone)]
+struct ClaudeBinding {
+    /// Canonical bound project directory: the startup `CLAUDE_PROJECT_DIR`, or a later re-root.
+    candidate: PathBuf,
+    /// Repository-wide rendezvous key of `candidate`.
+    key: PathBuf,
+    /// Canonical allowed roots copied once from the validated launcher template; a re-root admits
+    /// only directories below one of these, exactly as activation itself does.
+    allowed_roots: Vec<PathBuf>,
+}
+
+/// Attaches one binding to its repository's shared daemon exactly as a fresh session there would.
+///
+/// The one shared tail of managed startup, a reconnect, and a re-root (T15B): refresh the
+/// project's key cache so its hooks can resolve the daemon (EYES-r2 §3 — the hook cannot resolve
+/// the key itself), adopt or spawn the repository's shared daemon, open one fresh `ClientLease`,
+/// publish the candidate attachment, and swap the held lease so the daemon's idle countdown never
+/// runs under a live MCP. Returns the live `(runtime_dir, attachment)` pair.
+async fn attach_claude_binding(
+    binding: &ClaudeBinding,
+    launcher_template: &Path,
+    lease: &Arc<Mutex<Option<UnixStream>>>,
+) -> Option<(PathBuf, String)> {
+    write_claude_key_cache(&binding.candidate, &binding.key);
+    let path = claude_runtime_path(&binding.key).ok()?;
+    let (runtime_path, _) =
+        rendezvous_with_claude_daemon(&path, &binding.key, launcher_template, &binding.candidate)
+            .await?;
+    let (connection, attachment) = open_client_lease(&runtime_path, &binding.candidate).await?;
+    write_claude_candidate_attachment(&binding.candidate, &attachment);
+    *lease.lock().await = Some(connection);
+    Some((runtime_path, attachment))
+}
+
 async fn run_managed_claude_mcp(
     launcher_template: PathBuf,
     candidate: std::io::Result<PathBuf>,
@@ -2026,78 +2061,72 @@ async fn run_managed_claude_mcp(
     };
     // Lets this client log its own lifecycle facts into the daemon's per-repository log.
     agent_ide::errorlog::init(&path);
-    match rendezvous_with_claude_daemon(&path, &key, &launcher_template, &candidate).await {
-        Some((runtime_path, _)) => {
-            // Per EYES-r2 §2, this generation never owns the shared daemon's lifetime, so it holds
-            // one `ClientLease` connection open for its own entire lifetime instead: the daemon's
-            // idle-shutdown countdown only ever runs while zero managed Claude MCPs are attached.
-            // `claude_reestablish_hook` replaces this handle with a fresh lease against the
-            // re-established daemon, so the same guarantee holds across a reconnect.
-            let Some((connection, attachment)) = open_client_lease(&runtime_path, &candidate).await
-            else {
-                return serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None)
-                    .await;
-            };
-            write_claude_candidate_attachment(&candidate, &attachment);
-            let lease = Arc::new(Mutex::new(Some(connection)));
-            let reestablish = claude_reestablish_hook(
-                path,
-                key,
-                launcher_template,
-                candidate,
-                Arc::clone(&lease),
-            );
-            match StdioFacade::with_reestablishing_attachment(runtime_path, attachment, reestablish)
-            {
-                Some(facade) => serve_managed_stdio(facade, None, None, Some(lease), None).await,
-                None => {
-                    serve_managed_stdio(StdioFacade::unavailable(), None, None, Some(lease), None)
-                        .await
-                }
-            }
+    let allowed_roots = LauncherConfig::read(&launcher_template)
+        .map(|config| config.allowed_roots().to_vec())
+        .unwrap_or_default();
+    let binding = Arc::new(std::sync::Mutex::new(ClaudeBinding {
+        candidate: candidate.clone(),
+        key,
+        allowed_roots,
+    }));
+    let lease: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
+    // Per EYES-r2 §2, this generation never owns the shared daemon's lifetime, so it holds one
+    // `ClientLease` connection open for its own entire lifetime instead: the daemon's
+    // idle-shutdown countdown only ever runs while zero managed Claude MCPs are attached.
+    // `claude_reestablish_hook` replaces this handle with a fresh lease against the
+    // re-established daemon, so the same guarantee holds across a reconnect or a re-root.
+    let initial = binding.lock().expect("claude binding mutex").clone();
+    let Some((runtime_path, attachment)) =
+        attach_claude_binding(&initial, &launcher_template, &lease).await
+    else {
+        return serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None).await;
+    };
+    let reestablish = claude_reestablish_hook(
+        Arc::clone(&binding),
+        launcher_template.clone(),
+        Arc::clone(&lease),
+    );
+    let reroot = claude_reroot_hook(
+        Arc::clone(&binding),
+        launcher_template.clone(),
+        Arc::clone(&lease),
+    );
+    match StdioFacade::with_reestablishing_claude_attachment(
+        runtime_path,
+        attachment,
+        candidate,
+        reestablish,
+        reroot,
+    ) {
+        Some(facade) => serve_managed_stdio(facade, None, None, Some(lease), None).await,
+        None => {
+            serve_managed_stdio(StdioFacade::unavailable(), None, None, Some(lease), None).await
         }
-        None => serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None).await,
     }
 }
 
 /// Builds the closure a Claude [`StdioFacade`] calls to re-establish a lost shared daemon.
 ///
-/// Repeats the exact [`rendezvous_with_claude_daemon`] path used at startup, so a daemon that
-/// exited (idle timeout, `SIGTERM`, a crash, or a binary upgrade) is relaunched or re-adopted under
-/// the same runtime-dir lock, and several MCP clients racing to relaunch it still end up with one
-/// daemon (EYES-r2 §2). On success, also opens a fresh `ClientLease` against the re-established
+/// Repeats the exact attach path used at startup for the currently bound repository, so a daemon
+/// that exited (idle timeout, `SIGTERM`, a crash, or a binary upgrade) is relaunched or re-adopted
+/// under the same runtime-dir lock, and several MCP clients racing to relaunch it still end up with
+/// one daemon (EYES-r2 §2). On success, also opens a fresh `ClientLease` against the re-established
 /// daemon and stores it in `lease`, replacing (and thereby dropping) the dead one: otherwise the new
 /// daemon generation would see zero leases from this still-live MCP and idle out from under it.
+/// After a re-root (T15B) the shared binding already names the moved repository, so this same hook
+/// re-establishes that root's daemon.
 fn claude_reestablish_hook(
-    path: PathBuf,
-    key: PathBuf,
+    binding: Arc<std::sync::Mutex<ClaudeBinding>>,
     launcher_template: PathBuf,
-    candidate: PathBuf,
     lease: Arc<Mutex<Option<UnixStream>>>,
 ) -> ReestablishFn {
     Arc::new(move || {
-        let path = path.clone();
-        let key = key.clone();
+        let binding = binding.lock().expect("claude binding mutex").clone();
         let launcher_template = launcher_template.clone();
-        let candidate = candidate.clone();
         let lease = Arc::clone(&lease);
         Box::pin(async move {
             let started = std::time::Instant::now();
-            let result =
-                rendezvous_with_claude_daemon(&path, &key, &launcher_template, &candidate).await;
-            let result = if let Some((runtime_path, _)) = result {
-                if let Some((connection, attachment)) =
-                    open_client_lease(&runtime_path, &candidate).await
-                {
-                    write_claude_candidate_attachment(&candidate, &attachment);
-                    *lease.lock().await = Some(connection);
-                    Some((runtime_path, attachment))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+            let result = attach_claude_binding(&binding, &launcher_template, &lease).await;
             agent_ide::errorlog::record(
                 agent_ide::errorlog::Method::Client,
                 if result.is_some() {
@@ -2109,13 +2138,95 @@ fn claude_reestablish_hook(
                     reason: result
                         .is_none()
                         .then_some(agent_ide::errorlog::ReasonCode::ProviderUnavailable),
-                    worktree: Some(&candidate),
+                    worktree: Some(&binding.candidate),
                     host: Some(HostKind::Claude),
                     duration_ms: started.elapsed().as_millis().try_into().ok(),
                     ..Default::default()
                 },
             );
             result
+        })
+    })
+}
+
+/// Builds the closure a Claude [`StdioFacade`] calls to re-root a moved session (T15B).
+///
+/// A host that moves a project never restarts this MCP process, so a session started in one
+/// directory stays bound there while its hooks already run with the new project directory and
+/// find no rendezvous. The first `ide.start {root}` naming a different directory re-attaches
+/// through the exact fresh-session path of [`attach_claude_binding`] — key cache, shared daemon,
+/// lease, candidate attachment — so the session's next hooks reach a daemon this MCP dispatches
+/// against. Only roots below the template's `allowed_roots` are accepted; that single rule is the
+/// whole security boundary and is unchanged.
+fn claude_reroot_hook(
+    binding: Arc<std::sync::Mutex<ClaudeBinding>>,
+    launcher_template: PathBuf,
+    lease: Arc<Mutex<Option<UnixStream>>>,
+) -> RerootFn {
+    Arc::new(move |requested| {
+        let binding = Arc::clone(&binding);
+        let launcher_template = launcher_template.clone();
+        let lease = Arc::clone(&lease);
+        Box::pin(async move {
+            let started = std::time::Instant::now();
+            let current = binding.lock().expect("claude binding mutex").clone();
+            // An unresolvable root is not this hook's decision: the daemon's own admission answer
+            // names it, exactly as for a Start that never carried a usable root.
+            let outcome = match fs::canonicalize(&requested) {
+                Ok(candidate) if absolute_local_path(&candidate) => {
+                    if agent_ide::assistance::launcher::admit_worktree(
+                        &current.allowed_roots,
+                        &candidate,
+                    )
+                    .is_err()
+                    {
+                        RerootOutcome::OutsideAllowedRoots
+                    } else if candidate == current.candidate {
+                        RerootOutcome::Unchanged
+                    } else {
+                        let key = claude_rendezvous_key(&candidate).await;
+                        let moved = ClaudeBinding {
+                            candidate: candidate.clone(),
+                            key,
+                            allowed_roots: current.allowed_roots.clone(),
+                        };
+                        match attach_claude_binding(&moved, &launcher_template, &lease).await {
+                            Some((runtime, attachment)) => {
+                                *binding.lock().expect("claude binding mutex") = moved;
+                                RerootOutcome::Attached(runtime, attachment, candidate)
+                            }
+                            None => RerootOutcome::Failed,
+                        }
+                    }
+                }
+                _ => RerootOutcome::OutsideAllowedRoots,
+            };
+            agent_ide::errorlog::record(
+                agent_ide::errorlog::Method::Client,
+                if matches!(
+                    outcome,
+                    RerootOutcome::Attached(..) | RerootOutcome::Unchanged
+                ) {
+                    agent_ide::errorlog::Outcome::Completed
+                } else {
+                    agent_ide::errorlog::Outcome::Unavailable
+                },
+                agent_ide::errorlog::Fields {
+                    reason: matches!(outcome, RerootOutcome::Failed)
+                        .then_some(agent_ide::errorlog::ReasonCode::ProviderUnavailable),
+                    worktree: Some(&current.candidate),
+                    host: Some(HostKind::Claude),
+                    detail: Some(match &outcome {
+                        RerootOutcome::Unchanged => "reroot:unchanged",
+                        RerootOutcome::Attached(..) => "reroot:attached",
+                        RerootOutcome::OutsideAllowedRoots => "reroot:outside_allowed_roots",
+                        RerootOutcome::Failed => "reroot:failed",
+                    }),
+                    duration_ms: started.elapsed().as_millis().try_into().ok(),
+                    ..Default::default()
+                },
+            );
+            outcome
         })
     })
 }

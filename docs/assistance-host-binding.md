@@ -73,6 +73,18 @@ EYES-r1 §2, this MCP never owns that daemon's lifetime: stdio EOF, cancellation
 end this one MCP process only, leaving an adopted or spawned daemon running for the next MCP of the
 same repository to find.
 
+A host that moves a project never restarts this MCP process, so a session can stay bound to a
+directory its hooks no longer run in (T15B). The first `ide.start {root}` naming a different
+directory re-roots the session before dispatching: the MCP canonicalizes and admits the root against
+the template's `allowed_roots` — the same single rule activation applies, with no additional
+permission layer — then attaches through the exact fresh-session path of that directory (key cache,
+shared daemon, client lease, candidate attachment) and binds the session there. The re-rooted call's
+own pre-hook necessarily ran before the new rendezvous existed, so its first reply is the
+cause-tagged refusal plus a stable `retry` hint rather than a hard failure, and the next call pairs
+normally. A root below no allowed root is never re-rooted to; the daemon's own
+`outside_allowed_roots` error answers. A re-root that cannot attach answers
+`unavailable: host_binding (project_moved: bound to <path>, asked <path>)`.
+
 The plugin's `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, and `PermissionDenied` handlers run
 the argument-free `agent-ide claude-hook`. That command resolves the hook payload's canonical `cwd`
 to the nearest worktree with a private candidate cache, then validates the shared runtime and bounded
