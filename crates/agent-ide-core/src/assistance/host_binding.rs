@@ -382,11 +382,30 @@ enum ReplayDisposition {
     Completed,
 }
 
-/// Maps bounded call identities to their permanent outcome within one host/actor scope.
-type ReplayCalls = BTreeMap<String, ReplayDisposition>;
+/// One settled call identity plus the insertion order that bounds how long it is remembered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReplayRecord {
+    /// Why this identity settled.
+    disposition: ReplayDisposition,
+    /// Monotonic insertion order; the oldest records are evicted first when a scope is full.
+    sequence: u64,
+}
+
+/// Maps bounded call identities to their settled outcome within one host/actor scope.
+type ReplayCalls = BTreeMap<String, ReplayRecord>;
 
 /// Maps bounded host/actor scopes to independently budgeted replay records within one channel.
 type ChannelReplayScopes = BTreeMap<(HostKind, String), ReplayCalls>;
+
+/// Returns the most recent insertion order retained anywhere in one channel's scopes.
+fn scope_freshness(scopes: &ChannelReplayScopes) -> u64 {
+    scopes
+        .values()
+        .flat_map(|calls| calls.values())
+        .map(|record| record.sequence)
+        .max()
+        .unwrap_or_default()
+}
 
 /// Tracks bounded pre/MCP/post calls plus revocable actor/channel binding generations.
 ///
@@ -394,8 +413,9 @@ type ChannelReplayScopes = BTreeMap<(HostKind, String), ReplayCalls>;
 /// binding: only `establish_start` creates a generation, while ordinary calls use
 /// `validate_active`. Claude Stop may close a generation to all external admission while retaining
 /// cleanup-only consumes until its already-ready Edit receipts settle. Rejected and completed call
-/// evidence is partitioned by channel and scope, bounded without eviction, and survives ordinary
-/// stop/start within this guard.
+/// evidence is partitioned by channel and scope and bounded to a most-recent window: a full
+/// budget evicts its oldest settled records — never a live session's — so a session of any length
+/// keeps working while recent duplicates stay recognisable.
 #[derive(Debug, Default)]
 pub struct HostBindingGuard {
     /// Valid pre-hooks awaiting their exact MCP invocation on the same private channel.
@@ -412,6 +432,8 @@ pub struct HostBindingGuard {
     native_hints: BTreeSet<BindingRef>,
     /// Rejected and completed call IDs partitioned by channel and then exact host/actor scope.
     replays: BTreeMap<ChannelSessionRef, ChannelReplayScopes>,
+    /// Monotonic replay insertion order; the oldest settled records are evicted first.
+    next_replay_sequence: u64,
 }
 
 impl HostBindingGuard {
@@ -466,9 +488,7 @@ impl HostBindingGuard {
             return BindingStatus::Unavailable(BindingUnavailable::Replay);
         }
         self.pre_observed.remove(&invocation);
-        if self.replay_scope_saturated(&candidate, &channel)
-            || self.ensure_replay_scope(&candidate, &channel).is_err()
-        {
+        if self.ensure_replay_scope(&candidate, &channel).is_err() {
             return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
         }
         let binding_key = (candidate.host, candidate.actor_id.clone(), channel.clone());
@@ -517,9 +537,6 @@ impl HostBindingGuard {
             || self.settling.contains_key(&invocation)
         {
             return BindingStatus::Unavailable(BindingUnavailable::Replay);
-        }
-        if self.replay_scope_saturated(&candidate, &channel) {
-            return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
         }
         if !self.pre_observed.contains(&invocation) {
             if self
@@ -582,9 +599,6 @@ impl HostBindingGuard {
         {
             return BindingStatus::Unavailable(BindingUnavailable::Replay);
         }
-        if self.replay_scope_saturated(&candidate, &channel) {
-            return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
-        }
         let binding_key = (candidate.host, candidate.actor_id.clone(), channel.clone());
         let (binding, created_binding) = if let Some(existing) = self.bindings.get(&binding_key) {
             if self.stopping.contains(existing) {
@@ -630,9 +644,6 @@ impl HostBindingGuard {
             || self.settling.contains_key(&invocation)
         {
             return BindingStatus::Unavailable(BindingUnavailable::Replay);
-        }
-        if self.replay_scope_saturated(&candidate, &channel) {
-            return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
         }
         if !self.pre_observed.remove(&invocation) {
             if self
@@ -706,9 +717,7 @@ impl HostBindingGuard {
                 ReplayDisposition::Completed => BindingUnavailable::Replay,
             });
         }
-        if self.replay_scope_saturated(&candidate, &invocation.1)
-            || self.ensure_replay_scope(&candidate, &invocation.1).is_err()
-        {
+        if self.ensure_replay_scope(&candidate, &invocation.1).is_err() {
             return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
         }
         match event.phase {
@@ -821,19 +830,7 @@ impl HostBindingGuard {
             .get(channel)?
             .get(&(candidate.host, candidate.actor_id.clone()))?
             .get(&candidate.call_id)
-            .copied()
-    }
-
-    /// Returns whether one channel-local host/actor scope exhausted its replay budget.
-    fn replay_scope_saturated(
-        &self,
-        candidate: &CandidateInvocation,
-        channel: &ChannelSessionRef,
-    ) -> bool {
-        self.replays
-            .get(channel)
-            .and_then(|scopes| scopes.get(&(candidate.host, candidate.actor_id.clone())))
-            .is_some_and(|calls| calls.len() >= MAX_REPLAYS_PER_SCOPE)
+            .map(|record| record.disposition)
     }
 
     /// Counts observed and validated-but-unsettled calls in one exact capacity scope.
@@ -862,39 +859,50 @@ impl HostBindingGuard {
     }
 
     /// Reserves replay storage within independent channel and host/actor budgets.
+    ///
+    /// A full budget evicts its oldest settled evidence — never a live session's: a replay record
+    /// only has to outlive the host's retry window for its call id, so a session of any length
+    /// keeps working while recent duplicates stay recognisable (T15B capacity follow-up).
     fn ensure_replay_scope(
         &mut self,
         candidate: &CandidateInvocation,
         channel: &ChannelSessionRef,
     ) -> Result<(), BindingUnavailable> {
-        if !self.replays.contains_key(channel) {
-            if self.replays.len() >= MAX_REPLAY_CHANNELS {
-                return Err(BindingUnavailable::CapacityExceeded);
-            }
-            self.replays.insert(channel.clone(), BTreeMap::new());
-        }
-        let scopes = self
-            .replays
-            .get_mut(channel)
-            .expect("the replay channel was just ensured");
-        let scope = (candidate.host, candidate.actor_id.clone());
-        if scopes.contains_key(&scope) {
-            return Ok(());
-        }
-        if scopes.len() >= MAX_REPLAY_SCOPES_PER_CHANNEL {
+        if !self.replays.contains_key(channel)
+            && self.replays.len() >= MAX_REPLAY_CHANNELS
+            && !self.evict_oldest_dead_channel()
+        {
             return Err(BindingUnavailable::CapacityExceeded);
         }
-        scopes.insert(scope, BTreeMap::new());
+        let scope = (candidate.host, candidate.actor_id.clone());
+        let saturated = |scopes: &ChannelReplayScopes| {
+            !scopes.contains_key(&scope) && scopes.len() >= MAX_REPLAY_SCOPES_PER_CHANNEL
+        };
+        if self.replays.get(channel).is_some_and(saturated)
+            && !self.evict_oldest_dead_scope(channel)
+        {
+            return Err(BindingUnavailable::CapacityExceeded);
+        }
+        self.replays
+            .entry(channel.clone())
+            .or_default()
+            .entry(scope)
+            .or_default();
         Ok(())
     }
 
-    /// Retains one rejected or completed call without eviction or cross-channel budget sharing.
+    /// Retains one rejected or completed call, evicting the oldest settled record of a full scope.
+    ///
+    /// Cross-channel budgets are never shared; only a table full of nothing but live sessions
+    /// still refuses, because evicting a live session's recent evidence could re-admit a replay.
     fn record_replay(
         &mut self,
         invocation: &(CandidateInvocation, ChannelSessionRef),
         disposition: ReplayDisposition,
     ) -> Result<(), BindingUnavailable> {
         self.ensure_replay_scope(&invocation.0, &invocation.1)?;
+        let sequence = self.next_replay_sequence.checked_add(1).unwrap_or_default();
+        self.next_replay_sequence = sequence;
         let calls = self
             .replays
             .get_mut(&invocation.1)
@@ -905,10 +913,63 @@ impl HostBindingGuard {
             return Ok(());
         }
         if calls.len() >= MAX_REPLAYS_PER_SCOPE {
-            return Err(BindingUnavailable::CapacityExceeded);
+            let oldest = calls
+                .iter()
+                .min_by_key(|(_, record)| record.sequence)
+                .map(|(call_id, _)| call_id.clone())
+                .expect("a full scope has an oldest record");
+            calls.remove(&oldest);
         }
-        calls.insert(invocation.0.call_id.clone(), disposition);
+        calls.insert(
+            invocation.0.call_id.clone(),
+            ReplayRecord {
+                disposition,
+                sequence,
+            },
+        );
         Ok(())
+    }
+
+    /// Evicts the stalest replay channel that holds no live or stopped binding, if one exists.
+    fn evict_oldest_dead_channel(&mut self) -> bool {
+        let stalest = self
+            .replays
+            .iter()
+            .filter(|(channel, _)| !self.channel_bound(channel))
+            .min_by_key(|(_, scopes)| scope_freshness(scopes))
+            .map(|(channel, _)| channel.clone());
+        stalest.is_some_and(|channel| self.replays.remove(&channel).is_some())
+    }
+
+    /// Evicts the stalest host/actor scope of one channel whose binding is no longer live.
+    fn evict_oldest_dead_scope(&mut self, channel: &ChannelSessionRef) -> bool {
+        let live = self
+            .bindings
+            .keys()
+            .filter(|key| key.2 == *channel)
+            .map(|key| (key.0, key.1.clone()))
+            .chain(
+                self.stopping
+                    .iter()
+                    .filter(|binding| binding.channel == *channel)
+                    .map(|binding| (binding.host, binding.actor_id.clone())),
+            )
+            .collect::<BTreeSet<_>>();
+        let stalest = self
+            .replays
+            .get(channel)
+            .into_iter()
+            .flat_map(|scopes| scopes.iter())
+            .filter(|(scope, _)| !live.contains(*scope))
+            .min_by_key(|(_, calls)| calls.values().map(|record| record.sequence).max())
+            .map(|(scope, _)| scope.clone());
+        match stalest {
+            Some(scope) => self
+                .replays
+                .get_mut(channel)
+                .is_some_and(|scopes| scopes.remove(&scope).is_some()),
+            None => false,
+        }
     }
 
     /// Recovers the exact actor a matching Claude pre-hook already registered for one MCP call.
@@ -1099,7 +1160,7 @@ impl HostBindingGuard {
                 scopes.values().any(|calls| {
                     calls
                         .values()
-                        .any(|disposition| matches!(disposition, ReplayDisposition::Completed))
+                        .any(|record| matches!(record.disposition, ReplayDisposition::Completed))
                 })
             })
     }
@@ -2080,104 +2141,122 @@ mod tests {
         ));
     }
 
-    /// Fences a saturated scope while preserving unrelated Codex and Claude correlation capacity.
+    /// A scope that exceeds its replay budget keeps working: the oldest settled records are
+    /// evicted — a session of any length validates its next call (T15B capacity follow-up).
     #[test]
-    fn rejection_saturation_is_scoped_and_requires_a_fresh_scope() {
+    fn a_scope_survives_more_settled_calls_than_its_replay_budget() {
         let mut guard = HostBindingGuard::default();
-        let noisy = channel("noisy-channel");
-        for index in 0..MAX_REPLAYS_PER_SCOPE {
-            assert!(matches!(
-                guard.establish_start(
-                    codex_candidate("noisy-actor", &format!("rejected-{index}")),
-                    noisy.clone()
+        let channel = channel("long-lived-channel");
+        let actor = "long-actor";
+        for index in 0..MAX_REPLAYS_PER_SCOPE + 8 {
+            let call = format!("call-{index}");
+            let event = parse_hook_event(
+                json!({"hook_event_name":"PreToolUse","session_id":actor,"tool_use_id":call})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .expect("test hook is valid");
+            assert!(
+                matches!(
+                    guard.observe_hook(event, channel.clone()),
+                    BindingStatus::PreObserved
                 ),
-                BindingStatus::Unavailable(BindingUnavailable::MissingPre)
-            ));
+                "call {index} observes"
+            );
+            assert!(
+                matches!(
+                    guard.validate_active(codex_candidate(actor, &call), channel.clone()),
+                    BindingStatus::Unavailable(BindingUnavailable::InactiveBinding)
+                ),
+                "call {index} settles without a binding"
+            );
         }
+        // A binding established now still validates calls after the whole budget has churned.
+        let event = parse_hook_event(
+            json!({"hook_event_name":"PreToolUse","session_id":actor,"tool_use_id":"start"})
+                .to_string()
+                .as_bytes(),
+        )
+        .expect("test hook is valid");
         assert!(matches!(
-            guard.establish_start(codex_candidate("noisy-actor", "over-budget"), noisy.clone()),
-            BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded)
+            guard.observe_hook(event, channel.clone()),
+            BindingStatus::PreObserved
+        ));
+        assert!(matches!(
+            guard.establish_start(codex_candidate(actor, "start"), channel.clone()),
+            BindingStatus::Validated(_)
+        ));
+        let event = parse_hook_event(
+            json!({"hook_event_name":"PreToolUse","session_id":actor,"tool_use_id":"after-budget"})
+                .to_string()
+                .as_bytes(),
+        )
+        .expect("test hook is valid");
+        assert!(matches!(
+            guard.observe_hook(event, channel.clone()),
+            BindingStatus::PreObserved
+        ));
+        assert!(matches!(
+            guard.validate_active(codex_candidate(actor, "after-budget"), channel.clone()),
+            BindingStatus::Validated(_)
+        ));
+        // A recent settled call is still recognised as a replay; only the oldest left the table.
+        let recent = format!("call-{}", MAX_REPLAYS_PER_SCOPE + 7);
+        assert!(matches!(
+            guard.validate_active(codex_candidate(actor, &recent), channel.clone()),
+            BindingStatus::Unavailable(BindingUnavailable::Replay)
         ));
         assert!(matches!(
             guard.observe_hook(
                 parse_hook_event(
-                    br#"{"hook_event_name":"PreToolUse","session_id":"noisy-actor","tool_use_id":"valid"}"#
+                    json!({"hook_event_name":"PreToolUse","session_id":actor,"tool_use_id":"call-0"})
+                        .to_string()
+                        .as_bytes(),
                 )
                 .expect("test hook is valid"),
-                noisy
-            ),
-            BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded)
-        ));
-
-        let codex_channel = channel("fresh-codex-channel");
-        assert!(matches!(
-            guard.observe_hook(
-                parse_hook_event(
-                    br#"{"hook_event_name":"PreToolUse","session_id":"codex-actor","tool_use_id":"start"}"#
-                )
-                .expect("test hook is valid"),
-                codex_channel.clone()
+                channel
             ),
             BindingStatus::PreObserved
         ));
-        assert!(matches!(
-            guard.establish_start(codex_candidate("codex-actor", "start"), codex_channel),
-            BindingStatus::Validated(_)
-        ));
+        // The oldest rejection was evicted to make room, so its call id is no longer fenced.
+    }
 
-        let claude_channel = channel("fresh-claude-channel");
+    /// A long-lived managed Codex thread keeps validating calls past the whole replay budget.
+    #[test]
+    fn a_managed_codex_thread_survives_more_calls_than_its_replay_budget() {
+        let mut guard = HostBindingGuard::default();
+        let channel = channel("managed-long-channel");
         assert!(matches!(
-            guard.observe_hook(
-                claude_pre("claude-session", None, "start"),
-                claude_channel.clone()
-            ),
-            BindingStatus::PreObserved
-        ));
-        assert!(matches!(
-            guard.establish_start_claude("start", claude_channel),
+            guard
+                .establish_managed_codex_start(codex_candidate("thread", "start"), channel.clone()),
             BindingStatus::Validated(_)
+        ));
+        for index in 0..MAX_REPLAYS_PER_SCOPE + 8 {
+            assert!(
+                matches!(
+                    guard.validate_managed_codex_active(
+                        codex_candidate("thread", &format!("call-{index}")),
+                        channel.clone()
+                    ),
+                    BindingStatus::Validated(_)
+                ),
+                "call {index} validates"
+            );
+        }
+        // A genuine recent replay is still recognised.
+        assert!(matches!(
+            guard.validate_managed_codex_active(
+                codex_candidate("thread", &format!("call-{}", MAX_REPLAYS_PER_SCOPE + 7)),
+                channel
+            ),
+            BindingStatus::Unavailable(BindingUnavailable::Replay)
         ));
     }
 
-    /// Caps scopes within one channel without consuming an unrelated channel's scope budget.
+    /// More channels over time than the channel budget do not lock out a new channel: the oldest
+    /// dead channel's evidence is evicted, while a live session's channel never is.
     #[test]
-    fn replay_scope_allocation_is_partitioned_by_channel() {
-        let mut guard = HostBindingGuard::default();
-        let noisy_channel = channel("many-scopes-channel");
-        for index in 0..MAX_REPLAY_SCOPES_PER_CHANNEL {
-            assert!(matches!(
-                guard.establish_start(
-                    codex_candidate(&format!("actor-{index}"), "rejected"),
-                    noisy_channel.clone()
-                ),
-                BindingStatus::Unavailable(BindingUnavailable::MissingPre)
-            ));
-        }
-        assert!(matches!(
-            guard.establish_start(codex_candidate("new-actor", "rejected"), noisy_channel),
-            BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded)
-        ));
-
-        let unrelated = channel("unrelated-channel");
-        assert!(matches!(
-            guard.observe_hook(
-                parse_hook_event(
-                    br#"{"hook_event_name":"PreToolUse","session_id":"unrelated","tool_use_id":"start"}"#
-                )
-                .expect("test hook is valid"),
-                unrelated.clone()
-            ),
-            BindingStatus::PreObserved
-        ));
-        assert!(matches!(
-            guard.establish_start(codex_candidate("unrelated", "start"), unrelated),
-            BindingStatus::Validated(_)
-        ));
-    }
-
-    /// Keeps total channel, scope, and record counts within their explicit product bounds.
-    #[test]
-    fn replay_ledger_has_fixed_total_bounds_without_eviction() {
+    fn new_channels_are_not_locked_out_after_many_dead_ones() {
         let mut guard = HostBindingGuard::default();
         for index in 0..MAX_REPLAY_CHANNELS {
             assert!(matches!(
@@ -2189,26 +2268,71 @@ mod tests {
             ));
         }
         assert_eq!(guard.replays.len(), MAX_REPLAY_CHANNELS);
-        assert_eq!(
-            guard
-                .replays
-                .values()
-                .flat_map(BTreeMap::values)
-                .map(BTreeMap::len)
-                .sum::<usize>(),
-            MAX_REPLAY_CHANNELS
-        );
+        // The next dead channel evicts the stalest dead one instead of refusing.
         assert!(matches!(
             guard.establish_start(
                 codex_candidate("actor", "rejected"),
-                channel("over-channel-budget")
+                channel("one-more-dead-channel")
+            ),
+            BindingStatus::Unavailable(BindingUnavailable::MissingPre)
+        ));
+        assert_eq!(
+            guard.replays.len(),
+            MAX_REPLAY_CHANNELS,
+            "the table stays bounded"
+        );
+        // A live session keeps its evidence: fill every channel with a live binding first.
+        let mut guard = HostBindingGuard::default();
+        for index in 0..MAX_BINDINGS {
+            let live = channel(&format!("live-{index}"));
+            let event = parse_hook_event(
+                json!({"hook_event_name":"PreToolUse","session_id":"actor","tool_use_id":format!("start-{index}")})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .expect("test hook is valid");
+            assert!(matches!(
+                guard.observe_hook(event, live.clone()),
+                BindingStatus::PreObserved
+            ));
+            assert!(matches!(
+                guard.establish_start(codex_candidate("actor", &format!("start-{index}")), live),
+                BindingStatus::Validated(_)
+            ));
+        }
+        assert!(matches!(
+            guard.establish_start(
+                codex_candidate("actor", "rejected"),
+                channel("no-dead-channel-to-evict")
             ),
             BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded)
         ));
+        // Nothing but live sessions is never evicted.
+    }
+
+    /// Keeps total channel, scope, and record counts within their explicit product bounds.
+    #[test]
+    fn replay_ledger_keeps_fixed_total_bounds() {
+        let mut guard = HostBindingGuard::default();
+        for index in 0..MAX_REPLAY_CHANNELS {
+            assert!(matches!(
+                guard.establish_start(
+                    codex_candidate("actor", "rejected"),
+                    channel(&format!("channel-{index}"))
+                ),
+                BindingStatus::Unavailable(BindingUnavailable::MissingPre)
+            ));
+        }
+        assert_eq!(guard.replays.len(), MAX_REPLAY_CHANNELS);
+        for calls in guard.replays.values().flat_map(BTreeMap::values) {
+            assert!(calls.len() <= MAX_REPLAYS_PER_SCOPE);
+        }
+        // A channel whose evidence was evicted no longer fences its rejected call id.
         assert!(matches!(
             guard.establish_start(codex_candidate("actor", "rejected"), channel("channel-0")),
             BindingStatus::Unavailable(BindingUnavailable::Replay)
         ));
+        // Channels within the budget keep their evidence.
     }
 
     /// Settles more than the former global limit while keeping a fresh Claude scope usable.
