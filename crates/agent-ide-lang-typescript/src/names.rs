@@ -14,9 +14,10 @@
 //! * `getElementById("x")` uses id `x`; `querySelector`/`querySelectorAll` with one simple
 //!   selector (`"#x"`, `".x"`) uses that id or class, exactly.
 //!
-//! Regex-versus-division is decided from the previous token; a quoted string never spans a line,
-//! so a misread (an apostrophe in JSX text) costs at most the rest of that line. Minified files
-//! (`*.min.*`, or an average line over 2 000 bytes) are skipped.
+//! Regex-versus-division is decided from the previous token and a quoted string never spans a
+//! line. In `.tsx`/`.jsx`/`.js` files JSX elements are tracked, so JSX text (`<p>Don't</p>`) is
+//! skipped rather than read as code. Minified files (`*.min.*`, or an average line over 2 000
+//! bytes) are skipped.
 
 use std::{ops::Range, path::Path};
 
@@ -66,6 +67,11 @@ impl NameFacts for TsFacts {
         COVERAGE
     }
 
+    /// `2`: JSX text is skipped instead of lexed as code.
+    fn revision(&self) -> &'static str {
+        "2"
+    }
+
     /// Facts of one script (see the module docs).
     fn extract(&self, file: &Path, source: &str, sink: &mut FactSink) -> FileVerdict {
         let file_name = file
@@ -77,7 +83,11 @@ impl NameFacts for TsFacts {
         {
             return FileVerdict::Skipped("minified");
         }
-        let tokens = tokens(source);
+        let jsx = !matches!(
+            file.extension().and_then(|extension| extension.to_str()),
+            Some("ts" | "mts" | "cts")
+        );
+        let tokens = tokens(source, jsx);
         let mut facts = Facts {
             source,
             line_starts: std::iter::once(0)
@@ -104,24 +114,91 @@ enum Token {
     Template(Vec<(Range<usize>, bool)>),
 }
 
-/// Lexes `source` into tokens (see the module docs).
-fn tokens(source: &str) -> Vec<Token> {
+/// JSX state of the lexer: open JSX trees and where their text resumes.
+#[derive(Default)]
+struct Jsx {
+    /// Open elements of each JSX tree being lexed (a tree inside a `{…}` child pushes its own).
+    trees: Vec<usize>,
+    /// Brace depths at which a `{…}` child of JSX text returns to that text.
+    children: Vec<usize>,
+    /// Brace depth of the tag being lexed and whether it is a closing tag.
+    tag: Option<(usize, bool)>,
+    /// The lexer is in JSX text (not code): quotes and slashes there are plain text.
+    text: bool,
+}
+
+/// Lexes `source` into tokens (see the module docs). With `jsx`, JSX elements are recognized so
+/// that their text (`<p>Don't</p>`) is skipped rather than read as code.
+fn tokens(source: &str, jsx: bool) -> Vec<Token> {
     let bytes = source.as_bytes();
     let mut found: Vec<Token> = Vec::new();
     // Open template literals, each with the brace depth of its current `${…}` expression.
     let mut templates: Vec<(usize, usize)> = Vec::new();
     let mut depth = 0usize;
+    let mut markup = Jsx::default();
     let mut at = 0;
     while at < bytes.len() {
         let byte = bytes[at];
+        if markup.text {
+            match byte {
+                b'{' => {
+                    depth += 1;
+                    markup.children.push(depth);
+                    markup.text = false;
+                    found.push(Token::Punct(byte, at));
+                }
+                b'<' => {
+                    let closing = bytes.get(at + 1) == Some(&b'/');
+                    markup.tag = Some((depth, closing));
+                    markup.text = false;
+                    found.push(Token::Punct(byte, at));
+                }
+                _ => {}
+            }
+            at += 1;
+            continue;
+        }
         match byte {
+            b'<' if jsx
+                && markup.tag.is_none()
+                && regex_allowed(source, found.last())
+                && bytes
+                    .get(at + 1)
+                    .is_some_and(|next| next.is_ascii_alphabetic() || *next == b'>') =>
+            {
+                // A JSX element starts a tree in code.
+                markup.trees.push(0);
+                markup.tag = Some((depth, false));
+                found.push(Token::Punct(byte, at));
+                at += 1;
+            }
+            b'>' if markup.tag.is_some_and(|(open, _)| open == depth) => {
+                let (_, closing) = markup.tag.take().unwrap_or((depth, false));
+                let self_closing = at > 0 && bytes[at - 1] == b'/';
+                if let Some(open) = markup.trees.last_mut() {
+                    if closing {
+                        *open = open.saturating_sub(1);
+                    } else if !self_closing {
+                        *open += 1;
+                    }
+                    if *open == 0 {
+                        markup.trees.pop();
+                    } else {
+                        markup.text = true;
+                    }
+                }
+                found.push(Token::Punct(byte, at));
+                at += 1;
+            }
             b'/' if bytes.get(at + 1) == Some(&b'/') => {
                 at = find(bytes, at, b"\n").unwrap_or(bytes.len());
             }
             b'/' if bytes.get(at + 1) == Some(&b'*') => {
                 at = find(bytes, at + 2, b"*/").map_or(bytes.len(), |end| end + 2);
             }
-            b'/' if regex_allowed(source, found.last()) => at = regex_end(bytes, at),
+            b'/' if markup.tag.is_none() && regex_allowed(source, found.last()) => {
+                at = regex_end(bytes, at)
+            }
             b'"' | b'\'' => {
                 let mut end = at + 1;
                 while end < bytes.len() && bytes[end] != byte && bytes[end] != b'\n' {
@@ -154,6 +231,11 @@ fn tokens(source: &str) -> Vec<Token> {
                 at = next;
             }
             b'}' => {
+                // The end of a `{…}` child returns to its JSX text.
+                if markup.children.last() == Some(&depth) {
+                    markup.children.pop();
+                    markup.text = true;
+                }
                 depth = depth.saturating_sub(1);
                 found.push(Token::Punct(byte, at));
                 at += 1;
@@ -575,11 +657,18 @@ mod tests {
                       const u = `outer ${`inner ${x} deep`} tail`;\n\
                       if (/^x/.test(s)) { y = 1 }\n\
                       return <a className=\"yes\">it's</a>;\n\
-                      const v = <span>Save</span><i className=\"icon\" />;\n";
+                      const v = <span>Save</span><i className=\"icon\" />;\n\
+                      const w = <p>Don't <b>stop</b> {n > 1 ? 'x' : \"y\"} <i className=\"later\" /></p>;\n\
+                      const z = <><p>it's</p><u className=\"frag\" /></>;\n";
         let (_, rows) = facts("c.tsx", source);
         assert_eq!(
             rows,
-            [class("yes", 7, 22, None), class("icon", 8, 42, None)]
+            [
+                class("yes", 7, 22, None),
+                class("icon", 8, 42, None),
+                class("later", 9, 66, None),
+                class("frag", 10, 38, None),
+            ]
         );
     }
 
