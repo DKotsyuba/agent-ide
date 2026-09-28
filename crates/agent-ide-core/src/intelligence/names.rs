@@ -714,11 +714,20 @@ impl NameIndex {
         {
             return;
         }
-        self.reread += 1;
         if metadata.len() > MAX_FILE_BYTES as u64 {
+            // Too large to read: skipped by size alone, and cached under its blob so other
+            // worktrees skip it without a stat.
+            let extracted = skipped("large");
+            if let Some(content) = &content
+                && let Some(key) = CacheKey::of(language, content.clone())
+                && let Ok(mut cache) = self.cache.lock()
+            {
+                cache.insert(key, extracted.clone());
+            }
             let content = content.unwrap_or(ContentKey::Digest([0; 32]));
-            return self.store(path, language, Some(stamp), content, None, skipped("large"));
+            return self.store(path, language, Some(stamp), content, None, extracted);
         }
+        self.reread += 1;
         let limits =
             SourceReadLimits::new(MAX_SOURCE_PATH_BYTES, MAX_FILE_BYTES).expect("fixed limits");
         match read_authorized_source(&self.worktree, path, limits) {
@@ -938,9 +947,18 @@ fn skipped(reason: &'static str) -> Arc<Extracted> {
 /// `root` is not a Git worktree or a query fails.
 fn git_candidates(root: &Path) -> Option<Vec<(PathBuf, Option<Box<str>>)>> {
     use crate::checks::fingerprint::git_output;
-    let staged = git_output(root, &["ls-files", "-s", "-z", "--cached"])?;
-    let modified = git_output(root, &["diff-files", "--name-only", "-z"])?;
-    let others = git_output(root, &["ls-files", "-z", "--others", "--exclude-standard"])?;
+    // The three read-only queries run side by side; each costs a process start.
+    let (staged, modified, others) = std::thread::scope(|scope| {
+        let staged = scope.spawn(|| git_output(root, &["ls-files", "-s", "-z", "--cached"]));
+        let modified = scope.spawn(|| git_output(root, &["diff-files", "--name-only", "-z"]));
+        let others = git_output(root, &["ls-files", "-z", "--others", "--exclude-standard"]);
+        (
+            staged.join().ok().flatten(),
+            modified.join().ok().flatten(),
+            others,
+        )
+    });
+    let (staged, modified, others) = (staged?, modified?, others?);
     let modified: HashSet<&[u8]> = modified
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
@@ -1365,7 +1383,15 @@ mod tests {
         testing::install();
         let first = scratch("share-a");
         git(&first, &["init", "--quiet"]);
-        write(&first, &[("a.alpha", "@btn\n"), ("b.beta", "use:btn\n")]);
+        let big = "@big ".repeat(MAX_FILE_BYTES / 5 + 1);
+        write(
+            &first,
+            &[
+                ("a.alpha", "@btn\n"),
+                ("b.beta", "use:btn\n"),
+                ("big.alpha", &big),
+            ],
+        );
         git(&first, &["add", "--", "."]);
         git(&first, &["commit", "--quiet", "-m", "one"]);
         let second = scratch("share-b");
@@ -1380,12 +1406,17 @@ mod tests {
         let cache: Arc<Mutex<FactCache>> = Arc::default();
         let mut a = NameIndex::with_cache(worktree(&first, 1), cache.clone());
         assert_eq!(a.refresh(far()), IndexState::Ready);
-        assert_eq!((a.last_reread(), a.last_reused()), (2, 0));
+        assert_eq!(
+            (a.last_reread(), a.last_reused()),
+            (2, 0),
+            "a large file is never read"
+        );
+        assert_eq!(a.skipped(), BTreeMap::from([("large", 1)]));
         let mut b = NameIndex::with_cache(worktree(&second, 1), cache.clone());
         assert_eq!(b.refresh(far()), IndexState::Ready);
         assert_eq!(
             (b.last_reread(), b.last_reused()),
-            (0, 2),
+            (0, 3),
             "no read for clean files"
         );
         let key = NameKey::global(ns::CLASS, "btn");
