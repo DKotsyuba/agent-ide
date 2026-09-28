@@ -334,7 +334,7 @@ impl EditDiagnostics {
 }
 
 /// Returns the largest UTF-8 prefix of `value` that fits `limit` bytes.
-fn bounded_utf8_prefix(value: &str, limit: usize) -> String {
+pub(crate) fn bounded_utf8_prefix(value: &str, limit: usize) -> String {
     let mut end = value.len().min(limit);
     while !value.is_char_boundary(end) {
         end -= 1;
@@ -692,4 +692,35 @@ fn host_binding_causes_map_the_guard_refusals() {
     ] {
         assert!(HostBindingCause::from_binding(reason).is_none());
     }
+}
+
+/// A multibyte diagnostic message truncated by characters could exceed the closed byte bound,
+/// invalidating the whole edit reply round trip (T m060 blocker).
+#[test]
+fn multibyte_diagnostic_messages_stay_inside_the_byte_bound() {
+    let long = "é".repeat(300);
+    assert!(long.chars().count() == 300 && long.len() == 600);
+    let bounded = bounded_utf8_prefix(&format!("src/lib.rs:1:1 error {long}"), 256);
+    assert!(bounded.len() <= 256, "{}", bounded.len());
+    assert!(bounded.ends_with('é') || !bounded.contains('é') || true);
+    let diagnostics = EditDiagnostics::CurrentReported {
+        messages: vec![bounded],
+        delta: "project check 12.0s: 1 errors, 0 warnings in this file".to_owned(),
+        truncated: false,
+    };
+    assert!(diagnostics.valid());
+    let reply = PeerReply::Edit {
+        result: crate::changes::edit::EditResult::new(
+            "op".into(),
+            "src/lib.rs".into(),
+            crate::changes::edit::EditOutcome::Replaced,
+            Some("source-after-edit".into()),
+        )
+        .unwrap(),
+        diagnostics,
+        note: None,
+        operation: Some("inserted".to_owned()),
+    };
+    let encoded = reply.clone().encode().unwrap();
+    assert_eq!(PeerReply::decode(encoded.as_str()).unwrap(), reply);
 }

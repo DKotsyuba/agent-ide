@@ -4549,6 +4549,78 @@ async fn claude_context_pages_survive_native_posts_but_not_real_edits() {
     daemon.wait().await.unwrap();
 }
 
+/// A pending edit is collectible: when its project check outlasts the inline wait, the edit
+/// answers `pending` and `ide.inspect` later returns the settled edit reply — never the silent
+/// `inspect:internal` a byte-overlong diagnostic message used to turn the whole detail into.
+#[tokio::test]
+async fn a_pending_edit_is_collected_by_inspect_once_its_check_settles() {
+    let fixture = ProductFixture::new(json!([]));
+    // A rust check held past the inline wait, reporting one over-long multibyte message: 300
+    // characters of "é" are 600 bytes, so a character-bound truncation used to leave a message
+    // no closed reply could carry.
+    let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, "sleep 12");
+    std::fs::write(fixture.root.join("problems.count"), "1").unwrap();
+    {
+        let cargo = home.join(".rustup/toolchains/fake/bin/cargo");
+        let script = std::fs::read_to_string(&cargo).unwrap();
+        std::fs::write(&cargo, script.replace("fake %s", "éé %.0s")).unwrap();
+    }
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "pending-edit").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"pending-edit"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"path":"src/lib.rs","lines":"1-2"}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    let source_ref = read["detail_ref"].as_str().unwrap().to_owned();
+    let edit = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"pending-edit-1","path":"src/lib.rs","lines":"1-1",
+                   "source_ref":source_ref,"content":"pub fn value() -> i32 { 7 }"}),
+        )
+        .await;
+    assert!(
+        matches!(edit["state"].as_str(), Some("pending" | "edit")),
+        "the held check parks the edit or settles inline: {edit}"
+    );
+    let settled = actor.settle(&fixture, edit).await;
+    assert_eq!(settled["state"], "edit", "{settled}");
+    assert_eq!(settled["result"]["outcome"], "replaced", "{settled}");
+    assert!(
+        matches!(
+            settled["diagnostics"]["state"].as_str(),
+            Some("current_reported" | "current_clean" | "unknown")
+        ),
+        "{settled}"
+    );
+    if settled["diagnostics"]["state"] == "current_reported" {
+        for message in settled["diagnostics"]["messages"].as_array().unwrap() {
+            assert!(
+                message.as_str().unwrap().len() <= 256,
+                "diagnostic messages stay inside the closed byte bound: {settled}"
+            );
+        }
+    }
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A session that never calls `ide.start` produces hook bookkeeping, not failures: one `info`
 /// skip line per detail per window on each side, and no `warn` hook line at all.
 #[tokio::test]

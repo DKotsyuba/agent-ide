@@ -3077,7 +3077,9 @@ impl<'a> Worker<'a> {
                     .diagnostics
                     .iter()
                     .take(8)
-                    .map(|diagnostic| diagnostic.message.chars().take(256).collect::<String>())
+                    .map(|diagnostic| {
+                        super::reply::bounded_utf8_prefix(&diagnostic.message, 256)
+                    })
                     .collect::<Vec<_>>();
                 let feedback = feedback
                     .as_ref()
@@ -3659,15 +3661,13 @@ impl<'a> Worker<'a> {
                     Severity::Error => "error",
                     Severity::Warning => "warning",
                 };
-                messages.push(
-                    format!(
+                messages.push(super::reply::bounded_utf8_prefix(
+                    &format!(
                         "{wanted}:{}:{} {severity} {code}{}",
                         problem.line, problem.column, problem.message
-                    )
-                    .chars()
-                    .take(256)
-                    .collect(),
-                );
+                    ),
+                    256,
+                ));
             } else {
                 truncated = true;
             }
