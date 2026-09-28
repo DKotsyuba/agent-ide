@@ -564,7 +564,9 @@ fn render_symbol_line(
     }
 }
 
-/// Renders a symbol body or an explicit line range with line numbers, header included.
+/// Renders a symbol body or an explicit line range with line numbers, header included. The
+/// gutter is one tab — the separator agents already strip from their own read tool — so a
+/// copied `old_string` never keeps separator spaces.
 pub fn read_text(file: &Path, title: Option<&str>, range: LineRange, source: &str) -> String {
     let mut out = match title {
         Some(title) => format!("{title}  (lines {range})\n"),
@@ -573,7 +575,7 @@ pub fn read_text(file: &Path, title: Option<&str>, range: LineRange, source: &st
     let width = range.end.to_string().len();
     for (index, line) in slice_lines(source, range).split_inclusive('\n').enumerate() {
         let number = range.start as usize + index;
-        out.push_str(&format!("{number:>width$}  {line}"));
+        out.push_str(&format!("{number:>width$}\t{line}"));
         if !line.ends_with('\n') {
             out.push('\n');
         }
@@ -916,7 +918,7 @@ mod tests {
         );
         assert_eq!(
             text,
-            "a.rs#run  (lines 9–11)\n 9  fn run() {\n10      x\n11  }\n"
+            "a.rs#run  (lines 9–11)\n 9\tfn run() {\n10\t    x\n11\t}\n"
         );
     }
 

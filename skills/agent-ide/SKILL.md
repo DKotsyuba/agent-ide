@@ -54,7 +54,9 @@ and cost a fraction of the context:
   A bare name that matches several symbols answers with the candidate paths; repeat
   with one exact path.
 - `ide.read {"symbol":"src/x.rs#Type/method"}` or `{"path":"src/x.rs","lines":"120-180"}`
-  — the body with line numbers; its `source_ref` is what `ide.edit` needs.
+  — the body with line numbers; its `source_ref` is what `ide.edit` needs. Each line reads
+  `NNN<TAB>code`: one tab separates the number from the code, so stripping the gutter leaves
+  the code exactly as it is in the file.
 
 Edit by symbol with the same paths; every form formats the candidate with the project's
 formatter, then runs the project check (cargo check, pyright or tsc) and answers with the

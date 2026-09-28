@@ -5157,7 +5157,7 @@ async fn product_style_sheets_answer_symbol_tools_without_a_server() {
     let text = read["text"].as_str().unwrap();
     assert!(
         text.starts_with(
-            "styles.css#@media (min-width: 40em)/.card .btn  (lines 7)\n7    .card .btn { padding: 0; }\n"
+            "styles.css#@media (min-width: 40em)/.card .btn  (lines 7)\n7\t  .card .btn { padding: 0; }\n"
         ),
         "{read}"
     );
@@ -5332,7 +5332,7 @@ async fn configured_product_links_css_html_and_python_names() {
     let read = actor.settle(&fixture, read).await;
     assert!(
         read["text"].as_str().unwrap().starts_with(
-            "styles.css#.btn  (lines 2–4)\n2  .btn {\n3    color: var(--brand);\n4  }\n"
+            "styles.css#.btn  (lines 2–4)\n2\t.btn {\n3\t  color: var(--brand);\n4\t}\n"
         ),
         "{read}"
     );

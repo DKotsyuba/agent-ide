@@ -6755,7 +6755,7 @@ mod stop_retry_tests {
         .await
         .unwrap();
         assert!(
-            read.starts_with("a.gamma#card/btn  (lines 2–4)\n2    sym btn\n3    #top\n4    end\n"),
+            read.starts_with("a.gamma#card/btn  (lines 2–4)\n2\t  sym btn\n3\t  #top\n4\t  end\n"),
             "{read}"
         );
         assert_eq!(
@@ -6789,7 +6789,7 @@ mod stop_retry_tests {
         );
         assert_eq!(
             run(AssistanceTool::Read, serde_json::json!({"symbol":"##top"})).await,
-            Ok("b.alpha:1  (lines 1)\n1  #top @btn\nsource_ref: serverless\n".into())
+            Ok("b.alpha:1  (lines 1)\n1\t#top @btn\nsource_ref: serverless\n".into())
         );
         assert_eq!(
             run(
