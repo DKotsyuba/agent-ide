@@ -3892,9 +3892,16 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 .as_ref()
                 .is_some_and(|expected| expected != &detail.selection)
             {
+                // A repeated ide.start under one activation_id whose parameters differ can only
+                // name another root: the enqueue dedup returned the earlier start's reference,
+                // so say what actually happened instead of a generic mismatch.
                 return Err(InspectFailure::stage(
                     FailureCode::InvalidDetail,
-                    "inspect:detail_mismatch",
+                    if detail.selection.0 == AssistanceTool::Start {
+                        "start:activation_conflict"
+                    } else {
+                        "inspect:detail_mismatch"
+                    },
                 ));
             }
             (
@@ -6376,6 +6383,63 @@ mod stop_retry_tests {
             panic!("an unminted reference must fail")
         };
         assert_eq!(detail.as_deref(), Some("inspect:detail_unknown"));
+    }
+
+    /// A repeated ide.start under one activation_id with a different root reaches the earlier
+    /// start's retained reference; the mismatch names its own stage instead of a generic one.
+    #[tokio::test]
+    async fn repeated_start_with_another_root_names_its_own_stage() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join("main.rs"), "let value = 1;\n").unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (binding, authority) =
+            activate_worktree(&mut worker, "conflict-actor", "conflict-start").await;
+        // The enqueue dedup key is (binding, activation_id); the retained detail is the first
+        // start's, and the retried call differs only in its root.
+        let first = serde_json::json!({"activation_id":"same-id"});
+        worker.shared.ledger.lock().unwrap().details.insert(
+            "start-first".into(),
+            Detail {
+                binding: binding.clone(),
+                reply: PeerReply::Complete {
+                    kind: ResultKind::Activation,
+                    text: "activated".into(),
+                    detail_ref: None,
+                    truncated: false,
+                    continuation: false,
+                },
+                selection: (AssistanceTool::Start, selection(&first)),
+                authority: Some(authority),
+                source: None,
+                native_epoch: 0,
+                diff_page: None,
+                diff_page_fresh: false,
+                context_page: None,
+                context_page_fresh: false,
+                diff_provenance: None,
+            },
+        );
+        let retry = serde_json::json!({"activation_id":"same-id","root":"/another/root"});
+        let (reply_tx, reply_rx) = oneshot::channel();
+        serve_inspection(
+            &worker.workspace,
+            &worker.shared,
+            Inspection {
+                binding,
+                reference: "start-first".into(),
+                expected: Some((AssistanceTool::Start, selection(&retry))),
+                reply: reply_tx,
+            },
+        )
+        .await;
+        let PeerReply::Error { code, detail } = reply_rx.await.unwrap() else {
+            panic!("a conflicting activation retry must fail")
+        };
+        assert_eq!(code, FailureCode::InvalidDetail);
+        assert_eq!(detail.as_deref(), Some("start:activation_conflict"));
     }
 
     /// A small file's Context reply is byte-for-byte unchanged by the chunking path: it fits one

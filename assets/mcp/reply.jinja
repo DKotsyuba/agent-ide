@@ -46,6 +46,8 @@ error: source_too_large; source is {{ code.source_too_large.size }} bytes, excee
 error: unknown_symbol{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; no symbol matches that path or name; check the file with ide.outline or search a bare name with ide.symbol
 {%- elif code == "provider_loading" -%}
 error: provider_loading{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; the language server is still loading the workspace; repeat the call in a few seconds
+{%- elif code == "invalid_detail" and resolution_detail == "start:activation_conflict" -%}
+error: invalid_detail (start:activation_conflict); this activation_id was used with another root; use a new activation_id
 {%- elif code == "invalid_detail" -%}
 error: invalid_detail{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; {% if resolution_detail == "inspect:detail_expired" %}this detail_ref has expired{% else %}this detail_ref was never issued{% endif %}; repeat the original ide.* call to get a fresh one, or continue with native tools
 {%- elif code == "outside_allowed_roots" -%}

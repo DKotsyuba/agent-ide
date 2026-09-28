@@ -372,8 +372,9 @@ pub enum ParameterError {
     ContextTarget,
     /// `ide.read` needs either `symbol` or both `path` and `lines`.
     ReadTarget,
-    /// `ide.edit` needs `symbol` (with `op`), or `path` with `lines` for a range replace, or the
-    /// full-file form `path` + `source_ref` + `content`.
+    /// `ide.edit` needs `symbol` (with `op`), or `path` with `lines` and `source_ref` for a range
+    /// replace, or the full-file form `path` + `source_ref` + `content`; the forms are exclusive,
+    /// except a redundant `path` naming the symbol's own file.
     EditTarget,
     /// The language runner rejected a semantically unsupported test target.
     TestTargetUnsupported(String),
@@ -483,9 +484,17 @@ impl ParameterError {
                 format!("invalid bounded parameters: \"{field}\" {}", rule.text())
             }
             Self::ContextTarget => CONTEXT_TARGET_MESSAGE.to_string(),
-            Self::ReadTarget => "ide.read needs `symbol`, or `path` with `lines`".to_string(),
-            Self::EditTarget => "ide.edit needs `symbol` with `op`, or `path` with `lines`, or `path` with `source_ref` and `content`".to_string(),
-            Self::TestTargetUnsupported(message) => format!("invalid bounded parameters: {message}; use ide.test with `pattern` or `command`"),
+            Self::ReadTarget => {
+                "ide.read needs either `symbol`, or `path` with `lines` — not both".to_string()
+            }
+            Self::EditTarget => {
+                "ide.edit takes one form: `symbol` with `op`, or `path` with `lines` and \
+                 `source_ref` — not both"
+                    .to_string()
+            }
+            Self::TestTargetUnsupported(message) => format!(
+                "invalid bounded parameters: {message}; use ide.test with `pattern` or `command`"
+            ),
         }
     }
 }
@@ -850,7 +859,14 @@ pub fn validate_call(
             }
             if object.contains_key("symbol") {
                 required_string(object, "symbol", MAX_SYMBOL_PATH_BYTES)?;
-                if object.contains_key("path") || object.contains_key("lines") {
+                // A redundant `path` naming the symbol's own file is accepted and ignored; any
+                // other mix of the two forms is refused as exclusive.
+                let symbol = object["symbol"].as_str().unwrap_or_default();
+                let names_own_file = symbol.split_once('#').is_some_and(|(file, _)| {
+                    object.get("path").and_then(Value::as_str) == Some(file)
+                });
+                if (object.contains_key("path") && !names_own_file) || object.contains_key("lines")
+                {
                     return Err(ParameterError::EditTarget);
                 }
             } else {
@@ -2441,11 +2457,31 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
              re-read the lines (ide.read) and retry with the new source_ref"
                 .to_string(),
         ),
+        (
+            validate_call(
+                AssistanceTool::Read,
+                json!({"symbol":"a.rs#run","path":"a.rs","lines":"1-2"}),
+            )
+            .unwrap_err(),
+            AssistanceTool::Read,
+            "ide.read needs either `symbol`, or `path` with `lines` — not both".to_string(),
+        ),
+        (
+            validate_call(
+                AssistanceTool::Edit,
+                json!({"operation_id":"o","op":"replace","symbol":"a.rs#run","path":"b.rs","content":"x"}),
+            )
+            .unwrap_err(),
+            AssistanceTool::Edit,
+            "ide.edit takes one form: `symbol` with `op`, or `path` with `lines` and \
+             `source_ref` — not both"
+                .to_string(),
+        ),
     ]
 }
 
 /// A line-range edit carrying the read it came from validates; the symbol form's `source_ref`
-/// stays optional.
+/// stays optional and tolerates a redundant `path` naming the symbol's own file.
 #[test]
 fn range_edit_accepts_the_read_it_came_from() {
     assert!(
@@ -2467,6 +2503,18 @@ fn range_edit_accepts_the_read_it_came_from() {
         json!({"operation_id":"o","op":"replace","symbol":"a.rs#run","source_ref":"s","content":"x"})
     )
     .is_ok());
+    // A redundant `path` naming the symbol's own file is accepted and ignored.
+    assert!(validate_call(
+        AssistanceTool::Edit,
+        json!({"operation_id":"o","op":"replace","symbol":"a.rs#run","path":"a.rs","content":"x"})
+    )
+    .is_ok());
+    // `lines` belongs to the path form alone, even beside a symbol whose file is named.
+    assert!(validate_call(
+        AssistanceTool::Edit,
+        json!({"operation_id":"o","op":"replace","symbol":"a.rs#run","path":"a.rs","lines":"1-2","source_ref":"s","content":"x"})
+    )
+    .is_err());
 }
 
 /// Start accepts only absolute, normalized optional working-directory roots.

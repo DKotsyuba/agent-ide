@@ -371,6 +371,24 @@ mod tests {
         );
     }
 
+    /// A repeated activation under one id but another root names its own fix.
+    #[test]
+    fn activation_conflict_names_its_own_recovery() {
+        let conflict = render(
+            PeerReply::Error {
+                code: FailureCode::InvalidDetail,
+                detail: Some("start:activation_conflict".to_owned()),
+            },
+            Envelope::TextOnly,
+        )
+        .unwrap();
+        assert_eq!(
+            text_of(&conflict),
+            "error: invalid_detail (start:activation_conflict); this activation_id was used \
+             with another root; use a new activation_id"
+        );
+    }
+
     /// A generic failure carrying a stage tag names it after the reason, exactly the same tag
     /// the daemon journal records; a failure without one renders the bare reason as before.
     #[test]
