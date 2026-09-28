@@ -3910,6 +3910,123 @@ async fn managed_claude_first_worktree_start_pairs_before_mcp_call() {
     }
 }
 
+/// T15B: a session started in a directory outside `allowed_roots` and then moved by its host into
+/// an allowed project recovers through `ide.start {root}` re-rooting, and names the closed cause
+/// while it is still broken.
+#[tokio::test]
+async fn managed_claude_moved_session_reroots_into_an_allowed_root() {
+    let fixture = ProductFixture::new(json!([]));
+    // The scratch directory is a sibling of the fixture's sole allowed root, never below it.
+    let scratch = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!(
+            "t15b-scratch-{}-{}",
+            std::process::id(),
+            NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed)
+        ));
+    std::fs::create_dir_all(&scratch).unwrap();
+    let scratch_runtime = managed_claude_runtime_path(&scratch);
+    let moved_runtime = managed_claude_runtime_path(&fixture.root);
+    let _scratch_guard = SharedClaudeDaemonGuard(scratch_runtime.clone());
+    let _moved_guard = SharedClaudeDaemonGuard(moved_runtime.clone());
+    assert!(!scratch_runtime.exists() && !moved_runtime.exists());
+    let mut mcp = Mcp::start_managed_claude(&fixture.config, &scratch).await;
+
+    // No hook ever reached the scratch daemon, and its bound project is below no allowed root.
+    let refused = mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                "name":"ide.start","arguments":{"activation_id":"scratch"},
+                "_meta":{"claudecode/toolUseId":"scratch-start"}
+            }}),
+        )
+        .await;
+    assert_eq!(
+        assert_claude_envelope(&refused),
+        "unavailable: host_binding (outside_allowed_roots); continue with native tools",
+        "{refused}"
+    );
+
+    // After the host moves the session, its hooks run with the new project directory and find no
+    // rendezvous there yet: they stay silent fail-open, exactly as in the reproduced incident.
+    let lost = managed_claude_hook(
+        Some(&fixture.root),
+        managed_claude_event("PreToolUse", "moved-session", None, "moved-first"),
+    )
+    .await;
+    assert!(
+        lost.status.success() && lost.stdout.is_empty() && lost.stderr.is_empty(),
+        "undelivered moved hook must stay silent"
+    );
+
+    // The first start naming the moved root re-roots before dispatching. Its own pre-hook ran
+    // before the new rendezvous existed, so the reply is the cause-tagged refusal plus the stable
+    // re-root retry hint — never a bare hard refusal.
+    let rerooted = mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+                "name":"ide.start",
+                "arguments":{"activation_id":"moved","root":fixture.root.to_str().unwrap()},
+                "_meta":{"claudecode/toolUseId":"moved-first"}
+            }}),
+        )
+        .await;
+    let rerooted_text = assert_claude_envelope(&rerooted);
+    assert!(
+        rerooted_text.starts_with(
+            "unavailable: host_binding (hooks_not_delivered); continue with native tools"
+        ),
+        "{rerooted_text}"
+    );
+    assert!(
+        rerooted_text
+            .ends_with("; retry: session re-rooted to the requested root; repeat this call once"),
+        "{rerooted_text}"
+    );
+    assert!(
+        moved_runtime.is_dir(),
+        "the moved root's shared daemon must exist after re-rooting"
+    );
+
+    // The next hooks find the moved project's rendezvous, and the next start activates there.
+    let mut next = 4;
+    let pending = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "moved-session",
+        None,
+        "ide.start",
+        json!({"activation_id":"moved","root":fixture.root.to_str().unwrap()}),
+    )
+    .await;
+    let started = settle_managed_claude_start(
+        &mut mcp,
+        &fixture.root,
+        &mut next,
+        "moved-session",
+        None,
+        &pending,
+    )
+    .await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    next += 1;
+    let stopped = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "moved-session",
+        None,
+        "ide.stop",
+        json!({}),
+    )
+    .await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    mcp.close().await;
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 /// A removed worktree must not poison later activation in the same repository daemon.
 #[tokio::test]
 async fn managed_claude_activates_after_removing_an_earlier_worktree() {
