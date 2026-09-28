@@ -11,7 +11,8 @@ tool integration (planned).
 | `intelligence::names` index: listing, stat sweep, digest confirmation, `verify`, `uncovered`, LRU of worktrees | implemented |
 | Worker glue (`assistance/links.rs`): refresh on the blocking pool, park while building | implemented, not yet called by any tool |
 | Style-sheet provider (`agent-ide-lang-css`: CSS, SCSS, Sass, LESS), §7 | implemented |
-| Providers for markup and JSX | planned (stages 3–4) |
+| HTML provider (`agent-ide-lang-html`), §8 | implemented |
+| JSX provider | planned (stage 4) |
 | Bridge data in `ide.symbol` / `ide.graph` / the project card | planned (stages 3–5) |
 
 No tool reply shows bridge data yet. Style sheets answer `ide.outline`, `ide.read`, `ide.symbol`
@@ -165,6 +166,40 @@ no fact; the rest of the file is still indexed.
 **Domains.** Classes in `*.module.css` / `*.module.scss` (any `*.module.*` style sheet) get the
 file's worktree-relative path as their domain, so they never join global class names. Their ids and
 style variables stay global.
+
+**Skips.** `*.min.*` files and files whose average line exceeds 2 000 bytes are
+`Skipped("minified")`.
+
+## 8. HTML provider
+
+`agent-ide-lang-html` owns `.html` and `.htm`. It has no server and no project check; the outline
+holds landmark elements (`header`, `nav`, `main`, `section`, `article`, `aside`, `footer`, `form`,
+`table`), elements with an `id` (named `tag#id`, so `index.html#main#content` addresses one) and
+`script`/`style` elements, nested by the element tree. Other outlined elements are named by tag and
+first class (`nav.site-nav`).
+
+**Tokenizer.** Hand-written. Tag and attribute names are case-insensitive; values may be
+double-quoted, single-quoted or unquoted; comments, doctypes and processing instructions are
+skipped; void elements and `/>` never open; `<script>` and `<style>` bodies are skipped whole
+(embedded regions are a later stage). An end tag closes the nearest open element of its name.
+
+**Coverage.** `class/v1` use, `id/v1` define and use.
+
+| Syntax | Fact |
+|---|---|
+| `class="a b"` | `Use class a`, `Use class b` |
+| `id="x"` | `Define id x` |
+| `href="#x"` | `Use id x` |
+| `for="x"`, `list="x"`, `form="x"` | `Use id x` |
+| `aria-labelledby="a b"`, `aria-describedby="a b"` | `Use id a`, `Use id b` |
+
+**Normalization.** Character references decode (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`,
+`&nbsp;`, numeric); names are case-sensitive; positions point at the value token (at `#` for
+`href`).
+
+**Templates.** A class or id-list value holding a placeholder (`{{ }}`, `{% %}`, `<%= %>`, `${ }`)
+makes its other tokens `Heuristic("template")`; a token touching a placeholder, and a single-id value
+holding one, yield no fact.
 
 **Skips.** `*.min.*` files and files whose average line exceeds 2 000 bytes are
 `Skipped("minified")`.

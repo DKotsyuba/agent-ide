@@ -1,0 +1,13 @@
+[package]
+name = "agent-ide-lang-html"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "HTML for Agent IDE: element outlines and cross-language name facts."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+agent-ide-core = { path = "../agent-ide-core" }
+async-lsp = { version = "0.2.4", default-features = false, features = ["omni-trait", "tokio"] }

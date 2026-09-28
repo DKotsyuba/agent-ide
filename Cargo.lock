@@ -9,6 +9,7 @@ dependencies = [
  "agent-ide-core",
  "agent-ide-lang-css",
  "agent-ide-lang-go",
+ "agent-ide-lang-html",
  "agent-ide-lang-python",
  "agent-ide-lang-rust",
  "agent-ide-lang-typescript",
@@ -59,6 +60,14 @@ dependencies = [
  "blake3",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "agent-ide-lang-html"
+version = "0.5.0"
+dependencies = [
+ "agent-ide-core",
+ "async-lsp",
 ]
 
 [[package]]

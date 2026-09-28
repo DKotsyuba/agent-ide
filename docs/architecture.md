@@ -68,6 +68,7 @@ the root package that assembles them.
 | `agent-ide-lang-typescript` | `crates/agent-ide-lang-typescript` | TypeScript/JavaScript symbol support, confined `tsc` checks, the release-pinned TypeScript profile and backend | ~6 000 |
 | `agent-ide-lang-go` | `crates/agent-ide-lang-go` | Go symbol support, the shared-listener gopls profile and backend (no project check) | ~2 800 |
 | `agent-ide-lang-css` | `crates/agent-ide-lang-css` | Style sheets (CSS, SCSS, Sass, LESS): a hand-written tokenizer, outlines from source, cross-language name facts (no server, no project check) | ~1 200 |
+| `agent-ide-lang-html` | `crates/agent-ide-lang-html` | HTML documents: a hand-written tag tokenizer, element outlines from source, cross-language name facts (no server, no project check) | ~800 |
 | `agent-ide` (root) | `.` | The `agent-ide` binary (`src/main.rs`), registration of the bundled languages (`agent_ide::languages`), and re-exports of every core and language module under the historical `agent_ide::…` paths | ~3 400 |
 
 Assets, hooks, skills and plugin manifests stay at the repository root. The package version is
@@ -117,7 +118,7 @@ provider is reported as uncovered, never as "zero uses". See
 
 ### Adding a language (recipe)
 
-The next planned language is HTML; the steps are the same for any language. Use the
+The steps are the same for any language. Use the
 smallest existing crate as the template: `agent-ide-lang-go` when the language has no project
 check, `agent-ide-lang-python` when it does, and `agent-ide-lang-css` when it has no server
 either (outline from source plus name facts).
