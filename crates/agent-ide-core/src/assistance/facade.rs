@@ -1532,17 +1532,34 @@ pub(crate) fn stall_rendezvous_for_test() {
     std::thread::sleep(Duration::from_millis(milliseconds.min(60_000)));
 }
 
+/// One remembered successful activation, the facts a transparent re-activation replays.
+#[derive(Clone, Debug)]
+struct RememberedActivation {
+    /// The model-supplied activation id of the successful `ide.start`.
+    activation_id: String,
+    /// The `root` argument that start carried, when it carried one.
+    root: Option<String>,
+}
+
 /// Shares one live `(runtime_dir, attachment)` pair across every clone of a [`StdioFacade`].
 ///
 /// A managed daemon can exit while its MCP process keeps running. Every call reads the current
 /// pair and, on transport loss, re-runs `reestablish` once and stores its result for later calls.
-/// A managed Claude session additionally tracks the canonical project it is bound to and may carry
-/// a `reroot` hook that moves the whole pair (and the host's hook rendezvous) to another root an
-/// `ide.start {root}` named (T15B).
+/// A managed Claude session additionally tracks the canonical project it is bound to, may carry a
+/// `reroot` hook that moves the whole pair (and the host's hook rendezvous) to another root an
+/// `ide.start {root}` named (T15B), and remembers its last successful activation so a daemon
+/// replacement can be recovered transparently (T15B restart recovery).
 #[derive(Clone)]
 struct ManagedConnection {
     current: Arc<Mutex<(PathBuf, String)>>,
     candidate: Arc<Mutex<Option<PathBuf>>>,
+    /// The last successful activation of this session, when it ever activated.
+    last_activation: Arc<Mutex<Option<RememberedActivation>>>,
+    /// Set while a daemon replacement still needs its binding transparently re-activated.
+    recovery_pending: Arc<std::sync::atomic::AtomicBool>,
+    /// Set from a daemon replacement until the next successful activation; references issued
+    /// before it are the ones a replacement invalidated.
+    replaced: Arc<std::sync::atomic::AtomicBool>,
     reroot: Option<RerootFn>,
     reestablish: ReestablishFn,
 }
@@ -1552,6 +1569,9 @@ impl ManagedConnection {
         Self {
             current: Arc::new(Mutex::new((runtime_dir, attachment))),
             candidate: Arc::new(Mutex::new(None)),
+            last_activation: Arc::new(Mutex::new(None)),
+            recovery_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            replaced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reroot: None,
             reestablish,
         }
@@ -1567,11 +1587,16 @@ impl ManagedConnection {
         reroot: RerootFn,
     ) -> Self {
         Self {
-            current: Arc::new(Mutex::new((runtime_dir, attachment))),
             candidate: Arc::new(Mutex::new(Some(candidate))),
-            reroot: Some(reroot),
-            reestablish,
+            ..Self::new(runtime_dir, attachment, reestablish)
         }
+        .with_reroot(reroot)
+    }
+
+    /// Returns this connection with one re-root hook installed.
+    fn with_reroot(mut self, reroot: RerootFn) -> Self {
+        self.reroot = Some(reroot);
+        self
     }
 
     async fn current(&self) -> (PathBuf, String) {
@@ -1590,6 +1615,23 @@ impl ManagedConnection {
     /// Records the project a successful re-root bound the session to.
     async fn store_candidate(&self, candidate: PathBuf) {
         *self.candidate.lock().await = Some(candidate);
+    }
+
+    /// Marks this session's daemon as replaced, with its binding awaiting re-activation.
+    fn mark_replaced(&self) {
+        self.recovery_pending
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.replaced
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Marks a successful activation: the binding is current again.
+    ///
+    /// `replaced` stays sticky: references issued before a replacement remain invalid forever,
+    /// and only the session's explicit end forgets the remembered activation.
+    fn mark_activated(&self) {
+        self.recovery_pending
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -1878,6 +1920,18 @@ impl StdioFacade {
         } else {
             (runtime_dir, attachment)
         };
+        // T15B restart recovery: after a daemon replacement, the first call whose pre-hook
+        // already reached the healed daemon transparently re-runs the remembered activation
+        // before dispatching, so the session continues without the agent re-activating.
+        if let Some(reconnect) = &self.reconnect
+            && reconnect
+                .recovery_pending
+                .load(std::sync::atomic::Ordering::Acquire)
+            && reconnect.last_activation.lock().await.is_some()
+        {
+            self.reactivate_remembered_binding(&runtime_dir, &attachment)
+                .await;
+        }
         let Some(host) = self.build_host(&attachment, context) else {
             return (FacadeOutcome::MissingHostMetadata, resume);
         };
@@ -1903,6 +1957,10 @@ impl StdioFacade {
         reconnect
             .store(new_runtime.clone(), new_attachment.clone())
             .await;
+        if resume == Resume::Restarted {
+            // The replacement discarded this session's binding; the next call re-activates it.
+            reconnect.mark_replaced();
+        }
         let Some(host) = self.build_host(&new_attachment, context) else {
             return (outcome, resume);
         };
@@ -1912,6 +1970,117 @@ impl StdioFacade {
             .dispatch_at(&new_runtime, &host, tool, parameters)
             .await;
         (retried, resume)
+    }
+
+    /// Re-attaches after the shared daemon generation ended and marks the session for transparent
+    /// re-activation (T15B restart recovery); called from the lease watcher the moment the held
+    /// lease stream observes the daemon's end, and safe to repeat.
+    ///
+    /// Returns whether a live daemon is attached again. On success the remembered activation is
+    /// replayed immediately; while no pre-hook has reached the healed daemon yet, that attempt
+    /// waits inside its bounded arrival window and the session stays marked for the lazy
+    /// re-activation the next dispatched call performs.
+    pub async fn recover_lost_daemon(&self) -> bool {
+        let Some(reconnect) = &self.reconnect else {
+            return false;
+        };
+        reconnect.mark_replaced();
+        let Some((runtime, attachment)) = (reconnect.reestablish)().await else {
+            return false;
+        };
+        reconnect.store(runtime.clone(), attachment.clone()).await;
+        self.reactivate_remembered_binding(&runtime, &attachment)
+            .await;
+        true
+    }
+
+    /// Re-runs the remembered activation through the ordinary `ide.start` path, with the trusted
+    /// `claudecode/reactivation` host marker (T15B restart recovery).
+    ///
+    /// The daemon admits the root by the same `allowed_roots` rule as any start and binds from
+    /// the actor of a genuine pre-hook the channel already delivered, so a session whose next
+    /// pre arrived on the healed daemon re-activates without the agent doing anything.
+    async fn reactivate_remembered_binding(&self, runtime_dir: &Path, attachment: &str) {
+        let Some(reconnect) = &self.reconnect else {
+            return;
+        };
+        let Some(remembered) = reconnect.last_activation.lock().await.clone() else {
+            return;
+        };
+        let mut parameters = json!({"activation_id": remembered.activation_id});
+        if let Some(root) = &remembered.root {
+            parameters["root"] = json!(root);
+        }
+        // Each attempt carries a fresh call identity (a synthetic call never receives its own
+        // post-hook, so its settling entry could not be reused), and an activation retry reuses
+        // the committed facts of the one in flight, so a bounded second attempt settles a first
+        // `pending` quickly.
+        for attempt in 0..3 {
+            let call = format!("reactivate-{}-{}", remembered.activation_id, attempt);
+            let Some(mut host) =
+                TrustedTransport::from_host_ingress(&call, &call, attachment.to_owned())
+            else {
+                return;
+            };
+            host.host_meta = Some(json!({
+                "claudecode/toolUseId": call,
+                "claudecode/reactivation": true,
+            }));
+            if let FacadeOutcome::Reply(
+                PeerReply::Complete {
+                    kind: ResultKind::Activation,
+                    ..
+                },
+                _,
+            ) = self
+                .facade
+                .dispatch_at(
+                    runtime_dir,
+                    &host,
+                    AssistanceTool::Start,
+                    parameters.clone(),
+                )
+                .await
+            {
+                reconnect.mark_activated();
+                return;
+            }
+        }
+    }
+
+    /// Reports whether this session activated before and its daemon was replaced since.
+    async fn binding_was_replaced(&self) -> bool {
+        let Some(reconnect) = &self.reconnect else {
+            return false;
+        };
+        reconnect
+            .replaced
+            .load(std::sync::atomic::Ordering::Acquire)
+            && reconnect.last_activation.lock().await.is_some()
+    }
+
+    /// Reports whether one reply refuses a reference only a daemon replacement invalidated.
+    ///
+    /// Only a replaced daemon's `detail_ref`/`source_ref` reach this state on a healed session:
+    /// references are boot-unique, and the flag clears at the next successful activation, so a
+    /// merely mistyped reference keeps its ordinary error.
+    async fn references_predate_replacement(&self, reply: &PeerReply) -> bool {
+        self.binding_was_replaced().await
+            && matches!(
+                reply,
+                PeerReply::Error {
+                    code: FailureCode::InvalidDetail,
+                    ..
+                }
+            )
+    }
+
+    /// Forgets the remembered activation after the session explicitly ended.
+    async fn forget_remembered_activation(&self) {
+        if let Some(reconnect) = &self.reconnect {
+            *reconnect.last_activation.lock().await = None;
+            reconnect.mark_activated();
+        }
     }
 
     /// Validates model parameters before using separately supplied host metadata for finite IPC.
@@ -1952,22 +2121,82 @@ impl StdioFacade {
             }
             other => other,
         };
+        // Remember every successful activation: its id and root are what a transparent
+        // re-activation replays after a daemon replacement (T15B restart recovery).
+        if let FacadeOutcome::Reply(
+            PeerReply::Complete {
+                kind: ResultKind::Activation,
+                ..
+            },
+            _,
+        ) = &outcome
+            && let Some(reconnect) = &self.reconnect
+            && let Some(activation_id) = stage_parameters
+                .get("activation_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+        {
+            *reconnect.last_activation.lock().await = Some(RememberedActivation {
+                activation_id: activation_id.to_owned(),
+                root: stage_parameters
+                    .get("root")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            });
+            reconnect.mark_activated();
+        }
+        // A stop that finds no binding because the daemon was replaced already achieved its
+        // goal: the replacement revoked everything the stop would have revoked.
+        let outcome = match outcome {
+            FacadeOutcome::Reply(reply, status)
+                if tool == AssistanceTool::Stop
+                    && matches!(
+                        reply,
+                        PeerReply::Unavailable {
+                            reason: MissingPeer::HostBinding,
+                            ..
+                        }
+                    )
+                    && self.binding_was_replaced().await =>
+            {
+                self.forget_remembered_activation().await;
+                FacadeOutcome::Reply(
+                    PeerReply::Complete {
+                        kind: ResultKind::Stop,
+                        text: "stopped (the IDE had already restarted)".into(),
+                        detail_ref: None,
+                        truncated: false,
+                        continuation: false,
+                    },
+                    status,
+                )
+            }
+            other => other,
+        };
         let envelope = match parse_host_kind(&context.meta) {
             Ok(HostKind::Claude) => content::Envelope::TextOnly,
             _ => content::Envelope::WithStructured,
         };
         let message = match outcome {
             FacadeOutcome::Reply(reply, status) if resume != Resume::Fresh => {
-                return render_reply_after_reconnect(
-                    tool,
-                    reply,
-                    status.as_deref(),
-                    envelope,
-                    resume == Resume::Rerooted,
+                let note = self.references_predate_replacement(&reply).await;
+                return note_replaced_references(
+                    render_reply_after_reconnect(
+                        tool,
+                        reply,
+                        status.as_deref(),
+                        envelope,
+                        resume == Resume::Rerooted,
+                    ),
+                    note,
                 );
             }
             FacadeOutcome::Reply(reply, status) => {
-                return render_reply_with_status(reply, status.as_deref(), envelope);
+                let note = self.references_predate_replacement(&reply).await;
+                return note_replaced_references(
+                    render_reply_with_status(reply, status.as_deref(), envelope),
+                    note,
+                );
             }
             FacadeOutcome::InvalidParameters => {
                 "invalid bounded parameters; inspect the tool schema"
@@ -2183,6 +2412,15 @@ pub(crate) fn staged_detail(
         return format!("{stage} ext={extension}");
     }
     stage
+}
+
+/// Appends the explicit replaced-reference note to one rendered result, when due.
+fn note_replaced_references(mut rendered: CallToolResult, note: bool) -> CallToolResult {
+    if note && let Some(ContentBlock::Text(text)) = rendered.content.first_mut() {
+        text.text
+            .push_str(" (issued before the IDE restarted; re-read)");
+    }
+    rendered
 }
 
 /// Why one dispatch's target changed under the call, selecting its recovery hint.

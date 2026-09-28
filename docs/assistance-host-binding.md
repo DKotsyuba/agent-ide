@@ -193,7 +193,8 @@ optional `agent_id`, and optional `agent_type` fields. The placeholder-only exam
 implemented; `permission_mode` is never mapped to OS authority, and the same `allowed_roots`
 policy applies as on Codex.
 
-The hook command reads at most 64 KiB plus one overflow byte and uses a separate **250 ms
+The hook command reads at most 8 MiB plus one overflow byte (a larger payload's tool bodies are
+projected away before submission) and uses a separate **250 ms
 total deadline** for stdin, parsing, connect, dispatch and reply. An open stdin pipe cannot
 hold up process exit. Missing/invalid attachment, absent daemon, invalid or oversized
 JSON, malformed or ambiguous identity, transport loss and timeout all exit successfully
@@ -218,6 +219,27 @@ no longer drop their event: the hook reads up to 8 MiB on the same deadline and 
 payload down to the identity fields the daemon consumes, so a multi-megabyte Read/Write tool
 body is discarded rather than the lifecycle; only a projection that itself exceeds the 64 KiB
 transport bound is refused as `hook_input_oversize`.
+
+### Restart recovery (T15B follow-up)
+
+A shared daemon generation can end under a live session (idle expiry, a signal, a crash). Two
+mechanisms keep the session usable without the agent being told to re-activate:
+
+- **Late pre-hooks.** The host fires each pre exactly once, and a daemon busy with a sibling
+  call can observe its submission hundreds of milliseconds late. Before the guard records the
+  MCP-before-pre ordering as permanent replay evidence, the dispatcher gives an absent Claude
+  pre a bounded 600 ms arrival window; a call whose pre never arrives is still refused.
+- **Transparent re-activation.** The managed Claude MCP watches its held lease stream: EOF
+  means the generation ended, and it re-attaches at once so the host's next pre-hook already
+  finds a healthy rendezvous. The MCP remembers its last successful activation (activation id
+  and root) and, before its next dispatch, re-runs that start with the trusted
+  `claudecode/reactivation` host marker (never model arguments); the managed shared daemon
+  binds from the actor of a genuine pre-hook the channel already delivered, without consuming
+  it, under the same `allowed_roots` rule and the same replay and capacity rules as any start.
+  References issued by the dead generation are the one thing recovery cannot restore: an
+  invalid `detail_ref` after a replacement appends "issued before the IDE restarted; re-read",
+  and `ide.stop` against a binding the replacement already revoked answers success-shaped
+  ("stopped (the IDE had already restarted)").
 
 Hook parsing rejects duplicate known JSON keys and retains only explicit host, phase, bounded
 identity, and optional call ID. Codex root events require `session_id`; native child events carry

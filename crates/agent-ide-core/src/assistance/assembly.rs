@@ -571,24 +571,44 @@ impl ProductDispatcher {
                     });
                 }
                 let channel = self.channel(method.opaque_attachment())?;
+                // Trusted re-activation ingress (T15B restart recovery): the managed Claude MCP
+                // marks the start that re-runs a remembered activation after the daemon it had
+                // activated on was replaced. The marker rides host metadata, never model
+                // arguments, and only the managed shared daemon accepts it.
+                let reactivation = host == HostKind::Claude
+                    && method.method() == AssistanceMethod::Start
+                    && self.managed_claude
+                    && meta.contains_key("claudecode/reactivation");
                 // A merely-late pre-hook must not be recorded as MCP-before-pre replay
                 // evidence: the host fires each pre exactly once, and a daemon busy with a
                 // sibling call can observe its submission hundreds of milliseconds late
                 // (~405 ms in the T15B evidence, against the hook's own 250 ms deadline).
-                // Give an absent Claude pre a bounded arrival window before the guard op.
-                if host == HostKind::Claude
-                    && !self
+                // Give an absent Claude pre a bounded arrival window before the guard op; a
+                // re-activation start instead waits for any pre on its channel, whose actor it
+                // takes without consuming it.
+                if host == HostKind::Claude {
+                    let evidence = |bindings: &std::sync::MutexGuard<'_, HostBindingGuard>| {
+                        if reactivation {
+                            bindings.pending_pre_actor(&channel).is_some()
+                        } else {
+                            bindings.has_pre(method.correlation_id(), &channel)
+                        }
+                    };
+                    if !self
                         .bindings
                         .lock()
-                        .is_ok_and(|bindings| bindings.has_pre(method.correlation_id(), &channel))
-                {
-                    let deadline = tokio::time::Instant::now() + PRE_ARRIVAL_WAIT;
-                    while tokio::time::Instant::now() < deadline {
-                        tokio::time::sleep(PRE_ARRIVAL_POLL).await;
-                        if self.bindings.lock().is_ok_and(|bindings| {
-                            bindings.has_pre(method.correlation_id(), &channel)
-                        }) {
-                            break;
+                        .is_ok_and(|bindings| evidence(&bindings))
+                    {
+                        let deadline = tokio::time::Instant::now() + PRE_ARRIVAL_WAIT;
+                        while tokio::time::Instant::now() < deadline {
+                            tokio::time::sleep(PRE_ARRIVAL_POLL).await;
+                            if self
+                                .bindings
+                                .lock()
+                                .is_ok_and(|bindings| evidence(&bindings))
+                            {
+                                break;
+                            }
                         }
                     }
                 }
@@ -615,7 +635,9 @@ impl ProductDispatcher {
                             if call_id != method.correlation_id() {
                                 return None;
                             }
-                            if method.method() == AssistanceMethod::Start {
+                            if method.method() == AssistanceMethod::Start && reactivation {
+                                bindings.reactivate_start_claude(&call_id, channel.clone())
+                            } else if method.method() == AssistanceMethod::Start {
                                 bindings.establish_start_claude(&call_id, channel.clone())
                             } else {
                                 bindings.validate_active_claude(&call_id, channel.clone())

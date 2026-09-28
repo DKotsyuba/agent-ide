@@ -2228,9 +2228,39 @@ async fn run_managed_claude_mcp(
         reestablish,
         reroot,
     ) {
-        Some(facade) => serve_managed_stdio(facade, None, None, Some(lease), None).await,
+        Some(facade) => {
+            // The held lease stream is a live death notice for the shared daemon: watching it
+            // heals the session the moment a generation ends, instead of at the next failed tool
+            // call, so the host's next pre-hook already finds a healthy rendezvous (T15B).
+            tokio::spawn(watch_claude_lease(Arc::clone(&lease), facade.clone()));
+            serve_managed_stdio(facade, None, None, Some(lease), None).await
+        }
         None => {
             serve_managed_stdio(StdioFacade::unavailable(), None, None, Some(lease), None).await
+        }
+    }
+}
+
+/// Heals a managed Claude session the moment its shared daemon generation ends (T15B).
+///
+/// EOF or error on the held lease stream means the daemon exited — idle expiry, a signal, or a
+/// crash. The watcher re-attaches through the startup path at once; the facade marks the session
+/// for transparent re-activation, so the host's next pre-hook lands on a healthy daemon and the
+/// next tool call re-runs the remembered activation itself. A failed heal retries at a bounded
+/// cadence; nothing here can block or fail the MCP's serving loop.
+async fn watch_claude_lease(lease: Arc<Mutex<Option<UnixStream>>>, facade: StdioFacade) {
+    loop {
+        let stream = lease.lock().await.take();
+        let Some(mut stream) = stream else {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        };
+        let mut discard = [0_u8; 256];
+        use tokio::io::AsyncReadExt as _;
+        while matches!(stream.read(&mut discard).await, Ok(read) if read > 0) {}
+        // This generation ended; heal until a fresh one is attached, then watch its stream.
+        while !facade.recover_lost_daemon().await {
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 }

@@ -4254,6 +4254,198 @@ async fn claude_call_with_a_late_pre_hook_is_served_not_refused() {
     mcp.close().await;
 }
 
+/// A session survives a daemon restart between two of its tool calls: the lease watcher heals the
+/// rendezvous at once, the next call transparently re-runs the remembered activation from its own
+/// pre-hook, a reference issued by the dead generation names the restart explicitly, and the
+/// session still stops cleanly.
+#[tokio::test]
+async fn claude_session_survives_a_daemon_restart_between_calls() {
+    let fixture = ProductFixture::new(json!([]));
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    let mut next = 1;
+    let pending = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "restart-session",
+        None,
+        "ide.start",
+        json!({"activation_id":"survive-restart"}),
+    )
+    .await;
+    let started = settle_managed_claude_start(
+        &mut mcp,
+        &fixture.root,
+        &mut next,
+        "restart-session",
+        None,
+        &pending,
+    )
+    .await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    // One call before the restart, keeping its reference for the stale-reference check.
+    next += 1;
+    let before = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "restart-session",
+        None,
+        "ide.read",
+        json!({"path":"src/lib.rs","lines":"1-2"}),
+    )
+    .await;
+    let stale_ref = claude_text(&before)
+        .split("source_ref: ")
+        .nth(1)
+        .map(|tail| tail.trim().to_owned())
+        .expect("read reply carries a source_ref");
+
+    // The shared daemon generation ends; the watcher must heal it before the next pre-hook.
+    terminate_shared_claude_daemon(&runtime);
+    wait_for_healed_daemon(&runtime).await;
+
+    // The next pre-hook lands on the healed daemon and the next call transparently re-activates.
+    next += 1;
+    let after = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "restart-session",
+        None,
+        "ide.read",
+        json!({"path":"src/lib.rs","lines":"1-2"}),
+    )
+    .await;
+    let after_text = claude_text(&after);
+    assert!(
+        after_text.contains("pub fn value() -> i32"),
+        "the call after the restart must be served: {after_text}"
+    );
+
+    // A reference issued by the dead generation names the restart explicitly.
+    next += 1;
+    let pre = managed_claude_hook(
+        Some(&fixture.root),
+        managed_claude_event(
+            "PreToolUse",
+            "restart-session",
+            None,
+            &format!("stale-{next}"),
+        ),
+    )
+    .await;
+    assert!(pre.status.success() && pre.stderr.is_empty());
+    let stale = mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{
+                "name":"ide.inspect","arguments":{"detail_ref": stale_ref},
+                "_meta":{"claudecode/toolUseId":format!("stale-{next}")}
+            }}),
+        )
+        .await;
+    let stale_text = assert_claude_envelope(&stale);
+    assert!(
+        stale_text.starts_with("error: invalid_detail")
+            && stale_text.contains("issued before the IDE restarted; re-read"),
+        "{stale_text}"
+    );
+
+    // The session still ends cleanly.
+    next += 1;
+    let stopped = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "restart-session",
+        None,
+        "ide.stop",
+        json!({}),
+    )
+    .await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    mcp.close().await;
+}
+
+/// A stop whose binding already died with a replaced daemon answers success-shaped instead of an
+/// error: the replacement already revoked everything the stop would have revoked.
+#[tokio::test]
+async fn ide_stop_after_a_daemon_restart_answers_success() {
+    let fixture = ProductFixture::new(json!([]));
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    let mut next = 1;
+    let pending = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "stop-session",
+        None,
+        "ide.start",
+        json!({"activation_id":"stop-after-restart"}),
+    )
+    .await;
+    let started = settle_managed_claude_start(
+        &mut mcp,
+        &fixture.root,
+        &mut next,
+        "stop-session",
+        None,
+        &pending,
+    )
+    .await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    terminate_shared_claude_daemon(&runtime);
+    wait_for_healed_daemon(&runtime).await;
+
+    // No pre-hook is fired for this stop: the healed daemon has neither binding nor pre, and the
+    // facade answers the session-shaped success instead of a host-binding error.
+    let stopped = mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":next + 1,"method":"tools/call","params":{
+                "name":"ide.stop","arguments":{},
+                "_meta":{"claudecode/toolUseId":"stop-after-restart-call"}
+            }}),
+        )
+        .await;
+    let text = assert_claude_envelope(&stopped);
+    assert_eq!(
+        text,
+        "complete stop: stopped (the IDE had already restarted)\nWorkspace authority is released; native edits remain on disk",
+        "{stopped}"
+    );
+    mcp.close().await;
+}
+
+/// Returns the sole model-facing text block of one Claude-path reply.
+fn claude_text(fields: &Value) -> &str {
+    fields["text"].as_str().unwrap_or_default()
+}
+
+/// Waits until the shared runtime answers healthy again after its generation ended.
+async fn wait_for_healed_daemon(runtime: &Path) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if agent_ide::app::doctor_report(runtime)
+                .await
+                .is_ok_and(|report| {
+                    matches!(report.status, agent_ide::app::DoctorStatus::Healthy { .. })
+                })
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the lease watcher must heal the shared daemon");
+}
+
 /// A session that never calls `ide.start` produces hook bookkeeping, not failures: one `info`
 /// skip line per detail per window on each side, and no `warn` hook line at all.
 #[tokio::test]

@@ -530,6 +530,61 @@ impl HostBindingGuard {
             }
             return BindingStatus::Unavailable(BindingUnavailable::MissingPre);
         }
+        self.bind_established(candidate, channel)
+    }
+
+    /// Re-establishes a Claude start binding from trusted re-activation ingress (T15B restart
+    /// recovery), taking the actor from one genuine pre-hook this channel already delivered.
+    ///
+    /// A daemon replacement discards every binding; the managed Claude MCP that re-attached marks
+    /// its start with the trusted `claudecode/reactivation` host metadata (never model arguments),
+    /// and the actor is read from a real pending pre-hook on the same channel — exactly the actor
+    /// the dead generation's binding carried, since the channel is the same. Every replay,
+    /// capacity, and generation rule of [`Self::establish_start`] applies; no pre is consumed and
+    /// no replay evidence is recorded while the channel is still silent, so a later attempt with
+    /// its pre can succeed.
+    pub fn reactivate_start_claude(
+        &mut self,
+        call_id: &str,
+        channel: ChannelSessionRef,
+    ) -> BindingStatus {
+        let Some(actor_id) = self.pending_pre_actor(&channel) else {
+            return BindingStatus::Unavailable(BindingUnavailable::MissingPre);
+        };
+        self.bind_established(
+            CandidateInvocation {
+                host: HostKind::Claude,
+                actor_id,
+                call_id: call_id.to_owned(),
+            },
+            channel,
+        )
+    }
+
+    /// Returns the actor of one pending pre-hook on this channel, without consuming it.
+    pub fn pending_pre_actor(&self, channel: &ChannelSessionRef) -> Option<String> {
+        self.pre_observed
+            .iter()
+            .find(|(_, observed)| observed == channel)
+            .map(|(candidate, _)| candidate.actor_id.clone())
+    }
+
+    /// Creates or reuses the binding generation for one admitted start candidate and opens its
+    /// settling entry; the caller has already applied the replay and pre-observation rules.
+    fn bind_established(
+        &mut self,
+        candidate: CandidateInvocation,
+        channel: ChannelSessionRef,
+    ) -> BindingStatus {
+        let invocation = (candidate.clone(), channel.clone());
+        if self.replay_disposition(&candidate, &channel).is_some()
+            || self.settling.contains_key(&invocation)
+        {
+            return BindingStatus::Unavailable(BindingUnavailable::Replay);
+        }
+        if self.replay_scope_saturated(&candidate, &channel) {
+            return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
+        }
         let binding_key = (candidate.host, candidate.actor_id.clone(), channel.clone());
         let (binding, created_binding) = if let Some(existing) = self.bindings.get(&binding_key) {
             if self.stopping.contains(existing) {
@@ -1355,6 +1410,44 @@ mod tests {
             .as_bytes(),
         )
         .expect("test hook is valid")
+    }
+
+    /// A trusted re-activation binds from a pending pre's actor without consuming that pre, so
+    /// the real call it belongs to still validates; a silent channel is refused without replay
+    /// evidence, so a later attempt with its pre can succeed.
+    #[test]
+    fn reactivated_start_binds_from_a_pending_pre_without_consuming_it() {
+        let mut guard = HostBindingGuard::default();
+        let channel = channel("recovery-channel");
+        // A silent channel refuses without recording anything: a later attempt can still bind.
+        assert!(matches!(
+            guard.reactivate_start_claude("reactivate-1", channel.clone()),
+            BindingStatus::Unavailable(BindingUnavailable::MissingPre)
+        ));
+        // The host's next pre arrives; its actor re-establishes the dead generation's binding.
+        assert!(matches!(
+            guard.observe_hook(claude_pre("session", None, "real-call"), channel.clone()),
+            BindingStatus::PreObserved
+        ));
+        assert!(matches!(
+            guard.reactivate_start_claude("reactivate-2", channel.clone()),
+            BindingStatus::Validated(_)
+        ));
+        // The real call's own pre was not consumed: it still validates on the same binding.
+        assert!(matches!(
+            guard.validate_active_claude("real-call", channel.clone()),
+            BindingStatus::Validated(_)
+        ));
+        // The same re-activation identity cannot bind twice: with a fresh pre available, the
+        // settling entry of the first attempt is replay evidence.
+        assert!(matches!(
+            guard.observe_hook(claude_pre("session", None, "real-call-2"), channel.clone()),
+            BindingStatus::PreObserved
+        ));
+        assert!(matches!(
+            guard.reactivate_start_claude("reactivate-2", channel.clone()),
+            BindingStatus::Unavailable(BindingUnavailable::Replay)
+        ));
     }
 
     /// A pre lookup answers per exact call identity and channel, without consuming anything, so a
