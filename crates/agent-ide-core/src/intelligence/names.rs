@@ -59,7 +59,7 @@ const FACTS_CAP: &str = "facts cap";
 
 /// Directories no language walk enters: VCS internals, virtual environments, dependency installs
 /// and build output.
-pub(crate) const SKIPPED_DIRECTORIES: [&str; 7] = [
+pub const SKIPPED_DIRECTORIES: [&str; 7] = [
     ".git",
     ".hg",
     ".venv",

@@ -8,35 +8,20 @@
 //! ponytail: a selector containing `/` (an escaped `\/`) cannot be addressed, since `/` separates
 //! path segments; rename such rules in the outline if it matters.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use async_lsp::lsp_types as lsp;
 
 use agent_ide_core::lang::{
     InsertSite, InsertWhere, LangError, Language, LanguageProject, LanguageSupport, LineRange,
     Outline, ProjectCommands, Symbol, SymbolKind, SymbolPath, TestReport, TestSelection,
-    TestTarget, brace::place, line_count,
+    TestTarget, brace::place, line_count, text::has_files_with,
 };
 
 use crate::{
     LANGUAGE,
     scan::{Block, Sheet, sheet_text},
 };
-
-/// Directories the presence walk visits at most.
-const DETECT_MAX_DIRECTORIES: usize = 64;
-/// Directory levels below the root the presence walk enters.
-const DETECT_MAX_DEPTH: usize = 3;
-/// Directories the presence walk never enters (besides hidden ones).
-const DETECT_SKIPPED: [&str; 7] = [
-    ".git",
-    ".hg",
-    ".venv",
-    "venv",
-    "node_modules",
-    "target",
-    "dist",
-];
 
 /// Stateless style-sheet implementation of [`LanguageSupport`].
 #[derive(Clone, Copy, Debug, Default)]
@@ -52,7 +37,7 @@ impl LanguageSupport for CssSupport {
     /// build directories skipped) finds a `.css`, `.scss`, `.sass` or `.less` file. Style sheets
     /// have no manifest, environment, commands or entry points.
     fn detect(&self, root: &Path) -> Option<LanguageProject> {
-        has_style_sheet(root).then(|| LanguageProject {
+        has_files_with(root, LANGUAGE.descriptor().extensions).then(|| LanguageProject {
             language: LANGUAGE,
             manifests: Vec::new(),
             environment: Vec::new(),
@@ -165,46 +150,6 @@ fn symbols(sheet: &Sheet<'_>, blocks: &[Block], file: &Path, segments: &[String]
             }
         })
         .collect()
-}
-
-/// Whether a style sheet lies within the bounded presence walk of `root`.
-fn has_style_sheet(root: &Path) -> bool {
-    let mut queue = std::collections::VecDeque::from([(PathBuf::from(root), 0usize)]);
-    let mut visited = 0;
-    while let Some((directory, depth)) = queue.pop_front() {
-        visited += 1;
-        let Ok(entries) = std::fs::read_dir(&directory) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            let path = entry.path();
-            if kind.is_file()
-                && LANGUAGE
-                    .descriptor()
-                    .extensions
-                    .iter()
-                    .any(|extension| path.extension().is_some_and(|own| own == *extension))
-            {
-                return true;
-            }
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if kind.is_dir()
-                && depth < DETECT_MAX_DEPTH
-                && !name.starts_with('.')
-                && !DETECT_SKIPPED.contains(&name.as_ref())
-            {
-                queue.push_back((path, depth + 1));
-            }
-        }
-        if visited >= DETECT_MAX_DIRECTORIES {
-            break;
-        }
-    }
-    false
 }
 
 #[cfg(test)]

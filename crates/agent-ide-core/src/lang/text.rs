@@ -13,6 +13,53 @@ pub const MAX_NAMED_TESTS: usize = 12;
 /// Character ceiling for the signature of a class attribute or interface field.
 pub const MAX_ATTRIBUTE_CHARS: usize = 60;
 
+/// Directories [`has_files_with`] visits at most.
+const PRESENCE_MAX_DIRECTORIES: usize = 64;
+/// Directory levels below the root [`has_files_with`] enters.
+const PRESENCE_MAX_DEPTH: usize = 3;
+
+/// Whether a file with one of `extensions` lies within a bounded breadth-first walk of `root`:
+/// three levels, 64 directories, skipping hidden directories and
+/// [`SKIPPED_DIRECTORIES`](crate::intelligence::names::SKIPPED_DIRECTORIES). The presence rule of
+/// languages without a manifest.
+pub fn has_files_with(root: &Path, extensions: &[&str]) -> bool {
+    let mut queue = std::collections::VecDeque::from([(root.to_path_buf(), 0usize)]);
+    let mut visited = 0;
+    while let Some((directory, depth)) = queue.pop_front() {
+        visited += 1;
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if kind.is_file()
+                && path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extensions.contains(&extension))
+            {
+                return true;
+            }
+            if kind.is_dir()
+                && depth < PRESENCE_MAX_DEPTH
+                && !name.starts_with('.')
+                && !crate::intelligence::names::SKIPPED_DIRECTORIES.contains(&name.as_ref())
+            {
+                queue.push_back((path, depth + 1));
+            }
+        }
+        if visited >= PRESENCE_MAX_DIRECTORIES {
+            break;
+        }
+    }
+    false
+}
+
 /// Tests in first-seen order without duplicates.
 pub fn distinct(tests: &[TestId]) -> Vec<TestId> {
     let mut unique: Vec<TestId> = Vec::new();
@@ -133,4 +180,26 @@ pub fn one_line(text: &str) -> String {
         out = out.replace(from, to);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The presence walk finds a nested file but never one inside a skipped or hidden directory.
+    #[test]
+    fn presence_walk_skips_dependency_and_hidden_directories() {
+        let root = std::env::temp_dir().join(format!("agent-ide-presence-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for skipped in ["node_modules/pkg", ".cache"] {
+            fs::create_dir_all(root.join(skipped)).unwrap();
+            fs::write(root.join(skipped).join("a.x"), "").unwrap();
+        }
+        assert!(!has_files_with(&root, &["x"]));
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::write(root.join("a/b/c.x"), "").unwrap();
+        assert!(has_files_with(&root, &["y", "x"]));
+        assert!(!has_files_with(&root, &["y"]));
+        fs::remove_dir_all(&root).unwrap();
+    }
 }
