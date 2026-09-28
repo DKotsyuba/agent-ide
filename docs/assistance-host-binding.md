@@ -200,6 +200,21 @@ The private error log separates input-thread startup, read, deadline, size, and 
 failures with closed `hook_input_*` or `hook_no_cwd` details and an elapsed millisecond
 count; it never stores the hook payload.
 
+Hook logging levels follow one rule: a hook of a session that never activated the IDE is
+bookkeeping, not a failure. The daemon journals it at `info` with outcome `skipped` and the
+closed `hook_inactive` detail, the client-side hook keeps its own detail
+(`hook_no_rendezvous`, `hook_no_key_cache`, `hook_no_candidate_attachment`, or
+`hook_submit_refused:unavailable`) at the same `info`/`skipped` level, and each side emits at
+most one line per detail per ten-minute window, carrying `count=N` of the events suppressed
+since the last line (the stateless client keeps its window in a tiny stamp file beside the
+journal, whose content — not its mtime, which every counter update rewrites — carries the
+window start). `warn` and `error` stay reserved for hooks of a session that did activate and
+then fail, and for real ingress failures (`hook_input_*`, `hook_no_cwd`). Large host payloads
+no longer drop their event: the hook reads up to 8 MiB on the same deadline and projects the
+payload down to the identity fields the daemon consumes, so a multi-megabyte Read/Write tool
+body is discarded rather than the lifecycle; only a projection that itself exceeds the 64 KiB
+transport bound is refused as `hook_input_oversize`.
+
 Hook parsing rejects duplicate known JSON keys and retains only explicit host, phase, bounded
 identity, and optional call ID. Codex root events require `session_id`; native child events carry
 both root `session_id` and child `agent_id`, with the child selected as actor. Claude always retains `session_id` and selects its

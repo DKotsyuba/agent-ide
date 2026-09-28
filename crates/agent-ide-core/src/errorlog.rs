@@ -164,6 +164,8 @@ pub enum Outcome {
     LeaseOpened,
     /// Lifecycle fact: a client lease was released.
     LeaseClosed,
+    /// An event was deliberately not acted on because its session never activated; not a failure.
+    Skipped,
 }
 
 impl Outcome {
@@ -186,12 +188,13 @@ impl Outcome {
             Self::Reestablished => "reestablished",
             Self::LeaseOpened => "lease_opened",
             Self::LeaseClosed => "lease_closed",
+            Self::Skipped => "skipped",
         }
     }
 
     /// Maps this outcome to its closed severity (T107 full-logging extension): `error` for a real
     /// failure, `warn` for an unavailable/refused/cancelled/transient-check boundary, `info` for a
-    /// success, a legitimate pending round trip, or a lifecycle fact.
+    /// success, a legitimate pending round trip, a lifecycle fact, or a deliberate skip.
     pub const fn level(self) -> Level {
         match self {
             Self::Failed | Self::Invalid | Self::Fatal => Level::Error,
@@ -207,7 +210,8 @@ impl Outcome {
             | Self::IdleExit
             | Self::Reestablished
             | Self::LeaseOpened
-            | Self::LeaseClosed => Level::Info,
+            | Self::LeaseClosed
+            | Self::Skipped => Level::Info,
         }
     }
 }
@@ -667,6 +671,8 @@ pub struct Fields<'a> {
     pub correlation: Option<&'a str>,
     /// Bounded, already privacy-safe free text (at most 160 bytes; longer text is truncated).
     pub detail: Option<&'a str>,
+    /// Events suppressed by rate limiting since the last line for the same fact, when any.
+    pub count: Option<u64>,
     /// Elapsed wall-clock duration of the logged operation, saturated to whole milliseconds.
     pub duration_ms: Option<u32>,
 }
@@ -752,6 +758,9 @@ pub(crate) fn build_line(
             serde_json::Value::String(bounded_detail(detail).to_owned()),
         );
     }
+    if let Some(count) = fields.count {
+        object.insert("count".to_owned(), serde_json::Value::Number(count.into()));
+    }
     if let Some(duration_ms) = fields.duration_ms {
         object.insert(
             "duration_ms".to_owned(),
@@ -759,6 +768,59 @@ pub(crate) fn build_line(
         );
     }
     serde_json::to_vec(&serde_json::Value::Object(object)).unwrap_or_default()
+}
+
+/// Returns the current wall-clock time in whole milliseconds since the Unix epoch.
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// One rate-limited fact window: at most one line per fixed window, counting every suppressed
+/// repetition so the next window's line can flush the total (T15B hook-noise follow-up).
+///
+/// The first event opens a window and emits immediately; later events inside the window are only
+/// counted; the first event of the next window emits that count and starts over. Pure state — the
+/// daemon keeps one in memory per fact, the stateless hook keeps one in a stamp file.
+#[derive(Debug, Default)]
+pub struct RateWindow {
+    /// Window start in milliseconds; `None` before the first event.
+    started_at: Option<u64>,
+    /// Events suppressed since the last emitted line.
+    suppressed: u64,
+}
+
+impl RateWindow {
+    /// Records one event at `now_ms`; returns the suppressed count when a line should be emitted.
+    pub fn record(&mut self, now_ms: u64, window_ms: u64) -> Option<u64> {
+        match self.started_at {
+            Some(started) if now_ms.saturating_sub(started) < window_ms => {
+                self.suppressed = self.suppressed.saturating_add(1);
+                None
+            }
+            _ => {
+                let suppressed = self.suppressed;
+                self.started_at = Some(now_ms);
+                self.suppressed = 0;
+                Some(suppressed)
+            }
+        }
+    }
+
+    /// Restores a window a stateless caller persisted (the hook's stamp file).
+    pub fn resume(started_at: Option<u64>, suppressed: u64) -> Self {
+        Self {
+            started_at,
+            suppressed,
+        }
+    }
+
+    /// Returns the persistable `(window start, suppressed count)` pair.
+    pub fn parts(&self) -> (Option<u64>, u64) {
+        (self.started_at, self.suppressed)
+    }
 }
 
 /// One decoded log line, as read back by [`read_events`].
@@ -1173,5 +1235,56 @@ mod tests {
         let bounded = bounded_detail(&text);
         assert!(bounded.len() <= MAX_DETAIL_BYTES);
         assert!(text.starts_with(bounded));
+    }
+
+    /// A skipped outcome is info, and its line carries the rate-limiter's suppressed count.
+    #[test]
+    fn skipped_outcome_is_info_and_carries_its_suppressed_count() {
+        assert_eq!(Outcome::Skipped.as_str(), "skipped");
+        assert_eq!(Outcome::Skipped.level(), Level::Info);
+        let line = build_line(
+            Method::Hook,
+            Outcome::Skipped,
+            Fields {
+                detail: Some("hook_inactive"),
+                count: Some(41),
+                ..Default::default()
+            },
+            0,
+        );
+        let value: serde_json::Value = serde_json::from_slice(&line).unwrap();
+        assert_eq!(value["level"], "info");
+        assert_eq!(value["outcome"], "skipped");
+        assert_eq!(value["count"], 41);
+    }
+
+    /// The rate window emits its first line at once, counts repeats silently, and flushes the
+    /// total with the next window's first line; a restored window keeps its state.
+    #[test]
+    fn rate_window_emits_counts_and_flushes_per_window() {
+        let mut window = RateWindow::default();
+        assert_eq!(window.record(1_000, 600_000), Some(0), "first line emits");
+        for _ in 0..3 {
+            assert_eq!(window.record(2_000, 600_000), None, "repeats suppress");
+        }
+        assert_eq!(
+            window.record(500_000, 600_000),
+            None,
+            "still inside the window"
+        );
+        assert_eq!(
+            window.record(601_001, 600_000),
+            Some(4),
+            "next window flushes the count"
+        );
+        assert_eq!(window.record(601_005, 600_000), None);
+        // A stateless caller persists and restores exactly this state.
+        let (started, suppressed) = window.parts();
+        let restored = RateWindow::resume(started, suppressed);
+        assert_eq!(
+            restored.parts(),
+            (started, suppressed),
+            "restored windows keep their state"
+        );
     }
 }

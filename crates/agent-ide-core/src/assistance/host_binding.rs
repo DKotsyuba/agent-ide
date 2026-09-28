@@ -1007,8 +1007,19 @@ impl HostBindingGuard {
         self.native_hints.clear();
     }
 
-    /// Reports whether one channel delivered any successful hook observation since start.
+    /// Reports whether one channel ever established a start binding, including a stopped one.
     ///
+    /// A channel with no binding belongs to a session that never activated the IDE, so its hook
+    /// traffic is bookkeeping rather than a failure (T15B hook-noise follow-up). Pure lookup.
+    pub fn channel_bound(&self, channel: &ChannelSessionRef) -> bool {
+        self.bindings.keys().any(|key| key.2 == *channel)
+            || self
+                .stopping
+                .iter()
+                .any(|binding| binding.channel == *channel)
+    }
+
+    /// Reports whether one channel delivered any successful hook observation since start.
     /// Only hook-sourced evidence counts: a retained pre-observation, a validated call still
     /// settling, or a completed lifecycle. Rejected identities never do, because an MCP call that
     /// arrived before its pre-hook records the same rejection without any hook having been

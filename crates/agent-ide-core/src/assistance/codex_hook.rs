@@ -23,7 +23,10 @@ use std::{
     time::Duration,
 };
 
-/// Caps raw host input before parsing; discarded fields are never sent to the daemon.
+/// Caps raw host input before parsing; a host payload may carry megabytes of tool bodies that the
+/// daemon never consumes ([`project_hook_payload`] drops them before submission).
+pub const MAX_HOOK_INPUT_BYTES: u64 = 8 * 1024 * 1024;
+/// Bounds the projected identity payload handed to the parser and the daemon transport.
 const MAX_INPUT_BYTES: u64 = 64 * 1024;
 /// Bounds stdin, parsing, connect and reply together, including a silent or stuck host pipe.
 const TOTAL_DEADLINE: Duration = Duration::from_millis(250);
@@ -213,6 +216,80 @@ fn report_native_fallback(runtime_dir: &Path, attachment: &str) -> bool {
             .is_ok()
 }
 
+/// Reads one raw host payload from stdin and projects it when a large tool body would otherwise
+/// drop the event; a payload beyond [`MAX_HOOK_INPUT_BYTES`] names the closed oversize fact.
+async fn read_projected_stdin(host_kind: HostKind) -> Option<Vec<u8>> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("codex-hook-input".into())
+        .spawn(move || {
+            let mut payload = Vec::new();
+            let result = std::io::stdin()
+                .take(MAX_HOOK_INPUT_BYTES + 1)
+                .read_to_end(&mut payload);
+            let _ = sender.send(result.ok().map(|_| payload));
+        })
+        .ok()?;
+    let payload = receiver.await.ok()??;
+    if payload.len() > MAX_HOOK_INPUT_BYTES as usize {
+        log_oversize();
+        return None;
+    }
+    if payload.len() <= MAX_INPUT_BYTES as usize {
+        return Some(payload);
+    }
+    // A large tool body is projected away; only a projection that still cannot fit drops the
+    // event as oversize.
+    project_hook_payload(host_kind, &payload).or_else(|| {
+        log_oversize();
+        None
+    })
+}
+
+/// Records that even a projected payload could not fit the transport bound; warn, not skipped.
+fn log_oversize() {
+    crate::errorlog::record(
+        crate::errorlog::Method::Hook,
+        crate::errorlog::Outcome::Unavailable,
+        crate::errorlog::Fields {
+            detail: Some("hook_input_oversize"),
+            ..Default::default()
+        },
+    );
+}
+
+/// Projects one raw host payload down to the bounded identity fields the daemon consumes.
+///
+/// The daemon's observation uses only the host, phase, actor, session, and optional call/tool-name
+/// fields, so a multi-megabyte `tool_input`/`tool_response` body is dropped rather than the whole
+/// event. Payloads already inside the 64 KiB transport bound keep their exact bytes (preserving the
+/// parser's duplicate-key rejection); only larger ones are projected, where duplicate keys
+/// collapse last-wins. Returns `None` when the payload is not a JSON object or even the projection
+/// exceeds the transport bound (oversized identifiers).
+pub fn project_hook_payload(host_kind: HostKind, payload: &[u8]) -> Option<Vec<u8>> {
+    let mut projected = serde_json::Map::new();
+    {
+        let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
+        let object = value.as_object()?;
+        for field in [
+            "hook_event_name",
+            "session_id",
+            "agent_id",
+            "tool_use_id",
+            "tool_name",
+        ]
+        .into_iter()
+        .chain((host_kind == HostKind::Claude).then_some("agent_type"))
+        {
+            if let Some(item) = object.get(field) {
+                projected.insert(field.to_owned(), item.clone());
+            }
+        }
+    }
+    let bytes = serde_json::to_vec(&serde_json::Value::Object(projected)).ok()?;
+    (bytes.len() <= MAX_INPUT_BYTES as usize).then_some(bytes)
+}
+
 /// Reads one bounded native payload and submits only selected identity fields, without output.
 ///
 /// Missing/invalid launcher attachment, malformed input, absent daemon and deadline expiry all
@@ -251,20 +328,14 @@ pub async fn run_with_payload(
         let attachment = attachment?;
         TrustedTransport::from_host_ingress("hook", "hook", attachment.clone())?;
         let payload = if let Some(payload) = payload {
-            payload
+            // A caller-supplied payload is either already small or already projected.
+            if payload.len() > MAX_INPUT_BYTES as usize {
+                project_hook_payload(host_kind, &payload)?
+            } else {
+                payload
+            }
         } else {
-            let (sender, receiver) = tokio::sync::oneshot::channel();
-            std::thread::Builder::new()
-                .name("codex-hook-input".into())
-                .spawn(move || {
-                    let mut payload = Vec::new();
-                    let result = std::io::stdin()
-                        .take(MAX_INPUT_BYTES + 1)
-                        .read_to_end(&mut payload);
-                    let _ = sender.send(result.ok().map(|_| payload));
-                })
-                .ok()?;
-            receiver.await.ok()??
+            read_projected_stdin(host_kind).await?
         };
         if payload.len() > MAX_INPUT_BYTES as usize {
             return None;
@@ -319,18 +390,7 @@ pub async fn run_with_payload(
 pub async fn run_managed() {
     let deadline = tokio::time::Instant::now() + TOTAL_DEADLINE;
     let hook = tokio::time::timeout_at(deadline, async {
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        std::thread::Builder::new()
-            .name("codex-hook-input".into())
-            .spawn(move || {
-                let mut payload = Vec::new();
-                let result = std::io::stdin()
-                    .take(MAX_INPUT_BYTES + 1)
-                    .read_to_end(&mut payload);
-                let _ = sender.send(result.ok().map(|_| payload));
-            })
-            .ok()?;
-        let payload = receiver.await.ok()??;
+        let payload = read_projected_stdin(HostKind::Codex).await?;
         if payload.len() > MAX_INPUT_BYTES as usize {
             return None;
         }
@@ -376,9 +436,56 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
 
+    /// A one-megabyte Write tool body no longer drops the event: the projection keeps exactly the
+    /// identity fields, and a Pre/Post pair still parses and correlates as before.
+    #[test]
+    fn large_tool_bodies_project_and_still_pair_pre_and_post() {
+        let body = "x".repeat(1024 * 1024);
+        let lifecycle = |phase: &str| {
+            serde_json::json!({
+                "hook_event_name": phase,
+                "session_id": "session",
+                "tool_use_id": "call",
+                "tool_name": "Write",
+                "cwd": "/private/tmp/project",
+                "tool_input": {"file_path": "/private/tmp/project/a.txt", "content": body},
+            })
+            .to_string()
+        };
+        for phase in ["PreToolUse", "PostToolUse"] {
+            let raw = lifecycle(phase);
+            assert!(raw.len() > MAX_INPUT_BYTES as usize);
+            let projected =
+                project_hook_payload(HostKind::Claude, raw.as_bytes()).expect("projection fits");
+            assert!(projected.len() < 512, "{}", projected.len());
+            let event = parse_claude_hook_event(&projected).expect("projected payload parses");
+            assert_eq!(event.session_id(), Some("session"));
+            assert_eq!(event.optional_call_id(), Some("call"));
+            assert_eq!(
+                event.tool_name(),
+                phase.eq("PostToolUse").then_some("Write")
+            );
+            assert!(!String::from_utf8(projected).unwrap().contains('x'));
+        }
+        // A Codex payload keeps its own field set, and non-object input never projects.
+        let codex = project_hook_payload(
+            HostKind::Codex,
+            br#"{"hook_event_name":"PreToolUse","session_id":"actor","tool_use_id":"call","anything":"else"}"#,
+        )
+        .unwrap();
+        assert!(parse_hook_event(&codex).is_ok());
+        assert!(project_hook_payload(HostKind::Claude, b"[1,2,3]").is_none());
+        // A projected identity itself over the transport bound cannot fit and is refused.
+        let oversized = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "s".repeat(MAX_INPUT_BYTES as usize),
+        })
+        .to_string();
+        assert!(project_hook_payload(HostKind::Claude, oversized.as_bytes()).is_none());
+    }
+
     /// Distinguishes short Unix-socket test paths within this process.
     static NEXT_RUNTIME: AtomicU64 = AtomicU64::new(0);
-
     /// Returns one short private-runtime-shaped path beneath writable `/private/tmp`.
     fn runtime(prefix: &str) -> PathBuf {
         PathBuf::from(format!(

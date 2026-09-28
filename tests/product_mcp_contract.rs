@@ -2543,8 +2543,29 @@ fn managed_claude_runtime_path(project: &Path) -> PathBuf {
         .join(format!("ai-r-{}", &hash.to_hex().as_str()[..16]))
 }
 
+/// Returns the private journal directory a project's hooks and daemon write under the redirected
+/// test home, keyed by the same repository rendezvous identity [`managed_claude_runtime_path`]
+/// reproduces.
+fn hook_journal_dir(project: &Path) -> PathBuf {
+    let project = std::fs::canonicalize(project).unwrap();
+    let output = std::process::Command::new("/usr/bin/git")
+        .arg("-C")
+        .arg(&project)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .unwrap();
+    let key = if output.status.success() {
+        std::fs::canonicalize(String::from_utf8(output.stdout).unwrap().trim_end())
+            .unwrap_or_else(|_| project.clone())
+    } else {
+        project
+    };
+    agent_ide::errorlog::log_root()
+        .unwrap()
+        .join(&blake3::hash(key.as_os_str().as_bytes()).to_hex().as_str()[..16])
+}
+
 /// Sends SIGTERM to the exact process holding a shared Claude daemon's runtime lock, if any.
-///
 /// A shared daemon deliberately outlives every MCP process's own EOF (EYES-r1 §2), so a test that
 /// causes one to be spawned must reap it explicitly instead of leaving it running past the test
 /// binary's own exit. `lsof` is asked for the specific lock file's current holder only; this never
@@ -3646,10 +3667,34 @@ async fn managed_claude_hook_distinguishes_input_timeout_and_oversize() {
 
     let mut oversized = launch();
     let mut input = oversized.stdin.take().unwrap();
-    input.write_all(&vec![b'x'; 64 * 1024 + 1]).await.unwrap();
+    input
+        .write_all(&vec![b'x'; 8 * 1024 * 1024 + 1])
+        .await
+        .unwrap();
     input.shutdown().await.unwrap();
     drop(input);
     let output = oversized.wait_with_output().await.unwrap();
+    assert_managed_hook_silent(&output);
+
+    // A payload merely over the old 64 KiB bound now projects its tool body away instead of
+    // dropping the event, so it never names the oversize detail at all.
+    let mut projected = launch();
+    let mut input = projected.stdin.take().unwrap();
+    let mut body =
+        br#"{"hook_event_name":"PreToolUse","session_id":"session","tool_use_id":"call","cwd":""#
+            .to_vec();
+    body.extend_from_slice(
+        format!(
+            "\"{}, \"tool_input\":{{\"content\":\"{}\"}}}}",
+            project.display(),
+            "x".repeat(80 * 1024)
+        )
+        .as_bytes(),
+    );
+    input.write_all(&body).await.unwrap();
+    input.shutdown().await.unwrap();
+    drop(input);
+    let output = projected.wait_with_output().await.unwrap();
     assert_managed_hook_silent(&output);
 
     let digest = blake3::hash(project.as_os_str().as_bytes())
@@ -3671,6 +3716,14 @@ async fn managed_claude_hook_distinguishes_input_timeout_and_oversize() {
             .unwrap_or_else(|| panic!("missing closed hook detail {detail}"));
         assert!(event["duration_ms"].as_u64().is_some());
     }
+    let oversize_events = events
+        .iter()
+        .filter(|event| event["detail"] == "hook_input_oversize")
+        .count();
+    assert_eq!(
+        oversize_events, 1,
+        "only the beyond-8-MiB payload names oversize: {events:?}"
+    );
     std::fs::remove_dir_all(home).unwrap();
 }
 
@@ -4055,6 +4108,74 @@ async fn managed_claude_moved_session_reroots_into_an_allowed_root() {
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     mcp.close().await;
     let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// A session that never calls `ide.start` produces hook bookkeeping, not failures: one `info`
+/// skip line per detail per window on each side, and no `warn` hook line at all.
+#[tokio::test]
+async fn never_started_session_hook_noise_is_skipped_and_rate_limited() {
+    let fixture = ProductFixture::new(json!([]));
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    let journal = hook_journal_dir(&fixture.root);
+    let _ = std::fs::remove_dir_all(&journal);
+    let mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+
+    for index in 0..3 {
+        let pre = managed_claude_hook(
+            Some(&fixture.root),
+            managed_claude_event(
+                "PreToolUse",
+                "idle-session",
+                None,
+                &format!("idle-pre-{index}"),
+            ),
+        )
+        .await;
+        let post = managed_claude_hook(
+            Some(&fixture.root),
+            managed_claude_event(
+                "PostToolUse",
+                "idle-session",
+                None,
+                &format!("idle-post-{index}"),
+            ),
+        )
+        .await;
+        assert!(
+            pre.status.success() && pre.stderr.is_empty() && post.status.success(),
+            "hook processes stay silent fail-open"
+        );
+    }
+    let lines = std::fs::read_to_string(journal.join("events.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let skipped = lines
+        .iter()
+        .filter(|line| line.contains("\"outcome\":\"skipped\""))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        skipped.len(),
+        2,
+        "one daemon hook_inactive and one client hook_submit_refused line per window: {lines:?}"
+    );
+    assert!(
+        skipped
+            .iter()
+            .all(|line| line.contains("\"level\":\"info\"")
+                && (line.contains("hook_inactive") || line.contains("hook_submit_refused"))),
+        "{skipped:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .all(|line| !(line.contains("\"level\":\"warn\"")
+                && line.contains("\"method\":\"hook\""))),
+        "a never-started session logs no warn hook line: {lines:?}"
+    );
+    mcp.close().await;
 }
 
 /// An auto-mode MCP whose host is unrecognized (ZCode: no `CLAUDE_PROJECT_DIR`, no host metadata)

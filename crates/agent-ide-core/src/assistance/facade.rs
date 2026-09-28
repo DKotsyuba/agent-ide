@@ -35,7 +35,9 @@ use crate::{
             HookEvent, HookPhase, HostBindingGuard, HostKind, parse_candidate,
             parse_claude_call_id, parse_hook_event, parse_host_kind,
         },
-        reply::{HostBindingCause, MAX_FEEDBACK_BYTES, MissingPeer, PeerReply, ResultKind},
+        reply::{
+            FailureCode, HostBindingCause, MAX_FEEDBACK_BYTES, MissingPeer, PeerReply, ResultKind,
+        },
     },
     workspace::authority::{
         AuthorityError, AuthorityRegistry, AuthorityRevoked, AuthorityStamp, StopBindingHandoff,
@@ -1922,6 +1924,7 @@ impl StdioFacade {
         parameters: Value,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
+        let stage_parameters = parameters.clone();
         let (outcome, resume) = match validate_call(tool, parameters.clone()) {
             Ok(_) => {
                 self.dispatch_with_reconnect(tool, parameters, &context)
@@ -1943,7 +1946,7 @@ impl StdioFacade {
                 if let PeerReply::Error { code, detail } = &mut reply
                     && detail.is_none()
                 {
-                    *detail = Some(crate::telemetry::adapters::default_stage(tool, code));
+                    *detail = Some(staged_detail(tool, code, &stage_parameters));
                 }
                 FacadeOutcome::Reply(reply, status)
             }
@@ -2051,6 +2054,52 @@ const RECONNECT_START_HINT: &str =
 /// pre-hook ran before the new rendezvous existed, so the next call pairs normally.
 const REROOT_RETRY_HINT: &str = "session re-rooted to the requested root; repeat this call once";
 
+/// A provider refusal's derived stage names the requested file's extension only, never its path,
+/// and every other failure keeps the plain `<tool>:<reason>` default.
+#[test]
+fn provider_refusal_names_the_requested_file_extension() {
+    assert_eq!(
+        staged_detail(
+            AssistanceTool::Outline,
+            &FailureCode::ProviderUnavailable,
+            &json!({"path": "docs/notes.md"}),
+        ),
+        "outline:provider_unavailable ext=md"
+    );
+    assert_eq!(
+        staged_detail(
+            AssistanceTool::Read,
+            &FailureCode::ProviderUnavailable,
+            &json!({"symbol": "src/app.gamma#Button/onClick"}),
+        ),
+        "read:provider_unavailable ext=gamma"
+    );
+    assert_eq!(
+        staged_detail(
+            AssistanceTool::Symbol,
+            &FailureCode::ProviderUnavailable,
+            &json!({"symbol": "#main"}),
+        ),
+        "symbol:provider_unavailable"
+    );
+    assert_eq!(
+        staged_detail(
+            AssistanceTool::Context,
+            &FailureCode::ProviderLoading,
+            &json!({"path": "src/main.rs"}),
+        ),
+        "context:provider_loading"
+    );
+    assert_eq!(
+        staged_detail(
+            AssistanceTool::Outline,
+            &FailureCode::ProviderUnavailable,
+            &json!({"path": "notes.über-big-extension"}),
+        ),
+        "outline:provider_unavailable"
+    );
+}
+
 /// Renders like [`render_reply`], with a binding-recovery hint after a daemon replacement or
 /// re-root.
 ///
@@ -2095,6 +2144,45 @@ fn render_reply_after_reconnect(
         text.text = format!("{}; retry: {hint}", text.text);
     }
     rendered
+}
+
+/// Derives the default `<tool>:<reason>` stage, appending the requested file's extension for a
+/// provider refusal so the journal names which file type found no server (T15B log follow-up).
+///
+/// The extension is the only path fragment — the journal's privacy rule keeps paths out — and
+/// comes from the request's `path`, or a symbol path's file segment before its `#`.
+pub(crate) fn staged_detail(
+    tool: AssistanceTool,
+    code: &FailureCode,
+    parameters: &Value,
+) -> String {
+    let stage = crate::telemetry::adapters::default_stage(tool, code);
+    if !matches!(code, FailureCode::ProviderUnavailable) {
+        return stage;
+    }
+    let requested = parameters
+        .get("path")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            parameters
+                .get("symbol")
+                .and_then(Value::as_str)
+                .map(|symbol| symbol.split('#').next().unwrap_or_default())
+        })
+        .map(Path::new);
+    let Some(extension) = requested
+        .and_then(Path::extension)
+        .and_then(|ext| ext.to_str())
+    else {
+        return stage;
+    };
+    if !extension.is_empty()
+        && extension.len() <= 16
+        && extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return format!("{stage} ext={extension}");
+    }
+    stage
 }
 
 /// Why one dispatch's target changed under the call, selecting its recovery hint.

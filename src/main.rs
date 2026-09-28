@@ -1685,6 +1685,47 @@ fn read_claude_attachment(key: &Path) -> std::io::Result<(PathBuf, String)> {
 /// validated, the existing bounded Claude parser, sanitized transport, exact lifecycle correlation,
 /// feedback rendering, and foreground-helper recognition remain unchanged. Closed input failure
 /// details distinguish thread startup, timeout, read, size, and cwd failures without logging input.
+/// Window for one client-side hook skip: at most one journal line per detail per ten minutes.
+const HOOK_SKIP_WINDOW: Duration = Duration::from_secs(600);
+
+/// Records one rate-limited hook skip against a stamp file next to the journal.
+///
+/// The hook process is stateless, so the window state lives in one tiny file beside the journal,
+/// holding `<window start ms> <suppressed>`; the content carries the window start because
+/// rewriting the counter would reset a mtime-based window. Every failure is silent — the rate
+/// limiter must never block or fail the hook. Returns the suppressed count when a line is due.
+fn hook_skip_window(dir: &Path, detail: &str) -> Option<u64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    let stamp = dir.join(format!(
+        "{}.skip",
+        &blake3::hash(detail.as_bytes()).to_hex().as_str()[..16]
+    ));
+    let mut parts = fs::read_to_string(&stamp)
+        .map(|content| {
+            content
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+        .into_iter();
+    let mut window = agent_ide::errorlog::RateWindow::resume(
+        parts.next().and_then(|value| value.parse::<u64>().ok()),
+        parts
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0),
+    );
+    let due = window.record(now, HOOK_SKIP_WINDOW.as_millis() as u64);
+    let (started, suppressed) = window.parts();
+    let _ = fs::create_dir_all(dir);
+    let _ = fs::write(&stamp, format!("{} {}", started.unwrap_or(0), suppressed));
+    due
+}
+
 async fn run_managed_claude_hook() {
     let started = tokio::time::Instant::now();
     let deadline = started + Duration::from_millis(250);
@@ -1698,13 +1739,44 @@ async fn run_managed_claude_hook() {
             .unwrap_or_else(|| candidate.to_owned());
         agent_ide::errorlog::init_repository(&claude_rendezvous_identity(&key)[..16]);
     }
-    let log = |detail| {
+    // A hook for a session that never activated the IDE is bookkeeping, not a failure (the T15B
+    // noise): it is skipped at info, at most one line per detail per window, counting the rest.
+    let journal_dir = log_candidate.as_deref().and_then(|candidate| {
+        let key = common_dir_from_git_files(candidate)
+            .or_else(|| read_claude_key_cache(candidate))
+            .unwrap_or_else(|| candidate.to_owned());
+        agent_ide::errorlog::log_root()
+            .map(|root| root.join(&claude_rendezvous_identity(&key)[..16]))
+    });
+    let log = |detail: &str| {
+        let inactive = matches!(
+            detail,
+            "hook_no_rendezvous"
+                | "hook_no_key_cache"
+                | "hook_no_candidate_attachment"
+                | "hook_submit_refused:unavailable"
+        );
+        let count = inactive
+            .then(|| {
+                journal_dir
+                    .as_ref()
+                    .and_then(|dir| hook_skip_window(dir, detail))
+            })
+            .flatten();
+        if inactive && count.is_none() {
+            return; // Inside the rate window: suppressed, only counted.
+        }
         agent_ide::errorlog::record(
             agent_ide::errorlog::Method::Hook,
-            agent_ide::errorlog::Outcome::Unavailable,
+            if inactive {
+                agent_ide::errorlog::Outcome::Skipped
+            } else {
+                agent_ide::errorlog::Outcome::Unavailable
+            },
             agent_ide::errorlog::Fields {
                 host: Some(HostKind::Claude),
                 detail: Some(detail),
+                count,
                 duration_ms: Some(u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX)),
                 ..Default::default()
             },
@@ -1716,7 +1788,7 @@ async fn run_managed_claude_hook() {
         .spawn(move || {
             let mut payload = Vec::new();
             let result = std::io::stdin()
-                .take(64 * 1024 + 1)
+                .take(agent_ide::assistance::codex_hook::MAX_HOOK_INPUT_BYTES + 1)
                 .read_to_end(&mut payload);
             let _ = sender.send(result.ok().map(|_| payload));
         })
@@ -1736,7 +1808,7 @@ async fn run_managed_claude_hook() {
             return;
         }
     };
-    if payload.len() > 64 * 1024 {
+    if payload.len() > agent_ide::assistance::codex_hook::MAX_HOOK_INPUT_BYTES as usize {
         log("hook_input_oversize");
         return;
     }
@@ -2840,6 +2912,34 @@ mod tests {
         let (invalid_claude, candidate) = auto_managed_candidate(Some(OsString::from("relative")));
         assert_eq!(invalid_claude, ManagedHost::Claude);
         assert!(candidate.is_err());
+    }
+
+    /// The client hook's stamp file emits the first skip at once, counts repeats silently, and
+    /// flushes the total once the window has expired; no failure of the limiter can surface.
+    #[test]
+    fn hook_skip_window_emits_counts_and_flushes_per_window() {
+        let dir = std::env::temp_dir().join(format!("t15b-skip-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let detail = "hook_no_rendezvous";
+        assert_eq!(hook_skip_window(&dir, detail), Some(0), "first line emits");
+        for _ in 0..2 {
+            assert_eq!(hook_skip_window(&dir, detail), None, "repeats suppress");
+        }
+        // Age the stamp past the window by rewriting its start far in the past.
+        let identity = blake3::hash(detail.as_bytes()).to_hex().to_string();
+        let stamp = dir.join(format!("{}.skip", &identity[..16]));
+        let suppressed = fs::read_to_string(&stamp).unwrap();
+        let count = suppressed.split_whitespace().nth(1).unwrap().to_owned();
+        fs::write(&stamp, format!("0 {count}")).unwrap();
+        assert_eq!(
+            hook_skip_window(&dir, detail),
+            Some(2),
+            "next window flushes the count"
+        );
+        // A corrupt or unwritable stamp never panics and still emits.
+        fs::write(&stamp, "not a window").unwrap();
+        assert_eq!(hook_skip_window(&dir, detail), Some(0));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Claude's shortened rendezvous is stable for one root and different for another root.

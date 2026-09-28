@@ -42,6 +42,45 @@ pub struct ProductDispatcher {
     managed_codex: bool,
     /// Enables lease-registered Claude worktrees only for the managed shared daemon.
     managed_claude: bool,
+    /// Rate window for hooks of sessions that never activated; one line per ten minutes.
+    hook_noise: Mutex<crate::errorlog::RateWindow>,
+}
+
+/// Journals one hook of a session that never activated the IDE (T15B hook-noise follow-up).
+///
+/// Such a hook is bookkeeping, not a failure: `info`/`skipped` with the closed `hook_inactive`
+/// detail, at most one line per daemon per ten minutes, counting the suppressed repetitions. A
+/// channel with a binding — active or stopped — did activate once, so its real hook failures keep
+/// their `warn` lines.
+fn log_hook_inactive(noise: &Mutex<crate::errorlog::RateWindow>, host: HostKind) {
+    let Ok(mut noise) = noise.lock() else {
+        return;
+    };
+    let Some(suppressed) = noise.record(crate::errorlog::now_ms(), HOOK_INACTIVE_WINDOW_MS) else {
+        return;
+    };
+    errorlog::record(
+        errorlog::Method::Hook,
+        errorlog::Outcome::Skipped,
+        errorlog::Fields {
+            host: Some(host),
+            detail: Some("hook_inactive"),
+            count: (suppressed > 0).then_some(suppressed),
+            ..Default::default()
+        },
+    );
+}
+
+/// One journal line per daemon per ten minutes for never-activated hook traffic.
+const HOOK_INACTIVE_WINDOW_MS: u64 = 600_000;
+
+/// Returns the host contract one sanitized hook observation names, when it names a supported one.
+fn observed_host(object: &serde_json::Map<String, Value>) -> Option<HostKind> {
+    match object.get("host")?.as_str()? {
+        "codex" => Some(HostKind::Codex),
+        "claude" => Some(HostKind::Claude),
+        _ => None,
+    }
 }
 
 /// Logs the specific closed [`BindingUnavailable`](super::host_binding::BindingUnavailable) reason
@@ -267,6 +306,7 @@ impl Default for ProductDispatcher {
             admission,
             managed_codex: false,
             managed_claude: false,
+            hook_noise: Mutex::new(crate::errorlog::RateWindow::default()),
         }
     }
 }
@@ -339,16 +379,21 @@ impl ProductDispatcher {
     ) -> Option<PeerReply> {
         match request {
             AssistanceDispatch::HookSubmit(hook) => {
+                let observation: Value =
+                    serde_json::from_str(hook.sanitized_observation_json().as_str()).ok()?;
+                let object = observation.as_object()?;
                 if self
                     .worker
                     .as_ref()
                     .is_some_and(|worker| !worker.accepts_attachment(hook.opaque_attachment()))
                 {
+                    // This daemon never registered the calling attachment: its session was never
+                    // activated here, so the refused submission is bookkeeping, not a failure.
+                    if let Some(host) = observed_host(object) {
+                        log_hook_inactive(&self.hook_noise, host);
+                    }
                     return None;
                 }
-                let observation: Value =
-                    serde_json::from_str(hook.sanitized_observation_json().as_str()).ok()?;
-                let object = observation.as_object()?;
                 // Six fixed relayed fields plus the optional `tool_name`; a hook from a release
                 // that still relays the retired helper fields does not correlate.
                 if object.len() != 6 + usize::from(object.contains_key("tool_name")) {
@@ -401,7 +446,11 @@ impl ProductDispatcher {
                     event.phase(),
                     event.tool_name().unwrap_or("-")
                 );
-                let status = self.bindings.lock().ok()?.observe_hook(event, channel);
+                let status = self
+                    .bindings
+                    .lock()
+                    .ok()?
+                    .observe_hook(event.clone(), channel.clone());
                 match status {
                     BindingStatus::PreObserved => Some(PeerReply::HookObserved {}),
                     BindingStatus::Settled(binding) => {
@@ -464,7 +513,18 @@ impl ProductDispatcher {
                         }
                         Some(PeerReply::NativeHookObserved {})
                     }
-                    _ => None,
+                    _ => {
+                        // A hook that cannot correlate for a channel that never activated is
+                        // bookkeeping, not a failure; a channel that did activate keeps its warn.
+                        if self
+                            .bindings
+                            .lock()
+                            .is_ok_and(|bindings| !bindings.channel_bound(&channel))
+                        {
+                            log_hook_inactive(&self.hook_noise, event.host());
+                        }
+                        None
+                    }
                 }
             }
             AssistanceDispatch::MethodDispatch(method) => {
@@ -733,7 +793,7 @@ impl AssistanceDispatcher for ProductDispatcher {
         Box::pin(async move {
             let started = std::time::Instant::now();
             let mut status = None;
-            let result =
+            let mut result =
                 self.handle(&request, &mut status)
                     .await
                     .unwrap_or(PeerReply::Unavailable {
@@ -757,14 +817,23 @@ impl AssistanceDispatcher for ProductDispatcher {
                     AssistanceMethod::HookSubmit => None,
                 };
                 if let Some(tool) = tool {
-                    let requested = serde_json::from_str::<Value>(method.params_json().as_str())
+                    let parameters = serde_json::from_str::<Value>(method.params_json().as_str())
                         .ok()
-                        .and_then(|envelope| {
-                            envelope
-                                .pointer("/parameters/detail_ref")
-                                .and_then(Value::as_str)
-                                .map(str::to_owned)
-                        });
+                        .and_then(|envelope| envelope.get("parameters").cloned());
+                    let requested = parameters.as_ref().and_then(|parameters| {
+                        parameters
+                            .get("detail_ref")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    });
+                    // A provider refusal with no more specific stage derives its default here, so
+                    // the daemon journal and the model-facing reply name the same `ext=` file type.
+                    if let (Some(parameters), PeerReply::Error { code, detail }) =
+                        (&parameters, &mut result)
+                        && detail.is_none()
+                    {
+                        *detail = Some(super::facade::staged_detail(tool, code, parameters));
+                    }
                     adapters::log_tool_reply(
                         tool,
                         &result,
