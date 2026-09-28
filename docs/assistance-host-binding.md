@@ -228,7 +228,7 @@ Closed daemon outcomes are:
 
 | Outcome | Meaning |
 | --- | --- |
-| `{"state":"unavailable","reason":"host_binding"}` | No validated exact invocation. |
+| `{"state":"unavailable","reason":"host_binding"}` | No validated exact invocation. The compact text names one closed cause in parentheses (T15B): `(outside_allowed_roots)` when the attachment's bound project resolves below no allowed root and its channel never delivered a hook, `(hooks_not_delivered)` when a channel that never delivered a hook lacks this observation, `(missing_pre)`, `(replay)`, `(inactive_binding)`, or `(project_moved: bound to <path>, asked <path>)` when a managed re-root failed; the same tag is the journal `detail`. The structured reply keeps its historical fields. |
 | `{"state":"unavailable","reason":"workspace_activation"}` | Host invocation and current binding are proven; Workspace activation is not connected. |
 | `{"state":"hook_observed"}` | One pre-hook was retained; no authority or delivery claim. |
 | `{"state":"hook_settled"}` | One exact post-hook settled a validated invocation. |

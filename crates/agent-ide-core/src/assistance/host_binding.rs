@@ -1006,6 +1006,26 @@ impl HostBindingGuard {
         self.stopping.clear();
         self.native_hints.clear();
     }
+
+    /// Reports whether one channel delivered any successful hook observation since start.
+    ///
+    /// Only hook-sourced evidence counts: a retained pre-observation, a validated call still
+    /// settling, or a completed lifecycle. Rejected identities never do, because an MCP call that
+    /// arrived before its pre-hook records the same rejection without any hook having been
+    /// delivered (T15B). A channel with no such evidence is a silent hook stream. Pure lookup.
+    pub fn channel_observed_hook(&self, channel: &ChannelSessionRef) -> bool {
+        self.pre_observed
+            .iter()
+            .any(|(_, observed)| observed == channel)
+            || self.settling.keys().any(|key| key.1 == *channel)
+            || self.replays.get(channel).is_some_and(|scopes| {
+                scopes.values().any(|calls| {
+                    calls
+                        .values()
+                        .any(|disposition| matches!(disposition, ReplayDisposition::Completed))
+                })
+            })
+    }
 }
 
 /// Builds a public invocation record from a bounded candidate and immutable binding reference.
@@ -1263,9 +1283,19 @@ mod tests {
 
     /// Builds one Claude pre-hook whose actor is either its root session or explicit child ID.
     fn claude_pre(session: &str, agent: Option<&str>, call: &str) -> HookEvent {
+        claude_hook("PreToolUse", session, agent, call)
+    }
+
+    /// Builds one Claude post-hook for the same actor shapes as [`claude_pre`].
+    fn claude_post(session: &str, agent: Option<&str>, call: &str) -> HookEvent {
+        claude_hook("PostToolUse", session, agent, call)
+    }
+
+    /// Builds one parser-shaped Claude lifecycle event for an exact actor and call.
+    fn claude_hook(phase: &str, session: &str, agent: Option<&str>, call: &str) -> HookEvent {
         parse_claude_hook_event(
             json!({
-                "hook_event_name": "PreToolUse",
+                "hook_event_name": phase,
                 "session_id": session,
                 "agent_id": agent,
                 "tool_use_id": call
@@ -1303,6 +1333,43 @@ mod tests {
             .as_bytes(),
         )
         .expect("test hook is valid")
+    }
+
+    /// A channel counts as hook-delivered from its first retained observation through a completed
+    /// lifecycle, while an untouched channel — and one whose only evidence is an MCP-side
+    /// rejection — stays silent (T15B).
+    #[test]
+    fn channel_observed_hook_counts_only_hook_sourced_evidence() {
+        let mut guard = HostBindingGuard::default();
+        let silent = channel("silent-channel");
+        let live = channel("live-channel");
+        assert!(!guard.channel_observed_hook(&silent));
+        assert!(!guard.channel_observed_hook(&live));
+        assert!(matches!(
+            guard.observe_hook(claude_pre("session", None, "call"), live.clone()),
+            BindingStatus::PreObserved
+        ));
+        assert!(guard.channel_observed_hook(&live));
+        assert!(!guard.channel_observed_hook(&silent));
+        // The observation may be consumed by a validated start; the channel stays delivered.
+        assert!(matches!(
+            guard.establish_start_claude("call", live.clone()),
+            BindingStatus::Validated(_)
+        ));
+        assert!(guard.channel_observed_hook(&live));
+        // Even after the terminal post settles (settling empties), the completed record persists.
+        assert!(matches!(
+            guard.observe_hook(claude_post("session", None, "call"), live.clone()),
+            BindingStatus::Settled(_)
+        ));
+        assert!(guard.channel_observed_hook(&live));
+        // An MCP call that arrives before its pre-hook records only a rejection, which never
+        // marks the channel delivered.
+        assert!(matches!(
+            guard.establish_start_claude("never-hooked", silent.clone()),
+            BindingStatus::Unavailable(BindingUnavailable::MissingPre)
+        ));
+        assert!(!guard.channel_observed_hook(&silent));
     }
 
     /// Direct managed Codex binding needs no hook, rejects replay, and isolates actors by channel.

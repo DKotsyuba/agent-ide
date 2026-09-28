@@ -93,7 +93,7 @@ pub fn log_tool_reply(
     let reason = reply_reason(reply);
     // Every failure line names its stage: the reply's own detail when the failing path set one,
     // else the derived `<tool>:<reason>` default, so no failed reply journals without a stage.
-    let stage = reply_detail(reply).map(str::to_owned).or_else(|| {
+    let stage = reply_detail(reply).or_else(|| {
         reason
             .as_ref()
             .map(|reason| stage_default(tool, reason.as_str()))
@@ -111,10 +111,14 @@ pub fn log_tool_reply(
     );
 }
 
-/// Returns the stage tag an error reply already carries, when it carries one.
-fn reply_detail(reply: &PeerReply) -> Option<&str> {
+/// Returns the stage tag an error or cause-tagged unavailable reply already carries, if any.
+fn reply_detail(reply: &PeerReply) -> Option<String> {
     match reply {
-        PeerReply::Error { detail, .. } => detail.as_deref(),
+        PeerReply::Error { detail, .. } => detail.clone(),
+        PeerReply::Unavailable {
+            reason: MissingPeer::HostBinding,
+            cause: Some(cause),
+        } => Some(cause.cause_tag()),
         _ => None,
     }
 }
@@ -329,7 +333,7 @@ fn reply_outcome(reply: &PeerReply) -> ToolOutcome {
         }
         PeerReply::Pending { .. } => ToolOutcome::Pending,
         PeerReply::HookObserved {} | PeerReply::NativeHookObserved {} => ToolOutcome::Incomplete,
-        PeerReply::Unavailable { reason } => match reason {
+        PeerReply::Unavailable { reason, .. } => match reason {
             MissingPeer::WorkspaceActivation | MissingPeer::HostBinding => ToolOutcome::Unavailable,
         },
         PeerReply::Error {
@@ -430,7 +434,7 @@ mod tests {
             code: FailureCode::Capacity,
             detail: Some("diff:too_large".to_owned()),
         };
-        assert_eq!(reply_detail(&staged), Some("diff:too_large"));
+        assert_eq!(reply_detail(&staged), Some("diff:too_large".to_owned()));
         let bare = PeerReply::Error {
             code: FailureCode::Capacity,
             detail: None,
@@ -445,6 +449,7 @@ mod tests {
         assert_eq!(
             reply_outcome(&PeerReply::Unavailable {
                 reason: MissingPeer::HostBinding,
+                cause: None,
             }),
             ToolOutcome::Unavailable
         );

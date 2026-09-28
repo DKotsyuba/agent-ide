@@ -1,5 +1,7 @@
 //! Closed, serialized-size-bounded Assistance outcomes with no transport or authority secrets.
 
+use std::path::Path;
+
 use crate::app::transport::OpaqueJson;
 use serde::{Deserialize, Serialize};
 
@@ -9,6 +11,8 @@ pub const MAX_REPLY_BYTES: usize = 64 * 1024;
 pub const MAX_FEEDBACK_BYTES: usize = 4 * 1024;
 /// Leaves room for fixed MCP content and protocol wrapper fields.
 pub(crate) const MCP_RESERVE: usize = 1024;
+/// Bounds each path a `project_moved` cause names, after home shortening (T15B).
+const MAX_CAUSE_PATH_BYTES: usize = 256;
 
 /// First missing peer without implying workspace authority was granted.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -18,6 +22,86 @@ pub enum MissingPeer {
     HostBinding,
     /// Host correlation succeeded but Workspace activation is not connected.
     WorkspaceActivation,
+}
+
+/// Closed cause of one `unavailable: host_binding` refusal, named in parentheses after the reason
+/// (T15B) and journaled as the reply's `detail`.
+///
+/// Every variant except [`Self::ProjectMoved`] is a payload-free tag like the T115 stage tags.
+/// [`Self::ProjectMoved`] deliberately names both directories — that direction is the fix's whole
+/// value — with each path bounded to 256 bytes and home-shortened where possible.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostBindingCause {
+    /// The session's bound project resolves below no configured `allowed_roots` entry.
+    OutsideAllowedRoots,
+    /// This daemon received no successful hook for the calling channel since it started.
+    HooksNotDelivered,
+    /// No exact pre-hook observation existed for this invocation.
+    MissingPre,
+    /// The exact call identity was already observed, validated, or permanently rejected.
+    Replay,
+    /// A hook could not be linked exactly to one registered MCP candidate.
+    Mismatch,
+    /// No active matching actor/channel-session binding existed for an ordinary call.
+    InactiveBinding,
+    /// Bounded pending, binding, or replay storage is full for this scope.
+    CapacityExceeded,
+    /// `ide.start {root}` named a directory other than the session's bound project.
+    ProjectMoved {
+        /// Home-shortened bounded path the session is currently bound to.
+        bound: String,
+        /// Bounded requested root exactly as the model named it.
+        asked: String,
+    },
+}
+
+impl HostBindingCause {
+    /// Maps the guard's own closed refusal reasons that a model-facing reply can carry.
+    pub(crate) fn from_binding(reason: super::host_binding::BindingUnavailable) -> Option<Self> {
+        Some(match reason {
+            super::host_binding::BindingUnavailable::MissingPre => Self::MissingPre,
+            super::host_binding::BindingUnavailable::Replay => Self::Replay,
+            super::host_binding::BindingUnavailable::Mismatch => Self::Mismatch,
+            super::host_binding::BindingUnavailable::InactiveBinding => Self::InactiveBinding,
+            super::host_binding::BindingUnavailable::CapacityExceeded => Self::CapacityExceeded,
+            _ => return None,
+        })
+    }
+
+    /// Builds the one payload-carrying cause from both directories, bounded and home-shortened.
+    pub fn project_moved(bound: &Path, asked: &str) -> Self {
+        Self::ProjectMoved {
+            bound: shortened_cause_path(bound),
+            asked: bounded_utf8_prefix(asked, MAX_CAUSE_PATH_BYTES).to_owned(),
+        }
+    }
+
+    /// Renders the exact bounded text inside the reply's parentheses and the journal `detail`.
+    pub fn cause_tag(&self) -> String {
+        match self {
+            Self::OutsideAllowedRoots => "outside_allowed_roots".to_owned(),
+            Self::HooksNotDelivered => "hooks_not_delivered".to_owned(),
+            Self::MissingPre => "missing_pre".to_owned(),
+            Self::Replay => "replay".to_owned(),
+            Self::Mismatch => "mismatch".to_owned(),
+            Self::InactiveBinding => "inactive_binding".to_owned(),
+            Self::CapacityExceeded => "capacity_exceeded".to_owned(),
+            Self::ProjectMoved { bound, asked } => {
+                format!("project_moved: bound to {bound}, asked {asked}")
+            }
+        }
+    }
+}
+
+/// Returns one bounded display path, with the current home prefix shortened to `~` when it matches.
+fn shortened_cause_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let shortened = std::env::var_os("HOME")
+        .and_then(|home| home.into_string().ok())
+        .filter(|home| home.len() > 1 && text.starts_with(home.as_str()))
+        .map(|home| format!("~{}", &text[home.len()..]));
+    bounded_utf8_prefix(shortened.as_deref().unwrap_or(&text), MAX_CAUSE_PATH_BYTES).to_owned()
 }
 
 /// Closed failures; arbitrary owner or OS error strings never cross the product boundary.
@@ -270,6 +354,9 @@ pub enum PeerReply {
     Unavailable {
         /// First missing boundary.
         reason: MissingPeer,
+        /// Closed cause of a `host_binding` refusal (T15B); absent keeps the historical bare reply.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<HostBindingCause>,
     },
     /// One native pre-hook was retained without an authority or delivery claim.
     HookObserved {},
@@ -509,4 +596,84 @@ fn status_carried_replies_round_trip_and_stay_closed() {
     );
     let encoded = PeerReply::encode_with_status(&reply, &overlong).unwrap();
     assert!(PeerReply::decode_delivered(encoded.as_str()).is_none());
+}
+
+/// Every host-binding cause survives one encode/decode round trip, and a bare reply stays bare.
+#[test]
+fn host_binding_causes_round_trip_and_bare_replies_stay_bare() {
+    for cause in [
+        HostBindingCause::OutsideAllowedRoots,
+        HostBindingCause::HooksNotDelivered,
+        HostBindingCause::MissingPre,
+        HostBindingCause::Replay,
+        HostBindingCause::Mismatch,
+        HostBindingCause::InactiveBinding,
+        HostBindingCause::CapacityExceeded,
+        HostBindingCause::project_moved(
+            Path::new("/Users/pluto/projects/agent-worktree"),
+            "/private/tmp/agent-ide-stability/fixture",
+        ),
+    ] {
+        let reply = PeerReply::Unavailable {
+            reason: MissingPeer::HostBinding,
+            cause: Some(cause.clone()),
+        };
+        let decoded = PeerReply::decode(reply.clone().encode().unwrap().as_str()).unwrap();
+        assert_eq!(decoded, reply);
+        assert!(!cause.cause_tag().is_empty());
+    }
+    let bare = PeerReply::Unavailable {
+        reason: MissingPeer::HostBinding,
+        cause: None,
+    };
+    let encoded = bare.clone().encode().unwrap();
+    assert!(!encoded.as_str().contains("cause"));
+    assert_eq!(PeerReply::decode(encoded.as_str()).unwrap(), bare);
+    // The one payload-carrying cause renders both directories and bounds each path.
+    let moved = HostBindingCause::project_moved(
+        Path::new("/private/tmp"),
+        &format!("/private/tmp/{}", "x".repeat(600)),
+    );
+    let HostBindingCause::ProjectMoved { asked, .. } = &moved else {
+        panic!("project_moved cause");
+    };
+    assert!(asked.len() <= 256, "{asked}");
+    assert_eq!(
+        moved.cause_tag(),
+        format!("project_moved: bound to /private/tmp, asked {asked}")
+    );
+    assert_eq!(
+        moved.cause_tag().len(),
+        "project_moved: bound to /private/tmp, asked ".len() + asked.len()
+    );
+}
+
+/// The guard's own closed refusal reasons map onto exactly the model-visible causes.
+#[test]
+fn host_binding_causes_map_the_guard_refusals() {
+    use super::host_binding::BindingUnavailable;
+    for (reason, expected) in [
+        (BindingUnavailable::MissingPre, "missing_pre"),
+        (BindingUnavailable::Replay, "replay"),
+        (BindingUnavailable::Mismatch, "mismatch"),
+        (BindingUnavailable::InactiveBinding, "inactive_binding"),
+        (BindingUnavailable::CapacityExceeded, "capacity_exceeded"),
+    ] {
+        assert_eq!(
+            HostBindingCause::from_binding(reason)
+                .expect("reachable refusal maps")
+                .cause_tag(),
+            expected
+        );
+    }
+    for reason in [
+        BindingUnavailable::InvalidMetadata,
+        BindingUnavailable::MissingField("field"),
+        BindingUnavailable::InvalidField("field"),
+        BindingUnavailable::InvalidAttachment,
+        BindingUnavailable::UnsupportedHookPhase,
+        BindingUnavailable::MissingInvocation,
+    ] {
+        assert!(HostBindingCause::from_binding(reason).is_none());
+    }
 }

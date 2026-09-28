@@ -1921,7 +1921,8 @@ fn render_reply_after_reconnect(
     let is_host_binding_unavailable = matches!(
         reply,
         PeerReply::Unavailable {
-            reason: MissingPeer::HostBinding
+            reason: MissingPeer::HostBinding,
+            ..
         }
     );
     let mut rendered = render_reply_with_status(reply, status, envelope);
@@ -2005,6 +2006,7 @@ fn typed_lifecycle_replies_preserve_structured_content_without_transport_errors(
     for reply in [
         PeerReply::Unavailable {
             reason: crate::assistance::reply::MissingPeer::HostBinding,
+            cause: None,
         },
         PeerReply::HostStopped {},
     ] {
@@ -2024,6 +2026,7 @@ fn claude_envelope_never_carries_structured_content() {
     for reply in [
         PeerReply::Unavailable {
             reason: crate::assistance::reply::MissingPeer::HostBinding,
+            cause: None,
         },
         PeerReply::HostStopped {},
         PeerReply::Pending {
@@ -2051,6 +2054,7 @@ fn claude_envelope_reconnect_retry_hint_survives_in_content_text() {
         AssistanceTool::Start,
         PeerReply::Unavailable {
             reason: crate::assistance::reply::MissingPeer::HostBinding,
+            cause: None,
         },
         None,
         content::Envelope::TextOnly,
@@ -2064,6 +2068,7 @@ fn claude_envelope_reconnect_retry_hint_survives_in_content_text() {
         AssistanceTool::Context,
         PeerReply::Unavailable {
             reason: crate::assistance::reply::MissingPeer::HostBinding,
+            cause: None,
         },
         None,
         content::Envelope::TextOnly,

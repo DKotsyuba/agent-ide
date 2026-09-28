@@ -683,7 +683,7 @@ async fn binary_routes_methods_to_typed_missing_peer_and_survives_daemon_loss() 
         assert_eq!(response["result"]["content"].as_array().unwrap().len(), 1);
         assert_eq!(
             response["result"]["content"][0]["text"],
-            "unavailable: host_binding; continue with native tools"
+            "unavailable: host_binding (hooks_not_delivered); continue with native tools"
         );
         assert_eq!(
             response["result"]["structuredContent"],

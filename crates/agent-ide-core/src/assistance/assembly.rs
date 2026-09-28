@@ -1,7 +1,7 @@
 //! Explicit Codex/Claude ingress and finite dispatch into one daemon-owned product worker.
 
 /// Stable closed result types shared by existing callers of the assembly boundary.
-pub use super::reply::{MissingPeer, PeerReply};
+pub use super::reply::{HostBindingCause, MissingPeer, PeerReply};
 use super::{
     host_binding::{
         BindingStatus, HookPhase, HostBindingGuard, HostKind, parse_candidate,
@@ -77,6 +77,45 @@ fn log_binding_unavailable(
             ..Default::default()
         },
     );
+}
+
+/// Names the closed cause of one host-binding refusal for the model-facing reply (T15B).
+///
+/// A consumed or rejected call identity is its own replay evidence. When instead this exact
+/// pre/binding is missing, the deeper question is whether the calling channel ever delivered a
+/// hook to this daemon: a silent channel whose bound project also resolves below no allowed root
+/// is the moved-scratch session of T15B (`outside_allowed_roots`), a silent channel with an
+/// admitted project never saw its hooks (`hooks_not_delivered`), and a live channel simply lacks
+/// this one observation. Every other guard refusal keeps its own closed tag.
+fn host_binding_cause(
+    worker: Option<&WorkerHandle>,
+    hooks_delivered: bool,
+    attachment: &str,
+    reason: super::host_binding::BindingUnavailable,
+) -> Option<HostBindingCause> {
+    if !hooks_delivered
+        && matches!(
+            reason,
+            super::host_binding::BindingUnavailable::MissingPre
+                | super::host_binding::BindingUnavailable::InactiveBinding
+        )
+    {
+        let outside_roots = worker.is_some_and(|worker| {
+            worker.target(attachment).is_some_and(|target| {
+                crate::assistance::launcher::admit_worktree(
+                    worker.allowed_roots(),
+                    &target.candidate,
+                )
+                .is_err()
+            })
+        });
+        return Some(if outside_roots {
+            HostBindingCause::OutsideAllowedRoots
+        } else {
+            HostBindingCause::HooksNotDelivered
+        });
+    }
+    HostBindingCause::from_binding(reason)
 }
 
 /// Reports whether one validated context call names the in-memory `kind: "problems"` feed.
@@ -457,7 +496,12 @@ impl ProductDispatcher {
                     .as_ref()
                     .is_some_and(|worker| !worker.accepts_attachment(method.opaque_attachment()))
                 {
-                    return None;
+                    // This daemon never registered the calling attachment, so it has also never
+                    // received a hook on its channel (T15B).
+                    return Some(PeerReply::Unavailable {
+                        reason: MissingPeer::HostBinding,
+                        cause: Some(HostBindingCause::HooksNotDelivered),
+                    });
                 }
                 let channel = self.channel(method.opaque_attachment())?;
                 let invocation = {
@@ -469,13 +513,13 @@ impl ProductDispatcher {
                                 return None;
                             }
                             if self.managed_codex && method.method() == AssistanceMethod::Start {
-                                bindings.establish_managed_codex_start(candidate, channel)
+                                bindings.establish_managed_codex_start(candidate, channel.clone())
                             } else if self.managed_codex {
-                                bindings.validate_managed_codex_active(candidate, channel)
+                                bindings.validate_managed_codex_active(candidate, channel.clone())
                             } else if method.method() == AssistanceMethod::Start {
-                                bindings.establish_start(candidate, channel)
+                                bindings.establish_start(candidate, channel.clone())
                             } else {
-                                bindings.validate_active(candidate, channel)
+                                bindings.validate_active(candidate, channel.clone())
                             }
                         }
                         HostKind::Claude => {
@@ -484,15 +528,28 @@ impl ProductDispatcher {
                                 return None;
                             }
                             if method.method() == AssistanceMethod::Start {
-                                bindings.establish_start_claude(&call_id, channel)
+                                bindings.establish_start_claude(&call_id, channel.clone())
                             } else {
-                                bindings.validate_active_claude(&call_id, channel)
+                                bindings.validate_active_claude(&call_id, channel.clone())
                             }
                         }
                     };
                     let BindingStatus::Validated(invocation) = status else {
                         if let BindingStatus::Unavailable(reason) = status {
                             log_binding_unavailable(tool, host, method.correlation_id(), reason);
+                            // Channel activity is read under the guard; the root admission probe
+                            // below touches the filesystem only after the lock is released.
+                            let hooks_delivered = bindings.channel_observed_hook(&channel);
+                            drop(bindings);
+                            return Some(PeerReply::Unavailable {
+                                reason: MissingPeer::HostBinding,
+                                cause: host_binding_cause(
+                                    self.worker.as_ref(),
+                                    hooks_delivered,
+                                    method.opaque_attachment(),
+                                    reason,
+                                ),
+                            });
                         }
                         return None;
                     };
@@ -509,6 +566,7 @@ impl ProductDispatcher {
                     } else {
                         PeerReply::Unavailable {
                             reason: MissingPeer::WorkspaceActivation,
+                            cause: None,
                         }
                     });
                 };
@@ -680,6 +738,7 @@ impl AssistanceDispatcher for ProductDispatcher {
                     .await
                     .unwrap_or(PeerReply::Unavailable {
                         reason: MissingPeer::HostBinding,
+                        cause: None,
                     });
             // Hook payloads are intentionally never accepted by telemetry adapters or the log.
             if let AssistanceDispatch::MethodDispatch(method) = &request {
@@ -851,7 +910,8 @@ async fn claude_start_without_worker_is_unavailable_after_correlation() {
     assert_eq!(
         dispatcher.handle(&method, &mut None).await,
         Some(PeerReply::Unavailable {
-            reason: MissingPeer::WorkspaceActivation
+            reason: MissingPeer::WorkspaceActivation,
+            cause: None
         })
     );
 
@@ -897,7 +957,8 @@ async fn claude_start_without_worker_is_unavailable_after_correlation() {
     assert_eq!(
         dispatcher.handle(&next_method, &mut None).await,
         Some(PeerReply::Unavailable {
-            reason: MissingPeer::WorkspaceActivation
+            reason: MissingPeer::WorkspaceActivation,
+            cause: None
         })
     );
 }

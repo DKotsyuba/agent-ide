@@ -1,8 +1,9 @@
 {#-
 Projects one serialized Assistance `PeerReply` (tagged by `state`) into the exact deterministic
 compact model-facing text the MCP facade has always emitted. The context is the complete
-serialized reply, plus `cause_tag` only for a tagged execution-profile refusal whose structured
-copy keeps the stable public `code`.
+serialized reply, plus `cause_tag` for a tagged execution-profile refusal whose structured copy
+keeps the stable public `code`, and for an `unavailable: host_binding` reply's closed cause
+(T15B), whose structured copy keeps its historical fields.
 
 Contract:
 - Byte-identical to the retired manual formatter; tests in `src/assistance/content.rs` assert
@@ -17,7 +18,7 @@ Contract:
   flush-left, so the only newlines in the output are the intentional ones.
 -#}
 {%- if state == "unavailable" -%}
-unavailable: {{ reason }}; continue with native tools
+unavailable: {{ reason }}{% if cause_tag %} ({{ cause_tag }}){% endif %}; continue with native tools
 {%- endif -%}
 {%- if state == "hook_observed" -%}
 hook_observed: native pre-hook retained

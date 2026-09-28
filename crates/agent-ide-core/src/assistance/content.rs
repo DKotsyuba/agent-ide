@@ -85,10 +85,15 @@ fn project(reply: &PeerReply, status: Option<&str>, envelope: Envelope) -> Optio
         PeerReply::Error {
             code: FailureCode::ExecutionProfileCause(cause),
             ..
-        } => Some(cause.tag()),
+        } => Some(cause.tag().to_owned()),
+        PeerReply::Unavailable {
+            cause: Some(cause), ..
+        } => Some(cause.cause_tag()),
         _ => None,
     };
     let mut context = structured.clone();
+    // Always defined so strict-undefined rendering stays uniform for cause-less replies.
+    context["cause_tag"] = serde_json::Value::String(String::new());
     if let PeerReply::Error { detail, .. } = reply {
         context["resolution_detail"] =
             serde_json::Value::String(detail.clone().unwrap_or_default());
@@ -96,11 +101,26 @@ fn project(reply: &PeerReply, status: Option<&str>, envelope: Envelope) -> Optio
             fields.remove("detail");
         }
     }
+    if let PeerReply::Unavailable { .. } = reply {
+        // The public structured shape keeps its historical fields; the closed cause reaches the
+        // compact text only, exactly like an error's `detail` (T15B).
+        for value in [&mut structured, &mut context] {
+            if let Some(fields) = value.as_object_mut() {
+                fields.remove("cause");
+            }
+        }
+    }
     if let Some(tag) = cause_tag {
-        let public = serde_json::Value::String("execution_profile".to_owned());
-        structured["code"] = public.clone();
-        context["code"] = public;
-        context["cause_tag"] = serde_json::Value::String(tag.to_owned());
+        if let PeerReply::Error {
+            code: FailureCode::ExecutionProfileCause(_),
+            ..
+        } = reply
+        {
+            let public = serde_json::Value::String("execution_profile".to_owned());
+            structured["code"] = public.clone();
+            context["code"] = public;
+        }
+        context["cause_tag"] = serde_json::Value::String(tag);
     }
     let reply_text = render_text(&context)?;
     let structured = match status {
@@ -253,6 +273,7 @@ mod tests {
         let replies = vec![
             PeerReply::Unavailable {
                 reason: MissingPeer::HostBinding,
+                cause: None,
             },
             PeerReply::HookObserved {},
             PeerReply::HookSettled {},
@@ -320,6 +341,60 @@ mod tests {
                 .then_some(true)
             );
         }
+    }
+
+    /// Every host-binding cause names its closed tag in the compact text parentheses and never
+    /// changes the public structured copy; a cause-less refusal keeps its historical text (T15B).
+    #[test]
+    fn host_binding_causes_name_their_tag_in_compact_text_only() {
+        use crate::assistance::reply::HostBindingCause;
+        let causes = vec![
+            HostBindingCause::OutsideAllowedRoots,
+            HostBindingCause::HooksNotDelivered,
+            HostBindingCause::MissingPre,
+            HostBindingCause::Replay,
+            HostBindingCause::Mismatch,
+            HostBindingCause::InactiveBinding,
+            HostBindingCause::CapacityExceeded,
+            HostBindingCause::project_moved(
+                std::path::Path::new("/private/tmp/ai-r-move"),
+                "/Users/pluto/projects/agent-worktree",
+            ),
+        ];
+        for cause in causes {
+            let rendered = render(
+                PeerReply::Unavailable {
+                    reason: MissingPeer::HostBinding,
+                    cause: Some(cause.clone()),
+                },
+                Envelope::WithStructured,
+            )
+            .unwrap();
+            assert_eq!(
+                text_of(&rendered),
+                format!(
+                    "unavailable: host_binding ({}); continue with native tools",
+                    cause.cause_tag()
+                )
+            );
+            assert_eq!(
+                rendered.structured_content,
+                Some(serde_json::json!({"state":"unavailable","reason":"host_binding"}))
+            );
+            assert_ne!(rendered.is_error, Some(true));
+        }
+        let bare = render(
+            PeerReply::Unavailable {
+                reason: MissingPeer::HostBinding,
+                cause: None,
+            },
+            Envelope::WithStructured,
+        )
+        .unwrap();
+        assert_eq!(
+            text_of(&bare),
+            "unavailable: host_binding; continue with native tools"
+        );
     }
 
     /// An expired or unknown detail says to repeat the original call.

@@ -854,6 +854,11 @@ impl WorkerHandle {
         self.target(attachment).is_some()
     }
 
+    /// Returns the validated roots this daemon admits activation and checks under.
+    pub fn allowed_roots(&self) -> &[std::path::PathBuf] {
+        self.shared.launcher.allowed_roots()
+    }
+
     /// Registers a separate target for a host-selected Claude project without changing live peers.
     pub fn register_claude_candidate(&self, candidate: &Path) -> Option<String> {
         let template = self.shared.launcher.sole_target()?.clone();
