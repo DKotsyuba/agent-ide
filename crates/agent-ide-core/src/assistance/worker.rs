@@ -1872,7 +1872,10 @@ impl<'a> Worker<'a> {
                 (text, owns_detail.then_some(result.detail_ref))
             } else {
                 (
-                    format!("tests #{id}: running {} s", job_status.age.as_secs()),
+                    format!(
+                        "tests #{id}: running {} s; poll: ide.test {{\"status\": {id}}}",
+                        job_status.age.as_secs()
+                    ),
                     None,
                 )
             }
@@ -2076,7 +2079,8 @@ impl<'a> Worker<'a> {
                     let selected =
                         selected_count.map_or_else(String::new, |summary| format!(" ({summary})"));
                     let line = format!(
-                        "tests #{id}: started — {}{selected} (budget {} s)",
+                        "tests #{id}: started — {}{selected} (budget {} s); poll: ide.test \
+                         {{\"status\": {id}}}",
                         display_argv(&argv),
                         budget.as_secs()
                     );
@@ -2094,7 +2098,7 @@ impl<'a> Worker<'a> {
                 }
                 StartResult::Running(id, age) => (
                     format!(
-                        "tests #{id}: still running ({} s); ide.test {{\"status\": {id}}}",
+                        "tests #{id}: still running ({} s); poll: ide.test {{\"status\": {id}}}",
                         age.as_secs()
                     ),
                     None,
@@ -3829,6 +3833,29 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
         let active = shared
             .active(&request.binding)
             .map_err(InspectFailure::new)?;
+        // A test-run handle (`tests #N`, `tests-N`, `#N`, `N`) is what callers reach for first
+        // after `tests #N: started`; it names a background run, not a retained detail, so answer
+        // with that run's status instead of failing the lookup.
+        if let Some(id) = test_run_handle(&request.reference) {
+            let owner = request.binding.fingerprint();
+            let text = match shared.test_runs.find(id, &owner) {
+                Some(status) => match &status.result {
+                    Some(result) => test_result_text(id, result, status.owner == owner),
+                    None => format!(
+                        "tests #{id}: running {} s; poll: ide.test {{\"status\": {id}}}",
+                        status.age.as_secs()
+                    ),
+                },
+                None => format!("tests #{id}: unknown job; poll: ide.test {{\"status\": {id}}}"),
+            };
+            return Ok(PeerReply::Complete {
+                kind: ResultKind::Test,
+                text,
+                detail_ref: None,
+                truncated: false,
+                continuation: false,
+            });
+        }
         let (
             reply,
             authority,
@@ -3849,7 +3876,16 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 .get(&request.reference)
                 .filter(|detail| detail.binding == request.binding)
                 .ok_or_else(|| {
-                    InspectFailure::stage(FailureCode::InvalidDetail, "inspect:detail_unknown")
+                    InspectFailure::stage(
+                        FailureCode::InvalidDetail,
+                        // A reference this daemon never minted is unknown; one it minted and no
+                        // longer retains (or issued to another binding) has expired.
+                        if never_issued(&request.reference, &shared.nonce, ledger.next) {
+                            "inspect:detail_unknown"
+                        } else {
+                            "inspect:detail_expired"
+                        },
+                    )
                 })?;
             if request
                 .expected
@@ -4126,6 +4162,32 @@ fn source_matches(source: &SourceObservation) -> bool {
         Err(ObservationError::Missing) => source.state() == ObservedState::Missing,
         Err(_) => false,
     }
+}
+
+/// Parses a test-run handle — `tests #N`, `tests-N`, `#N` or `N` — to its run number. A minted
+/// detail reference (`<64-hex>-<n>`) never parses as one, so the alias cannot shadow a detail.
+fn test_run_handle(reference: &str) -> Option<u64> {
+    let rest = reference.strip_prefix("tests").unwrap_or(reference);
+    let rest = rest.trim_start_matches(' ');
+    let rest = rest
+        .strip_prefix('#')
+        .or_else(|| rest.strip_prefix('-'))
+        .unwrap_or(rest);
+    (rest.bytes().all(|byte| byte.is_ascii_digit()) && !rest.is_empty())
+        .then(|| rest.parse::<u64>().ok())
+        .flatten()
+        .filter(|id| *id > 0)
+}
+
+/// Reports whether this daemon could never have minted `reference`: another boot's nonce, a
+/// number beyond the ledger counter, or a shape no minted reference has.
+fn never_issued(reference: &str, nonce: &[u8; 32], next: u64) -> bool {
+    let Some((prefix, number)) = reference.rsplit_once('-') else {
+        return true;
+    };
+    prefix != blake3::Hash::from_bytes(*nonce).to_hex().to_string()
+        || number.bytes().any(|byte| !byte.is_ascii_digit())
+        || number.parse::<u64>().map_or(true, |minted| minted > next)
 }
 
 /// Returns the exact same-binding source eligible to authorize a replacement edit.
@@ -6159,6 +6221,160 @@ mod stop_retry_tests {
             panic!("a foreign reference must fail invalid_detail")
         };
         assert_eq!(code, FailureCode::InvalidDetail);
+        assert_eq!(detail.as_deref(), Some("inspect:detail_unknown"));
+    }
+
+    /// Every handle shape an agent reaches for names its run; a minted detail reference never
+    /// does, so the alias cannot shadow a retained detail.
+    #[test]
+    fn test_run_handles_parse_every_shape_but_no_minted_reference() {
+        assert_eq!(test_run_handle("tests #3"), Some(3));
+        assert_eq!(test_run_handle("tests-3"), Some(3));
+        assert_eq!(test_run_handle("#3"), Some(3));
+        assert_eq!(test_run_handle("3"), Some(3));
+        assert_eq!(test_run_handle("tests 3"), Some(3));
+        assert_eq!(test_run_handle("0"), None);
+        assert_eq!(test_run_handle("tests"), None);
+        assert_eq!(test_run_handle("sym-14"), None);
+        assert_eq!(
+            test_run_handle(&format!(
+                "{}-7",
+                blake3::Hash::from_bytes([0_u8; 32]).to_hex()
+            )),
+            None
+        );
+        assert!(never_issued(
+            &format!("{}-7", blake3::Hash::from_bytes([1_u8; 32]).to_hex()),
+            &[0_u8; 32],
+            10
+        ));
+        assert!(!never_issued(
+            &format!("{}-7", blake3::Hash::from_bytes([0_u8; 32]).to_hex()),
+            &[0_u8; 32],
+            10
+        ));
+        // A number this daemon has not minted yet was never issued.
+        assert!(never_issued(
+            &format!("{}-11", blake3::Hash::from_bytes([0_u8; 32]).to_hex()),
+            &[0_u8; 32],
+            10
+        ));
+    }
+
+    /// `ide.inspect` answers a test-run handle with that run's status, and an unknown detail
+    /// reference is split into never-issued and expired.
+    #[tokio::test]
+    async fn inspect_answers_test_handles_and_splits_unknown_from_expired() {
+        crate::lang::testing::install();
+        let gamma = crate::lang::Language::by_id("gamma").expect("test language");
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join("main.rs"), "let value = 1;\n").unwrap();
+        git_commit(&fixture.root, "inspect fixture");
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (binding, _) = activate_worktree(&mut worker, "inspect-actor", "inspect-start").await;
+        let owner = binding.fingerprint();
+
+        let inspect = |reference: String| async {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            serve_inspection(
+                &worker.workspace,
+                &worker.shared,
+                Inspection {
+                    binding: binding.clone(),
+                    reference,
+                    expected: None,
+                    reply: reply_tx,
+                },
+            )
+            .await;
+            reply_rx.await.unwrap()
+        };
+
+        // A finished run's handle answers with its parsed result.
+        match worker.shared.test_runs.start(
+            fixture.root.clone(),
+            vec!["/bin/echo".into(), "pass".into()],
+            gamma,
+            Duration::from_secs(30),
+            "echo-run-detail".into(),
+            owner,
+        ) {
+            StartResult::Started(id) => assert_eq!(id, 1),
+            StartResult::Running(..) | StartResult::Failed(..) => {
+                panic!("echo run must start")
+            }
+        }
+        let completed = loop {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let reply = inspect("tests #1".into()).await;
+            let PeerReply::Complete { text, .. } = &reply else {
+                panic!("handle alias must answer, got {reply:?}")
+            };
+            if text.contains("1 passed") {
+                break text.clone();
+            }
+        };
+        assert!(
+            completed.starts_with("tests #1: 1 passed, 0 failed")
+                && completed.contains("full output: ide.inspect echo-run-detail"),
+            "{completed}"
+        );
+
+        // A still-running run's handle answers with the running line and the poll hint.
+        let sleep_started = loop {
+            match worker.shared.test_runs.start(
+                fixture.root.clone(),
+                vec!["/bin/sleep".into(), "30".into()],
+                gamma,
+                Duration::from_secs(60),
+                "sleep-run-detail".into(),
+                owner,
+            ) {
+                StartResult::Started(id) => break id,
+                StartResult::Running(..) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                StartResult::Failed(_) => panic!("sleep run must start"),
+            }
+        };
+        assert_eq!(sleep_started, 2);
+        let running = inspect("#2".into()).await;
+        let PeerReply::Complete { text, .. } = &running else {
+            panic!("handle alias must answer, got {running:?}")
+        };
+        assert!(
+            text.starts_with("tests #2: running")
+                && text.ends_with("poll: ide.test {\"status\": 2}"),
+            "{text}"
+        );
+
+        // A number no run ever had answers unknown job, not invalid_detail.
+        let unknown = inspect("tests-9".into()).await;
+        let PeerReply::Complete { text, .. } = &unknown else {
+            panic!("unknown run must answer a status line, got {unknown:?}")
+        };
+        assert_eq!(
+            text,
+            "tests #9: unknown job; poll: ide.test {\"status\": 9}"
+        );
+
+        // A reference this daemon minted but no longer retains reads expired; one it could
+        // never have minted stays unknown.
+        worker.shared.ledger.lock().unwrap().next = 10;
+        let minted = format!(
+            "{}-5",
+            blake3::Hash::from_bytes(worker.shared.nonce).to_hex()
+        );
+        let PeerReply::Error { detail, .. } = inspect(minted).await else {
+            panic!("a dropped reference must fail")
+        };
+        assert_eq!(detail.as_deref(), Some("inspect:detail_expired"));
+        let PeerReply::Error { detail, .. } = inspect("never-retained".into()).await else {
+            panic!("an unminted reference must fail")
+        };
         assert_eq!(detail.as_deref(), Some("inspect:detail_unknown"));
     }
 

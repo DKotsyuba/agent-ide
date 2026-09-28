@@ -4627,6 +4627,12 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
         start_text.starts_with("tests #1: started — cargo test --workspace --lib (budget 120 s)"),
         "{start_text}"
     );
+    assert_eq!(
+        start_text.trim_end(),
+        "tests #1: started — cargo test --workspace --lib (budget 120 s); poll: ide.test \
+         {\"status\": 1}",
+        "{start_text}"
+    );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     let completed = loop {
         assert!(

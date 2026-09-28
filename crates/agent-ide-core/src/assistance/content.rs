@@ -340,6 +340,37 @@ mod tests {
         assert_eq!(expired.is_error, Some(true));
     }
 
+    /// A never-issued reference and an expired one say which they are.
+    #[test]
+    fn invalid_detail_names_unknown_and_expired_separately() {
+        let unknown = render(
+            PeerReply::Error {
+                code: FailureCode::InvalidDetail,
+                detail: Some("inspect:detail_unknown".to_owned()),
+            },
+            Envelope::TextOnly,
+        )
+        .unwrap();
+        assert_eq!(
+            text_of(&unknown),
+            "error: invalid_detail (inspect:detail_unknown); this detail_ref was never issued; \
+             repeat the original ide.* call to get a fresh one, or continue with native tools"
+        );
+        let expired = render(
+            PeerReply::Error {
+                code: FailureCode::InvalidDetail,
+                detail: Some("inspect:detail_expired".to_owned()),
+            },
+            Envelope::TextOnly,
+        )
+        .unwrap();
+        assert_eq!(
+            text_of(&expired),
+            "error: invalid_detail (inspect:detail_expired); this detail_ref has expired; \
+             repeat the original ide.* call to get a fresh one, or continue with native tools"
+        );
+    }
+
     /// A generic failure carrying a stage tag names it after the reason, exactly the same tag
     /// the daemon journal records; a failure without one renders the bare reason as before.
     #[test]

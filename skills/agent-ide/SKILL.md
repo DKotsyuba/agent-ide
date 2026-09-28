@@ -117,9 +117,11 @@ the language server is still loading the workspace: repeat the same call in a fe
    `{"symbol":"src/x.rs#Type/method"}` runs the tests that reference the symbol (including
    in-file `mod tests`), `{"path":"src/x.rs"}` the file's tests, `{"pattern":"name"}` a runner
    filter, `{"command":["cargo","test","--lib"]}` an exact argv; optional `budget_s` (default
-   120, max 600). The reply is `tests #N: started — <argv> (budget B s)`; poll with
-   `{"status":N}` until `tests #N: P passed, F failed, T s` with up to eight `FAIL name` /
-   `file:line message` lines, a `rerun:` argv and `full output: ide.inspect <detail_ref>`.
+   120, max 600). The reply is `tests #N: started — <argv> (budget B s); poll: ide.test
+   {"status":N}`; poll with `{"status":N}` until `tests #N: P passed, F failed, T s` with up to
+   eight `FAIL name` / `file:line message` lines, a `rerun:` argv and `full output:
+   ide.inspect <detail_ref>`. `ide.inspect` also accepts a test-run handle (`tests #N`,
+   `tests-N`, `#N`, `N`) and answers that run's status line.
    One job per worktree at a time; a stopped budget says `stopped at budget`. The
    `<agent-ide>` block carries the job's line once while it runs and once when it ends.
 6. `ide.diff` before finishing the task, to review the accumulated change.

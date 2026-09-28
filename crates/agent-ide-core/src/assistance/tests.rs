@@ -186,6 +186,21 @@ impl TestRuns {
         })
     }
 
+    /// Returns one daemon-global job's status for its starting binding, without a worktree: the
+    /// handle an agent invented for `ide.inspect` (`tests #N`) names a run, not a detail.
+    pub fn find(&self, id: u64, owner: &[u8; 32]) -> Option<JobStatus> {
+        let mut state = self.0.lock().ok()?;
+        let job = state.jobs.get_mut(&id).filter(|job| &job.owner == owner)?;
+        if job.result.is_some() {
+            job.observed = true;
+        }
+        Some(JobStatus {
+            age: job.started.elapsed(),
+            owner: job.owner,
+            result: job.result.clone(),
+        })
+    }
+
     /// Marks every job started by `binding` observed so stopping that actor cannot pin idle exit.
     pub fn observe_binding(&self, binding: &[u8; 32]) {
         if let Ok(mut state) = self.0.lock() {
@@ -346,7 +361,10 @@ fn render_status_line(id: u64, job: &Job) -> Option<String> {
             result.report.failed,
             result.elapsed.as_secs()
         ),
-        None => format!("tests #{id}: running {} s", job.started.elapsed().as_secs()),
+        None => format!(
+            "tests #{id}: running {} s; poll: ide.test {{\"status\": {id}}}",
+            job.started.elapsed().as_secs()
+        ),
     })
 }
 

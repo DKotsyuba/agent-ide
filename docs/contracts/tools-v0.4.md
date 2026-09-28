@@ -311,13 +311,15 @@ Input: `{symbol}` | `{path}` | `{pattern}` | `{command}`, with optional `budget_
 Immediate output:
 
 ```text
-tests #3: started — cargo test --workspace worker::  (4 tests selected, budget 120 s)
+tests #3: started — cargo test --workspace worker::  (4 tests selected, budget 120 s); poll: ide.test {"status": 3}
 ```
 
 The `symbol` form first asks the live language server for the symbol's references, which takes
 seconds on a cold session, so it answers `pending` at once and the started line (or
 `tests: no tests reference …`) arrives through `ide.inspect`; `path`, `pattern` and `command`
-answer inline.
+answer inline. Every start and running line ends with `poll: ide.test {"status": N}`, and
+`ide.inspect` with a test-run handle (`tests #N`, `tests-N`, `#N`, `N`) answers with that run's
+status line, so a handle mistaken for a `detail_ref` still reaches the result.
 
 Status appears in the status block and through `ide.test {status: 3}`:
 
@@ -354,7 +356,7 @@ Output uses the current `file:line:column code message` form, grouped by file an
 
 ### 2.9 Unchanged tools
 
-`ide.inspect {detail_ref, page?}` and `ide.stop {}` remain unchanged. `ide.context` in its current form is retired; its role is divided among `outline`, `symbol`, `read`, and `problems`.
+`ide.inspect {detail_ref, page?}` and `ide.stop {}` remain unchanged, except that an unknown `detail_ref` now says which it is — `this detail_ref was never issued` for a reference this daemon could not have minted, `this detail_ref has expired` for one it minted and no longer retains — and a test-run handle (`tests #N`, `tests-N`, `#N`, `N`) answers with that run's status line instead of failing the lookup. `ide.context` in its current form is retired; its role is divided among `outline`, `symbol`, `read`, and `problems`.
 
 ## 3. `LanguageSupport` contract
 
