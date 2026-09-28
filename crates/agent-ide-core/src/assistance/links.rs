@@ -70,19 +70,52 @@ pub(super) fn bridged_files_present(root: &Path) -> bool {
     crate::lang::text::has_files_with(root, &extensions)
 }
 
-/// Whether `file`'s own language states a name fact on `range` of `bytes`.
-fn has_facts_in(file: &Path, bytes: &[u8], range: LineRange) -> bool {
+/// Facts `file`'s own language states on `range` of `bytes` (none without a provider).
+fn local_facts(file: &Path, bytes: &[u8], range: LineRange) -> Vec<crate::lang::names::NameFact> {
     let (Some(names), Ok(source)) = (
         Lang::for_path(file).and_then(Lang::names),
         std::str::from_utf8(bytes),
     ) else {
-        return false;
+        return Vec::new();
     };
     let mut sink = crate::lang::names::FactSink::new();
     names.extract(file, source, &mut sink);
-    sink.facts()
-        .iter()
-        .any(|fact| range.start <= fact.line && fact.line <= range.end)
+    sink.into_facts()
+        .into_iter()
+        .filter(|fact| range.start <= fact.line && fact.line <= range.end)
+        .collect()
+}
+
+/// Whether `file`'s own language states a name fact on `range` of `bytes`.
+fn has_facts_in(file: &Path, bytes: &[u8], range: LineRange) -> bool {
+    !local_facts(file, bytes, range).is_empty()
+}
+
+/// Keys `found` defines itself (its children's definitions excluded), from `bytes`.
+fn owned_keys(file: &Path, bytes: &[u8], found: &Symbol) -> BTreeSet<NameKey> {
+    local_facts(file, bytes, found.range)
+        .into_iter()
+        .filter(|fact| fact.role == Role::Define)
+        .filter(|fact| {
+            !found
+                .children
+                .iter()
+                .any(|child| child.range.start <= fact.line && fact.line <= child.range.end)
+        })
+        .map(|fact| fact.key)
+        .collect()
+}
+
+/// A name a graph node uses: its display (`.btn`), label and first indexed definition.
+pub(super) struct LinkTarget {
+    /// `sigil + name`.
+    pub display: String,
+    /// `class name`, `element id`, ….
+    pub label: &'static str,
+    /// Definition word of the namespace (`rule`), for undefined names.
+    pub define_word: &'static str,
+    /// File and line of the first indexed definition.
+    pub definition: Option<(PathBuf, u32)>,
 }
 
 /// `sigil + name` of a key, with its domain when scoped.
@@ -161,19 +194,8 @@ fn address(index: &NameIndex, shown: &ShownSite) -> Option<(String, LineRange)> 
         .language
         .support()
         .outline_from_source(&shown.site.file, &source)?;
-    let line = shown.site.fact.line;
-    let mut found: Option<&Symbol> = None;
-    for symbol in &outline.symbols {
-        symbol.walk(&mut |candidate| {
-            if candidate.range.start <= line
-                && line <= candidate.range.end
-                && found.is_none_or(|old| candidate.range.len() <= old.range.len())
-            {
-                found = Some(candidate);
-            }
-        });
-    }
-    found.map(|symbol| (symbol.path.to_string(), symbol.range))
+    super::symbols::innermost(&outline, shown.site.fact.line)
+        .map(|symbol| (symbol.path.to_string(), symbol.range))
 }
 
 /// What a symbol card shows from the index, gathered on the blocking pool.
@@ -408,6 +430,83 @@ impl Worker<'_> {
         }
         card.links.extend(notes(&gathered.uncovered, state));
         Ok(())
+    }
+
+    /// Use sites (file, line, language) of the names `found` defines, in site order, each proven
+    /// against its file; empty without touching the index when it defines none.
+    ///
+    /// # Errors
+    ///
+    /// As [`Worker::name_index`].
+    pub(super) async fn defined_use_sites(
+        &mut self,
+        job: &mut Job,
+        worktree: &WorktreeRef,
+        file: &Path,
+        bytes: &[u8],
+        found: &Symbol,
+    ) -> Result<Vec<(PathBuf, u32, Lang)>, FailureCode> {
+        let keys = owned_keys(file, bytes, found);
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (index, _) = self.name_index(job, worktree).await?;
+        with_names(index, move |index| {
+            let mut sites = Vec::new();
+            for key in &keys {
+                let proven = index.proven_sites(key, Some(Role::Use), MAX_LINK_ROWS);
+                for shown in proven.sites {
+                    let site = (shown.site.file, shown.site.fact.line, shown.site.language);
+                    if !sites.contains(&site) {
+                        sites.push(site);
+                    }
+                }
+            }
+            sites
+        })
+        .await
+    }
+
+    /// The names `range` of `file` uses (at most `limit`), with their first indexed definition;
+    /// empty without touching the index when it uses none.
+    ///
+    /// # Errors
+    ///
+    /// As [`Worker::name_index`].
+    pub(super) async fn used_names(
+        &mut self,
+        job: &mut Job,
+        worktree: &WorktreeRef,
+        file: &Path,
+        bytes: &[u8],
+        range: LineRange,
+        limit: usize,
+    ) -> Result<Vec<LinkTarget>, FailureCode> {
+        let keys: BTreeSet<NameKey> = local_facts(file, bytes, range)
+            .into_iter()
+            .filter(|fact| fact.role == Role::Use)
+            .map(|fact| fact.key)
+            .collect();
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (index, _) = self.name_index(job, worktree).await?;
+        with_names(index, move |index| {
+            keys.iter()
+                .take(limit)
+                .map(|key| LinkTarget {
+                    display: display(key),
+                    label: key.namespace.label(),
+                    define_word: key.namespace.define_word(),
+                    definition: index
+                        .proven_sites(key, Some(Role::Define), 1)
+                        .sites
+                        .first()
+                        .map(|shown| (shown.site.file.clone(), shown.site.fact.line)),
+                })
+                .collect()
+        })
+        .await
     }
 
     /// Indexed keys spelled `name` (in `only`, when given); empty when no registered language

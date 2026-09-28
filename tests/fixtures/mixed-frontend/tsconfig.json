@@ -1,1 +1,1 @@
-{"compilerOptions":{"jsx":"preserve","types":[],"moduleResolution":"node10"},"files":["src/Button.tsx","src/Menu.tsx"]}
+{"compilerOptions":{"jsx":"preserve","types":[],"moduleResolution":"node10"},"files":["src/App.tsx","src/Button.tsx","src/Menu.tsx"]}

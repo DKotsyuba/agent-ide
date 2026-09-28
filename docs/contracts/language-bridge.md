@@ -14,7 +14,7 @@ tool integration (planned).
 | HTML provider (`agent-ide-lang-html`), §8 | implemented |
 | TypeScript/JavaScript provider (`agent-ide-lang-typescript`, JSX included), §9 | implemented |
 | Bridge data in `ide.symbol`, `ide.read` of sigil addresses and the `ide.start` card (tools-v0.4 §2.3.1) | implemented |
-| Link edges in `ide.graph` | planned (stage 5) |
+| Link edges in `ide.graph` (tools-v0.4 §2.3.1) | implemented |
 
 `ide.symbol` shows `defines:`, index-backed usages and `links:` for symbols of languages with name
 facts, name cards for sigil addresses, and bridge candidates in ambiguity lists (tools-v0.4

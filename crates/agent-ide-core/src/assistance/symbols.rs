@@ -491,31 +491,6 @@ impl Worker<'_> {
         .ok_or(FailureCode::UnknownSymbol)?;
         // A server whose call hierarchy answers nothing for constructors and partial answers for
         // everything else would make the walk below render a misleading graph; answer the fact.
-        // A file no server owns (outlined from source) has no call hierarchy at all.
-        let without_hierarchy = match self.session_server(observed.path()) {
-            None => Some((outline.language.name(), "")),
-            Some(server) if !server.call_hierarchy() => {
-                Some((server.name(), "; use ide.symbol usages"))
-            }
-            Some(_) => None,
-        };
-        if let Some((owner, hint)) = without_hierarchy {
-            let language = Lang::for_path(observed.path()).map_or("", Lang::name);
-            let authority = self.finish_symbol_job(job, &binding, &observed).await?;
-            let text = format!(
-                "graph: callers/callees unavailable for {language} ({owner} has no call hierarchy){hint}\n"
-            );
-            let (reply, page) =
-                ContextPageState::new(text, 0, false, ResultKind::Graph).next(&job.reference)?;
-            self.shared.set_context_page(&job.reference, page);
-            return Ok((reply, Some(authority), Some(observed)));
-        }
-        let root = render::GraphNode {
-            path: found.path.to_string(),
-            file: file.display().to_string(),
-            line: found.range.start,
-            is_test: found.kind == lang::SymbolKind::Test,
-        };
         let depth = job
             .parameters
             .get("depth")
@@ -540,17 +515,141 @@ impl Worker<'_> {
             "callees" => vec![render::GraphDirection::Callees],
             _ => vec![render::GraphDirection::Callers],
         };
+        // Cross-language links: the use sites of the names this symbol defines (callers) and the
+        // names it uses (callee leaves). Neither touches the index when the file states no fact.
+        let (mut link_sites, mut link_targets) = (Vec::new(), Vec::new());
+        if outline.language.names().is_some() && depth > 0 {
+            if directions.contains(&render::GraphDirection::Callers) {
+                link_sites = self
+                    .defined_use_sites(job, observed.worktree(), &file, &bytes, &found)
+                    .await?;
+            }
+            if directions.contains(&render::GraphDirection::Callees) {
+                link_targets = self
+                    .used_names(
+                        job,
+                        observed.worktree(),
+                        &file,
+                        &bytes,
+                        found.range,
+                        MAX_LINK_LEAVES,
+                    )
+                    .await?;
+            }
+        }
+        // A file no server owns (outlined from source) has no call hierarchy at all.
+        let without_hierarchy = match self.session_server(observed.path()) {
+            None => Some((outline.language.name(), "")),
+            Some(server) if !server.call_hierarchy() => {
+                Some((server.name(), "; use ide.symbol usages"))
+            }
+            Some(_) => None,
+        };
+        if let Some((owner, hint)) = without_hierarchy
+            && link_sites.is_empty()
+            && link_targets.is_empty()
+        {
+            let language = Lang::for_path(observed.path()).map_or("", Lang::name);
+            let authority = self.finish_symbol_job(job, &binding, &observed).await?;
+            let text = format!(
+                "graph: callers/callees unavailable for {language} ({owner} has no call hierarchy){hint}\n"
+            );
+            let (reply, page) =
+                ContextPageState::new(text, 0, false, ResultKind::Graph).next(&job.reference)?;
+            self.shared.set_context_page(&job.reference, page);
+            return Ok((reply, Some(authority), Some(observed)));
+        }
+        let root = render::GraphNode {
+            path: found.path.to_string(),
+            file: file.display().to_string(),
+            line: found.range.start,
+            is_test: found.kind == lang::SymbolKind::Test,
+            tag: None,
+        };
         let mut graph = render::CallGraph::new(root);
         let mut indexes = std::collections::HashMap::from([(graph.nodes[0].path.clone(), 0usize)]);
-        let mut queue = VecDeque::from([(0usize, file, found, 0u8, directions[0])]);
-        if directions.len() == 2 {
-            queue.push_back((
-                0usize,
-                queue[0].1.clone(),
-                queue[0].2.clone(),
-                0,
-                directions[1],
-            ));
+        let mut queue = VecDeque::new();
+        if without_hierarchy.is_none() {
+            for direction in &directions {
+                queue.push_back((0usize, file.clone(), found.clone(), 0u8, *direction));
+            }
+        }
+        // Link callers: each use site becomes its enclosing outline symbol (or its file), and a
+        // callable one continues through the ordinary call hierarchy.
+        let authority = self.authority(&binding).await?;
+        let mut outlines: std::collections::HashMap<PathBuf, Option<Outline>> =
+            std::collections::HashMap::new();
+        for (site_file, line, language) in link_sites {
+            if !outlines.contains_key(&site_file) {
+                let outline = self.scanned_outline(job, &authority, &site_file).await;
+                outlines.insert(site_file.clone(), outline);
+            }
+            let enclosing = outlines[&site_file]
+                .as_ref()
+                .and_then(|outline| innermost(outline, line))
+                .cloned();
+            let node = match &enclosing {
+                Some(symbol) => render::GraphNode {
+                    path: symbol.path.to_string(),
+                    file: site_file.display().to_string(),
+                    line: symbol.range.start,
+                    is_test: symbol.kind == lang::SymbolKind::Test,
+                    tag: Some(language.name().to_owned()),
+                },
+                None => render::GraphNode {
+                    path: site_file.display().to_string(),
+                    file: site_file.display().to_string(),
+                    line,
+                    is_test: false,
+                    tag: Some(language.name().to_owned()),
+                },
+            };
+            if node.is_test && !show_tests {
+                *graph
+                    .collapsed_tests
+                    .entry((0, render::GraphDirection::Callers))
+                    .or_default() += 1;
+                continue;
+            }
+            let (related, is_new) = match indexes.get(&node.path).copied() {
+                Some(index) => (index, false),
+                None => {
+                    let Some(index) = graph.add_node(node.clone()) else {
+                        break;
+                    };
+                    indexes.insert(node.path.clone(), index);
+                    (index, true)
+                }
+            };
+            if !graph.add_edge(render::GraphEdge {
+                from: 0,
+                to: related,
+                direction: render::GraphDirection::Callers,
+                link: true,
+            }) {
+                break;
+            }
+            if let Some(symbol) = enclosing
+                && is_new
+                && depth > 1
+                && matches!(
+                    symbol.kind,
+                    lang::SymbolKind::Function
+                        | lang::SymbolKind::Method
+                        | lang::SymbolKind::Constructor
+                )
+                && self
+                    .session_server(&site_file)
+                    .is_some_and(|server| server.call_hierarchy())
+            {
+                queue.push_back((
+                    related,
+                    site_file,
+                    symbol,
+                    1,
+                    render::GraphDirection::Callers,
+                ));
+            }
         }
         while let Some((parent, relative, symbol, level, edge_direction)) = queue.pop_front() {
             if level >= depth || graph.capped {
@@ -604,12 +703,48 @@ impl Worker<'_> {
                     from: parent,
                     to: related,
                     direction: edge_direction,
+                    link: false,
                 }) {
                     break;
                 }
                 if is_new && level + 1 < depth {
                     queue.push_back((related, item_file, item_symbol, level + 1, edge_direction));
                 }
+            }
+        }
+        // Callee leaves: the names the root uses, never expanded.
+        for target in link_targets {
+            let node = render::GraphNode {
+                path: target.display,
+                file: target
+                    .definition
+                    .as_ref()
+                    .map(|(file, _)| file.display().to_string())
+                    .unwrap_or_default(),
+                line: target.definition.as_ref().map_or(0, |(_, line)| *line),
+                is_test: false,
+                tag: Some(match target.definition {
+                    Some(_) => target.label.to_owned(),
+                    None => format!("{}, no indexed {}", target.label, target.define_word),
+                }),
+            };
+            let related = match indexes.get(&node.path).copied() {
+                Some(index) => index,
+                None => {
+                    let Some(index) = graph.add_node(node.clone()) else {
+                        break;
+                    };
+                    indexes.insert(node.path.clone(), index);
+                    index
+                }
+            };
+            if !graph.add_edge(render::GraphEdge {
+                from: 0,
+                to: related,
+                direction: render::GraphDirection::Callees,
+                link: true,
+            }) {
+                break;
             }
         }
         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
@@ -673,6 +808,7 @@ impl Worker<'_> {
                 file: render::display_path(worktree_root, &item.uri),
                 line: found.range.start,
                 is_test: found.kind == lang::SymbolKind::Test,
+                tag: None,
             },
             relative,
             found,
@@ -752,6 +888,7 @@ impl Worker<'_> {
             let anchor_source = scan_observation(
                 authority.worktree(),
                 authority.epoch(),
+                self.source_sequence,
                 anchor,
                 anchor_read.contents(),
             )?;
@@ -806,9 +943,13 @@ impl Worker<'_> {
                 if !contains_bare_name(bytes, name.as_bytes()) {
                     continue;
                 }
-                let Ok(observed) =
-                    scan_observation(authority.worktree(), authority.epoch(), file, bytes)
-                else {
+                let Ok(observed) = scan_observation(
+                    authority.worktree(),
+                    authority.epoch(),
+                    self.source_sequence,
+                    file,
+                    bytes,
+                ) else {
                     continue;
                 };
                 let language = Lang::for_path(file).ok_or(FailureCode::ProviderUnavailable)?;
@@ -846,6 +987,30 @@ impl Worker<'_> {
                     .collect(),
             )),
         }
+    }
+
+    /// The outline of `file` read without registering it against the binding (a graph node's
+    /// file), or `None` when it cannot be read or outlined.
+    async fn scanned_outline(
+        &mut self,
+        job: &mut Job,
+        authority: &AuthorityStamp,
+        file: &Path,
+    ) -> Option<Outline> {
+        let limits = SourceReadLimits::new(1024, MAX_SOURCE_BYTES).ok()?;
+        let read = read_authorized_source(authority.worktree(), file, limits).ok()?;
+        let observed = scan_observation(
+            authority.worktree(),
+            authority.epoch(),
+            self.source_sequence,
+            file,
+            read.contents(),
+        )
+        .ok()?;
+        self.outline_of(job, &observed, read.contents())
+            .await
+            .ok()
+            .map(|(outline, _)| outline)
     }
 
     /// Answers an ambiguous name with its candidates instead of guessing.
@@ -993,16 +1158,21 @@ impl Worker<'_> {
 }
 
 /// Builds an ephemeral provider input that carries no persisted or registered source authority.
+///
+/// `sequence` is the worker's current source sequence: a live session refuses observations older
+/// than the last one it synchronized, so a fixed sequence would fail once the session has served
+/// any registered observation.
 fn scan_observation(
     worktree: &WorktreeRef,
     authority_epoch: u64,
+    sequence: u64,
     path: &Path,
     bytes: &[u8],
 ) -> Result<SourceObservation, FailureCode> {
     SourceObservation::new(
         worktree.clone(),
         authority_epoch,
-        1,
+        sequence.max(1),
         ObservationRef::new("symbol-scan").map_err(|_| FailureCode::Internal)?,
         path.to_path_buf(),
         Some(SourceBytes::from_bytes(bytes)),
@@ -1059,6 +1229,25 @@ fn is_declaration_line(line: &str) -> bool {
     !line.is_empty()
         && !line.starts_with("```")
         && KEYWORDS.iter().any(|keyword| line.starts_with(keyword))
+}
+
+/// Name leaves one graph node lists.
+const MAX_LINK_LEAVES: usize = 10;
+
+/// The innermost symbol of `outline` holding `line`.
+pub(super) fn innermost(outline: &Outline, line: u32) -> Option<&lang::Symbol> {
+    let mut found: Option<&lang::Symbol> = None;
+    for symbol in &outline.symbols {
+        symbol.walk(&mut |candidate| {
+            if candidate.range.start <= line
+                && line <= candidate.range.end
+                && found.is_none_or(|old| candidate.range.len() <= old.range.len())
+            {
+                found = Some(candidate);
+            }
+        });
+    }
+    found
 }
 
 /// Candidates an ambiguity reply prints before the rest moves behind its `detail_ref`.

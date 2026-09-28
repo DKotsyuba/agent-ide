@@ -217,6 +217,24 @@ ambiguous_symbol: btn matches 2 symbols; repeat ide.symbol with one exact path:
 is present. While the index is first built, a query waits up to 1 s and then parks like a loading
 language server (`provider_loading`, detail `names:building`).
 
+**Graph.** `ide.graph` adds cross-language link edges, drawn `⇢`, for symbols of languages with
+name facts. Callers of a symbol that defines names (a style rule) are the enclosing outline symbols of
+their use sites (the file itself when no symbol encloses the site), tagged with their language; a
+callable one continues through the ordinary call hierarchy at the next level. Callees of a symbol
+that uses names end in one leaf per name (at most 10, never expanded), located at its first indexed
+definition. Depth, the 60-node and 120-edge ceilings, cycles and test collapsing are unchanged, and
+graphs without link edges are byte-identical:
+
+```text
+graph: callers of styles.css#.btn (depth 2, 5 nodes, 4 edges)
+  ⇢ index.html#main#main  index.html:4 [html]
+  ⇢ src/Button.tsx#Button  src/Button.tsx:1 [typescript]
+    ← src/App.tsx#App  src/App.tsx:2
+  ⇢ src/Menu.tsx#Menu  src/Menu.tsx:2 [typescript]
+graph: callees of src/Button.tsx#Button (depth 2, 2 nodes, 1 edges)
+  ⇢ .btn  styles.css:2 [class name]
+```
+
 ### 2.4 `ide.read` — symbol body or line range (implemented)
 
 Input: `{symbol}` or `{path, lines: "120-180"}`.

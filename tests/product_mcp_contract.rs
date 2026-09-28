@@ -5197,6 +5197,7 @@ async fn configured_product_links_css_html_and_python_names() {
         "theme.scss",
         "app.py",
         "tsconfig.json",
+        "src/App.tsx",
         "src/Button.tsx",
         "src/Menu.tsx",
     ] {
@@ -5278,6 +5279,32 @@ async fn configured_product_links_css_html_and_python_names() {
     assert!(
         button.contains("links: 1 class name used here\n  .btn  → styles.css:2 .btn, styles.css:6 .layout .btn (+1 more)\n"),
         "{button}"
+    );
+    let graph = async |actor: &mut ProductActor, requested: &str, direction: &str| {
+        let reply = actor
+            .call(
+                &fixture,
+                "ide.graph",
+                json!({"symbol":requested, "direction":direction, "depth":2}),
+            )
+            .await;
+        let reply = actor.settle(&fixture, reply).await;
+        let text = reply["text"].as_str().unwrap_or_default().to_owned();
+        println!("ide.graph {requested} {direction}:\n{text}");
+        text
+    };
+    assert_eq!(
+        graph(&mut actor, "styles.css#.btn", "callers").await,
+        "graph: callers of styles.css#.btn (depth 2, 5 nodes, 4 edges)\n\
+         \x20 ⇢ index.html#main#main  index.html:4 [html]\n\
+         \x20 ⇢ src/Button.tsx#Button  src/Button.tsx:1 [typescript]\n\
+         \x20   ← src/App.tsx#App  src/App.tsx:2\n\
+         \x20 ⇢ src/Menu.tsx#Menu  src/Menu.tsx:2 [typescript]\n"
+    );
+    assert_eq!(
+        graph(&mut actor, "src/Button.tsx#Button", "callees").await,
+        "graph: callees of src/Button.tsx#Button (depth 2, 2 nodes, 1 edges)\n\
+         \x20 ⇢ .btn  styles.css:2 [class name]\n"
     );
     let read = actor
         .call(&fixture, "ide.read", json!({"symbol":".btn"}))

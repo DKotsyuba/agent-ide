@@ -51,6 +51,9 @@ pub struct GraphNode {
     pub line: u32,
     /// Whether the outline classifies this symbol as a test.
     pub is_test: bool,
+    /// Printed after the location as `[tag]`: the language of a cross-language link node, or the
+    /// kind of a name node; `None` for call-hierarchy nodes.
+    pub tag: Option<String>,
 }
 
 /// One directed call relationship between node indexes in a [`CallGraph`].
@@ -62,6 +65,9 @@ pub struct GraphEdge {
     pub to: usize,
     /// Whether the related symbol calls or is called by `from`.
     pub direction: GraphDirection,
+    /// A cross-language name link (a use of a name `from` defines, or a name `from` uses),
+    /// rendered `⇢`, not a call.
+    pub link: bool,
 }
 
 /// Bounded, deduplicated graph collected from live call-hierarchy requests.
@@ -165,14 +171,18 @@ fn render_graph_children(
     {
         let node = &graph.nodes[edge.to];
         let already_seen = seen[edge.to];
+        let arrow = if edge.link { "⇢" } else { direction.arrow() };
         out.push_str(&format!(
-            "{}{} {}  {}:{}",
+            "{}{arrow} {}",
             "  ".repeat(level as usize),
-            direction.arrow(),
-            node.path,
-            node.file,
-            node.line
+            node.path
         ));
+        if !node.file.is_empty() {
+            out.push_str(&format!("  {}:{}", node.file, node.line));
+        }
+        if let Some(tag) = &node.tag {
+            out.push_str(&format!(" [{tag}]"));
+        }
         if !already_seen {
             seen[edge.to] = true;
         }
@@ -208,6 +218,7 @@ mod graph_tests {
             file: "src/lib.rs".to_owned(),
             line: 1,
             is_test: false,
+            tag: None,
         });
         for index in 1..3 {
             let node = graph
@@ -216,18 +227,21 @@ mod graph_tests {
                     file: "src/lib.rs".to_owned(),
                     line: index + 1,
                     is_test: index == 2,
+                    tag: None,
                 })
                 .unwrap();
             graph.add_edge(GraphEdge {
                 from: node - 1,
                 to: node,
                 direction: GraphDirection::Callers,
+                link: false,
             });
         }
         graph.add_edge(GraphEdge {
             from: 2,
             to: 0,
             direction: GraphDirection::Callers,
+            link: false,
         });
         let text = call_graph_text(&graph, "callers", 3);
         assert!(text.contains("← src/lib.rs#root  src/lib.rs:1 (seen)"));
@@ -241,6 +255,7 @@ mod graph_tests {
                         file: "src/lib.rs".to_owned(),
                         line: index as u32 + 1,
                         is_test: false,
+                        tag: None,
                     })
                     .is_some()
             );
@@ -252,6 +267,7 @@ mod graph_tests {
                     file: "src/lib.rs".to_owned(),
                     line: 99,
                     is_test: false,
+                    tag: None,
                 })
                 .is_none()
         );
@@ -267,6 +283,7 @@ mod graph_tests {
             file: "src/lib.rs".into(),
             line: 1,
             is_test: false,
+            tag: None,
         });
         for (path, is_test, direction) in [
             ("caller", false, GraphDirection::Callers),
@@ -278,18 +295,21 @@ mod graph_tests {
                     file: "src/lib.rs".into(),
                     line: 2,
                     is_test,
+                    tag: None,
                 })
                 .unwrap();
             graph.add_edge(GraphEdge {
                 from: 0,
                 to: index,
                 direction,
+                link: false,
             });
         }
         graph.add_edge(GraphEdge {
             from: 1,
             to: 2,
             direction: GraphDirection::Callers,
+            link: false,
         });
         let text = call_graph_text(&graph, "both", 2);
         assert!(text.find("← caller").unwrap() < text.find("→ test").unwrap());
@@ -305,6 +325,7 @@ mod graph_tests {
             file: "src/lib.rs".into(),
             line: 1,
             is_test: false,
+            tag: None,
         });
         let production = collapsed
             .add_node(GraphNode {
@@ -312,12 +333,14 @@ mod graph_tests {
                 file: "src/lib.rs".into(),
                 line: 2,
                 is_test: false,
+                tag: None,
             })
             .unwrap();
         collapsed.add_edge(GraphEdge {
             from: 0,
             to: production,
             direction: GraphDirection::Callers,
+            link: false,
         });
         collapsed
             .collapsed_tests
@@ -333,6 +356,7 @@ mod graph_tests {
             file: "src/lib.rs".into(),
             line: 1,
             is_test: false,
+            tag: None,
         });
         for (path, is_test) in [("prod", false), ("t1", true), ("t2", true)] {
             let index = shown
@@ -341,12 +365,14 @@ mod graph_tests {
                     file: "src/lib.rs".into(),
                     line: 2,
                     is_test,
+                    tag: None,
                 })
                 .unwrap();
             shown.add_edge(GraphEdge {
                 from: 0,
                 to: index,
                 direction: GraphDirection::Callers,
+                link: false,
             });
         }
         let text = call_graph_text(&shown, "callers", 2);
