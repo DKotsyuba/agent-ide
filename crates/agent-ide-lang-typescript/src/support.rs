@@ -20,7 +20,8 @@ use agent_ide_core::lang::{
     render::clip,
     text::{
         MAX_ATTRIBUTE_CHARS, MAX_NAMED_TESTS, distinct, distinct_files, entry_names, env_value,
-        indent_of, indent_unit, last_content_line, line_at, one_line, read_text, source_lines,
+        has_files_with, indent_of, indent_unit, last_content_line, line_at, one_line, read_text,
+        source_lines,
     },
 };
 
@@ -44,7 +45,9 @@ impl LanguageSupport for TypeScript {
     }
 
     /// Establishes a project from `package.json`, `tsconfig.json`, `tsconfig.*.json` or
-    /// `jsconfig.json` (any one suffices); `None` when none exists. Environment facts:
+    /// `jsconfig.json` (any one suffices); without one, TypeScript files found by the bounded
+    /// presence walk still make a project, with no manifests and no commands; `None` when
+    /// neither exists. Environment facts:
     /// `package_manager` (lockfile, then `packageManager`, else npm), `node` (`.nvmrc`,
     /// `.node-version`, `engines.node`), `tsconfig` (`tsconfig.json`, else the first
     /// `tsconfig.*.json`), `test_runner` (`vitest`, `jest` or `node`) and `formatter`
@@ -70,7 +73,14 @@ impl LanguageSupport for TypeScript {
             manifests.push(PathBuf::from("jsconfig.json"));
         }
         if manifests.is_empty() {
-            return None;
+            return has_files_with(root, &["ts", "tsx", "mts", "cts"]).then(|| LanguageProject {
+                language: LANGUAGE,
+                manifests,
+                environment: Vec::new(),
+                interpreter: None,
+                commands: ProjectCommands::default(),
+                entry_points: Vec::new(),
+            });
         }
         let package: Value =
             serde_json::from_str(&read_text(root, "package.json")).unwrap_or(Value::Null);
@@ -2104,6 +2114,27 @@ ok 2 - subtracts
         let empty = scratch("empty");
         assert_eq!(TypeScript.detect(&empty), None);
         fs::remove_dir_all(&empty).unwrap();
+    }
+
+    /// TypeScript files below the root without a root manifest: a project with nothing to run.
+    #[test]
+    fn detect_finds_nested_typescript_without_a_root_manifest() {
+        let root = scratch("nested");
+        put(
+            &root,
+            "frontend/package.json",
+            "{\"scripts\":{\"test\":\"vitest\"}}",
+        );
+        put(&root, "frontend/src/app.tsx", "export {}");
+        let project = TypeScript.detect(&root).unwrap();
+        assert!(project.manifests.is_empty());
+        assert!(project.environment.is_empty());
+        assert_eq!(project.commands, ProjectCommands::default());
+        fs::remove_dir_all(&root).unwrap();
+        let scripts = scratch("scripts-only");
+        put(&scripts, "tools/run.js", "");
+        assert_eq!(TypeScript.detect(&scripts), None);
+        fs::remove_dir_all(&scripts).unwrap();
     }
 
     #[test]

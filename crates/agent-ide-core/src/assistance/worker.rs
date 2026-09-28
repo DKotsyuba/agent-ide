@@ -4310,12 +4310,20 @@ fn errorlog_method(tool: AssistanceTool) -> crate::errorlog::Method {
     }
 }
 
-/// Chooses the first registered language whose project is detected at the worktree root.
-fn detect_test_language(root: &Path) -> Option<crate::lang::Language> {
-    crate::lang::registered()
+/// Projects detected at the worktree root in registration order, those with a root manifest
+/// first: a language present only by its files never shadows one the root declares.
+fn test_projects(root: &Path) -> Vec<(crate::lang::Language, LanguageProject)> {
+    let mut projects: Vec<_> = crate::lang::registered()
         .iter()
-        .copied()
-        .find(|language| language.support().detect(root).is_some())
+        .filter_map(|&language| Some((language, language.support().detect(root)?)))
+        .collect();
+    projects.sort_by_key(|(_, project)| project.manifests.is_empty());
+    projects
+}
+
+/// Chooses the first language of [`test_projects`].
+fn detect_test_language(root: &Path) -> Option<crate::lang::Language> {
+    test_projects(root).first().map(|(language, _)| *language)
 }
 
 /// Resolves a target through the detected runner, returning argv, language, and an optional
@@ -4325,19 +4333,15 @@ fn test_selection(
     root: &Path,
     target: crate::lang::TestTarget,
 ) -> Result<(Vec<String>, crate::lang::Language, Option<String>), crate::lang::LangError> {
-    for &language in crate::lang::registered() {
-        let support = language.support();
-        let Some(project) = support.detect(root) else {
-            continue;
-        };
-        let selection = support.test_selection(&project, &target)?;
-        let count = (!selection.tests.is_empty())
-            .then_some(format!("{} tests selected", selection.tests.len()));
-        return Ok((selection.command, language, count));
-    }
-    Err(crate::lang::LangError::Unsupported(
-        "no supported test runner was detected".to_owned(),
-    ))
+    let Some((language, project)) = test_projects(root).into_iter().next() else {
+        return Err(crate::lang::LangError::Unsupported(
+            "no supported test runner was detected".to_owned(),
+        ));
+    };
+    let selection = language.support().test_selection(&project, &target)?;
+    let count = (!selection.tests.is_empty())
+        .then_some(format!("{} tests selected", selection.tests.len()));
+    Ok((selection.command, language, count))
 }
 
 /// Formats an argv vector for the compact test status line without shell interpretation.
