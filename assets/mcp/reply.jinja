@@ -49,6 +49,8 @@ error: unknown_symbol{% if resolution_detail %} ({{ resolution_detail }}){% endi
 error: provider_loading{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; the language server is still loading the workspace; repeat the call in a few seconds
 {%- elif code == "invalid_detail" -%}
 error: invalid_detail{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; this detail_ref is unknown or has expired; repeat the original ide.* call to get a fresh one, or continue with native tools
+{%- elif code == "source_unavailable" -%}
+error: source_unavailable{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; the registered source bytes changed or left the authorized scope; call ide.context again for fresh bytes
 {%- elif code == "outside_allowed_roots" -%}
 error: outside_allowed_roots{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; the working directory is not below any configured allowed root; start the IDE in an allowed directory or add this one to allowed_roots, otherwise continue with native tools
 {%- elif code == "execution_profile" and cause_tag is defined -%}

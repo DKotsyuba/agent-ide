@@ -2940,26 +2940,58 @@ impl<'a> Worker<'a> {
         } else {
             self.semantic_context(job, &observed, &bytes, query).await
         };
-        let (context, diagnostics)=match semantic {
-            Ok(Some(result))=>(result.context, Some(result.diagnostics)),
-            Ok(None)=>(lexical_context(&observed,&bytes,query,"no accepted provider is configured for this source, or the registered path is missing").map_err(|_|FailureCode::SourceUnavailable)?, None),
-            Err(FailureCode::ProviderUnavailable)=>(lexical_context(&observed,&bytes,query,"accepted semantic provider is unavailable").map_err(|_|FailureCode::SourceUnavailable)?, None),
-            Err(FailureCode::ProviderLoading)=>(lexical_context(&observed,&bytes,query,"semantic provider is still loading the workspace; repeat the call in a few seconds").map_err(|_|FailureCode::SourceUnavailable)?, None),
-            Err(FailureCode::ResolutionUnverified) => (
-                lexical_context(
-                    &observed,
-                    &bytes,
-                    query,
-                    job.failure_detail
-                        .as_deref()
-                        .unwrap_or("semantic project resolution is unverified"),
-                )
-                .map_err(|_| FailureCode::SourceUnavailable)?,
+        let lexical = |job: &mut Job, reason: &'static str| {
+            lexical_context(&observed, &bytes, query, reason).map_err(|_| {
+                job.failure_detail = Some("context:observation_failed".to_owned());
+                FailureCode::SourceUnavailable
+            })
+        };
+        let (context, diagnostics) = match semantic {
+            Ok(Some(result)) => (result.context, Some(result.diagnostics)),
+            Ok(None) => (
+                lexical(
+                    job,
+                    "no accepted provider is configured for this source, or the registered path is missing",
+                )?,
                 None,
             ),
-            Err(FailureCode::ExecutionProfile)=>(lexical_context(&observed,&bytes,query,"accepted semantic provider cannot run under the current execution profile").map_err(|_|FailureCode::SourceUnavailable)?, None),
-            Err(code)=>return Err(code),
+            Err(FailureCode::ProviderUnavailable) => (
+                lexical(job, "accepted semantic provider is unavailable")?,
+                None,
+            ),
+            Err(FailureCode::ProviderLoading) => (
+                lexical(
+                    job,
+                    "semantic provider is still loading the workspace; repeat the call in a few seconds",
+                )?,
+                None,
+            ),
+            Err(FailureCode::ResolutionUnverified) => {
+                let reason = job
+                    .failure_detail
+                    .clone()
+                    .unwrap_or_else(|| "semantic project resolution is unverified".to_owned());
+                (
+                    lexical_context(&observed, &bytes, query, &reason).map_err(|_| {
+                        job.failure_detail = Some("context:observation_failed".to_owned());
+                        FailureCode::SourceUnavailable
+                    })?,
+                    None,
+                )
+            }
+            Err(FailureCode::ExecutionProfile) => (
+                lexical(
+                    job,
+                    "accepted semantic provider cannot run under the current execution profile",
+                )?,
+                None,
+            ),
+            Err(code) => return Err(code),
         };
+        // A finished context job is no longer fenced by the native epoch: pages are frozen byte
+        // slices of the page-1 snapshot and the exact-byte check below is the whole staleness
+        // contract (T15B follow-up). The epoch still bumps for every non-inert native post and
+        // every managed read boundary, which previously discarded jobs whose bytes never changed.
         let epoch = self
             .shared
             .ledger
@@ -2969,15 +3001,13 @@ impl<'a> Worker<'a> {
             .get(&binding)
             .copied()
             .unwrap_or(0);
-        if epoch != job.native_epoch {
-            return Err(FailureCode::SourceUnavailable);
-        }
         if tokio::time::Instant::now() >= job.deadline {
             return Err(FailureCode::Deadline);
         }
         let authority = self.authority(&binding).await?;
         self.shared.active(&binding)?;
         if !source_matches(&observed) {
+            job.failure_detail = Some("context:source_changed".to_owned());
             return Err(FailureCode::SourceUnavailable);
         }
         let mode = match &context.mode {
@@ -3818,7 +3848,7 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
             reply,
             authority,
             source,
-            native_epoch,
+            _native_epoch,
             diff_page,
             diff_page_fresh,
             context_page,
@@ -3901,42 +3931,13 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
         {
             return Err(InspectFailure::stage(
                 invalidate(FailureCode::SourceUnavailable),
-                "inspect:source_stale",
+                "inspect:source_changed",
             ));
         }
-        if matches!(
-            reply,
-            PeerReply::Complete {
-                kind: ResultKind::Context,
-                ..
-            }
-        ) && shared
-            .ledger
-            .lock()
-            .map_err(|_| InspectFailure::new(FailureCode::Internal))?
-            .native_epoch
-            .get(&request.binding)
-            .copied()
-            .unwrap_or(0)
-            != native_epoch
-        {
-            // Context carries an exact-byte source reference. Diff is a job-time tree snapshot,
-            // so a later native edit makes it stale in the same way as an inline-completed diff.
-            crate::errorlog::record(
-                crate::errorlog::Method::Inspect,
-                crate::errorlog::Outcome::Failed,
-                crate::errorlog::Fields {
-                    reason: Some(FailureCode::SourceUnavailable.into()),
-                    correlation: Some(request.reference.as_str()),
-                    detail: Some("native_epoch_advanced"),
-                    ..Default::default()
-                },
-            );
-            return Err(InspectFailure::stage(
-                invalidate(FailureCode::SourceUnavailable),
-                "inspect:source_stale",
-            ));
-        }
+        // Context pages are frozen byte slices of the page-1 snapshot, so the exact-byte check
+        // above is the whole staleness contract; the native epoch no longer discards a page
+        // whose bytes are unchanged (T15B follow-up). Diff keeps its own snapshot re-check in
+        // its paging branch below.
         let active = shared
             .active(&request.binding)
             .map_err(InspectFailure::new)?;

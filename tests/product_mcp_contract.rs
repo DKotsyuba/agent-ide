@@ -4446,6 +4446,85 @@ async fn wait_for_healed_daemon(runtime: &Path) {
     .expect("the lease watcher must heal the shared daemon");
 }
 
+/// A paged Context survives native tool activity between its pages: a non-inert post (Bash) no
+/// longer discards a page whose bytes are unchanged, while a real edit between pages still
+/// refuses with the explicit changed-source recovery.
+#[tokio::test]
+async fn claude_context_pages_survive_native_posts_but_not_real_edits() {
+    let fixture = ProductFixture::new(json!([]));
+    // ~150 KB of short lines, comfortably multi-page.
+    let content: String = (0..3300)
+        .map(|line| format!("value_{line:05} = \"padding padding padding {line:05}\"\n"))
+        .collect();
+    std::fs::write(fixture.root.join("claude-pages.py"), &content).unwrap();
+    fixture.git(&["add", "--", "claude-pages.py"]);
+    fixture.git(&["commit", "--quiet", "-m", "claude paged source"]);
+
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "claude-paged-context").await;
+    let started = actor
+        .call_claude(&fixture, "ide.start", json!({"activation_id":"start"}))
+        .await;
+    let (started, _) = actor.settle_claude(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    let first_call = actor
+        .call_claude(&fixture, "ide.context", json!({"path":"claude-pages.py"}))
+        .await;
+    let (page1, _) = actor.settle_claude(&fixture, first_call).await;
+    assert_eq!(page1["kind"], "context", "{page1}");
+    assert_eq!(page1["continuation"], true, "{page1}");
+    let reference = page1["detail_ref"].as_str().unwrap().to_owned();
+    let (_, _, _, end, total) = page_marker(page1["text"].as_str().unwrap());
+
+    // A non-inert native post (Bash) between pages bumps the native epoch without touching the
+    // file: page two must still be served byte-exactly.
+    actor
+        .claude_lifecycle(&fixture, "PostToolUse", "paged-bash")
+        .await;
+    let next = actor
+        .call_claude(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
+        .await;
+    assert_eq!(next["kind"], "context", "{next}");
+    let text = next["text"].as_str().unwrap();
+    let (number, _, from, to, _) = page_marker(text);
+    assert_eq!(number, 2, "page two is served after a Bash post: {text}");
+    assert_eq!(from, end, "page two continues byte-exactly: {text}");
+    assert!(
+        to > from && to <= total,
+        "page two covers real bytes: {text}"
+    );
+
+    // A real edit between pages changes the bytes: the next page refuses with the explicit
+    // changed-source recovery instead of a bare source_unavailable.
+    let edited = content.replace("value_00002", "value_EDITED");
+    std::fs::write(fixture.root.join("claude-pages.py"), &edited).unwrap();
+    actor.next += 1;
+    let call = format!("call-{}", actor.next);
+    actor.claude_lifecycle(&fixture, "PreToolUse", &call).await;
+    let refused = actor
+        .mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
+                "name":"ide.inspect","arguments":{"detail_ref":&reference},
+                "_meta":{"claudecode/toolUseId":call}
+            }}),
+        )
+        .await;
+    let refused_text = assert_claude_envelope(&refused);
+    let _ = total;
+    assert!(
+        refused_text.contains("error: source_unavailable")
+            && refused_text.contains("inspect:source_changed")
+            && refused_text.contains("call ide.context again for fresh bytes"),
+        "{refused_text}"
+    );
+    let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A session that never calls `ide.start` produces hook bookkeeping, not failures: one `info`
 /// skip line per detail per window on each side, and no `warn` hook line at all.
 #[tokio::test]
