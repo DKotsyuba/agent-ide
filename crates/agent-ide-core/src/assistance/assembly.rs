@@ -159,9 +159,13 @@ fn attach_test_plate(
     reply: &mut PeerReply,
     test_status_snapshot: Option<&str>,
 ) -> Option<String> {
-    let line = test_status_snapshot
-        .map(str::to_owned)
-        .or_else(|| worker.test_status_line(binding))?;
+    let current = worker.test_status_line(binding);
+    // The reply's own snapshot wins a completion race, but only while that line is still
+    // undelivered: a repeated status lookup of a finished run must not plate it again.
+    let line = match test_status_snapshot {
+        Some(snapshot) => (current.as_deref() == Some(snapshot)).then(|| snapshot.to_owned()),
+        None => current,
+    }?;
     let plate = format!("<agent-ide>\n{line}\n</agent-ide>");
     let mut fitting = reply.clone();
     loop {

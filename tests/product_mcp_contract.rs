@@ -2097,6 +2097,12 @@ impl ProductFixture {
         if let Some(home) = home {
             command.env(agent_ide::userhome::HOME_OVERRIDE_ENV, home);
         }
+        // Fixture `cargo` runs (`ide.test`) build into a fixture-private target directory, never
+        // the one this test binary was built in: cargo caches rustc probe results — failures
+        // included — in the shared target directory, so a fixture run orphaned by a killed daemon
+        // after its worktree was removed would replay "current directory is invalid" to every
+        // later run sharing that cache.
+        command.env("CARGO_TARGET_DIR", self.base.join("cargo-target"));
         if durable_telemetry {
             command.env("AGENT_IDE_TELEMETRY_DATABASE", &self.telemetry);
         }
@@ -4688,6 +4694,68 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
             .contains("test result: ok. 1 passed"),
         "last output page lost the summary: {page}"
     );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A finished run's output is paged into its detail once; every later status lookup still answers
+/// the status line, never `capacity`.
+#[tokio::test]
+async fn configured_product_test_status_repeats_after_output_is_paged() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "status-repeat").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"status-repeat"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let run = actor
+        .call(
+            &fixture,
+            "ide.test",
+            json!({"command":["/bin/sh","-c","echo retained-output"]}),
+        )
+        .await;
+    assert!(
+        run["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("tests #1: started"),
+        "{run}"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the run did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let status = actor.call(&fixture, "ide.test", json!({"status":1})).await;
+        if status["text"]
+            .as_str()
+            .unwrap()
+            .contains("no summary parsed")
+        {
+            break;
+        }
+    }
+    for _ in 0..3 {
+        let again = actor.call(&fixture, "ide.test", json!({"status":1})).await;
+        assert_eq!(again["state"], "complete", "{again}");
+        assert!(
+            again["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("tests #1: no summary parsed"),
+            "{again}"
+        );
+    }
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();

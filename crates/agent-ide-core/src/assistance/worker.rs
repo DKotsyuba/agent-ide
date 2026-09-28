@@ -1813,7 +1813,10 @@ impl<'a> Worker<'a> {
             if let Some(result) = job_status.result {
                 let owns_detail = job_status.owner == binding.fingerprint();
                 let text = test_result_text(id, &result, owns_detail);
-                if owns_detail {
+                // The output is paged into the owner's detail once and then dropped; a later
+                // status lookup finds it empty and leaves the retained pages as they are (an
+                // empty text has no page to cut and would fail the lookup with `capacity`).
+                if owns_detail && !result.output.is_empty() {
                     let (first_page, following_pages) =
                         ContextPageState::new(result.output.clone(), 0, false, ResultKind::Test)
                             .next(&result.detail_ref)?;
