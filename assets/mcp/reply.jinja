@@ -98,16 +98,17 @@ complete stop: {{ text }}
 Workspace authority is released; native edits remain on disk
 {%- endif -%}
 {%- if state == "edit" and result.outcome in ("created", "replaced", "unchanged") -%}
+{%- set outcome = operation or result.outcome -%}
 {%- if diagnostics.state == "current_reported" -%}
-edit: {{ result.outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: current_reported ({{ diagnostics.delta }}){{ " [truncated]" if diagnostics.truncated else "" }}
+edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: current_reported ({{ diagnostics.delta }}){{ " [truncated]" if diagnostics.truncated else "" }}
 {{ diagnostics.messages|join("\n") }}
 Next: use ide.edit with source_ref {{ result.source_ref }}
 {%- elif diagnostics.state == "current_clean" -%}
-edit: {{ result.outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: current_clean. Next: use ide.diff
+edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: current_clean. Next: use ide.diff
 {%- elif diagnostics.state == "unknown" -%}
-edit: {{ result.outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: unknown. Next: use ide.context
+edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: unknown. Next: use ide.context
 {%- elif diagnostics.state == "pending" -%}
-edit: {{ result.outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: pending. Next: use ide.inspect with detail_ref {{ diagnostics.detail_ref }}
+edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: pending. Next: use ide.inspect with detail_ref {{ diagnostics.detail_ref }}
 {%- endif -%}
 {%- if note %}{{ "\n" }}{{ note }}{%- endif %}
 {%- endif -%}

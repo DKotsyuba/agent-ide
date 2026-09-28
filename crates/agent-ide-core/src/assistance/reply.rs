@@ -336,6 +336,12 @@ pub enum PeerReply {
         /// older envelope, decoding as `None`.
         #[serde(default)]
         note: Option<String>,
+        /// Display word naming the operation the reply reports (`inserted`, `deleted`,
+        /// `renamed`), replacing the durable outcome word in the first line; `None` (the
+        /// default, and absent from an older envelope) keeps the outcome. Display only —
+        /// the durable outcome stays [`crate::changes::edit::EditResult::outcome`].
+        #[serde(default)]
+        operation: Option<String>,
     },
 }
 impl std::fmt::Debug for PeerReply {

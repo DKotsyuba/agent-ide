@@ -1301,6 +1301,9 @@ fn is_declaration_line(line: &str) -> bool {
 /// Name leaves one graph node lists.
 const MAX_LINK_LEAVES: usize = 10;
 
+/// Files a rename reply names inline before counting the rest as `+N more`.
+const RENAME_SUMMARY_FILES: usize = 5;
+
 /// The innermost symbol of `outline` holding `line`.
 pub(super) fn innermost(outline: &Outline, line: u32) -> Option<&lang::Symbol> {
     let mut found: Option<&lang::Symbol> = None;
@@ -1554,6 +1557,7 @@ impl Worker<'_> {
                                 },
                                 diagnostics: EditDiagnostics::Unknown {},
                                 note: None,
+                                operation: None,
                             },
                             authority,
                             None,
@@ -1613,6 +1617,8 @@ impl Worker<'_> {
                         result,
                         diagnostics: EditDiagnostics::Unknown {},
                         note: None,
+
+                        operation: None,
                     },
                     authority,
                     None,
@@ -1620,7 +1626,8 @@ impl Worker<'_> {
             }
             Err(_) => return Err(FailureCode::Internal),
         };
-        self.edit_with_source(job, request, prepared, base).await
+        self.edit_with_source(job, request, prepared, base, true)
+            .await
     }
 
     /// Runs the project's stdin formatter over a candidate text; the candidate is returned
@@ -1725,9 +1732,8 @@ impl Worker<'_> {
             job.failure_detail = Some(grouped.unsupported.join(", "));
             return Err(FailureCode::ProviderUnavailable);
         }
-        let mut summary = Vec::new();
-        let mut written = 0usize;
-        let mut last: Option<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>)> = None;
+        let mut summary: Vec<(String, usize)> = Vec::new();
+        let mut last: Option<(PeerReply, Option<SourceObservation>)> = None;
         for (index, file_edits) in grouped.files.iter().enumerate() {
             let Ok(absolute) = file_edits.uri.to_file_path() else {
                 continue;
@@ -1751,40 +1757,63 @@ impl Worker<'_> {
                 Ok(PrepareAdmission::Prepared(prepared)) => prepared,
                 _ => return Err(FailureCode::Internal),
             };
-            let outcome = self
-                .edit_with_source(job, request, prepared, observed)
+            // Never await the project check per file: a parked rename would resume as one
+            // file's plain edit reply with the remaining files unwritten.
+            let (outcome, _, source) = self
+                .edit_with_source(job, request, prepared, observed, false)
                 .await?;
-            if let PeerReply::Edit { result, .. } = &outcome.0 {
-                summary.push(format!(
-                    "{} ({}, {:?})",
-                    relative.display(),
-                    file_edits.edits.len(),
-                    result.outcome
-                ));
-                written += 1;
+            if let PeerReply::Edit { .. } = &outcome {
+                summary.push((relative.display().to_string(), file_edits.edits.len()));
             }
-            last = Some(outcome);
+            last = Some((outcome, source));
+        }
+        // One rename answers once, as an edit reply the Edit tool accepts: the operation word
+        // names the rename, the note lists every touched file with its site count, bounded like
+        // every other list, and the diagnostics are the last written file's.
+        let Some((
+            PeerReply::Edit {
+                result,
+                diagnostics,
+                ..
+            },
+            source,
+        )) = last
+        else {
+            job.failure_detail = Some("edit:rename_no_edits".to_owned());
+            return Err(FailureCode::ProviderUnavailable);
+        };
+        let sites: usize = summary.iter().map(|(_, count)| count).sum();
+        let mut note = format!(
+            "renamed {} → {new_name}; {sites} sites in {} files",
+            found.name,
+            summary.len()
+        );
+        if !summary.is_empty() {
+            note.push_str(": ");
+            note.push_str(
+                &summary
+                    .iter()
+                    .take(RENAME_SUMMARY_FILES)
+                    .map(|(file, count)| format!("{file} ({count})"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            let hidden = summary.len().saturating_sub(RENAME_SUMMARY_FILES);
+            if hidden > 0 {
+                note.push_str(&format!("; +{hidden} more"));
+            }
         }
         let authority = self.authority(&binding).await?;
-        let mut text = format!(
-            "rename: {} → {new_name}; {} edits in {written} files\n",
-            found.name,
-            grouped
-                .files
-                .iter()
-                .map(|file| file.edits.len())
-                .sum::<usize>()
-        );
-        for line in summary.iter().take(30) {
-            text.push_str(&format!("  {line}\n"));
-        }
-        if let Some((PeerReply::Edit { diagnostics, .. }, _, _)) = &last {
-            text.push_str(&format!("diagnostics (last file): {diagnostics:?}\n"));
-        }
-        let (reply, page) =
-            ContextPageState::new(text, 0, false, ResultKind::Symbol).next(&job.reference)?;
-        self.shared.set_context_page(&job.reference, page);
-        Ok((reply, Some(authority), last.and_then(|outcome| outcome.2)))
+        Ok((
+            PeerReply::Edit {
+                result,
+                diagnostics,
+                note: Some(note),
+                operation: Some("renamed".to_owned()),
+            },
+            Some(authority),
+            source,
+        ))
     }
 }
 

@@ -1047,7 +1047,8 @@ pub enum FacadeOutcome {
     /// IPC accepted the envelope but no typed peer result was available for safe rendering.
     Incomplete,
     /// Typed peer result accepted from the daemon, with its optional carried status plate (T28B).
-    Reply(PeerReply, Option<String>),
+    /// Boxed so the rare large reply does not size every outcome.
+    Reply(Box<PeerReply>, Option<String>),
 }
 
 /// Owns one local facade endpoint and the finite limits for every connect-only dispatch.
@@ -1152,17 +1153,17 @@ impl AssistanceFacade {
                         | PeerReply::Error { .. }
                         | PeerReply::InvalidParameters { .. }),
                         status,
-                    )) => FacadeOutcome::Reply(reply, status),
+                    )) => FacadeOutcome::Reply(Box::new(reply), status),
                     Some((reply @ PeerReply::Edit { .. }, status))
                         if matches!(tool, AssistanceTool::Edit | AssistanceTool::Inspect) =>
                     {
-                        FacadeOutcome::Reply(reply, status)
+                        FacadeOutcome::Reply(Box::new(reply), status)
                     }
                     Some((reply @ PeerReply::Complete { kind, .. }, status))
                         if tool == AssistanceTool::Inspect
                             || tool_accepts_result_kind(tool, kind) =>
                     {
-                        FacadeOutcome::Reply(reply, status)
+                        FacadeOutcome::Reply(Box::new(reply), status)
                     }
                     _ => FacadeOutcome::Incomplete,
                 }
@@ -1822,7 +1823,7 @@ impl StdioFacade {
         // the derived `<tool>:<reason>` default — the same tag the daemon journal records.
         let outcome = match outcome {
             FacadeOutcome::Reply(mut reply, status) => {
-                if let PeerReply::Error { code, detail } = &mut reply
+                if let PeerReply::Error { code, detail } = reply.as_mut()
                     && detail.is_none()
                 {
                     *detail = Some(crate::telemetry::adapters::default_stage(tool, code));
@@ -1837,10 +1838,10 @@ impl StdioFacade {
         };
         let message = match outcome {
             FacadeOutcome::Reply(reply, status) if reconnected => {
-                return render_reply_after_reconnect(tool, reply, status.as_deref(), envelope);
+                return render_reply_after_reconnect(tool, *reply, status.as_deref(), envelope);
             }
             FacadeOutcome::Reply(reply, status) => {
-                return render_reply_with_status(reply, status.as_deref(), envelope);
+                return render_reply_with_status(*reply, status.as_deref(), envelope);
             }
             FacadeOutcome::InvalidParameters => {
                 "invalid bounded parameters; inspect the tool schema"

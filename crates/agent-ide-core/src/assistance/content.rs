@@ -225,7 +225,37 @@ mod tests {
             .expect("fixed successful edit result"),
             diagnostics,
             note: None,
+            operation: None,
         }
+    }
+
+    /// The operation word (`inserted`, `deleted`, `renamed`) replaces the durable outcome word,
+    /// so the reply names what happened while the structured result keeps the closed outcome.
+    #[test]
+    fn edit_operation_word_replaces_the_outcome_word() {
+        let reply = PeerReply::Edit {
+            result: edit_result(EditOutcome::Replaced).unwrap(),
+            diagnostics: EditDiagnostics::CurrentClean {},
+            note: Some(
+                "renamed c → cee; 3 sites in 2 files: src/lib.rs (2), tests/x.rs (1)".into(),
+            ),
+            operation: Some("renamed".into()),
+        };
+        let expected = serde_json::to_value(&reply).unwrap();
+        let rendered = render(reply, Envelope::WithStructured).unwrap();
+        let text = text_of(&rendered);
+        assert!(
+            text.starts_with("edit: renamed; path src/lib.rs; source_ref source-after-edit"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "diagnostics: current_clean. Next: use ide.diff\n\
+                 renamed c → cee; 3 sites in 2 files: src/lib.rs (2), tests/x.rs (1)"
+            ),
+            "{text}"
+        );
+        assert_eq!(rendered.structured_content, Some(expected));
     }
 
     /// Refuses future reply variants instead of emitting an empty success-shaped MCP page.
@@ -437,6 +467,8 @@ mod tests {
                 result: edit_result(outcome).unwrap(),
                 diagnostics: EditDiagnostics::Unknown {},
                 note: None,
+
+                operation: None,
             };
             let expected = serde_json::to_value(&reply).unwrap();
             let rendered = render(reply, Envelope::WithStructured).unwrap();
@@ -501,6 +533,8 @@ mod tests {
             result: edit_result(EditOutcome::StaleSource).unwrap(),
             diagnostics: EditDiagnostics::Unknown {},
             note: None,
+
+            operation: None,
         };
         let rendered = render(reply, Envelope::TextOnly).unwrap();
         let text = text_of(&rendered);
@@ -697,6 +731,8 @@ mod tests {
                 result: edit_result(EditOutcome::ConflictingDuplicate).unwrap(),
                 diagnostics: EditDiagnostics::Unknown {},
                 note: None,
+
+                operation: None,
             },
             Envelope::WithStructured,
         )

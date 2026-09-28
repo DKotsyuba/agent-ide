@@ -1637,6 +1637,18 @@ fn queue_capacity(ordinary: usize, tool: AssistanceTool) -> usize {
     ordinary + usize::from(tool == AssistanceTool::Stop) * 64
 }
 
+/// Display word naming the symbol-edit operation an edit reply reports, from the call's `op`
+/// argument: `inserted` and `deleted` replace the durable `replaced` outcome word so the reply
+/// names what happened. `None` (replace, the line-range form, every plain edit) keeps the
+/// outcome word; rename builds its own summary reply.
+fn edit_operation(parameters: &Value) -> Option<String> {
+    match parameters.get("op").and_then(Value::as_str) {
+        Some("insert") => Some("inserted".to_owned()),
+        Some("delete") => Some("deleted".to_owned()),
+        _ => None,
+    }
+}
+
 /// Settled details every live binding keeps before its oldest facts may be evicted to admit
 /// another binding's work.
 const FAIR_DETAILS_PER_BINDING: usize = 8;
@@ -3242,6 +3254,7 @@ impl<'a> Worker<'a> {
                     result,
                     diagnostics,
                     note,
+                    operation: edit_operation(&job.parameters),
                 },
                 Some(authority),
                 source,
@@ -3267,6 +3280,7 @@ impl<'a> Worker<'a> {
                         result,
                         diagnostics: EditDiagnostics::Unknown {},
                         note: None,
+                        operation: None,
                     },
                     authority,
                     None,
@@ -3283,6 +3297,7 @@ impl<'a> Worker<'a> {
                         },
                         diagnostics: EditDiagnostics::Unknown {},
                         note: None,
+                        operation: None,
                     },
                     None,
                     None,
@@ -3305,7 +3320,8 @@ impl<'a> Worker<'a> {
                 )
                 .await;
         };
-        self.edit_with_source(job, request, prepared, source).await
+        self.edit_with_source(job, request, prepared, source, true)
+            .await
     }
 
     /// Writes one prepared edit whose base observation is already known: the full-file form
@@ -3316,6 +3332,7 @@ impl<'a> Worker<'a> {
         request: EditRequest,
         prepared: crate::changes::edit::PreparedEdit,
         source: SourceObservation,
+        await_check: bool,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
         let binding = job.invocation.binding_ref().clone();
         let authority = match self.authority(&binding).await {
@@ -3466,7 +3483,10 @@ impl<'a> Worker<'a> {
         };
         // A matching provider report is already authoritative. Otherwise the scheduled project
         // check verifies the settled write; its durable receipt is safe while this job is parked.
-        if result == expected
+        // A multi-file operation (rename) never parks: it must write every file and answer once,
+        // so it skips the wait and reports diagnostics as unknown until the next check lands.
+        if await_check
+            && result == expected
             && result.outcome.has_post_source()
             && !matches!(diagnostics, EditDiagnostics::CurrentReported { .. })
             && let Some(stage) = self.edit_check_stage(
@@ -3505,6 +3525,7 @@ impl<'a> Worker<'a> {
                 result,
                 diagnostics,
                 note,
+                operation: edit_operation(&job.parameters),
             },
             Some(authority),
             source,
@@ -3643,6 +3664,7 @@ impl<'a> Worker<'a> {
                 result,
                 diagnostics: EditDiagnostics::Unknown {},
                 note: None,
+                operation: None,
             },
             authority,
             source,

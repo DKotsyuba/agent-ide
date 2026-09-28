@@ -296,9 +296,11 @@ edit: replaced; path src/lang/path.rs; source_ref …-4; diagnostics: current_cl
 For `rename`:
 
 ```text
-rename: method → run; 7 edits in 4 files: src/index.ts (3), src/api.ts (2), test/index.test.ts (2)
-diagnostics: clean
+edit: renamed; path src/index.ts; source_ref …-5; diagnostics: current_clean. Next: use ide.diff
+renamed method → run; 7 sites in 4 files: src/index.ts (3), src/api.ts (2), test/index.test.ts (2), … (+1 more)
 ```
+
+The first line's operation word names what happened: `edit: inserted`, `edit: deleted`, `edit: renamed` (`replace` and every plain edit keep `edit: replaced`, `edit: created`, `edit: unchanged`). The rename's second line lists every touched file with its site count, bounded like every other list (five files inline, then `+N more`); its diagnostics are the last written file's, and a rename never waits for the project check — a still-running check reports `diagnostics: unknown` and reaches the next `<agent-ide>` block or `ide.context` like any other edit.
 
 Errors: `stale_source`, `ambiguous_symbol`, `unknown_symbol`, `syntax_error` (the edit is applied, but the file does not parse; report the error and do not roll back).
 
