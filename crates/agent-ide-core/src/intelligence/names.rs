@@ -97,6 +97,26 @@ pub struct Site {
     pub fact: NameFact,
 }
 
+/// A site with the text of its line, read and verified for display.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShownSite {
+    /// The site.
+    pub site: Site,
+    /// Its line, trimmed and clipped.
+    pub text: String,
+}
+
+/// Displayable sites of one key; see [`NameIndex::proven_sites`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Proven {
+    /// Sites whose files were read and verified, in site order.
+    pub sites: Vec<ShownSite>,
+    /// Rows dropped because their file could no longer be read.
+    pub dropped: usize,
+    /// Sites past the display limit, not read.
+    pub more: usize,
+}
+
 /// Indexed totals of one key.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeySummary {
@@ -331,6 +351,69 @@ impl NameIndex {
                 })
             })
             .collect()
+    }
+
+    /// Sites of `key` (of `role`, when given) proven against the current bytes, for display:
+    /// every file among the first
+    /// `limit` sites is read through [`read_authorized_source`] and [`NameIndex::verify`]ed; when
+    /// one changed it is re-extracted and the sites are queried again, so no row outlives its
+    /// bytes. Rows of files that can no longer be read are dropped and counted; sites past
+    /// `limit` are only counted.
+    pub fn proven_sites(&mut self, key: &NameKey, role: Option<Role>, limit: usize) -> Proven {
+        let of_role = |sites: Vec<Site>| -> Vec<Site> {
+            sites
+                .into_iter()
+                .filter(|site| role.is_none_or(|role| site.fact.role == role))
+                .collect()
+        };
+        let mut sites = of_role(self.sites(key));
+        let mut sources: HashMap<PathBuf, Option<String>> = HashMap::new();
+        let mut changed = false;
+        for site in sites.iter().take(limit) {
+            if sources.contains_key(&site.file) {
+                continue;
+            }
+            let text = self.read(&site.file).map(|bytes| {
+                changed |= !self.verify(&site.file, &bytes);
+                String::from_utf8(bytes).ok()
+            });
+            sources.insert(site.file.clone(), text.flatten());
+        }
+        if changed {
+            sites = of_role(self.sites(key));
+        }
+        let more = sites.len().saturating_sub(limit);
+        let mut proven = Proven {
+            sites: Vec::new(),
+            dropped: 0,
+            more,
+        };
+        for site in sites.into_iter().take(limit) {
+            match sources.get(&site.file) {
+                Some(Some(text)) => proven.sites.push(ShownSite {
+                    text: crate::lang::render::line_text(text, site.fact.line),
+                    site,
+                }),
+                _ => proven.dropped += 1,
+            }
+        }
+        proven
+    }
+
+    /// The current text of `file`, read through [`read_authorized_source`]; `None` when it is
+    /// missing, unreadable, over the size cap or not UTF-8.
+    pub fn source(&self, file: &Path) -> Option<String> {
+        self.read(file)
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+    }
+
+    /// The current bytes of `file` through the authorized reader.
+    fn read(&self, file: &Path) -> Option<Vec<u8>> {
+        let limits =
+            SourceReadLimits::new(MAX_SOURCE_PATH_BYTES, MAX_FILE_BYTES).expect("fixed limits");
+        read_authorized_source(&self.worktree, file, limits)
+            .ok()
+            .map(|read| read.contents().to_vec())
     }
 
     /// Skipped files counted by reason.
@@ -858,6 +941,45 @@ mod tests {
             [("b.beta".into(), 2, 1, Role::Use)]
         );
         assert!(index.verify(path, b"\nuse:card\n"));
+    }
+
+    /// Displayed rows are proven against the files: an edited file is re-extracted before rows
+    /// are shown, a deleted one's rows are dropped and counted, rows past the limit are counted.
+    #[test]
+    fn proven_sites_never_show_stale_rows() {
+        let root = scratch("proven");
+        write(
+            &root,
+            &[
+                ("a.beta", "use:btn\n"),
+                ("b.beta", "use:btn\n"),
+                ("c.beta", "use:btn\n"),
+            ],
+        );
+        let mut index = built(&root);
+        let key = NameKey::global(ns::CLASS, "btn");
+        // Same size, different line: only the digest can tell.
+        write(&root, &[("a.beta", "\nuse:btn")]);
+        std::fs::remove_file(root.join("b.beta")).unwrap();
+        let proven = index.proven_sites(&key, None, 2);
+        let shown: Vec<_> = proven
+            .sites
+            .iter()
+            .map(|shown| {
+                (
+                    shown.site.file.display().to_string(),
+                    shown.site.fact.line,
+                    shown.text.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(shown, [("a.beta".to_owned(), 2, "use:btn")]);
+        assert_eq!((proven.dropped, proven.more), (1, 1));
+        assert_eq!(
+            index.source(Path::new("c.beta")).as_deref(),
+            Some("use:btn\n")
+        );
+        assert_eq!(index.source(Path::new("b.beta")), None);
     }
 
     /// The sink drops invalid names and stops at the per-file cap; a capped file is counted.

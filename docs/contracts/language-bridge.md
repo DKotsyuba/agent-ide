@@ -1,6 +1,6 @@
 # Language bridge contract (cross-language name facts)
 
-Revision: stage 2. Provider: Agent IDE core. Consumers: language crates (providers) and the core's
+Revision: stage 3. Provider: Agent IDE core. Consumers: language crates (providers) and the core's
 tool integration (planned).
 
 ## Implementation status
@@ -9,15 +9,17 @@ tool integration (planned).
 |---|---|
 | `lang::names` contract: namespaces, `NameKey` with domain, `NameFact`, `FactSink`, `NameFacts` trait, `LanguageDescriptor::names` | implemented |
 | `intelligence::names` index: listing, stat sweep, digest confirmation, `verify`, `uncovered`, LRU of worktrees | implemented |
-| Worker glue (`assistance/links.rs`): refresh on the blocking pool, park while building | implemented, not yet called by any tool |
+| Worker glue (`assistance/links.rs`): refresh on the blocking pool, park while building | implemented |
 | Style-sheet provider (`agent-ide-lang-css`: CSS, SCSS, Sass, LESS), §7 | implemented |
 | HTML provider (`agent-ide-lang-html`), §8 | implemented |
 | JSX provider | planned (stage 4) |
-| Bridge data in `ide.symbol` / `ide.graph` / the project card | planned (stages 3–5) |
+| Bridge data in `ide.symbol`, `ide.read` of sigil addresses and the `ide.start` card (tools-v0.4 §2.3.1) | implemented |
+| Link edges in `ide.graph` | planned (stage 5) |
 
-No tool reply shows bridge data yet. Style sheets answer `ide.outline`, `ide.read`, `ide.symbol`
-and `ide.graph` from their source outline, with usages and callers reported unavailable; replies for
-the server-backed languages are byte-identical.
+`ide.symbol` shows `defines:`, index-backed usages and `links:` for symbols of languages with name
+facts, name cards for sigil addresses, and bridge candidates in ambiguity lists (tools-v0.4
+§2.3.1). Replies for languages without name facts are byte-identical, except that a bare name two
+languages share is now ambiguous instead of resolving in the first language.
 
 ## 1. Fact model
 

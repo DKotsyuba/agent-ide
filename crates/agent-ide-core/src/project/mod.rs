@@ -355,6 +355,38 @@ fn collect_git(root: &Path) -> Option<GitState> {
 /// [`crate::lang::LanguageSupport`] modules; `servers` and `problems` are the caller's own
 /// up-to-date readiness/problem summary. Everything else — git state, layout, per-language file
 /// and line counts, and doc paths — comes from one walk of the tree done here.
+/// The card's `links:` line when a detected language states cross-language name facts: the
+/// namespaces those languages cover (ids without their version) and the languages, in
+/// registration order (`links: class, id facts from alpha, beta`).
+pub fn links_line(languages: &[LanguageProject]) -> Option<String> {
+    let mut namespaces: Vec<&str> = Vec::new();
+    let mut ids: Vec<&str> = Vec::new();
+    for project in languages {
+        let Some(names) = project.language.names() else {
+            continue;
+        };
+        ids.push(project.language.name());
+        for coverage in names.coverage() {
+            let id = coverage
+                .namespace
+                .id()
+                .split('/')
+                .next()
+                .unwrap_or_default();
+            if !namespaces.contains(&id) {
+                namespaces.push(id);
+            }
+        }
+    }
+    (!ids.is_empty()).then(|| {
+        format!(
+            "links: {} facts from {}",
+            namespaces.join(", "),
+            ids.join(", ")
+        )
+    })
+}
+
 pub fn collect(
     root: &Path,
     languages: Vec<LanguageProject>,

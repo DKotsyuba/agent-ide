@@ -127,6 +127,8 @@ pub mod ns {
     pub const ELEMENT_ID: Namespace = Namespace::of(&ELEMENT_ID_DESCRIPTOR);
     /// Custom style properties: defined by `--x:` declarations, used by `var(--x)`.
     pub const STYLE_VARIABLE: Namespace = Namespace::of(&STYLE_VARIABLE_DESCRIPTOR);
+    /// Every core namespace, in id order.
+    pub const ALL: [Namespace; 3] = [CLASS, ELEMENT_ID, STYLE_VARIABLE];
 }
 
 /// The join key: facts meet only when namespace, domain and name are all byte-equal.

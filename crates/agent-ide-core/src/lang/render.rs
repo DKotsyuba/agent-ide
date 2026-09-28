@@ -562,6 +562,20 @@ pub struct Usage {
     pub line: u32,
     pub text: String,
     pub is_test: bool,
+    /// Printed before the text: `[<language>]` or `[<language> ~<reason>]` for an index-backed
+    /// row; `None` for a language-server row (printed untagged).
+    pub tag: Option<String>,
+}
+
+impl Usage {
+    /// The row as printed, with its location padded to `width`.
+    fn row(&self, width: usize) -> String {
+        let location = format!("{}:{}", self.file, self.line);
+        match &self.tag {
+            Some(tag) => format!("  {location:<width$}  {tag} {}\n", self.text),
+            None => format!("  {location:<width$}  {}\n", self.text),
+        }
+    }
 }
 
 /// One caller or callee path and its location; `name` is `file#Owner/name` when resolved.
@@ -597,6 +611,17 @@ pub struct SymbolCard {
     /// Prints the `usages:` line even with no references — the server legitimately answered
     /// none (a server answering nothing for a constructor nobody names explicitly).
     pub report_empty_usages: bool,
+    /// Rows under a `definitions:` line (a name card), printed after the heading block.
+    pub definitions: Vec<String>,
+    /// `defines:` lines: the cross-language names this symbol defines.
+    pub defines: Vec<String>,
+    /// The usages come from the name index: counts read `N indexed in`, not live.
+    pub usages_indexed: bool,
+    /// Index rows dropped because their file could no longer be read.
+    pub usages_dropped: usize,
+    /// Lines printed after the usages as they are (`links:` section, `unavailable for:`, index
+    /// state).
+    pub links: Vec<String>,
 }
 
 /// Renders the card with the fixed ceilings.
@@ -622,6 +647,24 @@ pub fn symbol_card_text(card: &SymbolCard) -> String {
             out.push('\n');
         }
     }
+    if !card.definitions.is_empty() {
+        out.push_str("definitions:\n");
+        for row in &card.definitions {
+            out.push_str(&format!("  {row}\n"));
+        }
+    }
+    for defines in &card.defines {
+        out.push_str(&format!("defines: {defines}\n"));
+    }
+    let counted = if card.usages_indexed {
+        "indexed in"
+    } else {
+        "in"
+    };
+    let dropped = match card.usages_dropped {
+        0 => String::new(),
+        dropped => format!("; {dropped} stale dropped"),
+    };
     if !card.usages.is_empty() {
         let (src, tests): (Vec<_>, Vec<_>) = card.usages.iter().partition(|usage| !usage.is_test);
         let files = card
@@ -631,7 +674,7 @@ pub fn symbol_card_text(card: &SymbolCard) -> String {
             .collect::<std::collections::BTreeSet<_>>()
             .len();
         out.push_str(&format!(
-            "usages: {} in {} files (src {}, tests {})\n",
+            "usages: {} {counted} {} files (src {}, tests {}{dropped})\n",
             card.usages.len(),
             files,
             src.len(),
@@ -645,8 +688,7 @@ pub fn symbol_card_text(card: &SymbolCard) -> String {
             .max()
             .unwrap_or(0);
         for usage in src.iter().chain(tests.iter()).take(MAX_USAGE_LINES) {
-            let location = format!("{}:{}", usage.file, usage.line);
-            out.push_str(&format!("  {location:<width$}  {}\n", usage.text));
+            out.push_str(&usage.row(width));
         }
         let hidden = card.usages.len().saturating_sub(MAX_USAGE_LINES);
         if hidden > 0 {
@@ -657,10 +699,23 @@ pub fn symbol_card_text(card: &SymbolCard) -> String {
                 None => out.push_str(&format!("  … {hidden} more\n")),
             }
         }
+        if card
+            .usages
+            .iter()
+            .any(|usage| usage.tag.as_deref().is_some_and(|tag| tag.contains('~')))
+        {
+            out.push_str("  (~ = heuristic match, not proven)\n");
+        }
     } else if let Some(note) = &card.usages_note {
         out.push_str(&format!("usages: {note}\n"));
     } else if card.report_empty_usages {
-        out.push_str("usages: 0 in 0 files (src 0, tests 0)\n");
+        out.push_str(&format!(
+            "usages: 0 {counted} 0 files (src 0, tests 0{dropped})\n"
+        ));
+    }
+    for line in &card.links {
+        out.push_str(line);
+        out.push('\n');
     }
     if card.callers_note.is_some() && card.callers.is_empty() {
         out.push_str(&format!(
@@ -700,8 +755,7 @@ pub fn hidden_usages_text(card: &SymbolCard) -> Option<String> {
         .max()
         .unwrap_or(0);
     for usage in hidden {
-        let location = format!("{}:{}", usage.file, usage.line);
-        out.push_str(&format!("  {location:<width$}  {}\n", usage.text));
+        out.push_str(&usage.row(width));
     }
     Some(out)
 }
@@ -889,6 +943,7 @@ mod tests {
                 line: index + 1,
                 text: "run();".into(),
                 is_test: index % 5 == 0,
+                tag: None,
             });
         }
         card.more_detail = Some("sym-1".into());

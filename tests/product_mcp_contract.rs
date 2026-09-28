@@ -5000,7 +5000,8 @@ async fn product_directory_outline_lists_files_and_rejects_escaping_symlinks() {
 }
 
 /// Style sheets have no language server: `ide.start` lists them, and outline, read and symbol
-/// answer from the source outline with honest unavailable lines for usages and callers.
+/// answer from the source outline; the card's usages and links come from the name index and
+/// callers are reported unavailable.
 #[tokio::test]
 async fn product_style_sheets_answer_symbol_tools_without_a_server() {
     let fixture = ProductFixture::new(json!([]));
@@ -5048,7 +5049,11 @@ async fn product_style_sheets_answer_symbol_tools_without_a_server() {
         symbol["text"],
         "symbol: .btn — symbol, styles.css#.btn (lines 2–4)\nsignature: .btn\n\
          definition styles.css#.btn  (lines 2–4)\n\
-         usages: unavailable (css has no language server; see links)\n\
+         defines: class name btn — also styles.css:7 .card .btn, theme.scss:1 .btn\n\
+         usages: 0 indexed in 0 files (src 0, tests 0)\n\
+         links: 1 style variable used here\n\
+         \x20 --brand  → no indexed declaration\n\
+         unavailable for: rust, go\n\
          callers: unavailable (css has no call hierarchy)\n",
         "{symbol}"
     );
@@ -5090,6 +5095,124 @@ async fn product_style_sheets_answer_symbol_tools_without_a_server() {
     assert_eq!(
         tests["text"], "tests: no tests in styles.css; the file has no tests",
         "{tests}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Cross-language links on the `tests/fixtures/mixed-frontend` tree (HTML, CSS, SCSS and a
+/// Python file no provider covers): the rule card with tagged HTML usages, sigil name cards, an
+/// ambiguity list merging a Python symbol with the class name, `ide.read` of a sigil address, the
+/// project card's `links:` line, and a native edit reflected by the very next query.
+#[tokio::test]
+async fn configured_product_links_css_html_and_python_names() {
+    let fixture = ProductFixture::new(json!([accepted_pyright_provider("links-pyright-cache")]));
+    fixture.git(&[
+        "rm",
+        "--quiet",
+        "--",
+        "Cargo.toml",
+        "src/lib.rs",
+        "go.mod",
+        "main.go",
+    ]);
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mixed-frontend");
+    for name in ["index.html", "styles.css", "theme.scss", "app.py"] {
+        std::fs::copy(source.join(name), fixture.root.join(name)).unwrap();
+    }
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "mixed frontend"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "links").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"links"}))
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert!(
+        started["text"]
+            .as_str()
+            .unwrap()
+            .contains("\nlinks: class, id, style-variable facts from css, html"),
+        "{started}"
+    );
+    let symbol = async |actor: &mut ProductActor, requested: &str| {
+        let reply = actor
+            .call(&fixture, "ide.symbol", json!({"symbol":requested}))
+            .await;
+        let reply = actor.settle(&fixture, reply).await;
+        let text = reply["text"].as_str().unwrap_or_default().to_owned();
+        println!("ide.symbol {requested}:\n{text}");
+        text
+    };
+
+    assert_eq!(
+        symbol(&mut actor, "styles.css#.btn").await,
+        "symbol: .btn — symbol, styles.css#.btn (lines 2–4)\nsignature: .btn\n\
+         definition styles.css#.btn  (lines 2–4)\n\
+         defines: class name btn — also styles.css:6 .layout .btn, theme.scss:2 .btn\n\
+         usages: 2 indexed in 1 files (src 2, tests 0)\n\
+         \x20 index.html:5  [html] <button class=\"btn btn-primary\">Save</button>\n\
+         \x20 index.html:6  [html ~template] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n\
+         \x20 (~ = heuristic match, not proven)\n\
+         links: 1 style variable used here\n\
+         \x20 --brand  → theme.scss:1 :root\n\
+         unavailable for: python\n\
+         callers: unavailable (css has no call hierarchy)\n"
+    );
+    assert_eq!(
+        symbol(&mut actor, "##main").await,
+        "symbol: ##main — element id, 1 element, 2 usages in 2 files (css, html)\n\
+         definitions:\n\
+         \x20 index.html:4  [html] <main id=\"main\" class=\"layout\">  (index.html#main#main, lines 4–8)\n\
+         usages: 2 indexed in 2 files (src 2, tests 0)\n\
+         \x20 index.html:6  [html] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n\
+         \x20 styles.css:7  [css] #main { display: block; }\n\
+         unavailable for: python\n"
+    );
+    assert_eq!(
+        symbol(&mut actor, ".btn").await,
+        "symbol: .btn — class name, 3 rules, 2 usages in 1 files (css, html)\n\
+         definitions:\n\
+         \x20 styles.css:2  [css] .btn  (styles.css#.btn, lines 2–4)\n\
+         \x20 styles.css:6  [css] .layout .btn  (styles.css#.layout .btn, lines 6)\n\
+         \x20 theme.scss:2  [css] .btn  (theme.scss#.btn, lines 2–4)\n\
+         usages: 2 indexed in 1 files (src 2, tests 0)\n\
+         \x20 index.html:5  [html] <button class=\"btn btn-primary\">Save</button>\n\
+         \x20 index.html:6  [html ~template] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n\
+         \x20 (~ = heuristic match, not proven)\n\
+         unavailable for: python\n"
+    );
+    assert_eq!(
+        symbol(&mut actor, "btn").await,
+        "ambiguous_symbol: btn matches 2 symbols; repeat ide.symbol with one exact path:\n\
+         \x20 app.py#btn\n\
+         \x20 .btn  (class name: 3 rules, 2 usages)\n"
+    );
+    let read = actor
+        .call(&fixture, "ide.read", json!({"symbol":".btn"}))
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    assert!(
+        read["text"].as_str().unwrap().starts_with(
+            "styles.css#.btn  (lines 2–4)\n2  .btn {\n3    color: var(--brand);\n4  }\n"
+        ),
+        "{read}"
+    );
+
+    // A native edit is visible to the very next query: the removed row is gone at once.
+    let edited = std::fs::read_to_string(fixture.root.join("index.html"))
+        .unwrap()
+        .replace("  <button class=\"btn btn-primary\">Save</button>\n", "");
+    std::fs::write(fixture.root.join("index.html"), edited).unwrap();
+    let after = symbol(&mut actor, "styles.css#.btn").await;
+    assert!(
+        after.contains(
+            "usages: 1 indexed in 1 files (src 1, tests 0)\n\
+             \x20 index.html:5  [html ~template] <a href=\"#main\""
+        ) && !after.contains("<button"),
+        "{after}"
     );
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;

@@ -2625,7 +2625,14 @@ impl<'a> Worker<'a> {
                         state: "not started".to_owned(),
                     })
                     .collect();
-                project_card::render(&project_card::collect(&root, languages, servers, None))
+                let links = project_card::links_line(&languages);
+                let mut card =
+                    project_card::render(&project_card::collect(&root, languages, servers, None));
+                if let Some(links) = links {
+                    card.push('\n');
+                    card.push_str(&links);
+                }
+                card
             });
             match tokio::time::timeout(PROJECT_CARD_BUDGET, walk).await {
                 Ok(Ok(card)) => card,
@@ -6020,17 +6027,20 @@ mod stop_retry_tests {
     }
 
     /// A language no server owns but that outlines from source answers outline, read, symbol
-    /// and graph from that outline, with usages and callers reported unavailable by its own id; a
-    /// language with neither keeps the provider-unavailable refusal.
+    /// and graph from that outline, callers reported unavailable by its own id and the names it
+    /// uses linked from the index; a sigil address answers a name card from the index and
+    /// `ide.read` reads its definition; a language with neither keeps the provider-unavailable
+    /// refusal.
     #[tokio::test]
     async fn serverless_language_answers_symbol_tools_from_its_source_outline() {
         crate::lang::testing::install();
         let fixture = Fixture::new();
         std::fs::write(
             fixture.root.join("a.gamma"),
-            "sym card\n  sym btn\n  x\n  end\nend\n",
+            "sym card\n  sym btn\n  #top\n  end\nend\n",
         )
         .unwrap();
+        std::fs::write(fixture.root.join("b.alpha"), "#top @btn\n").unwrap();
         std::fs::write(fixture.root.join("b.delta"), "sym card\nend\n").unwrap();
         git_commit(&fixture.root, "serverless fixture");
         let store = fixture.store();
@@ -6078,7 +6088,7 @@ mod stop_retry_tests {
         .await
         .unwrap();
         assert!(
-            read.starts_with("a.gamma#card/btn  (lines 2–4)\n2    sym btn\n3    x\n4    end\n"),
+            read.starts_with("a.gamma#card/btn  (lines 2–4)\n2    sym btn\n3    #top\n4    end\n"),
             "{read}"
         );
         assert_eq!(
@@ -6090,10 +6100,29 @@ mod stop_retry_tests {
             Ok(
                 "symbol: btn — symbol, a.gamma#card/btn (lines 2–4)\nsignature: sym btn\n\
                 definition a.gamma#card/btn  (lines 2–4)\n\
-                usages: unavailable (gamma has no language server; see links)\n\
+                links: 1 element id used here\n  ##top  → b.alpha:1 #top @btn\n\
+                unavailable for: delta\n\
                 callers: unavailable (gamma has no call hierarchy)\n"
                     .into()
             )
+        );
+        assert_eq!(
+            run(
+                AssistanceTool::Symbol,
+                serde_json::json!({"symbol":"##top"})
+            )
+            .await,
+            Ok(
+                "symbol: ##top — element id, 1 element, 1 usage in 1 files (alpha, gamma)\n\
+                definitions:\n  b.alpha:1  [alpha] #top @btn\n\
+                usages: 1 indexed in 1 files (src 1, tests 0)\n  a.gamma:3  [gamma] #top\n\
+                unavailable for: delta\n"
+                    .into()
+            )
+        );
+        assert_eq!(
+            run(AssistanceTool::Read, serde_json::json!({"symbol":"##top"})).await,
+            Ok("b.alpha:1  (lines 1)\n1  #top @btn\nsource_ref: serverless\n".into())
         );
         assert_eq!(
             run(

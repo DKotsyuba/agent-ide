@@ -161,8 +161,19 @@ impl Worker<'_> {
         job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
         let binding = job.invocation.binding_ref().clone();
-        let (path, range, title) = match job.parameters.get("symbol").and_then(Value::as_str) {
-            Some(symbol) => {
+        let requested = job
+            .parameters
+            .get("symbol")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let sigil = requested.as_deref().and_then(links::sigil_address);
+        let (path, range, title) = match (requested.as_deref(), sigil) {
+            // A sigil address reads the name's first indexed definition.
+            (_, Some((namespace, name))) => {
+                self.sigil_definition(job, &binding, namespace, name)
+                    .await?
+            }
+            (Some(symbol), None) => {
                 let symbol = SymbolPath::parse(symbol).map_err(|_| FailureCode::UnknownSymbol)?;
                 let file = symbol
                     .file()
@@ -173,7 +184,7 @@ impl Worker<'_> {
                 let found = outline.find(&symbol).ok_or(FailureCode::UnknownSymbol)?;
                 (file, found.range, symbol.to_string())
             }
-            None => {
+            (None, None) => {
                 let path = job.parameters["path"]
                     .as_str()
                     .ok_or(FailureCode::SourceUnavailable)?
@@ -234,16 +245,45 @@ impl Worker<'_> {
             .get("history")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        // Resolve the definition file: a bare name goes through workspace symbols first.
+        // Resolve the definition file: a sigil address goes to the name index; a bare name is
+        // looked up in the index and through workspace symbols, and both answers are merged.
         let file = match symbol.file() {
             Some(file) => file.to_path_buf(),
             None => {
+                if let Some((namespace, name)) = links::sigil_address(&requested) {
+                    let keys = self
+                        .indexed_keys(job, &binding, name, Some(namespace))
+                        .await?;
+                    if keys.is_empty() {
+                        job.failure_detail = Some("symbol:not_indexed".to_owned());
+                        return Err(FailureCode::UnknownSymbol);
+                    }
+                    let keys = keys.into_iter().map(|summary| summary.key).collect();
+                    return self.name_card(job, &binding, keys).await;
+                }
                 let name = symbol.name().ok_or(FailureCode::UnknownSymbol)?.to_owned();
-                match self.locate_by_name(job, &binding, &name).await? {
-                    Located::One(file) => file,
-                    Located::Many(candidates) => {
+                let indexed = self.indexed_keys(job, &binding, &name, None).await?;
+                match self.locate_by_name(job, &binding, &name).await {
+                    Ok(Located::One(file)) if indexed.is_empty() => file,
+                    Ok(Located::Many(candidates)) if indexed.is_empty() => {
                         return self.ambiguous(job, &binding, &requested, candidates).await;
                     }
+                    Ok(located) => {
+                        let mut candidates = match located {
+                            Located::One(file) => vec![format!("{}#{name}", file.display())],
+                            Located::Many(candidates) => candidates,
+                        };
+                        candidates.extend(indexed.iter().map(links::candidate));
+                        return self.ambiguous(job, &binding, &requested, candidates).await;
+                    }
+                    Err(FailureCode::UnknownSymbol | FailureCode::ProviderUnavailable)
+                        if !indexed.is_empty() =>
+                    {
+                        job.failure_detail = None;
+                        let keys = indexed.into_iter().map(|summary| summary.key).collect();
+                        return self.name_card(job, &binding, keys).await;
+                    }
+                    Err(code) => return Err(code),
                 }
             }
         };
@@ -283,12 +323,11 @@ impl Worker<'_> {
             ..Default::default()
         };
         if self.session_server(observed.path()).is_none() {
-            // Outlined from source: nothing answers hover, references or call hierarchy.
+            // Outlined from source: nothing answers hover, references or call hierarchy. A
+            // language with name facts shows index-backed usages instead (below).
             let language = outline.language;
-            if want_usages {
-                card.usages_note = Some(format!(
-                    "unavailable ({language} has no language server; see links)"
-                ));
+            if want_usages && language.names().is_none() {
+                card.usages_note = Some(format!("unavailable ({language} has no language server)"));
             }
             if callers_depth > 0 {
                 card.callers_note = Some(format!("unavailable ({language} has no call hierarchy)"));
@@ -374,6 +413,10 @@ impl Worker<'_> {
                     }
                 }
             }
+        }
+        if outline.language.names().is_some() {
+            self.card_links(job, observed.worktree(), &file, &bytes, &found, &mut card)
+                .await?;
         }
         if want_history {
             card.history = history_lines(&worktree_root, &file, found.range).await;
@@ -672,8 +715,8 @@ impl Worker<'_> {
     /// Resolves a bare symbol name to its definition file.
     ///
     /// Every language present in the worktree opens its own session — any source file of that
-    /// language opens it — and a mixed worktree searches each language session until one names
-    /// the symbol. The search asks the provider's workspace symbols first; a provider whose
+    /// language opens it — and a mixed worktree searches every language session before deciding
+    /// uniqueness, so a name two languages share is ambiguous. The search asks the provider's workspace symbols first; a provider whose
     /// workspace search stays empty or cannot answer (some servers never list unopened project
     /// files) falls back to scanning the bounded file list of that language's outlines. Only
     /// when no session produced any answer at all is the name reported provider-unavailable.
@@ -691,7 +734,7 @@ impl Worker<'_> {
             job.failure_detail = Some("symbol:anchor_missing".to_owned());
             return Err(FailureCode::ProviderUnavailable);
         }
-        // (relative file, outline symbol path) candidates in provider order.
+        // (relative file, candidate line) in language and provider order.
         let mut matches: Vec<(std::path::PathBuf, String)> = Vec::new();
         // True once at least one language produced a definite empty-or-nonempty answer.
         let mut answered = false;
@@ -740,20 +783,14 @@ impl Worker<'_> {
                     Err(_) => Vec::new(),
                 };
             if !workspace_hits.is_empty() {
-                return Ok(match workspace_hits.len() {
-                    1 => Located::One(workspace_hits.into_iter().next().unwrap().0),
-                    _ => Located::Many(
-                        workspace_hits
-                            .iter()
-                            .map(|(path, container)| match container {
-                                Some(container) => {
-                                    format!("{}#{container}/{name}", path.display())
-                                }
-                                None => format!("{}#{name}", path.display()),
-                            })
-                            .collect(),
-                    ),
-                });
+                matches.extend(workspace_hits.into_iter().map(|(path, container)| {
+                    let candidate = match container {
+                        Some(container) => format!("{}#{container}/{name}", path.display()),
+                        None => format!("{}#{name}", path.display()),
+                    };
+                    (path, candidate)
+                }));
+                continue;
             }
             // Scanned paths are read without registering them as editable source.
             for file in language_files {
@@ -784,15 +821,14 @@ impl Worker<'_> {
                     let source = String::from_utf8_lossy(bytes);
                     let outline = support.normalize(file, &source, symbols);
                     for candidate in outline.named(name) {
-                        matches.push((file.clone(), candidate.path.to_string()));
+                        let candidate = format!("{}#{}", file.display(), candidate.path);
+                        matches.push((file.clone(), candidate));
                     }
                 }
             }
-            // A name several languages share resolves in the first language that names it.
-            if !matches.is_empty() {
-                break;
-            }
         }
+        // Every language was searched: a name several languages share is ambiguous.
+        matches.dedup_by(|a, b| a.1 == b.1);
         if !answered {
             job.failure_detail = Some("symbol:workspace_symbols".to_owned());
             return Err(FailureCode::ProviderUnavailable);
@@ -805,8 +841,8 @@ impl Worker<'_> {
             1 => Ok(Located::One(matches.remove(0).0)),
             _ => Ok(Located::Many(
                 matches
-                    .iter()
-                    .map(|(file, path)| format!("{}#{path}", file.display()))
+                    .into_iter()
+                    .map(|(_, candidate)| candidate)
                     .collect(),
             )),
         }
@@ -891,6 +927,7 @@ impl Worker<'_> {
                 line,
                 text,
                 is_test,
+                tag: None,
             });
         }
         usages

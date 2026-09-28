@@ -37,7 +37,7 @@ src/agent_tasks/persistence.py#run_mutation
 
 - `#` separates the file from the symbol. A filename may contain any characters; the file boundary never has to be guessed by checking whether a path exists.
 - Within a symbol path, `/` expresses nesting: type/impl/class/namespace to member. Rust modules and nested Python functions use the same levels.
-- To search by name without a file, use `#BindingStatus` or `BindingStatus`. The IDE searches the project and returns candidates when there is more than one; it does not guess:
+- To search by name without a file, use `#BindingStatus` or `BindingStatus`. The IDE searches the project (every language) and returns candidates when there is more than one; it does not guess:
 
 ```text
 error: ambiguous_symbol; 3 candidates:
@@ -158,6 +158,62 @@ history: 3 last commits touching lines 330–346
 For functions, include `callers` (with locations) and `callees` to the requested depth, capped at 20 lines per level. Read function bodies with `ide.read`.
 
 Errors: `ambiguous_symbol` (candidates), `unknown_symbol` (similar names: “did you mean”), `provider_loading`.
+
+### 2.3.1 Cross-language links (implemented for CSS and HTML)
+
+Languages with name facts (see [the language bridge contract](language-bridge.md)) add index-backed
+lines to `ide.symbol`. Counts are indexed, not live; every row shown was read and verified against
+the file's current bytes first, and a row whose file can no longer be read is dropped and counted
+(`; N stale dropped` in the usages line). Cards of languages without name facts are unchanged.
+
+A symbol that defines names (a style rule) gains `defines:` lines and tagged usages; one that uses
+names gains a `links:` section (at most 20 names, 2 definitions each):
+
+```text
+symbol: .btn — symbol, styles.css#.btn (lines 2–4)
+signature: .btn
+definition styles.css#.btn  (lines 2–4)
+defines: class name btn — also styles.css:6 .layout .btn, theme.scss:2 .btn
+usages: 2 indexed in 1 files (src 2, tests 0)
+  index.html:5  [html] <button class="btn btn-primary">Save</button>
+  index.html:6  [html ~template] <a href="#main" class="btn {{ extra }}">Top</a>
+  (~ = heuristic match, not proven)
+links: 1 style variable used here
+  --brand  → theme.scss:1 :root
+unavailable for: python
+callers: unavailable (css has no call hierarchy)
+```
+
+A name with no indexed definition reads `→ no indexed <rule|element|declaration>`. `unavailable
+for:` lists languages present in the worktree that cannot state the name's namespace. While the
+index is bounded, `links: partial (indexed A of B files); counts are indexed, not live` follows.
+
+A sigil address (`.btn`, `##main`, `--brand`) goes straight to the index and answers a name card:
+
+```text
+symbol: ##main — element id, 1 element, 2 usages in 2 files (css, html)
+definitions:
+  index.html:4  [html] <main id="main" class="layout">  (index.html#main#main, lines 4–8)
+usages: 2 indexed in 2 files (src 2, tests 0)
+  index.html:6  [html] <a href="#main" class="btn {{ extra }}">Top</a>
+  styles.css:7  [css] #main { display: block; }
+unavailable for: python
+```
+
+A bare name is looked up in the index and through every language's workspace symbols. Index-only
+hits answer the name card; hits on both sides answer the ambiguity list, language-server
+candidates first:
+
+```text
+ambiguous_symbol: btn matches 2 symbols; repeat ide.symbol with one exact path:
+  app.py#btn
+  .btn  (class name: 3 rules, 2 usages)
+```
+
+`ide.read {symbol: ".btn"}` reads the first indexed definition (its enclosing outline symbol). The
+`ide.start` card gains `links: class, id, style-variable facts from css, html` when such a language
+is present. While the index is first built, a query waits up to 1 s and then parks like a loading
+language server (`provider_loading`, detail `names:building`).
 
 ### 2.4 `ide.read` — symbol body or line range (implemented)
 
