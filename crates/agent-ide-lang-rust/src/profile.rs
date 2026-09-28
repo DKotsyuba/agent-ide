@@ -85,18 +85,24 @@ pub struct RustProfile {
 /// two directories deep, skipping `target`, `node_modules`, hidden
 /// directories and the conventional test-material directories (`tests`, `fixtures`, `examples`,
 /// `benches`), whose crates are fixtures rather than projects. A root with a `[workspace]`
-/// table keeps auto-discovery: its members are covered and cross-workspace nesting is rare.
+/// table keeps auto-discovery for its members, but a nested manifest that declares its own
+/// `[workspace]` table is an independent project cargo refuses to fold into the root (a member
+/// can never carry that table), so such roots are linked explicitly too; without that, their
+/// files open detached and lose cross-file references.
 pub fn linked_projects(root: &Path) -> Option<Vec<String>> {
     let root_manifest = root.join("Cargo.toml");
-    if root_manifest.is_file() {
+    let root_is_workspace = root_manifest.is_file() && {
         let text = std::fs::read_to_string(&root_manifest).ok()?;
-        if text.lines().any(|line| line.trim() == "[workspace]") {
-            return None;
-        }
-    }
+        declares_workspace(&text)
+    };
     let mut found = Vec::new();
     collect_manifests(root, LINKED_PROJECT_DEPTH, &mut found);
     found.retain(|path| *path != root_manifest);
+    if root_is_workspace {
+        found.retain(|path| {
+            std::fs::read_to_string(path).is_ok_and(|text| declares_workspace(&text))
+        });
+    }
     if found.is_empty() {
         return None;
     }
@@ -107,6 +113,11 @@ pub fn linked_projects(root: &Path) -> Option<Vec<String>> {
     }
     projects.extend(found.into_iter().map(|path| path.display().to_string()));
     Some(projects)
+}
+
+/// Whether a manifest carries a `[workspace]` table, i.e. is a workspace root of its own.
+fn declares_workspace(manifest: &str) -> bool {
+    manifest.lines().any(|line| line.trim() == "[workspace]")
 }
 
 /// Directory depth [`linked_projects`] searches for nested manifests.
@@ -813,6 +824,21 @@ mod linked_project_tests {
         std::fs::create_dir_all(dir.join("a")).unwrap();
         std::fs::write(dir.join("a/Cargo.toml"), "[package]\n").unwrap();
         assert_eq!(linked_projects(&dir), None);
+        // A nested crate that is its own workspace root (an acceptance fixture placed inside a
+        // workspace checkout) is linked next to the root; the member stays auto-discovered.
+        std::fs::create_dir_all(dir.join("fixture-crate")).unwrap();
+        std::fs::write(
+            dir.join("fixture-crate/Cargo.toml"),
+            "[package]\nname = \"fixture-crate\"\n\n[workspace]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            linked_projects(&dir),
+            Some(vec![
+                dir.join("Cargo.toml").display().to_string(),
+                dir.join("fixture-crate/Cargo.toml").display().to_string(),
+            ])
+        );
         let flat = scratch("flat");
         std::fs::write(flat.join("Cargo.toml"), "[package]\n").unwrap();
         assert_eq!(linked_projects(&flat), None);
