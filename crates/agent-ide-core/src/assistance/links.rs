@@ -240,7 +240,18 @@ impl Worker<'_> {
     ) -> Result<(Arc<Mutex<NameIndex>>, IndexState), FailureCode> {
         let index = self.names.for_worktree(worktree);
         let deadline = std::time::Instant::now() + NAMES_QUERY_WAIT;
-        let state = with_names(index.clone(), move |index| index.refresh(deadline)).await?;
+        let telemetry = self.telemetry.clone();
+        let held = index.clone();
+        // A build already running (the activation prewarm) holds the index: the query parks
+        // instead of waiting on the lock.
+        let state = tokio::task::spawn_blocking(move || match held.try_lock() {
+            Ok(mut index) => Some(timed_refresh(&mut index, deadline, telemetry.as_ref())),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(_)) => Some(IndexState::Building),
+        })
+        .await
+        .map_err(|_| FailureCode::Internal)?
+        .unwrap_or(IndexState::Building);
         if state == IndexState::Building {
             let now = tokio::time::Instant::now();
             if job.deadline.saturating_duration_since(now) > NAMES_QUERY_WAIT {
@@ -250,6 +261,19 @@ impl Worker<'_> {
             return Err(FailureCode::ProviderLoading);
         }
         Ok((index, state))
+    }
+
+    /// Starts building `worktree`'s name index on the blocking pool and returns at once (the
+    /// activation prewarm). A query arriving before the build ends parks as `names:building`.
+    pub(super) fn prewarm_names(&mut self, worktree: &WorktreeRef) {
+        let index = self.names.for_worktree(worktree);
+        let telemetry = self.telemetry.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(mut index) = index.try_lock() {
+                let deadline = std::time::Instant::now() + crate::intelligence::names::BUILD_BUDGET;
+                timed_refresh(&mut index, deadline, telemetry.as_ref());
+            }
+        });
     }
 
     /// Adds the index's view of `found` to its card: `defines:` lines and tagged usages for the
@@ -715,6 +739,27 @@ pub(super) fn candidate(summary: &KeySummary) -> String {
         counted(summary.defines, summary.key.namespace.define_word()),
         counted(summary.uses, "usage")
     )
+}
+
+/// Refreshes `index` until `deadline` and records the refresh in telemetry when it re-read files.
+fn timed_refresh(
+    index: &mut NameIndex,
+    deadline: std::time::Instant,
+    telemetry: Option<&crate::telemetry::Telemetry>,
+) -> IndexState {
+    let started = std::time::Instant::now();
+    let state = index.refresh(deadline);
+    if index.last_reread() > 0
+        && let Some(telemetry) = telemetry
+    {
+        crate::telemetry::adapters::name_index_refreshed(
+            telemetry,
+            state,
+            index.summary(),
+            started.elapsed(),
+        );
+    }
+    state
 }
 
 /// Runs `query` against the locked index on the blocking pool (sites, `verify`, `uncovered`).

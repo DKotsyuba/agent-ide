@@ -2612,7 +2612,8 @@ impl<'a> Worker<'a> {
         // tree walk block, so they run on the blocking pool under [`PROJECT_CARD_BUDGET`]. Any
         // timeout, panic, or join failure yields an empty card and the plain activation text;
         // the card must never fail an activation that already succeeded.
-        let card = {
+        let names = self.names.get(authority.worktree());
+        let (card, bridged) = {
             let root = discovered.root().to_path_buf();
             let walk = tokio::task::spawn_blocking(move || {
                 let languages: Vec<LanguageProject> = crate::lang::registered()
@@ -2631,19 +2632,32 @@ impl<'a> Worker<'a> {
                     })
                     .collect();
                 let links = project_card::links_line(&languages);
+                let bridged = links::bridged_files_present(&root);
                 let mut card =
                     project_card::render(&project_card::collect(&root, languages, servers, None));
                 if let Some(links) = links {
                     card.push('\n');
                     card.push_str(&links);
+                    // The index summary, once a build of this worktree exists and is idle.
+                    if let Some((files, facts)) = names
+                        .as_ref()
+                        .and_then(|index| index.try_lock().ok().map(|index| index.summary()))
+                    {
+                        card.push_str(&format!(" (indexed {files} files, {facts} facts)"));
+                    }
                 }
-                card
+                (card, bridged)
             });
             match tokio::time::timeout(PROJECT_CARD_BUDGET, walk).await {
                 Ok(Ok(card)) => card,
-                Ok(Err(_)) | Err(_) => String::new(),
+                Ok(Err(_)) | Err(_) => (String::new(), false),
             }
         };
+        // Prewarm the name index off the reply path when files of a language that defines names
+        // are present; nothing is built in other repositories.
+        if bridged {
+            self.prewarm_names(authority.worktree());
+        }
         let mut text = format!(
             "activated: epoch {}; baseline: {baseline}",
             authority.epoch(),
@@ -6054,26 +6068,37 @@ mod stop_retry_tests {
         worker.observations.install_schema().await.unwrap();
         activate_worktree(&mut worker, "serverless-actor", "serverless-start").await;
         let mut calls = 0;
-        let mut run = async |tool: AssistanceTool, parameters: Value| {
+        // The activation prewarms the name index; a job that finds it building is parked and
+        // retried, exactly as the worker loop does.
+        let mut run = async |tool: AssistanceTool, parameters: Value| loop {
             calls += 1;
             let invocation = production_call(
                 &worker,
                 "serverless-actor",
                 &format!("serverless-call-{calls}"),
             );
-            let (mut job, _cancel) =
-                tool_job(&fixture.root, invocation, "serverless", tool, parameters);
+            let (mut job, _cancel) = tool_job(
+                &fixture.root,
+                invocation,
+                "serverless",
+                tool,
+                parameters.clone(),
+            );
             let result = match tool {
                 AssistanceTool::Outline => worker.outline(&mut job).await,
                 AssistanceTool::Read => worker.read(&mut job).await,
                 AssistanceTool::Symbol => worker.symbol(&mut job).await,
                 _ => worker.graph(&mut job).await,
             };
-            match result.map(|(reply, _, _)| reply) {
+            if job.park_until.is_some() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                continue;
+            }
+            break match result.map(|(reply, _, _)| reply) {
                 Ok(PeerReply::Complete { text, .. }) => Ok(text),
                 Ok(other) => panic!("not a complete reply: {other:?}"),
                 Err(code) => Err(code),
-            }
+            };
         };
         assert_eq!(
             run(

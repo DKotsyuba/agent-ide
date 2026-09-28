@@ -214,7 +214,8 @@ ambiguous_symbol: btn matches 2 symbols; repeat ide.symbol with one exact path:
 
 `ide.read {symbol: ".btn"}` reads the first indexed definition (its enclosing outline symbol). The
 `ide.start` card gains `links: class, id, style-variable facts from css, html` when such a language
-is present. While the index is first built, a query waits up to 1 s and then parks like a loading
+is present, followed by `(indexed N files, M facts)` once the worktree's index exists; activation
+prewarms that index in the background. While the index is first built, a query waits up to 1 s and then parks like a loading
 language server (`provider_loading`, detail `names:building`).
 
 **Graph.** `ide.graph` adds cross-language link edges, drawn `⇢`, for symbols of languages with

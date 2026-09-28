@@ -258,6 +258,29 @@ pub enum Event {
         /// Bucketed deduplicated warning count.
         warnings_bucket: CountBucket,
     },
+    /// Records one name-index refresh that re-read files (a build or an update), language-free.
+    NameIndexRefreshed {
+        /// Index state after the refresh.
+        state: NameIndexState,
+        /// Bucketed indexed file count.
+        files_bucket: CountBucket,
+        /// Bucketed fact count.
+        facts_bucket: CountBucket,
+        /// Refresh duration, saturated to whole milliseconds.
+        duration_ms: u32,
+    },
+}
+
+/// Classifies a name index after a refresh.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NameIndexState {
+    /// A sweep is still running inside its build budget.
+    Building,
+    /// Every listed candidate was swept.
+    Ready,
+    /// A bound was hit; counts are lower bounds.
+    Partial,
 }
 
 /// Classifies a completed project check's state without any path, message, or reason text.
@@ -330,6 +353,7 @@ impl Event {
             Self::ProviderObserved { .. } => "provider_observed",
             Self::NativeFallback { .. } => "native_fallback",
             Self::ProjectCheckCompleted { .. } => "project_check_completed",
+            Self::NameIndexRefreshed { .. } => "name_index_refreshed",
         }
     }
 
@@ -1078,6 +1102,23 @@ mod tests {
         assert!(serde_json::from_str::<Event>(r#"{"tag":"tool_completed","method":"context","outcome":"completed","duration_ms":1,"language":null,"cache":"hit","diagnostics":"clean","path":"secret"}"#).is_err());
         let encoded = event().encode().unwrap();
         assert!(!String::from_utf8(encoded).unwrap().contains("path"));
+    }
+
+    /// A name-index refresh records its state, bucketed counts and duration, and nothing that
+    /// names a language, path or name.
+    #[test]
+    fn name_index_event_encodes_closed_buckets() {
+        let event = Event::NameIndexRefreshed {
+            state: NameIndexState::Partial,
+            files_bucket: CountBucket::of(12),
+            facts_bucket: CountBucket::of(5_000),
+            duration_ms: 840,
+        };
+        assert_eq!(event.tag(), "name_index_refreshed");
+        assert_eq!(
+            String::from_utf8(event.encode().unwrap()).unwrap(),
+            r#"{"tag":"name_index_refreshed","state":"partial","files_bucket":"10-99","facts_bucket":"100+","duration_ms":840}"#
+        );
     }
 
     /// Proves the project check event encodes the EYES-r1 §8 bucket labels under its closed tag.

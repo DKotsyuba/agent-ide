@@ -5336,6 +5336,61 @@ async fn configured_product_links_css_html_and_python_names() {
     daemon.wait().await.unwrap();
 }
 
+/// `ide.start` prewarms the name index in the background when files of a language that defines
+/// names are present: the activation answers at once, the first bridge card answers inline, and a
+/// later activation card carries the index summary.
+#[tokio::test]
+async fn product_start_prewarms_the_name_index() {
+    let fixture = ProductFixture::new(json!([]));
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mixed-frontend");
+    for name in ["index.html", "styles.css", "theme.scss"] {
+        std::fs::copy(source.join(name), fixture.root.join(name)).unwrap();
+    }
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "web files"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "prewarm").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"prewarm-1"}))
+        .await;
+    assert_eq!(started["state"], "complete", "{started}");
+    let first = started["text"].as_str().unwrap();
+    assert!(
+        first.contains("\nlinks: class, id, style-variable facts from css, html\n")
+            || first.ends_with("\nlinks: class, id, style-variable facts from css, html"),
+        "no index summary before the first build: {first}"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let card = actor
+        .call(&fixture, "ide.symbol", json!({"symbol":"styles.css#.btn"}))
+        .await;
+    assert_eq!(card["state"], "complete", "{card}");
+    assert!(
+        card["text"]
+            .as_str()
+            .unwrap()
+            .contains("usages: 2 indexed in 1 files"),
+        "{card}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    // The index outlives the binding: the next activation of the worktree reports it.
+    let mut next = ProductActor::new(&fixture, "prewarm-next").await;
+    let again = next
+        .call(&fixture, "ide.start", json!({"activation_id":"prewarm-2"}))
+        .await;
+    let again = next.settle(&fixture, again).await;
+    let text = again["text"].as_str().unwrap_or_else(|| panic!("{again}"));
+    assert!(
+        text.contains("links: class, id, style-variable facts from css, html (indexed 3 files, "),
+        "{text}"
+    );
+    next.call(&fixture, "ide.stop", json!({})).await;
+    next.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Index-backed replies read every row's file without registering it against the binding: with
 /// `limits.details` at 9 (the registered-path budget too), cards and name cards whose rows come
 /// from fourteen files, followed by ordinary calls, never answer `capacity`.

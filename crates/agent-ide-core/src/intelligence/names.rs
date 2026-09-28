@@ -172,6 +172,8 @@ pub struct NameIndex {
     present: BTreeSet<Language>,
     /// The unfinished sweep, if any.
     sweep: Option<Sweep>,
+    /// Files the last refresh re-read (0 when nothing changed).
+    reread: usize,
 }
 
 impl NameIndex {
@@ -184,6 +186,7 @@ impl NameIndex {
             facts: 0,
             present: BTreeSet::new(),
             sweep: None,
+            reread: 0,
         }
     }
 
@@ -196,6 +199,7 @@ impl NameIndex {
     /// are always proven by [`NameIndex::verify`].
     pub fn refresh(&mut self, deadline: Instant) -> IndexState {
         let started = Instant::now();
+        self.reread = 0;
         let mut sweep = match self.sweep.take() {
             Some(sweep) => sweep,
             None => self.list(),
@@ -416,6 +420,16 @@ impl NameIndex {
             .map(|read| read.contents().to_vec())
     }
 
+    /// `(indexed files, facts)` held.
+    pub fn summary(&self) -> (usize, usize) {
+        (self.files.len(), self.facts)
+    }
+
+    /// Files the last refresh re-read; 0 when nothing changed since the previous one.
+    pub fn last_reread(&self) -> usize {
+        self.reread
+    }
+
     /// Skipped files counted by reason.
     pub fn skipped(&self) -> BTreeMap<&'static str, usize> {
         let mut counts = BTreeMap::new();
@@ -482,6 +496,7 @@ impl NameIndex {
         {
             return;
         }
+        self.reread += 1;
         if metadata.len() > MAX_FILE_BYTES as u64 {
             return self.store(path, language, stamp, [0; 32], Err("large"));
         }
@@ -596,6 +611,16 @@ pub struct NameIndexes {
 }
 
 impl NameIndexes {
+    /// The index of `worktree` (this incarnation), if one is held; never creates one.
+    pub fn get(&self, worktree: &WorktreeRef) -> Option<Arc<Mutex<NameIndex>>> {
+        self.recent
+            .iter()
+            .find(|(held, _)| {
+                held.id() == worktree.id() && held.incarnation() == worktree.incarnation()
+            })
+            .map(|(_, index)| index.clone())
+    }
+
     /// Whether an index of `worktree` (this incarnation) is held.
     pub fn contains(&self, worktree: &WorktreeRef) -> bool {
         self.recent.iter().any(|(held, _)| {

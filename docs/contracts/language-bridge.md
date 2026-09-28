@@ -1,6 +1,6 @@
 # Language bridge contract (cross-language name facts)
 
-Revision: stage 4. Provider: Agent IDE core. Consumers: language crates (providers) and the core's
+Revision: stage 5. Provider: Agent IDE core. Consumers: language crates (providers) and the core's
 tool integration (planned).
 
 ## Implementation status
@@ -89,7 +89,18 @@ pub trait NameFacts: Send + Sync {
 ## 5. Index, coverage and freshness
 
 The index lives in the worker, one per worktree incarnation, at most 4 worktrees (least recently
-used dropped; a recreated worktree never reuses its predecessor's index). Nothing is persisted.
+used dropped; a recreated worktree never reuses its predecessor's index). Storage is in memory only
+in this release: nothing is persisted, and a daemon restart rebuilds the index lazily.
+
+**Prewarm.** `ide.start` starts a build in the background (on the blocking pool, never delaying the
+activation reply) when the bounded presence walk finds files of a language that defines names; a
+repository without such files builds nothing. One build runs at a time per worktree: a bridge
+question that arrives while the build holds the index parks as `names:building` (the ordinary
+`pending` path) and is answered from the index once it is done. The `ide.start` card's `links:` line
+gains `(indexed N files, M facts)` once a build of the worktree exists.
+
+**Telemetry.** A refresh that re-read files records `name_index_refreshed` with the index state,
+bucketed file and fact counts and the duration; it names no language, path or name.
 
 **Candidates.** In a Git worktree: `git ls-files -z --cached --others --exclude-standard`, run like
 the check fingerprint (`/usr/bin/git`, fsmonitor off, 5 s budget), so ignored trees never enter.
