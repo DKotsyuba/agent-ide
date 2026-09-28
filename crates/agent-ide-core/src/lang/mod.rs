@@ -649,10 +649,11 @@ pub trait LanguageSupport: Send + Sync {
         None
     }
 
-    /// Outline computed from the text alone, for a language without a language server; `None`
-    /// (the default) keeps outlines server-backed. When no registered server owns the file's
-    /// extension, the symbol tools outline, read and describe the file from this and report
-    /// usages and callers as unavailable.
+    /// Outline computed from the text alone; `None` (the default) keeps outlines server-backed.
+    /// When no registered server owns the file's extension, the symbol tools outline, read and
+    /// describe the file from this and report usages and callers as unavailable. A language with
+    /// a server may still answer: graph use-site nodes and name-card addresses use it where the
+    /// server is not asked or cannot answer.
     fn outline_from_source(&self, file: &Path, source: &str) -> Option<Outline> {
         let _ = (file, source);
         None

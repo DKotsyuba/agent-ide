@@ -221,7 +221,10 @@ language server (`provider_loading`, detail `names:building`).
 **Graph.** `ide.graph` adds cross-language link edges, drawn `⇢`, for symbols of languages with
 name facts. Callers of a symbol that defines names (a style rule) are the enclosing outline symbols of
 their use sites (the file itself when no symbol encloses the site), tagged with their language; a
-callable one continues through the ordinary call hierarchy at the next level. Callees of a symbol
+callable one continues through the ordinary call hierarchy at the next level. When the server
+cannot outline the file (a TypeScript file whose `tsconfig.json` lives below the worktree root),
+the enclosing symbol comes from the language's top-level declarations read from the text, and the
+node is not expanded. Callees of a symbol
 that uses names end in one leaf per name (at most 10, never expanded), located at its first indexed
 definition. Depth, the 60-node and 120-edge ceilings, cycles and test collapsing are unchanged, and
 graphs without link edges are byte-identical:

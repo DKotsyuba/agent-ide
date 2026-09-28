@@ -577,17 +577,17 @@ impl Worker<'_> {
         // Link callers: each use site becomes its enclosing outline symbol (or its file), and a
         // callable one continues through the ordinary call hierarchy.
         let authority = self.authority(&binding).await?;
-        let mut outlines: std::collections::HashMap<PathBuf, Option<Outline>> =
+        let mut outlines: std::collections::HashMap<PathBuf, Option<(Outline, bool)>> =
             std::collections::HashMap::new();
         for (site_file, line, language) in link_sites {
             if !outlines.contains_key(&site_file) {
                 let outline = self.scanned_outline(job, &authority, &site_file).await;
                 outlines.insert(site_file.clone(), outline);
             }
-            let enclosing = outlines[&site_file]
-                .as_ref()
-                .and_then(|outline| innermost(outline, line))
-                .cloned();
+            let (enclosing, served) = match &outlines[&site_file] {
+                Some((outline, served)) => (innermost(outline, line).cloned(), *served),
+                None => (None, false),
+            };
             let node = match &enclosing {
                 Some(symbol) => render::GraphNode {
                     path: symbol.path.to_string(),
@@ -631,6 +631,7 @@ impl Worker<'_> {
             }
             if let Some(symbol) = enclosing
                 && is_new
+                && served
                 && depth > 1
                 && matches!(
                     symbol.kind,
@@ -990,13 +991,14 @@ impl Worker<'_> {
     }
 
     /// The outline of `file` read without registering it against the binding (a graph node's
-    /// file), or `None` when it cannot be read or outlined.
+    /// file) and whether the server answered it, falling back to the language's text outline
+    /// when the server cannot answer, or `None` when it cannot be read or outlined.
     async fn scanned_outline(
         &mut self,
         job: &mut Job,
         authority: &AuthorityStamp,
         file: &Path,
-    ) -> Option<Outline> {
+    ) -> Option<(Outline, bool)> {
         let limits = SourceReadLimits::new(1024, MAX_SOURCE_BYTES).ok()?;
         let read = read_authorized_source(authority.worktree(), file, limits).ok()?;
         let observed = scan_observation(
@@ -1007,10 +1009,15 @@ impl Worker<'_> {
             read.contents(),
         )
         .ok()?;
-        self.outline_of(job, &observed, read.contents())
-            .await
-            .ok()
-            .map(|(outline, _)| outline)
+        match self.outline_of(job, &observed, read.contents()).await {
+            Ok((outline, _)) => Some((outline, true)),
+            // The server could not outline it (its project config lives below the worktree
+            // root): the language's text outline still names the enclosing declaration.
+            Err(_) => Lang::for_path(file)?
+                .support()
+                .outline_from_source(file, observed_text(&observed, read.contents()).ok()?)
+                .map(|outline| (outline, false)),
+        }
     }
 
     /// Answers an ambiguous name with its candidates instead of guessing.

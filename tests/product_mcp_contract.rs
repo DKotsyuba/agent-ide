@@ -5391,6 +5391,70 @@ async fn product_start_prewarms_the_name_index() {
     daemon.wait().await.unwrap();
 }
 
+/// A use site in a file the TypeScript server cannot outline (its `tsconfig.json` lives in a
+/// subdirectory and falls outside the accepted profile) still becomes its enclosing declaration,
+/// read from the text, and is not expanded through the unavailable call hierarchy.
+#[tokio::test]
+async fn product_graph_names_use_sites_the_server_cannot_outline() {
+    let fixture = ProductFixture::new(json!([accepted_typescript_provider()]));
+    fixture.git(&[
+        "rm",
+        "--quiet",
+        "--",
+        "Cargo.toml",
+        "src/lib.rs",
+        "go.mod",
+        "main.go",
+    ]);
+    std::fs::create_dir_all(fixture.root.join("frontend/src")).unwrap();
+    for (name, text) in [
+        (
+            "frontend/tsconfig.json",
+            "{\"compilerOptions\":{\"jsx\":\"react-jsx\"}}\n",
+        ),
+        ("frontend/src/Layout.css", ".header {\n  color: red;\n}\n"),
+        (
+            "frontend/src/Layout.tsx",
+            "import \"./Layout.css\";\n\nexport default function Layout() {\n  return <header className=\"header\">Top</header>;\n}\n",
+        ),
+    ] {
+        std::fs::write(fixture.root.join(name), text).unwrap();
+    }
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "nested frontend"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "nested").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"nested"}))
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert!(
+        started["text"]
+            .as_str()
+            .unwrap()
+            .contains("\nlanguages: typescript "),
+        "{started}"
+    );
+    let graph = actor
+        .call(
+            &fixture,
+            "ide.graph",
+            json!({"symbol":"frontend/src/Layout.css#.header", "direction":"callers", "depth":2}),
+        )
+        .await;
+    let graph = actor.settle(&fixture, graph).await;
+    assert_eq!(
+        graph["text"].as_str().unwrap_or_default(),
+        "graph: callers of frontend/src/Layout.css#.header (depth 2, 2 nodes, 1 edges)\n\
+         \x20 ⇢ frontend/src/Layout.tsx#Layout  frontend/src/Layout.tsx:3 [typescript]\n",
+        "{graph}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A second worktree of the repository inherits the name index by content: its activation card
 /// reports the index summary at once and its first `.btn` card answers inline.
 #[tokio::test]

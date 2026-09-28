@@ -223,6 +223,56 @@ impl LanguageSupport for TypeScript {
         }
     }
 
+    /// Top-level declarations recognized from the text alone, for callers the server cannot
+    /// answer (a file whose `tsconfig.json` lives below the worktree root). Each column-0
+    /// `function`, `class`, `interface`, `type`, `enum`, `namespace` or `const`/`let`/`var`
+    /// declaration, behind any `export`/`default`/`declare`/`async`/`abstract`, spans its indented
+    /// lines and the column-0 `}`/`)`/`]` line closing them; no members, no docs.
+    // ponytail: column-0 line scan, so a keyword at column 0 inside a template literal or block
+    // comment counts; reuse the names lexer if that shows up.
+    fn outline_from_source(&self, file: &Path, source: &str) -> Option<Outline> {
+        let lines: Vec<&str> = source.lines().collect();
+        let mut symbols = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            let Some((kind, name)) = top_level_declaration(line) else {
+                continue;
+            };
+            let mut last = index;
+            for (next, text) in lines.iter().enumerate().skip(index + 1) {
+                if text.trim().is_empty() {
+                    continue;
+                }
+                if text.starts_with(char::is_whitespace) {
+                    last = next;
+                    continue;
+                }
+                if text.starts_with(['}', ')', ']']) {
+                    last = next;
+                }
+                break;
+            }
+            let text = lines[index..=last].join("\n");
+            let (end, stop) = scan_signature(&text);
+            let range = LineRange::new(index as u32 + 1, last as u32 + 1);
+            symbols.push(Symbol {
+                path: SymbolPath::new(Some(file.to_path_buf()), vec![name.clone()]),
+                kind,
+                name,
+                range,
+                body: range,
+                signature: render_signature(&text[..end], stop, kind),
+                doc: None,
+                children: Vec::new(),
+            });
+        }
+        Some(Outline {
+            file: file.to_path_buf(),
+            language: LANGUAGE,
+            line_count: line_count(source),
+            symbols,
+        })
+    }
+
     /// `Before`/`After` put one blank line between the new code and the anchor, at the anchor's
     /// indentation. `First`/`Last` accept classes, interfaces, namespaces, enums and object
     /// literal variables: `First` lands after the opening `{` line, `Last` before the closing
@@ -716,6 +766,50 @@ fn strip_modifiers(mut text: &str) -> &str {
             return text;
         };
         text = rest;
+    }
+}
+
+/// The kind and name of a column-0 declaration line; `export default function` without a name
+/// is `default`.
+fn top_level_declaration(line: &str) -> Option<(SymbolKind, String)> {
+    if line.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let mut text = line;
+    let mut default = false;
+    while let Some(rest) = ["export", "default", "declare", "async", "abstract"]
+        .iter()
+        .find_map(|modifier| {
+            text.strip_prefix(modifier)
+                .filter(|rest| rest.starts_with(char::is_whitespace))
+        })
+    {
+        default |= text.starts_with("default");
+        text = rest.trim_start();
+    }
+    let (keyword, rest) = text.split_once(|c: char| c.is_whitespace() || c == '*')?;
+    let kind = match keyword {
+        "function" => SymbolKind::Function,
+        "class" => SymbolKind::Class,
+        "interface" => SymbolKind::Interface,
+        "type" => SymbolKind::TypeAlias,
+        "enum" => SymbolKind::Enum,
+        "namespace" | "module" => SymbolKind::Namespace,
+        "const" if rest.trim_start().starts_with("enum ") => SymbolKind::Enum,
+        "const" => SymbolKind::Constant,
+        "let" | "var" => SymbolKind::Variable,
+        _ => return None,
+    };
+    let rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == '*');
+    let rest = rest.strip_prefix("enum ").map_or(rest, str::trim_start);
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || matches!(c, '_' | '$'))
+        .collect();
+    match (name.is_empty(), default) {
+        (false, _) => Some((kind, name)),
+        (true, true) => Some((kind, "default".to_owned())),
+        (true, false) => None,
     }
 }
 
@@ -2135,6 +2229,57 @@ ok 2 - subtracts
         put(&scripts, "tools/run.js", "");
         assert_eq!(TypeScript.detect(&scripts), None);
         fs::remove_dir_all(&scripts).unwrap();
+    }
+
+    /// Column-0 declarations outline from the text; members, statements and nameless
+    /// destructuring do not.
+    #[test]
+    fn outline_from_source_lists_top_level_declarations() {
+        let source = "import { x } from './x';\n\
+            \n\
+            export default function Layout({ children }: Props) {\n\
+            \x20 return <div className=\"layout\">{children}</div>;\n\
+            }\n\
+            \n\
+            export const Button = (props: P): JSX.Element => (\n\
+            \x20 <button />\n\
+            );\n\
+            const { a } = x;\n\
+            declare const enum Mode { A }\n\
+            export default class {\n\
+            \x20 run() {}\n\
+            }\n\
+            type Props = { children: string };\n\
+            let count = 0;\n\
+            export { Layout };\n";
+        let outline = TypeScript
+            .outline_from_source(Path::new("src/Layout.tsx"), source)
+            .unwrap();
+        let rows: Vec<String> = outline
+            .symbols
+            .iter()
+            .map(|symbol| {
+                format!(
+                    "{} {} {}-{} {}",
+                    symbol.path,
+                    symbol.kind.name(),
+                    symbol.range.start,
+                    symbol.range.end,
+                    symbol.signature
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "src/Layout.tsx#Layout fn 3-5 export default function Layout({ children }: Props)",
+                "src/Layout.tsx#Button const 7-9 export const Button = (props: P) => JSX.Element",
+                "src/Layout.tsx#Mode enum 11-11 declare const enum Mode",
+                "src/Layout.tsx#default class 12-14 export default class",
+                "src/Layout.tsx#Props type 15-15 type Props = {…}",
+                "src/Layout.tsx#count var 16-16 let count = 0",
+            ]
+        );
     }
 
     #[test]
