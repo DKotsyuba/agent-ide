@@ -51,8 +51,10 @@ error: provider_loading{% if resolution_detail %} ({{ resolution_detail }}){% en
 error: invalid_detail (start:activation_conflict); this activation_id was used with another root; use a new activation_id
 {%- elif code == "invalid_detail" -%}
 error: invalid_detail{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; {% if resolution_detail == "inspect:detail_expired" %}this detail_ref has expired{% else %}this detail_ref was never issued{% endif %}; repeat the original ide.* call to get a fresh one, or continue with native tools
+{%- elif code == "source_unavailable" and resolution_detail == "inspect:source_changed" -%}
+error: source_unavailable (inspect:source_changed); the file changed since this result was captured; call ide.context again for fresh bytes
 {%- elif code == "source_unavailable" -%}
-error: source_unavailable{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; the registered source bytes changed or left the authorized scope; call ide.context again for fresh bytes
+error: source_unavailable{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; continue with native tools
 {%- elif code == "outside_allowed_roots" -%}
 error: outside_allowed_roots{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; the working directory is not below any configured allowed root; start the IDE in an allowed directory or add this one to allowed_roots, otherwise continue with native tools
 {%- elif code == "execution_profile" and cause_tag is defined -%}

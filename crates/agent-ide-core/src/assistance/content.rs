@@ -429,6 +429,48 @@ mod tests {
         );
     }
 
+    /// The changed-source recovery text appears only for the stage that means it; every other
+    /// source_unavailable stage keeps the neutral continuation hint (T m060 item 2).
+    #[test]
+    fn source_unavailable_names_the_changed_file_only_for_the_changed_stage() {
+        let rendered = render(
+            PeerReply::Error {
+                code: FailureCode::SourceUnavailable,
+                detail: Some("diff:unsupported_entry".to_owned()),
+            },
+            Envelope::WithStructured,
+        )
+        .unwrap();
+        assert_eq!(
+            text_of(&rendered),
+            "error: source_unavailable (diff:unsupported_entry); continue with native tools"
+        );
+        let changed = render(
+            PeerReply::Error {
+                code: FailureCode::SourceUnavailable,
+                detail: Some("inspect:source_changed".to_owned()),
+            },
+            Envelope::WithStructured,
+        )
+        .unwrap();
+        assert_eq!(
+            text_of(&changed),
+            "error: source_unavailable (inspect:source_changed); the file changed since this result was captured; call ide.context again for fresh bytes"
+        );
+        let bare = render(
+            PeerReply::Error {
+                code: FailureCode::SourceUnavailable,
+                detail: None,
+            },
+            Envelope::WithStructured,
+        )
+        .unwrap();
+        assert_eq!(
+            text_of(&bare),
+            "error: source_unavailable; continue with native tools"
+        );
+    }
+
     /// An expired or unknown detail says to repeat the original call.
     #[test]
     fn expired_detail_explains_the_recovery() {
