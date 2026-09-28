@@ -149,7 +149,9 @@ async fn main() -> ExitCode {
             let candidate = match host {
                 // Codex retains its existing current-directory identity contract.
                 ManagedHost::Codex => std::env::current_dir(),
-                ManagedHost::Claude => canonical_claude_project(claude_project_dir),
+                ManagedHost::Claude | ManagedHost::ClaudeCompatible => {
+                    canonical_claude_project(claude_project_dir)
+                }
             };
             run_managed_mcp(launcher_template, candidate, host).await
         }
@@ -528,19 +530,32 @@ enum ManagedHost {
     Codex,
     /// Claude derives its candidate only from startup-captured `CLAUDE_PROJECT_DIR` and uses hooks.
     Claude,
+    /// An unrecognized host (no `CLAUDE_PROJECT_DIR`) whose hooks are the Claude-compatible
+    /// `claude-hook` contract (ZCode): the Claude flow with the process directory as candidate,
+    /// so `ide.start {root}` re-rooting binds it exactly like a moved Claude session.
+    ClaudeCompatible,
 }
 
 /// Selects the existing managed host and captures its candidate without fallback between hosts.
 ///
 /// A present `claude_project_dir` always selects Claude, including when canonical validation
 /// fails; the returned error then drives the existing Claude fail-open MCP path. An absent value
-/// selects Codex and returns the process current directory, preserving its existing error behavior.
+/// selects the Claude-compatible contract with the canonicalized process directory: such a host
+/// never supplies Codex MCP metadata, so its only possible correlation is the Claude-compatible
+/// hook stream, and its project arrives through `ide.start {root}` re-rooting. Codex keeps its
+/// explicit `--launcher-template` entrypoint.
 fn auto_managed_candidate(
     claude_project_dir: Option<OsString>,
 ) -> (ManagedHost, std::io::Result<PathBuf>) {
     match claude_project_dir {
         Some(project) => (ManagedHost::Claude, canonical_claude_project(Some(project))),
-        None => (ManagedHost::Codex, std::env::current_dir()),
+        None => match std::env::current_dir() {
+            Ok(directory) => (
+                ManagedHost::ClaudeCompatible,
+                canonical_claude_project(Some(directory.into_os_string())),
+            ),
+            Err(error) => (ManagedHost::ClaudeCompatible, Err(error)),
+        },
     }
 }
 
@@ -1777,7 +1792,11 @@ async fn run_managed_mcp(
 ) -> ExitCode {
     match host {
         ManagedHost::Codex => run_managed_codex_mcp(launcher_template, candidate).await,
-        ManagedHost::Claude => run_managed_claude_mcp(launcher_template, candidate).await,
+        // An unrecognized auto host runs the Claude contract: its hooks are claude-hook, and its
+        // project arrives through ide.start {root} re-rooting exactly like a moved Claude session.
+        ManagedHost::Claude | ManagedHost::ClaudeCompatible => {
+            run_managed_claude_mcp(launcher_template, candidate).await
+        }
     }
 }
 
@@ -2414,7 +2433,7 @@ async fn start_managed_daemon(
     // The error log is keyed by the repository, which a random Codex runtime directory cannot say.
     let log_key_source = match host {
         ManagedHost::Codex => claude_rendezvous_key(candidate).await,
-        ManagedHost::Claude => identity.to_owned(),
+        ManagedHost::Claude | ManagedHost::ClaudeCompatible => identity.to_owned(),
     };
     let mut command =
         tokio::process::Command::new(std::env::current_exe().map_err(|_| StartDaemonError::Other)?);
@@ -2437,7 +2456,7 @@ async fn start_managed_daemon(
             command.env("AGENT_IDE_MANAGED_CODEX_ATTACHMENT", &attachment);
             command.env_remove("AGENT_IDE_MANAGED_CLAUDE_DAEMON");
         }
-        ManagedHost::Claude => {
+        ManagedHost::Claude | ManagedHost::ClaudeCompatible => {
             // Claude deliberately uses the existing hook-correlated daemon path. The daemon is
             // shared by every worktree of this repository, so it must outlive this one MCP process:
             // it runs detached, in its own process group, and is never killed by dropping the handle.
@@ -2804,9 +2823,14 @@ mod tests {
     /// Auto host selection uses only Claude project-variable presence and never cross-falls back.
     #[test]
     fn auto_managed_candidate_preserves_invalid_claude_selection() {
-        let (codex, candidate) = auto_managed_candidate(None);
-        assert_eq!(codex, ManagedHost::Codex);
-        assert!(candidate.is_ok());
+        // An absent variable selects the Claude-compatible contract with the canonical process
+        // directory (an unrecognized host's only possible correlation is the Claude hook stream).
+        let (compatible, candidate) = auto_managed_candidate(None);
+        assert_eq!(compatible, ManagedHost::ClaudeCompatible);
+        assert_eq!(
+            candidate.unwrap(),
+            fs::canonicalize(std::env::current_dir().unwrap()).unwrap()
+        );
 
         let project = fs::canonicalize(std::env::temp_dir()).unwrap();
         let (claude, candidate) = auto_managed_candidate(Some(project.clone().into_os_string()));

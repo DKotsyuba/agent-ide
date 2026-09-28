@@ -136,7 +136,7 @@ impl Mcp {
         command
             .env("TOKIO_WORKER_THREADS", "1")
             .env_remove("CLAUDE_PROJECT_DIR")
-            .args(["mcp", "--auto-launcher-template"])
+            .args(["mcp", "--launcher-template"])
             .arg(template)
             .current_dir(candidate)
             .stdin(Stdio::piped())
@@ -190,6 +190,37 @@ impl Mcp {
         };
         let response = mcp.exchange(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
             "protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"managed-claude-contract","version":"1"}
+        }})).await;
+        assert!(response.get("result").is_some(), "{response}");
+        mcp.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+            .await;
+        mcp
+    }
+
+    /// Starts the auto-mode MCP exactly as a host with no recognized environment does: no
+    /// `CLAUDE_PROJECT_DIR`, current directory as the captured candidate (ZCode's shape).
+    async fn start_managed_auto(template: &Path, cwd: &Path) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
+        command
+            .env("TOKIO_WORKER_THREADS", "1")
+            .env_remove("CLAUDE_PROJECT_DIR")
+            .env_remove("AGENT_IDE_HOST_ATTACHMENT")
+            .env_remove("AGENT_IDE_MANAGED_CODEX_ATTACHMENT")
+            .args(["mcp", "--auto-launcher-template"])
+            .arg(template)
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let mut mcp = Self {
+            input: child.stdin.take().unwrap(),
+            output: BufReader::new(child.stdout.take().unwrap()),
+            child,
+        };
+        let response = mcp.exchange(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"auto-host-contract","version":"1"}
         }})).await;
         assert!(response.get("result").is_some(), "{response}");
         mcp.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
@@ -652,11 +683,10 @@ async fn binary_routes_methods_to_typed_missing_peer_and_survives_daemon_loss() 
             }}),
         )
         .await;
-    assert!(
-        no_metadata["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("host metadata or attachment")
+    // No supported host metadata can never correlate: the closed cause names it (T15B follow-up).
+    assert_eq!(
+        no_metadata["result"]["content"][0]["text"],
+        "unavailable: host_binding (host_unrecognized); continue with native tools"
     );
     for (index, (name, arguments)) in [
         ("ide.start", json!({"activation_id":"activate"})),
@@ -4025,6 +4055,117 @@ async fn managed_claude_moved_session_reroots_into_an_allowed_root() {
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     mcp.close().await;
     let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// An auto-mode MCP whose host is unrecognized (ZCode: no `CLAUDE_PROJECT_DIR`, no host metadata)
+/// is served by the Claude-compatible contract: a meta-less start names `host_unrecognized`, and
+/// `ide.start {root}` re-rooting plus Claude-shaped hooks activate inside the allowed root.
+#[tokio::test]
+async fn managed_auto_unrecognized_host_reroots_like_claude() {
+    let fixture = ProductFixture::new(json!([]));
+    let workspace = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!(
+            "t15b-auto-workspace-{}-{}",
+            std::process::id(),
+            NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed)
+        ));
+    std::fs::create_dir_all(&workspace).unwrap();
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    assert!(!runtime.exists());
+    let mut mcp = Mcp::start_managed_auto(&fixture.config, &workspace).await;
+
+    // A call carrying no supported host metadata can never correlate: it names the closed cause.
+    // (An unrecognized host is not known to misuse `structuredContent`, so this call keeps both
+    // projections; only a recognized Claude call is text-only.)
+    let unrecognized = mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                "name":"ide.start","arguments":{"activation_id":"zcode"}
+            }}),
+        )
+        .await;
+    assert_eq!(
+        unrecognized["result"]["content"][0]["text"],
+        "unavailable: host_binding (host_unrecognized); continue with native tools",
+        "{unrecognized}"
+    );
+    assert_eq!(
+        unrecognized["result"]["structuredContent"],
+        json!({"state":"unavailable","reason":"host_binding"}),
+        "{unrecognized}"
+    );
+
+    // Claude-shaped hooks for the real project stay silent fail-open before re-rooting, then the
+    // first start naming the project root re-roots through the exact moved-Claude path.
+    let silent = managed_claude_hook(
+        Some(&fixture.root),
+        managed_claude_event("PreToolUse", "auto-session", None, "auto-first"),
+    )
+    .await;
+    assert!(
+        silent.status.success() && silent.stdout.is_empty() && silent.stderr.is_empty(),
+        "undelivered auto-host hook must stay silent"
+    );
+    let rerooted = mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+                "name":"ide.start",
+                "arguments":{"activation_id":"zcode","root":fixture.root.to_str().unwrap()},
+                "_meta":{"claudecode/toolUseId":"auto-first"}
+            }}),
+        )
+        .await;
+    let rerooted_text = assert_claude_envelope(&rerooted);
+    assert!(
+        rerooted_text.starts_with(
+            "unavailable: host_binding (hooks_not_delivered); continue with native tools; retry: session re-rooted"
+        ),
+        "{rerooted_text}"
+    );
+    assert!(
+        runtime.is_dir(),
+        "the project root's shared daemon must exist"
+    );
+
+    // The next Claude-shaped hook pairs with the next start, and activation succeeds there.
+    let mut next = 4;
+    let pending = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "auto-session",
+        None,
+        "ide.start",
+        json!({"activation_id":"zcode","root":fixture.root.to_str().unwrap()}),
+    )
+    .await;
+    let started = settle_managed_claude_start(
+        &mut mcp,
+        &fixture.root,
+        &mut next,
+        "auto-session",
+        None,
+        &pending,
+    )
+    .await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    next += 1;
+    let stopped = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "auto-session",
+        None,
+        "ide.stop",
+        json!({}),
+    )
+    .await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    mcp.close().await;
+    let _ = std::fs::remove_dir_all(&workspace);
 }
 
 /// A removed worktree must not poison later activation in the same repository daemon.

@@ -356,6 +356,7 @@ mod tests {
             HostBindingCause::Mismatch,
             HostBindingCause::InactiveBinding,
             HostBindingCause::CapacityExceeded,
+            HostBindingCause::HostUnrecognized,
             HostBindingCause::project_moved(
                 std::path::Path::new("/private/tmp/ai-r-move"),
                 "/Users/pluto/projects/agent-worktree",

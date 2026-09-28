@@ -1970,6 +1970,16 @@ impl StdioFacade {
                 "invalid bounded parameters; inspect the tool schema"
             }
             FacadeOutcome::MissingHostMetadata => {
+                // A caller whose `_meta` names no supported host contract can never correlate an
+                // invocation (the ZCode auto-mode case): name that closed cause rather than the
+                // generic attachment text, which stays for a missing connection or attachment.
+                if parse_host_kind(&context.meta).is_err() {
+                    let reply = PeerReply::Unavailable {
+                        reason: MissingPeer::HostBinding,
+                        cause: Some(HostBindingCause::HostUnrecognized),
+                    };
+                    return render_reply_with_status(reply, None, envelope);
+                }
                 "Assistance host metadata or attachment is unavailable; continue with native tools"
             }
             FacadeOutcome::Unavailable => {

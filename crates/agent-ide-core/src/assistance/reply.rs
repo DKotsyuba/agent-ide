@@ -47,6 +47,8 @@ pub enum HostBindingCause {
     InactiveBinding,
     /// Bounded pending, binding, or replay storage is full for this scope.
     CapacityExceeded,
+    /// The caller's `_meta` names no supported host contract, so no invocation can correlate.
+    HostUnrecognized,
     /// `ide.start {root}` named a directory other than the session's bound project.
     ProjectMoved {
         /// Home-shortened bounded path the session is currently bound to.
@@ -87,6 +89,7 @@ impl HostBindingCause {
             Self::Mismatch => "mismatch".to_owned(),
             Self::InactiveBinding => "inactive_binding".to_owned(),
             Self::CapacityExceeded => "capacity_exceeded".to_owned(),
+            Self::HostUnrecognized => "host_unrecognized".to_owned(),
             Self::ProjectMoved { bound, asked } => {
                 format!("project_moved: bound to {bound}, asked {asked}")
             }
@@ -609,6 +612,7 @@ fn host_binding_causes_round_trip_and_bare_replies_stay_bare() {
         HostBindingCause::Mismatch,
         HostBindingCause::InactiveBinding,
         HostBindingCause::CapacityExceeded,
+        HostBindingCause::HostUnrecognized,
         HostBindingCause::project_moved(
             Path::new("/Users/pluto/projects/agent-worktree"),
             "/private/tmp/agent-ide-stability/fixture",
