@@ -148,6 +148,20 @@ impl LanguageServer for RustServer {
     }
 }
 
+/// Names the failed initialize stage on the job's failure reply: a handshake that exhausted its
+/// 30-second bound reports the timeout; any other initialize failure (a server that exited or
+/// answered invalidly before readiness) reports the failed initialize. Closed stage words only.
+fn initialize_stage(job: &mut dyn ProviderJob, error: &std::io::Error) {
+    if error.kind() == std::io::ErrorKind::TimedOut {
+        job.set_stage_failure(
+            &FailureCode::ProviderUnavailable,
+            "rust: initialize timeout",
+        );
+    } else {
+        job.set_stage_failure(&FailureCode::ProviderUnavailable, "rust: initialize failed");
+    }
+}
+
 /// One binding's live analyzer: the protocol child, its exclusive view and the session driver.
 struct RustLive {
     /// Analyzer process owned until reap.
@@ -271,6 +285,7 @@ impl RustBackend {
                 if let RustProfileError::Process(error) = error {
                     host.spawn_failure(error, &binding);
                 }
+                job.set_stage_failure(&FailureCode::ProviderUnavailable, "rust: spawn failed");
                 return Err(FailureCode::ProviderUnavailable);
             }
         };
@@ -305,11 +320,12 @@ impl RustBackend {
                 self.live.insert(binding, RustLive { child, view, live });
                 Ok(())
             }
-            Err(_) => {
+            Err(error) => {
                 self.reap(host, &binding, child, view).await;
                 if job.cancelled() {
                     Err(FailureCode::Cancelled)
                 } else {
+                    initialize_stage(job, &error);
                     Err(FailureCode::ProviderUnavailable)
                 }
             }
@@ -382,6 +398,10 @@ impl RustBackend {
                     return Err(FailureCode::ProviderLoading);
                 }
                 Err(ReadinessError::WorkspaceError) => {
+                    job.set_stage_failure(
+                        &FailureCode::ProviderUnavailable,
+                        "rust: workspace load failed",
+                    );
                     return Err(FailureCode::ProviderUnavailable);
                 }
                 Err(ReadinessError::Gone) => Err(std::io::Error::other("transport gone")),

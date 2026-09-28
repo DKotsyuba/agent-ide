@@ -327,6 +327,12 @@ pub trait ProviderJob: Send + Sync {
 
     /// Attaches a human-readable refusal detail to the job's failure reply.
     fn set_failure_detail(&mut self, detail: String);
+
+    /// Attaches the failed session stage to the job's failure reply: the default
+    /// `<tool>:<reason>` tag composed with the backend-reported stage, e.g.
+    /// `outline:provider_unavailable (<language>: workspace load failed)`. The stage is closed
+    /// words naming the failing step — never paths or payloads.
+    fn set_stage_failure(&mut self, code: &FailureCode, stage: &str);
 }
 
 /// Produces only an Execution scope from an already fresh durable stamp; it grants nothing itself.
