@@ -4927,6 +4927,49 @@ async fn configured_product_graph_traverses_live_calls_with_bounds() {
     daemon.wait().await.unwrap();
 }
 
+/// A source file whose inline `#[cfg(test)] mod tests` references `a` both from a helper and from
+/// a test: the card's src/tests split must classify those rows as tests, as callers already do.
+#[tokio::test]
+async fn configured_product_symbol_usages_split_counts_inline_test_module() {
+    let fixture = symbol_test_fixture();
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "pub fn a() {}\npub fn c() { a(); }\n#[cfg(test)]\nmod tests {\n    fn shared() { super::a(); }\n    #[test]\n    fn reaches_a() {\n        super::a();\n    }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.root.join("tests/path_tests.rs"), "").unwrap();
+    fixture.git(&["add", "--", "src/lib.rs", "tests/path_tests.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "inline test module fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "inline-tests").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"inline-tests-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let card = actor
+        .call(
+            &fixture,
+            "ide.symbol",
+            json!({"symbol":"src/lib.rs#a", "callers":0}),
+        )
+        .await;
+    let card = actor.settle(&fixture, card).await;
+    assert_eq!(card["kind"], "symbol", "{card}");
+    let text = card["text"].as_str().unwrap();
+    assert!(
+        text.contains("usages: 3 in 1 files (src 1, tests 2)\n"),
+        "the inline test module's rows must count as tests: {text}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A symbol card with more than 30 usages and an ambiguity list with more than 20 candidates
 /// keep their first page and name a `detail_ref`; `ide.inspect` then delivers the cut rows.
 #[tokio::test]

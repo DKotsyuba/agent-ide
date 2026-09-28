@@ -356,7 +356,13 @@ impl Worker<'_> {
                     .await
                     .map_err(|_| FailureCode::ProviderUnavailable)?;
                 card.usages = self
-                    .usage_lines(&worktree_root, &found.path, found.body.start, references)
+                    .usage_lines(
+                        job,
+                        &worktree_root,
+                        &found.path,
+                        found.body.start,
+                        references,
+                    )
                     .await;
                 // Some servers answer references with an empty list when nothing names the symbol
                 // explicitly (a constructor is only ever called through its class); that zero
@@ -1060,8 +1066,13 @@ impl Worker<'_> {
     }
 
     /// Usage lines for reference locations: relative path, line, trimmed text, test flag.
+    ///
+    /// A usage is a test when its file is one by the language's test-file conventions or when the
+    /// file's outline places it inside a test symbol (an inline `#[cfg(test)] mod tests`), the
+    /// same classification callers and graphs use; one outline per file answers every row.
     async fn usage_lines(
         &mut self,
+        job: &mut Job,
         worktree_root: &Path,
         definition: &SymbolPath,
         definition_line: u32,
@@ -1069,6 +1080,10 @@ impl Worker<'_> {
     ) -> Vec<Usage> {
         let mut cache: std::collections::BTreeMap<std::path::PathBuf, String> =
             std::collections::BTreeMap::new();
+        let mut outlines: std::collections::HashMap<std::path::PathBuf, Option<Outline>> =
+            std::collections::HashMap::new();
+        let binding = job.invocation.binding_ref().clone();
+        let authority = self.authority(&binding).await.ok();
         let mut usages = Vec::new();
         for location in references {
             let Ok(absolute) = location.uri.to_file_path() else {
@@ -1092,8 +1107,26 @@ impl Worker<'_> {
                     text
                 }
             };
-            let is_test = Lang::for_path(&relative)
+            let mut is_test = Lang::for_path(&relative)
                 .is_some_and(|language| language.support().is_test_file(&relative));
+            if !is_test
+                && authority.is_some()
+                && !outlines.contains_key(&relative)
+                && let Some(authority) = authority.as_ref()
+            {
+                let outline = self
+                    .scanned_outline(job, authority, &relative)
+                    .await
+                    .map(|(outline, _)| outline);
+                outlines.insert(relative.clone(), outline);
+            }
+            if !is_test {
+                is_test = outlines.get(&relative).is_some_and(|outline| {
+                    outline
+                        .as_ref()
+                        .is_some_and(|outline| inside_test(outline, line))
+                });
+            }
             usages.push(Usage {
                 file: relative.display().to_string(),
                 line,
@@ -1255,6 +1288,26 @@ pub(super) fn innermost(outline: &Outline, line: u32) -> Option<&lang::Symbol> {
         });
     }
     found
+}
+
+/// Whether the outline places 1-based `line` inside a test symbol at any nesting — a test module
+/// or a test itself — the same classification callers and graphs use, so a reference from inside
+/// an inline test module counts as a test wherever the file itself is not a test file.
+pub(super) fn inside_test(outline: &Outline, line: u32) -> bool {
+    let mut level: &[lang::Symbol] = &outline.symbols;
+    loop {
+        let Some(found) = level
+            .iter()
+            .filter(|symbol| symbol.range.start <= line && line <= symbol.range.end)
+            .min_by_key(|symbol| symbol.range.len())
+        else {
+            return false;
+        };
+        if found.kind == lang::SymbolKind::Test {
+            return true;
+        }
+        level = &found.children;
+    }
 }
 
 /// Candidates an ambiguity reply prints before the rest moves behind its `detail_ref`.
