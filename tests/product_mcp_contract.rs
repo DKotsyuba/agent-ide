@@ -935,18 +935,18 @@ fn host_call(actor: &str, call: &str, name: &str) -> Value {
         "x-codex-turn-metadata":{"private":"not-retained"},"codex/sandbox-state-meta":{"permissionProfile":{"type":"disabled"},"codexLinuxSandboxExe":null,"sandboxCwd":"/private/tmp","useLegacyLandlock":false}}}})
 }
 
-/// The Cargo home the analyzer inherits: the operator's own registry when it exists, otherwise
-/// the private namespace copy, exactly as `RustProfile::command` resolves it.
+/// The Cargo home the analyzer inherits: the operator's real registry when it exists, otherwise
+/// the private namespace copy, exactly as `RustProfile::command` resolves it from the real user
+/// home — never from the daemon's substituted `HOME` or inherited `CARGO_HOME`.
 fn operator_cargo_home(namespace: &Path) -> PathBuf {
-    std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_dir())
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|home| PathBuf::from(home).join(".cargo"))
-                .filter(|path| path.is_dir())
-        })
-        .unwrap_or_else(|| namespace.join("cargo"))
+    let derived = agent_ide::userhome::user_home()
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".cargo");
+    if derived.is_dir() {
+        derived
+    } else {
+        namespace.join("cargo")
+    }
 }
 
 /// Checks a closed host boundary response and proves private launch/input fields were not rendered.

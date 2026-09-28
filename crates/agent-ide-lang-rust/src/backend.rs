@@ -4,14 +4,14 @@
 //! session starts on the first request, is reused while its transport lives, and is shut down and
 //! reaped when the binding stops or an exchange fails.
 
-use std::{any::Any, collections::BTreeMap, sync::Arc, time::Duration};
+use std::{any::Any, collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
 use serde::Deserialize;
 
 use agent_ide_core::{
     assistance::{
         host_binding::BindingRef,
-        launcher::{AcceptedExecutable, ProviderLaunch, identifier},
+        launcher::{AcceptedExecutable, ProviderLaunch, absolute, identifier},
         reply::FailureCode,
     },
     checks::BoxFuture,
@@ -39,6 +39,9 @@ pub struct RustLaunchOptions {
     /// Absolute operator-declared `cargo` executable. Never chosen by model or project input; its
     /// measured identity must match `cargo_version`.
     pub cargo: Option<AcceptedExecutable>,
+    /// Absolute operator-declared Cargo home serving the analyzer's registry; `None` uses the
+    /// real home's `.cargo`. Never chosen by model or project input.
+    pub cargo_home: Option<PathBuf>,
     /// Accepted Cargo identity.
     pub cargo_version: Option<String>,
     /// Absolute operator-declared `rustc` executable. Never chosen by model or project input; its
@@ -62,9 +65,15 @@ impl LanguageServer for RustServer {
         "rust_cache_priming_disabled_v1"
     }
 
-    /// The Cargo and rustc executables and their identities.
+    /// The Cargo and rustc executables, the Cargo home, and their identities.
     fn option_fields(&self) -> &'static [&'static str] {
-        &["cargo", "cargo_version", "rustc", "rustc_version"]
+        &[
+            "cargo",
+            "cargo_home",
+            "cargo_version",
+            "rustc",
+            "rustc_version",
+        ]
     }
 
     /// Decodes [`RustLaunchOptions`].
@@ -83,6 +92,7 @@ impl LanguageServer for RustServer {
             return false;
         };
         options.cargo_version.as_deref().is_some_and(identifier)
+            && options.cargo_home.as_deref().is_none_or(absolute)
             && options.rustc_version.as_deref().is_some_and(identifier)
             && options.cargo.as_ref().is_some_and(|cargo| {
                 cargo.validate().is_ok()
@@ -191,6 +201,7 @@ impl RustBackend {
                 .ok_or(FailureCode::ExecutionProfile)?
                 .path
                 .clone(),
+            cargo_home: options.cargo_home.clone(),
             cargo_version: options
                 .cargo_version
                 .clone()

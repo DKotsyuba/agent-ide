@@ -35,6 +35,9 @@ pub struct RustProfileIdentity {
     pub rust_analyzer_version: String,
     /// Absolute operator-declared `cargo` executable; never chosen by model or project input.
     pub cargo: PathBuf,
+    /// Absolute operator-declared Cargo home serving the analyzer's registry; `None` uses the
+    /// real home's `.cargo`. Never chosen by model or project input.
+    pub cargo_home: Option<PathBuf>,
     /// Observed Cargo version paired with this profile.
     pub cargo_version: String,
     /// Absolute operator-declared `rustc` executable; never chosen by model or project input.
@@ -61,6 +64,8 @@ pub struct RustProfile {
     binary_digest: blake3::Hash,
     rust_analyzer_version: String,
     cargo: PathBuf,
+    /// Operator-declared Cargo home; `None` derives the real home's `.cargo` (see `command`).
+    cargo_home: Option<PathBuf>,
     /// Measured `cargo` bytes; binds the declared `cargo_version` to the exact executed binary.
     cargo_digest: blake3::Hash,
     cargo_version: String,
@@ -167,6 +172,7 @@ impl RustProfile {
             binary_digest,
             rust_analyzer_version: identity.rust_analyzer_version,
             cargo: identity.cargo,
+            cargo_home: identity.cargo_home,
             cargo_digest,
             cargo_version: identity.cargo_version,
             rustc: identity.rustc,
@@ -186,10 +192,37 @@ impl RustProfile {
 
     /// Returns the worktree-bound stdio command with the selected toolchain and the same
     /// environment a human editor gives rust-analyzer: `CARGO`/`RUSTC` name the exact
-    /// operator-verified executables, `PATH` lets build scripts find the system linker, the
-    /// operator's own Cargo home serves the registry so nothing is downloaded twice, and only the
-    /// build artifacts and temporary files stay in the private namespace.
+    /// operator-verified executables, `PATH` lets build scripts find the system linker, and the
+    /// operator's own Cargo home serves the registry so nothing is downloaded twice — resolved
+    /// exactly as the confined project check resolves it, from the real operator home rather
+    /// than a substituted `HOME` or an inherited `CARGO_HOME` (see
+    /// the shared `crate::home` helpers), with only the build artifacts and temporary files staying in the
+    /// private namespace.
     pub fn command(&self, worktree: &RustWorktree) -> Result<ControlledCommand, RustProfileError> {
+        ControlledCommand::from_validated_peer(
+            CommandKind::Provider,
+            self.binary.clone(),
+            Vec::new(),
+            worktree.worktree.worktree_path().to_path_buf(),
+            self.environment(),
+        )
+        .map_err(|_| RustProfileError::InvalidProfile)
+    }
+
+    /// Builds the complete server environment: the toolchain `PATH` plus `HOME`/`CARGO_HOME`
+    /// from the real operator home (the declared override winning when one is configured) and
+    /// the private-namespace target/temp directories. When no real cargo home exists the private
+    /// namespace copy is used so the analyzer never writes registry state outside it.
+    fn environment(&self) -> BTreeMap<OsString, OsString> {
+        let home = crate::home::real_home();
+        let derived = crate::home::effective_cargo_home(self.cargo_home.as_deref(), &home);
+        let cargo_home = if self.cargo_home.is_some() || derived.is_dir() {
+            derived.into_os_string()
+        } else {
+            Path::new(&self.cache_namespace)
+                .join("cargo")
+                .into_os_string()
+        };
         let mut path = OsString::new();
         for directory in [
             self.cargo.parent(),
@@ -205,20 +238,7 @@ impl RustProfile {
             }
             path.push(directory);
         }
-        let home = std::env::var_os("HOME").filter(|value| !value.is_empty());
-        let cargo_home = std::env::var_os("CARGO_HOME")
-            .filter(|value| Path::new(value).is_dir())
-            .or_else(|| {
-                home.as_ref()
-                    .map(|home| Path::new(home).join(".cargo").into_os_string())
-                    .filter(|value| Path::new(value).is_dir())
-            })
-            .unwrap_or_else(|| {
-                Path::new(&self.cache_namespace)
-                    .join("cargo")
-                    .into_os_string()
-            });
-        let mut environment = BTreeMap::from([
+        BTreeMap::from([
             (OsString::from("PATH"), path),
             (
                 OsString::from("RUSTUP_TOOLCHAIN"),
@@ -235,18 +255,8 @@ impl RustProfile {
                 OsString::from("TMPDIR"),
                 OsString::from(Path::new(&self.cache_namespace).join("tmp")),
             ),
-        ]);
-        if let Some(home) = home {
-            environment.insert(OsString::from("HOME"), home);
-        }
-        ControlledCommand::from_validated_peer(
-            CommandKind::Provider,
-            self.binary.clone(),
-            Vec::new(),
-            worktree.worktree.worktree_path().to_path_buf(),
-            environment,
-        )
-        .map_err(|_| RustProfileError::InvalidProfile)
+            (OsString::from("HOME"), home.into_os_string()),
+        ])
     }
 
     /// Produces the exclusive backend identity, including the canonical worktree incarnation.
@@ -260,6 +270,11 @@ impl RustProfile {
             self.cargo.to_string_lossy().as_ref(),
             self.cargo_digest.to_hex().as_str(),
             &self.cargo_version,
+            &self
+                .cargo_home
+                .as_deref()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
             self.rustc.to_string_lossy().as_ref(),
             self.rustc_digest.to_hex().as_str(),
             &self.rustc_version,
@@ -300,6 +315,10 @@ impl RustProfile {
     fn valid(&self) -> bool {
         self.binary.is_absolute()
             && self.cargo.is_absolute()
+            && self
+                .cargo_home
+                .as_deref()
+                .is_none_or(agent_ide_core::assistance::launcher::absolute)
             && self.rustc.is_absolute()
             && Path::new(&self.cache_namespace).is_absolute()
             && matches!(
@@ -777,6 +796,8 @@ impl RustProtocolChild {
 #[cfg(test)]
 mod linked_project_tests {
     use super::{RustProfile, RustProfileIdentity, linked_projects};
+    use std::ffi::OsStr;
+    use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
     fn scratch(label: &str) -> PathBuf {
@@ -848,10 +869,19 @@ mod linked_project_tests {
 
     /// Returns a Rust profile over a harmless measured executable with one accepted configuration.
     fn session_profile(configuration: &str) -> RustProfile {
+        session_profile_with_cargo_home(configuration, None)
+    }
+
+    /// [`session_profile`] with a caller-declared Cargo home override.
+    fn session_profile_with_cargo_home(
+        configuration: &str,
+        cargo_home: Option<PathBuf>,
+    ) -> RustProfile {
         RustProfile::new(RustProfileIdentity {
             binary: "/usr/bin/true".into(),
             rust_analyzer_version: "rust-analyzer contract-1".into(),
             cargo: "/usr/bin/true".into(),
+            cargo_home,
             cargo_version: "cargo-test".into(),
             rustc: "/usr/bin/true".into(),
             rustc_version: "rustc-test".into(),
@@ -927,5 +957,62 @@ mod linked_project_tests {
                 .status(serde_json::json!({"health": "unknown"}))
                 .is_err()
         );
+    }
+
+    /// A host that substitutes `HOME` (an empty `.cargo`, as `agent-run` runtimes ship) must not
+    /// move the server environment: `HOME`/`CARGO_HOME` resolve from the real operator home —
+    /// exactly the derivation the confined project check performs through the shared
+    /// the shared `crate::home` helpers helpers — and a declared cargo home override wins for the server too.
+    #[test]
+    fn server_environment_resolves_home_and_cargo_home_like_the_project_check() {
+        let root = scratch("cargo-home");
+        let hostile = root.join("hostile-home");
+        let real = root.join("real-home");
+        std::fs::create_dir_all(hostile.join(".cargo")).unwrap();
+        std::fs::create_dir_all(real.join(".cargo")).unwrap();
+        let previous_override = std::env::var_os(agent_ide_core::userhome::HOME_OVERRIDE_ENV);
+        let previous_home = std::env::var_os("HOME");
+        // SAFETY: this workspace gate runs with --test-threads=1 and this test restores both
+        // variables; nothing else in this test binary reads them meanwhile.
+        unsafe {
+            std::env::set_var("HOME", &hostile);
+            std::env::set_var(agent_ide_core::userhome::HOME_OVERRIDE_ENV, &real);
+        }
+        let expected_cargo_home =
+            crate::home::effective_cargo_home(None, &crate::home::real_home());
+        // The derived server environment, exactly as a spawn would hand it to rust-analyzer.
+        let environment = session_profile("cache-priming-disabled-v1").environment();
+        assert_eq!(
+            environment.get(OsStr::new("HOME")),
+            Some(&OsString::from(&real))
+        );
+        assert_eq!(
+            environment.get(OsStr::new("CARGO_HOME")),
+            Some(&OsString::from(&expected_cargo_home))
+        );
+        // A declared cargo home override wins for the server environment, as for the check.
+        let configured = session_profile_with_cargo_home(
+            "cache-priming-disabled-v1",
+            Some(hostile.join("configured-cargo")),
+        )
+        .environment();
+        assert_eq!(
+            configured.get(OsStr::new("CARGO_HOME")),
+            Some(&OsString::from(hostile.join("configured-cargo")))
+        );
+        // SAFETY: restoring the exact pre-test environment for the remaining checks.
+        unsafe {
+            match previous_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match previous_override {
+                Some(value) => {
+                    std::env::set_var(agent_ide_core::userhome::HOME_OVERRIDE_ENV, value)
+                }
+                None => std::env::remove_var(agent_ide_core::userhome::HOME_OVERRIDE_ENV),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
