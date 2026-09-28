@@ -332,6 +332,9 @@ impl Worker<'_> {
             if callers_depth > 0 {
                 card.callers_note = Some(format!("unavailable ({language} has no call hierarchy)"));
             }
+            if callees_depth > 0 {
+                card.callees_note = Some(format!("unavailable ({language} has no call hierarchy)"));
+            }
         } else {
             let byte_offset = name_offset(source, &found)?;
             let live = self.live_session_for(job, &observed).await?;
@@ -356,7 +359,13 @@ impl Worker<'_> {
                     .await
                     .map_err(|_| FailureCode::ProviderUnavailable)?;
                 card.usages = self
-                    .usage_lines(&worktree_root, &found.path, found.body.start, references)
+                    .usage_lines(
+                        job,
+                        &worktree_root,
+                        &found.path,
+                        found.body.start,
+                        references,
+                    )
                     .await;
                 // Some servers answer references with an empty list when nothing names the symbol
                 // explicitly (a constructor is only ever called through its class); that zero
@@ -381,35 +390,59 @@ impl Worker<'_> {
                         "unavailable ({} has no call hierarchy)",
                         server.name()
                     ));
-                } else if let Ok(calls) = self
-                    .live_session_for(job, &observed)
-                    .await?
-                    .session
-                    .incoming_calls(&observed, &bytes, byte_offset)
-                    .await
-                {
-                    for call in calls {
-                        card.callers.push(Call {
-                            name: self.call_symbol_path(job, &worktree_root, &call.from).await,
-                            file: render::display_path(&worktree_root, &call.from.uri),
-                            line: call.from.selection_range.start.line + 1,
-                        });
+                } else {
+                    // A failed incoming-call request is stated, never silently omitted; an
+                    // answered empty list stays absent exactly as before.
+                    match self
+                        .live_session_for(job, &observed)
+                        .await?
+                        .session
+                        .incoming_calls(&observed, &bytes, byte_offset)
+                        .await
+                    {
+                        Ok(calls) => {
+                            for call in calls {
+                                card.callers.push(Call {
+                                    name: self
+                                        .call_symbol_path(job, &worktree_root, &call.from)
+                                        .await,
+                                    file: render::display_path(&worktree_root, &call.from.uri),
+                                    line: call.from.selection_range.start.line + 1,
+                                });
+                            }
+                        }
+                        Err(_) => {
+                            card.callers_note =
+                                Some("unavailable (call hierarchy request failed)".to_owned());
+                        }
                     }
                 }
             }
             if callees_depth > 0 {
                 let live = self.live_session_for(job, &observed).await?;
-                if let Ok(calls) = live
+                // A requested callees section always answers: a failed request states
+                // unavailability and an answered empty list reports zero, so the card never
+                // omits what was asked for without saying why.
+                match live
                     .session
                     .outgoing_calls(&observed, &bytes, byte_offset)
                     .await
                 {
-                    for call in calls {
-                        card.callees.push(Call {
-                            name: self.call_symbol_path(job, &worktree_root, &call.to).await,
-                            file: render::display_path(&worktree_root, &call.to.uri),
-                            line: call.to.selection_range.start.line + 1,
-                        });
+                    Ok(calls) => {
+                        for call in &calls {
+                            card.callees.push(Call {
+                                name: self.call_symbol_path(job, &worktree_root, &call.to).await,
+                                file: render::display_path(&worktree_root, &call.to.uri),
+                                line: call.to.selection_range.start.line + 1,
+                            });
+                        }
+                        if calls.is_empty() {
+                            card.callees_note = Some("0".to_owned());
+                        }
+                    }
+                    Err(_) => {
+                        card.callees_note =
+                            Some("unavailable (call hierarchy request failed)".to_owned());
                     }
                 }
             }
@@ -1060,8 +1093,13 @@ impl Worker<'_> {
     }
 
     /// Usage lines for reference locations: relative path, line, trimmed text, test flag.
+    ///
+    /// A usage is a test when its file is one by the language's test-file conventions or when the
+    /// file's outline places it inside a test symbol (an inline `#[cfg(test)] mod tests`), the
+    /// same classification callers and graphs use; one outline per file answers every row.
     async fn usage_lines(
         &mut self,
+        job: &mut Job,
         worktree_root: &Path,
         definition: &SymbolPath,
         definition_line: u32,
@@ -1069,6 +1107,10 @@ impl Worker<'_> {
     ) -> Vec<Usage> {
         let mut cache: std::collections::BTreeMap<std::path::PathBuf, String> =
             std::collections::BTreeMap::new();
+        let mut outlines: std::collections::HashMap<std::path::PathBuf, Option<Outline>> =
+            std::collections::HashMap::new();
+        let binding = job.invocation.binding_ref().clone();
+        let authority = self.authority(&binding).await.ok();
         let mut usages = Vec::new();
         for location in references {
             let Ok(absolute) = location.uri.to_file_path() else {
@@ -1092,8 +1134,26 @@ impl Worker<'_> {
                     text
                 }
             };
-            let is_test = Lang::for_path(&relative)
+            let mut is_test = Lang::for_path(&relative)
                 .is_some_and(|language| language.support().is_test_file(&relative));
+            if !is_test
+                && authority.is_some()
+                && !outlines.contains_key(&relative)
+                && let Some(authority) = authority.as_ref()
+            {
+                let outline = self
+                    .scanned_outline(job, authority, &relative)
+                    .await
+                    .map(|(outline, _)| outline);
+                outlines.insert(relative.clone(), outline);
+            }
+            if !is_test {
+                is_test = outlines.get(&relative).is_some_and(|outline| {
+                    outline
+                        .as_ref()
+                        .is_some_and(|outline| inside_test(outline, line))
+                });
+            }
             usages.push(Usage {
                 file: relative.display().to_string(),
                 line,
@@ -1241,6 +1301,9 @@ fn is_declaration_line(line: &str) -> bool {
 /// Name leaves one graph node lists.
 const MAX_LINK_LEAVES: usize = 10;
 
+/// Files a rename reply names inline before counting the rest as `+N more`.
+const RENAME_SUMMARY_FILES: usize = 5;
+
 /// The innermost symbol of `outline` holding `line`.
 pub(super) fn innermost(outline: &Outline, line: u32) -> Option<&lang::Symbol> {
     let mut found: Option<&lang::Symbol> = None;
@@ -1255,6 +1318,26 @@ pub(super) fn innermost(outline: &Outline, line: u32) -> Option<&lang::Symbol> {
         });
     }
     found
+}
+
+/// Whether the outline places 1-based `line` inside a test symbol at any nesting — a test module
+/// or a test itself — the same classification callers and graphs use, so a reference from inside
+/// an inline test module counts as a test wherever the file itself is not a test file.
+pub(super) fn inside_test(outline: &Outline, line: u32) -> bool {
+    let mut level: &[lang::Symbol] = &outline.symbols;
+    loop {
+        let Some(found) = level
+            .iter()
+            .filter(|symbol| symbol.range.start <= line && line <= symbol.range.end)
+            .min_by_key(|symbol| symbol.range.len())
+        else {
+            return false;
+        };
+        if found.kind == lang::SymbolKind::Test {
+            return true;
+        }
+        level = &found.children;
+    }
 }
 
 /// Candidates an ambiguity reply prints before the rest moves behind its `detail_ref`.
@@ -1474,6 +1557,7 @@ impl Worker<'_> {
                                 },
                                 diagnostics: EditDiagnostics::Unknown {},
                                 note: None,
+                                operation: None,
                             },
                             authority,
                             None,
@@ -1533,6 +1617,8 @@ impl Worker<'_> {
                         result,
                         diagnostics: EditDiagnostics::Unknown {},
                         note: None,
+
+                        operation: None,
                     },
                     authority,
                     None,
@@ -1540,7 +1626,8 @@ impl Worker<'_> {
             }
             Err(_) => return Err(FailureCode::Internal),
         };
-        self.edit_with_source(job, request, prepared, base).await
+        self.edit_with_source(job, request, prepared, base, true)
+            .await
     }
 
     /// Runs the project's stdin formatter over a candidate text; the candidate is returned
@@ -1645,9 +1732,8 @@ impl Worker<'_> {
             job.failure_detail = Some(grouped.unsupported.join(", "));
             return Err(FailureCode::ProviderUnavailable);
         }
-        let mut summary = Vec::new();
-        let mut written = 0usize;
-        let mut last: Option<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>)> = None;
+        let mut summary: Vec<(String, usize)> = Vec::new();
+        let mut last: Option<(PeerReply, Option<SourceObservation>)> = None;
         for (index, file_edits) in grouped.files.iter().enumerate() {
             let Ok(absolute) = file_edits.uri.to_file_path() else {
                 continue;
@@ -1671,40 +1757,63 @@ impl Worker<'_> {
                 Ok(PrepareAdmission::Prepared(prepared)) => prepared,
                 _ => return Err(FailureCode::Internal),
             };
-            let outcome = self
-                .edit_with_source(job, request, prepared, observed)
+            // Never await the project check per file: a parked rename would resume as one
+            // file's plain edit reply with the remaining files unwritten.
+            let (outcome, _, source) = self
+                .edit_with_source(job, request, prepared, observed, false)
                 .await?;
-            if let PeerReply::Edit { result, .. } = &outcome.0 {
-                summary.push(format!(
-                    "{} ({}, {:?})",
-                    relative.display(),
-                    file_edits.edits.len(),
-                    result.outcome
-                ));
-                written += 1;
+            if let PeerReply::Edit { .. } = &outcome {
+                summary.push((relative.display().to_string(), file_edits.edits.len()));
             }
-            last = Some(outcome);
+            last = Some((outcome, source));
+        }
+        // One rename answers once, as an edit reply the Edit tool accepts: the operation word
+        // names the rename, the note lists every touched file with its site count, bounded like
+        // every other list, and the diagnostics are the last written file's.
+        let Some((
+            PeerReply::Edit {
+                result,
+                diagnostics,
+                ..
+            },
+            source,
+        )) = last
+        else {
+            job.failure_detail = Some("edit:rename_no_edits".to_owned());
+            return Err(FailureCode::ProviderUnavailable);
+        };
+        let sites: usize = summary.iter().map(|(_, count)| count).sum();
+        let mut note = format!(
+            "renamed {} → {new_name}; {sites} sites in {} files",
+            found.name,
+            summary.len()
+        );
+        if !summary.is_empty() {
+            note.push_str(": ");
+            note.push_str(
+                &summary
+                    .iter()
+                    .take(RENAME_SUMMARY_FILES)
+                    .map(|(file, count)| format!("{file} ({count})"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            let hidden = summary.len().saturating_sub(RENAME_SUMMARY_FILES);
+            if hidden > 0 {
+                note.push_str(&format!("; +{hidden} more"));
+            }
         }
         let authority = self.authority(&binding).await?;
-        let mut text = format!(
-            "rename: {} → {new_name}; {} edits in {written} files\n",
-            found.name,
-            grouped
-                .files
-                .iter()
-                .map(|file| file.edits.len())
-                .sum::<usize>()
-        );
-        for line in summary.iter().take(30) {
-            text.push_str(&format!("  {line}\n"));
-        }
-        if let Some((PeerReply::Edit { diagnostics, .. }, _, _)) = &last {
-            text.push_str(&format!("diagnostics (last file): {diagnostics:?}\n"));
-        }
-        let (reply, page) =
-            ContextPageState::new(text, 0, false, ResultKind::Symbol).next(&job.reference)?;
-        self.shared.set_context_page(&job.reference, page);
-        Ok((reply, Some(authority), last.and_then(|outcome| outcome.2)))
+        Ok((
+            PeerReply::Edit {
+                result,
+                diagnostics,
+                note: Some(note),
+                operation: Some("renamed".to_owned()),
+            },
+            Some(authority),
+            source,
+        ))
     }
 }
 

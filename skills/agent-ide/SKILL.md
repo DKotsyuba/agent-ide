@@ -73,7 +73,8 @@ which the reply says `unknown` and `ide.context` shows the result when it lands.
   impl, class or module); indentation follows the neighbours.
 - `ide.edit {"operation_id":"…","op":"delete","symbol":"…"}` — removes the symbol with its header.
 - `ide.edit {"operation_id":"…","op":"rename","symbol":"…","new_name":"…"}` — project-wide rename
-  by the language server; the reply lists every touched file.
+  by the language server; the reply reads `edit: renamed` and its second line lists every touched
+  file with its site count.
 - `ide.edit {"operation_id":"…","path":"src/x.rs","lines":"120-180","source_ref":"…","content":"…"}` —
   replaces a line range when the target is not a symbol (imports, constants, configuration).
   `source_ref` is required: the `ide.read` the lines came from. The edit is refused
@@ -107,7 +108,8 @@ the language server is still loading the workspace: repeat the same call in a fe
    and its Context contract is satisfied. Native host editing — the model's own
    file-edit tool (Claude's editor, Codex `apply_patch`, etc.) — remains available
    whenever `ide.edit` is inactive, unavailable, unsupported, declined, or uncertain.
-4. After a known `ide.edit` outcome (`created`, `replaced`, `unchanged`), follow
+4. After a known `ide.edit` outcome (`created`, `replaced`, `unchanged`; the first line
+   names the operation instead when it was an insert, delete or rename), follow
    its closed diagnostic state: `current_reported` → `ide.edit` with the
    returned `source_ref`; `current_clean` → `ide.diff`; `unknown` diagnostics
    → `ide.context`. A pending diagnostic still requires `ide.inspect` with its

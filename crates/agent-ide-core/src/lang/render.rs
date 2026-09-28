@@ -631,6 +631,10 @@ pub struct SymbolCard {
     /// hierarchy (`unavailable (<server> has no call hierarchy)`).
     pub callers_note: Option<String>,
     pub callers: Vec<Call>,
+    /// Printed in place of an empty callees list when callees were requested: `unavailable
+    /// (<reason>)` for a failed request, or `0` when the server legitimately answered none.
+    /// A requested section is never silently omitted.
+    pub callees_note: Option<String>,
     pub callees: Vec<Call>,
     /// Short sha, date and subject of recent commits touching the definition.
     pub history: Vec<String>,
@@ -753,7 +757,14 @@ pub fn symbol_card_text(card: &SymbolCard) -> String {
     } else {
         render_calls(&mut out, "callers", &card.callers);
     }
-    render_calls(&mut out, "callees", &card.callees);
+    if card.callees_note.is_some() && card.callees.is_empty() {
+        out.push_str(&format!(
+            "callees: {}\n",
+            card.callees_note.as_deref().unwrap_or_default()
+        ));
+    } else {
+        render_calls(&mut out, "callees", &card.callees);
+    }
     if !card.history.is_empty() {
         out.push_str(&format!(
             "history: {} last commits touching the definition\n",
@@ -1020,6 +1031,36 @@ mod tests {
         let text = symbol_card_text(&card);
         assert!(
             text.contains("callers: 1\n  main.py#caller  main.py:8\n"),
+            "{text}"
+        );
+    }
+
+    /// A requested callees section always answers: the note states a failed request or an
+    /// explicitly answered zero, and never suppresses a real list.
+    #[test]
+    fn symbol_card_never_omits_a_requested_callees_section() {
+        let mut card = SymbolCard {
+            heading: "work — method, a.rs#Service/work (lines 4–5)".into(),
+            callees_note: Some("unavailable (call hierarchy request failed)".into()),
+            ..Default::default()
+        };
+        let text = symbol_card_text(&card);
+        assert!(
+            text.contains("callees: unavailable (call hierarchy request failed)\n"),
+            "{text}"
+        );
+        card.callees_note = Some("0".into());
+        let text = symbol_card_text(&card);
+        assert!(text.contains("callees: 0\n"), "{text}");
+        // A note never suppresses a real callees list.
+        card.callees.push(Call {
+            name: "a.rs#Service/helper".into(),
+            file: "a.rs".into(),
+            line: 6,
+        });
+        let text = symbol_card_text(&card);
+        assert!(
+            text.contains("callees: 1\n  a.rs#Service/helper  a.rs:6\n"),
             "{text}"
         );
     }

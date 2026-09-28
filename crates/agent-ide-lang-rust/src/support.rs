@@ -83,7 +83,13 @@ impl LanguageSupport for RustSupport {
         }
 
         let mut commands = ProjectCommands::default();
+        let root_package = toml_string(&manifest, "name");
         for argv in ci_cargo_commands(root) {
+            // A CI line that builds only a member other than the root package (a helper such
+            // as `xtask`) is not the project's build; the slot falls through to the defaults.
+            if selects_foreign_package(&argv, root_package.as_deref()) {
+                continue;
+            }
             let slot = match argv
                 .iter()
                 .find(|arg| !arg.starts_with('+') && *arg != "cargo")
@@ -855,6 +861,29 @@ fn ci_cargo_commands(root: &Path) -> Vec<Vec<String>> {
     commands
 }
 
+/// Whether a CI cargo command restricts itself to packages other than the root package (a
+/// workspace helper member such as `xtask`): such a line builds the helper, not the project.
+/// A command without a package selection, one naming the root package among its selection, and
+/// every command under a virtual workspace root (no root package to compare with) are kept.
+fn selects_foreign_package(argv: &[String], root_package: Option<&str>) -> bool {
+    let Some(root) = root_package else {
+        return false;
+    };
+    let mut selected: Vec<&str> = Vec::new();
+    let mut tokens = argv.iter().map(String::as_str);
+    while let Some(token) = tokens.next() {
+        let name = if token == "-p" || token == "--package" {
+            tokens.next()
+        } else {
+            token.strip_prefix("--package=")
+        };
+        if let Some(name) = name {
+            selected.push(name);
+        }
+    }
+    !selected.is_empty() && !selected.contains(&root)
+}
+
 /// `(target, program)` pairs for the `build`/`check`/`test`/`lint`/`fmt` targets defined in
 /// `Makefile` (`make`) and then `justfile`/`Justfile` (`just`): a line starting at column 0 with
 /// the target name followed by `:` (and not `:=`), or for just a recipe with parameters.
@@ -1354,6 +1383,68 @@ mod tests {
         let compile_error = RustSupport.parse_test_output("", "error[E0425]: cannot find value\n");
         assert!(compile_error.incomplete);
         assert_eq!(compile_error.passed + compile_error.failed, 0);
+    }
+
+    /// A workspace whose only CI `cargo build` line builds a helper member (`-p xtask`, the
+    /// agent-worktree shape) must not present the helper as the project build: the slot falls
+    /// through to the Cargo default, while a line naming the root package stays CI-sourced.
+    #[test]
+    fn detect_skips_ci_lines_that_build_a_foreign_member() {
+        let root =
+            std::env::temp_dir().join(format!("agent-ide-lang-rust-xtask-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("xtask/src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"xtask\"]\ndefault-members = [\".\"]\n\n[package]\nname = \"agent-worktree\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "").unwrap();
+        fs::write(
+            root.join("xtask/Cargo.toml"),
+            "[package]\nname = \"xtask\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".github/workflows/release.yml"),
+            "jobs:\n  publish:\n    steps:\n      - name: Build only tooling\n        run: |\n          cargo fetch --locked\n          cargo build --frozen -p xtask\n",
+        )
+        .unwrap();
+        let project = RustSupport.detect(&root).unwrap();
+        let build = project.commands.build.as_ref().unwrap();
+        assert_eq!(
+            (build.argv.join(" "), build.source),
+            ("cargo build".to_owned(), CommandSource::Manifest),
+            "the xtask helper line must not become the project build"
+        );
+        let _ = fs::remove_dir_all(&root);
+
+        // A CI line naming the root package (alone or beside others) is the project's own.
+        let root = std::env::temp_dir().join(format!(
+            "agent-ide-lang-rust-root-pkg-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".github/workflows/ci.yml"),
+            "jobs:\n  build:\n    steps:\n      - run: cargo build --release -p app\n",
+        )
+        .unwrap();
+        let project = RustSupport.detect(&root).unwrap();
+        let build = project.commands.build.as_ref().unwrap();
+        assert_eq!(
+            (build.argv.join(" "), build.source),
+            ("cargo build --release -p app".to_owned(), CommandSource::Ci)
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

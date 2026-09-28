@@ -375,7 +375,9 @@ fn assert_compact_envelope(reply: &Value) {
     }
     if kind == Some("edit") {
         let outcome = structured["result"]["outcome"].as_str().unwrap();
-        assert!(text.starts_with(&format!("edit: {outcome}")), "{reply}");
+        // An operation word (inserted, deleted, renamed) replaces the durable outcome word.
+        let word = structured["operation"].as_str().unwrap_or(outcome);
+        assert!(text.starts_with(&format!("edit: {word}")), "{reply}");
     }
     assert_eq!(
         result.get("isError") == Some(&json!(true)),
@@ -441,9 +443,13 @@ fn claude_fields(text: &str) -> Value {
     }
     if let Some(rest) = text.strip_prefix("edit: ") {
         let outcome = token(rest);
-        let source_ref = matches!(outcome, "created" | "replaced" | "unchanged")
-            .then(|| after(rest, "source_ref "))
-            .flatten();
+        // Operation words (inserted, deleted, renamed) name the same settled-write states.
+        let source_ref = matches!(
+            outcome,
+            "created" | "replaced" | "unchanged" | "inserted" | "deleted" | "renamed"
+        )
+        .then(|| after(rest, "source_ref "))
+        .flatten();
         return json!({
             "state":"edit",
             "result":{"outcome":outcome,"source_ref":source_ref},
@@ -5722,6 +5728,161 @@ async fn configured_product_graph_traverses_live_calls_with_bounds() {
     assert!(callees_text.contains("#c"), "{callees_text}");
     // Struct and enum construction is not a call: non-callables never become nodes.
     assert!(!callees_text.contains("Unit"), "{callees_text}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A source file whose inline `#[cfg(test)] mod tests` references `a` both from a helper and from
+/// a test: the card's src/tests split must classify those rows as tests, as callers already do.
+#[tokio::test]
+async fn configured_product_symbol_usages_split_counts_inline_test_module() {
+    let fixture = symbol_test_fixture();
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "pub fn a() {}\npub fn c() { a(); }\n#[cfg(test)]\nmod tests {\n    fn shared() { super::a(); }\n    #[test]\n    fn reaches_a() {\n        super::a();\n    }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.root.join("tests/path_tests.rs"), "").unwrap();
+    fixture.git(&["add", "--", "src/lib.rs", "tests/path_tests.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "inline test module fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "inline-tests").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"inline-tests-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let card = actor
+        .call(
+            &fixture,
+            "ide.symbol",
+            json!({"symbol":"src/lib.rs#a", "callers":0}),
+        )
+        .await;
+    let card = actor.settle(&fixture, card).await;
+    assert_eq!(card["kind"], "symbol", "{card}");
+    let text = card["text"].as_str().unwrap();
+    assert!(
+        text.contains("usages: 3 in 1 files (src 1, tests 2)\n"),
+        "the inline test module's rows must count as tests: {text}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A requested callees section always answers: the method's callee is listed, and a function
+/// that calls nothing reports `callees: 0` instead of omitting the section without a word.
+#[tokio::test]
+async fn configured_product_symbol_card_answers_requested_callees() {
+    let fixture = symbol_test_fixture();
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "pub struct Service;\nimpl Service {\n    pub fn work(&self) -> bool { Self::helper() }\n    fn helper() -> bool { true }\n}\npub fn idle() {}\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.root.join("tests/path_tests.rs"), "").unwrap();
+    fixture.git(&["add", "--", "src/lib.rs", "tests/path_tests.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "callees fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "callees").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"callees-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let card = async |actor: &mut ProductActor, symbol: &str| {
+        let reply = actor
+            .call(
+                &fixture,
+                "ide.symbol",
+                json!({"symbol":symbol, "usages":false, "callers":0, "callees":2}),
+            )
+            .await;
+        actor.settle(&fixture, reply).await
+    };
+    let work = card(&mut actor, "src/lib.rs#Service/work").await;
+    let work_text = work["text"].as_str().unwrap_or_default();
+    assert!(
+        work_text.contains("callees: 1\n  src/lib.rs#Service/helper  src/lib.rs:4\n"),
+        "the method's callee must be listed: {work_text}"
+    );
+    let idle = card(&mut actor, "src/lib.rs#idle").await;
+    let idle_text = idle["text"].as_str().unwrap_or_default();
+    assert!(
+        idle_text.contains("callees: 0\n"),
+        "an answered zero must be stated, not omitted: {idle_text}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// The symbol edit replies name their operation — `edit: inserted`, `edit: deleted` — and a
+/// rename answers once with `edit: renamed` plus a note listing every touched file with its
+/// site count, instead of one file's plain `edit: replaced`.
+#[tokio::test]
+async fn configured_product_edit_replies_name_their_operation() {
+    let fixture = symbol_test_fixture();
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "pub struct Service;\nimpl Service {\n    pub fn work(&self) -> bool { Self::helper() }\n    fn helper() -> bool { true }\n}\npub fn user() { let _ = Service.work(); }\n#[cfg(test)]\nmod tests {\n    use super::Service;\n    #[test]\n    fn works() {\n        let service = Service;\n        assert!(service.work());\n    }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.root.join("tests/path_tests.rs"), "").unwrap();
+    fixture.git(&["add", "--", "src/lib.rs", "tests/path_tests.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "edit operation fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "edit-ops").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"edit-ops-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    // Warm the analyzer session first, exactly as the workflow's outline call would.
+    let warmup = actor
+        .call(&fixture, "ide.outline", json!({"path":"src/lib.rs"}))
+        .await;
+    assert_eq!(actor.settle(&fixture, warmup).await["kind"], "outline");
+    let mut edit = async |params: Value| {
+        let reply = actor.call(&fixture, "ide.edit", params).await;
+        actor.settle(&fixture, reply).await
+    };
+    let insert = edit(json!({"operation_id":"ops-insert","op":"insert","symbol":"src/lib.rs#user","where":"after","content":"pub fn added() -> bool { true }"})).await;
+    assert_eq!(insert["state"], "edit", "{insert}");
+    assert_eq!(insert["operation"], "inserted", "{insert}");
+    assert_eq!(insert["result"]["outcome"], "replaced", "{insert}");
+    let rename = edit(json!({"operation_id":"ops-rename","op":"rename","symbol":"src/lib.rs#Service/work","new_name":"operate"})).await;
+    assert_eq!(rename["state"], "edit", "{rename}");
+    assert_eq!(rename["operation"], "renamed", "{rename}");
+    let note = rename["note"].as_str().unwrap_or_default();
+    assert!(
+        note.starts_with("renamed work → operate; "),
+        "the rename must summarize its sites per file: {rename}"
+    );
+    assert!(
+        note.contains(" sites in 1 files: src/lib.rs ("),
+        "the rename must list its sites per file: {rename}"
+    );
+    let delete = edit(
+        json!({"operation_id":"ops-delete","op":"delete","symbol":"src/lib.rs#Service/operate"}),
+    )
+    .await;
+    assert_eq!(delete["state"], "edit", "{delete}");
+    assert_eq!(delete["operation"], "deleted", "{delete}");
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();

@@ -614,6 +614,7 @@ mod tests {
                 truncated: false,
             },
             note: None,
+            operation: None,
         };
         tool_reply(
             &telemetry,

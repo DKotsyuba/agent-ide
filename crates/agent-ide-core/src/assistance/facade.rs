@@ -1065,7 +1065,8 @@ pub enum FacadeOutcome {
     /// IPC accepted the envelope but no typed peer result was available for safe rendering.
     Incomplete,
     /// Typed peer result accepted from the daemon, with its optional carried status plate (T28B).
-    Reply(PeerReply, Option<String>),
+    /// Boxed so the rare large reply does not size every outcome.
+    Reply(Box<PeerReply>, Option<String>),
 }
 
 /// Owns one local facade endpoint and the finite limits for every connect-only dispatch.
@@ -1170,17 +1171,17 @@ impl AssistanceFacade {
                         | PeerReply::Error { .. }
                         | PeerReply::InvalidParameters { .. }),
                         status,
-                    )) => FacadeOutcome::Reply(reply, status),
+                    )) => FacadeOutcome::Reply(Box::new(reply), status),
                     Some((reply @ PeerReply::Edit { .. }, status))
                         if matches!(tool, AssistanceTool::Edit | AssistanceTool::Inspect) =>
                     {
-                        FacadeOutcome::Reply(reply, status)
+                        FacadeOutcome::Reply(Box::new(reply), status)
                     }
                     Some((reply @ PeerReply::Complete { kind, .. }, status))
                         if tool == AssistanceTool::Inspect
                             || tool_accepts_result_kind(tool, kind) =>
                     {
-                        FacadeOutcome::Reply(reply, status)
+                        FacadeOutcome::Reply(Box::new(reply), status)
                     }
                     _ => FacadeOutcome::Incomplete,
                 }
@@ -1930,10 +1931,10 @@ impl StdioFacade {
                     let cause = bound.map(|bound| HostBindingCause::project_moved(&bound, root));
                     return (
                         FacadeOutcome::Reply(
-                            PeerReply::Unavailable {
+                            Box::new(PeerReply::Unavailable {
                                 reason: MissingPeer::HostBinding,
                                 cause,
-                            },
+                            }),
                             None,
                         ),
                         resume,
@@ -2055,13 +2056,7 @@ impl StdioFacade {
                 "claudecode/toolUseId": call,
                 "claudecode/reactivation": true,
             }));
-            if let FacadeOutcome::Reply(
-                PeerReply::Complete {
-                    kind: ResultKind::Activation,
-                    ..
-                },
-                _,
-            ) = self
+            if let FacadeOutcome::Reply(reply, _) = self
                 .facade
                 .dispatch_at(
                     runtime_dir,
@@ -2070,6 +2065,13 @@ impl StdioFacade {
                     parameters.clone(),
                 )
                 .await
+                && matches!(
+                    reply.as_ref(),
+                    PeerReply::Complete {
+                        kind: ResultKind::Activation,
+                        ..
+                    }
+                )
             {
                 reconnect.mark_activated();
                 return;
@@ -2141,7 +2143,7 @@ impl StdioFacade {
         // the derived `<tool>:<reason>` default — the same tag the daemon journal records.
         let outcome = match outcome {
             FacadeOutcome::Reply(mut reply, status) => {
-                if let PeerReply::Error { code, detail } = &mut reply
+                if let PeerReply::Error { code, detail } = reply.as_mut()
                     && detail.is_none()
                 {
                     *detail = Some(staged_detail(tool, code, &stage_parameters));
@@ -2152,13 +2154,14 @@ impl StdioFacade {
         };
         // Remember every successful activation: its id and root are what a transparent
         // re-activation replays after a daemon replacement (T15B restart recovery).
-        if let FacadeOutcome::Reply(
-            PeerReply::Complete {
-                kind: ResultKind::Activation,
-                ..
-            },
-            _,
-        ) = &outcome
+        if let FacadeOutcome::Reply(reply, _) = &outcome
+            && matches!(
+                reply.as_ref(),
+                PeerReply::Complete {
+                    kind: ResultKind::Activation,
+                    ..
+                }
+            )
             && let Some(reconnect) = &self.reconnect
             && let Some(activation_id) = stage_parameters
                 .get("activation_id")
@@ -2180,7 +2183,7 @@ impl StdioFacade {
             FacadeOutcome::Reply(reply, status)
                 if tool == AssistanceTool::Stop
                     && matches!(
-                        reply,
+                        reply.as_ref(),
                         PeerReply::Unavailable {
                             reason: MissingPeer::HostBinding,
                             ..
@@ -2190,13 +2193,13 @@ impl StdioFacade {
             {
                 self.forget_remembered_activation().await;
                 FacadeOutcome::Reply(
-                    PeerReply::Complete {
+                    Box::new(PeerReply::Complete {
                         kind: ResultKind::Stop,
                         text: "stopped (the IDE had already restarted)".into(),
                         detail_ref: None,
                         truncated: false,
                         continuation: false,
-                    },
+                    }),
                     status,
                 )
             }
@@ -2212,7 +2215,7 @@ impl StdioFacade {
                 return note_replaced_references(
                     render_reply_after_reconnect(
                         tool,
-                        reply,
+                        *reply,
                         status.as_deref(),
                         envelope,
                         resume == Resume::Rerooted,
@@ -2223,7 +2226,7 @@ impl StdioFacade {
             FacadeOutcome::Reply(reply, status) => {
                 let note = self.references_predate_replacement(&reply).await;
                 return note_replaced_references(
-                    render_reply_with_status(reply, status.as_deref(), envelope),
+                    render_reply_with_status(*reply, status.as_deref(), envelope),
                     note,
                 );
             }
