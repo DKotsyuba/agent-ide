@@ -60,7 +60,9 @@ mod language_free {
     /// Language and language-server names the core must never mention, assembled from pieces so
     /// this file does not trip its own scan. Matched case-insensitively as whole words, so
     /// hyphenated server names such as `<language>-analyzer` are caught by the language name.
-    const NAMES: [&str; 8] = [
+    /// The web languages are listed ahead of their crates. `less` cannot be listed: it is an
+    /// English word the core's prose uses.
+    const NAMES: [&str; 14] = [
         concat!("ru", "st"),
         concat!("pyth", "on"),
         concat!("type", "script"),
@@ -69,6 +71,12 @@ mod language_free {
         concat!("py", "right"),
         concat!("ts", "server"),
         concat!("go", "pls"),
+        concat!("ht", "ml"),
+        concat!("c", "ss"),
+        concat!("sc", "ss"),
+        concat!("sa", "ss"),
+        concat!("ts", "x"),
+        concat!("js", "x"),
     ];
 
     /// The capitalized language name matched case-sensitively (the lowercase word is English).

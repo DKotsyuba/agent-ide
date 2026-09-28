@@ -4,7 +4,7 @@
 //! from, plus the deterministic compact page text. The source never runs a check; it only
 //! reports the latest completed snapshots for one authorized worktree, and every rendered
 //! textual field is treated as untrusted checker output: single line, control characters
-//! stripped, never interpreted as markdown or HTML.
+//! stripped, never interpreted as markdown or markup.
 //!
 //! [`ProjectProblemFeed`](crate::assistance::problems::ProjectProblemFeed) is the daemon-owned
 //! wiring behind that seam: it admits bound worktrees against the allowed roots, forwards
