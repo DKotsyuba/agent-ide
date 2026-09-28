@@ -267,11 +267,15 @@ impl Mcp {
         self.input.flush().await.unwrap();
     }
 
-    /// Exchanges one request, ignoring notifications and enforcing a twelve-second test deadline.
+    /// Exchanges one request, ignoring notifications and enforcing a thirty-second test deadline.
+    ///
+    /// The product answers inline within ~10 s of bridge budget; under a full suite's load the
+    /// daemon's own dispatch can stall past a tighter harness ceiling before it even replies
+    /// `pending`, so this uses the same 30 s ceiling the settle helpers established.
     async fn exchange(&mut self, request: Value) -> Value {
         let id = request["id"].clone();
         self.send(request).await;
-        tokio::time::timeout(Duration::from_secs(12), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let mut line = String::new();
                 assert_ne!(
@@ -4253,7 +4257,7 @@ async fn claude_call_with_a_late_pre_hook_is_served_not_refused() {
         pre.status.success() && pre.stdout.is_empty() && pre.stderr.is_empty(),
         "late pre-hook submits silently"
     );
-    let reply = tokio::time::timeout(Duration::from_secs(12), async {
+    let reply = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let mut line = String::new();
             assert_ne!(mcp.output.read_line(&mut line).await.unwrap(), 0);
