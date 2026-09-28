@@ -4549,6 +4549,42 @@ async fn claude_context_pages_survive_native_posts_but_not_real_edits() {
     daemon.wait().await.unwrap();
 }
 
+/// An untracked symlink to a directory outside the worktree does not refuse the whole diff: the
+/// entry stays a listed name — never read, its target never disclosed — and the diff completes.
+#[tokio::test]
+async fn a_diff_with_an_untracked_symlink_lists_it_and_still_completes() {
+    let fixture = ProductFixture::new(json!([]));
+    std::os::unix::fs::symlink(
+        fixture.base.join("outside-node-modules"),
+        fixture.root.join("node_modules"),
+    )
+    .unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "symlink-diff").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"symlink-diff"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let diff = actor
+        .call(&fixture, "ide.diff", json!({"mode":"unstaged"}))
+        .await;
+    let diff = actor.settle(&fixture, diff).await;
+    assert_eq!(diff["kind"], "diff", "{diff}");
+    let text = diff["text"].as_str().unwrap();
+    assert!(
+        text.contains("node_modules") && !text.contains("outside-node-modules"),
+        "the entry is listed by name only, its target never disclosed: {text}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A pending edit is collectible: when its project check outlasts the inline wait, the edit
 /// answers `pending` and `ide.inspect` later returns the settled edit reply — never the silent
 /// `inspect:internal` a byte-overlong diagnostic message used to turn the whole detail into.

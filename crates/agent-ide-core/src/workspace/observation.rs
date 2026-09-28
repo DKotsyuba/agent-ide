@@ -640,13 +640,6 @@ pub(super) fn directory_identity(
 
 /// Classifies one registered raw path without reading content, blocking on a FIFO, or following symlinks.
 /// Uses the same root-identity and component checks as source reads; only a regular file succeeds.
-pub(super) fn inspect_authorized_source_kind(
-    worktree: &WorktreeRef,
-    path: &Path,
-) -> Result<(), ObservationError> {
-    open_authorized_regular_file(worktree, path, MAX_SOURCE_PATH_BYTES).map(|_| ())
-}
-
 /// Returns no-follow regular-file metadata for snapshot candidate discovery, without reading
 /// source bytes. The same root identity and component checks as source reads apply; a missing,
 /// linked, or special path remains an error for the collector to classify as a candidate.

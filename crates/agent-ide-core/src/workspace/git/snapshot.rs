@@ -2048,19 +2048,26 @@ async fn capture_attempt<R: SnapshotRunner>(
     })
 }
 
-/// Rejects untracked symlink/special entries without reading bytes; disappearing paths trigger retry.
+/// Keeps untracked entries listed by name only, whatever their kind; disappearing paths retry.
+///
+/// Untracked paths are never treated as baseline content and their bytes are never captured, so
+/// an untracked symlink (typically `node_modules ->` a sibling checkout) or special file stays a
+/// listed name instead of refusing the whole snapshot: one such entry used to fail every diff
+/// with `unsupported_entry`. No content and no link target is read or disclosed; a path that
+/// disappears or a worktree whose root identity changed still triggers the unstable retry.
 fn inspect_untracked(worktree: &WorktreeRef, path: &Path) -> Result<(), GitError> {
-    crate::workspace::observation::inspect_authorized_source_kind(worktree, path).map_err(|error| {
-        match error {
-            ObservationError::SymlinkEscape | ObservationError::NotRegularFile => {
-                GitError::UnsupportedSnapshot
-            }
-            ObservationError::Missing | ObservationError::RootIdentityChanged => {
-                GitError::UnstableSnapshot
-            }
-            _ => GitError::SnapshotIo,
+    match crate::workspace::observation::snapshot_source_metadata(worktree, path) {
+        Ok(_) => Ok(()),
+        Err(
+            ObservationError::SymlinkEscape
+            | ObservationError::NotRegularFile
+            | ObservationError::Missing,
+        ) => Ok(()),
+        Err(ObservationError::RootIdentityChanged | ObservationError::RootUnavailable) => {
+            Err(GitError::UnstableSnapshot)
         }
-    })
+        Err(_) => Err(GitError::SnapshotIo),
+    }
 }
 
 #[cfg(test)]
