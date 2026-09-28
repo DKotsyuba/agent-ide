@@ -4181,6 +4181,79 @@ async fn managed_auto_codex_children_keep_the_codex_contract() {
     );
 }
 
+/// Two calls of one binding may race: a pre-hook whose submission the daemon observes late
+/// (hundreds of milliseconds behind a sibling call) still serves its own call instead of being
+/// recorded as MCP-before-pre ordering and refused.
+#[tokio::test]
+async fn claude_call_with_a_late_pre_hook_is_served_not_refused() {
+    let fixture = ProductFixture::new(json!([]));
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    let mut next = 1;
+    let pending = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "parallel-session",
+        None,
+        "ide.start",
+        json!({"activation_id":"parallel"}),
+    )
+    .await;
+    let started = settle_managed_claude_start(
+        &mut mcp,
+        &fixture.root,
+        &mut next,
+        "parallel-session",
+        None,
+        &pending,
+    )
+    .await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    // The second read's dispatch is issued before its pre-hook is submitted, and the pre lands
+    // well after the daemon first sees the call — inside the bounded arrival window.
+    let call = "late-pre-read";
+    next += 1;
+    mcp.send(
+        json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{
+            "name":"ide.read","arguments":{"path":"src/lib.rs","lines":"1-2"},
+            "_meta":{"claudecode/toolUseId":call}
+        }}),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let pre = managed_claude_hook(
+        Some(&fixture.root),
+        managed_claude_event("PreToolUse", "parallel-session", None, call),
+    )
+    .await;
+    assert!(
+        pre.status.success() && pre.stdout.is_empty() && pre.stderr.is_empty(),
+        "late pre-hook submits silently"
+    );
+    let reply = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let mut line = String::new();
+            assert_ne!(mcp.output.read_line(&mut line).await.unwrap(), 0);
+            let response: Value = serde_json::from_str(&line).unwrap();
+            if response["id"] == json!(next) {
+                return response;
+            }
+        }
+    })
+    .await
+    .expect("late-pre call answers within the deadline");
+    let fields = claude_fields(assert_claude_envelope(&reply));
+    let text = fields["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("pub fn value() -> i32") && text.contains("source_ref: "),
+        "the late-pre read must be served, not refused: {reply}"
+    );
+    mcp.close().await;
+}
+
 /// A session that never calls `ide.start` produces hook bookkeeping, not failures: one `info`
 /// skip line per detail per window on each side, and no `warn` hook line at all.
 #[tokio::test]

@@ -73,6 +73,13 @@ fn log_hook_inactive(noise: &Mutex<crate::errorlog::RateWindow>, host: HostKind)
 
 /// One journal line per daemon per ten minutes for never-activated hook traffic.
 const HOOK_INACTIVE_WINDOW_MS: u64 = 600_000;
+/// Bounded arrival window for a Claude pre-hook that has not reached the guard yet.
+///
+/// Generous against the observed ~405 ms submission stall, short enough to fit the client's
+/// one-second first-reply budget with room for the call itself.
+const PRE_ARRIVAL_WAIT: std::time::Duration = std::time::Duration::from_millis(600);
+/// Poll interval of the pre-arrival window.
+const PRE_ARRIVAL_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Returns the host contract one sanitized hook observation names, when it names a supported one.
 fn observed_host(object: &serde_json::Map<String, Value>) -> Option<HostKind> {
@@ -564,6 +571,27 @@ impl ProductDispatcher {
                     });
                 }
                 let channel = self.channel(method.opaque_attachment())?;
+                // A merely-late pre-hook must not be recorded as MCP-before-pre replay
+                // evidence: the host fires each pre exactly once, and a daemon busy with a
+                // sibling call can observe its submission hundreds of milliseconds late
+                // (~405 ms in the T15B evidence, against the hook's own 250 ms deadline).
+                // Give an absent Claude pre a bounded arrival window before the guard op.
+                if host == HostKind::Claude
+                    && !self
+                        .bindings
+                        .lock()
+                        .is_ok_and(|bindings| bindings.has_pre(method.correlation_id(), &channel))
+                {
+                    let deadline = tokio::time::Instant::now() + PRE_ARRIVAL_WAIT;
+                    while tokio::time::Instant::now() < deadline {
+                        tokio::time::sleep(PRE_ARRIVAL_POLL).await;
+                        if self.bindings.lock().is_ok_and(|bindings| {
+                            bindings.has_pre(method.correlation_id(), &channel)
+                        }) {
+                            break;
+                        }
+                    }
+                }
                 let invocation = {
                     let mut bindings = self.bindings.lock().ok()?;
                     let status = match host {

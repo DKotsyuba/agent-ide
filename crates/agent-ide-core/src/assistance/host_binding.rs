@@ -1007,6 +1007,17 @@ impl HostBindingGuard {
         self.native_hints.clear();
     }
 
+    /// Reports whether one exact call identity already delivered its pre-hook on this channel.
+    ///
+    /// Lets a dispatcher give a merely-late pre-hook a bounded arrival window before the guard
+    /// records the MCP-before-pre ordering as permanent replay evidence (T15B parallel calls).
+    /// Pure lookup.
+    pub fn has_pre(&self, call_id: &str, channel: &ChannelSessionRef) -> bool {
+        self.pre_observed
+            .iter()
+            .any(|(candidate, observed)| candidate.call_id == call_id && observed == channel)
+    }
+
     /// Reports whether one channel ever established a start binding, including a stopped one.
     ///
     /// A channel with no binding belongs to a session that never activated the IDE, so its hook
@@ -1344,6 +1355,33 @@ mod tests {
             .as_bytes(),
         )
         .expect("test hook is valid")
+    }
+
+    /// A pre lookup answers per exact call identity and channel, without consuming anything, so a
+    /// dispatcher can wait for a merely-late pre before recording the ordering as replay
+    /// evidence (T15B parallel calls).
+    #[test]
+    fn has_pre_answers_per_exact_call_and_channel() {
+        let mut guard = HostBindingGuard::default();
+        let left = channel("left-channel");
+        let right = channel("right-channel");
+        assert!(!guard.has_pre("call", &left));
+        assert!(matches!(
+            guard.observe_hook(claude_pre("session", None, "call"), left.clone()),
+            BindingStatus::PreObserved
+        ));
+        assert!(guard.has_pre("call", &left));
+        assert!(!guard.has_pre("call", &right), "channels stay distinct");
+        assert!(
+            !guard.has_pre("other-call", &left),
+            "call identities stay distinct"
+        );
+        // Consuming the pre by a validated start flips the lookup back, exactly like delivery.
+        assert!(matches!(
+            guard.establish_start_claude("call", left.clone()),
+            BindingStatus::Validated(_)
+        ));
+        assert!(!guard.has_pre("call", &left));
     }
 
     /// A channel counts as hook-delivered from its first retained observation through a completed
