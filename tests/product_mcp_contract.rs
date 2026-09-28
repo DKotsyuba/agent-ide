@@ -4970,6 +4970,57 @@ async fn configured_product_symbol_usages_split_counts_inline_test_module() {
     daemon.wait().await.unwrap();
 }
 
+/// A requested callees section always answers: the method's callee is listed, and a function
+/// that calls nothing reports `callees: 0` instead of omitting the section without a word.
+#[tokio::test]
+async fn configured_product_symbol_card_answers_requested_callees() {
+    let fixture = symbol_test_fixture();
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "pub struct Service;\nimpl Service {\n    pub fn work(&self) -> bool { Self::helper() }\n    fn helper() -> bool { true }\n}\npub fn idle() {}\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.root.join("tests/path_tests.rs"), "").unwrap();
+    fixture.git(&["add", "--", "src/lib.rs", "tests/path_tests.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "callees fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "callees").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"callees-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let card = async |actor: &mut ProductActor, symbol: &str| {
+        let reply = actor
+            .call(
+                &fixture,
+                "ide.symbol",
+                json!({"symbol":symbol, "usages":false, "callers":0, "callees":2}),
+            )
+            .await;
+        actor.settle(&fixture, reply).await
+    };
+    let work = card(&mut actor, "src/lib.rs#Service/work").await;
+    let work_text = work["text"].as_str().unwrap_or_default();
+    assert!(
+        work_text.contains("callees: 1\n  src/lib.rs#Service/helper  src/lib.rs:4\n"),
+        "the method's callee must be listed: {work_text}"
+    );
+    let idle = card(&mut actor, "src/lib.rs#idle").await;
+    let idle_text = idle["text"].as_str().unwrap_or_default();
+    assert!(
+        idle_text.contains("callees: 0\n"),
+        "an answered zero must be stated, not omitted: {idle_text}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A symbol card with more than 30 usages and an ambiguity list with more than 20 candidates
 /// keep their first page and name a `detail_ref`; `ide.inspect` then delivers the cut rows.
 #[tokio::test]

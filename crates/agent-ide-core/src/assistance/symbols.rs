@@ -332,6 +332,9 @@ impl Worker<'_> {
             if callers_depth > 0 {
                 card.callers_note = Some(format!("unavailable ({language} has no call hierarchy)"));
             }
+            if callees_depth > 0 {
+                card.callees_note = Some(format!("unavailable ({language} has no call hierarchy)"));
+            }
         } else {
             let byte_offset = name_offset(source, &found)?;
             let live = self.live_session_for(job, &observed).await?;
@@ -387,35 +390,59 @@ impl Worker<'_> {
                         "unavailable ({} has no call hierarchy)",
                         server.name()
                     ));
-                } else if let Ok(calls) = self
-                    .live_session_for(job, &observed)
-                    .await?
-                    .session
-                    .incoming_calls(&observed, &bytes, byte_offset)
-                    .await
-                {
-                    for call in calls {
-                        card.callers.push(Call {
-                            name: self.call_symbol_path(job, &worktree_root, &call.from).await,
-                            file: render::display_path(&worktree_root, &call.from.uri),
-                            line: call.from.selection_range.start.line + 1,
-                        });
+                } else {
+                    // A failed incoming-call request is stated, never silently omitted; an
+                    // answered empty list stays absent exactly as before.
+                    match self
+                        .live_session_for(job, &observed)
+                        .await?
+                        .session
+                        .incoming_calls(&observed, &bytes, byte_offset)
+                        .await
+                    {
+                        Ok(calls) => {
+                            for call in calls {
+                                card.callers.push(Call {
+                                    name: self
+                                        .call_symbol_path(job, &worktree_root, &call.from)
+                                        .await,
+                                    file: render::display_path(&worktree_root, &call.from.uri),
+                                    line: call.from.selection_range.start.line + 1,
+                                });
+                            }
+                        }
+                        Err(_) => {
+                            card.callers_note =
+                                Some("unavailable (call hierarchy request failed)".to_owned());
+                        }
                     }
                 }
             }
             if callees_depth > 0 {
                 let live = self.live_session_for(job, &observed).await?;
-                if let Ok(calls) = live
+                // A requested callees section always answers: a failed request states
+                // unavailability and an answered empty list reports zero, so the card never
+                // omits what was asked for without saying why.
+                match live
                     .session
                     .outgoing_calls(&observed, &bytes, byte_offset)
                     .await
                 {
-                    for call in calls {
-                        card.callees.push(Call {
-                            name: self.call_symbol_path(job, &worktree_root, &call.to).await,
-                            file: render::display_path(&worktree_root, &call.to.uri),
-                            line: call.to.selection_range.start.line + 1,
-                        });
+                    Ok(calls) => {
+                        for call in &calls {
+                            card.callees.push(Call {
+                                name: self.call_symbol_path(job, &worktree_root, &call.to).await,
+                                file: render::display_path(&worktree_root, &call.to.uri),
+                                line: call.to.selection_range.start.line + 1,
+                            });
+                        }
+                        if calls.is_empty() {
+                            card.callees_note = Some("0".to_owned());
+                        }
+                    }
+                    Err(_) => {
+                        card.callees_note =
+                            Some("unavailable (call hierarchy request failed)".to_owned());
                     }
                 }
             }
