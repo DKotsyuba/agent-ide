@@ -114,6 +114,10 @@ create_fixture() {
         '' \
         '[lib]' \
         'path = "src/lib.rs"' \
+        '' \
+        '# Own workspace root: the fixture sits inside the candidate checkout, whose root manifest' \
+        '# is a workspace since 0.5.0; without this cargo refuses the nested package.' \
+        '[workspace]' \
         >"$1/acceptance-fixture/Cargo.toml"
     printf '%s\n' \
         '//! Fixture crate for the agent-ide symbol tools acceptance scenario.' \
